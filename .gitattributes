@@ -1,0 +1,25 @@
+* text=auto
+
+# Keep source and project metadata stable across Windows and Unix checkouts.
+*.c text eol=lf
+*.cc text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.cmake text eol=lf
+*.in text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.jinja text eol=lf
+CMakeLists.txt text eol=lf
+.clang-format text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+LICENSE text eol=lf
+
+# Model and compiled artifacts are binary even when force-added intentionally.
+*.bin binary
+*.safetensors binary
+*.gguf binary
+*.onnx binary

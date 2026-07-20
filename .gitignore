@@ -1,0 +1,91 @@
+# CMake build trees and generated files
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+/install/
+/dist/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+Testing/
+_deps/
+Makefile
+*.ninja
+.ninja_deps
+.ninja_log
+
+# Compiled objects, libraries, and executables
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.d
+
+# Coverage and profiling output
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+coverage/
+
+# Downloaded models and generated weights
+/models/
+/checkpoints/
+/weights/
+/downloads/
+*.safetensors
+*.gguf
+*.onnx
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# IDE and editor state
+/.vs/
+/.vscode/
+/.idea/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.code-workspace
+CMakeSettings.json
+CMakeUserPresets.json
+*.user
+*.suo
+*.swp
+*.swo
+*~
+
+# Local caches, logs, and environment files
+/.cache/
+*.log
+*.tmp
+*.bak
+*.orig
+.env
+.env.*
+!.env.example
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
