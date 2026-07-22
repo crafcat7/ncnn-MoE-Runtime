@@ -3,7 +3,9 @@
 #include "ncnn_linear.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <cstdint>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -19,6 +21,14 @@ float bfloat16_to_float(uint16_t value) noexcept
     return result;
 }
 
+uint16_t float_to_bfloat16(float value) noexcept
+{
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t rounding = 0x7fffu + ((bits >> 16) & 1u);
+    return static_cast<uint16_t>((bits + rounding) >> 16);
+}
+
 static float tensor_value(const TensorData& tensor, size_t index)
 {
     if (tensor.dtype == DType::Float32)
@@ -27,6 +37,17 @@ static float tensor_value(const TensorData& tensor, size_t index)
         return bfloat16_to_float(tensor.bfloat16_data[index]);
     assert(false && "tensor_value only supports float32 and bfloat16");
     return 0.0f;
+}
+
+static const std::array<float, 256>& mxfp4_scale_table()
+{
+    static const std::array<float, 256> values = [] {
+        std::array<float, 256> table = {};
+        for (uint32_t index = 0; index < table.size(); ++index)
+            table[index] = std::ldexp(1.0f, static_cast<int>(index) - 127);
+        return table;
+    }();
+    return values;
 }
 
 CpuBatch embedding_batch(const TensorData& embedding, std::span<const int32_t> input_ids)
@@ -54,9 +75,10 @@ CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input)
     if (matrix.linear_operator && matrix.linear_operator->forward(input, output))
         return output;
     output = CpuBatch(input.rows(), output_columns);
+    const int64_t parallel_output_columns = static_cast<int64_t>(output_columns);
     if (matrix.dtype == DType::Float32) {
 #pragma omp parallel for
-        for (uint32_t output_column = 0; output_column < output_columns; ++output_column) {
+        for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column) {
             const float* weights = matrix.float32_data.data() + static_cast<size_t>(output_column) * input_columns;
             for (size_t token_index = 0; token_index < input.rows(); ++token_index) {
                 const float* token = input.row(token_index);
@@ -67,7 +89,7 @@ CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input)
     }
     else if (matrix.dtype == DType::BFloat16) {
 #pragma omp parallel for
-        for (uint32_t output_column = 0; output_column < output_columns; ++output_column) {
+        for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column) {
             const uint16_t* weights = matrix.bfloat16_data.data() + static_cast<size_t>(output_column) * input_columns;
             for (size_t token_index = 0; token_index < input.rows(); ++token_index) {
                 const float* token = input.row(token_index);
@@ -80,7 +102,7 @@ CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input)
     }
     else if (matrix.dtype == DType::Int8) {
 #pragma omp parallel for
-        for (uint32_t output_column = 0; output_column < output_columns; ++output_column) {
+        for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column) {
             const int8_t* weights = matrix.int8_data.data() + static_cast<size_t>(output_column) * input_columns;
             const float scale = matrix.quantization_scales[output_column];
             for (size_t token_index = 0; token_index < input.rows(); ++token_index) {
@@ -97,15 +119,17 @@ CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input)
             0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
             -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
         const uint32_t blocks_per_row = input_columns / 32;
+        const std::array<float, 256>& scale_table = mxfp4_scale_table();
 #pragma omp parallel for
-        for (uint32_t output_column = 0; output_column < output_columns; ++output_column) {
+        for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column) {
             const uint8_t* blocks = matrix.mxfp4_blocks.data() + static_cast<size_t>(output_column) * input_columns / 2;
-            const uint8_t* scales = matrix.mxfp4_scales.data() + static_cast<size_t>(output_column) * blocks_per_row;
+            const uint8_t* scales = matrix.mxfp4_scales.data()
+                                    + static_cast<size_t>(output_column) * blocks_per_row;
             for (size_t token_index = 0; token_index < input.rows(); ++token_index) {
                 const float* token = input.row(token_index);
                 float sum = 0.0f;
                 for (uint32_t block_index = 0; block_index < blocks_per_row; ++block_index) {
-                    const float scale = std::ldexp(1.0f, static_cast<int>(scales[block_index]) - 127);
+                    const float scale = scale_table[scales[block_index]];
                     const uint8_t* packed = blocks + block_index * 16;
                     const float* input_block = token + block_index * 32;
                     float block_sum = 0.0f;

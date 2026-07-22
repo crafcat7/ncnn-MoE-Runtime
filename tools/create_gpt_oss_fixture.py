@@ -96,9 +96,9 @@ def build_fixture(output: Path) -> None:
         "num_local_experts": 1,
         "experts_per_token": 1,
         "num_experts_per_tok": 1,
-        "num_attention_heads": 1,
-        "num_key_value_heads": 1,
-        "head_dim": 2,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 4,
         "sliding_window": 4,
         "initial_context_length": 16,
         "max_position_embeddings": 32,
@@ -120,15 +120,20 @@ def build_fixture(output: Path) -> None:
     add_bfloat16(tensors, "model.embed_tokens.weight", [2, 32], identity(2, 32))
     prefix = "model.layers.0."
     add_bfloat16(tensors, prefix + "input_layernorm.weight", [32], [1.0] * 32)
-    add_bfloat16(tensors, prefix + "self_attn.q_proj.weight", [2, 32], zeros(64))
-    add_bfloat16(tensors, prefix + "self_attn.q_proj.bias", [2], zeros(2))
-    add_bfloat16(tensors, prefix + "self_attn.k_proj.weight", [2, 32], zeros(64))
-    add_bfloat16(tensors, prefix + "self_attn.k_proj.bias", [2], zeros(2))
-    add_bfloat16(tensors, prefix + "self_attn.v_proj.weight", [2, 32], identity(2, 32))
-    add_bfloat16(tensors, prefix + "self_attn.v_proj.bias", [2], zeros(2))
-    add_bfloat16(tensors, prefix + "self_attn.o_proj.weight", [32, 2], identity(32, 2))
+    add_bfloat16(tensors, prefix + "self_attn.q_proj.weight", [32, 32], identity(32, 32))
+    add_bfloat16(tensors, prefix + "self_attn.q_proj.bias", [32], zeros(32))
+    add_bfloat16(tensors, prefix + "self_attn.k_proj.weight", [8, 32], identity(8, 32))
+    add_bfloat16(tensors, prefix + "self_attn.k_proj.bias", [8], zeros(8))
+    add_bfloat16(tensors, prefix + "self_attn.v_proj.weight", [8, 32], identity(8, 32))
+    add_bfloat16(tensors, prefix + "self_attn.v_proj.bias", [8], zeros(8))
+    add_bfloat16(tensors, prefix + "self_attn.o_proj.weight", [32, 32], identity(32, 32))
     add_bfloat16(tensors, prefix + "self_attn.o_proj.bias", [32], zeros(32))
-    add_bfloat16(tensors, prefix + "self_attn.sinks", [1], zeros(1))
+    add_bfloat16(
+        tensors,
+        prefix + "self_attn.sinks",
+        [8],
+        [0.125 * index for index in range(8)],
+    )
     add_bfloat16(
         tensors, prefix + "post_attention_layernorm.weight", [32], [1.0] * 32
     )
@@ -158,18 +163,55 @@ def main() -> None:
     args = parse_args()
     build_fixture(args.output.resolve())
     if args.verify_runner:
-        completed = subprocess.run(
-            [str(args.verify_runner.resolve()), str(args.output.resolve()), "0"],
+        common_arguments = [
+            str(args.verify_runner.resolve()),
+            str(args.output.resolve()),
+            "0",
+            "1",
+            "0",
+            "1",
+            "--max-new-tokens",
+            "3",
+            "--temperature",
+            "0",
+        ]
+        automatic = subprocess.run(
+            common_arguments,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=False,
         )
-        print(completed.stdout, end="")
-        if completed.returncode:
-            raise SystemExit(completed.returncode)
-        if "loaded gpt_oss" not in completed.stdout or "generated token ids:" not in completed.stdout:
+        cpu = subprocess.run(
+            common_arguments + ["--cpu"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        print(automatic.stdout, end="")
+        if automatic.returncode:
+            raise SystemExit(automatic.returncode)
+        if cpu.returncode:
+            print(cpu.stdout, end="")
+            raise SystemExit(cpu.returncode)
+        if "loaded gpt_oss" not in automatic.stdout or "generated token ids:" not in automatic.stdout:
             raise SystemExit("GPT-OSS fixture runner output is incomplete")
+        def generated_tokens(output: str) -> str:
+            return next(
+                line.partition(":")[2].strip()
+                for line in output.splitlines()
+                if line.startswith("generated token ids:")
+            )
+
+        automatic_tokens = generated_tokens(automatic.stdout)
+        cpu_tokens = generated_tokens(cpu.stdout)
+        if automatic_tokens != cpu_tokens:
+            print(cpu.stdout, end="")
+            raise SystemExit("automatic and CPU GPT-OSS outputs differ")
+        if "backend vulkan-dense/cpu-experts" in automatic.stdout \
+                and "Vulkan attention blocks: 0" in automatic.stdout:
+            raise SystemExit("Vulkan GPT-OSS run did not execute GPU attention")
 
 
 if __name__ == "__main__":

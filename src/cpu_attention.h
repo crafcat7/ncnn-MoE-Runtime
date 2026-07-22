@@ -15,6 +15,7 @@ namespace moe {
     const WeightTable& weights,
     const AttentionBlockPlan& plan,
     float norm_epsilon,
+    DType kv_cache_dtype,
     uint64_t position_offset,
     CpuLayerCache& cache,
     const CpuBatch& hidden);

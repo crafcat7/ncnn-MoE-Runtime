@@ -50,6 +50,8 @@ struct ExpertPlan
 
 struct AttentionBlockPlan
 {
+    std::shared_ptr<NcnnVulkanAttentionOperator> vulkan_attention_operator;
+    std::shared_ptr<NcnnLinearOperator> fused_qkv_operator;
     TensorHandle pre_attention_norm_weight = invalid_tensor_handle;
     TensorHandle query_weight = invalid_tensor_handle;
     TensorHandle query_bias = invalid_tensor_handle;
@@ -102,6 +104,7 @@ struct CompiledModel
     TensorHandle token_embedding = invalid_tensor_handle;
     TensorHandle final_norm_weight = invalid_tensor_handle;
     TensorHandle lm_head_weight = invalid_tensor_handle;
+    HybridMode hybrid_mode = HybridMode::CpuOnly;
 };
 
 class ModelCompiler
@@ -109,7 +112,8 @@ class ModelCompiler
 public:
     [[nodiscard]] Result<CompiledModel> compile(
         MoeModelDescriptor descriptor,
-        WeightMapping mapping) const;
+        WeightMapping mapping,
+        HybridMode hybrid_mode = HybridMode::CpuOnly) const;
 };
 
 } // namespace moe

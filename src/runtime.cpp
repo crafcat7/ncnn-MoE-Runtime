@@ -2,6 +2,7 @@
 
 #include "ncnn/moe/execution_plan.h"
 #include "moe_adapter.h"
+#include "ncnn_linear.h"
 
 #include <fstream>
 #include <regex>
@@ -35,6 +36,16 @@ static Result<std::string> required_json_string(const std::string& json, const s
 
 Runtime::Runtime()
 {
+#if defined(NCNN_MOE_USE_NCNN) && NCNN_MOE_USE_NCNN
+    capabilities_.ncnn_cpu_linear = true;
+#endif
+#if defined(NCNN_MOE_WITH_VULKAN) && NCNN_MOE_WITH_VULKAN
+    capabilities_.vulkan_device_count = NcnnLinearOperator::vulkan_device_count();
+    capabilities_.vulkan_execution = capabilities_.vulkan_device_count > 0;
+#endif
+    capabilities_.vulkan_cpu_mix = capabilities_.vulkan_execution;
+    capabilities_.vulkan_cpu_prefetch = capabilities_.vulkan_cpu_mix;
+    capabilities_.vulkan_attention = capabilities_.vulkan_cpu_mix;
     register_adapter(std::make_shared<MoeAdapter>());
 }
 
@@ -48,8 +59,15 @@ Result<ModelPtr> Runtime::load_model(
     const std::filesystem::path& model_path,
     const RuntimeOptions& options)
 {
-    if (options.hybrid_mode != HybridMode::CpuOnly && options.hybrid_mode != HybridMode::Auto)
-        return Error{ErrorCode::UnsupportedModel, "the current executor supports CPU mode only"};
+    HybridMode resolved_mode = options.hybrid_mode;
+    if (resolved_mode == HybridMode::Auto)
+        resolved_mode = capabilities_.vulkan_cpu_mix ? HybridMode::HybridExperts : HybridMode::CpuOnly;
+    if (resolved_mode == HybridMode::VulkanOnly)
+        return Error{ErrorCode::UnsupportedModel, "Vulkan-only execution is not implemented; use HybridExperts"};
+    if (resolved_mode == HybridMode::HybridExperts && !capabilities_.vulkan_cpu_mix)
+        return Error{ErrorCode::UnsupportedModel, "HybridExperts requires a Vulkan device and Vulkan-enabled ncnn"};
+    if (resolved_mode == HybridMode::VulkanWithCpuPrefetch && !capabilities_.vulkan_cpu_prefetch)
+        return Error{ErrorCode::UnsupportedModel, "VulkanWithCpuPrefetch requires a Vulkan device and Vulkan-enabled ncnn"};
 
     std::filesystem::path root = model_path;
     std::filesystem::path manifest_path;
@@ -95,7 +113,10 @@ Result<ModelPtr> Runtime::load_model(
         return weights.error();
 
     ModelCompiler compiler;
-    auto compiled = compiler.compile(std::move(descriptor).value(), std::move(weights).value());
+    auto compiled = compiler.compile(
+        std::move(descriptor).value(),
+        std::move(weights).value(),
+        resolved_mode);
     if (!compiled)
         return compiled.error();
 
@@ -109,7 +130,7 @@ Result<SessionPtr> Runtime::create_session(const ModelPtr& model, const SessionO
         return Error{ErrorCode::InvalidArgument, "model cannot be null"};
     if (options.logits_output_mode != LogitsOutputMode::FullLogits)
         return Error{ErrorCode::UnsupportedModel, "the current executor supports full logits output only"};
-    return SessionPtr(new Session(model));
+    return SessionPtr(new Session(model, options));
 }
 
 } // namespace moe

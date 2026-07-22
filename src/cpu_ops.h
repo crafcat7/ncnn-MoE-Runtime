@@ -13,6 +13,7 @@ namespace ncnn {
 namespace moe {
 
 [[nodiscard]] float bfloat16_to_float(uint16_t value) noexcept;
+[[nodiscard]] uint16_t float_to_bfloat16(float value) noexcept;
 [[nodiscard]] CpuBatch embedding_batch(const TensorData& embedding, std::span<const int32_t> input_ids);
 [[nodiscard]] CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input);
 [[nodiscard]] CpuBatch linear_batch(const TensorData& matrix, const TensorData& bias, const CpuBatch& input);

@@ -1,6 +1,7 @@
 #include "ncnn/moe/execution_plan.h"
 
 #include "internal/tensor_names.h"
+#include "ncnn_attention.h"
 #include "ncnn_linear.h"
 
 #include <algorithm>
@@ -115,17 +116,24 @@ TensorHandle WeightTable::find_handle(const std::string& name) const noexcept
     return it == handles_.end() ? invalid_tensor_handle : it->second;
 }
 
-static void prepare_linear_operator(
+static Result<void> prepare_linear_operator(
     WeightTable& weights,
     TensorHandle matrix_handle,
-    TensorHandle bias_handle = invalid_tensor_handle)
+    TensorHandle bias_handle,
+    NcnnLinearDevice device)
 {
     TensorData& matrix = weights.at_mutable(matrix_handle);
     const TensorData* bias = bias_handle == invalid_tensor_handle ? nullptr : &weights.at(bias_handle);
-    matrix.linear_operator = NcnnLinearOperator::create(matrix, bias);
+    matrix.linear_operator = NcnnLinearOperator::create(matrix, bias, device);
+    if (device == NcnnLinearDevice::Vulkan && !matrix.linear_operator)
+        return Error{ErrorCode::InternalError, "failed to create Vulkan InnerProduct operator"};
+    return {};
 }
 
-Result<CompiledModel> ModelCompiler::compile(MoeModelDescriptor descriptor, WeightMapping mapping) const
+Result<CompiledModel> ModelCompiler::compile(
+    MoeModelDescriptor descriptor,
+    WeightMapping mapping,
+    HybridMode hybrid_mode) const
 {
     if (descriptor.vocabulary_size == 0 || descriptor.hidden_size == 0 || descriptor.layer_count == 0
         || descriptor.intermediate_size == 0 || descriptor.expert_count == 0
@@ -135,11 +143,19 @@ Result<CompiledModel> ModelCompiler::compile(MoeModelDescriptor descriptor, Weig
         return Error{ErrorCode::InvalidModel, "layer_count does not match layers"};
     if (descriptor.activation_dtype != DType::Float32 && descriptor.activation_dtype != DType::BFloat16)
         return Error{ErrorCode::UnsupportedModel, "dense weights must use float32 or bfloat16"};
+    if (descriptor.kv_cache_dtype != DType::Float32 && descriptor.kv_cache_dtype != DType::BFloat16)
+        return Error{ErrorCode::UnsupportedModel, "KV cache must use float32 or bfloat16"};
     if (descriptor.norm_epsilon <= 0.0f)
         return Error{ErrorCode::InvalidModel, "norm_epsilon must be positive"};
 
     CompiledModel compiled;
     compiled.descriptor = std::move(descriptor);
+    compiled.hybrid_mode = hybrid_mode;
+    const bool use_vulkan_dense = hybrid_mode == HybridMode::HybridExperts
+                                  || hybrid_mode == HybridMode::VulkanWithCpuPrefetch;
+    const NcnnLinearDevice dense_device = use_vulkan_dense
+                                              ? NcnnLinearDevice::Vulkan
+                                              : NcnnLinearDevice::Cpu;
 
     for (auto& [name, tensor] : mapping.tensors) {
         auto added = compiled.weights.add(name, std::move(tensor));
@@ -166,7 +182,13 @@ Result<CompiledModel> ModelCompiler::compile(MoeModelDescriptor descriptor, Weig
     if (!lm_head)
         return lm_head.error();
     compiled.lm_head_weight = lm_head.value();
-    prepare_linear_operator(compiled.weights, compiled.lm_head_weight);
+    auto prepared = prepare_linear_operator(
+        compiled.weights,
+        compiled.lm_head_weight,
+        invalid_tensor_handle,
+        dense_device);
+    if (!prepared)
+        return prepared.error();
 
     compiled.layers.reserve(compiled.descriptor.layer_count);
     for (uint32_t layer_id = 0; layer_id < compiled.descriptor.layer_count; ++layer_id) {
@@ -262,10 +284,59 @@ Result<CompiledModel> ModelCompiler::compile(MoeModelDescriptor descriptor, Weig
             plan.output_weight = output_weight.value();
             plan.output_bias = output_bias.value();
             plan.sinks = sinks.value();
-            prepare_linear_operator(compiled.weights, plan.query_weight, plan.query_bias);
-            prepare_linear_operator(compiled.weights, plan.key_weight, plan.key_bias);
-            prepare_linear_operator(compiled.weights, plan.value_weight, plan.value_bias);
-            prepare_linear_operator(compiled.weights, plan.output_weight, plan.output_bias);
+            if (dense_device == NcnnLinearDevice::Vulkan) {
+                plan.fused_qkv_operator = NcnnLinearOperator::create_fused(
+                    {
+                        &compiled.weights.at(plan.query_weight),
+                        &compiled.weights.at(plan.key_weight),
+                        &compiled.weights.at(plan.value_weight),
+                    },
+                    {
+                        &compiled.weights.at(plan.query_bias),
+                        &compiled.weights.at(plan.key_bias),
+                        &compiled.weights.at(plan.value_bias),
+                    },
+                    dense_device);
+                if (!plan.fused_qkv_operator)
+                    return Error{ErrorCode::InternalError, "failed to create fused Vulkan QKV operator"};
+            }
+            else {
+                prepared = prepare_linear_operator(compiled.weights, plan.query_weight, plan.query_bias, dense_device);
+                if (!prepared)
+                    return prepared.error();
+                prepared = prepare_linear_operator(compiled.weights, plan.key_weight, plan.key_bias, dense_device);
+                if (!prepared)
+                    return prepared.error();
+                prepared = prepare_linear_operator(compiled.weights, plan.value_weight, plan.value_bias, dense_device);
+                if (!prepared)
+                    return prepared.error();
+            }
+            prepared = prepare_linear_operator(
+                compiled.weights, plan.output_weight, plan.output_bias, dense_device);
+            if (!prepared)
+                return prepared.error();
+            if (dense_device == NcnnLinearDevice::Vulkan) {
+                NcnnVulkanAttentionConfig attention_config;
+                attention_config.hidden_size = compiled.descriptor.hidden_size;
+                attention_config.head_count = plan.head_count;
+                attention_config.kv_head_count = plan.kv_head_count;
+                attention_config.head_dimension = plan.head_dimension;
+                attention_config.sliding_window = plan.sliding_window;
+                attention_config.initial_context_length = plan.initial_context_length;
+                attention_config.norm_epsilon = compiled.descriptor.norm_epsilon;
+                attention_config.rope_theta = plan.rope_theta;
+                attention_config.rope_scaling_factor = plan.rope_scaling_factor;
+                attention_config.rope_ntk_alpha = plan.rope_ntk_alpha;
+                attention_config.rope_ntk_beta = plan.rope_ntk_beta;
+                attention_config.activation_dtype = compiled.descriptor.activation_dtype;
+                attention_config.kv_cache_dtype = compiled.descriptor.kv_cache_dtype;
+                plan.vulkan_attention_operator = NcnnVulkanAttentionOperator::create(
+                    compiled.weights.at(plan.pre_attention_norm_weight),
+                    compiled.weights.at(plan.sinks),
+                    plan.fused_qkv_operator,
+                    compiled.weights.at(plan.output_weight).linear_operator,
+                    attention_config);
+            }
         }
 
         auto norm = require_tensor(
@@ -287,7 +358,13 @@ Result<CompiledModel> ModelCompiler::compile(MoeModelDescriptor descriptor, Weig
                 return bias.error();
             layer_plan.moe.router_bias = bias.value();
         }
-        prepare_linear_operator(compiled.weights, layer_plan.moe.router_weight, layer_plan.moe.router_bias);
+        prepared = prepare_linear_operator(
+            compiled.weights,
+            layer_plan.moe.router_weight,
+            layer_plan.moe.router_bias,
+            dense_device);
+        if (!prepared)
+            return prepared.error();
 
         layer_plan.moe.experts.reserve(moe.expert_count);
         for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id) {
@@ -312,7 +389,11 @@ Result<CompiledModel> ModelCompiler::compile(MoeModelDescriptor descriptor, Weig
                 if (!gate)
                     return gate.error();
                 expert.gate_weight = gate.value();
-                prepare_linear_operator(compiled.weights, expert.gate_weight);
+                (void)prepare_linear_operator(
+                    compiled.weights,
+                    expert.gate_weight,
+                    invalid_tensor_handle,
+                    NcnnLinearDevice::Cpu);
             }
 
             if (moe.layout != ExpertLayout::InterleavedGateUpDown) {
@@ -322,7 +403,11 @@ Result<CompiledModel> ModelCompiler::compile(MoeModelDescriptor descriptor, Weig
                 if (!up)
                     return up.error();
                 expert.up_weight = up.value();
-                prepare_linear_operator(compiled.weights, expert.up_weight);
+                (void)prepare_linear_operator(
+                    compiled.weights,
+                    expert.up_weight,
+                    invalid_tensor_handle,
+                    NcnnLinearDevice::Cpu);
             }
 
             auto down = require_tensor(
@@ -344,7 +429,11 @@ Result<CompiledModel> ModelCompiler::compile(MoeModelDescriptor descriptor, Weig
                 expert.gate_up_bias = gate_up_bias.value();
                 expert.down_bias = down_bias.value();
             }
-            prepare_linear_operator(compiled.weights, expert.down_weight, expert.down_bias);
+            (void)prepare_linear_operator(
+                compiled.weights,
+                expert.down_weight,
+                expert.down_bias,
+                NcnnLinearDevice::Cpu);
 
             layer_plan.moe.experts.push_back(expert);
         }

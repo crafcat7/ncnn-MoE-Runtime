@@ -1,6 +1,8 @@
 #include "cpu_attention.h"
 
 #include "cpu_ops.h"
+#include "ncnn_attention.h"
+#include "ncnn_linear.h"
 
 #include <algorithm>
 #include <cassert>
@@ -53,17 +55,161 @@ static void apply_rope(
     }
 }
 
-static void append_cache(CpuLayerCache& cache, const CpuBatch& key, const CpuBatch& value)
+static uint64_t cache_slot(const CpuLayerCache& cache, uint64_t token_index)
 {
-    const size_t old_key_size = cache.keys.size();
-    const size_t old_value_size = cache.values.size();
-    cache.keys.resize(old_key_size + key.rows() * key.columns());
-    cache.values.resize(old_value_size + value.rows() * value.columns());
-    for (size_t token_index = 0; token_index < key.rows(); ++token_index) {
-        std::copy_n(key.row(token_index), key.columns(), cache.keys.data() + old_key_size + token_index * key.columns());
-        std::copy_n(value.row(token_index), value.columns(), cache.values.data() + old_value_size + token_index * value.columns());
+    assert(cache.capacity_tokens > 0);
+    return (cache.first_slot + token_index) % cache.capacity_tokens;
+}
+
+static void configure_cache(CpuLayerCache& cache, uint32_t columns, DType dtype)
+{
+    if (cache.columns == columns && cache.dtype == dtype)
+        return;
+
+    cache = {};
+    cache.columns = columns;
+    cache.dtype = dtype;
+}
+
+static uint64_t next_capacity(uint64_t current, uint64_t required)
+{
+    uint64_t capacity = current == 0 ? 16 : current;
+    while (capacity < required) {
+        if (capacity > std::numeric_limits<uint64_t>::max() / 2)
+            return required;
+        capacity *= 2;
     }
-    cache.token_count += key.rows();
+    return capacity;
+}
+
+static void resize_cache(CpuLayerCache& cache, uint64_t required_tokens)
+{
+    if (required_tokens <= cache.capacity_tokens)
+        return;
+
+    const uint64_t new_capacity = next_capacity(cache.capacity_tokens, required_tokens);
+    const size_t element_count = static_cast<size_t>(new_capacity) * cache.columns;
+    if (cache.dtype == DType::BFloat16) {
+        std::vector<uint16_t> keys(element_count);
+        std::vector<uint16_t> values(element_count);
+        for (uint64_t token_index = 0; token_index < cache.token_count; ++token_index) {
+            const uint64_t old_slot = cache_slot(cache, token_index);
+            std::copy_n(
+                cache.bfloat16_keys.data() + old_slot * cache.columns,
+                cache.columns,
+                keys.data() + token_index * cache.columns);
+            std::copy_n(
+                cache.bfloat16_values.data() + old_slot * cache.columns,
+                cache.columns,
+                values.data() + token_index * cache.columns);
+        }
+        cache.bfloat16_keys = std::move(keys);
+        cache.bfloat16_values = std::move(values);
+    }
+    else {
+        std::vector<float> keys(element_count);
+        std::vector<float> values(element_count);
+        for (uint64_t token_index = 0; token_index < cache.token_count; ++token_index) {
+            const uint64_t old_slot = cache_slot(cache, token_index);
+            std::copy_n(
+                cache.keys.data() + old_slot * cache.columns,
+                cache.columns,
+                keys.data() + token_index * cache.columns);
+            std::copy_n(
+                cache.values.data() + old_slot * cache.columns,
+                cache.columns,
+                values.data() + token_index * cache.columns);
+        }
+        cache.keys = std::move(keys);
+        cache.values = std::move(values);
+    }
+    cache.first_slot = 0;
+    cache.capacity_tokens = new_capacity;
+}
+
+static void compact_cache(CpuLayerCache& cache, uint64_t target_capacity)
+{
+    if (target_capacity >= cache.capacity_tokens)
+        return;
+
+    const uint64_t previous_capacity = cache.capacity_tokens;
+    cache.capacity_tokens = 0;
+    if (cache.dtype == DType::BFloat16) {
+        std::vector<uint16_t> old_keys = std::move(cache.bfloat16_keys);
+        std::vector<uint16_t> old_values = std::move(cache.bfloat16_values);
+        cache.bfloat16_keys.assign(static_cast<size_t>(target_capacity) * cache.columns, 0);
+        cache.bfloat16_values.assign(static_cast<size_t>(target_capacity) * cache.columns, 0);
+        for (uint64_t token_index = 0; token_index < cache.token_count; ++token_index) {
+            const uint64_t old_slot = (cache.first_slot + token_index) % previous_capacity;
+            std::copy_n(
+                old_keys.data() + old_slot * cache.columns,
+                cache.columns,
+                cache.bfloat16_keys.data() + token_index * cache.columns);
+            std::copy_n(
+                old_values.data() + old_slot * cache.columns,
+                cache.columns,
+                cache.bfloat16_values.data() + token_index * cache.columns);
+        }
+    }
+    else {
+        std::vector<float> old_keys = std::move(cache.keys);
+        std::vector<float> old_values = std::move(cache.values);
+        cache.keys.assign(static_cast<size_t>(target_capacity) * cache.columns, 0.0f);
+        cache.values.assign(static_cast<size_t>(target_capacity) * cache.columns, 0.0f);
+        for (uint64_t token_index = 0; token_index < cache.token_count; ++token_index) {
+            const uint64_t old_slot = (cache.first_slot + token_index) % previous_capacity;
+            std::copy_n(
+                old_keys.data() + old_slot * cache.columns,
+                cache.columns,
+                cache.keys.data() + token_index * cache.columns);
+            std::copy_n(
+                old_values.data() + old_slot * cache.columns,
+                cache.columns,
+                cache.values.data() + token_index * cache.columns);
+        }
+    }
+    cache.first_slot = 0;
+    cache.capacity_tokens = target_capacity;
+}
+
+static void append_cache(
+    CpuLayerCache& cache,
+    DType dtype,
+    const CpuBatch& key,
+    const CpuBatch& value)
+{
+    assert(key.columns() == value.columns());
+    configure_cache(cache, key.columns(), dtype);
+    resize_cache(cache, cache.token_count + key.rows());
+    for (size_t token_index = 0; token_index < key.rows(); ++token_index) {
+        const uint64_t slot = cache_slot(cache, cache.token_count);
+        if (cache.dtype == DType::BFloat16) {
+            uint16_t* key_destination = cache.bfloat16_keys.data() + slot * cache.columns;
+            uint16_t* value_destination = cache.bfloat16_values.data() + slot * cache.columns;
+            for (uint32_t column = 0; column < cache.columns; ++column) {
+                key_destination[column] = float_to_bfloat16(key.row(token_index)[column]);
+                value_destination[column] = float_to_bfloat16(value.row(token_index)[column]);
+            }
+        }
+        else {
+            std::copy_n(key.row(token_index), cache.columns, cache.keys.data() + slot * cache.columns);
+            std::copy_n(value.row(token_index), cache.columns, cache.values.data() + slot * cache.columns);
+        }
+        ++cache.token_count;
+    }
+}
+
+static float cache_element(
+    const CpuLayerCache& cache,
+    bool key,
+    uint64_t token_index,
+    uint32_t column)
+{
+    const uint64_t slot = cache_slot(cache, token_index);
+    const size_t offset = static_cast<size_t>(slot) * cache.columns + column;
+    if (cache.dtype == DType::BFloat16)
+        return bfloat16_to_float(key ? cache.bfloat16_keys[offset] : cache.bfloat16_values[offset]);
+    return key ? cache.keys[offset] : cache.values[offset];
 }
 
 static CpuBatch scaled_dot_product_attention(
@@ -77,7 +223,6 @@ static CpuBatch scaled_dot_product_attention(
     const uint32_t kv_head_count = plan.kv_head_count;
     const uint32_t head_dimension = plan.head_dimension;
     const uint32_t heads_per_group = head_count / kv_head_count;
-    const uint32_t kv_columns = kv_head_count * head_dimension;
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dimension));
     CpuBatch output(query.rows(), head_count * head_dimension);
     std::vector<float> logits(cache.token_count);
@@ -103,10 +248,10 @@ static CpuBatch scaled_dot_product_attention(
                     continue;
                 }
 
-                const float* key_vector = cache.keys.data() + key_index * kv_columns + kv_head * head_dimension;
                 float dot = 0.0f;
                 for (uint32_t column = 0; column < head_dimension; ++column)
-                    dot += query_vector[column] * key_vector[column];
+                    dot += query_vector[column]
+                           * cache_element(cache, true, key_index, kv_head * head_dimension + column);
                 logits[key_index] = dot * scale;
                 maximum = std::max(maximum, logits[key_index]);
             }
@@ -128,9 +273,9 @@ static CpuBatch scaled_dot_product_attention(
             float* output_vector = output.row(query_index) + query_head * head_dimension;
             for (uint64_t key_index = 0; key_index < cache.token_count; ++key_index) {
                 const float probability = logits[key_index] / normalizer;
-                const float* value_vector = cache.values.data() + key_index * kv_columns + kv_head * head_dimension;
                 for (uint32_t column = 0; column < head_dimension; ++column)
-                    output_vector[column] += probability * value_vector[column];
+                    output_vector[column] += probability
+                                              * cache_element(cache, false, key_index, kv_head * head_dimension + column);
             }
         }
     }
@@ -146,29 +291,55 @@ static void trim_sliding_cache(CpuLayerCache& cache, const AttentionBlockPlan& p
         return;
 
     const uint64_t removed_tokens = cache.token_count - retained_tokens;
-    const size_t columns = static_cast<size_t>(plan.kv_head_count) * plan.head_dimension;
-    if (retained_tokens > 0) {
-        std::move(cache.keys.begin() + removed_tokens * columns, cache.keys.end(), cache.keys.begin());
-        std::move(cache.values.begin() + removed_tokens * columns, cache.values.end(), cache.values.begin());
-    }
-    cache.keys.resize(retained_tokens * columns);
-    cache.values.resize(retained_tokens * columns);
+    cache.first_slot = (cache.first_slot + removed_tokens) % cache.capacity_tokens;
     cache.start_position += removed_tokens;
     cache.token_count = retained_tokens;
+    const uint64_t target_capacity = std::max<uint64_t>(16, retained_tokens * 2);
+    if (cache.capacity_tokens > target_capacity * 4)
+        compact_cache(cache, target_capacity);
 }
 
 CpuBatch execute_attention_block(
     const WeightTable& weights,
     const AttentionBlockPlan& plan,
     float norm_epsilon,
+    DType kv_cache_dtype,
     uint64_t position_offset,
     CpuLayerCache& cache,
     const CpuBatch& hidden)
 {
+    CpuBatch vulkan_output;
+    if (plan.vulkan_attention_operator
+        && plan.vulkan_attention_operator->forward(
+            position_offset, cache, hidden, vulkan_output))
+        return vulkan_output;
+
     const CpuBatch normalized = rms_norm_batch(hidden, weights.at(plan.pre_attention_norm_weight), norm_epsilon);
-    CpuBatch query = linear_batch(weights.at(plan.query_weight), weights.at(plan.query_bias), normalized);
-    CpuBatch key = linear_batch(weights.at(plan.key_weight), weights.at(plan.key_bias), normalized);
-    CpuBatch value = linear_batch(weights.at(plan.value_weight), weights.at(plan.value_bias), normalized);
+    CpuBatch query;
+    CpuBatch key;
+    CpuBatch value;
+    CpuBatch fused_qkv;
+    if (plan.fused_qkv_operator
+        && plan.fused_qkv_operator->forward(normalized, fused_qkv)) {
+        const uint32_t query_columns = plan.head_count * plan.head_dimension;
+        const uint32_t key_value_columns = plan.kv_head_count * plan.head_dimension;
+        query = CpuBatch(hidden.rows(), query_columns);
+        key = CpuBatch(hidden.rows(), key_value_columns);
+        value = CpuBatch(hidden.rows(), key_value_columns);
+        for (size_t token_index = 0; token_index < hidden.rows(); ++token_index) {
+            const float* source = fused_qkv.row(token_index);
+            std::copy_n(source, query_columns, query.row(token_index));
+            source += query_columns;
+            std::copy_n(source, key_value_columns, key.row(token_index));
+            source += key_value_columns;
+            std::copy_n(source, key_value_columns, value.row(token_index));
+        }
+    }
+    else {
+        query = linear_batch(weights.at(plan.query_weight), weights.at(plan.query_bias), normalized);
+        key = linear_batch(weights.at(plan.key_weight), weights.at(plan.key_bias), normalized);
+        value = linear_batch(weights.at(plan.value_weight), weights.at(plan.value_bias), normalized);
+    }
 
     for (size_t token_index = 0; token_index < hidden.rows(); ++token_index) {
         const uint64_t position = position_offset + token_index;
@@ -180,7 +351,7 @@ CpuBatch execute_attention_block(
 
     if (cache.token_count == 0)
         cache.start_position = position_offset;
-    append_cache(cache, key, value);
+    append_cache(cache, kv_cache_dtype, key, value);
     const CpuBatch attention = scaled_dot_product_attention(
         plan, weights.at(plan.sinks), position_offset, query, cache);
     CpuBatch projected = linear_batch(weights.at(plan.output_weight), weights.at(plan.output_bias), attention);

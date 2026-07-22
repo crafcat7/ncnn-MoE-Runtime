@@ -41,7 +41,6 @@ Makefile
 coverage/
 
 # Downloaded models and generated weights
-/models/
 /checkpoints/
 /weights/
 /downloads/

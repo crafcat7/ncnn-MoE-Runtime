@@ -11,6 +11,7 @@ namespace ncnn {
 namespace moe {
 
 class NcnnLinearOperator;
+class NcnnVulkanAttentionOperator;
 
 enum class DType
 {

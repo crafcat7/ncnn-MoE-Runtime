@@ -94,6 +94,15 @@ static Result<DType> parse_dtype(const std::string& value)
     return Error{ErrorCode::InvalidModel, "unsupported expert_weight_dtype: " + value};
 }
 
+static Result<DType> parse_kv_cache_dtype(const std::string& value)
+{
+    if (value == "float32")
+        return DType::Float32;
+    if (value == "bfloat16")
+        return DType::BFloat16;
+    return Error{ErrorCode::InvalidModel, "unsupported kv_cache_dtype: " + value};
+}
+
 static Result<std::vector<uint8_t> > read_binary_file(const std::filesystem::path& path)
 {
     std::ifstream stream(path, std::ios::binary | std::ios::ate);
@@ -455,6 +464,9 @@ Result<MoeModelDescriptor> MoeAdapter::parse_model(const ModelPackage& package) 
     auto expert_weight_dtype = parse_dtype(optional_string(json, "expert_weight_dtype", "float32"));
     if (!expert_weight_dtype)
         return expert_weight_dtype.error();
+    auto kv_cache_dtype = parse_kv_cache_dtype(optional_string(json, "kv_cache_dtype", "float32"));
+    if (!kv_cache_dtype)
+        return kv_cache_dtype.error();
 
     MoeModelDescriptor descriptor;
     descriptor.model_type = "tiny_moe";
@@ -464,6 +476,7 @@ Result<MoeModelDescriptor> MoeAdapter::parse_model(const ModelPackage& package) 
     descriptor.layer_count = layer_count.value();
     descriptor.expert_count = expert_count.value();
     descriptor.experts_per_token = top_k.value();
+    descriptor.kv_cache_dtype = kv_cache_dtype.value();
     descriptor.norm_epsilon = optional_float(json, "norm_epsilon", 1e-5f);
 
     const bool use_attention = optional_bool(json, "use_attention", false);

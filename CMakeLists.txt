@@ -6,6 +6,8 @@ option(NCNN_BUILD_MOE_RUNTIME "Build the ncnn MoE transformer runtime" ON)
 option(NCNN_MOE_BUILD_TESTS "Build ncnn_moe tests" ON)
 option(NCNN_MOE_BUILD_EXAMPLES "Build ncnn_moe examples" ON)
 option(NCNN_MOE_USE_NCNN "Use ncnn optimized CPU operators when available" ON)
+option(NCNN_MOE_USE_VULKAN "Require Vulkan support from a discovered ncnn package" ON)
+option(NCNN_MOE_BUILD_BUNDLED_NCNN "Build the ncnn git submodule" ON)
 
 if(NOT NCNN_BUILD_MOE_RUNTIME)
     return()
@@ -43,12 +45,46 @@ if(OpenMP_CXX_FOUND)
 endif()
 
 set(NCNN_MOE_WITH_NCNN OFF)
+set(NCNN_MOE_WITH_VULKAN OFF)
 if(NCNN_MOE_USE_NCNN)
-    find_package(ncnn CONFIG QUIET)
+    if(NCNN_MOE_BUILD_BUNDLED_NCNN)
+        if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ncnn/CMakeLists.txt")
+            message(FATAL_ERROR
+                "Bundled ncnn is unavailable. Initialize the submodule with "
+                "'git submodule update --init --recursive', or configure "
+                "-DNCNN_MOE_BUILD_BUNDLED_NCNN=OFF and provide ncnn_DIR.")
+        endif()
+
+        # These defaults apply only when callers have not already configured ncnn.
+        set(NCNN_BUILD_BENCHMARK OFF CACHE BOOL "Build ncnn benchmark")
+        set(NCNN_BUILD_TESTS OFF CACHE BOOL "Build ncnn tests")
+        set(NCNN_BUILD_EXAMPLES OFF CACHE BOOL "Build ncnn examples")
+        set(NCNN_BUILD_TOOLS OFF CACHE BOOL "Build ncnn tools")
+        set(NCNN_VULKAN ${NCNN_MOE_USE_VULKAN} CACHE BOOL "Build ncnn with Vulkan support")
+        set(NCNN_BF16 ON CACHE BOOL "Build ncnn with bfloat16 support")
+        add_subdirectory(third_party/ncnn EXCLUDE_FROM_ALL)
+    else()
+        if(NCNN_MOE_USE_VULKAN)
+            find_package(ncnn CONFIG REQUIRED)
+        else()
+            find_package(ncnn CONFIG QUIET)
+        endif()
+    endif()
     if(TARGET ncnn)
         target_link_libraries(ncnn_moe PUBLIC ncnn)
         target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_USE_NCNN=1)
         set(NCNN_MOE_WITH_NCNN ON)
+        if(NCNN_MOE_USE_VULKAN AND NOT NCNN_VULKAN)
+            message(FATAL_ERROR
+                "NCNN_MOE_USE_VULKAN defaults to ON, but the discovered ncnn package was built "
+                "with NCNN_VULKAN=OFF. Rebuild ncnn with -DNCNN_VULKAN=ON, select that install "
+                "through ncnn_DIR, or explicitly configure -DNCNN_MOE_USE_VULKAN=OFF."
+            )
+        endif()
+        if(NCNN_MOE_USE_VULKAN AND NCNN_VULKAN)
+            target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_WITH_VULKAN=1)
+            set(NCNN_MOE_WITH_VULKAN ON)
+        endif()
     endif()
 endif()
 

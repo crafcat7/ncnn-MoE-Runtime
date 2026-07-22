@@ -4,14 +4,118 @@
 #include "cpu_session_state.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
+#include <numeric>
 #include <utility>
 
 namespace ncnn {
 namespace moe {
 
-Session::Session(ModelPtr model)
-    : model_(std::move(model)), state_(new CpuSessionState)
+struct SamplingCandidate
+{
+    int32_t token_id = -1;
+    float probability = 0.0f;
+};
+
+static bool contains_token(const std::vector<int32_t>& tokens, int32_t token)
+{
+    return std::find(tokens.begin(), tokens.end(), token) != tokens.end();
+}
+
+static Result<void> validate_sampling_options(const SamplingOptions& options)
+{
+    if (!std::isfinite(options.temperature) || options.temperature < 0.0f)
+        return Error{ErrorCode::InvalidArgument, "temperature must be finite and non-negative"};
+    if (!std::isfinite(options.top_p) || options.top_p <= 0.0f || options.top_p > 1.0f)
+        return Error{ErrorCode::InvalidArgument, "top_p must be in the range (0, 1]"};
+    if (!std::isfinite(options.min_p) || options.min_p < 0.0f || options.min_p > 1.0f)
+        return Error{ErrorCode::InvalidArgument, "min_p must be in the range [0, 1]"};
+    return {};
+}
+
+static Result<std::vector<SamplingCandidate> > sampling_distribution(
+    const LogitsOutput& logits,
+    const SamplingOptions& options)
+{
+    if (logits.values.empty())
+        return Error{ErrorCode::InvalidArgument, "cannot sample empty logits"};
+    auto valid_options = validate_sampling_options(options);
+    if (!valid_options)
+        return valid_options.error();
+
+    std::vector<int32_t> token_ids(logits.values.size());
+    std::iota(token_ids.begin(), token_ids.end(), 0);
+    std::stable_sort(token_ids.begin(), token_ids.end(), [&logits](int32_t left, int32_t right) {
+        if (logits.values[left] == logits.values[right])
+            return left < right;
+        return logits.values[left] > logits.values[right];
+    });
+
+    if (!std::isfinite(logits.values[token_ids.front()]))
+        return Error{ErrorCode::InvalidArgument, "sampling requires at least one finite logit"};
+    if (options.temperature == 0.0f)
+        return std::vector<SamplingCandidate>{{token_ids.front(), 1.0f}};
+
+    if (options.top_k > 0 && options.top_k < token_ids.size())
+        token_ids.resize(options.top_k);
+
+    const float maximum = logits.values[token_ids.front()] / options.temperature;
+    std::vector<SamplingCandidate> candidates;
+    candidates.reserve(token_ids.size());
+    float normalizer = 0.0f;
+    for (int32_t token_id : token_ids) {
+        const float logit = logits.values[token_id];
+        if (!std::isfinite(logit))
+            continue;
+        const float probability = std::exp(logit / options.temperature - maximum);
+        candidates.push_back(SamplingCandidate{token_id, probability});
+        normalizer += probability;
+    }
+    if (candidates.empty() || !std::isfinite(normalizer) || normalizer <= 0.0f)
+        return Error{ErrorCode::InvalidArgument, "sampling distribution is invalid"};
+    for (SamplingCandidate& candidate : candidates)
+        candidate.probability /= normalizer;
+
+    if (options.min_p > 0.0f) {
+        const float threshold = candidates.front().probability * options.min_p;
+        candidates.erase(
+            std::remove_if(candidates.begin(), candidates.end(), [threshold](const SamplingCandidate& candidate) {
+                return candidate.probability < threshold;
+            }),
+            candidates.end());
+    }
+
+    float cumulative_probability = 0.0f;
+    size_t top_p_count = 0;
+    for (const SamplingCandidate& candidate : candidates) {
+        cumulative_probability += candidate.probability;
+        ++top_p_count;
+        if (cumulative_probability >= options.top_p)
+            break;
+    }
+    candidates.resize(top_p_count);
+
+    normalizer = 0.0f;
+    for (const SamplingCandidate& candidate : candidates)
+        normalizer += candidate.probability;
+    for (SamplingCandidate& candidate : candidates)
+        candidate.probability /= normalizer;
+    return candidates;
+}
+
+static void update_cache_statistics(SessionStatistics& statistics, const CpuSessionState& state)
+{
+    statistics.kv_cache_logical_bytes = state.kv_cache_logical_bytes();
+    statistics.kv_cache_allocated_bytes = state.kv_cache_allocated_bytes();
+}
+
+Session::Session(ModelPtr model, const SessionOptions& options)
+    : model_(std::move(model)),
+      state_(new CpuSessionState),
+      executor_(new CpuExecutor),
+      random_generator_(options.sampling_seed),
+      prefill_chunk_size_(options.prefill_chunk_size)
 {
     statistics_.expert_token_counts.resize(model_->descriptor().expert_count, 0);
 }
@@ -31,17 +135,33 @@ Result<PrefillResult> Session::prefill(std::span<const int32_t> input_ids)
         return Error{ErrorCode::InvalidArgument, "prefill exceeds the model context length"};
 
     SessionStatistics updated_statistics = statistics_;
-    CpuExecutor executor;
-    auto all_logits = executor.execute(*model_->compiled_, input_ids, updated_statistics, *state_, sequence_length_);
-    if (!all_logits)
-        return all_logits.error();
+    std::vector<float> final_logits;
+    size_t processed_tokens = 0;
+    while (processed_tokens < input_ids.size()) {
+        const size_t remaining_tokens = input_ids.size() - processed_tokens;
+        const size_t chunk_size = prefill_chunk_size_ == 0
+                                      ? remaining_tokens
+                                      : std::min<size_t>(remaining_tokens, prefill_chunk_size_);
+        const std::span<const int32_t> chunk = input_ids.subspan(processed_tokens, chunk_size);
+        auto chunk_logits = executor_->execute(
+            *model_->compiled_,
+            chunk,
+            updated_statistics,
+            *state_,
+            sequence_length_ + processed_tokens);
+        if (!chunk_logits)
+            return chunk_logits.error();
+        final_logits = std::move(chunk_logits.value().back());
+        processed_tokens += chunk_size;
+    }
 
     statistics_ = std::move(updated_statistics);
     statistics_.prefill_tokens += input_ids.size();
     sequence_length_ += input_ids.size();
+    update_cache_statistics(statistics_, *state_);
 
     PrefillResult result;
-    result.logits.values = std::move(all_logits.value().back());
+    result.logits.values = std::move(final_logits);
     result.processed_tokens = static_cast<uint32_t>(input_ids.size());
     return result;
 }
@@ -55,18 +175,90 @@ Result<DecodeResult> Session::decode(int32_t input_id)
         return Error{ErrorCode::InvalidArgument, "decode exceeds the model context length"};
     SessionStatistics updated_statistics = statistics_;
     const std::span<const int32_t> input(&input_id, 1);
-    CpuExecutor executor;
-    auto all_logits = executor.execute(*model_->compiled_, input, updated_statistics, *state_, sequence_length_);
+    auto all_logits = executor_->execute(*model_->compiled_, input, updated_statistics, *state_, sequence_length_);
     if (!all_logits)
         return all_logits.error();
 
     statistics_ = std::move(updated_statistics);
     ++statistics_.decode_tokens;
     ++sequence_length_;
+    update_cache_statistics(statistics_, *state_);
 
     DecodeResult result;
     result.logits.values = std::move(all_logits.value().front());
     result.sequence_length = sequence_length_;
+    return result;
+}
+
+Result<SampledToken> Session::sample(const LogitsOutput& logits, const SamplingOptions& options)
+{
+    auto candidates = sampling_distribution(logits, options);
+    if (!candidates)
+        return candidates.error();
+
+    if (candidates.value().size() == 1)
+        return SampledToken{candidates.value().front().token_id, 1.0f};
+
+    std::uniform_real_distribution<float> distribution(0.0f, 1.0f);
+    const float sample_value = distribution(random_generator_);
+    float cumulative_probability = 0.0f;
+    for (const SamplingCandidate& candidate : candidates.value()) {
+        cumulative_probability += candidate.probability;
+        if (sample_value < cumulative_probability)
+            return SampledToken{candidate.token_id, candidate.probability};
+    }
+    const SamplingCandidate& final_candidate = candidates.value().back();
+    return SampledToken{final_candidate.token_id, final_candidate.probability};
+}
+
+Result<GenerationResult> Session::generate(
+    std::span<const int32_t> input_ids,
+    const GenerationOptions& options,
+    TokenStreamCallback on_token,
+    TokenTextDecoder decode_text)
+{
+    if (options.max_new_tokens == 0)
+        return Error{ErrorCode::InvalidArgument, "max_new_tokens must be non-zero"};
+    auto valid_sampling = validate_sampling_options(options.sampling);
+    if (!valid_sampling)
+        return valid_sampling.error();
+
+    auto prefill_result = prefill(input_ids);
+    if (!prefill_result)
+        return prefill_result.error();
+
+    LogitsOutput logits = std::move(prefill_result).value().logits;
+    GenerationResult result;
+    for (uint32_t index = 0; index < options.max_new_tokens; ++index) {
+        auto sampled = sample(logits, options.sampling);
+        if (!sampled)
+            return sampled.error();
+
+        StreamToken token;
+        token.index = index;
+        token.token_id = sampled.value().token_id;
+        token.probability = sampled.value().probability;
+        token.is_stop_token = contains_token(options.stop_tokens, token.token_id);
+        if (decode_text)
+            token.text = decode_text(token.token_id);
+        result.tokens.push_back(token);
+
+        if (on_token && !on_token(result.tokens.back())) {
+            result.stopped_by_callback = true;
+            break;
+        }
+        if (token.is_stop_token) {
+            result.stopped_by_stop_token = true;
+            break;
+        }
+        if (index + 1 == options.max_new_tokens)
+            break;
+
+        auto decoded = decode(token.token_id);
+        if (!decoded)
+            return decoded.error();
+        logits = std::move(decoded).value().logits;
+    }
     return result;
 }
 

@@ -15,6 +15,10 @@ public:
     {
         return compiled_->descriptor;
     }
+    [[nodiscard]] HybridMode hybrid_mode() const noexcept
+    {
+        return compiled_->hybrid_mode;
+    }
 
 private:
     explicit Model(std::shared_ptr<const CompiledModel> compiled) : compiled_(std::move(compiled))

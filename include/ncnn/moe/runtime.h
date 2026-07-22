@@ -16,13 +16,29 @@ namespace moe {
 
 struct RuntimeOptions
 {
-    HybridMode hybrid_mode = HybridMode::CpuOnly;
+    HybridMode hybrid_mode = HybridMode::Auto;
+};
+
+struct RuntimeCapabilities
+{
+    bool cpu_execution = true;
+    bool ncnn_cpu_linear = false;
+    bool vulkan_execution = false;
+    bool vulkan_cpu_mix = false;
+    bool vulkan_cpu_prefetch = false;
+    bool vulkan_attention = false;
+    uint32_t vulkan_device_count = 0;
 };
 
 class Runtime
 {
 public:
     Runtime();
+
+    [[nodiscard]] const RuntimeCapabilities& capabilities() const noexcept
+    {
+        return capabilities_;
+    }
 
     void register_adapter(std::shared_ptr<IMoeModelAdapter> adapter);
 
@@ -36,6 +52,7 @@ public:
 
 private:
     std::vector<std::shared_ptr<IMoeModelAdapter> > adapters_;
+    RuntimeCapabilities capabilities_;
 };
 
 } // namespace moe
