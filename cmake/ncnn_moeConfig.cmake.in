@@ -2,7 +2,11 @@
 
 include(CMakeFindDependencyMacro)
 
-if(@NCNN_MOE_WITH_OPENMP@)
+if(@NCNN_MOE_WITH_OPENMP@ OR @NCNN_MOE_WITH_NCNN@)
+    include("${CMAKE_CURRENT_LIST_DIR}/ncnn_moe_openmp.cmake")
+endif()
+
+if(@NCNN_MOE_WITH_OPENMP@ AND NOT TARGET OpenMP::OpenMP_CXX)
     find_dependency(OpenMP COMPONENTS CXX)
 endif()
 

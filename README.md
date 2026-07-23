@@ -3,10 +3,11 @@
 > ❗ ❗ ❗**This project is in the early stages of development.**
 
 `ncnn_moe` is a general model-inference framework built around ncnn. Its current
-implementation is a C++20 Mixture-of-Experts Transformer runtime with an
-ncnn-powered Vulkan/CPU mixed backend. It is designed to grow from an embedded
-inference core into reusable model adapters, execution plans, session lifecycle
-management, and device backends.
+implementation is a C++20 Mixture-of-Experts Transformer runtime. Its verified
+baseline is portable CPU execution, with optional ncnn CPU operators. The
+ncnn/MoltenVK mixed backend remains experimental on macOS. The project is
+designed to grow from an embedded inference core into reusable model adapters,
+execution plans, session lifecycle management, and device backends.
 
 > Its current model adapters support deterministic Tiny MoE packages and the
 > official GPT-OSS Safetensors packages. GPT-OSS loads directly from the original
@@ -35,10 +36,10 @@ than adding model-specific branches to the executor.
 ## Current MoE runtime path
 
 A mixed backend is useful when the GPU has enough VRAM for attention state and
-dense activations, but not for the complete model. `ncnn_moe` keeps the
-latency-sensitive dense path on Vulkan and executes only the routed expert groups
-on CPU. GPT-OSS is the current production-scale adapter and exercises this path
-with BF16 dense tensors and MXFP4 experts.
+dense activations, but not for the complete model. The experimental mixed path
+keeps eligible dense operators on Vulkan and executes routed expert groups on
+CPU. GPT-OSS is the current production-scale adapter and exercises the same
+execution plan with BF16 dense tensors and MXFP4 experts.
 
 ```text
 supported model package
@@ -46,8 +47,7 @@ supported model package
             v
        adapter + compiler
             |
-            +-- Vulkan: RMSNorm, fused QKV, RoPE, GQA attention,
-            |           output projection, Router, LM head, BF16 KV cache
+            +-- Vulkan (experimental): eligible dense operators and KV cache
             |
             +-- CPU: Top-K routing, native MXFP4 expert groups, sampling
 ```
@@ -64,7 +64,7 @@ offload path yet.
 | Tiny MoE adapter | Deterministic native package for runtime and integration testing |
 | GPT-OSS adapter | Direct multi-shard Safetensors loading; RMSNorm, GQA, attention sinks, sliding/full attention, YaRN RoPE, Top-4 routing, and clamped SwiGLU |
 | Execution core | Model-neutral descriptors and compiled execution plans behind the adapter boundary |
-| Dense backend | ncnn Vulkan operators for attention blocks, Router, and LM head; portable CPU fallback |
+| Dense backend | Portable CPU baseline; optional ncnn CPU `InnerProduct`; experimental Vulkan dense path with CPU fallback |
 | Expert weights | Native MXFP4 storage and scalar CPU execution; Float32 and INT8 test paths |
 | KV cache | BF16 or FP32; GPU-resident compact cache in mixed mode, ring cache on CPU |
 | Generation | Greedy and temperature / Top-K / Top-P / Min-P sampling; token streaming |
@@ -79,6 +79,9 @@ offload path yet.
   SSD-backed expert cache.
 - Current adapter coverage is Tiny MoE and GPT-OSS. Shared experts and other
   model families are rejected explicitly.
+- On macOS, the MoltenVK backend is experimental. Attention operations may fall
+  back to CPU; inspect the reported Vulkan dispatch and attention-block counts
+  instead of assuming a requested hybrid placement was fully offloaded.
 
 ## Performance and memory reporting
 
@@ -87,10 +90,7 @@ assignments, KV-cache bytes, and attention/router/expert timings per session.
 This makes mixed-backend bottlenecks visible instead of treating the GPU as a
 black box.
 
-Do not compare a single `ncnn_moe` run with another runtime's published number:
-model format, prompt length, generated length, warm-up policy, CPU threads,
-context length, and GPU placement all materially affect the result. A useful
-comparison should report at least:
+A useful comparison should report at least:
 
 - the exact model package and revision;
 - hardware, OS, driver, backend, and CPU thread count;
@@ -108,30 +108,87 @@ Clone the runtime and initialize the pinned ncnn dependency:
 ```powershell
 git clone --recurse-submodules https://github.com/crafcat7/ncnn-MoE-Runtime.git
 cd ncnn-MoE-Runtime
-cmake -S . -B build-ncnn `
-  -DNCNN_MOE_BUILD_BUNDLED_NCNN=ON `
-  -DNCNN_MOE_USE_VULKAN=ON
+cmake -S . -B build-ncnn
 cmake --build build-ncnn --config Release --parallel
 ctest --test-dir build-ncnn -C Release --output-on-failure
 ```
 
-The bundled ncnn build enables Vulkan and BF16 by default. With a separately
-installed ncnn package, set `NCNN_MOE_BUILD_BUNDLED_NCNN=OFF` and pass
-`-Dncnn_DIR=<path-to-ncnn-config>`.
+The build compiles the pinned `third_party/ncnn` submodule together with the
+runtime. Initialize it with `git submodule update --init --recursive` if the
+checkout was not cloned with `--recurse-submodules`.
 
 The commands above use a multi-config generator such as Visual Studio. With a
 single-config generator, add `-DCMAKE_BUILD_TYPE=Release`, omit `-C Release`
 from `ctest`, and remove `Release` from the executable paths below.
 
-For a portable CPU-only build, disable ncnn explicitly:
+### macOS
 
-```powershell
-cmake -S . -B build-cpu `
-  -DNCNN_MOE_USE_NCNN=OFF `
-  -DNCNN_MOE_USE_VULKAN=OFF
-cmake --build build-cpu --config Release --parallel
-ctest --test-dir build-cpu -C Release --output-on-failure
+macOS builds use the pinned `third_party/ncnn` submodule. Vulkan is enabled by
+default and uses the experimental MoltenVK hybrid backend. Its requirements
+are:
+
+- Xcode or the Xcode Command Line Tools, including the Metal framework;
+- a Metal-capable Mac; and
+- `libMoltenVK.dylib` installed locally. `brew install molten-vk` is one way to
+  provide this system Vulkan implementation; it does **not** provide ncnn.
+
+The configuration searches the standard Homebrew prefixes automatically. For
+a manually installed MoltenVK, pass its absolute library path with
+`NCNN_MOE_MOLTENVK_LIBRARY` instead. A missing library stops configuration with
+an actionable error.
+
+```sh
+brew install molten-vk
+cmake -S . -B build-macos -G Xcode \
+  -DCMAKE_OSX_ARCHITECTURES="$(uname -m)"
+cmake --build build-macos --config Release --parallel
+ctest --test-dir build-macos -C Release --output-on-failure
 ```
+
+To use a manually installed MoltenVK:
+
+```sh
+cmake -S . -B build-macos -G Xcode \
+  -DCMAKE_OSX_ARCHITECTURES="$(uname -m)" \
+  -DNCNN_MOE_MOLTENVK_LIBRARY=/absolute/path/to/libMoltenVK.dylib
+```
+
+The backend is experimental: dense and attention operators may fall back to
+CPU, and the resulting static library embeds an absolute MoltenVK path. Build
+it on the machine that will run it; do not redistribute it as a general CMake
+package. To make a CPU-only build, set `-DNCNN_MOE_USE_VULKAN=OFF` explicitly.
+
+#### Run GPT-OSS on macOS
+
+Pass an official `openai/gpt-oss-20b` model directory followed by one or more
+token IDs. The runner chooses the available backend automatically; use `--cpu`
+or `--hybrid` to select one explicitly:
+
+```sh
+MODEL_DIR="/absolute/path/to/gpt-oss-20b"
+./build-macos/Release/ncnn_moe_gpt_oss \
+  "$MODEL_DIR" 0 \
+  --max-new-tokens 64
+```
+
+The runner accepts token IDs, not prompt text. To run an OpenAI Harmony text
+prompt, install the optional wrapper:
+
+```sh
+python3 -m pip install openai-harmony
+python3 tools/run_gpt_oss_prompt.py \
+  ./build-macos/Release/ncnn_moe_gpt_oss \
+  "$MODEL_DIR" \
+  "Reply with exactly: OK" \
+  --max-new-tokens 64 --stream
+```
+
+When using a custom ncnn/MoltenVK installation, pass
+`-DNCNN_MOE_MOLTENVK_LIBRARY=/absolute/path/to/libMoltenVK.dylib`; the runtime
+uses that path directly instead of relying on the system Vulkan loader.
+
+For a universal binary, replace `$(uname -m)` with `arm64;x86_64` and use a
+universal ncnn build with the same architectures.
 
 ## Run GPT-OSS
 

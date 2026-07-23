@@ -16,7 +16,6 @@
 #include <limits>
 #include <mutex>
 #include <numbers>
-#include <thread>
 #include <vector>
 
 #if NCNN_MOE_WITH_VULKAN
@@ -54,7 +53,12 @@ public:
         const std::lock_guard<std::mutex> lock(creation_mutex);
         if (context)
             return context;
+#if defined(__APPLE__) && defined(NCNN_MOE_MOLTENVK_LIBRARY_PATH)
+        if (ncnn::create_gpu_instance(NCNN_MOE_MOLTENVK_LIBRARY_PATH) != 0
+            || ncnn::get_gpu_count() <= 0)
+#else
         if (ncnn::create_gpu_instance() != 0 || ncnn::get_gpu_count() <= 0)
+#endif
             return {};
 
         ncnn::VulkanDevice* device = ncnn::get_gpu_device();
@@ -130,10 +134,8 @@ public:
 
     ncnn::Layer* layer = nullptr;
     ncnn::Option option;
-    std::vector<float> bias;
     uint32_t input_columns = 0;
     uint32_t output_columns = 0;
-    bool bfloat16 = false;
     bool pipeline_created = false;
 #if NCNN_MOE_WITH_VULKAN
     std::shared_ptr<NcnnVulkanContext> vulkan_context;
@@ -200,16 +202,6 @@ NcnnLinearOperator::NcnnLinearOperator()
 
 NcnnLinearOperator::~NcnnLinearOperator() = default;
 
-#if NCNN_MOE_USE_NCNN
-static uint16_t float_to_bfloat16_storage(float value)
-{
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    const uint32_t rounding = 0x7fffu + ((bits >> 16) & 1u);
-    return static_cast<uint16_t>((bits + rounding) >> 16);
-}
-#endif
-
 std::shared_ptr<NcnnLinearOperator> NcnnLinearOperator::create(
     const TensorData& matrix,
     const TensorData* bias,
@@ -231,10 +223,11 @@ std::shared_ptr<NcnnLinearOperator> NcnnLinearOperator::create(
     Implementation& implementation = *linear->implementation_;
     implementation.input_columns = matrix.shape[1];
     implementation.output_columns = matrix.shape[0];
-    implementation.bfloat16 = matrix.dtype == DType::BFloat16;
-    implementation.option.lightmode = true;
-    implementation.option.use_packing_layout = true;
-    implementation.option.num_threads = std::max(1u, std::thread::hardware_concurrency());
+    implementation.option.use_fp16_packed = false;
+    implementation.option.use_fp16_storage = false;
+    implementation.option.use_fp16_arithmetic = false;
+    implementation.option.use_bf16_packed = false;
+    implementation.option.use_bf16_storage = false;
 
 #if NCNN_MOE_WITH_VULKAN
     if (device == NcnnLinearDevice::Vulkan) {
@@ -247,11 +240,6 @@ std::shared_ptr<NcnnLinearOperator> NcnnLinearOperator::create(
         implementation.option.blob_vkallocator = implementation.vulkan_context->blob_allocator();
         implementation.option.workspace_vkallocator = implementation.vulkan_context->blob_allocator();
         implementation.option.staging_vkallocator = implementation.vulkan_context->staging_allocator();
-        implementation.option.use_fp16_packed = false;
-        implementation.option.use_fp16_storage = false;
-        implementation.option.use_fp16_arithmetic = false;
-        implementation.option.use_bf16_packed = implementation.bfloat16 && vkdev->info.support_bf16_packed();
-        implementation.option.use_bf16_storage = implementation.bfloat16 && vkdev->info.support_bf16_storage();
         implementation.option.use_cooperative_matrix = vkdev->info.support_cooperative_matrix();
         implementation.option.use_subgroup_ops = vkdev->info.support_subgroup_ops();
         implementation.layer = ncnn::create_layer_vulkan(ncnn::LayerType::InnerProduct);
@@ -261,7 +249,6 @@ std::shared_ptr<NcnnLinearOperator> NcnnLinearOperator::create(
     else
 #endif
     {
-        implementation.option.use_bf16_storage = implementation.bfloat16;
         implementation.layer = ncnn::create_layer_cpu(ncnn::LayerType::InnerProduct);
     }
     if (!implementation.layer)
@@ -274,35 +261,26 @@ std::shared_ptr<NcnnLinearOperator> NcnnLinearOperator::create(
     if (implementation.layer->load_param(parameters) != 0)
         return {};
 
-    std::vector<float> converted_weight;
     ncnn::Mat model_data[2];
-    if (implementation.bfloat16) {
-        converted_weight.resize(matrix.element_count());
-        for (size_t index = 0; index < converted_weight.size(); ++index)
-            converted_weight[index] = bfloat16_to_float(matrix.bfloat16_data[index]);
-        model_data[0] = ncnn::Mat(
-            static_cast<int>(matrix.element_count()),
-            converted_weight.data(),
-            sizeof(float));
-    }
-    else {
-        model_data[0] = ncnn::Mat(
-            static_cast<int>(matrix.element_count()),
-            const_cast<float*>(matrix.float32_data.data()),
-            sizeof(float));
-    }
+    model_data[0].create(static_cast<int>(matrix.element_count()), sizeof(float));
+    if (model_data[0].empty())
+        return {};
+    float* weight_data = static_cast<float*>(model_data[0].data);
+    for (size_t index = 0; index < matrix.element_count(); ++index)
+        weight_data[index] = matrix.dtype == DType::Float32
+                                 ? matrix.float32_data[index]
+                                 : bfloat16_to_float(matrix.bfloat16_data[index]);
 
     if (bias) {
-        implementation.bias.resize(implementation.output_columns);
+        model_data[1].create(static_cast<int>(implementation.output_columns), sizeof(float));
+        if (model_data[1].empty())
+            return {};
+        float* bias_data = static_cast<float*>(model_data[1].data);
         for (uint32_t column = 0; column < implementation.output_columns; ++column) {
-            implementation.bias[column] = bias->dtype == DType::Float32
-                                              ? bias->float32_data[column]
-                                              : bfloat16_to_float(bias->bfloat16_data[column]);
+            bias_data[column] = bias->dtype == DType::Float32
+                                    ? bias->float32_data[column]
+                                    : bfloat16_to_float(bias->bfloat16_data[column]);
         }
-        model_data[1] = ncnn::Mat(
-            static_cast<int>(implementation.output_columns),
-            implementation.bias.data(),
-            sizeof(float));
     }
 
     if (implementation.layer->load_model(ncnn::ModelBinFromMatArray(model_data)) != 0
@@ -439,6 +417,7 @@ bool NcnnLinearOperator::forward(const CpuBatch& input, CpuBatch& output) const
 
         const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
         ncnn::VulkanDevice* vkdev = implementation.vulkan_context->device();
+        output = CpuBatch(input.rows(), implementation.output_columns);
         ncnn::VkCompute command(vkdev);
         ncnn::VkMat bottom_gpu;
         command.record_upload(bottom, bottom_gpu, implementation.option);
@@ -466,13 +445,11 @@ bool NcnnLinearOperator::forward(const CpuBatch& input, CpuBatch& output) const
         ncnn::Option download_option = implementation.option;
         download_option.use_packing_layout = false;
         command.record_download(download_gpu, top, download_option);
-        if (command.submit_and_wait() != 0 || top.empty())
-            return false;
-
         const size_t output_size = input.rows() * implementation.output_columns;
-        if (top.total() * top.elempack != output_size || top.elembits() != 32)
+        if (command.submit_and_wait() != 0 || top.empty()
+            || top.total() * top.elempack != output_size
+            || top.elembits() != 32)
             return false;
-        output = CpuBatch(input.rows(), implementation.output_columns);
         const float* source = static_cast<const float*>(top.data);
         for (size_t row_index = 0; row_index < input.rows(); ++row_index) {
             std::copy_n(
@@ -485,39 +462,23 @@ bool NcnnLinearOperator::forward(const CpuBatch& input, CpuBatch& output) const
     }
 #endif
 
-    ncnn::Mat bottom;
-    if (implementation.bfloat16) {
-        bottom.create(static_cast<int>(input.columns()), static_cast<int>(input.rows()), sizeof(uint16_t));
-        if (bottom.empty())
-            return false;
-        for (size_t row_index = 0; row_index < input.rows(); ++row_index) {
-            uint16_t* destination = bottom.row<uint16_t>(static_cast<int>(row_index));
-            const float* source = input.row(row_index);
-            for (uint32_t column = 0; column < input.columns(); ++column)
-                destination[column] = float_to_bfloat16_storage(source[column]);
-        }
-    }
-    else {
-        bottom.create(static_cast<int>(input.columns()), static_cast<int>(input.rows()), sizeof(float));
-        if (bottom.empty())
-            return false;
-        for (size_t row_index = 0; row_index < input.rows(); ++row_index)
-            std::copy_n(input.row(row_index), input.columns(), bottom.row<float>(static_cast<int>(row_index)));
-    }
+    ncnn::Mat bottom(
+        static_cast<int>(input.columns()),
+        static_cast<int>(input.rows()),
+        sizeof(float));
+    if (bottom.empty())
+        return false;
+    for (size_t row_index = 0; row_index < input.rows(); ++row_index)
+        std::copy_n(input.row(row_index), input.columns(), bottom.row<float>(static_cast<int>(row_index)));
 
     ncnn::Mat top;
-    if (implementation.layer->forward(bottom, top, implementation.option) != 0 || top.empty())
+    if (implementation.layer->forward(bottom, top, implementation.option) != 0 || top.empty()
+        || top.total() * top.elempack != input.rows() * implementation.output_columns)
         return false;
     output = CpuBatch(input.rows(), implementation.output_columns);
-    if (implementation.bfloat16) {
-        const uint16_t* source = static_cast<const uint16_t*>(top.data);
-        for (size_t index = 0; index < input.rows() * implementation.output_columns; ++index)
-            output.row(index / implementation.output_columns)[index % implementation.output_columns] = bfloat16_to_float(source[index]);
-    }
-    else {
-        const float* source = static_cast<const float*>(top.data);
-        for (size_t row_index = 0; row_index < input.rows(); ++row_index)
-            std::copy_n(source + row_index * implementation.output_columns, implementation.output_columns, output.row(row_index));
+    for (size_t row_index = 0; row_index < input.rows(); ++row_index) {
+        const float* source = top.row<float>(static_cast<int>(row_index));
+        std::copy_n(source, implementation.output_columns, output.row(row_index));
     }
     return true;
 #else
@@ -552,7 +513,7 @@ uint64_t NcnnVulkanAttentionOperator::current_thread_blocks() noexcept
 #endif
 }
 
-#if NCNN_MOE_WITH_VULKAN && NCNN_BATCH
+#if NCNN_MOE_WITH_VULKAN
 static bool tensor_to_float_vector(const TensorData& tensor, std::vector<float>& values)
 {
     if (tensor.dtype != DType::Float32 && tensor.dtype != DType::BFloat16)
@@ -627,7 +588,7 @@ static ncnn::Mat make_rope_cache(
             const float angle = static_cast<float>(position_offset + token_index) * inverse_frequency;
             const float value = (sine ? std::sin(angle) : std::cos(angle)) * concentration;
             if (bfloat16_storage)
-                bfloat16_row[index] = float_to_bfloat16_storage(value);
+                bfloat16_row[index] = float_to_bfloat16(value);
             else
                 float_row[index] = value;
         }
@@ -664,7 +625,7 @@ static ncnn::Mat make_attention_mask(
             const uint64_t actual_end = cache.token_count + token_count;
             if (bfloat16_storage) {
                 uint16_t* row = head_mask.row<uint16_t>(static_cast<int>(query_index));
-                const uint16_t masked_value = float_to_bfloat16_storage(masked_logit);
+                const uint16_t masked_value = float_to_bfloat16(masked_logit);
                 for (uint64_t key_index = 0; key_index < actual_end; ++key_index) {
                     const uint64_t key_position = key_index < cache.token_count
                                                       ? cache.start_position + key_index
@@ -674,7 +635,7 @@ static ncnn::Mat make_attention_mask(
                                          && key_position + config.sliding_window <= query_position;
                     row[key_index] = future || too_old ? masked_value : 0;
                 }
-                row[actual_end] = float_to_bfloat16_storage(sinks[head]);
+                row[actual_end] = float_to_bfloat16(sinks[head]);
                 std::fill(row + actual_end + 1, row + destination_count, masked_value);
             }
             else {
@@ -704,7 +665,7 @@ std::shared_ptr<NcnnVulkanAttentionOperator> NcnnVulkanAttentionOperator::create
     std::shared_ptr<NcnnLinearOperator> output_projection,
     const NcnnVulkanAttentionConfig& config)
 {
-#if NCNN_MOE_WITH_VULKAN && NCNN_BATCH
+#if NCNN_MOE_WITH_VULKAN
     if (!fused_qkv || !output_projection || !fused_qkv->uses_vulkan()
         || !output_projection->uses_vulkan() || config.hidden_size == 0
         || config.head_count == 0 || config.kv_head_count == 0
@@ -894,7 +855,7 @@ bool NcnnVulkanAttentionOperator::forward(
     const CpuBatch& input,
     CpuBatch& output) const
 {
-#if NCNN_MOE_WITH_VULKAN && NCNN_BATCH
+#if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *implementation_;
     const NcnnVulkanAttentionConfig& config = implementation.config;
     if (input.rows() == 0 || input.columns() != config.hidden_size
