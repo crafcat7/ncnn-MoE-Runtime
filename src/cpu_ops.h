@@ -17,6 +17,11 @@ namespace moe {
 [[nodiscard]] CpuBatch embedding_batch(const TensorData& embedding, std::span<const int32_t> input_ids);
 [[nodiscard]] CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input);
 [[nodiscard]] CpuBatch linear_batch(const TensorData& matrix, const TensorData& bias, const CpuBatch& input);
+[[nodiscard]] CpuBatch fused_mxfp4_gate_up_batch(
+    const TensorData& matrix,
+    const TensorData* bias,
+    const CpuBatch& input,
+    float activation_limit);
 [[nodiscard]] CpuBatch rms_norm_batch(const CpuBatch& input, const TensorData& weight, float epsilon);
 void add_bias_inplace(CpuBatch& destination, const TensorData& bias);
 void add_batch_inplace(CpuBatch& destination, const CpuBatch& source);

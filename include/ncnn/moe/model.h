@@ -19,6 +19,10 @@ public:
     {
         return compiled_->hybrid_mode;
     }
+    [[nodiscard]] const std::vector<CompiledLayerPlan>& execution_plan() const noexcept
+    {
+        return compiled_->layers;
+    }
 
 private:
     explicit Model(std::shared_ptr<const CompiledModel> compiled) : compiled_(std::move(compiled))

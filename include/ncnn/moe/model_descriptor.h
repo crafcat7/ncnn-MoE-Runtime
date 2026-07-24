@@ -10,6 +10,25 @@
 namespace ncnn {
 namespace moe {
 
+enum class ModelNodeType
+{
+    RmsNorm,
+    FusedQkv,
+    Rope,
+    AttentionSink,
+    Sdpa,
+    Projection,
+    Router,
+    TopK,
+    ExpertGroup,
+    Combine
+};
+
+struct ModelNodeDescriptor
+{
+    ModelNodeType type = ModelNodeType::RmsNorm;
+};
+
 struct AttentionDescriptor
 {
     uint32_t head_count = 0;
@@ -57,10 +76,13 @@ struct LayerDescriptor
 {
     AttentionDescriptor attention;
     FfnDescriptor ffn;
+    std::vector<ModelNodeDescriptor> nodes;
 
     NormType pre_attention_norm = NormType::None;
     NormType pre_ffn_norm = NormType::RmsNorm;
 
+    // Adapter-side package hints used while constructing nodes and mapping
+    // weights. ModelCompiler derives execution structure from nodes.
     bool use_attention = false;
     bool use_moe = true;
 };

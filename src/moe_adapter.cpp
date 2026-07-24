@@ -282,6 +282,19 @@ static Result<MoeModelDescriptor> parse_gpt_oss_model(const ModelPackage& packag
         layer.attention = attention;
         layer.attention.sliding_window = layer_id % 2 == 0 ? sliding_window.value() : 0;
         layer.ffn.moe = moe;
+        layer.nodes = {
+            {ModelNodeType::RmsNorm},
+            {ModelNodeType::FusedQkv},
+            {ModelNodeType::Rope},
+            {ModelNodeType::AttentionSink},
+            {ModelNodeType::Sdpa},
+            {ModelNodeType::Projection},
+            {ModelNodeType::RmsNorm},
+            {ModelNodeType::Router},
+            {ModelNodeType::TopK},
+            {ModelNodeType::ExpertGroup},
+            {ModelNodeType::Combine},
+        };
     }
     return descriptor;
 }
@@ -528,6 +541,7 @@ Result<MoeModelDescriptor> MoeAdapter::parse_model(const ModelPackage& package) 
         LayerDescriptor& layer = descriptor.layers[layer_id];
         layer.ffn.moe = moe;
         layer.use_attention = use_attention;
+        layer.nodes.push_back({ModelNodeType::RmsNorm});
         if (use_attention) {
             layer.pre_attention_norm = NormType::RmsNorm;
             layer.attention.head_count = descriptor.attention_head_count;
@@ -540,9 +554,23 @@ Result<MoeModelDescriptor> MoeAdapter::parse_model(const ModelPackage& package) 
             layer.attention.rope_scaling_factor = optional_float(json, "rope_scaling_factor", 1.0f);
             layer.attention.rope_ntk_alpha = optional_float(json, "rope_ntk_alpha", 1.0f);
             layer.attention.rope_ntk_beta = optional_float(json, "rope_ntk_beta", 32.0f);
-            layer.attention.use_bias = true;
-            layer.attention.use_sinks = true;
+            layer.attention.use_bias = optional_bool(json, "attention_bias", true);
+            layer.attention.use_sinks = optional_bool(json, "attention_sinks", true);
+            layer.nodes = {
+                {ModelNodeType::RmsNorm},
+                {ModelNodeType::FusedQkv},
+                {ModelNodeType::Rope},
+            };
+            if (layer.attention.use_sinks)
+                layer.nodes.push_back({ModelNodeType::AttentionSink});
+            layer.nodes.push_back({ModelNodeType::Sdpa});
+            layer.nodes.push_back({ModelNodeType::Projection});
+            layer.nodes.push_back({ModelNodeType::RmsNorm});
         }
+        layer.nodes.push_back({ModelNodeType::Router});
+        layer.nodes.push_back({ModelNodeType::TopK});
+        layer.nodes.push_back({ModelNodeType::ExpertGroup});
+        layer.nodes.push_back({ModelNodeType::Combine});
     }
 
     return descriptor;
@@ -585,30 +613,40 @@ Result<WeightMapping> MoeAdapter::map_weights(
             status = add(layer + "attention.query.weight", {query_size, descriptor.hidden_size}, DType::Float32);
             if (!status)
                 return status.error();
-            status = add(layer + "attention.query.bias", {query_size}, DType::Float32);
-            if (!status)
-                return status.error();
+            if (attention.use_bias) {
+                status = add(layer + "attention.query.bias", {query_size}, DType::Float32);
+                if (!status)
+                    return status.error();
+            }
             status = add(layer + "attention.key.weight", {key_value_size, descriptor.hidden_size}, DType::Float32);
             if (!status)
                 return status.error();
-            status = add(layer + "attention.key.bias", {key_value_size}, DType::Float32);
-            if (!status)
-                return status.error();
+            if (attention.use_bias) {
+                status = add(layer + "attention.key.bias", {key_value_size}, DType::Float32);
+                if (!status)
+                    return status.error();
+            }
             status = add(layer + "attention.value.weight", {key_value_size, descriptor.hidden_size}, DType::Float32);
             if (!status)
                 return status.error();
-            status = add(layer + "attention.value.bias", {key_value_size}, DType::Float32);
-            if (!status)
-                return status.error();
+            if (attention.use_bias) {
+                status = add(layer + "attention.value.bias", {key_value_size}, DType::Float32);
+                if (!status)
+                    return status.error();
+            }
             status = add(layer + "attention.output.weight", {descriptor.hidden_size, query_size}, DType::Float32);
             if (!status)
                 return status.error();
-            status = add(layer + "attention.output.bias", {descriptor.hidden_size}, DType::Float32);
-            if (!status)
-                return status.error();
-            status = add(layer + "attention.sinks", {attention.head_count}, DType::Float32);
-            if (!status)
-                return status.error();
+            if (attention.use_bias) {
+                status = add(layer + "attention.output.bias", {descriptor.hidden_size}, DType::Float32);
+                if (!status)
+                    return status.error();
+            }
+            if (attention.use_sinks) {
+                status = add(layer + "attention.sinks", {attention.head_count}, DType::Float32);
+                if (!status)
+                    return status.error();
+            }
         }
         status = add(layer + "pre_ffn_norm.weight", {descriptor.hidden_size}, DType::Float32);
         if (!status)

@@ -13,6 +13,10 @@
 #include <chrono>
 #include <cmath>
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 #if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
 #include <immintrin.h>
 #endif
@@ -30,6 +34,15 @@ struct RouteCandidate
 {
     uint32_t expert_id = 0;
     float score = 0.0f;
+};
+
+struct ExpertExecutionMetrics
+{
+    uint64_t hinted_bytes = 0;
+    uint64_t mxfp4_decode_gemv_rows = 0;
+    uint64_t mxfp4_prefill_gemm_rows = 0;
+    uint64_t mxfp4_paired_rows = 0;
+    uint64_t mxfp4_fused_gate_up_rows = 0;
 };
 
 static constexpr size_t expert_prefetch_limit_bytes = 4 * 1024;
@@ -148,48 +161,108 @@ static float activate(float value, ExpertActivation activation, float limit)
     return value;
 }
 
+static void record_mxfp4_projection(
+    const TensorData& matrix,
+    const CpuBatch& input,
+    ExpertExecutionMetrics& metrics)
+{
+    if (matrix.dtype != DType::MxFp4)
+        return;
+    const uint64_t rows = static_cast<uint64_t>(matrix.shape[0]) * input.rows();
+    metrics.mxfp4_paired_rows
+        += static_cast<uint64_t>(matrix.shape[0] / 2) * 2 * input.rows();
+    if (input.rows() == 1)
+        metrics.mxfp4_decode_gemv_rows += rows;
+    else
+        metrics.mxfp4_prefill_gemm_rows += rows;
+}
+
+static CpuBatch execute_expert_linear(
+    const TensorData& matrix,
+    const TensorData* bias,
+    const CpuBatch& input,
+    ExpertExecutionMetrics& metrics)
+{
+    record_mxfp4_projection(matrix, input, metrics);
+    return bias ? linear_batch(matrix, *bias, input) : linear_batch(matrix, input);
+}
+
 static CpuBatch execute_expert_batch(
     const WeightTable& weights,
     const ExpertPlan& expert,
     const CpuBatch& input,
     bool prefetch,
-    uint64_t& hinted_bytes)
+    ExpertExecutionMetrics& metrics)
 {
     if (expert.gate_up_weight != invalid_tensor_handle) {
         if (prefetch)
-            hinted_bytes += prefetch_weight(weights, expert.gate_up_weight);
-        CpuBatch gate_up = expert.gate_up_bias == invalid_tensor_handle
-                               ? linear_batch(weights.at(expert.gate_up_weight), input)
-                               : linear_batch(weights.at(expert.gate_up_weight), weights.at(expert.gate_up_bias), input);
-        CpuBatch activated(gate_up.rows(), gate_up.columns() / 2);
-        for (size_t token_index = 0; token_index < gate_up.rows(); ++token_index) {
-            const float* source = gate_up.row(token_index);
-            float* destination = activated.row(token_index);
-            for (uint32_t column = 0; column < activated.columns(); ++column) {
-                const float gate = expert.activation_limit > 0.0f
-                                       ? std::min(source[column * 2], expert.activation_limit)
-                                       : source[column * 2];
-                const float linear = expert.activation_limit > 0.0f
-                                         ? std::clamp(source[column * 2 + 1], -expert.activation_limit, expert.activation_limit)
-                                         : source[column * 2 + 1];
-                const float silu = gate / (1.0f + std::exp(-1.702f * gate));
-                destination[column] = silu * (linear + 1.0f);
+            metrics.hinted_bytes += prefetch_weight(weights, expert.gate_up_weight);
+        const TensorData& gate_up_weight = weights.at(expert.gate_up_weight);
+        const TensorData* gate_up_bias = expert.gate_up_bias == invalid_tensor_handle
+                                             ? nullptr
+                                             : &weights.at(expert.gate_up_bias);
+        CpuBatch activated;
+        if (gate_up_weight.dtype == DType::MxFp4) {
+            activated = fused_mxfp4_gate_up_batch(
+                gate_up_weight,
+                gate_up_bias,
+                input,
+                expert.activation_limit);
+            metrics.mxfp4_fused_gate_up_rows
+                += static_cast<uint64_t>(activated.rows()) * activated.columns();
+            record_mxfp4_projection(gate_up_weight, input, metrics);
+        }
+        else {
+            CpuBatch gate_up = execute_expert_linear(
+                gate_up_weight,
+                gate_up_bias,
+                input,
+                metrics);
+            activated = CpuBatch(gate_up.rows(), gate_up.columns() / 2);
+            for (size_t token_index = 0; token_index < gate_up.rows(); ++token_index) {
+                const float* source = gate_up.row(token_index);
+                float* destination = activated.row(token_index);
+                for (uint32_t column = 0; column < activated.columns(); ++column) {
+                    const float gate = expert.activation_limit > 0.0f
+                                           ? std::min(source[column * 2], expert.activation_limit)
+                                           : source[column * 2];
+                    const float linear = expert.activation_limit > 0.0f
+                                             ? std::clamp(
+                                                   source[column * 2 + 1],
+                                                   -expert.activation_limit,
+                                                   expert.activation_limit)
+                                             : source[column * 2 + 1];
+                    const float silu = gate / (1.0f + std::exp(-1.702f * gate));
+                    destination[column] = silu * (linear + 1.0f);
+                }
             }
         }
         if (prefetch)
-            hinted_bytes += prefetch_weight(weights, expert.down_weight);
-        return expert.down_bias == invalid_tensor_handle
-                   ? linear_batch(weights.at(expert.down_weight), activated)
-                   : linear_batch(weights.at(expert.down_weight), weights.at(expert.down_bias), activated);
+            metrics.hinted_bytes += prefetch_weight(weights, expert.down_weight);
+        return execute_expert_linear(
+            weights.at(expert.down_weight),
+            expert.down_bias == invalid_tensor_handle
+                ? nullptr
+                : &weights.at(expert.down_bias),
+            activated,
+            metrics);
     }
 
     if (prefetch)
-        hinted_bytes += prefetch_weight(weights, expert.up_weight);
-    CpuBatch up = linear_batch(weights.at(expert.up_weight), input);
+        metrics.hinted_bytes += prefetch_weight(weights, expert.up_weight);
+    CpuBatch up = execute_expert_linear(
+        weights.at(expert.up_weight),
+        nullptr,
+        input,
+        metrics);
     if (expert.gated) {
         if (prefetch)
-            hinted_bytes += prefetch_weight(weights, expert.gate_weight);
-        const CpuBatch gate = linear_batch(weights.at(expert.gate_weight), input);
+            metrics.hinted_bytes += prefetch_weight(weights, expert.gate_weight);
+        const CpuBatch gate = execute_expert_linear(
+            weights.at(expert.gate_weight),
+            nullptr,
+            input,
+            metrics);
         for (size_t token_index = 0; token_index < up.rows(); ++token_index) {
             float* up_row = up.row(token_index);
             const float* gate_row = gate.row(token_index);
@@ -205,8 +278,12 @@ static CpuBatch execute_expert_batch(
         }
     }
     if (prefetch)
-        hinted_bytes += prefetch_weight(weights, expert.down_weight);
-    return linear_batch(weights.at(expert.down_weight), up);
+        metrics.hinted_bytes += prefetch_weight(weights, expert.down_weight);
+    return execute_expert_linear(
+        weights.at(expert.down_weight),
+        nullptr,
+        up,
+        metrics);
 }
 
 static CpuBatch gather_tokens(const CpuBatch& source, const std::vector<RouteItem>& routes)
@@ -230,6 +307,8 @@ Result<std::vector<std::vector<float> > > CpuExecutor::execute(
 {
     const uint64_t initial_vulkan_dispatches = NcnnLinearOperator::current_thread_vulkan_dispatches();
     const uint64_t initial_vulkan_attention_blocks = NcnnVulkanAttentionOperator::current_thread_blocks();
+    const NcnnVulkanRuntimeCounters initial_vulkan_runtime_counters
+        = NcnnLinearOperator::current_thread_vulkan_runtime_counters();
     for (int32_t token_id : input_ids) {
         if (token_id < 0 || static_cast<uint32_t>(token_id) >= model.descriptor.vocabulary_size)
             return Error{ErrorCode::InvalidArgument, "token id is outside the model vocabulary"};
@@ -302,25 +381,49 @@ Result<std::vector<std::vector<float> > > CpuExecutor::execute(
 
         const auto expert_start = std::chrono::steady_clock::now();
         CpuBatch moe_output(hidden.rows(), hidden_size);
-        for (uint32_t expert_id = 0; expert_id < groups.size(); ++expert_id) {
+        size_t active_expert_count = 0;
+        for (const std::vector<RouteItem>& group : groups)
+            active_expert_count += group.empty() ? 0 : 1;
+        bool parallelize_experts = false;
+#if defined(_OPENMP)
+        parallelize_experts = active_expert_count > 1 && omp_get_max_threads() > 1;
+#endif
+        std::vector<CpuBatch> expert_outputs(groups.size());
+        std::vector<ExpertExecutionMetrics> expert_metrics(groups.size());
+        const int64_t parallel_expert_count = static_cast<int64_t>(groups.size());
+#pragma omp parallel for schedule(dynamic, 1) if(parallelize_experts)
+        for (int64_t expert_index = 0; expert_index < parallel_expert_count; ++expert_index) {
+            const uint32_t expert_id = static_cast<uint32_t>(expert_index);
             const std::vector<RouteItem>& group = groups[expert_id];
             if (group.empty())
                 continue;
 
             const CpuBatch expert_input = gather_tokens(normalized, group);
-            uint64_t hinted_bytes = 0;
-            const CpuBatch expert_output = execute_expert_batch(
+            expert_outputs[expert_id] = execute_expert_batch(
                 model.weights,
                 moe.experts[expert_id],
                 expert_input,
                 model.hybrid_mode == HybridMode::VulkanWithCpuPrefetch,
-                hinted_bytes);
-            if (hinted_bytes > 0) {
+                expert_metrics[expert_id]);
+        }
+        if (parallelize_experts)
+            statistics.expert_parallel_tasks += active_expert_count;
+        for (uint32_t expert_id = 0; expert_id < groups.size(); ++expert_id) {
+            const std::vector<RouteItem>& group = groups[expert_id];
+            if (group.empty())
+                continue;
+            const ExpertExecutionMetrics& metrics = expert_metrics[expert_id];
+            if (metrics.hinted_bytes > 0) {
                 ++statistics.expert_prefetches;
-                statistics.expert_prefetch_bytes += hinted_bytes;
+                statistics.expert_prefetch_bytes += metrics.hinted_bytes;
             }
+            statistics.mxfp4_decode_gemv_rows += metrics.mxfp4_decode_gemv_rows;
+            statistics.mxfp4_prefill_gemm_rows += metrics.mxfp4_prefill_gemm_rows;
+            statistics.mxfp4_paired_rows += metrics.mxfp4_paired_rows;
+            statistics.mxfp4_fused_gate_up_rows += metrics.mxfp4_fused_gate_up_rows;
             ++statistics.expert_batches;
 
+            const CpuBatch& expert_output = expert_outputs[expert_id];
             for (size_t batch_index = 0; batch_index < group.size(); ++batch_index) {
                 const RouteItem& route = group[batch_index];
                 float* destination = moe_output.row(route.token_index);
@@ -347,6 +450,35 @@ Result<std::vector<std::vector<float> > > CpuExecutor::execute(
                                            - initial_vulkan_dispatches;
     statistics.vulkan_attention_blocks += NcnnVulkanAttentionOperator::current_thread_blocks()
                                           - initial_vulkan_attention_blocks;
+    const NcnnVulkanRuntimeCounters final_vulkan_runtime_counters
+        = NcnnLinearOperator::current_thread_vulkan_runtime_counters();
+    statistics.vulkan_compute_submissions
+        += final_vulkan_runtime_counters.compute_submissions
+           - initial_vulkan_runtime_counters.compute_submissions;
+    statistics.vulkan_batch_uploads
+        += final_vulkan_runtime_counters.batch_uploads
+           - initial_vulkan_runtime_counters.batch_uploads;
+    statistics.vulkan_batch_downloads
+        += final_vulkan_runtime_counters.batch_downloads
+           - initial_vulkan_runtime_counters.batch_downloads;
+    statistics.vulkan_auxiliary_uploads
+        += final_vulkan_runtime_counters.auxiliary_uploads
+           - initial_vulkan_runtime_counters.auxiliary_uploads;
+    statistics.vulkan_auxiliary_upload_bytes
+        += final_vulkan_runtime_counters.auxiliary_upload_bytes
+           - initial_vulkan_runtime_counters.auxiliary_upload_bytes;
+    statistics.vulkan_staging_slot_resizes
+        += final_vulkan_runtime_counters.staging_slot_resizes
+           - initial_vulkan_runtime_counters.staging_slot_resizes;
+    statistics.vulkan_staging_slot_reuses
+        += final_vulkan_runtime_counters.staging_slot_reuses
+           - initial_vulkan_runtime_counters.staging_slot_reuses;
+    statistics.vulkan_staging_slot_acquisitions
+        += final_vulkan_runtime_counters.staging_slot_acquisitions
+           - initial_vulkan_runtime_counters.staging_slot_acquisitions;
+    statistics.vulkan_staging_slot_contentions
+        += final_vulkan_runtime_counters.staging_slot_contentions
+           - initial_vulkan_runtime_counters.staging_slot_contentions;
     return logits;
 }
 

@@ -164,6 +164,19 @@ int main(int argc, char** argv)
                   << session.value()->statistics().vulkan_linear_dispatches << '\n';
         std::cout << "Vulkan attention blocks: "
                   << session.value()->statistics().vulkan_attention_blocks << '\n';
+        std::cout << "Vulkan compute submissions: "
+                  << session.value()->statistics().vulkan_compute_submissions << '\n';
+        std::cout << "Vulkan batch transfers: "
+                  << session.value()->statistics().vulkan_batch_uploads << " upload(s), "
+                  << session.value()->statistics().vulkan_batch_downloads << " download(s)\n";
+        std::cout << "Vulkan auxiliary uploads: "
+                  << session.value()->statistics().vulkan_auxiliary_uploads << " upload(s), "
+                  << session.value()->statistics().vulkan_auxiliary_upload_bytes << " bytes\n";
+        std::cout << "Vulkan staging slots: "
+                  << session.value()->statistics().vulkan_staging_slot_resizes << " resize(s), "
+                  << session.value()->statistics().vulkan_staging_slot_reuses << " reuse(s), "
+                  << session.value()->statistics().vulkan_staging_slot_acquisitions << " acquisition(s), "
+                  << session.value()->statistics().vulkan_staging_slot_contentions << " contention(s)\n";
         std::cout << "Attention time: "
                   << session.value()->statistics().attention_time_microseconds / 1000.0 << " ms\n";
         std::cout << "Router time: "
@@ -172,6 +185,22 @@ int main(int argc, char** argv)
                   << session.value()->statistics().expert_time_microseconds / 1000.0 << " ms\n";
         std::cout << "Expert prefetches: " << session.value()->statistics().expert_prefetches
                   << " (" << session.value()->statistics().expert_prefetch_bytes << " bytes hinted)\n";
+        std::cout << "Parallel CPU experts: "
+                  << (runtime.capabilities().openmp_expert_parallelism
+                          ? "OpenMP enabled"
+                          : "single-thread fallback")
+                  << '\n';
+        std::cout << "MXFP4 CPU kernel: " << runtime.capabilities().mxfp4_kernel << '\n';
+        std::cout << "MXFP4 decode GEMV rows: "
+                  << session.value()->statistics().mxfp4_decode_gemv_rows << '\n';
+        std::cout << "MXFP4 prefill GEMM rows: "
+                  << session.value()->statistics().mxfp4_prefill_gemm_rows << '\n';
+        std::cout << "MXFP4 paired rows: "
+                  << session.value()->statistics().mxfp4_paired_rows << '\n';
+        std::cout << "MXFP4 fused Gate/Up rows: "
+                  << session.value()->statistics().mxfp4_fused_gate_up_rows << '\n';
+        std::cout << "Parallel expert tasks: "
+                  << session.value()->statistics().expert_parallel_tasks << '\n';
         std::cout << "generated token ids:";
         for (const ncnn::moe::StreamToken& token : generated.value().tokens)
             std::cout << ' ' << token.token_id;

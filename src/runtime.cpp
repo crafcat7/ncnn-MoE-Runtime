@@ -1,6 +1,7 @@
 #include "ncnn/moe/runtime.h"
 
 #include "ncnn/moe/execution_plan.h"
+#include "cpu_mxfp4.h"
 #include "moe_adapter.h"
 #include "ncnn_linear.h"
 
@@ -36,6 +37,13 @@ static Result<std::string> required_json_string(const std::string& json, const s
 
 Runtime::Runtime()
 {
+    capabilities_.mxfp4_kernel = mxfp4_kernel_name();
+    capabilities_.mxfp4_arm_neon = mxfp4_kernel_kind() == MxFp4KernelKind::ArmNeon;
+    capabilities_.mxfp4_x86_avx2 = mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2;
+    capabilities_.mxfp4_x86_avx512 = mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512;
+#if defined(_OPENMP)
+    capabilities_.openmp_expert_parallelism = true;
+#endif
 #if defined(NCNN_MOE_USE_NCNN) && NCNN_MOE_USE_NCNN
     capabilities_.ncnn_cpu_linear = true;
 #endif
@@ -112,11 +120,19 @@ Result<ModelPtr> Runtime::load_model(
     if (!weights)
         return weights.error();
 
+    const bool use_vulkan_dense = resolved_mode == HybridMode::HybridExperts
+                                  || resolved_mode == HybridMode::VulkanWithCpuPrefetch;
     ModelCompiler compiler;
+    ModelCompiler::BackendCapabilities compiler_capabilities;
+    compiler_capabilities.cpu_execution = capabilities_.cpu_execution;
+    compiler_capabilities.vulkan_dense = use_vulkan_dense && capabilities_.vulkan_execution;
+    compiler_capabilities.vulkan_attention = use_vulkan_dense && capabilities_.vulkan_attention;
+    compiler_capabilities.mxfp4_cpu_kernel = capabilities_.mxfp4_cpu_kernel;
     auto compiled = compiler.compile(
         std::move(descriptor).value(),
         std::move(weights).value(),
-        resolved_mode);
+        resolved_mode,
+        compiler_capabilities);
     if (!compiled)
         return compiled.error();
 
@@ -131,6 +147,40 @@ Result<SessionPtr> Runtime::create_session(const ModelPtr& model, const SessionO
     if (options.logits_output_mode != LogitsOutputMode::FullLogits)
         return Error{ErrorCode::UnsupportedModel, "the current executor supports full logits output only"};
     return SessionPtr(new Session(model, options));
+}
+
+Result<BatchSchedulerPtr> Runtime::create_scheduler(const SchedulerOptions& options)
+{
+    if (options.worker_count > 1024)
+        return Error{ErrorCode::InvalidArgument, "scheduler worker_count exceeds 1024"};
+    if (options.expert_threads_per_worker > 1024)
+        return Error{
+            ErrorCode::InvalidArgument,
+            "scheduler expert_threads_per_worker exceeds 1024"};
+    if (options.worker_cpu_sets.size() > 1024)
+        return Error{
+            ErrorCode::InvalidArgument,
+            "scheduler worker_cpu_sets exceeds 1024 entries"};
+    if (!options.worker_cpu_sets.empty()
+        && options.worker_count != 0
+        && options.worker_count != options.worker_cpu_sets.size()) {
+        return Error{
+            ErrorCode::InvalidArgument,
+            "scheduler worker_count must match worker_cpu_sets"};
+    }
+    for (const std::vector<uint32_t>& cpu_set : options.worker_cpu_sets) {
+        if (cpu_set.empty())
+            return Error{
+                ErrorCode::InvalidArgument,
+                "scheduler worker_cpu_sets entries cannot be empty"};
+    }
+#if !defined(__linux__)
+    if (!options.worker_cpu_sets.empty())
+        return Error{
+            ErrorCode::UnsupportedModel,
+            "scheduler worker_cpu_sets are supported only on Linux"};
+#endif
+    return std::make_shared<BatchScheduler>(options);
 }
 
 } // namespace moe

@@ -29,17 +29,41 @@ model adapters  --->  model-neutral descriptor + compiled execution plan
                                   application, CLI, or external service host
 ```
 
-The runtime core already separates model-family parsing from execution. New
-model adapters therefore feed the same compiled-plan and session boundary rather
-than adding model-specific branches to the executor.
+The runtime core separates model-family parsing from execution. Adapters emit
+an explicit operator graph (`RmsNorm`, `FusedQKV`, `RoPE`, optional
+`AttentionSink`, `SDPA`, `Projection`, `Router`, `TopK`, `ExpertGroup`, and
+`Combine`). The compiler validates that graph and selects implementations from
+backend capabilities; it does not branch on a model-family name or use the
+legacy adapter package flags as execution truth. The compiled plan records the
+selected CPU/Vulkan backend for every node and is available for introspection.
 
 ## Current MoE runtime path
 
 A mixed backend is useful when the GPU has enough VRAM for attention state and
 dense activations, but not for the complete model. The experimental mixed path
-keeps eligible dense operators on Vulkan and executes routed expert groups on
-CPU. GPT-OSS is the current production-scale adapter and exercises the same
+keeps eligible dense operators on Vulkan and executes routing and routed expert
+groups on CPU. Each attention block forms one explicit heterogeneous boundary:
+the hidden state is uploaded once, all ncnn layers are recorded into one
+`VkCompute`, and the result is downloaded once for CPU routing and experts.
+The boundary uses two reusable host-visible Vulkan staging slots instead of
+allocating intermediate pageable `ncnn::Mat` buffers for every transfer.
+Each slot owns a separate staging allocator and is leased independently; the
+next session can fill its mapped upload, RoPE, and mask buffers before entering
+the serialized Vulkan command-recording section while the other slot remains
+owned by the preceding command.
+Attention cosine, sine, and mask tensors are generated directly in those
+mapped slots; RoPE frequencies are precomputed and the invariant zero KV sink
+is uploaded once when the attention operator is created.
+GPT-OSS is the current production-scale adapter and exercises the same
 execution plan with BF16 dense tensors and MXFP4 experts.
+
+The asynchronous `BatchScheduler` accepts decode work from independent
+sessions. It preserves submission order within each session while allowing a
+CPU expert phase from one session to overlap a Vulkan dense phase from another.
+The scheduler divides the available OpenMP expert threads across its workers to
+avoid multiplying full-size expert teams. Vulkan command recording remains
+serialized per device context, so reusable staging slots and shared model
+operators remain race-free.
 
 ```text
 supported model package
@@ -63,9 +87,11 @@ offload path yet.
 | --- | --- |
 | Tiny MoE adapter | Deterministic native package for runtime and integration testing |
 | GPT-OSS adapter | Direct multi-shard Safetensors loading; RMSNorm, GQA, attention sinks, sliding/full attention, YaRN RoPE, Top-4 routing, and clamped SwiGLU |
-| Execution core | Model-neutral descriptors and compiled execution plans behind the adapter boundary |
+| Execution core | Explicit adapter operator graphs and backend-capability-selected compiled plans |
 | Dense backend | Portable CPU baseline; optional ncnn CPU `InnerProduct`; experimental Vulkan dense path with CPU fallback |
-| Expert weights | Native MXFP4 storage and scalar CPU execution; Float32 and INT8 test paths |
+| Expert weights | Native MXFP4 with runtime-dispatched ARM NEON, GCC/Clang x86 AVX2/FMA, x86 AVX-512, and scalar fallback kernels; Float32 and INT8 paths |
+| Expert execution | Fused MXFP4 unpack/dequant/FMA, fused interleaved Gate/Up activation, decode GEMV, weight-reusing prefill GEMM rows, and parallel active experts |
+| Scheduling | Future-based cross-session decode batches, per-session ordering, bounded worker/OpenMP concurrency, and Linux allowed-CPU/NUMA-topology affinity |
 | KV cache | BF16 or FP32; GPU-resident compact cache in mixed mode, ring cache on CPU |
 | Generation | Greedy and temperature / Top-K / Top-P / Min-P sampling; token streaming |
 | Prompting | Optional OpenAI Harmony wrapper for GPT-OSS text prompts |
@@ -73,8 +99,17 @@ offload path yet.
 
 ### Current limits
 
-- MXFP4 expert GEMM is CPU-only. It is the primary decode bottleneck in the
-  current mixed backend; native Vulkan MXFP4 experts are planned work.
+- MXFP4 experts remain CPU-only. The SIMD kernels remove the scalar-only path,
+  but they still need model-scale benchmarking and further cache/blocking work;
+  native Vulkan MXFP4 experts are not implemented.
+- The scheduler pipelines independent sessions, but it does not yet merge
+  multiple sessions into one shape-compatible Vulkan dispatch.
+- Linux scheduler workers can discover the process allowed-CPU mask and sysfs
+  NUMA node CPU lists, choose at least one default worker per detected node,
+  form disjoint node-local partitions, and size default OpenMP teams from the
+  allowed mask; callers may still provide explicit CPU sets. Per-node expert
+  placement, memory policy, and first-touch weight replication are not yet
+  implemented.
 - Weights are eagerly loaded. There is no memory mapping, demand paging, or
   SSD-backed expert cache.
 - Current adapter coverage is Tiny MoE and GPT-OSS. Shared experts and other
@@ -85,10 +120,16 @@ offload path yet.
 
 ## Performance and memory reporting
 
-The project reports Vulkan dispatch counts, attention-block counts, expert
-assignments, KV-cache bytes, and attention/router/expert timings per session.
-This makes mixed-backend bottlenecks visible instead of treating the GPU as a
-black box.
+The project reports Vulkan dispatch counts, compute submissions, host/device
+batch transfers, auxiliary upload counts/bytes, staging-slot resizes/reuses,
+staging-slot acquisitions/contentions,
+attention-block counts, expert assignments, parallel expert tasks, MXFP4
+decode-GEMV/prefill-GEMM/paired-output/fused-Gate-Up rows, KV-cache bytes, and
+attention/router/expert timings per session. Scheduler statistics separately
+report submitted/completed/rejected work, maximum in-flight requests,
+per-session serialization, and effective worker/team sizes.
+This makes mixed-backend bottlenecks and heterogeneous transfer boundaries
+visible instead of treating the GPU as a black box.
 
 A useful comparison should report at least:
 
@@ -249,6 +290,19 @@ options.sampling.top_p = 0.9f;
 auto generated = session.value()->generate(prompt, options);
 ```
 
+Independent decode sessions can be submitted without blocking the caller:
+
+```cpp
+ncnn::moe::SchedulerOptions scheduler_options;
+scheduler_options.worker_count = 2;
+auto scheduler = runtime.create_scheduler(scheduler_options);
+auto pending = scheduler.value()->submit_decode({
+    {first_session, first_token},
+    {second_session, second_token},
+});
+auto results = pending.get();
+```
+
 `Model` is immutable and shared; `Session` owns the request-local KV cache,
 sampling state, and timing statistics. `SessionOptions::prefill_chunk_size`
 defaults to 256 to bound prompt working memory. Set it to zero for one-shot
@@ -282,13 +336,15 @@ models/            Model catalog and setup notes
 
 ## Roadmap
 
-1. Native Vulkan MXFP4 expert GEMM with CPU/Vulkan numerical parity tests.
-2. Reproducible same-hardware benchmarks against comparable runtimes, including
-   decode, prefill, RSS, and VRAM.
-3. Lazy/mmap and SSD-backed expert loading with a bounded cache for models that
+1. Model-scale MXFP4 kernel benchmarks, cache blocking, and NUMA-aware expert
+   placement.
+2. Shape-compatible cross-session Vulkan batching beyond asynchronous
+   pipelining.
+3. Native Vulkan MXFP4 expert GEMM with CPU/Vulkan numerical parity tests.
+4. Lazy/mmap and SSD-backed expert loading with a bounded cache for models that
    exceed host memory.
-4. Broader model-family support, shared experts, and batched inference.
-5. Better inference-core memory management, including paged KV allocation.
+5. Broader adapter coverage, shared experts, tokenizer integration, and paged
+   KV allocation.
 
 ## License and acknowledgments
 

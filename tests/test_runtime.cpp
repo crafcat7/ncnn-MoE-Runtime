@@ -1,13 +1,18 @@
 #include "ncnn/moe/runtime.h"
 
+#include "cpu_mxfp4.h"
 #include "cpu_ops.h"
+#include "cpu_topology.h"
+#include "moe_adapter.h"
 #include "ncnn_linear.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -350,7 +355,11 @@ private:
 class AttentionPackage
 {
 public:
-    explicit AttentionPackage(bool bfloat16_kv_cache = false, uint32_t sliding_window = 2)
+    explicit AttentionPackage(
+        bool bfloat16_kv_cache = false,
+        uint32_t sliding_window = 2,
+        bool attention_bias = true,
+        bool attention_sinks = true)
     {
         path_ = create_unique_test_directory("ncnn_moe_attention_test_");
 
@@ -376,70 +385,47 @@ public:
   "max_context_length": 32,
   "rope_theta": 10000.0,
   "rope_scaling_factor": 1.0,
+  "attention_bias": )"
+                 << (attention_bias ? "true" : "false") << R"(,
+  "attention_sinks": )"
+                 << (attention_sinks ? "true" : "false") << R"(,
   "norm_epsilon": 0.00001,
   "kv_cache_dtype": ")"
                  << (bfloat16_kv_cache ? "bfloat16" : "float32") << R"("
 })";
         manifest.close();
 
-        const std::vector<float> values = {
-            // Embedding and pre-attention norm.
-            1.0f,
-            0.0f,
-            0.0f,
-            1.0f,
-            1.0f,
-            1.0f,
-            // Zero query projection and bias.
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            // Zero key projection and bias.
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            // Identity value projection and zero bias.
-            1.0f,
-            0.0f,
-            0.0f,
-            1.0f,
-            0.0f,
-            0.0f,
-            // Identity output projection, zero bias, and zero sink.
-            1.0f,
-            0.0f,
-            0.0f,
-            1.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            // Pre-FFN norm, router, zero up, and zero down.
-            1.0f,
-            1.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            // Final norm and identity LM head.
-            1.0f,
-            1.0f,
-            1.0f,
-            0.0f,
-            0.0f,
-            1.0f,
+        std::vector<float> values;
+        auto append = [&values](std::initializer_list<float> additions) {
+            values.insert(values.end(), additions.begin(), additions.end());
         };
+        // Embedding and pre-attention norm.
+        append({1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f});
+        // Zero query and key projections.
+        append({0.0f, 0.0f, 0.0f, 0.0f});
+        if (attention_bias)
+            append({0.0f, 0.0f});
+        append({0.0f, 0.0f, 0.0f, 0.0f});
+        if (attention_bias)
+            append({0.0f, 0.0f});
+        // Identity value and output projections.
+        append({1.0f, 0.0f, 0.0f, 1.0f});
+        if (attention_bias)
+            append({0.0f, 0.0f});
+        append({1.0f, 0.0f, 0.0f, 1.0f});
+        if (attention_bias)
+            append({0.0f, 0.0f});
+        if (attention_sinks)
+            append({0.0f});
+        // Pre-FFN norm, router, zero up, and zero down.
+        append({
+            1.0f, 1.0f,
+            0.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 0.0f,
+        });
+        // Final norm and identity LM head.
+        append({1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f});
         std::ofstream weights(path_ / "model.ncnnmoe.bin", std::ios::binary);
         weights.write(
             reinterpret_cast<const char*>(values.data()),
@@ -587,7 +573,358 @@ void test_ncnn_linear_operator()
             CHECK_NEAR(output.row(row_index)[column], expected, 1e-5f);
         }
     }
+
+    if (NcnnLinearOperator::vulkan_device_count() > 0) {
+        const auto vulkan_linear = NcnnLinearOperator::create(
+            matrix,
+            &bias,
+            NcnnLinearDevice::Vulkan);
+        CHECK(vulkan_linear);
+        const NcnnVulkanRuntimeCounters initial_counters
+            = NcnnLinearOperator::current_thread_vulkan_runtime_counters();
+        for (uint32_t iteration = 0; iteration < 4; ++iteration) {
+            CHECK(vulkan_linear->forward(input, output));
+            for (size_t row_index = 0; row_index < input.rows(); ++row_index) {
+                for (uint32_t column = 0; column < output.columns(); ++column) {
+                    float expected = bias.float32_data[column];
+                    for (uint32_t input_column = 0; input_column < input.columns(); ++input_column) {
+                        expected += matrix.float32_data[column * input.columns() + input_column]
+                                    * input.row(row_index)[input_column];
+                    }
+                    CHECK_NEAR(output.row(row_index)[column], expected, 1e-4f);
+                }
+            }
+        }
+        const NcnnVulkanRuntimeCounters final_counters
+            = NcnnLinearOperator::current_thread_vulkan_runtime_counters();
+        CHECK(final_counters.compute_submissions - initial_counters.compute_submissions == 4);
+        CHECK(final_counters.batch_uploads - initial_counters.batch_uploads == 4);
+        CHECK(final_counters.batch_downloads - initial_counters.batch_downloads == 4);
+        CHECK(final_counters.auxiliary_uploads - initial_counters.auxiliary_uploads == 0);
+        CHECK(final_counters.staging_slot_resizes - initial_counters.staging_slot_resizes
+                  + final_counters.staging_slot_reuses - initial_counters.staging_slot_reuses
+              == 8);
+        CHECK(final_counters.staging_slot_reuses - initial_counters.staging_slot_reuses >= 4);
+        CHECK(final_counters.staging_slot_acquisitions
+                  - initial_counters.staging_slot_acquisitions
+              == 4);
+    }
 #endif
+}
+
+void test_mxfp4_cpu_kernel_and_fused_gate_up()
+{
+    TensorData matrix;
+    matrix.dtype = DType::MxFp4;
+    matrix.shape = {4, 32};
+    matrix.mxfp4_scales = {127, 127, 127, 127};
+    matrix.mxfp4_blocks.resize(64);
+    for (size_t row = 0; row < 4; ++row) {
+        for (size_t byte = 0; byte < 16; ++byte) {
+            const uint8_t low = static_cast<uint8_t>((byte + row) % 16);
+            const uint8_t high = static_cast<uint8_t>((byte * 3 + row + 1) % 16);
+            matrix.mxfp4_blocks[row * 16 + byte]
+                = static_cast<uint8_t>(low | (high << 4));
+        }
+    }
+    CpuBatch input(2, 32);
+    for (size_t row = 0; row < input.rows(); ++row) {
+        for (uint32_t column = 0; column < input.columns(); ++column)
+            input.row(row)[column] = static_cast<float>(
+                static_cast<int>(column % 7) - 3)
+                                     * (row == 0 ? 0.25f : -0.125f);
+    }
+    static constexpr float values[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    auto scalar_row = [&](size_t matrix_row, size_t input_row) {
+        float sum = 0.0f;
+        for (size_t byte = 0; byte < 16; ++byte) {
+            const uint8_t packed = matrix.mxfp4_blocks[matrix_row * 16 + byte];
+            sum += values[packed & 0x0f] * input.row(input_row)[byte * 2];
+            sum += values[packed >> 4] * input.row(input_row)[byte * 2 + 1];
+        }
+        return sum;
+    };
+
+    const CpuBatch projected = linear_batch(matrix, input);
+    for (size_t input_row = 0; input_row < input.rows(); ++input_row) {
+        for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row) {
+            CHECK_NEAR(
+                projected.row(input_row)[matrix_row],
+                scalar_row(matrix_row, input_row),
+                1e-5f);
+        }
+    }
+
+    CpuBatch decode_input(1, 32);
+    std::copy_n(input.row(0), input.columns(), decode_input.row(0));
+    const CpuBatch decoded = linear_batch(matrix, decode_input);
+    for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row) {
+        CHECK_NEAR(
+            decoded.row(0)[matrix_row],
+            scalar_row(matrix_row, 0),
+            1e-5f);
+    }
+
+    TensorData odd_matrix = matrix;
+    odd_matrix.shape[0] = 3;
+    odd_matrix.mxfp4_blocks.resize(3 * 16);
+    odd_matrix.mxfp4_scales.resize(3);
+    const CpuBatch odd_projected = linear_batch(odd_matrix, input);
+    CHECK(odd_projected.columns() == 3);
+    for (size_t input_row = 0; input_row < input.rows(); ++input_row) {
+        for (size_t matrix_row = 0; matrix_row < 3; ++matrix_row) {
+            CHECK_NEAR(
+                odd_projected.row(input_row)[matrix_row],
+                scalar_row(matrix_row, input_row),
+                1e-5f);
+        }
+    }
+
+    TensorData bias;
+    bias.dtype = DType::Float32;
+    bias.shape = {4};
+    bias.float32_data = {0.25f, -0.5f, 0.75f, -1.0f};
+    const CpuBatch fused = fused_mxfp4_gate_up_batch(matrix, &bias, input, 7.0f);
+    CHECK(fused.rows() == input.rows());
+    CHECK(fused.columns() == 2);
+    for (size_t input_row = 0; input_row < input.rows(); ++input_row) {
+        for (size_t column = 0; column < fused.columns(); ++column) {
+            const float gate = std::min(
+                scalar_row(column * 2, input_row) + bias.float32_data[column * 2],
+                7.0f);
+            const float linear = std::clamp(
+                scalar_row(column * 2 + 1, input_row)
+                    + bias.float32_data[column * 2 + 1],
+                -7.0f,
+                7.0f);
+            const float expected
+                = gate / (1.0f + std::exp(-1.702f * gate)) * (linear + 1.0f);
+            CHECK_NEAR(fused.row(input_row)[column], expected, 1e-5f);
+        }
+    }
+#if defined(__aarch64__) || defined(_M_ARM64)
+    CHECK(mxfp4_kernel_kind() == MxFp4KernelKind::ArmNeon);
+#endif
+    CHECK(std::string(mxfp4_kernel_name()).size() > 0);
+}
+
+void test_cpu_topology_parsing_and_partitioning()
+{
+    CHECK(
+        parse_linux_cpu_list("0-3,8,10-11")
+        == std::vector<uint32_t>({0, 1, 2, 3, 8, 10, 11}));
+    CHECK(
+        parse_linux_cpu_list("4,2-4,2")
+        == std::vector<uint32_t>({2, 3, 4}));
+    CHECK(parse_linux_cpu_list("3-1").empty());
+    CHECK(parse_linux_cpu_list("1,,2").empty());
+    CHECK(parse_linux_cpu_list("1,").empty());
+
+    CpuTopology flat;
+    flat.allowed_cpus = {2, 4, 7, 9, 12};
+    const std::vector<std::vector<uint32_t> > flat_partitions
+        = partition_cpu_topology(flat, 2);
+    CHECK(flat_partitions.size() == 2);
+    CHECK(flat_partitions[0] == std::vector<uint32_t>({2, 4, 7}));
+    CHECK(flat_partitions[1] == std::vector<uint32_t>({9, 12}));
+
+    CpuTopology numa;
+    numa.allowed_cpus = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    numa.numa_nodes = {
+        {0, 1, 2, 3},
+        {4, 5, 6, 7, 8, 9, 10, 11},
+    };
+    const std::vector<std::vector<uint32_t> > numa_partitions
+        = partition_cpu_topology(numa, 4);
+    CHECK(numa_partitions.size() == 4);
+    std::vector<uint32_t> partitioned_cpus;
+    for (const std::vector<uint32_t>& partition : numa_partitions) {
+        CHECK(!partition.empty());
+        const bool first_node = partition.front() < 4;
+        for (uint32_t cpu : partition)
+            CHECK((cpu < 4) == first_node);
+        partitioned_cpus.insert(
+            partitioned_cpus.end(), partition.begin(), partition.end());
+    }
+    std::sort(partitioned_cpus.begin(), partitioned_cpus.end());
+    CHECK(partitioned_cpus == numa.allowed_cpus);
+}
+
+void test_cross_session_batch_scheduler()
+{
+    TemporaryModelPackage package;
+    Runtime runtime;
+    auto model = runtime.load_model(package.path());
+    CHECK(model);
+    auto first = runtime.create_session(model.value());
+    auto second = runtime.create_session(model.value());
+    CHECK(first);
+    CHECK(second);
+
+    SchedulerOptions options;
+    options.worker_count = 2;
+    auto scheduler = runtime.create_scheduler(options);
+    CHECK(scheduler);
+    auto future = scheduler.value()->submit_decode({
+        {first.value(), 0},
+        {second.value(), 1},
+    });
+    std::vector<Result<DecodeResult> > results = future.get();
+    CHECK(results.size() == 2);
+    CHECK(results[0]);
+    CHECK(results[1]);
+    CHECK(first.value()->sequence_length() == 1);
+    CHECK(second.value()->sequence_length() == 1);
+
+    auto ordered_session = runtime.create_session(model.value());
+    auto reference_session = runtime.create_session(model.value());
+    CHECK(ordered_session);
+    CHECK(reference_session);
+    auto ordered_first = scheduler.value()->submit_decode({
+        {ordered_session.value(), 0},
+    });
+    auto ordered_second = scheduler.value()->submit_decode({
+        {ordered_session.value(), 1},
+    });
+    auto reference_first = reference_session.value()->decode(0);
+    auto reference_second = reference_session.value()->decode(1);
+    CHECK(reference_first);
+    CHECK(reference_second);
+    std::vector<Result<DecodeResult> > ordered_first_result = ordered_first.get();
+    std::vector<Result<DecodeResult> > ordered_second_result = ordered_second.get();
+    CHECK(ordered_first_result[0]);
+    CHECK(ordered_second_result[0]);
+    CHECK(ordered_first_result[0].value().sequence_length == 1);
+    CHECK(ordered_second_result[0].value().sequence_length == 2);
+    for (size_t index = 0;
+         index < reference_second.value().logits.values.size();
+         ++index) {
+        CHECK_NEAR(
+            ordered_second_result[0].value().logits.values[index],
+            reference_second.value().logits.values[index],
+            1e-5f);
+    }
+
+    auto duplicate_future = scheduler.value()->submit_decode({
+        {first.value(), 0},
+        {first.value(), 1},
+    });
+    std::vector<Result<DecodeResult> > duplicate_results = duplicate_future.get();
+    CHECK(!duplicate_results[0]);
+    CHECK(!duplicate_results[1]);
+    CHECK(first.value()->sequence_length() == 1);
+    const SchedulerStatistics statistics = scheduler.value()->statistics();
+    CHECK(statistics.worker_count == 2);
+    CHECK(statistics.expert_threads_per_worker >= 1);
+    CHECK(statistics.submitted_batches == 4);
+    CHECK(statistics.submitted_requests == 6);
+    CHECK(statistics.completed_requests == 6);
+    CHECK(statistics.rejected_requests == 2);
+    CHECK(statistics.max_batch_size == 2);
+    CHECK(statistics.max_in_flight >= 2);
+
+    SchedulerOptions mismatched_affinity;
+    mismatched_affinity.worker_count = 2;
+    mismatched_affinity.worker_cpu_sets = {{0}};
+    auto mismatched_scheduler = runtime.create_scheduler(mismatched_affinity);
+    CHECK(!mismatched_scheduler);
+    CHECK(mismatched_scheduler.error().code == ErrorCode::InvalidArgument);
+
+    SchedulerOptions empty_affinity;
+    empty_affinity.worker_cpu_sets = {{}};
+    auto empty_affinity_scheduler = runtime.create_scheduler(empty_affinity);
+    CHECK(!empty_affinity_scheduler);
+    CHECK(empty_affinity_scheduler.error().code == ErrorCode::InvalidArgument);
+#if !defined(__linux__)
+    SchedulerOptions unsupported_affinity;
+    unsupported_affinity.worker_cpu_sets = {{0}};
+    auto unsupported_scheduler = runtime.create_scheduler(unsupported_affinity);
+    CHECK(!unsupported_scheduler);
+    CHECK(unsupported_scheduler.error().code == ErrorCode::UnsupportedModel);
+#endif
+
+    if (runtime.capabilities().vulkan_cpu_mix) {
+        AttentionPackage attention_package;
+        RuntimeOptions hybrid_options;
+        hybrid_options.hybrid_mode = HybridMode::HybridExperts;
+        RuntimeOptions cpu_options;
+        cpu_options.hybrid_mode = HybridMode::CpuOnly;
+        auto hybrid_model = runtime.load_model(
+            attention_package.path(), hybrid_options);
+        auto cpu_model = runtime.load_model(attention_package.path(), cpu_options);
+        CHECK(hybrid_model);
+        CHECK(cpu_model);
+
+        SchedulerOptions pipeline_options;
+        pipeline_options.worker_count = 4;
+        auto pipeline_scheduler = runtime.create_scheduler(pipeline_options);
+        CHECK(pipeline_scheduler);
+        std::vector<SessionPtr> hybrid_sessions;
+        std::vector<SessionPtr> cpu_sessions;
+        for (uint32_t index = 0; index < 4; ++index) {
+            auto hybrid_session = runtime.create_session(hybrid_model.value());
+            auto cpu_session = runtime.create_session(cpu_model.value());
+            CHECK(hybrid_session);
+            CHECK(cpu_session);
+            hybrid_sessions.push_back(hybrid_session.value());
+            cpu_sessions.push_back(cpu_session.value());
+        }
+
+        constexpr uint32_t pipeline_rounds = 6;
+        for (uint32_t round = 0; round < pipeline_rounds; ++round) {
+            std::vector<DecodeBatchRequest> requests;
+            for (uint32_t session_index = 0;
+                 session_index < hybrid_sessions.size();
+                 ++session_index) {
+                requests.push_back({
+                    hybrid_sessions[session_index],
+                    static_cast<int32_t>((round + session_index) % 2),
+                });
+            }
+            std::vector<Result<DecodeResult> > pipeline_results
+                = pipeline_scheduler.value()->submit_decode(std::move(requests)).get();
+            CHECK(pipeline_results.size() == hybrid_sessions.size());
+            for (uint32_t session_index = 0;
+                 session_index < hybrid_sessions.size();
+                 ++session_index) {
+                auto cpu_result = cpu_sessions[session_index]->decode(
+                    static_cast<int32_t>((round + session_index) % 2));
+                CHECK(pipeline_results[session_index]);
+                CHECK(cpu_result);
+                CHECK(pipeline_results[session_index].value().sequence_length
+                      == round + 1);
+                CHECK(
+                    pipeline_results[session_index].value().logits.values.size()
+                    == cpu_result.value().logits.values.size());
+                for (size_t logit = 0;
+                     logit < cpu_result.value().logits.values.size();
+                     ++logit) {
+                    CHECK_NEAR(
+                        pipeline_results[session_index]
+                            .value()
+                            .logits.values[logit],
+                        cpu_result.value().logits.values[logit],
+                        1e-4f);
+                }
+            }
+        }
+        for (const SessionPtr& session : hybrid_sessions) {
+            const SessionStatistics session_statistics = session->statistics();
+            CHECK(session_statistics.vulkan_attention_blocks == pipeline_rounds);
+            CHECK(
+                session_statistics.vulkan_compute_submissions
+                == pipeline_rounds * 2);
+            CHECK(
+                session_statistics.vulkan_staging_slot_acquisitions
+                == pipeline_rounds * 2);
+        }
+        const SchedulerStatistics pipeline_statistics
+            = pipeline_scheduler.value()->statistics();
+        CHECK(pipeline_statistics.completed_requests == pipeline_rounds * 4);
+        CHECK(pipeline_statistics.max_in_flight >= 4);
+    }
 }
 
 void test_invalid_token_is_transactional()
@@ -674,6 +1011,8 @@ void test_topk_selected_weight_normalization_and_combine()
     CHECK(session.value()->statistics().expert_assignments == 2);
     CHECK(session.value()->statistics().expert_batches == 2);
     CHECK(session.value()->statistics().expert_token_counts == std::vector<uint64_t>({1, 1, 0}));
+    if (runtime.capabilities().openmp_expert_parallelism)
+        CHECK(session.value()->statistics().expert_parallel_tasks == 2);
 }
 
 void test_int8_expert_linear()
@@ -760,6 +1099,102 @@ void test_bfloat16_ring_kv_cache()
         CHECK(bfloat16_session.value()->decode(static_cast<int32_t>(index % 2)));
     CHECK(bfloat16_session.value()->statistics().kv_cache_allocated_bytes
           <= bfloat16_session.value()->statistics().kv_cache_logical_bytes * 16);
+}
+
+void test_attention_graph_without_bias_or_sink()
+{
+    AttentionPackage package(false, 0, false, false);
+    std::ifstream manifest_stream(package.path() / "model.ncnnmoe.json");
+    const std::string manifest_json{
+        std::istreambuf_iterator<char>(manifest_stream),
+        std::istreambuf_iterator<char>()};
+    ModelPackage model_package;
+    model_package.root = package.path();
+    model_package.manifest.model_type = "tiny_moe";
+    model_package.manifest.raw_json = manifest_json;
+    MoeAdapter adapter;
+    auto descriptor = adapter.parse_model(model_package);
+    CHECK(descriptor);
+    auto mapping = adapter.map_weights(model_package, descriptor.value());
+    CHECK(mapping);
+    descriptor.value().layers[0].use_attention = false;
+    descriptor.value().layers[0].use_moe = false;
+    ModelCompiler compiler;
+    auto graph_driven_model = compiler.compile(
+        std::move(descriptor).value(),
+        std::move(mapping).value(),
+        HybridMode::CpuOnly);
+    CHECK(graph_driven_model);
+    CHECK(graph_driven_model.value().layers[0].use_attention);
+
+    Runtime runtime;
+    RuntimeOptions cpu_options;
+    cpu_options.hybrid_mode = HybridMode::CpuOnly;
+    auto cpu_model = runtime.load_model(package.path(), cpu_options);
+    CHECK(cpu_model);
+    const LayerDescriptor& layer = cpu_model.value()->descriptor().layers[0];
+    const std::vector<ModelNodeType> expected_nodes = {
+        ModelNodeType::RmsNorm,
+        ModelNodeType::FusedQkv,
+        ModelNodeType::Rope,
+        ModelNodeType::Sdpa,
+        ModelNodeType::Projection,
+        ModelNodeType::RmsNorm,
+        ModelNodeType::Router,
+        ModelNodeType::TopK,
+        ModelNodeType::ExpertGroup,
+        ModelNodeType::Combine,
+    };
+    CHECK(layer.nodes.size() == expected_nodes.size());
+    for (size_t index = 0; index < expected_nodes.size(); ++index)
+        CHECK(layer.nodes[index].type == expected_nodes[index]);
+    CHECK(!layer.attention.use_bias);
+    CHECK(!layer.attention.use_sinks);
+    const CompiledLayerPlan& cpu_plan
+        = cpu_model.value()->execution_plan()[0];
+    CHECK(cpu_plan.nodes.size() == expected_nodes.size());
+    for (const CompiledNodePlan& node : cpu_plan.nodes)
+        CHECK(node.backend == ExecutionBackend::Cpu);
+
+    auto cpu_session = runtime.create_session(cpu_model.value());
+    CHECK(cpu_session);
+    const std::vector<int32_t> prompt = {0, 1, 0};
+    auto cpu_prefill = cpu_session.value()->prefill(prompt);
+    CHECK(cpu_prefill);
+
+    if (runtime.capabilities().vulkan_attention) {
+        RuntimeOptions hybrid_options;
+        hybrid_options.hybrid_mode = HybridMode::HybridExperts;
+        auto hybrid_model = runtime.load_model(package.path(), hybrid_options);
+        CHECK(hybrid_model);
+        const CompiledLayerPlan& hybrid_plan
+            = hybrid_model.value()->execution_plan()[0];
+        CHECK(hybrid_plan.nodes.size() == expected_nodes.size());
+        for (size_t node_index = 0;
+             node_index < hybrid_plan.nodes.size();
+             ++node_index) {
+            CHECK(
+                hybrid_plan.nodes[node_index].backend
+                == (node_index < 5
+                        ? ExecutionBackend::Vulkan
+                        : ExecutionBackend::Cpu));
+        }
+        auto hybrid_session = runtime.create_session(hybrid_model.value());
+        CHECK(hybrid_session);
+        auto hybrid_prefill = hybrid_session.value()->prefill(prompt);
+        CHECK(hybrid_prefill);
+        CHECK(hybrid_session.value()->statistics().vulkan_attention_blocks == 1);
+        CHECK(hybrid_prefill.value().logits.values.size()
+              == cpu_prefill.value().logits.values.size());
+        for (size_t index = 0;
+             index < cpu_prefill.value().logits.values.size();
+             ++index) {
+            CHECK_NEAR(
+                hybrid_prefill.value().logits.values[index],
+                cpu_prefill.value().logits.values[index],
+                1e-4f);
+        }
+    }
 }
 
 void test_sampling_and_streaming_generation()
@@ -865,8 +1300,19 @@ void test_backend_capabilities_and_hybrid_execution()
     const std::vector<int32_t> packed_prompt = {0, 1, 2, 3};
     auto automatic_prefill = automatic_session.value()->prefill(packed_prompt);
     CHECK(automatic_prefill);
-    if (runtime.capabilities().vulkan_cpu_mix)
-        CHECK(automatic_session.value()->statistics().vulkan_linear_dispatches > 0);
+    if (runtime.capabilities().vulkan_cpu_mix) {
+        const SessionStatistics& statistics = automatic_session.value()->statistics();
+        CHECK(statistics.vulkan_linear_dispatches == 1);
+        CHECK(statistics.vulkan_compute_submissions == 1);
+        CHECK(statistics.vulkan_batch_uploads == 1);
+        CHECK(statistics.vulkan_batch_downloads == 1);
+        CHECK(statistics.vulkan_auxiliary_uploads == 0);
+        CHECK(statistics.vulkan_auxiliary_upload_bytes == 0);
+        CHECK(statistics.vulkan_staging_slot_resizes
+                  + statistics.vulkan_staging_slot_reuses
+              == 2);
+        CHECK(statistics.vulkan_staging_slot_acquisitions == 1);
+    }
     else
         CHECK(automatic_session.value()->statistics().vulkan_linear_dispatches == 0);
 
@@ -901,6 +1347,18 @@ void test_backend_capabilities_and_hybrid_execution()
         const std::vector<int32_t> attention_prompt = {0, 1, 0, 1};
         auto attention_prefill = attention_session.value()->prefill(attention_prompt);
         CHECK(attention_prefill);
+        CHECK(attention_session.value()->statistics().vulkan_attention_blocks == 1);
+        CHECK(attention_session.value()->statistics().vulkan_linear_dispatches == 3);
+        CHECK(attention_session.value()->statistics().vulkan_compute_submissions == 2);
+        CHECK(attention_session.value()->statistics().vulkan_batch_uploads == 2);
+        CHECK(attention_session.value()->statistics().vulkan_batch_downloads == 2);
+        CHECK(attention_session.value()->statistics().vulkan_auxiliary_uploads == 3);
+        CHECK(attention_session.value()->statistics().vulkan_auxiliary_upload_bytes > 0);
+        CHECK(attention_session.value()->statistics().vulkan_staging_slot_resizes
+                  + attention_session.value()->statistics().vulkan_staging_slot_reuses
+              == 7);
+        CHECK(attention_session.value()->statistics().vulkan_staging_slot_reuses > 0);
+        CHECK(attention_session.value()->statistics().vulkan_staging_slot_acquisitions == 2);
         CHECK(attention_session.value()->statistics().kv_cache_logical_bytes > 0);
         CHECK(attention_session.value()->statistics().kv_cache_allocated_bytes
               >= attention_session.value()->statistics().kv_cache_logical_bytes);
@@ -1010,6 +1468,9 @@ int main()
 {
     try {
         ncnn::moe::test_ncnn_linear_operator();
+        ncnn::moe::test_mxfp4_cpu_kernel_and_fused_gate_up();
+        ncnn::moe::test_cpu_topology_parsing_and_partitioning();
+        ncnn::moe::test_cross_session_batch_scheduler();
         ncnn::moe::test_prefill_decode_and_reset();
         ncnn::moe::test_invalid_token_is_transactional();
         ncnn::moe::test_chunked_prefill_matches_single_batch();
@@ -1018,6 +1479,7 @@ int main()
         ncnn::moe::test_invalid_int8_scale_is_rejected();
         ncnn::moe::test_attention_kv_cache_and_reset();
         ncnn::moe::test_bfloat16_ring_kv_cache();
+        ncnn::moe::test_attention_graph_without_bias_or_sink();
         ncnn::moe::test_sampling_and_streaming_generation();
         ncnn::moe::test_loader_reports_adapter_and_weight_errors();
         ncnn::moe::test_backend_capabilities_and_hybrid_execution();

@@ -4,11 +4,13 @@
 #include "ncnn/moe/model.h"
 #include "ncnn/moe/model_adapter.h"
 #include "ncnn/moe/result.h"
+#include "ncnn/moe/scheduler.h"
 #include "ncnn/moe/session.h"
 #include "ncnn/moe/types.h"
 
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace ncnn {
@@ -27,7 +29,14 @@ struct RuntimeCapabilities
     bool vulkan_cpu_mix = false;
     bool vulkan_cpu_prefetch = false;
     bool vulkan_attention = false;
+    bool mxfp4_cpu_kernel = true;
+    bool mxfp4_arm_neon = false;
+    bool mxfp4_x86_avx2 = false;
+    bool mxfp4_x86_avx512 = false;
+    bool openmp_expert_parallelism = false;
+    bool cross_session_scheduling = true;
     uint32_t vulkan_device_count = 0;
+    std::string mxfp4_kernel;
 };
 
 class Runtime
@@ -49,6 +58,9 @@ public:
     [[nodiscard]] Result<SessionPtr> create_session(
         const ModelPtr& model,
         const SessionOptions& options = {});
+
+    [[nodiscard]] Result<BatchSchedulerPtr> create_scheduler(
+        const SchedulerOptions& options = {});
 
 private:
     std::vector<std::shared_ptr<IMoeModelAdapter> > adapters_;

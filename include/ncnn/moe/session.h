@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <span>
 #include <string>
@@ -87,8 +88,22 @@ struct SessionStatistics
     uint64_t expert_batches = 0;
     uint64_t expert_prefetches = 0;
     uint64_t expert_prefetch_bytes = 0;
+    uint64_t expert_parallel_tasks = 0;
+    uint64_t mxfp4_decode_gemv_rows = 0;
+    uint64_t mxfp4_prefill_gemm_rows = 0;
+    uint64_t mxfp4_paired_rows = 0;
+    uint64_t mxfp4_fused_gate_up_rows = 0;
     uint64_t vulkan_linear_dispatches = 0;
     uint64_t vulkan_attention_blocks = 0;
+    uint64_t vulkan_compute_submissions = 0;
+    uint64_t vulkan_batch_uploads = 0;
+    uint64_t vulkan_batch_downloads = 0;
+    uint64_t vulkan_auxiliary_uploads = 0;
+    uint64_t vulkan_auxiliary_upload_bytes = 0;
+    uint64_t vulkan_staging_slot_resizes = 0;
+    uint64_t vulkan_staging_slot_reuses = 0;
+    uint64_t vulkan_staging_slot_acquisitions = 0;
+    uint64_t vulkan_staging_slot_contentions = 0;
     uint64_t attention_time_microseconds = 0;
     uint64_t router_time_microseconds = 0;
     uint64_t expert_time_microseconds = 0;
@@ -125,10 +140,12 @@ public:
 
     [[nodiscard]] uint64_t sequence_length() const noexcept
     {
+        const std::lock_guard<std::recursive_mutex> lock(mutex_);
         return sequence_length_;
     }
-    [[nodiscard]] const SessionStatistics& statistics() const noexcept
+    [[nodiscard]] SessionStatistics statistics() const
     {
+        const std::lock_guard<std::recursive_mutex> lock(mutex_);
         return statistics_;
     }
 
@@ -142,6 +159,7 @@ private:
     std::unique_ptr<IExecutor> executor_;
     std::mt19937_64 random_generator_;
     uint32_t prefill_chunk_size_ = 256;
+    mutable std::recursive_mutex mutex_;
 
     friend class Runtime;
 };

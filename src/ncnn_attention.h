@@ -29,6 +29,7 @@ struct NcnnVulkanAttentionConfig
     float rope_ntk_beta = 32.0f;
     DType activation_dtype = DType::Float32;
     DType kv_cache_dtype = DType::Float32;
+    bool use_attention_sink = false;
 };
 
 class NcnnVulkanAttentionOperator
@@ -38,12 +39,15 @@ public:
 
     [[nodiscard]] static std::shared_ptr<NcnnVulkanAttentionOperator> create(
         const TensorData& norm_weight,
-        const TensorData& sinks,
+        const TensorData* sinks,
         std::shared_ptr<NcnnLinearOperator> fused_qkv,
         std::shared_ptr<NcnnLinearOperator> output_projection,
         const NcnnVulkanAttentionConfig& config);
     [[nodiscard]] static uint64_t current_thread_blocks() noexcept;
 
+    // Executes the complete dense attention block across one heterogeneous
+    // boundary: one hidden-state upload, one VkCompute submission containing
+    // every ncnn layer, and one hidden-state download for CPU routing/experts.
     [[nodiscard]] bool forward(
         uint64_t position_offset,
         CpuLayerCache& cache,

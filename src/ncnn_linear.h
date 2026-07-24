@@ -17,6 +17,19 @@ enum class NcnnLinearDevice
     Vulkan
 };
 
+struct NcnnVulkanRuntimeCounters
+{
+    uint64_t compute_submissions = 0;
+    uint64_t batch_uploads = 0;
+    uint64_t batch_downloads = 0;
+    uint64_t auxiliary_uploads = 0;
+    uint64_t auxiliary_upload_bytes = 0;
+    uint64_t staging_slot_resizes = 0;
+    uint64_t staging_slot_reuses = 0;
+    uint64_t staging_slot_acquisitions = 0;
+    uint64_t staging_slot_contentions = 0;
+};
+
 class NcnnLinearOperator
 {
 public:
@@ -32,6 +45,7 @@ public:
         NcnnLinearDevice device);
     [[nodiscard]] static uint32_t vulkan_device_count() noexcept;
     [[nodiscard]] static uint64_t current_thread_vulkan_dispatches() noexcept;
+    [[nodiscard]] static NcnnVulkanRuntimeCounters current_thread_vulkan_runtime_counters() noexcept;
     [[nodiscard]] bool forward(const CpuBatch& input, CpuBatch& output) const;
     [[nodiscard]] bool uses_vulkan() const noexcept;
 

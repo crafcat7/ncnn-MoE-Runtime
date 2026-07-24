@@ -124,6 +124,7 @@ Session::~Session() = default;
 
 Result<PrefillResult> Session::prefill(std::span<const int32_t> input_ids)
 {
+    const std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (input_ids.empty())
         return Error{ErrorCode::InvalidArgument, "prefill requires at least one token"};
     if (input_ids.size() > std::numeric_limits<uint32_t>::max())
@@ -168,6 +169,7 @@ Result<PrefillResult> Session::prefill(std::span<const int32_t> input_ids)
 
 Result<DecodeResult> Session::decode(int32_t input_id)
 {
+    const std::lock_guard<std::recursive_mutex> lock(mutex_);
     const uint32_t max_context_length = model_->descriptor().layers.empty()
                                             ? 0
                                             : model_->descriptor().layers[0].attention.max_context_length;
@@ -192,6 +194,7 @@ Result<DecodeResult> Session::decode(int32_t input_id)
 
 Result<SampledToken> Session::sample(const LogitsOutput& logits, const SamplingOptions& options)
 {
+    const std::lock_guard<std::recursive_mutex> lock(mutex_);
     auto candidates = sampling_distribution(logits, options);
     if (!candidates)
         return candidates.error();
@@ -217,6 +220,7 @@ Result<GenerationResult> Session::generate(
     TokenStreamCallback on_token,
     TokenTextDecoder decode_text)
 {
+    const std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (options.max_new_tokens == 0)
         return Error{ErrorCode::InvalidArgument, "max_new_tokens must be non-zero"};
     auto valid_sampling = validate_sampling_options(options.sampling);
@@ -264,6 +268,7 @@ Result<GenerationResult> Session::generate(
 
 Result<void> Session::reset()
 {
+    const std::lock_guard<std::recursive_mutex> lock(mutex_);
     sequence_length_ = 0;
     statistics_ = {};
     statistics_.expert_token_counts.resize(model_->descriptor().expert_count, 0);

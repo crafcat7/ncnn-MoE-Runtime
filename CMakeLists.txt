@@ -18,11 +18,14 @@ endif()
 add_library(ncnn_moe STATIC
     src/cpu_attention.cpp
     src/cpu_executor.cpp
+    src/cpu_mxfp4.cpp
     src/cpu_ops.cpp
+    src/cpu_topology.cpp
     src/model_compiler.cpp
     src/ncnn_linear.cpp
     src/runtime.cpp
     src/safetensors.cpp
+    src/scheduler.cpp
     src/session.cpp
     src/moe_adapter.cpp
 )
@@ -44,6 +47,9 @@ set(NCNN_MOE_WITH_OPENMP OFF)
 if(TARGET OpenMP::OpenMP_CXX)
     target_link_libraries(ncnn_moe PUBLIC OpenMP::OpenMP_CXX)
     set(NCNN_MOE_WITH_OPENMP ON)
+    message(STATUS "ncnn_moe OpenMP expert parallelism enabled")
+else()
+    message(STATUS "ncnn_moe OpenMP unavailable; expert groups use one CPU thread")
 endif()
 
 set(NCNN_MOE_WITH_NCNN OFF)

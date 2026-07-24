@@ -73,6 +73,7 @@ struct AttentionBlockPlan
     float rope_scaling_factor = 1.0f;
     float rope_ntk_alpha = 1.0f;
     float rope_ntk_beta = 32.0f;
+    bool use_attention_sink = false;
 };
 
 struct MoeBlockPlan
@@ -88,9 +89,22 @@ struct MoeBlockPlan
     bool normalize_topk_weights = true;
 };
 
+enum class ExecutionBackend
+{
+    Cpu,
+    Vulkan
+};
+
+struct CompiledNodePlan
+{
+    ModelNodeType type = ModelNodeType::RmsNorm;
+    ExecutionBackend backend = ExecutionBackend::Cpu;
+};
+
 struct CompiledLayerPlan
 {
     uint32_t layer_id = 0;
+    std::vector<CompiledNodePlan> nodes;
     AttentionBlockPlan attention;
     MoeBlockPlan moe;
     bool use_attention = false;
@@ -110,10 +124,24 @@ struct CompiledModel
 class ModelCompiler
 {
 public:
+    struct BackendCapabilities
+    {
+        bool cpu_execution = true;
+        bool vulkan_dense = false;
+        bool vulkan_attention = false;
+        bool mxfp4_cpu_kernel = true;
+    };
+
     [[nodiscard]] Result<CompiledModel> compile(
         MoeModelDescriptor descriptor,
         WeightMapping mapping,
         HybridMode hybrid_mode = HybridMode::CpuOnly) const;
+
+    [[nodiscard]] Result<CompiledModel> compile(
+        MoeModelDescriptor descriptor,
+        WeightMapping mapping,
+        HybridMode hybrid_mode,
+        const BackendCapabilities& capabilities) const;
 };
 
 } // namespace moe

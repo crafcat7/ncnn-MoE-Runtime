@@ -214,7 +214,7 @@ static float cache_element(
 
 static CpuBatch scaled_dot_product_attention(
     const AttentionBlockPlan& plan,
-    const TensorData& sinks,
+    const TensorData* sinks,
     uint64_t position_offset,
     const CpuBatch& query,
     const CpuLayerCache& cache)
@@ -232,11 +232,12 @@ static CpuBatch scaled_dot_product_attention(
         for (uint32_t query_head = 0; query_head < head_count; ++query_head) {
             const uint32_t kv_head = query_head / heads_per_group;
             const float* query_vector = query.row(query_index) + query_head * head_dimension;
-            float maximum = bfloat16_to_float(sinks.bfloat16_data.empty()
-                                                  ? static_cast<uint16_t>(0)
-                                                  : sinks.bfloat16_data[query_head]);
-            if (sinks.dtype == DType::Float32)
-                maximum = sinks.float32_data[query_head];
+            float maximum = -std::numeric_limits<float>::infinity();
+            if (sinks) {
+                maximum = sinks->dtype == DType::Float32
+                              ? sinks->float32_data[query_head]
+                              : bfloat16_to_float(sinks->bfloat16_data[query_head]);
+            }
 
             for (uint64_t key_index = 0; key_index < cache.token_count; ++key_index) {
                 const uint64_t key_position = cache.start_position + key_index;
@@ -256,10 +257,13 @@ static CpuBatch scaled_dot_product_attention(
                 maximum = std::max(maximum, logits[key_index]);
             }
 
-            const float sink_value = sinks.dtype == DType::Float32
-                                         ? sinks.float32_data[query_head]
-                                         : bfloat16_to_float(sinks.bfloat16_data[query_head]);
-            float normalizer = std::exp(sink_value - maximum);
+            float normalizer = 0.0f;
+            if (sinks) {
+                const float sink_value = sinks->dtype == DType::Float32
+                                             ? sinks->float32_data[query_head]
+                                             : bfloat16_to_float(sinks->bfloat16_data[query_head]);
+                normalizer = std::exp(sink_value - maximum);
+            }
             for (uint64_t key_index = 0; key_index < cache.token_count; ++key_index) {
                 if (std::isfinite(logits[key_index])) {
                     logits[key_index] = std::exp(logits[key_index] - maximum);
@@ -299,6 +303,17 @@ static void trim_sliding_cache(CpuLayerCache& cache, const AttentionBlockPlan& p
         compact_cache(cache, target_capacity);
 }
 
+static CpuBatch attention_linear(
+    const WeightTable& weights,
+    TensorHandle matrix,
+    TensorHandle bias,
+    const CpuBatch& input)
+{
+    return bias == invalid_tensor_handle
+               ? linear_batch(weights.at(matrix), input)
+               : linear_batch(weights.at(matrix), weights.at(bias), input);
+}
+
 CpuBatch execute_attention_block(
     const WeightTable& weights,
     const AttentionBlockPlan& plan,
@@ -336,9 +351,12 @@ CpuBatch execute_attention_block(
         }
     }
     else {
-        query = linear_batch(weights.at(plan.query_weight), weights.at(plan.query_bias), normalized);
-        key = linear_batch(weights.at(plan.key_weight), weights.at(plan.key_bias), normalized);
-        value = linear_batch(weights.at(plan.value_weight), weights.at(plan.value_bias), normalized);
+        query = attention_linear(
+            weights, plan.query_weight, plan.query_bias, normalized);
+        key = attention_linear(
+            weights, plan.key_weight, plan.key_bias, normalized);
+        value = attention_linear(
+            weights, plan.value_weight, plan.value_bias, normalized);
     }
 
     for (size_t token_index = 0; token_index < hidden.rows(); ++token_index) {
@@ -353,8 +371,13 @@ CpuBatch execute_attention_block(
         cache.start_position = position_offset;
     append_cache(cache, kv_cache_dtype, key, value);
     const CpuBatch attention = scaled_dot_product_attention(
-        plan, weights.at(plan.sinks), position_offset, query, cache);
-    CpuBatch projected = linear_batch(weights.at(plan.output_weight), weights.at(plan.output_bias), attention);
+        plan,
+        plan.sinks == invalid_tensor_handle ? nullptr : &weights.at(plan.sinks),
+        position_offset,
+        query,
+        cache);
+    CpuBatch projected = attention_linear(
+        weights, plan.output_weight, plan.output_bias, attention);
     CpuBatch output = hidden;
     add_batch_inplace(output, projected);
     trim_sliding_cache(cache, plan);
