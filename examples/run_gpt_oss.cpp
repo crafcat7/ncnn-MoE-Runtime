@@ -5,6 +5,7 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,7 @@ int main(int argc, char** argv)
         std::cerr << "usage: ncnn_moe_gpt_oss <model-directory> <token-id> [token-id ...]"
                      " [--max-new-tokens N] [--stop-token ID ...] [--temperature T]"
                      " [--top-k K] [--top-p P] [--min-p P] [--seed N]"
+                     " [--expert-cache-mb N] [--expert-io-workers N]"
                      " [--cpu|--hybrid|--hybrid-prefetch]"
                      " [--stream-token-ids]\n";
         return 2;
@@ -42,6 +44,8 @@ int main(int argc, char** argv)
     try {
         uint32_t max_new_tokens = 1;
         uint64_t sampling_seed = 0;
+        uint64_t expert_cache_bytes = 0;
+        uint32_t expert_io_workers = 0;
         ncnn::moe::SamplingOptions sampling;
         sampling.temperature = 0.0f;
         std::vector<int32_t> prompt;
@@ -99,6 +103,30 @@ int main(int argc, char** argv)
                 }
                 sampling_seed = std::stoull(argv[index]);
             }
+            else if (argument == "--expert-cache-mb") {
+                if (++index >= argc) {
+                    std::cerr << "--expert-cache-mb requires a value\n";
+                    return 2;
+                }
+                const uint64_t megabytes = std::stoull(argv[index]);
+                if (megabytes > std::numeric_limits<uint64_t>::max() / (1024 * 1024)) {
+                    std::cerr << "--expert-cache-mb is too large\n";
+                    return 2;
+                }
+                expert_cache_bytes = megabytes * 1024 * 1024;
+            }
+            else if (argument == "--expert-io-workers") {
+                if (++index >= argc) {
+                    std::cerr << "--expert-io-workers requires a value\n";
+                    return 2;
+                }
+                const uint64_t workers = std::stoull(argv[index]);
+                if (workers > 64) {
+                    std::cerr << "--expert-io-workers must be between 0 and 64\n";
+                    return 2;
+                }
+                expert_io_workers = static_cast<uint32_t>(workers);
+            }
             else if (argument == "--stream-token-ids") {
                 stream_token_ids = true;
             }
@@ -123,6 +151,8 @@ int main(int argc, char** argv)
         ncnn::moe::Runtime runtime;
         ncnn::moe::RuntimeOptions runtime_options;
         runtime_options.hybrid_mode = requested_mode;
+        runtime_options.expert_cache_bytes = expert_cache_bytes;
+        runtime_options.expert_io_workers = expert_io_workers;
         const auto load_start = std::chrono::steady_clock::now();
         auto model = runtime.load_model(std::filesystem::path(argv[1]), runtime_options);
         if (!model) {
@@ -185,6 +215,16 @@ int main(int argc, char** argv)
                   << session.value()->statistics().expert_time_microseconds / 1000.0 << " ms\n";
         std::cout << "Expert prefetches: " << session.value()->statistics().expert_prefetches
                   << " (" << session.value()->statistics().expert_prefetch_bytes << " bytes hinted)\n";
+        std::cout << "Expert cache: " << session.value()->statistics().expert_cache_hits
+                  << " hit(s), " << session.value()->statistics().expert_cache_misses
+                  << " miss(es), " << session.value()->statistics().expert_cache_evictions
+                  << " eviction(s), " << session.value()->statistics().expert_cache_bytes_read
+                  << " bytes read, " << session.value()->statistics().expert_cache_resident_bytes
+                  << " bytes resident, "
+                  << session.value()->statistics().expert_cache_queued_reads
+                  << " queued read(s), "
+                  << session.value()->statistics().expert_cache_speculative_reads
+                  << " speculative read(s)\n";
         std::cout << "Parallel CPU experts: "
                   << (runtime.capabilities().openmp_expert_parallelism
                           ? "OpenMP enabled"

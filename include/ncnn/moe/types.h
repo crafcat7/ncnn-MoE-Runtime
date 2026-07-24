@@ -71,6 +71,16 @@ enum class LogitsOutputMode
     SampledToken
 };
 
+struct MxFp4FileStorage
+{
+    std::string blocks_path;
+    uint64_t blocks_offset = 0;
+    uint64_t blocks_bytes = 0;
+    std::string scales_path;
+    uint64_t scales_offset = 0;
+    uint64_t scales_bytes = 0;
+};
+
 struct TensorData
 {
     DType dtype = DType::Float32;
@@ -81,6 +91,7 @@ struct TensorData
     std::vector<float> quantization_scales;
     std::vector<uint8_t> mxfp4_blocks;
     std::vector<uint8_t> mxfp4_scales;
+    std::shared_ptr<const MxFp4FileStorage> mxfp4_file_storage;
     std::shared_ptr<NcnnLinearOperator> linear_operator;
 
     [[nodiscard]] uint64_t element_count() const noexcept;

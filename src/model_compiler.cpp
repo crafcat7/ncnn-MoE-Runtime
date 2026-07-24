@@ -124,10 +124,21 @@ static Result<TensorHandle> require_tensor(
     else if (dtype == DType::MxFp4) {
         if (tensor.shape.size() != 2 || tensor.shape[1] % 32 != 0)
             return Error{ErrorCode::InvalidModel, "MXFP4 tensor must be a matrix with 32-aligned columns: " + name};
-        if (tensor.mxfp4_blocks.size() != tensor.element_count() / 2)
-            return Error{ErrorCode::InvalidModel, "invalid MXFP4 block data length for tensor: " + name};
-        if (tensor.mxfp4_scales.size() != tensor.element_count() / 32)
-            return Error{ErrorCode::InvalidModel, "invalid MXFP4 scale data length for tensor: " + name};
+        if (tensor.mxfp4_file_storage) {
+            if (!tensor.mxfp4_blocks.empty() || !tensor.mxfp4_scales.empty()
+                || tensor.mxfp4_file_storage->blocks_path.empty()
+                || tensor.mxfp4_file_storage->scales_path.empty()
+                || tensor.mxfp4_file_storage->blocks_bytes != tensor.element_count() / 2
+                || tensor.mxfp4_file_storage->scales_bytes != tensor.element_count() / 32) {
+                return Error{ErrorCode::InvalidModel, "invalid file-backed MXFP4 storage: " + name};
+            }
+        }
+        else {
+            if (tensor.mxfp4_blocks.size() != tensor.element_count() / 2)
+                return Error{ErrorCode::InvalidModel, "invalid MXFP4 block data length for tensor: " + name};
+            if (tensor.mxfp4_scales.size() != tensor.element_count() / 32)
+                return Error{ErrorCode::InvalidModel, "invalid MXFP4 scale data length for tensor: " + name};
+        }
         if (!tensor.float32_data.empty() || !tensor.bfloat16_data.empty() || !tensor.int8_data.empty()
             || !tensor.quantization_scales.empty())
             return Error{ErrorCode::InvalidModel, "MXFP4 tensor contains unrelated storage: " + name};
@@ -179,9 +190,12 @@ static Result<void> prepare_linear_operator(
     WeightTable& weights,
     TensorHandle matrix_handle,
     TensorHandle bias_handle,
-    NcnnLinearDevice device)
+    NcnnLinearDevice device,
+    bool retain_cpu_dense_copy)
 {
     TensorData& matrix = weights.at_mutable(matrix_handle);
+    if (device == NcnnLinearDevice::Cpu && !retain_cpu_dense_copy)
+        return {};
     const TensorData* bias = bias_handle == invalid_tensor_handle ? nullptr : &weights.at(bias_handle);
     matrix.linear_operator = NcnnLinearOperator::create(matrix, bias, device);
     if (device == NcnnLinearDevice::Vulkan && !matrix.linear_operator)
@@ -265,7 +279,8 @@ Result<CompiledModel> ModelCompiler::compile(
         compiled.weights,
         compiled.lm_head_weight,
         invalid_tensor_handle,
-        dense_device);
+        dense_device,
+        capabilities.retain_cpu_dense_copies);
     if (!prepared)
         return prepared.error();
 
@@ -450,18 +465,22 @@ Result<CompiledModel> ModelCompiler::compile(
                     return Error{ErrorCode::InternalError, "failed to create fused Vulkan QKV operator"};
             }
             else {
-                prepared = prepare_linear_operator(compiled.weights, plan.query_weight, plan.query_bias, attention_device);
+                prepared = prepare_linear_operator(compiled.weights, plan.query_weight, plan.query_bias, attention_device, capabilities.retain_cpu_dense_copies);
                 if (!prepared)
                     return prepared.error();
-                prepared = prepare_linear_operator(compiled.weights, plan.key_weight, plan.key_bias, attention_device);
+                prepared = prepare_linear_operator(compiled.weights, plan.key_weight, plan.key_bias, attention_device, capabilities.retain_cpu_dense_copies);
                 if (!prepared)
                     return prepared.error();
-                prepared = prepare_linear_operator(compiled.weights, plan.value_weight, plan.value_bias, attention_device);
+                prepared = prepare_linear_operator(compiled.weights, plan.value_weight, plan.value_bias, attention_device, capabilities.retain_cpu_dense_copies);
                 if (!prepared)
                     return prepared.error();
             }
             prepared = prepare_linear_operator(
-                compiled.weights, plan.output_weight, plan.output_bias, attention_device);
+                compiled.weights,
+                plan.output_weight,
+                plan.output_bias,
+                attention_device,
+                capabilities.retain_cpu_dense_copies);
             if (!prepared)
                 return prepared.error();
             if (attention_device == NcnnLinearDevice::Vulkan) {
@@ -517,7 +536,8 @@ Result<CompiledModel> ModelCompiler::compile(
             compiled.weights,
             layer_plan.moe.router_weight,
             layer_plan.moe.router_bias,
-            NcnnLinearDevice::Cpu);
+            NcnnLinearDevice::Cpu,
+            capabilities.retain_cpu_dense_copies);
         if (!prepared)
             return prepared.error();
 
@@ -548,7 +568,8 @@ Result<CompiledModel> ModelCompiler::compile(
                     compiled.weights,
                     expert.gate_weight,
                     invalid_tensor_handle,
-                    NcnnLinearDevice::Cpu);
+                    NcnnLinearDevice::Cpu,
+                    capabilities.retain_cpu_dense_copies);
             }
 
             if (moe.layout != ExpertLayout::InterleavedGateUpDown) {
@@ -562,7 +583,8 @@ Result<CompiledModel> ModelCompiler::compile(
                     compiled.weights,
                     expert.up_weight,
                     invalid_tensor_handle,
-                    NcnnLinearDevice::Cpu);
+                    NcnnLinearDevice::Cpu,
+                    capabilities.retain_cpu_dense_copies);
             }
 
             auto down = require_tensor(
@@ -588,7 +610,8 @@ Result<CompiledModel> ModelCompiler::compile(
                 compiled.weights,
                 expert.down_weight,
                 expert.down_bias,
-                NcnnLinearDevice::Cpu);
+                NcnnLinearDevice::Cpu,
+                capabilities.retain_cpu_dense_copies);
 
             layer_plan.moe.experts.push_back(expert);
         }

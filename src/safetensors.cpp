@@ -270,7 +270,8 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
     const std::string& scales_name,
     uint32_t expert_id,
     uint32_t rows,
-    uint32_t columns) const
+    uint32_t columns,
+    bool defer_data) const
 {
     const SafetensorInfo* blocks = find(blocks_name);
     const SafetensorInfo* scales = find(scales_name);
@@ -285,6 +286,21 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
 
     const uint64_t block_bytes = static_cast<uint64_t>(rows) * columns / 2;
     const uint64_t scale_bytes = static_cast<uint64_t>(rows) * columns / 32;
+    TensorData tensor;
+    tensor.dtype = DType::MxFp4;
+    tensor.shape = {rows, columns};
+    if (defer_data) {
+        auto storage = std::make_shared<MxFp4FileStorage>();
+        storage->blocks_path = blocks->path.string();
+        storage->blocks_offset = blocks->offset + expert_id * block_bytes;
+        storage->blocks_bytes = block_bytes;
+        storage->scales_path = scales->path.string();
+        storage->scales_offset = scales->offset + expert_id * scale_bytes;
+        storage->scales_bytes = scale_bytes;
+        tensor.mxfp4_file_storage = std::move(storage);
+        return tensor;
+    }
+
     auto block_data = read_range(blocks->path, blocks->offset + expert_id * block_bytes, block_bytes);
     if (!block_data)
         return block_data.error();
@@ -292,9 +308,6 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
     if (!scale_data)
         return scale_data.error();
 
-    TensorData tensor;
-    tensor.dtype = DType::MxFp4;
-    tensor.shape = {rows, columns};
     tensor.mxfp4_blocks = std::move(block_data).value();
     tensor.mxfp4_scales = std::move(scale_data).value();
     return tensor;

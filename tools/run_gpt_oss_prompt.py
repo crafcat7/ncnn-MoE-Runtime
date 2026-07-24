@@ -30,6 +30,18 @@ def parse_arguments():
     parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--expert-cache-mb",
+        type=int,
+        default=0,
+        help="Bound the file-backed MXFP4 expert cache; zero keeps eager loading.",
+    )
+    parser.add_argument(
+        "--expert-io-workers",
+        type=int,
+        default=0,
+        help="Fixed expert-storage worker count; zero chooses a hardware-derived default.",
+    )
+    parser.add_argument(
         "--backend",
         choices=("auto", "cpu", "hybrid", "hybrid-prefetch"),
         default="auto",
@@ -92,6 +104,12 @@ def stream_harmony_token(encoding, token, stream_state):
 
 def main():
     arguments = parse_arguments()
+    if arguments.expert_cache_mb < 0:
+        print("--expert-cache-mb must be non-negative", file=sys.stderr)
+        return 2
+    if arguments.expert_io_workers < 0 or arguments.expert_io_workers > 64:
+        print("--expert-io-workers must be between 0 and 64", file=sys.stderr)
+        return 2
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     conversation = Conversation.from_messages(
         [
@@ -121,6 +139,10 @@ def main():
         "--seed",
         str(arguments.seed),
     ]
+    if arguments.expert_cache_mb:
+        command.extend(["--expert-cache-mb", str(arguments.expert_cache_mb)])
+    if arguments.expert_io_workers:
+        command.extend(["--expert-io-workers", str(arguments.expert_io_workers)])
     for token in stop_tokens:
         command.extend(["--stop-token", str(token)])
     if arguments.backend != "auto":

@@ -88,6 +88,13 @@ struct SessionStatistics
     uint64_t expert_batches = 0;
     uint64_t expert_prefetches = 0;
     uint64_t expert_prefetch_bytes = 0;
+    uint64_t expert_cache_hits = 0;
+    uint64_t expert_cache_misses = 0;
+    uint64_t expert_cache_evictions = 0;
+    uint64_t expert_cache_bytes_read = 0;
+    uint64_t expert_cache_resident_bytes = 0;
+    uint64_t expert_cache_queued_reads = 0;
+    uint64_t expert_cache_speculative_reads = 0;
     uint64_t expert_parallel_tasks = 0;
     uint64_t mxfp4_decode_gemv_rows = 0;
     uint64_t mxfp4_prefill_gemm_rows = 0;

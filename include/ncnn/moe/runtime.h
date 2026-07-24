@@ -19,6 +19,13 @@ namespace moe {
 struct RuntimeOptions
 {
     HybridMode hybrid_mode = HybridMode::Auto;
+    // Zero eagerly loads every expert. A non-zero value enables file-backed
+    // MXFP4 experts with a shared, byte-bounded host-memory cache.
+    uint64_t expert_cache_bytes = 0;
+    // Zero selects a conservative hardware-derived default. The pool remains
+    // fixed for the model lifetime so expert routing cannot create unbounded
+    // I/O threads.
+    uint32_t expert_io_workers = 0;
 };
 
 struct RuntimeCapabilities

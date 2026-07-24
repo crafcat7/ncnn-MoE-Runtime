@@ -4,6 +4,7 @@
 #include "cpu_batch.h"
 #include "cpu_ops.h"
 #include "cpu_session_state.h"
+#include "expert_cache.h"
 #include "ncnn_attention.h"
 #include "ncnn_linear.h"
 
@@ -141,6 +142,92 @@ static void select_topk_routes(
     }
 }
 
+static float dense_tensor_value(const TensorData& tensor, size_t index)
+{
+    if (tensor.dtype == DType::Float32)
+        return tensor.float32_data[index];
+    if (tensor.dtype == DType::BFloat16)
+        return bfloat16_to_float(tensor.bfloat16_data[index]);
+    if (tensor.dtype == DType::Int8) {
+        const uint32_t columns = tensor.shape[1];
+        return static_cast<float>(tensor.int8_data[index])
+               * tensor.quantization_scales[index / columns];
+    }
+    return 0.0f;
+}
+
+static void predict_next_layer_experts(
+    const CompiledModel& model,
+    size_t layer_index,
+    uint64_t prediction_generation,
+    std::vector<float> hidden)
+{
+    if (!model.expert_cache || layer_index >= model.layers.size())
+        return;
+    const MoeBlockPlan& moe = model.layers[layer_index].moe;
+    if (moe.pre_ffn_norm_weight == invalid_tensor_handle
+        || moe.router_weight == invalid_tensor_handle
+        || hidden.empty()) {
+        return;
+    }
+
+    const TensorData& norm_weight = model.weights.at(moe.pre_ffn_norm_weight);
+    const TensorData& router_weight = model.weights.at(moe.router_weight);
+    if (norm_weight.element_count() < hidden.size()
+        || router_weight.shape.size() != 2
+        || router_weight.shape[1] != hidden.size()) {
+        return;
+    }
+
+    float square_sum = 0.0f;
+    for (float value : hidden)
+        square_sum += value * value;
+    const float inverse_rms = 1.0f / std::sqrt(
+        square_sum / static_cast<float>(hidden.size())
+        + model.descriptor.norm_epsilon);
+    for (size_t column = 0; column < hidden.size(); ++column)
+        hidden[column] *= inverse_rms * dense_tensor_value(norm_weight, column);
+
+    const TensorData* bias = moe.router_bias == invalid_tensor_handle
+                                 ? nullptr
+                                 : &model.weights.at(moe.router_bias);
+    std::vector<RouteCandidate> selected;
+    selected.reserve(moe.top_k);
+    for (uint32_t expert_id = 0; expert_id < router_weight.shape[0]; ++expert_id) {
+        float score = bias ? dense_tensor_value(*bias, expert_id) : 0.0f;
+        const size_t weight_offset = static_cast<size_t>(expert_id) * hidden.size();
+        for (size_t column = 0; column < hidden.size(); ++column)
+            score += dense_tensor_value(router_weight, weight_offset + column) * hidden[column];
+        const RouteCandidate candidate{expert_id, score};
+        const auto insertion = std::lower_bound(
+            selected.begin(), selected.end(), candidate, route_precedes);
+        if (selected.size() == moe.top_k && insertion == selected.end())
+            continue;
+        selected.insert(insertion, candidate);
+        if (selected.size() > moe.top_k)
+            selected.pop_back();
+    }
+
+    for (const RouteCandidate& candidate : selected) {
+        if (!model.expert_cache->prediction_is_current(prediction_generation))
+            return;
+        if (candidate.expert_id >= moe.experts.size())
+            continue;
+        const ExpertPlan& expert = moe.experts[candidate.expert_id];
+        if (expert.gate_up_weight == invalid_tensor_handle
+            || expert.down_weight == invalid_tensor_handle) {
+            continue;
+        }
+        const TensorData& gate_up = model.weights.at(expert.gate_up_weight);
+        const TensorData& down = model.weights.at(expert.down_weight);
+        if (!gate_up.mxfp4_file_storage || !down.mxfp4_file_storage)
+            continue;
+        // Prediction is best effort: invalid metadata is rejected during exact
+        // execution and capacity pressure merely skips speculative admission.
+        (void)model.expert_cache->prefetch_pair(gate_up, down);
+    }
+}
+
 static float activate(float value, ExpertActivation activation, float limit)
 {
     switch (activation) {
@@ -190,14 +277,17 @@ static CpuBatch execute_expert_linear(
 static CpuBatch execute_expert_batch(
     const WeightTable& weights,
     const ExpertPlan& expert,
+    const ExpertCacheLease* cached_weights,
     const CpuBatch& input,
     bool prefetch,
     ExpertExecutionMetrics& metrics)
 {
     if (expert.gate_up_weight != invalid_tensor_handle) {
+        const TensorData& gate_up_weight = cached_weights && cached_weights->gate_up
+                                                   ? *cached_weights->gate_up
+                                                   : weights.at(expert.gate_up_weight);
         if (prefetch)
-            metrics.hinted_bytes += prefetch_weight(weights, expert.gate_up_weight);
-        const TensorData& gate_up_weight = weights.at(expert.gate_up_weight);
+            metrics.hinted_bytes += prefetch_tensor(gate_up_weight);
         const TensorData* gate_up_bias = expert.gate_up_bias == invalid_tensor_handle
                                              ? nullptr
                                              : &weights.at(expert.gate_up_bias);
@@ -237,10 +327,13 @@ static CpuBatch execute_expert_batch(
                 }
             }
         }
+        const TensorData& down_weight = cached_weights && cached_weights->down
+                                                ? *cached_weights->down
+                                                : weights.at(expert.down_weight);
         if (prefetch)
-            metrics.hinted_bytes += prefetch_weight(weights, expert.down_weight);
+            metrics.hinted_bytes += prefetch_tensor(down_weight);
         return execute_expert_linear(
-            weights.at(expert.down_weight),
+            down_weight,
             expert.down_bias == invalid_tensor_handle
                 ? nullptr
                 : &weights.at(expert.down_bias),
@@ -323,7 +416,12 @@ Result<std::vector<std::vector<float> > > CpuExecutor::execute(
     if (state.layers.size() != model.layers.size())
         state.layers.resize(model.layers.size());
 
-    for (const CompiledLayerPlan& layer : model.layers) {
+    ExpertCacheStatistics execution_cache_before;
+    if (model.expert_cache)
+        execution_cache_before = model.expert_cache->statistics();
+
+    for (size_t layer_index = 0; layer_index < model.layers.size(); ++layer_index) {
+        const CompiledLayerPlan& layer = model.layers[layer_index];
         if (layer.use_attention) {
             const auto attention_start = std::chrono::steady_clock::now();
             hidden = execute_attention_block(
@@ -336,6 +434,8 @@ Result<std::vector<std::vector<float> > > CpuExecutor::execute(
                 hidden);
             statistics.attention_time_microseconds += elapsed_microseconds(attention_start);
         }
+        if (model.expert_cache)
+            model.expert_cache->cancel_prediction();
 
         const auto router_start = std::chrono::steady_clock::now();
         const MoeBlockPlan& moe = layer.moe;
@@ -390,21 +490,77 @@ Result<std::vector<std::vector<float> > > CpuExecutor::execute(
 #endif
         std::vector<CpuBatch> expert_outputs(groups.size());
         std::vector<ExpertExecutionMetrics> expert_metrics(groups.size());
-        const int64_t parallel_expert_count = static_cast<int64_t>(groups.size());
+        std::vector<uint32_t> expert_order;
+        expert_order.reserve(active_expert_count);
+        for (uint32_t expert_id = 0; expert_id < groups.size(); ++expert_id) {
+            if (!groups[expert_id].empty())
+                expert_order.push_back(expert_id);
+        }
+        std::vector<Error> expert_errors(groups.size());
+        std::vector<uint8_t> expert_failed(groups.size(), 0);
+        if (model.expert_cache) {
+            for (uint32_t expert_id : expert_order) {
+                const ExpertPlan& expert = moe.experts[expert_id];
+                if (expert.gate_up_weight == invalid_tensor_handle)
+                    continue;
+                const TensorData& gate_up = model.weights.at(expert.gate_up_weight);
+                const TensorData& down = model.weights.at(expert.down_weight);
+                if (!gate_up.mxfp4_file_storage && !down.mxfp4_file_storage)
+                    continue;
+                auto requested = model.expert_cache->request_pair(gate_up, down);
+                if (!requested)
+                    return requested.error();
+            }
+            // Ready experts run first on the serial fallback. With OpenMP this
+            // also prevents all worker slots from blocking behind cold reads.
+            std::stable_sort(
+                expert_order.begin(),
+                expert_order.end(),
+                [&model, &moe](uint32_t left, uint32_t right) {
+                    const ExpertPlan& left_plan = moe.experts[left];
+                    const ExpertPlan& right_plan = moe.experts[right];
+                    const bool left_ready = model.expert_cache->is_ready(
+                        model.weights.at(left_plan.gate_up_weight),
+                        model.weights.at(left_plan.down_weight));
+                    const bool right_ready = model.expert_cache->is_ready(
+                        model.weights.at(right_plan.gate_up_weight),
+                        model.weights.at(right_plan.down_weight));
+                    return left_ready && !right_ready;
+                });
+        }
+        const int64_t parallel_expert_count = static_cast<int64_t>(expert_order.size());
 #pragma omp parallel for schedule(dynamic, 1) if(parallelize_experts)
         for (int64_t expert_index = 0; expert_index < parallel_expert_count; ++expert_index) {
-            const uint32_t expert_id = static_cast<uint32_t>(expert_index);
+            const uint32_t expert_id = expert_order[static_cast<size_t>(expert_index)];
             const std::vector<RouteItem>& group = groups[expert_id];
-            if (group.empty())
-                continue;
+            ExpertCacheLease expert_lease;
+            if (model.expert_cache) {
+                const ExpertPlan& expert = moe.experts[expert_id];
+                const TensorData& gate_up = model.weights.at(expert.gate_up_weight);
+                const TensorData& down = model.weights.at(expert.down_weight);
+                if (gate_up.mxfp4_file_storage || down.mxfp4_file_storage) {
+                    auto lease = model.expert_cache->acquire_pair(gate_up, down);
+                    if (!lease) {
+                        expert_errors[expert_id] = lease.error();
+                        expert_failed[expert_id] = 1;
+                        continue;
+                    }
+                    expert_lease = std::move(lease).value();
+                }
+            }
 
             const CpuBatch expert_input = gather_tokens(normalized, group);
             expert_outputs[expert_id] = execute_expert_batch(
                 model.weights,
                 moe.experts[expert_id],
+                expert_lease.gate_up ? &expert_lease : nullptr,
                 expert_input,
                 model.hybrid_mode == HybridMode::VulkanWithCpuPrefetch,
                 expert_metrics[expert_id]);
+        }
+        for (uint32_t expert_id : expert_order) {
+            if (expert_failed[expert_id])
+                return expert_errors[expert_id];
         }
         if (parallelize_experts)
             statistics.expert_parallel_tasks += active_expert_count;
@@ -439,7 +595,36 @@ Result<std::vector<std::vector<float> > > CpuExecutor::execute(
             for (uint32_t column = 0; column < hidden_size; ++column)
                 hidden_row[column] += output_row[column];
         }
+        if (model.expert_cache
+            && hidden.rows() == 1
+            && layer_index + 1 < model.layers.size()) {
+            std::vector<float> prediction_input(
+                hidden.row(0),
+                hidden.row(0) + hidden.columns());
+            model.expert_cache->submit_prediction(
+                [&model, next_layer = layer_index + 1, hidden = std::move(prediction_input)](
+                    uint64_t prediction_generation) mutable {
+                    predict_next_layer_experts(
+                        model,
+                        next_layer,
+                        prediction_generation,
+                        std::move(hidden));
+                });
+        }
         statistics.expert_time_microseconds += elapsed_microseconds(expert_start);
+    }
+
+    if (model.expert_cache) {
+        const ExpertCacheStatistics after = model.expert_cache->statistics();
+        statistics.expert_cache_hits += after.hits - execution_cache_before.hits;
+        statistics.expert_cache_misses += after.misses - execution_cache_before.misses;
+        statistics.expert_cache_evictions += after.evictions - execution_cache_before.evictions;
+        statistics.expert_cache_bytes_read += after.bytes_read - execution_cache_before.bytes_read;
+        statistics.expert_cache_queued_reads
+            += after.queued_reads - execution_cache_before.queued_reads;
+        statistics.expert_cache_speculative_reads
+            += after.speculative_reads - execution_cache_before.speculative_reads;
+        statistics.expert_cache_resident_bytes = after.resident_bytes;
     }
 
     const TensorData& final_norm = model.weights.at(model.final_norm_weight);

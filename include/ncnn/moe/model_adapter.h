@@ -21,6 +21,7 @@ struct ModelPackage
 {
     std::filesystem::path root;
     ModelManifest manifest;
+    bool defer_mxfp4_experts = false;
 };
 
 class IMoeModelAdapter

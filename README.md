@@ -77,9 +77,10 @@ supported model package
 ```
 
 This design reduces the **VRAM requirement** relative to a full-GPU model
-placement. It does not currently reduce total host-RAM use: weights are eagerly
-loaded, experts are resident in memory, and there is no mmap or SSD expert
-offload path yet.
+placement. GPT-OSS can also opt into a byte-bounded, file-backed MXFP4 expert
+cache. In that mode, the loader records Safetensors shard ranges instead of
+making every expert resident, and routed Gate/Up plus Down pairs are read into
+the shared host cache on demand. Dense weights and expert biases remain eager.
 
 ## What works today
 
@@ -91,6 +92,7 @@ offload path yet.
 | Dense backend | Portable CPU baseline; optional ncnn CPU `InnerProduct`; experimental Vulkan dense path with CPU fallback |
 | Expert weights | Native MXFP4 with runtime-dispatched ARM NEON, GCC/Clang x86 AVX2/FMA, x86 AVX-512, and scalar fallback kernels; Float32 and INT8 paths |
 | Expert execution | Fused MXFP4 unpack/dequant/FMA, fused interleaved Gate/Up activation, decode GEMV, weight-reusing prefill GEMM rows, and parallel active experts |
+| Expert residency | Optional byte-bounded, file-backed GPT-OSS MXFP4 expert-pair cache with LRU eviction, fixed async I/O workers, exact/speculative priority queues, and compute-time leases |
 | Scheduling | Future-based cross-session decode batches, per-session ordering, bounded worker/OpenMP concurrency, and Linux allowed-CPU/NUMA-topology affinity |
 | KV cache | BF16 or FP32; GPU-resident compact cache in mixed mode, ring cache on CPU |
 | Generation | Greedy and temperature / Top-K / Top-P / Min-P sampling; token streaming |
@@ -110,8 +112,17 @@ offload path yet.
   allowed mask; callers may still provide explicit CPU sets. Per-node expert
   placement, memory policy, and first-touch weight replication are not yet
   implemented.
-- Weights are eagerly loaded. There is no memory mapping, demand paging, or
-  SSD-backed expert cache.
+- File-backed expert misses use a bounded worker pool. All exact routes are
+  queued before compute; ready experts execute first while cold experts read in
+  parallel. Decode also submits one low-priority, replaceable next-layer route
+  prediction. The exact router remains authoritative.
+- Dedicated expert handles use `F_NOCACHE` on macOS, offset `pread` plus
+  `POSIX_FADV_DONTNEED` on Linux, and overlapped random-access reads on Windows.
+  The runtime does not require repacking the official Safetensors shards.
+- In constrained CPU mode, dense tensors keep their original BF16/FP32 storage
+  and skip optional transformed ncnn CPU copies. Vulkan mode retains the
+  original dense tensors for correctness-preserving CPU fallback while ncnn
+  releases its transient upload-side weights.
 - Current adapter coverage is Tiny MoE and GPT-OSS. Shared experts and other
   model families are rejected explicitly.
 - On macOS, the MoltenVK backend is experimental. Attention operations may fall
@@ -124,7 +135,9 @@ The project reports Vulkan dispatch counts, compute submissions, host/device
 batch transfers, auxiliary upload counts/bytes, staging-slot resizes/reuses,
 staging-slot acquisitions/contentions,
 attention-block counts, expert assignments, parallel expert tasks, MXFP4
-decode-GEMV/prefill-GEMM/paired-output/fused-Gate-Up rows, KV-cache bytes, and
+decode-GEMV/prefill-GEMM/paired-output/fused-Gate-Up rows, expert-cache
+hits/misses/evictions/queued and speculative reads/bytes read/resident bytes,
+KV-cache bytes, and
 attention/router/expert timings per session. Scheduler statistics separately
 report submitted/completed/rejected work, maximum in-flight requests,
 per-session serialization, and effective worker/team sizes.
@@ -250,6 +263,17 @@ available. The explicit backend modes are:
 | `--hybrid` | Vulkan dense path with CPU experts |
 | `--hybrid-prefetch` | Hybrid mode with bounded CPU cache hints before selected experts |
 
+`--expert-cache-mb N` changes MXFP4 expert residency independently of the
+compute backend. A non-zero value keeps the official Safetensors expert slices
+on disk until routing selects them, and bounds cached expert pairs to `N` MiB.
+For the 48 GB `gpt-oss-120b` target, start with a 16 GiB cache:
+
+```powershell
+.\build-ncnn\Release\ncnn_moe_gpt_oss.exe `
+  D:\Models\gpt-oss-120b 0 `
+  --max-new-tokens 1 --hybrid --expert-cache-mb 16384
+```
+
 For a real text prompt, install OpenAI's Harmony package and use the wrapper:
 
 ```powershell
@@ -277,7 +301,9 @@ independent of a tokenizer library.
 #include <vector>
 
 ncnn::moe::Runtime runtime;
-auto model = runtime.load_model("model-directory");
+ncnn::moe::RuntimeOptions options;
+options.expert_cache_bytes = UINT64_C(16) * 1024 * 1024 * 1024;
+auto model = runtime.load_model("model-directory", options);
 if (!model)
     return;
 
@@ -341,8 +367,8 @@ models/            Model catalog and setup notes
 2. Shape-compatible cross-session Vulkan batching beyond asynchronous
    pipelining.
 3. Native Vulkan MXFP4 expert GEMM with CPU/Vulkan numerical parity tests.
-4. Lazy/mmap and SSD-backed expert loading with a bounded cache for models that
-   exceed host memory.
+4. Official `gpt-oss-120b` 48 GB/8K model-scale residency validation, followed
+   by measured cache-size, I/O-worker, and route-prediction tuning.
 5. Broader adapter coverage, shared experts, tokenizer integration, and paged
    KV allocation.
 

@@ -335,9 +335,16 @@ static Result<void> add_mxfp4_expert(
     const std::string& scales_name,
     uint32_t expert_id,
     uint32_t rows,
-    uint32_t columns)
+    uint32_t columns,
+    bool defer_data)
 {
-    auto tensor = archive.load_mxfp4_expert(blocks_name, scales_name, expert_id, rows, columns);
+    auto tensor = archive.load_mxfp4_expert(
+        blocks_name,
+        scales_name,
+        expert_id,
+        rows,
+        columns,
+        defer_data);
     if (!tensor)
         return tensor.error();
     mapping.tensors.emplace(target_name, std::move(tensor).value());
@@ -411,7 +418,8 @@ static Result<WeightMapping> map_gpt_oss_weights(
             const std::string expert = expert_prefix(layer_id, expert_id);
             status = add_mxfp4_expert(
                 mapping, archive, expert + "gate_up.weight", gate_up_blocks, gate_up_scales,
-                expert_id, descriptor.intermediate_size * 2, descriptor.hidden_size);
+                expert_id, descriptor.intermediate_size * 2, descriptor.hidden_size,
+                package.defer_mxfp4_experts);
             if (!status)
                 return status.error();
             status = add_safetensor_slice(
@@ -421,7 +429,8 @@ static Result<WeightMapping> map_gpt_oss_weights(
                 return status.error();
             status = add_mxfp4_expert(
                 mapping, archive, expert + "down.weight", down_blocks, down_scales,
-                expert_id, descriptor.hidden_size, descriptor.intermediate_size);
+                expert_id, descriptor.hidden_size, descriptor.intermediate_size,
+                package.defer_mxfp4_experts);
             if (!status)
                 return status.error();
             status = add_safetensor_slice(

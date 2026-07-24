@@ -189,12 +189,22 @@ def main() -> None:
             stderr=subprocess.STDOUT,
             check=False,
         )
+        paged = subprocess.run(
+            common_arguments + ["--cpu", "--expert-cache-mb", "1"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
         print(automatic.stdout, end="")
         if automatic.returncode:
             raise SystemExit(automatic.returncode)
         if cpu.returncode:
             print(cpu.stdout, end="")
             raise SystemExit(cpu.returncode)
+        if paged.returncode:
+            print(paged.stdout, end="")
+            raise SystemExit(paged.returncode)
         if "loaded gpt_oss" not in automatic.stdout or "generated token ids:" not in automatic.stdout:
             raise SystemExit("GPT-OSS fixture runner output is incomplete")
         def generated_tokens(output: str) -> str:
@@ -206,9 +216,14 @@ def main() -> None:
 
         automatic_tokens = generated_tokens(automatic.stdout)
         cpu_tokens = generated_tokens(cpu.stdout)
-        if automatic_tokens != cpu_tokens:
+        paged_tokens = generated_tokens(paged.stdout)
+        if automatic_tokens != cpu_tokens or automatic_tokens != paged_tokens:
             print(cpu.stdout, end="")
+            print(paged.stdout, end="")
             raise SystemExit("automatic and CPU GPT-OSS outputs differ")
+        if "Expert cache: 2 hit(s), 1 miss(es)" not in paged.stdout:
+            print(paged.stdout, end="")
+            raise SystemExit("paged GPT-OSS fixture did not exercise the expert cache")
         if "backend vulkan-dense/cpu-experts" in automatic.stdout \
                 and "Vulkan attention blocks: 0" in automatic.stdout:
             raise SystemExit("Vulkan GPT-OSS run did not execute GPU attention")

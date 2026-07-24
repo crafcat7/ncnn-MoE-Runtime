@@ -2,7 +2,8 @@
 
 ## Provenance
 
-- Model: [`openai/gpt-oss-20b`](https://huggingface.co/openai/gpt-oss-20b)
+- Models: [`openai/gpt-oss-20b`](https://huggingface.co/openai/gpt-oss-20b)
+  and [`openai/gpt-oss-120b`](https://huggingface.co/openai/gpt-oss-120b)
 - Publisher: OpenAI
 - Checkpoint format: original Hugging Face Safetensors shards
 - Runtime adapter: `gpt_oss`
@@ -34,6 +35,10 @@ The runner selects the available backend automatically unless one is requested:
 | `--cpu` | CPU execution |
 | `--hybrid` | Vulkan dense operators with CPU experts, when available |
 | `--hybrid-prefetch` | Hybrid execution with CPU expert-cache hints |
+
+Add `--expert-cache-mb N` to keep MXFP4 experts file-backed and bound the
+resident expert-pair cache to `N` MiB. This option is independent of the CPU or
+hybrid compute backend.
 
 `--hybrid` requires a Vulkan-enabled build. On macOS, also enable the
 experimental MoltenVK configuration described in the root README. Operations
@@ -76,6 +81,32 @@ python3 tools/run_gpt_oss_prompt.py \
   "Reply with exactly: OK" \
   --max-new-tokens 64 --stream
 ```
+
+For the 48 GB Mac `gpt-oss-120b` target, use a 16 GiB expert cache for the
+initial model-scale validation:
+
+```sh
+export MODEL_DIR="$HOME/Models/gpt-oss-120b"
+python3 tools/run_gpt_oss_prompt.py \
+  ./build-macos/Release/ncnn_moe_gpt_oss \
+  "$MODEL_DIR" \
+  "Reply with exactly: OK" \
+  --backend hybrid --expert-cache-mb 16384 --expert-io-workers 4 \
+  --max-new-tokens 32 --stream
+```
+
+The cache keeps expert residency bounded and preserves eager-path token parity.
+It queues all exact Top-K pairs before compute, overlaps ready-expert work with
+cold reads through a fixed worker pool, and gives exact routes priority over
+replaceable cross-layer predictions. The prediction only warms storage; every
+layer still executes the exact router before selecting experts. Zero I/O
+workers selects a conservative hardware-derived default capped at four.
+
+On macOS, expert reads use dedicated `F_NOCACHE` handles so streamed MXFP4
+ranges do not displace dense weights and KV state from the unified file cache.
+Linux uses offset reads with a post-read `DONTNEED` hint, while Windows uses
+overlapped random-access handles. CPU-only constrained mode also skips optional
+expanded ncnn dense copies.
 
 For local MoltenVK experimentation, add `--hybrid` (or
 `--backend hybrid` to the Harmony wrapper) to the relevant command. Inspect the

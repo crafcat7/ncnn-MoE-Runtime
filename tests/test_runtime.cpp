@@ -3,6 +3,7 @@
 #include "cpu_mxfp4.h"
 #include "cpu_ops.h"
 #include "cpu_topology.h"
+#include "expert_cache.h"
 #include "moe_adapter.h"
 #include "ncnn_linear.h"
 
@@ -15,6 +16,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace ncnn {
@@ -708,6 +710,140 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     CHECK(mxfp4_kernel_kind() == MxFp4KernelKind::ArmNeon);
 #endif
     CHECK(std::string(mxfp4_kernel_name()).size() > 0);
+}
+
+void test_file_backed_mxfp4_expert_cache()
+{
+    const std::filesystem::path directory
+        = create_unique_test_directory("ncnn_moe_expert_cache_test_");
+    const std::filesystem::path blocks_path = directory / "blocks.bin";
+    const std::filesystem::path scales_path = directory / "scales.bin";
+    {
+        std::vector<uint8_t> blocks(64);
+        for (size_t index = 0; index < blocks.size(); ++index)
+            blocks[index] = static_cast<uint8_t>(index);
+        std::ofstream stream(blocks_path, std::ios::binary);
+        stream.write(
+            reinterpret_cast<const char*>(blocks.data()),
+            static_cast<std::streamsize>(blocks.size()));
+    }
+    {
+        const std::vector<uint8_t> scales = {101, 102, 103, 104};
+        std::ofstream stream(scales_path, std::ios::binary);
+        stream.write(
+            reinterpret_cast<const char*>(scales.data()),
+            static_cast<std::streamsize>(scales.size()));
+    }
+
+    auto file_backed = [&](uint64_t block_offset, uint64_t scale_offset) {
+        TensorData tensor;
+        tensor.dtype = DType::MxFp4;
+        tensor.shape = {1, 32};
+        auto storage = std::make_shared<MxFp4FileStorage>();
+        storage->blocks_path = blocks_path.string();
+        storage->blocks_offset = block_offset;
+        storage->blocks_bytes = 16;
+        storage->scales_path = scales_path.string();
+        storage->scales_offset = scale_offset;
+        storage->scales_bytes = 1;
+        tensor.mxfp4_file_storage = std::move(storage);
+        return tensor;
+    };
+
+    const TensorData gate_zero = file_backed(0, 0);
+    const TensorData down_zero = file_backed(16, 1);
+    const TensorData gate_one = file_backed(32, 2);
+    const TensorData down_one = file_backed(48, 3);
+    Mxfp4ExpertCache cache(34);
+    {
+        auto first = cache.acquire_pair(gate_zero, down_zero);
+        CHECK(first);
+        CHECK(!first.value().cache_hit);
+        CHECK(first.value().bytes_read == 34);
+        CHECK(first.value().gate_up->mxfp4_blocks.front() == 0);
+        CHECK(first.value().down->mxfp4_blocks.front() == 16);
+        CHECK(first.value().gate_up->mxfp4_scales.front() == 101);
+        CHECK(first.value().down->mxfp4_scales.front() == 102);
+    }
+    {
+        auto hit = cache.acquire_pair(gate_zero, down_zero);
+        CHECK(hit);
+        CHECK(hit.value().cache_hit);
+        CHECK(hit.value().bytes_read == 0);
+    }
+    {
+        auto second = cache.acquire_pair(gate_one, down_one);
+        CHECK(second);
+        CHECK(!second.value().cache_hit);
+        CHECK(second.value().gate_up->mxfp4_blocks.front() == 32);
+        CHECK(second.value().down->mxfp4_scales.front() == 104);
+    }
+    const ExpertCacheStatistics statistics = cache.statistics();
+    CHECK(statistics.hits == 1);
+    CHECK(statistics.misses == 2);
+    CHECK(statistics.evictions == 1);
+    CHECK(statistics.bytes_read == 68);
+    CHECK(statistics.resident_bytes == 34);
+
+    Mxfp4ExpertCache concurrent(68, 2);
+    CHECK(concurrent.request_pair(gate_zero, down_zero));
+    bool first_ok = false;
+    bool second_ok = false;
+    bool first_hit = false;
+    bool second_hit = false;
+    std::thread first_waiter([&] {
+        auto lease = concurrent.acquire_pair(gate_zero, down_zero);
+        first_ok = static_cast<bool>(lease);
+        first_hit = lease && lease.value().cache_hit;
+    });
+    std::thread second_waiter([&] {
+        auto lease = concurrent.acquire_pair(gate_zero, down_zero);
+        second_ok = static_cast<bool>(lease);
+        second_hit = lease && lease.value().cache_hit;
+    });
+    first_waiter.join();
+    second_waiter.join();
+    CHECK(first_ok);
+    CHECK(second_ok);
+    CHECK(first_hit != second_hit);
+    CHECK(concurrent.statistics().misses == 1);
+    CHECK(concurrent.statistics().hits == 1);
+    CHECK(concurrent.statistics().queued_reads == 1);
+
+    Mxfp4ExpertCache speculative(68, 1);
+    CHECK(speculative.prefetch_pair(gate_zero, down_zero));
+    auto prefetched = speculative.acquire_pair(gate_zero, down_zero);
+    CHECK(prefetched);
+    CHECK(speculative.statistics().speculative_reads == 1);
+    CHECK(speculative.statistics().queued_reads == 1);
+
+    Mxfp4ExpertCache pressure(34, 1);
+    auto pinned = pressure.acquire_pair(gate_zero, down_zero);
+    CHECK(pinned);
+    CHECK(pressure.prefetch_pair(gate_one, down_one));
+    CHECK(pressure.statistics().speculative_reads == 0);
+    auto exhausted = pressure.acquire_pair(gate_one, down_one);
+    CHECK(!exhausted);
+    CHECK(exhausted.error().code == ErrorCode::InvalidArgument);
+
+    const TensorData truncated_gate = file_backed(60, 0);
+    Mxfp4ExpertCache retryable(34, 1);
+    auto failed_read = retryable.acquire_pair(truncated_gate, down_zero);
+    CHECK(!failed_read);
+    CHECK(failed_read.error().code == ErrorCode::IoError);
+    auto retried_read = retryable.acquire_pair(truncated_gate, down_zero);
+    CHECK(!retried_read);
+    CHECK(retried_read.error().code == ErrorCode::IoError);
+    CHECK(retryable.statistics().misses == 2);
+    CHECK(retryable.statistics().resident_bytes == 0);
+
+    Mxfp4ExpertCache undersized(33);
+    auto rejected = undersized.acquire_pair(gate_zero, down_zero);
+    CHECK(!rejected);
+    CHECK(rejected.error().code == ErrorCode::InvalidArgument);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
 }
 
 void test_cpu_topology_parsing_and_partitioning()
@@ -1469,6 +1605,7 @@ int main()
     try {
         ncnn::moe::test_ncnn_linear_operator();
         ncnn::moe::test_mxfp4_cpu_kernel_and_fused_gate_up();
+        ncnn::moe::test_file_backed_mxfp4_expert_cache();
         ncnn::moe::test_cpu_topology_parsing_and_partitioning();
         ncnn::moe::test_cross_session_batch_scheduler();
         ncnn::moe::test_prefill_decode_and_reset();

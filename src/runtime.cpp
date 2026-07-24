@@ -2,6 +2,7 @@
 
 #include "ncnn/moe/execution_plan.h"
 #include "cpu_mxfp4.h"
+#include "expert_cache.h"
 #include "moe_adapter.h"
 #include "ncnn_linear.h"
 
@@ -100,7 +101,8 @@ Result<ModelPtr> Runtime::load_model(
 
     ModelPackage package{
         root,
-        ModelManifest{std::move(model_type).value(), std::move(manifest_text).value()}};
+        ModelManifest{std::move(model_type).value(), std::move(manifest_text).value()},
+        options.expert_cache_bytes != 0};
 
     const IMoeModelAdapter* selected_adapter = nullptr;
     for (const auto& adapter : adapters_) {
@@ -128,6 +130,7 @@ Result<ModelPtr> Runtime::load_model(
     compiler_capabilities.vulkan_dense = use_vulkan_dense && capabilities_.vulkan_execution;
     compiler_capabilities.vulkan_attention = use_vulkan_dense && capabilities_.vulkan_attention;
     compiler_capabilities.mxfp4_cpu_kernel = capabilities_.mxfp4_cpu_kernel;
+    compiler_capabilities.retain_cpu_dense_copies = options.expert_cache_bytes == 0;
     auto compiled = compiler.compile(
         std::move(descriptor).value(),
         std::move(weights).value(),
@@ -135,6 +138,12 @@ Result<ModelPtr> Runtime::load_model(
         compiler_capabilities);
     if (!compiled)
         return compiled.error();
+    if (options.expert_cache_bytes != 0) {
+        compiled.value().expert_cache
+            = std::make_shared<Mxfp4ExpertCache>(
+                options.expert_cache_bytes,
+                options.expert_io_workers);
+    }
 
     auto immutable = std::make_shared<const CompiledModel>(std::move(compiled).value());
     return ModelPtr(new Model(std::move(immutable)));

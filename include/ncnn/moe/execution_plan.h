@@ -14,6 +14,8 @@
 namespace ncnn {
 namespace moe {
 
+class Mxfp4ExpertCache;
+
 using TensorHandle = uint32_t;
 inline constexpr TensorHandle invalid_tensor_handle = std::numeric_limits<TensorHandle>::max();
 
@@ -118,6 +120,7 @@ struct CompiledModel
     TensorHandle token_embedding = invalid_tensor_handle;
     TensorHandle final_norm_weight = invalid_tensor_handle;
     TensorHandle lm_head_weight = invalid_tensor_handle;
+    std::shared_ptr<Mxfp4ExpertCache> expert_cache;
     HybridMode hybrid_mode = HybridMode::CpuOnly;
 };
 
@@ -130,6 +133,9 @@ public:
         bool vulkan_dense = false;
         bool vulkan_attention = false;
         bool mxfp4_cpu_kernel = true;
+        // File-backed expert mode prioritizes fitting the model over retaining
+        // an additional transformed ncnn copy of every CPU dense matrix.
+        bool retain_cpu_dense_copies = true;
     };
 
     [[nodiscard]] Result<CompiledModel> compile(

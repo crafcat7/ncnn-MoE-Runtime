@@ -21,6 +21,7 @@ add_library(ncnn_moe STATIC
     src/cpu_mxfp4.cpp
     src/cpu_ops.cpp
     src/cpu_topology.cpp
+    src/expert_cache.cpp
     src/model_compiler.cpp
     src/ncnn_linear.cpp
     src/runtime.cpp

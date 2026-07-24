@@ -37,7 +37,8 @@ public:
         const std::string& scales_name,
         uint32_t expert_id,
         uint32_t rows,
-        uint32_t columns) const;
+        uint32_t columns,
+        bool defer_data = false) const;
 
 private:
     std::unordered_map<std::string, SafetensorInfo> tensors_;
