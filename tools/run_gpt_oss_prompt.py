@@ -30,16 +30,39 @@ def parse_arguments():
     parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--expert-memory",
+        choices=("auto", "eager", "on-demand"),
+        default="auto",
+        help="Select expert residency; auto switches large GPT-OSS models to file-backed experts.",
+    )
+    parser.add_argument(
+        "--host-memory-mb",
+        type=int,
+        default=0,
+        help="Override the host-memory budget; zero uses the runtime's detected-RAM policy.",
+    )
+    parser.add_argument(
         "--expert-cache-mb",
         type=int,
         default=0,
-        help="Bound the file-backed MXFP4 expert cache; zero keeps eager loading.",
+        help="Override the file-backed MXFP4 cache; zero lets auto mode size it.",
     )
     parser.add_argument(
         "--expert-io-workers",
         type=int,
         default=0,
         help="Fixed expert-storage worker count; zero chooses a hardware-derived default.",
+    )
+    parser.add_argument(
+        "--expert-gpu-cache-mb",
+        type=int,
+        default=0,
+        help="Optional device-local victim cache for evicted MXFP4 Expert pairs.",
+    )
+    parser.add_argument(
+        "--mmap-experts",
+        action="store_true",
+        help="Use page-backed memory-mapped on-demand MXFP4 ranges.",
     )
     parser.add_argument(
         "--backend",
@@ -104,11 +127,17 @@ def stream_harmony_token(encoding, token, stream_state):
 
 def main():
     arguments = parse_arguments()
+    if arguments.host_memory_mb < 0:
+        print("--host-memory-mb must be non-negative", file=sys.stderr)
+        return 2
     if arguments.expert_cache_mb < 0:
         print("--expert-cache-mb must be non-negative", file=sys.stderr)
         return 2
     if arguments.expert_io_workers < 0 or arguments.expert_io_workers > 64:
         print("--expert-io-workers must be between 0 and 64", file=sys.stderr)
+        return 2
+    if arguments.expert_gpu_cache_mb < 0:
+        print("--expert-gpu-cache-mb must be non-negative", file=sys.stderr)
         return 2
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     conversation = Conversation.from_messages(
@@ -139,10 +168,20 @@ def main():
         "--seed",
         str(arguments.seed),
     ]
+    if arguments.expert_memory != "auto":
+        command.extend(["--expert-memory", arguments.expert_memory])
+    if arguments.host_memory_mb:
+        command.extend(["--host-memory-mb", str(arguments.host_memory_mb)])
     if arguments.expert_cache_mb:
         command.extend(["--expert-cache-mb", str(arguments.expert_cache_mb)])
     if arguments.expert_io_workers:
         command.extend(["--expert-io-workers", str(arguments.expert_io_workers)])
+    if arguments.expert_gpu_cache_mb:
+        command.extend(
+            ["--expert-gpu-cache-mb", str(arguments.expert_gpu_cache_mb)]
+        )
+    if arguments.mmap_experts:
+        command.append("--mmap-experts")
     for token in stop_tokens:
         command.extend(["--stop-token", str(token)])
     if arguments.backend != "auto":

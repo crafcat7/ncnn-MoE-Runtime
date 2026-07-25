@@ -3,6 +3,7 @@
 
 #include "ncnn/moe/result.h"
 #include "ncnn/moe/session.h"
+#include "ncnn/moe/types.h"
 
 #include <cstdint>
 #include <future>
@@ -18,21 +19,16 @@ struct DecodeBatchRequest
     int32_t input_id = -1;
 };
 
+enum SchedulerOptionFlag : uint32_t
+{
+    SchedulerOptionPinWorkers = 1u << 0
+};
+
 struct SchedulerOptions
 {
-    // Zero selects a small allowed-CPU-derived pool intended to overlap GPU
-    // and CPU phases without multiplying every OpenMP team. On Linux with
-    // automatic NUMA affinity, it also creates at least one worker per node.
     uint32_t worker_count = 0;
-    // Zero divides the allowed CPUs across scheduler workers. This bounds
-    // OpenMP expert teams so cross-session concurrency does not oversubscribe
-    // the machine.
     uint32_t expert_threads_per_worker = 0;
-    // Linux workers can be pinned to disjoint allowed-CPU partitions. When
-    // sysfs exposes NUMA nodes, automatic partitions stay within a node.
-    bool pin_workers = false;
-    // Optional Linux CPU sets, one set per scheduler worker. This permits
-    // callers to align workers with known NUMA-node CPU lists.
+    uint32_t flags = 0;
     std::vector<std::vector<uint32_t> > worker_cpu_sets;
 };
 

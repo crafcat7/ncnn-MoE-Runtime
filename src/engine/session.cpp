@@ -1,7 +1,7 @@
 #include "ncnn/moe/session.h"
 
-#include "cpu_executor.h"
-#include "cpu_session_state.h"
+#include "engine/cpu_executor.h"
+#include "engine/cpu_session_state.h"
 
 #include <algorithm>
 #include <cmath>

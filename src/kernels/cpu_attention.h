@@ -2,7 +2,7 @@
 #define NCNN_MOE_CPU_ATTENTION_H
 
 #include "cpu_batch.h"
-#include "cpu_session_state.h"
+#include "engine/cpu_session_state.h"
 
 #include "ncnn/moe/execution_plan.h"
 

@@ -15,21 +15,46 @@ if(NOT NCNN_BUILD_MOE_RUNTIME)
     return()
 endif()
 
-add_library(ncnn_moe STATIC
-    src/cpu_attention.cpp
-    src/cpu_executor.cpp
-    src/cpu_mxfp4.cpp
-    src/cpu_ops.cpp
-    src/cpu_topology.cpp
-    src/expert_cache.cpp
-    src/model_compiler.cpp
-    src/ncnn_linear.cpp
-    src/runtime.cpp
-    src/safetensors.cpp
-    src/scheduler.cpp
-    src/session.cpp
-    src/moe_adapter.cpp
+set(NCNN_MOE_SOURCES
+    src/backends/ncnn/ncnn_linear.cpp
+    src/engine/cpu_executor.cpp
+    src/engine/cpu_topology.cpp
+    src/engine/runtime.cpp
+    src/engine/scheduler.cpp
+    src/engine/session.cpp
+    src/graph/execution_graph.cpp
+    src/graph/expert_dispatcher.cpp
+    src/graph/memory_planner.cpp
+    src/graph/model_compiler.cpp
+    src/kernels/cpu_attention.cpp
+    src/kernels/cpu_mxfp4.cpp
+    src/kernels/cpu_ops.cpp
+    src/models/builtin_model_adapter.cpp
+    src/models/safetensors.cpp
+    src/storage/expert_cache.cpp
+    src/storage/mapped_file.cpp
+    src/storage/system_memory.cpp
 )
+add_library(ncnn_moe STATIC ${NCNN_MOE_SOURCES})
+source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_SOURCES})
+
+if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
+    set(NCNN_MOE_MSVC_SIMD_SOURCES
+        src/kernels/cpu_mxfp4_msvc_avx2.cpp
+        src/kernels/cpu_mxfp4_msvc_avx512.cpp
+    )
+    target_sources(ncnn_moe PRIVATE ${NCNN_MOE_MSVC_SIMD_SOURCES})
+    source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_MSVC_SIMD_SOURCES})
+    set_source_files_properties(
+        src/kernels/cpu_mxfp4_msvc_avx2.cpp
+        PROPERTIES COMPILE_OPTIONS "/arch:AVX2"
+    )
+    set_source_files_properties(
+        src/kernels/cpu_mxfp4_msvc_avx512.cpp
+        PROPERTIES COMPILE_OPTIONS "/arch:AVX512"
+    )
+    target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_MSVC_X86_SIMD=1)
+endif()
 
 add_library(ncnn::moe ALIAS ncnn_moe)
 set_target_properties(ncnn_moe PROPERTIES EXPORT_NAME moe)
@@ -148,7 +173,10 @@ endif()
 
 if(NCNN_MOE_BUILD_TESTS)
     enable_testing()
-    add_executable(ncnn_moe_tests tests/test_runtime.cpp)
+    add_executable(ncnn_moe_tests
+        tests/fixture_model_adapter.cpp
+        tests/test_runtime.cpp
+    )
     target_link_libraries(ncnn_moe_tests PRIVATE ncnn::moe)
     target_compile_features(ncnn_moe_tests PRIVATE cxx_std_20)
     target_include_directories(ncnn_moe_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -163,10 +191,6 @@ if(NCNN_MOE_BUILD_TESTS)
 endif()
 
 if(NCNN_MOE_BUILD_EXAMPLES)
-    add_executable(ncnn_moe_tiny examples/run_tiny.cpp)
-    target_link_libraries(ncnn_moe_tiny PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_tiny PRIVATE cxx_std_20)
-
     add_executable(ncnn_moe_gpt_oss examples/run_gpt_oss.cpp)
     target_link_libraries(ncnn_moe_gpt_oss PRIVATE ncnn::moe)
     target_compile_features(ncnn_moe_gpt_oss PRIVATE cxx_std_20)

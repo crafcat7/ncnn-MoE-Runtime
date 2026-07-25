@@ -41,7 +41,8 @@ Makefile
 coverage/
 
 # Downloaded models and generated weights
-/checkpoints/
+/models/gpt-oss/gpt-oss-20b/
+/models/gpt-oss/gpt-oss-120b/
 /weights/
 /downloads/
 *.safetensors

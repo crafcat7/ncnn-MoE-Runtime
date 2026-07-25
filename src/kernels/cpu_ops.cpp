@@ -1,7 +1,7 @@
 #include "cpu_ops.h"
 
 #include "cpu_mxfp4.h"
-#include "ncnn_linear.h"
+#include "backends/ncnn/ncnn_linear.h"
 
 #include <algorithm>
 #include <cassert>
@@ -36,9 +36,9 @@ uint16_t float_to_bfloat16(float value) noexcept
 static float tensor_value(const TensorData& tensor, size_t index)
 {
     if (tensor.dtype == DType::Float32)
-        return tensor.float32_data[index];
+        return tensor.float32_values()[index];
     if (tensor.dtype == DType::BFloat16)
-        return bfloat16_to_float(tensor.bfloat16_data[index]);
+        return bfloat16_to_float(tensor.bfloat16_values()[index]);
     assert(false && "tensor_value only supports float32 and bfloat16");
     return 0.0f;
 }
@@ -49,6 +49,25 @@ static bool allow_openmp_parallel_region() noexcept
     return omp_in_parallel() == 0;
 #else
     return false;
+#endif
+}
+
+static int openmp_linear_team_size(uint64_t operation_count) noexcept
+{
+#if defined(_OPENMP)
+    static constexpr uint64_t minimum_parallel_operations = 128 * 1024;
+    static constexpr uint64_t full_team_operations = 1024 * 1024;
+    if (omp_in_parallel() != 0
+        || operation_count < minimum_parallel_operations) {
+        return 1;
+    }
+    const int maximum_threads = omp_get_max_threads();
+    if (operation_count < full_team_operations)
+        return std::min(4, maximum_threads);
+    return maximum_threads;
+#else
+    (void)operation_count;
+    return 1;
 #endif
 }
 
@@ -78,10 +97,21 @@ CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input)
         return output;
     output = CpuBatch(input.rows(), output_columns);
     const int64_t parallel_output_columns = static_cast<int64_t>(output_columns);
+    const uint64_t operation_count
+        = static_cast<uint64_t>(output_columns)
+          * input_columns
+          * input.rows();
+    const int linear_team_size
+        = openmp_linear_team_size(operation_count);
+    const bool parallelize_linear = linear_team_size > 1;
     if (matrix.dtype == DType::Float32) {
-#pragma omp parallel for if(allow_openmp_parallel_region())
+        const std::span<const float> matrix_values
+            = matrix.float32_values();
+#pragma omp parallel for num_threads(linear_team_size) if (parallelize_linear)
         for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column) {
-            const float* weights = matrix.float32_data.data() + static_cast<size_t>(output_column) * input_columns;
+            const float* weights = matrix_values.data()
+                                   + static_cast<size_t>(output_column)
+                                         * input_columns;
             for (size_t token_index = 0; token_index < input.rows(); ++token_index) {
                 const float* token = input.row(token_index);
                 output.row(token_index)[output_column] = std::inner_product(
@@ -90,9 +120,14 @@ CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input)
         }
     }
     else if (matrix.dtype == DType::BFloat16) {
-#pragma omp parallel for if(allow_openmp_parallel_region())
+        const std::span<const uint16_t> matrix_values
+            = matrix.bfloat16_values();
+#pragma omp parallel for num_threads(linear_team_size) if (parallelize_linear)
         for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column) {
-            const uint16_t* weights = matrix.bfloat16_data.data() + static_cast<size_t>(output_column) * input_columns;
+            const uint16_t* weights
+                = matrix_values.data()
+                  + static_cast<size_t>(output_column)
+                        * input_columns;
             for (size_t token_index = 0; token_index < input.rows(); ++token_index) {
                 const float* token = input.row(token_index);
                 float sum = 0.0f;
@@ -103,9 +138,14 @@ CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input)
         }
     }
     else if (matrix.dtype == DType::Int8) {
-#pragma omp parallel for if(allow_openmp_parallel_region())
+        const std::span<const int8_t> matrix_values
+            = matrix.int8_values();
+#pragma omp parallel for num_threads(linear_team_size) if (parallelize_linear)
         for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column) {
-            const int8_t* weights = matrix.int8_data.data() + static_cast<size_t>(output_column) * input_columns;
+            const int8_t* weights
+                = matrix_values.data()
+                  + static_cast<size_t>(output_column)
+                        * input_columns;
             const float scale = matrix.quantization_scales[output_column];
             for (size_t token_index = 0; token_index < input.rows(); ++token_index) {
                 const float* token = input.row(token_index);
@@ -120,7 +160,7 @@ CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input)
         const uint32_t blocks_per_row = input_columns / 32;
         const int64_t row_pair_count
             = static_cast<int64_t>((output_columns + 1) / 2);
-#pragma omp parallel for if(allow_openmp_parallel_region())
+#pragma omp parallel for num_threads(linear_team_size) if (parallelize_linear)
         for (int64_t row_pair = 0; row_pair < row_pair_count; ++row_pair) {
             const uint32_t first_row = static_cast<uint32_t>(row_pair) * 2;
             const uint32_t second_row = first_row + 1;
@@ -193,7 +233,7 @@ CpuBatch fused_mxfp4_gate_up_batch(
 
     CpuBatch output(input.rows(), intermediate_size);
     const int64_t parallel_columns = static_cast<int64_t>(intermediate_size);
-#pragma omp parallel for if(allow_openmp_parallel_region())
+#pragma omp parallel for if (allow_openmp_parallel_region())
     for (int64_t column = 0; column < parallel_columns; ++column) {
         const size_t gate_row = static_cast<size_t>(column) * 2;
         const size_t up_row = gate_row + 1;
@@ -227,7 +267,10 @@ CpuBatch fused_mxfp4_gate_up_batch(
             linear += up_bias;
             if (activation_limit > 0.0f) {
                 gate = std::min(gate, activation_limit);
-                linear = std::clamp(linear, -activation_limit, activation_limit);
+                linear = std::clamp(
+                    linear,
+                    -activation_limit,
+                    activation_limit);
             }
             const float silu = gate / (1.0f + std::exp(-1.702f * gate));
             output.row(0)[column] = silu * (linear + 1.0f);
@@ -248,14 +291,20 @@ CpuBatch fused_mxfp4_gate_up_batch(
                 output.columns(),
                 linear.data(),
                 1);
-            for (size_t token_index = 0; token_index < input.rows(); ++token_index) {
+            for (size_t token_index = 0;
+                 token_index < input.rows();
+                 ++token_index) {
                 float gate = output.row(token_index)[column] + gate_bias;
                 float up = linear[token_index] + up_bias;
                 if (activation_limit > 0.0f) {
                     gate = std::min(gate, activation_limit);
-                    up = std::clamp(up, -activation_limit, activation_limit);
+                    up = std::clamp(
+                        up,
+                        -activation_limit,
+                        activation_limit);
                 }
-                const float silu = gate / (1.0f + std::exp(-1.702f * gate));
+                const float silu
+                    = gate / (1.0f + std::exp(-1.702f * gate));
                 output.row(token_index)[column] = silu * (up + 1.0f);
             }
         }

@@ -1,7 +1,9 @@
 #ifndef NCNN_MOE_EXECUTION_PLAN_H
 #define NCNN_MOE_EXECUTION_PLAN_H
 
-#include "ncnn/moe/model_descriptor.h"
+#include "ncnn/moe/execution_graph.h"
+#include "ncnn/moe/memory_plan.h"
+#include "ncnn/moe/moe_ir.h"
 #include "ncnn/moe/result.h"
 #include "ncnn/moe/types.h"
 
@@ -37,6 +39,11 @@ private:
     std::unordered_map<std::string, TensorHandle> handles_;
 };
 
+enum ExpertPlanFlag : uint32_t
+{
+    ExpertPlanGated = 1u << 0
+};
+
 struct ExpertPlan
 {
     TensorHandle gate_weight = invalid_tensor_handle;
@@ -47,7 +54,12 @@ struct ExpertPlan
     TensorHandle down_bias = invalid_tensor_handle;
     ExpertActivation activation = ExpertActivation::Silu;
     float activation_limit = 0.0f;
-    bool gated = true;
+    uint32_t flags = ExpertPlanGated;
+};
+
+enum AttentionBlockFlag : uint32_t
+{
+    AttentionBlockSink = 1u << 0
 };
 
 struct AttentionBlockPlan
@@ -75,7 +87,12 @@ struct AttentionBlockPlan
     float rope_scaling_factor = 1.0f;
     float rope_ntk_alpha = 1.0f;
     float rope_ntk_beta = 32.0f;
-    bool use_attention_sink = false;
+    uint32_t flags = 0;
+};
+
+enum MoeBlockFlag : uint32_t
+{
+    MoeBlockNormalizeTopKWeights = 1u << 0
 };
 
 struct MoeBlockPlan
@@ -88,13 +105,7 @@ struct MoeBlockPlan
     uint32_t top_k = 0;
     uint32_t hidden_size = 0;
     RouterNormalization normalization = RouterNormalization::SelectedExperts;
-    bool normalize_topk_weights = true;
-};
-
-enum class ExecutionBackend
-{
-    Cpu,
-    Vulkan
+    uint32_t flags = MoeBlockNormalizeTopKWeights;
 };
 
 struct CompiledNodePlan
@@ -103,19 +114,27 @@ struct CompiledNodePlan
     ExecutionBackend backend = ExecutionBackend::Cpu;
 };
 
+enum CompiledLayerFlag : uint32_t
+{
+    CompiledLayerAttention = 1u << 0
+};
+
 struct CompiledLayerPlan
 {
     uint32_t layer_id = 0;
     std::vector<CompiledNodePlan> nodes;
     AttentionBlockPlan attention;
     MoeBlockPlan moe;
-    bool use_attention = false;
+    uint32_t flags = 0;
 };
 
 struct CompiledModel
 {
-    MoeModelDescriptor descriptor;
+    MoeIR descriptor;
     std::vector<CompiledLayerPlan> layers;
+    ExecutionGraph graph;
+    ExecutionSchedule schedule;
+    ModelMemoryPlan memory_plan;
     WeightTable weights;
     TensorHandle token_embedding = invalid_tensor_handle;
     TensorHandle final_norm_weight = invalid_tensor_handle;
@@ -127,28 +146,35 @@ struct CompiledModel
 class ModelCompiler
 {
 public:
+    enum BackendCapabilityFlag : uint32_t
+    {
+        BackendCapabilityCpuExecution = 1u << 0,
+        BackendCapabilityVulkanDense = 1u << 1,
+        BackendCapabilityVulkanAttention = 1u << 2,
+        BackendCapabilityMxfp4CpuKernel = 1u << 3,
+        BackendCapabilityRetainCpuDenseCopies = 1u << 4
+    };
+
     struct BackendCapabilities
     {
-        bool cpu_execution = true;
-        bool vulkan_dense = false;
-        bool vulkan_attention = false;
-        bool mxfp4_cpu_kernel = true;
-        // File-backed expert mode prioritizes fitting the model over retaining
-        // an additional transformed ncnn copy of every CPU dense matrix.
-        bool retain_cpu_dense_copies = true;
+        uint32_t flags = BackendCapabilityCpuExecution
+                         | BackendCapabilityMxfp4CpuKernel
+                         | BackendCapabilityRetainCpuDenseCopies;
     };
 
     [[nodiscard]] Result<CompiledModel> compile(
-        MoeModelDescriptor descriptor,
+        MoeIR ir,
         WeightMapping mapping,
         HybridMode hybrid_mode = HybridMode::CpuOnly) const;
 
     [[nodiscard]] Result<CompiledModel> compile(
-        MoeModelDescriptor descriptor,
+        MoeIR ir,
         WeightMapping mapping,
         HybridMode hybrid_mode,
         const BackendCapabilities& capabilities) const;
 };
+
+using MoeCompiler = ModelCompiler;
 
 } // namespace moe
 } // namespace ncnn

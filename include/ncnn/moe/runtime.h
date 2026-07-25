@@ -3,6 +3,7 @@
 
 #include "ncnn/moe/model.h"
 #include "ncnn/moe/model_adapter.h"
+#include "ncnn/moe/memory_plan.h"
 #include "ncnn/moe/result.h"
 #include "ncnn/moe/scheduler.h"
 #include "ncnn/moe/session.h"
@@ -16,33 +17,47 @@
 namespace ncnn {
 namespace moe {
 
+enum RuntimeOptionFlag : uint32_t
+{
+    RuntimeOptionMemoryMapExperts = 1u << 0
+};
+
 struct RuntimeOptions
 {
     HybridMode hybrid_mode = HybridMode::Auto;
-    // Zero eagerly loads every expert. A non-zero value enables file-backed
-    // MXFP4 experts with a shared, byte-bounded host-memory cache.
+    ExpertMemoryMode expert_memory_mode = ExpertMemoryMode::Auto;
+    uint64_t host_memory_budget_bytes = 0;
     uint64_t expert_cache_bytes = 0;
-    // Zero selects a conservative hardware-derived default. The pool remains
-    // fixed for the model lifetime so expert routing cannot create unbounded
-    // I/O threads.
+    uint64_t expert_gpu_cache_bytes = 0;
     uint32_t expert_io_workers = 0;
+    uint32_t flags = 0;
+};
+
+enum RuntimeCapabilityFlag : uint32_t
+{
+    RuntimeCapabilityCpuExecution = 1u << 0,
+    RuntimeCapabilityNcnnCpuLinear = 1u << 1,
+    RuntimeCapabilityVulkanExecution = 1u << 2,
+    RuntimeCapabilityVulkanCpuMix = 1u << 3,
+    RuntimeCapabilityVulkanCpuPrefetch = 1u << 4,
+    RuntimeCapabilityVulkanAttention = 1u << 5,
+    RuntimeCapabilityVulkanExpertVictimCache = 1u << 6,
+    RuntimeCapabilityMxfp4CpuKernel = 1u << 7,
+    RuntimeCapabilityMxfp4ArmNeon = 1u << 8,
+    RuntimeCapabilityMxfp4X86Avx2 = 1u << 9,
+    RuntimeCapabilityMxfp4X86Avx512 = 1u << 10,
+    RuntimeCapabilityOpenmpExpertParallelism = 1u << 11,
+    RuntimeCapabilityCrossSessionScheduling = 1u << 12
 };
 
 struct RuntimeCapabilities
 {
-    bool cpu_execution = true;
-    bool ncnn_cpu_linear = false;
-    bool vulkan_execution = false;
-    bool vulkan_cpu_mix = false;
-    bool vulkan_cpu_prefetch = false;
-    bool vulkan_attention = false;
-    bool mxfp4_cpu_kernel = true;
-    bool mxfp4_arm_neon = false;
-    bool mxfp4_x86_avx2 = false;
-    bool mxfp4_x86_avx512 = false;
-    bool openmp_expert_parallelism = false;
-    bool cross_session_scheduling = true;
+    uint64_t physical_memory_bytes = 0;
+    uint64_t vulkan_heap_budget_bytes = 0;
     uint32_t vulkan_device_count = 0;
+    uint32_t flags = RuntimeCapabilityCpuExecution
+                     | RuntimeCapabilityMxfp4CpuKernel
+                     | RuntimeCapabilityCrossSessionScheduling;
     std::string mxfp4_kernel;
 };
 

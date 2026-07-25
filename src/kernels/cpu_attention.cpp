@@ -1,8 +1,8 @@
 #include "cpu_attention.h"
 
 #include "cpu_ops.h"
-#include "ncnn_attention.h"
-#include "ncnn_linear.h"
+#include "backends/ncnn/ncnn_attention.h"
+#include "backends/ncnn/ncnn_linear.h"
 
 #include <algorithm>
 #include <cassert>
@@ -235,8 +235,8 @@ static CpuBatch scaled_dot_product_attention(
             float maximum = -std::numeric_limits<float>::infinity();
             if (sinks) {
                 maximum = sinks->dtype == DType::Float32
-                              ? sinks->float32_data[query_head]
-                              : bfloat16_to_float(sinks->bfloat16_data[query_head]);
+                              ? sinks->float32_values()[query_head]
+                              : bfloat16_to_float(sinks->bfloat16_values()[query_head]);
             }
 
             for (uint64_t key_index = 0; key_index < cache.token_count; ++key_index) {
@@ -260,8 +260,8 @@ static CpuBatch scaled_dot_product_attention(
             float normalizer = 0.0f;
             if (sinks) {
                 const float sink_value = sinks->dtype == DType::Float32
-                                             ? sinks->float32_data[query_head]
-                                             : bfloat16_to_float(sinks->bfloat16_data[query_head]);
+                                             ? sinks->float32_values()[query_head]
+                                             : bfloat16_to_float(sinks->bfloat16_values()[query_head]);
                 normalizer = std::exp(sink_value - maximum);
             }
             for (uint64_t key_index = 0; key_index < cache.token_count; ++key_index) {
@@ -279,7 +279,7 @@ static CpuBatch scaled_dot_product_attention(
                 const float probability = logits[key_index] / normalizer;
                 for (uint32_t column = 0; column < head_dimension; ++column)
                     output_vector[column] += probability
-                                              * cache_element(cache, false, key_index, kv_head * head_dimension + column);
+                                             * cache_element(cache, false, key_index, kv_head * head_dimension + column);
             }
         }
     }

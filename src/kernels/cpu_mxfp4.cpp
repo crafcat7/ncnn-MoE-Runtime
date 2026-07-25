@@ -1,5 +1,10 @@
 #include "cpu_mxfp4.h"
 
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#include "cpu_mxfp4_msvc.h"
+#include <intrin.h>
+#endif
+
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -171,14 +176,14 @@ static float neon_dot(
         const int16x8_t high_16 = vmovl_s8(vget_low_s8(decoded_high));
         const int16x8_t high_high_16 = vmovl_s8(vget_high_s8(decoded_high));
 #define NCNN_MOE_ACCUMULATE_MXFP4_NEON(values16, input_offset) \
-        accumulator = vfmaq_f32( \
-            accumulator, \
-            vcvtq_f32_s32(vmovl_s16(vget_low_s16(values16))), \
-            vld1q_f32(input_block + input_offset)); \
-        accumulator = vfmaq_f32( \
-            accumulator, \
-            vcvtq_f32_s32(vmovl_s16(vget_high_s16(values16))), \
-            vld1q_f32(input_block + input_offset + 4))
+    accumulator = vfmaq_f32(                                   \
+        accumulator,                                           \
+        vcvtq_f32_s32(vmovl_s16(vget_low_s16(values16))),      \
+        vld1q_f32(input_block + input_offset));                \
+    accumulator = vfmaq_f32(                                   \
+        accumulator,                                           \
+        vcvtq_f32_s32(vmovl_s16(vget_high_s16(values16))),     \
+        vld1q_f32(input_block + input_offset + 4))
         NCNN_MOE_ACCUMULATE_MXFP4_NEON(low_16, 0);
         NCNN_MOE_ACCUMULATE_MXFP4_NEON(low_high_16, 8);
         NCNN_MOE_ACCUMULATE_MXFP4_NEON(high_16, 16);
@@ -336,8 +341,7 @@ static void neon_matmul_rows2(
 #endif
 
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
-__attribute__((target("avx2,fma,ssse3")))
-static float avx2_dot(
+__attribute__((target("avx2,fma,ssse3"))) static float avx2_dot(
     const uint8_t* packed,
     const uint8_t* scales,
     uint32_t block_count,
@@ -361,10 +365,10 @@ static float avx2_dot(
         const float* input_block = input + static_cast<size_t>(block_index) * 32;
         __m256 accumulator = _mm256_setzero_ps();
 #define NCNN_MOE_ACCUMULATE_MXFP4_AVX2(values8, input_offset) \
-        accumulator = _mm256_fmadd_ps( \
-            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(values8)), \
-            _mm256_loadu_ps(input_block + input_offset), \
-            accumulator)
+    accumulator = _mm256_fmadd_ps(                            \
+        _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(values8)),    \
+        _mm256_loadu_ps(input_block + input_offset),          \
+        accumulator)
         NCNN_MOE_ACCUMULATE_MXFP4_AVX2(decoded_low, 0);
         NCNN_MOE_ACCUMULATE_MXFP4_AVX2(_mm_srli_si128(decoded_low, 8), 8);
         NCNN_MOE_ACCUMULATE_MXFP4_AVX2(decoded_high, 16);
@@ -380,8 +384,7 @@ static float avx2_dot(
     return sum;
 }
 
-__attribute__((target("avx2,fma,ssse3")))
-static void avx2_gemm_row(
+__attribute__((target("avx2,fma,ssse3"))) static void avx2_gemm_row(
     const uint8_t* packed,
     const uint8_t* scales,
     uint32_t block_count,
@@ -437,8 +440,7 @@ static void avx2_gemm_row(
     }
 }
 
-__attribute__((target("avx2,fma,ssse3")))
-static void avx2_matmul_rows2(
+__attribute__((target("avx2,fma,ssse3"))) static void avx2_matmul_rows2(
     const uint8_t* first_packed,
     const uint8_t* first_scales,
     const uint8_t* second_packed,
@@ -536,8 +538,7 @@ static void avx2_matmul_rows2(
     }
 }
 
-__attribute__((target("avx512f,avx512bw,avx512vl,ssse3,fma")))
-static float avx512_dot(
+__attribute__((target("avx512f,avx512bw,avx512vl,ssse3,fma"))) static float avx512_dot(
     const uint8_t* packed,
     const uint8_t* scales,
     uint32_t block_count,
@@ -572,8 +573,7 @@ static float avx512_dot(
     return sum;
 }
 
-__attribute__((target("avx512f,avx512bw,avx512vl,ssse3,fma")))
-static void avx512_gemm_row(
+__attribute__((target("avx512f,avx512bw,avx512vl,ssse3,fma"))) static void avx512_gemm_row(
     const uint8_t* packed,
     const uint8_t* scales,
     uint32_t block_count,
@@ -621,8 +621,7 @@ static void avx512_gemm_row(
     }
 }
 
-__attribute__((target("avx512f,avx512bw,avx512vl,ssse3,fma")))
-static void avx512_matmul_rows2(
+__attribute__((target("avx512f,avx512bw,avx512vl,ssse3,fma"))) static void avx512_matmul_rows2(
     const uint8_t* first_packed,
     const uint8_t* first_scales,
     const uint8_t* second_packed,
@@ -731,6 +730,47 @@ struct KernelDispatch
     MatmulRows2Function matmul_rows2 = scalar_matmul_rows2;
 };
 
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+static bool msvc_cpu_supports_avx(bool require_avx512) noexcept
+{
+    int registers[4] = {};
+    __cpuid(registers, 0);
+    const int maximum_leaf = registers[0];
+    if (maximum_leaf < 1)
+        return false;
+
+    __cpuidex(registers, 1, 0);
+    const uint32_t feature_ecx = static_cast<uint32_t>(registers[2]);
+    const uint32_t required_ecx
+        = (UINT32_C(1) << 9)
+          | (UINT32_C(1) << 12)
+          | (UINT32_C(1) << 27)
+          | (UINT32_C(1) << 28);
+    if ((feature_ecx & required_ecx) != required_ecx)
+        return false;
+
+    const uint64_t enabled_xstate = _xgetbv(0);
+    if ((enabled_xstate & UINT64_C(0x06)) != UINT64_C(0x06)
+        || maximum_leaf < 7) {
+        return false;
+    }
+
+    __cpuidex(registers, 7, 0);
+    const uint32_t feature_ebx = static_cast<uint32_t>(registers[1]);
+    if ((feature_ebx & (UINT32_C(1) << 5)) == 0)
+        return false;
+    if (!require_avx512)
+        return true;
+
+    const uint32_t required_ebx
+        = (UINT32_C(1) << 16)
+          | (UINT32_C(1) << 30)
+          | (UINT32_C(1) << 31);
+    return (enabled_xstate & UINT64_C(0xe6)) == UINT64_C(0xe6)
+           && (feature_ebx & required_ebx) == required_ebx;
+}
+#endif
+
 static KernelDispatch select_kernel() noexcept
 {
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -739,6 +779,21 @@ static KernelDispatch select_kernel() noexcept
         neon_dot,
         neon_gemm_row,
         neon_matmul_rows2};
+#elif defined(NCNN_MOE_MSVC_X86_SIMD)
+    if (msvc_cpu_supports_avx(true)) {
+        return {
+            MxFp4KernelKind::X86Avx512,
+            msvc_avx512_mxfp4_dot,
+            msvc_avx512_mxfp4_gemm_row,
+            msvc_avx512_mxfp4_matmul_rows2};
+    }
+    if (msvc_cpu_supports_avx(false)) {
+        return {
+            MxFp4KernelKind::X86Avx2,
+            msvc_avx2_mxfp4_dot,
+            msvc_avx2_mxfp4_gemm_row,
+            msvc_avx2_mxfp4_matmul_rows2};
+    }
 #elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
     __builtin_cpu_init();
     if (__builtin_cpu_supports("avx512f")

@@ -1,7 +1,7 @@
 #ifndef NCNN_MOE_NCNN_LINEAR_H
 #define NCNN_MOE_NCNN_LINEAR_H
 
-#include "cpu_batch.h"
+#include "kernels/cpu_batch.h"
 
 #include "ncnn/moe/types.h"
 
@@ -44,6 +44,7 @@ public:
         const std::vector<const TensorData*>& biases,
         NcnnLinearDevice device);
     [[nodiscard]] static uint32_t vulkan_device_count() noexcept;
+    [[nodiscard]] static uint64_t vulkan_heap_budget_bytes() noexcept;
     [[nodiscard]] static uint64_t current_thread_vulkan_dispatches() noexcept;
     [[nodiscard]] static NcnnVulkanRuntimeCounters current_thread_vulkan_runtime_counters() noexcept;
     [[nodiscard]] bool forward(const CpuBatch& input, CpuBatch& output) const;

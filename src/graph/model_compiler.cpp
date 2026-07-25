@@ -1,8 +1,8 @@
 #include "ncnn/moe/execution_plan.h"
 
-#include "internal/tensor_names.h"
-#include "ncnn_attention.h"
-#include "ncnn_linear.h"
+#include "models/internal/tensor_names.h"
+#include "backends/ncnn/ncnn_attention.h"
+#include "backends/ncnn/ncnn_linear.h"
 
 #include <algorithm>
 #include <cassert>
@@ -19,11 +19,16 @@ static bool shape_equals(const TensorData& tensor, std::initializer_list<uint32_
            && std::equal(tensor.shape.begin(), tensor.shape.end(), expected.begin());
 }
 
+enum AdapterGraphFlag : uint32_t
+{
+    AdapterGraphAttention = 1u << 0,
+    AdapterGraphAttentionSink = 1u << 1,
+    AdapterGraphMoe = 1u << 2
+};
+
 struct AdapterGraph
 {
-    bool use_attention = false;
-    bool use_attention_sink = false;
-    bool use_moe = false;
+    uint32_t flags = 0;
     size_t attention_node_count = 0;
 };
 
@@ -37,11 +42,11 @@ static Result<AdapterGraph> validate_adapter_graph(const LayerDescriptor& layer)
         && layer.nodes[0].type == ModelNodeType::RmsNorm
         && layer.nodes[1].type == ModelNodeType::FusedQkv
         && layer.nodes[2].type == ModelNodeType::Rope) {
-        graph.use_attention = true;
+        graph.flags |= AdapterGraphAttention;
         cursor = 3;
         if (cursor < layer.nodes.size()
             && layer.nodes[cursor].type == ModelNodeType::AttentionSink) {
-            graph.use_attention_sink = true;
+            graph.flags |= AdapterGraphAttentionSink;
             ++cursor;
         }
         if (cursor + 1 >= layer.nodes.size()
@@ -69,7 +74,7 @@ static Result<AdapterGraph> validate_adapter_graph(const LayerDescriptor& layer)
             [](ModelNodeType expected, const ModelNodeDescriptor& actual) {
                 return expected == actual.type;
             })) {
-        graph.use_moe = true;
+        graph.flags |= AdapterGraphMoe;
         cursor += std::size(moe_nodes);
     }
     if (cursor != layer.nodes.size())
@@ -94,15 +99,19 @@ static Result<TensorHandle> require_tensor(
         return Error{ErrorCode::InvalidModel, "unexpected shape for tensor: " + name};
 
     if (dtype == DType::Float32) {
-        if (tensor.float32_data.size() != tensor.element_count())
+        if (tensor.float32_values().size() != tensor.element_count())
             return Error{ErrorCode::InvalidModel, "invalid float32 data length for tensor: " + name};
+        if (!tensor.float32_data.empty() && tensor.mapped_data)
+            return Error{ErrorCode::InvalidModel, "float32 tensor has duplicate storage: " + name};
         if (!tensor.bfloat16_data.empty() || !tensor.int8_data.empty() || !tensor.quantization_scales.empty()
             || !tensor.mxfp4_blocks.empty() || !tensor.mxfp4_scales.empty())
             return Error{ErrorCode::InvalidModel, "float32 tensor contains quantized storage: " + name};
     }
     else if (dtype == DType::BFloat16) {
-        if (tensor.bfloat16_data.size() != tensor.element_count())
+        if (tensor.bfloat16_values().size() != tensor.element_count())
             return Error{ErrorCode::InvalidModel, "invalid bfloat16 data length for tensor: " + name};
+        if (!tensor.bfloat16_data.empty() && tensor.mapped_data)
+            return Error{ErrorCode::InvalidModel, "bfloat16 tensor has duplicate storage: " + name};
         if (!tensor.float32_data.empty() || !tensor.int8_data.empty() || !tensor.quantization_scales.empty()
             || !tensor.mxfp4_blocks.empty() || !tensor.mxfp4_scales.empty())
             return Error{ErrorCode::InvalidModel, "bfloat16 tensor contains unrelated storage: " + name};
@@ -110,8 +119,10 @@ static Result<TensorHandle> require_tensor(
     else if (dtype == DType::Int8) {
         if (tensor.shape.size() != 2)
             return Error{ErrorCode::InvalidModel, "int8 tensor must be a matrix: " + name};
-        if (tensor.int8_data.size() != tensor.element_count())
+        if (tensor.int8_values().size() != tensor.element_count())
             return Error{ErrorCode::InvalidModel, "invalid int8 data length for tensor: " + name};
+        if (!tensor.int8_data.empty() && tensor.mapped_data)
+            return Error{ErrorCode::InvalidModel, "int8 tensor has duplicate storage: " + name};
         if (tensor.quantization_scales.size() != tensor.shape[0])
             return Error{ErrorCode::InvalidModel, "invalid per-row scale count for tensor: " + name};
         if (!tensor.float32_data.empty())
@@ -140,7 +151,7 @@ static Result<TensorHandle> require_tensor(
                 return Error{ErrorCode::InvalidModel, "invalid MXFP4 scale data length for tensor: " + name};
         }
         if (!tensor.float32_data.empty() || !tensor.bfloat16_data.empty() || !tensor.int8_data.empty()
-            || !tensor.quantization_scales.empty())
+            || !tensor.quantization_scales.empty() || tensor.mapped_data)
             return Error{ErrorCode::InvalidModel, "MXFP4 tensor contains unrelated storage: " + name};
     }
     else {
@@ -186,6 +197,123 @@ TensorHandle WeightTable::find_handle(const std::string& name) const noexcept
     return it == handles_.end() ? invalid_tensor_handle : it->second;
 }
 
+static ExecutionNodeId append_execution_node(
+    ExecutionGraph& graph,
+    ExecutionNodeType type,
+    ExecutionBackend backend,
+    std::string name,
+    std::vector<ExecutionNodeId> dependencies,
+    uint32_t layer_id = invalid_execution_layer_id,
+    uint32_t expert_id = invalid_execution_expert_id,
+    uint32_t flags = 0)
+{
+    const ExecutionNodeId node_id
+        = static_cast<ExecutionNodeId>(graph.nodes.size());
+    graph.nodes.push_back({
+        node_id,
+        type,
+        backend,
+        layer_id,
+        expert_id,
+        flags,
+        std::move(name),
+        std::move(dependencies),
+    });
+    return node_id;
+}
+
+static Result<void> build_execution_graph(CompiledModel& compiled)
+{
+    ExecutionGraph graph;
+    ExecutionNodeId previous = append_execution_node(
+        graph,
+        ExecutionNodeType::TokenEmbedding,
+        ExecutionBackend::Cpu,
+        "token_embedding",
+        {});
+
+    for (const CompiledLayerPlan& layer : compiled.layers) {
+        const std::string layer_name
+            = "layers." + std::to_string(layer.layer_id) + ".";
+        if (has_flag(layer.flags, CompiledLayerAttention)) {
+            const ExecutionBackend backend
+                = layer.nodes.empty()
+                      ? ExecutionBackend::Cpu
+                      : layer.nodes.front().backend;
+            previous = append_execution_node(
+                graph,
+                ExecutionNodeType::Attention,
+                backend,
+                layer_name + "attention",
+                {previous},
+                layer.layer_id);
+        }
+
+        const ExecutionNodeId router = append_execution_node(
+            graph,
+            ExecutionNodeType::Router,
+            ExecutionBackend::Cpu,
+            layer_name + "router",
+            {previous},
+            layer.layer_id);
+        const ExecutionNodeId dispatch = append_execution_node(
+            graph,
+            ExecutionNodeType::ExpertDispatch,
+            ExecutionBackend::Cpu,
+            layer_name + "expert_dispatch",
+            {router},
+            layer.layer_id);
+
+        std::vector<ExecutionNodeId> expert_nodes;
+        expert_nodes.reserve(layer.moe.experts.size());
+        for (uint32_t expert_id = 0;
+             expert_id < layer.moe.experts.size();
+             ++expert_id) {
+            expert_nodes.push_back(append_execution_node(
+                graph,
+                ExecutionNodeType::Expert,
+                ExecutionBackend::Cpu,
+                layer_name + "experts." + std::to_string(expert_id),
+                {dispatch},
+                layer.layer_id,
+                expert_id,
+                ExecutionNodeConditional));
+        }
+        previous = append_execution_node(
+            graph,
+            ExecutionNodeType::Combine,
+            ExecutionBackend::Cpu,
+            layer_name + "combine",
+            std::move(expert_nodes),
+            layer.layer_id);
+    }
+
+    previous = append_execution_node(
+        graph,
+        ExecutionNodeType::FinalNorm,
+        ExecutionBackend::Cpu,
+        "final_norm",
+        {previous});
+    const ExecutionBackend lm_head_backend
+        = compiled.hybrid_mode == HybridMode::CpuOnly
+              ? ExecutionBackend::Cpu
+              : ExecutionBackend::Vulkan;
+    (void)append_execution_node(
+        graph,
+        ExecutionNodeType::LmHead,
+        lm_head_backend,
+        "lm_head",
+        {previous});
+
+    MoeScheduler scheduler;
+    auto schedule = scheduler.schedule(graph);
+    if (!schedule)
+        return schedule.error();
+    compiled.graph = std::move(graph);
+    compiled.schedule = std::move(schedule).value();
+    return {};
+}
+
 static Result<void> prepare_linear_operator(
     WeightTable& weights,
     TensorHandle matrix_handle,
@@ -204,14 +332,16 @@ static Result<void> prepare_linear_operator(
 }
 
 Result<CompiledModel> ModelCompiler::compile(
-    MoeModelDescriptor descriptor,
+    MoeIR descriptor,
     WeightMapping mapping,
     HybridMode hybrid_mode) const
 {
     BackendCapabilities capabilities;
-    capabilities.vulkan_dense = hybrid_mode == HybridMode::HybridExperts
-                                 || hybrid_mode == HybridMode::VulkanWithCpuPrefetch;
-    capabilities.vulkan_attention = capabilities.vulkan_dense;
+    if (hybrid_mode == HybridMode::HybridExperts
+        || hybrid_mode == HybridMode::VulkanWithCpuPrefetch) {
+        capabilities.flags |= BackendCapabilityVulkanDense
+                              | BackendCapabilityVulkanAttention;
+    }
     return compile(
         std::move(descriptor),
         std::move(mapping),
@@ -220,12 +350,12 @@ Result<CompiledModel> ModelCompiler::compile(
 }
 
 Result<CompiledModel> ModelCompiler::compile(
-    MoeModelDescriptor descriptor,
+    MoeIR descriptor,
     WeightMapping mapping,
     HybridMode hybrid_mode,
     const BackendCapabilities& capabilities) const
 {
-    if (!capabilities.cpu_execution)
+    if (!has_flag(capabilities.flags, BackendCapabilityCpuExecution))
         return Error{ErrorCode::UnsupportedModel, "compiler requires a CPU execution backend"};
     if (descriptor.vocabulary_size == 0 || descriptor.hidden_size == 0 || descriptor.layer_count == 0
         || descriptor.intermediate_size == 0 || descriptor.expert_count == 0
@@ -244,7 +374,11 @@ Result<CompiledModel> ModelCompiler::compile(
     compiled.descriptor = std::move(descriptor);
     const bool hybrid_requests_vulkan = hybrid_mode == HybridMode::HybridExperts
                                         || hybrid_mode == HybridMode::VulkanWithCpuPrefetch;
-    const bool use_vulkan_dense = hybrid_requests_vulkan && capabilities.vulkan_dense;
+    const bool use_vulkan_dense
+        = hybrid_requests_vulkan
+          && has_flag(capabilities.flags, BackendCapabilityVulkanDense);
+    const bool retain_cpu_dense_copies
+        = has_flag(capabilities.flags, BackendCapabilityRetainCpuDenseCopies);
     compiled.hybrid_mode = use_vulkan_dense ? hybrid_mode : HybridMode::CpuOnly;
     const NcnnLinearDevice dense_device = use_vulkan_dense
                                               ? NcnnLinearDevice::Vulkan
@@ -280,7 +414,7 @@ Result<CompiledModel> ModelCompiler::compile(
         compiled.lm_head_weight,
         invalid_tensor_handle,
         dense_device,
-        capabilities.retain_cpu_dense_copies);
+        retain_cpu_dense_copies);
     if (!prepared)
         return prepared.error();
 
@@ -292,7 +426,7 @@ Result<CompiledModel> ModelCompiler::compile(
             return parsed_graph.error();
         const AdapterGraph graph = parsed_graph.value();
         const MoeDescriptor& moe = layer.ffn.moe;
-        if (!graph.use_moe)
+        if (!has_flag(graph.flags, AdapterGraphMoe))
             return Error{
                 ErrorCode::UnsupportedModel,
                 "the current executor requires an ExpertGroup in every layer graph"};
@@ -307,13 +441,15 @@ Result<CompiledModel> ModelCompiler::compile(
             || moe.intermediate_size != compiled.descriptor.intermediate_size) {
             return Error{ErrorCode::InvalidModel, "layer MoE dimensions do not match the model descriptor"};
         }
-        if (moe.use_shared_expert)
+        if (has_flag(moe.flags, MoeDescriptorSharedExpert))
             return Error{ErrorCode::UnsupportedModel, "shared experts are reserved for a later phase"};
         if (moe.expert_weight_dtype != DType::Float32 && moe.expert_weight_dtype != DType::Int8
             && moe.expert_weight_dtype != DType::MxFp4)
             return Error{ErrorCode::UnsupportedModel, "expert weights must use float32, int8, or MXFP4"};
         if (moe.expert_weight_dtype == DType::MxFp4
-            && !capabilities.mxfp4_cpu_kernel) {
+            && !has_flag(
+                capabilities.flags,
+                BackendCapabilityMxfp4CpuKernel)) {
             return Error{
                 ErrorCode::UnsupportedModel,
                 "backend capabilities do not provide an MXFP4 CPU expert kernel"};
@@ -321,11 +457,14 @@ Result<CompiledModel> ModelCompiler::compile(
 
         CompiledLayerPlan layer_plan;
         layer_plan.layer_id = layer_id;
-        layer_plan.use_attention = graph.use_attention;
+        if (has_flag(graph.flags, AdapterGraphAttention))
+            layer_plan.flags |= CompiledLayerAttention;
         const bool use_vulkan_attention
-            = graph.use_attention
+            = has_flag(graph.flags, AdapterGraphAttention)
               && use_vulkan_dense
-              && capabilities.vulkan_attention;
+              && has_flag(
+                  capabilities.flags,
+                  BackendCapabilityVulkanAttention);
         layer_plan.nodes.reserve(layer.nodes.size());
         for (size_t node_index = 0;
              node_index < layer.nodes.size();
@@ -343,10 +482,15 @@ Result<CompiledModel> ModelCompiler::compile(
         layer_plan.moe.top_k = moe.top_k;
         layer_plan.moe.hidden_size = compiled.descriptor.hidden_size;
         layer_plan.moe.normalization = moe.normalization;
-        layer_plan.moe.normalize_topk_weights = moe.normalize_topk_weights;
+        layer_plan.moe.flags = 0;
+        if (has_flag(
+                moe.flags,
+                MoeDescriptorNormalizeTopKWeights)) {
+            layer_plan.moe.flags |= MoeBlockNormalizeTopKWeights;
+        }
 
         const std::string layer_name = layer_prefix(layer_id);
-        if (graph.use_attention) {
+        if (has_flag(graph.flags, AdapterGraphAttention)) {
             const AttentionDescriptor& attention = layer.attention;
             const NcnnLinearDevice attention_device
                 = use_vulkan_attention
@@ -373,7 +517,8 @@ Result<CompiledModel> ModelCompiler::compile(
             plan.rope_scaling_factor = attention.rope_scaling_factor;
             plan.rope_ntk_alpha = attention.rope_ntk_alpha;
             plan.rope_ntk_beta = attention.rope_ntk_beta;
-            plan.use_attention_sink = graph.use_attention_sink;
+            if (has_flag(graph.flags, AdapterGraphAttentionSink))
+                plan.flags |= AttentionBlockSink;
 
             const uint32_t query_size = attention.head_count * attention.head_dimension;
             const uint32_t key_value_size = attention.kv_head_count * attention.head_dimension;
@@ -386,7 +531,7 @@ Result<CompiledModel> ModelCompiler::compile(
             Result<TensorHandle> key_bias = invalid_tensor_handle;
             Result<TensorHandle> value_bias = invalid_tensor_handle;
             Result<TensorHandle> output_bias = invalid_tensor_handle;
-            if (attention.use_bias) {
+            if (has_flag(attention.flags, AttentionDescriptorBias)) {
                 query_bias = require_tensor(
                     compiled.weights,
                     layer_name + "attention.query.bias",
@@ -409,7 +554,7 @@ Result<CompiledModel> ModelCompiler::compile(
                     compiled.descriptor.activation_dtype);
             }
             Result<TensorHandle> sinks = invalid_tensor_handle;
-            if (plan.use_attention_sink) {
+            if (has_flag(plan.flags, AttentionBlockSink)) {
                 sinks = require_tensor(
                     compiled.weights,
                     layer_name + "attention.sinks",
@@ -465,13 +610,13 @@ Result<CompiledModel> ModelCompiler::compile(
                     return Error{ErrorCode::InternalError, "failed to create fused Vulkan QKV operator"};
             }
             else {
-                prepared = prepare_linear_operator(compiled.weights, plan.query_weight, plan.query_bias, attention_device, capabilities.retain_cpu_dense_copies);
+                prepared = prepare_linear_operator(compiled.weights, plan.query_weight, plan.query_bias, attention_device, retain_cpu_dense_copies);
                 if (!prepared)
                     return prepared.error();
-                prepared = prepare_linear_operator(compiled.weights, plan.key_weight, plan.key_bias, attention_device, capabilities.retain_cpu_dense_copies);
+                prepared = prepare_linear_operator(compiled.weights, plan.key_weight, plan.key_bias, attention_device, retain_cpu_dense_copies);
                 if (!prepared)
                     return prepared.error();
-                prepared = prepare_linear_operator(compiled.weights, plan.value_weight, plan.value_bias, attention_device, capabilities.retain_cpu_dense_copies);
+                prepared = prepare_linear_operator(compiled.weights, plan.value_weight, plan.value_bias, attention_device, retain_cpu_dense_copies);
                 if (!prepared)
                     return prepared.error();
             }
@@ -480,7 +625,7 @@ Result<CompiledModel> ModelCompiler::compile(
                 plan.output_weight,
                 plan.output_bias,
                 attention_device,
-                capabilities.retain_cpu_dense_copies);
+                retain_cpu_dense_copies);
             if (!prepared)
                 return prepared.error();
             if (attention_device == NcnnLinearDevice::Vulkan) {
@@ -498,7 +643,8 @@ Result<CompiledModel> ModelCompiler::compile(
                 attention_config.rope_ntk_beta = plan.rope_ntk_beta;
                 attention_config.activation_dtype = compiled.descriptor.activation_dtype;
                 attention_config.kv_cache_dtype = compiled.descriptor.kv_cache_dtype;
-                attention_config.use_attention_sink = plan.use_attention_sink;
+                if (has_flag(plan.flags, AttentionBlockSink))
+                    attention_config.flags |= NcnnAttentionSink;
                 plan.vulkan_attention_operator = NcnnVulkanAttentionOperator::create(
                     compiled.weights.at(plan.pre_attention_norm_weight),
                     plan.sinks == invalid_tensor_handle
@@ -523,7 +669,7 @@ Result<CompiledModel> ModelCompiler::compile(
             return router.error();
         layer_plan.moe.router_weight = router.value();
 
-        if (moe.use_router_bias) {
+        if (has_flag(moe.flags, MoeDescriptorRouterBias)) {
             auto bias = require_tensor(compiled.weights, layer_name + "router.bias", {moe.expert_count}, compiled.descriptor.activation_dtype);
             if (!bias)
                 return bias.error();
@@ -537,7 +683,7 @@ Result<CompiledModel> ModelCompiler::compile(
             layer_plan.moe.router_weight,
             layer_plan.moe.router_bias,
             NcnnLinearDevice::Cpu,
-            capabilities.retain_cpu_dense_copies);
+            retain_cpu_dense_copies);
         if (!prepared)
             return prepared.error();
 
@@ -546,7 +692,8 @@ Result<CompiledModel> ModelCompiler::compile(
             ExpertPlan expert;
             expert.activation = moe.activation;
             expert.activation_limit = moe.activation_limit;
-            expert.gated = moe.layout == ExpertLayout::GateUpDown || moe.layout == ExpertLayout::InterleavedGateUpDown;
+            if (moe.layout == ExpertLayout::UpDown)
+                expert.flags &= ~ExpertPlanGated;
             const std::string prefix = expert_prefix(layer_id, expert_id);
 
             if (moe.layout == ExpertLayout::InterleavedGateUpDown) {
@@ -557,7 +704,7 @@ Result<CompiledModel> ModelCompiler::compile(
                     return gate_up.error();
                 expert.gate_up_weight = gate_up.value();
             }
-            else if (expert.gated) {
+            else if (has_flag(expert.flags, ExpertPlanGated)) {
                 auto gate = require_tensor(
                     compiled.weights, prefix + "gate.weight",
                     {moe.intermediate_size, compiled.descriptor.hidden_size}, moe.expert_weight_dtype);
@@ -569,7 +716,7 @@ Result<CompiledModel> ModelCompiler::compile(
                     expert.gate_weight,
                     invalid_tensor_handle,
                     NcnnLinearDevice::Cpu,
-                    capabilities.retain_cpu_dense_copies);
+                    retain_cpu_dense_copies);
             }
 
             if (moe.layout != ExpertLayout::InterleavedGateUpDown) {
@@ -584,7 +731,7 @@ Result<CompiledModel> ModelCompiler::compile(
                     expert.up_weight,
                     invalid_tensor_handle,
                     NcnnLinearDevice::Cpu,
-                    capabilities.retain_cpu_dense_copies);
+                    retain_cpu_dense_copies);
             }
 
             auto down = require_tensor(
@@ -594,7 +741,7 @@ Result<CompiledModel> ModelCompiler::compile(
                 return down.error();
             expert.down_weight = down.value();
 
-            if (moe.use_projection_bias) {
+            if (has_flag(moe.flags, MoeDescriptorProjectionBias)) {
                 auto gate_up_bias = require_tensor(
                     compiled.weights, prefix + "gate_up.bias", {moe.intermediate_size * 2}, compiled.descriptor.activation_dtype);
                 auto down_bias = require_tensor(
@@ -611,7 +758,7 @@ Result<CompiledModel> ModelCompiler::compile(
                 expert.down_weight,
                 expert.down_bias,
                 NcnnLinearDevice::Cpu,
-                capabilities.retain_cpu_dense_copies);
+                retain_cpu_dense_copies);
 
             layer_plan.moe.experts.push_back(expert);
         }
@@ -619,6 +766,9 @@ Result<CompiledModel> ModelCompiler::compile(
         compiled.layers.push_back(std::move(layer_plan));
     }
 
+    auto graph = build_execution_graph(compiled);
+    if (!graph)
+        return graph.error();
     return compiled;
 }
 

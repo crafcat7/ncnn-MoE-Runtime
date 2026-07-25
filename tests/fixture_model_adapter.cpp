@@ -1,7 +1,6 @@
-#include "moe_adapter.h"
+#include "fixture_model_adapter.h"
 
-#include "internal/tensor_names.h"
-#include "safetensors.h"
+#include "models/internal/tensor_names.h"
 
 #include <cstring>
 #include <fstream>
@@ -173,6 +172,7 @@ public:
     {
         return offset_ == bytes_.size();
     }
+
     [[nodiscard]] size_t remaining() const noexcept
     {
         return bytes_.size() - offset_;
@@ -197,268 +197,15 @@ static Result<void> add_tensor(
     return {};
 }
 
-static Result<MoeModelDescriptor> parse_gpt_oss_model(const ModelPackage& package)
+bool FixtureModelAdapter::can_load(const ModelManifest& manifest) const
 {
-    const std::string& json = package.manifest.raw_json;
-    auto vocabulary_size = required_uint32(json, "vocab_size");
-    auto hidden_size = required_uint32(json, "hidden_size");
-    auto intermediate_size = required_uint32(json, "intermediate_size");
-    auto layer_count = required_uint32(json, "num_hidden_layers");
-    auto expert_count = required_uint32(json, "num_local_experts");
-    auto top_k = required_uint32(json, "experts_per_token");
-    auto attention_head_count = required_uint32(json, "num_attention_heads");
-    auto kv_head_count = required_uint32(json, "num_key_value_heads");
-    auto head_dimension = required_uint32(json, "head_dim");
-    auto sliding_window = required_uint32(json, "sliding_window");
-    auto initial_context_length = required_uint32(json, "initial_context_length");
-    auto max_context_length = required_uint32(json, "max_position_embeddings");
-    if (!vocabulary_size || !hidden_size || !intermediate_size || !layer_count || !expert_count || !top_k
-        || !attention_head_count || !kv_head_count || !head_dimension || !sliding_window
-        || !initial_context_length || !max_context_length) {
-        const Error* error = !vocabulary_size          ? &vocabulary_size.error()
-                             : !hidden_size            ? &hidden_size.error()
-                             : !intermediate_size      ? &intermediate_size.error()
-                             : !layer_count            ? &layer_count.error()
-                             : !expert_count           ? &expert_count.error()
-                             : !top_k                  ? &top_k.error()
-                             : !attention_head_count   ? &attention_head_count.error()
-                             : !kv_head_count          ? &kv_head_count.error()
-                             : !head_dimension         ? &head_dimension.error()
-                             : !sliding_window         ? &sliding_window.error()
-                             : !initial_context_length ? &initial_context_length.error()
-                                                       : &max_context_length.error();
-        return *error;
-    }
-
-    MoeModelDescriptor descriptor;
-    descriptor.model_type = "gpt_oss";
-    descriptor.vocabulary_size = vocabulary_size.value();
-    descriptor.hidden_size = hidden_size.value();
-    descriptor.intermediate_size = intermediate_size.value();
-    descriptor.layer_count = layer_count.value();
-    descriptor.attention_head_count = attention_head_count.value();
-    descriptor.kv_head_count = kv_head_count.value();
-    descriptor.head_dimension = head_dimension.value();
-    descriptor.expert_count = expert_count.value();
-    descriptor.experts_per_token = top_k.value();
-    descriptor.activation_dtype = DType::BFloat16;
-    descriptor.kv_cache_dtype = DType::BFloat16;
-    descriptor.norm_epsilon = optional_float(json, "rms_norm_eps", 1e-5f);
-
-    MoeDescriptor moe;
-    moe.expert_count = descriptor.expert_count;
-    moe.top_k = descriptor.experts_per_token;
-    moe.intermediate_size = descriptor.intermediate_size;
-    moe.score_function = RouterScoreFunction::Softmax;
-    moe.normalization = RouterNormalization::SelectedExperts;
-    moe.activation = ExpertActivation::GptOssSwiGlu;
-    moe.layout = ExpertLayout::InterleavedGateUpDown;
-    moe.expert_weight_dtype = DType::MxFp4;
-    moe.normalize_topk_weights = true;
-    moe.use_router_bias = true;
-    moe.use_projection_bias = true;
-    moe.activation_limit = optional_float(json, "swiglu_limit", 7.0f);
-
-    AttentionDescriptor attention;
-    attention.head_count = descriptor.attention_head_count;
-    attention.kv_head_count = descriptor.kv_head_count;
-    attention.head_dimension = descriptor.head_dimension;
-    attention.initial_context_length = initial_context_length.value();
-    attention.max_context_length = max_context_length.value();
-    attention.rope_theta = optional_float(json, "rope_theta", 150000.0f);
-    attention.rope_scaling_factor = optional_float(json, "factor", 32.0f);
-    attention.rope_ntk_alpha = optional_float(json, "beta_slow", 1.0f);
-    attention.rope_ntk_beta = optional_float(json, "beta_fast", 32.0f);
-    attention.use_bias = optional_bool(json, "attention_bias", true);
-    attention.use_sinks = true;
-
-    descriptor.layers.resize(descriptor.layer_count);
-    for (uint32_t layer_id = 0; layer_id < descriptor.layer_count; ++layer_id) {
-        LayerDescriptor& layer = descriptor.layers[layer_id];
-        layer.use_attention = true;
-        layer.use_moe = true;
-        layer.pre_attention_norm = NormType::RmsNorm;
-        layer.pre_ffn_norm = NormType::RmsNorm;
-        layer.attention = attention;
-        layer.attention.sliding_window = layer_id % 2 == 0 ? sliding_window.value() : 0;
-        layer.ffn.moe = moe;
-        layer.nodes = {
-            {ModelNodeType::RmsNorm},
-            {ModelNodeType::FusedQkv},
-            {ModelNodeType::Rope},
-            {ModelNodeType::AttentionSink},
-            {ModelNodeType::Sdpa},
-            {ModelNodeType::Projection},
-            {ModelNodeType::RmsNorm},
-            {ModelNodeType::Router},
-            {ModelNodeType::TopK},
-            {ModelNodeType::ExpertGroup},
-            {ModelNodeType::Combine},
-        };
-    }
-    return descriptor;
+    return manifest.model_type == "test_moe";
 }
 
-static Result<void> add_safetensor(
-    WeightMapping& mapping,
-    const SafetensorsArchive& archive,
-    const std::string& target_name,
-    const std::string& source_name)
+Result<MoeIR> FixtureModelAdapter::parse_model(const ModelPackage& package) const
 {
-    auto tensor = archive.load_tensor(source_name);
-    if (!tensor)
-        return tensor.error();
-    mapping.tensors.emplace(target_name, std::move(tensor).value());
-    return {};
-}
-
-static Result<void> add_safetensor_slice(
-    WeightMapping& mapping,
-    const SafetensorsArchive& archive,
-    const std::string& target_name,
-    const std::string& source_name,
-    uint32_t index,
-    std::vector<uint32_t> shape)
-{
-    auto tensor = archive.load_bfloat16_slice(source_name, index, std::move(shape));
-    if (!tensor)
-        return tensor.error();
-    mapping.tensors.emplace(target_name, std::move(tensor).value());
-    return {};
-}
-
-static Result<void> add_mxfp4_expert(
-    WeightMapping& mapping,
-    const SafetensorsArchive& archive,
-    const std::string& target_name,
-    const std::string& blocks_name,
-    const std::string& scales_name,
-    uint32_t expert_id,
-    uint32_t rows,
-    uint32_t columns,
-    bool defer_data)
-{
-    auto tensor = archive.load_mxfp4_expert(
-        blocks_name,
-        scales_name,
-        expert_id,
-        rows,
-        columns,
-        defer_data);
-    if (!tensor)
-        return tensor.error();
-    mapping.tensors.emplace(target_name, std::move(tensor).value());
-    return {};
-}
-
-static Result<WeightMapping> map_gpt_oss_weights(
-    const ModelPackage& package,
-    const MoeModelDescriptor& descriptor)
-{
-    auto opened = SafetensorsArchive::open(package.root);
-    if (!opened)
-        return opened.error();
-    SafetensorsArchive archive = std::move(opened).value();
-    WeightMapping mapping;
-
-    auto status = add_safetensor(mapping, archive, "token_embedding.weight", "model.embed_tokens.weight");
-    if (!status)
-        return status.error();
-
-    for (uint32_t layer_id = 0; layer_id < descriptor.layer_count; ++layer_id) {
-        const std::string source = "model.layers." + std::to_string(layer_id) + ".";
-        const std::string target = layer_prefix(layer_id);
-        status = add_safetensor(mapping, archive, target + "pre_attention_norm.weight", source + "input_layernorm.weight");
-        if (!status)
-            return status.error();
-        status = add_safetensor(mapping, archive, target + "attention.query.weight", source + "self_attn.q_proj.weight");
-        if (!status)
-            return status.error();
-        status = add_safetensor(mapping, archive, target + "attention.query.bias", source + "self_attn.q_proj.bias");
-        if (!status)
-            return status.error();
-        status = add_safetensor(mapping, archive, target + "attention.key.weight", source + "self_attn.k_proj.weight");
-        if (!status)
-            return status.error();
-        status = add_safetensor(mapping, archive, target + "attention.key.bias", source + "self_attn.k_proj.bias");
-        if (!status)
-            return status.error();
-        status = add_safetensor(mapping, archive, target + "attention.value.weight", source + "self_attn.v_proj.weight");
-        if (!status)
-            return status.error();
-        status = add_safetensor(mapping, archive, target + "attention.value.bias", source + "self_attn.v_proj.bias");
-        if (!status)
-            return status.error();
-        status = add_safetensor(mapping, archive, target + "attention.output.weight", source + "self_attn.o_proj.weight");
-        if (!status)
-            return status.error();
-        status = add_safetensor(mapping, archive, target + "attention.output.bias", source + "self_attn.o_proj.bias");
-        if (!status)
-            return status.error();
-        status = add_safetensor(mapping, archive, target + "attention.sinks", source + "self_attn.sinks");
-        if (!status)
-            return status.error();
-        status = add_safetensor(mapping, archive, target + "pre_ffn_norm.weight", source + "post_attention_layernorm.weight");
-        if (!status)
-            return status.error();
-        status = add_safetensor(mapping, archive, target + "router.weight", source + "mlp.router.weight");
-        if (!status)
-            return status.error();
-        status = add_safetensor(mapping, archive, target + "router.bias", source + "mlp.router.bias");
-        if (!status)
-            return status.error();
-
-        const std::string gate_up_bias = source + "mlp.experts.gate_up_proj_bias";
-        const std::string down_bias = source + "mlp.experts.down_proj_bias";
-        const std::string gate_up_blocks = source + "mlp.experts.gate_up_proj_blocks";
-        const std::string gate_up_scales = source + "mlp.experts.gate_up_proj_scales";
-        const std::string down_blocks = source + "mlp.experts.down_proj_blocks";
-        const std::string down_scales = source + "mlp.experts.down_proj_scales";
-        for (uint32_t expert_id = 0; expert_id < descriptor.expert_count; ++expert_id) {
-            const std::string expert = expert_prefix(layer_id, expert_id);
-            status = add_mxfp4_expert(
-                mapping, archive, expert + "gate_up.weight", gate_up_blocks, gate_up_scales,
-                expert_id, descriptor.intermediate_size * 2, descriptor.hidden_size,
-                package.defer_mxfp4_experts);
-            if (!status)
-                return status.error();
-            status = add_safetensor_slice(
-                mapping, archive, expert + "gate_up.bias", gate_up_bias,
-                expert_id, {descriptor.intermediate_size * 2});
-            if (!status)
-                return status.error();
-            status = add_mxfp4_expert(
-                mapping, archive, expert + "down.weight", down_blocks, down_scales,
-                expert_id, descriptor.hidden_size, descriptor.intermediate_size,
-                package.defer_mxfp4_experts);
-            if (!status)
-                return status.error();
-            status = add_safetensor_slice(
-                mapping, archive, expert + "down.bias", down_bias,
-                expert_id, {descriptor.hidden_size});
-            if (!status)
-                return status.error();
-        }
-    }
-
-    status = add_safetensor(mapping, archive, "final_norm.weight", "model.norm.weight");
-    if (!status)
-        return status.error();
-    status = add_safetensor(mapping, archive, "lm_head.weight", "lm_head.weight");
-    if (!status)
-        return status.error();
-    return mapping;
-}
-
-bool MoeAdapter::can_load(const ModelManifest& manifest) const
-{
-    return manifest.model_type == "tiny_moe" || manifest.model_type == "gpt_oss";
-}
-
-Result<MoeModelDescriptor> MoeAdapter::parse_model(const ModelPackage& package) const
-{
-    if (package.manifest.model_type == "gpt_oss")
-        return parse_gpt_oss_model(package);
+    if (package.manifest.model_type != "test_moe")
+        return Error{ErrorCode::UnsupportedModel, "unsupported fixture model_type: " + package.manifest.model_type};
 
     const std::string& json = package.manifest.raw_json;
     auto vocabulary_size = required_uint32(json, "vocabulary_size");
@@ -490,8 +237,8 @@ Result<MoeModelDescriptor> MoeAdapter::parse_model(const ModelPackage& package) 
     if (!kv_cache_dtype)
         return kv_cache_dtype.error();
 
-    MoeModelDescriptor descriptor;
-    descriptor.model_type = "tiny_moe";
+    MoeIR descriptor;
+    descriptor.model_type = "test_moe";
     descriptor.vocabulary_size = vocabulary_size.value();
     descriptor.hidden_size = hidden_size.value();
     descriptor.intermediate_size = intermediate_size.value();
@@ -501,11 +248,14 @@ Result<MoeModelDescriptor> MoeAdapter::parse_model(const ModelPackage& package) 
     descriptor.kv_cache_dtype = kv_cache_dtype.value();
     descriptor.norm_epsilon = optional_float(json, "norm_epsilon", 1e-5f);
 
-    const bool use_attention = optional_bool(json, "use_attention", false);
+    const uint32_t layer_flags
+        = optional_bool(json, "use_attention", false)
+              ? LayerDescriptorAttention | LayerDescriptorMoe
+              : LayerDescriptorMoe;
     uint32_t sliding_window = 0;
     uint32_t initial_context_length = 0;
     uint32_t max_context_length = 0;
-    if (use_attention) {
+    if (has_flag(layer_flags, LayerDescriptorAttention)) {
         auto attention_head_count = required_uint32(json, "attention_head_count");
         auto kv_head_count = required_uint32(json, "kv_head_count");
         auto head_dimension = required_uint32(json, "head_dimension");
@@ -537,21 +287,23 @@ Result<MoeModelDescriptor> MoeAdapter::parse_model(const ModelPackage& package) 
     moe.activation = activation.value();
     moe.layout = layout.value();
     moe.expert_weight_dtype = expert_weight_dtype.value();
-    moe.normalize_topk_weights = optional_bool(json, "normalize_topk_weights", true);
-    moe.normalization = moe.normalize_topk_weights
+    moe.flags = 0;
+    if (optional_bool(json, "normalize_topk_weights", true))
+        moe.flags |= MoeDescriptorNormalizeTopKWeights;
+    moe.normalization = has_flag(moe.flags, MoeDescriptorNormalizeTopKWeights)
                             ? RouterNormalization::SelectedExperts
                             : RouterNormalization::None;
-    moe.use_expert_bias = optional_bool(json, "use_expert_bias", false);
-    moe.use_router_bias = moe.use_expert_bias;
+    if (optional_bool(json, "use_expert_bias", false))
+        moe.flags |= MoeDescriptorExpertBias | MoeDescriptorRouterBias;
     moe.activation_limit = optional_float(json, "activation_limit", 0.0f);
 
     descriptor.layers.resize(descriptor.layer_count);
     for (uint32_t layer_id = 0; layer_id < descriptor.layer_count; ++layer_id) {
         LayerDescriptor& layer = descriptor.layers[layer_id];
         layer.ffn.moe = moe;
-        layer.use_attention = use_attention;
+        layer.flags = layer_flags;
         layer.nodes.push_back({ModelNodeType::RmsNorm});
-        if (use_attention) {
+        if (has_flag(layer_flags, LayerDescriptorAttention)) {
             layer.pre_attention_norm = NormType::RmsNorm;
             layer.attention.head_count = descriptor.attention_head_count;
             layer.attention.kv_head_count = descriptor.kv_head_count;
@@ -563,14 +315,16 @@ Result<MoeModelDescriptor> MoeAdapter::parse_model(const ModelPackage& package) 
             layer.attention.rope_scaling_factor = optional_float(json, "rope_scaling_factor", 1.0f);
             layer.attention.rope_ntk_alpha = optional_float(json, "rope_ntk_alpha", 1.0f);
             layer.attention.rope_ntk_beta = optional_float(json, "rope_ntk_beta", 32.0f);
-            layer.attention.use_bias = optional_bool(json, "attention_bias", true);
-            layer.attention.use_sinks = optional_bool(json, "attention_sinks", true);
+            if (optional_bool(json, "attention_bias", true))
+                layer.attention.flags |= AttentionDescriptorBias;
+            if (optional_bool(json, "attention_sinks", true))
+                layer.attention.flags |= AttentionDescriptorSinks;
             layer.nodes = {
                 {ModelNodeType::RmsNorm},
                 {ModelNodeType::FusedQkv},
                 {ModelNodeType::Rope},
             };
-            if (layer.attention.use_sinks)
+            if (has_flag(layer.attention.flags, AttentionDescriptorSinks))
                 layer.nodes.push_back({ModelNodeType::AttentionSink});
             layer.nodes.push_back({ModelNodeType::Sdpa});
             layer.nodes.push_back({ModelNodeType::Projection});
@@ -585,15 +339,15 @@ Result<MoeModelDescriptor> MoeAdapter::parse_model(const ModelPackage& package) 
     return descriptor;
 }
 
-Result<WeightMapping> MoeAdapter::map_weights(
+Result<WeightMapping> FixtureModelAdapter::map_weights(
     const ModelPackage& package,
-    const MoeModelDescriptor& descriptor) const
+    const MoeIR& descriptor) const
 {
-    if (descriptor.model_type == "gpt_oss")
-        return map_gpt_oss_weights(package, descriptor);
+    if (descriptor.model_type != "test_moe")
+        return Error{ErrorCode::UnsupportedModel, "unsupported fixture model_type: " + descriptor.model_type};
 
     const std::string weights_name = optional_string(
-        package.manifest.raw_json, "weights_file", "model.ncnnmoe.bin");
+        package.manifest.raw_json, "weights_file", "model.test.bin");
     auto bytes = read_binary_file(package.root / weights_name);
     if (!bytes)
         return bytes.error();
@@ -612,7 +366,7 @@ Result<WeightMapping> MoeAdapter::map_weights(
     for (uint32_t layer_id = 0; layer_id < descriptor.layer_count; ++layer_id) {
         const MoeDescriptor& moe = descriptor.layers[layer_id].ffn.moe;
         const std::string layer = layer_prefix(layer_id);
-        if (descriptor.layers[layer_id].use_attention) {
+        if (has_flag(descriptor.layers[layer_id].flags, LayerDescriptorAttention)) {
             const AttentionDescriptor& attention = descriptor.layers[layer_id].attention;
             const uint32_t query_size = attention.head_count * attention.head_dimension;
             const uint32_t key_value_size = attention.kv_head_count * attention.head_dimension;
@@ -622,7 +376,7 @@ Result<WeightMapping> MoeAdapter::map_weights(
             status = add(layer + "attention.query.weight", {query_size, descriptor.hidden_size}, DType::Float32);
             if (!status)
                 return status.error();
-            if (attention.use_bias) {
+            if (has_flag(attention.flags, AttentionDescriptorBias)) {
                 status = add(layer + "attention.query.bias", {query_size}, DType::Float32);
                 if (!status)
                     return status.error();
@@ -630,7 +384,7 @@ Result<WeightMapping> MoeAdapter::map_weights(
             status = add(layer + "attention.key.weight", {key_value_size, descriptor.hidden_size}, DType::Float32);
             if (!status)
                 return status.error();
-            if (attention.use_bias) {
+            if (has_flag(attention.flags, AttentionDescriptorBias)) {
                 status = add(layer + "attention.key.bias", {key_value_size}, DType::Float32);
                 if (!status)
                     return status.error();
@@ -638,7 +392,7 @@ Result<WeightMapping> MoeAdapter::map_weights(
             status = add(layer + "attention.value.weight", {key_value_size, descriptor.hidden_size}, DType::Float32);
             if (!status)
                 return status.error();
-            if (attention.use_bias) {
+            if (has_flag(attention.flags, AttentionDescriptorBias)) {
                 status = add(layer + "attention.value.bias", {key_value_size}, DType::Float32);
                 if (!status)
                     return status.error();
@@ -646,12 +400,12 @@ Result<WeightMapping> MoeAdapter::map_weights(
             status = add(layer + "attention.output.weight", {descriptor.hidden_size, query_size}, DType::Float32);
             if (!status)
                 return status.error();
-            if (attention.use_bias) {
+            if (has_flag(attention.flags, AttentionDescriptorBias)) {
                 status = add(layer + "attention.output.bias", {descriptor.hidden_size}, DType::Float32);
                 if (!status)
                     return status.error();
             }
-            if (attention.use_sinks) {
+            if (has_flag(attention.flags, AttentionDescriptorSinks)) {
                 status = add(layer + "attention.sinks", {attention.head_count}, DType::Float32);
                 if (!status)
                     return status.error();
@@ -663,7 +417,7 @@ Result<WeightMapping> MoeAdapter::map_weights(
         status = add(layer + "router.weight", {moe.expert_count, descriptor.hidden_size}, DType::Float32);
         if (!status)
             return status.error();
-        if (moe.use_router_bias) {
+        if (has_flag(moe.flags, MoeDescriptorRouterBias)) {
             status = add(layer + "router.bias", {moe.expert_count}, DType::Float32);
             if (!status)
                 return status.error();
@@ -692,10 +446,11 @@ Result<WeightMapping> MoeAdapter::map_weights(
     if (!status)
         return status.error();
 
-    if (!reader.exhausted())
+    if (!reader.exhausted()) {
         return Error{
             ErrorCode::InvalidModel,
             "weight file contains " + std::to_string(reader.remaining()) + " trailing bytes"};
+    }
     return mapping;
 }
 

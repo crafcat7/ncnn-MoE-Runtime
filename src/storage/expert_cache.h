@@ -1,6 +1,8 @@
 #ifndef NCNN_MOE_EXPERT_CACHE_H
 #define NCNN_MOE_EXPERT_CACHE_H
 
+#include "expert_victim_cache.h"
+
 #include "ncnn/moe/result.h"
 #include "ncnn/moe/types.h"
 
@@ -40,12 +42,24 @@ struct ExpertCacheStatistics
     uint64_t resident_bytes = 0;
     uint64_t queued_reads = 0;
     uint64_t speculative_reads = 0;
+    uint64_t mapped_ranges = 0;
+    uint64_t mapped_bytes = 0;
+    ExpertVictimCacheStatistics victim;
+};
+
+enum ExpertCacheOptionFlag : uint32_t
+{
+    ExpertCacheMemoryMapRanges = 1u << 0
 };
 
 class Mxfp4ExpertCache
 {
 public:
-    explicit Mxfp4ExpertCache(uint64_t capacity_bytes, uint32_t io_worker_count = 0);
+    explicit Mxfp4ExpertCache(
+        uint64_t capacity_bytes,
+        uint32_t io_worker_count = 0,
+        std::shared_ptr<IExpertVictimCache> victim_cache = {},
+        uint32_t flags = 0);
     ~Mxfp4ExpertCache();
 
     Mxfp4ExpertCache(const Mxfp4ExpertCache&) = delete;
@@ -84,7 +98,9 @@ private:
     struct FileRangeReader;
 
     [[nodiscard]] Result<std::shared_ptr<TensorData> > load_tensor(
-        const TensorData& source);
+        const TensorData& source,
+        uint64_t& mapped_ranges,
+        uint64_t& mapped_bytes);
     [[nodiscard]] static Result<uint64_t> stored_bytes(const TensorData& tensor);
     [[nodiscard]] static std::string key_for(
         const TensorData& gate_up,
@@ -106,6 +122,8 @@ private:
     uint64_t bytes_read_ = 0;
     uint64_t queued_reads_ = 0;
     uint64_t speculative_reads_ = 0;
+    uint64_t mapped_ranges_ = 0;
+    uint64_t mapped_bytes_ = 0;
     bool stopping_ = false;
     mutable std::mutex mutex_;
     std::condition_variable ready_;
@@ -120,6 +138,8 @@ private:
     uint64_t pending_prediction_generation_ = 0;
     uint64_t prediction_generation_ = 0;
     std::unique_ptr<FileRangeReader> reader_;
+    std::shared_ptr<IExpertVictimCache> victim_cache_;
+    uint32_t flags_ = 0;
 };
 
 } // namespace moe

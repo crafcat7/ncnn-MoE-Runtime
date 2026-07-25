@@ -11,6 +11,10 @@ namespace moe {
 class Model
 {
 public:
+    [[nodiscard]] const MoeIR& ir() const noexcept
+    {
+        return compiled_->descriptor;
+    }
     [[nodiscard]] const MoeModelDescriptor& descriptor() const noexcept
     {
         return compiled_->descriptor;
@@ -22,6 +26,18 @@ public:
     [[nodiscard]] const std::vector<CompiledLayerPlan>& execution_plan() const noexcept
     {
         return compiled_->layers;
+    }
+    [[nodiscard]] const ExecutionGraph& execution_graph() const noexcept
+    {
+        return compiled_->graph;
+    }
+    [[nodiscard]] const ExecutionSchedule& execution_schedule() const noexcept
+    {
+        return compiled_->schedule;
+    }
+    [[nodiscard]] const ModelMemoryPlan& memory_plan() const noexcept
+    {
+        return compiled_->memory_plan;
     }
 
 private:

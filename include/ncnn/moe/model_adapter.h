@@ -1,7 +1,7 @@
 #ifndef NCNN_MOE_MODEL_ADAPTER_H
 #define NCNN_MOE_MODEL_ADAPTER_H
 
-#include "ncnn/moe/model_descriptor.h"
+#include "ncnn/moe/moe_ir.h"
 #include "ncnn/moe/result.h"
 #include "ncnn/moe/types.h"
 
@@ -17,11 +17,16 @@ struct ModelManifest
     std::string raw_json;
 };
 
+enum ModelPackageFlag : uint32_t
+{
+    ModelPackageDeferMxfp4Experts = 1u << 0
+};
+
 struct ModelPackage
 {
     std::filesystem::path root;
     ModelManifest manifest;
-    bool defer_mxfp4_experts = false;
+    uint32_t flags = 0;
 };
 
 class IMoeModelAdapter
@@ -31,13 +36,13 @@ public:
 
     [[nodiscard]] virtual bool can_load(const ModelManifest& manifest) const = 0;
 
-    [[nodiscard]] virtual Result<MoeModelDescriptor> parse_model(
+    [[nodiscard]] virtual Result<MoeIR> parse_model(
         const ModelPackage& package) const
         = 0;
 
     [[nodiscard]] virtual Result<WeightMapping> map_weights(
         const ModelPackage& package,
-        const MoeModelDescriptor& descriptor) const
+        const MoeIR& ir) const
         = 0;
 };
 

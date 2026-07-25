@@ -1,7 +1,8 @@
 #include "ncnn_linear.h"
 
-#include "cpu_session_state.h"
-#include "cpu_ops.h"
+#include "engine/cpu_session_state.h"
+#include "kernels/cpu_ops.h"
+#include "storage/expert_victim_cache.h"
 #include "ncnn_attention.h"
 
 #if NCNN_MOE_USE_NCNN
@@ -14,10 +15,16 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if NCNN_MOE_WITH_VULKAN
@@ -164,6 +171,464 @@ private:
     // host memory while the other slot is referenced by a Vulkan command.
     std::array<NcnnVulkanTransferSlot, 2> transfer_slots_;
     std::atomic<size_t> next_transfer_slot_{0};
+};
+
+class VulkanExpertVictimCache final : public IExpertVictimCache
+{
+public:
+    VulkanExpertVictimCache(
+        std::shared_ptr<NcnnVulkanContext> context,
+        uint64_t capacity_bytes)
+        : context_(std::move(context)),
+          capacity_bytes_(capacity_bytes),
+          maximum_pending_bytes_(std::min(
+              capacity_bytes,
+              UINT64_C(256) * 1024 * 1024)),
+          upload_staging_allocator_(
+              context_->device()->acquire_staging_allocator()),
+          worker_(&VulkanExpertVictimCache::worker_loop, this)
+    {
+        for (DownloadSlot& slot : download_slots_) {
+            slot.staging_allocator
+                = context_->device()->acquire_staging_allocator();
+        }
+    }
+
+    ~VulkanExpertVictimCache() override
+    {
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+            while (!pending_.empty()) {
+                pending_bytes_ -= pending_.front().bytes;
+                pending_keys_.erase(pending_.front().key);
+                pending_.pop_front();
+                ++dropped_admissions_;
+            }
+        }
+        work_available_.notify_all();
+        if (worker_.joinable())
+            worker_.join();
+        upload_staging_ = ncnn::VkMat();
+        context_->device()->reclaim_staging_allocator(
+            upload_staging_allocator_);
+        for (DownloadSlot& slot : download_slots_) {
+            slot.staging = ncnn::VkMat();
+            context_->device()->reclaim_staging_allocator(
+                slot.staging_allocator);
+        }
+    }
+
+    void admit(
+        std::string key,
+        std::shared_ptr<const TensorData> gate_up,
+        std::shared_ptr<const TensorData> down) override
+    {
+        if (!gate_up || !down)
+            return;
+        const uint64_t gate_blocks = gate_up->mxfp4_blocks.size();
+        const uint64_t gate_scales = gate_up->mxfp4_scales.size();
+        const uint64_t down_blocks = down->mxfp4_blocks.size();
+        const uint64_t down_scales = down->mxfp4_scales.size();
+        if (gate_blocks > std::numeric_limits<uint64_t>::max() - gate_scales
+            || gate_blocks + gate_scales
+                   > std::numeric_limits<uint64_t>::max() - down_blocks
+            || gate_blocks + gate_scales + down_blocks
+                   > std::numeric_limits<uint64_t>::max() - down_scales) {
+            return;
+        }
+        const uint64_t bytes
+            = gate_blocks + gate_scales + down_blocks + down_scales;
+        if (bytes == 0 || bytes > capacity_bytes_
+            || bytes > maximum_pending_bytes_
+            || bytes > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+            return;
+        }
+
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (stopping_
+            || entries_.find(key) != entries_.end()
+            || pending_keys_.find(key) != pending_keys_.end()) {
+            return;
+        }
+        while (!pending_.empty()
+               && pending_bytes_ > maximum_pending_bytes_ - bytes) {
+            pending_bytes_ -= pending_.front().bytes;
+            pending_keys_.erase(pending_.front().key);
+            pending_.pop_front();
+            ++dropped_admissions_;
+        }
+        if (pending_bytes_ > maximum_pending_bytes_ - bytes) {
+            ++dropped_admissions_;
+            return;
+        }
+
+        PendingAdmission admission;
+        admission.key = std::move(key);
+        admission.gate_up = std::move(gate_up);
+        admission.down = std::move(down);
+        admission.bytes = bytes;
+        pending_bytes_ += bytes;
+        pending_keys_.insert(admission.key);
+        pending_.push_back(std::move(admission));
+        ++admissions_;
+        work_available_.notify_one();
+    }
+
+    std::optional<ExpertVictimPair> restore(
+        const std::string& key,
+        const TensorData& gate_up_source,
+        const TensorData& down_source) override
+    {
+        std::shared_ptr<DeviceEntry> entry;
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            const auto existing = entries_.find(key);
+            if (existing == entries_.end()) {
+                ++misses_;
+                return std::nullopt;
+            }
+            entry = existing->second;
+            entry->used_at = ++clock_;
+        }
+
+        ExpertVictimPair restored;
+        const bool mapped_restore = entry->data.mapped_ptr() != nullptr;
+        const auto restore_started = std::chrono::steady_clock::now();
+        if (!download(*entry, gate_up_source, down_source, restored)) {
+            const uint64_t restore_microseconds
+                = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now()
+                        - restore_started)
+                        .count());
+            const std::lock_guard<std::mutex> lock(mutex_);
+            restore_time_microseconds_ += restore_microseconds;
+            ++restore_failures_;
+            const auto existing = entries_.find(key);
+            if (existing != entries_.end() && existing->second == entry) {
+                resident_bytes_ -= entry->bytes;
+                entries_.erase(existing);
+            }
+            return std::nullopt;
+        }
+        const uint64_t restore_microseconds
+            = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now()
+                    - restore_started)
+                    .count());
+
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            ++hits_;
+            bytes_downloaded_ += entry->bytes;
+            restore_time_microseconds_ += restore_microseconds;
+            if (mapped_restore)
+                ++mapped_restores_;
+        }
+        return restored;
+    }
+
+    ExpertVictimCacheStatistics statistics() const override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return {
+            hits_,
+            misses_,
+            admissions_,
+            stores_,
+            evictions_,
+            dropped_admissions_,
+            restore_failures_,
+            bytes_uploaded_,
+            bytes_downloaded_,
+            restore_time_microseconds_,
+            mapped_stores_,
+            mapped_restores_,
+            resident_bytes_,
+            pending_bytes_};
+    }
+
+    uint64_t capacity_bytes() const noexcept override
+    {
+        return capacity_bytes_;
+    }
+
+private:
+    struct DeviceEntry
+    {
+        ncnn::VkMat data;
+        uint64_t bytes = 0;
+        uint64_t gate_blocks = 0;
+        uint64_t gate_scales = 0;
+        uint64_t down_blocks = 0;
+        uint64_t down_scales = 0;
+        uint64_t used_at = 0;
+        bool host_mapped = false;
+    };
+
+    struct PendingAdmission
+    {
+        std::string key;
+        std::shared_ptr<const TensorData> gate_up;
+        std::shared_ptr<const TensorData> down;
+        uint64_t bytes = 0;
+    };
+
+    struct DownloadSlot
+    {
+        std::mutex mutex;
+        ncnn::VkAllocator* staging_allocator = nullptr;
+        ncnn::VkMat staging;
+    };
+
+    std::shared_ptr<DeviceEntry> upload(const PendingAdmission& admission)
+    {
+        auto entry = std::make_shared<DeviceEntry>();
+        entry->bytes = admission.bytes;
+        entry->gate_blocks = admission.gate_up->mxfp4_blocks.size();
+        entry->gate_scales = admission.gate_up->mxfp4_scales.size();
+        entry->down_blocks = admission.down->mxfp4_blocks.size();
+        entry->down_scales = admission.down->mxfp4_scales.size();
+        const auto copy_payload = [&admission](uint8_t* destination) {
+            const auto copy = [&destination](
+                                  const MxFp4ByteBuffer& source) {
+                std::memcpy(
+                    destination,
+                    source.data(),
+                    source.size());
+                destination += source.size();
+            };
+            copy(admission.gate_up->mxfp4_blocks);
+            copy(admission.gate_up->mxfp4_scales);
+            copy(admission.down->mxfp4_blocks);
+            copy(admission.down->mxfp4_scales);
+        };
+
+        {
+            const std::lock_guard<std::mutex> command_lock(
+                context_->command_mutex());
+            entry->data.create(
+                static_cast<int>(admission.bytes),
+                sizeof(uint8_t),
+                context_->blob_allocator());
+        }
+        if (entry->data.empty())
+            return {};
+        if (entry->data.mapped_ptr()) {
+            entry->host_mapped = true;
+            copy_payload(
+                static_cast<uint8_t*>(entry->data.mapped_ptr()));
+            entry->data.allocator->flush(entry->data.data);
+            entry->data.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
+            entry->data.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
+            return entry;
+        }
+
+        upload_staging_.create(
+            static_cast<int>(admission.bytes),
+            sizeof(uint8_t),
+            upload_staging_allocator_);
+        if (upload_staging_.empty() || !upload_staging_.mapped_ptr())
+            return {};
+
+        uint8_t* destination
+            = static_cast<uint8_t*>(upload_staging_.mapped_ptr());
+        copy_payload(destination);
+        upload_staging_.allocator->flush(upload_staging_.data);
+        upload_staging_.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
+        upload_staging_.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
+
+        const std::lock_guard<std::mutex> command_lock(
+            context_->command_mutex());
+        ncnn::Option option;
+        option.blob_vkallocator = context_->blob_allocator();
+        option.workspace_vkallocator = context_->blob_allocator();
+        option.staging_vkallocator = upload_staging_allocator_;
+        ncnn::VkCompute command(context_->device());
+        command.record_clone(upload_staging_, entry->data, option);
+        if (entry->data.empty() || command.submit_and_wait() != 0)
+            return {};
+        return entry;
+    }
+
+    bool download(
+        const DeviceEntry& entry,
+        const TensorData& gate_up_source,
+        const TensorData& down_source,
+        ExpertVictimPair& restored)
+    {
+        if (!gate_up_source.mxfp4_file_storage
+            || !down_source.mxfp4_file_storage) {
+            return false;
+        }
+        const MxFp4FileStorage& gate_file
+            = *gate_up_source.mxfp4_file_storage;
+        const MxFp4FileStorage& down_file
+            = *down_source.mxfp4_file_storage;
+        if (gate_file.blocks_bytes != entry.gate_blocks
+            || gate_file.scales_bytes != entry.gate_scales
+            || down_file.blocks_bytes != entry.down_blocks
+            || down_file.scales_bytes != entry.down_scales) {
+            return false;
+        }
+
+        const auto materialize = [&](
+                                     const uint8_t* source) {
+            const auto copy = [&source](
+                                  uint64_t byte_count) {
+                const size_t bytes
+                    = static_cast<size_t>(byte_count);
+                MxFp4ByteBuffer destination;
+                destination.assign(source, bytes);
+                source += bytes;
+                return destination;
+            };
+            restored.gate_up = std::make_shared<TensorData>();
+            restored.gate_up->dtype = DType::MxFp4;
+            restored.gate_up->shape = gate_up_source.shape;
+            restored.gate_up->mxfp4_blocks
+                = copy(entry.gate_blocks);
+            restored.gate_up->mxfp4_scales
+                = copy(entry.gate_scales);
+            restored.down = std::make_shared<TensorData>();
+            restored.down->dtype = DType::MxFp4;
+            restored.down->shape = down_source.shape;
+            restored.down->mxfp4_blocks
+                = copy(entry.down_blocks);
+            restored.down->mxfp4_scales
+                = copy(entry.down_scales);
+        };
+        if (entry.data.mapped_ptr()) {
+            entry.data.allocator->invalidate(entry.data.data);
+            materialize(static_cast<const uint8_t*>(
+                entry.data.mapped_ptr()));
+            entry.data.data->access_flags = VK_ACCESS_HOST_READ_BIT;
+            entry.data.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
+            return true;
+        }
+
+        DownloadSlot& slot = download_slots_[next_download_slot_.fetch_add(
+                                                 1,
+                                                 std::memory_order_relaxed)
+                                             % download_slots_.size()];
+        const std::lock_guard<std::mutex> slot_lock(slot.mutex);
+        slot.staging.create(
+            static_cast<int>(entry.bytes),
+            sizeof(uint8_t),
+            slot.staging_allocator);
+        if (slot.staging.empty() || !slot.staging.mapped_ptr())
+            return false;
+
+        {
+            const std::lock_guard<std::mutex> command_lock(
+                context_->command_mutex());
+            ncnn::Option option;
+            option.blob_vkallocator = slot.staging_allocator;
+            option.workspace_vkallocator = slot.staging_allocator;
+            option.staging_vkallocator = slot.staging_allocator;
+            ncnn::VkCompute command(context_->device());
+            command.record_clone(entry.data, slot.staging, option);
+            if (slot.staging.empty()
+                || command.submit_and_wait() != 0) {
+                return false;
+            }
+        }
+        slot.staging.allocator->invalidate(slot.staging.data);
+        const uint8_t* source
+            = static_cast<const uint8_t*>(
+                slot.staging.mapped_ptr());
+        materialize(source);
+        slot.staging.data->access_flags = VK_ACCESS_HOST_READ_BIT;
+        slot.staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
+        return true;
+    }
+
+    void worker_loop()
+    {
+        for (;;) {
+            PendingAdmission admission;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                work_available_.wait(lock, [this] {
+                    return stopping_ || !pending_.empty();
+                });
+                if (stopping_ && pending_.empty())
+                    return;
+                admission = std::move(pending_.front());
+                pending_.pop_front();
+            }
+
+            std::shared_ptr<DeviceEntry> entry = upload(admission);
+            {
+                const std::lock_guard<std::mutex> lock(mutex_);
+                pending_bytes_ -= admission.bytes;
+                pending_keys_.erase(admission.key);
+                if (!entry)
+                    continue;
+
+                while (resident_bytes_
+                       > capacity_bytes_ - entry->bytes) {
+                    auto victim = entries_.end();
+                    for (auto iterator = entries_.begin();
+                         iterator != entries_.end();
+                         ++iterator) {
+                        if (victim == entries_.end()
+                            || iterator->second->used_at
+                                   < victim->second->used_at) {
+                            victim = iterator;
+                        }
+                    }
+                    if (victim == entries_.end())
+                        break;
+                    resident_bytes_ -= victim->second->bytes;
+                    entries_.erase(victim);
+                    ++evictions_;
+                }
+                if (resident_bytes_
+                    <= capacity_bytes_ - entry->bytes) {
+                    entry->used_at = ++clock_;
+                    resident_bytes_ += entry->bytes;
+                    bytes_uploaded_ += entry->bytes;
+                    if (entry->host_mapped)
+                        ++mapped_stores_;
+                    ++stores_;
+                    entries_[admission.key] = std::move(entry);
+                }
+            }
+        }
+    }
+
+    std::shared_ptr<NcnnVulkanContext> context_;
+    uint64_t capacity_bytes_ = 0;
+    uint64_t maximum_pending_bytes_ = 0;
+    ncnn::VkAllocator* upload_staging_allocator_ = nullptr;
+    mutable std::mutex mutex_;
+    std::condition_variable work_available_;
+    std::deque<PendingAdmission> pending_;
+    std::unordered_set<std::string> pending_keys_;
+    std::unordered_map<std::string, std::shared_ptr<DeviceEntry> > entries_;
+    uint64_t pending_bytes_ = 0;
+    uint64_t resident_bytes_ = 0;
+    uint64_t clock_ = 0;
+    uint64_t hits_ = 0;
+    uint64_t misses_ = 0;
+    uint64_t admissions_ = 0;
+    uint64_t stores_ = 0;
+    uint64_t evictions_ = 0;
+    uint64_t dropped_admissions_ = 0;
+    uint64_t restore_failures_ = 0;
+    uint64_t bytes_uploaded_ = 0;
+    uint64_t bytes_downloaded_ = 0;
+    uint64_t restore_time_microseconds_ = 0;
+    uint64_t mapped_stores_ = 0;
+    uint64_t mapped_restores_ = 0;
+    bool stopping_ = false;
+    ncnn::VkMat upload_staging_;
+    std::array<DownloadSlot, 2> download_slots_;
+    std::atomic<size_t> next_download_slot_{0};
+    std::thread worker_;
 };
 
 static bool has_batch_shape(const ncnn::VkMat& buffer, size_t rows, uint32_t columns)
@@ -371,7 +836,7 @@ public:
             }
             else
 #endif
-            if (pipeline_created) {
+                if (pipeline_created) {
                 layer->destroy_pipeline(option);
             }
             delete layer;
@@ -520,20 +985,28 @@ std::shared_ptr<NcnnLinearOperator> NcnnLinearOperator::create(
     if (model_data[0].empty())
         return {};
     float* weight_data = static_cast<float*>(model_data[0].data);
+    const std::span<const float> float32_weights
+        = matrix.float32_values();
+    const std::span<const uint16_t> bfloat16_weights
+        = matrix.bfloat16_values();
     for (size_t index = 0; index < matrix.element_count(); ++index)
         weight_data[index] = matrix.dtype == DType::Float32
-                                 ? matrix.float32_data[index]
-                                 : bfloat16_to_float(matrix.bfloat16_data[index]);
+                                 ? float32_weights[index]
+                                 : bfloat16_to_float(bfloat16_weights[index]);
 
     if (bias) {
         model_data[1].create(static_cast<int>(implementation.output_columns), sizeof(float));
         if (model_data[1].empty())
             return {};
         float* bias_data = static_cast<float*>(model_data[1].data);
+        const std::span<const float> float32_bias
+            = bias->float32_values();
+        const std::span<const uint16_t> bfloat16_bias
+            = bias->bfloat16_values();
         for (uint32_t column = 0; column < implementation.output_columns; ++column) {
             bias_data[column] = bias->dtype == DType::Float32
-                                    ? bias->float32_data[column]
-                                    : bfloat16_to_float(bias->bfloat16_data[column]);
+                                    ? float32_bias[column]
+                                    : bfloat16_to_float(bfloat16_bias[column]);
         }
     }
 
@@ -610,15 +1083,19 @@ std::shared_ptr<NcnnLinearOperator> NcnnLinearOperator::create_fused(
         if (has_bias)
             fused_bias.float32_data.reserve(output_columns);
         for (size_t index = 0; index < matrices.size(); ++index) {
+            const std::span<const float> matrix_values
+                = matrices[index]->float32_values();
             fused_matrix.float32_data.insert(
                 fused_matrix.float32_data.end(),
-                matrices[index]->float32_data.begin(),
-                matrices[index]->float32_data.end());
+                matrix_values.begin(),
+                matrix_values.end());
             if (has_bias) {
+                const std::span<const float> bias_values
+                    = biases[index]->float32_values();
                 fused_bias.float32_data.insert(
                     fused_bias.float32_data.end(),
-                    biases[index]->float32_data.begin(),
-                    biases[index]->float32_data.end());
+                    bias_values.begin(),
+                    bias_values.end());
             }
         }
     }
@@ -627,19 +1104,40 @@ std::shared_ptr<NcnnLinearOperator> NcnnLinearOperator::create_fused(
         if (has_bias)
             fused_bias.bfloat16_data.reserve(output_columns);
         for (size_t index = 0; index < matrices.size(); ++index) {
+            const std::span<const uint16_t> matrix_values
+                = matrices[index]->bfloat16_values();
             fused_matrix.bfloat16_data.insert(
                 fused_matrix.bfloat16_data.end(),
-                matrices[index]->bfloat16_data.begin(),
-                matrices[index]->bfloat16_data.end());
+                matrix_values.begin(),
+                matrix_values.end());
             if (has_bias) {
+                const std::span<const uint16_t> bias_values
+                    = biases[index]->bfloat16_values();
                 fused_bias.bfloat16_data.insert(
                     fused_bias.bfloat16_data.end(),
-                    biases[index]->bfloat16_data.begin(),
-                    biases[index]->bfloat16_data.end());
+                    bias_values.begin(),
+                    bias_values.end());
             }
         }
     }
     return create(fused_matrix, has_bias ? &fused_bias : nullptr, device);
+}
+
+std::shared_ptr<IExpertVictimCache>
+create_vulkan_expert_victim_cache(uint64_t capacity_bytes)
+{
+#if NCNN_MOE_WITH_VULKAN
+    const std::shared_ptr<NcnnVulkanContext> context
+        = NcnnVulkanContext::acquire();
+    if (!context || capacity_bytes == 0)
+        return {};
+    return std::make_shared<VulkanExpertVictimCache>(
+        context,
+        capacity_bytes);
+#else
+    (void)capacity_bytes;
+    return {};
+#endif
 }
 
 uint32_t NcnnLinearOperator::vulkan_device_count() noexcept
@@ -647,6 +1145,21 @@ uint32_t NcnnLinearOperator::vulkan_device_count() noexcept
 #if NCNN_MOE_WITH_VULKAN
     const std::shared_ptr<NcnnVulkanContext> context = NcnnVulkanContext::acquire();
     return context ? static_cast<uint32_t>(ncnn::get_gpu_count()) : 0;
+#else
+    return 0;
+#endif
+}
+
+uint64_t NcnnLinearOperator::vulkan_heap_budget_bytes() noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    const std::shared_ptr<NcnnVulkanContext> context
+        = NcnnVulkanContext::acquire();
+    if (!context)
+        return 0;
+    return static_cast<uint64_t>(
+               context->device()->get_heap_budget())
+           * 1024 * 1024;
 #else
     return 0;
 #endif
@@ -804,15 +1317,22 @@ static bool tensor_to_float_vector(const TensorData& tensor, std::vector<float>&
         return false;
     values.resize(tensor.element_count());
     if (tensor.dtype == DType::Float32) {
-        if (tensor.float32_data.size() != values.size())
+        const std::span<const float> tensor_values
+            = tensor.float32_values();
+        if (tensor_values.size() != values.size())
             return false;
-        values = tensor.float32_data;
+        std::copy(
+            tensor_values.begin(),
+            tensor_values.end(),
+            values.begin());
     }
     else {
-        if (tensor.bfloat16_data.size() != values.size())
+        const std::span<const uint16_t> tensor_values
+            = tensor.bfloat16_values();
+        if (tensor_values.size() != values.size())
             return false;
         for (size_t index = 0; index < values.size(); ++index)
-            values[index] = bfloat16_to_float(tensor.bfloat16_data[index]);
+            values[index] = bfloat16_to_float(tensor_values[index]);
     }
     return true;
 }
@@ -855,11 +1375,11 @@ static bool fill_rope_staging_pair(
                                     ? nullptr
                                     : sine_mapped.row<float>(static_cast<int>(token_index));
         uint16_t* cosine_bfloat16_row = bfloat16_storage
-                                           ? cosine_mapped.row<uint16_t>(static_cast<int>(token_index))
-                                           : nullptr;
+                                            ? cosine_mapped.row<uint16_t>(static_cast<int>(token_index))
+                                            : nullptr;
         uint16_t* sine_bfloat16_row = bfloat16_storage
-                                         ? sine_mapped.row<uint16_t>(static_cast<int>(token_index))
-                                         : nullptr;
+                                          ? sine_mapped.row<uint16_t>(static_cast<int>(token_index))
+                                          : nullptr;
         for (size_t index = 0; index < inverse_frequencies.size(); ++index) {
             const float angle = static_cast<float>(position_offset + token_index)
                                 * inverse_frequencies[index];
@@ -886,7 +1406,6 @@ static bool fill_attention_mask_staging(
     const CpuLayerCache& cache,
     const NcnnVulkanAttentionConfig& config,
     const std::vector<float>& sinks,
-    bool use_attention_sink,
     bool bfloat16_storage,
     ncnn::VkAllocator* allocator)
 {
@@ -908,6 +1427,8 @@ static bool fill_attention_mask_staging(
     if (mapped.empty())
         return false;
     const uint64_t actual_end = cache.token_count + token_count;
+    const bool use_attention_sink
+        = has_flag(config.flags, NcnnAttentionSink);
     ncnn::Mat first_head = mapped.channel(0);
     for (size_t query_index = 0; query_index < token_count; ++query_index) {
         const uint64_t query_position = position_offset + query_index;
@@ -987,9 +1508,10 @@ std::shared_ptr<NcnnVulkanAttentionOperator> NcnnVulkanAttentionOperator::create
         || config.head_dimension == 0 || config.head_dimension % 2 != 0
         || config.head_count % config.kv_head_count != 0
         || config.activation_dtype != config.kv_cache_dtype
-        || (!config.use_attention_sink && config.sliding_window > 0)
+        || (!has_flag(config.flags, NcnnAttentionSink)
+            && config.sliding_window > 0)
         || norm_weight.shape != std::vector<uint32_t>{config.hidden_size}
-        || (config.use_attention_sink
+        || (has_flag(config.flags, NcnnAttentionSink)
             && (!sinks
                 || sinks->shape != std::vector<uint32_t>{config.head_count})))
         return {};
@@ -1011,7 +1533,7 @@ std::shared_ptr<NcnnVulkanAttentionOperator> NcnnVulkanAttentionOperator::create
     implementation.fused_qkv = std::move(fused_qkv);
     implementation.output_projection = std::move(output_projection);
     implementation.config = config;
-    if (config.use_attention_sink
+    if (has_flag(config.flags, NcnnAttentionSink)
         && !tensor_to_float_vector(*sinks, implementation.sinks))
         return {};
     implementation.vulkan_context = fused_implementation.vulkan_context;
@@ -1029,13 +1551,9 @@ std::shared_ptr<NcnnVulkanAttentionOperator> NcnnVulkanAttentionOperator::create
         implementation.rope_concentration
             = 0.1f * std::log(config.rope_scaling_factor) + 1.0f;
         const float half = static_cast<float>(half_dimension);
-        rope_low = half * std::log(
-                              static_cast<float>(config.initial_context_length)
-                              / (config.rope_ntk_beta * 2.0f * std::acos(-1.0f)))
+        rope_low = half * std::log(static_cast<float>(config.initial_context_length) / (config.rope_ntk_beta * 2.0f * std::acos(-1.0f)))
                    / std::log(config.rope_theta);
-        rope_high = half * std::log(
-                               static_cast<float>(config.initial_context_length)
-                               / (config.rope_ntk_alpha * 2.0f * std::acos(-1.0f)))
+        rope_high = half * std::log(static_cast<float>(config.initial_context_length) / (config.rope_ntk_alpha * 2.0f * std::acos(-1.0f)))
                     / std::log(config.rope_theta);
     }
     for (uint32_t index = 0; index < half_dimension; ++index) {
@@ -1190,7 +1708,7 @@ std::shared_ptr<NcnnVulkanAttentionOperator> NcnnVulkanAttentionOperator::create
     upload_option.staging_vkallocator = implementation.weight_staging_allocator.get();
     const bool bfloat16_storage = config.activation_dtype == DType::BFloat16
                                   && implementation.option.use_bf16_storage;
-    if (config.use_attention_sink) {
+    if (has_flag(config.flags, NcnnAttentionSink)) {
         ncnn::Mat zero_key_value(
             static_cast<int>(config.head_dimension),
             1,
@@ -1208,7 +1726,8 @@ std::shared_ptr<NcnnVulkanAttentionOperator> NcnnVulkanAttentionOperator::create
             upload_option,
             false);
     }
-    if ((config.use_attention_sink && implementation.zero_key_value.empty())
+    if ((has_flag(config.flags, NcnnAttentionSink)
+         && implementation.zero_key_value.empty())
         || implementation.norm->upload_model(command, upload_option) != 0
         || command.submit_and_wait() != 0)
         return {};
@@ -1241,7 +1760,8 @@ bool NcnnVulkanAttentionOperator::forward(
     const bool bfloat16_storage = config.activation_dtype == DType::BFloat16
                                   && implementation.option.use_bf16_storage;
     const uint64_t actual_token_count = cache.token_count + input.rows();
-    const uint64_t sink_token_count = config.use_attention_sink ? 1 : 0;
+    const uint64_t sink_token_count
+        = has_flag(config.flags, NcnnAttentionSink) ? 1 : 0;
     const uint64_t destination_count = actual_token_count + sink_token_count;
 
     const NcnnLinearOperator::Implementation& fused = *implementation.fused_qkv->implementation_;
@@ -1270,7 +1790,6 @@ bool NcnnVulkanAttentionOperator::forward(
             cache,
             config,
             implementation.sinks,
-            config.use_attention_sink,
             bfloat16_storage,
             transfer_slot.staging_allocator)
         || !prepare_staging_batch(
@@ -1387,7 +1906,7 @@ bool NcnnVulkanAttentionOperator::forward(
 
     std::vector<ncnn::VkMat> key_with_sink_output = {key_rope_output[0]};
     std::vector<ncnn::VkMat> value_with_sink_output = {value_heads};
-    if (config.use_attention_sink) {
+    if (has_flag(config.flags, NcnnAttentionSink)) {
         std::vector<ncnn::VkMat> key_with_sink_input = {
             key_rope_output[0],
             implementation.zero_key_value,
@@ -1550,7 +2069,7 @@ bool NcnnVulkanAttentionOperator::forward(
                        retained_value_parts,
                        command,
                        implementation.option)
-                    != 0)
+                       != 0)
                 return false;
             next_cache->key = retained_key_parts[1];
             next_cache->value = retained_value_parts[1];

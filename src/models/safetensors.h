@@ -22,6 +22,11 @@ struct SafetensorInfo
     uint64_t byte_count = 0;
 };
 
+enum SafetensorLoadFlag : uint32_t
+{
+    SafetensorLoadDeferMxfp4Data = 1u << 0
+};
+
 class SafetensorsArchive
 {
 public:
@@ -38,7 +43,7 @@ public:
         uint32_t expert_id,
         uint32_t rows,
         uint32_t columns,
-        bool defer_data = false) const;
+        uint32_t flags = 0) const;
 
 private:
     std::unordered_map<std::string, SafetensorInfo> tensors_;

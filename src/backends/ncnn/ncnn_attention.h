@@ -1,7 +1,7 @@
 #ifndef NCNN_MOE_NCNN_ATTENTION_H
 #define NCNN_MOE_NCNN_ATTENTION_H
 
-#include "cpu_batch.h"
+#include "kernels/cpu_batch.h"
 
 #include "ncnn/moe/types.h"
 
@@ -13,6 +13,11 @@ namespace moe {
 
 struct CpuLayerCache;
 class NcnnLinearOperator;
+
+enum NcnnAttentionFlag : uint32_t
+{
+    NcnnAttentionSink = 1u << 0
+};
 
 struct NcnnVulkanAttentionConfig
 {
@@ -29,7 +34,7 @@ struct NcnnVulkanAttentionConfig
     float rope_ntk_beta = 32.0f;
     DType activation_dtype = DType::Float32;
     DType kv_cache_dtype = DType::Float32;
-    bool use_attention_sink = false;
+    uint32_t flags = 0;
 };
 
 class NcnnVulkanAttentionOperator

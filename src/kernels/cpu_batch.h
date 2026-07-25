@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace ncnn {
@@ -38,6 +39,11 @@ public:
     {
         assert(index < rows_);
         return data_.data() + index * columns_;
+    }
+
+    [[nodiscard]] std::span<const float> values() const noexcept
+    {
+        return data_;
     }
 
 private:

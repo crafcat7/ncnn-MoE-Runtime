@@ -1,6 +1,6 @@
 #include "ncnn/moe/scheduler.h"
 
-#include "cpu_topology.h"
+#include "engine/cpu_topology.h"
 
 #include <algorithm>
 #include <atomic>
@@ -32,7 +32,8 @@ class BatchScheduler::Implementation
 {
 public:
     explicit Implementation(const SchedulerOptions& options)
-        : pin_workers_(options.pin_workers || !options.worker_cpu_sets.empty()),
+        : pin_workers_(has_flag(options.flags, SchedulerOptionPinWorkers)
+                       || !options.worker_cpu_sets.empty()),
           worker_cpu_sets_(options.worker_cpu_sets)
     {
         const uint32_t hardware_threads = std::max(1u, std::thread::hardware_concurrency());
@@ -61,9 +62,9 @@ public:
 #endif
         worker_count_ = !worker_cpu_sets_.empty()
                             ? static_cast<uint32_t>(worker_cpu_sets_.size())
-                            : options.worker_count == 0
-                                  ? default_worker_count
-                                  : options.worker_count;
+                        : options.worker_count == 0
+                            ? default_worker_count
+                            : options.worker_count;
         worker_count_ = std::max(1u, worker_count_);
 #if defined(__linux__)
         if (pin_workers_ && worker_cpu_sets_.empty()) {

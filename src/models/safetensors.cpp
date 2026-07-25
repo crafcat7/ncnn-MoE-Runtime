@@ -1,4 +1,5 @@
 #include "safetensors.h"
+#include "storage/mapped_file.h"
 
 #include <algorithm>
 #include <cctype>
@@ -213,9 +214,6 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) cons
     const SafetensorInfo* info = find(name);
     if (!info)
         return Error{ErrorCode::InvalidModel, "missing safetensors tensor: " + name};
-    auto bytes = read_range(info->path, info->offset, info->byte_count);
-    if (!bytes)
-        return bytes.error();
 
     TensorData tensor;
     tensor.shape = info->shape;
@@ -223,6 +221,21 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) cons
         if (info->byte_count % sizeof(uint16_t) != 0)
             return Error{ErrorCode::InvalidModel, "invalid BF16 byte count: " + name};
         tensor.dtype = DType::BFloat16;
+        auto mapped = MappedFileRange::open(
+            info->path,
+            info->offset,
+            info->byte_count);
+        if (mapped
+            && reinterpret_cast<uintptr_t>(mapped.value()->data())
+                       % alignof(uint16_t)
+                   == 0) {
+            tensor.mapped_data = mapped.value()->share_data();
+            tensor.mapped_byte_count = info->byte_count;
+            return tensor;
+        }
+        auto bytes = read_range(info->path, info->offset, info->byte_count);
+        if (!bytes)
+            return bytes.error();
         tensor.bfloat16_data.resize(static_cast<size_t>(info->byte_count / sizeof(uint16_t)));
         std::memcpy(tensor.bfloat16_data.data(), bytes.value().data(), static_cast<size_t>(info->byte_count));
     }
@@ -230,6 +243,21 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) cons
         if (info->byte_count % sizeof(float) != 0)
             return Error{ErrorCode::InvalidModel, "invalid F32 byte count: " + name};
         tensor.dtype = DType::Float32;
+        auto mapped = MappedFileRange::open(
+            info->path,
+            info->offset,
+            info->byte_count);
+        if (mapped
+            && reinterpret_cast<uintptr_t>(mapped.value()->data())
+                       % alignof(float)
+                   == 0) {
+            tensor.mapped_data = mapped.value()->share_data();
+            tensor.mapped_byte_count = info->byte_count;
+            return tensor;
+        }
+        auto bytes = read_range(info->path, info->offset, info->byte_count);
+        if (!bytes)
+            return bytes.error();
         tensor.float32_data.resize(static_cast<size_t>(info->byte_count / sizeof(float)));
         std::memcpy(tensor.float32_data.data(), bytes.value().data(), static_cast<size_t>(info->byte_count));
     }
@@ -253,13 +281,28 @@ Result<TensorData> SafetensorsArchive::load_bfloat16_slice(
     const uint64_t byte_count = element_count * sizeof(uint16_t);
     if (byte_count * info->shape[0] != info->byte_count)
         return Error{ErrorCode::InvalidModel, "BF16 tensor slice shape mismatch: " + name};
-    auto bytes = read_range(info->path, info->offset + index * byte_count, byte_count);
-    if (!bytes)
-        return bytes.error();
 
     TensorData tensor;
     tensor.dtype = DType::BFloat16;
     tensor.shape = std::move(shape);
+    auto mapped = MappedFileRange::open(
+        info->path,
+        info->offset + index * byte_count,
+        byte_count);
+    if (mapped
+        && reinterpret_cast<uintptr_t>(mapped.value()->data())
+                   % alignof(uint16_t)
+               == 0) {
+        tensor.mapped_data = mapped.value()->share_data();
+        tensor.mapped_byte_count = byte_count;
+        return tensor;
+    }
+    auto bytes = read_range(
+        info->path,
+        info->offset + index * byte_count,
+        byte_count);
+    if (!bytes)
+        return bytes.error();
     tensor.bfloat16_data.resize(static_cast<size_t>(element_count));
     std::memcpy(tensor.bfloat16_data.data(), bytes.value().data(), static_cast<size_t>(byte_count));
     return tensor;
@@ -271,7 +314,7 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
     uint32_t expert_id,
     uint32_t rows,
     uint32_t columns,
-    bool defer_data) const
+    uint32_t flags) const
 {
     const SafetensorInfo* blocks = find(blocks_name);
     const SafetensorInfo* scales = find(scales_name);
@@ -289,7 +332,7 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
     TensorData tensor;
     tensor.dtype = DType::MxFp4;
     tensor.shape = {rows, columns};
-    if (defer_data) {
+    if (has_flag(flags, SafetensorLoadDeferMxfp4Data)) {
         auto storage = std::make_shared<MxFp4FileStorage>();
         storage->blocks_path = blocks->path.string();
         storage->blocks_offset = blocks->offset + expert_id * block_bytes;
@@ -301,15 +344,42 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
         return tensor;
     }
 
-    auto block_data = read_range(blocks->path, blocks->offset + expert_id * block_bytes, block_bytes);
+    auto block_mapping = MappedFileRange::open(
+        blocks->path,
+        blocks->offset + expert_id * block_bytes,
+        block_bytes);
+    auto scale_mapping = MappedFileRange::open(
+        scales->path,
+        scales->offset + expert_id * scale_bytes,
+        scale_bytes);
+    if (block_mapping && scale_mapping) {
+        block_mapping.value()->prefault();
+        scale_mapping.value()->prefault();
+        tensor.mxfp4_blocks
+            = block_mapping.value()->share_bytes();
+        tensor.mxfp4_scales
+            = scale_mapping.value()->share_bytes();
+        return tensor;
+    }
+
+    auto block_data = read_range(
+        blocks->path,
+        blocks->offset + expert_id * block_bytes,
+        block_bytes);
     if (!block_data)
         return block_data.error();
-    auto scale_data = read_range(scales->path, scales->offset + expert_id * scale_bytes, scale_bytes);
+    auto scale_data = read_range(
+        scales->path,
+        scales->offset + expert_id * scale_bytes,
+        scale_bytes);
     if (!scale_data)
         return scale_data.error();
-
-    tensor.mxfp4_blocks = std::move(block_data).value();
-    tensor.mxfp4_scales = std::move(scale_data).value();
+    tensor.mxfp4_blocks.assign(
+        block_data.value().data(),
+        block_data.value().size());
+    tensor.mxfp4_scales.assign(
+        scale_data.value().data(),
+        scale_data.value().size());
     return tensor;
 }
 

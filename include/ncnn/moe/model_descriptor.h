@@ -29,6 +29,12 @@ struct ModelNodeDescriptor
     ModelNodeType type = ModelNodeType::RmsNorm;
 };
 
+enum AttentionDescriptorFlag : uint32_t
+{
+    AttentionDescriptorBias = 1u << 0,
+    AttentionDescriptorSinks = 1u << 1
+};
+
 struct AttentionDescriptor
 {
     uint32_t head_count = 0;
@@ -42,9 +48,16 @@ struct AttentionDescriptor
     float rope_scaling_factor = 1.0f;
     float rope_ntk_alpha = 1.0f;
     float rope_ntk_beta = 32.0f;
+    uint32_t flags = 0;
+};
 
-    bool use_bias = false;
-    bool use_sinks = false;
+enum MoeDescriptorFlag : uint32_t
+{
+    MoeDescriptorNormalizeTopKWeights = 1u << 0,
+    MoeDescriptorSharedExpert = 1u << 1,
+    MoeDescriptorExpertBias = 1u << 2,
+    MoeDescriptorRouterBias = 1u << 3,
+    MoeDescriptorProjectionBias = 1u << 4
 };
 
 struct MoeDescriptor
@@ -59,17 +72,19 @@ struct MoeDescriptor
     ExpertLayout layout = ExpertLayout::GateUpDown;
     DType expert_weight_dtype = DType::Float32;
 
-    bool normalize_topk_weights = true;
-    bool use_shared_expert = false;
-    bool use_expert_bias = false;
-    bool use_router_bias = false;
-    bool use_projection_bias = false;
     float activation_limit = 0.0f;
+    uint32_t flags = MoeDescriptorNormalizeTopKWeights;
 };
 
 struct FfnDescriptor
 {
     MoeDescriptor moe;
+};
+
+enum LayerDescriptorFlag : uint32_t
+{
+    LayerDescriptorAttention = 1u << 0,
+    LayerDescriptorMoe = 1u << 1
 };
 
 struct LayerDescriptor
@@ -80,11 +95,7 @@ struct LayerDescriptor
 
     NormType pre_attention_norm = NormType::None;
     NormType pre_ffn_norm = NormType::RmsNorm;
-
-    // Adapter-side package hints used while constructing nodes and mapping
-    // weights. ModelCompiler derives execution structure from nodes.
-    bool use_attention = false;
-    bool use_moe = true;
+    uint32_t flags = LayerDescriptorMoe;
 };
 
 struct MoeModelDescriptor
