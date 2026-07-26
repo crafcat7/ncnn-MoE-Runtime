@@ -1,45 +1,199 @@
 # ncnn MoE Runtime
 
-A compact C++20 Mixture-of-Experts inference runtime built on
-[Tencent/ncnn](https://github.com/Tencent/ncnn). It loads official GPT-OSS
-Safetensors directly, keeps dense operators eligible for Vulkan, and executes
-routed MXFP4 Experts with optimized CPU kernels.
+>❗This software is in the early development stage
 
-The release path targets practical local inference for
-`openai/gpt-oss-20b` and `openai/gpt-oss-120b` without GGUF conversion or a
-private checkpoint format.
+ncnn MoE Runtime is a lightweight, high-performance C++20 inference engine for
+sparse Mixture-of-Experts models, built on
+[Tencent/ncnn](https://github.com/Tencent/ncnn). Model adapters lower external
+packages into a model-neutral `MoeIR`; the Runtime compiles that IR into an
+execution graph and schedules Dense Transformer work, routing, and sparse
+Experts across CPU, Vulkan, memory, and storage backends.
 
-## GPT-OSS-120B on 32 GB RAM + 16 GB VRAM
+The runtime targets local inference on Desktop and edge-class systems where the
+complete model may be larger than available RAM. The public API is independent
+of a model family, device vendor, and fixed cache size. The distributed release
+includes a validated GPT-OSS adapter for official Safetensors packages.
 
-The official 60.7678 GiB checkpoint is verified on a Ryzen 7 9800X3D,
-31.14 GiB RAM, and RTX 5070 Ti 16 GiB Windows host. Dense weights are
-memory-mapped, while routed Expert pairs enter a byte-bounded host cache from
-their original Safetensors shards.
+[Runtime capabilities](#runtime-capabilities) | [Architecture](#architecture) |
+[Unified performance](#unified-reference-performance) |
+[Quick start](#quick-start)
 
-| Metric | Result |
+## Unified reference performance
+
+GPT-OSS is the first built-in adapter and real-checkpoint validation target.
+The protocol below keeps workload, warm-up policy, and reporting fields
+identical across the Runtime's hybrid and storage paths. The adapter is
+model-specific; the scheduling, cache, graph, and backend interfaces remain
+model-neutral.
+
+All rows use a fixed 16-token prompt, greedy decoding, three fresh measured
+processes per case (and per cache size in the sweep), and generated-token
+parity validation. Short means 32 generated
+tokens and long means 256 generated tokens. Cold uses
+`warmup=0` and `cache-warmup-runs=0`. Warm uses one unreported
+`warmup=1` generation run plus one unreported
+`cache-warmup-runs=1` cache run before the three measured samples;
+it warms the actual execution path but does not promise that every routed
+Expert remains resident.
+
+The host is a Ryzen 7 9800X3D with 31.14 GiB RAM, an RTX 5070 Ti 16 GiB,
+AVX-512 MXFP4 Expert kernels, ncnn Vulkan Dense/Attention, and greedy
+decoding. Throughput is the median of the three measured samples. Two-session
+rows report aggregate token/s.
+
+![GPT-OSS unified performance matrix](assets/gpt-oss-performance.svg)
+
+The chart uses the same published matrix as the tables below: blue bars are
+cold runs, gray bars are warm runs, and the two read panels separate Runtime
+logical Expert traffic from sampled system physical traffic. The teal panel
+contains the named short-text reference points.
+Regenerate it after a new matrix with
+`python tools\generate_performance_chart.py --report <matrix.json> --output assets\gpt-oss-performance.svg`.
+
+### Short-text reference points
+
+These representative short-text measurements use their named workload
+settings and are retained alongside the unified matrix. They are not a
+replacement for the fixed 32/256-token cold/warm protocol above.
+
+| Scenario | Median throughput |
 | --- | ---: |
-| Decode throughput | **1.902 token/s** |
-| 32-token generation | **16.822 s** |
-| Expert-cache hit rate | 70.29% |
-| Peak process working set | 19,815 MiB |
-| Peak total NVIDIA memory | 12,029 MiB |
+| GPT-OSS-120B cold start, 1 × 32 | **3.294 token/s** |
+| GPT-OSS-120B warm cache, 1 × 32 | **11.045 token/s** |
+| GPT-OSS-120B concurrent, 2 × 16 | **20.510 aggregate token/s** |
+| GPT-OSS-120B long concurrent, 2 × 96 | **9.778 aggregate token/s** |
+| GPT-OSS-20B eager, 1 × 64 | **16.898 token/s** |
 
-Protocol: Windows Release build, Vulkan dense/Attention, CPU AVX-512 MXFP4
-Experts, 24 GiB host budget, 16 GiB Expert cache, four I/O workers, one warm-up,
-and the median of three measured runs with identical token output.
+### Hybrid Runtime
 
-## What works
+These rows use Vulkan Dense/Attention with CPU Experts, on-demand Expert
+residency, and the Runtime scheduler. The 20B path uses eager Expert
+residency; 120B rows use a bounded host ARC.
+
+| Workload | Window | Warm-up | Throughput | Peak RSS | ARC hit | Runtime reads |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| GPT-OSS-20B, one Session | Short | No | **14.103 token/s** | 17.18 GiB | n/a | n/a |
+| GPT-OSS-20B, one Session | Short | Yes | **14.855 token/s** | 17.18 GiB | n/a | n/a |
+| GPT-OSS-20B, one Session | Long | No | **17.069 token/s** | 17.18 GiB | n/a | n/a |
+| GPT-OSS-20B, one Session | Long | Yes | **16.597 token/s** | 17.19 GiB | n/a | n/a |
+| GPT-OSS-120B, one Session | Short | No | **2.885 token/s** | 23.26 GiB | 66.7% | 24.6 GB |
+| GPT-OSS-120B, one Session | Short | Yes | **4.718 token/s** | 23.32 GiB | 84.6% | 11.4 GB |
+| GPT-OSS-120B, one Session | Long | No | **4.971 token/s** | 23.29 GiB | 82.9% | 85.5 GB |
+| GPT-OSS-120B, one Session | Long | Yes | **5.171 token/s** | 23.35 GiB | 84.3% | 78.7 GB |
+| GPT-OSS-120B, two Sessions | Short | No | **5.284 aggregate token/s** | 25.24 GiB | 81.6% | 24.4 GB |
+| GPT-OSS-120B, two Sessions | Short | Yes | **10.916 aggregate token/s** | 25.34 GiB | 96.2% | 2.6 GB |
+| GPT-OSS-120B, two Sessions | Long | No | **9.870 aggregate token/s** | 25.34 GiB | 91.9% | 70.0 GB |
+| GPT-OSS-120B, two Sessions | Long | Yes | **10.295 aggregate token/s** | 25.31 GiB | 93.1% | 55.3 GB |
+
+### GPT-OSS-120B CPU Expert storage sweep
+
+This control path keeps Expert execution on the CPU and varies the bounded
+ARC cache. Each cache size has the same short/long and cold/warm protocol.
+Runtime reads are Expert-cache logical bytes.
+
+| Window | Warm-up | 1 GiB | 10 GiB | 16 GiB |
+| --- | --- | ---: | ---: | ---: |
+| Short | No | 1.042 token/s | 1.812 token/s | **2.119 token/s** |
+| Short | Yes | 1.050 token/s | 2.006 token/s | **2.444 token/s** |
+| Long | No | 1.143 token/s | 2.145 token/s | **2.637 token/s** |
+| Long | Yes | 1.133 token/s | 2.160 token/s | **2.636 token/s** |
+
+| Window | Warm-up | 1 GiB reads | 10 GiB reads | 16 GiB reads |
+| --- | --- | ---: | ---: | ---: |
+| Short | No | 73.9 GB | 34.7 GB | 26.6 GB |
+| Short | Yes | 73.8 GB | 29.5 GB | 20.8 GB |
+| Long | No | 500.0 GB | 183.7 GB | 115.0 GB |
+| Long | Yes | 500.0 GB | 182.1 GB | 115.4 GB |
+
+Sampled system physical reads for the same sweep were:
+
+| Window | Warm-up | 1 GiB | 10 GiB | 16 GiB |
+| --- | --- | ---: | ---: | ---: |
+| Short | No | 57.8 GB | 26.0 GB | 19.1 GB |
+| Short | Yes | 114.4 GB | 50.6 GB | 37.6 GB |
+| Long | No | 392.1 GB | 140.8 GB | 88.4 GB |
+| Long | Yes | 783.5 GB | 285.5 GB | 174.8 GB |
+
+Peak RSS for the 1/10/16 GiB rows is approximately 4.1/13.2/19.2 GiB.
+The JSON report also records ARC hit rate, process logical reads, and sampled
+system physical reads. System physical reads are a Windows CIM
+one-second total-disk estimate and include unrelated system traffic; they
+are not process-attributed SSD traffic.
+
+Run the complete matrix with:
+
+```powershell
+python tools\benchmark_performance_matrix.py `
+  --runner .\build-gptoss-vulkan-msvc\Release\ncnn_moe_gpt_oss.exe `
+  --model-20b .\models\gpt-oss\gpt-oss-20b `
+  --model-120b .\models\gpt-oss\gpt-oss-120b `
+  --output-dir .\build-gptoss-vulkan-msvc\performance-matrix-unified `
+  --repeats 3 --short-tokens 32 --long-tokens 256 `
+  --vulkan-device-index 0
+```
+
+The aggregate JSON is written to
+`build-gptoss-vulkan-msvc/performance-matrix-unified/performance-matrix.json`.
+These are GPT-OSS reference results on the stated Windows/x86 host, not a
+direct cross-hardware comparison with another MoE model.
+
+## Sparse models beyond resident memory
+
+Large MoE models contain many Expert weights while each token activates only a
+small routed subset. ncnn MoE Runtime treats Experts as schedulable,
+cacheable Runtime objects instead of requiring every Expert to remain resident.
+Dense tensors can stay memory-mapped, while active Expert pairs move through
+bounded host and device cache tiers backed by asynchronous range I/O.
+
+| Runtime concern | Mechanism |
+| --- | --- |
+| Model integration | `IMoeModelAdapter` lowers package metadata and weights into `MoeIR` |
+| Compilation | Validation, normalization, weight resolution, graph construction, and backend placement |
+| Dense Transformer | Portable CPU, ncnn CPU operators, or ncnn Vulkan |
+| Sparse Experts | Stable Top-K grouping, batched execution, and runtime-selected kernels |
+| Weight residency | Automatic eager or byte-bounded on-demand Expert storage |
+| Cache policy | Host ARC with independent optional Vulkan execution and victim tiers |
+| Scheduling | Dependency waves, backend events, and cross-Session micro-batching |
+
+The Runtime therefore scales with the active Expert working set rather than
+requiring a resident copy of every routed weight.
+
+## Runtime capabilities
 
 | Area | Release capability |
 | --- | --- |
-| Models | Official GPT-OSS-20B/120B Safetensors |
-| Graph | Model-neutral IR, validation, backend placement, and dependency scheduling |
-| Dense path | Portable CPU, optional ncnn CPU operators, and Vulkan mixed execution |
-| Attention | RMSNorm, GQA, learned sinks, full/sliding Attention, YaRN RoPE, BF16/FP32 KV cache |
-| Experts | Float32, INT8, and native MXFP4 with NEON, AVX2/FMA, AVX-512, and scalar kernels |
-| Storage | Automatic dense/eager mmap and bounded asynchronous Expert caching |
+| Runtime API | `Runtime`, immutable shared `Model`, per-request `Session`, and cross-Session `BatchScheduler` |
+| Model integration | Public `IMoeModelAdapter` contract and model-neutral `MoeIR`; built-in GPT-OSS reference adapter |
+| IR and compiler | Model-neutral `MoeIR` for Attention, Router, ExpertGroup, Combine, KV Cache, and quantization metadata; validation, normalization, weight resolution, and immutable compilation |
+| Execution graph | Tensor and node dependencies, backend candidates and placement, cross-backend events, and topological execution waves |
+| Dense path | Portable CPU, optional ncnn CPU operators, and mixed ncnn Vulkan Dense/Attention execution |
+| Attention | RMSNorm, GQA, full/sliding Attention, RoPE variants, persistent KV rings, fused QKV+RoPE, and adaptive online Decode SDPA |
+| Experts | Stable Top-K regrouping, per-Expert batching, float32/BF16/INT8 execution, and fused-decode MXFP4 kernels selected at runtime for scalar, NEON, SVE2, AVX2/FMA, or AVX-512 |
+| Memory and storage | Automatic eager/on-demand planning, per-Session Tensor residency accounting, Expert lifecycle/hotset statistics, byte-bounded host ARC, mmap or asynchronous direct/buffered reads, optional packed Expert storage, and optional Vulkan cache tiers |
+| Heterogeneous execution | CPU Experts by default, optional calibrated native Vulkan MXFP4 Experts, and capability-weighted multi-Vulkan layer placement |
+| Scheduling | Independent Session state, same-Expert coalescing, adaptive staged/independent execution, and bounded cross-call micro-batching |
 | Generation | Greedy, temperature, Top-K, Top-P, Min-P, stop tokens, and streaming |
-| Sessions | Independent KV state with bounded CPU/OpenMP decode concurrency |
+
+## Why it is fast
+
+- **Heterogeneous placement.** Dense projections and Attention run through
+  ncnn Vulkan while routing and sparse Expert work use the CPU; native Vulkan
+  Experts are admitted only when phase-level calibration measures a benefit.
+- **Fused MXFP4 compute.** Expert kernels decode MXFP4 blocks inside the
+  compute loop instead of materializing complete FP32 weights. Runtime dispatch
+  selects scalar, NEON, SVE2, AVX2/FMA, or AVX-512 implementations.
+- **Expert-oriented batching.** Stable Top-K regrouping turns routed tokens
+  into contiguous per-Expert batches and shares work across concurrent
+  Sessions.
+- **Adaptive weight residency.** A byte-aware ARC, asynchronous exact-range
+  reads, optional aligned direct I/O, and the packed Expert sidecar keep the
+  active route working set close to compute.
+- **Reusable execution state.** Persistent KV rings, reusable scratch buffers,
+  direct QKV-to-ring writes, command reuse, and online Decode SDPA reduce
+  per-token allocation and transfer overhead.
+- **Workload-aware scheduling.** Cross-Session collection, Expert coalescing,
+  and adaptive staged/independent execution improve service throughput without
+  fixing policy choices to one device.
 
 ## Quick start
 
@@ -65,39 +219,125 @@ The pinned ncnn submodule is built with the runtime. Restore it with
 `git submodule update --init --recursive` when necessary. A CPU-only build can
 be selected with `-DNCNN_MOE_USE_VULKAN=OFF`.
 
-## Runtime design
+## Runtime API
 
-The architecture follows four explicit responsibility boundaries:
+`Runtime` selects a registered adapter for the supplied model package, compiles
+its `MoeIR`, creates independent Session state, and exposes Prefill, Decode, or
+complete generation:
 
-| Boundary | Ownership |
-| --- | --- |
-| Runtime | Model lifetime, Sessions, generation, sampling, and scheduling |
-| Graph | Adapter IR, validation, memory planning, backend placement, and execution waves |
-| Backends | Portable CPU kernels and ncnn CPU/Vulkan operator blocks |
-| Model storage | Family adapters, Safetensors metadata, mmap, and Expert caches |
+```cpp
+#include "ncnn/moe/runtime.h"
 
-```text
-official model package
-        |
-        v
- model adapter --> MoeIR --> ModelCompiler --> CompiledModel
-                                                   |
-                                             Session state
-                                                   |
-                                      +------------+------------+
-                                      |                         |
-                                CPU execution              ncnn / Vulkan
-                           routing + MXFP4 Experts       dense + Attention
+ncnn::moe::Result<ncnn::moe::GenerationResult> run(
+    const std::filesystem::path& model_path,
+    std::span<const int32_t> input_ids)
+{
+    ncnn::moe::Runtime runtime;
+    ncnn::moe::RuntimeOptions runtime_options;
+    runtime_options.hybrid_mode = ncnn::moe::HybridMode::Auto;
+
+    auto model = runtime.load_model(model_path, runtime_options);
+    if (!model)
+        return model.error();
+
+    auto session = runtime.create_session(model.value());
+    if (!session)
+        return session.error();
+
+    ncnn::moe::GenerationOptions generation_options;
+    generation_options.max_new_tokens = 64;
+    return session.value()->generate(input_ids, generation_options);
+}
 ```
 
-Adapters translate model-family metadata and tensor names into `MoeIR`.
-`ModelCompiler` resolves weights, validates the graph, and creates an immutable
-compiled plan. `Session` owns mutable KV cache, sampling state, and statistics.
-Configuration switches use typed, domain-specific `uint32_t` flag groups.
+Applications add model families that map to the supported `MoeIR` node set
+through `IMoeModelAdapter::can_load`, `parse_model`, and `map_weights`;
+execution code consumes only the compiled model-neutral representation. The
+bundled GPT-OSS command-line runner and Harmony text wrapper are documented in the
+[GPT-OSS model guide](models/gpt-oss/README.md).
 
-## Models
+## Architecture
 
-Model execution guides live with their model-family definitions:
+`Runtime Core` is a responsibility layer rather than one monolithic class. The
+public API owns application-facing lifetime and request state; adapters and the
+compiler produce immutable model state; the execution and memory subsystems
+consume that state through explicit contracts.
+
+| Boundary | Responsibility |
+| --- | --- |
+| MoE Runtime API | Hardware capabilities, model loading, immutable `Model` lifetime, mutable `Session` state, generation, sampling, cache synchronization, and `BatchScheduler` creation |
+| Adapter and compiler | Model-package parsing through `IMoeModelAdapter`, model-neutral `MoeIR`, validation and normalization, weight resolution, memory planning, backend placement, and `CompiledModel` construction |
+| Execution | `ExecutionGraph` dependencies and Tensor locations, `RuntimeScheduler` backend lanes/events, `MoeScheduler` topological waves, routing, and Expert dispatch |
+| Memory | `ModelMemoryPlan`, per-Session `MemoryManager`, runtime `Expert`/`ExpertStore` state, host ARC residency, and optional Vulkan cache tiers |
+| Backends | Portable CPU kernels, ncnn CPU/Vulkan Dense and Attention blocks, CPU Expert execution, and the optional native Vulkan MXFP4 Expert backend |
+| Model storage | Package metadata and mappings, asynchronous range I/O, packed Expert storage, and cache lifetime ownership |
+
+```text
+Application
+    |
+MoE Runtime API
+Runtime / Model / Session / BatchScheduler
+    |
+Runtime Core
+    |
+Model Adapter -> MoeIR -> ModelCompiler -> CompiledModel
+                                                |
+                         +----------------------+----------------------+
+                         |                                             |
+             ExecutionGraph + RuntimeScheduler          Memory plan + MemoryManager
+                         |                               Expert + ExpertStore + ARC
+                         +----------------------+----------------------+
+                                                |
+                            +-------------------+-------------------+
+                            |                                       |
+                    ncnn CPU/Vulkan                        CPU Expert Backend
+                 Dense + Attention + KV              Router + Dispatch + MXFP4
+                            |                                       |
+                            +--- optional native Vulkan Experts ----+
+```
+
+Model adapters translate family-specific metadata and tensor names into
+`MoeIR`. `ModelCompiler` resolves weights, validates the graph, and creates an
+immutable compiled plan. `ExecutionGraph` records data dependencies, placement
+and event metadata; `RuntimeScheduler` turns it into CPU/Vulkan lanes and
+waves. `Session` owns mutable KV cache, sampling state, reusable execution
+scratch, Tensor-residency accounting, and statistics. `ExpertStore` exposes
+Expert lifecycle and hotset information, while the byte-bounded Expert cache
+implements ARC recent/frequent resident lists and ghost histories.
+
+Autoregressive dependencies are preserved within each Session. Independent
+Sessions can overlap through the batch scheduler. Expert cache admission and
+range I/O retain explicit asynchronous lifetimes, while Vulkan commands use
+the public upstream ncnn submission API.
+
+Kernel, scheduling, memory-management, and fallback behavior are provided by
+the Runtime API and its public model guides.
+
+## Supported scope
+
+| Capability | Public behavior |
+| --- | --- |
+| Adapter interface | Public `IMoeModelAdapter` to `MoeIR` lowering contract |
+| Built-in reference adapter | GPT-OSS-20B and GPT-OSS-120B Safetensors |
+| CPU execution | Complete portable path |
+| Heterogeneous execution | Vulkan Dense/Attention with CPU routing and Experts |
+| Native Vulkan Experts | Optional MXFP4 cache and execution with runtime calibration and CPU fallback |
+| Multiple Vulkan devices | Capability-weighted whole-layer placement |
+| Expert memory | Automatic eager or byte-bounded on-demand residency |
+| KV cache | CPU FP32/BF16 or mixed-backend FP32 ring |
+| Output | Full logits with native sampling and streaming |
+
+The distributed release includes one validated production adapter. Additional
+adapters use the same public IR and compiler boundary without adding
+model-family checks to Prefill, Decode, scheduling, or Expert execution.
+Multi-device placement is layer placement rather than Tensor Parallelism, and
+Vulkan-only execution is not a supported public mode.
+
+## Model adapters
+
+The Runtime core is model-neutral; production package support is supplied by
+registered adapters. Model execution guides live with their adapter
+definitions:
 
 - [Model catalog and capability matrix](models/README.md)
 - [GPT-OSS-20B/120B execution and performance](models/gpt-oss/README.md)
@@ -105,17 +345,20 @@ Model execution guides live with their model-family definitions:
 ## Project layout
 
 ```text
-include/ncnn/moe/  Installed API, IR, graph, plans, and model descriptors
-src/engine/        Runtime, Sessions, scheduling, and CPU execution lifecycle
-src/graph/         IR lowering, validation, memory planning, and execution graph
-src/models/        GPT-OSS adapter, Safetensors loading, and canonical tensor names
-src/storage/       mmap, system-memory discovery, and Expert cache residency
-src/kernels/       Portable CPU Attention, Linear, and MXFP4 kernels
-src/backends/ncnn/ ncnn CPU/Vulkan packaging and mixed Attention backend
+include/ncnn/moe/  Installed Runtime API, MoeIR, graph, plan, Expert, memory, and scheduler contracts
+src/compiler/      MoeIR validation, normalization, descriptor conversion, and graph construction
+src/graph/         Model compilation, execution-graph scheduling, Expert dispatch, and memory planning
+src/engine/        Runtime Core, Sessions, batch scheduling, MemoryManager, CPU execution, and Expert-backend coordination
+src/models/        Built-in model adapters, package loading, packed-sidecar selection, and canonical Tensor names
+src/storage/       Mapped files, range I/O, host ARC, Vulkan victim cache, system-memory discovery, and Expert lifecycle
+src/kernels/       Portable CPU Attention/Linear, BF16 helpers, and runtime-selected MXFP4 SIMD kernels
+src/backends/ncnn/ ncnn CPU/Vulkan operator packaging, mixed Attention, Vulkan contexts, and native MXFP4 Experts
 models/            Model catalog and model-family execution guides
-examples/          Model command-line runner
-tools/             Fixture, Harmony, and benchmark utilities
-tests/             Deterministic, parity, concurrency, and error-path tests
+assets/            Published benchmark visualizations used by this README
+memories/repo/     Maintainer build, architecture, and performance evidence
+examples/          Reference model runner and MXFP4 microbenchmark
+tools/             Fixture, Harmony, packed-Expert, and benchmark utilities
+tests/             Deterministic, parity, cache, scheduling, concurrency, and error-path tests
 third_party/ncnn/  Pinned ncnn source submodule
 ```
 

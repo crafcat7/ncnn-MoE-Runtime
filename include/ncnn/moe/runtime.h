@@ -17,9 +17,17 @@
 namespace ncnn {
 namespace moe {
 
+#define NCNN_MOE_RUNTIME_MMAP_EXPERT_BIT         0
+#define NCNN_MOE_RUNTIME_DIRECT_IO_BIT           1
+#define NCNN_MOE_RUNTIME_BUFFERED_IO_BIT         2
+#define NCNN_MOE_RUNTIME_DISABLE_VICTIM_EXEC_BIT 3
+
 enum RuntimeOptionFlag : uint32_t
 {
-    RuntimeOptionMemoryMapExperts = 1u << 0
+    RuntimeOptionMemoryMapExperts = UINT32_C(1) << NCNN_MOE_RUNTIME_MMAP_EXPERT_BIT,
+    RuntimeOptionDirectExpertIo = UINT32_C(1) << NCNN_MOE_RUNTIME_DIRECT_IO_BIT,
+    RuntimeOptionBufferedExpertIo = UINT32_C(1) << NCNN_MOE_RUNTIME_BUFFERED_IO_BIT,
+    RuntimeOptionDisableGpuVictimExecution = UINT32_C(1) << NCNN_MOE_RUNTIME_DISABLE_VICTIM_EXEC_BIT
 };
 
 struct RuntimeOptions
@@ -29,25 +37,81 @@ struct RuntimeOptions
     uint64_t host_memory_budget_bytes = 0;
     uint64_t expert_cache_bytes = 0;
     uint64_t expert_gpu_cache_bytes = 0;
+    uint64_t expert_gpu_victim_cache_bytes = 0;
+    uint32_t expert_gpu_victim_reuse_probe_interval = 1;
     uint32_t expert_io_workers = 0;
+    uint32_t vulkan_device_index = automatic_vulkan_device_index;
+    uint32_t expected_concurrency = 1;
+    std::vector<uint32_t> vulkan_device_indices;
     uint32_t flags = 0;
 };
 
+#define NCNN_MOE_RUNTIME_CAP_CPU_BIT              0
+#define NCNN_MOE_RUNTIME_CAP_NCNN_LINEAR_BIT      1
+#define NCNN_MOE_RUNTIME_CAP_VULKAN_BIT           2
+#define NCNN_MOE_RUNTIME_CAP_VULKAN_CPU_BIT       3
+#define NCNN_MOE_RUNTIME_CAP_VULKAN_PREFETCH_BIT  4
+#define NCNN_MOE_RUNTIME_CAP_VULKAN_ATTENTION_BIT 5
+#define NCNN_MOE_RUNTIME_CAP_VULKAN_VICTIM_BIT    6
+#define NCNN_MOE_RUNTIME_CAP_MXFP4_CPU_BIT        7
+#define NCNN_MOE_RUNTIME_CAP_NEON_BIT             8
+#define NCNN_MOE_RUNTIME_CAP_AVX2_BIT             9
+#define NCNN_MOE_RUNTIME_CAP_AVX512_BIT           10
+#define NCNN_MOE_RUNTIME_CAP_OPENMP_BIT           11
+#define NCNN_MOE_RUNTIME_CAP_CROSS_SESSION_BIT    12
+#define NCNN_MOE_RUNTIME_CAP_ASYNC_VULKAN_BIT     13
+#define NCNN_MOE_RUNTIME_CAP_DOUBLE_BUFFER_BIT    14
+#define NCNN_MOE_RUNTIME_CAP_MXFP4_VULKAN_BIT     15
+#define NCNN_MOE_RUNTIME_CAP_SVE2_BIT             16
+#define NCNN_MOE_RUNTIME_CAP_MULTI_VULKAN_BIT     17
+
 enum RuntimeCapabilityFlag : uint32_t
 {
-    RuntimeCapabilityCpuExecution = 1u << 0,
-    RuntimeCapabilityNcnnCpuLinear = 1u << 1,
-    RuntimeCapabilityVulkanExecution = 1u << 2,
-    RuntimeCapabilityVulkanCpuMix = 1u << 3,
-    RuntimeCapabilityVulkanCpuPrefetch = 1u << 4,
-    RuntimeCapabilityVulkanAttention = 1u << 5,
-    RuntimeCapabilityVulkanExpertVictimCache = 1u << 6,
-    RuntimeCapabilityMxfp4CpuKernel = 1u << 7,
-    RuntimeCapabilityMxfp4ArmNeon = 1u << 8,
-    RuntimeCapabilityMxfp4X86Avx2 = 1u << 9,
-    RuntimeCapabilityMxfp4X86Avx512 = 1u << 10,
-    RuntimeCapabilityOpenmpExpertParallelism = 1u << 11,
-    RuntimeCapabilityCrossSessionScheduling = 1u << 12
+    RuntimeCapabilityCpuExecution = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_CPU_BIT,
+    RuntimeCapabilityNcnnCpuLinear = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_NCNN_LINEAR_BIT,
+    RuntimeCapabilityVulkanExecution = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_VULKAN_BIT,
+    RuntimeCapabilityVulkanCpuMix = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_VULKAN_CPU_BIT,
+    RuntimeCapabilityVulkanCpuPrefetch = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_VULKAN_PREFETCH_BIT,
+    RuntimeCapabilityVulkanAttention = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_VULKAN_ATTENTION_BIT,
+    RuntimeCapabilityVulkanVictimCache = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_VULKAN_VICTIM_BIT,
+    RuntimeCapabilityMxfp4CpuKernel = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_MXFP4_CPU_BIT,
+    RuntimeCapabilityMxfp4ArmNeon = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_NEON_BIT,
+    RuntimeCapabilityMxfp4X86Avx2 = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_AVX2_BIT,
+    RuntimeCapabilityMxfp4X86Avx512 = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_AVX512_BIT,
+    RuntimeCapabilityOpenmpExperts = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_OPENMP_BIT,
+    RuntimeCapabilityCrossSessionScheduling = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_CROSS_SESSION_BIT,
+    RuntimeCapabilityVulkanAsyncExecution = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_ASYNC_VULKAN_BIT,
+    RuntimeCapabilityVulkanDoubleBuffering = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_DOUBLE_BUFFER_BIT,
+    RuntimeCapabilityMxfp4VulkanProjection = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_MXFP4_VULKAN_BIT,
+    RuntimeCapabilityMxfp4ArmSve2 = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_SVE2_BIT,
+    RuntimeCapabilityMultiVulkanPlacement = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_MULTI_VULKAN_BIT
+};
+
+#define NCNN_MOE_ISA_ARM_NEON_BIT        0
+#define NCNN_MOE_ISA_ARM_SVE_BIT         1
+#define NCNN_MOE_ISA_ARM_SVE2_BIT        2
+#define NCNN_MOE_ISA_X86_AVX2_FMA_BIT    3
+#define NCNN_MOE_ISA_X86_AVX512_BIT      4
+#define NCNN_MOE_ISA_X86_AVX_VNNI_BIT    5
+#define NCNN_MOE_ISA_X86_AVX512_VNNI_BIT 6
+#define NCNN_MOE_ISA_X86_AVX512_BF16_BIT 7
+#define NCNN_MOE_ISA_X86_AMX_TILE_BIT    8
+#define NCNN_MOE_ISA_X86_AMX_INT8_BIT    9
+#define NCNN_MOE_ISA_X86_AMX_BF16_BIT    10
+
+enum CpuIsaCapabilityFlag : uint64_t
+{
+    CpuIsaArmNeon = UINT64_C(1) << NCNN_MOE_ISA_ARM_NEON_BIT,
+    CpuIsaArmSve = UINT64_C(1) << NCNN_MOE_ISA_ARM_SVE_BIT,
+    CpuIsaArmSve2 = UINT64_C(1) << NCNN_MOE_ISA_ARM_SVE2_BIT,
+    CpuIsaX86Avx2Fma = UINT64_C(1) << NCNN_MOE_ISA_X86_AVX2_FMA_BIT,
+    CpuIsaX86Avx512 = UINT64_C(1) << NCNN_MOE_ISA_X86_AVX512_BIT,
+    CpuIsaX86AvxVnni = UINT64_C(1) << NCNN_MOE_ISA_X86_AVX_VNNI_BIT,
+    CpuIsaX86Avx512Vnni = UINT64_C(1) << NCNN_MOE_ISA_X86_AVX512_VNNI_BIT,
+    CpuIsaX86Avx512Bf16 = UINT64_C(1) << NCNN_MOE_ISA_X86_AVX512_BF16_BIT,
+    CpuIsaX86AmxTile = UINT64_C(1) << NCNN_MOE_ISA_X86_AMX_TILE_BIT,
+    CpuIsaX86AmxInt8 = UINT64_C(1) << NCNN_MOE_ISA_X86_AMX_INT8_BIT,
+    CpuIsaX86AmxBf16 = UINT64_C(1) << NCNN_MOE_ISA_X86_AMX_BF16_BIT
 };
 
 struct RuntimeCapabilities
@@ -55,14 +119,25 @@ struct RuntimeCapabilities
     uint64_t physical_memory_bytes = 0;
     uint64_t vulkan_heap_budget_bytes = 0;
     uint32_t vulkan_device_count = 0;
-    uint32_t flags = RuntimeCapabilityCpuExecution
-                     | RuntimeCapabilityMxfp4CpuKernel
-                     | RuntimeCapabilityCrossSessionScheduling;
+    uint32_t selected_vulkan_device_index = 0;
+    uint32_t logical_cpu_count = 1;
+    uint32_t physical_cpu_core_count = 1;
+    uint32_t openmp_thread_count = 1;
+    uint32_t mxfp4_decode_row_pair_group_size = 1;
+    uint64_t cpu_isa_flags = 0;
+    uint32_t flags = RuntimeCapabilityCpuExecution | RuntimeCapabilityMxfp4CpuKernel | RuntimeCapabilityCrossSessionScheduling;
     std::string mxfp4_kernel;
+    std::string cpu_isa;
+    std::string activation_kernel;
+    std::vector<VulkanDeviceCapabilities> vulkan_devices;
 };
 
 class Runtime
 {
+private:
+    std::vector<std::shared_ptr<IMoeModelAdapter>> adapters_;
+    RuntimeCapabilities capabilities_;
+
 public:
     Runtime();
 
@@ -73,20 +148,14 @@ public:
 
     void register_adapter(std::shared_ptr<IMoeModelAdapter> adapter);
 
-    [[nodiscard]] Result<ModelPtr> load_model(
-        const std::filesystem::path& model_path,
-        const RuntimeOptions& options = {});
+    [[nodiscard]] Result<ModelPtr> load_model(const std::filesystem::path& model_path, const RuntimeOptions& options = {});
 
-    [[nodiscard]] Result<SessionPtr> create_session(
-        const ModelPtr& model,
-        const SessionOptions& options = {});
+    // Synchronization point for warm-up and traffic transitions.
+    [[nodiscard]] Result<void> synchronize_model_caches(const ModelPtr& model);
 
-    [[nodiscard]] Result<BatchSchedulerPtr> create_scheduler(
-        const SchedulerOptions& options = {});
+    [[nodiscard]] Result<SessionPtr> create_session(const ModelPtr& model, const SessionOptions& options = {});
 
-private:
-    std::vector<std::shared_ptr<IMoeModelAdapter> > adapters_;
-    RuntimeCapabilities capabilities_;
+    [[nodiscard]] Result<BatchSchedulerPtr> create_scheduler(const SchedulerOptions& options = {});
 };
 
 } // namespace moe

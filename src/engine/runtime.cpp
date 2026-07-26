@@ -1,18 +1,33 @@
 #include "ncnn/moe/runtime.h"
 
 #include "ncnn/moe/execution_plan.h"
+#include "cpu_features.h"
+#include "cpu_topology.h"
+#include "expert_backend.h"
+#include "compiler/moe_ir.hpp"
 #include "models/builtin_model_adapter.h"
 #include "kernels/cpu_mxfp4.h"
+#include "kernels/cpu_ops.h"
 #include "storage/expert_cache.h"
 #include "storage/expert_victim_cache.h"
 #include "graph/memory_planner.h"
 #include "backends/ncnn/ncnn_linear.h"
 #include "storage/system_memory.h"
 
+#include <algorithm>
 #include <fstream>
+#include <limits>
+#include <numeric>
 #include <regex>
+#include <set>
 #include <sstream>
+#include <string_view>
+#include <thread>
 #include <utility>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 namespace ncnn {
 namespace moe {
@@ -39,34 +54,94 @@ static Result<std::string> required_json_string(const std::string& json, const s
     return match[1].str();
 }
 
+static Result<std::vector<uint64_t>> distribute_gpu_capacity(uint64_t total_capacity, uint64_t expert_pair_bytes, const std::vector<uint32_t>& device_indices, const std::vector<VulkanDeviceCapabilities>& devices,
+                                                             std::string_view cache_name)
+{
+    std::vector<uint64_t> capacities(device_indices.size(), 0);
+    if (total_capacity == 0)
+        return capacities;
+    if (device_indices.empty())
+    {
+        return Error{ErrorCode::InvalidArgument, std::string(cache_name) + " requires at least one active Vulkan device"};
+    }
+    if (expert_pair_bytes == 0 || device_indices.size() > total_capacity / expert_pair_bytes)
+    {
+        return Error{ErrorCode::InvalidArgument, std::string(cache_name) + " cannot hold one Expert pair per active Vulkan device"};
+    }
+
+    uint64_t total_score = 0;
+    for (uint32_t device_index : device_indices)
+    {
+        const uint64_t score = std::max(1u, devices[device_index].rough_score);
+        if (total_score > std::numeric_limits<uint64_t>::max() - score)
+            return Error{ErrorCode::InvalidArgument, "Vulkan device score sum overflows"};
+        total_score += score;
+    }
+
+    const uint64_t minimum_capacity = expert_pair_bytes * device_indices.size();
+    const uint64_t distributable_capacity = total_capacity - minimum_capacity;
+    uint64_t assigned_extra_capacity = 0;
+    for (size_t index = 0; index < device_indices.size(); ++index)
+    {
+        const uint64_t score = std::max(1u, devices[device_indices[index]].rough_score);
+        const uint64_t extra_capacity = index + 1 == device_indices.size()
+                                            ? distributable_capacity - assigned_extra_capacity
+                                            : distributable_capacity / total_score * score + distributable_capacity % total_score * score / total_score;
+        capacities[index] = expert_pair_bytes + extra_capacity;
+        assigned_extra_capacity += extra_capacity;
+    }
+    return capacities;
+}
+
 Runtime::Runtime()
 {
     capabilities_.physical_memory_bytes = physical_memory_bytes();
+    capabilities_.logical_cpu_count = std::max(1u, std::thread::hardware_concurrency());
+    const CpuTopology cpu_topology = discover_cpu_topology();
+    capabilities_.physical_cpu_core_count = cpu_topology.physical_core_count == 0 ? capabilities_.logical_cpu_count : cpu_topology.physical_core_count;
+    const CpuIsaCapabilities cpu_isa = detect_cpu_isa_capabilities();
+    capabilities_.cpu_isa_flags = cpu_isa.flags;
+    capabilities_.cpu_isa = cpu_isa.names;
     capabilities_.mxfp4_kernel = mxfp4_kernel_name();
+    capabilities_.mxfp4_decode_row_pair_group_size = mxfp4_decode_row_pair_group_size();
+    capabilities_.activation_kernel = scaled_silu_kernel_name();
     const MxFp4KernelKind kernel = mxfp4_kernel_kind();
     if (kernel == MxFp4KernelKind::ArmNeon)
         capabilities_.flags |= RuntimeCapabilityMxfp4ArmNeon;
+    else if (kernel == MxFp4KernelKind::ArmSve2)
+        capabilities_.flags |= RuntimeCapabilityMxfp4ArmSve2;
     if (kernel == MxFp4KernelKind::X86Avx2)
         capabilities_.flags |= RuntimeCapabilityMxfp4X86Avx2;
     if (kernel == MxFp4KernelKind::X86Avx512)
         capabilities_.flags |= RuntimeCapabilityMxfp4X86Avx512;
 #if defined(_OPENMP)
-    capabilities_.flags |= RuntimeCapabilityOpenmpExpertParallelism;
+    capabilities_.flags |= RuntimeCapabilityOpenmpExperts;
+    capabilities_.openmp_thread_count = static_cast<uint32_t>(std::max(1, omp_get_max_threads()));
 #endif
 #if defined(NCNN_MOE_USE_NCNN) && NCNN_MOE_USE_NCNN
     capabilities_.flags |= RuntimeCapabilityNcnnCpuLinear;
 #endif
 #if defined(NCNN_MOE_WITH_VULKAN) && NCNN_MOE_WITH_VULKAN
     capabilities_.vulkan_device_count = NcnnLinearOperator::vulkan_device_count();
-    if (capabilities_.vulkan_device_count > 0) {
-        capabilities_.flags |= RuntimeCapabilityVulkanExecution
-                               | RuntimeCapabilityVulkanCpuMix
-                               | RuntimeCapabilityVulkanCpuPrefetch
-                               | RuntimeCapabilityVulkanAttention
-                               | RuntimeCapabilityVulkanExpertVictimCache;
+    if (capabilities_.vulkan_device_count > 0)
+    {
+        capabilities_.flags |= RuntimeCapabilityVulkanExecution | RuntimeCapabilityVulkanCpuMix | RuntimeCapabilityVulkanCpuPrefetch | RuntimeCapabilityVulkanAttention | RuntimeCapabilityVulkanVictimCache
+                               | RuntimeCapabilityVulkanAsyncExecution | RuntimeCapabilityVulkanDoubleBuffering | RuntimeCapabilityMxfp4VulkanProjection;
     }
-    capabilities_.vulkan_heap_budget_bytes
-        = NcnnLinearOperator::vulkan_heap_budget_bytes();
+    capabilities_.vulkan_heap_budget_bytes = NcnnLinearOperator::vulkan_heap_budget_bytes();
+    capabilities_.vulkan_devices = NcnnLinearOperator::vulkan_device_capabilities();
+    if (capabilities_.vulkan_devices.size() > 1)
+    {
+        capabilities_.flags |= RuntimeCapabilityMultiVulkanPlacement;
+    }
+    for (const VulkanDeviceCapabilities& device : capabilities_.vulkan_devices)
+    {
+        if (has_flag(device.flags, VulkanDeviceSelected))
+        {
+            capabilities_.selected_vulkan_device_index = device.index;
+            break;
+        }
+    }
 #endif
     register_adapter(std::make_shared<BuiltinModelAdapter>());
 }
@@ -77,30 +152,90 @@ void Runtime::register_adapter(std::shared_ptr<IMoeModelAdapter> adapter)
         adapters_.push_back(std::move(adapter));
 }
 
-Result<ModelPtr> Runtime::load_model(
-    const std::filesystem::path& model_path,
-    const RuntimeOptions& options)
+Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, const RuntimeOptions& options)
 {
+    if (has_flag(options.flags, RuntimeOptionMemoryMapExperts)
+        && (has_flag(options.flags, RuntimeOptionDirectExpertIo)
+            || has_flag(options.flags, RuntimeOptionBufferedExpertIo)))
+    {
+        return Error{ErrorCode::InvalidArgument, "memory-mapped and explicit Expert I/O modes are mutually exclusive"};
+    }
+    if (has_flag(options.flags, RuntimeOptionDirectExpertIo) && has_flag(options.flags, RuntimeOptionBufferedExpertIo))
+    {
+        return Error{ErrorCode::InvalidArgument, "direct and buffered Expert I/O are mutually exclusive"};
+    }
+    if (options.expert_gpu_victim_reuse_probe_interval == 0 || options.expert_gpu_victim_reuse_probe_interval > 1024)
+    {
+        return Error{ErrorCode::InvalidArgument, "Expert GPU victim reuse-probe interval must be between 1 and 1024"};
+    }
+    if (options.expected_concurrency == 0 || options.expected_concurrency > 1024)
+    {
+        return Error{ErrorCode::InvalidArgument, "expected_concurrency must be between 1 and 1024"};
+    }
     HybridMode resolved_mode = options.hybrid_mode;
     if (resolved_mode == HybridMode::Auto)
-        resolved_mode = has_flag(
-                            capabilities_.flags,
-                            RuntimeCapabilityVulkanCpuMix)
-                            ? HybridMode::HybridExperts
-                            : HybridMode::CpuOnly;
+        resolved_mode = has_flag(capabilities_.flags, RuntimeCapabilityVulkanCpuMix) ? HybridMode::HybridExperts : HybridMode::CpuOnly;
     if (resolved_mode == HybridMode::VulkanOnly)
         return Error{ErrorCode::UnsupportedModel, "Vulkan-only execution is not implemented; use HybridExperts"};
-    if (resolved_mode == HybridMode::HybridExperts
-        && !has_flag(
-            capabilities_.flags,
-            RuntimeCapabilityVulkanCpuMix)) {
+    if (resolved_mode == HybridMode::HybridExperts && !has_flag(capabilities_.flags, RuntimeCapabilityVulkanCpuMix))
+    {
         return Error{ErrorCode::UnsupportedModel, "HybridExperts requires a Vulkan device and Vulkan-enabled ncnn"};
     }
-    if (resolved_mode == HybridMode::VulkanWithCpuPrefetch
-        && !has_flag(
-            capabilities_.flags,
-            RuntimeCapabilityVulkanCpuPrefetch)) {
+    if (resolved_mode == HybridMode::VulkanWithCpuPrefetch && !has_flag(capabilities_.flags, RuntimeCapabilityVulkanCpuPrefetch))
+    {
         return Error{ErrorCode::UnsupportedModel, "VulkanWithCpuPrefetch requires a Vulkan device and Vulkan-enabled ncnn"};
+    }
+    std::vector<uint32_t> selected_vulkan_device_indices;
+    if (!options.vulkan_device_indices.empty())
+    {
+        if (options.vulkan_device_index != automatic_vulkan_device_index && options.vulkan_device_index != options.vulkan_device_indices.front())
+        {
+            return Error{ErrorCode::InvalidArgument, "vulkan_device_index must match the first explicit Vulkan device"};
+        }
+        selected_vulkan_device_indices = options.vulkan_device_indices;
+    }
+    else
+    {
+        if (options.vulkan_device_index != automatic_vulkan_device_index)
+        {
+            selected_vulkan_device_indices.push_back(options.vulkan_device_index);
+        }
+        else if (!capabilities_.vulkan_devices.empty())
+        {
+            selected_vulkan_device_indices.push_back(capabilities_.selected_vulkan_device_index);
+        }
+    }
+    std::set<uint32_t> unique_device_indices;
+    for (uint32_t device_index : selected_vulkan_device_indices)
+    {
+        if (device_index >= capabilities_.vulkan_devices.size())
+        {
+            return Error{ErrorCode::InvalidArgument, "a Vulkan device index is out of range"};
+        }
+        if (!unique_device_indices.insert(device_index).second)
+        {
+            return Error{ErrorCode::InvalidArgument, "Vulkan device indices must be unique"};
+        }
+    }
+    const uint32_t selected_vulkan_device_index = selected_vulkan_device_indices.empty()
+                                                      ? automatic_vulkan_device_index
+                                                      : selected_vulkan_device_indices.front();
+    const VulkanDeviceCapabilities* selected_vulkan_device = selected_vulkan_device_index < capabilities_.vulkan_devices.size()
+                                                                 ? &capabilities_.vulkan_devices[selected_vulkan_device_index]
+                                                                 : nullptr;
+    if (options.hybrid_mode == HybridMode::Auto && (!selected_vulkan_device || selected_vulkan_device->type == VulkanDeviceType::Cpu))
+    {
+        resolved_mode = HybridMode::CpuOnly;
+    }
+    if (resolved_mode != HybridMode::CpuOnly)
+    {
+        for (uint32_t device_index : selected_vulkan_device_indices)
+        {
+            if (capabilities_.vulkan_devices[device_index].type == VulkanDeviceType::Cpu)
+            {
+                return Error{ErrorCode::UnsupportedModel, "Vulkan CPU devices cannot participate in heterogeneous placement"};
+            }
+        }
     }
 
     std::filesystem::path root = model_path;
@@ -108,7 +243,8 @@ Result<ModelPtr> Runtime::load_model(
     std::error_code filesystem_error;
     if (std::filesystem::is_directory(model_path, filesystem_error))
         manifest_path = model_path / "config.json";
-    else {
+    else
+    {
         manifest_path = model_path;
         root = model_path.parent_path();
     }
@@ -121,14 +257,13 @@ Result<ModelPtr> Runtime::load_model(
     if (!model_type)
         return model_type.error();
 
-    ModelPackage package{
-        root,
-        ModelManifest{std::move(model_type).value(), std::move(manifest_text).value()},
-        0};
+    ModelPackage package{root, ModelManifest{std::move(model_type).value(), std::move(manifest_text).value()}, 0};
 
     const IMoeModelAdapter* selected_adapter = nullptr;
-    for (const auto& adapter : adapters_) {
-        if (adapter->can_load(package.manifest)) {
+    for (const auto& adapter : adapters_)
+    {
+        if (adapter->can_load(package.manifest))
+        {
             selected_adapter = adapter.get();
             break;
         }
@@ -139,49 +274,37 @@ Result<ModelPtr> Runtime::load_model(
     auto parsed_ir = selected_adapter->parse_model(package);
     if (!parsed_ir)
         return parsed_ir.error();
+    auto normalized_ir = normalize_moe_ir(parsed_ir.value());
+    if (!normalized_ir)
+        return normalized_ir.error();
 
-    auto memory_plan = plan_model_memory(
-        parsed_ir.value(),
-        options,
-        capabilities_.physical_memory_bytes);
+    auto memory_plan = plan_model_memory(parsed_ir.value(), options, capabilities_.physical_memory_bytes);
     if (!memory_plan)
         return memory_plan.error();
     ModelMemoryPlan plan = std::move(memory_plan).value();
-    const bool file_backed_experts
-        = has_flag(plan.flags, ModelMemoryFileBackedExperts);
+    const bool file_backed_experts = has_flag(plan.flags, ModelMemoryFileBackedExperts);
     if (file_backed_experts)
         package.flags |= ModelPackageDeferMxfp4Experts;
 
-    const bool use_vulkan_dense = resolved_mode == HybridMode::HybridExperts
-                                  || resolved_mode == HybridMode::VulkanWithCpuPrefetch;
-    if (options.expert_gpu_cache_bytes != 0) {
-        if (!file_backed_experts) {
-            return Error{
-                ErrorCode::InvalidArgument,
-                "the Expert GPU cache requires on-demand Expert memory"};
+    const bool use_vulkan_dense = resolved_mode == HybridMode::HybridExperts || resolved_mode == HybridMode::VulkanWithCpuPrefetch;
+    if (options.expert_gpu_cache_bytes > std::numeric_limits<uint64_t>::max() - options.expert_gpu_victim_cache_bytes)
+    {
+        return Error{ErrorCode::InvalidArgument, "the combined Expert GPU cache capacity overflows"};
+    }
+    const uint64_t requested_expert_gpu_bytes = options.expert_gpu_cache_bytes + options.expert_gpu_victim_cache_bytes;
+    if (requested_expert_gpu_bytes != 0)
+    {
+        if (!file_backed_experts)
+        {
+            return Error{ErrorCode::InvalidArgument, "the Expert GPU cache requires on-demand Expert memory"};
         }
-        if (!use_vulkan_dense
-            || !has_flag(
-                capabilities_.flags,
-                RuntimeCapabilityVulkanExpertVictimCache)) {
-            return Error{
-                ErrorCode::UnsupportedModel,
-                "the Expert GPU cache requires Vulkan mixed execution"};
+        if (!use_vulkan_dense || !has_flag(capabilities_.flags, RuntimeCapabilityVulkanVictimCache))
+        {
+            return Error{ErrorCode::UnsupportedModel, "the Expert GPU cache requires Vulkan mixed execution"};
         }
-        if (options.expert_gpu_cache_bytes
-            < plan.expert_pair_bytes) {
-            return Error{
-                ErrorCode::InvalidArgument,
-                "the Expert GPU cache cannot hold one Expert pair"};
-        }
-        const uint64_t maximum_safe_capacity
-            = capabilities_.vulkan_heap_budget_bytes / 4;
-        if (maximum_safe_capacity == 0
-            || options.expert_gpu_cache_bytes
-                   > maximum_safe_capacity) {
-            return Error{
-                ErrorCode::InvalidArgument,
-                "the Expert GPU cache exceeds one quarter of the Vulkan heap budget"};
+        if (requested_expert_gpu_bytes < plan.expert_pair_bytes)
+        {
+            return Error{ErrorCode::InvalidArgument, "the Expert GPU cache cannot hold one Expert pair"};
         }
     }
 
@@ -192,57 +315,173 @@ Result<ModelPtr> Runtime::load_model(
     ModelCompiler compiler;
     ModelCompiler::BackendCapabilities compiler_capabilities;
     compiler_capabilities.flags = 0;
+    compiler_capabilities.cpu_parallelism = capabilities_.openmp_thread_count;
+    compiler_capabilities.vulkan_device_index = selected_vulkan_device_index;
+    compiler_capabilities.expected_concurrency = options.expected_concurrency;
+    compiler_capabilities.vulkan_device_indices = selected_vulkan_device_indices;
+    compiler_capabilities.vulkan_device_scores.reserve(selected_vulkan_device_indices.size());
+    for (uint32_t device_index : selected_vulkan_device_indices)
+    {
+        compiler_capabilities.vulkan_device_scores.push_back(std::max(1u, capabilities_.vulkan_devices[device_index].rough_score));
+    }
+    if (selected_vulkan_device)
+    {
+        compiler_capabilities.vulkan_queue_count = selected_vulkan_device->compute_queue_count;
+    }
     if (has_flag(capabilities_.flags, RuntimeCapabilityCpuExecution))
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityCpuExecution;
-    if (use_vulkan_dense
-        && has_flag(capabilities_.flags, RuntimeCapabilityVulkanExecution)) {
+    if (use_vulkan_dense && has_flag(capabilities_.flags, RuntimeCapabilityVulkanExecution))
+    {
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityVulkanDense;
     }
-    if (use_vulkan_dense
-        && has_flag(capabilities_.flags, RuntimeCapabilityVulkanAttention)) {
+    if (use_vulkan_dense && has_flag(capabilities_.flags, RuntimeCapabilityVulkanAttention))
+    {
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityVulkanAttention;
     }
     if (has_flag(capabilities_.flags, RuntimeCapabilityMxfp4CpuKernel))
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityMxfp4CpuKernel;
     if (!file_backed_experts)
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityRetainCpuDenseCopies;
-    auto compiled = compiler.compile(
-        std::move(parsed_ir).value(),
-        std::move(weights).value(),
-        resolved_mode,
-        compiler_capabilities);
+    auto compiled = compiler.compile(std::move(parsed_ir).value(), std::move(weights).value(), resolved_mode, compiler_capabilities);
     if (!compiled)
         return compiled.error();
     CompiledModel compiled_model = std::move(compiled).value();
     compiled_model.memory_plan = plan;
-    if (file_backed_experts) {
-        std::shared_ptr<IExpertVictimCache> victim_cache;
+    if (file_backed_experts)
+    {
+        uint32_t expert_io_workers = options.expert_io_workers;
+        if (expert_io_workers == 0)
+        {
+            uint32_t maximum_active_experts = 1;
+            for (const CompiledLayerPlan& layer : compiled_model.layers)
+            {
+                maximum_active_experts = std::max(maximum_active_experts, layer.moe.top_k);
+            }
+            const uint32_t exact_and_speculative_budget = maximum_active_experts > std::numeric_limits<uint32_t>::max() / 2
+                                                              ? std::numeric_limits<uint32_t>::max()
+                                                              : maximum_active_experts * 2;
+            const uint32_t io_core_budget = std::max(1u, capabilities_.physical_cpu_core_count);
+            expert_io_workers = std::min(exact_and_speculative_budget, io_core_budget);
+        }
         uint32_t expert_cache_flags = 0;
-        if (has_flag(
-                options.flags,
-                RuntimeOptionMemoryMapExperts)) {
+        if (has_flag(options.flags, RuntimeOptionMemoryMapExperts))
+        {
             expert_cache_flags |= ExpertCacheMemoryMapRanges;
         }
-        if (options.expert_gpu_cache_bytes != 0) {
-            victim_cache = create_vulkan_expert_victim_cache(
-                options.expert_gpu_cache_bytes);
-            if (!victim_cache) {
-                return Error{
-                    ErrorCode::UnsupportedModel,
-                    "cannot create the Vulkan Expert victim cache"};
+        if (has_flag(options.flags, RuntimeOptionDirectExpertIo))
+        {
+            expert_cache_flags |= ExpertCacheDirectReads;
+        }
+        if (has_flag(options.flags, RuntimeOptionBufferedExpertIo))
+        {
+            expert_cache_flags |= ExpertCacheBufferedReads;
+        }
+        const std::vector<uint32_t>& expert_vulkan_device_indices = compiled_model.vulkan_device_indices;
+        auto executable_capacities_result = distribute_gpu_capacity(options.expert_gpu_cache_bytes, plan.expert_pair_bytes, expert_vulkan_device_indices, capabilities_.vulkan_devices, "the executable Expert GPU cache");
+        if (!executable_capacities_result)
+            return executable_capacities_result.error();
+        auto victim_capacities_result = distribute_gpu_capacity(options.expert_gpu_victim_cache_bytes, plan.expert_pair_bytes, expert_vulkan_device_indices, capabilities_.vulkan_devices, "the Expert GPU victim cache");
+        if (!victim_capacities_result)
+            return victim_capacities_result.error();
+        std::vector<uint64_t> executable_capacities = std::move(executable_capacities_result).value();
+        std::vector<uint64_t> victim_capacities = std::move(victim_capacities_result).value();
+        for (size_t index = 0; index < expert_vulkan_device_indices.size(); ++index)
+        {
+            const uint64_t executable_capacity = executable_capacities[index];
+            const uint64_t victim_capacity = victim_capacities[index];
+            if (executable_capacity > std::numeric_limits<uint64_t>::max() - victim_capacity)
+            {
+                return Error{ErrorCode::InvalidArgument, "the combined per-device Expert GPU cache capacity overflows"};
+            }
+            const uint64_t maximum_safe_capacity = capabilities_.vulkan_devices[expert_vulkan_device_indices[index]].heap_budget_bytes / 4;
+            if (maximum_safe_capacity == 0 || executable_capacity + victim_capacity > maximum_safe_capacity)
+            {
+                return Error{ErrorCode::InvalidArgument, "combined per-device Expert GPU caches exceed one quarter of the Vulkan heap budget"};
             }
         }
-        compiled_model.expert_cache
-            = std::make_shared<Mxfp4ExpertCache>(
-                plan.expert_cache_bytes,
-                options.expert_io_workers,
-                std::move(victim_cache),
-                expert_cache_flags);
+        std::vector<std::shared_ptr<IExpertVictimCache>> expert_victim_cache_shards;
+        std::shared_ptr<IExpertVictimCache> expert_victim_cache;
+        if (options.expert_gpu_victim_cache_bytes != 0)
+        {
+            expert_victim_cache_shards.reserve(expert_vulkan_device_indices.size());
+            for (size_t index = 0; index < expert_vulkan_device_indices.size(); ++index)
+            {
+                const uint32_t device_index = expert_vulkan_device_indices[index];
+                const uint64_t capacity = victim_capacities[index];
+                auto shard = create_vulkan_victim_cache(capacity, device_index);
+                if (!shard)
+                {
+                    return Error{ErrorCode::UnsupportedModel, "cannot create an Expert GPU victim-cache shard"};
+                }
+                expert_victim_cache_shards.push_back(std::move(shard));
+            }
+            expert_victim_cache = create_sharded_victim_cache(expert_victim_cache_shards);
+            if (!expert_victim_cache)
+            {
+                return Error{ErrorCode::UnsupportedModel, "cannot create the sharded Expert GPU victim cache"};
+            }
+            if (options.expert_gpu_victim_reuse_probe_interval > 1)
+            {
+                expert_victim_cache = create_reuse_victim_cache(std::move(expert_victim_cache), options.expert_gpu_victim_reuse_probe_interval);
+            }
+        }
+        const bool use_victim_device_source = !has_flag(options.flags, RuntimeOptionDisableGpuVictimExecution) && !expert_victim_cache_shards.empty();
+        if (options.expert_gpu_cache_bytes != 0 || use_victim_device_source)
+        {
+            std::vector<std::shared_ptr<IExpertExecutionBackend>> device_backends;
+            std::vector<uint32_t> expert_device_indices;
+            for (size_t index = 0; index < expert_vulkan_device_indices.size(); ++index)
+            {
+                const uint32_t placement_device_index = expert_vulkan_device_indices[index];
+                const uint64_t capacity = executable_capacities[index];
+                auto backend = create_vulkan_mxfp4_expert_backend(
+                    capacity,
+                    placement_device_index,
+                    !use_victim_device_source ? std::shared_ptr<IExpertVictimCache>() : expert_victim_cache_shards[index]);
+                if (!backend)
+                {
+                    return Error{ErrorCode::UnsupportedModel, "cannot create a Vulkan MXFP4 Expert execution cache/source backend"};
+                }
+                device_backends.push_back(std::move(backend));
+                expert_device_indices.push_back(placement_device_index);
+            }
+            std::vector<uint32_t> residency_group_devices;
+            residency_group_devices.reserve(compiled_model.layers.size());
+            for (const CompiledLayerPlan& layer : compiled_model.layers)
+            {
+                residency_group_devices.push_back(layer.vulkan_device_index);
+            }
+            if (!use_victim_device_source)
+            {
+                compiled_model.expert_backend = create_multi_device_expert_backend(std::move(device_backends), std::move(expert_device_indices), std::move(residency_group_devices));
+            }
+            else
+            {
+                compiled_model.expert_backend = create_key_sharded_expert_backend(std::move(device_backends), std::move(expert_device_indices));
+            }
+            if (!compiled_model.expert_backend)
+            {
+                return Error{ErrorCode::UnsupportedModel, "cannot create the Vulkan MXFP4 Expert execution cache/source backend"};
+            }
+        }
+        compiled_model.expert_cache = std::make_shared<Mxfp4ExpertCache>(plan.expert_cache_bytes, expert_io_workers, std::move(expert_victim_cache), expert_cache_flags, static_cast<uint32_t>(compiled_model.layers.size()));
     }
 
-    auto immutable = std::make_shared<const CompiledModel>(
-        std::move(compiled_model));
+    auto immutable = std::make_shared<const CompiledModel>(std::move(compiled_model));
     return ModelPtr(new Model(std::move(immutable)));
+}
+
+Result<void> Runtime::synchronize_model_caches(const ModelPtr& model)
+{
+    if (!model)
+    {
+        return Error{ErrorCode::InvalidArgument, "model cannot be null"};
+    }
+    if (model->compiled_->expert_cache)
+        model->compiled_->expert_cache->wait_for_background_work();
+    if (model->compiled_->expert_backend)
+        model->compiled_->expert_backend->wait_for_background_work();
+    return {};
 }
 
 Result<SessionPtr> Runtime::create_session(const ModelPtr& model, const SessionOptions& options)
@@ -256,34 +495,40 @@ Result<SessionPtr> Runtime::create_session(const ModelPtr& model, const SessionO
 
 Result<BatchSchedulerPtr> Runtime::create_scheduler(const SchedulerOptions& options)
 {
+    if (has_flag(options.flags, SchedulerOptionDisableStagedBatching) && has_flag(options.flags, SchedulerOptionForceStagedBatching))
+    {
+        return Error{ErrorCode::InvalidArgument, "scheduler staged batching cannot be both disabled and forced"};
+    }
     if (options.worker_count > 1024)
         return Error{ErrorCode::InvalidArgument, "scheduler worker_count exceeds 1024"};
     if (options.expert_threads_per_worker > 1024)
-        return Error{
-            ErrorCode::InvalidArgument,
-            "scheduler expert_threads_per_worker exceeds 1024"};
-    if (options.worker_cpu_sets.size() > 1024)
-        return Error{
-            ErrorCode::InvalidArgument,
-            "scheduler worker_cpu_sets exceeds 1024 entries"};
-    if (!options.worker_cpu_sets.empty()
-        && options.worker_count != 0
-        && options.worker_count != options.worker_cpu_sets.size()) {
-        return Error{
-            ErrorCode::InvalidArgument,
-            "scheduler worker_count must match worker_cpu_sets"};
+        return Error{ErrorCode::InvalidArgument, "scheduler expert_threads_per_worker exceeds 1024"};
+    if (options.adaptive_probe_interval > 1000000)
+    {
+        return Error{ErrorCode::InvalidArgument, "scheduler adaptive_probe_interval exceeds 1000000"};
     }
-    for (const std::vector<uint32_t>& cpu_set : options.worker_cpu_sets) {
+    if (options.cross_call_window_microseconds > 1000000)
+    {
+        return Error{ErrorCode::InvalidArgument, "scheduler cross_call_window_microseconds exceeds 1000000"};
+    }
+    if (options.cross_call_max_batch_size > 1024)
+    {
+        return Error{ErrorCode::InvalidArgument, "scheduler cross_call_max_batch_size exceeds 1024"};
+    }
+    if (options.worker_cpu_sets.size() > 1024)
+        return Error{ErrorCode::InvalidArgument, "scheduler worker_cpu_sets exceeds 1024 entries"};
+    if (!options.worker_cpu_sets.empty() && options.worker_count != 0 && options.worker_count != options.worker_cpu_sets.size())
+    {
+        return Error{ErrorCode::InvalidArgument, "scheduler worker_count must match worker_cpu_sets"};
+    }
+    for (const std::vector<uint32_t>& cpu_set : options.worker_cpu_sets)
+    {
         if (cpu_set.empty())
-            return Error{
-                ErrorCode::InvalidArgument,
-                "scheduler worker_cpu_sets entries cannot be empty"};
+            return Error{ErrorCode::InvalidArgument, "scheduler worker_cpu_sets entries cannot be empty"};
     }
 #if !defined(__linux__)
     if (!options.worker_cpu_sets.empty())
-        return Error{
-            ErrorCode::UnsupportedModel,
-            "scheduler worker_cpu_sets are supported only on Linux"};
+        return Error{ErrorCode::UnsupportedModel, "scheduler worker_cpu_sets are supported only on Linux"};
 #endif
     return std::make_shared<BatchScheduler>(options);
 }

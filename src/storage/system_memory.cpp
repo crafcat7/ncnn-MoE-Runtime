@@ -19,15 +19,11 @@ uint64_t physical_memory_bytes() noexcept
 #if defined(_WIN32)
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof(status);
-    return GlobalMemoryStatusEx(&status)
-               ? static_cast<uint64_t>(status.ullTotalPhys)
-               : 0;
+    return GlobalMemoryStatusEx(&status) ? static_cast<uint64_t>(status.ullTotalPhys) : 0;
 #elif defined(__APPLE__)
     uint64_t bytes = 0;
     size_t size = sizeof(bytes);
-    return sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) == 0
-               ? bytes
-               : 0;
+    return sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) == 0 ? bytes : 0;
 #else
     const long pages = sysconf(_SC_PHYS_PAGES);
     const long page_size = sysconf(_SC_PAGESIZE);

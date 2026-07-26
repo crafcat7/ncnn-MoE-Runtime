@@ -18,28 +18,31 @@ static Result<uint32_t> required_uint32(const std::string& json, const std::stri
     if (!std::regex_search(json, match, expression))
         return Error{ErrorCode::InvalidModel, "manifest is missing integer field: " + key};
 
-    try {
+    try
+    {
         const unsigned long long value = std::stoull(match[1].str());
         if (value > std::numeric_limits<uint32_t>::max())
             return Error{ErrorCode::InvalidModel, "manifest integer is out of range: " + key};
         return static_cast<uint32_t>(value);
     }
-    catch (const std::exception&) {
+    catch (const std::exception&)
+    {
         return Error{ErrorCode::InvalidModel, "invalid integer field: " + key};
     }
 }
 
 static float optional_float(const std::string& json, const std::string& key, float fallback)
 {
-    const std::regex expression(
-        "\\\"" + key + "\\\"\\s*:\\s*([-+]?(?:[0-9]+\\.?[0-9]*|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?)");
+    const std::regex expression("\\\"" + key + "\\\"\\s*:\\s*([-+]?(?:[0-9]+\\.?[0-9]*|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?)");
     std::smatch match;
     if (!std::regex_search(json, match, expression))
         return fallback;
-    try {
+    try
+    {
         return std::stof(match[1].str());
     }
-    catch (const std::exception&) {
+    catch (const std::exception&)
+    {
         return fallback;
     }
 }
@@ -102,7 +105,7 @@ static Result<DType> parse_kv_cache_dtype(const std::string& value)
     return Error{ErrorCode::InvalidModel, "unsupported kv_cache_dtype: " + value};
 }
 
-static Result<std::vector<uint8_t> > read_binary_file(const std::filesystem::path& path)
+static Result<std::vector<uint8_t>> read_binary_file(const std::filesystem::path& path)
 {
     std::ifstream stream(path, std::ios::binary | std::ios::ate);
     if (!stream)
@@ -122,7 +125,8 @@ static Result<std::vector<uint8_t> > read_binary_file(const std::filesystem::pat
 class SequentialWeightReader
 {
 public:
-    explicit SequentialWeightReader(std::vector<uint8_t> bytes) : bytes_(std::move(bytes))
+    explicit SequentialWeightReader(std::vector<uint8_t> bytes)
+        : bytes_(std::move(bytes))
     {
     }
 
@@ -139,14 +143,16 @@ public:
         tensor.shape = std::move(shape);
         const size_t count = static_cast<size_t>(element_count);
 
-        if (dtype == DType::Float32) {
+        if (dtype == DType::Float32)
+        {
             if (count > remaining() / sizeof(float))
                 return Error{ErrorCode::InvalidModel, "weight file ends before float32 tensor: " + name};
             tensor.float32_data.resize(count);
             std::memcpy(tensor.float32_data.data(), bytes_.data() + offset_, count * sizeof(float));
             offset_ += count * sizeof(float);
         }
-        else if (dtype == DType::Int8) {
+        else if (dtype == DType::Int8)
+        {
             if (tensor.shape.size() != 2)
                 return Error{ErrorCode::InvalidModel, "int8 tensor must be a matrix: " + name};
             if (count > remaining())
@@ -162,7 +168,8 @@ public:
             std::memcpy(tensor.quantization_scales.data(), bytes_.data() + offset_, scale_count * sizeof(float));
             offset_ += scale_count * sizeof(float);
         }
-        else {
+        else
+        {
             return Error{ErrorCode::UnsupportedModel, "unsupported tensor dtype: " + name};
         }
         return tensor;
@@ -183,12 +190,7 @@ private:
     size_t offset_ = 0;
 };
 
-static Result<void> add_tensor(
-    WeightMapping& mapping,
-    SequentialWeightReader& reader,
-    const std::string& name,
-    std::vector<uint32_t> shape,
-    DType dtype)
+static Result<void> add_tensor(WeightMapping& mapping, SequentialWeightReader& reader, const std::string& name, std::vector<uint32_t> shape, DType dtype)
 {
     auto tensor = reader.take(name, std::move(shape), dtype);
     if (!tensor)
@@ -214,7 +216,8 @@ Result<MoeIR> FixtureModelAdapter::parse_model(const ModelPackage& package) cons
     auto layer_count = required_uint32(json, "layer_count");
     auto expert_count = required_uint32(json, "expert_count");
     auto top_k = required_uint32(json, "experts_per_token");
-    if (!vocabulary_size || !hidden_size || !intermediate_size || !layer_count || !expert_count || !top_k) {
+    if (!vocabulary_size || !hidden_size || !intermediate_size || !layer_count || !expert_count || !top_k)
+    {
         const Error* error = !vocabulary_size     ? &vocabulary_size.error()
                              : !hidden_size       ? &hidden_size.error()
                              : !intermediate_size ? &intermediate_size.error()
@@ -248,22 +251,20 @@ Result<MoeIR> FixtureModelAdapter::parse_model(const ModelPackage& package) cons
     descriptor.kv_cache_dtype = kv_cache_dtype.value();
     descriptor.norm_epsilon = optional_float(json, "norm_epsilon", 1e-5f);
 
-    const uint32_t layer_flags
-        = optional_bool(json, "use_attention", false)
-              ? LayerDescriptorAttention | LayerDescriptorMoe
-              : LayerDescriptorMoe;
+    const uint32_t layer_flags = optional_bool(json, "use_attention", false) ? LayerDescriptorAttention | LayerDescriptorMoe : LayerDescriptorMoe;
     uint32_t sliding_window = 0;
     uint32_t initial_context_length = 0;
     uint32_t max_context_length = 0;
-    if (has_flag(layer_flags, LayerDescriptorAttention)) {
+    if (has_flag(layer_flags, LayerDescriptorAttention))
+    {
         auto attention_head_count = required_uint32(json, "attention_head_count");
         auto kv_head_count = required_uint32(json, "kv_head_count");
         auto head_dimension = required_uint32(json, "head_dimension");
         auto parsed_sliding_window = required_uint32(json, "sliding_window");
         auto parsed_initial_context_length = required_uint32(json, "initial_context_length");
         auto parsed_max_context_length = required_uint32(json, "max_context_length");
-        if (!attention_head_count || !kv_head_count || !head_dimension || !parsed_sliding_window
-            || !parsed_initial_context_length || !parsed_max_context_length) {
+        if (!attention_head_count || !kv_head_count || !head_dimension || !parsed_sliding_window || !parsed_initial_context_length || !parsed_max_context_length)
+        {
             const Error* error = !attention_head_count            ? &attention_head_count.error()
                                  : !kv_head_count                 ? &kv_head_count.error()
                                  : !head_dimension                ? &head_dimension.error()
@@ -290,20 +291,20 @@ Result<MoeIR> FixtureModelAdapter::parse_model(const ModelPackage& package) cons
     moe.flags = 0;
     if (optional_bool(json, "normalize_topk_weights", true))
         moe.flags |= MoeDescriptorNormalizeTopKWeights;
-    moe.normalization = has_flag(moe.flags, MoeDescriptorNormalizeTopKWeights)
-                            ? RouterNormalization::SelectedExperts
-                            : RouterNormalization::None;
+    moe.normalization = has_flag(moe.flags, MoeDescriptorNormalizeTopKWeights) ? RouterNormalization::SelectedExperts : RouterNormalization::None;
     if (optional_bool(json, "use_expert_bias", false))
         moe.flags |= MoeDescriptorExpertBias | MoeDescriptorRouterBias;
     moe.activation_limit = optional_float(json, "activation_limit", 0.0f);
 
     descriptor.layers.resize(descriptor.layer_count);
-    for (uint32_t layer_id = 0; layer_id < descriptor.layer_count; ++layer_id) {
+    for (uint32_t layer_id = 0; layer_id < descriptor.layer_count; ++layer_id)
+    {
         LayerDescriptor& layer = descriptor.layers[layer_id];
         layer.ffn.moe = moe;
         layer.flags = layer_flags;
         layer.nodes.push_back({ModelNodeType::RmsNorm});
-        if (has_flag(layer_flags, LayerDescriptorAttention)) {
+        if (has_flag(layer_flags, LayerDescriptorAttention))
+        {
             layer.pre_attention_norm = NormType::RmsNorm;
             layer.attention.head_count = descriptor.attention_head_count;
             layer.attention.kv_head_count = descriptor.kv_head_count;
@@ -339,34 +340,30 @@ Result<MoeIR> FixtureModelAdapter::parse_model(const ModelPackage& package) cons
     return descriptor;
 }
 
-Result<WeightMapping> FixtureModelAdapter::map_weights(
-    const ModelPackage& package,
-    const MoeIR& descriptor) const
+Result<WeightMapping> FixtureModelAdapter::map_weights(const ModelPackage& package, const MoeIR& descriptor) const
 {
     if (descriptor.model_type != "test_moe")
         return Error{ErrorCode::UnsupportedModel, "unsupported fixture model_type: " + descriptor.model_type};
 
-    const std::string weights_name = optional_string(
-        package.manifest.raw_json, "weights_file", "model.test.bin");
+    const std::string weights_name = optional_string(package.manifest.raw_json, "weights_file", "model.test.bin");
     auto bytes = read_binary_file(package.root / weights_name);
     if (!bytes)
         return bytes.error();
 
     SequentialWeightReader reader(std::move(bytes).value());
     WeightMapping mapping;
-    auto add = [&](const std::string& name, std::vector<uint32_t> shape, DType dtype) -> Result<void> {
-        return add_tensor(mapping, reader, name, std::move(shape), dtype);
-    };
+    auto add = [&](const std::string& name, std::vector<uint32_t> shape, DType dtype) -> Result<void> { return add_tensor(mapping, reader, name, std::move(shape), dtype); };
 
-    auto status = add(
-        "token_embedding.weight", {descriptor.vocabulary_size, descriptor.hidden_size}, DType::Float32);
+    auto status = add("token_embedding.weight", {descriptor.vocabulary_size, descriptor.hidden_size}, DType::Float32);
     if (!status)
         return status.error();
 
-    for (uint32_t layer_id = 0; layer_id < descriptor.layer_count; ++layer_id) {
+    for (uint32_t layer_id = 0; layer_id < descriptor.layer_count; ++layer_id)
+    {
         const MoeDescriptor& moe = descriptor.layers[layer_id].ffn.moe;
         const std::string layer = layer_prefix(layer_id);
-        if (has_flag(descriptor.layers[layer_id].flags, LayerDescriptorAttention)) {
+        if (has_flag(descriptor.layers[layer_id].flags, LayerDescriptorAttention))
+        {
             const AttentionDescriptor& attention = descriptor.layers[layer_id].attention;
             const uint32_t query_size = attention.head_count * attention.head_dimension;
             const uint32_t key_value_size = attention.kv_head_count * attention.head_dimension;
@@ -376,7 +373,8 @@ Result<WeightMapping> FixtureModelAdapter::map_weights(
             status = add(layer + "attention.query.weight", {query_size, descriptor.hidden_size}, DType::Float32);
             if (!status)
                 return status.error();
-            if (has_flag(attention.flags, AttentionDescriptorBias)) {
+            if (has_flag(attention.flags, AttentionDescriptorBias))
+            {
                 status = add(layer + "attention.query.bias", {query_size}, DType::Float32);
                 if (!status)
                     return status.error();
@@ -384,7 +382,8 @@ Result<WeightMapping> FixtureModelAdapter::map_weights(
             status = add(layer + "attention.key.weight", {key_value_size, descriptor.hidden_size}, DType::Float32);
             if (!status)
                 return status.error();
-            if (has_flag(attention.flags, AttentionDescriptorBias)) {
+            if (has_flag(attention.flags, AttentionDescriptorBias))
+            {
                 status = add(layer + "attention.key.bias", {key_value_size}, DType::Float32);
                 if (!status)
                     return status.error();
@@ -392,7 +391,8 @@ Result<WeightMapping> FixtureModelAdapter::map_weights(
             status = add(layer + "attention.value.weight", {key_value_size, descriptor.hidden_size}, DType::Float32);
             if (!status)
                 return status.error();
-            if (has_flag(attention.flags, AttentionDescriptorBias)) {
+            if (has_flag(attention.flags, AttentionDescriptorBias))
+            {
                 status = add(layer + "attention.value.bias", {key_value_size}, DType::Float32);
                 if (!status)
                     return status.error();
@@ -400,12 +400,14 @@ Result<WeightMapping> FixtureModelAdapter::map_weights(
             status = add(layer + "attention.output.weight", {descriptor.hidden_size, query_size}, DType::Float32);
             if (!status)
                 return status.error();
-            if (has_flag(attention.flags, AttentionDescriptorBias)) {
+            if (has_flag(attention.flags, AttentionDescriptorBias))
+            {
                 status = add(layer + "attention.output.bias", {descriptor.hidden_size}, DType::Float32);
                 if (!status)
                     return status.error();
             }
-            if (has_flag(attention.flags, AttentionDescriptorSinks)) {
+            if (has_flag(attention.flags, AttentionDescriptorSinks))
+            {
                 status = add(layer + "attention.sinks", {attention.head_count}, DType::Float32);
                 if (!status)
                     return status.error();
@@ -417,15 +419,18 @@ Result<WeightMapping> FixtureModelAdapter::map_weights(
         status = add(layer + "router.weight", {moe.expert_count, descriptor.hidden_size}, DType::Float32);
         if (!status)
             return status.error();
-        if (has_flag(moe.flags, MoeDescriptorRouterBias)) {
+        if (has_flag(moe.flags, MoeDescriptorRouterBias))
+        {
             status = add(layer + "router.bias", {moe.expert_count}, DType::Float32);
             if (!status)
                 return status.error();
         }
 
-        for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id) {
+        for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
+        {
             const std::string expert = expert_prefix(layer_id, expert_id);
-            if (moe.layout == ExpertLayout::GateUpDown) {
+            if (moe.layout == ExpertLayout::GateUpDown)
+            {
                 status = add(expert + "gate.weight", {moe.intermediate_size, descriptor.hidden_size}, moe.expert_weight_dtype);
                 if (!status)
                     return status.error();
@@ -446,10 +451,9 @@ Result<WeightMapping> FixtureModelAdapter::map_weights(
     if (!status)
         return status.error();
 
-    if (!reader.exhausted()) {
-        return Error{
-            ErrorCode::InvalidModel,
-            "weight file contains " + std::to_string(reader.remaining()) + " trailing bytes"};
+    if (!reader.exhausted())
+    {
+        return Error{ErrorCode::InvalidModel, "weight file contains " + std::to_string(reader.remaining()) + " trailing bytes"};
     }
     return mapping;
 }

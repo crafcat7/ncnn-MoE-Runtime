@@ -11,9 +11,7 @@ class FixtureModelAdapter final : public IMoeModelAdapter
 public:
     [[nodiscard]] bool can_load(const ModelManifest& manifest) const override;
     [[nodiscard]] Result<MoeIR> parse_model(const ModelPackage& package) const override;
-    [[nodiscard]] Result<WeightMapping> map_weights(
-        const ModelPackage& package,
-        const MoeIR& ir) const override;
+    [[nodiscard]] Result<WeightMapping> map_weights(const ModelPackage& package, const MoeIR& ir) const override;
 };
 
 } // namespace moe

@@ -5,11 +5,15 @@ endif()
 file(GLOB_RECURSE NCNN_MOE_STYLE_FILES
     LIST_DIRECTORIES false
     "${NCNN_MOE_SOURCE_DIR}/include/*.h"
+    "${NCNN_MOE_SOURCE_DIR}/include/*.hpp"
     "${NCNN_MOE_SOURCE_DIR}/src/*.h"
+    "${NCNN_MOE_SOURCE_DIR}/src/*.hpp"
     "${NCNN_MOE_SOURCE_DIR}/src/*.cpp"
     "${NCNN_MOE_SOURCE_DIR}/tests/*.h"
+    "${NCNN_MOE_SOURCE_DIR}/tests/*.hpp"
     "${NCNN_MOE_SOURCE_DIR}/tests/*.cpp"
     "${NCNN_MOE_SOURCE_DIR}/examples/*.h"
+    "${NCNN_MOE_SOURCE_DIR}/examples/*.hpp"
     "${NCNN_MOE_SOURCE_DIR}/examples/*.cpp"
 )
 
@@ -40,10 +44,22 @@ foreach(SOURCE_FILE IN LISTS NCNN_MOE_STYLE_FILES)
     if(SOURCE_TEXT MATCHES "#pragma[ \t]+once")
         string(APPEND NCNN_MOE_STYLE_ERRORS "${RELATIVE_FILE}: use an include guard instead of pragma once\n")
     endif()
-    if(SOURCE_TEXT MATCHES "(^|\n)[ \t]*(if|for|while|switch|catch)[^\n]*\n[ \t]*\\{")
-        string(APPEND NCNN_MOE_STYLE_ERRORS "${RELATIVE_FILE}: control-flow opening brace must stay on the condition line\n")
+    if(SOURCE_TEXT MATCHES "R[ \t]+\"[A-Za-z0-9_]*\\(")
+        string(APPEND NCNN_MOE_STYLE_ERRORS "${RELATIVE_FILE}: malformed raw string literal\n")
     endif()
-    if(SOURCE_TEXT MATCHES "\\}[ \t]+(else|catch|while)([ \t]|\\()")
+    if(SOURCE_TEXT MATCHES "(1[uUlL]*|UINT(32|64)_C\\(1\\))[ \t]*<<[ \t]*[0-9]+")
+        string(APPEND NCNN_MOE_STYLE_ERRORS
+            "${RELATIVE_FILE}: name bitmap positions with NCNN_MOE_*_BIT macros\n")
+    endif()
+    if(SOURCE_TEXT MATCHES "\n[ \t]+(=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=)[ \t]+")
+        string(APPEND NCNN_MOE_STYLE_ERRORS
+            "${RELATIVE_FILE}: keep an assignment operator with its left-hand side\n")
+    endif()
+    if(SOURCE_TEXT MATCHES "\n[ \t]+(\\.|->)[A-Za-z_]")
+        string(APPEND NCNN_MOE_STYLE_ERRORS
+            "${RELATIVE_FILE}: keep chained member access with the preceding expression\n")
+    endif()
+    if(SOURCE_TEXT MATCHES "\\}[ \t]+(else|catch)([ \t]|\\()")
         string(APPEND NCNN_MOE_STYLE_ERRORS "${RELATIVE_FILE}: text after a closing brace must start on a new line\n")
     endif()
     if(NOT RELATIVE_FILE STREQUAL "include/ncnn/moe/result.h" AND SOURCE_TEXT MATCHES "template[ \t]*<")

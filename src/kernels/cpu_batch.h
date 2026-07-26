@@ -1,6 +1,7 @@
 #ifndef NCNN_MOE_CPU_BATCH_H
 #define NCNN_MOE_CPU_BATCH_H
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -12,11 +13,39 @@ namespace moe {
 
 class CpuBatch
 {
+private:
+    size_t rows_ = 0;
+    uint32_t columns_ = 0;
+    std::vector<float> data_;
+
 public:
     CpuBatch() = default;
     CpuBatch(size_t rows, uint32_t columns)
-        : rows_(rows), columns_(columns), data_(rows * columns, 0.0f)
     {
+        reset(rows, columns, true);
+    }
+
+    void reset(size_t rows, uint32_t columns, bool clear)
+    {
+        rows_ = rows;
+        columns_ = columns;
+        data_.resize(rows * columns);
+        if (clear)
+            std::fill(data_.begin(), data_.end(), 0.0f);
+    }
+
+    void clear() noexcept
+    {
+        rows_ = 0;
+        columns_ = 0;
+        data_.clear();
+    }
+
+    void swap(CpuBatch& other) noexcept
+    {
+        std::swap(rows_, other.rows_);
+        std::swap(columns_, other.columns_);
+        data_.swap(other.data_);
     }
 
     [[nodiscard]] size_t rows() const noexcept
@@ -45,11 +74,6 @@ public:
     {
         return data_;
     }
-
-private:
-    size_t rows_ = 0;
-    uint32_t columns_ = 0;
-    std::vector<float> data_;
 };
 
 } // namespace moe

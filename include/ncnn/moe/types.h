@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <new>
 #include <span>
@@ -12,25 +13,64 @@
 #include <unordered_map>
 #include <vector>
 
+#define NCNN_MOE_VK_FP16_STORAGE_BIT            0
+#define NCNN_MOE_VK_FP16_ARITHMETIC_BIT         1
+#define NCNN_MOE_VK_BF16_STORAGE_BIT            2
+#define NCNN_MOE_VK_BF16_ARITHMETIC_BIT         3
+#define NCNN_MOE_VK_UNIFIED_QUEUE_BIT           4
+#define NCNN_MOE_VK_RESIZABLE_BAR_BIT           5
+#define NCNN_MOE_VK_SELECTED_BIT                6
+#define NCNN_MOE_VK_INT8_STORAGE_BIT            7
+#define NCNN_MOE_VK_INT8_ARITHMETIC_BIT         8
+#define NCNN_MOE_VK_INTEGER_DOT_BIT             9
+#define NCNN_MOE_VK_SUBGROUP_BIT                10
+#define NCNN_MOE_VK_COOPERATIVE_MATRIX_BIT      11
+#define NCNN_MOE_VK_INT8_COOPERATIVE_MATRIX_BIT 12
+
 namespace ncnn {
 namespace moe {
+
+inline constexpr uint32_t automatic_vulkan_device_index = std::numeric_limits<uint32_t>::max();
 
 class NcnnLinearOperator;
 class NcnnVulkanAttentionOperator;
 class MappedFileRange;
+class Mxfp4ExpertCache;
 
 [[nodiscard]] inline bool has_flag(uint32_t flags, uint32_t flag) noexcept
 {
     return (flags & flag) != 0;
 }
 
+[[nodiscard]] inline bool has_flag(uint64_t flags, uint64_t flag) noexcept
+{
+    return (flags & flag) != 0;
+}
+
 class MxFp4ByteBuffer
 {
+private:
+    friend class MappedFileRange;
+    friend class Mxfp4ExpertCache;
+
+    MxFp4ByteBuffer(std::shared_ptr<uint8_t> data, size_t size) noexcept
+        : data_(std::move(data)),
+          size_(size)
+    {
+    }
+
+    [[nodiscard]] static std::shared_ptr<uint8_t> allocate(size_t count)
+    {
+        return std::shared_ptr<uint8_t>(new uint8_t[count], std::default_delete<uint8_t[]>());
+    }
+
+    std::shared_ptr<uint8_t> data_;
+    size_t size_ = 0;
+
 public:
     MxFp4ByteBuffer() = default;
 
-    MxFp4ByteBuffer(
-        std::initializer_list<uint8_t> values)
+    MxFp4ByteBuffer(std::initializer_list<uint8_t> values)
     {
         resize(values.size());
         size_t index = 0;
@@ -43,8 +83,7 @@ public:
         assign(other.data(), other.size());
     }
 
-    MxFp4ByteBuffer& operator=(
-        const MxFp4ByteBuffer& other)
+    MxFp4ByteBuffer& operator=(const MxFp4ByteBuffer& other)
     {
         if (this != &other)
             assign(other.data(), other.size());
@@ -58,10 +97,10 @@ public:
         other.size_ = 0;
     }
 
-    MxFp4ByteBuffer& operator=(
-        MxFp4ByteBuffer&& other) noexcept
+    MxFp4ByteBuffer& operator=(MxFp4ByteBuffer&& other) noexcept
     {
-        if (this != &other) {
+        if (this != &other)
+        {
             data_ = std::move(other.data_);
             size_ = other.size_;
             other.size_ = 0;
@@ -69,8 +108,7 @@ public:
         return *this;
     }
 
-    MxFp4ByteBuffer& operator=(
-        std::initializer_list<uint8_t> values)
+    MxFp4ByteBuffer& operator=(std::initializer_list<uint8_t> values)
     {
         MxFp4ByteBuffer replacement(values);
         *this = std::move(replacement);
@@ -82,13 +120,11 @@ public:
         if (count == size_)
             return;
         std::shared_ptr<uint8_t> replacement;
-        if (count != 0) {
+        if (count != 0)
+        {
             replacement = allocate(count);
             if (data_)
-                std::memcpy(
-                    replacement.get(),
-                    data_.get(),
-                    std::min(size_, count));
+                std::memcpy(replacement.get(), data_.get(), std::min(size_, count));
         }
         data_ = std::move(replacement);
         size_ = count;
@@ -97,7 +133,8 @@ public:
     void assign(const uint8_t* source, size_t count)
     {
         std::shared_ptr<uint8_t> replacement;
-        if (count != 0) {
+        if (count != 0)
+        {
             replacement = allocate(count);
             std::memcpy(replacement.get(), source, count);
         }
@@ -154,28 +191,6 @@ public:
     {
         return data_.get()[size_ - 1];
     }
-
-private:
-    friend class MappedFileRange;
-
-    MxFp4ByteBuffer(
-        std::shared_ptr<uint8_t> data,
-        size_t size) noexcept
-        : data_(std::move(data)),
-          size_(size)
-    {
-    }
-
-    [[nodiscard]] static std::shared_ptr<uint8_t> allocate(
-        size_t count)
-    {
-        return std::shared_ptr<uint8_t>(
-            new uint8_t[count],
-            std::default_delete<uint8_t[]>());
-    }
-
-    std::shared_ptr<uint8_t> data_;
-    size_t size_ = 0;
 };
 
 enum class DType
@@ -183,6 +198,7 @@ enum class DType
     Float32,
     Float16,
     BFloat16,
+    Int32,
     Int8,
     MxFp4
 };
@@ -195,7 +211,8 @@ enum class NormType
 
 enum class RouterScoreFunction
 {
-    Softmax
+    Softmax,
+    Sigmoid
 };
 
 enum class RouterNormalization
@@ -217,6 +234,7 @@ enum class ExpertLayout
 {
     UpDown,
     GateUpDown,
+    PackedGateUpDown,
     InterleavedGateUpDown
 };
 
@@ -227,6 +245,54 @@ enum class HybridMode
     VulkanWithCpuPrefetch,
     HybridExperts,
     Auto
+};
+
+enum class TensorLocation
+{
+    Automatic,
+    Cpu,
+    Vulkan,
+    Shared
+};
+
+enum class VulkanDeviceType
+{
+    Discrete,
+    Integrated,
+    Virtual,
+    Cpu,
+    Unknown
+};
+
+enum VulkanDeviceCapabilityFlag : uint32_t
+{
+    VulkanDeviceFp16Storage = UINT32_C(1) << NCNN_MOE_VK_FP16_STORAGE_BIT,
+    VulkanDeviceFp16Arithmetic = UINT32_C(1) << NCNN_MOE_VK_FP16_ARITHMETIC_BIT,
+    VulkanDeviceBf16Storage = UINT32_C(1) << NCNN_MOE_VK_BF16_STORAGE_BIT,
+    VulkanDeviceBf16Arithmetic = UINT32_C(1) << NCNN_MOE_VK_BF16_ARITHMETIC_BIT,
+    VulkanDeviceUnifiedComputeTransfer = UINT32_C(1) << NCNN_MOE_VK_UNIFIED_QUEUE_BIT,
+    VulkanDeviceResizableBar = UINT32_C(1) << NCNN_MOE_VK_RESIZABLE_BAR_BIT,
+    VulkanDeviceSelected = UINT32_C(1) << NCNN_MOE_VK_SELECTED_BIT,
+    VulkanDeviceInt8Storage = UINT32_C(1) << NCNN_MOE_VK_INT8_STORAGE_BIT,
+    VulkanDeviceInt8Arithmetic = UINT32_C(1) << NCNN_MOE_VK_INT8_ARITHMETIC_BIT,
+    VulkanDeviceIntegerDotProduct = UINT32_C(1) << NCNN_MOE_VK_INTEGER_DOT_BIT,
+    VulkanDeviceSubgroupOperations = UINT32_C(1) << NCNN_MOE_VK_SUBGROUP_BIT,
+    VulkanDeviceCooperativeMatrix = UINT32_C(1) << NCNN_MOE_VK_COOPERATIVE_MATRIX_BIT,
+    VulkanDeviceInt8CooperativeMatrix = UINT32_C(1) << NCNN_MOE_VK_INT8_COOPERATIVE_MATRIX_BIT
+};
+
+struct VulkanDeviceCapabilities
+{
+    uint32_t index = 0;
+    uint32_t vendor_id = 0;
+    uint32_t device_id = 0;
+    VulkanDeviceType type = VulkanDeviceType::Unknown;
+    uint32_t rough_score = 0;
+    uint32_t compute_queue_count = 0;
+    uint32_t transfer_queue_count = 0;
+    uint64_t heap_budget_bytes = 0;
+    uint32_t flags = 0;
+    std::string name;
 };
 
 enum class LogitsOutputMode
@@ -284,47 +350,33 @@ inline std::span<const float> TensorData::float32_values() const noexcept
 {
     if (!float32_data.empty())
         return float32_data;
-    if (dtype != DType::Float32
-        || !mapped_data
-        || mapped_byte_count % sizeof(float) != 0
-        || reinterpret_cast<uintptr_t>(mapped_data.get())
-                   % alignof(float)
-               != 0) {
+    if (dtype != DType::Float32 || !mapped_data || mapped_byte_count % sizeof(float) != 0 || reinterpret_cast<uintptr_t>(mapped_data.get()) % alignof(float) != 0)
+    {
         return {};
     }
-    return {
-        reinterpret_cast<const float*>(mapped_data.get()),
-        static_cast<size_t>(mapped_byte_count / sizeof(float))};
+    return {reinterpret_cast<const float*>(mapped_data.get()), static_cast<size_t>(mapped_byte_count / sizeof(float))};
 }
 
 inline std::span<const uint16_t> TensorData::bfloat16_values() const noexcept
 {
     if (!bfloat16_data.empty())
         return bfloat16_data;
-    if (dtype != DType::BFloat16
-        || !mapped_data
-        || mapped_byte_count % sizeof(uint16_t) != 0
-        || reinterpret_cast<uintptr_t>(mapped_data.get())
-                   % alignof(uint16_t)
-               != 0) {
+    if (dtype != DType::BFloat16 || !mapped_data || mapped_byte_count % sizeof(uint16_t) != 0 || reinterpret_cast<uintptr_t>(mapped_data.get()) % alignof(uint16_t) != 0)
+    {
         return {};
     }
-    return {
-        reinterpret_cast<const uint16_t*>(mapped_data.get()),
-        static_cast<size_t>(mapped_byte_count / sizeof(uint16_t))};
+    return {reinterpret_cast<const uint16_t*>(mapped_data.get()), static_cast<size_t>(mapped_byte_count / sizeof(uint16_t))};
 }
 
 inline std::span<const int8_t> TensorData::int8_values() const noexcept
 {
     if (!int8_data.empty())
         return int8_data;
-    if (dtype != DType::Int8
-        || !mapped_data) {
+    if (dtype != DType::Int8 || !mapped_data)
+    {
         return {};
     }
-    return {
-        reinterpret_cast<const int8_t*>(mapped_data.get()),
-        static_cast<size_t>(mapped_byte_count)};
+    return {reinterpret_cast<const int8_t*>(mapped_data.get()), static_cast<size_t>(mapped_byte_count)};
 }
 
 } // namespace moe

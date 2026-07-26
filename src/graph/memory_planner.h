@@ -12,10 +12,7 @@ namespace moe {
 
 struct RuntimeOptions;
 
-[[nodiscard]] Result<ModelMemoryPlan> plan_model_memory(
-    const MoeIR& ir,
-    const RuntimeOptions& options,
-    uint64_t physical_memory_bytes);
+[[nodiscard]] Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeOptions& options, uint64_t physical_memory_bytes);
 
 } // namespace moe
 } // namespace ncnn

@@ -1,7 +1,11 @@
 #include "ncnn/moe/runtime.h"
 
+#include "compiler/moe_ir.hpp"
 #include "kernels/cpu_mxfp4.h"
 #include "kernels/cpu_ops.h"
+#include "engine/cpu_executor.h"
+#include "engine/expert_backend.h"
+#include "engine/cpu_session_state.h"
 #include "engine/cpu_topology.h"
 #include "storage/expert_cache.h"
 #include "fixture_model_adapter.h"
@@ -9,18 +13,22 @@
 #include "graph/memory_planner.h"
 #include "backends/ncnn/ncnn_linear.h"
 #include "ncnn/moe/expert_dispatcher.h"
+#include "models/builtin_model_adapter.h"
 #include "models/safetensors.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <regex>
+#include <source_location>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -30,20 +38,70 @@
 namespace ncnn {
 namespace moe {
 
-static void check(bool condition)
+static void check(bool condition, const std::source_location location = std::source_location::current())
 {
     if (!condition)
-        throw std::runtime_error("test check failed");
+    {
+        throw std::runtime_error("test check failed at " + std::string(location.file_name()) + ":" + std::to_string(location.line()));
+    }
 }
 
 static void check_near(float actual, float expected, float tolerance)
 {
-    if (std::abs(actual - expected) > tolerance) {
-        throw std::runtime_error(
-            "near check failed: actual=" + std::to_string(actual)
-            + ", expected=" + std::to_string(expected));
+    if (std::abs(actual - expected) > tolerance)
+    {
+        throw std::runtime_error("near check failed: actual=" + std::to_string(actual) + ", expected=" + std::to_string(expected));
     }
 }
+
+class ScopedEnvironmentOverride
+{
+public:
+    ScopedEnvironmentOverride(const char* name, const char* value)
+        : name_(name)
+    {
+#if defined(_WIN32)
+        size_t required = 0;
+        getenv_s(&required, nullptr, 0, name);
+        if (required > 0)
+        {
+            previous_.resize(required);
+            getenv_s(&required, previous_.data(), previous_.size(), name);
+            had_previous_ = true;
+        }
+        _putenv_s(name, value);
+#else
+        const char* previous = std::getenv(name);
+        if (previous)
+        {
+            previous_ = previous;
+            had_previous_ = true;
+        }
+        setenv(name, value, 1);
+#endif
+    }
+
+    ~ScopedEnvironmentOverride()
+    {
+#if defined(_WIN32)
+        _putenv_s(name_.c_str(), had_previous_ ? previous_.c_str() : "");
+#else
+        if (had_previous_)
+        {
+            setenv(name_.c_str(), previous_.c_str(), 1);
+        }
+        else
+        {
+            unsetenv(name_.c_str());
+        }
+#endif
+    }
+
+private:
+    std::string name_;
+    std::string previous_;
+    bool had_previous_ = false;
+};
 
 class TestRuntime final : public Runtime
 {
@@ -56,11 +114,10 @@ public:
 
 static std::filesystem::path create_unique_test_directory(const char* prefix)
 {
-    for (uint32_t attempt = 0; attempt < 1000; ++attempt) {
+    for (uint32_t attempt = 0; attempt < 1000; ++attempt)
+    {
         const auto stamp = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        const std::filesystem::path candidate = std::filesystem::temp_directory_path()
-                                                / (std::string(prefix) + std::to_string(stamp)
-                                                   + "_" + std::to_string(attempt));
+        const std::filesystem::path candidate = std::filesystem::temp_directory_path() / (std::string(prefix) + std::to_string(stamp) + "_" + std::to_string(attempt));
         std::error_code error;
         if (std::filesystem::create_directory(candidate, error))
             return candidate;
@@ -109,20 +166,20 @@ private:
     {
         std::ofstream manifest(path_ / "config.json", std::ios::binary);
         manifest << R"({
-  "model_type": "test_moe",
-  "vocabulary_size": 4,
-  "hidden_size": 2,
-  "intermediate_size": 2,
-  "layer_count": 1,
-  "expert_count": 2,
-  "experts_per_token": 1,
-  "expert_activation": "relu",
-  "expert_layout": "up_down",
-  "normalize_topk_weights": true,
-  "use_expert_bias": false,
-  "norm_epsilon": 0.00001,
-  "weights_file": "model.test.bin"
-})";
+                      "model_type" : "test_moe",
+            "vocabulary_size" : 4,
+            "hidden_size" : 2,
+            "intermediate_size" : 2,
+            "layer_count" : 1,
+            "expert_count" : 2,
+            "experts_per_token" : 1,
+            "expert_activation" : "relu",
+                                  "expert_layout" : "up_down",
+                                                    "normalize_topk_weights" : true,
+                                                                               "use_expert_bias" : false,
+                                                                                                   "norm_epsilon" : 0.00001,
+                                                                                                   "weights_file" : "model.test.bin"
+    })";
     }
 
     void write_valid_weights()
@@ -171,9 +228,7 @@ private:
         };
 
         std::ofstream weights(path_ / "model.test.bin", std::ios::binary);
-        weights.write(
-            reinterpret_cast<const char*>(values.data()),
-            static_cast<std::streamsize>(values.size() * sizeof(float)));
+        weights.write(reinterpret_cast<const char*>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(float)));
     }
 
     std::filesystem::path path_;
@@ -188,18 +243,18 @@ public:
 
         std::ofstream manifest(path_ / "config.json", std::ios::binary);
         manifest << R"({
-  "model_type": "test_moe",
-  "vocabulary_size": 2,
-  "hidden_size": 2,
-  "intermediate_size": 2,
-  "layer_count": 1,
-  "expert_count": 3,
-  "experts_per_token": 2,
-  "expert_activation": "relu",
-  "expert_layout": "up_down",
-  "normalize_topk_weights": true,
-  "norm_epsilon": 0.00001
-})";
+                      "model_type" : "test_moe",
+            "vocabulary_size" : 2,
+            "hidden_size" : 2,
+            "intermediate_size" : 2,
+            "layer_count" : 1,
+            "expert_count" : 3,
+            "experts_per_token" : 2,
+            "expert_activation" : "relu",
+                                  "expert_layout" : "up_down",
+                                                    "normalize_topk_weights" : true,
+                                                                               "norm_epsilon" : 0.00001
+    })";
         manifest.close();
 
         const std::vector<float> values = {
@@ -247,9 +302,7 @@ public:
             1.0f,
         };
         std::ofstream weights(path_ / "model.test.bin", std::ios::binary);
-        weights.write(
-            reinterpret_cast<const char*>(values.data()),
-            static_cast<std::streamsize>(values.size() * sizeof(float)));
+        weights.write(reinterpret_cast<const char*>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(float)));
     }
 
     ~WeightedTopKPackage()
@@ -276,19 +329,19 @@ public:
 
         std::ofstream manifest(path_ / "config.json", std::ios::binary);
         manifest << R"({
-  "model_type": "test_moe",
-  "vocabulary_size": 2,
-  "hidden_size": 2,
-  "intermediate_size": 2,
-  "layer_count": 1,
-  "expert_count": 1,
-  "experts_per_token": 1,
-  "expert_activation": "relu",
-  "expert_layout": "up_down",
-  "expert_weight_dtype": "int8",
-  "normalize_topk_weights": true,
-  "norm_epsilon": 0.00001
-})";
+                      "model_type" : "test_moe",
+            "vocabulary_size" : 2,
+            "hidden_size" : 2,
+            "intermediate_size" : 2,
+            "layer_count" : 1,
+            "expert_count" : 1,
+            "experts_per_token" : 1,
+            "expert_activation" : "relu",
+                                  "expert_layout" : "up_down",
+                                                    "expert_weight_dtype" : "int8",
+                                                                            "normalize_topk_weights" : true,
+                                                                                                       "norm_epsilon" : 0.00001
+    })";
         manifest.close();
 
         std::ofstream weights(path_ / "model.test.bin", std::ios::binary);
@@ -332,19 +385,12 @@ public:
 private:
     static void write_floats(std::ofstream& stream, const std::vector<float>& values)
     {
-        stream.write(
-            reinterpret_cast<const char*>(values.data()),
-            static_cast<std::streamsize>(values.size() * sizeof(float)));
+        stream.write(reinterpret_cast<const char*>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(float)));
     }
 
-    static void write_int8_matrix(
-        std::ofstream& stream,
-        const std::vector<int8_t>& values,
-        const std::vector<float>& scales)
+    static void write_int8_matrix(std::ofstream& stream, const std::vector<int8_t>& values, const std::vector<float>& scales)
     {
-        stream.write(
-            reinterpret_cast<const char*>(values.data()),
-            static_cast<std::streamsize>(values.size()));
+        stream.write(reinterpret_cast<const char*>(values.data()), static_cast<std::streamsize>(values.size()));
         write_floats(stream, scales);
     }
 
@@ -354,11 +400,7 @@ private:
 class AttentionPackage
 {
 public:
-    explicit AttentionPackage(
-        bool bfloat16_kv_cache = false,
-        uint32_t sliding_window = 2,
-        bool attention_bias = true,
-        bool attention_sinks = true)
+    explicit AttentionPackage(bool bfloat16_kv_cache = false, uint32_t sliding_window = 2, bool attention_bias = true, bool attention_sinks = true)
     {
         path_ = create_unique_test_directory("ncnn_moe_attention_test_");
 
@@ -391,13 +433,11 @@ public:
   "norm_epsilon": 0.00001,
   "kv_cache_dtype": ")"
                  << (bfloat16_kv_cache ? "bfloat16" : "float32") << R"("
-})";
+    })";
         manifest.close();
 
         std::vector<float> values;
-        auto append = [&values](std::initializer_list<float> additions) {
-            values.insert(values.end(), additions.begin(), additions.end());
-        };
+        auto append = [&values](std::initializer_list<float> additions) { values.insert(values.end(), additions.begin(), additions.end()); };
         append({1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f});
         append({0.0f, 0.0f, 0.0f, 0.0f});
         if (attention_bias)
@@ -412,7 +452,7 @@ public:
         if (attention_bias)
             append({0.0f, 0.0f});
         if (attention_sinks)
-            append({0.0f});
+            append({0.375f});
         append({
             1.0f,
             1.0f,
@@ -429,9 +469,7 @@ public:
         });
         append({1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f});
         std::ofstream weights(path_ / "model.test.bin", std::ios::binary);
-        weights.write(
-            reinterpret_cast<const char*>(values.data()),
-            static_cast<std::streamsize>(values.size() * sizeof(float)));
+        weights.write(reinterpret_cast<const char*>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(float)));
     }
 
     ~AttentionPackage()
@@ -453,12 +491,7 @@ void test_prefill_decode_and_reset()
 {
     TemporaryModelPackage package;
     TestRuntime runtime;
-    check(static_cast<bool>(has_flag(
-                                runtime.capabilities().flags,
-                                RuntimeCapabilityVulkanAttention)
-                            == has_flag(
-                                runtime.capabilities().flags,
-                                RuntimeCapabilityVulkanCpuMix)));
+    check(static_cast<bool>(has_flag(runtime.capabilities().flags, RuntimeCapabilityVulkanAttention) == has_flag(runtime.capabilities().flags, RuntimeCapabilityVulkanCpuMix)));
     auto model = runtime.load_model(package.path());
     check(static_cast<bool>(model));
     check(static_cast<bool>(model.value()->descriptor().model_type == "test_moe"));
@@ -474,8 +507,7 @@ void test_prefill_decode_and_reset()
     check(static_cast<bool>(prefill.value().logits.values.size() == 4));
 
     const float normalized_equal = (1.0f + 1.0f / std::sqrt(1.0f + 1e-5f));
-    const float final_value = normalized_equal
-                              / std::sqrt(normalized_equal * normalized_equal + 1e-5f);
+    const float final_value = normalized_equal / std::sqrt(normalized_equal * normalized_equal + 1e-5f);
     check_near(prefill.value().logits.values[0], final_value, 1e-5f);
     check_near(prefill.value().logits.values[1], final_value, 1e-5f);
     check_near(prefill.value().logits.values[2], 2.0f * final_value, 1e-5f);
@@ -498,8 +530,7 @@ void test_prefill_decode_and_reset()
 
     const float pre_norm = 1.0f / std::sqrt(0.5f + 1e-5f);
     const float expert_one_value = 1.0f + 2.0f * pre_norm;
-    const float final_expert_one = expert_one_value
-                                   / std::sqrt(expert_one_value * expert_one_value / 2.0f + 1e-5f);
+    const float final_expert_one = expert_one_value / std::sqrt(expert_one_value * expert_one_value / 2.0f + 1e-5f);
     check_near(decode.value().logits.values[0], 0.0f, 1e-5f);
     check_near(decode.value().logits.values[1], final_expert_one, 2e-5f);
     check_near(decode.value().logits.values[2], final_expert_one, 2e-5f);
@@ -551,12 +582,14 @@ void test_ncnn_linear_operator()
     check(static_cast<bool>(linear->forward(input, output)));
     check(static_cast<bool>(output.rows() == 2));
     check(static_cast<bool>(output.columns() == 4));
-    for (size_t row_index = 0; row_index < input.rows(); ++row_index) {
-        for (uint32_t column = 0; column < output.columns(); ++column) {
+    for (size_t row_index = 0; row_index < input.rows(); ++row_index)
+    {
+        for (uint32_t column = 0; column < output.columns(); ++column)
+        {
             float expected = bias.float32_data[column];
-            for (uint32_t input_column = 0; input_column < input.columns(); ++input_column) {
-                expected += matrix.float32_data[column * input.columns() + input_column]
-                            * input.row(row_index)[input_column];
+            for (uint32_t input_column = 0; input_column < input.columns(); ++input_column)
+            {
+                expected += matrix.float32_data[column * input.columns() + input_column] * input.row(row_index)[input_column];
             }
             check_near(output.row(row_index)[column], expected, 1e-5f);
         }
@@ -576,52 +609,48 @@ void test_ncnn_linear_operator()
     const auto bfloat_linear = NcnnLinearOperator::create(bfloat_matrix, &bfloat_bias);
     check(static_cast<bool>(bfloat_linear));
     check(static_cast<bool>(bfloat_linear->forward(input, output)));
-    for (size_t row_index = 0; row_index < input.rows(); ++row_index) {
-        for (uint32_t column = 0; column < output.columns(); ++column) {
+    for (size_t row_index = 0; row_index < input.rows(); ++row_index)
+    {
+        for (uint32_t column = 0; column < output.columns(); ++column)
+        {
             float expected = bfloat16_to_float(bfloat_bias.bfloat16_data[column]);
-            for (uint32_t input_column = 0; input_column < input.columns(); ++input_column) {
-                expected += bfloat16_to_float(
-                                bfloat_matrix.bfloat16_data[column * input.columns() + input_column])
-                            * input.row(row_index)[input_column];
+            for (uint32_t input_column = 0; input_column < input.columns(); ++input_column)
+            {
+                expected += bfloat16_to_float(bfloat_matrix.bfloat16_data[column * input.columns() + input_column]) * input.row(row_index)[input_column];
             }
             check_near(output.row(row_index)[column], expected, 1e-5f);
         }
     }
 
-    if (NcnnLinearOperator::vulkan_device_count() > 0) {
-        const auto vulkan_linear = NcnnLinearOperator::create(
-            matrix,
-            &bias,
-            NcnnLinearDevice::Vulkan);
+    if (NcnnLinearOperator::vulkan_device_count() > 0)
+    {
+        const auto vulkan_linear = NcnnLinearOperator::create(matrix, &bias, NcnnLinearDevice::Vulkan);
         check(static_cast<bool>(vulkan_linear));
-        const NcnnVulkanRuntimeCounters initial_counters
-            = NcnnLinearOperator::current_thread_vulkan_runtime_counters();
-        for (uint32_t iteration = 0; iteration < 4; ++iteration) {
+        const NcnnVulkanRuntimeCounters initial_counters = NcnnLinearOperator::current_thread_vulkan_runtime_counters();
+        for (uint32_t iteration = 0; iteration < 4; ++iteration)
+        {
             check(static_cast<bool>(vulkan_linear->forward(input, output)));
-            for (size_t row_index = 0; row_index < input.rows(); ++row_index) {
-                for (uint32_t column = 0; column < output.columns(); ++column) {
+            for (size_t row_index = 0; row_index < input.rows(); ++row_index)
+            {
+                for (uint32_t column = 0; column < output.columns(); ++column)
+                {
                     float expected = bias.float32_data[column];
-                    for (uint32_t input_column = 0; input_column < input.columns(); ++input_column) {
-                        expected += matrix.float32_data[column * input.columns() + input_column]
-                                    * input.row(row_index)[input_column];
+                    for (uint32_t input_column = 0; input_column < input.columns(); ++input_column)
+                    {
+                        expected += matrix.float32_data[column * input.columns() + input_column] * input.row(row_index)[input_column];
                     }
                     check_near(output.row(row_index)[column], expected, 1e-4f);
                 }
             }
         }
-        const NcnnVulkanRuntimeCounters final_counters
-            = NcnnLinearOperator::current_thread_vulkan_runtime_counters();
+        const NcnnVulkanRuntimeCounters final_counters = NcnnLinearOperator::current_thread_vulkan_runtime_counters();
         check(static_cast<bool>(final_counters.compute_submissions - initial_counters.compute_submissions == 4));
         check(static_cast<bool>(final_counters.batch_uploads - initial_counters.batch_uploads == 4));
         check(static_cast<bool>(final_counters.batch_downloads - initial_counters.batch_downloads == 4));
         check(static_cast<bool>(final_counters.auxiliary_uploads - initial_counters.auxiliary_uploads == 0));
-        check(static_cast<bool>(final_counters.staging_slot_resizes - initial_counters.staging_slot_resizes
-                                    + final_counters.staging_slot_reuses - initial_counters.staging_slot_reuses
-                                == 8));
+        check(static_cast<bool>(final_counters.staging_slot_resizes - initial_counters.staging_slot_resizes + final_counters.staging_slot_reuses - initial_counters.staging_slot_reuses == 8));
         check(static_cast<bool>(final_counters.staging_slot_reuses - initial_counters.staging_slot_reuses >= 4));
-        check(static_cast<bool>(final_counters.staging_slot_acquisitions
-                                    - initial_counters.staging_slot_acquisitions
-                                == 4));
+        check(static_cast<bool>(final_counters.staging_slot_acquisitions - initial_counters.staging_slot_acquisitions == 4));
     }
 #endif
 }
@@ -633,27 +662,26 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     matrix.shape = {4, 32};
     matrix.mxfp4_scales = {127, 127, 127, 127};
     matrix.mxfp4_blocks.resize(64);
-    for (size_t row = 0; row < 4; ++row) {
-        for (size_t byte = 0; byte < 16; ++byte) {
+    for (size_t row = 0; row < 4; ++row)
+    {
+        for (size_t byte = 0; byte < 16; ++byte)
+        {
             const uint8_t low = static_cast<uint8_t>((byte + row) % 16);
             const uint8_t high = static_cast<uint8_t>((byte * 3 + row + 1) % 16);
-            matrix.mxfp4_blocks[row * 16 + byte]
-                = static_cast<uint8_t>(low | (high << 4));
+            matrix.mxfp4_blocks[row * 16 + byte] = static_cast<uint8_t>(low | (high << 4));
         }
     }
     CpuBatch input(2, 32);
-    for (size_t row = 0; row < input.rows(); ++row) {
+    for (size_t row = 0; row < input.rows(); ++row)
+    {
         for (uint32_t column = 0; column < input.columns(); ++column)
-            input.row(row)[column] = static_cast<float>(
-                                         static_cast<int>(column % 7) - 3)
-                                     * (row == 0 ? 0.25f : -0.125f);
+            input.row(row)[column] = static_cast<float>(static_cast<int>(column % 7) - 3) * (row == 0 ? 0.25f : -0.125f);
     }
-    static constexpr float values[16] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    static constexpr float values[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
     auto scalar_row = [&](size_t matrix_row, size_t input_row) {
         float sum = 0.0f;
-        for (size_t byte = 0; byte < 16; ++byte) {
+        for (size_t byte = 0; byte < 16; ++byte)
+        {
             const uint8_t packed = matrix.mxfp4_blocks[matrix_row * 16 + byte];
             sum += values[packed & 0x0f] * input.row(input_row)[byte * 2];
             sum += values[packed >> 4] * input.row(input_row)[byte * 2 + 1];
@@ -662,23 +690,58 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     };
 
     const CpuBatch projected = linear_batch(matrix, input);
-    for (size_t input_row = 0; input_row < input.rows(); ++input_row) {
-        for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row) {
-            check_near(
-                projected.row(input_row)[matrix_row],
-                scalar_row(matrix_row, input_row),
-                1e-5f);
+    for (size_t input_row = 0; input_row < input.rows(); ++input_row)
+    {
+        for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row)
+        {
+            check_near(projected.row(input_row)[matrix_row], scalar_row(matrix_row, input_row), 1e-5f);
         }
+    }
+    auto vulkan_projection = NcnnVulkanMxfp4Operator::create(matrix);
+    if (NcnnLinearOperator::vulkan_device_count() > 0)
+    {
+        check(static_cast<bool>(vulkan_projection));
+        check(static_cast<bool>(vulkan_projection->input_columns() == 32));
+        check(static_cast<bool>(vulkan_projection->output_columns() == 4));
+        CpuBatch vulkan_output;
+        check(static_cast<bool>(vulkan_projection->forward(input, vulkan_output)));
+        for (size_t input_row = 0; input_row < input.rows(); ++input_row)
+        {
+            for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row)
+            {
+                check_near(vulkan_output.row(input_row)[matrix_row], projected.row(input_row)[matrix_row], 1e-4f);
+            }
+        }
+        CpuBatch four_row_input(4, 32);
+        for (size_t row = 0; row < four_row_input.rows(); ++row)
+        {
+            for (uint32_t column = 0; column < four_row_input.columns(); ++column)
+            {
+                four_row_input.row(row)[column] = static_cast<float>(static_cast<int>((column + row * 5) % 11) - 5) * 0.0625f;
+            }
+        }
+        const CpuBatch four_row_cpu = linear_batch(matrix, four_row_input);
+        CpuBatch four_row_vulkan;
+        check(static_cast<bool>(vulkan_projection->forward(four_row_input, four_row_vulkan)));
+        for (size_t row = 0; row < four_row_input.rows(); ++row)
+        {
+            for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row)
+            {
+                check_near(four_row_vulkan.row(row)[matrix_row], four_row_cpu.row(row)[matrix_row], 1e-4f);
+            }
+        }
+    }
+    else
+    {
+        check(static_cast<bool>(!vulkan_projection));
     }
 
     CpuBatch decode_input(1, 32);
     std::copy_n(input.row(0), input.columns(), decode_input.row(0));
     const CpuBatch decoded = linear_batch(matrix, decode_input);
-    for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row) {
-        check_near(
-            decoded.row(0)[matrix_row],
-            scalar_row(matrix_row, 0),
-            1e-5f);
+    for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row)
+    {
+        check_near(decoded.row(0)[matrix_row], scalar_row(matrix_row, 0), 1e-5f);
     }
 
     TensorData odd_matrix = matrix;
@@ -687,13 +750,30 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     odd_matrix.mxfp4_scales.resize(3);
     const CpuBatch odd_projected = linear_batch(odd_matrix, input);
     check(static_cast<bool>(odd_projected.columns() == 3));
-    for (size_t input_row = 0; input_row < input.rows(); ++input_row) {
-        for (size_t matrix_row = 0; matrix_row < 3; ++matrix_row) {
-            check_near(
-                odd_projected.row(input_row)[matrix_row],
-                scalar_row(matrix_row, input_row),
-                1e-5f);
+    for (size_t input_row = 0; input_row < input.rows(); ++input_row)
+    {
+        for (size_t matrix_row = 0; matrix_row < 3; ++matrix_row)
+        {
+            check_near(odd_projected.row(input_row)[matrix_row], scalar_row(matrix_row, input_row), 1e-5f);
         }
+    }
+    auto odd_vulkan_projection = NcnnVulkanMxfp4Operator::create(odd_matrix);
+    if (NcnnLinearOperator::vulkan_device_count() > 0)
+    {
+        check(static_cast<bool>(odd_vulkan_projection));
+        CpuBatch odd_vulkan_output;
+        check(static_cast<bool>(odd_vulkan_projection->forward(input, odd_vulkan_output)));
+        for (size_t input_row = 0; input_row < input.rows(); ++input_row)
+        {
+            for (size_t matrix_row = 0; matrix_row < 3; ++matrix_row)
+            {
+                check_near(odd_vulkan_output.row(input_row)[matrix_row], odd_projected.row(input_row)[matrix_row], 1e-4f);
+            }
+        }
+    }
+    else
+    {
+        check(static_cast<bool>(!odd_vulkan_projection));
     }
 
     TensorData bias;
@@ -703,20 +783,204 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     const CpuBatch fused = fused_mxfp4_gate_up_batch(matrix, &bias, input, 7.0f);
     check(static_cast<bool>(fused.rows() == input.rows()));
     check(static_cast<bool>(fused.columns() == 2));
-    for (size_t input_row = 0; input_row < input.rows(); ++input_row) {
-        for (size_t column = 0; column < fused.columns(); ++column) {
-            const float gate = std::min(
-                scalar_row(column * 2, input_row) + bias.float32_data[column * 2],
-                7.0f);
-            const float linear = std::clamp(
-                scalar_row(column * 2 + 1, input_row)
-                    + bias.float32_data[column * 2 + 1],
-                -7.0f,
-                7.0f);
-            const float expected
-                = gate / (1.0f + std::exp(-1.702f * gate)) * (linear + 1.0f);
+    for (float sigmoid_scale : {1.0f, 1.702f})
+    {
+        for (int step = -1000; step <= 700; ++step)
+        {
+            const float value = static_cast<float>(step) * 0.01f;
+            const float expected = value / (1.0f + std::exp(-sigmoid_scale * value));
+            check_near(approximate_scaled_silu(value, sigmoid_scale), expected, 1e-5f);
+            check_near(scaled_silu(value, sigmoid_scale), expected, 1e-5f);
+        }
+    }
+    for (size_t input_row = 0; input_row < input.rows(); ++input_row)
+    {
+        for (size_t column = 0; column < fused.columns(); ++column)
+        {
+            const float gate = std::min(scalar_row(column * 2, input_row) + bias.float32_data[column * 2], 7.0f);
+            const float linear = std::clamp(scalar_row(column * 2 + 1, input_row) + bias.float32_data[column * 2 + 1], -7.0f, 7.0f);
+            const float expected = gate / (1.0f + std::exp(-1.702f * gate)) * (linear + 1.0f);
             check_near(fused.row(input_row)[column], expected, 1e-5f);
         }
+    }
+
+    TensorData expert_gate_up;
+    expert_gate_up.dtype = DType::MxFp4;
+    expert_gate_up.shape = {64, 32};
+    expert_gate_up.mxfp4_scales.resize(64);
+    expert_gate_up.mxfp4_blocks.resize(64 * 16);
+    for (size_t row = 0; row < 64; ++row)
+    {
+        expert_gate_up.mxfp4_scales[row] = static_cast<uint8_t>(125 + row % 5);
+        for (size_t byte = 0; byte < 16; ++byte)
+        {
+            const uint8_t low = static_cast<uint8_t>((row * 3 + byte * 5 + 1) % 16);
+            const uint8_t high = static_cast<uint8_t>((row * 7 + byte * 2 + 4) % 16);
+            expert_gate_up.mxfp4_blocks[row * 16 + byte] = static_cast<uint8_t>(low | (high << 4));
+        }
+    }
+    TensorData expert_gate_up_bias;
+    expert_gate_up_bias.dtype = DType::Float32;
+    expert_gate_up_bias.shape = {64};
+    expert_gate_up_bias.float32_data.resize(64);
+    for (size_t row = 0; row < 64; ++row)
+    {
+        expert_gate_up_bias.float32_data[row] = static_cast<float>(static_cast<int>(row % 9) - 4) * 0.03125f;
+    }
+    TensorData expert_down;
+    expert_down.dtype = DType::MxFp4;
+    expert_down.shape = {7, 32};
+    expert_down.mxfp4_scales.resize(7);
+    expert_down.mxfp4_blocks.resize(7 * 16);
+    for (size_t row = 0; row < 7; ++row)
+    {
+        expert_down.mxfp4_scales[row] = static_cast<uint8_t>(126 + row % 3);
+        for (size_t byte = 0; byte < 16; ++byte)
+        {
+            const uint8_t low = static_cast<uint8_t>((row * 11 + byte * 3 + 2) % 16);
+            const uint8_t high = static_cast<uint8_t>((row * 5 + byte * 7 + 8) % 16);
+            expert_down.mxfp4_blocks[row * 16 + byte] = static_cast<uint8_t>(low | (high << 4));
+        }
+    }
+    TensorData expert_down_bias;
+    expert_down_bias.dtype = DType::Float32;
+    expert_down_bias.shape = {7};
+    expert_down_bias.float32_data.resize(7);
+    for (size_t row = 0; row < 7; ++row)
+    {
+        expert_down_bias.float32_data[row] = static_cast<float>(static_cast<int>(row) - 3) * 0.0625f;
+    }
+    constexpr float expert_activation_limit = 5.25f;
+    auto vulkan_expert = NcnnVulkanMxfp4ExpertOperator::create(expert_gate_up, &expert_gate_up_bias, expert_down, &expert_down_bias, expert_activation_limit);
+    if (NcnnLinearOperator::vulkan_device_count() > 0)
+    {
+        check(static_cast<bool>(vulkan_expert));
+        for (size_t token_count : {size_t(1), size_t(2), size_t(4)})
+        {
+            CpuBatch expert_input(token_count, 32);
+            for (size_t row = 0; row < expert_input.rows(); ++row)
+            {
+                for (uint32_t column = 0; column < expert_input.columns(); ++column)
+                {
+                    expert_input.row(row)[column] = static_cast<float>(static_cast<int>((column * 5 + row * 7) % 17) - 8) * 0.015625f;
+                }
+            }
+            const CpuBatch cpu_activated = fused_mxfp4_gate_up_batch(expert_gate_up, &expert_gate_up_bias, expert_input, expert_activation_limit);
+            const CpuBatch cpu_expert = linear_batch(expert_down, expert_down_bias, cpu_activated);
+            CpuBatch vulkan_expert_output;
+            check(static_cast<bool>(vulkan_expert->forward(expert_input, vulkan_expert_output)));
+            check(static_cast<bool>(vulkan_expert_output.rows() == cpu_expert.rows()));
+            check(static_cast<bool>(vulkan_expert_output.columns() == cpu_expert.columns()));
+            for (size_t row = 0; row < cpu_expert.rows(); ++row)
+            {
+                for (uint32_t column = 0; column < cpu_expert.columns(); ++column)
+                {
+                    check_near(vulkan_expert_output.row(row)[column], cpu_expert.row(row)[column], 1e-3f);
+                }
+            }
+        }
+    }
+    else
+    {
+        check(static_cast<bool>(!vulkan_expert));
+    }
+
+    auto expert_backend = create_vulkan_mxfp4_expert_backend(4096);
+    if (NcnnLinearOperator::vulkan_device_count() > 0)
+    {
+        check(static_cast<bool>(expert_backend));
+        const auto backend_gate_up = std::make_shared<TensorData>(expert_gate_up);
+        const auto backend_down = std::make_shared<TensorData>(expert_down);
+        expert_backend->admit("test-expert", backend_gate_up, &expert_gate_up_bias, backend_down, &expert_down_bias, 0, 1, expert_activation_limit);
+        expert_backend->admit("test-expert", backend_gate_up, &expert_gate_up_bias, backend_down, &expert_down_bias, 0, 1, expert_activation_limit);
+        const auto admission_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (expert_backend->statistics().stores == 0 && std::chrono::steady_clock::now() < admission_deadline)
+        {
+            std::this_thread::yield();
+        }
+        check(static_cast<bool>(expert_backend->statistics().stores == 1));
+        const uint64_t backend_weight_bytes = expert_gate_up.mxfp4_blocks.size() + expert_gate_up.mxfp4_scales.size() + expert_down.mxfp4_blocks.size() + expert_down.mxfp4_scales.size();
+        for (uint32_t sample = 0; sample < 3; ++sample)
+        {
+            expert_backend->observe_cpu(1, backend_weight_bytes, 1000);
+        }
+        CpuBatch backend_input(1, 32);
+        for (uint32_t column = 0; column < backend_input.columns(); ++column)
+        {
+            backend_input.row(0)[column] = static_cast<float>(static_cast<int>(column % 13) - 6) * 0.015625f;
+        }
+        const CpuBatch backend_activated = fused_mxfp4_gate_up_batch(expert_gate_up, &expert_gate_up_bias, backend_input, expert_activation_limit);
+        const CpuBatch backend_expected = linear_batch(expert_down, expert_down_bias, backend_activated);
+        for (uint32_t sample = 0; sample < 3; ++sample)
+        {
+            CpuBatch backend_output;
+            check(static_cast<bool>(expert_backend->try_execute("test-expert", backend_input, backend_output) == ExpertBackendExecutionResult ::Executed));
+            for (uint32_t column = 0; column < backend_expected.columns(); ++column)
+            {
+                check_near(backend_output.row(0)[column], backend_expected.row(0)[column], 1e-3f);
+            }
+        }
+        CpuBatch backend_batch_output_first;
+        CpuBatch backend_batch_output_second;
+        const std::array<ExpertBackendRequest, 2> backend_requests = {{
+            {
+                "test-expert",
+                &backend_input,
+                &backend_batch_output_first,
+            },
+            {
+                "test-expert",
+                &backend_input,
+                &backend_batch_output_second,
+            },
+        }};
+        const auto backend_batch_results = expert_backend->try_execute_batch(backend_requests);
+        check(static_cast<bool>(backend_batch_results.size() == 2));
+        for (ExpertBackendExecutionResult result : backend_batch_results)
+        {
+            check(static_cast<bool>(result == ExpertBackendExecutionResult ::Executed));
+        }
+        for (const CpuBatch* batch_output : {&backend_batch_output_first, &backend_batch_output_second})
+        {
+            for (uint32_t column = 0; column < backend_expected.columns(); ++column)
+            {
+                check_near(batch_output->row(0)[column], backend_expected.row(0)[column], 1e-3f);
+            }
+        }
+        const ExpertBackendStatistics backend_statistics = expert_backend->statistics();
+        check(static_cast<bool>(backend_statistics.executions == 5));
+        check(static_cast<bool>(backend_statistics.hits == 5));
+        check(static_cast<bool>(backend_statistics.bytes_uploaded > 0));
+        check(static_cast<bool>(backend_statistics.arc_frequent_bytes > 0));
+
+        auto device_source = create_vulkan_victim_cache(4096);
+        check(static_cast<bool>(device_source));
+        device_source->admit("victim-expert", backend_gate_up, backend_down, 0,
+                             {
+                                 &expert_gate_up_bias,
+                                 &expert_down_bias,
+                                 expert_activation_limit,
+                                 true,
+                             });
+        device_source->wait_for_background_work();
+        check(static_cast<bool>(device_source->statistics().stores == 1));
+        auto source_backend = create_vulkan_mxfp4_expert_backend(0, automatic_vulkan_device_index, device_source);
+        check(static_cast<bool>(source_backend));
+        CpuBatch source_output;
+        check(static_cast<bool>(source_backend->try_execute("victim-expert", backend_input, source_output) == ExpertBackendExecutionResult ::Executed));
+        for (uint32_t column = 0; column < backend_expected.columns(); ++column)
+        {
+            check_near(source_output.row(0)[column], backend_expected.row(0)[column], 1e-3f);
+        }
+        const ExpertBackendStatistics source_statistics = source_backend->statistics();
+        check(static_cast<bool>(source_statistics.device_source_hits == 1));
+        check(static_cast<bool>(source_statistics.device_source_executions == 1));
+        check(static_cast<bool>(source_statistics.device_source_execution_failures == 0));
+        check(static_cast<bool>(device_source->statistics().bytes_downloaded == 0));
+    }
+    else
+    {
+        check(static_cast<bool>(!expert_backend));
     }
 
     constexpr uint32_t test_block_count = 4;
@@ -726,111 +990,101 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     constexpr size_t test_output_stride = 3;
     std::vector<uint8_t> first_packed(test_block_count * 16);
     std::vector<uint8_t> second_packed(test_block_count * 16);
-    for (size_t index = 0; index < first_packed.size(); ++index) {
-        first_packed[index] = static_cast<uint8_t>(
-            ((index * 5 + 3) % 16) | (((index * 7 + 1) % 16) << 4));
-        second_packed[index] = static_cast<uint8_t>(
-            ((index * 11 + 2) % 16) | (((index * 3 + 9) % 16) << 4));
+    for (size_t index = 0; index < first_packed.size(); ++index)
+    {
+        first_packed[index] = static_cast<uint8_t>(((index * 5 + 3) % 16) | (((index * 7 + 1) % 16) << 4));
+        second_packed[index] = static_cast<uint8_t>(((index * 11 + 2) % 16) | (((index * 3 + 9) % 16) << 4));
     }
-    const std::array<uint8_t, test_block_count> first_scales
-        = {125, 127, 128, 126};
-    const std::array<uint8_t, test_block_count> second_scales
-        = {128, 124, 127, 129};
+    const std::array<uint8_t, test_block_count> first_scales = {125, 127, 128, 126};
+    const std::array<uint8_t, test_block_count> second_scales = {128, 124, 127, 129};
     std::vector<float> strided_input(test_token_count * test_input_stride);
-    for (size_t token = 0; token < test_token_count; ++token) {
-        for (size_t column = 0; column < test_input_stride; ++column) {
-            strided_input[token * test_input_stride + column]
-                = static_cast<float>(
-                      static_cast<int>((column * 13 + token * 5) % 23) - 11)
-                  * 0.03125f;
+    for (size_t token = 0; token < test_token_count; ++token)
+    {
+        for (size_t column = 0; column < test_input_stride; ++column)
+        {
+            strided_input[token * test_input_stride + column] = static_cast<float>(static_cast<int>((column * 13 + token * 5) % 23) - 11) * 0.03125f;
         }
     }
-    auto reference_dot = [&](
-                             const std::vector<uint8_t>& packed,
-                             const std::array<uint8_t, test_block_count>& scales,
-                             size_t token) {
+    auto reference_dot = [&](const std::vector<uint8_t>& packed, const std::array<uint8_t, test_block_count>& scales, size_t token) {
         float sum = 0.0f;
-        for (uint32_t block = 0; block < test_block_count; ++block) {
+        for (uint32_t block = 0; block < test_block_count; ++block)
+        {
             float block_sum = 0.0f;
-            for (uint32_t byte = 0; byte < 16; ++byte) {
+            for (uint32_t byte = 0; byte < 16; ++byte)
+            {
                 const uint8_t value = packed[block * 16 + byte];
-                const size_t input_offset
-                    = token * test_input_stride + block * 32 + byte * 2;
-                block_sum
-                    += values[value & 0x0f] * strided_input[input_offset];
-                block_sum
-                    += values[value >> 4] * strided_input[input_offset + 1];
+                const size_t input_offset = token * test_input_stride + block * 32 + byte * 2;
+                block_sum += values[value & 0x0f] * strided_input[input_offset];
+                block_sum += values[value >> 4] * strided_input[input_offset + 1];
             }
-            sum += block_sum
-                   * std::ldexp(
-                       1.0f,
-                       static_cast<int>(scales[block]) - 127);
+            sum += block_sum * std::ldexp(1.0f, static_cast<int>(scales[block]) - 127);
         }
         return sum;
     };
 
-    check_near(
-        mxfp4_dot(
-            first_packed.data(),
-            first_scales.data(),
-            test_block_count,
-            strided_input.data()),
-        reference_dot(first_packed, first_scales, 0),
-        1e-4f);
+    check_near(mxfp4_dot(first_packed.data(), first_scales.data(), test_block_count, strided_input.data()), reference_dot(first_packed, first_scales, 0), 1e-4f);
 
-    std::vector<float> gemm_output(
-        test_token_count * test_output_stride,
-        -999.0f);
-    mxfp4_gemm_row(
-        first_packed.data(),
-        first_scales.data(),
-        test_block_count,
-        strided_input.data(),
-        test_input_stride,
-        test_token_count,
-        gemm_output.data(),
-        test_output_stride);
-    for (size_t token = 0; token < test_token_count; ++token) {
-        check_near(
-            gemm_output[token * test_output_stride],
-            reference_dot(first_packed, first_scales, token),
-            1e-4f);
+    std::vector<float> gemm_output(test_token_count * test_output_stride, -999.0f);
+    mxfp4_gemm_row(first_packed.data(), first_scales.data(), test_block_count, strided_input.data(), test_input_stride, test_token_count, gemm_output.data(), test_output_stride);
+    for (size_t token = 0; token < test_token_count; ++token)
+    {
+        check_near(gemm_output[token * test_output_stride], reference_dot(first_packed, first_scales, token), 1e-4f);
     }
 
-    std::vector<float> paired_first(
-        test_token_count * test_output_stride,
-        -999.0f);
-    std::vector<float> paired_second(
-        test_token_count * test_output_stride,
-        -999.0f);
-    mxfp4_matmul_rows2(
-        first_packed.data(),
-        first_scales.data(),
-        second_packed.data(),
-        second_scales.data(),
-        test_block_count,
-        strided_input.data(),
-        test_input_stride,
-        test_token_count,
-        paired_first.data(),
-        test_output_stride,
-        paired_second.data(),
-        test_output_stride);
-    for (size_t token = 0; token < test_token_count; ++token) {
-        check_near(
-            paired_first[token * test_output_stride],
-            reference_dot(first_packed, first_scales, token),
-            1e-4f);
-        check_near(
-            paired_second[token * test_output_stride],
-            reference_dot(second_packed, second_scales, token),
-            1e-4f);
+    std::vector<float> paired_first(test_token_count * test_output_stride, -999.0f);
+    std::vector<float> paired_second(test_token_count * test_output_stride, -999.0f);
+    mxfp4_matmul_rows2(first_packed.data(), first_scales.data(), second_packed.data(), second_scales.data(), test_block_count, strided_input.data(), test_input_stride, test_token_count, paired_first.data(), test_output_stride,
+                       paired_second.data(), test_output_stride);
+    for (size_t token = 0; token < test_token_count; ++token)
+    {
+        check_near(paired_first[token * test_output_stride], reference_dot(first_packed, first_scales, token), 1e-4f);
+        check_near(paired_second[token * test_output_stride], reference_dot(second_packed, second_scales, token), 1e-4f);
+    }
+
+    constexpr uint32_t bulk_pair_count = 2;
+    constexpr size_t bulk_output_stride = 7;
+    std::vector<uint8_t> bulk_packed(bulk_pair_count * 2 * test_block_count * 16);
+    std::vector<uint8_t> bulk_scales(bulk_pair_count * 2 * test_block_count);
+    const size_t packed_row_bytes = test_block_count * 16;
+    for (uint32_t pair = 0; pair < bulk_pair_count; ++pair)
+    {
+        const std::vector<uint8_t>& first_source = pair == 0 ? first_packed : second_packed;
+        const std::vector<uint8_t>& second_source = pair == 0 ? second_packed : first_packed;
+        const auto& first_scale_source = pair == 0 ? first_scales : second_scales;
+        const auto& second_scale_source = pair == 0 ? second_scales : first_scales;
+        std::copy(first_source.begin(), first_source.end(), bulk_packed.begin() + pair * 2 * packed_row_bytes);
+        std::copy(second_source.begin(), second_source.end(), bulk_packed.begin() + (pair * 2 + 1) * packed_row_bytes);
+        std::copy(first_scale_source.begin(), first_scale_source.end(), bulk_scales.begin() + pair * 2 * test_block_count);
+        std::copy(second_scale_source.begin(), second_scale_source.end(), bulk_scales.begin() + (pair * 2 + 1) * test_block_count);
+    }
+    std::vector<float> bulk_output(test_token_count * bulk_output_stride, -999.0f);
+    mxfp4_matmul_row_pairs(bulk_packed.data(), bulk_scales.data(), test_block_count, bulk_pair_count, strided_input.data(), test_input_stride, test_token_count, bulk_output.data() + 1, 2, bulk_output_stride, bulk_output.data() + 2, 2,
+                           bulk_output_stride);
+    for (size_t token = 0; token < test_token_count; ++token)
+    {
+        check_near(bulk_output[token * bulk_output_stride + 1], reference_dot(first_packed, first_scales, token), 1e-4f);
+        check_near(bulk_output[token * bulk_output_stride + 2], reference_dot(second_packed, second_scales, token), 1e-4f);
+        check_near(bulk_output[token * bulk_output_stride + 3], reference_dot(second_packed, second_scales, token), 1e-4f);
+        check_near(bulk_output[token * bulk_output_stride + 4], reference_dot(first_packed, first_scales, token), 1e-4f);
+    }
+
+    constexpr size_t paired_token_count = 2;
+    std::vector<float> paired_bulk_output(paired_token_count * bulk_output_stride, -999.0f);
+    mxfp4_matmul_row_pairs(bulk_packed.data(), bulk_scales.data(), test_block_count, bulk_pair_count, strided_input.data(), test_input_stride, paired_token_count, paired_bulk_output.data() + 1, 2, bulk_output_stride,
+                           paired_bulk_output.data() + 2, 2, bulk_output_stride);
+    for (size_t token = 0; token < paired_token_count; ++token)
+    {
+        check_near(paired_bulk_output[token * bulk_output_stride + 1], reference_dot(first_packed, first_scales, token), 1e-4f);
+        check_near(paired_bulk_output[token * bulk_output_stride + 2], reference_dot(second_packed, second_scales, token), 1e-4f);
+        check_near(paired_bulk_output[token * bulk_output_stride + 3], reference_dot(second_packed, second_scales, token), 1e-4f);
+        check_near(paired_bulk_output[token * bulk_output_stride + 4], reference_dot(first_packed, first_scales, token), 1e-4f);
     }
 
 #if defined(__aarch64__) || defined(_M_ARM64)
-    check(static_cast<bool>(mxfp4_kernel_kind() == MxFp4KernelKind::ArmNeon));
+    check(static_cast<bool>(mxfp4_kernel_kind() == MxFp4KernelKind::ArmNeon || mxfp4_kernel_kind() == MxFp4KernelKind::ArmSve2));
 #endif
     check(static_cast<bool>(std::string(mxfp4_kernel_name()).size() > 0));
+    check(static_cast<bool>(std::string(scaled_silu_kernel_name()).size() > 0));
 }
 
 class TestExpertVictimCache final : public IExpertVictimCache
@@ -841,10 +1095,7 @@ public:
     {
     }
 
-    void admit(
-        std::string key,
-        std::shared_ptr<const TensorData> gate_up,
-        std::shared_ptr<const TensorData> down) override
+    void admit(std::string key, std::shared_ptr<const TensorData> gate_up, std::shared_ptr<const TensorData> down, uint32_t, ExpertVictimExecutionMetadata) override
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         ExpertVictimPair pair;
@@ -853,26 +1104,24 @@ public:
         entries_[std::move(key)] = std::move(pair);
         ++statistics_.admissions;
         ++statistics_.stores;
-        statistics_.resident_bytes
-            += gate_up->mxfp4_blocks.size()
-               + gate_up->mxfp4_scales.size()
-               + down->mxfp4_blocks.size()
-               + down->mxfp4_scales.size();
+        statistics_.resident_bytes += gate_up->mxfp4_blocks.size() + gate_up->mxfp4_scales.size() + down->mxfp4_blocks.size() + down->mxfp4_scales.size();
     }
 
-    std::optional<ExpertVictimPair> restore(
-        const std::string& key,
-        const TensorData&,
-        const TensorData&) override
+    std::optional<ExpertVictimPair> restore(const std::string& key, const TensorData&, const TensorData&) override
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         const auto existing = entries_.find(key);
-        if (existing == entries_.end()) {
+        if (existing == entries_.end())
+        {
             ++statistics_.misses;
             return std::nullopt;
         }
         ++statistics_.hits;
         return existing->second;
+    }
+
+    void wait_for_background_work() override
+    {
     }
 
     ExpertVictimCacheStatistics statistics() const override
@@ -893,10 +1142,115 @@ private:
     ExpertVictimCacheStatistics statistics_;
 };
 
+class DelayedExpertVictimCache final : public IExpertVictimCache
+{
+public:
+    void admit(std::string, std::shared_ptr<const TensorData>, std::shared_ptr<const TensorData>, uint32_t, ExpertVictimExecutionMetadata) override
+    {
+    }
+
+    std::optional<ExpertVictimPair> restore(const std::string& key, const TensorData& gate_up_source, const TensorData& down_source) override
+    {
+        std::this_thread::sleep_for(key == "slow" ? std::chrono::milliseconds(100) : std::chrono::milliseconds(1));
+        ExpertVictimPair pair;
+        pair.gate_up = make_tensor(gate_up_source, 7);
+        pair.down = make_tensor(down_source, 9);
+        return pair;
+    }
+
+    void wait_for_background_work() override
+    {
+    }
+
+    ExpertVictimCacheStatistics statistics() const override
+    {
+        return {};
+    }
+
+    uint64_t capacity_bytes() const noexcept override
+    {
+        return 68;
+    }
+
+private:
+    static std::shared_ptr<TensorData> make_tensor(const TensorData& source, uint8_t value)
+    {
+        auto result = std::make_shared<TensorData>(source);
+        result->mxfp4_file_storage.reset();
+        result->mxfp4_blocks.resize(source.mxfp4_file_storage->blocks_bytes);
+        std::fill_n(result->mxfp4_blocks.data(), result->mxfp4_blocks.size(), value);
+        result->mxfp4_scales.resize(source.mxfp4_file_storage->scales_bytes);
+        std::fill_n(result->mxfp4_scales.data(), result->mxfp4_scales.size(), uint8_t{127});
+        return result;
+    }
+};
+
+void test_sharded_expert_victim_cache()
+{
+    auto first = std::make_shared<TestExpertVictimCache>(34);
+    auto second = std::make_shared<TestExpertVictimCache>(68);
+    auto sharded = create_sharded_victim_cache({
+        first,
+        nullptr,
+        second,
+    });
+    check(static_cast<bool>(sharded));
+    check(static_cast<bool>(sharded->capacity_bytes() == 102));
+
+    auto gate_up = std::make_shared<TensorData>();
+    gate_up->dtype = DType::MxFp4;
+    gate_up->shape = {2, 32};
+    gate_up->mxfp4_blocks.resize(32);
+    std::fill_n(gate_up->mxfp4_blocks.data(), gate_up->mxfp4_blocks.size(), uint8_t{7});
+    gate_up->mxfp4_scales.resize(2);
+    std::fill_n(gate_up->mxfp4_scales.data(), gate_up->mxfp4_scales.size(), uint8_t{127});
+    auto down = std::make_shared<TensorData>();
+    down->dtype = DType::MxFp4;
+    down->shape = {1, 1};
+    down->mxfp4_blocks.resize(16);
+    std::fill_n(down->mxfp4_blocks.data(), down->mxfp4_blocks.size(), uint8_t{9});
+    down->mxfp4_scales.resize(1);
+    std::fill_n(down->mxfp4_scales.data(), down->mxfp4_scales.size(), uint8_t{126});
+
+    sharded->admit("layer.0.expert.1", gate_up, down);
+    sharded->admit("layer.7.expert.3", gate_up, down);
+    sharded->wait_for_background_work();
+    auto restored_first = sharded->restore("layer.0.expert.1", *gate_up, *down);
+    auto restored_second = sharded->restore("layer.7.expert.3", *gate_up, *down);
+    check(static_cast<bool>(restored_first));
+    check(static_cast<bool>(restored_second));
+    check(static_cast<bool>(restored_first->gate_up->mxfp4_blocks.front() == 7));
+    check(static_cast<bool>(restored_second->down->mxfp4_blocks.front() == 9));
+    const ExpertVictimCacheStatistics statistics = sharded->statistics();
+    check(static_cast<bool>(statistics.admissions == 2));
+    check(static_cast<bool>(statistics.stores == 2));
+    check(static_cast<bool>(statistics.hits == 2));
+
+    auto filtered_inner = std::make_shared<TestExpertVictimCache>(1024);
+    auto filtered = create_reuse_victim_cache(filtered_inner, 4);
+    check(static_cast<bool>(filtered));
+    for (uint32_t index = 0; index < 8; ++index)
+    {
+        filtered->admit("weak." + std::to_string(index), gate_up, down);
+    }
+    for (uint32_t index = 0; index < 2; ++index)
+    {
+        filtered->admit("weak." + std::to_string(index + 1), gate_up, down);
+    }
+    const ExpertVictimCacheStatistics filtered_statistics = filtered->statistics();
+    check(static_cast<bool>(filtered_statistics.admissions == 4));
+    check(static_cast<bool>(filtered_statistics.filtered_admissions == 6));
+    check(static_cast<bool>(filtered_statistics.reused_admissions == 2));
+    check(static_cast<bool>(filtered_statistics.probe_admissions == 2));
+    check(static_cast<bool>(filtered->restore("weak.0", *gate_up, *down)));
+    check(static_cast<bool>(filtered->restore("weak.1", *gate_up, *down)));
+    check(static_cast<bool>(filtered->restore("weak.2", *gate_up, *down)));
+    check(static_cast<bool>(!filtered->restore("weak.3", *gate_up, *down)));
+}
+
 void test_mapped_file_range_and_shared_buffer()
 {
-    const std::filesystem::path directory
-        = create_unique_test_directory("ncnn_moe_mapped_file_test_");
+    const std::filesystem::path directory = create_unique_test_directory("ncnn_moe_mapped_file_test_");
     const std::filesystem::path path = directory / "range.bin";
     const size_t file_size = 3 * 4096 + 257;
     std::vector<uint8_t> expected(file_size);
@@ -904,25 +1258,18 @@ void test_mapped_file_range_and_shared_buffer()
         expected[index] = static_cast<uint8_t>((index * 29 + 7) % 251);
     {
         std::ofstream stream(path, std::ios::binary);
-        stream.write(
-            reinterpret_cast<const char*>(expected.data()),
-            static_cast<std::streamsize>(expected.size()));
+        stream.write(reinterpret_cast<const char*>(expected.data()), static_cast<std::streamsize>(expected.size()));
     }
 
     {
         constexpr size_t offset = 123;
         constexpr size_t byte_count = 2 * 4096 + 91;
-        auto mapped = MappedFileRange::open(
-            path,
-            offset,
-            byte_count);
+        auto mapped = MappedFileRange::open(path, offset, byte_count);
         check(static_cast<bool>(mapped));
         mapped.value()->prefault();
         check(static_cast<bool>(mapped.value()->size() == byte_count));
         check(static_cast<bool>(mapped.value()->data()[0] == expected[offset]));
-        check(static_cast<bool>(
-            mapped.value()->data()[byte_count - 1]
-            == expected[offset + byte_count - 1]));
+        check(static_cast<bool>(mapped.value()->data()[byte_count - 1] == expected[offset + byte_count - 1]));
 
         MxFp4ByteBuffer shared = mapped.value()->share_bytes();
         check(static_cast<bool>(shared.size() == byte_count));
@@ -933,10 +1280,7 @@ void test_mapped_file_range_and_shared_buffer()
         check(static_cast<bool>(shared.front() == expected[offset]));
         check(static_cast<bool>(copy.front() != shared.front()));
 
-        auto truncated = MappedFileRange::open(
-            path,
-            file_size - 8,
-            16);
+        auto truncated = MappedFileRange::open(path, file_size - 8, 16);
         check(static_cast<bool>(!truncated));
         check(static_cast<bool>(truncated.error().code == ErrorCode::InvalidModel));
     }
@@ -947,32 +1291,20 @@ void test_mapped_file_range_and_shared_buffer()
 
 void test_safetensors_dense_mmap()
 {
-    const std::filesystem::path directory
-        = create_unique_test_directory("ncnn_moe_safetensors_mmap_test_");
+    const std::filesystem::path directory = create_unique_test_directory("ncnn_moe_safetensors_mmap_test_");
     const std::filesystem::path path = directory / "model.safetensors";
-    std::string header
-        = R"({"bf16":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]},"f32":{"dtype":"F32","shape":[2],"data_offsets":[4,12]}})";
+    std::string header = R"({"bf16":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]},"f32":{"dtype":"F32","shape":[2],"data_offsets":[4,12]}})";
     while (header.size() % 8 != 0)
         header.push_back(' ');
     const uint64_t header_size = header.size();
-    const std::array<uint16_t, 2> bfloat_values = {
-        float_to_bfloat16(1.0f),
-        float_to_bfloat16(-2.0f)};
+    const std::array<uint16_t, 2> bfloat_values = {float_to_bfloat16(1.0f), float_to_bfloat16(-2.0f)};
     const std::array<float, 2> float_values = {3.5f, -2.25f};
     {
         std::ofstream stream(path, std::ios::binary);
-        stream.write(
-            reinterpret_cast<const char*>(&header_size),
-            sizeof(header_size));
-        stream.write(
-            header.data(),
-            static_cast<std::streamsize>(header.size()));
-        stream.write(
-            reinterpret_cast<const char*>(bfloat_values.data()),
-            sizeof(bfloat_values));
-        stream.write(
-            reinterpret_cast<const char*>(float_values.data()),
-            sizeof(float_values));
+        stream.write(reinterpret_cast<const char*>(&header_size), sizeof(header_size));
+        stream.write(header.data(), static_cast<std::streamsize>(header.size()));
+        stream.write(reinterpret_cast<const char*>(bfloat_values.data()), sizeof(bfloat_values));
+        stream.write(reinterpret_cast<const char*>(float_values.data()), sizeof(float_values));
     }
 
     {
@@ -983,34 +1315,57 @@ void test_safetensors_dense_mmap()
         check(static_cast<bool>(bfloat.value().mapped_data));
         check(static_cast<bool>(bfloat.value().bfloat16_data.empty()));
         check(static_cast<bool>(bfloat.value().bfloat16_values().size() == 2));
-        check_near(
-            bfloat16_to_float(
-                bfloat.value().bfloat16_values()[1]),
-            -2.0f,
-            0.0f);
+        check_near(bfloat16_to_float(bfloat.value().bfloat16_values()[1]), -2.0f, 0.0f);
 
         auto floating = archive.value().load_tensor("f32");
         check(static_cast<bool>(floating));
         check(static_cast<bool>(floating.value().mapped_data));
         check(static_cast<bool>(floating.value().float32_data.empty()));
         check(static_cast<bool>(floating.value().float32_values().size() == 2));
-        check_near(
-            floating.value().float32_values()[0],
-            3.5f,
-            0.0f);
+        check_near(floating.value().float32_values()[0], 3.5f, 0.0f);
 
-        auto slice = archive.value().load_bfloat16_slice(
-            "bf16",
-            1,
-            {1});
+        auto slice = archive.value().load_bfloat16_slice("bf16", 1, {1});
         check(static_cast<bool>(slice));
         check(static_cast<bool>(slice.value().mapped_data));
-        check_near(
-            bfloat16_to_float(
-                slice.value().bfloat16_values()[0]),
-            -2.0f,
-            0.0f);
+        check_near(bfloat16_to_float(slice.value().bfloat16_values()[0]), -2.0f, 0.0f);
     }
+
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
+void test_safetensors_packed_mxfp4_expert()
+{
+    const std::filesystem::path directory = create_unique_test_directory("ncnn_moe_safetensors_packed_test_");
+    const auto write_archive = [](const std::filesystem::path& path, std::string header, const std::vector<uint8_t>& data) {
+        while (header.size() % 8 != 0)
+            header.push_back(' ');
+        const uint64_t header_size = header.size();
+        std::ofstream stream(path, std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(&header_size), sizeof(header_size));
+        stream.write(header.data(), static_cast<std::streamsize>(header.size()));
+        stream.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    };
+    write_archive(directory / "model.safetensors", R"({"gate_blocks":{"dtype":"U8","shape":[1,1,1,16],"data_offsets":[0,16]},"gate_scales":{"dtype":"U8","shape":[1,1,1],"data_offsets":[16,17]}})", std::vector<uint8_t>(17, 3));
+    std::vector<uint8_t> packed(17, 9);
+    packed.back() = 123;
+    write_archive(directory / "ncnn-moe-packed-experts.safetensors",
+                  R"({"__ncnn_moe_packed__.0.gate_blocks":{"dtype":"U8","shape":[1,1,16],"data_offsets":[0,16]},"__ncnn_moe_packed__.0.gate_scales":{"dtype":"U8","shape":[1,1],"data_offsets":[16,17]}})", packed);
+
+    auto archive = SafetensorsArchive::open(directory);
+    check(static_cast<bool>(archive));
+    auto expert = archive.value().load_mxfp4_expert("gate_blocks", "gate_scales", 0, 1, 32, SafetensorLoadDeferMxfp4Data);
+    check(static_cast<bool>(expert));
+    check(static_cast<bool>(expert.value().mxfp4_file_storage));
+    const MxFp4FileStorage& storage = *expert.value().mxfp4_file_storage;
+    check(static_cast<bool>(storage.blocks_path == storage.scales_path));
+    check(static_cast<bool>(storage.blocks_offset + storage.blocks_bytes == storage.scales_offset));
+
+    Mxfp4ExpertCache cache(34, 1, {}, ExpertCacheBufferedReads);
+    auto pair = cache.acquire_pair(expert.value(), expert.value());
+    check(static_cast<bool>(pair));
+    check(static_cast<bool>(pair.value().gate_up->mxfp4_blocks.front() == 9));
+    check(static_cast<bool>(pair.value().gate_up->mxfp4_scales.front() == 123));
 
     std::error_code ignored;
     std::filesystem::remove_all(directory, ignored);
@@ -1018,8 +1373,7 @@ void test_safetensors_dense_mmap()
 
 void test_file_backed_mxfp4_expert_cache()
 {
-    const std::filesystem::path directory
-        = create_unique_test_directory("ncnn_moe_expert_cache_test_");
+    const std::filesystem::path directory = create_unique_test_directory("ncnn_moe_expert_cache_test_");
     const std::filesystem::path blocks_path = directory / "blocks.bin";
     const std::filesystem::path scales_path = directory / "scales.bin";
     {
@@ -1027,26 +1381,22 @@ void test_file_backed_mxfp4_expert_cache()
         for (size_t index = 0; index < blocks.size(); ++index)
             blocks[index] = static_cast<uint8_t>(index);
         std::ofstream stream(blocks_path, std::ios::binary);
-        stream.write(
-            reinterpret_cast<const char*>(blocks.data()),
-            static_cast<std::streamsize>(blocks.size()));
+        stream.write(reinterpret_cast<const char*>(blocks.data()), static_cast<std::streamsize>(blocks.size()));
     }
     {
         const std::vector<uint8_t> scales = {101, 102, 103, 104};
         std::ofstream stream(scales_path, std::ios::binary);
-        stream.write(
-            reinterpret_cast<const char*>(scales.data()),
-            static_cast<std::streamsize>(scales.size()));
+        stream.write(reinterpret_cast<const char*>(scales.data()), static_cast<std::streamsize>(scales.size()));
     }
 
-    auto file_backed = [&](uint64_t block_offset, uint64_t scale_offset) {
+    auto file_backed = [&](uint64_t block_offset, uint64_t scale_offset, uint64_t block_bytes = 16) {
         TensorData tensor;
         tensor.dtype = DType::MxFp4;
         tensor.shape = {1, 32};
         auto storage = std::make_shared<MxFp4FileStorage>();
         storage->blocks_path = blocks_path.string();
         storage->blocks_offset = block_offset;
-        storage->blocks_bytes = 16;
+        storage->blocks_bytes = block_bytes;
         storage->scales_path = scales_path.string();
         storage->scales_offset = scale_offset;
         storage->scales_bytes = 1;
@@ -1070,10 +1420,28 @@ void test_file_backed_mxfp4_expert_cache()
         check(static_cast<bool>(first.value().down->mxfp4_scales.front() == 102));
     }
     {
-        auto hit = cache.acquire_pair(gate_zero, down_zero);
+        const std::string prepared_key = Mxfp4ExpertCache::make_pair_key(gate_zero, down_zero);
+        check(cache.is_ready(gate_zero, down_zero, prepared_key));
+        auto hit = cache.acquire_pair(gate_zero, down_zero, std::numeric_limits<uint32_t>::max(), prepared_key);
         check(static_cast<bool>(hit));
         check(static_cast<bool>(hit.value().cache_hit));
         check(static_cast<bool>(hit.value().bytes_read == 0));
+    }
+    {
+        const std::string prepared_key = Mxfp4ExpertCache::make_pair_key(gate_zero, down_zero);
+        const std::array<ExpertCachePairRequest, 1> requests = {{
+            &gate_zero,
+            &down_zero,
+            std::numeric_limits<uint32_t>::max(),
+            prepared_key,
+        }};
+        std::array<ExpertCacheLease, 1> leases;
+        auto acquired = cache.try_acquire_ready_pairs(requests, leases);
+        check(static_cast<bool>(acquired));
+        check(static_cast<bool>(acquired.value()));
+        check(static_cast<bool>(leases[0].cache_hit));
+        check(static_cast<bool>(leases[0].bytes_read == 0));
+        check(static_cast<bool>(leases[0].gate_up->mxfp4_blocks.front() == 0));
     }
     {
         auto second = cache.acquire_pair(gate_one, down_one);
@@ -1083,7 +1451,7 @@ void test_file_backed_mxfp4_expert_cache()
         check(static_cast<bool>(second.value().down->mxfp4_scales.front() == 104));
     }
     const ExpertCacheStatistics statistics = cache.statistics();
-    check(static_cast<bool>(statistics.hits == 1));
+    check(static_cast<bool>(statistics.hits == 2));
     check(static_cast<bool>(statistics.misses == 2));
     check(static_cast<bool>(statistics.evictions == 1));
     check(static_cast<bool>(statistics.bytes_read == 68));
@@ -1091,12 +1459,48 @@ void test_file_backed_mxfp4_expert_cache()
     check(static_cast<bool>(statistics.mapped_ranges == 8));
     check(static_cast<bool>(statistics.mapped_bytes == statistics.bytes_read));
 
+    const std::filesystem::path packed_path = directory / "packed.bin";
+    {
+        std::vector<uint8_t> packed;
+        packed.reserve(34);
+        for (uint8_t value = 0; value < 16; ++value)
+            packed.push_back(value);
+        packed.push_back(101);
+        for (uint8_t value = 16; value < 32; ++value)
+            packed.push_back(value);
+        packed.push_back(102);
+        std::ofstream stream(packed_path, std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(packed.data()), static_cast<std::streamsize>(packed.size()));
+    }
+    auto packed_tensor = [&](uint64_t block_offset, uint64_t scale_offset) {
+        TensorData tensor;
+        tensor.dtype = DType::MxFp4;
+        tensor.shape = {1, 32};
+        auto storage = std::make_shared<MxFp4FileStorage>();
+        storage->blocks_path = packed_path.string();
+        storage->blocks_offset = block_offset;
+        storage->blocks_bytes = 16;
+        storage->scales_path = packed_path.string();
+        storage->scales_offset = scale_offset;
+        storage->scales_bytes = 1;
+        tensor.mxfp4_file_storage = std::move(storage);
+        return tensor;
+    };
+    const TensorData packed_gate = packed_tensor(0, 16);
+    const TensorData packed_down = packed_tensor(17, 33);
+    Mxfp4ExpertCache packed_cache(34, 1, {}, ExpertCacheBufferedReads);
+    auto packed_pair = packed_cache.acquire_pair(packed_gate, packed_down);
+    check(static_cast<bool>(packed_pair));
+    check(static_cast<bool>(packed_pair.value().gate_up->mxfp4_blocks.front() == 0));
+    check(static_cast<bool>(packed_pair.value().gate_up->mxfp4_scales.front() == 101));
+    check(static_cast<bool>(packed_pair.value().down->mxfp4_blocks.front() == 16));
+    check(static_cast<bool>(packed_pair.value().down->mxfp4_scales.front() == 102));
+    const ExpertCacheStatistics packed_statistics = packed_cache.statistics();
+    check(static_cast<bool>(packed_statistics.buffered_read_ranges == 1));
+    check(static_cast<bool>(packed_statistics.buffered_read_bytes == 34));
+
     auto victim = std::make_shared<TestExpertVictimCache>(68);
-    Mxfp4ExpertCache tiered(
-        34,
-        1,
-        victim,
-        ExpertCacheMemoryMapRanges);
+    Mxfp4ExpertCache tiered(34, 1, victim, ExpertCacheMemoryMapRanges);
     {
         auto first = tiered.acquire_pair(gate_zero, down_zero);
         check(static_cast<bool>(first));
@@ -1124,40 +1528,27 @@ void test_file_backed_mxfp4_expert_cache()
     check(static_cast<bool>(tiered_statistics.victim.misses == 2));
     check(static_cast<bool>(tiered_statistics.victim.admissions == 2));
 
-    if (NcnnLinearOperator::vulkan_device_count() > 0) {
+    if (NcnnLinearOperator::vulkan_device_count() > 0)
+    {
         auto gpu_source = cache.acquire_pair(gate_zero, down_zero);
         check(static_cast<bool>(gpu_source));
-        auto gpu_victim = create_vulkan_expert_victim_cache(68);
+        auto gpu_victim = create_vulkan_victim_cache(68);
         check(static_cast<bool>(gpu_victim));
-        gpu_victim->admit(
-            "gpu-roundtrip",
-            gpu_source.value().gate_up,
-            gpu_source.value().down);
-        for (uint32_t attempt = 0;
-             attempt < 2000
-             && gpu_victim->statistics().stores == 0;
-             ++attempt) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
+        gpu_victim->admit("gpu-roundtrip", gpu_source.value().gate_up, gpu_source.value().down);
+        gpu_victim->wait_for_background_work();
         check(static_cast<bool>(gpu_victim->statistics().stores == 1));
-        auto gpu_restored = gpu_victim->restore(
-            "gpu-roundtrip",
-            gate_zero,
-            down_zero);
+        auto gpu_restored = gpu_victim->restore("gpu-roundtrip", gate_zero, down_zero);
         check(static_cast<bool>(gpu_restored));
         check(static_cast<bool>(gpu_restored->gate_up->mxfp4_blocks.front() == 0));
         check(static_cast<bool>(gpu_restored->down->mxfp4_blocks.front() == 16));
         check(static_cast<bool>(gpu_restored->gate_up->mxfp4_scales.front() == 101));
         check(static_cast<bool>(gpu_restored->down->mxfp4_scales.front() == 102));
-        const ExpertVictimCacheStatistics gpu_statistics
-            = gpu_victim->statistics();
-        check(static_cast<bool>(gpu_statistics.bytes_uploaded == 34));
-        check(static_cast<bool>(gpu_statistics.bytes_downloaded == 34));
+        const ExpertVictimCacheStatistics gpu_statistics = gpu_victim->statistics();
+        check(static_cast<bool>(gpu_statistics.bytes_uploaded >= 34));
+        check(static_cast<bool>(gpu_statistics.bytes_downloaded == gpu_statistics.bytes_uploaded));
         check(static_cast<bool>(gpu_statistics.mapped_stores <= gpu_statistics.stores));
         check(static_cast<bool>(gpu_statistics.mapped_restores <= gpu_statistics.hits));
-        check(static_cast<bool>(
-            gpu_statistics.mapped_stores
-            == gpu_statistics.mapped_restores));
+        check(static_cast<bool>(gpu_statistics.mapped_stores == gpu_statistics.mapped_restores));
     }
 
     Mxfp4ExpertCache concurrent(68, 2);
@@ -1187,21 +1578,131 @@ void test_file_backed_mxfp4_expert_cache()
     check(static_cast<bool>(concurrent.statistics().mapped_ranges == 0));
     check(static_cast<bool>(concurrent.statistics().mapped_bytes == 0));
 
+    {
+        auto delayed = std::make_shared<DelayedExpertVictimCache>();
+        Mxfp4ExpertCache any_ready(68, 2, delayed);
+        const std::array<ExpertCachePairRequest, 2> requests = {{
+            {
+                &gate_zero,
+                &down_zero,
+                0,
+                "slow",
+            },
+            {
+                &gate_one,
+                &down_one,
+                0,
+                "fast",
+            },
+        }};
+        std::array<ExpertCacheLease, 2> leases;
+        auto acquired = any_ready.wait_acquire_ready_pairs(requests, leases);
+        check(static_cast<bool>(acquired));
+        check(static_cast<bool>(acquired.value() == 1));
+        check(static_cast<bool>(!leases[0].gate_up));
+        check(static_cast<bool>(leases[1].gate_up));
+        check(static_cast<bool>(leases[1].gate_up->mxfp4_blocks.front() == 7));
+
+        const std::array<ExpertCachePairRequest, 1> slow_request = {{
+            {
+                &gate_zero,
+                &down_zero,
+                0,
+                "slow",
+            },
+        }};
+        std::array<ExpertCacheLease, 1> slow_lease;
+        acquired = any_ready.wait_acquire_ready_pairs(slow_request, slow_lease);
+        check(static_cast<bool>(acquired));
+        check(static_cast<bool>(acquired.value() == 1));
+        check(static_cast<bool>(slow_lease[0].gate_up));
+        check(static_cast<bool>(any_ready.statistics().misses == 2));
+
+        Mxfp4ExpertCache front_ready(68, 2, delayed);
+        leases = {};
+        acquired = front_ready.wait_acquire_ready_pairs(requests, leases, false);
+        check(static_cast<bool>(acquired));
+        check(static_cast<bool>(acquired.value() == 2));
+        check(static_cast<bool>(leases[0].gate_up));
+        check(static_cast<bool>(leases[1].gate_up));
+    }
+
     Mxfp4ExpertCache speculative(68, 1);
     check(static_cast<bool>(speculative.prefetch_pair(gate_zero, down_zero)));
+    speculative.wait_for_background_work();
+    check(speculative.is_ready(gate_zero, down_zero));
     auto prefetched = speculative.acquire_pair(gate_zero, down_zero);
     check(static_cast<bool>(prefetched));
     check(static_cast<bool>(speculative.statistics().speculative_reads == 1));
     check(static_cast<bool>(speculative.statistics().queued_reads == 1));
+
+    Mxfp4ExpertCache adaptive_replacement(68, 1);
+    {
+        auto first = adaptive_replacement.acquire_pair(gate_zero, down_zero);
+        check(static_cast<bool>(first));
+    }
+    {
+        auto reused = adaptive_replacement.acquire_pair(gate_zero, down_zero);
+        check(static_cast<bool>(reused && reused.value().cache_hit));
+    }
+    {
+        auto single_use = adaptive_replacement.acquire_pair(gate_one, down_one);
+        check(static_cast<bool>(single_use));
+    }
+    {
+        auto third = adaptive_replacement.acquire_pair(gate_zero, down_one);
+        check(static_cast<bool>(third));
+    }
+    {
+        auto retained_hot = adaptive_replacement.acquire_pair(gate_zero, down_zero);
+        check(static_cast<bool>(retained_hot && retained_hot.value().cache_hit));
+    }
+    {
+        auto recent_ghost = adaptive_replacement.acquire_pair(gate_one, down_one);
+        check(static_cast<bool>(recent_ghost));
+        const ExpertCacheStatistics adapted = adaptive_replacement.statistics();
+        check(static_cast<bool>(adapted.arc_recent_ghost_hits == 1));
+        check(static_cast<bool>(adapted.arc_recent_target_bytes == 34));
+    }
+    {
+        auto frequent_ghost = adaptive_replacement.acquire_pair(gate_zero, down_zero);
+        check(static_cast<bool>(frequent_ghost));
+        const ExpertCacheStatistics adapted = adaptive_replacement.statistics();
+        check(static_cast<bool>(adapted.arc_frequent_ghost_hits == 1));
+        check(static_cast<bool>(adapted.arc_recent_target_bytes == 0));
+        check(static_cast<bool>(adapted.arc_recent_bytes + adapted.arc_frequent_bytes == adapted.resident_bytes));
+    }
 
     Mxfp4ExpertCache pressure(34, 1);
     auto pinned = pressure.acquire_pair(gate_zero, down_zero);
     check(static_cast<bool>(pinned));
     check(static_cast<bool>(pressure.prefetch_pair(gate_one, down_one)));
     check(static_cast<bool>(pressure.statistics().speculative_reads == 0));
+    check(static_cast<bool>(pressure.statistics().dropped_speculative_admissions == 1));
     auto exhausted = pressure.acquire_pair(gate_one, down_one);
     check(static_cast<bool>(!exhausted));
     check(static_cast<bool>(exhausted.error().code == ErrorCode::InvalidArgument));
+
+    Mxfp4ExpertCache variable_size(52, 1);
+    const TensorData small_gate = file_backed(0, 0, 8);
+    const TensorData small_down = file_backed(8, 1, 8);
+    {
+        auto small = variable_size.acquire_pair(small_gate, small_down);
+        check(static_cast<bool>(small));
+        check(static_cast<bool>(small.value().bytes_read == 18));
+    }
+    {
+        auto regular = variable_size.acquire_pair(gate_one, down_one);
+        check(static_cast<bool>(regular));
+        check(static_cast<bool>(regular.value().bytes_read == 34));
+    }
+    const ExpertCacheStatistics variable_statistics = variable_size.statistics();
+    check(static_cast<bool>(variable_statistics.resident_bytes == 52));
+    check(static_cast<bool>(variable_statistics.arc_recent_bytes + variable_statistics.arc_frequent_bytes == variable_statistics.resident_bytes));
+
+    Mxfp4ExpertCache oversized_prefetch(17, 1);
+    check(static_cast<bool>(oversized_prefetch.prefetch_pair(small_gate, small_down)));
+    check(static_cast<bool>(oversized_prefetch.statistics().dropped_speculative_admissions == 1));
 
     const TensorData truncated_gate = file_backed(60, 0);
     Mxfp4ExpertCache retryable(34, 1);
@@ -1229,18 +1730,14 @@ void test_file_backed_mxfp4_expert_cache()
         for (size_t index = 0; index < blocks.size(); ++index)
             blocks[index] = static_cast<uint8_t>((index * 13) % 251);
         std::ofstream stream(large_blocks_path, std::ios::binary);
-        stream.write(
-            reinterpret_cast<const char*>(blocks.data()),
-            static_cast<std::streamsize>(blocks.size()));
+        stream.write(reinterpret_cast<const char*>(blocks.data()), static_cast<std::streamsize>(blocks.size()));
     }
     {
         std::vector<uint8_t> scales(large_scales_per_tensor * 2);
         for (size_t index = 0; index < scales.size(); ++index)
             scales[index] = static_cast<uint8_t>((index * 7) % 239);
         std::ofstream stream(large_scales_path, std::ios::binary);
-        stream.write(
-            reinterpret_cast<const char*>(scales.data()),
-            static_cast<std::streamsize>(scales.size()));
+        stream.write(reinterpret_cast<const char*>(scales.data()), static_cast<std::streamsize>(scales.size()));
     }
 
     auto large_file_backed = [&](uint64_t block_offset, uint64_t scale_offset) {
@@ -1258,29 +1755,17 @@ void test_file_backed_mxfp4_expert_cache()
         return tensor;
     };
     const TensorData large_gate = large_file_backed(0, 0);
-    const TensorData large_down = large_file_backed(
-        large_blocks_per_tensor,
-        large_scales_per_tensor);
-    const uint64_t large_pair_bytes
-        = (large_blocks_per_tensor + large_scales_per_tensor) * 2;
-    Mxfp4ExpertCache large_reads(
-        large_pair_bytes,
-        2,
-        {},
-        true);
+    const TensorData large_down = large_file_backed(large_blocks_per_tensor, large_scales_per_tensor);
+    const uint64_t large_pair_bytes = (large_blocks_per_tensor + large_scales_per_tensor) * 2;
+    Mxfp4ExpertCache large_reads(large_pair_bytes, 2, {}, true);
     auto large_pair = large_reads.acquire_pair(large_gate, large_down);
     check(static_cast<bool>(large_pair));
     check(static_cast<bool>(large_pair.value().bytes_read == large_pair_bytes));
     check(static_cast<bool>(large_reads.statistics().mapped_ranges == 4));
     check(static_cast<bool>(large_reads.statistics().mapped_bytes == large_pair_bytes));
     check(static_cast<bool>(large_pair.value().gate_up->mxfp4_blocks.front() == 0));
-    check(static_cast<bool>(
-        large_pair.value().gate_up->mxfp4_blocks.back()
-        == static_cast<uint8_t>(((large_blocks_per_tensor - 1) * 13) % 251)));
-    check(static_cast<bool>(
-        large_pair.value().down->mxfp4_scales.back()
-        == static_cast<uint8_t>(
-            ((large_scales_per_tensor * 2 - 1) * 7) % 239)));
+    check(static_cast<bool>(large_pair.value().gate_up->mxfp4_blocks.back() == static_cast<uint8_t>(((large_blocks_per_tensor - 1) * 13) % 251)));
+    check(static_cast<bool>(large_pair.value().down->mxfp4_scales.back() == static_cast<uint8_t>(((large_scales_per_tensor * 2 - 1) * 7) % 239)));
 
     std::error_code ignored;
     std::filesystem::remove_all(directory, ignored);
@@ -1288,20 +1773,15 @@ void test_file_backed_mxfp4_expert_cache()
 
 void test_cpu_topology_parsing_and_partitioning()
 {
-    check(static_cast<bool>(
-        parse_linux_cpu_list("0-3,8,10-11")
-        == std::vector<uint32_t>({0, 1, 2, 3, 8, 10, 11})));
-    check(static_cast<bool>(
-        parse_linux_cpu_list("4,2-4,2")
-        == std::vector<uint32_t>({2, 3, 4})));
+    check(static_cast<bool>(parse_linux_cpu_list("0-3,8,10-11") == std::vector<uint32_t>({0, 1, 2, 3, 8, 10, 11})));
+    check(static_cast<bool>(parse_linux_cpu_list("4,2-4,2") == std::vector<uint32_t>({2, 3, 4})));
     check(static_cast<bool>(parse_linux_cpu_list("3-1").empty()));
     check(static_cast<bool>(parse_linux_cpu_list("1,,2").empty()));
     check(static_cast<bool>(parse_linux_cpu_list("1,").empty()));
 
     CpuTopology flat;
     flat.allowed_cpus = {2, 4, 7, 9, 12};
-    const std::vector<std::vector<uint32_t> > flat_partitions
-        = partition_cpu_topology(flat, 2);
+    const std::vector<std::vector<uint32_t>> flat_partitions = partition_cpu_topology(flat, 2);
     check(static_cast<bool>(flat_partitions.size() == 2));
     check(static_cast<bool>(flat_partitions[0] == std::vector<uint32_t>({2, 4, 7})));
     check(static_cast<bool>(flat_partitions[1] == std::vector<uint32_t>({9, 12})));
@@ -1312,17 +1792,16 @@ void test_cpu_topology_parsing_and_partitioning()
         {0, 1, 2, 3},
         {4, 5, 6, 7, 8, 9, 10, 11},
     };
-    const std::vector<std::vector<uint32_t> > numa_partitions
-        = partition_cpu_topology(numa, 4);
+    const std::vector<std::vector<uint32_t>> numa_partitions = partition_cpu_topology(numa, 4);
     check(static_cast<bool>(numa_partitions.size() == 4));
     std::vector<uint32_t> partitioned_cpus;
-    for (const std::vector<uint32_t>& partition : numa_partitions) {
+    for (const std::vector<uint32_t>& partition : numa_partitions)
+    {
         check(static_cast<bool>(!partition.empty()));
         const bool first_node = partition.front() < 4;
         for (uint32_t cpu : partition)
             check(static_cast<bool>((cpu < 4) == first_node));
-        partitioned_cpus.insert(
-            partitioned_cpus.end(), partition.begin(), partition.end());
+        partitioned_cpus.insert(partitioned_cpus.end(), partition.begin(), partition.end());
     }
     std::sort(partitioned_cpus.begin(), partitioned_cpus.end());
     check(static_cast<bool>(partitioned_cpus == numa.allowed_cpus));
@@ -1341,13 +1820,14 @@ void test_cross_session_batch_scheduler()
 
     SchedulerOptions options;
     options.worker_count = 2;
+    options.flags = SchedulerOptionForceStagedBatching;
     auto scheduler = runtime.create_scheduler(options);
     check(static_cast<bool>(scheduler));
     auto future = scheduler.value()->submit_decode({
         {first.value(), 0},
-        {second.value(), 1},
+        {second.value(), 0},
     });
-    std::vector<Result<DecodeResult> > results = future.get();
+    std::vector<Result<DecodeResult>> results = future.get();
     check(static_cast<bool>(results.size() == 2));
     check(static_cast<bool>(results[0]));
     check(static_cast<bool>(results[1]));
@@ -1368,26 +1848,22 @@ void test_cross_session_batch_scheduler()
     auto reference_second = reference_session.value()->decode(1);
     check(static_cast<bool>(reference_first));
     check(static_cast<bool>(reference_second));
-    std::vector<Result<DecodeResult> > ordered_first_result = ordered_first.get();
-    std::vector<Result<DecodeResult> > ordered_second_result = ordered_second.get();
+    std::vector<Result<DecodeResult>> ordered_first_result = ordered_first.get();
+    std::vector<Result<DecodeResult>> ordered_second_result = ordered_second.get();
     check(static_cast<bool>(ordered_first_result[0]));
     check(static_cast<bool>(ordered_second_result[0]));
     check(static_cast<bool>(ordered_first_result[0].value().sequence_length == 1));
     check(static_cast<bool>(ordered_second_result[0].value().sequence_length == 2));
-    for (size_t index = 0;
-         index < reference_second.value().logits.values.size();
-         ++index) {
-        check_near(
-            ordered_second_result[0].value().logits.values[index],
-            reference_second.value().logits.values[index],
-            1e-5f);
+    for (size_t index = 0; index < reference_second.value().logits.values.size(); ++index)
+    {
+        check_near(ordered_second_result[0].value().logits.values[index], reference_second.value().logits.values[index], 1e-5f);
     }
 
     auto duplicate_future = scheduler.value()->submit_decode({
         {first.value(), 0},
         {first.value(), 1},
     });
-    std::vector<Result<DecodeResult> > duplicate_results = duplicate_future.get();
+    std::vector<Result<DecodeResult>> duplicate_results = duplicate_future.get();
     check(static_cast<bool>(!duplicate_results[0]));
     check(static_cast<bool>(!duplicate_results[1]));
     check(static_cast<bool>(first.value()->sequence_length() == 1));
@@ -1400,6 +1876,135 @@ void test_cross_session_batch_scheduler()
     check(static_cast<bool>(statistics.rejected_requests == 2));
     check(static_cast<bool>(statistics.max_batch_size == 2));
     check(static_cast<bool>(statistics.max_in_flight >= 2));
+    check(static_cast<bool>(statistics.staged_batches == 1));
+    check(static_cast<bool>(statistics.staged_requests == 2));
+    check(static_cast<bool>(statistics.logical_expert_batches > statistics.physical_expert_batches));
+    check(static_cast<bool>(statistics.coalesced_expert_batches > 0));
+    check(static_cast<bool>(statistics.coalesced_expert_routes >= 2));
+    check(static_cast<bool>(statistics.max_coalesced_expert_batch_size >= 2));
+
+    auto bypass_first = runtime.create_session(model.value());
+    auto bypass_second = runtime.create_session(model.value());
+    check(static_cast<bool>(bypass_first));
+    check(static_cast<bool>(bypass_second));
+    SchedulerOptions adaptive_options;
+    adaptive_options.worker_count = 2;
+    adaptive_options.adaptive_probe_interval = 2;
+    auto bypass_scheduler = runtime.create_scheduler(adaptive_options);
+    check(static_cast<bool>(bypass_scheduler));
+    auto bypass_future = bypass_scheduler.value()->submit_decode({
+        {bypass_first.value(), 0},
+        {bypass_second.value(), 1},
+    });
+    std::vector<Result<DecodeResult>> bypass_results = bypass_future.get();
+    check(static_cast<bool>(bypass_results.size() == 2));
+    check(static_cast<bool>(bypass_results[0]));
+    check(static_cast<bool>(bypass_results[1]));
+    const SchedulerStatistics bypass_statistics = bypass_scheduler.value()->statistics();
+    check(static_cast<bool>(bypass_statistics.staged_batches == 0));
+    check(static_cast<bool>(bypass_statistics.staging_bypassed_batches == 1));
+    for (uint32_t iteration = 0; iteration < 3; ++iteration)
+    {
+        auto adaptive_future = bypass_scheduler.value()->submit_decode({
+            {
+                bypass_first.value(),
+                0,
+            },
+            {
+                bypass_second.value(),
+                1,
+            },
+        });
+        auto adaptive_results = adaptive_future.get();
+        check(static_cast<bool>(adaptive_results.size() == 2));
+        check(static_cast<bool>(adaptive_results[0]));
+        check(static_cast<bool>(adaptive_results[1]));
+    }
+    const SchedulerStatistics adaptive_statistics = bypass_scheduler.value()->statistics();
+    check(static_cast<bool>(adaptive_statistics.adaptive_independent_decisions + adaptive_statistics.adaptive_staged_decisions == 4));
+    check(static_cast<bool>(adaptive_statistics.adaptive_independent_decisions >= 1));
+    check(static_cast<bool>(adaptive_statistics.adaptive_staged_decisions >= 1));
+    check(static_cast<bool>(adaptive_statistics.adaptive_probe_decisions >= 1));
+    check(static_cast<bool>(adaptive_statistics.adaptive_independent_observations >= 1));
+    check(static_cast<bool>(adaptive_statistics.adaptive_staged_observations >= 1));
+    check(static_cast<bool>(adaptive_statistics.adaptive_resident_decisions + adaptive_statistics.adaptive_mixed_decisions + adaptive_statistics.adaptive_storage_decisions == adaptive_statistics.adaptive_independent_decisions + adaptive_statistics.adaptive_staged_decisions));
+    check(static_cast<bool>(adaptive_statistics.adaptive_resident_observations + adaptive_statistics.adaptive_mixed_observations + adaptive_statistics.adaptive_storage_observations == adaptive_statistics.adaptive_independent_observations + adaptive_statistics.adaptive_staged_observations));
+    check(static_cast<bool>(adaptive_statistics.adaptive_resident_observations >= 1));
+
+    auto collected_first = runtime.create_session(model.value());
+    auto collected_second = runtime.create_session(model.value());
+    check(static_cast<bool>(collected_first));
+    check(static_cast<bool>(collected_second));
+    SchedulerOptions collection_options;
+    collection_options.worker_count = 2;
+    collection_options.cross_call_window_microseconds = 50000;
+    collection_options.flags = SchedulerOptionForceStagedBatching;
+    auto collection_scheduler = runtime.create_scheduler(collection_options);
+    check(static_cast<bool>(collection_scheduler));
+    auto collected_first_future = collection_scheduler.value()->submit_decode({
+        {collected_first.value(), 0},
+    });
+    auto collected_second_future = collection_scheduler.value()->submit_decode({
+        {collected_second.value(), 0},
+    });
+    const std::vector<Result<DecodeResult>> collected_first_result = collected_first_future.get();
+    const std::vector<Result<DecodeResult>> collected_second_result = collected_second_future.get();
+    check(static_cast<bool>(collected_first_result.size() == 1));
+    check(static_cast<bool>(collected_second_result.size() == 1));
+    check(static_cast<bool>(collected_first_result.front()));
+    check(static_cast<bool>(collected_second_result.front()));
+    const SchedulerStatistics collection_statistics = collection_scheduler.value()->statistics();
+    check(static_cast<bool>(collection_statistics.submitted_batches == 2));
+    check(static_cast<bool>(collection_statistics.submitted_requests == 2));
+    check(static_cast<bool>(collection_statistics.cross_call_collected_batches == 1));
+    check(static_cast<bool>(collection_statistics.cross_call_collected_requests == 2));
+    check(static_cast<bool>(collection_statistics.max_cross_call_batch_size == 2));
+    check(static_cast<bool>(collection_statistics.staged_batches == 1));
+    check(static_cast<bool>(collection_statistics.staged_requests == 2));
+
+    auto collection_backoff_session = runtime.create_session(model.value());
+    check(static_cast<bool>(collection_backoff_session));
+    SchedulerOptions collection_backoff_options;
+    collection_backoff_options.worker_count = 2;
+    collection_backoff_options.cross_call_window_microseconds = 1000;
+    auto collection_backoff_scheduler = runtime.create_scheduler(collection_backoff_options);
+    check(static_cast<bool>(collection_backoff_scheduler));
+    for (int32_t token = 0; token < 6; ++token)
+    {
+        auto singleton_future = collection_backoff_scheduler.value()->submit_decode({
+            {
+                collection_backoff_session.value(),
+                0,
+            },
+        });
+        auto singleton = singleton_future.get();
+        check(static_cast<bool>(singleton.size() == 1));
+        check(static_cast<bool>(singleton.front()));
+    }
+    const SchedulerStatistics collection_backoff_statistics = collection_backoff_scheduler.value()->statistics();
+    check(static_cast<bool>(collection_backoff_statistics.cross_call_collected_batches == 0));
+    check(static_cast<bool>(collection_backoff_statistics.cross_call_collection_probes == 4));
+    check(static_cast<bool>(collection_backoff_statistics.cross_call_collection_timeouts == 4));
+    check(static_cast<bool>(collection_backoff_statistics.cross_call_collection_bypasses == 2));
+
+    SchedulerOptions conflicting_staging;
+    conflicting_staging.flags = SchedulerOptionDisableStagedBatching | SchedulerOptionForceStagedBatching;
+    auto conflicting_scheduler = runtime.create_scheduler(conflicting_staging);
+    check(static_cast<bool>(!conflicting_scheduler));
+    check(static_cast<bool>(conflicting_scheduler.error().code == ErrorCode::InvalidArgument));
+
+    SchedulerOptions excessive_probe_interval;
+    excessive_probe_interval.adaptive_probe_interval = 1000001;
+    auto invalid_adaptive_scheduler = runtime.create_scheduler(excessive_probe_interval);
+    check(static_cast<bool>(!invalid_adaptive_scheduler));
+
+    SchedulerOptions excessive_collection_window;
+    excessive_collection_window.cross_call_window_microseconds = 1000001;
+    check(static_cast<bool>(!runtime.create_scheduler(excessive_collection_window)));
+
+    SchedulerOptions excessive_collection_batch;
+    excessive_collection_batch.cross_call_max_batch_size = 1025;
+    check(static_cast<bool>(!runtime.create_scheduler(excessive_collection_batch)));
 
     SchedulerOptions mismatched_affinity;
     mismatched_affinity.worker_count = 2;
@@ -1421,16 +2026,14 @@ void test_cross_session_batch_scheduler()
     check(static_cast<bool>(unsupported_scheduler.error().code == ErrorCode::UnsupportedModel));
 #endif
 
-    if (has_flag(
-            runtime.capabilities().flags,
-            RuntimeCapabilityVulkanCpuMix)) {
+    if (has_flag(runtime.capabilities().flags, RuntimeCapabilityVulkanCpuMix))
+    {
         AttentionPackage attention_package;
         RuntimeOptions hybrid_options;
         hybrid_options.hybrid_mode = HybridMode::HybridExperts;
         RuntimeOptions cpu_options;
         cpu_options.hybrid_mode = HybridMode::CpuOnly;
-        auto hybrid_model = runtime.load_model(
-            attention_package.path(), hybrid_options);
+        auto hybrid_model = runtime.load_model(attention_package.path(), hybrid_options);
         auto cpu_model = runtime.load_model(attention_package.path(), cpu_options);
         check(static_cast<bool>(hybrid_model));
         check(static_cast<bool>(cpu_model));
@@ -1441,7 +2044,8 @@ void test_cross_session_batch_scheduler()
         check(static_cast<bool>(pipeline_scheduler));
         std::vector<SessionPtr> hybrid_sessions;
         std::vector<SessionPtr> cpu_sessions;
-        for (uint32_t index = 0; index < 4; ++index) {
+        for (uint32_t index = 0; index < 4; ++index)
+        {
             auto hybrid_session = runtime.create_session(hybrid_model.value());
             auto cpu_session = runtime.create_session(cpu_model.value());
             check(static_cast<bool>(hybrid_session));
@@ -1451,55 +2055,39 @@ void test_cross_session_batch_scheduler()
         }
 
         constexpr uint32_t pipeline_rounds = 6;
-        for (uint32_t round = 0; round < pipeline_rounds; ++round) {
+        for (uint32_t round = 0; round < pipeline_rounds; ++round)
+        {
             std::vector<DecodeBatchRequest> requests;
-            for (uint32_t session_index = 0;
-                 session_index < hybrid_sessions.size();
-                 ++session_index) {
+            for (uint32_t session_index = 0; session_index < hybrid_sessions.size(); ++session_index)
+            {
                 requests.push_back({
                     hybrid_sessions[session_index],
                     static_cast<int32_t>((round + session_index) % 2),
                 });
             }
-            std::vector<Result<DecodeResult> > pipeline_results
-                = pipeline_scheduler.value()->submit_decode(std::move(requests)).get();
+            std::vector<Result<DecodeResult>> pipeline_results = pipeline_scheduler.value()->submit_decode(std::move(requests)).get();
             check(static_cast<bool>(pipeline_results.size() == hybrid_sessions.size()));
-            for (uint32_t session_index = 0;
-                 session_index < hybrid_sessions.size();
-                 ++session_index) {
-                auto cpu_result = cpu_sessions[session_index]->decode(
-                    static_cast<int32_t>((round + session_index) % 2));
+            for (uint32_t session_index = 0; session_index < hybrid_sessions.size(); ++session_index)
+            {
+                auto cpu_result = cpu_sessions[session_index]->decode(static_cast<int32_t>((round + session_index) % 2));
                 check(static_cast<bool>(pipeline_results[session_index]));
                 check(static_cast<bool>(cpu_result));
-                check(static_cast<bool>(pipeline_results[session_index].value().sequence_length
-                                        == round + 1));
-                check(static_cast<bool>(
-                    pipeline_results[session_index].value().logits.values.size()
-                    == cpu_result.value().logits.values.size()));
-                for (size_t logit = 0;
-                     logit < cpu_result.value().logits.values.size();
-                     ++logit) {
-                    check_near(
-                        pipeline_results[session_index]
-                            .value()
-                            .logits.values[logit],
-                        cpu_result.value().logits.values[logit],
-                        1e-4f);
+                check(static_cast<bool>(pipeline_results[session_index].value().sequence_length == round + 1));
+                check(static_cast<bool>(pipeline_results[session_index].value().logits.values.size() == cpu_result.value().logits.values.size()));
+                for (size_t logit = 0; logit < cpu_result.value().logits.values.size(); ++logit)
+                {
+                    check_near(pipeline_results[session_index].value().logits.values[logit], cpu_result.value().logits.values[logit], 1e-4f);
                 }
             }
         }
-        for (const SessionPtr& session : hybrid_sessions) {
+        for (const SessionPtr& session : hybrid_sessions)
+        {
             const SessionStatistics session_statistics = session->statistics();
             check(static_cast<bool>(session_statistics.vulkan_attention_blocks == pipeline_rounds));
-            check(static_cast<bool>(
-                session_statistics.vulkan_compute_submissions
-                == pipeline_rounds * 2));
-            check(static_cast<bool>(
-                session_statistics.vulkan_staging_slot_acquisitions
-                == pipeline_rounds * 2));
+            check(static_cast<bool>(session_statistics.vulkan_compute_submissions == pipeline_rounds * 2));
+            check(static_cast<bool>(session_statistics.vulkan_staging_slot_acquisitions == pipeline_rounds * 2));
         }
-        const SchedulerStatistics pipeline_statistics
-            = pipeline_scheduler.value()->statistics();
+        const SchedulerStatistics pipeline_statistics = pipeline_scheduler.value()->statistics();
         check(static_cast<bool>(pipeline_statistics.completed_requests == pipeline_rounds * 4));
         check(static_cast<bool>(pipeline_statistics.max_in_flight >= 4));
     }
@@ -1553,11 +2141,9 @@ void test_chunked_prefill_matches_single_batch()
     check(static_cast<bool>(chunked_session.value()->sequence_length() == prompt.size()));
     check(static_cast<bool>(chunked_session.value()->statistics().prefill_tokens == prompt.size()));
     check(static_cast<bool>(chunked.value().logits.values.size() == single_batch.value().logits.values.size()));
-    for (size_t index = 0; index < single_batch.value().logits.values.size(); ++index) {
-        check_near(
-            chunked.value().logits.values[index],
-            single_batch.value().logits.values[index],
-            1e-5f);
+    for (size_t index = 0; index < single_batch.value().logits.values.size(); ++index)
+    {
+        check_near(chunked.value().logits.values[index], single_batch.value().logits.values[index], 1e-5f);
     }
 }
 
@@ -1574,24 +2160,19 @@ void test_topk_selected_weight_normalization_and_combine()
     check(static_cast<bool>(result));
 
     const float normalized_input = 1.0f / std::sqrt(0.5f + 1e-5f);
-    // Expert 2 participates in the global softmax but is removed by Top-2.
-    // Renormalization over experts 0 and 1 therefore cancels its probability.
-    const float expert_zero_weight = std::exp(normalized_input)
-                                     / (std::exp(normalized_input) + 1.0f);
+    const float expert_zero_weight = std::exp(normalized_input) / (std::exp(normalized_input) + 1.0f);
     const float expert_one_weight = 1.0f - expert_zero_weight;
     const float hidden_x = 1.0f + expert_zero_weight * normalized_input;
     const float hidden_y = expert_one_weight * normalized_input;
-    const float final_scale = std::sqrt(
-        (hidden_x * hidden_x + hidden_y * hidden_y) / 2.0f + 1e-5f);
+    const float final_scale = std::sqrt((hidden_x * hidden_x + hidden_y * hidden_y) / 2.0f + 1e-5f);
 
     check_near(result.value().logits.values[0], hidden_x / final_scale, 1e-5f);
     check_near(result.value().logits.values[1], hidden_y / final_scale, 1e-5f);
     check(static_cast<bool>(session.value()->statistics().expert_assignments == 2));
     check(static_cast<bool>(session.value()->statistics().expert_batches == 2));
     check(static_cast<bool>(session.value()->statistics().expert_token_counts == std::vector<uint64_t>({1, 1, 0})));
-    if (has_flag(
-            runtime.capabilities().flags,
-            RuntimeCapabilityOpenmpExpertParallelism)) {
+    if (has_flag(runtime.capabilities().flags, RuntimeCapabilityOpenmpExperts))
+    {
         check(static_cast<bool>(session.value()->statistics().expert_parallel_tasks == 2));
     }
 }
@@ -1633,9 +2214,7 @@ void test_attention_kv_cache_and_reset()
     TestRuntime runtime;
     auto model = runtime.load_model(package.path());
     check(static_cast<bool>(model));
-    check(static_cast<bool>(has_flag(
-        model.value()->descriptor().layers[0].flags,
-        LayerDescriptorAttention)));
+    check(static_cast<bool>(has_flag(model.value()->descriptor().layers[0].flags, LayerDescriptorAttention)));
 
     auto session = runtime.create_session(model.value());
     check(static_cast<bool>(session));
@@ -1673,24 +2252,19 @@ void test_bfloat16_ring_kv_cache()
     const std::vector<int32_t> prompt = {0, 1, 0, 1, 0, 1, 0, 1};
     check(static_cast<bool>(float32_session.value()->prefill(prompt)));
     check(static_cast<bool>(bfloat16_session.value()->prefill(prompt)));
-    check(static_cast<bool>(bfloat16_session.value()->statistics().kv_cache_logical_bytes
-                            == float32_session.value()->statistics().kv_cache_logical_bytes / 2));
-    check(static_cast<bool>(bfloat16_session.value()->statistics().kv_cache_allocated_bytes
-                            == float32_session.value()->statistics().kv_cache_allocated_bytes / 2));
+    check(static_cast<bool>(bfloat16_session.value()->statistics().kv_cache_logical_bytes == float32_session.value()->statistics().kv_cache_logical_bytes / 2));
+    check(static_cast<bool>(bfloat16_session.value()->statistics().kv_cache_allocated_bytes == float32_session.value()->statistics().kv_cache_allocated_bytes / 2));
 
     for (uint32_t index = 0; index < 16; ++index)
         check(static_cast<bool>(bfloat16_session.value()->decode(static_cast<int32_t>(index % 2))));
-    check(static_cast<bool>(bfloat16_session.value()->statistics().kv_cache_allocated_bytes
-                            <= bfloat16_session.value()->statistics().kv_cache_logical_bytes * 16));
+    check(static_cast<bool>(bfloat16_session.value()->statistics().kv_cache_allocated_bytes <= bfloat16_session.value()->statistics().kv_cache_logical_bytes * 16));
 }
 
 void test_attention_graph_without_bias_or_sink()
 {
     AttentionPackage package(false, 0, false, false);
     std::ifstream manifest_stream(package.path() / "config.json");
-    const std::string manifest_json{
-        std::istreambuf_iterator<char>(manifest_stream),
-        std::istreambuf_iterator<char>()};
+    const std::string manifest_json{std::istreambuf_iterator<char>(manifest_stream), std::istreambuf_iterator<char>()};
     ModelPackage model_package;
     model_package.root = package.path();
     model_package.manifest.model_type = "test_moe";
@@ -1700,17 +2274,14 @@ void test_attention_graph_without_bias_or_sink()
     check(static_cast<bool>(descriptor));
     auto mapping = adapter.map_weights(model_package, descriptor.value());
     check(static_cast<bool>(mapping));
-    descriptor.value().layers[0].flags
-        &= ~(LayerDescriptorAttention | LayerDescriptorMoe);
+    descriptor.value().layers[0].flags &= ~(LayerDescriptorAttention | LayerDescriptorMoe);
     ModelCompiler compiler;
-    auto graph_driven_model = compiler.compile(
-        std::move(descriptor).value(),
-        std::move(mapping).value(),
-        HybridMode::CpuOnly);
-    check(static_cast<bool>(graph_driven_model));
-    check(static_cast<bool>(has_flag(
-        graph_driven_model.value().layers[0].flags,
-        CompiledLayerAttention)));
+    auto graph_driven_model = compiler.compile(std::move(descriptor).value(), std::move(mapping).value(), HybridMode::CpuOnly);
+    if (!graph_driven_model)
+    {
+        throw std::runtime_error("graph-driven model compilation failed: " + graph_driven_model.error().message);
+    }
+    check(static_cast<bool>(has_flag(graph_driven_model.value().layers[0].flags, CompiledLayerAttention)));
 
     TestRuntime runtime;
     RuntimeOptions cpu_options;
@@ -1735,8 +2306,7 @@ void test_attention_graph_without_bias_or_sink()
         check(static_cast<bool>(layer.nodes[index].type == expected_nodes[index]));
     check(static_cast<bool>(!has_flag(layer.attention.flags, AttentionDescriptorBias)));
     check(static_cast<bool>(!has_flag(layer.attention.flags, AttentionDescriptorSinks)));
-    const CompiledLayerPlan& cpu_plan
-        = cpu_model.value()->execution_plan()[0];
+    const CompiledLayerPlan& cpu_plan = cpu_model.value()->execution_plan()[0];
     check(static_cast<bool>(cpu_plan.nodes.size() == expected_nodes.size()));
     for (const CompiledNodePlan& node : cpu_plan.nodes)
         check(static_cast<bool>(node.backend == ExecutionBackend::Cpu));
@@ -1747,39 +2317,32 @@ void test_attention_graph_without_bias_or_sink()
     auto cpu_prefill = cpu_session.value()->prefill(prompt);
     check(static_cast<bool>(cpu_prefill));
 
-    if (has_flag(
-            runtime.capabilities().flags,
-            RuntimeCapabilityVulkanAttention)) {
+    if (has_flag(runtime.capabilities().flags, RuntimeCapabilityVulkanAttention))
+    {
         RuntimeOptions hybrid_options;
         hybrid_options.hybrid_mode = HybridMode::HybridExperts;
         auto hybrid_model = runtime.load_model(package.path(), hybrid_options);
         check(static_cast<bool>(hybrid_model));
-        const CompiledLayerPlan& hybrid_plan
-            = hybrid_model.value()->execution_plan()[0];
+        const CompiledLayerPlan& hybrid_plan = hybrid_model.value()->execution_plan()[0];
         check(static_cast<bool>(hybrid_plan.nodes.size() == expected_nodes.size()));
-        for (size_t node_index = 0;
-             node_index < hybrid_plan.nodes.size();
-             ++node_index) {
-            check(static_cast<bool>(
-                hybrid_plan.nodes[node_index].backend
-                == (node_index < 5
-                        ? ExecutionBackend::Vulkan
-                        : ExecutionBackend::Cpu)));
+        for (size_t node_index = 0; node_index < hybrid_plan.nodes.size(); ++node_index)
+        {
+            check(static_cast<bool>(hybrid_plan.nodes[node_index].backend == (node_index < 5 ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu)));
         }
-        const ExecutionGraph& hybrid_graph
-            = hybrid_model.value()->execution_graph();
+        const ExecutionGraph& hybrid_graph = hybrid_model.value()->execution_graph();
         size_t vulkan_attention_nodes = 0;
         size_t vulkan_lm_head_nodes = 0;
-        for (const ExecutionNode& node : hybrid_graph.nodes) {
-            if (node.type == ExecutionNodeType::Attention
-                && node.backend == ExecutionBackend::Vulkan) {
+        for (const ExecutionNode& node : hybrid_graph.nodes)
+        {
+            if (node.type == ExecutionNodeType::Attention && node.backend == ExecutionBackend::Vulkan)
+            {
                 ++vulkan_attention_nodes;
             }
-            if (node.type == ExecutionNodeType::LmHead
-                && node.backend == ExecutionBackend::Vulkan) {
+            if (node.type == ExecutionNodeType::LmHead && node.backend == ExecutionBackend::Vulkan)
+            {
                 ++vulkan_lm_head_nodes;
             }
-            if (node.type == ExecutionNodeType::Expert)
+            if (node.type == ExecutionNodeType::Expert || node.type == ExecutionNodeType::ExpertGroup)
                 check(static_cast<bool>(node.backend == ExecutionBackend::Cpu));
         }
         check(static_cast<bool>(vulkan_attention_nodes == 1));
@@ -1789,15 +2352,10 @@ void test_attention_graph_without_bias_or_sink()
         auto hybrid_prefill = hybrid_session.value()->prefill(prompt);
         check(static_cast<bool>(hybrid_prefill));
         check(static_cast<bool>(hybrid_session.value()->statistics().vulkan_attention_blocks == 1));
-        check(static_cast<bool>(hybrid_prefill.value().logits.values.size()
-                                == cpu_prefill.value().logits.values.size()));
-        for (size_t index = 0;
-             index < cpu_prefill.value().logits.values.size();
-             ++index) {
-            check_near(
-                hybrid_prefill.value().logits.values[index],
-                cpu_prefill.value().logits.values[index],
-                1e-4f);
+        check(static_cast<bool>(hybrid_prefill.value().logits.values.size() == cpu_prefill.value().logits.values.size()));
+        for (size_t index = 0; index < cpu_prefill.value().logits.values.size(); ++index)
+        {
+            check_near(hybrid_prefill.value().logits.values[index], cpu_prefill.value().logits.values[index], 1e-4f);
         }
     }
 }
@@ -1811,53 +2369,120 @@ void test_moe_ir_execution_graph_and_scheduler()
     auto model = runtime.load_model(package.path(), options);
     check(static_cast<bool>(model));
     check(static_cast<bool>(model.value()->ir().model_type == "test_moe"));
+    const MoeGraph& ir_graph = model.value()->ir().graph;
+    check(static_cast<bool>(ir_graph.validate()));
+    check(static_cast<bool>(ir_graph.nodes.size() == 6));
+    check(static_cast<bool>(ir_graph.nodes[0].operation == MoeIROperator::TokenEmbedding));
+    check(static_cast<bool>(ir_graph.nodes[2].operation == MoeIROperator::ExpertGroup));
+    check(static_cast<bool>(ir_graph.nodes[2].quantization.storage_dtype == DType::Float32));
+    check(static_cast<bool>(ir_graph.nodes[2].experts.expert_count == 2));
+    MoeIR graph_only_ir = model.value()->ir();
+    graph_only_ir.layers.clear();
+    auto graph_only_status = normalize_moe_ir(graph_only_ir);
+    check(static_cast<bool>(graph_only_status));
+    check(static_cast<bool>(graph_only_ir.layers.size() == 1));
+    check(static_cast<bool>(graph_only_ir.layers[0].nodes.size() == 5));
+    MoeIR inconsistent_ir = model.value()->ir();
+    inconsistent_ir.graph.nodes[2].experts.top_k = 2;
+    auto inconsistent_status = normalize_moe_ir(inconsistent_ir);
+    check(static_cast<bool>(!inconsistent_status));
+    check(static_cast<bool>(inconsistent_status.error().code == ErrorCode::InvalidModel));
 
     const ExecutionGraph& graph = model.value()->execution_graph();
     check(static_cast<bool>(graph.validate()));
-    check(static_cast<bool>(graph.nodes.size() == 8));
+    check(static_cast<bool>(graph.nodes.size() == 7));
+    check(static_cast<bool>(!graph.tensors.empty()));
     const std::vector<ExecutionNodeType> expected_types = {
         ExecutionNodeType::TokenEmbedding,
         ExecutionNodeType::Router,
         ExecutionNodeType::ExpertDispatch,
-        ExecutionNodeType::Expert,
-        ExecutionNodeType::Expert,
+        ExecutionNodeType::ExpertGroup,
         ExecutionNodeType::Combine,
         ExecutionNodeType::FinalNorm,
         ExecutionNodeType::LmHead,
     };
-    for (size_t index = 0; index < expected_types.size(); ++index) {
+    for (size_t index = 0; index < expected_types.size(); ++index)
+    {
         check(static_cast<bool>(graph.nodes[index].id == index));
         check(static_cast<bool>(graph.nodes[index].type == expected_types[index]));
         check(static_cast<bool>(graph.nodes[index].backend == ExecutionBackend::Cpu));
     }
-    check(static_cast<bool>(has_flag(graph.nodes[3].flags, ExecutionNodeConditional)));
-    check(static_cast<bool>(graph.nodes[3].expert_id == 0));
-    check(static_cast<bool>(has_flag(graph.nodes[4].flags, ExecutionNodeConditional)));
-    check(static_cast<bool>(graph.nodes[4].expert_id == 1));
-    check(static_cast<bool>(graph.nodes[5].dependencies.size() == 2));
-    check(static_cast<bool>(graph.nodes[5].dependencies[0] == 3));
-    check(static_cast<bool>(graph.nodes[5].dependencies[1] == 4));
+    check(static_cast<bool>(graph.nodes[3].flags == 0));
+    check(static_cast<bool>(graph.nodes[3].expert_id == invalid_execution_expert_id));
+    check(static_cast<bool>(graph.nodes[4].dependencies.size() == 1));
+    check(static_cast<bool>(graph.nodes[4].dependencies[0] == 3));
 
-    const ExecutionSchedule& compiled_schedule
-        = model.value()->execution_schedule();
+    const ExecutionSchedule& compiled_schedule = model.value()->execution_schedule();
+    check(static_cast<bool>(compiled_schedule.cpu_parallelism == runtime.capabilities().openmp_thread_count));
     check(static_cast<bool>(compiled_schedule.waves.size() == 7));
-    check(static_cast<bool>(compiled_schedule.waves[3].nodes.size() == 2));
-    check(static_cast<bool>(
-        graph.find(compiled_schedule.waves[3].nodes[0])->type
-        == ExecutionNodeType::Expert));
-    check(static_cast<bool>(
-        graph.find(compiled_schedule.waves[3].nodes[1])->type
-        == ExecutionNodeType::Expert));
+    check(static_cast<bool>(compiled_schedule.waves[3].nodes.size() == 1));
+    check(static_cast<bool>(graph.find(compiled_schedule.waves[3].nodes[0])->type == ExecutionNodeType::ExpertGroup));
+    check(static_cast<bool>(compiled_schedule.waves[3].cpu_nodes.size() == 1));
+    check(static_cast<bool>(compiled_schedule.waves[3].vulkan_nodes.empty()));
+
+    const ExpertStoreStatistics initial_experts = model.value()->expert_store().statistics();
+    check(static_cast<bool>(initial_experts.expert_count == 2));
+    check(static_cast<bool>(initial_experts.resident_experts == 2));
+    auto session = runtime.create_session(model.value());
+    check(static_cast<bool>(session));
+    const std::array<int32_t, 1> prompt = {0};
+    auto prefill = session.value()->prefill(prompt);
+    check(static_cast<bool>(prefill));
+    const SessionStatistics session_statistics = session.value()->statistics();
+    check(static_cast<bool>(session_statistics.expert_batch_weight_bytes > 0));
+    check(static_cast<bool>(session_statistics.expert_route_weight_bytes >= session_statistics.expert_batch_weight_bytes));
+    const ExpertStoreStatistics used_experts = model.value()->expert_store().statistics();
+    check(static_cast<bool>(used_experts.dispatch_count > 0));
+    check(static_cast<bool>(used_experts.token_count > 0));
+    const ExpertHotsetEstimate empty_hotset = model.value()->expert_store().estimate_hotset(0);
+    check(static_cast<bool>(empty_hotset.active_expert_count > 0));
+    check(static_cast<bool>(empty_hotset.resident_expert_count == 0));
+    check(static_cast<bool>(empty_hotset.covered_batch_weight_bytes == 0));
+    const ExpertHotsetEstimate full_hotset = model.value()->expert_store().estimate_hotset(used_experts.registered_weight_bytes);
+    check(static_cast<bool>(full_hotset.resident_expert_count == full_hotset.active_expert_count));
+    check(static_cast<bool>(full_hotset.covered_batch_weight_bytes == full_hotset.requested_batch_weight_bytes));
+    check(static_cast<bool>(full_hotset.covered_route_weight_bytes == full_hotset.requested_route_weight_bytes));
+    const MemoryManagerStatistics memory = session.value()->memory_statistics();
+    check(static_cast<bool>(memory.registered_tensors == graph.tensors.size()));
+    check(static_cast<bool>(memory.tensor_uses > 0));
 
     MoeScheduler scheduler;
     auto rescheduled = scheduler.schedule(graph);
     check(static_cast<bool>(rescheduled));
     check(static_cast<bool>(rescheduled.value().waves.size() == compiled_schedule.waves.size()));
 
+    ExecutionGraph hybrid_graph = graph;
+    hybrid_graph.nodes.back().backend_mask |= ExecutionBackendVulkan;
+    RuntimeSchedulingOptions scheduling_options;
+    scheduling_options.available_backends = ExecutionBackendCpu | ExecutionBackendVulkan;
+    scheduling_options.vulkan_queue_count = 1;
+    RuntimeScheduler runtime_scheduler;
+    auto hybrid_schedule = runtime_scheduler.compile(std::move(hybrid_graph), scheduling_options);
+    check(static_cast<bool>(hybrid_schedule));
+    check(static_cast<bool>(hybrid_schedule.value().graph.nodes.back().backend == ExecutionBackend::Vulkan));
+    check(static_cast<bool>(!hybrid_schedule.value().graph.events.empty()));
+    check(static_cast<bool>(hybrid_schedule.value().schedule.events.size() == hybrid_schedule.value().graph.events.size()));
+
     ExecutionGraph cyclic;
+    ExecutionNode cyclic_router;
+    cyclic_router.id = 0;
+    cyclic_router.type = ExecutionNodeType::Router;
+    cyclic_router.backend = ExecutionBackend::Cpu;
+    cyclic_router.backend_mask = ExecutionBackendCpu;
+    cyclic_router.layer_id = 0;
+    cyclic_router.name = "router";
+    cyclic_router.dependencies = {1};
+    ExecutionNode cyclic_combine;
+    cyclic_combine.id = 1;
+    cyclic_combine.type = ExecutionNodeType::Combine;
+    cyclic_combine.backend = ExecutionBackend::Cpu;
+    cyclic_combine.backend_mask = ExecutionBackendCpu;
+    cyclic_combine.layer_id = 0;
+    cyclic_combine.name = "combine";
+    cyclic_combine.dependencies = {0};
     cyclic.nodes = {
-        {0, ExecutionNodeType::Router, ExecutionBackend::Cpu, 0, invalid_execution_expert_id, false, "router", {1}},
-        {1, ExecutionNodeType::Combine, ExecutionBackend::Cpu, 0, invalid_execution_expert_id, false, "combine", {0}},
+        std::move(cyclic_router),
+        std::move(cyclic_combine),
     };
     auto invalid_schedule = scheduler.schedule(cyclic);
     check(static_cast<bool>(!invalid_schedule));
@@ -1913,18 +2538,28 @@ void test_expert_dispatcher_groups_routes()
     options.expert_count = 3;
     options.top_k = 2;
     const std::vector<float> weighted_logits = {2.0f, 1.0f, 0.0f};
-    auto weighted = dispatcher.dispatch(
-        weighted_logits,
-        1,
-        options);
+    auto weighted = dispatcher.dispatch(weighted_logits, 1, options);
     check(static_cast<bool>(weighted));
     check(static_cast<bool>(weighted.value().assignment_count == 2));
     check(static_cast<bool>(weighted.value().batches.size() == 2));
-    check_near(
-        weighted.value().batches[0].routes[0].weight
-            + weighted.value().batches[1].routes[0].weight,
-        1.0f,
-        1e-6f);
+    check_near(weighted.value().batches[0].routes[0].weight + weighted.value().batches[1].routes[0].weight, 1.0f, 1e-6f);
+    ExpertDispatchPlan reusable;
+    auto dispatched_into = dispatcher.dispatch_into(weighted_logits, 1, options, reusable);
+    check(static_cast<bool>(dispatched_into));
+    check(static_cast<bool>(reusable.assignment_count == weighted.value().assignment_count));
+    check(static_cast<bool>(reusable.batches.size() == weighted.value().batches.size()));
+    for (size_t index = 0; index < reusable.batches.size(); ++index)
+    {
+        check(static_cast<bool>(reusable.batches[index].expert_id == weighted.value().batches[index].expert_id));
+        check_near(reusable.batches[index].routes.front().weight, weighted.value().batches[index].routes.front().weight, 1e-6f);
+    }
+    const ExpertBatch* reused_batches = reusable.batches.data();
+    const ExpertRoute* reused_first_route = reusable.batches.front().routes.data();
+    const std::vector<float> next_logits = {0.0f, 1.0f, 2.0f};
+    dispatched_into = dispatcher.dispatch_into(next_logits, 1, options, reusable);
+    check(static_cast<bool>(dispatched_into));
+    check(static_cast<bool>(reusable.batches.data() == reused_batches));
+    check(static_cast<bool>(reusable.batches.front().routes.data() == reused_first_route));
 
     const std::vector<float> invalid_logits = {1.0f, 2.0f};
     auto invalid = dispatcher.dispatch(invalid_logits, 1, options);
@@ -1932,9 +2567,7 @@ void test_expert_dispatcher_groups_routes()
     check(static_cast<bool>(invalid.error().code == ErrorCode::InvalidArgument));
 }
 
-static MoeIR gpt_oss_memory_ir(
-    uint32_t layer_count,
-    uint32_t expert_count)
+static MoeIR gpt_oss_memory_ir(uint32_t layer_count, uint32_t expert_count)
 {
     MoeIR ir;
     ir.model_type = "gpt_oss";
@@ -1950,27 +2583,25 @@ static MoeIR gpt_oss_memory_ir(
     ir.activation_dtype = DType::BFloat16;
     ir.kv_cache_dtype = DType::BFloat16;
     ir.layers.resize(layer_count);
-    for (LayerDescriptor& layer : ir.layers) {
+    for (LayerDescriptor& layer : ir.layers)
+    {
         layer.flags |= LayerDescriptorAttention;
         layer.attention.head_count = 64;
         layer.attention.kv_head_count = 8;
         layer.attention.head_dimension = 64;
-        layer.attention.flags |= AttentionDescriptorBias
-                                 | AttentionDescriptorSinks;
+        layer.attention.flags |= AttentionDescriptorBias | AttentionDescriptorSinks;
         layer.ffn.moe.expert_count = expert_count;
         layer.ffn.moe.top_k = 4;
         layer.ffn.moe.intermediate_size = 2880;
         layer.ffn.moe.expert_weight_dtype = DType::MxFp4;
-        layer.ffn.moe.flags |= MoeDescriptorRouterBias
-                               | MoeDescriptorProjectionBias;
+        layer.ffn.moe.flags |= MoeDescriptorRouterBias | MoeDescriptorProjectionBias;
     }
     return ir;
 }
 
 void test_automatic_expert_memory_planning()
 {
-    static constexpr uint64_t gibibyte
-        = 1024ull * 1024ull * 1024ull;
+    static constexpr uint64_t gibibyte = 1024ull * 1024ull * 1024ull;
     RuntimeOptions options;
     const uint64_t physical_memory = 32 * gibibyte;
 
@@ -1978,29 +2609,20 @@ void test_automatic_expert_memory_planning()
     auto small_plan = plan_model_memory(small, options, physical_memory);
     check(static_cast<bool>(small_plan));
     check(static_cast<bool>(small_plan.value().selected_mode == ExpertMemoryMode::Eager));
-    check(static_cast<bool>(!has_flag(
-        small_plan.value().flags,
-        ModelMemoryFileBackedExperts)));
+    check(static_cast<bool>(!has_flag(small_plan.value().flags, ModelMemoryFileBackedExperts)));
     check(static_cast<bool>(small_plan.value().estimated_expert_bytes < 11 * gibibyte));
 
     const MoeIR large = gpt_oss_memory_ir(36, 128);
     auto large_plan = plan_model_memory(large, options, physical_memory);
     check(static_cast<bool>(large_plan));
     check(static_cast<bool>(large_plan.value().selected_mode == ExpertMemoryMode::OnDemand));
-    check(static_cast<bool>(has_flag(
-        large_plan.value().flags,
-        ModelMemoryFileBackedExperts)));
+    check(static_cast<bool>(has_flag(large_plan.value().flags, ModelMemoryFileBackedExperts)));
     check(static_cast<bool>(large_plan.value().host_memory_budget_bytes == 24 * gibibyte));
     check(static_cast<bool>(large_plan.value().estimated_dense_bytes == 4334742144ull));
     check(static_cast<bool>(large_plan.value().expert_pair_bytes == 13219200ull));
     check(static_cast<bool>(large_plan.value().estimated_expert_bytes == 60914073600ull));
-    check(static_cast<bool>(
-        large_plan.value().expert_cache_bytes
-        == 20 * gibibyte
-               - large_plan.value().estimated_dense_bytes));
-    check(static_cast<bool>(
-        large_plan.value().expert_cache_bytes
-        >= large_plan.value().minimum_active_expert_bytes));
+    check(static_cast<bool>(large_plan.value().expert_cache_bytes == 20 * gibibyte - large_plan.value().estimated_dense_bytes));
+    check(static_cast<bool>(large_plan.value().expert_cache_bytes >= large_plan.value().minimum_active_expert_bytes));
 
     RuntimeOptions undersized;
     undersized.expert_cache_bytes = 32 * 1024 * 1024;
@@ -2043,6 +2665,17 @@ void test_sampling_and_streaming_generation()
     check(static_cast<bool>(greedy.value().token_id == 2));
     check_near(greedy.value().probability, 1.0f, 1e-6f);
 
+    logits.values = {3.0f, std::numeric_limits<float>::quiet_NaN(), 3.0f};
+    greedy = session.value()->sample(logits, greedy_options);
+    check(static_cast<bool>(greedy));
+    check(static_cast<bool>(greedy.value().token_id == 0));
+
+    logits.values = {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()};
+    greedy = session.value()->sample(logits, greedy_options);
+    check(static_cast<bool>(!greedy));
+    check(static_cast<bool>(greedy.error().code == ErrorCode::InvalidArgument));
+
+    logits.values = {1.0f, 2.0f, 3.0f};
     SamplingOptions top_k_options;
     top_k_options.top_k = 1;
     auto top_k = session.value()->sample(logits, top_k_options);
@@ -2060,9 +2693,9 @@ void test_sampling_and_streaming_generation()
     generation_options.sampling.temperature = 0.0f;
     std::vector<StreamToken> streamed;
     auto generated = session.value()->generate(
-        std::vector<int32_t>{0},
-        generation_options,
-        [&streamed](const StreamToken& token) {
+        std::vector<int32_t>{0}, generation_options,
+        [&streamed, &session](const StreamToken& token) {
+            check(session.value()->statistics().prefill_tokens == 1);
             streamed.push_back(token);
             return true;
         },
@@ -2070,24 +2703,47 @@ void test_sampling_and_streaming_generation()
     check(static_cast<bool>(generated));
     check(static_cast<bool>(generated.value().tokens.size() == 3));
     check(static_cast<bool>(streamed.size() == 3));
-    check(static_cast<bool>(generated.value().tokens[0].text
-                            == "<" + std::to_string(generated.value().tokens[0].token_id) + ">"));
+    check(static_cast<bool>(generated.value().tokens[0].text == "<" + std::to_string(generated.value().tokens[0].token_id) + ">"));
     check(static_cast<bool>(session.value()->sequence_length() == 3));
 
     auto stopped_session = runtime.create_session(model.value(), session_options);
     check(static_cast<bool>(stopped_session));
-    auto stopped = stopped_session.value()->generate(
-        std::vector<int32_t>{0},
-        generation_options,
-        [](const StreamToken&) { return false; });
+    auto stopped = stopped_session.value()->generate(std::vector<int32_t>{0}, generation_options, [](const StreamToken&) { return false; });
     check(static_cast<bool>(stopped));
     check(static_cast<bool>(stopped.value().stopped_by_callback));
     check(static_cast<bool>(stopped.value().tokens.size() == 1));
     check(static_cast<bool>(stopped_session.value()->sequence_length() == 1));
 }
 
+void test_builtin_adapter_scope()
+{
+    BuiltinModelAdapter adapter;
+    ModelManifest manifest;
+    manifest.model_type = "gpt_oss";
+    check(adapter.can_load(manifest));
+
+    manifest.model_type = "unsupported_moe";
+    check(!adapter.can_load(manifest));
+
+    ModelPackage package;
+    package.manifest = manifest;
+    auto descriptor = adapter.parse_model(package);
+    check(!descriptor);
+    check(descriptor.error().code == ErrorCode::UnsupportedModel);
+}
+
 void test_loader_reports_adapter_and_weight_errors()
 {
+    {
+        TemporaryModelPackage package;
+        TestRuntime runtime;
+        RuntimeOptions options;
+        options.expert_gpu_victim_reuse_probe_interval = 0;
+        auto model = runtime.load_model(package.path(), options);
+        check(static_cast<bool>(!model));
+        check(static_cast<bool>(model.error().code == ErrorCode::InvalidArgument));
+    }
+
     {
         TemporaryModelPackage package;
         package.write_manifest("unknown_family");
@@ -2116,50 +2772,92 @@ void test_loader_reports_adapter_and_weight_errors()
         check(static_cast<bool>(!model));
         check(static_cast<bool>(model.error().code == ErrorCode::InvalidArgument));
     }
+
+    {
+        TemporaryModelPackage package;
+        TestRuntime runtime;
+        RuntimeOptions options;
+        options.expert_memory_mode = ExpertMemoryMode::Eager;
+        options.expert_gpu_victim_cache_bytes = 64 * 1024 * 1024;
+        auto model = runtime.load_model(package.path(), options);
+        check(static_cast<bool>(!model));
+        check(static_cast<bool>(model.error().code == ErrorCode::InvalidArgument));
+    }
 }
 
 void test_backend_capabilities_and_hybrid_execution()
 {
     TemporaryModelPackage package;
     TestRuntime runtime;
-    check(static_cast<bool>(has_flag(
-        runtime.capabilities().flags,
-        RuntimeCapabilityCpuExecution)));
-    check(static_cast<bool>(has_flag(
-                                runtime.capabilities().flags,
-                                RuntimeCapabilityVulkanCpuPrefetch)
-                            == has_flag(
-                                runtime.capabilities().flags,
-                                RuntimeCapabilityVulkanCpuMix)));
+    auto null_cache_sync = runtime.synchronize_model_caches({});
+    check(static_cast<bool>(!null_cache_sync));
+    check(static_cast<bool>(null_cache_sync.error().code == ErrorCode::InvalidArgument));
+    check(static_cast<bool>(has_flag(runtime.capabilities().flags, RuntimeCapabilityCpuExecution)));
+    check(static_cast<bool>(has_flag(runtime.capabilities().flags, RuntimeCapabilityVulkanCpuPrefetch) == has_flag(runtime.capabilities().flags, RuntimeCapabilityVulkanCpuMix)));
+    RuntimeOptions invalid_device_options;
+    invalid_device_options.vulkan_device_index = static_cast<uint32_t>(runtime.capabilities().vulkan_devices.size());
+    auto invalid_device_model = runtime.load_model(package.path(), invalid_device_options);
+    check(static_cast<bool>(!invalid_device_model));
+    check(static_cast<bool>(invalid_device_model.error().code == ErrorCode::InvalidArgument));
+    if (!runtime.capabilities().vulkan_devices.empty())
+    {
+        RuntimeOptions duplicate_devices;
+        duplicate_devices.vulkan_device_indices = {
+            0,
+            0,
+        };
+        auto duplicate_device_model = runtime.load_model(package.path(), duplicate_devices);
+        check(static_cast<bool>(!duplicate_device_model));
+        check(static_cast<bool>(duplicate_device_model.error().code == ErrorCode::InvalidArgument));
+    }
 
     RuntimeOptions automatic_options;
     automatic_options.hybrid_mode = HybridMode::Auto;
+    const uint32_t automatic_device_index = runtime.capabilities().selected_vulkan_device_index;
+    const bool automatic_uses_vulkan = has_flag(runtime.capabilities().flags, RuntimeCapabilityVulkanCpuMix) && automatic_device_index < runtime.capabilities().vulkan_devices.size()
+                                       && runtime.capabilities().vulkan_devices[automatic_device_index].type != VulkanDeviceType::Cpu;
     auto automatic_model = runtime.load_model(package.path(), automatic_options);
     check(static_cast<bool>(automatic_model));
-    check(static_cast<bool>(automatic_model.value()->hybrid_mode()
-                            == (has_flag(
-                                    runtime.capabilities().flags,
-                                    RuntimeCapabilityVulkanCpuMix)
-                                    ? HybridMode::HybridExperts
-                                    : HybridMode::CpuOnly)));
+    check(static_cast<bool>(runtime.synchronize_model_caches(automatic_model.value())));
+    check(static_cast<bool>(automatic_model.value()->hybrid_mode() == (automatic_uses_vulkan ? HybridMode::HybridExperts : HybridMode::CpuOnly)));
+    check(static_cast<bool>(automatic_model.value()->vulkan_device_index() == (automatic_uses_vulkan ? automatic_device_index : automatic_vulkan_device_index)));
     auto automatic_session = runtime.create_session(automatic_model.value());
     check(static_cast<bool>(automatic_session));
     const std::vector<int32_t> packed_prompt = {0, 1, 2, 3};
     auto automatic_prefill = automatic_session.value()->prefill(packed_prompt);
     check(static_cast<bool>(automatic_prefill));
-    if (has_flag(
-            runtime.capabilities().flags,
-            RuntimeCapabilityVulkanCpuMix)) {
+    if (automatic_uses_vulkan)
+    {
+        RuntimeOptions selected_device_options;
+        selected_device_options.hybrid_mode = HybridMode::HybridExperts;
+        selected_device_options.vulkan_device_index = runtime.capabilities().selected_vulkan_device_index;
+        auto selected_device_model = runtime.load_model(package.path(), selected_device_options);
+        check(static_cast<bool>(selected_device_model));
+        check(static_cast<bool>(selected_device_model.value()->vulkan_device_index() == selected_device_options.vulkan_device_index));
+
+        if (runtime.capabilities().vulkan_devices.size() >= 2 && runtime.capabilities().vulkan_devices[0].type != VulkanDeviceType::Cpu && runtime.capabilities().vulkan_devices[1].type != VulkanDeviceType::Cpu)
+        {
+            RuntimeOptions multi_device_options;
+            multi_device_options.hybrid_mode = HybridMode::HybridExperts;
+            multi_device_options.vulkan_device_indices = {
+                0,
+                1,
+            };
+            auto multi_device_model = runtime.load_model(package.path(), multi_device_options);
+            check(static_cast<bool>(multi_device_model));
+            check(static_cast<bool>(multi_device_model.value()->vulkan_device_indices() == std::vector<uint32_t>({0})));
+            check(static_cast<bool>(multi_device_model.value()->execution_plan().front().vulkan_device_index < runtime.capabilities().vulkan_devices.size()));
+        }
+
         const SessionStatistics& statistics = automatic_session.value()->statistics();
         check(static_cast<bool>(statistics.vulkan_linear_dispatches == 1));
         check(static_cast<bool>(statistics.vulkan_compute_submissions == 1));
+        check(static_cast<bool>(statistics.vulkan_async_submissions == 0));
         check(static_cast<bool>(statistics.vulkan_batch_uploads == 1));
         check(static_cast<bool>(statistics.vulkan_batch_downloads == 1));
         check(static_cast<bool>(statistics.vulkan_auxiliary_uploads == 0));
         check(static_cast<bool>(statistics.vulkan_auxiliary_upload_bytes == 0));
-        check(static_cast<bool>(statistics.vulkan_staging_slot_resizes
-                                    + statistics.vulkan_staging_slot_reuses
-                                == 2));
+        check(static_cast<bool>(statistics.vulkan_staging_slot_resizes + statistics.vulkan_staging_slot_reuses == 2));
         check(static_cast<bool>(statistics.vulkan_staging_slot_acquisitions == 1));
     }
     else
@@ -2169,24 +2867,22 @@ void test_backend_capabilities_and_hybrid_execution()
     cpu_options.hybrid_mode = HybridMode::CpuOnly;
     auto cpu_model = runtime.load_model(package.path(), cpu_options);
     check(static_cast<bool>(cpu_model));
+    check(static_cast<bool>(cpu_model.value()->vulkan_device_index() == automatic_vulkan_device_index));
     auto cpu_session = runtime.create_session(cpu_model.value());
     check(static_cast<bool>(cpu_session));
     auto cpu_prefill = cpu_session.value()->prefill(packed_prompt);
     check(static_cast<bool>(cpu_prefill));
     check(static_cast<bool>(cpu_prefill.value().logits.values.size() == automatic_prefill.value().logits.values.size()));
-    for (size_t index = 0; index < cpu_prefill.value().logits.values.size(); ++index) {
-        check_near(
-            automatic_prefill.value().logits.values[index],
-            cpu_prefill.value().logits.values[index],
-            1e-4f);
+    for (size_t index = 0; index < cpu_prefill.value().logits.values.size(); ++index)
+    {
+        check_near(automatic_prefill.value().logits.values[index], cpu_prefill.value().logits.values[index], 1e-4f);
     }
 
     RuntimeOptions hybrid_options;
     hybrid_options.hybrid_mode = HybridMode::HybridExperts;
     auto hybrid_model = runtime.load_model(package.path(), hybrid_options);
-    if (has_flag(
-            runtime.capabilities().flags,
-            RuntimeCapabilityVulkanCpuMix)) {
+    if (has_flag(runtime.capabilities().flags, RuntimeCapabilityVulkanCpuMix))
+    {
         check(static_cast<bool>(hybrid_model));
         check(static_cast<bool>(hybrid_model.value()->hybrid_mode() == HybridMode::HybridExperts));
 
@@ -2199,20 +2895,21 @@ void test_backend_capabilities_and_hybrid_execution()
         auto attention_prefill = attention_session.value()->prefill(attention_prompt);
         check(static_cast<bool>(attention_prefill));
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_attention_blocks == 1));
+        check(static_cast<bool>(attention_session.value()->statistics().vulkan_attention_qkv_rope_fusions == 1));
+        check(static_cast<bool>(attention_session.value()->statistics().vulkan_attention_qkv_ring_fusions == 0));
+        check(static_cast<bool>(attention_session.value()->statistics().vulkan_attention_decode_sdpa_fusions == 0));
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_linear_dispatches == 3));
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_compute_submissions == 2));
+        check(static_cast<bool>(attention_session.value()->statistics().vulkan_async_submissions == 0));
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_batch_uploads == 2));
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_batch_downloads == 2));
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_auxiliary_uploads == 3));
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_auxiliary_upload_bytes > 0));
-        check(static_cast<bool>(attention_session.value()->statistics().vulkan_staging_slot_resizes
-                                    + attention_session.value()->statistics().vulkan_staging_slot_reuses
-                                == 7));
+        check(static_cast<bool>(attention_session.value()->statistics().vulkan_staging_slot_resizes + attention_session.value()->statistics().vulkan_staging_slot_reuses == 7));
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_staging_slot_reuses > 0));
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_staging_slot_acquisitions == 2));
         check(static_cast<bool>(attention_session.value()->statistics().kv_cache_logical_bytes > 0));
-        check(static_cast<bool>(attention_session.value()->statistics().kv_cache_allocated_bytes
-                                >= attention_session.value()->statistics().kv_cache_logical_bytes));
+        check(static_cast<bool>(attention_session.value()->statistics().kv_cache_allocated_bytes >= attention_session.value()->statistics().kv_cache_logical_bytes));
 
         auto cpu_attention_model = runtime.load_model(attention_package.path(), cpu_options);
         check(static_cast<bool>(cpu_attention_model));
@@ -2220,23 +2917,63 @@ void test_backend_capabilities_and_hybrid_execution()
         check(static_cast<bool>(cpu_attention_session));
         auto cpu_attention_prefill = cpu_attention_session.value()->prefill(attention_prompt);
         check(static_cast<bool>(cpu_attention_prefill));
-        check(static_cast<bool>(cpu_attention_prefill.value().logits.values.size()
-                                == attention_prefill.value().logits.values.size()));
-        for (size_t index = 0; index < cpu_attention_prefill.value().logits.values.size(); ++index) {
-            check_near(
-                attention_prefill.value().logits.values[index],
-                cpu_attention_prefill.value().logits.values[index],
-                1e-4f);
+        check(static_cast<bool>(cpu_attention_prefill.value().logits.values.size() == attention_prefill.value().logits.values.size()));
+        for (size_t index = 0; index < cpu_attention_prefill.value().logits.values.size(); ++index)
+        {
+            check_near(attention_prefill.value().logits.values[index], cpu_attention_prefill.value().logits.values[index], 1e-4f);
         }
-        auto attention_decode = attention_session.value()->decode(1);
-        auto cpu_attention_decode = cpu_attention_session.value()->decode(1);
-        check(static_cast<bool>(attention_decode));
-        check(static_cast<bool>(cpu_attention_decode));
-        for (size_t index = 0; index < cpu_attention_decode.value().logits.values.size(); ++index) {
-            check_near(
-                attention_decode.value().logits.values[index],
-                cpu_attention_decode.value().logits.values[index],
-                1e-4f);
+        {
+            const ScopedEnvironmentOverride force_decode_sdpa("NCNN_MOE_VULKAN_DECODE_SDPA", "1");
+            auto attention_decode = attention_session.value()->decode(1);
+            auto cpu_attention_decode = cpu_attention_session.value()->decode(1);
+            check(static_cast<bool>(attention_decode));
+            check(static_cast<bool>(cpu_attention_decode));
+            for (size_t index = 0; index < cpu_attention_decode.value().logits.values.size(); ++index)
+            {
+                check_near(attention_decode.value().logits.values[index], cpu_attention_decode.value().logits.values[index], 1e-4f);
+            }
+            for (uint32_t iteration = 0; iteration < 20; ++iteration)
+            {
+                auto wrapped_decode = attention_session.value()->decode(static_cast<int32_t>(iteration % 2));
+                auto wrapped_cpu_decode = cpu_attention_session.value()->decode(static_cast<int32_t>(iteration % 2));
+                check(static_cast<bool>(wrapped_decode));
+                check(static_cast<bool>(wrapped_cpu_decode));
+                for (size_t index = 0; index < wrapped_cpu_decode.value().logits.values.size(); ++index)
+                {
+                    check_near(wrapped_decode.value().logits.values[index], wrapped_cpu_decode.value().logits.values[index], 1e-4f);
+                }
+            }
+            const SessionStatistics& wrapped_statistics = attention_session.value()->statistics();
+            check(static_cast<bool>(wrapped_statistics.vulkan_kv_ring_appends == wrapped_statistics.vulkan_attention_blocks));
+            check(static_cast<bool>(wrapped_statistics.vulkan_attention_qkv_rope_fusions > 0));
+            check(static_cast<bool>(wrapped_statistics.vulkan_attention_qkv_rope_fusions <= wrapped_statistics.vulkan_attention_blocks));
+            check(static_cast<bool>(wrapped_statistics.vulkan_attention_qkv_ring_fusions == wrapped_statistics.vulkan_attention_blocks - 1));
+            check(static_cast<bool>(wrapped_statistics.vulkan_attention_decode_sdpa_fusions == wrapped_statistics.vulkan_attention_blocks - 1));
+            check(static_cast<bool>(wrapped_statistics.vulkan_kv_ring_resizes == 1));
+            check(static_cast<bool>(wrapped_statistics.vulkan_kv_ring_wrapped_views > 0));
+        }
+
+        auto ncnn_sdpa_ring_session = runtime.create_session(attention_model.value());
+        check(static_cast<bool>(ncnn_sdpa_ring_session));
+        auto ncnn_sdpa_ring_prefill = ncnn_sdpa_ring_session.value()->prefill(attention_prompt);
+        check(static_cast<bool>(ncnn_sdpa_ring_prefill));
+        auto ncnn_sdpa_ring_cpu_session = runtime.create_session(cpu_attention_model.value());
+        check(static_cast<bool>(ncnn_sdpa_ring_cpu_session));
+        auto ncnn_sdpa_ring_cpu_prefill = ncnn_sdpa_ring_cpu_session.value()->prefill(attention_prompt);
+        check(static_cast<bool>(ncnn_sdpa_ring_cpu_prefill));
+        {
+            const ScopedEnvironmentOverride disable_decode_sdpa("NCNN_MOE_VULKAN_DECODE_SDPA", "0");
+            const ScopedEnvironmentOverride force_qkv_ring("NCNN_MOE_VULKAN_QKV_RING", "1");
+            auto ncnn_sdpa_ring_decode = ncnn_sdpa_ring_session.value()->decode(1);
+            auto ncnn_sdpa_ring_cpu_decode = ncnn_sdpa_ring_cpu_session.value()->decode(1);
+            check(static_cast<bool>(ncnn_sdpa_ring_decode));
+            check(static_cast<bool>(ncnn_sdpa_ring_cpu_decode));
+            for (size_t index = 0; index < ncnn_sdpa_ring_cpu_decode.value().logits.values.size(); ++index)
+            {
+                check_near(ncnn_sdpa_ring_decode.value().logits.values[index], ncnn_sdpa_ring_cpu_decode.value().logits.values[index], 1e-4f);
+            }
+            check(static_cast<bool>(ncnn_sdpa_ring_session.value()->statistics().vulkan_attention_qkv_ring_fusions == 1));
+            check(static_cast<bool>(ncnn_sdpa_ring_session.value()->statistics().vulkan_attention_decode_sdpa_fusions == 0));
         }
 
         AttentionPackage full_attention_package(false, 0);
@@ -2244,13 +2981,11 @@ void test_backend_capabilities_and_hybrid_execution()
         check(static_cast<bool>(full_attention_model));
         SessionOptions chunked_attention_options;
         chunked_attention_options.prefill_chunk_size = 2;
-        auto chunked_attention_session = runtime.create_session(
-            full_attention_model.value(), chunked_attention_options);
+        auto chunked_attention_session = runtime.create_session(full_attention_model.value(), chunked_attention_options);
         check(static_cast<bool>(chunked_attention_session));
         auto chunked_attention_prefill = chunked_attention_session.value()->prefill(attention_prompt);
         check(static_cast<bool>(chunked_attention_prefill));
-        check(static_cast<bool>(chunked_attention_session.value()->statistics().kv_cache_allocated_bytes
-                                > chunked_attention_session.value()->statistics().kv_cache_logical_bytes));
+        check(static_cast<bool>(chunked_attention_session.value()->statistics().kv_cache_allocated_bytes > chunked_attention_session.value()->statistics().kv_cache_logical_bytes));
 
         auto full_cpu_model = runtime.load_model(full_attention_package.path(), cpu_options);
         check(static_cast<bool>(full_cpu_model));
@@ -2258,21 +2993,35 @@ void test_backend_capabilities_and_hybrid_execution()
         check(static_cast<bool>(full_cpu_session));
         auto full_cpu_prefill = full_cpu_session.value()->prefill(attention_prompt);
         check(static_cast<bool>(full_cpu_prefill));
-        for (size_t index = 0; index < full_cpu_prefill.value().logits.values.size(); ++index) {
-            check_near(
-                chunked_attention_prefill.value().logits.values[index],
-                full_cpu_prefill.value().logits.values[index],
-                1e-4f);
+        for (size_t index = 0; index < full_cpu_prefill.value().logits.values.size(); ++index)
+        {
+            check_near(chunked_attention_prefill.value().logits.values[index], full_cpu_prefill.value().logits.values[index], 1e-4f);
         }
-        auto chunked_attention_decode = chunked_attention_session.value()->decode(1);
-        auto full_cpu_decode = full_cpu_session.value()->decode(1);
-        check(static_cast<bool>(chunked_attention_decode));
-        check(static_cast<bool>(full_cpu_decode));
-        for (size_t index = 0; index < full_cpu_decode.value().logits.values.size(); ++index) {
-            check_near(
-                chunked_attention_decode.value().logits.values[index],
-                full_cpu_decode.value().logits.values[index],
-                1e-4f);
+        {
+            const ScopedEnvironmentOverride force_decode_sdpa("NCNN_MOE_VULKAN_DECODE_SDPA", "1");
+            auto chunked_attention_decode = chunked_attention_session.value()->decode(1);
+            auto full_cpu_decode = full_cpu_session.value()->decode(1);
+            check(static_cast<bool>(chunked_attention_decode));
+            check(static_cast<bool>(full_cpu_decode));
+            for (size_t index = 0; index < full_cpu_decode.value().logits.values.size(); ++index)
+            {
+                check_near(chunked_attention_decode.value().logits.values[index], full_cpu_decode.value().logits.values[index], 1e-4f);
+            }
+            check(static_cast<bool>(chunked_attention_session.value()->statistics().vulkan_attention_qkv_ring_fusions == 1));
+            check(static_cast<bool>(chunked_attention_session.value()->statistics().vulkan_attention_decode_sdpa_fusions == 1));
+        }
+
+        auto unfused_ring_session = runtime.create_session(full_attention_model.value());
+        check(static_cast<bool>(unfused_ring_session));
+        auto unfused_ring_prefill = unfused_ring_session.value()->prefill(attention_prompt);
+        check(static_cast<bool>(unfused_ring_prefill));
+        {
+            const ScopedEnvironmentOverride force_decode_sdpa("NCNN_MOE_VULKAN_DECODE_SDPA", "1");
+            const ScopedEnvironmentOverride disable_qkv_ring("NCNN_MOE_VULKAN_QKV_RING", "0");
+            auto unfused_ring_decode = unfused_ring_session.value()->decode(1);
+            check(static_cast<bool>(unfused_ring_decode));
+            check(static_cast<bool>(unfused_ring_session.value()->statistics().vulkan_attention_qkv_ring_fusions == 0));
+            check(static_cast<bool>(unfused_ring_session.value()->statistics().vulkan_attention_decode_sdpa_fusions == 1));
         }
 
         RuntimeOptions prefetch_options;
@@ -2286,7 +3035,8 @@ void test_backend_capabilities_and_hybrid_execution()
         check(static_cast<bool>(prefetch_session.value()->statistics().expert_prefetches > 0));
         check(static_cast<bool>(prefetch_session.value()->statistics().expert_prefetch_bytes > 0));
     }
-    else {
+    else
+    {
         check(static_cast<bool>(!hybrid_model));
         check(static_cast<bool>(hybrid_model.error().code == ErrorCode::UnsupportedModel));
 
@@ -2320,17 +3070,15 @@ void test_flag_defaults()
     RuntimeCapabilities capabilities;
     check(static_cast<bool>(has_flag(capabilities.flags, RuntimeCapabilityCpuExecution)));
     check(static_cast<bool>(has_flag(capabilities.flags, RuntimeCapabilityMxfp4CpuKernel)));
-    check(static_cast<bool>(has_flag(
-        capabilities.flags,
-        RuntimeCapabilityCrossSessionScheduling)));
+    check(static_cast<bool>(has_flag(capabilities.flags, RuntimeCapabilityCrossSessionScheduling)));
 
     SchedulerOptions scheduler;
     check(static_cast<bool>(!has_flag(scheduler.flags, SchedulerOptionPinWorkers)));
+    check(static_cast<bool>(!has_flag(scheduler.flags, SchedulerOptionDisableStagedBatching)));
+    check(static_cast<bool>(!has_flag(scheduler.flags, SchedulerOptionForceStagedBatching)));
 
     ExpertDispatchOptions dispatch;
-    check(static_cast<bool>(has_flag(
-        dispatch.flags,
-        ExpertDispatchNormalizeTopKWeights)));
+    check(static_cast<bool>(has_flag(dispatch.flags, ExpertDispatchNormalizeTopKWeights)));
 
     MoeDescriptor moe;
     check(static_cast<bool>(has_flag(moe.flags, MoeDescriptorNormalizeTopKWeights)));
@@ -2351,12 +3099,15 @@ void test_flag_defaults()
 
 int main()
 {
-    try {
+    try
+    {
         ncnn::moe::test_flag_defaults();
         ncnn::moe::test_ncnn_linear_operator();
         ncnn::moe::test_mxfp4_cpu_kernel_and_fused_gate_up();
+        ncnn::moe::test_sharded_expert_victim_cache();
         ncnn::moe::test_mapped_file_range_and_shared_buffer();
         ncnn::moe::test_safetensors_dense_mmap();
+        ncnn::moe::test_safetensors_packed_mxfp4_expert();
         ncnn::moe::test_file_backed_mxfp4_expert_cache();
         ncnn::moe::test_cpu_topology_parsing_and_partitioning();
         ncnn::moe::test_cross_session_batch_scheduler();
@@ -2373,13 +3124,15 @@ int main()
         ncnn::moe::test_expert_dispatcher_groups_routes();
         ncnn::moe::test_automatic_expert_memory_planning();
         ncnn::moe::test_sampling_and_streaming_generation();
+        ncnn::moe::test_builtin_adapter_scope();
         ncnn::moe::test_loader_reports_adapter_and_weight_errors();
         ncnn::moe::test_backend_capabilities_and_hybrid_execution();
         ncnn::moe::test_phase_zero_rejects_unimplemented_output_mode();
         std::cout << "all ncnn_moe tests passed\n";
         return 0;
     }
-    catch (const std::exception& error) {
+    catch (const std::exception& error)
+    {
         std::cerr << error.what() << '\n';
         return 1;
     }

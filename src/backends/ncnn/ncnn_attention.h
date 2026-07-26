@@ -14,9 +14,11 @@ namespace moe {
 struct CpuLayerCache;
 class NcnnLinearOperator;
 
+#define NCNN_MOE_NCNN_ATTN_SINK_BIT 0
+
 enum NcnnAttentionFlag : uint32_t
 {
-    NcnnAttentionSink = 1u << 0
+    NcnnAttentionSink = UINT32_C(1) << NCNN_MOE_NCNN_ATTN_SINK_BIT
 };
 
 struct NcnnVulkanAttentionConfig
@@ -39,31 +41,23 @@ struct NcnnVulkanAttentionConfig
 
 class NcnnVulkanAttentionOperator
 {
-public:
-    ~NcnnVulkanAttentionOperator();
-
-    [[nodiscard]] static std::shared_ptr<NcnnVulkanAttentionOperator> create(
-        const TensorData& norm_weight,
-        const TensorData* sinks,
-        std::shared_ptr<NcnnLinearOperator> fused_qkv,
-        std::shared_ptr<NcnnLinearOperator> output_projection,
-        const NcnnVulkanAttentionConfig& config);
-    [[nodiscard]] static uint64_t current_thread_blocks() noexcept;
-
-    // Executes the complete dense attention block across one heterogeneous
-    // boundary: one hidden-state upload, one VkCompute submission containing
-    // every ncnn layer, and one hidden-state download for CPU routing/experts.
-    [[nodiscard]] bool forward(
-        uint64_t position_offset,
-        CpuLayerCache& cache,
-        const CpuBatch& input,
-        CpuBatch& output) const;
-
 private:
     class Implementation;
 
     NcnnVulkanAttentionOperator();
     std::unique_ptr<Implementation> implementation_;
+
+public:
+    ~NcnnVulkanAttentionOperator();
+
+    [[nodiscard]] static std::shared_ptr<NcnnVulkanAttentionOperator> create(const TensorData& norm_weight, const TensorData* sinks,
+                                                                             std::shared_ptr<NcnnLinearOperator> fused_qkv,
+                                                                             std::shared_ptr<NcnnLinearOperator> output_projection,
+                                                                             const NcnnVulkanAttentionConfig& config);
+    [[nodiscard]] static uint64_t current_thread_blocks() noexcept;
+
+    // One upload, one submission, and one download per Attention block.
+    [[nodiscard]] bool forward(uint64_t position_offset, CpuLayerCache& cache, const CpuBatch& input, CpuBatch& output) const;
 };
 
 } // namespace moe

@@ -1,6 +1,7 @@
 #ifndef NCNN_MOE_EXECUTION_PLAN_H
 #define NCNN_MOE_EXECUTION_PLAN_H
 
+#include "ncnn/moe/expert.h"
 #include "ncnn/moe/execution_graph.h"
 #include "ncnn/moe/memory_plan.h"
 #include "ncnn/moe/moe_ir.h"
@@ -17,35 +18,41 @@ namespace ncnn {
 namespace moe {
 
 class Mxfp4ExpertCache;
+class IExpertExecutionBackend;
 
 using TensorHandle = uint32_t;
 inline constexpr TensorHandle invalid_tensor_handle = std::numeric_limits<TensorHandle>::max();
 
 class WeightTable
 {
+private:
+    std::vector<TensorData> tensors_;
+    std::unordered_map<std::string, TensorHandle> handles_;
+
 public:
     [[nodiscard]] Result<TensorHandle> add(std::string name, TensorData tensor);
     [[nodiscard]] const TensorData& at(TensorHandle handle) const;
     [[nodiscard]] TensorData& at_mutable(TensorHandle handle);
-    [[nodiscard]] const TensorData* find(const std::string& name) const noexcept;
     [[nodiscard]] TensorHandle find_handle(const std::string& name) const noexcept;
     [[nodiscard]] size_t size() const noexcept
     {
         return tensors_.size();
     }
-
-private:
-    std::vector<TensorData> tensors_;
-    std::unordered_map<std::string, TensorHandle> handles_;
 };
+
+#define NCNN_MOE_EXPERT_PLAN_GATED_BIT          0
+#define NCNN_MOE_EXPERT_PLAN_PACKED_GATE_UP_BIT 1
 
 enum ExpertPlanFlag : uint32_t
 {
-    ExpertPlanGated = 1u << 0
+    ExpertPlanGated = UINT32_C(1) << NCNN_MOE_EXPERT_PLAN_GATED_BIT,
+    ExpertPlanPackedGateUp = UINT32_C(1) << NCNN_MOE_EXPERT_PLAN_PACKED_GATE_UP_BIT
 };
 
 struct ExpertPlan
 {
+    std::shared_ptr<Expert> runtime;
+    std::string cache_key;
     TensorHandle gate_weight = invalid_tensor_handle;
     TensorHandle up_weight = invalid_tensor_handle;
     TensorHandle gate_up_weight = invalid_tensor_handle;
@@ -54,12 +61,17 @@ struct ExpertPlan
     TensorHandle down_bias = invalid_tensor_handle;
     ExpertActivation activation = ExpertActivation::Silu;
     float activation_limit = 0.0f;
+    uint64_t weight_bytes = 0;
     uint32_t flags = ExpertPlanGated;
 };
 
+#define NCNN_MOE_ATTN_PLAN_SINK_BIT    0
+#define NCNN_MOE_ATTN_PLAN_QK_NORM_BIT 1
+
 enum AttentionBlockFlag : uint32_t
 {
-    AttentionBlockSink = 1u << 0
+    AttentionBlockSink = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_SINK_BIT,
+    AttentionBlockQueryKeyNorm = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_QK_NORM_BIT
 };
 
 struct AttentionBlockPlan
@@ -69,8 +81,10 @@ struct AttentionBlockPlan
     TensorHandle pre_attention_norm_weight = invalid_tensor_handle;
     TensorHandle query_weight = invalid_tensor_handle;
     TensorHandle query_bias = invalid_tensor_handle;
+    TensorHandle query_norm_weight = invalid_tensor_handle;
     TensorHandle key_weight = invalid_tensor_handle;
     TensorHandle key_bias = invalid_tensor_handle;
+    TensorHandle key_norm_weight = invalid_tensor_handle;
     TensorHandle value_weight = invalid_tensor_handle;
     TensorHandle value_bias = invalid_tensor_handle;
     TensorHandle output_weight = invalid_tensor_handle;
@@ -90,9 +104,11 @@ struct AttentionBlockPlan
     uint32_t flags = 0;
 };
 
+#define NCNN_MOE_BLOCK_NORMALIZE_TOPK_BIT 0
+
 enum MoeBlockFlag : uint32_t
 {
-    MoeBlockNormalizeTopKWeights = 1u << 0
+    MoeBlockNormalizeTopKWeights = UINT32_C(1) << NCNN_MOE_BLOCK_NORMALIZE_TOPK_BIT
 };
 
 struct MoeBlockPlan
@@ -114,14 +130,17 @@ struct CompiledNodePlan
     ExecutionBackend backend = ExecutionBackend::Cpu;
 };
 
+#define NCNN_MOE_COMPILED_LAYER_ATTENTION_BIT 0
+
 enum CompiledLayerFlag : uint32_t
 {
-    CompiledLayerAttention = 1u << 0
+    CompiledLayerAttention = UINT32_C(1) << NCNN_MOE_COMPILED_LAYER_ATTENTION_BIT
 };
 
 struct CompiledLayerPlan
 {
     uint32_t layer_id = 0;
+    uint32_t vulkan_device_index = automatic_vulkan_device_index;
     std::vector<CompiledNodePlan> nodes;
     AttentionBlockPlan attention;
     MoeBlockPlan moe;
@@ -140,38 +159,45 @@ struct CompiledModel
     TensorHandle final_norm_weight = invalid_tensor_handle;
     TensorHandle lm_head_weight = invalid_tensor_handle;
     std::shared_ptr<Mxfp4ExpertCache> expert_cache;
+    std::shared_ptr<IExpertExecutionBackend> expert_backend;
+    std::shared_ptr<ExpertStore> expert_store;
     HybridMode hybrid_mode = HybridMode::CpuOnly;
+    uint32_t vulkan_device_index = automatic_vulkan_device_index;
+    std::vector<uint32_t> vulkan_device_indices;
 };
+
+#define NCNN_MOE_BACKEND_CAP_CPU_BIT              0
+#define NCNN_MOE_BACKEND_CAP_VULKAN_DENSE_BIT     1
+#define NCNN_MOE_BACKEND_CAP_VULKAN_ATTN_BIT      2
+#define NCNN_MOE_BACKEND_CAP_MXFP4_CPU_BIT        3
+#define NCNN_MOE_BACKEND_CAP_RETAIN_CPU_DENSE_BIT 4
 
 class ModelCompiler
 {
 public:
     enum BackendCapabilityFlag : uint32_t
     {
-        BackendCapabilityCpuExecution = 1u << 0,
-        BackendCapabilityVulkanDense = 1u << 1,
-        BackendCapabilityVulkanAttention = 1u << 2,
-        BackendCapabilityMxfp4CpuKernel = 1u << 3,
-        BackendCapabilityRetainCpuDenseCopies = 1u << 4
+        BackendCapabilityCpuExecution = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_CPU_BIT,
+        BackendCapabilityVulkanDense = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_VULKAN_DENSE_BIT,
+        BackendCapabilityVulkanAttention = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_VULKAN_ATTN_BIT,
+        BackendCapabilityMxfp4CpuKernel = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_MXFP4_CPU_BIT,
+        BackendCapabilityRetainCpuDenseCopies = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_RETAIN_CPU_DENSE_BIT
     };
 
     struct BackendCapabilities
     {
-        uint32_t flags = BackendCapabilityCpuExecution
-                         | BackendCapabilityMxfp4CpuKernel
-                         | BackendCapabilityRetainCpuDenseCopies;
+        uint32_t flags = BackendCapabilityCpuExecution | BackendCapabilityMxfp4CpuKernel | BackendCapabilityRetainCpuDenseCopies;
+        uint32_t cpu_parallelism = 1;
+        uint32_t vulkan_queue_count = 0;
+        uint32_t vulkan_device_index = automatic_vulkan_device_index;
+        uint32_t expected_concurrency = 1;
+        std::vector<uint32_t> vulkan_device_indices;
+        std::vector<uint32_t> vulkan_device_scores;
     };
 
-    [[nodiscard]] Result<CompiledModel> compile(
-        MoeIR ir,
-        WeightMapping mapping,
-        HybridMode hybrid_mode = HybridMode::CpuOnly) const;
+    [[nodiscard]] Result<CompiledModel> compile(MoeIR ir, WeightMapping mapping, HybridMode hybrid_mode = HybridMode::CpuOnly) const;
 
-    [[nodiscard]] Result<CompiledModel> compile(
-        MoeIR ir,
-        WeightMapping mapping,
-        HybridMode hybrid_mode,
-        const BackendCapabilities& capabilities) const;
+    [[nodiscard]] Result<CompiledModel> compile(MoeIR ir, WeightMapping mapping, HybridMode hybrid_mode, const BackendCapabilities& capabilities) const;
 };
 
 using MoeCompiler = ModelCompiler;

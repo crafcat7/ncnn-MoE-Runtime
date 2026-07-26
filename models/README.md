@@ -17,7 +17,7 @@ directories in `models/` and are not version-controlled.
 
 | Capability | GPT-OSS |
 | --- | ---: |
-| Direct model loading | Yes |
+| Direct model loading | Verified |
 | Portable CPU backend | Yes |
 | ncnn/Vulkan mixed backend | Dense projections and Attention |
 | Native MXFP4 Experts | Yes |
@@ -28,3 +28,6 @@ directories in `models/` and are not version-controlled.
 | Optional on-demand Expert mmap | Yes |
 | Text prompt wrapper | Harmony |
 | Repeatable performance benchmark | Yes |
+
+`MoeIR` is model-neutral. The public adapter catalog contains the validated
+GPT-OSS implementation.

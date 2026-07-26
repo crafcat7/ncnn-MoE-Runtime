@@ -57,7 +57,13 @@ def parse_arguments():
         "--expert-gpu-cache-mb",
         type=int,
         default=0,
-        help="Optional device-local victim cache for evicted MXFP4 Expert pairs.",
+        help="Optional native Vulkan executable Expert cache.",
+    )
+    parser.add_argument(
+        "--expert-gpu-victim-cache-mb",
+        type=int,
+        default=0,
+        help="Optional device-local compressed-weight victim cache for evicted MXFP4 Expert pairs.",
     )
     parser.add_argument(
         "--mmap-experts",
@@ -139,6 +145,9 @@ def main():
     if arguments.expert_gpu_cache_mb < 0:
         print("--expert-gpu-cache-mb must be non-negative", file=sys.stderr)
         return 2
+    if arguments.expert_gpu_victim_cache_mb < 0:
+        print("--expert-gpu-victim-cache-mb must be non-negative", file=sys.stderr)
+        return 2
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     conversation = Conversation.from_messages(
         [
@@ -179,6 +188,13 @@ def main():
     if arguments.expert_gpu_cache_mb:
         command.extend(
             ["--expert-gpu-cache-mb", str(arguments.expert_gpu_cache_mb)]
+        )
+    if arguments.expert_gpu_victim_cache_mb:
+        command.extend(
+            [
+                "--expert-gpu-victim-cache-mb",
+                str(arguments.expert_gpu_victim_cache_mb),
+            ]
         )
     if arguments.mmap_experts:
         command.append("--mmap-experts")

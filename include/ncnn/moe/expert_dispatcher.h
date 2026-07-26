@@ -24,9 +24,11 @@ struct ExpertBatch
     std::vector<ExpertRoute> routes;
 };
 
+#define NCNN_MOE_DISPATCH_NORMALIZE_TOPK_BIT 0
+
 enum ExpertDispatchOptionFlag : uint32_t
 {
-    ExpertDispatchNormalizeTopKWeights = 1u << 0
+    ExpertDispatchNormalizeTopKWeights = UINT32_C(1) << NCNN_MOE_DISPATCH_NORMALIZE_TOPK_BIT
 };
 
 struct ExpertDispatchOptions
@@ -46,13 +48,11 @@ struct ExpertDispatchPlan
 class ExpertDispatcher
 {
 public:
-    // router_logits is a contiguous token_count x expert_count row-major
-    // matrix. The result contains only active Experts, ordered by expert id,
-    // with token order preserved inside each batch.
-    [[nodiscard]] Result<ExpertDispatchPlan> dispatch(
-        std::span<const float> router_logits,
-        uint32_t token_count,
-        const ExpertDispatchOptions& options) const;
+    // Input is token-major; output is stable and ordered by Expert id.
+    [[nodiscard]] Result<ExpertDispatchPlan> dispatch(std::span<const float> router_logits, uint32_t token_count, const ExpertDispatchOptions& options) const;
+
+    // Reuses caller storage across decode steps.
+    [[nodiscard]] Result<void> dispatch_into(std::span<const float> router_logits, uint32_t token_count, const ExpertDispatchOptions& options, ExpertDispatchPlan& result) const;
 };
 
 } // namespace moe

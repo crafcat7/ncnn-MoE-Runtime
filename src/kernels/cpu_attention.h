@@ -11,14 +11,9 @@
 namespace ncnn {
 namespace moe {
 
-[[nodiscard]] CpuBatch execute_attention_block(
-    const WeightTable& weights,
-    const AttentionBlockPlan& plan,
-    float norm_epsilon,
-    DType kv_cache_dtype,
-    uint64_t position_offset,
-    CpuLayerCache& cache,
-    const CpuBatch& hidden);
+void execute_attention_block_into(const WeightTable& weights, const AttentionBlockPlan& plan, float norm_epsilon, DType kv_cache_dtype,
+                                  uint64_t position_offset, CpuLayerCache& cache, CpuAttentionExecutionScratch& scratch, const CpuBatch& hidden,
+                                  CpuBatch& output);
 
 } // namespace moe
 } // namespace ncnn

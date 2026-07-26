@@ -8,8 +8,22 @@
 namespace ncnn {
 namespace moe {
 
+class SessionBatchAccess;
+
 class Model
 {
+private:
+    explicit Model(std::shared_ptr<const CompiledModel> compiled)
+        : compiled_(std::move(compiled))
+    {
+    }
+
+    std::shared_ptr<const CompiledModel> compiled_;
+
+    friend class Runtime;
+    friend class Session;
+    friend class SessionBatchAccess;
+
 public:
     [[nodiscard]] const MoeIR& ir() const noexcept
     {
@@ -22,6 +36,14 @@ public:
     [[nodiscard]] HybridMode hybrid_mode() const noexcept
     {
         return compiled_->hybrid_mode;
+    }
+    [[nodiscard]] uint32_t vulkan_device_index() const noexcept
+    {
+        return compiled_->vulkan_device_index;
+    }
+    [[nodiscard]] const std::vector<uint32_t>& vulkan_device_indices() const noexcept
+    {
+        return compiled_->vulkan_device_indices;
     }
     [[nodiscard]] const std::vector<CompiledLayerPlan>& execution_plan() const noexcept
     {
@@ -39,16 +61,10 @@ public:
     {
         return compiled_->memory_plan;
     }
-
-private:
-    explicit Model(std::shared_ptr<const CompiledModel> compiled) : compiled_(std::move(compiled))
+    [[nodiscard]] const ExpertStore& expert_store() const noexcept
     {
+        return *compiled_->expert_store;
     }
-
-    std::shared_ptr<const CompiledModel> compiled_;
-
-    friend class Runtime;
-    friend class Session;
 };
 
 using ModelPtr = std::shared_ptr<Model>;

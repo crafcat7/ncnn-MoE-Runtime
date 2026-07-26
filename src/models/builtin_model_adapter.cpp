@@ -17,28 +17,31 @@ static Result<uint32_t> required_uint32(const std::string& json, const std::stri
     if (!std::regex_search(json, match, expression))
         return Error{ErrorCode::InvalidModel, "manifest is missing integer field: " + key};
 
-    try {
+    try
+    {
         const unsigned long long value = std::stoull(match[1].str());
         if (value > std::numeric_limits<uint32_t>::max())
             return Error{ErrorCode::InvalidModel, "manifest integer is out of range: " + key};
         return static_cast<uint32_t>(value);
     }
-    catch (const std::exception&) {
+    catch (const std::exception&)
+    {
         return Error{ErrorCode::InvalidModel, "invalid integer field: " + key};
     }
 }
 
 static float optional_float(const std::string& json, const std::string& key, float fallback)
 {
-    const std::regex expression(
-        "\\\"" + key + "\\\"\\s*:\\s*([-+]?(?:[0-9]+\\.?[0-9]*|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?)");
+    const std::regex expression("\\\"" + key + "\\\"\\s*:\\s*([-+]?(?:[0-9]+\\.?[0-9]*|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?)");
     std::smatch match;
     if (!std::regex_search(json, match, expression))
         return fallback;
-    try {
+    try
+    {
         return std::stof(match[1].str());
     }
-    catch (const std::exception&) {
+    catch (const std::exception&)
+    {
         return fallback;
     }
 }
@@ -52,7 +55,7 @@ static bool optional_bool(const std::string& json, const std::string& key, bool 
     return match[1].str() == "true";
 }
 
-static Result<MoeModelDescriptor> parse_gpt_oss_model(const ModelPackage& package)
+static Result<MoeIR> parse_gpt_oss_model(const ModelPackage& package)
 {
     const std::string& json = package.manifest.raw_json;
     auto vocabulary_size = required_uint32(json, "vocab_size");
@@ -69,7 +72,8 @@ static Result<MoeModelDescriptor> parse_gpt_oss_model(const ModelPackage& packag
     auto max_context_length = required_uint32(json, "max_position_embeddings");
     if (!vocabulary_size || !hidden_size || !intermediate_size || !layer_count || !expert_count || !top_k
         || !attention_head_count || !kv_head_count || !head_dimension || !sliding_window
-        || !initial_context_length || !max_context_length) {
+        || !initial_context_length || !max_context_length)
+    {
         const Error* error = !vocabulary_size          ? &vocabulary_size.error()
                              : !hidden_size            ? &hidden_size.error()
                              : !intermediate_size      ? &intermediate_size.error()
@@ -85,7 +89,7 @@ static Result<MoeModelDescriptor> parse_gpt_oss_model(const ModelPackage& packag
         return *error;
     }
 
-    MoeModelDescriptor descriptor;
+    MoeIR descriptor;
     descriptor.model_type = "gpt_oss";
     descriptor.vocabulary_size = vocabulary_size.value();
     descriptor.hidden_size = hidden_size.value();
@@ -109,9 +113,7 @@ static Result<MoeModelDescriptor> parse_gpt_oss_model(const ModelPackage& packag
     moe.activation = ExpertActivation::GptOssSwiGlu;
     moe.layout = ExpertLayout::InterleavedGateUpDown;
     moe.expert_weight_dtype = DType::MxFp4;
-    moe.flags = MoeDescriptorNormalizeTopKWeights
-                | MoeDescriptorRouterBias
-                | MoeDescriptorProjectionBias;
+    moe.flags = MoeDescriptorNormalizeTopKWeights | MoeDescriptorRouterBias | MoeDescriptorProjectionBias;
     moe.activation_limit = optional_float(json, "swiglu_limit", 7.0f);
 
     AttentionDescriptor attention;
@@ -129,7 +131,8 @@ static Result<MoeModelDescriptor> parse_gpt_oss_model(const ModelPackage& packag
         attention.flags |= AttentionDescriptorBias;
 
     descriptor.layers.resize(descriptor.layer_count);
-    for (uint32_t layer_id = 0; layer_id < descriptor.layer_count; ++layer_id) {
+    for (uint32_t layer_id = 0; layer_id < descriptor.layer_count; ++layer_id)
+    {
         LayerDescriptor& layer = descriptor.layers[layer_id];
         layer.flags = LayerDescriptorAttention | LayerDescriptorMoe;
         layer.pre_attention_norm = NormType::RmsNorm;
@@ -193,22 +196,14 @@ static Result<void> add_mxfp4_expert(
     uint32_t columns,
     uint32_t flags)
 {
-    auto tensor = archive.load_mxfp4_expert(
-        blocks_name,
-        scales_name,
-        expert_id,
-        rows,
-        columns,
-        flags);
+    auto tensor = archive.load_mxfp4_expert(blocks_name, scales_name, expert_id, rows, columns, flags);
     if (!tensor)
         return tensor.error();
     mapping.tensors.emplace(target_name, std::move(tensor).value());
     return {};
 }
 
-static Result<WeightMapping> map_gpt_oss_weights(
-    const ModelPackage& package,
-    const MoeModelDescriptor& descriptor)
+static Result<WeightMapping> map_gpt_oss_weights(const ModelPackage& package, const MoeModelDescriptor& descriptor)
 {
     auto opened = SafetensorsArchive::open(package.root);
     if (!opened)
@@ -223,7 +218,8 @@ static Result<WeightMapping> map_gpt_oss_weights(
     if (!status)
         return status.error();
 
-    for (uint32_t layer_id = 0; layer_id < descriptor.layer_count; ++layer_id) {
+    for (uint32_t layer_id = 0; layer_id < descriptor.layer_count; ++layer_id)
+    {
         const std::string source = "model.layers." + std::to_string(layer_id) + ".";
         const std::string target = layer_prefix(layer_id);
         status = add_safetensor(mapping, archive, target + "pre_attention_norm.weight", source + "input_layernorm.weight");
@@ -272,7 +268,8 @@ static Result<WeightMapping> map_gpt_oss_weights(
         const std::string gate_up_scales = source + "mlp.experts.gate_up_proj_scales";
         const std::string down_blocks = source + "mlp.experts.down_proj_blocks";
         const std::string down_scales = source + "mlp.experts.down_proj_scales";
-        for (uint32_t expert_id = 0; expert_id < descriptor.expert_count; ++expert_id) {
+        for (uint32_t expert_id = 0; expert_id < descriptor.expert_count; ++expert_id)
+        {
             const std::string expert = expert_prefix(layer_id, expert_id);
             status = add_mxfp4_expert(
                 mapping, archive, expert + "gate_up.weight", gate_up_blocks, gate_up_scales,
@@ -291,9 +288,7 @@ static Result<WeightMapping> map_gpt_oss_weights(
                 expert_load_flags);
             if (!status)
                 return status.error();
-            status = add_safetensor_slice(
-                mapping, archive, expert + "down.bias", down_bias,
-                expert_id, {descriptor.hidden_size});
+            status = add_safetensor_slice(mapping, archive, expert + "down.bias", down_bias, expert_id, {descriptor.hidden_size});
             if (!status)
                 return status.error();
         }
@@ -320,9 +315,7 @@ Result<MoeIR> BuiltinModelAdapter::parse_model(const ModelPackage& package) cons
     return parse_gpt_oss_model(package);
 }
 
-Result<WeightMapping> BuiltinModelAdapter::map_weights(
-    const ModelPackage& package,
-    const MoeIR& descriptor) const
+Result<WeightMapping> BuiltinModelAdapter::map_weights(const ModelPackage& package, const MoeIR& descriptor) const
 {
     if (descriptor.model_type != "gpt_oss")
         return Error{ErrorCode::UnsupportedModel, "unsupported built-in model_type: " + descriptor.model_type};

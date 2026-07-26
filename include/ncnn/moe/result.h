@@ -27,11 +27,16 @@ struct Error
 template<typename T>
 class Result
 {
+private:
+    std::variant<T, Error> storage_;
+
 public:
-    Result(T value) : storage_(std::move(value))
+    Result(T value)
+        : storage_(std::move(value))
     {
     }
-    Result(Error error) : storage_(std::move(error))
+    Result(Error error)
+        : storage_(std::move(error))
     {
     }
 
@@ -63,17 +68,19 @@ public:
         assert(std::holds_alternative<Error>(storage_));
         return std::get<Error>(storage_);
     }
-
-private:
-    std::variant<T, Error> storage_;
 };
 
 template<>
 class Result<void>
 {
+private:
+    bool has_error_ = false;
+    Error error_;
+
 public:
     Result() = default;
-    Result(Error error) : has_error_(true), error_(std::move(error))
+    Result(Error error)
+        : has_error_(true), error_(std::move(error))
     {
     }
 
@@ -87,10 +94,6 @@ public:
         assert(has_error_);
         return error_;
     }
-
-private:
-    bool has_error_ = false;
-    Error error_;
 };
 
 } // namespace moe

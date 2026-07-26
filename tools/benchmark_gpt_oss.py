@@ -10,11 +10,30 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 
 MIB = 1024 * 1024
+DEFAULT_PROMPT_TOKEN_IDS = [
+    50117,
+    261,
+    82463,
+    30547,
+    328,
+    70531,
+    13236,
+    10978,
+    13108,
+    12,
+    149295,
+    91643,
+    395,
+    2698,
+    10220,
+    13,
+]
 
 
 def parse_arguments():
@@ -35,11 +54,61 @@ def parse_arguments():
         "--prompt-token-ids",
         type=int,
         nargs="+",
-        default=[0],
-        help="Input token IDs passed to the runner (default: 0).",
+        default=DEFAULT_PROMPT_TOKEN_IDS,
+        help="Input token IDs passed to the runner (default: fixed 16-token prompt).",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=32)
-    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--warmup", type=int, default=0)
+    parser.add_argument(
+        "--cache-warmup-runs",
+        type=int,
+        default=0,
+        help="Warm the shared model Expert cache before each measured run.",
+    )
+    parser.add_argument(
+        "--parallel-sessions",
+        type=int,
+        default=1,
+        help=(
+            "Generate independent sequences through the cross-session "
+            "scheduler and report aggregate throughput."
+        ),
+    )
+    parser.add_argument(
+        "--scheduler-expert-threads",
+        type=int,
+        default=0,
+        help=(
+            "Override Expert OpenMP threads per scheduler worker "
+            "(zero keeps the runner's topology default)."
+        ),
+    )
+    parser.add_argument(
+        "--scheduler-staging",
+        choices=("auto", "force", "off"),
+        default="auto",
+        help="Control cross-session staged decode batching.",
+    )
+    parser.add_argument(
+        "--scheduler-cross-call",
+        action="store_true",
+        help=(
+            "Submit each Session as an independent scheduler call so the "
+            "Runtime cross-call collector is exercised."
+        ),
+    )
+    parser.add_argument(
+        "--scheduler-collection-us",
+        type=int,
+        default=200,
+        help="Maximum cross-call collection window in microseconds.",
+    )
+    parser.add_argument(
+        "--scheduler-max-micro-batch",
+        type=int,
+        default=0,
+        help="Maximum collected requests; zero follows scheduler workers.",
+    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
         "--backend",
@@ -53,12 +122,69 @@ def parse_arguments():
     )
     parser.add_argument("--host-memory-mb", type=int, default=0)
     parser.add_argument("--expert-cache-mb", type=int, default=0)
+    parser.add_argument(
+        "--expert-cache-sweep-mb",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Run independent process repeats for each Expert cache size.",
+    )
     parser.add_argument("--expert-gpu-cache-mb", type=int, default=0)
+    parser.add_argument(
+        "--expert-gpu-victim-cache-mb",
+        type=int,
+        default=0,
+        help=(
+            "Use a compressed-weight Vulkan L2 behind the host Expert ARC; "
+            "entries can execute in place or restore to CPU."
+        ),
+    )
+    parser.add_argument(
+        "--disable-gpu-victim-execution",
+        action="store_true",
+        help=(
+            "Disable in-place execution from the Vulkan victim tier for an "
+            "A/B control or compatibility fallback."
+        ),
+    )
+    parser.add_argument(
+        "--expert-gpu-victim-reuse-probe",
+        type=int,
+        default=1,
+        help=(
+            "Admit Experts observed across host-ARC residencies, plus one "
+            "of each N first-observation evictions as a victim-tier probe."
+        ),
+    )
     parser.add_argument("--expert-io-workers", type=int, default=0)
+    parser.add_argument(
+        "--vulkan-device-index",
+        type=int,
+        default=None,
+        help="Vulkan device index selected by the runtime.",
+    )
+    parser.add_argument(
+        "--vulkan-device-indices",
+        default=None,
+        help=(
+            "Comma-separated Vulkan devices used for weighted layer and "
+            "Expert placement."
+        ),
+    )
     parser.add_argument(
         "--mmap-experts",
         action="store_true",
         help="Use memory-mapped on-demand MXFP4 ranges.",
+    )
+    parser.add_argument(
+        "--direct-expert-io",
+        action="store_true",
+        help="Use aligned direct reads for on-demand MXFP4 ranges.",
+    )
+    parser.add_argument(
+        "--buffered-expert-io",
+        action="store_true",
+        help="Force buffered reads instead of adaptive Expert I/O.",
     )
     parser.add_argument(
         "--sample-interval-ms",
@@ -84,20 +210,106 @@ def validate_arguments(arguments):
         raise ValueError("--max-new-tokens must be positive")
     if arguments.warmup < 0:
         raise ValueError("--warmup must be non-negative")
+    if arguments.cache_warmup_runs < 0:
+        raise ValueError("--cache-warmup-runs must be non-negative")
+    if (
+        arguments.parallel_sessions <= 0
+        or arguments.parallel_sessions > 64
+    ):
+        raise ValueError("--parallel-sessions must be between 1 and 64")
+    if (
+        arguments.scheduler_expert_threads < 0
+        or arguments.scheduler_expert_threads > 1024
+    ):
+        raise ValueError(
+            "--scheduler-expert-threads must be between 0 and 1024"
+        )
+    if (
+        arguments.scheduler_collection_us < 0
+        or arguments.scheduler_collection_us > 1000000
+    ):
+        raise ValueError(
+            "--scheduler-collection-us must be between 0 and 1000000"
+        )
+    if (
+        arguments.scheduler_max_micro_batch < 0
+        or arguments.scheduler_max_micro_batch > 1024
+    ):
+        raise ValueError(
+            "--scheduler-max-micro-batch must be between 0 and 1024"
+        )
     if arguments.repeats <= 0:
         raise ValueError("--repeats must be positive")
     if (
         arguments.host_memory_mb < 0
         or arguments.expert_cache_mb < 0
         or arguments.expert_gpu_cache_mb < 0
+        or arguments.expert_gpu_victim_cache_mb < 0
     ):
         raise ValueError("memory limits must be non-negative")
+    if arguments.expert_cache_sweep_mb is not None:
+        if any(cache_mb <= 0 for cache_mb in arguments.expert_cache_sweep_mb):
+            raise ValueError("--expert-cache-sweep-mb values must be positive")
+        if len(set(arguments.expert_cache_sweep_mb)) != len(
+            arguments.expert_cache_sweep_mb
+        ):
+            raise ValueError("--expert-cache-sweep-mb values must be unique")
+        if arguments.expert_cache_mb:
+            raise ValueError(
+                "--expert-cache-mb and --expert-cache-sweep-mb are mutually exclusive"
+            )
     if arguments.expert_io_workers < 0 or arguments.expert_io_workers > 64:
         raise ValueError("--expert-io-workers must be between 0 and 64")
+    if (
+        arguments.expert_gpu_victim_reuse_probe < 1
+        or arguments.expert_gpu_victim_reuse_probe > 1024
+    ):
+        raise ValueError(
+            "--expert-gpu-victim-reuse-probe must be between 1 and 1024"
+        )
+    if (
+        arguments.vulkan_device_index is not None
+        and arguments.vulkan_device_index < 0
+    ):
+        raise ValueError("--vulkan-device-index must be non-negative")
+    if arguments.vulkan_device_indices is not None:
+        try:
+            device_indices = [
+                int(value)
+                for value in arguments.vulkan_device_indices.split(",")
+            ]
+        except ValueError as error:
+            raise ValueError(
+                "--vulkan-device-indices must contain comma-separated integers"
+            ) from error
+        if not device_indices or any(index < 0 for index in device_indices):
+            raise ValueError(
+                "--vulkan-device-indices must contain non-negative indices"
+            )
+        if len(set(device_indices)) != len(device_indices):
+            raise ValueError("--vulkan-device-indices must be unique")
+        if (
+            arguments.vulkan_device_index is not None
+            and arguments.vulkan_device_index != device_indices[0]
+        ):
+            raise ValueError(
+                "--vulkan-device-index must match the first multi-device index"
+            )
     if arguments.sample_interval_ms < 20:
         raise ValueError("--sample-interval-ms must be at least 20")
     if arguments.gpu_index < 0:
         raise ValueError("--gpu-index must be non-negative")
+    selected_io_modes = sum(
+        (
+            arguments.mmap_experts,
+            arguments.direct_expert_io,
+            arguments.buffered_expert_io,
+        )
+    )
+    if selected_io_modes > 1:
+        raise ValueError(
+            "Expert mmap, direct I/O, and buffered I/O are mutually exclusive"
+        )
 
 
 def runner_command(arguments):
@@ -108,6 +320,39 @@ def runner_command(arguments):
         "--max-new-tokens",
         str(arguments.max_new_tokens),
     ]
+    if arguments.cache_warmup_runs:
+        command.extend(
+            ["--cache-warmup-runs", str(arguments.cache_warmup_runs)]
+        )
+    if arguments.parallel_sessions != 1:
+        command.extend(
+            ["--parallel-sessions", str(arguments.parallel_sessions)]
+        )
+    if arguments.scheduler_expert_threads:
+        command.extend(
+            [
+                "--scheduler-expert-threads",
+                str(arguments.scheduler_expert_threads),
+            ]
+        )
+    if arguments.scheduler_staging != "auto":
+        command.extend(["--scheduler-staging", arguments.scheduler_staging])
+    if arguments.scheduler_cross_call:
+        command.append("--scheduler-cross-call")
+    if arguments.scheduler_collection_us != 200:
+        command.extend(
+            [
+                "--scheduler-collection-us",
+                str(arguments.scheduler_collection_us),
+            ]
+        )
+    if arguments.scheduler_max_micro_batch:
+        command.extend(
+            [
+                "--scheduler-max-micro-batch",
+                str(arguments.scheduler_max_micro_batch),
+            ]
+        )
     if arguments.backend != "auto":
         command.append(f"--{arguments.backend}")
     if arguments.expert_memory != "auto":
@@ -120,10 +365,37 @@ def runner_command(arguments):
         command.extend(
             ["--expert-gpu-cache-mb", str(arguments.expert_gpu_cache_mb)]
         )
+    if arguments.expert_gpu_victim_cache_mb:
+        command.extend(
+            [
+                "--expert-gpu-victim-cache-mb",
+                str(arguments.expert_gpu_victim_cache_mb),
+            ]
+        )
+        if arguments.disable_gpu_victim_execution:
+            command.append("--disable-gpu-victim-execution")
+        command.extend(
+            [
+                "--expert-gpu-victim-reuse-probe",
+                str(arguments.expert_gpu_victim_reuse_probe),
+            ]
+        )
     if arguments.expert_io_workers:
         command.extend(["--expert-io-workers", str(arguments.expert_io_workers)])
+    if arguments.vulkan_device_index is not None:
+        command.extend(
+            ["--vulkan-device", str(arguments.vulkan_device_index)]
+        )
+    if arguments.vulkan_device_indices is not None:
+        command.extend(
+            ["--vulkan-devices", arguments.vulkan_device_indices]
+        )
     if arguments.mmap_experts:
         command.append("--mmap-experts")
+    if arguments.direct_expert_io:
+        command.append("--direct-expert-io")
+    if arguments.buffered_expert_io:
+        command.append("--buffered-expert-io")
     return command
 
 
@@ -141,7 +413,17 @@ class WindowsProcessMemory:
             ("PagefileUsage", ctypes.c_size_t),
             ("PeakPagefileUsage", ctypes.c_size_t),
             ("PrivateUsage", ctypes.c_size_t),
-    ]
+        ]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
 
     def __init__(self, process_id):
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -160,7 +442,12 @@ class WindowsProcessMemory:
             ctypes.c_ulong,
         ]
         self.psapi.GetProcessMemoryInfo.restype = ctypes.c_int
-        access = 0x1000 | 0x0010
+        self.kernel32.GetProcessIoCounters.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(self.IoCounters),
+        ]
+        self.kernel32.GetProcessIoCounters.restype = ctypes.c_int
+        access = 0x0400 | 0x1000 | 0x0010
         self.handle = self.kernel32.OpenProcess(access, False, process_id)
 
     def sample(self):
@@ -174,6 +461,21 @@ class WindowsProcessMemory:
             counters.cb,
         )
         return int(counters.PeakWorkingSetSize) if succeeded else None
+
+    def io_counters(self):
+        if not self.handle:
+            return None
+        counters = self.IoCounters()
+        if not self.kernel32.GetProcessIoCounters(
+            self.handle, ctypes.byref(counters)
+        ):
+            return None
+        return {
+            "logical_read_bytes": int(counters.ReadTransferCount),
+            "logical_read_operations": int(counters.ReadOperationCount),
+            "physical_read_bytes": None,
+            "source": "Windows GetProcessIoCounters ReadTransferCount",
+        }
 
     def close(self):
         if self.handle:
@@ -206,6 +508,27 @@ class PortableProcessMemory:
         if self.windows:
             self.windows.close()
 
+    def io_counters(self):
+        if self.windows:
+            return self.windows.io_counters()
+        if sys.platform.startswith("linux"):
+            try:
+                values = {}
+                for line in Path(
+                    f"/proc/{self.process_id}/io"
+                ).read_text(encoding="utf-8").splitlines():
+                    key, value = line.split(":", 1)
+                    values[key.strip()] = int(value.strip())
+            except (OSError, ValueError):
+                return None
+            return {
+                "logical_read_bytes": values.get("rchar"),
+                "logical_read_operations": values.get("syscr"),
+                "physical_read_bytes": values.get("read_bytes"),
+                "source": "Linux /proc/<pid>/io rchar/read_bytes",
+            }
+        return None
+
     def _linux_rss(self):
         try:
             status = Path(f"/proc/{self.process_id}/status").read_text(
@@ -226,6 +549,150 @@ class PortableProcessMemory:
             return int(completed.stdout.strip()) * 1024
         except ValueError:
             return None
+
+
+class WindowsPhysicalDiskMonitor:
+    COUNTER = r"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec"
+
+    def __init__(self):
+        self.executable = shutil.which("typeperf")
+        self.powershell = shutil.which("powershell")
+        self.output = None
+        self.process = None
+        self.sample_source = None
+
+    def start(self):
+        if not self.executable and not self.powershell:
+            return
+        if self.executable:
+            self.output = tempfile.TemporaryFile(mode="w+b")
+            try:
+                self.process = subprocess.Popen(
+                    [self.executable, self.COUNTER, "-si", "1"],
+                    stdout=self.output,
+                    stderr=subprocess.DEVNULL,
+                )
+                time.sleep(0.05)
+                if self.process.poll() is not None:
+                    self.process = None
+                    self.output.close()
+                    self.output = None
+            except OSError:
+                if self.output:
+                    self.output.close()
+                self.output = None
+        if self.output is not None or not self.powershell:
+            self.sample_source = "typeperf"
+            return
+        self.output = tempfile.TemporaryFile(mode="w+b")
+        command = (
+            "$ErrorActionPreference='SilentlyContinue'; "
+            "while ($true) { "
+            "$counter = Get-CimInstance "
+            "Win32_PerfFormattedData_PerfDisk_PhysicalDisk | "
+            "Where-Object { $_.Name -eq '_Total' }; "
+            "if ($counter) { [Console]::WriteLine($counter.DiskReadBytesPersec) }; "
+            "Start-Sleep -Seconds 1 }"
+        )
+        try:
+            self.process = subprocess.Popen(
+                [self.powershell, "-NoProfile", "-Command", command],
+                stdout=self.output,
+                stderr=subprocess.DEVNULL,
+            )
+            self.sample_source = "CIM"
+        except OSError:
+            self.output.close()
+            self.output = None
+
+    def stop(self):
+        if not self.process or not self.output:
+            return None
+        self.process.terminate()
+        try:
+            self.process.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.communicate()
+        self.output.flush()
+        self.output.seek(0)
+        text = self.output.read().decode("utf-8", errors="replace")
+        self.output.close()
+        self.output = None
+        values = []
+        for line in text.splitlines():
+            value = line.rsplit(",", 1)[-1].strip().strip('"')
+            try:
+                values.append(float(value.replace(",", "")))
+            except ValueError:
+                continue
+        if not values:
+            return None
+        return {
+            "physical_read_bytes": int(sum(values)),
+            "source": (
+                f"Windows {self.sample_source} physical disk read bytes/sec "
+                "(system total, one-second samples)"
+            ),
+        }
+
+
+class LinuxPhysicalDiskMonitor:
+    def __init__(self):
+        self.before = None
+
+    @staticmethod
+    def snapshot():
+        try:
+            block_devices = {
+                path.name for path in Path("/sys/block").iterdir()
+            }
+            values = {}
+            for line in Path("/proc/diskstats").read_text(
+                encoding="utf-8"
+            ).splitlines():
+                fields = line.split()
+                if len(fields) < 14 or fields[2] not in block_devices:
+                    continue
+                values[fields[2]] = int(fields[5]) * 512
+            return values
+        except (OSError, ValueError):
+            return None
+
+    def start(self):
+        self.before = self.snapshot()
+
+    def stop(self):
+        if self.before is None:
+            return None
+        after = self.snapshot()
+        if after is None:
+            return None
+        total = sum(
+            max(0, after.get(name, 0) - value)
+            for name, value in self.before.items()
+        )
+        return {
+            "physical_read_bytes": total,
+            "source": "Linux /proc/diskstats base block devices (system total)",
+        }
+
+
+class PhysicalDiskMonitor:
+    def __init__(self):
+        if os.name == "nt":
+            self.monitor = WindowsPhysicalDiskMonitor()
+        elif sys.platform.startswith("linux"):
+            self.monitor = LinuxPhysicalDiskMonitor()
+        else:
+            self.monitor = None
+
+    def start(self):
+        if self.monitor:
+            self.monitor.start()
+
+    def stop(self):
+        return self.monitor.stop() if self.monitor else None
 
 
 class NvidiaMemoryMonitor:
@@ -330,6 +797,21 @@ def extract_number(output, pattern, cast=float):
     return cast(match.group(1)) if match else None
 
 
+def extract_text(output, pattern):
+    match = re.search(pattern, output, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def io_delta(before, after, field):
+    if not before or not after:
+        return None
+    before_value = before.get(field)
+    after_value = after.get(field)
+    if before_value is None or after_value is None:
+        return None
+    return max(0, after_value - before_value)
+
+
 def parse_runner_output(output):
     token_match = re.search(
         r"^generated token ids:(.*)$",
@@ -341,12 +823,38 @@ def parse_runner_output(output):
         if token_match
         else []
     )
+    hotsets = [
+        {
+            "capacity_mib": int(match.group(1)),
+            "resident_experts": int(match.group(2)),
+            "active_experts": int(match.group(3)),
+            "resident_bytes": int(match.group(4)),
+            "batch_weight_coverage": float(match.group(5)) / 100.0,
+            "route_weight_coverage": float(match.group(6)) / 100.0,
+        }
+        for match in re.finditer(
+            r"^Expert static hotset at (\d+) MiB: "
+            r"(\d+)/(\d+) Expert\(s\), (\d+) bytes resident, "
+            r"([0-9.]+)% batch-byte coverage, "
+            r"([0-9.]+)% route-byte coverage$",
+            output,
+            re.MULTILINE,
+        )
+    ]
     result = {
         "load_seconds": extract_number(
             output, r"^loaded gpt_oss in ([0-9.]+) s,"
         ),
         "generated_tokens": extract_number(
             output, r"^generated (\d+) token\(s\) in", int
+        ),
+        "parallel_sessions": extract_number(
+            output, r"^Parallel sessions: (\d+)", int
+        ),
+        "reported_aggregate_tokens_per_second": extract_number(
+            output,
+            r"^Parallel sessions: \d+, aggregate throughput: "
+            r"([0-9.]+) token/s",
         ),
         "generation_seconds": extract_number(
             output, r"^generated \d+ token\(s\) in ([0-9.]+) s"
@@ -356,6 +864,290 @@ def parse_runner_output(output):
         ),
         "router_ms": extract_number(output, r"^Router time: ([0-9.]+) ms"),
         "expert_ms": extract_number(output, r"^Expert time: ([0-9.]+) ms"),
+        "expert_batch_weight_bytes": extract_number(
+            output, r"^Expert weight demand: (\d+) batched bytes", int
+        ),
+        "expert_route_weight_bytes": extract_number(
+            output,
+            r"^Expert weight demand: \d+ batched bytes, (\d+) route bytes",
+            int,
+        ),
+        "expert_cache_wait_ms": extract_number(
+            output, r"^Expert cache wait time: ([0-9.]+) ms"
+        ),
+        "expert_cache_management_ms": extract_number(
+            output, r"^Expert cache management time: ([0-9.]+) ms"
+        ),
+        "expert_engine_ms": extract_number(
+            output, r"^Expert engine wall time: ([0-9.]+) ms"
+        ),
+        "expert_compute_ms": extract_number(
+            output, r"^Expert compute(?: wall)? time: ([0-9.]+) ms"
+        ),
+        "expert_orchestration_ms": extract_number(
+            output, r"^Expert orchestration wall time: ([0-9.]+) ms"
+        ),
+        "expert_regroup_ms": extract_number(
+            output, r"^Expert regroup time: ([0-9.]+) ms"
+        ),
+        "expert_combine_ms": extract_number(
+            output, r"^Expert combine time: ([0-9.]+) ms"
+        ),
+        "embedding_ms": extract_number(
+            output, r"^Embedding time: ([0-9.]+) ms"
+        ),
+        "final_norm_ms": extract_number(
+            output, r"^Final norm time: ([0-9.]+) ms"
+        ),
+        "lm_head_ms": extract_number(
+            output, r"^LM head time: ([0-9.]+) ms"
+        ),
+        "physical_cpu_core_count": extract_number(
+            output, r"^CPU topology: (\d+) physical core", int
+        ),
+        "runtime_logical_cpu_count": extract_number(
+            output,
+            r"^CPU topology: \d+ physical core\(s\), (\d+) logical processor",
+            int,
+        ),
+        "runtime_openmp_thread_count": extract_number(
+            output, r"^CPU topology:.*?(\d+) OpenMP thread", int
+        ),
+        "cpu_isa": extract_text(
+            output, r"^CPU ISA capabilities: (.+)$"
+        ),
+        "mxfp4_kernel": extract_text(
+            output, r"^MXFP4 CPU kernel: (.+)$"
+        ),
+        "mxfp4_decode_row_pair_group_size": extract_number(
+            output, r"^MXFP4 decode row-pair group: (\d+)", int
+        ),
+        "activation_kernel": extract_text(
+            output, r"^Activation CPU kernel: (.+)$"
+        ),
+        "vulkan_compute_submissions": extract_number(
+            output, r"^Vulkan compute submissions: (\d+)", int
+        ),
+        "vulkan_async_submissions": extract_number(
+            output, r"^Vulkan async submissions: (\d+)", int
+        ),
+        "vulkan_auxiliary_uploads": extract_number(
+            output,
+            r"^Vulkan auxiliary uploads: (\d+) upload",
+            int,
+        ),
+        "vulkan_auxiliary_upload_bytes": extract_number(
+            output,
+            r"^Vulkan auxiliary uploads: \d+ upload\(s\), (\d+) bytes",
+            int,
+        ),
+        "vulkan_model_device_index": extract_number(
+            output, r"^Vulkan model device: (\d+)", int
+        ),
+        "vulkan_model_devices": extract_text(
+            output, r"^Vulkan model devices: ([^;]+);"
+        ),
+        "vulkan_layer_placement": extract_text(
+            output, r"^Vulkan model devices: [^;]+; layer placement: (.+)$"
+        ),
+        "vulkan_attention_blocks": extract_number(
+            output, r"^Vulkan attention blocks: (\d+)", int
+        ),
+        "vulkan_kernel_features": extract_text(
+            output, r"^Vulkan kernel features: (.+)$"
+        ),
+        "vulkan_command_buffer_reuses": extract_number(
+            output,
+            r"^Vulkan command buffer reuses: (\d+)",
+            int,
+        ),
+        "vulkan_attention_qkv_rope_fusions": extract_number(
+            output,
+            r"^Vulkan attention fusion: (\d+) QKV\+RoPE block",
+            int,
+        ),
+        "vulkan_attention_qkv_ring_fusions": extract_number(
+            output,
+            r"^Vulkan attention fusion: \d+ QKV\+RoPE block\(s\), (\d+) QKV->ring block",
+            int,
+        ),
+        "vulkan_attention_decode_sdpa_fusions": extract_number(
+            output,
+            r"^Vulkan attention fusion: \d+ QKV\+RoPE block\(s\), \d+ QKV->ring block\(s\), (\d+) Decode-SDPA block",
+            int,
+        ),
+        "vulkan_kv_ring_appends": extract_number(
+            output, r"^Vulkan KV ring: (\d+) append", int
+        ),
+        "vulkan_kv_ring_resizes": extract_number(
+            output, r"^Vulkan KV ring: \d+ append\(s\), (\d+) resize", int
+        ),
+        "vulkan_kv_ring_wrapped_views": extract_number(
+            output,
+            r"^Vulkan KV ring: \d+ append\(s\), \d+ resize\(s\), (\d+) wrapped",
+            int,
+        ),
+        "scheduler_staged_batches": extract_number(
+            output, r"^Scheduler staging: (\d+) batch", int
+        ),
+        "scheduler_staged_requests": extract_number(
+            output,
+            r"^Scheduler staging: \d+ batch\(es\), (\d+) request",
+            int,
+        ),
+        "scheduler_staging_bypassed_batches": extract_number(
+            output,
+            r"^Scheduler staging: \d+ batch\(es\), \d+ request\(s\), (\d+) bypassed",
+            int,
+        ),
+        "scheduler_logical_expert_batches": extract_number(
+            output,
+            r"^Scheduler staging:.*?(\d+) logical Expert batch",
+            int,
+        ),
+        "scheduler_physical_expert_batches": extract_number(
+            output,
+            r"^Scheduler staging:.*?-> (\d+) physical",
+            int,
+        ),
+        "scheduler_coalesced_expert_routes": extract_number(
+            output,
+            r"^Scheduler staging:.*?(\d+) coalesced route",
+            int,
+        ),
+        "scheduler_max_coalesced_expert_batch_size": extract_number(
+            output,
+            r"^Scheduler staging:.*?max (\d+) row",
+            int,
+        ),
+        "scheduler_adaptive_staged_decisions": extract_number(
+            output,
+            r"^Scheduler adaptive policy: (\d+) staged decision",
+            int,
+        ),
+        "scheduler_adaptive_independent_decisions": extract_number(
+            output,
+            r"^Scheduler adaptive policy: \d+ staged decision\(s\), (\d+) independent",
+            int,
+        ),
+        "scheduler_adaptive_probe_decisions": extract_number(
+            output,
+            r"^Scheduler adaptive policy:.*?(\d+) probe",
+            int,
+        ),
+        "scheduler_adaptive_policy_switches": extract_number(
+            output,
+            r"^Scheduler adaptive policy:.*?(\d+) switch",
+            int,
+        ),
+        "scheduler_adaptive_staged_ms_per_request": extract_number(
+            output,
+            r"^Scheduler adaptive policy:.*?([0-9.]+)/[0-9.]+ mean ms/request",
+        ),
+        "scheduler_adaptive_independent_ms_per_request": extract_number(
+            output,
+            r"^Scheduler adaptive policy:.*?[0-9.]+/([0-9.]+) mean ms/request",
+        ),
+        "scheduler_adaptive_resident_decisions": extract_number(
+            output,
+            r"^Scheduler adaptive phases: (\d+)/",
+            int,
+        ),
+        "scheduler_adaptive_mixed_decisions": extract_number(
+            output,
+            r"^Scheduler adaptive phases: \d+/(\d+)/",
+            int,
+        ),
+        "scheduler_adaptive_storage_decisions": extract_number(
+            output,
+            r"^Scheduler adaptive phases: \d+/\d+/(\d+) resident",
+            int,
+        ),
+        "scheduler_adaptive_resident_observations": extract_number(
+            output,
+            r"^Scheduler adaptive phases:.*?, (\d+)/\d+/\d+ observation",
+            int,
+        ),
+        "scheduler_adaptive_mixed_observations": extract_number(
+            output,
+            r"^Scheduler adaptive phases:.*?, \d+/(\d+)/\d+ observation",
+            int,
+        ),
+        "scheduler_adaptive_storage_observations": extract_number(
+            output,
+            r"^Scheduler adaptive phases:.*?, \d+/\d+/(\d+) observation",
+            int,
+        ),
+        "scheduler_adaptive_phase_changes": extract_number(
+            output,
+            r"^Scheduler adaptive phases:.*?(\d+) phase change",
+            int,
+        ),
+        "scheduler_adaptive_noisy_switch_rejections": extract_number(
+            output,
+            r"^Scheduler adaptive phases:.*?(\d+) noisy switch rejection",
+            int,
+        ),
+        "scheduler_cross_call_collected_batches": extract_number(
+            output,
+            r"^Scheduler cross-call: (\d+) collected batch",
+            int,
+        ),
+        "scheduler_cross_call_collected_requests": extract_number(
+            output,
+            r"^Scheduler cross-call: \d+ collected batch\(es\), (\d+) collected request",
+            int,
+        ),
+        "scheduler_cross_call_collection_probes": extract_number(
+            output,
+            r"^Scheduler cross-call:.*?(\d+) probe",
+            int,
+        ),
+        "scheduler_cross_call_collection_timeouts": extract_number(
+            output,
+            r"^Scheduler cross-call:.*?(\d+) timeout",
+            int,
+        ),
+        "scheduler_cross_call_collection_bypasses": extract_number(
+            output,
+            r"^Scheduler cross-call:.*?(\d+) bypass",
+            int,
+        ),
+        "scheduler_cross_call_collection_wait_us": extract_number(
+            output,
+            r"^Scheduler cross-call:.*?(\d+) us waiting",
+            int,
+        ),
+        "scheduler_cross_call_max_batch_size": extract_number(
+            output,
+            r"^Scheduler cross-call:.*?max batch (\d+)",
+            int,
+        ),
+        "scheduler_cross_call_max_pending": extract_number(
+            output,
+            r"^Scheduler cross-call:.*?max pending (\d+)",
+            int,
+        ),
+        "expert_route_predictions": extract_number(
+            output,
+            r"^Expert route prediction: (\d+) prediction",
+            int,
+        ),
+        "expert_route_prediction_matches": extract_number(
+            output,
+            r"^Expert route prediction: \d+ prediction\(s\), (\d+) match",
+            int,
+        ),
+        "expert_route_prediction_cache_hits": extract_number(
+            output,
+            r"^Expert route prediction:.*?(\d+) cache-ready",
+            int,
+        ),
+        "expert_route_prediction_cache_misses": extract_number(
+            output,
+            r"^Expert route prediction:.*?(\d+) not-ready",
+            int,
+        ),
         "expert_cache_hits": extract_number(
             output, r"^Expert cache: (\d+) hit", int
         ),
@@ -373,54 +1165,213 @@ def parse_runner_output(output):
         "expert_cache_resident_bytes": extract_number(
             output, r"^Expert cache:.*?(\d+) bytes resident", int
         ),
+        "expert_cache_queued_reads": extract_number(
+            output, r"^Expert cache:.*?(\d+) queued read", int
+        ),
+        "expert_cache_speculative_reads": extract_number(
+            output, r"^Expert cache:.*?(\d+) speculative read", int
+        ),
+        "expert_cache_cancelled_speculative_reads": extract_number(
+            output,
+            r"^Expert cache:.*?(\d+) cancelled speculative read",
+            int,
+        ),
+        "expert_cache_dropped_speculative_admissions": extract_number(
+            output,
+            r"^Expert cache:.*?(\d+) dropped speculative admission",
+            int,
+        ),
+        "expert_cache_arc_recent_bytes": extract_number(
+            output, r"^Expert ARC: T1 (\d+) bytes", int
+        ),
+        "expert_cache_arc_frequent_bytes": extract_number(
+            output, r"^Expert ARC:.*?T2 (\d+) bytes", int
+        ),
+        "expert_cache_arc_recent_target_bytes": extract_number(
+            output, r"^Expert ARC:.*?target T1 (\d+) bytes", int
+        ),
+        "expert_cache_arc_recent_ghost_bytes": extract_number(
+            output, r"^Expert ARC:.*?B1 (\d+) bytes", int
+        ),
+        "expert_cache_arc_frequent_ghost_bytes": extract_number(
+            output, r"^Expert ARC:.*?B2 (\d+) bytes", int
+        ),
+        "expert_cache_arc_recent_ghost_hits": extract_number(
+            output,
+            r"^Expert ARC:.*?B1 \d+ bytes, B2 \d+ bytes, B1 (\d+) hit",
+            int,
+        ),
+        "expert_cache_arc_frequent_ghost_hits": extract_number(
+            output, r"^Expert ARC:.*?B2 (\d+) hit", int
+        ),
         "expert_cache_mapped_ranges": extract_number(
             output, r"^Expert mmap: (\d+) range", int
         ),
         "expert_cache_mapped_bytes": extract_number(
             output, r"^Expert mmap:.*?(\d+) bytes", int
         ),
+        "expert_cache_read_policy": extract_text(
+            output, r"^Expert I/O policy: ([^,]+)"
+        ),
+        "expert_cache_direct_read_ranges": extract_number(
+            output, r"^Expert I/O policy:.*?(\d+) direct range", int
+        ),
+        "expert_cache_direct_read_bytes": extract_number(
+            output,
+            r"^Expert I/O policy:.*?direct range\(s\), (\d+) direct byte",
+            int,
+        ),
+        "expert_cache_direct_read_fallbacks": extract_number(
+            output, r"^Expert I/O policy:.*?(\d+) fallback", int
+        ),
+        "expert_cache_buffered_read_ranges": extract_number(
+            output, r"^Expert I/O policy:.*?(\d+) buffered range", int
+        ),
+        "expert_cache_buffered_read_bytes": extract_number(
+            output,
+            r"^Expert I/O policy:.*?buffered range\(s\), (\d+) buffered byte",
+            int,
+        ),
         "expert_gpu_cache_hits": extract_number(
-            output, r"^Expert GPU cache: (\d+) hit", int
+            output, r"^Expert GPU execution cache: (\d+) hit", int
         ),
         "expert_gpu_cache_misses": extract_number(
-            output, r"^Expert GPU cache: \d+ hit\(s\), (\d+) miss", int
+            output,
+            r"^Expert GPU execution cache: \d+ hit\(s\), (\d+) miss",
+            int,
         ),
         "expert_gpu_cache_admissions": extract_number(
-            output, r"^Expert GPU cache:.*?(\d+) admission", int
+            output, r"^Expert GPU execution cache:.*?(\d+) admission", int
         ),
         "expert_gpu_cache_stores": extract_number(
-            output, r"^Expert GPU cache:.*?(\d+) store", int
+            output, r"^Expert GPU execution cache:.*?(\d+) store", int
         ),
         "expert_gpu_cache_evictions": extract_number(
-            output, r"^Expert GPU cache:.*?(\d+) eviction", int
+            output, r"^Expert GPU execution cache:.*?(\d+) eviction", int
         ),
         "expert_gpu_cache_dropped_admissions": extract_number(
-            output, r"^Expert GPU cache:.*?(\d+) dropped admission", int
-        ),
-        "expert_gpu_cache_restore_failures": extract_number(
-            output, r"^Expert GPU cache:.*?(\d+) restore failure", int
+            output,
+            r"^Expert GPU execution cache:.*?(\d+) dropped admission",
+            int,
         ),
         "expert_gpu_cache_bytes_uploaded": extract_number(
-            output, r"^Expert GPU cache:.*?(\d+) bytes uploaded", int
-        ),
-        "expert_gpu_cache_bytes_downloaded": extract_number(
-            output, r"^Expert GPU cache:.*?(\d+) bytes downloaded", int
-        ),
-        "expert_gpu_cache_restore_ms": extract_number(
-            output, r"^Expert GPU cache:.*?([0-9.]+) ms restoring"
-        ),
-        "expert_gpu_cache_mapped_stores": extract_number(
-            output, r"^Expert GPU cache:.*?(\d+) mapped store", int
-        ),
-        "expert_gpu_cache_mapped_restores": extract_number(
-            output, r"^Expert GPU cache:.*?(\d+) mapped restore", int
+            output,
+            r"^Expert GPU execution cache:.*?(\d+) bytes uploaded",
+            int,
         ),
         "expert_gpu_cache_resident_bytes": extract_number(
-            output, r"^Expert GPU cache:.*?(\d+) bytes resident", int
+            output,
+            r"^Expert GPU execution cache:.*?(\d+) bytes resident",
+            int,
         ),
         "expert_gpu_cache_pending_bytes": extract_number(
-            output, r"^Expert GPU cache:.*?(\d+) bytes pending", int
+            output,
+            r"^Expert GPU execution cache:.*?(\d+) bytes pending",
+            int,
         ),
+        "expert_gpu_victim_cache_hits": extract_number(
+            output, r"^Expert GPU victim cache: (\d+) hit", int
+        ),
+        "expert_gpu_victim_cache_misses": extract_number(
+            output,
+            r"^Expert GPU victim cache: \d+ hit\(s\), (\d+) miss",
+            int,
+        ),
+        "expert_gpu_victim_cache_admissions": extract_number(
+            output, r"^Expert GPU victim cache:.*?(\d+) admission", int
+        ),
+        "expert_gpu_victim_cache_filtered_admissions": extract_number(
+            output,
+            r"^Expert GPU victim cache:.*?(\d+) filtered admission",
+            int,
+        ),
+        "expert_gpu_victim_cache_reused_admissions": extract_number(
+            output,
+            r"^Expert GPU victim cache:.*?(\d+) reused admission",
+            int,
+        ),
+        "expert_gpu_victim_cache_probe_admissions": extract_number(
+            output,
+            r"^Expert GPU victim cache:.*?(\d+) probe admission",
+            int,
+        ),
+        "expert_gpu_victim_cache_stores": extract_number(
+            output, r"^Expert GPU victim cache:.*?(\d+) store", int
+        ),
+        "expert_gpu_victim_cache_evictions": extract_number(
+            output, r"^Expert GPU victim cache:.*?(\d+) eviction", int
+        ),
+        "expert_gpu_victim_cache_dropped_admissions": extract_number(
+            output,
+            r"^Expert GPU victim cache:.*?(\d+) dropped admission",
+            int,
+        ),
+        "expert_gpu_victim_cache_restore_failures": extract_number(
+            output, r"^Expert GPU victim cache:.*?(\d+) restore failure", int
+        ),
+        "expert_gpu_victim_cache_bytes_uploaded": extract_number(
+            output, r"^Expert GPU victim cache:.*?(\d+) bytes uploaded", int
+        ),
+        "expert_gpu_victim_cache_bytes_downloaded": extract_number(
+            output, r"^Expert GPU victim cache:.*?(\d+) bytes downloaded", int
+        ),
+        "expert_gpu_victim_cache_restore_ms": extract_number(
+            output, r"^Expert GPU victim cache:.*?([0-9.]+) ms restoring"
+        ),
+        "expert_gpu_victim_cache_mapped_stores": extract_number(
+            output, r"^Expert GPU victim cache:.*?(\d+) mapped store", int
+        ),
+        "expert_gpu_victim_cache_mapped_restores": extract_number(
+            output, r"^Expert GPU victim cache:.*?(\d+) mapped restore", int
+        ),
+        "expert_gpu_victim_cache_resident_bytes": extract_number(
+            output, r"^Expert GPU victim cache:.*?(\d+) bytes resident", int
+        ),
+        "expert_gpu_victim_cache_pending_bytes": extract_number(
+            output, r"^Expert GPU victim cache:.*?(\d+) bytes pending", int
+        ),
+        "expert_gpu_executions": extract_number(
+            output, r"^Expert GPU execution: (\d+) execution", int
+        ),
+        "expert_gpu_execution_failures": extract_number(
+            output, r"^Expert GPU execution:.*?(\d+) failure", int
+        ),
+        "expert_gpu_cpu_preferred": extract_number(
+            output, r"^Expert GPU execution:.*?(\d+) CPU-preferred", int
+        ),
+        "expert_gpu_execution_ms": extract_number(
+            output, r"^Expert GPU execution:.*?([0-9.]+) ms executing"
+        ),
+        "expert_gpu_device_source_hits": extract_number(
+            output, r"^Expert GPU device source: (\d+) hit", int
+        ),
+        "expert_gpu_device_source_misses": extract_number(
+            output,
+            r"^Expert GPU device source: \d+ hit\(s\), (\d+) miss",
+            int,
+        ),
+        "expert_gpu_device_source_executions": extract_number(
+            output, r"^Expert GPU device source:.*?(\d+) execution", int
+        ),
+        "expert_gpu_device_source_execution_failures": extract_number(
+            output, r"^Expert GPU device source:.*?(\d+) failure", int
+        ),
+        "expert_gpu_arc_recent_bytes": extract_number(
+            output, r"^Expert GPU ARC: (\d+) recent byte", int
+        ),
+        "expert_gpu_arc_frequent_bytes": extract_number(
+            output, r"^Expert GPU ARC:.*?(\d+) frequent byte", int
+        ),
+        "expert_gpu_arc_recent_target_bytes": extract_number(
+            output, r"^Expert GPU ARC:.*?(\d+) recent target byte", int
+        ),
+        "expert_gpu_arc_recent_ghost_bytes": extract_number(
+            output, r"^Expert GPU ARC:.*?(\d+) recent ghost byte", int
+        ),
+        "expert_gpu_arc_frequent_ghost_bytes": extract_number(
+            output, r"^Expert GPU ARC:.*?(\d+) frequent ghost byte", int
+        ),
+        "expert_static_hotsets": hotsets,
         "generated_token_ids": tokens,
     }
     if result["generation_seconds"] and result["generated_tokens"]:
@@ -429,6 +1380,18 @@ def parse_runner_output(output):
         )
     else:
         result["decode_tokens_per_second"] = None
+    if result["generated_tokens"] and result["expert_batch_weight_bytes"] is not None:
+        result["expert_batch_weight_bytes_per_generated_token"] = (
+            result["expert_batch_weight_bytes"] / result["generated_tokens"]
+        )
+        result["required_pcie_gib_per_second_at_20_tps"] = (
+            result["expert_batch_weight_bytes_per_generated_token"]
+            * 20
+            / (1024**3)
+        )
+    else:
+        result["expert_batch_weight_bytes_per_generated_token"] = None
+        result["required_pcie_gib_per_second_at_20_tps"] = None
     cache_lookups = (
         (result["expert_cache_hits"] or 0)
         + (result["expert_cache_misses"] or 0)
@@ -444,19 +1407,38 @@ def parse_runner_output(output):
 def execute_sample(command, gpu_index, sample_interval_ms):
     gpu_monitor = NvidiaMemoryMonitor(gpu_index, sample_interval_ms)
     gpu_monitor.start()
-    process = subprocess.Popen(
-        command,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    memory = PortableProcessMemory(process.pid)
-    while process.poll() is None:
-        memory.sample()
-        time.sleep(sample_interval_ms / 1000.0)
-    stdout, stderr = process.communicate()
+    disk_monitor = PhysicalDiskMonitor()
+    disk_monitor.start()
+    # The runner emits enough diagnostics for a Windows anonymous pipe to
+    # fill. Keeping both streams in temporary files lets the parent continue
+    # sampling memory without deadlocking while the child writes its report.
+    with tempfile.TemporaryFile(
+        mode="w+", encoding="utf-8", errors="replace"
+    ) as stdout_file, tempfile.TemporaryFile(
+        mode="w+", encoding="utf-8", errors="replace"
+    ) as stderr_file:
+        process = subprocess.Popen(
+            command,
+            text=True,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        memory = PortableProcessMemory(process.pid)
+        io_before = memory.io_counters()
+        while process.poll() is None:
+            memory.sample()
+            time.sleep(sample_interval_ms / 1000.0)
+        io_after = memory.io_counters()
+        process.wait()
+        stdout_file.flush()
+        stderr_file.flush()
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read()
+        stderr = stderr_file.read()
     memory.close()
     peak_gpu_mib, gpu_delta_mib = gpu_monitor.stop()
+    physical_io = disk_monitor.stop()
     if process.returncode != 0:
         raise RuntimeError(
             f"runner exited with {process.returncode}\n{stdout}\n{stderr}"
@@ -472,12 +1454,145 @@ def execute_sample(command, gpu_index, sample_interval_ms):
     parsed["peak_gpu_mib"] = peak_gpu_mib
     parsed["peak_gpu_delta_mib"] = gpu_delta_mib
     parsed["gpu_device"] = gpu_monitor.device
+    parsed["runtime_logical_read_bytes"] = parsed["expert_cache_bytes_read"]
+    parsed["process_logical_read_bytes"] = io_delta(
+        io_before, io_after, "logical_read_bytes"
+    )
+    parsed["process_logical_read_operations"] = io_delta(
+        io_before, io_after, "logical_read_operations"
+    )
+    parsed["process_physical_read_bytes"] = io_delta(
+        io_before, io_after, "physical_read_bytes"
+    )
+    parsed["system_physical_read_bytes"] = (
+        physical_io["physical_read_bytes"] if physical_io else None
+    )
+    parsed["logical_read_source"] = (
+        io_after["source"] if io_after else None
+    )
+    parsed["physical_read_source"] = (
+        physical_io["source"] if physical_io else None
+    )
     return parsed
 
 
 def median_field(samples, field):
     values = [sample[field] for sample in samples if sample[field] is not None]
     return statistics.median(values) if values else None
+
+
+def sweep_child_arguments(cache_mb, report_path):
+    arguments = sys.argv[1:]
+    child_arguments = []
+    index = 0
+    has_cache_limit = False
+    has_json_output = False
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--expert-cache-sweep-mb":
+            index += 1
+            while index < len(arguments) and not arguments[index].startswith(
+                "--"
+            ):
+                index += 1
+            continue
+        if argument == "--expert-cache-mb":
+            child_arguments.extend([argument, str(cache_mb)])
+            has_cache_limit = True
+            index += 2
+            continue
+        if argument == "--json-output":
+            child_arguments.extend([argument, str(report_path)])
+            has_json_output = True
+            index += 2
+            continue
+        child_arguments.append(argument)
+        index += 1
+    if not has_cache_limit:
+        child_arguments.extend(["--expert-cache-mb", str(cache_mb)])
+    if not has_json_output:
+        child_arguments.extend(["--json-output", str(report_path)])
+    return [sys.executable, str(Path(__file__).resolve()), *child_arguments]
+
+
+def run_cache_sweep(arguments):
+    reports = []
+    with tempfile.TemporaryDirectory(prefix="ncnn-moe-cache-sweep-") as directory:
+        for cache_mb in arguments.expert_cache_sweep_mb:
+            report_path = Path(directory) / f"cache-{cache_mb}.json"
+            command = sweep_child_arguments(cache_mb, report_path)
+            completed = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+            )
+            if completed.stdout:
+                print(completed.stdout, end="")
+            if completed.stderr:
+                print(completed.stderr, end="", file=sys.stderr)
+            if completed.returncode != 0:
+                return completed.returncode
+            reports.append(json.loads(report_path.read_text(encoding="utf-8")))
+
+    rows = []
+    for report in reports:
+        median = report["median"]
+        maximum = report["maximum"]
+        rows.append(
+            {
+                "expert_cache_mb": report["expert_cache_mb"],
+                "decode_tokens_per_second": median["decode_tokens_per_second"],
+                "peak_rss_mib": maximum["peak_rss_mib"],
+                "expert_cache_hit_rate": median["expert_cache_hit_rate"],
+                "runtime_logical_read_bytes": median[
+                    "runtime_logical_read_bytes"
+                ],
+                "process_logical_read_bytes": median[
+                    "process_logical_read_bytes"
+                ],
+                "process_physical_read_bytes": median[
+                    "process_physical_read_bytes"
+                ],
+                "system_physical_read_bytes": median[
+                    "system_physical_read_bytes"
+                ],
+            }
+        )
+
+    report = {
+        "schema_version": 2,
+        "benchmark": "gpt_oss_expert_cache_sweep",
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "model": str(Path(arguments.model).resolve()),
+        "runner": str(Path(arguments.runner).resolve()),
+        "prompt_token_ids": arguments.prompt_token_ids,
+        "max_new_tokens": arguments.max_new_tokens,
+        "warmup_runs": arguments.warmup,
+        "cache_warmup_runs": arguments.cache_warmup_runs,
+        "repeats": arguments.repeats,
+        "cache_sizes_mb": arguments.expert_cache_sweep_mb,
+        "rows": rows,
+        "reports": reports,
+    }
+    rendered = json.dumps(report, ensure_ascii=False, indent=2)
+    if arguments.json_output:
+        output_path = Path(arguments.json_output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(rendered + "\n", encoding="utf-8")
+
+    print("cache sweep:")
+    for row in rows:
+        print(
+            f"  {row['expert_cache_mb']} MiB: "
+            f"{row['decode_tokens_per_second']:.3f} token/s, "
+            f"RSS {row['peak_rss_mib']:.1f} MiB, "
+            f"hit rate {row['expert_cache_hit_rate']:.1%}, "
+            f"Runtime reads {row['runtime_logical_read_bytes']} bytes, "
+            f"system physical reads {row['system_physical_read_bytes']} bytes"
+        )
+    if arguments.json_output:
+        print(f"JSON report: {Path(arguments.json_output).resolve()}")
+    return 0
 
 
 def main():
@@ -487,6 +1602,9 @@ def main():
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
+
+    if arguments.expert_cache_sweep_mb is not None:
+        return run_cache_sweep(arguments)
 
     command = runner_command(arguments)
     samples = []
@@ -512,26 +1630,103 @@ def main():
             samples.append(sample)
 
     reference_tokens = samples[0]["generated_token_ids"]
-    if any(sample["generated_token_ids"] != reference_tokens for sample in samples[1:]):
-        print("measured runs produced different token sequences", file=sys.stderr)
+    for sample_index, sample in enumerate(samples[1:], start=2):
+        candidate_tokens = sample["generated_token_ids"]
+        if candidate_tokens == reference_tokens:
+            continue
+        first_difference = next(
+            (
+                index
+                for index, (expected, actual) in enumerate(
+                    zip(reference_tokens, candidate_tokens)
+                )
+                if expected != actual
+            ),
+            min(len(reference_tokens), len(candidate_tokens)),
+        )
+        print(
+            "measured runs produced different token sequences: "
+            f"run 1 vs run {sample_index}, first difference at "
+            f"flattened token {first_difference}",
+            file=sys.stderr,
+        )
+        print("run 1 tokens:", *reference_tokens, file=sys.stderr)
+        print(
+            f"run {sample_index} tokens:",
+            *candidate_tokens,
+            file=sys.stderr,
+        )
         return 1
 
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model": str(Path(arguments.model).resolve()),
         "model_revision": arguments.model_revision or None,
         "runner": str(Path(arguments.runner).resolve()),
         "command": command,
+        "prompt_token_ids": arguments.prompt_token_ids,
+        "max_new_tokens": arguments.max_new_tokens,
+        "backend": arguments.backend,
+        "expert_memory": arguments.expert_memory,
+        "host_memory_mb": arguments.host_memory_mb,
+        "expert_cache_mb": arguments.expert_cache_mb,
         "host": {
             "platform": platform.platform(),
             "processor": platform.processor(),
             "logical_cpu_count": os.cpu_count(),
+            "physical_cpu_core_count": samples[0][
+                "physical_cpu_core_count"
+            ],
+            "runtime_logical_cpu_count": samples[0][
+                "runtime_logical_cpu_count"
+            ],
+            "runtime_openmp_thread_count": samples[0][
+                "runtime_openmp_thread_count"
+            ],
+            "mxfp4_kernel": samples[0]["mxfp4_kernel"],
+            "cpu_isa": samples[0]["cpu_isa"],
+            "mxfp4_decode_row_pair_group_size": samples[0][
+                "mxfp4_decode_row_pair_group_size"
+            ],
+            "activation_kernel": samples[0]["activation_kernel"],
             "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
             "gpu_index": arguments.gpu_index,
+            "vulkan_device_index": arguments.vulkan_device_index,
+            "vulkan_device_indices": arguments.vulkan_device_indices,
+            "runtime_vulkan_model_device_index": samples[0][
+                "vulkan_model_device_index"
+            ],
+            "runtime_vulkan_model_devices": samples[0][
+                "vulkan_model_devices"
+            ],
+            "vulkan_layer_placement": samples[0][
+                "vulkan_layer_placement"
+            ],
+            "vulkan_kernel_features": samples[0][
+                "vulkan_kernel_features"
+            ],
             "gpu": samples[0]["gpu_device"],
         },
         "warmup_runs": arguments.warmup,
+        "cache_warmup_runs": arguments.cache_warmup_runs,
+        "parallel_sessions": arguments.parallel_sessions,
+        "scheduler_expert_threads": arguments.scheduler_expert_threads,
+        "scheduler_staging": arguments.scheduler_staging,
+        "scheduler_cross_call": arguments.scheduler_cross_call,
+        "scheduler_collection_us": (
+            arguments.scheduler_collection_us
+        ),
+        "scheduler_max_micro_batch": (
+            arguments.scheduler_max_micro_batch
+        ),
+        "expert_gpu_cache_mb": arguments.expert_gpu_cache_mb,
+        "expert_gpu_victim_cache_mb": (
+            arguments.expert_gpu_victim_cache_mb
+        ),
+        "expert_gpu_victim_reuse_probe": (
+            arguments.expert_gpu_victim_reuse_probe
+        ),
         "measured_runs": arguments.repeats,
         "median": {
             "load_seconds": median_field(samples, "load_seconds"),
@@ -542,11 +1737,235 @@ def main():
             "attention_ms": median_field(samples, "attention_ms"),
             "router_ms": median_field(samples, "router_ms"),
             "expert_ms": median_field(samples, "expert_ms"),
+            "expert_batch_weight_bytes": median_field(
+                samples, "expert_batch_weight_bytes"
+            ),
+            "expert_route_weight_bytes": median_field(
+                samples, "expert_route_weight_bytes"
+            ),
+            "expert_batch_weight_bytes_per_generated_token": median_field(
+                samples,
+                "expert_batch_weight_bytes_per_generated_token",
+            ),
+            "required_pcie_gib_per_second_at_20_tps": median_field(
+                samples,
+                "required_pcie_gib_per_second_at_20_tps",
+            ),
+            "expert_static_hotsets": samples[-1][
+                "expert_static_hotsets"
+            ],
+            "expert_cache_wait_ms": median_field(
+                samples, "expert_cache_wait_ms"
+            ),
+            "expert_cache_management_ms": median_field(
+                samples, "expert_cache_management_ms"
+            ),
+            "expert_engine_ms": median_field(
+                samples, "expert_engine_ms"
+            ),
+            "expert_compute_ms": median_field(
+                samples, "expert_compute_ms"
+            ),
+            "expert_orchestration_ms": median_field(
+                samples, "expert_orchestration_ms"
+            ),
+            "expert_regroup_ms": median_field(
+                samples, "expert_regroup_ms"
+            ),
+            "expert_combine_ms": median_field(
+                samples, "expert_combine_ms"
+            ),
+            "embedding_ms": median_field(samples, "embedding_ms"),
+            "final_norm_ms": median_field(samples, "final_norm_ms"),
+            "lm_head_ms": median_field(samples, "lm_head_ms"),
+            "vulkan_compute_submissions": median_field(
+                samples, "vulkan_compute_submissions"
+            ),
+            "vulkan_async_submissions": median_field(
+                samples, "vulkan_async_submissions"
+            ),
+            "vulkan_auxiliary_uploads": median_field(
+                samples, "vulkan_auxiliary_uploads"
+            ),
+            "vulkan_auxiliary_upload_bytes": median_field(
+                samples, "vulkan_auxiliary_upload_bytes"
+            ),
+            "vulkan_command_buffer_reuses": median_field(
+                samples, "vulkan_command_buffer_reuses"
+            ),
+            "vulkan_attention_qkv_rope_fusions": median_field(
+                samples, "vulkan_attention_qkv_rope_fusions"
+            ),
+            "vulkan_attention_qkv_ring_fusions": median_field(
+                samples, "vulkan_attention_qkv_ring_fusions"
+            ),
+            "vulkan_attention_decode_sdpa_fusions": median_field(
+                samples, "vulkan_attention_decode_sdpa_fusions"
+            ),
+            "vulkan_attention_blocks": median_field(
+                samples, "vulkan_attention_blocks"
+            ),
+            "vulkan_kv_ring_appends": median_field(
+                samples, "vulkan_kv_ring_appends"
+            ),
+            "vulkan_kv_ring_resizes": median_field(
+                samples, "vulkan_kv_ring_resizes"
+            ),
+            "vulkan_kv_ring_wrapped_views": median_field(
+                samples, "vulkan_kv_ring_wrapped_views"
+            ),
+            "scheduler_staged_batches": median_field(
+                samples, "scheduler_staged_batches"
+            ),
+            "scheduler_staged_requests": median_field(
+                samples, "scheduler_staged_requests"
+            ),
+            "scheduler_staging_bypassed_batches": median_field(
+                samples, "scheduler_staging_bypassed_batches"
+            ),
+            "scheduler_logical_expert_batches": median_field(
+                samples, "scheduler_logical_expert_batches"
+            ),
+            "scheduler_physical_expert_batches": median_field(
+                samples, "scheduler_physical_expert_batches"
+            ),
+            "scheduler_coalesced_expert_routes": median_field(
+                samples, "scheduler_coalesced_expert_routes"
+            ),
+            "scheduler_max_coalesced_expert_batch_size": median_field(
+                samples, "scheduler_max_coalesced_expert_batch_size"
+            ),
+            "scheduler_adaptive_staged_decisions": median_field(
+                samples, "scheduler_adaptive_staged_decisions"
+            ),
+            "scheduler_adaptive_independent_decisions": median_field(
+                samples, "scheduler_adaptive_independent_decisions"
+            ),
+            "scheduler_adaptive_probe_decisions": median_field(
+                samples, "scheduler_adaptive_probe_decisions"
+            ),
+            "scheduler_adaptive_policy_switches": median_field(
+                samples, "scheduler_adaptive_policy_switches"
+            ),
+            "scheduler_adaptive_staged_ms_per_request": median_field(
+                samples, "scheduler_adaptive_staged_ms_per_request"
+            ),
+            "scheduler_adaptive_independent_ms_per_request": median_field(
+                samples, "scheduler_adaptive_independent_ms_per_request"
+            ),
+            "scheduler_adaptive_resident_decisions": median_field(
+                samples, "scheduler_adaptive_resident_decisions"
+            ),
+            "scheduler_adaptive_mixed_decisions": median_field(
+                samples, "scheduler_adaptive_mixed_decisions"
+            ),
+            "scheduler_adaptive_storage_decisions": median_field(
+                samples, "scheduler_adaptive_storage_decisions"
+            ),
+            "scheduler_adaptive_resident_observations": median_field(
+                samples, "scheduler_adaptive_resident_observations"
+            ),
+            "scheduler_adaptive_mixed_observations": median_field(
+                samples, "scheduler_adaptive_mixed_observations"
+            ),
+            "scheduler_adaptive_storage_observations": median_field(
+                samples, "scheduler_adaptive_storage_observations"
+            ),
+            "scheduler_adaptive_phase_changes": median_field(
+                samples, "scheduler_adaptive_phase_changes"
+            ),
+            "scheduler_adaptive_noisy_switch_rejections": median_field(
+                samples, "scheduler_adaptive_noisy_switch_rejections"
+            ),
+            "scheduler_cross_call_collected_batches": median_field(
+                samples, "scheduler_cross_call_collected_batches"
+            ),
+            "scheduler_cross_call_collected_requests": median_field(
+                samples, "scheduler_cross_call_collected_requests"
+            ),
+            "scheduler_cross_call_collection_probes": median_field(
+                samples, "scheduler_cross_call_collection_probes"
+            ),
+            "scheduler_cross_call_collection_timeouts": median_field(
+                samples, "scheduler_cross_call_collection_timeouts"
+            ),
+            "scheduler_cross_call_collection_bypasses": median_field(
+                samples, "scheduler_cross_call_collection_bypasses"
+            ),
+            "scheduler_cross_call_collection_wait_us": median_field(
+                samples, "scheduler_cross_call_collection_wait_us"
+            ),
+            "scheduler_cross_call_max_batch_size": median_field(
+                samples, "scheduler_cross_call_max_batch_size"
+            ),
+            "scheduler_cross_call_max_pending": median_field(
+                samples, "scheduler_cross_call_max_pending"
+            ),
+            "expert_route_predictions": median_field(
+                samples, "expert_route_predictions"
+            ),
+            "expert_route_prediction_matches": median_field(
+                samples, "expert_route_prediction_matches"
+            ),
+            "expert_route_prediction_cache_hits": median_field(
+                samples, "expert_route_prediction_cache_hits"
+            ),
+            "expert_route_prediction_cache_misses": median_field(
+                samples, "expert_route_prediction_cache_misses"
+            ),
             "expert_cache_hit_rate": median_field(
                 samples, "expert_cache_hit_rate"
             ),
             "expert_cache_bytes_read": median_field(
                 samples, "expert_cache_bytes_read"
+            ),
+            "runtime_logical_read_bytes": median_field(
+                samples, "runtime_logical_read_bytes"
+            ),
+            "process_logical_read_bytes": median_field(
+                samples, "process_logical_read_bytes"
+            ),
+            "process_logical_read_operations": median_field(
+                samples, "process_logical_read_operations"
+            ),
+            "process_physical_read_bytes": median_field(
+                samples, "process_physical_read_bytes"
+            ),
+            "system_physical_read_bytes": median_field(
+                samples, "system_physical_read_bytes"
+            ),
+            "expert_cache_queued_reads": median_field(
+                samples, "expert_cache_queued_reads"
+            ),
+            "expert_cache_speculative_reads": median_field(
+                samples, "expert_cache_speculative_reads"
+            ),
+            "expert_cache_cancelled_speculative_reads": median_field(
+                samples, "expert_cache_cancelled_speculative_reads"
+            ),
+            "expert_cache_dropped_speculative_admissions": median_field(
+                samples, "expert_cache_dropped_speculative_admissions"
+            ),
+            "expert_cache_arc_recent_bytes": median_field(
+                samples, "expert_cache_arc_recent_bytes"
+            ),
+            "expert_cache_arc_frequent_bytes": median_field(
+                samples, "expert_cache_arc_frequent_bytes"
+            ),
+            "expert_cache_arc_recent_target_bytes": median_field(
+                samples, "expert_cache_arc_recent_target_bytes"
+            ),
+            "expert_cache_arc_recent_ghost_bytes": median_field(
+                samples, "expert_cache_arc_recent_ghost_bytes"
+            ),
+            "expert_cache_arc_frequent_ghost_bytes": median_field(
+                samples, "expert_cache_arc_frequent_ghost_bytes"
+            ),
+            "expert_cache_arc_recent_ghost_hits": median_field(
+                samples, "expert_cache_arc_recent_ghost_hits"
+            ),
+            "expert_cache_arc_frequent_ghost_hits": median_field(
+                samples, "expert_cache_arc_frequent_ghost_hits"
             ),
             "expert_cache_mapped_ranges": median_field(
                 samples, "expert_cache_mapped_ranges"
@@ -554,23 +1973,140 @@ def main():
             "expert_cache_mapped_bytes": median_field(
                 samples, "expert_cache_mapped_bytes"
             ),
+            "expert_cache_read_policy": samples[-1][
+                "expert_cache_read_policy"
+            ],
+            "expert_cache_direct_read_ranges": median_field(
+                samples, "expert_cache_direct_read_ranges"
+            ),
+            "expert_cache_direct_read_bytes": median_field(
+                samples, "expert_cache_direct_read_bytes"
+            ),
+            "expert_cache_direct_read_fallbacks": median_field(
+                samples, "expert_cache_direct_read_fallbacks"
+            ),
+            "expert_cache_buffered_read_ranges": median_field(
+                samples, "expert_cache_buffered_read_ranges"
+            ),
+            "expert_cache_buffered_read_bytes": median_field(
+                samples, "expert_cache_buffered_read_bytes"
+            ),
             "expert_gpu_cache_hits": median_field(
                 samples, "expert_gpu_cache_hits"
+            ),
+            "expert_gpu_cache_misses": median_field(
+                samples, "expert_gpu_cache_misses"
+            ),
+            "expert_gpu_cache_admissions": median_field(
+                samples, "expert_gpu_cache_admissions"
+            ),
+            "expert_gpu_cache_stores": median_field(
+                samples, "expert_gpu_cache_stores"
+            ),
+            "expert_gpu_cache_evictions": median_field(
+                samples, "expert_gpu_cache_evictions"
+            ),
+            "expert_gpu_cache_dropped_admissions": median_field(
+                samples, "expert_gpu_cache_dropped_admissions"
             ),
             "expert_gpu_cache_bytes_uploaded": median_field(
                 samples, "expert_gpu_cache_bytes_uploaded"
             ),
-            "expert_gpu_cache_bytes_downloaded": median_field(
-                samples, "expert_gpu_cache_bytes_downloaded"
+            "expert_gpu_cache_resident_bytes": median_field(
+                samples, "expert_gpu_cache_resident_bytes"
             ),
-            "expert_gpu_cache_restore_ms": median_field(
-                samples, "expert_gpu_cache_restore_ms"
+            "expert_gpu_cache_pending_bytes": median_field(
+                samples, "expert_gpu_cache_pending_bytes"
             ),
-            "expert_gpu_cache_mapped_stores": median_field(
-                samples, "expert_gpu_cache_mapped_stores"
+            "expert_gpu_victim_cache_hits": median_field(
+                samples, "expert_gpu_victim_cache_hits"
             ),
-            "expert_gpu_cache_mapped_restores": median_field(
-                samples, "expert_gpu_cache_mapped_restores"
+            "expert_gpu_victim_cache_misses": median_field(
+                samples, "expert_gpu_victim_cache_misses"
+            ),
+            "expert_gpu_victim_cache_admissions": median_field(
+                samples, "expert_gpu_victim_cache_admissions"
+            ),
+            "expert_gpu_victim_cache_filtered_admissions": median_field(
+                samples, "expert_gpu_victim_cache_filtered_admissions"
+            ),
+            "expert_gpu_victim_cache_reused_admissions": median_field(
+                samples, "expert_gpu_victim_cache_reused_admissions"
+            ),
+            "expert_gpu_victim_cache_probe_admissions": median_field(
+                samples, "expert_gpu_victim_cache_probe_admissions"
+            ),
+            "expert_gpu_victim_cache_stores": median_field(
+                samples, "expert_gpu_victim_cache_stores"
+            ),
+            "expert_gpu_victim_cache_evictions": median_field(
+                samples, "expert_gpu_victim_cache_evictions"
+            ),
+            "expert_gpu_victim_cache_dropped_admissions": median_field(
+                samples, "expert_gpu_victim_cache_dropped_admissions"
+            ),
+            "expert_gpu_victim_cache_restore_failures": median_field(
+                samples, "expert_gpu_victim_cache_restore_failures"
+            ),
+            "expert_gpu_victim_cache_bytes_uploaded": median_field(
+                samples, "expert_gpu_victim_cache_bytes_uploaded"
+            ),
+            "expert_gpu_victim_cache_bytes_downloaded": median_field(
+                samples, "expert_gpu_victim_cache_bytes_downloaded"
+            ),
+            "expert_gpu_victim_cache_restore_ms": median_field(
+                samples, "expert_gpu_victim_cache_restore_ms"
+            ),
+            "expert_gpu_victim_cache_mapped_stores": median_field(
+                samples, "expert_gpu_victim_cache_mapped_stores"
+            ),
+            "expert_gpu_victim_cache_mapped_restores": median_field(
+                samples, "expert_gpu_victim_cache_mapped_restores"
+            ),
+            "expert_gpu_victim_cache_resident_bytes": median_field(
+                samples, "expert_gpu_victim_cache_resident_bytes"
+            ),
+            "expert_gpu_victim_cache_pending_bytes": median_field(
+                samples, "expert_gpu_victim_cache_pending_bytes"
+            ),
+            "expert_gpu_executions": median_field(
+                samples, "expert_gpu_executions"
+            ),
+            "expert_gpu_execution_failures": median_field(
+                samples, "expert_gpu_execution_failures"
+            ),
+            "expert_gpu_cpu_preferred": median_field(
+                samples, "expert_gpu_cpu_preferred"
+            ),
+            "expert_gpu_execution_ms": median_field(
+                samples, "expert_gpu_execution_ms"
+            ),
+            "expert_gpu_device_source_hits": median_field(
+                samples, "expert_gpu_device_source_hits"
+            ),
+            "expert_gpu_device_source_misses": median_field(
+                samples, "expert_gpu_device_source_misses"
+            ),
+            "expert_gpu_device_source_executions": median_field(
+                samples, "expert_gpu_device_source_executions"
+            ),
+            "expert_gpu_device_source_execution_failures": median_field(
+                samples, "expert_gpu_device_source_execution_failures"
+            ),
+            "expert_gpu_arc_recent_bytes": median_field(
+                samples, "expert_gpu_arc_recent_bytes"
+            ),
+            "expert_gpu_arc_frequent_bytes": median_field(
+                samples, "expert_gpu_arc_frequent_bytes"
+            ),
+            "expert_gpu_arc_recent_target_bytes": median_field(
+                samples, "expert_gpu_arc_recent_target_bytes"
+            ),
+            "expert_gpu_arc_recent_ghost_bytes": median_field(
+                samples, "expert_gpu_arc_recent_ghost_bytes"
+            ),
+            "expert_gpu_arc_frequent_ghost_bytes": median_field(
+                samples, "expert_gpu_arc_frequent_ghost_bytes"
             ),
         },
         "maximum": {
@@ -592,6 +2128,16 @@ def main():
                 default=None,
             ),
         },
+        "read_traffic": {
+            "runtime_logical": "Expert cache bytes read",
+            "process_logical": samples[0]["logical_read_source"],
+            "process_physical": (
+                "Linux /proc/<pid>/io read_bytes"
+                if samples[0]["process_physical_read_bytes"] is not None
+                else None
+            ),
+            "system_physical": samples[0]["physical_read_source"],
+        },
         "generated_token_ids": reference_tokens,
         "samples": samples,
     }
@@ -611,16 +2157,51 @@ def main():
     print(f"median Expert time: {median['expert_ms']:.3f} ms")
     if median["expert_gpu_cache_hits"] is not None:
         print(
-            "median GPU Expert cache: "
+            "median GPU Expert execution cache: "
             f"{median['expert_gpu_cache_hits']:.0f} hit(s), "
-            f"{median['expert_gpu_cache_bytes_downloaded']:.0f} bytes restored, "
-            f"{median['expert_gpu_cache_mapped_restores']:.0f} direct-mapped"
+            f"{median['expert_gpu_executions']:.0f} execution(s), "
+            f"{median['expert_gpu_cpu_preferred']:.0f} CPU-preferred"
+        )
+    if median["expert_gpu_victim_cache_hits"] is not None:
+        print(
+            "median GPU Expert victim cache: "
+            f"{median['expert_gpu_victim_cache_hits']:.0f} hit(s), "
+            f"{median['expert_gpu_victim_cache_misses']:.0f} miss(es), "
+            f"{median['expert_gpu_victim_cache_restore_ms']:.3f} ms restoring"
+        )
+    if median["expert_gpu_device_source_hits"] is not None:
+        print(
+            "median GPU Expert device source: "
+            f"{median['expert_gpu_device_source_hits']:.0f} hit(s), "
+            f"{median['expert_gpu_device_source_executions']:.0f} execution(s), "
+            f"{median['expert_gpu_device_source_execution_failures']:.0f} failure(s)"
         )
     print(f"peak RSS: {maximum['peak_rss_mib']:.1f} MiB")
     if maximum["peak_gpu_mib"] is not None:
         print(
             f"peak NVIDIA memory: {maximum['peak_gpu_mib']} MiB "
             f"(+{maximum['peak_gpu_delta_mib']} MiB)"
+        )
+    if median["runtime_logical_read_bytes"] is not None:
+        print(
+            "median Runtime logical reads: "
+            f"{median['runtime_logical_read_bytes']} bytes"
+        )
+    if median["process_logical_read_bytes"] is not None:
+        print(
+            "median process logical reads: "
+            f"{median['process_logical_read_bytes']} bytes "
+            f"({median['process_logical_read_operations']} operations)"
+        )
+    if median["process_physical_read_bytes"] is not None:
+        print(
+            "median process physical reads: "
+            f"{median['process_physical_read_bytes']} bytes"
+        )
+    if median["system_physical_read_bytes"] is not None:
+        print(
+            "median system physical disk reads: "
+            f"{median['system_physical_read_bytes']} bytes"
         )
     print("generated token ids:", *reference_tokens)
     if arguments.json_output:

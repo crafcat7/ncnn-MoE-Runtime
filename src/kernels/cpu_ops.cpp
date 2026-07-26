@@ -1,13 +1,18 @@
 #include "cpu_ops.h"
 
+#include "cpu_bfloat16.h"
 #include "cpu_mxfp4.h"
 #include "backends/ncnn/ncnn_linear.h"
+#include "engine/cpu_topology.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <numeric>
 
 #if defined(_OPENMP)
@@ -43,6 +48,120 @@ static float tensor_value(const TensorData& tensor, size_t index)
     return 0.0f;
 }
 
+static float exact_scaled_silu(float value, float sigmoid_scale) noexcept
+{
+    return value / (1.0f + std::exp(-sigmoid_scale * value));
+}
+
+static float approximate_exp(float value) noexcept
+{
+    if (value <= -80.0f)
+        return 0.0f;
+    value = std::min(value, 0.0f);
+    constexpr float inverse_log_two = 1.4426950408889634f;
+    constexpr float log_two = 0.6931471805599453f;
+    const float scaled = value * inverse_log_two;
+    int exponent = static_cast<int>(scaled);
+    if (static_cast<float>(exponent) > scaled)
+        --exponent;
+    const float remainder = value - static_cast<float>(exponent) * log_two;
+    const float polynomial = 1.0f
+                             + remainder
+                                   * (1.0f
+                                      + remainder
+                                            * (0.5f
+                                               + remainder
+                                                     * (0.16666666666666667f
+                                                        + remainder
+                                                              * (0.04166666666666667f
+                                                                 + remainder
+                                                                       * (0.008333333333333333f
+                                                                          + remainder
+                                                                                * (0.001388888888888889f
+                                                                                   + remainder * 0.0001984126984126984f))))));
+    const uint32_t exponent_bits = static_cast<uint32_t>(exponent + 127) << 23;
+    float power_of_two = 0.0f;
+    std::memcpy(&power_of_two, &exponent_bits, sizeof(power_of_two));
+    return power_of_two * polynomial;
+}
+
+// Degree-7 approximation over one range-reduced log2 interval.
+float approximate_scaled_silu(float value, float sigmoid_scale) noexcept
+{
+    const float scaled_value = sigmoid_scale * value;
+    if (scaled_value >= 0.0f)
+        return value / (1.0f + approximate_exp(-scaled_value));
+    const float exponential = approximate_exp(scaled_value);
+    return value * exponential / (1.0f + exponential);
+}
+
+static volatile float scaled_silu_benchmark_sink = 0.0f;
+
+using ScaledSiluFunction = float (*)(float, float) noexcept;
+
+static int64_t benchmark_scaled_silu(const std::array<float, 128>& values, ScaledSiluFunction function)
+{
+    const auto started = std::chrono::steady_clock::now();
+    float accumulator = 0.0f;
+    for (uint32_t repeat = 0; repeat < 256; ++repeat)
+    {
+        for (float value : values)
+            accumulator += function(value, 1.702f);
+    }
+    scaled_silu_benchmark_sink = accumulator;
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
+}
+
+static bool prefer_approximate_scaled_silu() noexcept
+{
+    if constexpr (!std::numeric_limits<float>::is_iec559)
+        return false;
+
+    std::array<float, 128> values = {};
+    for (size_t index = 0; index < values.size(); ++index)
+    {
+        values[index] = -10.0f + static_cast<float>(index) * (17.0f / static_cast<float>(values.size() - 1));
+    }
+    // Alternate trials to reduce cold-code and frequency-ramp bias.
+    int64_t exact_time = 0;
+    int64_t approximate_time = 0;
+    for (uint32_t round = 0; round < 3; ++round)
+    {
+        if (round % 2 == 0)
+        {
+            exact_time += benchmark_scaled_silu(values, exact_scaled_silu);
+            approximate_time += benchmark_scaled_silu(values, approximate_scaled_silu);
+        }
+        else
+        {
+            approximate_time += benchmark_scaled_silu(values, approximate_scaled_silu);
+            exact_time += benchmark_scaled_silu(values, exact_scaled_silu);
+        }
+    }
+    return approximate_time < exact_time - exact_time / 50;
+}
+
+static bool use_approximate_scaled_silu() noexcept
+{
+    static const bool selected = prefer_approximate_scaled_silu();
+    return selected;
+}
+
+static float selected_scaled_silu(float value, float sigmoid_scale, bool approximate) noexcept
+{
+    return approximate ? approximate_scaled_silu(value, sigmoid_scale) : exact_scaled_silu(value, sigmoid_scale);
+}
+
+float scaled_silu(float value, float sigmoid_scale) noexcept
+{
+    return selected_scaled_silu(value, sigmoid_scale, use_approximate_scaled_silu());
+}
+
+const char* scaled_silu_kernel_name() noexcept
+{
+    return use_approximate_scaled_silu() ? "polynomial-auto" : "libm-auto";
+}
+
 static bool allow_openmp_parallel_region() noexcept
 {
 #if defined(_OPENMP)
@@ -52,13 +171,20 @@ static bool allow_openmp_parallel_region() noexcept
 #endif
 }
 
+static uint32_t physical_core_count()
+{
+    static const uint32_t count = discover_cpu_topology().physical_core_count;
+    return count;
+}
+
 static int openmp_linear_team_size(uint64_t operation_count) noexcept
 {
 #if defined(_OPENMP)
-    static constexpr uint64_t minimum_parallel_operations = 128 * 1024;
-    static constexpr uint64_t full_team_operations = 1024 * 1024;
-    if (omp_in_parallel() != 0
-        || operation_count < minimum_parallel_operations) {
+    // Scale the OpenMP team by operation count.
+    static constexpr uint64_t minimum_parallel_operations = 1024 * 1024;
+    static constexpr uint64_t full_team_operations = 8 * 1024 * 1024;
+    if (omp_in_parallel() != 0 || operation_count < minimum_parallel_operations)
+    {
         return 1;
     }
     const int maximum_threads = omp_get_max_threads();
@@ -71,83 +197,94 @@ static int openmp_linear_team_size(uint64_t operation_count) noexcept
 #endif
 }
 
-CpuBatch embedding_batch(const TensorData& embedding, std::span<const int32_t> input_ids)
+static int openmp_mxfp4_group_team_size(uint64_t operation_count) noexcept
+{
+#if defined(_OPENMP)
+    static constexpr uint64_t minimum_operations_per_thread = 128 * 1024;
+    const uint32_t core_count = physical_core_count();
+    const int maximum_threads = omp_get_max_threads();
+    const uint64_t useful_threads = std::max<uint64_t>(1, (operation_count + minimum_operations_per_thread - 1) / minimum_operations_per_thread);
+    const int topology_limit = core_count == 0 ? maximum_threads : std::min(maximum_threads, static_cast<int>(core_count));
+    return std::max(1, std::min(topology_limit, static_cast<int>(std::min<uint64_t>(useful_threads, static_cast<uint64_t>(std::numeric_limits<int>::max())))));
+#else
+    (void)operation_count;
+    return 1;
+#endif
+}
+
+void embedding_batch_into(const TensorData& embedding, std::span<const int32_t> input_ids, CpuBatch& output)
 {
     assert(embedding.shape.size() == 2);
     const uint32_t hidden_size = embedding.shape[1];
-    CpuBatch output(input_ids.size(), hidden_size);
-    for (size_t token_index = 0; token_index < input_ids.size(); ++token_index) {
+    output.reset(input_ids.size(), hidden_size, false);
+    for (size_t token_index = 0; token_index < input_ids.size(); ++token_index)
+    {
         const size_t offset = static_cast<size_t>(input_ids[token_index]) * hidden_size;
         float* destination = output.row(token_index);
         for (uint32_t column = 0; column < hidden_size; ++column)
             destination[column] = tensor_value(embedding, offset + column);
     }
+}
+
+CpuBatch embedding_batch(const TensorData& embedding, std::span<const int32_t> input_ids)
+{
+    CpuBatch output;
+    embedding_batch_into(embedding, input_ids, output);
     return output;
 }
 
-CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input)
+void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch& output)
 {
     assert(matrix.shape.size() == 2);
     const uint32_t output_columns = matrix.shape[0];
     const uint32_t input_columns = matrix.shape[1];
     assert(input.columns() == input_columns);
 
-    CpuBatch output;
     if (matrix.linear_operator && matrix.linear_operator->forward(input, output))
-        return output;
-    output = CpuBatch(input.rows(), output_columns);
+        return;
+    output.reset(input.rows(), output_columns, false);
     const int64_t parallel_output_columns = static_cast<int64_t>(output_columns);
-    const uint64_t operation_count
-        = static_cast<uint64_t>(output_columns)
-          * input_columns
-          * input.rows();
-    const int linear_team_size
-        = openmp_linear_team_size(operation_count);
+    const uint64_t operation_count = static_cast<uint64_t>(output_columns) * input_columns * input.rows();
+    const int linear_team_size = openmp_linear_team_size(operation_count);
     const bool parallelize_linear = linear_team_size > 1;
-    if (matrix.dtype == DType::Float32) {
-        const std::span<const float> matrix_values
-            = matrix.float32_values();
+    if (matrix.dtype == DType::Float32)
+    {
+        const std::span<const float> matrix_values = matrix.float32_values();
 #pragma omp parallel for num_threads(linear_team_size) if (parallelize_linear)
-        for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column) {
-            const float* weights = matrix_values.data()
-                                   + static_cast<size_t>(output_column)
-                                         * input_columns;
-            for (size_t token_index = 0; token_index < input.rows(); ++token_index) {
+        for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column)
+        {
+            const float* weights = matrix_values.data() + static_cast<size_t>(output_column) * input_columns;
+            for (size_t token_index = 0; token_index < input.rows(); ++token_index)
+            {
                 const float* token = input.row(token_index);
-                output.row(token_index)[output_column] = std::inner_product(
-                    weights, weights + input_columns, token, 0.0f);
+                output.row(token_index)[output_column] = std::inner_product(weights, weights + input_columns, token, 0.0f);
             }
         }
     }
-    else if (matrix.dtype == DType::BFloat16) {
-        const std::span<const uint16_t> matrix_values
-            = matrix.bfloat16_values();
+    else if (matrix.dtype == DType::BFloat16)
+    {
+        const std::span<const uint16_t> matrix_values = matrix.bfloat16_values();
 #pragma omp parallel for num_threads(linear_team_size) if (parallelize_linear)
-        for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column) {
-            const uint16_t* weights
-                = matrix_values.data()
-                  + static_cast<size_t>(output_column)
-                        * input_columns;
-            for (size_t token_index = 0; token_index < input.rows(); ++token_index) {
+        for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column)
+        {
+            const uint16_t* weights = matrix_values.data() + static_cast<size_t>(output_column) * input_columns;
+            for (size_t token_index = 0; token_index < input.rows(); ++token_index)
+            {
                 const float* token = input.row(token_index);
-                float sum = 0.0f;
-                for (uint32_t input_column = 0; input_column < input_columns; ++input_column)
-                    sum += bfloat16_to_float(weights[input_column]) * token[input_column];
-                output.row(token_index)[output_column] = sum;
+                output.row(token_index)[output_column] = bfloat16_dot(weights, token, input_columns);
             }
         }
     }
-    else if (matrix.dtype == DType::Int8) {
-        const std::span<const int8_t> matrix_values
-            = matrix.int8_values();
+    else if (matrix.dtype == DType::Int8)
+    {
+        const std::span<const int8_t> matrix_values = matrix.int8_values();
 #pragma omp parallel for num_threads(linear_team_size) if (parallelize_linear)
-        for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column) {
-            const int8_t* weights
-                = matrix_values.data()
-                  + static_cast<size_t>(output_column)
-                        * input_columns;
+        for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column)
+        {
+            const int8_t* weights = matrix_values.data() + static_cast<size_t>(output_column) * input_columns;
             const float scale = matrix.quantization_scales[output_column];
-            for (size_t token_index = 0; token_index < input.rows(); ++token_index) {
+            for (size_t token_index = 0; token_index < input.rows(); ++token_index)
+            {
                 const float* token = input.row(token_index);
                 float sum = 0.0f;
                 for (uint32_t input_column = 0; input_column < input_columns; ++input_column)
@@ -156,155 +293,104 @@ CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input)
             }
         }
     }
-    else if (matrix.dtype == DType::MxFp4) {
+    else if (matrix.dtype == DType::MxFp4)
+    {
         const uint32_t blocks_per_row = input_columns / 32;
-        const int64_t row_pair_count
-            = static_cast<int64_t>((output_columns + 1) / 2);
+        const int64_t row_pair_count = static_cast<int64_t>((output_columns + 1) / 2);
 #pragma omp parallel for num_threads(linear_team_size) if (parallelize_linear)
-        for (int64_t row_pair = 0; row_pair < row_pair_count; ++row_pair) {
+        for (int64_t row_pair = 0; row_pair < row_pair_count; ++row_pair)
+        {
             const uint32_t first_row = static_cast<uint32_t>(row_pair) * 2;
             const uint32_t second_row = first_row + 1;
-            const uint8_t* first_blocks
-                = matrix.mxfp4_blocks.data()
-                  + static_cast<size_t>(first_row) * input_columns / 2;
-            const uint8_t* first_scales
-                = matrix.mxfp4_scales.data()
-                  + static_cast<size_t>(first_row) * blocks_per_row;
-            if (second_row < output_columns) {
-                const uint8_t* second_blocks
-                    = matrix.mxfp4_blocks.data()
-                      + static_cast<size_t>(second_row) * input_columns / 2;
-                const uint8_t* second_scales
-                    = matrix.mxfp4_scales.data()
-                      + static_cast<size_t>(second_row) * blocks_per_row;
-                mxfp4_matmul_rows2(
-                    first_blocks,
-                    first_scales,
-                    second_blocks,
-                    second_scales,
-                    blocks_per_row,
-                    input.row(0),
-                    input.columns(),
-                    input.rows(),
-                    output.row(0) + first_row,
-                    output.columns(),
-                    output.row(0) + second_row,
-                    output.columns());
+            const uint8_t* first_blocks = matrix.mxfp4_blocks.data() + static_cast<size_t>(first_row) * input_columns / 2;
+            const uint8_t* first_scales = matrix.mxfp4_scales.data() + static_cast<size_t>(first_row) * blocks_per_row;
+            if (second_row < output_columns)
+            {
+                const uint8_t* second_blocks = matrix.mxfp4_blocks.data() + static_cast<size_t>(second_row) * input_columns / 2;
+                const uint8_t* second_scales = matrix.mxfp4_scales.data() + static_cast<size_t>(second_row) * blocks_per_row;
+                mxfp4_matmul_rows2(first_blocks, first_scales, second_blocks, second_scales, blocks_per_row, input.row(0), input.columns(), input.rows(),
+                                   output.row(0) + first_row, output.columns(), output.row(0) + second_row, output.columns());
             }
-            else if (input.rows() == 1) {
-                output.row(0)[first_row] = mxfp4_dot(
-                    first_blocks,
-                    first_scales,
-                    blocks_per_row,
-                    input.row(0));
+            else if (input.rows() == 1)
+            {
+                output.row(0)[first_row] = mxfp4_dot(first_blocks, first_scales, blocks_per_row, input.row(0));
             }
-            else {
-                mxfp4_gemm_row(
-                    first_blocks,
-                    first_scales,
-                    blocks_per_row,
-                    input.row(0),
-                    input.columns(),
-                    input.rows(),
-                    output.row(0) + first_row,
-                    output.columns());
+            else
+            {
+                mxfp4_gemm_row(first_blocks, first_scales, blocks_per_row, input.row(0), input.columns(), input.rows(), output.row(0) + first_row,
+                               output.columns());
             }
         }
     }
-    else {
+    else
+    {
         assert(false && "unsupported matrix dtype");
     }
+}
+
+CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input)
+{
+    CpuBatch output;
+    linear_batch_into(matrix, input, output);
     return output;
 }
 
-CpuBatch fused_mxfp4_gate_up_batch(
-    const TensorData& matrix,
-    const TensorData* bias,
-    const CpuBatch& input,
-    float activation_limit)
+CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* bias, const CpuBatch& input, float activation_limit)
 {
     assert(matrix.dtype == DType::MxFp4 && matrix.shape.size() == 2);
     assert(matrix.shape[0] % 2 == 0 && matrix.shape[1] == input.columns());
+    const bool approximate_activation = use_approximate_scaled_silu();
     const uint32_t intermediate_size = matrix.shape[0] / 2;
     const uint32_t input_columns = matrix.shape[1];
     const uint32_t blocks_per_row = input_columns / 32;
     if (bias)
         assert(bias->shape == std::vector<uint32_t>{matrix.shape[0]});
 
-    CpuBatch output(input.rows(), intermediate_size);
+    CpuBatch output;
+    output.reset(input.rows(), intermediate_size, false);
     const int64_t parallel_columns = static_cast<int64_t>(intermediate_size);
 #pragma omp parallel for if (allow_openmp_parallel_region())
-    for (int64_t column = 0; column < parallel_columns; ++column) {
+    for (int64_t column = 0; column < parallel_columns; ++column)
+    {
         const size_t gate_row = static_cast<size_t>(column) * 2;
         const size_t up_row = gate_row + 1;
-        const uint8_t* gate_blocks
-            = matrix.mxfp4_blocks.data() + gate_row * input_columns / 2;
-        const uint8_t* up_blocks
-            = matrix.mxfp4_blocks.data() + up_row * input_columns / 2;
-        const uint8_t* gate_scales
-            = matrix.mxfp4_scales.data() + gate_row * blocks_per_row;
-        const uint8_t* up_scales
-            = matrix.mxfp4_scales.data() + up_row * blocks_per_row;
+        const uint8_t* gate_blocks = matrix.mxfp4_blocks.data() + gate_row * input_columns / 2;
+        const uint8_t* up_blocks = matrix.mxfp4_blocks.data() + up_row * input_columns / 2;
+        const uint8_t* gate_scales = matrix.mxfp4_scales.data() + gate_row * blocks_per_row;
+        const uint8_t* up_scales = matrix.mxfp4_scales.data() + up_row * blocks_per_row;
         const float gate_bias = bias ? tensor_value(*bias, gate_row) : 0.0f;
         const float up_bias = bias ? tensor_value(*bias, up_row) : 0.0f;
-        if (input.rows() == 1) {
+        if (input.rows() == 1)
+        {
             float gate = 0.0f;
             float linear = 0.0f;
-            mxfp4_matmul_rows2(
-                gate_blocks,
-                gate_scales,
-                up_blocks,
-                up_scales,
-                blocks_per_row,
-                input.row(0),
-                input.columns(),
-                1,
-                &gate,
-                1,
-                &linear,
-                1);
+            mxfp4_matmul_rows2(gate_blocks, gate_scales, up_blocks, up_scales, blocks_per_row, input.row(0), input.columns(), 1, &gate, 1, &linear, 1);
             gate += gate_bias;
             linear += up_bias;
-            if (activation_limit > 0.0f) {
+            if (activation_limit > 0.0f)
+            {
                 gate = std::min(gate, activation_limit);
-                linear = std::clamp(
-                    linear,
-                    -activation_limit,
-                    activation_limit);
+                linear = std::clamp(linear, -activation_limit, activation_limit);
             }
-            const float silu = gate / (1.0f + std::exp(-1.702f * gate));
+            const float silu = selected_scaled_silu(gate, 1.702f, approximate_activation);
             output.row(0)[column] = silu * (linear + 1.0f);
         }
-        else {
+        else
+        {
             static thread_local std::vector<float> linear;
             linear.resize(input.rows());
-            mxfp4_matmul_rows2(
-                gate_blocks,
-                gate_scales,
-                up_blocks,
-                up_scales,
-                blocks_per_row,
-                input.row(0),
-                input.columns(),
-                input.rows(),
-                output.row(0) + column,
-                output.columns(),
-                linear.data(),
-                1);
-            for (size_t token_index = 0;
-                 token_index < input.rows();
-                 ++token_index) {
+            mxfp4_matmul_rows2(gate_blocks, gate_scales, up_blocks, up_scales, blocks_per_row, input.row(0), input.columns(), input.rows(),
+                               output.row(0) + column, output.columns(), linear.data(), 1);
+            for (size_t token_index = 0; token_index < input.rows(); ++token_index)
+            {
                 float gate = output.row(token_index)[column] + gate_bias;
                 float up = linear[token_index] + up_bias;
-                if (activation_limit > 0.0f) {
+                if (activation_limit > 0.0f)
+                {
                     gate = std::min(gate, activation_limit);
-                    up = std::clamp(
-                        up,
-                        -activation_limit,
-                        activation_limit);
+                    up = std::clamp(up, -activation_limit, activation_limit);
                 }
-                const float silu
-                    = gate / (1.0f + std::exp(-1.702f * gate));
+                const float silu = selected_scaled_silu(gate, 1.702f, approximate_activation);
                 output.row(token_index)[column] = silu * (up + 1.0f);
             }
         }
@@ -312,26 +398,424 @@ CpuBatch fused_mxfp4_gate_up_batch(
     return output;
 }
 
-CpuBatch linear_batch(const TensorData& matrix, const TensorData& bias, const CpuBatch& input)
+static void locate_mxfp4_group(uint64_t flat_index, std::span<const Mxfp4Task> tasks, bool gate_stage, uint32_t pair_group_size, bool uniform,
+                               uint64_t groups_per_task, size_t& task_index, uint32_t& local_index)
 {
-    CpuBatch accelerated;
-    if (matrix.linear_operator && matrix.linear_operator->forward(input, accelerated))
-        return accelerated;
-    CpuBatch output = linear_batch(matrix, input);
+    if (uniform && groups_per_task != 0)
+    {
+        task_index = static_cast<size_t>(flat_index / groups_per_task);
+        local_index = static_cast<uint32_t>(flat_index % groups_per_task);
+        if (task_index < tasks.size())
+            return;
+    }
+
+    uint64_t offset = 0;
+    for (task_index = 0; task_index < tasks.size(); ++task_index)
+    {
+        const TensorData& matrix = gate_stage ? *tasks[task_index].gate_up : *tasks[task_index].down;
+        const uint64_t work_items = gate_stage ? ((matrix.shape[0] / 2) + pair_group_size - 1) / pair_group_size
+                                               : (((matrix.shape[0] + 1) / 2) + pair_group_size - 1) / pair_group_size;
+        if (flat_index < offset + work_items)
+        {
+            local_index = static_cast<uint32_t>(flat_index - offset);
+            return;
+        }
+        offset += work_items;
+    }
+    local_index = 0;
+}
+
+static bool mxfp4_expert_decode(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch)
+{
+    Mxfp4Scratch local_scratch;
+    Mxfp4Scratch& buffers = scratch ? *scratch : local_scratch;
+    buffers.activated.resize(tasks.size());
+    std::vector<CpuBatch>& activated = buffers.activated;
+    const bool approximate_activation = use_approximate_scaled_silu();
+    const uint32_t pair_group_size = mxfp4_decode_row_pair_group_size();
+    uint64_t gate_pair_group_count = 0;
+    uint64_t down_pair_group_count = 0;
+    uint64_t uniform_gate_pair_group_count = 0;
+    uint64_t uniform_down_pair_group_count = 0;
+    bool uniform_gate_pair_groups = true;
+    bool uniform_down_pair_groups = true;
+    uint64_t operation_count = 0;
+    for (size_t task_index = 0; task_index < tasks.size(); ++task_index)
+    {
+        const Mxfp4Task& task = tasks[task_index];
+        if (!task.gate_up || !task.down || !task.input || !task.output || task.input->rows() != 1 || task.gate_up->dtype != DType::MxFp4
+            || task.down->dtype != DType::MxFp4 || task.gate_up->shape.size() != 2 || task.down->shape.size() != 2 || task.gate_up->shape[0] % 2 != 0
+            || task.gate_up->shape[1] != task.input->columns() || task.down->shape[1] != task.gate_up->shape[0] / 2)
+        {
+            return false;
+        }
+        if (task.gate_up_bias && task.gate_up_bias->shape != std::vector<uint32_t>{task.gate_up->shape[0]})
+        {
+            return false;
+        }
+        if (task.down_bias && task.down_bias->shape != std::vector<uint32_t>{task.down->shape[0]})
+        {
+            return false;
+        }
+        const uint32_t intermediate_size = task.gate_up->shape[0] / 2;
+        activated[task_index].reset(1, intermediate_size, false);
+        task.output->reset(1, task.down->shape[0], false);
+        const uint64_t task_gate_pair_groups = (intermediate_size + pair_group_size - 1) / pair_group_size;
+        const uint64_t task_down_pair_groups = ((task.down->shape[0] + 1) / 2 + pair_group_size - 1) / pair_group_size;
+        gate_pair_group_count += task_gate_pair_groups;
+        down_pair_group_count += task_down_pair_groups;
+        if (task_index == 0)
+        {
+            uniform_gate_pair_group_count = task_gate_pair_groups;
+            uniform_down_pair_group_count = task_down_pair_groups;
+        }
+        else
+        {
+            uniform_gate_pair_groups = uniform_gate_pair_groups && task_gate_pair_groups == uniform_gate_pair_group_count;
+            uniform_down_pair_groups = uniform_down_pair_groups && task_down_pair_groups == uniform_down_pair_group_count;
+        }
+        const uint64_t gate_operations = static_cast<uint64_t>(task.gate_up->shape[0]) * task.gate_up->shape[1];
+        const uint64_t down_operations = static_cast<uint64_t>(task.down->shape[0]) * task.down->shape[1];
+        const uint64_t maximum_operations = std::numeric_limits<uint64_t>::max();
+        if (gate_operations > maximum_operations - down_operations)
+        {
+            operation_count = std::numeric_limits<uint64_t>::max();
+        }
+        else
+        {
+            const uint64_t task_operations = gate_operations + down_operations;
+            if (operation_count > maximum_operations - task_operations)
+            {
+                operation_count = maximum_operations;
+            }
+            else
+            {
+                operation_count += task_operations;
+            }
+        }
+    }
+
+    const int group_team_size = openmp_mxfp4_group_team_size(operation_count);
+    const bool parallelize_group = group_team_size > 1 && allow_openmp_parallel_region();
+    const int64_t parallel_gate_pair_groups = static_cast<int64_t>(gate_pair_group_count);
+    const int64_t parallel_down_pair_groups = static_cast<int64_t>(down_pair_group_count);
+#pragma omp parallel num_threads(group_team_size) if (parallelize_group)
+    {
+#pragma omp for schedule(static)
+        for (int64_t flat_group = 0; flat_group < parallel_gate_pair_groups; ++flat_group)
+        {
+            size_t task_index = 0;
+            uint32_t pair_group = 0;
+            locate_mxfp4_group(static_cast<uint64_t>(flat_group), tasks, true, pair_group_size, uniform_gate_pair_groups, uniform_gate_pair_group_count,
+                               task_index, pair_group);
+            const Mxfp4Task& task = tasks[task_index];
+            const TensorData& matrix = *task.gate_up;
+            const uint32_t input_columns = matrix.shape[1];
+            const uint32_t blocks_per_row = input_columns / 32;
+            const uint32_t intermediate_size = matrix.shape[0] / 2;
+            const uint32_t first_column = pair_group * pair_group_size;
+            const uint32_t column_count = std::min<uint32_t>(pair_group_size, intermediate_size - first_column);
+            const size_t gate_row = static_cast<size_t>(first_column) * 2;
+            float gates[2] = {};
+            float linears[2] = {};
+            mxfp4_matmul_row_pairs(matrix.mxfp4_blocks.data() + gate_row * input_columns / 2, matrix.mxfp4_scales.data() + gate_row * blocks_per_row,
+                                   blocks_per_row, column_count, task.input->row(0), task.input->columns(), 1, gates, 1, 1, linears, 1, 1);
+            for (uint32_t local_column = 0; local_column < column_count; ++local_column)
+            {
+                const uint32_t column = first_column + local_column;
+                const size_t local_gate_row = static_cast<size_t>(column) * 2;
+                const size_t local_up_row = local_gate_row + 1;
+                float gate = gates[local_column];
+                float linear = linears[local_column];
+                if (task.gate_up_bias)
+                {
+                    gate += tensor_value(*task.gate_up_bias, local_gate_row);
+                    linear += tensor_value(*task.gate_up_bias, local_up_row);
+                }
+                if (task.activation_limit > 0.0f)
+                {
+                    gate = std::min(gate, task.activation_limit);
+                    linear = std::clamp(linear, -task.activation_limit, task.activation_limit);
+                }
+                const float silu = selected_scaled_silu(gate, 1.702f, approximate_activation);
+                activated[task_index].row(0)[column] = silu * (linear + 1.0f);
+            }
+        }
+
+#pragma omp for schedule(static)
+        for (int64_t flat_group = 0; flat_group < parallel_down_pair_groups; ++flat_group)
+        {
+            size_t task_index = 0;
+            uint32_t pair_group = 0;
+            locate_mxfp4_group(static_cast<uint64_t>(flat_group), tasks, false, pair_group_size, uniform_down_pair_groups, uniform_down_pair_group_count,
+                               task_index, pair_group);
+            const Mxfp4Task& task = tasks[task_index];
+            const TensorData& matrix = *task.down;
+            const uint32_t input_columns = matrix.shape[1];
+            const uint32_t blocks_per_row = input_columns / 32;
+            const uint32_t first_pair = pair_group * pair_group_size;
+            const uint32_t full_pair_count = matrix.shape[0] / 2;
+            const uint32_t pair_count = first_pair < full_pair_count ? std::min<uint32_t>(pair_group_size, full_pair_count - first_pair) : 0;
+            const uint32_t first_row = first_pair * 2;
+            float* first_output = task.output->row(0) + first_row;
+            if (pair_count != 0)
+            {
+                mxfp4_matmul_row_pairs(matrix.mxfp4_blocks.data() + static_cast<size_t>(first_row) * input_columns / 2,
+                                       matrix.mxfp4_scales.data() + static_cast<size_t>(first_row) * blocks_per_row, blocks_per_row, pair_count,
+                                       activated[task_index].row(0), activated[task_index].columns(), 1, first_output, 2, 1, first_output + 1, 2, 1);
+                if (task.down_bias)
+                {
+                    for (uint32_t row = 0; row < pair_count * 2; ++row)
+                    {
+                        first_output[row] += tensor_value(*task.down_bias, first_row + row);
+                    }
+                }
+            }
+            const uint32_t odd_row = full_pair_count * 2;
+            if (odd_row < matrix.shape[0] && first_pair + pair_count == full_pair_count)
+            {
+                float* odd_output = task.output->row(0) + odd_row;
+                odd_output[0] = mxfp4_dot(
+                    matrix.mxfp4_blocks.data() + static_cast<size_t>(odd_row) * input_columns / 2,
+                    matrix.mxfp4_scales.data() + static_cast<size_t>(odd_row) * blocks_per_row, blocks_per_row, activated[task_index].row(0));
+                if (task.down_bias)
+                {
+                    odd_output[0] += tensor_value(*task.down_bias, odd_row);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch)
+{
+    if (tasks.empty())
+        return true;
+    bool single_token = true;
+    for (const Mxfp4Task& task : tasks)
+    {
+        if (!task.input || task.input->rows() != 1)
+        {
+            single_token = false;
+            break;
+        }
+    }
+    if (single_token)
+    {
+        return mxfp4_expert_decode(tasks, scratch);
+    }
+
+    Mxfp4Scratch local_scratch;
+    Mxfp4Scratch& buffers = scratch ? *scratch : local_scratch;
+    buffers.activated.resize(tasks.size());
+    buffers.linear.resize(tasks.size());
+    std::vector<CpuBatch>& activated = buffers.activated;
+    std::vector<CpuBatch>& linear = buffers.linear;
+    const bool approximate_activation = use_approximate_scaled_silu();
+    uint64_t gate_column_count = 0;
+    uint64_t down_row_pair_count = 0;
+    uint64_t operation_count = 0;
+    for (size_t task_index = 0; task_index < tasks.size(); ++task_index)
+    {
+        const Mxfp4Task& task = tasks[task_index];
+        if (!task.gate_up || !task.down || !task.input || !task.output || task.input->rows() == 0 || task.gate_up->dtype != DType::MxFp4
+            || task.down->dtype != DType::MxFp4 || task.gate_up->shape.size() != 2 || task.down->shape.size() != 2 || task.gate_up->shape[0] % 2 != 0
+            || task.gate_up->shape[1] != task.input->columns() || task.down->shape[1] != task.gate_up->shape[0] / 2)
+        {
+            return false;
+        }
+        if (task.gate_up_bias && task.gate_up_bias->shape != std::vector<uint32_t>{task.gate_up->shape[0]})
+        {
+            return false;
+        }
+        if (task.down_bias && task.down_bias->shape != std::vector<uint32_t>{task.down->shape[0]})
+        {
+            return false;
+        }
+        const uint32_t intermediate_size = task.gate_up->shape[0] / 2;
+        activated[task_index].reset(task.input->rows(), intermediate_size, false);
+        linear[task_index].reset(task.input->rows(), intermediate_size, false);
+        task.output->reset(task.input->rows(), task.down->shape[0], false);
+        gate_column_count += intermediate_size;
+        down_row_pair_count += (task.down->shape[0] + 1) / 2;
+        const uint64_t gate_operations = static_cast<uint64_t>(task.gate_up->shape[0]) * task.gate_up->shape[1];
+        const uint64_t down_operations = static_cast<uint64_t>(task.down->shape[0]) * task.down->shape[1];
+        const uint64_t maximum_operations = std::numeric_limits<uint64_t>::max();
+        if (gate_operations > maximum_operations - down_operations)
+        {
+            operation_count = maximum_operations;
+        }
+        else
+        {
+            const uint64_t task_operations = gate_operations + down_operations;
+            if (operation_count > maximum_operations - task_operations)
+            {
+                operation_count = maximum_operations;
+            }
+            else
+            {
+                operation_count += task_operations;
+            }
+        }
+    }
+
+    const int group_team_size = openmp_mxfp4_group_team_size(operation_count);
+    const bool parallelize_group = group_team_size > 1 && allow_openmp_parallel_region();
+#pragma omp parallel num_threads(group_team_size) if (parallelize_group)
+    {
+        uint64_t thread_index = 0;
+        uint64_t actual_team_size = 1;
+#if defined(_OPENMP)
+        thread_index = static_cast<uint64_t>(omp_get_thread_num());
+        actual_team_size = static_cast<uint64_t>(omp_get_num_threads());
+#endif
+        const uint64_t gate_begin = gate_column_count * thread_index / actual_team_size;
+        const uint64_t gate_end = gate_column_count * (thread_index + 1) / actual_team_size;
+        uint64_t task_begin = 0;
+        for (size_t task_index = 0; task_index < tasks.size(); ++task_index)
+        {
+            const Mxfp4Task& task = tasks[task_index];
+            const TensorData& matrix = *task.gate_up;
+            const uint64_t task_end = task_begin + matrix.shape[0] / 2;
+            const uint64_t intersection_begin = std::max(gate_begin, task_begin);
+            const uint64_t intersection_end = std::min(gate_end, task_end);
+            if (intersection_begin >= intersection_end)
+            {
+                task_begin = task_end;
+                continue;
+            }
+            const uint64_t local_begin = intersection_begin - task_begin;
+            const uint64_t local_end = intersection_end - task_begin;
+            const uint32_t input_columns = matrix.shape[1];
+            const uint32_t blocks_per_row = input_columns / 32;
+            const size_t first_row = static_cast<size_t>(local_begin) * 2;
+            mxfp4_matmul_row_pairs(matrix.mxfp4_blocks.data() + first_row * input_columns / 2, matrix.mxfp4_scales.data() + first_row * blocks_per_row,
+                                   blocks_per_row, static_cast<uint32_t>(local_end - local_begin), task.input->row(0), task.input->columns(),
+                                   task.input->rows(), activated[task_index].row(0) + local_begin, 1, activated[task_index].columns(),
+                                   linear[task_index].row(0) + local_begin, 1, linear[task_index].columns());
+            for (size_t token_index = 0; token_index < task.input->rows(); ++token_index)
+            {
+                float* gate_values = activated[task_index].row(token_index);
+                float* linear_values = linear[task_index].row(token_index);
+                for (uint64_t column = local_begin; column < local_end; ++column)
+                {
+                    const size_t gate_row = static_cast<size_t>(column) * 2;
+                    const size_t up_row = gate_row + 1;
+                    float gate = gate_values[column];
+                    float up = linear_values[column];
+                    if (task.gate_up_bias)
+                    {
+                        gate += tensor_value(*task.gate_up_bias, gate_row);
+                        up += tensor_value(*task.gate_up_bias, up_row);
+                    }
+                    if (task.activation_limit > 0.0f)
+                    {
+                        gate = std::min(gate, task.activation_limit);
+                        up = std::clamp(up, -task.activation_limit, task.activation_limit);
+                    }
+                    const float silu = selected_scaled_silu(gate, 1.702f, approximate_activation);
+                    gate_values[column] = silu * (up + 1.0f);
+                }
+            }
+            task_begin = task_end;
+        }
+
+#pragma omp barrier
+        const uint64_t down_begin = down_row_pair_count * thread_index / actual_team_size;
+        const uint64_t down_end = down_row_pair_count * (thread_index + 1) / actual_team_size;
+        task_begin = 0;
+        for (size_t task_index = 0; task_index < tasks.size(); ++task_index)
+        {
+            const Mxfp4Task& task = tasks[task_index];
+            const TensorData& matrix = *task.down;
+            const uint64_t task_pair_count = matrix.shape[0] / 2;
+            const uint64_t task_end = task_begin + (matrix.shape[0] + 1) / 2;
+            const uint64_t intersection_begin = std::max(down_begin, task_begin);
+            const uint64_t intersection_end = std::min(down_end, task_end);
+            const uint64_t local_begin = intersection_begin > task_begin ? intersection_begin - task_begin : 0;
+            const uint64_t local_end = intersection_end > task_begin ? std::min<uint64_t>(task_pair_count, intersection_end - task_begin) : 0;
+            if (intersection_begin >= intersection_end || local_begin >= local_end)
+            {
+                task_begin = task_end;
+                continue;
+            }
+            const uint32_t input_columns = matrix.shape[1];
+            const uint32_t blocks_per_row = input_columns / 32;
+            const size_t first_row = static_cast<size_t>(local_begin) * 2;
+            mxfp4_matmul_row_pairs(matrix.mxfp4_blocks.data() + first_row * input_columns / 2, matrix.mxfp4_scales.data() + first_row * blocks_per_row,
+                                   blocks_per_row, static_cast<uint32_t>(local_end - local_begin), activated[task_index].row(0),
+                                   activated[task_index].columns(), activated[task_index].rows(), task.output->row(0) + first_row, 2, task.output->columns(),
+                                   task.output->row(0) + first_row + 1, 2, task.output->columns());
+            if (task.down_bias)
+            {
+                for (size_t token_index = 0; token_index < task.output->rows(); ++token_index)
+                {
+                    float* output = task.output->row(token_index);
+                    for (uint64_t row_pair = local_begin; row_pair < local_end; ++row_pair)
+                    {
+                        const size_t row = static_cast<size_t>(row_pair) * 2;
+                        output[row] += tensor_value(*task.down_bias, row);
+                        output[row + 1] += tensor_value(*task.down_bias, row + 1);
+                    }
+                }
+            }
+            task_begin = task_end;
+        }
+    }
+
+    for (size_t task_index = 0; task_index < tasks.size(); ++task_index)
+    {
+        const Mxfp4Task& task = tasks[task_index];
+        const TensorData& matrix = *task.down;
+        if (matrix.shape[0] % 2 == 0)
+            continue;
+        const uint32_t row = matrix.shape[0] - 1;
+        const uint32_t blocks_per_row = matrix.shape[1] / 32;
+        mxfp4_gemm_row(matrix.mxfp4_blocks.data() + static_cast<size_t>(row) * matrix.shape[1] / 2,
+                       matrix.mxfp4_scales.data() + static_cast<size_t>(row) * blocks_per_row, blocks_per_row, activated[task_index].row(0),
+                       activated[task_index].columns(), activated[task_index].rows(), task.output->row(0) + row, task.output->columns());
+        if (task.down_bias)
+        {
+            const float bias = tensor_value(*task.down_bias, row);
+            for (size_t token_index = 0; token_index < task.output->rows(); ++token_index)
+            {
+                task.output->row(token_index)[row] += bias;
+            }
+        }
+    }
+    return true;
+}
+
+void linear_batch_into(const TensorData& matrix, const TensorData& bias, const CpuBatch& input, CpuBatch& output)
+{
+    if (matrix.linear_operator && matrix.linear_operator->forward(input, output))
+    {
+        return;
+    }
+    linear_batch_into(matrix, input, output);
     assert(bias.shape.size() == 1 && bias.shape[0] == output.columns());
-    for (size_t token_index = 0; token_index < output.rows(); ++token_index) {
+    for (size_t token_index = 0; token_index < output.rows(); ++token_index)
+    {
         float* row = output.row(token_index);
         for (uint32_t column = 0; column < output.columns(); ++column)
             row[column] += tensor_value(bias, column);
     }
+}
+
+CpuBatch linear_batch(const TensorData& matrix, const TensorData& bias, const CpuBatch& input)
+{
+    CpuBatch output;
+    linear_batch_into(matrix, bias, input, output);
     return output;
 }
 
-CpuBatch rms_norm_batch(const CpuBatch& input, const TensorData& weight, float epsilon)
+void rms_norm_batch_into(const CpuBatch& input, const TensorData& weight, float epsilon, CpuBatch& output)
 {
     assert(weight.element_count() == input.columns());
-    CpuBatch output(input.rows(), input.columns());
-    for (size_t token_index = 0; token_index < input.rows(); ++token_index) {
+    output.reset(input.rows(), input.columns(), false);
+    for (size_t token_index = 0; token_index < input.rows(); ++token_index)
+    {
         const float* source = input.row(token_index);
         float* destination = output.row(token_index);
         float sum_of_squares = 0.0f;
@@ -341,13 +825,20 @@ CpuBatch rms_norm_batch(const CpuBatch& input, const TensorData& weight, float e
         for (uint32_t column = 0; column < input.columns(); ++column)
             destination[column] = source[column] * inverse_rms * tensor_value(weight, column);
     }
+}
+
+CpuBatch rms_norm_batch(const CpuBatch& input, const TensorData& weight, float epsilon)
+{
+    CpuBatch output;
+    rms_norm_batch_into(input, weight, epsilon, output);
     return output;
 }
 
 void add_bias_inplace(CpuBatch& destination, const TensorData& bias)
 {
     assert(bias.shape.size() == 1 && bias.shape[0] == destination.columns());
-    for (size_t row_index = 0; row_index < destination.rows(); ++row_index) {
+    for (size_t row_index = 0; row_index < destination.rows(); ++row_index)
+    {
         float* output = destination.row(row_index);
         for (uint32_t column = 0; column < destination.columns(); ++column)
             output[column] += tensor_value(bias, column);
@@ -357,7 +848,8 @@ void add_bias_inplace(CpuBatch& destination, const TensorData& bias)
 void add_batch_inplace(CpuBatch& destination, const CpuBatch& source)
 {
     assert(destination.rows() == source.rows() && destination.columns() == source.columns());
-    for (size_t row_index = 0; row_index < destination.rows(); ++row_index) {
+    for (size_t row_index = 0; row_index < destination.rows(); ++row_index)
+    {
         float* output = destination.row(row_index);
         const float* input = source.row(row_index);
         for (uint32_t column = 0; column < destination.columns(); ++column)
@@ -365,9 +857,9 @@ void add_batch_inplace(CpuBatch& destination, const CpuBatch& source)
     }
 }
 
-std::vector<std::vector<float> > batch_to_vectors(const CpuBatch& batch)
+std::vector<std::vector<float>> batch_to_vectors(const CpuBatch& batch)
 {
-    std::vector<std::vector<float> > output(batch.rows(), std::vector<float>(batch.columns()));
+    std::vector<std::vector<float>> output(batch.rows(), std::vector<float>(batch.columns()));
     for (size_t row_index = 0; row_index < batch.rows(); ++row_index)
         std::copy_n(batch.row(row_index), batch.columns(), output[row_index].begin());
     return output;

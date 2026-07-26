@@ -13,9 +13,11 @@ enum class ExpertMemoryMode
     OnDemand
 };
 
+#define NCNN_MOE_MEMORY_FILE_BACKED_EXPERT_BIT 0
+
 enum ModelMemoryFlag : uint32_t
 {
-    ModelMemoryFileBackedExperts = 1u << 0
+    ModelMemoryFileBackedExperts = UINT32_C(1) << NCNN_MOE_MEMORY_FILE_BACKED_EXPERT_BIT
 };
 
 struct ModelMemoryPlan

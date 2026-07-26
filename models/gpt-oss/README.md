@@ -1,41 +1,57 @@
 # GPT-OSS
 
-The built-in `gpt_oss` adapter loads the official
+The built-in `gpt_oss` adapter runs the official
 [`openai/gpt-oss-20b`](https://huggingface.co/openai/gpt-oss-20b) and
 [`openai/gpt-oss-120b`](https://huggingface.co/openai/gpt-oss-120b)
-Safetensors packages directly. No conversion, GGUF export, or weight repacking
+Safetensors packages directly. No GGUF conversion or private checkpoint format
 is required.
 
-## Execution capability
+## Model support
 
 | Area | Implementation |
 | --- | --- |
 | Package | Official multi-shard Hugging Face Safetensors and `config.json` |
 | Dense weights | BF16/F32 with automatic mmap and buffered fallback |
-| Attention | RMSNorm, fused QKV, GQA, learned sinks, full/sliding Attention, YaRN RoPE |
-| KV cache | Persistent per-Session BF16 or FP32 cache |
-| Experts | Native MXFP4 block/scales with CPU SIMD kernels |
-| CPU backend | Complete portable execution |
-| Mixed backend | Vulkan dense/Attention with CPU routing and Experts |
+| Attention | RMSNorm, fused QKV+RoPE, adaptive online Decode SDPA, GQA, learned sinks, full/sliding Attention, and YaRN RoPE |
+| KV cache | Persistent per-Session BF16 or FP32 CPU cache; FP32 mixed-backend ring |
+| Experts | Native MXFP4 blocks and scales with runtime-selected CPU SIMD kernels |
+| Mixed execution | Vulkan Dense/Attention with CPU routing and Experts |
 | Expert residency | Automatic, eager, or byte-bounded on-demand |
-| Expert I/O | Fixed worker pool, exact-route priority, speculative prefetch, LRU eviction |
+| Expert I/O | Asynchronous range reads, Windows aligned direct I/O, packed sidecar support, and byte-aware ARC |
+| Scheduling | Independent Sessions, Expert coalescing, and bounded cross-call micro-batching |
 | Generation | Greedy, temperature, Top-K, Top-P, Min-P, stop tokens, and streaming |
+
+GPT-OSS-20B can use eager Expert residency when memory permits. GPT-OSS-120B
+is designed to run with on-demand Expert residency on hosts that cannot keep
+the complete checkpoint in RAM.
 
 ## Download
 
-Run every command in this guide from the repository root. Download checkpoints
-into the model-specific directories below this guide:
+Run commands from the repository root and keep checkpoints in the ignored
+model directories:
 
 ```powershell
 hf download openai/gpt-oss-20b --local-dir .\models\gpt-oss\gpt-oss-20b
 hf download openai/gpt-oss-120b --local-dir .\models\gpt-oss\gpt-oss-120b
 ```
 
-The repository `.gitignore` excludes both model directories, including
-configuration, index, tokenizer, and weight files downloaded into them.
 Each directory must contain `config.json`, `model.safetensors.index.json`, and
 every shard referenced by the index. Build the Release runner by following the
 root [Quick start](../../README.md#quick-start).
+
+## Run a text prompt
+
+The Harmony wrapper provides official prompt formatting and token decoding
+without adding a tokenizer dependency to the C++ runtime:
+
+```powershell
+python -m pip install openai-harmony
+python tools\run_gpt_oss_prompt.py `
+  .\build-ncnn\Release\ncnn_moe_gpt_oss.exe `
+  .\models\gpt-oss\gpt-oss-20b `
+  "Reply with exactly: OK" `
+  --max-new-tokens 64 --stream --backend hybrid
+```
 
 ## Run token IDs
 
@@ -48,25 +64,11 @@ token IDs:
   --max-new-tokens 64 --hybrid
 ```
 
-Use `--stream-token-ids` to print each generated ID as it becomes available.
-The final report includes backend dispatch counts, Attention/Router/Expert
-timings, cache statistics, and the complete generated token sequence.
+Use `--stream-token-ids` to print generated IDs as they become available. The
+final report includes backend dispatch counts, phase timings, cache statistics,
+and the complete generated sequence.
 
-## Run text prompts
-
-The optional Harmony wrapper performs prompt formatting and token decoding
-without adding a tokenizer dependency to the C++ runtime:
-
-```powershell
-python -m pip install openai-harmony
-python tools\run_gpt_oss_prompt.py `
-  .\build-ncnn\Release\ncnn_moe_gpt_oss.exe `
-  .\models\gpt-oss\gpt-oss-20b `
-  "Reply with exactly: OK" `
-  --max-new-tokens 64 --stream --backend hybrid
-```
-
-Sampling controls shared by both entry points:
+## Sampling
 
 | Option | Meaning |
 | --- | --- |
@@ -79,18 +81,21 @@ Sampling controls shared by both entry points:
 
 The native runner also accepts repeated `--stop-token ID` options.
 
-## Select a backend
+## Execution modes
 
 | Option | Execution |
 | --- | --- |
 | `--cpu` | Portable CPU path |
-| `--hybrid` | Vulkan dense/Attention and CPU MXFP4 Experts |
+| `--hybrid` | Vulkan Dense/Attention and CPU MXFP4 Experts |
 | `--hybrid-prefetch` | Mixed path with explicit CPU cache hints |
 
-`HybridMode::Auto` selects the mixed path when a compatible Vulkan device is
-available. MXFP4 Expert arithmetic remains CPU-owned in every mixed mode.
+`HybridMode::Auto` selects mixed execution for a hardware Vulkan device and
+falls back to CPU-only for a software CPU Vulkan implementation. MXFP4 Experts
+use CPU arithmetic by default. A non-zero executable Expert GPU cache enables
+native Vulkan MXFP4 kernels only when runtime calibration measures an
+end-to-end benefit; losing workload buckets return to CPU automatically.
 
-## Control Expert memory
+## Expert memory and storage
 
 `Auto` estimates dense and MXFP4 storage before loading weights. It selects
 eager Expert residency when the host budget has safe headroom and otherwise
@@ -98,25 +103,49 @@ uses a byte-bounded cache backed by exact ranges in the original shards.
 
 | Option | Effect |
 | --- | --- |
-| `--expert-memory auto\|eager\|on-demand` | Select the residency policy |
+| `--expert-memory auto\|eager\|on-demand` | Select Expert residency |
 | `--host-memory-mb N` | Override the detected host-memory budget |
 | `--expert-cache-mb N` | Bound resident Expert pairs in RAM |
-| `--expert-io-workers N` | Set asynchronous read concurrency |
-| `--expert-gpu-cache-mb N` | Add an opt-in packed-Expert Vulkan victim cache |
-| `--mmap-experts` | Map on-demand Expert ranges instead of buffered reads |
+| `--expert-io-workers N` | Set asynchronous read concurrency; `0` derives it from Top-K and physical cores |
+| `--mmap-experts` | Map on-demand Expert ranges |
+| `--direct-expert-io` | Force aligned direct reads when supported |
+| `--buffered-expert-io` | Force conventional buffered reads |
+| `--expert-gpu-cache-mb N` | Add an executable Vulkan MXFP4 Expert cache |
+| `--expert-gpu-victim-cache-mb N` | Add a compressed-weight Vulkan cache behind the host ARC |
+| `--vulkan-device N` | Select one Vulkan device |
+| `--vulkan-devices N[,N...]` | Supply candidates for capability-weighted layer placement |
+| `--parallel-sessions N` | Run independent sequences through the batch scheduler |
+| `--scheduler-expert-threads N` | Override Expert threads per scheduler worker |
+| `--scheduler-cross-call` | Let the Runtime collector form micro-batches across submissions |
 
-Dense tensors and eager MXFP4 ranges are mapped automatically. The default
-on-demand path reads each requested Expert pair directly into final cache
-storage, so it does not allocate or zero-fill complete Expert tensors.
+Dense tensors and eager MXFP4 ranges are mapped automatically. On-demand
+Experts are read directly into final cache storage without allocating or
+zero-filling complete Expert tensors.
 
-`--mmap-experts` affects only on-demand Experts. Buffered overlapped reads are
-the default because they were faster than page-fault-driven Expert access on
-the verified Windows/NVMe system.
+The host cache uses byte-aware Adaptive Replacement Cache lists: T1 tracks
+recent pairs, T2 tracks repeatedly used pairs, and the B1/B2 ghost histories
+adapt the resident split without retaining weight bytes. Cache accounting and
+the benchmark report expose resident bytes, ghost hits, reads, cancellations,
+and speculative admissions.
 
-## Run GPT-OSS-120B with constrained memory
+### Optional packed Expert sidecar
 
-The following configuration is verified with the official 60.7678 GiB
-checkpoint on 31.14 GiB RAM and an RTX 5070 Ti 16 GiB:
+For storage-bound GPT-OSS-120B deployments, a derived sidecar can place each
+Expert's MXFP4 ranges contiguously:
+
+```powershell
+python tools\pack_mxfp4_experts.py .\models\gpt-oss\gpt-oss-120b
+```
+
+The tool writes `ncnn-moe-packed-experts.safetensors` atomically and leaves the
+official shards unchanged. The loader selects the sidecar automatically when
+present and otherwise reads the original shard ranges. The sidecar is an I/O
+layout optimization, not a required model conversion.
+
+## GPT-OSS-120B on a constrained-memory host
+
+This configuration is suitable as a starting point for a machine with about
+32 GiB RAM and a 16 GiB Vulkan device:
 
 ```powershell
 python tools\run_gpt_oss_prompt.py `
@@ -129,58 +158,74 @@ python tools\run_gpt_oss_prompt.py `
   --max-new-tokens 128 --stream
 ```
 
-Add `--expert-gpu-cache-mb 3072` when a repeated or sustained workload benefits
-from additional VRAM residency.
+Begin with CPU Expert execution and measure the intended prompt, context, and
+Session mix before assigning memory to Vulkan Expert tiers. Larger host ARC
+budgets improve route reuse but must leave enough memory for dense mappings,
+KV state, execution scratch, and the operating system.
 
-## Performance
+## Unified performance matrix
 
-### Repeated GPT-OSS-120B decode
+The public reference protocol uses one fixed 16-token prompt, greedy decoding,
+three fresh measured processes per case (and per cache size in the sweep), and
+generated-token parity validation. Short
+means 32 generated tokens; long means 256. Cold uses
+`warmup=0` and `cache-warmup-runs=0`. Warm adds one unreported
+generation warm-up and one unreported cache warm-up before the three measured
+samples. Warm-up improves repeatability for resident routes but does not imply
+that every Expert stays in memory.
 
-Protocol: Windows Release build, Ryzen 7 9800X3D, RTX 5070 Ti 16 GiB, Vulkan
-dense/Attention, CPU AVX-512 MXFP4 Experts, 24 GiB host budget, 16 GiB Expert
-cache, four I/O workers, one process warm-up, and three measured 32-token runs
-with identical generated token IDs.
+Reference host: Ryzen 7 9800X3D, 31.14 GiB RAM, RTX 5070 Ti 16 GiB, AVX-512
+MXFP4 Experts, ncnn Vulkan Dense/Attention, and greedy decoding. Two-session
+throughput is aggregate.
 
-| Metric | Median |
-| --- | ---: |
-| Decode throughput | **1.902 token/s** |
-| 32-token generation | **16.822 s** |
-| Expert execution | 14.443 s |
-| Expert-cache hit rate | 70.29% |
-| Peak process working set | 19,815 MiB |
-| Peak total NVIDIA memory | 12,029 MiB |
+| Model/workload | Short cold | Short warm | Long cold | Long warm |
+| --- | ---: | ---: | ---: | ---: |
+| GPT-OSS-20B, one Session | 14.103 | 14.855 | 17.069 | 16.597 |
+| GPT-OSS-120B, one Session | 2.885 | 4.718 | 4.971 | 5.171 |
+| GPT-OSS-120B, two Sessions | 5.284 | 10.916 | 9.870 | 10.295 |
 
-### mmap comparison
+Values are token/s except the two-session row, which is aggregate token/s.
+The hybrid path uses Vulkan Dense/Attention with CPU Experts and the Runtime
+scheduler.
 
-The following 128-token runs used the same host and generated the same token
-sequence:
+### GPT-OSS-120B CPU Expert storage control
 
-| Storage path | Load | Generation | Throughput | Expert time | Peak RSS |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Buffered baseline before dense mmap | 11.281 s | 40.202 s | 3.18 token/s | 32.416 s | 20,773 MiB |
-| **Dense mmap + buffered Experts** | **7.223 s** | **40.295 s** | **3.18 token/s** | **32.222 s** | **19,597 MiB** |
-| Dense mmap + Expert mmap | 6.235 s | 49.757 s | 2.57 token/s | 41.792 s | 19,693 MiB |
+The storage control keeps Expert execution on the CPU and varies the bounded
+ARC cache. Each cell is throughput in token/s; the parenthesized value is
+Runtime Expert-cache logical reads.
 
-A separate 128-token B/A/B/A comparison measured 42.290 seconds without the
-3 GiB GPU victim cache and 40.049 seconds with it. Token IDs were identical and
-SSD reads fell by 7.35 GB.
+| Expert cache | Short cold | Short warm | Long cold | Long warm |
+| --- | ---: | ---: | ---: | ---: |
+| 1 GiB | 1.042 (73.9 GB) | 1.050 (73.8 GB) | 1.143 (500.0 GB) | 1.133 (500.0 GB) |
+| 10 GiB | 1.812 (34.7 GB) | 2.006 (29.5 GB) | 2.145 (183.7 GB) | 2.160 (182.1 GB) |
+| 16 GiB | 2.119 (26.6 GB) | 2.444 (20.8 GB) | 2.637 (115.0 GB) | 2.636 (115.4 GB) |
 
-These measurements are a reproducible local baseline, not a cross-platform
-guarantee.
+Sampled system physical reads for 1/10/16 GiB were 57.8/26.0/19.1 GB
+(short cold), 114.4/50.6/37.6 GB (short warm), 392.1/140.8/88.4 GB
+(long cold), and 783.5/285.5/174.8 GB (long warm). They are total-disk
+samples rather than process-attributed SSD traffic.
 
-### Repeat the benchmark
+Peak RSS for 1/10/16 GiB is approximately 4.1/13.2/19.2 GiB. System
+physical reads are sampled total-disk counters and include unrelated system
+traffic; use the JSON report for process and Runtime logical counters.
 
-`tools/benchmark_gpt_oss.py` checks token parity, reports medians, samples peak
-process RSS, and records NVIDIA memory when `nvidia-smi` is available.
+## Reproduce the benchmark
+
+The matrix driver validates parity for every case, runs the cold and warm
+policies, and writes per-case reports plus one aggregate JSON file:
 
 ```powershell
-python tools\benchmark_gpt_oss.py `
-  .\build-ncnn\Release\ncnn_moe_gpt_oss.exe `
-  .\models\gpt-oss\gpt-oss-120b `
-  --model-revision "Hugging-Face-commit" `
-  --max-new-tokens 32 --warmup 1 --repeats 3 `
-  --backend hybrid --expert-memory on-demand `
-  --host-memory-mb 24576 --expert-cache-mb 16384 `
-  --expert-io-workers 4 `
-  --json-output .\build-ncnn\gpt-oss-120b-benchmark.json
+python tools\benchmark_performance_matrix.py `
+  --runner .\build-gptoss-vulkan-msvc\Release\ncnn_moe_gpt_oss.exe `
+  --model-20b .\models\gpt-oss\gpt-oss-20b `
+  --model-120b .\models\gpt-oss\gpt-oss-120b `
+  --output-dir .\build-gptoss-vulkan-msvc\performance-matrix-unified `
+  --repeats 3 --short-tokens 32 --long-tokens 256 `
+  --vulkan-device-index 0
 ```
+
+Use `tools/benchmark_gpt_oss.py` directly for a custom prompt or token
+window. Keep the model path, warm-up policy, memory budgets, Session count, and
+backend fixed when comparing implementation changes. Public reference commands
+use the workspace-local paths shown above; external weight locations are not
+part of the reproducibility contract.

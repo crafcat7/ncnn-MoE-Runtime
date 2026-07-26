@@ -17,8 +17,13 @@ endif()
 
 set(NCNN_MOE_SOURCES
     src/backends/ncnn/ncnn_linear.cpp
+    src/compiler/graph_builder.cpp
+    src/compiler/moe_graph.cpp
     src/engine/cpu_executor.cpp
+    src/engine/cpu_features.cpp
     src/engine/cpu_topology.cpp
+    src/engine/expert_backend.cpp
+    src/engine/memory_manager.cpp
     src/engine/runtime.cpp
     src/engine/scheduler.cpp
     src/engine/session.cpp
@@ -27,11 +32,14 @@ set(NCNN_MOE_SOURCES
     src/graph/memory_planner.cpp
     src/graph/model_compiler.cpp
     src/kernels/cpu_attention.cpp
+    src/kernels/cpu_bfloat16.cpp
     src/kernels/cpu_mxfp4.cpp
     src/kernels/cpu_ops.cpp
     src/models/builtin_model_adapter.cpp
     src/models/safetensors.cpp
     src/storage/expert_cache.cpp
+    src/storage/expert_store.cpp
+    src/storage/expert_victim_cache.cpp
     src/storage/mapped_file.cpp
     src/storage/system_memory.cpp
 )
@@ -54,6 +62,31 @@ if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
         PROPERTIES COMPILE_OPTIONS "/arch:AVX512"
     )
     target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_MSVC_X86_SIMD=1)
+endif()
+
+if(
+    CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$"
+    AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"
+)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag(
+        "-march=armv8.2-a+sve2"
+        NCNN_MOE_COMPILER_SUPPORTS_SVE2
+    )
+    if(NCNN_MOE_COMPILER_SUPPORTS_SVE2)
+        target_sources(
+            ncnn_moe
+            PRIVATE src/kernels/cpu_mxfp4_sve2.cpp
+        )
+        set_source_files_properties(
+            src/kernels/cpu_mxfp4_sve2.cpp
+            PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+sve2"
+        )
+        target_compile_definitions(
+            ncnn_moe
+            PRIVATE NCNN_MOE_ARM_SVE2_KERNEL=1
+        )
+    endif()
 endif()
 
 add_library(ncnn::moe ALIAS ncnn_moe)
@@ -194,6 +227,19 @@ if(NCNN_MOE_BUILD_EXAMPLES)
     add_executable(ncnn_moe_gpt_oss examples/run_gpt_oss.cpp)
     target_link_libraries(ncnn_moe_gpt_oss PRIVATE ncnn::moe)
     target_compile_features(ncnn_moe_gpt_oss PRIVATE cxx_std_20)
+
+    add_executable(
+        ncnn_moe_mxfp4_bench
+        examples/benchmark_mxfp4.cpp)
+    target_link_libraries(
+        ncnn_moe_mxfp4_bench
+        PRIVATE ncnn::moe)
+    target_compile_features(
+        ncnn_moe_mxfp4_bench
+        PRIVATE cxx_std_20)
+    target_include_directories(
+        ncnn_moe_mxfp4_bench
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endif()
 
 if(NCNN_MOE_BUILD_TESTS AND NCNN_MOE_BUILD_EXAMPLES)
