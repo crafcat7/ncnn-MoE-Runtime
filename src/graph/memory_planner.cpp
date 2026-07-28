@@ -25,8 +25,175 @@ static Result<uint64_t> checked_multiply(uint64_t left, uint64_t right, const ch
     return left * right;
 }
 
+static Result<uint64_t> matrix_storage_bytes(uint64_t rows, uint64_t columns, DType dtype, const char* name)
+{
+    auto elements = checked_multiply(rows, columns, name);
+    if (!elements)
+        return elements.error();
+    if (dtype == DType::Float8E4M3)
+    {
+        const uint64_t scale_count = ((rows + 127) / 128) * ((columns + 127) / 128);
+        return checked_add(elements.value(), scale_count, name);
+    }
+    const uint64_t element_bytes = dtype == DType::Int64 ? 8 : dtype == DType::BFloat16 ? 2
+                                                                                        : 4;
+    return checked_multiply(elements.value(), element_bytes, name);
+}
+
+static Result<void> add_matrix_bytes(uint64_t rows, uint64_t columns, DType dtype, const char* name, uint64_t& total)
+{
+    auto bytes = matrix_storage_bytes(rows, columns, dtype, name);
+    if (!bytes)
+        return bytes.error();
+    auto added = checked_add(total, bytes.value(), name);
+    if (!added)
+        return added.error();
+    total = added.value();
+    return {};
+}
+
+static Result<void> add_vector_bytes(uint64_t count, uint64_t element_bytes, const char* name, uint64_t& total)
+{
+    auto bytes = checked_multiply(count, element_bytes, name);
+    if (!bytes)
+        return bytes.error();
+    auto added = checked_add(total, bytes.value(), name);
+    if (!added)
+        return added.error();
+    total = added.value();
+    return {};
+}
+
+static Result<uint64_t> latent_fp8_dense_bytes(const MoeIR& ir)
+{
+    uint64_t total = 0;
+    Result<void> status = add_matrix_bytes(ir.vocabulary_size, ir.hidden_size, DType::BFloat16, "DeepSeek embedding", total);
+    if (!status)
+        return status.error();
+    status = add_matrix_bytes(ir.vocabulary_size, ir.hidden_size, DType::BFloat16, "DeepSeek LM head", total);
+    if (!status)
+        return status.error();
+    status = add_vector_bytes(ir.hidden_size, 2, "DeepSeek final norm", total);
+    if (!status)
+        return status.error();
+
+    const uint64_t multiplier = ir.hyper_connection_multiplier;
+    status = add_matrix_bytes(multiplier, multiplier * ir.hidden_size, DType::Float32, "DeepSeek hyper head", total);
+    if (!status)
+        return status.error();
+    status = add_vector_bytes(multiplier + 1, 4, "DeepSeek hyper head parameters", total);
+    if (!status)
+        return status.error();
+
+    for (uint32_t layer_id = 0; layer_id < ir.layers.size(); ++layer_id)
+    {
+        const LayerDescriptor& layer = ir.layers[layer_id];
+        const AttentionDescriptor& attention = layer.attention;
+        const MoeDescriptor& moe = layer.ffn.moe;
+        const uint64_t mix_count = (2 + multiplier) * multiplier;
+        for (uint32_t block = 0; block < 2; ++block)
+        {
+            status = add_matrix_bytes(mix_count, multiplier * ir.hidden_size, DType::Float32, "DeepSeek hyper function", total);
+            if (!status)
+                return status.error();
+            status = add_vector_bytes(mix_count + 3, 4, "DeepSeek hyper parameters", total);
+            if (!status)
+                return status.error();
+        }
+        status = add_vector_bytes(ir.hidden_size * 2ull, 2, "DeepSeek layer norms", total);
+        if (!status)
+            return status.error();
+
+        status = add_matrix_bytes(attention.query_lora_rank, ir.hidden_size, attention.projection_weight_dtype, "DeepSeek query A", total);
+        if (!status)
+            return status.error();
+        status = add_matrix_bytes(static_cast<uint64_t>(attention.head_count) * attention.head_dimension, attention.query_lora_rank, attention.projection_weight_dtype, "DeepSeek query B", total);
+        if (!status)
+            return status.error();
+        status = add_matrix_bytes(attention.head_dimension, ir.hidden_size, attention.projection_weight_dtype, "DeepSeek latent KV", total);
+        if (!status)
+            return status.error();
+        const uint64_t group_input = static_cast<uint64_t>(attention.head_count) * attention.head_dimension / attention.output_group_count;
+        status = add_matrix_bytes(static_cast<uint64_t>(attention.output_group_count) * attention.output_lora_rank, group_input, attention.projection_weight_dtype, "DeepSeek output A", total);
+        if (!status)
+            return status.error();
+        status = add_matrix_bytes(ir.hidden_size, static_cast<uint64_t>(attention.output_group_count) * attention.output_lora_rank, attention.projection_weight_dtype, "DeepSeek output B", total);
+        if (!status)
+            return status.error();
+        status = add_vector_bytes(attention.query_lora_rank + attention.head_dimension, 2, "DeepSeek attention norms", total);
+        if (!status)
+            return status.error();
+        status = add_vector_bytes(attention.head_count, 4, "DeepSeek attention sinks", total);
+        if (!status)
+            return status.error();
+
+        if (attention.compression_ratio != 0)
+        {
+            const uint64_t compressor_multiplier = attention.compression_ratio == 4 ? 2 : 1;
+            status = add_matrix_bytes(compressor_multiplier * attention.head_dimension, ir.hidden_size, DType::BFloat16, "DeepSeek compressor KV", total);
+            if (!status)
+                return status.error();
+            status = add_matrix_bytes(compressor_multiplier * attention.head_dimension, ir.hidden_size, DType::BFloat16, "DeepSeek compressor gate", total);
+            if (!status)
+                return status.error();
+            status = add_matrix_bytes(attention.compression_ratio, compressor_multiplier * attention.head_dimension, DType::Float32, "DeepSeek compressor position", total);
+            if (!status)
+                return status.error();
+            status = add_vector_bytes(attention.head_dimension, 2, "DeepSeek compressor norm", total);
+            if (!status)
+                return status.error();
+            if (attention.compression_ratio == 4)
+            {
+                status = add_matrix_bytes(2ull * attention.index_head_dimension, ir.hidden_size, DType::BFloat16, "DeepSeek index compressor KV", total);
+                if (!status)
+                    return status.error();
+                status = add_matrix_bytes(2ull * attention.index_head_dimension, ir.hidden_size, DType::BFloat16, "DeepSeek index compressor gate", total);
+                if (!status)
+                    return status.error();
+                status = add_matrix_bytes(attention.compression_ratio, 2ull * attention.index_head_dimension, DType::Float32, "DeepSeek index compressor position", total);
+                if (!status)
+                    return status.error();
+                status = add_matrix_bytes(static_cast<uint64_t>(attention.index_head_count) * attention.index_head_dimension, attention.query_lora_rank, attention.projection_weight_dtype, "DeepSeek index query", total);
+                if (!status)
+                    return status.error();
+                status = add_matrix_bytes(attention.index_head_count, ir.hidden_size, DType::BFloat16, "DeepSeek index weights", total);
+                if (!status)
+                    return status.error();
+                status = add_vector_bytes(attention.index_head_dimension, 2, "DeepSeek index norm", total);
+                if (!status)
+                    return status.error();
+            }
+        }
+
+        status = add_matrix_bytes(moe.expert_count, ir.hidden_size, DType::BFloat16, "DeepSeek router", total);
+        if (!status)
+            return status.error();
+        if (layer_id < ir.hash_routing_layer_count)
+            status = add_matrix_bytes(ir.vocabulary_size, moe.top_k, DType::Int64, "DeepSeek hash router", total);
+        else
+            status = add_vector_bytes(moe.expert_count, 4, "DeepSeek router bias", total);
+        if (!status)
+            return status.error();
+        for (uint32_t projection = 0; projection < 2; ++projection)
+        {
+            status = add_matrix_bytes(moe.intermediate_size, ir.hidden_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert input", total);
+            if (!status)
+                return status.error();
+        }
+        status = add_matrix_bytes(ir.hidden_size, moe.intermediate_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert output", total);
+        if (!status)
+            return status.error();
+    }
+    return total;
+}
+
 static Result<uint64_t> dense_bytes(const MoeIR& ir)
 {
+    if (!ir.layers.empty()
+        && ir.hyper_connection_multiplier > 1
+        && ir.layers.front().attention.kind == AttentionKind::MultiHeadLatent
+        && ir.layers.front().attention.projection_weight_dtype == DType::Float8E4M3)
+        return latent_fp8_dense_bytes(ir);
     const uint64_t element_bytes = ir.activation_dtype == DType::BFloat16 ? 2 : 4;
     auto embedding_elements = checked_multiply(ir.vocabulary_size, ir.hidden_size, "embedding");
     if (!embedding_elements)

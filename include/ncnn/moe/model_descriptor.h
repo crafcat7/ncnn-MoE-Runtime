@@ -65,11 +65,19 @@ struct AttentionDescriptor
     uint32_t qk_nope_head_dimension = 0;
     uint32_t qk_rope_head_dimension = 0;
     uint32_t value_head_dimension = 0;
+    uint32_t output_lora_rank = 0;
+    uint32_t output_group_count = 0;
+    uint32_t compression_ratio = 0;
+    uint32_t index_head_count = 0;
+    uint32_t index_head_dimension = 0;
+    uint32_t index_top_k = 0;
 
     float rope_theta = 10000.0f;
+    float compressed_rope_theta = 10000.0f;
     float rope_scaling_factor = 1.0f;
     float rope_ntk_alpha = 1.0f;
     float rope_ntk_beta = 32.0f;
+    DType projection_weight_dtype = DType::Float32;
     uint32_t flags = 0;
 };
 
@@ -102,6 +110,7 @@ struct MoeDescriptor
     ExpertActivation activation = ExpertActivation::Silu;
     ExpertLayout layout = ExpertLayout::GateUpDown;
     DType expert_weight_dtype = DType::Float32;
+    DType shared_expert_weight_dtype = DType::Float32;
 
     float activation_limit = 0.0f;
     float routed_scaling_factor = 1.0f;
@@ -155,8 +164,17 @@ struct MoeModelDescriptor
     DType activation_dtype = DType::Float32;
     DType kv_cache_dtype = DType::Float32;
     float norm_epsilon = 1e-5f;
+    uint32_t hyper_connection_multiplier = 1;
+    uint32_t hyper_connection_iterations = 0;
+    float hyper_connection_epsilon = 1e-6f;
+    uint32_t hash_routing_layer_count = 0;
+    uint32_t speculative_layer_count = 0;
+    uint32_t speculative_block_size = 0;
+    uint32_t speculative_noise_token_id = 0;
+    uint32_t speculative_markov_rank = 0;
 
     std::vector<LayerDescriptor> layers;
+    std::vector<uint32_t> speculative_target_layer_ids;
 };
 
 } // namespace moe

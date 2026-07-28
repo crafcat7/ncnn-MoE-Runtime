@@ -65,13 +65,17 @@ struct ExpertPlan
     uint32_t flags = ExpertPlanGated;
 };
 
-#define NCNN_MOE_ATTN_PLAN_SINK_BIT    0
-#define NCNN_MOE_ATTN_PLAN_QK_NORM_BIT 1
+#define NCNN_MOE_ATTN_PLAN_SINK_BIT       0
+#define NCNN_MOE_ATTN_PLAN_QK_NORM_BIT    1
+#define NCNN_MOE_ATTN_PLAN_LATENT_BIT     2
+#define NCNN_MOE_ATTN_PLAN_COMPRESSED_BIT 3
 
 enum AttentionBlockFlag : uint32_t
 {
     AttentionBlockSink = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_SINK_BIT,
-    AttentionBlockQueryKeyNorm = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_QK_NORM_BIT
+    AttentionBlockQueryKeyNorm = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_QK_NORM_BIT,
+    AttentionBlockLatent = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_LATENT_BIT,
+    AttentionBlockCompressed = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_COMPRESSED_BIT
 };
 
 struct AttentionBlockPlan
@@ -90,6 +94,22 @@ struct AttentionBlockPlan
     TensorHandle output_weight = invalid_tensor_handle;
     TensorHandle output_bias = invalid_tensor_handle;
     TensorHandle sinks = invalid_tensor_handle;
+    TensorHandle query_a_weight = invalid_tensor_handle;
+    TensorHandle query_b_weight = invalid_tensor_handle;
+    TensorHandle key_value_weight = invalid_tensor_handle;
+    TensorHandle key_value_norm_weight = invalid_tensor_handle;
+    TensorHandle output_a_weight = invalid_tensor_handle;
+    TensorHandle output_b_weight = invalid_tensor_handle;
+    TensorHandle compressor_position = invalid_tensor_handle;
+    TensorHandle compressor_norm_weight = invalid_tensor_handle;
+    TensorHandle compressor_key_value_weight = invalid_tensor_handle;
+    TensorHandle compressor_gate_weight = invalid_tensor_handle;
+    TensorHandle indexer_compressor_position = invalid_tensor_handle;
+    TensorHandle indexer_compressor_norm_weight = invalid_tensor_handle;
+    TensorHandle indexer_compressor_key_value_weight = invalid_tensor_handle;
+    TensorHandle indexer_compressor_gate_weight = invalid_tensor_handle;
+    TensorHandle indexer_query_weight = invalid_tensor_handle;
+    TensorHandle indexer_weights_weight = invalid_tensor_handle;
 
     uint32_t head_count = 0;
     uint32_t kv_head_count = 0;
@@ -97,11 +117,30 @@ struct AttentionBlockPlan
     uint32_t sliding_window = 0;
     uint32_t initial_context_length = 0;
     uint32_t max_context_length = 0;
+    uint32_t query_lora_rank = 0;
+    uint32_t rope_head_dimension = 0;
+    uint32_t output_lora_rank = 0;
+    uint32_t output_group_count = 0;
+    uint32_t compression_ratio = 0;
+    uint32_t index_head_count = 0;
+    uint32_t index_head_dimension = 0;
+    uint32_t index_top_k = 0;
     float rope_theta = 10000.0f;
+    float compressed_rope_theta = 10000.0f;
     float rope_scaling_factor = 1.0f;
     float rope_ntk_alpha = 1.0f;
     float rope_ntk_beta = 32.0f;
     uint32_t flags = 0;
+};
+
+struct HyperConnectionPlan
+{
+    TensorHandle attention_function = invalid_tensor_handle;
+    TensorHandle attention_base = invalid_tensor_handle;
+    TensorHandle attention_scale = invalid_tensor_handle;
+    TensorHandle ffn_function = invalid_tensor_handle;
+    TensorHandle ffn_base = invalid_tensor_handle;
+    TensorHandle ffn_scale = invalid_tensor_handle;
 };
 
 #define NCNN_MOE_BLOCK_NORMALIZE_TOPK_BIT 0
@@ -116,11 +155,17 @@ struct MoeBlockPlan
     TensorHandle pre_ffn_norm_weight = invalid_tensor_handle;
     TensorHandle router_weight = invalid_tensor_handle;
     TensorHandle router_bias = invalid_tensor_handle;
+    TensorHandle router_selection_bias = invalid_tensor_handle;
+    TensorHandle token_experts = invalid_tensor_handle;
     std::vector<ExpertPlan> experts;
+    ExpertPlan shared_expert;
 
     uint32_t top_k = 0;
     uint32_t hidden_size = 0;
+    RouterScoreFunction score_function = RouterScoreFunction::Softmax;
     RouterNormalization normalization = RouterNormalization::SelectedExperts;
+    float routed_scaling_factor = 1.0f;
+    bool has_shared_expert = false;
     uint32_t flags = MoeBlockNormalizeTopKWeights;
 };
 
@@ -143,8 +188,32 @@ struct CompiledLayerPlan
     uint32_t vulkan_device_index = automatic_vulkan_device_index;
     std::vector<CompiledNodePlan> nodes;
     AttentionBlockPlan attention;
+    HyperConnectionPlan hyper_connection;
     MoeBlockPlan moe;
     uint32_t flags = 0;
+};
+
+struct SpeculativeModelPlan
+{
+    std::vector<CompiledLayerPlan> layers;
+    std::vector<uint32_t> target_layer_ids;
+    TensorHandle main_projection_weight = invalid_tensor_handle;
+    TensorHandle main_norm_weight = invalid_tensor_handle;
+    TensorHandle final_norm_weight = invalid_tensor_handle;
+    TensorHandle hyper_head_function = invalid_tensor_handle;
+    TensorHandle hyper_head_base = invalid_tensor_handle;
+    TensorHandle hyper_head_scale = invalid_tensor_handle;
+    TensorHandle markov_embedding_weight = invalid_tensor_handle;
+    TensorHandle markov_head_weight = invalid_tensor_handle;
+    TensorHandle confidence_weight = invalid_tensor_handle;
+    uint32_t block_size = 0;
+    uint32_t noise_token_id = 0;
+    uint32_t markov_rank = 0;
+
+    [[nodiscard]] bool enabled() const noexcept
+    {
+        return !layers.empty() && block_size != 0;
+    }
 };
 
 struct CompiledModel
@@ -158,12 +227,18 @@ struct CompiledModel
     TensorHandle token_embedding = invalid_tensor_handle;
     TensorHandle final_norm_weight = invalid_tensor_handle;
     TensorHandle lm_head_weight = invalid_tensor_handle;
+    TensorHandle hyper_head_function = invalid_tensor_handle;
+    TensorHandle hyper_head_base = invalid_tensor_handle;
+    TensorHandle hyper_head_scale = invalid_tensor_handle;
+    SpeculativeModelPlan speculative;
     std::shared_ptr<Mxfp4ExpertCache> expert_cache;
     std::shared_ptr<IExpertExecutionBackend> expert_backend;
     std::shared_ptr<ExpertStore> expert_store;
     HybridMode hybrid_mode = HybridMode::CpuOnly;
     uint32_t vulkan_device_index = automatic_vulkan_device_index;
     std::vector<uint32_t> vulkan_device_indices;
+    uint32_t runtime_option_flags = 0;
+    uint32_t expected_concurrency = 1;
 };
 
 #define NCNN_MOE_BACKEND_CAP_CPU_BIT              0

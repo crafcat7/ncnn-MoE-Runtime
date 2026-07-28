@@ -433,8 +433,10 @@ static uint64_t dtype_size(DType dtype)
     {
     case DType::Float32:
     case DType::Int32: return 4;
+    case DType::Int64: return 8;
     case DType::Float16:
     case DType::BFloat16: return 2;
+    case DType::Float8E4M3:
     case DType::Int8: return 1;
     case DType::MxFp4: return 0;
     }

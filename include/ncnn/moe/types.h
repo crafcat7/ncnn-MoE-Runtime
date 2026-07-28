@@ -33,6 +33,7 @@ namespace moe {
 inline constexpr uint32_t automatic_vulkan_device_index = std::numeric_limits<uint32_t>::max();
 
 class NcnnLinearOperator;
+class NcnnVulkanFloat8Operator;
 class NcnnVulkanAttentionOperator;
 class MappedFileRange;
 class Mxfp4ExpertCache;
@@ -198,7 +199,9 @@ enum class DType
     Float32,
     Float16,
     BFloat16,
+    Float8E4M3,
     Int32,
+    Int64,
     Int8,
     MxFp4
 };
@@ -212,7 +215,8 @@ enum class NormType
 enum class RouterScoreFunction
 {
     Softmax,
-    Sigmoid
+    Sigmoid,
+    SqrtSoftplus
 };
 
 enum class RouterNormalization
@@ -227,6 +231,7 @@ enum class ExpertActivation
     Silu,
     Gelu,
     ClampedSilu,
+    DeepSeekSwiGlu,
     GptOssSwiGlu
 };
 
@@ -310,6 +315,13 @@ struct MxFp4FileStorage
     std::string scales_path;
     uint64_t scales_offset = 0;
     uint64_t scales_bytes = 0;
+    std::string secondary_blocks_path;
+    uint64_t secondary_blocks_offset = 0;
+    uint64_t secondary_blocks_bytes = 0;
+    std::string secondary_scales_path;
+    uint64_t secondary_scales_offset = 0;
+    uint64_t secondary_scales_bytes = 0;
+    bool interleave_rows = false;
 };
 
 struct TensorData
@@ -318,6 +330,7 @@ struct TensorData
     std::vector<uint32_t> shape;
     std::vector<float> float32_data;
     std::vector<uint16_t> bfloat16_data;
+    std::vector<int64_t> int64_data;
     std::vector<int8_t> int8_data;
     std::vector<float> quantization_scales;
     MxFp4ByteBuffer mxfp4_blocks;
@@ -326,10 +339,13 @@ struct TensorData
     uint64_t mapped_byte_count = 0;
     std::shared_ptr<const MxFp4FileStorage> mxfp4_file_storage;
     std::shared_ptr<NcnnLinearOperator> linear_operator;
+    std::shared_ptr<NcnnVulkanFloat8Operator> float8_linear_operator;
 
     [[nodiscard]] uint64_t element_count() const noexcept;
     [[nodiscard]] std::span<const float> float32_values() const noexcept;
     [[nodiscard]] std::span<const uint16_t> bfloat16_values() const noexcept;
+    [[nodiscard]] std::span<const uint8_t> float8_values() const noexcept;
+    [[nodiscard]] std::span<const int64_t> int64_values() const noexcept;
     [[nodiscard]] std::span<const int8_t> int8_values() const noexcept;
 };
 
@@ -366,6 +382,26 @@ inline std::span<const uint16_t> TensorData::bfloat16_values() const noexcept
         return {};
     }
     return {reinterpret_cast<const uint16_t*>(mapped_data.get()), static_cast<size_t>(mapped_byte_count / sizeof(uint16_t))};
+}
+
+inline std::span<const uint8_t> TensorData::float8_values() const noexcept
+{
+    if (dtype != DType::Float8E4M3 || !mapped_data)
+    {
+        return {};
+    }
+    return {mapped_data.get(), static_cast<size_t>(mapped_byte_count)};
+}
+
+inline std::span<const int64_t> TensorData::int64_values() const noexcept
+{
+    if (!int64_data.empty())
+        return int64_data;
+    if (dtype != DType::Int64 || !mapped_data || mapped_byte_count % sizeof(int64_t) != 0 || reinterpret_cast<uintptr_t>(mapped_data.get()) % alignof(int64_t) != 0)
+    {
+        return {};
+    }
+    return {reinterpret_cast<const int64_t*>(mapped_data.get()), static_cast<size_t>(mapped_byte_count / sizeof(int64_t))};
 }
 
 inline std::span<const int8_t> TensorData::int8_values() const noexcept

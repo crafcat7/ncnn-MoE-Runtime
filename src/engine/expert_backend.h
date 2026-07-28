@@ -82,7 +82,16 @@ public:
     virtual ~IExpertExecutionBackend() = default;
 
     // Weight ownership is retained until asynchronous admission completes.
-    virtual void admit(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group, uint32_t token_count, float activation_limit) = 0;
+    virtual void admit(
+        std::string key,
+        std::shared_ptr<const TensorData> gate_up,
+        const TensorData* gate_up_bias,
+        std::shared_ptr<const TensorData> down,
+        const TensorData* down_bias,
+        uint32_t residency_group,
+        uint32_t token_count,
+        float activation_limit,
+        ExpertActivation activation = ExpertActivation::GptOssSwiGlu) = 0;
 
     [[nodiscard]] virtual ExpertBackendExecutionResult try_execute(const std::string& key, const CpuBatch& input, CpuBatch& output) = 0;
 

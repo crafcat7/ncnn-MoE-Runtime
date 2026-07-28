@@ -6,7 +6,9 @@
 #include "expert_backend.h"
 #include "compiler/moe_ir.hpp"
 #include "models/builtin_model_adapter.h"
+#include "models/deepseek_v4_model_adapter.h"
 #include "kernels/cpu_mxfp4.h"
+#include "kernels/cpu_float8.h"
 #include "kernels/cpu_ops.h"
 #include "storage/expert_cache.h"
 #include "storage/expert_victim_cache.h"
@@ -103,6 +105,10 @@ Runtime::Runtime()
     capabilities_.cpu_isa_flags = cpu_isa.flags;
     capabilities_.cpu_isa = cpu_isa.names;
     capabilities_.mxfp4_kernel = mxfp4_kernel_name();
+    capabilities_.float8_kernel = float8_kernel_name();
+    capabilities_.cpu_linear_thread_limit = cpu_linear_thread_limit();
+    capabilities_.float8_linear_thread_limit = float8_linear_thread_limit();
+    capabilities_.float8_linear_row_group_size = float8_linear_row_group_size();
     capabilities_.mxfp4_decode_row_pair_group_size = mxfp4_decode_row_pair_group_size();
     capabilities_.activation_kernel = scaled_silu_kernel_name();
     const MxFp4KernelKind kernel = mxfp4_kernel_kind();
@@ -126,7 +132,7 @@ Runtime::Runtime()
     if (capabilities_.vulkan_device_count > 0)
     {
         capabilities_.flags |= RuntimeCapabilityVulkanExecution | RuntimeCapabilityVulkanCpuMix | RuntimeCapabilityVulkanCpuPrefetch | RuntimeCapabilityVulkanAttention | RuntimeCapabilityVulkanVictimCache
-                               | RuntimeCapabilityVulkanAsyncExecution | RuntimeCapabilityVulkanDoubleBuffering | RuntimeCapabilityMxfp4VulkanProjection;
+                               | RuntimeCapabilityVulkanDoubleBuffering | RuntimeCapabilityMxfp4VulkanProjection;
     }
     capabilities_.vulkan_heap_budget_bytes = NcnnLinearOperator::vulkan_heap_budget_bytes();
     capabilities_.vulkan_devices = NcnnLinearOperator::vulkan_device_capabilities();
@@ -144,6 +150,7 @@ Runtime::Runtime()
     }
 #endif
     register_adapter(std::make_shared<BuiltinModelAdapter>());
+    register_adapter(std::make_shared<DeepSeekV4ModelAdapter>());
 }
 
 void Runtime::register_adapter(std::shared_ptr<IMoeModelAdapter> adapter)
@@ -347,6 +354,8 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
         return compiled.error();
     CompiledModel compiled_model = std::move(compiled).value();
     compiled_model.memory_plan = plan;
+    compiled_model.runtime_option_flags = options.flags;
+    compiled_model.expected_concurrency = options.expected_concurrency;
     if (file_backed_experts)
     {
         uint32_t expert_io_workers = options.expert_io_workers;
@@ -375,6 +384,14 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
         if (has_flag(options.flags, RuntimeOptionBufferedExpertIo))
         {
             expert_cache_flags |= ExpertCacheBufferedReads;
+        }
+        if (has_flag(options.flags, RuntimeOptionForwardAwareCache))
+        {
+            expert_cache_flags |= ExpertCacheForwardAwareEviction;
+        }
+        if (has_flag(options.flags, RuntimeOptionCrossExpertReadCoalescing))
+        {
+            expert_cache_flags |= ExpertCacheCrossExpertReadCoalescing;
         }
         const std::vector<uint32_t>& expert_vulkan_device_indices = compiled_model.vulkan_device_indices;
         auto executable_capacities_result = distribute_gpu_capacity(options.expert_gpu_cache_bytes, plan.expert_pair_bytes, expert_vulkan_device_indices, capabilities_.vulkan_devices, "the executable Expert GPU cache");

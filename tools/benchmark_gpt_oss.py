@@ -3,6 +3,7 @@
 import argparse
 import ctypes
 import json
+import math
 import os
 import platform
 import re
@@ -58,6 +59,17 @@ def parse_arguments():
         help="Input token IDs passed to the runner (default: fixed 16-token prompt).",
     )
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature passed explicitly to the runner (default: greedy).",
+    )
+    parser.add_argument(
+        "--no-speculative",
+        action="store_true",
+        help="Disable model-specific speculative decoding in the runner.",
+    )
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument(
         "--cache-warmup-runs",
@@ -147,6 +159,20 @@ def parse_arguments():
             "A/B control or compatibility fallback."
         ),
     )
+    parser.add_argument("--disable-router-prediction", action="store_true")
+    parser.add_argument(
+        "--disable-async-router-prediction", action="store_true"
+    )
+    parser.add_argument("--disable-forward-aware-cache", action="store_true")
+    parser.add_argument("--disable-rank-adaptive-prefetch", action="store_true")
+    parser.add_argument(
+        "--disable-cross-expert-read-coalescing", action="store_true"
+    )
+    parser.add_argument("--router-prediction", action="store_true")
+    parser.add_argument("--async-router-prediction", action="store_true")
+    parser.add_argument("--forward-aware-cache", action="store_true")
+    parser.add_argument("--rank-adaptive-prefetch", action="store_true")
+    parser.add_argument("--cross-expert-read-coalescing", action="store_true")
     parser.add_argument(
         "--expert-gpu-victim-reuse-probe",
         type=int,
@@ -206,8 +232,47 @@ def parse_arguments():
 
 
 def validate_arguments(arguments):
+    feature_pairs = (
+        (
+            arguments.router_prediction,
+            arguments.disable_router_prediction,
+            "router prediction",
+        ),
+        (
+            arguments.async_router_prediction,
+            arguments.disable_async_router_prediction,
+            "async Router prediction",
+        ),
+        (
+            arguments.forward_aware_cache,
+            arguments.disable_forward_aware_cache,
+            "Forward-aware cache",
+        ),
+        (
+            arguments.rank_adaptive_prefetch,
+            arguments.disable_rank_adaptive_prefetch,
+            "Rank-adaptive prefetch",
+        ),
+        (
+            arguments.cross_expert_read_coalescing,
+            arguments.disable_cross_expert_read_coalescing,
+            "cross-Expert read coalescing",
+        ),
+    )
+    for enabled, disabled, name in feature_pairs:
+        if enabled and disabled:
+            raise ValueError(f"{name} cannot be both enabled and disabled")
+    if (
+        arguments.async_router_prediction
+        and arguments.disable_router_prediction
+    ):
+        raise ValueError(
+            "async Router prediction cannot disable Router prediction"
+        )
     if arguments.max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be positive")
+    if not math.isfinite(arguments.temperature) or arguments.temperature < 0:
+        raise ValueError("--temperature must be finite and non-negative")
     if arguments.warmup < 0:
         raise ValueError("--warmup must be non-negative")
     if arguments.cache_warmup_runs < 0:
@@ -319,7 +384,11 @@ def runner_command(arguments):
         *[str(token) for token in arguments.prompt_token_ids],
         "--max-new-tokens",
         str(arguments.max_new_tokens),
+        "--temperature",
+        str(arguments.temperature),
     ]
+    if arguments.no_speculative:
+        command.append("--no-speculative")
     if arguments.cache_warmup_runs:
         command.extend(
             ["--cache-warmup-runs", str(arguments.cache_warmup_runs)]
@@ -380,6 +449,26 @@ def runner_command(arguments):
                 str(arguments.expert_gpu_victim_reuse_probe),
             ]
         )
+    if arguments.disable_router_prediction:
+        command.append("--disable-router-prediction")
+    if arguments.disable_async_router_prediction:
+        command.append("--disable-async-router-prediction")
+    if arguments.disable_forward_aware_cache:
+        command.append("--disable-forward-aware-cache")
+    if arguments.disable_rank_adaptive_prefetch:
+        command.append("--disable-rank-adaptive-prefetch")
+    if arguments.disable_cross_expert_read_coalescing:
+        command.append("--disable-cross-expert-read-coalescing")
+    if arguments.router_prediction:
+        command.append("--router-prediction")
+    if arguments.async_router_prediction:
+        command.append("--async-router-prediction")
+    if arguments.forward_aware_cache:
+        command.append("--forward-aware-cache")
+    if arguments.rank_adaptive_prefetch:
+        command.append("--rank-adaptive-prefetch")
+    if arguments.cross_expert_read_coalescing:
+        command.append("--cross-expert-read-coalescing")
     if arguments.expert_io_workers:
         command.extend(["--expert-io-workers", str(arguments.expert_io_workers)])
     if arguments.vulkan_device_index is not None:
@@ -841,6 +930,20 @@ def parse_runner_output(output):
             re.MULTILINE,
         )
     ]
+    route_ranks = [
+        {
+            "rank": int(match.group(1)),
+            "predictions": int(match.group(2)),
+            "matches": int(match.group(3)),
+            "demands": int(match.group(4)),
+            "demand_queue_time_us": int(match.group(5)),
+        }
+        for match in re.finditer(
+            r"\br(\d+) (\d+) predicted/(\d+) matched/"
+            r"(\d+) demanded/(\d+)us queued;",
+            output,
+        )
+    ]
     result = {
         "load_seconds": extract_number(
             output, r"^loaded gpt_oss in ([0-9.]+) s,"
@@ -928,8 +1031,8 @@ def parse_runner_output(output):
         "vulkan_compute_submissions": extract_number(
             output, r"^Vulkan compute submissions: (\d+)", int
         ),
-        "vulkan_async_submissions": extract_number(
-            output, r"^Vulkan async submissions: (\d+)", int
+        "vulkan_submit_wait_ms": extract_number(
+            output, r"^Vulkan submit/wait time: ([0-9.eE+-]+) ms", float
         ),
         "vulkan_auxiliary_uploads": extract_number(
             output,
@@ -1148,6 +1251,30 @@ def parse_runner_output(output):
             r"^Expert route prediction:.*?(\d+) not-ready",
             int,
         ),
+        "expert_route_prediction_ms": extract_number(
+            output,
+            r"^Expert route prediction:.*?([0-9.]+) ms predictor",
+        ),
+        "expert_route_prediction_wait_ms": extract_number(
+            output,
+            r"^Expert route prediction:.*?([0-9.]+) ms waiting",
+        ),
+        "expert_route_prediction_async_submissions": extract_number(
+            output,
+            r"^Expert route prediction:.*?(\d+) async submission",
+            int,
+        ),
+        "expert_route_prediction_async_completions": extract_number(
+            output,
+            r"^Expert route prediction:.*?(\d+) completion",
+            int,
+        ),
+        "expert_route_prediction_async_fallbacks": extract_number(
+            output,
+            r"^Expert route prediction:.*?(\d+) fallback",
+            int,
+        ),
+        "expert_route_ranks": route_ranks,
         "expert_cache_hits": extract_number(
             output, r"^Expert cache: (\d+) hit", int
         ),
@@ -1180,6 +1307,14 @@ def parse_runner_output(output):
             output,
             r"^Expert cache:.*?(\d+) dropped speculative admission",
             int,
+        ),
+        "expert_cache_unused_speculative_reads": extract_number(
+            output,
+            r"^Expert cache:.*?(\d+) unused speculative read",
+            int,
+        ),
+        "expert_cache_short_term_reloads": extract_number(
+            output, r"^Expert cache:.*?(\d+) short-term reload", int
         ),
         "expert_cache_arc_recent_bytes": extract_number(
             output, r"^Expert ARC: T1 (\d+) bytes", int
@@ -1231,6 +1366,15 @@ def parse_runner_output(output):
             output,
             r"^Expert I/O policy:.*?buffered range\(s\), (\d+) buffered byte",
             int,
+        ),
+        "expert_cache_coalesced_read_batches": extract_number(
+            output, r"^Expert I/O policy:.*?(\d+) coalesced batch", int
+        ),
+        "expert_cache_coalesced_experts": extract_number(
+            output, r"^Expert I/O policy:.*?(\d+) coalesced Expert", int
+        ),
+        "expert_cache_coalesced_read_ranges_saved": extract_number(
+            output, r"^Expert I/O policy:.*?(\d+) physical range\(s\) saved", int
         ),
         "expert_gpu_cache_hits": extract_number(
             output, r"^Expert GPU execution cache: (\d+) hit", int
@@ -1481,6 +1625,34 @@ def median_field(samples, field):
     return statistics.median(values) if values else None
 
 
+def median_route_ranks(samples):
+    ranks = {}
+    for sample in samples:
+        for item in sample.get("expert_route_ranks", []):
+            rank = item["rank"]
+            aggregate = ranks.setdefault(
+                rank,
+                {
+                    "predictions": [],
+                    "matches": [],
+                    "demands": [],
+                    "demand_queue_time_us": [],
+                },
+            )
+            for field in aggregate:
+                aggregate[field].append(item[field])
+    return [
+        {
+            "rank": rank,
+            **{
+                field: statistics.median(values)
+                for field, values in aggregate.items()
+            },
+        }
+        for rank, aggregate in sorted(ranks.items())
+    ]
+
+
 def sweep_child_arguments(cache_mb, report_path):
     arguments = sys.argv[1:]
     child_arguments = []
@@ -1567,6 +1739,7 @@ def run_cache_sweep(arguments):
         "runner": str(Path(arguments.runner).resolve()),
         "prompt_token_ids": arguments.prompt_token_ids,
         "max_new_tokens": arguments.max_new_tokens,
+        "temperature": arguments.temperature,
         "warmup_runs": arguments.warmup,
         "cache_warmup_runs": arguments.cache_warmup_runs,
         "repeats": arguments.repeats,
@@ -1667,6 +1840,7 @@ def main():
         "command": command,
         "prompt_token_ids": arguments.prompt_token_ids,
         "max_new_tokens": arguments.max_new_tokens,
+        "temperature": arguments.temperature,
         "backend": arguments.backend,
         "expert_memory": arguments.expert_memory,
         "host_memory_mb": arguments.host_memory_mb,
@@ -1781,8 +1955,8 @@ def main():
             "vulkan_compute_submissions": median_field(
                 samples, "vulkan_compute_submissions"
             ),
-            "vulkan_async_submissions": median_field(
-                samples, "vulkan_async_submissions"
+            "vulkan_submit_wait_ms": median_field(
+                samples, "vulkan_submit_wait_ms"
             ),
             "vulkan_auxiliary_uploads": median_field(
                 samples, "vulkan_auxiliary_uploads"
@@ -1913,6 +2087,22 @@ def main():
             "expert_route_prediction_cache_misses": median_field(
                 samples, "expert_route_prediction_cache_misses"
             ),
+            "expert_route_prediction_ms": median_field(
+                samples, "expert_route_prediction_ms"
+            ),
+            "expert_route_prediction_wait_ms": median_field(
+                samples, "expert_route_prediction_wait_ms"
+            ),
+            "expert_route_prediction_async_submissions": median_field(
+                samples, "expert_route_prediction_async_submissions"
+            ),
+            "expert_route_prediction_async_completions": median_field(
+                samples, "expert_route_prediction_async_completions"
+            ),
+            "expert_route_prediction_async_fallbacks": median_field(
+                samples, "expert_route_prediction_async_fallbacks"
+            ),
+            "expert_route_ranks": median_route_ranks(samples),
             "expert_cache_hit_rate": median_field(
                 samples, "expert_cache_hit_rate"
             ),
@@ -1945,6 +2135,12 @@ def main():
             ),
             "expert_cache_dropped_speculative_admissions": median_field(
                 samples, "expert_cache_dropped_speculative_admissions"
+            ),
+            "expert_cache_unused_speculative_reads": median_field(
+                samples, "expert_cache_unused_speculative_reads"
+            ),
+            "expert_cache_short_term_reloads": median_field(
+                samples, "expert_cache_short_term_reloads"
             ),
             "expert_cache_arc_recent_bytes": median_field(
                 samples, "expert_cache_arc_recent_bytes"
@@ -1990,6 +2186,15 @@ def main():
             ),
             "expert_cache_buffered_read_bytes": median_field(
                 samples, "expert_cache_buffered_read_bytes"
+            ),
+            "expert_cache_coalesced_read_batches": median_field(
+                samples, "expert_cache_coalesced_read_batches"
+            ),
+            "expert_cache_coalesced_experts": median_field(
+                samples, "expert_cache_coalesced_experts"
+            ),
+            "expert_cache_coalesced_read_ranges_saved": median_field(
+                samples, "expert_cache_coalesced_read_ranges_saved"
             ),
             "expert_gpu_cache_hits": median_field(
                 samples, "expert_gpu_cache_hits"

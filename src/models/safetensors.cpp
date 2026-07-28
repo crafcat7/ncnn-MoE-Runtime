@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstring>
 #include <fstream>
+#include <cmath>
 #include <limits>
 #include <regex>
 #include <sstream>
@@ -261,9 +262,178 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) cons
         tensor.float32_data.resize(static_cast<size_t>(info->byte_count / sizeof(float)));
         std::memcpy(tensor.float32_data.data(), bytes.value().data(), static_cast<size_t>(info->byte_count));
     }
+    else if (info->dtype == "I64")
+    {
+        if (info->byte_count % sizeof(int64_t) != 0)
+            return Error{ErrorCode::InvalidModel, "invalid I64 byte count: " + name};
+        tensor.dtype = DType::Int64;
+        auto mapped = MappedFileRange::open(info->path, info->offset, info->byte_count);
+        if (mapped && reinterpret_cast<uintptr_t>(mapped.value()->data()) % alignof(int64_t) == 0)
+        {
+            tensor.mapped_data = mapped.value()->share_data();
+            tensor.mapped_byte_count = info->byte_count;
+            return tensor;
+        }
+        auto bytes = read_range(info->path, info->offset, info->byte_count);
+        if (!bytes)
+            return bytes.error();
+        tensor.int64_data.resize(static_cast<size_t>(info->byte_count / sizeof(int64_t)));
+        std::memcpy(tensor.int64_data.data(), bytes.value().data(), static_cast<size_t>(info->byte_count));
+    }
     else
     {
         return Error{ErrorCode::UnsupportedModel, "unsupported safetensors dtype for tensor: " + name};
+    }
+    return tensor;
+}
+
+Result<TensorData> SafetensorsArchive::load_float8_tensor(const std::string& weight_name, const std::string& scale_name) const
+{
+    const SafetensorInfo* weight = find(weight_name);
+    const SafetensorInfo* scale = find(scale_name);
+    if (!weight || !scale || weight->dtype != "F8_E4M3" || scale->dtype != "F8_E8M0" || weight->shape.size() != 2 || scale->shape.size() != 2)
+        return Error{ErrorCode::InvalidModel, "invalid blockwise FP8 tensor: " + weight_name};
+    const uint32_t output_blocks = (weight->shape[0] + 127) / 128;
+    const uint32_t input_blocks = (weight->shape[1] + 127) / 128;
+    if (scale->shape != std::vector<uint32_t>{output_blocks, input_blocks}
+        || weight->byte_count != static_cast<uint64_t>(weight->shape[0]) * weight->shape[1]
+        || scale->byte_count != static_cast<uint64_t>(output_blocks) * input_blocks)
+    {
+        return Error{ErrorCode::InvalidModel, "invalid blockwise FP8 tensor shape: " + weight_name};
+    }
+
+    TensorData tensor;
+    tensor.dtype = DType::Float8E4M3;
+    tensor.shape = weight->shape;
+    auto mapped = MappedFileRange::open(weight->path, weight->offset, weight->byte_count);
+    if (mapped)
+    {
+        tensor.mapped_data = mapped.value()->share_data();
+        tensor.mapped_byte_count = weight->byte_count;
+    }
+    else
+    {
+        return Error{ErrorCode::IoError, "cannot map blockwise FP8 tensor: " + weight_name};
+    }
+
+    auto scale_bytes = read_range(scale->path, scale->offset, scale->byte_count);
+    if (!scale_bytes)
+        return scale_bytes.error();
+    tensor.quantization_scales.resize(scale_bytes.value().size());
+    for (size_t index = 0; index < scale_bytes.value().size(); ++index)
+        tensor.quantization_scales[index] = std::ldexp(1.0f, static_cast<int>(scale_bytes.value()[index]) - 127);
+    return tensor;
+}
+
+Result<TensorData> SafetensorsArchive::load_mxfp4_tensor(const std::string& blocks_name, const std::string& scales_name, uint32_t rows, uint32_t columns, uint32_t flags) const
+{
+    const SafetensorInfo* blocks = find(blocks_name);
+    const SafetensorInfo* scales = find(scales_name);
+    if (!blocks || !scales || blocks->dtype != "I8" || scales->dtype != "F8_E8M0"
+        || columns % 32 != 0
+        || blocks->shape != std::vector<uint32_t>{rows, columns / 2}
+        || scales->shape != std::vector<uint32_t>{rows, columns / 32})
+    {
+        return Error{ErrorCode::InvalidModel, "invalid packed MXFP4 tensor: " + blocks_name};
+    }
+
+    TensorData tensor;
+    tensor.dtype = DType::MxFp4;
+    tensor.shape = {rows, columns};
+    if (has_flag(flags, SafetensorLoadDeferMxfp4Data))
+    {
+        auto storage = std::make_shared<MxFp4FileStorage>();
+        storage->blocks_path = blocks->path.string();
+        storage->blocks_offset = blocks->offset;
+        storage->blocks_bytes = blocks->byte_count;
+        storage->scales_path = scales->path.string();
+        storage->scales_offset = scales->offset;
+        storage->scales_bytes = scales->byte_count;
+        tensor.mxfp4_file_storage = std::move(storage);
+        return tensor;
+    }
+
+    auto block_mapping = MappedFileRange::open(blocks->path, blocks->offset, blocks->byte_count);
+    auto scale_mapping = MappedFileRange::open(scales->path, scales->offset, scales->byte_count);
+    if (block_mapping && scale_mapping)
+    {
+        block_mapping.value()->prefault();
+        scale_mapping.value()->prefault();
+        tensor.mxfp4_blocks = block_mapping.value()->share_bytes();
+        tensor.mxfp4_scales = scale_mapping.value()->share_bytes();
+        return tensor;
+    }
+    auto block_data = read_range(blocks->path, blocks->offset, blocks->byte_count);
+    auto scale_data = read_range(scales->path, scales->offset, scales->byte_count);
+    if (!block_data)
+        return block_data.error();
+    if (!scale_data)
+        return scale_data.error();
+    tensor.mxfp4_blocks.assign(block_data.value().data(), block_data.value().size());
+    tensor.mxfp4_scales.assign(scale_data.value().data(), scale_data.value().size());
+    return tensor;
+}
+
+Result<TensorData> SafetensorsArchive::load_interleaved_mxfp4_tensor(const std::string& gate_blocks_name, const std::string& gate_scales_name,
+                                                                     const std::string& up_blocks_name, const std::string& up_scales_name,
+                                                                     uint32_t rows, uint32_t columns, uint32_t flags) const
+{
+    if (has_flag(flags, SafetensorLoadDeferMxfp4Data))
+    {
+        const SafetensorInfo* gate_blocks = find(gate_blocks_name);
+        const SafetensorInfo* gate_scales = find(gate_scales_name);
+        const SafetensorInfo* up_blocks = find(up_blocks_name);
+        const SafetensorInfo* up_scales = find(up_scales_name);
+        if (!gate_blocks || !gate_scales || !up_blocks || !up_scales
+            || gate_blocks->dtype != "I8" || up_blocks->dtype != "I8"
+            || gate_scales->dtype != "F8_E8M0" || up_scales->dtype != "F8_E8M0"
+            || gate_blocks->shape != std::vector<uint32_t>{rows, columns / 2}
+            || up_blocks->shape != gate_blocks->shape
+            || gate_scales->shape != std::vector<uint32_t>{rows, columns / 32}
+            || up_scales->shape != gate_scales->shape)
+        {
+            return Error{ErrorCode::InvalidModel, "invalid interleaved MXFP4 tensor: " + gate_blocks_name};
+        }
+        TensorData tensor;
+        tensor.dtype = DType::MxFp4;
+        tensor.shape = {rows * 2, columns};
+        auto storage = std::make_shared<MxFp4FileStorage>();
+        storage->blocks_path = gate_blocks->path.string();
+        storage->blocks_offset = gate_blocks->offset;
+        storage->blocks_bytes = gate_blocks->byte_count;
+        storage->scales_path = gate_scales->path.string();
+        storage->scales_offset = gate_scales->offset;
+        storage->scales_bytes = gate_scales->byte_count;
+        storage->secondary_blocks_path = up_blocks->path.string();
+        storage->secondary_blocks_offset = up_blocks->offset;
+        storage->secondary_blocks_bytes = up_blocks->byte_count;
+        storage->secondary_scales_path = up_scales->path.string();
+        storage->secondary_scales_offset = up_scales->offset;
+        storage->secondary_scales_bytes = up_scales->byte_count;
+        storage->interleave_rows = true;
+        tensor.mxfp4_file_storage = std::move(storage);
+        return tensor;
+    }
+
+    auto gate = load_mxfp4_tensor(gate_blocks_name, gate_scales_name, rows, columns);
+    auto up = load_mxfp4_tensor(up_blocks_name, up_scales_name, rows, columns);
+    if (!gate)
+        return gate.error();
+    if (!up)
+        return up.error();
+    TensorData tensor;
+    tensor.dtype = DType::MxFp4;
+    tensor.shape = {rows * 2, columns};
+    const size_t block_row_bytes = columns / 2;
+    const size_t scale_row_bytes = columns / 32;
+    tensor.mxfp4_blocks.resize(static_cast<size_t>(rows) * block_row_bytes * 2);
+    tensor.mxfp4_scales.resize(static_cast<size_t>(rows) * scale_row_bytes * 2);
+    for (uint32_t row = 0; row < rows; ++row)
+    {
+        std::memcpy(tensor.mxfp4_blocks.data() + static_cast<size_t>(row * 2) * block_row_bytes, gate.value().mxfp4_blocks.data() + static_cast<size_t>(row) * block_row_bytes, block_row_bytes);
+        std::memcpy(tensor.mxfp4_blocks.data() + static_cast<size_t>(row * 2 + 1) * block_row_bytes, up.value().mxfp4_blocks.data() + static_cast<size_t>(row) * block_row_bytes, block_row_bytes);
+        std::memcpy(tensor.mxfp4_scales.data() + static_cast<size_t>(row * 2) * scale_row_bytes, gate.value().mxfp4_scales.data() + static_cast<size_t>(row) * scale_row_bytes, scale_row_bytes);
+        std::memcpy(tensor.mxfp4_scales.data() + static_cast<size_t>(row * 2 + 1) * scale_row_bytes, up.value().mxfp4_scales.data() + static_cast<size_t>(row) * scale_row_bytes, scale_row_bytes);
     }
     return tensor;
 }

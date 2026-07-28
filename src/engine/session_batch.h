@@ -33,6 +33,10 @@ class SessionBatchAccess
 {
 public:
     [[nodiscard]] static bool compatible(std::span<Session* const> sessions) noexcept;
+    [[nodiscard]] static Result<std::vector<PrefillResult>> prefill(
+        std::span<Session* const> sessions,
+        std::span<const std::vector<int32_t>> input_ids,
+        StagedDecodeBatchMetrics& metrics);
     [[nodiscard]] static Result<std::vector<DecodeResult>> decode(std::span<Session* const> sessions, std::span<const int32_t> input_ids, StagedDecodeBatchMetrics& metrics);
     [[nodiscard]] static SessionDecodePhaseSnapshot phase_snapshot(Session& session);
 };

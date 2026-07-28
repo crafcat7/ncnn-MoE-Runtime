@@ -15,6 +15,7 @@ namespace moe {
 struct ExpertRoute
 {
     uint32_t token_index = 0;
+    uint32_t rank = 0;
     float weight = 0.0f;
 };
 
@@ -35,7 +36,11 @@ struct ExpertDispatchOptions
 {
     uint32_t expert_count = 0;
     uint32_t top_k = 0;
+    RouterScoreFunction score_function = RouterScoreFunction::Softmax;
     RouterNormalization normalization = RouterNormalization::SelectedExperts;
+    float routed_scaling_factor = 1.0f;
+    std::span<const float> selection_bias;
+    std::span<const uint32_t> explicit_expert_ids;
     uint32_t flags = ExpertDispatchNormalizeTopKWeights;
 };
 

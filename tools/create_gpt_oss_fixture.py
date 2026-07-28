@@ -163,13 +163,13 @@ def main() -> None:
     args = parse_args()
     build_fixture(args.output.resolve())
     if args.verify_runner:
+        prompt_file = args.output.resolve() / "prompt.tokens"
+        prompt_file.write_text("0 1 0 1\n", encoding="ascii")
         common_arguments = [
             str(args.verify_runner.resolve()),
             str(args.output.resolve()),
-            "0",
-            "1",
-            "0",
-            "1",
+            "--prompt-token-file",
+            str(prompt_file),
             "--max-new-tokens",
             "3",
             "--temperature",

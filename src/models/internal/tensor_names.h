@@ -17,6 +17,16 @@ inline std::string expert_prefix(uint32_t layer_id, uint32_t expert_id)
     return layer_prefix(layer_id) + "experts." + std::to_string(expert_id) + ".";
 }
 
+inline std::string speculative_layer_prefix(uint32_t layer_id)
+{
+    return "speculative.layers." + std::to_string(layer_id) + ".";
+}
+
+inline std::string speculative_expert_prefix(uint32_t layer_id, uint32_t expert_id)
+{
+    return speculative_layer_prefix(layer_id) + "experts." + std::to_string(expert_id) + ".";
+}
+
 } // namespace moe
 } // namespace ncnn
 

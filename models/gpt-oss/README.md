@@ -50,8 +50,15 @@ python tools\run_gpt_oss_prompt.py `
   .\build-ncnn\Release\ncnn_moe_gpt_oss.exe `
   .\models\gpt-oss\gpt-oss-20b `
   "Reply with exactly: OK" `
-  --max-new-tokens 64 --stream --backend hybrid
+  --max-new-tokens 1024 --stream --backend hybrid
 ```
+
+By default, the text wrapper prints only the human-readable
+`[reasoning]` and `[answer]` sections. Native runner diagnostics, token IDs,
+timings, and cache statistics are suppressed unless `--verbose` is present.
+The reply limit defaults to 1024 tokens; reaching it before a Harmony stop
+token produces a warning. `--stream-final-only` remains available when only
+the answer is wanted.
 
 ## Run token IDs
 
@@ -66,7 +73,11 @@ token IDs:
 
 Use `--stream-token-ids` to print generated IDs as they become available. The
 final report includes backend dispatch counts, phase timings, cache statistics,
-and the complete generated sequence.
+and the complete generated sequence. For long whitespace-separated token
+sequences, use `--prompt-token-file PATH` instead of positional IDs.
+`ncnn_moe_gpt_oss` and `ncnn_moe_deepseek_v4` use the same native runner
+implementation and option parser; their entry points only select the expected
+adapter and model-specific default EOS.
 
 ## Sampling
 
@@ -78,6 +89,7 @@ and the complete generated sequence.
 | `--top-p P` | Nucleus sampling probability threshold |
 | `--min-p P` | Remove tokens below a fraction of the highest probability |
 | `--seed N` | Sampling seed |
+| `--no-speculative` | Disable model-provided speculative decoding |
 
 The native runner also accepts repeated `--stop-token ID` options.
 
@@ -117,6 +129,11 @@ uses a byte-bounded cache backed by exact ranges in the original shards.
 | `--parallel-sessions N` | Run independent sequences through the batch scheduler |
 | `--scheduler-expert-threads N` | Override Expert threads per scheduler worker |
 | `--scheduler-cross-call` | Let the Runtime collector form micro-batches across submissions |
+| `--router-prediction` | Experimentally run the next layer's real Router on the current normalized Router input |
+| `--async-router-prediction` | Run Router prediction on a bounded Session worker; implies `--router-prediction` |
+| `--forward-aware-cache` | Experimentally resolve speculative predictions and prefer forward-distance ARC victims |
+| `--rank-adaptive-prefetch` | Experimentally adapt predicted Top-K width from per-Rank accuracy and demand queue time |
+| `--cross-expert-read-coalescing` | Experimentally merge physically adjacent buffered ranges across Experts |
 
 Dense tensors and eager MXFP4 ranges are mapped automatically. On-demand
 Experts are read directly into final cache storage without allocating or
@@ -127,6 +144,17 @@ recent pairs, T2 tracks repeatedly used pairs, and the B1/B2 ghost histories
 adapt the resident split without retaining weight bytes. Cache accounting and
 the benchmark report expose resident bytes, ghost hits, reads, cancellations,
 and speculative admissions.
+
+The prediction and cache controls above are disabled by default. The current
+24-token Direct-I/O GPT-OSS-20B triplets measured 98.5% prediction-set
+accuracy. Synchronous prediction was neutral at 4.2307 versus 4.2291 token/s;
+the bounded worker reached 4.2664 token/s (+0.88%), reduced Cache wait by
+1.46%, and completed 529/529 predictions with 0.020 ms target-layer wait.
+Logical reads still increased by 0.49%, so this remains an opt-in result. The
+[Palm-Infra transfer report](../../memories/repo/investigation-results/palm-infra-transfer-experiment.md)
+contains the current protocol. The historical
+[DeepSeek/GPT A/B report](../../memories/repo/investigation-results/router-prefetch-cache-io-ab.md)
+retains the earlier transition-predictor and read-coalescing screening.
 
 ### Optional packed Expert sidecar
 

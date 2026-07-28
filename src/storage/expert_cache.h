@@ -47,6 +47,8 @@ struct ExpertCacheStatistics
     uint64_t speculative_reads = 0;
     uint64_t cancelled_speculative_reads = 0;
     uint64_t dropped_speculative_admissions = 0;
+    uint64_t unused_speculative_reads = 0;
+    uint64_t short_term_reloads = 0;
     uint64_t arc_recent_bytes = 0;
     uint64_t arc_frequent_bytes = 0;
     uint64_t arc_recent_target_bytes = 0;
@@ -61,6 +63,9 @@ struct ExpertCacheStatistics
     uint64_t direct_read_fallbacks = 0;
     uint64_t buffered_read_ranges = 0;
     uint64_t buffered_read_bytes = 0;
+    uint64_t coalesced_read_batches = 0;
+    uint64_t coalesced_experts = 0;
+    uint64_t coalesced_read_ranges_saved = 0;
     uint32_t adaptive_read_policy = 0;
     ExpertVictimCacheStatistics victim;
 };
@@ -77,12 +82,16 @@ struct ExpertCachePairRequest
 #define NCNN_MOE_EXPERT_CACHE_MMAP_BIT        0
 #define NCNN_MOE_EXPERT_CACHE_DIRECT_IO_BIT   1
 #define NCNN_MOE_EXPERT_CACHE_BUFFERED_IO_BIT 2
+#define NCNN_MOE_EXPERT_CACHE_FORWARD_ARC_BIT 3
+#define NCNN_MOE_EXPERT_CACHE_READ_MERGE_BIT  4
 
 enum ExpertCacheOptionFlag : uint32_t
 {
     ExpertCacheMemoryMapRanges = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_MMAP_BIT,
     ExpertCacheDirectReads = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_DIRECT_IO_BIT,
-    ExpertCacheBufferedReads = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_BUFFERED_IO_BIT
+    ExpertCacheBufferedReads = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_BUFFERED_IO_BIT,
+    ExpertCacheForwardAwareEviction = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_FORWARD_ARC_BIT,
+    ExpertCacheCrossExpertReadCoalescing = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_READ_MERGE_BIT
 };
 
 class Mxfp4ExpertCache
@@ -111,7 +120,14 @@ private:
     using GhostIndex = std::unordered_map<std::string, GhostList::iterator, TransparentStringHash, std::equal_to<>>;
 
     [[nodiscard]] Result<std::shared_ptr<TensorData>> load_tensor(const TensorData& source, uint64_t& mapped_ranges, uint64_t& mapped_bytes);
+    [[nodiscard]] Result<ExpertVictimPair> load_interleaved_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_ranges, uint64_t& mapped_bytes);
     [[nodiscard]] Result<ExpertVictimPair> load_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_ranges, uint64_t& mapped_bytes);
+    [[nodiscard]] Result<std::vector<ExpertVictimPair>> load_coalesced_pairs(
+        std::span<const std::shared_ptr<Entry>> entries,
+        uint64_t& mapped_ranges,
+        uint64_t& mapped_bytes,
+        uint64_t& ranges_saved,
+        bool& coalesced);
     [[nodiscard]] static Result<uint64_t> stored_bytes(const TensorData& tensor);
     [[nodiscard]] Result<std::shared_ptr<Entry>> enqueue_pair(
         const TensorData& gate_up,
@@ -131,7 +147,12 @@ private:
     void trim_ghosts_locked();
     [[nodiscard]] uint64_t arc_delta(uint64_t required, uint64_t numerator, uint64_t denominator) const;
     [[nodiscard]] bool consume_ghost_locked(std::string_view key, uint64_t required, bool& frequent, bool& from_frequent_ghost);
-    [[nodiscard]] Entry* find_victim_locked(const std::list<Entry*>& list, bool speculative, uint32_t residency_group);
+    [[nodiscard]] Entry* find_victim_locked(
+        const std::list<Entry*>& list,
+        bool speculative,
+        uint32_t residency_group,
+        uint32_t forward_anchor = invalid_residency_group,
+        bool allow_predicted_victim = false);
     void worker_loop();
 
     uint64_t capacity_bytes_ = 0;
@@ -151,6 +172,11 @@ private:
     uint64_t speculative_reads_ = 0;
     uint64_t cancelled_speculative_reads_ = 0;
     uint64_t dropped_speculative_admissions_ = 0;
+    uint64_t unused_speculative_reads_ = 0;
+    uint64_t short_term_reloads_ = 0;
+    uint64_t coalesced_read_batches_ = 0;
+    uint64_t coalesced_experts_ = 0;
+    uint64_t coalesced_read_ranges_saved_ = 0;
     uint64_t mapped_ranges_ = 0;
     uint64_t mapped_bytes_ = 0;
     bool stopping_ = false;
@@ -212,6 +238,7 @@ public:
     [[nodiscard]] bool is_ready(const TensorData& gate_up, const TensorData& down, std::string_view prepared_key = {}) const;
     [[nodiscard]] static std::string make_pair_key(const TensorData& gate_up, const TensorData& down);
     void cancel_prediction();
+    void resolve_predictions(uint32_t residency_group, std::span<const std::string_view> demanded_keys);
     void wait_for_background_work();
     [[nodiscard]] ExpertCacheStatistics statistics() const;
     [[nodiscard]] uint64_t capacity_bytes() const noexcept

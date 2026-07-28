@@ -40,20 +40,20 @@ static bool use_avx512_batch2_row_group() noexcept
     return enabled;
 }
 
-static __m512 avx512_decode_half(__m128i values, __m128i indices) noexcept
+static __m512 avx512_decode_half(__m128i indices) noexcept
 {
-    return _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_shuffle_epi8(values, indices)));
+    const __m512 values = _mm512_setr_ps(0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f, 0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f);
+    return _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(indices), values);
 }
 
 static void avx512_decode_block(const uint8_t* packed, __m512 decoded[2]) noexcept
 {
     const __m128i nibble_mask = _mm_set1_epi8(0x0f);
-    const __m128i value_table = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
     const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed));
     const __m128i low = _mm_and_si128(bytes, nibble_mask);
     const __m128i high = _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask);
-    decoded[0] = avx512_decode_half(value_table, _mm_unpacklo_epi8(low, high));
-    decoded[1] = avx512_decode_half(value_table, _mm_unpackhi_epi8(low, high));
+    decoded[0] = avx512_decode_half(_mm_unpacklo_epi8(low, high));
+    decoded[1] = avx512_decode_half(_mm_unpackhi_epi8(low, high));
 }
 
 static __forceinline void avx512_accumulate_contiguous_rows4_block(const uint8_t* packed, const uint8_t* scales, size_t packed_row_bytes, uint32_t block_count,

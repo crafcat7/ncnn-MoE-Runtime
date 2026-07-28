@@ -21,6 +21,7 @@ set(NCNN_MOE_SOURCES
     src/compiler/moe_graph.cpp
     src/engine/cpu_executor.cpp
     src/engine/cpu_features.cpp
+    src/engine/cpu_task_worker.cpp
     src/engine/cpu_topology.cpp
     src/engine/expert_backend.cpp
     src/engine/memory_manager.cpp
@@ -33,9 +34,14 @@ set(NCNN_MOE_SOURCES
     src/graph/model_compiler.cpp
     src/kernels/cpu_attention.cpp
     src/kernels/cpu_bfloat16.cpp
+    src/kernels/cpu_float8.cpp
+    src/kernels/cpu_hyper_connection.cpp
+    src/kernels/cpu_latent_attention.cpp
     src/kernels/cpu_mxfp4.cpp
     src/kernels/cpu_ops.cpp
+    src/kernels/cpu_vector.cpp
     src/models/builtin_model_adapter.cpp
+    src/models/deepseek_v4_model_adapter.cpp
     src/models/safetensors.cpp
     src/storage/expert_cache.cpp
     src/storage/expert_store.cpp
@@ -48,17 +54,25 @@ source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_SOURCES})
 
 if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
     set(NCNN_MOE_MSVC_SIMD_SOURCES
+        src/kernels/cpu_float8_msvc_avx2.cpp
+        src/kernels/cpu_float8_msvc_avx512.cpp
         src/kernels/cpu_mxfp4_msvc_avx2.cpp
         src/kernels/cpu_mxfp4_msvc_avx512.cpp
+        src/kernels/cpu_vector_msvc_avx2.cpp
+        src/kernels/cpu_vector_msvc_avx512.cpp
     )
     target_sources(ncnn_moe PRIVATE ${NCNN_MOE_MSVC_SIMD_SOURCES})
     source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_MSVC_SIMD_SOURCES})
     set_source_files_properties(
+        src/kernels/cpu_float8_msvc_avx2.cpp
         src/kernels/cpu_mxfp4_msvc_avx2.cpp
+        src/kernels/cpu_vector_msvc_avx2.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX2"
     )
     set_source_files_properties(
+        src/kernels/cpu_float8_msvc_avx512.cpp
         src/kernels/cpu_mxfp4_msvc_avx512.cpp
+        src/kernels/cpu_vector_msvc_avx512.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX512"
     )
     target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_MSVC_X86_SIMD=1)
@@ -224,9 +238,23 @@ if(NCNN_MOE_BUILD_TESTS)
 endif()
 
 if(NCNN_MOE_BUILD_EXAMPLES)
-    add_executable(ncnn_moe_gpt_oss examples/run_gpt_oss.cpp)
+    add_executable(
+        ncnn_moe_gpt_oss
+        examples/run_gpt_oss.cpp
+        examples/internal/run_model.cpp)
     target_link_libraries(ncnn_moe_gpt_oss PRIVATE ncnn::moe)
     target_compile_features(ncnn_moe_gpt_oss PRIVATE cxx_std_20)
+
+    add_executable(
+        ncnn_moe_deepseek_v4
+        examples/run_deepseek_v4_flash_dspark.cpp
+        examples/internal/run_model.cpp)
+    target_link_libraries(
+        ncnn_moe_deepseek_v4
+        PRIVATE ncnn::moe)
+    target_compile_features(
+        ncnn_moe_deepseek_v4
+        PRIVATE cxx_std_20)
 
     add_executable(
         ncnn_moe_mxfp4_bench

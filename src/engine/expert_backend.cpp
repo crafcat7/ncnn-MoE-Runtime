@@ -64,7 +64,7 @@ public:
     }
 
     void admit(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group, uint32_t token_count,
-               float activation_limit) override
+               float activation_limit, ExpertActivation activation) override
     {
         if (backends_.empty() || key.empty())
             return;
@@ -73,7 +73,16 @@ public:
             const std::lock_guard<std::mutex> lock(placement_mutex_);
             key_placements_.insert_or_assign(key, backend_index);
         }
-        backends_[backend_index]->admit(std::move(key), std::move(gate_up), gate_up_bias, std::move(down), down_bias, residency_group, token_count, activation_limit);
+        backends_[backend_index]->admit(
+            std::move(key),
+            std::move(gate_up),
+            gate_up_bias,
+            std::move(down),
+            down_bias,
+            residency_group,
+            token_count,
+            activation_limit,
+            activation);
     }
 
     ExpertBackendExecutionResult try_execute(const std::string& key, const CpuBatch& input, CpuBatch& output) override

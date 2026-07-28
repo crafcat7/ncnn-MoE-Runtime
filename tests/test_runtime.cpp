@@ -3,7 +3,11 @@
 #include "compiler/moe_ir.hpp"
 #include "kernels/cpu_mxfp4.h"
 #include "kernels/cpu_ops.h"
+#include "kernels/cpu_float8.h"
+#include "kernels/cpu_vector.h"
+#include "kernels/cpu_hyper_connection.h"
 #include "engine/cpu_executor.h"
+#include "engine/cpu_task_worker.h"
 #include "engine/expert_backend.h"
 #include "engine/cpu_session_state.h"
 #include "engine/cpu_topology.h"
@@ -14,12 +18,15 @@
 #include "backends/ncnn/ncnn_linear.h"
 #include "ncnn/moe/expert_dispatcher.h"
 #include "models/builtin_model_adapter.h"
+#include "models/deepseek_v4_model_adapter.h"
 #include "models/safetensors.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -492,6 +499,10 @@ void test_prefill_decode_and_reset()
     TemporaryModelPackage package;
     TestRuntime runtime;
     check(static_cast<bool>(has_flag(runtime.capabilities().flags, RuntimeCapabilityVulkanAttention) == has_flag(runtime.capabilities().flags, RuntimeCapabilityVulkanCpuMix)));
+    check(static_cast<bool>(runtime.capabilities().cpu_linear_thread_limit >= 1));
+    check(static_cast<bool>(runtime.capabilities().float8_linear_thread_limit >= 1));
+    check(static_cast<bool>(runtime.capabilities().float8_linear_row_group_size == 1 || runtime.capabilities().float8_linear_row_group_size == 2
+                            || runtime.capabilities().float8_linear_row_group_size == 4));
     auto model = runtime.load_model(package.path());
     check(static_cast<bool>(model));
     check(static_cast<bool>(model.value()->descriptor().model_type == "test_moe"));
@@ -655,6 +666,130 @@ void test_ncnn_linear_operator()
 #endif
 }
 
+void test_ncnn_vulkan_float8_operator()
+{
+#if NCNN_MOE_WITH_NCNN
+    if (NcnnLinearOperator::vulkan_device_count() == 0)
+        return;
+
+    TensorData matrix;
+    matrix.dtype = DType::Float8E4M3;
+    matrix.shape = {256, 128};
+    const size_t element_count = static_cast<size_t>(matrix.shape[0]) * matrix.shape[1];
+    std::shared_ptr<uint8_t[]> storage(new uint8_t[element_count], std::default_delete<uint8_t[]>());
+    for (size_t index = 0; index < element_count; ++index)
+    {
+        const float value = static_cast<float>(static_cast<int>(index % 31) - 15) * 0.03125f;
+        storage[index] = float_to_float8_e4m3(value);
+    }
+    matrix.mapped_data = std::shared_ptr<const uint8_t>(storage, storage.get());
+    matrix.mapped_byte_count = element_count;
+    matrix.quantization_scales = {0.5f, 2.0f};
+
+    CpuBatch input(2, 128);
+    for (size_t row = 0; row < input.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < input.columns(); ++column)
+        {
+            input.row(row)[column] = static_cast<float>(static_cast<int>((row * input.columns() + column) % 37) - 18) * 0.015625f;
+        }
+    }
+    const CpuBatch cpu_output = linear_batch(matrix, input);
+    const auto vulkan = NcnnVulkanFloat8Operator::create(matrix);
+    check(static_cast<bool>(vulkan));
+    CpuBatch vulkan_output;
+    check(static_cast<bool>(vulkan->forward(input, vulkan_output)));
+    check(static_cast<bool>(vulkan_output.rows() == cpu_output.rows()));
+    check(static_cast<bool>(vulkan_output.columns() == cpu_output.columns()));
+    for (size_t row = 0; row < cpu_output.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < cpu_output.columns(); ++column)
+            check_near(vulkan_output.row(row)[column], cpu_output.row(row)[column], 1e-4f);
+    }
+
+    TensorData second_matrix;
+    second_matrix.dtype = DType::Float8E4M3;
+    second_matrix.shape = {128, 256};
+    const size_t second_element_count = static_cast<size_t>(second_matrix.shape[0]) * second_matrix.shape[1];
+    std::shared_ptr<uint8_t[]> second_storage(new uint8_t[second_element_count], std::default_delete<uint8_t[]>());
+    for (size_t index = 0; index < second_element_count; ++index)
+    {
+        const float value = static_cast<float>(static_cast<int>((index * 5) % 29) - 14) * 0.015625f;
+        second_storage[index] = float_to_float8_e4m3(value);
+    }
+    second_matrix.mapped_data = std::shared_ptr<const uint8_t>(second_storage, second_storage.get());
+    second_matrix.mapped_byte_count = second_element_count;
+    second_matrix.quantization_scales = {0.5f, 1.5f};
+    const CpuBatch cpu_chain = linear_batch(second_matrix, cpu_output);
+    const auto second_vulkan = NcnnVulkanFloat8Operator::create(second_matrix);
+    check(static_cast<bool>(second_vulkan));
+    CpuBatch vulkan_chain;
+    check(static_cast<bool>(vulkan->forward_chain(input, *second_vulkan, vulkan_chain)));
+    check(static_cast<bool>(vulkan_chain.rows() == cpu_chain.rows()));
+    check(static_cast<bool>(vulkan_chain.columns() == cpu_chain.columns()));
+    for (size_t row = 0; row < cpu_chain.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < cpu_chain.columns(); ++column)
+            check_near(vulkan_chain.row(row)[column], cpu_chain.row(row)[column], 1e-3f);
+    }
+    TensorData norm_weight;
+    norm_weight.dtype = DType::Float32;
+    norm_weight.shape = {256};
+    norm_weight.float32_data.resize(256);
+    for (uint32_t column = 0; column < 256; ++column)
+        norm_weight.float32_data[column] = 0.75f + static_cast<float>(column % 9) * 0.03125f;
+    constexpr float norm_epsilon = 1e-6f;
+    const CpuBatch normalized_cpu_output = rms_norm_batch(cpu_output, norm_weight, norm_epsilon);
+    const CpuBatch cpu_norm_chain = linear_batch(second_matrix, normalized_cpu_output);
+    check(static_cast<bool>(vulkan->prepare_rms_norm(norm_weight, norm_epsilon)));
+    CpuBatch vulkan_norm_chain;
+    check(static_cast<bool>(vulkan->forward_rms_norm_chain(input, *second_vulkan, vulkan_norm_chain)));
+    for (size_t row = 0; row < cpu_norm_chain.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < cpu_norm_chain.columns(); ++column)
+            check_near(vulkan_norm_chain.row(row)[column], cpu_norm_chain.row(row)[column], 2e-3f);
+    }
+    CpuBatch vulkan_parallel_chain;
+    CpuBatch vulkan_parallel_output;
+    check(static_cast<bool>(vulkan->forward_rms_norm_chain_parallel(
+        input,
+        *second_vulkan,
+        *vulkan,
+        vulkan_parallel_chain,
+        vulkan_parallel_output)));
+    for (size_t row = 0; row < cpu_norm_chain.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < cpu_norm_chain.columns(); ++column)
+            check_near(vulkan_parallel_chain.row(row)[column], cpu_norm_chain.row(row)[column], 2e-3f);
+        for (uint32_t column = 0; column < cpu_output.columns(); ++column)
+            check_near(vulkan_parallel_output.row(row)[column], cpu_output.row(row)[column], 1e-4f);
+    }
+    CpuBatch cpu_activated = cpu_output;
+    for (size_t row = 0; row < cpu_activated.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < cpu_activated.columns(); ++column)
+        {
+            const float gate = cpu_output.row(row)[column];
+            cpu_activated.row(row)[column] = gate / (1.0f + std::exp(-gate)) * gate;
+        }
+    }
+    const CpuBatch cpu_swiglu_chain = linear_batch(second_matrix, cpu_activated);
+    CpuBatch vulkan_swiglu_chain;
+    check(static_cast<bool>(vulkan->forward_swiglu_chain(
+        input,
+        *vulkan,
+        *second_vulkan,
+        ExpertActivation::DeepSeekSwiGlu,
+        0.0f,
+        vulkan_swiglu_chain)));
+    for (size_t row = 0; row < cpu_swiglu_chain.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < cpu_swiglu_chain.columns(); ++column)
+            check_near(vulkan_swiglu_chain.row(row)[column], cpu_swiglu_chain.row(row)[column], 2e-3f);
+    }
+#endif
+}
+
 void test_mxfp4_cpu_kernel_and_fused_gate_up()
 {
     TensorData matrix;
@@ -743,7 +878,6 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     {
         check_near(decoded.row(0)[matrix_row], scalar_row(matrix_row, 0), 1e-5f);
     }
-
     TensorData odd_matrix = matrix;
     odd_matrix.shape[0] = 3;
     odd_matrix.mxfp4_blocks.resize(3 * 16);
@@ -780,7 +914,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     bias.dtype = DType::Float32;
     bias.shape = {4};
     bias.float32_data = {0.25f, -0.5f, 0.75f, -1.0f};
-    const CpuBatch fused = fused_mxfp4_gate_up_batch(matrix, &bias, input, 7.0f);
+    const CpuBatch fused = fused_mxfp4_gate_up_batch(matrix, &bias, input, ExpertActivation::GptOssSwiGlu, 7.0f);
     check(static_cast<bool>(fused.rows() == input.rows()));
     check(static_cast<bool>(fused.columns() == 2));
     for (float sigmoid_scale : {1.0f, 1.702f})
@@ -851,6 +985,83 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         expert_down_bias.float32_data[row] = static_cast<float>(static_cast<int>(row) - 3) * 0.0625f;
     }
     constexpr float expert_activation_limit = 5.25f;
+    CpuBatch repeated_expert_input(4, 32);
+    for (uint32_t column = 0;
+         column < repeated_expert_input.columns();
+         ++column)
+    {
+        repeated_expert_input.row(0)[column] = static_cast<float>(
+                                                   static_cast<int>(column % 11) - 5)
+                                               * 0.03125f;
+        repeated_expert_input.row(1)[column] = static_cast<float>(
+                                                   static_cast<int>((column * 3) % 17) - 8)
+                                               * 0.015625f;
+        repeated_expert_input.row(3)[column] = static_cast<float>(
+                                                   static_cast<int>((column * 5) % 19) - 9)
+                                               * 0.015625f;
+    }
+    std::copy_n(
+        repeated_expert_input.row(0),
+        repeated_expert_input.columns(),
+        repeated_expert_input.row(2));
+    const CpuBatch repeated_activated = fused_mxfp4_gate_up_batch(
+        expert_gate_up,
+        &expert_gate_up_bias,
+        repeated_expert_input,
+        ExpertActivation::DeepSeekSwiGlu,
+        expert_activation_limit);
+    const CpuBatch repeated_reference = linear_batch(
+        expert_down,
+        expert_down_bias,
+        repeated_activated);
+    CpuBatch repeated_output;
+    Mxfp4Task repeated_task;
+    repeated_task.gate_up = &expert_gate_up;
+    repeated_task.gate_up_bias = &expert_gate_up_bias;
+    repeated_task.down = &expert_down;
+    repeated_task.down_bias = &expert_down_bias;
+    repeated_task.input = &repeated_expert_input;
+    repeated_task.output = &repeated_output;
+    repeated_task.activation = ExpertActivation::DeepSeekSwiGlu;
+    repeated_task.activation_limit = expert_activation_limit;
+    Mxfp4Scratch repeated_scratch;
+    check(static_cast<bool>(
+        mxfp4_expert_batch(
+            std::span<const Mxfp4Task>(
+                &repeated_task,
+                1),
+            &repeated_scratch)));
+    check(static_cast<bool>(
+        repeated_scratch.physical_input_rows
+        == std::vector<uint32_t>({3})));
+    check(static_cast<bool>(
+        repeated_output.rows()
+        == repeated_reference.rows()));
+    for (size_t row = 0;
+         row < repeated_output.rows();
+         ++row)
+    {
+        for (uint32_t column = 0;
+             column < repeated_output.columns();
+             ++column)
+        {
+            check_near(
+                repeated_output.row(row)[column],
+                repeated_reference.row(row)[column],
+                1e-5f);
+        }
+    }
+    repeated_expert_input.row(2)[0] += 0.03125f;
+    check(static_cast<bool>(
+        mxfp4_expert_batch(
+            std::span<const Mxfp4Task>(
+                &repeated_task,
+                1),
+            &repeated_scratch)));
+    check(static_cast<bool>(
+        repeated_scratch.physical_input_rows
+        == std::vector<uint32_t>({4})));
+
     auto vulkan_expert = NcnnVulkanMxfp4ExpertOperator::create(expert_gate_up, &expert_gate_up_bias, expert_down, &expert_down_bias, expert_activation_limit);
     if (NcnnLinearOperator::vulkan_device_count() > 0)
     {
@@ -865,7 +1076,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                     expert_input.row(row)[column] = static_cast<float>(static_cast<int>((column * 5 + row * 7) % 17) - 8) * 0.015625f;
                 }
             }
-            const CpuBatch cpu_activated = fused_mxfp4_gate_up_batch(expert_gate_up, &expert_gate_up_bias, expert_input, expert_activation_limit);
+            const CpuBatch cpu_activated = fused_mxfp4_gate_up_batch(expert_gate_up, &expert_gate_up_bias, expert_input, ExpertActivation::GptOssSwiGlu, expert_activation_limit);
             const CpuBatch cpu_expert = linear_batch(expert_down, expert_down_bias, cpu_activated);
             CpuBatch vulkan_expert_output;
             check(static_cast<bool>(vulkan_expert->forward(expert_input, vulkan_expert_output)));
@@ -879,6 +1090,29 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 }
             }
         }
+        auto deepseek_vulkan_expert = NcnnVulkanMxfp4ExpertOperator::create(
+            expert_gate_up,
+            &expert_gate_up_bias,
+            expert_down,
+            &expert_down_bias,
+            expert_activation_limit,
+            automatic_vulkan_device_index,
+            ExpertActivation::DeepSeekSwiGlu);
+        check(static_cast<bool>(deepseek_vulkan_expert));
+        CpuBatch deepseek_input(1, 32);
+        for (uint32_t column = 0; column < deepseek_input.columns(); ++column)
+            deepseek_input.row(0)[column] = static_cast<float>(static_cast<int>((column * 3) % 19) - 9) * 0.015625f;
+        const CpuBatch deepseek_activated = fused_mxfp4_gate_up_batch(
+            expert_gate_up,
+            &expert_gate_up_bias,
+            deepseek_input,
+            ExpertActivation::DeepSeekSwiGlu,
+            expert_activation_limit);
+        const CpuBatch deepseek_expected = linear_batch(expert_down, expert_down_bias, deepseek_activated);
+        CpuBatch deepseek_actual;
+        check(static_cast<bool>(deepseek_vulkan_expert->forward(deepseek_input, deepseek_actual)));
+        for (uint32_t column = 0; column < deepseek_expected.columns(); ++column)
+            check_near(deepseek_actual.row(0)[column], deepseek_expected.row(0)[column], 1e-3f);
     }
     else
     {
@@ -909,7 +1143,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         {
             backend_input.row(0)[column] = static_cast<float>(static_cast<int>(column % 13) - 6) * 0.015625f;
         }
-        const CpuBatch backend_activated = fused_mxfp4_gate_up_batch(expert_gate_up, &expert_gate_up_bias, backend_input, expert_activation_limit);
+        const CpuBatch backend_activated = fused_mxfp4_gate_up_batch(expert_gate_up, &expert_gate_up_bias, backend_input, ExpertActivation::GptOssSwiGlu, expert_activation_limit);
         const CpuBatch backend_expected = linear_batch(expert_down, expert_down_bias, backend_activated);
         for (uint32_t sample = 0; sample < 3; ++sample)
         {
@@ -1499,6 +1733,263 @@ void test_file_backed_mxfp4_expert_cache()
     check(static_cast<bool>(packed_statistics.buffered_read_ranges == 1));
     check(static_cast<bool>(packed_statistics.buffered_read_bytes == 34));
 
+    const std::filesystem::path coalesced_path = directory / "coalesced.bin";
+    {
+        std::vector<uint8_t> bytes(68);
+        for (size_t index = 0; index < bytes.size(); ++index)
+            bytes[index] = static_cast<uint8_t>(index);
+        std::ofstream stream(coalesced_path, std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    auto coalesced_tensor = [&](uint64_t block_offset, uint64_t scale_offset) {
+        TensorData tensor;
+        tensor.dtype = DType::MxFp4;
+        tensor.shape = {1, 32};
+        auto storage = std::make_shared<MxFp4FileStorage>();
+        storage->blocks_path = coalesced_path.string();
+        storage->blocks_offset = block_offset;
+        storage->blocks_bytes = 16;
+        storage->scales_path = coalesced_path.string();
+        storage->scales_offset = scale_offset;
+        storage->scales_bytes = 1;
+        tensor.mxfp4_file_storage = std::move(storage);
+        return tensor;
+    };
+    const TensorData coalesced_gate_zero = coalesced_tensor(0, 16);
+    const TensorData coalesced_down_zero = coalesced_tensor(17, 33);
+    const TensorData coalesced_gate_one = coalesced_tensor(34, 50);
+    const TensorData coalesced_down_one = coalesced_tensor(51, 67);
+    Mxfp4ExpertCache coalesced_cache(
+        68,
+        1,
+        {},
+        ExpertCacheBufferedReads | ExpertCacheCrossExpertReadCoalescing);
+    auto coalesced_request_zero = coalesced_cache.request_pair(coalesced_gate_zero, coalesced_down_zero, 0);
+    auto coalesced_request_one = coalesced_cache.request_pair(coalesced_gate_one, coalesced_down_one, 1);
+    check(static_cast<bool>(coalesced_request_zero && !coalesced_request_zero.value()));
+    check(static_cast<bool>(coalesced_request_one && !coalesced_request_one.value()));
+    coalesced_cache.wait_for_background_work();
+    auto coalesced_zero = coalesced_cache.acquire_pair(coalesced_gate_zero, coalesced_down_zero, 0);
+    auto coalesced_one = coalesced_cache.acquire_pair(coalesced_gate_one, coalesced_down_one, 1);
+    check(static_cast<bool>(coalesced_zero));
+    check(static_cast<bool>(coalesced_one));
+    check(coalesced_zero.value().gate_up->mxfp4_blocks.front() == 0);
+    check(coalesced_zero.value().down->mxfp4_blocks.front() == 17);
+    check(coalesced_one.value().gate_up->mxfp4_blocks.front() == 34);
+    check(coalesced_one.value().down->mxfp4_scales.front() == 67);
+    const ExpertCacheStatistics coalesced_statistics = coalesced_cache.statistics();
+    check(coalesced_statistics.buffered_read_ranges == 1);
+    check(coalesced_statistics.buffered_read_bytes == 68);
+    check(coalesced_statistics.coalesced_read_batches == 1);
+    check(coalesced_statistics.coalesced_experts == 2);
+    check(coalesced_statistics.coalesced_read_ranges_saved == 1);
+
+    Mxfp4ExpertCache resolved_predictions(68, 1, {}, ExpertCacheBufferedReads);
+    auto prediction_zero = resolved_predictions.prefetch_pair(gate_zero, down_zero, 1, "prediction-zero");
+    auto prediction_one = resolved_predictions.prefetch_pair(gate_one, down_one, 1, "prediction-one");
+    check(static_cast<bool>(prediction_zero && !prediction_zero.value()));
+    check(static_cast<bool>(prediction_one && !prediction_one.value()));
+    resolved_predictions.wait_for_background_work();
+    const std::array<std::string_view, 1> demanded_prediction = {"prediction-zero"};
+    resolved_predictions.resolve_predictions(1, demanded_prediction);
+    check(resolved_predictions.is_ready(gate_zero, down_zero, "prediction-zero"));
+    check(!resolved_predictions.is_ready(gate_one, down_one, "prediction-one"));
+    check(resolved_predictions.statistics().unused_speculative_reads == 1);
+
+    Mxfp4ExpertCache forward_aware(
+        68,
+        1,
+        {},
+        ExpertCacheBufferedReads | ExpertCacheForwardAwareEviction,
+        4);
+    {
+        auto group_zero = forward_aware.acquire_pair(gate_zero, down_zero, 0, "forward-zero");
+        auto group_two = forward_aware.acquire_pair(gate_one, down_one, 2, "forward-two");
+        check(static_cast<bool>(group_zero));
+        check(static_cast<bool>(group_two));
+    }
+    auto group_one = forward_aware.acquire_pair(gate_zero, down_one, 1, "forward-one");
+    check(static_cast<bool>(group_one));
+    check(!forward_aware.is_ready(gate_zero, down_zero, "forward-zero"));
+    check(forward_aware.is_ready(gate_one, down_one, "forward-two"));
+
+    Mxfp4ExpertCache predicted_protection(
+        68,
+        1,
+        {},
+        ExpertCacheBufferedReads | ExpertCacheForwardAwareEviction,
+        4);
+    {
+        auto exact = predicted_protection.acquire_pair(
+            gate_zero,
+            down_zero,
+            2,
+            "protected-exact");
+        auto repeated = predicted_protection.acquire_pair(
+            gate_zero,
+            down_zero,
+            2,
+            "protected-exact");
+        check(static_cast<bool>(exact));
+        check(static_cast<bool>(repeated));
+    }
+    auto predicted = predicted_protection.prefetch_pair(
+        gate_one,
+        down_one,
+        1,
+        "protected-prediction");
+    check(static_cast<bool>(predicted && !predicted.value()));
+    predicted_protection.wait_for_background_work();
+    auto incoming = predicted_protection.acquire_pair(
+        gate_zero,
+        down_one,
+        0,
+        "protected-incoming");
+    check(static_cast<bool>(incoming));
+    check(!predicted_protection.is_ready(
+        gate_zero,
+        down_zero,
+        "protected-exact"));
+    check(predicted_protection.is_ready(
+        gate_one,
+        down_one,
+        "protected-prediction"));
+
+    const std::filesystem::path clustered_path = directory / "clustered.bin";
+    {
+        std::vector<uint8_t> clustered(112, UINT8_C(0xee));
+        clustered[0] = 101;
+        clustered[1] = 102;
+        clustered[2] = 201;
+        clustered[3] = 202;
+        clustered[4] = 111;
+        clustered[5] = 112;
+        for (uint8_t value = 0; value < 96; ++value)
+            clustered[16 + value] = value;
+        std::ofstream stream(clustered_path, std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(clustered.data()), static_cast<std::streamsize>(clustered.size()));
+    }
+    TensorData clustered_gate;
+    clustered_gate.dtype = DType::MxFp4;
+    clustered_gate.shape = {4, 32};
+    auto clustered_gate_storage = std::make_shared<MxFp4FileStorage>();
+    clustered_gate_storage->blocks_path = clustered_path.string();
+    clustered_gate_storage->blocks_offset = 16;
+    clustered_gate_storage->blocks_bytes = 32;
+    clustered_gate_storage->scales_path = clustered_path.string();
+    clustered_gate_storage->scales_offset = 0;
+    clustered_gate_storage->scales_bytes = 2;
+    clustered_gate_storage->secondary_blocks_path = clustered_path.string();
+    clustered_gate_storage->secondary_blocks_offset = 80;
+    clustered_gate_storage->secondary_blocks_bytes = 32;
+    clustered_gate_storage->secondary_scales_path = clustered_path.string();
+    clustered_gate_storage->secondary_scales_offset = 4;
+    clustered_gate_storage->secondary_scales_bytes = 2;
+    clustered_gate_storage->interleave_rows = true;
+    clustered_gate.mxfp4_file_storage = std::move(clustered_gate_storage);
+    TensorData clustered_down;
+    clustered_down.dtype = DType::MxFp4;
+    clustered_down.shape = {2, 32};
+    auto clustered_down_storage = std::make_shared<MxFp4FileStorage>();
+    clustered_down_storage->blocks_path = clustered_path.string();
+    clustered_down_storage->blocks_offset = 48;
+    clustered_down_storage->blocks_bytes = 32;
+    clustered_down_storage->scales_path = clustered_path.string();
+    clustered_down_storage->scales_offset = 2;
+    clustered_down_storage->scales_bytes = 2;
+    clustered_down.mxfp4_file_storage = std::move(clustered_down_storage);
+    Mxfp4ExpertCache clustered_cache(102, 1, {}, ExpertCacheBufferedReads);
+    auto clustered_pair = clustered_cache.acquire_pair(clustered_gate, clustered_down);
+    check(static_cast<bool>(clustered_pair));
+    check(clustered_pair.value().gate_up->mxfp4_blocks[0] == 0);
+    check(clustered_pair.value().gate_up->mxfp4_blocks[16] == 64);
+    check(clustered_pair.value().gate_up->mxfp4_blocks[32] == 16);
+    check(clustered_pair.value().gate_up->mxfp4_blocks[48] == 80);
+    check(clustered_pair.value().gate_up->mxfp4_scales[0] == 101);
+    check(clustered_pair.value().gate_up->mxfp4_scales[1] == 111);
+    check(clustered_pair.value().gate_up->mxfp4_scales[2] == 102);
+    check(clustered_pair.value().gate_up->mxfp4_scales[3] == 112);
+    check(clustered_pair.value().down->mxfp4_blocks[0] == 32);
+    check(clustered_pair.value().down->mxfp4_blocks[16] == 48);
+    check(clustered_pair.value().down->mxfp4_scales[0] == 201);
+    check(clustered_pair.value().down->mxfp4_scales[1] == 202);
+    const ExpertCacheStatistics clustered_statistics = clustered_cache.statistics();
+    check(clustered_statistics.buffered_read_ranges == 2);
+    check(clustered_statistics.buffered_read_bytes == 102);
+
+    const std::filesystem::path fragmented_path = directory / "fragmented.bin";
+    {
+        std::vector<uint8_t> fragmented(107, UINT8_C(0xee));
+        for (uint8_t value = 0; value < 32; ++value)
+            fragmented[value] = value;
+        fragmented[33] = 101;
+        fragmented[34] = 102;
+        for (uint8_t value = 0; value < 32; ++value)
+            fragmented[36 + value] = static_cast<uint8_t>(64 + value);
+        fragmented[69] = 111;
+        fragmented[70] = 112;
+        for (uint8_t value = 0; value < 32; ++value)
+            fragmented[72 + value] = static_cast<uint8_t>(32 + value);
+        fragmented[105] = 201;
+        fragmented[106] = 202;
+        std::ofstream stream(fragmented_path, std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(fragmented.data()), static_cast<std::streamsize>(fragmented.size()));
+    }
+    TensorData fragmented_gate;
+    fragmented_gate.dtype = DType::MxFp4;
+    fragmented_gate.shape = {4, 32};
+    auto fragmented_gate_storage = std::make_shared<MxFp4FileStorage>();
+    fragmented_gate_storage->blocks_path = fragmented_path.string();
+    fragmented_gate_storage->blocks_offset = 0;
+    fragmented_gate_storage->blocks_bytes = 32;
+    fragmented_gate_storage->scales_path = fragmented_path.string();
+    fragmented_gate_storage->scales_offset = 33;
+    fragmented_gate_storage->scales_bytes = 2;
+    fragmented_gate_storage->secondary_blocks_path = fragmented_path.string();
+    fragmented_gate_storage->secondary_blocks_offset = 36;
+    fragmented_gate_storage->secondary_blocks_bytes = 32;
+    fragmented_gate_storage->secondary_scales_path = fragmented_path.string();
+    fragmented_gate_storage->secondary_scales_offset = 69;
+    fragmented_gate_storage->secondary_scales_bytes = 2;
+    fragmented_gate_storage->interleave_rows = true;
+    fragmented_gate.mxfp4_file_storage = std::move(fragmented_gate_storage);
+    TensorData fragmented_down;
+    fragmented_down.dtype = DType::MxFp4;
+    fragmented_down.shape = {2, 32};
+    auto fragmented_down_storage = std::make_shared<MxFp4FileStorage>();
+    fragmented_down_storage->blocks_path = fragmented_path.string();
+    fragmented_down_storage->blocks_offset = 72;
+    fragmented_down_storage->blocks_bytes = 32;
+    fragmented_down_storage->scales_path = fragmented_path.string();
+    fragmented_down_storage->scales_offset = 105;
+    fragmented_down_storage->scales_bytes = 2;
+    fragmented_down.mxfp4_file_storage = std::move(fragmented_down_storage);
+    Mxfp4ExpertCache fragmented_cache(102, 1, {}, ExpertCacheBufferedReads);
+    auto fragmented_pair = fragmented_cache.acquire_pair(fragmented_gate, fragmented_down);
+    check(static_cast<bool>(fragmented_pair));
+    check(fragmented_pair.value().gate_up->mxfp4_blocks[0] == 0);
+    check(fragmented_pair.value().gate_up->mxfp4_blocks[16] == 64);
+    check(fragmented_pair.value().gate_up->mxfp4_blocks[32] == 16);
+    check(fragmented_pair.value().gate_up->mxfp4_blocks[48] == 80);
+    check(fragmented_pair.value().gate_up->mxfp4_scales[0] == 101);
+    check(fragmented_pair.value().gate_up->mxfp4_scales[1] == 111);
+    check(fragmented_pair.value().down->mxfp4_blocks[0] == 32);
+    check(fragmented_pair.value().down->mxfp4_scales[0] == 201);
+    const ExpertCacheStatistics fragmented_statistics = fragmented_cache.statistics();
+    check(fragmented_statistics.buffered_read_ranges == 6);
+    check(fragmented_statistics.buffered_read_bytes == 102);
+
+    TensorData invalid_secondary = packed_gate;
+    auto invalid_secondary_storage = std::make_shared<MxFp4FileStorage>(*packed_gate.mxfp4_file_storage);
+    invalid_secondary_storage->secondary_blocks_path = packed_path.string();
+    invalid_secondary_storage->secondary_blocks_offset = 17;
+    invalid_secondary_storage->secondary_blocks_bytes = 16;
+    invalid_secondary.mxfp4_file_storage = std::move(invalid_secondary_storage);
+    Mxfp4ExpertCache invalid_secondary_cache(50, 1, {}, ExpertCacheBufferedReads);
+    auto invalid_secondary_pair = invalid_secondary_cache.acquire_pair(invalid_secondary, packed_down);
+    check(!invalid_secondary_pair);
+    check(invalid_secondary_pair.error().code == ErrorCode::InvalidModel);
+
     auto victim = std::make_shared<TestExpertVictimCache>(68);
     Mxfp4ExpertCache tiered(34, 1, victim, ExpertCacheMemoryMapRanges);
     {
@@ -1823,6 +2314,50 @@ void test_cross_session_batch_scheduler()
     options.flags = SchedulerOptionForceStagedBatching;
     auto scheduler = runtime.create_scheduler(options);
     check(static_cast<bool>(scheduler));
+    auto prefill_first = runtime.create_session(model.value());
+    auto prefill_second = runtime.create_session(model.value());
+    auto prefill_reference_first = runtime.create_session(model.value());
+    auto prefill_reference_second = runtime.create_session(model.value());
+    check(static_cast<bool>(prefill_first));
+    check(static_cast<bool>(prefill_second));
+    check(static_cast<bool>(prefill_reference_first));
+    check(static_cast<bool>(prefill_reference_second));
+    const std::vector<int32_t> first_prompt = {0, 1};
+    const std::vector<int32_t> second_prompt = {1};
+    auto prefill_future = scheduler.value()->submit_prefill({
+        {prefill_first.value(), first_prompt},
+        {prefill_second.value(), second_prompt},
+    });
+    auto prefill_results = prefill_future.get();
+    auto first_reference = prefill_reference_first.value()->prefill(first_prompt);
+    auto second_reference = prefill_reference_second.value()->prefill(second_prompt);
+    check(static_cast<bool>(prefill_results.size() == 2));
+    check(static_cast<bool>(prefill_results[0]));
+    check(static_cast<bool>(prefill_results[1]));
+    check(static_cast<bool>(first_reference));
+    check(static_cast<bool>(second_reference));
+    check(static_cast<bool>(
+        prefill_first.value()->sequence_length() == 2));
+    check(static_cast<bool>(
+        prefill_second.value()->sequence_length() == 1));
+    for (size_t index = 0;
+         index < first_reference.value().logits.values.size();
+         ++index)
+    {
+        check_near(
+            prefill_results[0].value().logits.values[index],
+            first_reference.value().logits.values[index],
+            1e-5f);
+    }
+    for (size_t index = 0;
+         index < second_reference.value().logits.values.size();
+         ++index)
+    {
+        check_near(
+            prefill_results[1].value().logits.values[index],
+            second_reference.value().logits.values[index],
+            1e-5f);
+    }
     auto future = scheduler.value()->submit_decode({
         {first.value(), 0},
         {second.value(), 0},
@@ -1870,6 +2405,16 @@ void test_cross_session_batch_scheduler()
     const SchedulerStatistics statistics = scheduler.value()->statistics();
     check(static_cast<bool>(statistics.worker_count == 2));
     check(static_cast<bool>(statistics.expert_threads_per_worker >= 1));
+    check(static_cast<bool>(
+        statistics.submitted_prefill_batches == 1));
+    check(static_cast<bool>(
+        statistics.submitted_prefill_requests == 2));
+    check(static_cast<bool>(
+        statistics.completed_prefill_requests == 2));
+    check(static_cast<bool>(
+        statistics.staged_prefill_batches == 1));
+    check(static_cast<bool>(
+        statistics.staged_prefill_requests == 2));
     check(static_cast<bool>(statistics.submitted_batches == 4));
     check(static_cast<bool>(statistics.submitted_requests == 6));
     check(static_cast<bool>(statistics.completed_requests == 6));
@@ -2542,6 +3087,8 @@ void test_expert_dispatcher_groups_routes()
     check(static_cast<bool>(weighted));
     check(static_cast<bool>(weighted.value().assignment_count == 2));
     check(static_cast<bool>(weighted.value().batches.size() == 2));
+    check(weighted.value().batches[0].routes[0].rank == 0);
+    check(weighted.value().batches[1].routes[0].rank == 1);
     check_near(weighted.value().batches[0].routes[0].weight + weighted.value().batches[1].routes[0].weight, 1.0f, 1e-6f);
     ExpertDispatchPlan reusable;
     auto dispatched_into = dispatcher.dispatch_into(weighted_logits, 1, options, reusable);
@@ -2551,6 +3098,7 @@ void test_expert_dispatcher_groups_routes()
     for (size_t index = 0; index < reusable.batches.size(); ++index)
     {
         check(static_cast<bool>(reusable.batches[index].expert_id == weighted.value().batches[index].expert_id));
+        check(reusable.batches[index].routes.front().rank == weighted.value().batches[index].routes.front().rank);
         check_near(reusable.batches[index].routes.front().weight, weighted.value().batches[index].routes.front().weight, 1e-6f);
     }
     const ExpertBatch* reused_batches = reusable.batches.data();
@@ -2565,6 +3113,255 @@ void test_expert_dispatcher_groups_routes()
     auto invalid = dispatcher.dispatch(invalid_logits, 1, options);
     check(static_cast<bool>(!invalid));
     check(static_cast<bool>(invalid.error().code == ErrorCode::InvalidArgument));
+
+    const auto check_dispatch_into_matches = [&](std::span<const float> test_logits, const ExpertDispatchOptions& test_options) {
+        auto expected = dispatcher.dispatch(test_logits, 1, test_options);
+        check(static_cast<bool>(expected));
+        ExpertDispatchPlan actual;
+        auto status = dispatcher.dispatch_into(test_logits, 1, test_options, actual);
+        check(static_cast<bool>(status));
+        check(actual.assignment_count == expected.value().assignment_count);
+        check(actual.batches.size() == expected.value().batches.size());
+        for (size_t batch_index = 0; batch_index < actual.batches.size(); ++batch_index)
+        {
+            check(actual.batches[batch_index].expert_id == expected.value().batches[batch_index].expert_id);
+            check(actual.batches[batch_index].routes.size() == expected.value().batches[batch_index].routes.size());
+            for (size_t route_index = 0; route_index < actual.batches[batch_index].routes.size(); ++route_index)
+            {
+                check(actual.batches[batch_index].routes[route_index].token_index == expected.value().batches[batch_index].routes[route_index].token_index);
+                check(actual.batches[batch_index].routes[route_index].rank == expected.value().batches[batch_index].routes[route_index].rank);
+                check_near(actual.batches[batch_index].routes[route_index].weight, expected.value().batches[batch_index].routes[route_index].weight, 1e-6f);
+            }
+        }
+    };
+    ExpertDispatchOptions sigmoid_options;
+    sigmoid_options.expert_count = 4;
+    sigmoid_options.top_k = 2;
+    sigmoid_options.score_function = RouterScoreFunction::Sigmoid;
+    sigmoid_options.normalization = RouterNormalization::None;
+    sigmoid_options.routed_scaling_factor = 2.0f;
+    sigmoid_options.flags = 0;
+    const std::array<float, 4> tied_sigmoid_logits = {0.0f, 0.0f, -1.0f, -1.0f};
+    check_dispatch_into_matches(tied_sigmoid_logits, sigmoid_options);
+
+    ExpertDispatchOptions wide_options;
+    wide_options.expert_count = 20;
+    std::array<float, 20> wide_logits;
+    for (size_t index = 0; index < wide_logits.size(); ++index)
+        wide_logits[index] = static_cast<float>(static_cast<int>(index % 7) - 3);
+    wide_options.top_k = 16;
+    check_dispatch_into_matches(wide_logits, wide_options);
+    wide_options.top_k = 17;
+    check_dispatch_into_matches(wide_logits, wide_options);
+
+    ExpertDispatchOptions duplicate_options;
+    duplicate_options.expert_count = 4;
+    duplicate_options.top_k = 2;
+    const std::array<uint32_t, 2> duplicate_experts = {1, 1};
+    duplicate_options.explicit_expert_ids = duplicate_experts;
+    const std::array<float, 4> duplicate_logits = {0.0f, 1.0f, 2.0f, 3.0f};
+    check_dispatch_into_matches(duplicate_logits, duplicate_options);
+}
+
+void test_deepseek_router_and_hyper_connection_kernels()
+{
+    ExpertDispatcher dispatcher;
+    ExpertDispatchOptions options;
+    options.expert_count = 4;
+    options.top_k = 2;
+    options.score_function = RouterScoreFunction::SqrtSoftplus;
+    options.routed_scaling_factor = 1.5f;
+    const std::array<float, 4> selection_bias = {0.0f, 100.0f, 0.0f, 0.0f};
+    options.selection_bias = selection_bias;
+    const std::array<float, 4> logits = {4.0f, -4.0f, 3.0f, 2.0f};
+    auto routed = dispatcher.dispatch(logits, 1, options);
+    check(static_cast<bool>(routed));
+    check(routed.value().batches.size() == 2);
+    check(routed.value().batches[0].expert_id == 0);
+    check(routed.value().batches[1].expert_id == 1);
+    check_near(routed.value().batches[0].routes[0].weight + routed.value().batches[1].routes[0].weight, 1.5f, 1e-5f);
+    ExpertDispatchPlan reusable;
+    auto routed_into = dispatcher.dispatch_into(logits, 1, options, reusable);
+    check(static_cast<bool>(routed_into));
+    check(reusable.assignment_count == routed.value().assignment_count);
+    check(reusable.batches.size() == routed.value().batches.size());
+    for (size_t index = 0; index < reusable.batches.size(); ++index)
+    {
+        check(reusable.batches[index].expert_id == routed.value().batches[index].expert_id);
+        check_near(reusable.batches[index].routes[0].weight, routed.value().batches[index].routes[0].weight, 1e-6f);
+    }
+    const ExpertBatch* reusable_batches = reusable.batches.data();
+    const ExpertRoute* reusable_route = reusable.batches.front().routes.data();
+    routed_into = dispatcher.dispatch_into(logits, 1, options, reusable);
+    check(static_cast<bool>(routed_into));
+    check(reusable.batches.data() == reusable_batches);
+    check(reusable.batches.front().routes.data() == reusable_route);
+
+    const std::array<uint32_t, 2> explicit_experts = {3, 2};
+    options.selection_bias = {};
+    options.explicit_expert_ids = explicit_experts;
+    routed = dispatcher.dispatch(logits, 1, options);
+    check(static_cast<bool>(routed));
+    check(routed.value().batches[0].expert_id == 2);
+    check(routed.value().batches[1].expert_id == 3);
+    routed_into = dispatcher.dispatch_into(logits, 1, options, reusable);
+    check(static_cast<bool>(routed_into));
+    check(reusable.batches[0].expert_id == 2);
+    check(reusable.batches[1].expert_id == 3);
+
+    CpuBatch hyper_input(1, 2);
+    hyper_input.row(0)[0] = 2.0f;
+    hyper_input.row(0)[1] = 4.0f;
+    TensorData function;
+    function.dtype = DType::Float32;
+    function.shape = {8, 2};
+    function.float32_data.resize(16, 0.0f);
+    TensorData base;
+    base.dtype = DType::Float32;
+    base.shape = {8};
+    base.float32_data.resize(8, 0.0f);
+    TensorData scale;
+    scale.dtype = DType::Float32;
+    scale.shape = {3};
+    scale.float32_data.resize(3, 0.0f);
+    auto mixed = hyper_connection_pre(hyper_input, function, scale, base, 2, 2, 1e-6f, 1e-6f);
+    check(static_cast<bool>(mixed));
+    check_near(mixed.value().reduced.row(0)[0], 3.000006f, 1e-4f);
+    CpuBatch branch(1, 1);
+    branch.row(0)[0] = 10.0f;
+    auto connected = hyper_connection_post(branch, hyper_input, mixed.value(), 2);
+    check(static_cast<bool>(connected));
+    check_near(connected.value().row(0)[0], 13.0f, 1e-3f);
+    check_near(connected.value().row(0)[1], 13.0f, 1e-3f);
+    CpuHyperConnectionMix directed_mix;
+    directed_mix.post = {0.0f, 0.0f};
+    directed_mix.combine = {1.0f, 2.0f, 3.0f, 4.0f};
+    branch.row(0)[0] = 0.0f;
+    connected = hyper_connection_post(branch, hyper_input, directed_mix, 2);
+    check(static_cast<bool>(connected));
+    check_near(connected.value().row(0)[0], 14.0f, 1e-5f);
+    check_near(connected.value().row(0)[1], 20.0f, 1e-5f);
+
+    for (float value : std::array<float, 7>{-448.0f, -1.5f, -0.001f, 0.0f, 0.5f, 6.0f, 448.0f})
+    {
+        const float round_trip = float8_e4m3_to_float(float_to_float8_e4m3(value));
+        check(std::isfinite(round_trip));
+        check(std::signbit(round_trip) == std::signbit(value) || value == 0.0f);
+    }
+    std::array<uint8_t, 256> float8_weights = {};
+    std::array<float, 256> float8_input = {};
+    for (size_t index = 0; index < float8_weights.size(); ++index)
+    {
+        uint8_t encoded = static_cast<uint8_t>(index);
+        if ((encoded & UINT8_C(0x7f)) == UINT8_C(0x7f))
+            encoded ^= UINT8_C(1);
+        float8_weights[index] = encoded;
+        float8_input[index] = static_cast<float>(static_cast<int>(index % 29) - 14) * 0.015625f;
+    }
+    const std::array<float, 2> float8_scales = {0.5f, 2.0f};
+    float float8_reference = 0.0f;
+    for (size_t block = 0; block < float8_scales.size(); ++block)
+    {
+        float partial = 0.0f;
+        for (size_t index = block * 128; index < (block + 1) * 128; ++index)
+            partial += float8_e4m3_to_float(float8_weights[index]) * float8_input[index];
+        float8_reference += partial * float8_scales[block];
+    }
+    check_near(float8_e4m3_block_dot(float8_weights.data(), float8_scales.data(), float8_input.data(), 256, 128), float8_reference, 1e-3f);
+    std::array<uint8_t, 4 * 256> float8_row_weights = {};
+    std::array<float, 4> float8_row_reference = {};
+    std::array<float, 4> float8_row_output = {};
+    for (size_t row = 0; row < float8_row_reference.size(); ++row)
+    {
+        for (size_t index = 0; index < float8_weights.size(); ++index)
+        {
+            uint8_t encoded = static_cast<uint8_t>(index + row * 13);
+            if ((encoded & UINT8_C(0x7f)) == UINT8_C(0x7f))
+                encoded ^= UINT8_C(1);
+            float8_row_weights[row * float8_weights.size() + index] = encoded;
+            float8_row_reference[row] += float8_e4m3_to_float(encoded) * float8_input[index] * float8_scales[index / 128];
+        }
+    }
+    float8_e4m3_block_dot_rows4(
+        float8_row_weights.data(),
+        256,
+        float8_scales.data(),
+        float8_input.data(),
+        256,
+        128,
+        4,
+        float8_row_output.data());
+    for (size_t row = 0; row < float8_row_output.size(); ++row)
+        check_near(float8_row_output[row], float8_row_reference[row], 1e-3f);
+    check(static_cast<bool>(std::string(float8_kernel_name()).size() > 0));
+}
+
+void test_deepseek_v4_dspark_descriptor()
+{
+    ModelPackage package;
+    package.manifest.model_type = "deepseek_v4";
+    package.manifest.raw_json = R"({
+        "vocab_size": 129280,
+        "hidden_size": 4096,
+        "moe_intermediate_size": 2048,
+        "num_hidden_layers": 4,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 6,
+        "n_shared_experts": 1,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 1,
+        "head_dim": 512,
+        "q_lora_rank": 1024,
+        "qk_rope_head_dim": 64,
+        "o_groups": 8,
+        "o_lora_rank": 1024,
+        "sliding_window": 128,
+        "max_position_embeddings": 1048576,
+        "original_max_position_embeddings": 65536,
+        "num_hash_layers": 3,
+        "index_n_heads": 64,
+        "index_head_dim": 128,
+        "index_topk": 512,
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 20,
+        "compress_ratios": [0, 0, 4, 128],
+        "dspark_target_layer_ids": [1, 2, 3],
+        "dspark_block_size": 5,
+        "dspark_noise_token_id": 127,
+        "dspark_markov_rank": 256,
+        "expert_dtype": "fp4",
+        "scoring_func": "sqrtsoftplus",
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "scale_fmt": "ue8m0",
+        "weight_block_size": [128, 128],
+        "rms_norm_eps": 0.000001,
+        "hc_eps": 0.000001,
+        "swiglu_limit": 10.0,
+        "routed_scaling_factor": 1.5
+    })";
+    DeepSeekV4ModelAdapter adapter;
+    auto parsed = adapter.parse_model(package);
+    check(static_cast<bool>(parsed));
+    const MoeIR& descriptor = parsed.value();
+    check(descriptor.model_type == "deepseek_v4");
+    check(descriptor.hyper_connection_multiplier == 4);
+    check(descriptor.hash_routing_layer_count == 3);
+    check(descriptor.speculative_layer_count == 3);
+    check(descriptor.speculative_block_size == 5);
+    check(descriptor.speculative_noise_token_id == 127);
+    check(descriptor.speculative_markov_rank == 256);
+    check(descriptor.layers[2].attention.kind == AttentionKind::MultiHeadLatent);
+    check(descriptor.layers[2].attention.compression_ratio == 4);
+    check(descriptor.layers[3].attention.compression_ratio == 128);
+    check(descriptor.layers[0].ffn.moe.score_function == RouterScoreFunction::SqrtSoftplus);
+    check(descriptor.layers[0].ffn.moe.shared_expert_count == 1);
+    check(has_flag(descriptor.layers[0].ffn.moe.flags, MoeDescriptorSharedExpert));
+    RuntimeOptions options;
+    auto memory = plan_model_memory(descriptor, options, UINT64_C(8) * 1024 * 1024 * 1024);
+    check(static_cast<bool>(memory));
+    check(memory.value().selected_mode == ExpertMemoryMode::OnDemand);
+    check(memory.value().estimated_dense_bytes < UINT64_C(10) * 1024 * 1024 * 1024);
 }
 
 static MoeIR gpt_oss_memory_ir(uint32_t layer_count, uint32_t expert_count)
@@ -2715,7 +3512,7 @@ void test_sampling_and_streaming_generation()
     check(static_cast<bool>(stopped_session.value()->sequence_length() == 1));
 }
 
-void test_builtin_adapter_scope()
+void test_model_adapter_scopes()
 {
     BuiltinModelAdapter adapter;
     ModelManifest manifest;
@@ -2728,6 +3525,17 @@ void test_builtin_adapter_scope()
     ModelPackage package;
     package.manifest = manifest;
     auto descriptor = adapter.parse_model(package);
+    check(!descriptor);
+    check(descriptor.error().code == ErrorCode::UnsupportedModel);
+
+    DeepSeekV4ModelAdapter deepseek_adapter;
+    manifest.model_type = "deepseek_v4";
+    check(deepseek_adapter.can_load(manifest));
+    check(!adapter.can_load(manifest));
+
+    manifest.model_type = "unsupported_moe";
+    package.manifest = manifest;
+    descriptor = deepseek_adapter.parse_model(package);
     check(!descriptor);
     check(descriptor.error().code == ErrorCode::UnsupportedModel);
 }
@@ -2852,7 +3660,6 @@ void test_backend_capabilities_and_hybrid_execution()
         const SessionStatistics& statistics = automatic_session.value()->statistics();
         check(static_cast<bool>(statistics.vulkan_linear_dispatches == 1));
         check(static_cast<bool>(statistics.vulkan_compute_submissions == 1));
-        check(static_cast<bool>(statistics.vulkan_async_submissions == 0));
         check(static_cast<bool>(statistics.vulkan_batch_uploads == 1));
         check(static_cast<bool>(statistics.vulkan_batch_downloads == 1));
         check(static_cast<bool>(statistics.vulkan_auxiliary_uploads == 0));
@@ -2900,7 +3707,6 @@ void test_backend_capabilities_and_hybrid_execution()
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_attention_decode_sdpa_fusions == 0));
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_linear_dispatches == 3));
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_compute_submissions == 2));
-        check(static_cast<bool>(attention_session.value()->statistics().vulkan_async_submissions == 0));
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_batch_uploads == 2));
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_batch_downloads == 2));
         check(static_cast<bool>(attention_session.value()->statistics().vulkan_auxiliary_uploads == 3));
@@ -3066,6 +3872,11 @@ void test_flag_defaults()
 {
     RuntimeOptions runtime;
     check(static_cast<bool>(!has_flag(runtime.flags, RuntimeOptionMemoryMapExperts)));
+    check(static_cast<bool>(!has_flag(runtime.flags, RuntimeOptionRouterPrediction)));
+    check(static_cast<bool>(!has_flag(runtime.flags, RuntimeOptionForwardAwareCache)));
+    check(static_cast<bool>(!has_flag(runtime.flags, RuntimeOptionRankAdaptivePrefetch)));
+    check(static_cast<bool>(!has_flag(runtime.flags, RuntimeOptionCrossExpertReadCoalescing)));
+    check(static_cast<bool>(!has_flag(runtime.flags, RuntimeOptionAsyncRouterPrediction)));
 
     RuntimeCapabilities capabilities;
     check(static_cast<bool>(has_flag(capabilities.flags, RuntimeCapabilityCpuExecution)));
@@ -3094,6 +3905,68 @@ void test_flag_defaults()
     check(static_cast<bool>(!has_flag(memory.flags, ModelMemoryFileBackedExperts)));
 }
 
+void test_cpu_task_worker()
+{
+    CpuTaskWorker worker(2);
+    std::mutex mutex;
+    std::condition_variable started_condition;
+    std::condition_variable release_condition;
+    bool release = false;
+    uint32_t started = 0;
+    auto blocking_task = [&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        ++started;
+        started_condition.notify_all();
+        release_condition.wait(lock, [&] {
+            return release;
+        });
+    };
+
+    check(worker.try_submit(blocking_task));
+    check(worker.try_submit(blocking_task));
+    check(!worker.try_submit([] {}));
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        started_condition.wait(lock, [&] {
+            return started != 0;
+        });
+        release = true;
+    }
+    release_condition.notify_all();
+    worker.wait_idle();
+    check(worker.completed_tasks() == 2);
+
+    std::atomic<uint32_t> drained = 0;
+    {
+        CpuTaskWorker draining_worker(1);
+        check(draining_worker.try_submit([&] {
+            drained.fetch_add(1, std::memory_order_relaxed);
+        }));
+    }
+    check(drained.load(std::memory_order_relaxed) == 1);
+}
+
+void test_float_scaled_add()
+{
+    std::array<float, 17> output = {};
+    std::array<float, 17> input = {};
+    std::array<float, 17> expected = {};
+    constexpr float scale = -0.375f;
+    for (size_t index = 0; index < output.size(); ++index)
+    {
+        output[index] = static_cast<float>(index) * 0.125f - 0.75f;
+        input[index] = static_cast<float>(static_cast<int>(index % 7) - 3) * 0.25f;
+        expected[index] = output[index] + scale * input[index];
+    }
+    float_scaled_add(
+        output.data(),
+        input.data(),
+        scale,
+        static_cast<uint32_t>(output.size()));
+    for (size_t index = 0; index < output.size(); ++index)
+        check_near(output[index], expected[index], 1e-6f);
+}
+
 } // namespace moe
 } // namespace ncnn
 
@@ -3102,7 +3975,10 @@ int main()
     try
     {
         ncnn::moe::test_flag_defaults();
+        ncnn::moe::test_cpu_task_worker();
+        ncnn::moe::test_float_scaled_add();
         ncnn::moe::test_ncnn_linear_operator();
+        ncnn::moe::test_ncnn_vulkan_float8_operator();
         ncnn::moe::test_mxfp4_cpu_kernel_and_fused_gate_up();
         ncnn::moe::test_sharded_expert_victim_cache();
         ncnn::moe::test_mapped_file_range_and_shared_buffer();
@@ -3122,9 +3998,11 @@ int main()
         ncnn::moe::test_attention_graph_without_bias_or_sink();
         ncnn::moe::test_moe_ir_execution_graph_and_scheduler();
         ncnn::moe::test_expert_dispatcher_groups_routes();
+        ncnn::moe::test_deepseek_router_and_hyper_connection_kernels();
+        ncnn::moe::test_deepseek_v4_dspark_descriptor();
         ncnn::moe::test_automatic_expert_memory_planning();
         ncnn::moe::test_sampling_and_streaming_generation();
-        ncnn::moe::test_builtin_adapter_scope();
+        ncnn::moe::test_model_adapter_scopes();
         ncnn::moe::test_loader_reports_adapter_and_weight_errors();
         ncnn::moe::test_backend_capabilities_and_hybrid_execution();
         ncnn::moe::test_phase_zero_rejects_unimplemented_output_mode();

@@ -102,7 +102,7 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
     for (uint32_t repeat = 0; repeat <= repeats; ++repeat)
     {
         const auto started = std::chrono::steady_clock::now();
-        const CpuBatch activated = fused_mxfp4_gate_up_batch(gate_up, nullptr, input, 7.0f);
+        const CpuBatch activated = fused_mxfp4_gate_up_batch(gate_up, nullptr, input, ExpertActivation::GptOssSwiGlu, 7.0f);
         cpu_output = linear_batch(down, activated);
         if (repeat != 0)
         {

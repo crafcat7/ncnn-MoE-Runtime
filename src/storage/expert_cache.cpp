@@ -53,6 +53,7 @@ static HANDLE thread_read_event()
 #define NCNN_MOE_CACHE_ENTRY_SPECULATIVE_BIT 0
 #define NCNN_MOE_CACHE_ENTRY_JOB_STARTED_BIT 1
 #define NCNN_MOE_CACHE_ENTRY_EXACT_MISS_BIT  2
+#define NCNN_MOE_CACHE_ENTRY_DISCARD_BIT     3
 
 struct Mxfp4ExpertCache::Entry
 {
@@ -74,7 +75,8 @@ struct Mxfp4ExpertCache::Entry
     {
         Speculative = UINT32_C(1) << NCNN_MOE_CACHE_ENTRY_SPECULATIVE_BIT,
         JobStarted = UINT32_C(1) << NCNN_MOE_CACHE_ENTRY_JOB_STARTED_BIT,
-        FirstExactMiss = UINT32_C(1) << NCNN_MOE_CACHE_ENTRY_EXACT_MISS_BIT
+        FirstExactMiss = UINT32_C(1) << NCNN_MOE_CACHE_ENTRY_EXACT_MISS_BIT,
+        DiscardWhenReady = UINT32_C(1) << NCNN_MOE_CACHE_ENTRY_DISCARD_BIT
     };
 
     State state = State::Loading;
@@ -573,6 +575,48 @@ void Mxfp4ExpertCache::cancel_prediction()
     }
 }
 
+void Mxfp4ExpertCache::resolve_predictions(uint32_t residency_group, std::span<const std::string_view> demanded_keys)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto iterator = entries_.begin(); iterator != entries_.end();)
+    {
+        const std::shared_ptr<Entry>& entry = iterator->second;
+        if (!entry
+            || entry->residency_group != residency_group
+            || !has_flag(entry->flags, Entry::Speculative))
+        {
+            ++iterator;
+            continue;
+        }
+        const bool demanded = std::find(demanded_keys.begin(), demanded_keys.end(), std::string_view(entry->key)) != demanded_keys.end();
+        if (demanded)
+        {
+            ++iterator;
+            continue;
+        }
+        if (entry->state == Entry::State::Loading && has_flag(entry->flags, Entry::JobStarted))
+        {
+            entry->flags |= Entry::DiscardWhenReady;
+            ++iterator;
+            continue;
+        }
+        if (entry->state == Entry::State::Loading)
+        {
+            entry->state = Entry::State::Failed;
+            entry->error = Error{ErrorCode::InternalError, "speculative Expert read was cancelled"};
+            ++cancelled_speculative_reads_;
+        }
+        else if (entry->state == Entry::State::Ready)
+        {
+            ++unused_speculative_reads_;
+        }
+        remove_resident_locked(*entry, false);
+        iterator = entries_.erase(iterator);
+    }
+    if (high_priority_.empty() && active_jobs_ == 0)
+        idle_.notify_all();
+}
+
 void Mxfp4ExpertCache::wait_for_background_work()
 {
     {
@@ -594,7 +638,31 @@ Result<uint64_t> Mxfp4ExpertCache::stored_bytes(const TensorData& tensor)
     const MxFp4FileStorage& source = *tensor.mxfp4_file_storage;
     if (source.scales_bytes > std::numeric_limits<uint64_t>::max() - source.blocks_bytes)
         return Error{ErrorCode::InvalidModel, "file-backed MXFP4 tensor byte count overflows"};
-    return source.blocks_bytes + source.scales_bytes;
+    uint64_t bytes = source.blocks_bytes + source.scales_bytes;
+    if (!source.interleave_rows)
+    {
+        if (source.secondary_blocks_bytes != 0
+            || source.secondary_scales_bytes != 0
+            || !source.secondary_blocks_path.empty()
+            || !source.secondary_scales_path.empty())
+        {
+            return Error{ErrorCode::InvalidModel, "non-interleaved file-backed MXFP4 tensor has secondary ranges"};
+        }
+        return bytes;
+    }
+    if (source.secondary_blocks_bytes == 0
+        || source.secondary_scales_bytes == 0
+        || source.secondary_blocks_path.empty()
+        || source.secondary_scales_path.empty())
+    {
+        return Error{ErrorCode::InvalidModel, "interleaved file-backed MXFP4 tensor is missing secondary ranges"};
+    }
+    if (source.secondary_blocks_bytes > std::numeric_limits<uint64_t>::max() - bytes)
+        return Error{ErrorCode::InvalidModel, "file-backed MXFP4 tensor byte count overflows"};
+    bytes += source.secondary_blocks_bytes;
+    if (source.secondary_scales_bytes > std::numeric_limits<uint64_t>::max() - bytes)
+        return Error{ErrorCode::InvalidModel, "file-backed MXFP4 tensor byte count overflows"};
+    return bytes + source.secondary_scales_bytes;
 }
 
 std::string Mxfp4ExpertCache::make_pair_key(const TensorData& gate_up, const TensorData& down)
@@ -605,10 +673,59 @@ std::string Mxfp4ExpertCache::make_pair_key(const TensorData& gate_up, const Ten
            + ":" + std::to_string(gate.blocks_bytes)
            + ":" + gate.scales_path + ":" + std::to_string(gate.scales_offset)
            + ":" + std::to_string(gate.scales_bytes)
+           + ":" + gate.secondary_blocks_path + ":" + std::to_string(gate.secondary_blocks_offset)
+           + ":" + std::to_string(gate.secondary_blocks_bytes)
+           + ":" + gate.secondary_scales_path + ":" + std::to_string(gate.secondary_scales_offset)
+           + ":" + std::to_string(gate.secondary_scales_bytes)
            + "|" + projection.blocks_path + ":" + std::to_string(projection.blocks_offset)
            + ":" + std::to_string(projection.blocks_bytes)
            + ":" + projection.scales_path + ":" + std::to_string(projection.scales_offset)
            + ":" + std::to_string(projection.scales_bytes);
+}
+
+static Result<void> copy_interleaved_mxfp4_rows(
+    const TensorData& source,
+    const MxFp4ByteBuffer& first_blocks,
+    const MxFp4ByteBuffer& first_scales,
+    const MxFp4ByteBuffer& second_blocks,
+    const MxFp4ByteBuffer& second_scales,
+    MxFp4ByteBuffer& destination_blocks,
+    MxFp4ByteBuffer& destination_scales)
+{
+    if (first_blocks.size() != second_blocks.size()
+        || first_scales.size() != second_scales.size()
+        || source.shape.size() != 2
+        || source.shape[0] == 0
+        || source.shape[0] % 2 != 0
+        || source.shape[1] == 0
+        || source.shape[1] % 32 != 0)
+    {
+        return Error{ErrorCode::InvalidModel, "invalid interleaved file-backed MXFP4 tensor"};
+    }
+    const size_t source_rows = source.shape[0] / 2;
+    const uint64_t expected_block_bytes = static_cast<uint64_t>(source_rows) * source.shape[1] / 2;
+    const uint64_t expected_scale_bytes = static_cast<uint64_t>(source_rows) * source.shape[1] / 32;
+    if (first_blocks.size() % source_rows != 0
+        || first_scales.size() % source_rows != 0
+        || first_blocks.size() != expected_block_bytes
+        || first_scales.size() != expected_scale_bytes
+        || first_blocks.size() > std::numeric_limits<size_t>::max() - second_blocks.size()
+        || first_scales.size() > std::numeric_limits<size_t>::max() - second_scales.size())
+    {
+        return Error{ErrorCode::InvalidModel, "invalid interleaved file-backed MXFP4 tensor"};
+    }
+    const size_t block_row_bytes = first_blocks.size() / source_rows;
+    const size_t scale_row_bytes = first_scales.size() / source_rows;
+    destination_blocks.resize(first_blocks.size() + second_blocks.size());
+    destination_scales.resize(first_scales.size() + second_scales.size());
+    for (size_t row = 0; row < source_rows; ++row)
+    {
+        std::memcpy(destination_blocks.data() + row * block_row_bytes * 2, first_blocks.data() + row * block_row_bytes, block_row_bytes);
+        std::memcpy(destination_blocks.data() + (row * 2 + 1) * block_row_bytes, second_blocks.data() + row * block_row_bytes, block_row_bytes);
+        std::memcpy(destination_scales.data() + row * scale_row_bytes * 2, first_scales.data() + row * scale_row_bytes, scale_row_bytes);
+        std::memcpy(destination_scales.data() + (row * 2 + 1) * scale_row_bytes, second_scales.data() + row * scale_row_bytes, scale_row_bytes);
+    }
+    return {};
 }
 
 Result<std::shared_ptr<TensorData>> Mxfp4ExpertCache::load_tensor(const TensorData& source, uint64_t& mapped_ranges, uint64_t& mapped_bytes)
@@ -617,7 +734,9 @@ Result<std::shared_ptr<TensorData>> Mxfp4ExpertCache::load_tensor(const TensorDa
         return Error{ErrorCode::InvalidArgument, "MXFP4 tensor is not file-backed"};
     const MxFp4FileStorage& file = *source.mxfp4_file_storage;
     if (file.blocks_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
-        || file.scales_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+        || file.scales_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
+        || file.secondary_blocks_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
+        || file.secondary_scales_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
     {
         return Error{ErrorCode::InvalidModel, "file-backed MXFP4 tensor is too large"};
     }
@@ -641,9 +760,185 @@ Result<std::shared_ptr<TensorData>> Mxfp4ExpertCache::load_tensor(const TensorDa
         ++mapped_ranges;
         mapped_bytes += file.scales_bytes;
     }
-    loaded->mxfp4_blocks = std::move(blocks).value().bytes;
-    loaded->mxfp4_scales = std::move(scales).value().bytes;
+    if (!file.interleave_rows)
+    {
+        loaded->mxfp4_blocks = std::move(blocks).value().bytes;
+        loaded->mxfp4_scales = std::move(scales).value().bytes;
+        return loaded;
+    }
+
+    auto secondary_blocks = reader_->load(file.secondary_blocks_path, file.secondary_blocks_offset, file.secondary_blocks_bytes, flags_);
+    if (!secondary_blocks)
+        return secondary_blocks.error();
+    auto secondary_scales = reader_->load(file.secondary_scales_path, file.secondary_scales_offset, file.secondary_scales_bytes, flags_);
+    if (!secondary_scales)
+        return secondary_scales.error();
+    if (secondary_blocks.value().mapped)
+    {
+        ++mapped_ranges;
+        mapped_bytes += file.secondary_blocks_bytes;
+    }
+    if (secondary_scales.value().mapped)
+    {
+        ++mapped_ranges;
+        mapped_bytes += file.secondary_scales_bytes;
+    }
+    const MxFp4ByteBuffer& first_blocks = blocks.value().bytes;
+    const MxFp4ByteBuffer& first_scales = scales.value().bytes;
+    const MxFp4ByteBuffer& second_blocks = secondary_blocks.value().bytes;
+    const MxFp4ByteBuffer& second_scales = secondary_scales.value().bytes;
+    auto copied = copy_interleaved_mxfp4_rows(source, first_blocks, first_scales, second_blocks, second_scales, loaded->mxfp4_blocks, loaded->mxfp4_scales);
+    if (!copied)
+        return copied.error();
     return loaded;
+}
+
+Result<ExpertVictimPair> Mxfp4ExpertCache::load_interleaved_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_ranges, uint64_t& mapped_bytes)
+{
+    const MxFp4FileStorage& gate = *gate_up.mxfp4_file_storage;
+    const MxFp4FileStorage& projection = *down.mxfp4_file_storage;
+    const bool one_file = !projection.interleave_rows
+                          && gate.blocks_path == gate.scales_path
+                          && gate.blocks_path == gate.secondary_blocks_path
+                          && gate.blocks_path == gate.secondary_scales_path
+                          && gate.blocks_path == projection.blocks_path
+                          && gate.blocks_path == projection.scales_path;
+    if (!one_file)
+    {
+        auto loaded_gate = load_tensor(gate_up, mapped_ranges, mapped_bytes);
+        if (!loaded_gate)
+            return loaded_gate.error();
+        auto loaded_down = load_tensor(down, mapped_ranges, mapped_bytes);
+        if (!loaded_down)
+            return loaded_down.error();
+        return ExpertVictimPair{std::move(loaded_gate).value(), std::move(loaded_down).value()};
+    }
+
+    struct Range
+    {
+        uint64_t offset = 0;
+        uint64_t bytes = 0;
+        uint32_t destination = 0;
+        uint32_t cluster = 0;
+    };
+    std::array<Range, 6> ranges{{
+        {gate.blocks_offset, gate.blocks_bytes, 0, 0},
+        {gate.scales_offset, gate.scales_bytes, 1, 0},
+        {gate.secondary_blocks_offset, gate.secondary_blocks_bytes, 2, 0},
+        {gate.secondary_scales_offset, gate.secondary_scales_bytes, 3, 0},
+        {projection.blocks_offset, projection.blocks_bytes, 4, 0},
+        {projection.scales_offset, projection.scales_bytes, 5, 0},
+    }};
+    std::sort(ranges.begin(), ranges.end(), [](const Range& first, const Range& second) {
+        return first.offset < second.offset;
+    });
+
+    struct Cluster
+    {
+        uint64_t offset = 0;
+        uint64_t bytes = 0;
+        FileRangeReader::LoadedRange loaded;
+    };
+    std::array<Cluster, 6> clusters;
+    size_t cluster_count = 0;
+    for (Range& range : ranges)
+    {
+        if (range.bytes == 0
+            || range.bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
+            || range.offset > std::numeric_limits<uint64_t>::max() - range.bytes)
+        {
+            return Error{ErrorCode::InvalidModel, "invalid interleaved file-backed MXFP4 tensor range"};
+        }
+        if (cluster_count == 0
+            || clusters[cluster_count - 1].offset + clusters[cluster_count - 1].bytes != range.offset)
+        {
+            if (cluster_count != 0
+                && range.offset < clusters[cluster_count - 1].offset + clusters[cluster_count - 1].bytes)
+            {
+                return Error{ErrorCode::InvalidModel, "overlapping interleaved file-backed MXFP4 tensor ranges"};
+            }
+            clusters[cluster_count].offset = range.offset;
+            clusters[cluster_count].bytes = range.bytes;
+            ++cluster_count;
+        }
+        else
+        {
+            clusters[cluster_count - 1].bytes += range.bytes;
+        }
+        range.cluster = static_cast<uint32_t>(cluster_count - 1);
+    }
+    if (cluster_count == ranges.size())
+    {
+        auto loaded_gate = load_tensor(gate_up, mapped_ranges, mapped_bytes);
+        if (!loaded_gate)
+            return loaded_gate.error();
+        auto loaded_down = load_tensor(down, mapped_ranges, mapped_bytes);
+        if (!loaded_down)
+            return loaded_down.error();
+        return ExpertVictimPair{std::move(loaded_gate).value(), std::move(loaded_down).value()};
+    }
+
+    for (size_t cluster_index = 0; cluster_index < cluster_count; ++cluster_index)
+    {
+        Cluster& cluster = clusters[cluster_index];
+        auto loaded = reader_->load(gate.blocks_path, cluster.offset, cluster.bytes, flags_);
+        if (!loaded)
+            return loaded.error();
+        cluster.loaded = std::move(loaded).value();
+        if (cluster.loaded.mapped)
+        {
+            ++mapped_ranges;
+            mapped_bytes += cluster.bytes;
+        }
+    }
+
+    std::array<MxFp4ByteBuffer, 6> sources;
+    for (const Range& range : ranges)
+    {
+        const Cluster& cluster = clusters[range.cluster];
+        const std::shared_ptr<uint8_t> owner = cluster.loaded.bytes.data_;
+        std::shared_ptr<uint8_t> view(owner, owner.get() + static_cast<size_t>(range.offset - cluster.offset));
+        sources[range.destination] = MxFp4ByteBuffer(std::move(view), static_cast<size_t>(range.bytes));
+    }
+
+    auto gate_bytes = stored_bytes(gate_up);
+    if (!gate_bytes)
+        return gate_bytes.error();
+    auto down_bytes = stored_bytes(down);
+    if (!down_bytes)
+        return down_bytes.error();
+    if (gate_bytes.value() > std::numeric_limits<uint64_t>::max() - down_bytes.value())
+        return Error{ErrorCode::InvalidModel, "interleaved file-backed MXFP4 Expert pair byte count overflows"};
+    const uint64_t total_bytes = gate_bytes.value() + down_bytes.value();
+    if (total_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+        return Error{ErrorCode::InvalidModel, "interleaved file-backed MXFP4 Expert pair is too large"};
+    MxFp4ByteBuffer resident;
+    resident.resize(static_cast<size_t>(total_bytes));
+    const std::shared_ptr<uint8_t> resident_owner = resident.data_;
+    size_t resident_offset = 0;
+    const auto make_resident_view = [&](size_t bytes) {
+        std::shared_ptr<uint8_t> view(resident_owner, resident_owner.get() + resident_offset);
+        resident_offset += bytes;
+        return MxFp4ByteBuffer(std::move(view), bytes);
+    };
+
+    auto loaded_gate = std::make_shared<TensorData>();
+    loaded_gate->dtype = DType::MxFp4;
+    loaded_gate->shape = gate_up.shape;
+    loaded_gate->mxfp4_blocks = make_resident_view(static_cast<size_t>(gate.blocks_bytes + gate.secondary_blocks_bytes));
+    loaded_gate->mxfp4_scales = make_resident_view(static_cast<size_t>(gate.scales_bytes + gate.secondary_scales_bytes));
+    auto copied = copy_interleaved_mxfp4_rows(gate_up, sources[0], sources[1], sources[2], sources[3], loaded_gate->mxfp4_blocks, loaded_gate->mxfp4_scales);
+    if (!copied)
+        return copied.error();
+
+    auto loaded_down = std::make_shared<TensorData>();
+    loaded_down->dtype = DType::MxFp4;
+    loaded_down->shape = down.shape;
+    loaded_down->mxfp4_blocks = make_resident_view(static_cast<size_t>(projection.blocks_bytes));
+    loaded_down->mxfp4_scales = make_resident_view(static_cast<size_t>(projection.scales_bytes));
+    std::memcpy(loaded_down->mxfp4_blocks.data(), sources[4].data(), sources[4].size());
+    std::memcpy(loaded_down->mxfp4_scales.data(), sources[5].data(), sources[5].size());
+    return ExpertVictimPair{std::move(loaded_gate), std::move(loaded_down)};
 }
 
 Result<ExpertVictimPair> Mxfp4ExpertCache::load_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_ranges, uint64_t& mapped_bytes)
@@ -656,6 +951,8 @@ Result<ExpertVictimPair> Mxfp4ExpertCache::load_pair(const TensorData& gate_up, 
     }
     const MxFp4FileStorage& gate = *gate_up.mxfp4_file_storage;
     const MxFp4FileStorage& projection = *down.mxfp4_file_storage;
+    if (gate.interleave_rows)
+        return load_interleaved_pair(gate_up, down, mapped_ranges, mapped_bytes);
     struct Range
     {
         uint64_t offset = 0;
@@ -671,7 +968,7 @@ Result<ExpertVictimPair> Mxfp4ExpertCache::load_pair(const TensorData& gate_up, 
     const bool one_file = gate.blocks_path == gate.scales_path
                           && gate.blocks_path == projection.blocks_path
                           && gate.blocks_path == projection.scales_path;
-    bool contiguous = one_file;
+    bool contiguous = one_file && !gate.interleave_rows;
     if (contiguous)
     {
         std::sort(ranges.begin(), ranges.end(), [](const Range& first, const Range& second) {
@@ -748,6 +1045,206 @@ Result<ExpertVictimPair> Mxfp4ExpertCache::load_pair(const TensorData& gate_up, 
         }
     }
     return ExpertVictimPair{std::move(loaded_gate), std::move(loaded_down)};
+}
+
+Result<std::vector<ExpertVictimPair>> Mxfp4ExpertCache::load_coalesced_pairs(
+    std::span<const std::shared_ptr<Entry>> entries,
+    uint64_t& mapped_ranges,
+    uint64_t& mapped_bytes,
+    uint64_t& ranges_saved,
+    bool& coalesced)
+{
+    static constexpr uint64_t maximum_cluster_bytes = UINT64_C(64) * 1024 * 1024;
+    struct Range
+    {
+        const std::string* path = nullptr;
+        uint64_t offset = 0;
+        uint64_t bytes = 0;
+        uint32_t entry = 0;
+        uint32_t destination = 0;
+        uint32_t cluster = 0;
+    };
+    struct Cluster
+    {
+        const std::string* path = nullptr;
+        uint64_t offset = 0;
+        uint64_t bytes = 0;
+        FileRangeReader::LoadedRange loaded;
+    };
+
+    coalesced = false;
+    ranges_saved = 0;
+    mapped_ranges = 0;
+    mapped_bytes = 0;
+    if (entries.size() < 2 || has_flag(flags_, ExpertCacheMemoryMapRanges))
+        return std::vector<ExpertVictimPair>();
+
+    std::vector<Range> ranges;
+    ranges.reserve(entries.size() * 6);
+    for (size_t entry_index = 0; entry_index < entries.size(); ++entry_index)
+    {
+        const Entry& entry = *entries[entry_index];
+        if (!entry.gate_up_source.mxfp4_file_storage
+            || !entry.down_source.mxfp4_file_storage)
+        {
+            return Error{ErrorCode::InvalidArgument, "coalesced Expert read requires file-backed MXFP4 pairs"};
+        }
+        const MxFp4FileStorage& gate = *entry.gate_up_source.mxfp4_file_storage;
+        const MxFp4FileStorage& down = *entry.down_source.mxfp4_file_storage;
+        if (down.interleave_rows)
+            return Error{ErrorCode::InvalidModel, "coalesced Expert read does not support an interleaved Down tensor"};
+        ranges.push_back({&gate.blocks_path, gate.blocks_offset, gate.blocks_bytes, static_cast<uint32_t>(entry_index), 0, 0});
+        ranges.push_back({&gate.scales_path, gate.scales_offset, gate.scales_bytes, static_cast<uint32_t>(entry_index), 1, 0});
+        if (gate.interleave_rows)
+        {
+            ranges.push_back({&gate.secondary_blocks_path, gate.secondary_blocks_offset, gate.secondary_blocks_bytes, static_cast<uint32_t>(entry_index), 2, 0});
+            ranges.push_back({&gate.secondary_scales_path, gate.secondary_scales_offset, gate.secondary_scales_bytes, static_cast<uint32_t>(entry_index), 3, 0});
+        }
+        ranges.push_back({&down.blocks_path, down.blocks_offset, down.blocks_bytes, static_cast<uint32_t>(entry_index), 4, 0});
+        ranges.push_back({&down.scales_path, down.scales_offset, down.scales_bytes, static_cast<uint32_t>(entry_index), 5, 0});
+    }
+    for (const Range& range : ranges)
+    {
+        if (!range.path
+            || range.path->empty()
+            || range.bytes == 0
+            || range.bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
+            || range.offset > std::numeric_limits<uint64_t>::max() - range.bytes)
+        {
+            return Error{ErrorCode::InvalidModel, "invalid coalesced Expert file range"};
+        }
+    }
+    uint64_t independent_range_count = 0;
+    for (uint32_t entry_index = 0; entry_index < entries.size(); ++entry_index)
+    {
+        std::vector<const Range*> entry_ranges;
+        for (const Range& range : ranges)
+        {
+            if (range.entry == entry_index)
+                entry_ranges.push_back(&range);
+        }
+        std::sort(entry_ranges.begin(), entry_ranges.end(), [](const Range* first, const Range* second) {
+            if (*first->path != *second->path)
+                return *first->path < *second->path;
+            return first->offset < second->offset;
+        });
+        const Range* previous = nullptr;
+        uint64_t cluster_bytes = 0;
+        for (const Range* range : entry_ranges)
+        {
+            const bool adjacent = previous
+                                  && *previous->path == *range->path
+                                  && previous->offset + previous->bytes == range->offset
+                                  && cluster_bytes <= maximum_cluster_bytes
+                                  && range->bytes <= maximum_cluster_bytes - cluster_bytes;
+            if (!adjacent)
+            {
+                ++independent_range_count;
+                cluster_bytes = range->bytes;
+            }
+            else
+            {
+                cluster_bytes += range->bytes;
+            }
+            previous = range;
+        }
+    }
+    std::sort(ranges.begin(), ranges.end(), [](const Range& first, const Range& second) {
+        if (*first.path != *second.path)
+            return *first.path < *second.path;
+        return first.offset < second.offset;
+    });
+
+    std::vector<Cluster> clusters;
+    clusters.reserve(ranges.size());
+    for (Range& range : ranges)
+    {
+        const bool adjacent = !clusters.empty()
+                              && *clusters.back().path == *range.path
+                              && clusters.back().offset + clusters.back().bytes == range.offset
+                              && clusters.back().bytes <= maximum_cluster_bytes
+                              && range.bytes <= maximum_cluster_bytes - clusters.back().bytes;
+        if (!clusters.empty()
+            && *clusters.back().path == *range.path
+            && range.offset < clusters.back().offset + clusters.back().bytes)
+        {
+            return Error{ErrorCode::InvalidModel, "overlapping coalesced Expert file ranges"};
+        }
+        if (!adjacent)
+        {
+            clusters.push_back({range.path, range.offset, range.bytes, {}});
+        }
+        else
+        {
+            clusters.back().bytes += range.bytes;
+        }
+        range.cluster = static_cast<uint32_t>(clusters.size() - 1);
+    }
+    if (clusters.size() >= independent_range_count)
+        return std::vector<ExpertVictimPair>();
+
+    coalesced = true;
+    ranges_saved = independent_range_count - clusters.size();
+    for (Cluster& cluster : clusters)
+    {
+        auto loaded = reader_->load(*cluster.path, cluster.offset, cluster.bytes, flags_);
+        if (!loaded)
+            return loaded.error();
+        cluster.loaded = std::move(loaded).value();
+        if (cluster.loaded.mapped)
+        {
+            ++mapped_ranges;
+            mapped_bytes += cluster.bytes;
+        }
+    }
+
+    std::vector<std::array<MxFp4ByteBuffer, 6>> sources(entries.size());
+    for (const Range& range : ranges)
+    {
+        const Cluster& cluster = clusters[range.cluster];
+        const std::shared_ptr<uint8_t> owner = cluster.loaded.bytes.data_;
+        std::shared_ptr<uint8_t> view(owner, owner.get() + static_cast<size_t>(range.offset - cluster.offset));
+        sources[range.entry][range.destination] = MxFp4ByteBuffer(std::move(view), static_cast<size_t>(range.bytes));
+    }
+
+    std::vector<ExpertVictimPair> loaded_pairs(entries.size());
+    for (size_t entry_index = 0; entry_index < entries.size(); ++entry_index)
+    {
+        const TensorData& gate_source = entries[entry_index]->gate_up_source;
+        const TensorData& down_source = entries[entry_index]->down_source;
+        const MxFp4FileStorage& gate = *gate_source.mxfp4_file_storage;
+        const std::array<MxFp4ByteBuffer, 6>& entry_sources = sources[entry_index];
+
+        auto loaded_gate = std::make_shared<TensorData>();
+        loaded_gate->dtype = DType::MxFp4;
+        loaded_gate->shape = gate_source.shape;
+        if (gate.interleave_rows)
+        {
+            auto copied = copy_interleaved_mxfp4_rows(
+                gate_source,
+                entry_sources[0],
+                entry_sources[1],
+                entry_sources[2],
+                entry_sources[3],
+                loaded_gate->mxfp4_blocks,
+                loaded_gate->mxfp4_scales);
+            if (!copied)
+                return copied.error();
+        }
+        else
+        {
+            loaded_gate->mxfp4_blocks.assign(entry_sources[0].data(), entry_sources[0].size());
+            loaded_gate->mxfp4_scales.assign(entry_sources[1].data(), entry_sources[1].size());
+        }
+
+        auto loaded_down = std::make_shared<TensorData>();
+        loaded_down->dtype = DType::MxFp4;
+        loaded_down->shape = down_source.shape;
+        loaded_down->mxfp4_blocks.assign(entry_sources[4].data(), entry_sources[4].size());
+        loaded_down->mxfp4_scales.assign(entry_sources[5].data(), entry_sources[5].size());
+        loaded_pairs[entry_index] = {std::move(loaded_gate), std::move(loaded_down)};
+    }
+    return loaded_pairs;
 }
 
 void Mxfp4ExpertCache::insert_resident_locked(Entry& entry, bool frequent)
@@ -921,13 +1418,27 @@ bool Mxfp4ExpertCache::consume_ghost_locked(std::string_view key, uint64_t requi
     return true;
 }
 
-Mxfp4ExpertCache::Entry* Mxfp4ExpertCache::find_victim_locked(const std::list<Entry*>& list, bool speculative, uint32_t residency_group)
+Mxfp4ExpertCache::Entry* Mxfp4ExpertCache::find_victim_locked(
+    const std::list<Entry*>& list,
+    bool speculative,
+    uint32_t residency_group,
+    uint32_t forward_anchor,
+    bool allow_predicted_victim)
 {
+    Entry* selected = nullptr;
+    uint32_t selected_distance = 0;
     for (Entry* entry : list)
     {
+        const bool speculative_requires_speculative_victim =
+            speculative && !has_flag(flags_, ExpertCacheForwardAwareEviction);
         if (!entry
             || entry->state != Entry::State::Ready
-            || (speculative && !has_flag(entry->flags, Entry::Speculative))
+            || (speculative_requires_speculative_victim
+                && !has_flag(entry->flags, Entry::Speculative))
+            || (has_flag(flags_, ExpertCacheForwardAwareEviction)
+                && !speculative
+                && !allow_predicted_victim
+                && has_flag(entry->flags, Entry::Speculative))
             || (residency_group != invalid_residency_group
                 && entry->residency_group != residency_group))
         {
@@ -936,10 +1447,24 @@ Mxfp4ExpertCache::Entry* Mxfp4ExpertCache::find_victim_locked(const std::list<En
         const auto existing = entries_.find(entry->key);
         if (existing != entries_.end() && existing->second.get() == entry && existing->second.use_count() == 1)
         {
-            return entry;
+            if (forward_anchor == invalid_residency_group
+                || forward_anchor >= residency_group_bytes_.size()
+                || entry->residency_group >= residency_group_bytes_.size())
+            {
+                return entry;
+            }
+            const uint32_t group_count = static_cast<uint32_t>(residency_group_bytes_.size());
+            const uint32_t distance = entry->residency_group > forward_anchor
+                                          ? entry->residency_group - forward_anchor
+                                          : group_count - forward_anchor + entry->residency_group;
+            if (!selected || distance > selected_distance)
+            {
+                selected = entry;
+                selected_distance = distance;
+            }
         }
     }
-    return nullptr;
+    return selected;
 }
 
 bool Mxfp4ExpertCache::evict_one_locked(bool incoming_from_frequent_ghost, bool speculative_admission, uint32_t incoming_group, uint64_t required)
@@ -970,14 +1495,19 @@ bool Mxfp4ExpertCache::evict_one_locked(bool incoming_from_frequent_ghost, bool 
         }
     }
 
+    const uint32_t forward_anchor = has_flag(flags_, ExpertCacheForwardAwareEviction)
+                                            ? incoming_group
+                                            : invalid_residency_group;
+    if (forward_anchor != invalid_residency_group)
+        preferred_group = invalid_residency_group;
     Entry* victim = prefer_recent
-                        ? find_victim_locked(arc_recent_, speculative_admission, preferred_group)
-                        : find_victim_locked(arc_frequent_, speculative_admission, preferred_group);
+                        ? find_victim_locked(arc_recent_, speculative_admission, preferred_group, forward_anchor)
+                        : find_victim_locked(arc_frequent_, speculative_admission, preferred_group, forward_anchor);
     if (!victim)
     {
         victim = prefer_recent
-                     ? find_victim_locked(arc_frequent_, speculative_admission, preferred_group)
-                     : find_victim_locked(arc_recent_, speculative_admission, preferred_group);
+                     ? find_victim_locked(arc_frequent_, speculative_admission, preferred_group, forward_anchor)
+                     : find_victim_locked(arc_recent_, speculative_admission, preferred_group, forward_anchor);
     }
     if (!victim && preferred_group != invalid_residency_group)
     {
@@ -991,6 +1521,40 @@ bool Mxfp4ExpertCache::evict_one_locked(bool incoming_from_frequent_ghost, bool 
                          : find_victim_locked(arc_recent_, speculative_admission, invalid_residency_group);
         }
     }
+    if (!victim
+        && !speculative_admission
+        && forward_anchor != invalid_residency_group)
+    {
+        victim = prefer_recent
+                     ? find_victim_locked(
+                           arc_recent_,
+                           false,
+                           invalid_residency_group,
+                           forward_anchor,
+                           true)
+                     : find_victim_locked(
+                           arc_frequent_,
+                           false,
+                           invalid_residency_group,
+                           forward_anchor,
+                           true);
+        if (!victim)
+        {
+            victim = prefer_recent
+                         ? find_victim_locked(
+                               arc_frequent_,
+                               false,
+                               invalid_residency_group,
+                               forward_anchor,
+                               true)
+                         : find_victim_locked(
+                               arc_recent_,
+                               false,
+                               invalid_residency_group,
+                               forward_anchor,
+                               true);
+        }
+    }
     if (!victim)
         return false;
 
@@ -1001,6 +1565,8 @@ bool Mxfp4ExpertCache::evict_one_locked(bool incoming_from_frequent_ghost, bool 
     {
         victim_cache_->admit(victim->key, victim->gate_up, victim->down, victim->residency_group, victim->victim_execution);
     }
+    if (has_flag(victim->flags, Entry::Speculative))
+        ++unused_speculative_reads_;
     remove_resident_locked(*victim, !has_flag(victim->flags, Entry::Speculative));
     entries_.erase(existing);
     ++evictions_;
@@ -1068,6 +1634,7 @@ Result<std::shared_ptr<Mxfp4ExpertCache::Entry>> Mxfp4ExpertCache::enqueue_pair(
         if (!speculative && has_flag(entry->flags, Entry::Speculative) && entry->state == Entry::State::Loading)
         {
             entry->flags &= ~Entry::Speculative;
+            entry->flags &= ~Entry::DiscardWhenReady;
             entry->flags |= Entry::FirstExactMiss;
             ++misses_;
             if (!has_flag(entry->flags, Entry::JobStarted))
@@ -1081,7 +1648,8 @@ Result<std::shared_ptr<Mxfp4ExpertCache::Entry>> Mxfp4ExpertCache::enqueue_pair(
     bool incoming_from_frequent_ghost = false;
     if (!speculative)
     {
-        (void)consume_ghost_locked(key, required, insert_frequent, incoming_from_frequent_ghost);
+        if (consume_ghost_locked(key, required, insert_frequent, incoming_from_frequent_ghost))
+            ++short_term_reloads_;
     }
     while (resident_bytes_ > capacity_bytes_ - required)
     {
@@ -1155,9 +1723,60 @@ Result<bool> Mxfp4ExpertCache::prefetch_pair(
 
 void Mxfp4ExpertCache::worker_loop()
 {
+    static constexpr size_t maximum_coalesced_experts = 8;
+    struct PhysicalRange
+    {
+        const std::string* path = nullptr;
+        uint64_t offset = 0;
+        uint64_t bytes = 0;
+    };
+    const auto collect_ranges = [](const Entry& entry, std::array<PhysicalRange, 6>& ranges) {
+        const MxFp4FileStorage& gate = *entry.gate_up_source.mxfp4_file_storage;
+        const MxFp4FileStorage& down = *entry.down_source.mxfp4_file_storage;
+        size_t count = 0;
+        ranges[count++] = {&gate.blocks_path, gate.blocks_offset, gate.blocks_bytes};
+        ranges[count++] = {&gate.scales_path, gate.scales_offset, gate.scales_bytes};
+        if (gate.interleave_rows)
+        {
+            ranges[count++] = {&gate.secondary_blocks_path, gate.secondary_blocks_offset, gate.secondary_blocks_bytes};
+            ranges[count++] = {&gate.secondary_scales_path, gate.secondary_scales_offset, gate.secondary_scales_bytes};
+        }
+        ranges[count++] = {&down.blocks_path, down.blocks_offset, down.blocks_bytes};
+        ranges[count++] = {&down.scales_path, down.scales_offset, down.scales_bytes};
+        return count;
+    };
+    const auto entries_are_adjacent = [&collect_ranges](const Entry& first, const Entry& second) {
+        if (!first.gate_up_source.mxfp4_file_storage
+            || !first.down_source.mxfp4_file_storage
+            || !second.gate_up_source.mxfp4_file_storage
+            || !second.down_source.mxfp4_file_storage)
+        {
+            return false;
+        }
+        std::array<PhysicalRange, 6> first_ranges;
+        std::array<PhysicalRange, 6> second_ranges;
+        const size_t first_count = collect_ranges(first, first_ranges);
+        const size_t second_count = collect_ranges(second, second_ranges);
+        for (size_t first_index = 0; first_index < first_count; ++first_index)
+        {
+            const PhysicalRange& left = first_ranges[first_index];
+            for (size_t second_index = 0; second_index < second_count; ++second_index)
+            {
+                const PhysicalRange& right = second_ranges[second_index];
+                if (*left.path != *right.path)
+                    continue;
+                if (left.offset + left.bytes == right.offset
+                    || right.offset + right.bytes == left.offset)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
     for (;;)
     {
-        std::shared_ptr<Entry> entry;
+        std::vector<std::shared_ptr<Entry>> entries;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             work_available_.wait(lock, [this] {
@@ -1165,30 +1784,53 @@ void Mxfp4ExpertCache::worker_loop()
             });
             if (stopping_ && high_priority_.empty() && low_priority_.empty())
                 return;
-            for (;;)
+            const bool high_priority_batch = !high_priority_.empty();
+            std::deque<std::shared_ptr<Entry>>& queue = high_priority_batch ? high_priority_ : low_priority_;
+            while (!queue.empty())
             {
-                if (!high_priority_.empty())
-                {
-                    entry = std::move(high_priority_.front());
-                    high_priority_.pop_front();
-                }
-                else if (!low_priority_.empty())
-                {
-                    entry = std::move(low_priority_.front());
-                    low_priority_.pop_front();
-                }
-                else
-                {
-                    break;
-                }
+                std::shared_ptr<Entry> entry = std::move(queue.front());
+                queue.pop_front();
                 if (entry && !has_flag(entry->flags, Entry::JobStarted) && entry->state == Entry::State::Loading)
                 {
                     entry->flags |= Entry::JobStarted;
+                    entries.push_back(std::move(entry));
                     break;
                 }
-                entry.reset();
             }
-            if (!entry)
+            if (entries.size() == 1
+                && has_flag(flags_, ExpertCacheCrossExpertReadCoalescing)
+                && !has_flag(flags_, ExpertCacheMemoryMapRanges))
+            {
+                if (queue.empty())
+                {
+                    work_available_.wait_for(lock, std::chrono::microseconds(50), [&] {
+                        return stopping_ || !queue.empty();
+                    });
+                }
+                for (auto iterator = queue.begin(); iterator != queue.end() && entries.size() < maximum_coalesced_experts;)
+                {
+                    const std::shared_ptr<Entry>& candidate = *iterator;
+                    if (!candidate
+                        || has_flag(candidate->flags, Entry::JobStarted)
+                        || candidate->state != Entry::State::Loading)
+                    {
+                        iterator = queue.erase(iterator);
+                        continue;
+                    }
+                    bool adjacent = false;
+                    for (const std::shared_ptr<Entry>& selected : entries)
+                        adjacent = adjacent || entries_are_adjacent(*selected, *candidate);
+                    if (!adjacent)
+                    {
+                        ++iterator;
+                        continue;
+                    }
+                    candidate->flags |= Entry::JobStarted;
+                    entries.push_back(std::move(*iterator));
+                    iterator = queue.erase(iterator);
+                }
+            }
+            if (entries.empty())
             {
                 if (high_priority_.empty() && low_priority_.empty() && active_jobs_ == 0)
                 {
@@ -1196,51 +1838,156 @@ void Mxfp4ExpertCache::worker_loop()
                 }
                 continue;
             }
-            ++active_jobs_;
+            active_jobs_ += static_cast<uint32_t>(entries.size());
         }
 
-        std::optional<ExpertVictimPair> restored;
-        if (victim_cache_)
+        std::vector<std::optional<ExpertVictimPair>> loaded_pairs(entries.size());
+        std::vector<std::optional<Error>> errors(entries.size());
+        std::vector<uint8_t> restored(entries.size(), 0);
+        std::vector<uint64_t> entry_mapped_ranges(entries.size(), 0);
+        std::vector<uint64_t> entry_mapped_bytes(entries.size(), 0);
+        std::vector<std::shared_ptr<Entry>> disk_entries;
+        std::vector<size_t> disk_slots;
+        disk_entries.reserve(entries.size());
+        disk_slots.reserve(entries.size());
+        for (size_t index = 0; index < entries.size(); ++index)
         {
-            restored = victim_cache_->restore(entry->key, entry->gate_up_source, entry->down_source);
-        }
-        uint64_t mapped_ranges = 0;
-        uint64_t mapped_bytes = 0;
-        auto loaded = restored ? Result<ExpertVictimPair>(std::move(*restored))
-                               : load_pair(entry->gate_up_source, entry->down_source, mapped_ranges, mapped_bytes);
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!loaded)
+            if (victim_cache_)
             {
-                entry->state = Entry::State::Failed;
-                entry->error = loaded.error();
-                const auto existing = entries_.find(entry->key);
-                if (existing != entries_.end() && existing->second == entry)
+                std::optional<ExpertVictimPair> victim = victim_cache_->restore(
+                    entries[index]->key,
+                    entries[index]->gate_up_source,
+                    entries[index]->down_source);
+                if (victim)
                 {
-                    remove_resident_locked(*entry, false);
-                    entries_.erase(existing);
+                    loaded_pairs[index] = std::move(*victim);
+                    restored[index] = 1;
+                    continue;
                 }
             }
-            else
+            disk_entries.push_back(entries[index]);
+            disk_slots.push_back(index);
+        }
+
+        bool coalesced = false;
+        uint64_t coalesced_mapped_ranges = 0;
+        uint64_t coalesced_mapped_bytes = 0;
+        uint64_t coalesced_ranges_saved = 0;
+        if (disk_entries.size() > 1
+            && has_flag(flags_, ExpertCacheCrossExpertReadCoalescing))
+        {
+            auto loaded = load_coalesced_pairs(
+                disk_entries,
+                coalesced_mapped_ranges,
+                coalesced_mapped_bytes,
+                coalesced_ranges_saved,
+                coalesced);
+            if (!loaded)
             {
-                ExpertVictimPair pair = std::move(loaded).value();
+                for (size_t slot : disk_slots)
+                    errors[slot] = loaded.error();
+            }
+            else if (coalesced)
+            {
+                std::vector<ExpertVictimPair> pairs = std::move(loaded).value();
+                for (size_t index = 0; index < disk_slots.size(); ++index)
+                    loaded_pairs[disk_slots[index]] = std::move(pairs[index]);
+                entry_mapped_ranges[disk_slots.front()] = coalesced_mapped_ranges;
+                entry_mapped_bytes[disk_slots.front()] = coalesced_mapped_bytes;
+            }
+        }
+        if (!coalesced)
+        {
+            for (size_t index = 0; index < disk_entries.size(); ++index)
+            {
+                const size_t slot = disk_slots[index];
+                if (errors[slot])
+                    continue;
+                auto loaded = load_pair(
+                    disk_entries[index]->gate_up_source,
+                    disk_entries[index]->down_source,
+                    entry_mapped_ranges[slot],
+                    entry_mapped_bytes[slot]);
+                if (!loaded)
+                {
+                    errors[slot] = loaded.error();
+                    continue;
+                }
+                loaded_pairs[slot] = std::move(loaded).value();
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (coalesced)
+            {
+                ++coalesced_read_batches_;
+                coalesced_experts_ += disk_entries.size();
+                coalesced_read_ranges_saved_ += coalesced_ranges_saved;
+            }
+            for (size_t index = 0; index < entries.size(); ++index)
+            {
+                const std::shared_ptr<Entry>& entry = entries[index];
+                if (errors[index])
+                {
+                    entry->state = Entry::State::Failed;
+                    entry->error = *errors[index];
+                    const auto existing = entries_.find(entry->key);
+                    if (existing != entries_.end() && existing->second == entry)
+                    {
+                        remove_resident_locked(*entry, false);
+                        entries_.erase(existing);
+                    }
+                    continue;
+                }
+                if (has_flag(entry->flags, Entry::DiscardWhenReady)
+                    && has_flag(entry->flags, Entry::Speculative))
+                {
+                    if (!restored[index])
+                    {
+                        bytes_read_ += entry->bytes;
+                        mapped_ranges_ += entry_mapped_ranges[index];
+                        mapped_bytes_ += entry_mapped_bytes[index];
+                    }
+                    entry->state = Entry::State::Failed;
+                    entry->error = Error{ErrorCode::InternalError, "unused speculative Expert read was discarded"};
+                    const auto existing = entries_.find(entry->key);
+                    if (existing != entries_.end() && existing->second == entry)
+                    {
+                        remove_resident_locked(*entry, false);
+                        entries_.erase(existing);
+                    }
+                    ++unused_speculative_reads_;
+                    continue;
+                }
+                if (!loaded_pairs[index])
+                {
+                    entry->state = Entry::State::Failed;
+                    entry->error = Error{ErrorCode::InternalError, "Expert read completed without a payload"};
+                    const auto existing = entries_.find(entry->key);
+                    if (existing != entries_.end() && existing->second == entry)
+                    {
+                        remove_resident_locked(*entry, false);
+                        entries_.erase(existing);
+                    }
+                    continue;
+                }
+                ExpertVictimPair pair = std::move(*loaded_pairs[index]);
                 entry->gate_up = std::move(pair.gate_up);
                 entry->down = std::move(pair.down);
                 entry->state = Entry::State::Ready;
-                if (!restored)
+                if (!restored[index])
                 {
                     bytes_read_ += entry->bytes;
-                    mapped_ranges_ += mapped_ranges;
-                    mapped_bytes_ += mapped_bytes;
+                    mapped_ranges_ += entry_mapped_ranges[index];
+                    mapped_bytes_ += entry_mapped_bytes[index];
                 }
             }
-            --active_jobs_;
+            active_jobs_ -= static_cast<uint32_t>(entries.size());
             if (high_priority_.empty() && low_priority_.empty() && active_jobs_ == 0)
-            {
                 idle_.notify_all();
-            }
         }
-        entry.reset();
+        entries.clear();
         ready_.notify_all();
     }
 }
@@ -1464,26 +2211,35 @@ bool Mxfp4ExpertCache::is_ready(const TensorData& gate_up, const TensorData& dow
 
 ExpertCacheStatistics Mxfp4ExpertCache::statistics() const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
     ExpertCacheStatistics result;
-    result.hits = hits_;
-    result.misses = misses_;
-    result.evictions = evictions_;
-    result.bytes_read = bytes_read_;
-    result.resident_bytes = resident_bytes_;
-    result.queued_reads = queued_reads_;
-    result.speculative_reads = speculative_reads_;
-    result.cancelled_speculative_reads = cancelled_speculative_reads_;
-    result.dropped_speculative_admissions = dropped_speculative_admissions_;
-    result.arc_recent_bytes = arc_recent_bytes_;
-    result.arc_frequent_bytes = arc_frequent_bytes_;
-    result.arc_recent_target_bytes = arc_recent_target_bytes_;
-    result.arc_recent_ghost_bytes = arc_recent_ghost_bytes_;
-    result.arc_frequent_ghost_bytes = arc_frequent_ghost_bytes_;
-    result.arc_recent_ghost_hits = arc_recent_ghost_hits_;
-    result.arc_frequent_ghost_hits = arc_frequent_ghost_hits_;
-    result.mapped_ranges = mapped_ranges_;
-    result.mapped_bytes = mapped_bytes_;
+    std::shared_ptr<IExpertVictimCache> victim_cache;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        result.hits = hits_;
+        result.misses = misses_;
+        result.evictions = evictions_;
+        result.bytes_read = bytes_read_;
+        result.resident_bytes = resident_bytes_;
+        result.queued_reads = queued_reads_;
+        result.speculative_reads = speculative_reads_;
+        result.cancelled_speculative_reads = cancelled_speculative_reads_;
+        result.dropped_speculative_admissions = dropped_speculative_admissions_;
+        result.unused_speculative_reads = unused_speculative_reads_;
+        result.short_term_reloads = short_term_reloads_;
+        result.coalesced_read_batches = coalesced_read_batches_;
+        result.coalesced_experts = coalesced_experts_;
+        result.coalesced_read_ranges_saved = coalesced_read_ranges_saved_;
+        result.arc_recent_bytes = arc_recent_bytes_;
+        result.arc_frequent_bytes = arc_frequent_bytes_;
+        result.arc_recent_target_bytes = arc_recent_target_bytes_;
+        result.arc_recent_ghost_bytes = arc_recent_ghost_bytes_;
+        result.arc_frequent_ghost_bytes = arc_frequent_ghost_bytes_;
+        result.arc_recent_ghost_hits = arc_recent_ghost_hits_;
+        result.arc_frequent_ghost_hits = arc_frequent_ghost_hits_;
+        result.mapped_ranges = mapped_ranges_;
+        result.mapped_bytes = mapped_bytes_;
+        victim_cache = victim_cache_;
+    }
     reader_->populate_statistics(result);
     if (has_flag(flags_, ExpertCacheMemoryMapRanges))
         result.adaptive_read_policy = 3;
@@ -1497,8 +2253,8 @@ ExpertCacheStatistics Mxfp4ExpertCache::statistics() const
     }
     else if (has_flag(flags_, ExpertCacheBufferedReads))
         result.adaptive_read_policy = FileRangeReader::ReadPolicyBuffered;
-    if (victim_cache_)
-        result.victim = victim_cache_->statistics();
+    if (victim_cache)
+        result.victim = victim_cache->statistics();
     return result;
 }
 

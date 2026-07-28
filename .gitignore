@@ -43,6 +43,7 @@ coverage/
 # Downloaded models and generated weights
 /models/gpt-oss/gpt-oss-20b/
 /models/gpt-oss/gpt-oss-120b/
+/models/deepseek-v4/DeepSeek-V4-Flash-DSpark/
 /weights/
 /downloads/
 *.safetensors
@@ -76,6 +77,7 @@ CMakeUserPresets.json
 *~
 
 # Local caches, logs, and environment files
+/memories/
 /.cache/
 *.log
 *.tmp
@@ -84,6 +86,7 @@ CMakeUserPresets.json
 .env
 .env.*
 !.env.example
+repair-report.md
 
 # Operating-system metadata
 .DS_Store

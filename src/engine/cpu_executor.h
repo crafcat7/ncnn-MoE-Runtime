@@ -5,6 +5,7 @@
 #include "ncnn/moe/result.h"
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -30,12 +31,32 @@ struct CpuDecodeBatchMetrics
     uint64_t max_expert_batch_size = 0;
 };
 
+struct CpuSpeculativeProposal
+{
+    std::vector<int32_t> token_ids;
+    std::vector<std::vector<float>> logits;
+    std::vector<float> confidence_logits;
+};
+
+using CpuSpeculativeSampler = std::function<Result<int32_t>(const std::vector<float>& logits)>;
+
 class IExecutor
 {
 public:
     virtual ~IExecutor() = default;
 
     [[nodiscard]] virtual Result<std::vector<std::vector<float>>> execute(const CompiledModel& model, std::span<const int32_t> input_ids, SessionStatistics& statistics, CpuSessionState& state, uint64_t position_offset) const = 0;
+    [[nodiscard]] virtual Result<void> update_speculative_context(
+        const CompiledModel& model,
+        SessionStatistics& statistics,
+        CpuSessionState& state) const = 0;
+    [[nodiscard]] virtual Result<CpuSpeculativeProposal> propose_speculative(
+        const CompiledModel& model,
+        int32_t input_id,
+        SessionStatistics& statistics,
+        CpuSessionState& state,
+        uint64_t position_offset,
+        const CpuSpeculativeSampler& sampler) const = 0;
 };
 
 class CpuExecutor final : public IExecutor
@@ -44,6 +65,19 @@ public:
     [[nodiscard]] Result<std::vector<std::vector<float>>> execute(const CompiledModel& model, std::span<const int32_t> input_ids, SessionStatistics& statistics, CpuSessionState& state, uint64_t position_offset) const override;
 
     [[nodiscard]] Result<std::vector<std::vector<float>>> execute_decode_batch(const CompiledModel& model, std::span<const CpuDecodeBatchEntry> entries, CpuDecodeBatchMetrics& metrics) const;
+
+    [[nodiscard]] Result<void> update_speculative_context(
+        const CompiledModel& model,
+        SessionStatistics& statistics,
+        CpuSessionState& state) const override;
+
+    [[nodiscard]] Result<CpuSpeculativeProposal> propose_speculative(
+        const CompiledModel& model,
+        int32_t input_id,
+        SessionStatistics& statistics,
+        CpuSessionState& state,
+        uint64_t position_offset,
+        const CpuSpeculativeSampler& sampler) const override;
 };
 
 } // namespace moe

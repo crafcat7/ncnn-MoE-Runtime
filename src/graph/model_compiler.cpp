@@ -21,15 +21,19 @@ static bool shape_equals(const TensorData& tensor, std::initializer_list<uint32_
     return tensor.shape.size() == expected.size() && std::equal(tensor.shape.begin(), tensor.shape.end(), expected.begin());
 }
 
-#define NCNN_MOE_ADAPTER_GRAPH_ATTN_BIT 0
-#define NCNN_MOE_ADAPTER_GRAPH_SINK_BIT 1
-#define NCNN_MOE_ADAPTER_GRAPH_MOE_BIT  2
+#define NCNN_MOE_ADAPTER_GRAPH_ATTN_BIT   0
+#define NCNN_MOE_ADAPTER_GRAPH_SINK_BIT   1
+#define NCNN_MOE_ADAPTER_GRAPH_MOE_BIT    2
+#define NCNN_MOE_ADAPTER_GRAPH_MLA_BIT    3
+#define NCNN_MOE_ADAPTER_GRAPH_SHARED_BIT 4
 
 enum AdapterGraphFlag : uint32_t
 {
     AdapterGraphAttention = UINT32_C(1) << NCNN_MOE_ADAPTER_GRAPH_ATTN_BIT,
     AdapterGraphAttentionSink = UINT32_C(1) << NCNN_MOE_ADAPTER_GRAPH_SINK_BIT,
-    AdapterGraphMoe = UINT32_C(1) << NCNN_MOE_ADAPTER_GRAPH_MOE_BIT
+    AdapterGraphMoe = UINT32_C(1) << NCNN_MOE_ADAPTER_GRAPH_MOE_BIT,
+    AdapterGraphMla = UINT32_C(1) << NCNN_MOE_ADAPTER_GRAPH_MLA_BIT,
+    AdapterGraphSharedExpert = UINT32_C(1) << NCNN_MOE_ADAPTER_GRAPH_SHARED_BIT
 };
 
 struct AdapterGraph
@@ -63,21 +67,38 @@ static Result<AdapterGraph> validate_adapter_graph(const LayerDescriptor& layer)
         cursor += 2;
         graph.attention_node_count = cursor;
     }
-    static constexpr ModelNodeType moe_nodes[] = {
+    else if (layer.nodes.size() >= 4
+             && layer.nodes[0].type == ModelNodeType::RmsNorm
+             && layer.nodes[1].type == ModelNodeType::MultiHeadLatentAttention
+             && layer.nodes[2].type == ModelNodeType::AttentionSink
+             && layer.nodes[3].type == ModelNodeType::Projection)
+    {
+        graph.flags |= AdapterGraphAttention | AdapterGraphAttentionSink | AdapterGraphMla;
+        cursor = 4;
+        graph.attention_node_count = cursor;
+    }
+    static constexpr ModelNodeType moe_prefix[] = {
         ModelNodeType::RmsNorm,
         ModelNodeType::Router,
         ModelNodeType::TopK,
         ModelNodeType::ExpertGroup,
-        ModelNodeType::Combine,
     };
-    constexpr size_t moe_node_count = sizeof(moe_nodes) / sizeof(moe_nodes[0]);
-    bool has_moe = cursor + moe_node_count <= layer.nodes.size();
-    for (size_t index = 0; has_moe && index < moe_node_count; ++index)
-        has_moe = moe_nodes[index] == layer.nodes[cursor + index].type;
+    constexpr size_t moe_prefix_count = sizeof(moe_prefix) / sizeof(moe_prefix[0]);
+    bool has_moe = cursor + moe_prefix_count + 1 <= layer.nodes.size();
+    for (size_t index = 0; has_moe && index < moe_prefix_count; ++index)
+        has_moe = moe_prefix[index] == layer.nodes[cursor + index].type;
     if (has_moe)
     {
         graph.flags |= AdapterGraphMoe;
-        cursor += moe_node_count;
+        cursor += moe_prefix_count;
+        if (cursor < layer.nodes.size() && layer.nodes[cursor].type == ModelNodeType::SharedExpertGroup)
+        {
+            graph.flags |= AdapterGraphSharedExpert;
+            ++cursor;
+        }
+        if (cursor >= layer.nodes.size() || layer.nodes[cursor].type != ModelNodeType::Combine)
+            return Error{ErrorCode::InvalidModel, "adapter MoE graph must end with Combine"};
+        ++cursor;
     }
     if (cursor != layer.nodes.size())
         return Error{ErrorCode::InvalidModel, "adapter operator graph has an invalid node order"};
@@ -140,18 +161,39 @@ static Result<TensorHandle> require_tensor(const WeightTable& weights, const std
                 return Error{ErrorCode::InvalidModel, "invalid int8 scale for tensor: " + name};
         }
     }
+    else if (dtype == DType::Float8E4M3)
+    {
+        if (tensor.shape.size() != 2 || tensor.float8_values().size() != tensor.element_count())
+            return Error{ErrorCode::InvalidModel, "invalid blockwise FP8 data length for tensor: " + name};
+        const uint64_t output_blocks = (tensor.shape[0] + 127) / 128;
+        const uint64_t input_blocks = (tensor.shape[1] + 127) / 128;
+        if (tensor.quantization_scales.size() != output_blocks * input_blocks)
+            return Error{ErrorCode::InvalidModel, "invalid blockwise FP8 scale count for tensor: " + name};
+        for (float scale : tensor.quantization_scales)
+        {
+            if (!std::isfinite(scale) || scale <= 0.0f)
+                return Error{ErrorCode::InvalidModel, "invalid blockwise FP8 scale for tensor: " + name};
+        }
+    }
+    else if (dtype == DType::Int64)
+    {
+        if (tensor.int64_values().size() != tensor.element_count())
+            return Error{ErrorCode::InvalidModel, "invalid int64 data length for tensor: " + name};
+    }
     else if (dtype == DType::MxFp4)
     {
         if (tensor.shape.size() != 2 || tensor.shape[1] % 32 != 0)
             return Error{ErrorCode::InvalidModel, "MXFP4 tensor must be a matrix with 32-aligned columns: " + name};
         if (tensor.mxfp4_file_storage)
         {
+            const uint64_t stored_blocks = tensor.mxfp4_file_storage->blocks_bytes + tensor.mxfp4_file_storage->secondary_blocks_bytes;
+            const uint64_t stored_scales = tensor.mxfp4_file_storage->scales_bytes + tensor.mxfp4_file_storage->secondary_scales_bytes;
             if (!tensor.mxfp4_blocks.empty()
                 || !tensor.mxfp4_scales.empty()
                 || tensor.mxfp4_file_storage->blocks_path.empty()
                 || tensor.mxfp4_file_storage->scales_path.empty()
-                || tensor.mxfp4_file_storage->blocks_bytes != tensor.element_count() / 2
-                || tensor.mxfp4_file_storage->scales_bytes != tensor.element_count() / 32)
+                || stored_blocks != tensor.element_count() / 2
+                || stored_scales != tensor.element_count() / 32)
             {
                 return Error{ErrorCode::InvalidModel, "invalid file-backed MXFP4 storage: " + name};
             }
@@ -208,16 +250,159 @@ TensorHandle WeightTable::find_handle(const std::string& name) const noexcept
     return it == handles_.end() ? invalid_tensor_handle : it->second;
 }
 
-static Result<void> prepare_linear_operator(WeightTable& weights, TensorHandle matrix_handle, TensorHandle bias_handle, NcnnLinearDevice device, bool retain_cpu_dense_copy, uint32_t vulkan_device_index)
+static Result<void> prepare_linear_operator(
+    WeightTable& weights,
+    TensorHandle matrix_handle,
+    TensorHandle bias_handle,
+    NcnnLinearDevice device,
+    bool retain_cpu_dense_copy,
+    uint32_t vulkan_device_index,
+    uint32_t input_group_count = 1)
 {
     TensorData& matrix = weights.at_mutable(matrix_handle);
+    const TensorData* bias = bias_handle == invalid_tensor_handle ? nullptr : &weights.at(bias_handle);
+    if (matrix.dtype == DType::Float8E4M3)
+    {
+        if (device == NcnnLinearDevice::Vulkan)
+        {
+            matrix.float8_linear_operator = NcnnVulkanFloat8Operator::create(matrix, bias, input_group_count, vulkan_device_index);
+            if (!matrix.float8_linear_operator)
+                return Error{ErrorCode::InternalError, "failed to create Vulkan FP8 Linear operator"};
+        }
+        return {};
+    }
+    if (matrix.dtype != DType::Float32 && matrix.dtype != DType::BFloat16)
+        return {};
     if (device == NcnnLinearDevice::Cpu && !retain_cpu_dense_copy)
         return {};
-    const TensorData* bias = bias_handle == invalid_tensor_handle ? nullptr : &weights.at(bias_handle);
     matrix.linear_operator = NcnnLinearOperator::create(matrix, bias, device, vulkan_device_index);
     if (device == NcnnLinearDevice::Vulkan && !matrix.linear_operator)
         return Error{ErrorCode::InternalError, "failed to create Vulkan InnerProduct operator"};
     return {};
+}
+
+static Result<void> assign_required_tensor(
+    const WeightTable& weights,
+    const std::string& name,
+    std::initializer_list<uint32_t> shape,
+    DType dtype,
+    TensorHandle& destination)
+{
+    auto tensor = require_tensor(weights, name, shape, dtype);
+    if (!tensor)
+        return tensor.error();
+    destination = tensor.value();
+    return {};
+}
+
+static Result<void> compile_latent_attention(
+    const WeightTable& weights,
+    const std::string& layer_name,
+    const MoeIR& descriptor,
+    const AttentionDescriptor& attention,
+    AttentionBlockPlan& plan)
+{
+    if (attention.query_lora_rank == 0
+        || attention.head_count == 0
+        || attention.head_dimension == 0
+        || attention.qk_rope_head_dimension == 0
+        || attention.qk_rope_head_dimension >= attention.head_dimension
+        || attention.output_group_count == 0
+        || attention.head_count % attention.output_group_count != 0
+        || attention.output_lora_rank == 0)
+        return Error{ErrorCode::InvalidModel, "invalid multi-head latent attention dimensions"};
+    if (attention.compression_ratio != 0 && attention.compression_ratio != 4 && attention.compression_ratio != 128)
+        return Error{ErrorCode::UnsupportedModel, "compressed latent attention only supports ratios 4 and 128"};
+
+    plan.flags |= AttentionBlockLatent | AttentionBlockSink | AttentionBlockQueryKeyNorm;
+    if (attention.compression_ratio != 0)
+        plan.flags |= AttentionBlockCompressed;
+    plan.head_count = attention.head_count;
+    plan.kv_head_count = attention.kv_head_count;
+    plan.head_dimension = attention.head_dimension;
+    plan.sliding_window = attention.sliding_window;
+    plan.initial_context_length = attention.initial_context_length;
+    plan.max_context_length = attention.max_context_length;
+    plan.query_lora_rank = attention.query_lora_rank;
+    plan.rope_head_dimension = attention.qk_rope_head_dimension;
+    plan.output_lora_rank = attention.output_lora_rank;
+    plan.output_group_count = attention.output_group_count;
+    plan.compression_ratio = attention.compression_ratio;
+    plan.index_head_count = attention.index_head_count;
+    plan.index_head_dimension = attention.index_head_dimension;
+    plan.index_top_k = attention.index_top_k;
+    plan.rope_theta = attention.rope_theta;
+    plan.compressed_rope_theta = attention.compressed_rope_theta;
+    plan.rope_scaling_factor = attention.rope_scaling_factor;
+    plan.rope_ntk_alpha = attention.rope_ntk_alpha;
+    plan.rope_ntk_beta = attention.rope_ntk_beta;
+
+    Result<void> status = assign_required_tensor(weights, layer_name + "pre_attention_norm.weight", {descriptor.hidden_size}, descriptor.activation_dtype, plan.pre_attention_norm_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(weights, layer_name + "attention.query_a.weight", {attention.query_lora_rank, descriptor.hidden_size}, attention.projection_weight_dtype, plan.query_a_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(weights, layer_name + "attention.query_norm.weight", {attention.query_lora_rank}, descriptor.activation_dtype, plan.query_norm_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(weights, layer_name + "attention.query_b.weight", {attention.head_count * attention.head_dimension, attention.query_lora_rank}, attention.projection_weight_dtype, plan.query_b_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(weights, layer_name + "attention.key_value.weight", {attention.head_dimension, descriptor.hidden_size}, attention.projection_weight_dtype, plan.key_value_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(weights, layer_name + "attention.key_value_norm.weight", {attention.head_dimension}, descriptor.activation_dtype, plan.key_value_norm_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(weights, layer_name + "attention.sinks", {attention.head_count}, DType::Float32, plan.sinks);
+    if (!status)
+        return status.error();
+    const uint32_t group_input = attention.head_count * attention.head_dimension / attention.output_group_count;
+    status = assign_required_tensor(weights, layer_name + "attention.output_a.weight", {attention.output_group_count * attention.output_lora_rank, group_input}, attention.projection_weight_dtype, plan.output_a_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(weights, layer_name + "attention.output_b.weight", {descriptor.hidden_size, attention.output_group_count * attention.output_lora_rank}, attention.projection_weight_dtype, plan.output_b_weight);
+    if (!status)
+        return status.error();
+
+    if (attention.compression_ratio == 0)
+        return {};
+
+    const uint32_t compressor_multiplier = attention.compression_ratio == 4 ? 2 : 1;
+    status = assign_required_tensor(weights, layer_name + "attention.compressor.position", {attention.compression_ratio, compressor_multiplier * attention.head_dimension}, DType::Float32, plan.compressor_position);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(weights, layer_name + "attention.compressor.norm.weight", {attention.head_dimension}, descriptor.activation_dtype, plan.compressor_norm_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(weights, layer_name + "attention.compressor.key_value.weight", {compressor_multiplier * attention.head_dimension, descriptor.hidden_size}, descriptor.activation_dtype, plan.compressor_key_value_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(weights, layer_name + "attention.compressor.gate.weight", {compressor_multiplier * attention.head_dimension, descriptor.hidden_size}, descriptor.activation_dtype, plan.compressor_gate_weight);
+    if (!status)
+        return status.error();
+
+    if (attention.compression_ratio != 4)
+        return {};
+    if (attention.index_head_count == 0 || attention.index_head_dimension == 0 || attention.index_top_k == 0)
+        return Error{ErrorCode::InvalidModel, "ratio-4 compressed attention requires an indexer"};
+    status = assign_required_tensor(weights, layer_name + "attention.indexer.compressor.position", {attention.compression_ratio, 2 * attention.index_head_dimension}, DType::Float32, plan.indexer_compressor_position);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(weights, layer_name + "attention.indexer.compressor.norm.weight", {attention.index_head_dimension}, descriptor.activation_dtype, plan.indexer_compressor_norm_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(weights, layer_name + "attention.indexer.compressor.key_value.weight", {2 * attention.index_head_dimension, descriptor.hidden_size}, descriptor.activation_dtype, plan.indexer_compressor_key_value_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(weights, layer_name + "attention.indexer.compressor.gate.weight", {2 * attention.index_head_dimension, descriptor.hidden_size}, descriptor.activation_dtype, plan.indexer_compressor_gate_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(weights, layer_name + "attention.indexer.query.weight", {attention.index_head_count * attention.index_head_dimension, attention.query_lora_rank}, attention.projection_weight_dtype, plan.indexer_query_weight);
+    if (!status)
+        return status.error();
+    return assign_required_tensor(weights, layer_name + "attention.indexer.weights.weight", {attention.index_head_count, descriptor.hidden_size}, descriptor.activation_dtype, plan.indexer_weights_weight);
 }
 
 static uint64_t tensor_storage_bytes(const TensorData& tensor)
@@ -225,6 +410,7 @@ static uint64_t tensor_storage_bytes(const TensorData& tensor)
     uint64_t bytes = tensor.mapped_byte_count;
     bytes += static_cast<uint64_t>(tensor.float32_data.size()) * sizeof(float);
     bytes += static_cast<uint64_t>(tensor.bfloat16_data.size()) * sizeof(uint16_t);
+    bytes += static_cast<uint64_t>(tensor.int64_data.size()) * sizeof(int64_t);
     bytes += tensor.int8_data.size();
     bytes += static_cast<uint64_t>(tensor.quantization_scales.size()) * sizeof(float);
     bytes += tensor.mxfp4_blocks.size();
@@ -233,6 +419,8 @@ static uint64_t tensor_storage_bytes(const TensorData& tensor)
     {
         bytes += tensor.mxfp4_file_storage->blocks_bytes;
         bytes += tensor.mxfp4_file_storage->scales_bytes;
+        bytes += tensor.mxfp4_file_storage->secondary_blocks_bytes;
+        bytes += tensor.mxfp4_file_storage->secondary_scales_bytes;
     }
     return bytes;
 }
@@ -300,6 +488,353 @@ static uint32_t choose_layer_device(bool use_vulkan, const std::vector<uint32_t>
     return devices[selected];
 }
 
+static Result<void> compile_speculative_model(
+    CompiledModel& compiled,
+    NcnnLinearDevice dense_device,
+    bool retain_cpu_dense_copies)
+{
+    if (compiled.descriptor.speculative_layer_count == 0)
+        return {};
+    if (compiled.descriptor.speculative_target_layer_ids.size() != compiled.descriptor.speculative_layer_count
+        || compiled.descriptor.speculative_block_size == 0
+        || compiled.descriptor.speculative_noise_token_id >= compiled.descriptor.vocabulary_size
+        || compiled.descriptor.speculative_markov_rank == 0)
+    {
+        return Error{ErrorCode::InvalidModel, "invalid speculative model configuration"};
+    }
+
+    SpeculativeModelPlan& speculative = compiled.speculative;
+    speculative.target_layer_ids = compiled.descriptor.speculative_target_layer_ids;
+    speculative.block_size = compiled.descriptor.speculative_block_size;
+    speculative.noise_token_id = compiled.descriptor.speculative_noise_token_id;
+    speculative.markov_rank = compiled.descriptor.speculative_markov_rank;
+    const uint32_t hidden_size = compiled.descriptor.hidden_size;
+    const uint32_t multiplier = compiled.descriptor.hyper_connection_multiplier;
+    const uint32_t hyper_columns = multiplier * hidden_size;
+    Result<void> status = assign_required_tensor(
+        compiled.weights,
+        "speculative.main_projection.weight",
+        {hidden_size, hidden_size * static_cast<uint32_t>(speculative.target_layer_ids.size())},
+        DType::Float8E4M3,
+        speculative.main_projection_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(
+        compiled.weights,
+        "speculative.main_norm.weight",
+        {hidden_size},
+        compiled.descriptor.activation_dtype,
+        speculative.main_norm_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(
+        compiled.weights,
+        "speculative.final_norm.weight",
+        {hidden_size},
+        compiled.descriptor.activation_dtype,
+        speculative.final_norm_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(
+        compiled.weights,
+        "speculative.hyper.head.function",
+        {multiplier, hyper_columns},
+        DType::Float32,
+        speculative.hyper_head_function);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(
+        compiled.weights,
+        "speculative.hyper.head.base",
+        {multiplier},
+        DType::Float32,
+        speculative.hyper_head_base);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(
+        compiled.weights,
+        "speculative.hyper.head.scale",
+        {1},
+        DType::Float32,
+        speculative.hyper_head_scale);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(
+        compiled.weights,
+        "speculative.markov.embedding.weight",
+        {compiled.descriptor.vocabulary_size, speculative.markov_rank},
+        compiled.descriptor.activation_dtype,
+        speculative.markov_embedding_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(
+        compiled.weights,
+        "speculative.markov.head.weight",
+        {compiled.descriptor.vocabulary_size, speculative.markov_rank},
+        compiled.descriptor.activation_dtype,
+        speculative.markov_head_weight);
+    if (!status)
+        return status.error();
+    status = assign_required_tensor(
+        compiled.weights,
+        "speculative.confidence.weight",
+        {1, hidden_size + speculative.markov_rank},
+        compiled.descriptor.activation_dtype,
+        speculative.confidence_weight);
+    if (!status)
+        return status.error();
+
+    const TensorHandle dense_handles[] = {
+        speculative.main_projection_weight,
+        speculative.markov_head_weight,
+    };
+    for (TensorHandle handle : dense_handles)
+    {
+        status = prepare_linear_operator(
+            compiled.weights,
+            handle,
+            invalid_tensor_handle,
+            dense_device,
+            retain_cpu_dense_copies,
+            compiled.vulkan_device_index);
+        if (!status)
+            return status.error();
+    }
+
+    LayerDescriptor draft_layer = compiled.descriptor.layers.back();
+    draft_layer.attention.compression_ratio = 0;
+    draft_layer.ffn.moe.flags |= MoeDescriptorRouterBias;
+    speculative.layers.reserve(compiled.descriptor.speculative_layer_count);
+    for (uint32_t layer_id = 0; layer_id < compiled.descriptor.speculative_layer_count; ++layer_id)
+    {
+        const std::string layer_name = speculative_layer_prefix(layer_id);
+        const MoeDescriptor& moe = draft_layer.ffn.moe;
+        CompiledLayerPlan layer_plan;
+        layer_plan.layer_id = compiled.descriptor.layer_count + layer_id;
+        layer_plan.vulkan_device_index = compiled.vulkan_device_index;
+        layer_plan.flags |= CompiledLayerAttention;
+        layer_plan.moe.top_k = moe.top_k;
+        layer_plan.moe.hidden_size = hidden_size;
+        layer_plan.moe.score_function = moe.score_function;
+        layer_plan.moe.normalization = moe.normalization;
+        layer_plan.moe.routed_scaling_factor = moe.routed_scaling_factor;
+        layer_plan.moe.has_shared_expert = true;
+        layer_plan.moe.flags = MoeBlockNormalizeTopKWeights;
+
+        const uint32_t mix_count = (2 + multiplier) * multiplier;
+        status = assign_required_tensor(
+            compiled.weights,
+            layer_name + "hyper.attention.function",
+            {mix_count, hyper_columns},
+            DType::Float32,
+            layer_plan.hyper_connection.attention_function);
+        if (!status)
+            return status.error();
+        status = assign_required_tensor(
+            compiled.weights,
+            layer_name + "hyper.attention.base",
+            {mix_count},
+            DType::Float32,
+            layer_plan.hyper_connection.attention_base);
+        if (!status)
+            return status.error();
+        status = assign_required_tensor(
+            compiled.weights,
+            layer_name + "hyper.attention.scale",
+            {3},
+            DType::Float32,
+            layer_plan.hyper_connection.attention_scale);
+        if (!status)
+            return status.error();
+        status = assign_required_tensor(
+            compiled.weights,
+            layer_name + "hyper.ffn.function",
+            {mix_count, hyper_columns},
+            DType::Float32,
+            layer_plan.hyper_connection.ffn_function);
+        if (!status)
+            return status.error();
+        status = assign_required_tensor(
+            compiled.weights,
+            layer_name + "hyper.ffn.base",
+            {mix_count},
+            DType::Float32,
+            layer_plan.hyper_connection.ffn_base);
+        if (!status)
+            return status.error();
+        status = assign_required_tensor(
+            compiled.weights,
+            layer_name + "hyper.ffn.scale",
+            {3},
+            DType::Float32,
+            layer_plan.hyper_connection.ffn_scale);
+        if (!status)
+            return status.error();
+
+        status = compile_latent_attention(
+            compiled.weights,
+            layer_name,
+            compiled.descriptor,
+            draft_layer.attention,
+            layer_plan.attention);
+        if (!status)
+            return status.error();
+        const TensorHandle latent_linear_handles[] = {
+            layer_plan.attention.query_a_weight,
+            layer_plan.attention.query_b_weight,
+            layer_plan.attention.key_value_weight,
+            layer_plan.attention.output_b_weight,
+        };
+        for (TensorHandle handle : latent_linear_handles)
+        {
+            status = prepare_linear_operator(
+                compiled.weights,
+                handle,
+                invalid_tensor_handle,
+                dense_device,
+                retain_cpu_dense_copies,
+                layer_plan.vulkan_device_index);
+            if (!status)
+                return status.error();
+        }
+        status = prepare_linear_operator(
+            compiled.weights,
+            layer_plan.attention.output_a_weight,
+            invalid_tensor_handle,
+            dense_device,
+            retain_cpu_dense_copies,
+            layer_plan.vulkan_device_index,
+            layer_plan.attention.output_group_count);
+        if (!status)
+            return status.error();
+        if (dense_device == NcnnLinearDevice::Vulkan)
+        {
+            TensorData& query_a = compiled.weights.at_mutable(layer_plan.attention.query_a_weight);
+            const TensorData& query_b = compiled.weights.at(layer_plan.attention.query_b_weight);
+            if (query_a.float8_linear_operator && query_b.float8_linear_operator
+                && !query_a.float8_linear_operator->prepare_rms_norm(
+                    compiled.weights.at(layer_plan.attention.query_norm_weight),
+                    compiled.descriptor.norm_epsilon))
+            {
+                return Error{ErrorCode::InternalError, "failed to prepare speculative Vulkan FP8 query RMSNorm chain"};
+            }
+        }
+
+        status = assign_required_tensor(
+            compiled.weights,
+            layer_name + "pre_ffn_norm.weight",
+            {hidden_size},
+            compiled.descriptor.activation_dtype,
+            layer_plan.moe.pre_ffn_norm_weight);
+        if (!status)
+            return status.error();
+        status = assign_required_tensor(
+            compiled.weights,
+            layer_name + "router.weight",
+            {moe.expert_count, hidden_size},
+            compiled.descriptor.activation_dtype,
+            layer_plan.moe.router_weight);
+        if (!status)
+            return status.error();
+        status = assign_required_tensor(
+            compiled.weights,
+            layer_name + "router.selection_bias",
+            {moe.expert_count},
+            DType::Float32,
+            layer_plan.moe.router_selection_bias);
+        if (!status)
+            return status.error();
+        status = prepare_linear_operator(
+            compiled.weights,
+            layer_plan.moe.router_weight,
+            invalid_tensor_handle,
+            NcnnLinearDevice::Cpu,
+            retain_cpu_dense_copies,
+            layer_plan.vulkan_device_index);
+        if (!status)
+            return status.error();
+
+        ExpertPlan& shared = layer_plan.moe.shared_expert;
+        shared.activation = moe.activation;
+        shared.activation_limit = moe.activation_limit;
+        status = assign_required_tensor(
+            compiled.weights,
+            layer_name + "shared_expert.gate.weight",
+            {moe.intermediate_size, hidden_size},
+            moe.shared_expert_weight_dtype,
+            shared.gate_weight);
+        if (!status)
+            return status.error();
+        status = assign_required_tensor(
+            compiled.weights,
+            layer_name + "shared_expert.up.weight",
+            {moe.intermediate_size, hidden_size},
+            moe.shared_expert_weight_dtype,
+            shared.up_weight);
+        if (!status)
+            return status.error();
+        status = assign_required_tensor(
+            compiled.weights,
+            layer_name + "shared_expert.down.weight",
+            {hidden_size, moe.intermediate_size},
+            moe.shared_expert_weight_dtype,
+            shared.down_weight);
+        if (!status)
+            return status.error();
+        shared.weight_bytes = expert_weight_bytes(compiled.weights, shared);
+        const TensorHandle shared_handles[] = {
+            shared.gate_weight,
+            shared.up_weight,
+            shared.down_weight,
+        };
+        for (TensorHandle handle : shared_handles)
+        {
+            status = prepare_linear_operator(
+                compiled.weights,
+                handle,
+                invalid_tensor_handle,
+                dense_device,
+                retain_cpu_dense_copies,
+                layer_plan.vulkan_device_index);
+            if (!status)
+                return status.error();
+        }
+
+        layer_plan.moe.experts.reserve(moe.expert_count);
+        for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
+        {
+            ExpertPlan expert;
+            expert.activation = moe.activation;
+            expert.activation_limit = moe.activation_limit;
+            const std::string prefix = speculative_expert_prefix(layer_id, expert_id);
+            status = assign_required_tensor(
+                compiled.weights,
+                prefix + "gate_up.weight",
+                {moe.intermediate_size * 2, hidden_size},
+                moe.expert_weight_dtype,
+                expert.gate_up_weight);
+            if (!status)
+                return status.error();
+            status = assign_required_tensor(
+                compiled.weights,
+                prefix + "down.weight",
+                {hidden_size, moe.intermediate_size},
+                moe.expert_weight_dtype,
+                expert.down_weight);
+            if (!status)
+                return status.error();
+            expert.weight_bytes = expert_weight_bytes(compiled.weights, expert);
+            const TensorData& gate_up_weight = compiled.weights.at(expert.gate_up_weight);
+            const TensorData& down_weight = compiled.weights.at(expert.down_weight);
+            if (gate_up_weight.mxfp4_file_storage && down_weight.mxfp4_file_storage)
+                expert.cache_key = Mxfp4ExpertCache::make_pair_key(gate_up_weight, down_weight);
+            layer_plan.moe.experts.push_back(std::move(expert));
+        }
+        speculative.layers.push_back(std::move(layer_plan));
+    }
+    return {};
+}
+
 Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping mapping, HybridMode hybrid_mode) const
 {
     BackendCapabilities capabilities;
@@ -338,25 +873,15 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
         {
             return Error{ErrorCode::UnsupportedModel, "dense FFN decoder layers are represented by MoeIR but are not yet executable"};
         }
-        if (has_flag(layer.flags, LayerDescriptorAttention) && layer.attention.kind != AttentionKind::Standard)
-        {
-            return Error{ErrorCode::UnsupportedModel, "multi-head latent attention is represented by MoeIR but is not yet executable"};
-        }
         if (has_flag(layer.flags, LayerDescriptorMoe))
         {
             const MoeDescriptor& moe = layer.ffn.moe;
-            if (moe.score_function != RouterScoreFunction::Softmax)
-            {
-                return Error{ErrorCode::UnsupportedModel, "non-softmax routing is represented by MoeIR but is not yet executable"};
-            }
             if (moe.router_group_count != 0 || moe.router_top_k_groups != 0)
             {
                 return Error{ErrorCode::UnsupportedModel, "group-limited routing is represented by MoeIR but is not yet executable"};
             }
-            if (moe.routed_scaling_factor != 1.0f)
-            {
-                return Error{ErrorCode::UnsupportedModel, "scaled routed Experts are represented by MoeIR but are not yet executable"};
-            }
+            if (!std::isfinite(moe.routed_scaling_factor) || moe.routed_scaling_factor <= 0.0f)
+                return Error{ErrorCode::InvalidModel, "routed scaling factor must be finite and positive"};
         }
     }
 
@@ -449,6 +974,21 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
     auto prepared = prepare_linear_operator(compiled.weights, compiled.lm_head_weight, invalid_tensor_handle, dense_device, retain_cpu_dense_copies, compiled.vulkan_device_index);
     if (!prepared)
         return prepared.error();
+    if (compiled.descriptor.hyper_connection_multiplier > 1)
+    {
+        const uint32_t hyper_columns = compiled.descriptor.hyper_connection_multiplier * compiled.descriptor.hidden_size;
+        auto status = assign_required_tensor(compiled.weights, "hyper.head.function", {compiled.descriptor.hyper_connection_multiplier, hyper_columns}, DType::Float32, compiled.hyper_head_function);
+        if (!status)
+            return status.error();
+        status = assign_required_tensor(compiled.weights, "hyper.head.base", {compiled.descriptor.hyper_connection_multiplier}, DType::Float32, compiled.hyper_head_base);
+        if (!status)
+            return status.error();
+        status = assign_required_tensor(compiled.weights, "hyper.head.scale", {1}, DType::Float32, compiled.hyper_head_scale);
+        if (!status)
+            return status.error();
+        if (compiled.descriptor.hyper_connection_iterations == 0 || compiled.descriptor.hyper_connection_epsilon <= 0.0f)
+            return Error{ErrorCode::InvalidModel, "invalid hyper-connection configuration"};
+    }
 
     compiled.layers.reserve(compiled.descriptor.layer_count);
     for (uint32_t layer_id = 0; layer_id < compiled.descriptor.layer_count; ++layer_id)
@@ -473,8 +1013,8 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
         {
             return Error{ErrorCode::InvalidModel, "layer MoE dimensions do not match the model descriptor"};
         }
-        if (has_flag(moe.flags, MoeDescriptorSharedExpert))
-            return Error{ErrorCode::UnsupportedModel, "shared experts are reserved for a later phase"};
+        if (has_flag(moe.flags, MoeDescriptorSharedExpert) != has_flag(graph.flags, AdapterGraphSharedExpert))
+            return Error{ErrorCode::InvalidModel, "shared Expert descriptor and operator graph do not match"};
         if (moe.expert_weight_dtype != DType::Float32
             && moe.expert_weight_dtype != DType::BFloat16
             && moe.expert_weight_dtype != DType::Int8
@@ -491,8 +1031,12 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
         if (has_flag(graph.flags, AdapterGraphAttention))
             layer_plan.flags |= CompiledLayerAttention;
         const bool use_vulkan_attention = has_flag(graph.flags, AdapterGraphAttention)
+                                          && layer.attention.kind == AttentionKind::Standard
                                           && use_vulkan_dense
                                           && has_flag(capabilities.flags, BackendCapabilityVulkanAttention);
+        const bool use_vulkan_latent_linear = has_flag(graph.flags, AdapterGraphAttention)
+                                              && layer.attention.kind == AttentionKind::MultiHeadLatent
+                                              && use_vulkan_dense;
         layer_plan.nodes.reserve(layer.nodes.size());
         for (size_t node_index = 0; node_index < layer.nodes.size(); ++node_index)
         {
@@ -501,7 +1045,10 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
         }
         layer_plan.moe.top_k = moe.top_k;
         layer_plan.moe.hidden_size = compiled.descriptor.hidden_size;
+        layer_plan.moe.score_function = moe.score_function;
         layer_plan.moe.normalization = moe.normalization;
+        layer_plan.moe.routed_scaling_factor = moe.routed_scaling_factor;
+        layer_plan.moe.has_shared_expert = has_flag(moe.flags, MoeDescriptorSharedExpert);
         layer_plan.moe.flags = 0;
         if (has_flag(moe.flags, MoeDescriptorNormalizeTopKWeights))
         {
@@ -509,10 +1056,34 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
         }
 
         const std::string layer_name = layer_prefix(layer_id);
+        if (compiled.descriptor.hyper_connection_multiplier > 1)
+        {
+            const uint32_t multiplier = compiled.descriptor.hyper_connection_multiplier;
+            const uint32_t mix_count = (2 + multiplier) * multiplier;
+            const uint32_t hyper_columns = multiplier * compiled.descriptor.hidden_size;
+            auto status = assign_required_tensor(compiled.weights, layer_name + "hyper.attention.function", {mix_count, hyper_columns}, DType::Float32, layer_plan.hyper_connection.attention_function);
+            if (!status)
+                return status.error();
+            status = assign_required_tensor(compiled.weights, layer_name + "hyper.attention.base", {mix_count}, DType::Float32, layer_plan.hyper_connection.attention_base);
+            if (!status)
+                return status.error();
+            status = assign_required_tensor(compiled.weights, layer_name + "hyper.attention.scale", {3}, DType::Float32, layer_plan.hyper_connection.attention_scale);
+            if (!status)
+                return status.error();
+            status = assign_required_tensor(compiled.weights, layer_name + "hyper.ffn.function", {mix_count, hyper_columns}, DType::Float32, layer_plan.hyper_connection.ffn_function);
+            if (!status)
+                return status.error();
+            status = assign_required_tensor(compiled.weights, layer_name + "hyper.ffn.base", {mix_count}, DType::Float32, layer_plan.hyper_connection.ffn_base);
+            if (!status)
+                return status.error();
+            status = assign_required_tensor(compiled.weights, layer_name + "hyper.ffn.scale", {3}, DType::Float32, layer_plan.hyper_connection.ffn_scale);
+            if (!status)
+                return status.error();
+        }
         if (has_flag(graph.flags, AdapterGraphAttention))
         {
             const AttentionDescriptor& attention = layer.attention;
-            const NcnnLinearDevice attention_device = use_vulkan_attention ? NcnnLinearDevice::Vulkan : NcnnLinearDevice::Cpu;
+            const NcnnLinearDevice attention_device = use_vulkan_attention || use_vulkan_latent_linear ? NcnnLinearDevice::Vulkan : NcnnLinearDevice::Cpu;
             if (layer.pre_attention_norm != NormType::RmsNorm)
                 return Error{ErrorCode::UnsupportedModel, "attention requires a pre-attention RMSNorm"};
             if (attention.head_count == 0
@@ -526,141 +1097,193 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 || attention.head_dimension != compiled.descriptor.head_dimension)
                 return Error{ErrorCode::InvalidModel, "layer attention dimensions do not match the model descriptor"};
             AttentionBlockPlan& plan = layer_plan.attention;
-            plan.head_count = attention.head_count;
-            plan.kv_head_count = attention.kv_head_count;
-            plan.head_dimension = attention.head_dimension;
-            plan.sliding_window = attention.sliding_window;
-            plan.initial_context_length = attention.initial_context_length;
-            plan.max_context_length = attention.max_context_length;
-            plan.rope_theta = attention.rope_theta;
-            plan.rope_scaling_factor = attention.rope_scaling_factor;
-            plan.rope_ntk_alpha = attention.rope_ntk_alpha;
-            plan.rope_ntk_beta = attention.rope_ntk_beta;
-            if (has_flag(graph.flags, AdapterGraphAttentionSink))
-                plan.flags |= AttentionBlockSink;
-            if (has_flag(attention.flags, AttentionDescriptorQueryKeyNorm))
+            if (attention.kind == AttentionKind::MultiHeadLatent)
             {
-                plan.flags |= AttentionBlockQueryKeyNorm;
-            }
-
-            const uint32_t query_size = attention.head_count * attention.head_dimension;
-            const uint32_t key_value_size = attention.kv_head_count * attention.head_dimension;
-            auto attention_norm = require_tensor(compiled.weights, layer_name + "pre_attention_norm.weight", {compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype);
-            auto query_weight = require_tensor(compiled.weights, layer_name + "attention.query.weight", {query_size, compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype);
-            auto key_weight = require_tensor(compiled.weights, layer_name + "attention.key.weight", {key_value_size, compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype);
-            auto value_weight = require_tensor(compiled.weights, layer_name + "attention.value.weight", {key_value_size, compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype);
-            auto output_weight = require_tensor(compiled.weights, layer_name + "attention.output.weight", {compiled.descriptor.hidden_size, query_size}, compiled.descriptor.activation_dtype);
-            Result<TensorHandle> query_bias = invalid_tensor_handle;
-            Result<TensorHandle> key_bias = invalid_tensor_handle;
-            Result<TensorHandle> value_bias = invalid_tensor_handle;
-            Result<TensorHandle> output_bias = invalid_tensor_handle;
-            Result<TensorHandle> query_norm_weight = invalid_tensor_handle;
-            Result<TensorHandle> key_norm_weight = invalid_tensor_handle;
-            if (has_flag(attention.flags, AttentionDescriptorBias))
-            {
-                query_bias = require_tensor(compiled.weights, layer_name + "attention.query.bias", {query_size}, compiled.descriptor.activation_dtype);
-                key_bias = require_tensor(compiled.weights, layer_name + "attention.key.bias", {key_value_size}, compiled.descriptor.activation_dtype);
-                value_bias = require_tensor(compiled.weights, layer_name + "attention.value.bias", {key_value_size}, compiled.descriptor.activation_dtype);
-                output_bias = require_tensor(compiled.weights, layer_name + "attention.output.bias", {compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype);
-            }
-            if (has_flag(plan.flags, AttentionBlockQueryKeyNorm))
-            {
-                query_norm_weight = require_tensor(compiled.weights, layer_name + "attention.query_norm.weight", {attention.head_dimension}, compiled.descriptor.activation_dtype);
-                key_norm_weight = require_tensor(compiled.weights, layer_name + "attention.key_norm.weight", {attention.head_dimension}, compiled.descriptor.activation_dtype);
-            }
-            Result<TensorHandle> sinks = invalid_tensor_handle;
-            if (has_flag(plan.flags, AttentionBlockSink))
-            {
-                sinks = require_tensor(compiled.weights, layer_name + "attention.sinks", {attention.head_count}, compiled.descriptor.activation_dtype);
-            }
-            if (!attention_norm
-                || !query_weight || !query_bias || !query_norm_weight
-                || !key_weight || !key_bias || !key_norm_weight
-                || !value_weight || !value_bias
-                || !output_weight || !output_bias
-                || !sinks)
-            {
-                const Error* error = !attention_norm      ? &attention_norm.error()
-                                     : !query_weight      ? &query_weight.error()
-                                     : !query_bias        ? &query_bias.error()
-                                     : !query_norm_weight ? &query_norm_weight.error()
-                                     : !key_weight        ? &key_weight.error()
-                                     : !key_bias          ? &key_bias.error()
-                                     : !key_norm_weight   ? &key_norm_weight.error()
-                                     : !value_weight      ? &value_weight.error()
-                                     : !value_bias        ? &value_bias.error()
-                                     : !output_weight     ? &output_weight.error()
-                                     : !output_bias       ? &output_bias.error()
-                                                          : &sinks.error();
-                return *error;
-            }
-            plan.pre_attention_norm_weight = attention_norm.value();
-            plan.query_weight = query_weight.value();
-            plan.query_bias = query_bias.value();
-            plan.query_norm_weight = query_norm_weight.value();
-            plan.key_weight = key_weight.value();
-            plan.key_bias = key_bias.value();
-            plan.key_norm_weight = key_norm_weight.value();
-            plan.value_weight = value_weight.value();
-            plan.value_bias = value_bias.value();
-            plan.output_weight = output_weight.value();
-            plan.output_bias = output_bias.value();
-            plan.sinks = sinks.value();
-            if (attention_device == NcnnLinearDevice::Vulkan)
-            {
-                const TensorData* query_bias_data = plan.query_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.query_bias);
-                const TensorData* key_bias_data = plan.key_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.key_bias);
-                const TensorData* value_bias_data = plan.value_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.value_bias);
-                plan.fused_qkv_operator = NcnnLinearOperator::create_fused(
+                auto status = compile_latent_attention(compiled.weights, layer_name, compiled.descriptor, attention, plan);
+                if (!status)
+                    return status.error();
+                const TensorHandle latent_linear_handles[] = {
+                    plan.query_a_weight,
+                    plan.query_b_weight,
+                    plan.key_value_weight,
+                    plan.output_b_weight,
+                    plan.indexer_query_weight,
+                };
+                for (TensorHandle handle : latent_linear_handles)
+                {
+                    if (handle == invalid_tensor_handle)
+                        continue;
+                    prepared = prepare_linear_operator(
+                        compiled.weights,
+                        handle,
+                        invalid_tensor_handle,
+                        attention_device,
+                        retain_cpu_dense_copies,
+                        layer_plan.vulkan_device_index);
+                    if (!prepared)
+                        return prepared.error();
+                }
+                prepared = prepare_linear_operator(
+                    compiled.weights,
+                    plan.output_a_weight,
+                    invalid_tensor_handle,
+                    attention_device,
+                    retain_cpu_dense_copies,
+                    layer_plan.vulkan_device_index,
+                    plan.output_group_count);
+                if (!prepared)
+                    return prepared.error();
+                if (attention_device == NcnnLinearDevice::Vulkan)
+                {
+                    TensorData& query_a = compiled.weights.at_mutable(plan.query_a_weight);
+                    const TensorData& query_b = compiled.weights.at(plan.query_b_weight);
+                    if (query_a.float8_linear_operator && query_b.float8_linear_operator
+                        && !query_a.float8_linear_operator->prepare_rms_norm(
+                            compiled.weights.at(plan.query_norm_weight),
+                            compiled.descriptor.norm_epsilon))
                     {
-                        &compiled.weights.at(plan.query_weight),
-                        &compiled.weights.at(plan.key_weight),
-                        &compiled.weights.at(plan.value_weight),
-                    },
-                    {
-                        query_bias_data,
-                        key_bias_data,
-                        value_bias_data,
-                    },
-                    attention_device, layer_plan.vulkan_device_index);
-                if (!plan.fused_qkv_operator)
-                    return Error{ErrorCode::InternalError, "failed to create fused Vulkan QKV operator"};
+                        return Error{ErrorCode::InternalError, "failed to prepare Vulkan FP8 query RMSNorm chain"};
+                    }
+                }
             }
             else
             {
-                prepared = prepare_linear_operator(compiled.weights, plan.query_weight, plan.query_bias, attention_device, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
-                if (!prepared)
-                    return prepared.error();
-                prepared = prepare_linear_operator(compiled.weights, plan.key_weight, plan.key_bias, attention_device, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
-                if (!prepared)
-                    return prepared.error();
-                prepared = prepare_linear_operator(compiled.weights, plan.value_weight, plan.value_bias, attention_device, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
-                if (!prepared)
-                    return prepared.error();
-            }
-            prepared = prepare_linear_operator(compiled.weights, plan.output_weight, plan.output_bias, attention_device, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
-            if (!prepared)
-                return prepared.error();
-            if (attention_device == NcnnLinearDevice::Vulkan && !has_flag(plan.flags, AttentionBlockQueryKeyNorm))
-            {
-                NcnnVulkanAttentionConfig attention_config;
-                attention_config.hidden_size = compiled.descriptor.hidden_size;
-                attention_config.head_count = plan.head_count;
-                attention_config.kv_head_count = plan.kv_head_count;
-                attention_config.head_dimension = plan.head_dimension;
-                attention_config.sliding_window = plan.sliding_window;
-                attention_config.initial_context_length = plan.initial_context_length;
-                attention_config.norm_epsilon = compiled.descriptor.norm_epsilon;
-                attention_config.rope_theta = plan.rope_theta;
-                attention_config.rope_scaling_factor = plan.rope_scaling_factor;
-                attention_config.rope_ntk_alpha = plan.rope_ntk_alpha;
-                attention_config.rope_ntk_beta = plan.rope_ntk_beta;
-                attention_config.activation_dtype = compiled.descriptor.activation_dtype;
-                attention_config.kv_cache_dtype = compiled.descriptor.kv_cache_dtype;
+                plan.head_count = attention.head_count;
+                plan.kv_head_count = attention.kv_head_count;
+                plan.head_dimension = attention.head_dimension;
+                plan.sliding_window = attention.sliding_window;
+                plan.initial_context_length = attention.initial_context_length;
+                plan.max_context_length = attention.max_context_length;
+                plan.rope_theta = attention.rope_theta;
+                plan.rope_scaling_factor = attention.rope_scaling_factor;
+                plan.rope_ntk_alpha = attention.rope_ntk_alpha;
+                plan.rope_ntk_beta = attention.rope_ntk_beta;
+                if (has_flag(graph.flags, AdapterGraphAttentionSink))
+                    plan.flags |= AttentionBlockSink;
+                if (has_flag(attention.flags, AttentionDescriptorQueryKeyNorm))
+                {
+                    plan.flags |= AttentionBlockQueryKeyNorm;
+                }
+
+                const uint32_t query_size = attention.head_count * attention.head_dimension;
+                const uint32_t key_value_size = attention.kv_head_count * attention.head_dimension;
+                auto attention_norm = require_tensor(compiled.weights, layer_name + "pre_attention_norm.weight", {compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype);
+                auto query_weight = require_tensor(compiled.weights, layer_name + "attention.query.weight", {query_size, compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype);
+                auto key_weight = require_tensor(compiled.weights, layer_name + "attention.key.weight", {key_value_size, compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype);
+                auto value_weight = require_tensor(compiled.weights, layer_name + "attention.value.weight", {key_value_size, compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype);
+                auto output_weight = require_tensor(compiled.weights, layer_name + "attention.output.weight", {compiled.descriptor.hidden_size, query_size}, compiled.descriptor.activation_dtype);
+                Result<TensorHandle> query_bias = invalid_tensor_handle;
+                Result<TensorHandle> key_bias = invalid_tensor_handle;
+                Result<TensorHandle> value_bias = invalid_tensor_handle;
+                Result<TensorHandle> output_bias = invalid_tensor_handle;
+                Result<TensorHandle> query_norm_weight = invalid_tensor_handle;
+                Result<TensorHandle> key_norm_weight = invalid_tensor_handle;
+                if (has_flag(attention.flags, AttentionDescriptorBias))
+                {
+                    query_bias = require_tensor(compiled.weights, layer_name + "attention.query.bias", {query_size}, compiled.descriptor.activation_dtype);
+                    key_bias = require_tensor(compiled.weights, layer_name + "attention.key.bias", {key_value_size}, compiled.descriptor.activation_dtype);
+                    value_bias = require_tensor(compiled.weights, layer_name + "attention.value.bias", {key_value_size}, compiled.descriptor.activation_dtype);
+                    output_bias = require_tensor(compiled.weights, layer_name + "attention.output.bias", {compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype);
+                }
+                if (has_flag(plan.flags, AttentionBlockQueryKeyNorm))
+                {
+                    query_norm_weight = require_tensor(compiled.weights, layer_name + "attention.query_norm.weight", {attention.head_dimension}, compiled.descriptor.activation_dtype);
+                    key_norm_weight = require_tensor(compiled.weights, layer_name + "attention.key_norm.weight", {attention.head_dimension}, compiled.descriptor.activation_dtype);
+                }
+                Result<TensorHandle> sinks = invalid_tensor_handle;
                 if (has_flag(plan.flags, AttentionBlockSink))
-                    attention_config.flags |= NcnnAttentionSink;
-                plan.vulkan_attention_operator = NcnnVulkanAttentionOperator::create(compiled.weights.at(plan.pre_attention_norm_weight), plan.sinks == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.sinks),
-                                                                                     plan.fused_qkv_operator, compiled.weights.at(plan.output_weight).linear_operator, attention_config);
+                {
+                    sinks = require_tensor(compiled.weights, layer_name + "attention.sinks", {attention.head_count}, compiled.descriptor.activation_dtype);
+                }
+                if (!attention_norm
+                    || !query_weight || !query_bias || !query_norm_weight
+                    || !key_weight || !key_bias || !key_norm_weight
+                    || !value_weight || !value_bias
+                    || !output_weight || !output_bias
+                    || !sinks)
+                {
+                    const Error* error = !attention_norm      ? &attention_norm.error()
+                                         : !query_weight      ? &query_weight.error()
+                                         : !query_bias        ? &query_bias.error()
+                                         : !query_norm_weight ? &query_norm_weight.error()
+                                         : !key_weight        ? &key_weight.error()
+                                         : !key_bias          ? &key_bias.error()
+                                         : !key_norm_weight   ? &key_norm_weight.error()
+                                         : !value_weight      ? &value_weight.error()
+                                         : !value_bias        ? &value_bias.error()
+                                         : !output_weight     ? &output_weight.error()
+                                         : !output_bias       ? &output_bias.error()
+                                                              : &sinks.error();
+                    return *error;
+                }
+                plan.pre_attention_norm_weight = attention_norm.value();
+                plan.query_weight = query_weight.value();
+                plan.query_bias = query_bias.value();
+                plan.query_norm_weight = query_norm_weight.value();
+                plan.key_weight = key_weight.value();
+                plan.key_bias = key_bias.value();
+                plan.key_norm_weight = key_norm_weight.value();
+                plan.value_weight = value_weight.value();
+                plan.value_bias = value_bias.value();
+                plan.output_weight = output_weight.value();
+                plan.output_bias = output_bias.value();
+                plan.sinks = sinks.value();
+                if (attention_device == NcnnLinearDevice::Vulkan)
+                {
+                    const TensorData* query_bias_data = plan.query_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.query_bias);
+                    const TensorData* key_bias_data = plan.key_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.key_bias);
+                    const TensorData* value_bias_data = plan.value_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.value_bias);
+                    plan.fused_qkv_operator = NcnnLinearOperator::create_fused(
+                        {
+                            &compiled.weights.at(plan.query_weight),
+                            &compiled.weights.at(plan.key_weight),
+                            &compiled.weights.at(plan.value_weight),
+                        },
+                        {
+                            query_bias_data,
+                            key_bias_data,
+                            value_bias_data,
+                        },
+                        attention_device, layer_plan.vulkan_device_index);
+                    if (!plan.fused_qkv_operator)
+                        return Error{ErrorCode::InternalError, "failed to create fused Vulkan QKV operator"};
+                }
+                else
+                {
+                    prepared = prepare_linear_operator(compiled.weights, plan.query_weight, plan.query_bias, attention_device, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
+                    if (!prepared)
+                        return prepared.error();
+                    prepared = prepare_linear_operator(compiled.weights, plan.key_weight, plan.key_bias, attention_device, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
+                    if (!prepared)
+                        return prepared.error();
+                    prepared = prepare_linear_operator(compiled.weights, plan.value_weight, plan.value_bias, attention_device, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
+                    if (!prepared)
+                        return prepared.error();
+                }
+                prepared = prepare_linear_operator(compiled.weights, plan.output_weight, plan.output_bias, attention_device, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
+                if (!prepared)
+                    return prepared.error();
+                if (attention_device == NcnnLinearDevice::Vulkan && !has_flag(plan.flags, AttentionBlockQueryKeyNorm))
+                {
+                    NcnnVulkanAttentionConfig attention_config;
+                    attention_config.hidden_size = compiled.descriptor.hidden_size;
+                    attention_config.head_count = plan.head_count;
+                    attention_config.kv_head_count = plan.kv_head_count;
+                    attention_config.head_dimension = plan.head_dimension;
+                    attention_config.sliding_window = plan.sliding_window;
+                    attention_config.initial_context_length = plan.initial_context_length;
+                    attention_config.norm_epsilon = compiled.descriptor.norm_epsilon;
+                    attention_config.rope_theta = plan.rope_theta;
+                    attention_config.rope_scaling_factor = plan.rope_scaling_factor;
+                    attention_config.rope_ntk_alpha = plan.rope_ntk_alpha;
+                    attention_config.rope_ntk_beta = plan.rope_ntk_beta;
+                    attention_config.activation_dtype = compiled.descriptor.activation_dtype;
+                    attention_config.kv_cache_dtype = compiled.descriptor.kv_cache_dtype;
+                    if (has_flag(plan.flags, AttentionBlockSink))
+                        attention_config.flags |= NcnnAttentionSink;
+                    plan.vulkan_attention_operator = NcnnVulkanAttentionOperator::create(compiled.weights.at(plan.pre_attention_norm_weight), plan.sinks == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.sinks),
+                                                                                         plan.fused_qkv_operator, compiled.weights.at(plan.output_weight).linear_operator, attention_config);
+                }
             }
         }
 
@@ -676,15 +1299,80 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
 
         if (has_flag(moe.flags, MoeDescriptorRouterBias))
         {
-            auto bias = require_tensor(compiled.weights, layer_name + "router.bias", {moe.expert_count}, compiled.descriptor.activation_dtype);
-            if (!bias)
-                return bias.error();
-            layer_plan.moe.router_bias = bias.value();
+            if (moe.score_function == RouterScoreFunction::Softmax)
+            {
+                auto bias = require_tensor(compiled.weights, layer_name + "router.bias", {moe.expert_count}, compiled.descriptor.activation_dtype);
+                if (!bias)
+                    return bias.error();
+                layer_plan.moe.router_bias = bias.value();
+            }
+            else
+            {
+                auto bias = require_tensor(compiled.weights, layer_name + "router.selection_bias", {moe.expert_count}, DType::Float32);
+                if (!bias)
+                    return bias.error();
+                layer_plan.moe.router_selection_bias = bias.value();
+            }
+        }
+        if (layer_id < compiled.descriptor.hash_routing_layer_count)
+        {
+            auto token_experts = require_tensor(compiled.weights, layer_name + "router.token_experts", {compiled.descriptor.vocabulary_size, moe.top_k}, DType::Int64);
+            if (!token_experts)
+                return token_experts.error();
+            layer_plan.moe.token_experts = token_experts.value();
         }
         // The CPU router avoids a Vulkan round trip before Expert dispatch.
         prepared = prepare_linear_operator(compiled.weights, layer_plan.moe.router_weight, layer_plan.moe.router_bias, NcnnLinearDevice::Cpu, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
         if (!prepared)
             return prepared.error();
+
+        if (layer_plan.moe.has_shared_expert)
+        {
+            if (moe.shared_expert_count != 1)
+                return Error{ErrorCode::UnsupportedModel, "the CPU runtime supports one shared Expert per MoE block"};
+            ExpertPlan& shared = layer_plan.moe.shared_expert;
+            shared.activation = moe.activation;
+            shared.activation_limit = moe.activation_limit;
+            auto gate = require_tensor(compiled.weights, layer_name + "shared_expert.gate.weight", {moe.intermediate_size, compiled.descriptor.hidden_size}, moe.shared_expert_weight_dtype);
+            auto up = require_tensor(compiled.weights, layer_name + "shared_expert.up.weight", {moe.intermediate_size, compiled.descriptor.hidden_size}, moe.shared_expert_weight_dtype);
+            auto down = require_tensor(compiled.weights, layer_name + "shared_expert.down.weight", {compiled.descriptor.hidden_size, moe.intermediate_size}, moe.shared_expert_weight_dtype);
+            if (!gate || !up || !down)
+            {
+                return !gate ? gate.error() : !up ? up.error()
+                                                  : down.error();
+            }
+            shared.gate_weight = gate.value();
+            shared.up_weight = up.value();
+            shared.down_weight = down.value();
+            shared.weight_bytes = expert_weight_bytes(compiled.weights, shared);
+            prepared = prepare_linear_operator(
+                compiled.weights,
+                shared.gate_weight,
+                invalid_tensor_handle,
+                dense_device,
+                retain_cpu_dense_copies,
+                layer_plan.vulkan_device_index);
+            if (!prepared)
+                return prepared.error();
+            prepared = prepare_linear_operator(
+                compiled.weights,
+                shared.up_weight,
+                invalid_tensor_handle,
+                dense_device,
+                retain_cpu_dense_copies,
+                layer_plan.vulkan_device_index);
+            if (!prepared)
+                return prepared.error();
+            prepared = prepare_linear_operator(
+                compiled.weights,
+                shared.down_weight,
+                invalid_tensor_handle,
+                dense_device,
+                retain_cpu_dense_copies,
+                layer_plan.vulkan_device_index);
+            if (!prepared)
+                return prepared.error();
+        }
 
         layer_plan.moe.experts.reserve(moe.expert_count);
         for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
@@ -762,6 +1450,10 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
 
         compiled.layers.push_back(std::move(layer_plan));
     }
+
+    auto speculative = compile_speculative_model(compiled, dense_device, retain_cpu_dense_copies);
+    if (!speculative)
+        return speculative.error();
 
     auto graph = build_compiled_execution_graph(compiled, capabilities);
     if (!graph)

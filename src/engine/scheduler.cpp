@@ -164,6 +164,255 @@ public:
         }
     }
 
+    std::future<std::vector<Result<PrefillResult>>> submit_prefill(
+        std::vector<PrefillBatchRequest> requests)
+    {
+        struct PrefillState
+        {
+            std::promise<std::vector<Result<PrefillResult>>> promise;
+        };
+
+        submitted_prefill_batches_.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        submitted_prefill_requests_.fetch_add(
+            requests.size(),
+            std::memory_order_relaxed);
+        auto state = std::make_shared<PrefillState>();
+        std::future<std::vector<Result<PrefillResult>>> future = state->promise.get_future();
+        if (requests.empty())
+        {
+            state->promise.set_value({});
+            return future;
+        }
+
+        std::unordered_map<Session*, size_t> session_counts;
+        std::vector<Session*> sessions;
+        sessions.reserve(requests.size());
+        bool valid = true;
+        for (const PrefillBatchRequest& request : requests)
+        {
+            if (!request.session || request.input_ids.empty())
+            {
+                valid = false;
+                continue;
+            }
+            sessions.push_back(request.session.get());
+            ++session_counts[request.session.get()];
+        }
+        if (sessions.size() != requests.size()
+            || std::any_of(
+                session_counts.begin(),
+                session_counts.end(),
+                [](const auto& item) {
+                    return item.second != 1;
+                }))
+        {
+            valid = false;
+        }
+
+        auto reject = [this,
+                       state,
+                       request_count = requests.size()](
+                          const std::string& message) {
+            std::vector<Result<PrefillResult>> results;
+            results.reserve(request_count);
+            for (size_t index = 0;
+                 index < request_count;
+                 ++index)
+            {
+                results.emplace_back(Error{
+                    ErrorCode::InvalidArgument,
+                    message});
+            }
+            completed_prefill_requests_.fetch_add(
+                request_count,
+                std::memory_order_relaxed);
+            state->promise.set_value(std::move(results));
+        };
+        if (!valid)
+        {
+            reject(
+                "a prefill batch requires unique sessions and "
+                "non-empty inputs");
+            return future;
+        }
+
+        if (requests.size() == 1)
+        {
+            PrefillBatchRequest request = std::move(requests.front());
+            Session* session = request.session.get();
+            enqueue_session(
+                session,
+                [this,
+                 state,
+                 request = std::move(request)]() mutable {
+                    std::vector<Result<PrefillResult>> results;
+                    try
+                    {
+                        results.emplace_back(
+                            request.session->prefill(
+                                request.input_ids));
+                    }
+                    catch (const std::exception& error)
+                    {
+                        results.emplace_back(Error{
+                            ErrorCode::InternalError,
+                            std::string(
+                                "prefill worker failed: ")
+                                + error.what()});
+                    }
+                    catch (...)
+                    {
+                        results.emplace_back(Error{
+                            ErrorCode::InternalError,
+                            "prefill worker failed"});
+                    }
+                    completed_prefill_requests_.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                    state->promise.set_value(
+                        std::move(results));
+                });
+            return future;
+        }
+
+        if (!SessionBatchAccess::compatible(sessions))
+        {
+            reject(
+                "staged prefill sessions must share one loaded model");
+            return future;
+        }
+
+        std::function<void()> staged_work = [this,
+                                             state,
+                                             sessions,
+                                             requests = std::move(requests)]() mutable {
+#if defined(_OPENMP)
+            struct OpenMpTeamRestore
+            {
+                int team_size = 1;
+                ~OpenMpTeamRestore()
+                {
+                    omp_set_num_threads(team_size);
+                }
+            };
+            const OpenMpTeamRestore restore{
+                omp_get_max_threads()};
+            const uint32_t staged_team_size = std::max(
+                1u,
+                std::min(
+                    static_cast<uint32_t>(
+                        std::thread::hardware_concurrency()),
+                    expert_threads_per_worker_
+                        * static_cast<uint32_t>(
+                            requests.size())));
+            omp_set_num_threads(
+                static_cast<int>(staged_team_size));
+#endif
+            std::vector<Result<PrefillResult>> results;
+            try
+            {
+                std::vector<std::vector<int32_t>> input_ids;
+                input_ids.reserve(requests.size());
+                for (PrefillBatchRequest& request : requests)
+                {
+                    input_ids.push_back(
+                        std::move(request.input_ids));
+                }
+                StagedDecodeBatchMetrics metrics;
+                auto prefilled = SessionBatchAccess::prefill(
+                    sessions,
+                    input_ids,
+                    metrics);
+                staged_prefill_batches_.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                staged_prefill_requests_.fetch_add(
+                    requests.size(),
+                    std::memory_order_relaxed);
+                logical_expert_batches_.fetch_add(
+                    metrics.logical_expert_batches,
+                    std::memory_order_relaxed);
+                physical_expert_batches_.fetch_add(
+                    metrics.physical_expert_batches,
+                    std::memory_order_relaxed);
+                if (metrics.logical_expert_batches
+                    > metrics.physical_expert_batches)
+                {
+                    coalesced_expert_batches_.fetch_add(
+                        metrics.logical_expert_batches
+                            - metrics.physical_expert_batches,
+                        std::memory_order_relaxed);
+                }
+                coalesced_expert_routes_.fetch_add(
+                    metrics.coalesced_expert_routes,
+                    std::memory_order_relaxed);
+                update_max(
+                    max_coalesced_expert_batch_size_,
+                    metrics.max_expert_batch_size);
+                if (prefilled)
+                {
+                    results.reserve(prefilled.value().size());
+                    for (PrefillResult& result :
+                         prefilled.value())
+                    {
+                        results.emplace_back(
+                            std::move(result));
+                    }
+                }
+                else
+                {
+                    results.reserve(requests.size());
+                    for (size_t index = 0;
+                         index < requests.size();
+                         ++index)
+                    {
+                        results.emplace_back(
+                            prefilled.error());
+                    }
+                }
+            }
+            catch (const std::exception& error)
+            {
+                results.reserve(requests.size());
+                for (size_t index = 0;
+                     index < requests.size();
+                     ++index)
+                {
+                    results.emplace_back(Error{
+                        ErrorCode::InternalError,
+                        std::string(
+                            "staged prefill worker failed: ")
+                            + error.what()});
+                }
+            }
+            catch (...)
+            {
+                results.reserve(requests.size());
+                for (size_t index = 0;
+                     index < requests.size();
+                     ++index)
+                {
+                    results.emplace_back(Error{
+                        ErrorCode::InternalError,
+                        "staged prefill worker failed"});
+                }
+            }
+            release_batch_sessions(sessions);
+            completed_prefill_requests_.fetch_add(
+                requests.size(),
+                std::memory_order_relaxed);
+            state->promise.set_value(std::move(results));
+        };
+        if (!try_enqueue_batch(sessions, std::move(staged_work)))
+        {
+            reject(
+                "staged prefill sessions have pending scheduler work");
+        }
+        return future;
+    }
+
     std::future<std::vector<Result<DecodeResult>>> submit_decode(std::vector<DecodeBatchRequest> requests)
     {
         submitted_batches_.fetch_add(1, std::memory_order_relaxed);
@@ -411,6 +660,16 @@ public:
     SchedulerStatistics statistics() const noexcept
     {
         SchedulerStatistics result;
+        result.submitted_prefill_batches = submitted_prefill_batches_.load(
+            std::memory_order_relaxed);
+        result.submitted_prefill_requests = submitted_prefill_requests_.load(
+            std::memory_order_relaxed);
+        result.completed_prefill_requests = completed_prefill_requests_.load(
+            std::memory_order_relaxed);
+        result.staged_prefill_batches = staged_prefill_batches_.load(
+            std::memory_order_relaxed);
+        result.staged_prefill_requests = staged_prefill_requests_.load(
+            std::memory_order_relaxed);
         result.submitted_batches = submitted_batches_.load(std::memory_order_relaxed);
         result.submitted_requests = submitted_requests_.load(std::memory_order_relaxed);
         result.completed_requests = completed_requests_.load(std::memory_order_relaxed);
@@ -1056,6 +1315,11 @@ private:
     std::atomic<uint64_t> max_cross_call_pending_{0};
     std::atomic<uint64_t> affinity_workers_configured_{0};
     std::atomic<uint64_t> affinity_failures_{0};
+    std::atomic<uint64_t> submitted_prefill_batches_{0};
+    std::atomic<uint64_t> submitted_prefill_requests_{0};
+    std::atomic<uint64_t> completed_prefill_requests_{0};
+    std::atomic<uint64_t> staged_prefill_batches_{0};
+    std::atomic<uint64_t> staged_prefill_requests_{0};
 };
 
 BatchScheduler::BatchScheduler(const SchedulerOptions& options)
@@ -1064,6 +1328,12 @@ BatchScheduler::BatchScheduler(const SchedulerOptions& options)
 }
 
 BatchScheduler::~BatchScheduler() = default;
+
+std::future<std::vector<Result<PrefillResult>>> BatchScheduler::submit_prefill(
+    std::vector<PrefillBatchRequest> requests)
+{
+    return implementation_->submit_prefill(std::move(requests));
+}
 
 std::future<std::vector<Result<DecodeResult>>> BatchScheduler::submit_decode(std::vector<DecodeBatchRequest> requests)
 {
