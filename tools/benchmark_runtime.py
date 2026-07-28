@@ -40,12 +40,12 @@ DEFAULT_PROMPT_TOKEN_IDS = [
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark ncnn_moe_gpt_oss with repeatable runtime, memory, "
-            "and output-token reporting."
+            "Benchmark an ncnn_moe model runner with repeatable runtime, "
+            "memory, and output-token reporting."
         )
     )
-    parser.add_argument("runner", help="Path to ncnn_moe_gpt_oss")
-    parser.add_argument("model", help="Path to an official GPT-OSS model directory")
+    parser.add_argument("runner", help="Path to an ncnn_moe model runner")
+    parser.add_argument("model", help="Path to a supported model directory")
     parser.add_argument(
         "--model-revision",
         default="",
@@ -946,7 +946,7 @@ def parse_runner_output(output):
     ]
     result = {
         "load_seconds": extract_number(
-            output, r"^loaded gpt_oss in ([0-9.]+) s,"
+            output, r"^loaded [a-zA-Z0-9_-]+ in ([0-9.]+) s,"
         ),
         "generated_tokens": extract_number(
             output, r"^generated (\d+) token\(s\) in", int
@@ -1733,7 +1733,7 @@ def run_cache_sweep(arguments):
 
     report = {
         "schema_version": 2,
-        "benchmark": "gpt_oss_expert_cache_sweep",
+        "benchmark": "runtime_expert_cache_sweep",
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model": str(Path(arguments.model).resolve()),
         "runner": str(Path(arguments.runner).resolve()),

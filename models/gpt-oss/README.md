@@ -243,16 +243,18 @@ The matrix driver validates parity for every case, runs the cold and warm
 policies, and writes per-case reports plus one aggregate JSON file:
 
 ```powershell
-python tools\benchmark_performance_matrix.py `
-  --runner .\build-gptoss-vulkan-msvc\Release\ncnn_moe_gpt_oss.exe `
+python tools\benchmark_reference_matrix.py gpt-oss `
+  --runner .\build-ncnn\Release\ncnn_moe_gpt_oss.exe `
   --model-20b .\models\gpt-oss\gpt-oss-20b `
   --model-120b .\models\gpt-oss\gpt-oss-120b `
-  --output-dir .\build-gptoss-vulkan-msvc\performance-matrix-unified `
+  --output-dir .\build-reports\performance-matrix\gpt-oss `
   --repeats 3 --short-tokens 32 --long-tokens 256 `
   --vulkan-device-index 0
 ```
 
-Use `tools/benchmark_gpt_oss.py` directly for a custom prompt or token
+The aggregate report is
+`build-reports/performance-matrix/gpt-oss/report.json`.
+Use `tools/benchmark_runtime.py` directly for a custom prompt or token
 window. Keep the model path, warm-up policy, memory budgets, Session count, and
 backend fixed when comparing implementation changes. Public reference commands
 use the workspace-local paths shown above; external weight locations are not

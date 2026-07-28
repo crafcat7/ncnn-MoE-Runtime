@@ -18,7 +18,7 @@ COLORS = {
 }
 
 
-REFERENCE_DATA = {
+GPT_OSS_REFERENCE_DATA = {
     "hybrid": [
         {"label": "20B · 32 tok", "cold": 14.103, "warm": 14.855},
         {"label": "20B · 256 tok", "cold": 17.069, "warm": 16.597},
@@ -60,25 +60,64 @@ REFERENCE_DATA = {
     ],
 }
 
+DEEPSEEK_REFERENCE_DATA = {
+    "hybrid": [
+        {"label": "1S · 32 tok", "cold": 1.144, "warm": 1.264},
+        {"label": "1S · 256 tok", "cold": 1.378, "warm": 1.377},
+        {"label": "4S · 32 tok", "cold": 3.284, "warm": 3.462},
+        {"label": "4S · 256 tok", "cold": 3.214, "warm": 3.291},
+    ],
+    "storage": [
+        {"label": "1 GiB · 32 tok", "cold": 0.649, "warm": 0.650},
+        {"label": "10 GiB · 32 tok", "cold": 0.727, "warm": 0.780},
+        {"label": "16 GiB · 32 tok", "cold": 0.663, "warm": 0.674},
+        {"label": "1 GiB · 256 tok", "cold": 0.710, "warm": 0.667},
+        {"label": "10 GiB · 256 tok", "cold": 0.812, "warm": 0.838},
+        {"label": "16 GiB · 256 tok", "cold": 0.773, "warm": 0.807},
+    ],
+    "logical_reads": [
+        {"label": "1 GiB · 32 tok", "cold": 111.1, "warm": 111.1},
+        {"label": "10 GiB · 32 tok", "cold": 44.9, "warm": 39.7},
+        {"label": "16 GiB · 32 tok", "cold": 39.3, "warm": 31.0},
+        {"label": "1 GiB · 256 tok", "cold": 883.8, "warm": 883.8},
+        {"label": "10 GiB · 256 tok", "cold": 296.0, "warm": 296.4},
+        {"label": "16 GiB · 256 tok", "cold": 216.1, "warm": 216.3},
+    ],
+    "physical_reads": [
+        {"label": "1 GiB · 32 tok", "cold": 32.8, "warm": 54.7},
+        {"label": "10 GiB · 32 tok", "cold": 30.6, "warm": 57.7},
+        {"label": "16 GiB · 32 tok", "cold": 31.7, "warm": 63.5},
+        {"label": "1 GiB · 256 tok", "cold": 196.1, "warm": 424.1},
+        {"label": "10 GiB · 256 tok", "cold": 208.5, "warm": 428.0},
+        {"label": "16 GiB · 256 tok", "cold": 193.6, "warm": 356.1},
+    ],
+}
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Generate the published GPT-OSS benchmark SVG."
+        description="Generate a published ncnn_moe reference benchmark SVG."
+    )
+    parser.add_argument(
+        "--family",
+        choices=("gpt-oss", "deepseek-v4"),
+        default="gpt-oss",
+        help="Published matrix family; defaults to GPT-OSS.",
     )
     parser.add_argument(
         "--report",
-        default="build-gptoss-vulkan-msvc/performance-matrix-unified/performance-matrix.json",
+        default=None,
         help="Unified matrix JSON; published values are used when absent.",
     )
     parser.add_argument(
         "--output",
-        default="assets/gpt-oss-performance.svg",
+        default=None,
         help="Output SVG path.",
     )
     return parser.parse_args()
 
 
-def from_report(path):
+def gpt_oss_from_report(path):
     if not path.is_file():
         return None
 
@@ -157,7 +196,96 @@ def from_report(path):
             "storage": storage,
             "logical_reads": logical_reads,
             "physical_reads": physical_reads,
-            "short_reference": REFERENCE_DATA["short_reference"],
+            "short_reference": GPT_OSS_REFERENCE_DATA["short_reference"],
+        }
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        print(
+            f"warning: cannot parse {path}: {error}; using published values",
+            file=sys.stderr,
+        )
+        return None
+
+
+def deepseek_from_report(path):
+    if not path.is_file():
+        return None
+
+    try:
+        aggregate = json.loads(path.read_text(encoding="utf-8"))
+        if aggregate["benchmark"] != "deepseek_v4_performance_matrix":
+            raise ValueError("not a DeepSeek V4 performance matrix")
+        results = {
+            result["case"]["name"]: result["report"]
+            for result in aggregate["results"]
+        }
+
+        hybrid = []
+        for name, label in (
+            ("deepseek-v4-single-short", "1S · 32 tok"),
+            ("deepseek-v4-single-long", "1S · 256 tok"),
+            ("deepseek-v4-service-4xshort", "4S · 32 tok"),
+            ("deepseek-v4-service-4xlong", "4S · 256 tok"),
+        ):
+            hybrid.append(
+                {
+                    "label": label,
+                    "cold": results[f"{name}-cold"]["median"][
+                        "decode_tokens_per_second"
+                    ],
+                    "warm": results[f"{name}-warm"]["median"][
+                        "decode_tokens_per_second"
+                    ],
+                }
+            )
+
+        storage = []
+        logical_reads = []
+        physical_reads = []
+        for window in ("short", "long"):
+            cold_rows = {
+                row["expert_cache_mb"]: row
+                for row in results[f"deepseek-v4-storage-{window}-cold"][
+                    "rows"
+                ]
+            }
+            warm_rows = {
+                row["expert_cache_mb"]: row
+                for row in results[f"deepseek-v4-storage-{window}-warm"][
+                    "rows"
+                ]
+            }
+            tokens = 32 if window == "short" else 256
+            for cache_mb in (1024, 10240, 16384):
+                label = f"{cache_mb // 1024} GiB · {tokens} tok"
+                cold = cold_rows[cache_mb]
+                warm = warm_rows[cache_mb]
+                storage.append(
+                    {
+                        "label": label,
+                        "cold": cold["decode_tokens_per_second"],
+                        "warm": warm["decode_tokens_per_second"],
+                    }
+                )
+                logical_reads.append(
+                    {
+                        "label": label,
+                        "cold": cold["runtime_logical_read_bytes"] / 1e9,
+                        "warm": warm["runtime_logical_read_bytes"] / 1e9,
+                    }
+                )
+                physical_reads.append(
+                    {
+                        "label": label,
+                        "cold": cold["system_physical_read_bytes"] / 1e9,
+                        "warm": warm["system_physical_read_bytes"] / 1e9,
+                    }
+                )
+
+        return {
+            "hybrid": hybrid,
+            "storage": storage,
+            "logical_reads": logical_reads,
+            "physical_reads": physical_reads,
         }
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         print(
@@ -265,7 +393,7 @@ def bar_panel(
     return "".join(parts)
 
 
-def build_svg(data):
+def build_gpt_oss_svg(data):
     width = 1400
     height = 1450
     margin = 42
@@ -361,13 +489,116 @@ def build_svg(data):
     return "\n".join(parts) + "\n"
 
 
+def build_deepseek_svg(data):
+    width = 1400
+    height = 1130
+    margin = 42
+    gap = 42
+    panel_width = (width - margin * 2 - gap) / 2
+    panel_height = 460
+    lower_y = 585
+    title = "DeepSeek V4 Flash DSpark unified performance matrix"
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+        f'height="{height}" viewBox="0 0 {width} {height}" role="img" '
+        'aria-labelledby="chart-title chart-desc">',
+        f'<title id="chart-title">{title}</title>',
+        '<desc id="chart-desc">Cold and warm throughput, Runtime logical '
+        'Expert reads, and sampled system physical reads for the DeepSeek V4 '
+        'Flash DSpark benchmark matrix.</desc>',
+        f'<rect width="{width}" height="{height}" fill="#ffffff"/>',
+        svg_text(margin, 44, title, size=27, weight=600),
+        svg_text(
+            margin,
+            70,
+            "Ryzen 7 9800X3D · 31.14 GiB RAM · RTX 5070 Ti 16 GiB · "
+            "fixed 16-token prompt · three-run medians · DSpark off",
+            size=13,
+            fill=COLORS["muted"],
+        ),
+        f'<rect x="{width - 250}" y="31" width="14" height="10" rx="2" '
+        f'fill="{COLORS["cold"]}"/>',
+        svg_text(width - 229, 41, "cold", size=12),
+        f'<rect x="{width - 168}" y="31" width="14" height="10" rx="2" '
+        f'fill="{COLORS["warm"]}"/>',
+        svg_text(width - 147, 41, "warm", size=12),
+        bar_panel(
+            margin,
+            95,
+            panel_width,
+            panel_height,
+            "Hybrid Runtime throughput",
+            "token/s",
+            data["hybrid"],
+            4,
+        ),
+        bar_panel(
+            margin + panel_width + gap,
+            95,
+            panel_width,
+            panel_height,
+            "CPU Expert storage control",
+            "token/s",
+            data["storage"],
+            1,
+        ),
+        bar_panel(
+            margin,
+            lower_y,
+            panel_width,
+            panel_height,
+            "Runtime logical Expert reads",
+            "GB",
+            data["logical_reads"],
+            950,
+        ),
+        bar_panel(
+            margin + panel_width + gap,
+            lower_y,
+            panel_width,
+            panel_height,
+            "Sampled system physical reads",
+            "GB · total-disk estimate",
+            data["physical_reads"],
+            450,
+        ),
+        svg_text(
+            margin,
+            height - 21,
+            "Short = 32 tokens · long = 256 tokens · 4S throughput is "
+            "aggregate · operating-system file cache not flushed",
+            size=12,
+            fill=COLORS["muted"],
+        ),
+        "</svg>",
+    ]
+    return "\n".join(parts) + "\n"
+
+
 def main():
     arguments = parse_arguments()
-    report_path = Path(arguments.report)
-    data = from_report(report_path) or REFERENCE_DATA
-    output_path = Path(arguments.output)
+    if arguments.family == "gpt-oss":
+        default_report = (
+            "build-reports/performance-matrix/gpt-oss/report.json"
+        )
+        default_output = "assets/gpt-oss-performance.svg"
+        reference_data = GPT_OSS_REFERENCE_DATA
+        report_loader = gpt_oss_from_report
+        renderer = build_gpt_oss_svg
+    else:
+        default_report = (
+            "build-reports/performance-matrix/deepseek-v4/report.json"
+        )
+        default_output = "assets/deepseek-v4-performance.svg"
+        reference_data = DEEPSEEK_REFERENCE_DATA
+        report_loader = deepseek_from_report
+        renderer = build_deepseek_svg
+
+    report_path = Path(arguments.report or default_report)
+    data = report_loader(report_path) or reference_data
+    output_path = Path(arguments.output or default_output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(build_svg(data), encoding="utf-8")
+    output_path.write_text(renderer(data), encoding="utf-8")
     print(f"wrote {output_path.resolve()}")
     return 0
 
