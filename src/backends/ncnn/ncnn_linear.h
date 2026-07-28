@@ -24,7 +24,7 @@ enum class NcnnLinearDevice
 struct NcnnVulkanRuntimeCounters
 {
     uint64_t compute_submissions = 0;
-    uint64_t asynchronous_submissions = 0;
+    uint64_t submit_wait_time_microseconds = 0;
     uint64_t batch_uploads = 0;
     uint64_t batch_downloads = 0;
     uint64_t auxiliary_uploads = 0;
@@ -70,6 +70,41 @@ public:
     [[nodiscard]] bool uses_vulkan() const noexcept;
 };
 
+class NcnnVulkanFloat8Operator
+{
+private:
+    class Implementation;
+
+    NcnnVulkanFloat8Operator();
+    std::unique_ptr<Implementation> implementation_;
+
+public:
+    ~NcnnVulkanFloat8Operator();
+
+    [[nodiscard]] static std::shared_ptr<NcnnVulkanFloat8Operator> create(
+        const TensorData& matrix,
+        const TensorData* bias = nullptr,
+        uint32_t input_group_count = 1,
+        uint32_t vulkan_device_index = automatic_vulkan_device_index);
+    [[nodiscard]] bool prepare_rms_norm(const TensorData& weight, float epsilon);
+    [[nodiscard]] bool forward(const CpuBatch& input, CpuBatch& output) const;
+    [[nodiscard]] bool forward_chain(const CpuBatch& input, const NcnnVulkanFloat8Operator& next, CpuBatch& output) const;
+    [[nodiscard]] bool forward_rms_norm_chain(const CpuBatch& input, const NcnnVulkanFloat8Operator& next, CpuBatch& output) const;
+    [[nodiscard]] bool forward_rms_norm_chain_parallel(
+        const CpuBatch& input,
+        const NcnnVulkanFloat8Operator& next,
+        const NcnnVulkanFloat8Operator& parallel,
+        CpuBatch& output,
+        CpuBatch& parallel_output) const;
+    [[nodiscard]] bool forward_swiglu_chain(
+        const CpuBatch& input,
+        const NcnnVulkanFloat8Operator& up,
+        const NcnnVulkanFloat8Operator& down,
+        ExpertActivation activation,
+        float activation_limit,
+        CpuBatch& output) const;
+};
+
 class NcnnVulkanMxfp4Operator
 {
 private:
@@ -111,7 +146,8 @@ private:
     [[nodiscard]] static std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> create_with_allocator(const TensorData& gate_up, const TensorData* gate_up_bias,
                                                                                               const TensorData& down, const TensorData* down_bias,
                                                                                               float activation_limit, uint32_t vulkan_device_index,
-                                                                                              ncnn::VkAllocator* weight_allocator);
+                                                                                              ncnn::VkAllocator* weight_allocator,
+                                                                                              ExpertActivation activation);
 
     class Implementation;
 
@@ -123,10 +159,12 @@ public:
 
     [[nodiscard]] static std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> create(const TensorData& gate_up, const TensorData* gate_up_bias,
                                                                                const TensorData& down, const TensorData* down_bias, float activation_limit,
-                                                                               uint32_t vulkan_device_index = automatic_vulkan_device_index);
+                                                                               uint32_t vulkan_device_index = automatic_vulkan_device_index,
+                                                                               ExpertActivation activation = ExpertActivation::GptOssSwiGlu);
     [[nodiscard]] static std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> create_from_device_storage(
         const NcnnVulkanMxfp4DeviceMatrixView& gate_up, const TensorData* gate_up_bias, const NcnnVulkanMxfp4DeviceMatrixView& down,
-        const TensorData* down_bias, float activation_limit, uint32_t vulkan_device_index, const ncnn::VkMat& storage);
+        const TensorData* down_bias, float activation_limit, uint32_t vulkan_device_index, const ncnn::VkMat& storage,
+        ExpertActivation activation = ExpertActivation::GptOssSwiGlu);
     [[nodiscard]] bool forward(const CpuBatch& input, CpuBatch& output) const;
 };
 

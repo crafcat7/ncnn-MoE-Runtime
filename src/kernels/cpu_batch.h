@@ -74,6 +74,11 @@ public:
     {
         return data_;
     }
+
+    [[nodiscard]] uint64_t allocated_bytes() const noexcept
+    {
+        return static_cast<uint64_t>(data_.capacity()) * sizeof(float);
+    }
 };
 
 } // namespace moe

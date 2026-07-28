@@ -39,6 +39,11 @@ public:
     [[nodiscard]] const SafetensorInfo* find(const std::string& name) const noexcept;
     [[nodiscard]] Result<TensorData> load_tensor(const std::string& name) const;
     [[nodiscard]] Result<TensorData> load_bfloat16_slice(const std::string& name, uint32_t index, std::vector<uint32_t> shape) const;
+    [[nodiscard]] Result<TensorData> load_float8_tensor(const std::string& weight_name, const std::string& scale_name) const;
+    [[nodiscard]] Result<TensorData> load_mxfp4_tensor(const std::string& blocks_name, const std::string& scales_name, uint32_t rows, uint32_t columns, uint32_t flags = 0) const;
+    [[nodiscard]] Result<TensorData> load_interleaved_mxfp4_tensor(const std::string& gate_blocks_name, const std::string& gate_scales_name,
+                                                                   const std::string& up_blocks_name, const std::string& up_scales_name,
+                                                                   uint32_t rows, uint32_t columns, uint32_t flags = 0) const;
     [[nodiscard]] Result<TensorData> load_mxfp4_expert(const std::string& blocks_name, const std::string& scales_name, uint32_t expert_id, uint32_t rows, uint32_t columns, uint32_t flags = 0) const;
 };
 

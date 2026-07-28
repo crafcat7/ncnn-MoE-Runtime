@@ -114,10 +114,5 @@ float bfloat16_dot(const uint16_t* weights, const float* input, uint32_t count) 
     }
 }
 
-const char* bfloat16_kernel_name() noexcept
-{
-    return mxfp4_kernel_name();
-}
-
 } // namespace moe
 } // namespace ncnn

@@ -25,6 +25,7 @@ struct ExpertVictimExecutionMetadata
     const TensorData* down_bias = nullptr;
     float activation_limit = 0.0f;
     bool enabled = false;
+    ExpertActivation activation = ExpertActivation::GptOssSwiGlu;
 };
 
 struct ExpertVictimCacheStatistics

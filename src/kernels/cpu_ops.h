@@ -20,6 +20,7 @@ struct Mxfp4Task
     const TensorData* down_bias = nullptr;
     const CpuBatch* input = nullptr;
     CpuBatch* output = nullptr;
+    ExpertActivation activation = ExpertActivation::GptOssSwiGlu;
     float activation_limit = 0.0f;
 };
 
@@ -27,6 +28,11 @@ struct Mxfp4Scratch
 {
     std::vector<CpuBatch> activated;
     std::vector<CpuBatch> linear;
+    std::vector<CpuBatch> unique_input;
+    std::vector<CpuBatch> unique_output;
+    std::vector<std::vector<uint32_t>> unique_row_maps;
+    std::vector<Mxfp4Task> effective_tasks;
+    std::vector<uint32_t> physical_input_rows;
 };
 
 [[nodiscard]] float bfloat16_to_float(uint16_t value) noexcept;
@@ -34,13 +40,14 @@ struct Mxfp4Scratch
 [[nodiscard]] float scaled_silu(float value, float sigmoid_scale = 1.0f) noexcept;
 [[nodiscard]] float approximate_scaled_silu(float value, float sigmoid_scale = 1.0f) noexcept;
 [[nodiscard]] const char* scaled_silu_kernel_name() noexcept;
-[[nodiscard]] CpuBatch embedding_batch(const TensorData& embedding, std::span<const int32_t> input_ids);
+[[nodiscard]] uint32_t cpu_linear_thread_limit() noexcept;
+[[nodiscard]] uint32_t float8_linear_thread_limit() noexcept;
 void embedding_batch_into(const TensorData& embedding, std::span<const int32_t> input_ids, CpuBatch& output);
 [[nodiscard]] CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input);
 void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch& output);
 [[nodiscard]] CpuBatch linear_batch(const TensorData& matrix, const TensorData& bias, const CpuBatch& input);
 void linear_batch_into(const TensorData& matrix, const TensorData& bias, const CpuBatch& input, CpuBatch& output);
-[[nodiscard]] CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* bias, const CpuBatch& input, float activation_limit);
+[[nodiscard]] CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* bias, const CpuBatch& input, ExpertActivation activation, float activation_limit);
 [[nodiscard]] bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch = nullptr);
 [[nodiscard]] CpuBatch rms_norm_batch(const CpuBatch& input, const TensorData& weight, float epsilon);
 void rms_norm_batch_into(const CpuBatch& input, const TensorData& weight, float epsilon, CpuBatch& output);

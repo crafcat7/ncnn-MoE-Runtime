@@ -5,6 +5,7 @@
 #include "ncnn/moe/model.h"
 #include "ncnn/moe/result.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -16,6 +17,8 @@
 
 namespace ncnn {
 namespace moe {
+
+static constexpr uint32_t maximum_expert_route_ranks = 16;
 
 class SessionBatchAccess;
 
@@ -67,6 +70,9 @@ struct GenerationOptions
     uint32_t max_new_tokens = 1;
     SamplingOptions sampling;
     std::vector<int32_t> stop_tokens;
+    bool enable_speculative = true;
+    float speculative_confidence_threshold = 0.5f;
+    uint32_t speculative_max_draft_tokens = 0;
 };
 
 struct GenerationResult
@@ -93,6 +99,15 @@ struct SessionStatistics
     uint64_t expert_route_prediction_matches = 0;
     uint64_t expert_route_prediction_cache_hits = 0;
     uint64_t expert_route_prediction_cache_misses = 0;
+    uint64_t expert_route_prediction_time_microseconds = 0;
+    uint64_t expert_route_prediction_wait_time_microseconds = 0;
+    uint64_t expert_route_prediction_async_submissions = 0;
+    uint64_t expert_route_prediction_async_completions = 0;
+    uint64_t expert_route_prediction_async_fallbacks = 0;
+    std::array<uint64_t, maximum_expert_route_ranks> expert_route_rank_predictions{};
+    std::array<uint64_t, maximum_expert_route_ranks> expert_route_rank_matches{};
+    std::array<uint64_t, maximum_expert_route_ranks> expert_route_rank_demands{};
+    std::array<uint64_t, maximum_expert_route_ranks> expert_route_rank_demand_queue_time_microseconds{};
     uint64_t expert_cache_hits = 0;
     uint64_t expert_cache_misses = 0;
     uint64_t expert_cache_evictions = 0;
@@ -102,6 +117,8 @@ struct SessionStatistics
     uint64_t expert_cache_speculative_reads = 0;
     uint64_t expert_cache_cancelled_speculative_reads = 0;
     uint64_t expert_cache_dropped_speculative_admissions = 0;
+    uint64_t expert_cache_unused_speculative_reads = 0;
+    uint64_t expert_cache_short_term_reloads = 0;
     uint64_t expert_cache_arc_recent_bytes = 0;
     uint64_t expert_cache_arc_frequent_bytes = 0;
     uint64_t expert_cache_arc_recent_target_bytes = 0;
@@ -116,6 +133,9 @@ struct SessionStatistics
     uint64_t expert_cache_direct_read_fallbacks = 0;
     uint64_t expert_cache_buffered_read_ranges = 0;
     uint64_t expert_cache_buffered_read_bytes = 0;
+    uint64_t expert_cache_coalesced_read_batches = 0;
+    uint64_t expert_cache_coalesced_experts = 0;
+    uint64_t expert_cache_coalesced_read_ranges_saved = 0;
     uint32_t expert_cache_read_policy = 0;
     uint64_t expert_gpu_cache_hits = 0;
     uint64_t expert_gpu_cache_misses = 0;
@@ -161,10 +181,11 @@ struct SessionStatistics
     uint64_t mxfp4_prefill_gemm_rows = 0;
     uint64_t mxfp4_paired_rows = 0;
     uint64_t mxfp4_fused_gate_up_rows = 0;
+    uint64_t mxfp4_reused_input_rows = 0;
     uint64_t vulkan_linear_dispatches = 0;
     uint64_t vulkan_attention_blocks = 0;
     uint64_t vulkan_compute_submissions = 0;
-    uint64_t vulkan_async_submissions = 0;
+    uint64_t vulkan_submit_wait_time_microseconds = 0;
     uint64_t vulkan_batch_uploads = 0;
     uint64_t vulkan_batch_downloads = 0;
     uint64_t vulkan_auxiliary_uploads = 0;
@@ -192,6 +213,12 @@ struct SessionStatistics
     uint64_t embedding_time_microseconds = 0;
     uint64_t final_norm_time_microseconds = 0;
     uint64_t lm_head_time_microseconds = 0;
+    uint64_t speculative_proposals = 0;
+    uint64_t speculative_draft_tokens = 0;
+    uint64_t speculative_accepted_tokens = 0;
+    uint64_t speculative_context_time_microseconds = 0;
+    uint64_t speculative_draft_time_microseconds = 0;
+    uint64_t speculative_verify_time_microseconds = 0;
     uint64_t kv_cache_logical_bytes = 0;
     uint64_t kv_cache_allocated_bytes = 0;
     std::vector<uint64_t> expert_token_counts;
@@ -210,6 +237,7 @@ private:
     explicit Session(ModelPtr model, const SessionOptions& options);
     [[nodiscard]] Result<PrefillResult> prefill_unlocked(std::span<const int32_t> input_ids);
     [[nodiscard]] Result<DecodeResult> decode_unlocked(int32_t input_id);
+    [[nodiscard]] Result<SampledToken> sample_unlocked(std::span<const float> logits, const SamplingOptions& options);
     [[nodiscard]] Result<SampledToken> sample_unlocked(const LogitsOutput& logits, const SamplingOptions& options);
 
     ModelPtr model_;

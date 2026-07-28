@@ -19,6 +19,12 @@ struct DecodeBatchRequest
     int32_t input_id = -1;
 };
 
+struct PrefillBatchRequest
+{
+    SessionPtr session;
+    std::vector<int32_t> input_ids;
+};
+
 #define NCNN_MOE_SCHEDULER_PIN_WORKER_BIT         0
 #define NCNN_MOE_SCHEDULER_DISABLE_STAGED_BIT     1
 #define NCNN_MOE_SCHEDULER_FORCE_STAGED_BIT       2
@@ -47,6 +53,11 @@ struct SchedulerOptions
 
 struct SchedulerStatistics
 {
+    uint64_t submitted_prefill_batches = 0;
+    uint64_t submitted_prefill_requests = 0;
+    uint64_t completed_prefill_requests = 0;
+    uint64_t staged_prefill_batches = 0;
+    uint64_t staged_prefill_requests = 0;
     uint64_t submitted_batches = 0;
     uint64_t submitted_requests = 0;
     uint64_t completed_requests = 0;
@@ -108,6 +119,7 @@ public:
     BatchScheduler(const BatchScheduler&) = delete;
     BatchScheduler& operator=(const BatchScheduler&) = delete;
 
+    [[nodiscard]] std::future<std::vector<Result<PrefillResult>>> submit_prefill(std::vector<PrefillBatchRequest> requests);
     [[nodiscard]] std::future<std::vector<Result<DecodeResult>>> submit_decode(std::vector<DecodeBatchRequest> requests);
     [[nodiscard]] SchedulerStatistics statistics() const noexcept;
 };
