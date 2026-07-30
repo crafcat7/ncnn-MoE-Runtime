@@ -27,6 +27,10 @@ GPT_OSS_PROMPT_TOKEN_IDS = [
     13,
 ]
 DEEPSEEK_PROMPT_TOKEN_IDS = [0] * 16
+DEEPSEEK_FAMILIES = (
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-dspark",
+)
 
 
 def add_common_arguments(parser):
@@ -59,22 +63,23 @@ def parse_arguments():
     gpt_oss.add_argument("--skip-service", action="store_true")
     gpt_oss.add_argument("--skip-single-120b", action="store_true")
 
-    deepseek = families.add_parser("deepseek-v4")
-    add_common_arguments(deepseek)
-    deepseek.add_argument("--model", required=True)
-    deepseek.add_argument("--host-memory-mb", type=int, default=28672)
-    deepseek.add_argument("--expert-cache-mb", type=int, default=16384)
-    deepseek.add_argument(
-        "--storage-cache-mb",
-        type=int,
-        nargs="+",
-        default=(1024, 10240, 16384),
-    )
-    deepseek.add_argument("--expert-io-workers", type=int, default=4)
-    deepseek.add_argument("--parallel-sessions", type=int, default=4)
-    deepseek.add_argument("--skip-storage", action="store_true")
-    deepseek.add_argument("--skip-single", action="store_true")
-    deepseek.add_argument("--skip-service", action="store_true")
+    for family in DEEPSEEK_FAMILIES:
+        deepseek = families.add_parser(family)
+        add_common_arguments(deepseek)
+        deepseek.add_argument("--model", required=True)
+        deepseek.add_argument("--host-memory-mb", type=int, default=28672)
+        deepseek.add_argument("--expert-cache-mb", type=int, default=16384)
+        deepseek.add_argument(
+            "--storage-cache-mb",
+            type=int,
+            nargs="+",
+            default=(1024, 10240, 16384),
+        )
+        deepseek.add_argument("--expert-io-workers", type=int, default=4)
+        deepseek.add_argument("--parallel-sessions", type=int, default=4)
+        deepseek.add_argument("--skip-storage", action="store_true")
+        deepseek.add_argument("--skip-single", action="store_true")
+        deepseek.add_argument("--skip-service", action="store_true")
     return parser.parse_args()
 
 
@@ -141,8 +146,18 @@ def common_arguments(arguments, model, tokens, warmup, extra):
         "--max-new-tokens",
         str(tokens),
     ]
-    if arguments.family == "deepseek-v4":
+    if arguments.family == "deepseek-v4-flash":
         command.extend(("--temperature", "0", "--no-speculative"))
+    elif arguments.family == "deepseek-v4-flash-dspark":
+        command.extend(
+            (
+                "--temperature",
+                "0",
+                "--speculative-confidence",
+                "0.5",
+                "--require-speculative",
+            )
+        )
     command.extend(
         (
             *warmup_options(warmup),
@@ -290,6 +305,8 @@ def gpt_oss_cases(arguments):
 
 def deepseek_cases(arguments):
     cases = []
+    prefix = arguments.family
+    speculative = arguments.family == "deepseek-v4-flash-dspark"
     windows = (("short", arguments.short_tokens), ("long", arguments.long_tokens))
     warmups = (("cold", False), ("warm", True))
     storage = [
@@ -307,8 +324,8 @@ def deepseek_cases(arguments):
             for warmup_name, warmup in warmups:
                 cases.append(
                     {
-                        "name": f"deepseek-v4-single-{window_name}-{warmup_name}",
-                        "family": "deepseek-v4-flash-dspark",
+                        "name": f"{prefix}-single-{window_name}-{warmup_name}",
+                        "family": prefix,
                         "workload": "single-session",
                         "backend": "hybrid",
                         "scheduler_staging": "auto",
@@ -334,15 +351,24 @@ def deepseek_cases(arguments):
                 cases.append(
                     {
                         "name": (
-                            f"deepseek-v4-service-{arguments.parallel_sessions}x"
+                            f"{prefix}-service-{arguments.parallel_sessions}x"
                             f"{window_name}-{warmup_name}"
                         ),
-                        "family": "deepseek-v4-flash-dspark",
+                        "family": prefix,
                         "workload": (
-                            f"{arguments.parallel_sessions}-session-service"
+                            (
+                                f"{arguments.parallel_sessions}-session-"
+                                "independent-speculative"
+                            )
+                            if speculative
+                            else f"{arguments.parallel_sessions}-session-service"
                         ),
                         "backend": "hybrid",
-                        "scheduler_staging": "force",
+                        "scheduler_staging": (
+                            "independent-speculative"
+                            if speculative
+                            else "force"
+                        ),
                         "token_window": window_name,
                         "generated_tokens": tokens,
                         "warmup": warmup_name,
@@ -355,8 +381,11 @@ def deepseek_cases(arguments):
                             str(arguments.expert_cache_mb),
                             "--parallel-sessions",
                             str(arguments.parallel_sessions),
-                            "--scheduler-staging",
-                            "force",
+                            *(
+                                ["--parallel-speculative"]
+                                if speculative
+                                else ["--scheduler-staging", "force"]
+                            ),
                             "--vulkan-device-index",
                             str(arguments.vulkan_device_index),
                         ],
@@ -368,8 +397,8 @@ def deepseek_cases(arguments):
             for warmup_name, warmup in warmups:
                 cases.append(
                     {
-                        "name": f"deepseek-v4-storage-{window_name}-{warmup_name}",
-                        "family": "deepseek-v4-flash-dspark",
+                        "name": f"{prefix}-storage-{window_name}-{warmup_name}",
+                        "family": prefix,
                         "workload": "cpu-storage-control",
                         "backend": "cpu",
                         "scheduler_staging": "auto",
@@ -447,7 +476,7 @@ def write_aggregate(arguments, results, started, output_dir):
     benchmark = (
         "gpt_oss_performance_matrix"
         if arguments.family == "gpt-oss"
-        else "deepseek_v4_performance_matrix"
+        else f"{arguments.family.replace('-', '_')}_performance_matrix"
     )
     aggregate = {
         "schema_version": 1,
@@ -459,6 +488,9 @@ def write_aggregate(arguments, results, started, output_dir):
         "short_tokens": arguments.short_tokens,
         "long_tokens": arguments.long_tokens,
         "repeats": arguments.repeats,
+        "speculative_enabled": (
+            arguments.family == "deepseek-v4-flash-dspark"
+        ),
         "results": results,
         "elapsed_seconds": time.time() - started,
     }

@@ -81,6 +81,12 @@ static Result<std::vector<uint32_t>> deepseek_required_uint32_array(const std::s
     return values;
 }
 
+static bool deepseek_has_key(const std::string& json, const std::string& key)
+{
+    const std::regex expression("\\\"" + key + "\\\"\\s*:");
+    return std::regex_search(json, expression);
+}
+
 bool DeepSeekV4ModelAdapter::can_load(const ModelManifest& manifest) const
 {
     return manifest.model_type == "deepseek_v4";
@@ -116,10 +122,6 @@ Result<MoeIR> DeepSeekV4ModelAdapter::parse_model(const ModelPackage& package) c
     auto hyper_multiplier = deepseek_required_uint32(json, "hc_mult");
     auto hyper_iterations = deepseek_required_uint32(json, "hc_sinkhorn_iters");
     auto compress_ratios = deepseek_required_uint32_array(json, "compress_ratios");
-    auto speculative_targets = deepseek_required_uint32_array(json, "dspark_target_layer_ids");
-    auto speculative_block_size = deepseek_required_uint32(json, "dspark_block_size");
-    auto speculative_noise_token_id = deepseek_required_uint32(json, "dspark_noise_token_id");
-    auto speculative_markov_rank = deepseek_required_uint32(json, "dspark_markov_rank");
     auto expert_dtype = deepseek_required_string(json, "expert_dtype");
     auto scoring_function = deepseek_required_string(json, "scoring_func");
     auto quantization_method = deepseek_required_string(json, "quant_method");
@@ -131,49 +133,73 @@ Result<MoeIR> DeepSeekV4ModelAdapter::parse_model(const ModelPackage& package) c
         || !attention_head_count || !kv_head_count || !head_dimension || !query_lora_rank || !rope_head_dimension
         || !output_group_count || !output_lora_rank || !sliding_window || !maximum_context || !initial_context
         || !hash_layer_count || !index_head_count || !index_head_dimension || !index_top_k
-        || !hyper_multiplier || !hyper_iterations || !compress_ratios || !speculative_targets || !speculative_block_size
-        || !speculative_noise_token_id || !speculative_markov_rank
+        || !hyper_multiplier || !hyper_iterations || !compress_ratios
         || !expert_dtype || !scoring_function || !quantization_method || !quantization_format || !scale_format || !weight_block_size)
     {
-        const Error* error = !vocabulary_size              ? &vocabulary_size.error()
-                             : !hidden_size                ? &hidden_size.error()
-                             : !intermediate_size          ? &intermediate_size.error()
-                             : !layer_count                ? &layer_count.error()
-                             : !expert_count               ? &expert_count.error()
-                             : !top_k                      ? &top_k.error()
-                             : !shared_expert_count        ? &shared_expert_count.error()
-                             : !attention_head_count       ? &attention_head_count.error()
-                             : !kv_head_count              ? &kv_head_count.error()
-                             : !head_dimension             ? &head_dimension.error()
-                             : !query_lora_rank            ? &query_lora_rank.error()
-                             : !rope_head_dimension        ? &rope_head_dimension.error()
-                             : !output_group_count         ? &output_group_count.error()
-                             : !output_lora_rank           ? &output_lora_rank.error()
-                             : !sliding_window             ? &sliding_window.error()
-                             : !maximum_context            ? &maximum_context.error()
-                             : !initial_context            ? &initial_context.error()
-                             : !hash_layer_count           ? &hash_layer_count.error()
-                             : !index_head_count           ? &index_head_count.error()
-                             : !index_head_dimension       ? &index_head_dimension.error()
-                             : !index_top_k                ? &index_top_k.error()
-                             : !hyper_multiplier           ? &hyper_multiplier.error()
-                             : !hyper_iterations           ? &hyper_iterations.error()
-                             : !compress_ratios            ? &compress_ratios.error()
-                             : !speculative_targets        ? &speculative_targets.error()
-                             : !speculative_block_size     ? &speculative_block_size.error()
-                             : !speculative_noise_token_id ? &speculative_noise_token_id.error()
-                             : !speculative_markov_rank    ? &speculative_markov_rank.error()
-                             : !expert_dtype               ? &expert_dtype.error()
-                             : !scoring_function           ? &scoring_function.error()
-                             : !quantization_method        ? &quantization_method.error()
-                             : !quantization_format        ? &quantization_format.error()
-                             : !scale_format               ? &scale_format.error()
-                                                           : &weight_block_size.error();
+        const Error* error = !vocabulary_size        ? &vocabulary_size.error()
+                             : !hidden_size          ? &hidden_size.error()
+                             : !intermediate_size    ? &intermediate_size.error()
+                             : !layer_count          ? &layer_count.error()
+                             : !expert_count         ? &expert_count.error()
+                             : !top_k                ? &top_k.error()
+                             : !shared_expert_count  ? &shared_expert_count.error()
+                             : !attention_head_count ? &attention_head_count.error()
+                             : !kv_head_count        ? &kv_head_count.error()
+                             : !head_dimension       ? &head_dimension.error()
+                             : !query_lora_rank      ? &query_lora_rank.error()
+                             : !rope_head_dimension  ? &rope_head_dimension.error()
+                             : !output_group_count   ? &output_group_count.error()
+                             : !output_lora_rank     ? &output_lora_rank.error()
+                             : !sliding_window       ? &sliding_window.error()
+                             : !maximum_context      ? &maximum_context.error()
+                             : !initial_context      ? &initial_context.error()
+                             : !hash_layer_count     ? &hash_layer_count.error()
+                             : !index_head_count     ? &index_head_count.error()
+                             : !index_head_dimension ? &index_head_dimension.error()
+                             : !index_top_k          ? &index_top_k.error()
+                             : !hyper_multiplier     ? &hyper_multiplier.error()
+                             : !hyper_iterations     ? &hyper_iterations.error()
+                             : !compress_ratios      ? &compress_ratios.error()
+                             : !expert_dtype         ? &expert_dtype.error()
+                             : !scoring_function     ? &scoring_function.error()
+                             : !quantization_method  ? &quantization_method.error()
+                             : !quantization_format  ? &quantization_format.error()
+                             : !scale_format         ? &scale_format.error()
+                                                     : &weight_block_size.error();
         return *error;
     }
+
+    std::vector<uint32_t> speculative_targets;
+    uint32_t speculative_block_size = 0;
+    uint32_t speculative_noise_token_id = 0;
+    uint32_t speculative_markov_rank = 0;
+    const bool has_dspark = deepseek_has_key(json, "dspark_target_layer_ids")
+                            || deepseek_has_key(json, "dspark_block_size")
+                            || deepseek_has_key(json, "dspark_noise_token_id")
+                            || deepseek_has_key(json, "dspark_markov_rank");
+    if (has_dspark)
+    {
+        auto targets = deepseek_required_uint32_array(json, "dspark_target_layer_ids");
+        auto block_size = deepseek_required_uint32(json, "dspark_block_size");
+        auto noise_token_id = deepseek_required_uint32(json, "dspark_noise_token_id");
+        auto markov_rank = deepseek_required_uint32(json, "dspark_markov_rank");
+        if (!targets)
+            return targets.error();
+        if (!block_size)
+            return block_size.error();
+        if (!noise_token_id)
+            return noise_token_id.error();
+        if (!markov_rank)
+            return markov_rank.error();
+        speculative_targets = std::move(targets).value();
+        speculative_block_size = block_size.value();
+        speculative_noise_token_id = noise_token_id.value();
+        speculative_markov_rank = markov_rank.value();
+    }
+
     if (compress_ratios.value().size() < layer_count.value())
         return Error{ErrorCode::InvalidModel, "DeepSeek-V4 compress_ratios is shorter than num_hidden_layers"};
-    for (uint32_t target_layer_id : speculative_targets.value())
+    for (uint32_t target_layer_id : speculative_targets)
     {
         if (target_layer_id >= layer_count.value())
             return Error{ErrorCode::InvalidModel, "DeepSeek-V4 DSpark target layer is out of range"};
@@ -210,11 +236,11 @@ Result<MoeIR> DeepSeekV4ModelAdapter::parse_model(const ModelPackage& package) c
     descriptor.hyper_connection_iterations = hyper_iterations.value();
     descriptor.hyper_connection_epsilon = deepseek_optional_float(json, "hc_eps", 1e-6f);
     descriptor.hash_routing_layer_count = hash_layer_count.value();
-    descriptor.speculative_layer_count = static_cast<uint32_t>(speculative_targets.value().size());
-    descriptor.speculative_block_size = speculative_block_size.value();
-    descriptor.speculative_noise_token_id = speculative_noise_token_id.value();
-    descriptor.speculative_markov_rank = speculative_markov_rank.value();
-    descriptor.speculative_target_layer_ids = speculative_targets.value();
+    descriptor.speculative_layer_count = static_cast<uint32_t>(speculative_targets.size());
+    descriptor.speculative_block_size = speculative_block_size;
+    descriptor.speculative_noise_token_id = speculative_noise_token_id;
+    descriptor.speculative_markov_rank = speculative_markov_rank;
+    descriptor.speculative_target_layer_ids = std::move(speculative_targets);
 
     AttentionDescriptor attention;
     attention.kind = AttentionKind::MultiHeadLatent;
@@ -470,6 +496,9 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
             mapping.tensors.emplace(expert_target + "down.weight", std::move(down).value());
         }
     }
+
+    if (descriptor.speculative_layer_count == 0)
+        return mapping;
 
     for (uint32_t layer_id = 0; layer_id < descriptor.speculative_layer_count; ++layer_id)
     {

@@ -191,30 +191,54 @@ Session mix before assigning memory to Vulkan Expert tiers. Larger host ARC
 budgets improve route reuse but must leave enough memory for dense mappings,
 KV state, execution scratch, and the operating system.
 
-## Unified performance matrix
+## Reference performance
 
 The public reference protocol uses one fixed 16-token prompt, greedy decoding,
 three fresh measured processes per case (and per cache size in the sweep), and
 generated-token parity validation. Short
 means 32 generated tokens; long means 256. Cold uses
 `warmup=0` and `cache-warmup-runs=0`. Warm adds one unreported
-generation warm-up and one unreported cache warm-up before the three measured
-samples. Warm-up improves repeatability for resident routes but does not imply
-that every Expert stays in memory.
+benchmark process and configures one in-process cache warm-up before each
+measured generation. Warm-up improves repeatability for resident routes but
+does not imply that every Expert stays in memory.
 
 Reference host: Ryzen 7 9800X3D, 31.14 GiB RAM, RTX 5070 Ti 16 GiB, AVX-512
 MXFP4 Experts, ncnn Vulkan Dense/Attention, and greedy decoding. Two-session
 throughput is aggregate.
 
-| Model/workload | Short cold | Short warm | Long cold | Long warm |
-| --- | ---: | ---: | ---: | ---: |
-| GPT-OSS-20B, one Session | 14.103 | 14.855 | 17.069 | 16.597 |
-| GPT-OSS-120B, one Session | 2.885 | 4.718 | 4.971 | 5.171 |
-| GPT-OSS-120B, two Sessions | 5.284 | 10.916 | 9.870 | 10.295 |
+![GPT-OSS performance matrix](../../assets/gpt-oss-performance.svg)
 
-Values are token/s except the two-session row, which is aggregate token/s.
+Representative short-text measurements retained with the matrix are:
+
+| Scenario | Median throughput |
+| --- | ---: |
+| GPT-OSS-120B cold start, 1 × 32 | 3.294 token/s |
+| GPT-OSS-120B warm cache, 1 × 32 | 11.045 token/s |
+| GPT-OSS-120B concurrent, 2 × 16 | 20.510 aggregate token/s |
+| GPT-OSS-120B long concurrent, 2 × 96 | 9.778 aggregate token/s |
+| GPT-OSS-20B eager, 1 × 64 | 16.898 token/s |
+
+These named workloads predate the fixed 32/256-token matrix and should not be
+compared as if they were matrix cells.
+
 The hybrid path uses Vulkan Dense/Attention with CPU Experts and the Runtime
-scheduler.
+scheduler. GPT-OSS-20B uses eager Expert residency; GPT-OSS-120B uses a
+bounded host ARC.
+
+| Workload | Window | Warm-up | Throughput | Peak RSS | ARC hit | Runtime reads |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| GPT-OSS-20B, one Session | Short | No | 14.103 token/s | 17.18 GiB | n/a | n/a |
+| GPT-OSS-20B, one Session | Short | Yes | 14.855 token/s | 17.18 GiB | n/a | n/a |
+| GPT-OSS-20B, one Session | Long | No | 17.069 token/s | 17.18 GiB | n/a | n/a |
+| GPT-OSS-20B, one Session | Long | Yes | 16.597 token/s | 17.19 GiB | n/a | n/a |
+| GPT-OSS-120B, one Session | Short | No | 2.885 token/s | 23.26 GiB | 66.7% | 24.6 GB |
+| GPT-OSS-120B, one Session | Short | Yes | 4.718 token/s | 23.32 GiB | 84.6% | 11.4 GB |
+| GPT-OSS-120B, one Session | Long | No | 4.971 token/s | 23.29 GiB | 82.9% | 85.5 GB |
+| GPT-OSS-120B, one Session | Long | Yes | 5.171 token/s | 23.35 GiB | 84.3% | 78.7 GB |
+| GPT-OSS-120B, two Sessions | Short | No | 5.284 aggregate token/s | 25.24 GiB | 81.6% | 24.4 GB |
+| GPT-OSS-120B, two Sessions | Short | Yes | 10.916 aggregate token/s | 25.34 GiB | 96.2% | 2.6 GB |
+| GPT-OSS-120B, two Sessions | Long | No | 9.870 aggregate token/s | 25.34 GiB | 91.9% | 70.0 GB |
+| GPT-OSS-120B, two Sessions | Long | Yes | 10.295 aggregate token/s | 25.31 GiB | 93.1% | 55.3 GB |
 
 ### GPT-OSS-120B CPU Expert storage control
 
@@ -228,10 +252,14 @@ Runtime Expert-cache logical reads.
 | 10 GiB | 1.812 (34.7 GB) | 2.006 (29.5 GB) | 2.145 (183.7 GB) | 2.160 (182.1 GB) |
 | 16 GiB | 2.119 (26.6 GB) | 2.444 (20.8 GB) | 2.637 (115.0 GB) | 2.636 (115.4 GB) |
 
-Sampled system physical reads for 1/10/16 GiB were 57.8/26.0/19.1 GB
-(short cold), 114.4/50.6/37.6 GB (short warm), 392.1/140.8/88.4 GB
-(long cold), and 783.5/285.5/174.8 GB (long warm). They are total-disk
-samples rather than process-attributed SSD traffic.
+Sampled system physical reads for the same cells were:
+
+| Window | Warm-up | 1 GiB | 10 GiB | 16 GiB |
+| --- | --- | ---: | ---: | ---: |
+| Short | No | 57.8 GB | 26.0 GB | 19.1 GB |
+| Short | Yes | 114.4 GB | 50.6 GB | 37.6 GB |
+| Long | No | 392.1 GB | 140.8 GB | 88.4 GB |
+| Long | Yes | 783.5 GB | 285.5 GB | 174.8 GB |
 
 Peak RSS for 1/10/16 GiB is approximately 4.1/13.2/19.2 GiB. System
 physical reads are sampled total-disk counters and include unrelated system

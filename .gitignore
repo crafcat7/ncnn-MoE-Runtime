@@ -43,6 +43,7 @@ coverage/
 # Downloaded models and generated weights
 /models/gpt-oss/gpt-oss-20b/
 /models/gpt-oss/gpt-oss-120b/
+/models/deepseek-v4/DeepSeek-V4-Flash/
 /models/deepseek-v4/DeepSeek-V4-Flash-DSpark/
 /weights/
 /downloads/

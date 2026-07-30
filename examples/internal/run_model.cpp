@@ -11,6 +11,7 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -157,6 +158,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                      " [--buffered-expert-io]"
                      " [--cache-warmup-runs N]"
                      " [--parallel-sessions N]"
+                     " [--parallel-speculative]"
                      " [--scheduler-expert-threads N]"
                      " [--scheduler-staging auto|force|off]"
                      " [--scheduler-cross-call]"
@@ -178,6 +180,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         std::vector<int32_t> prompt;
         bool stream_token_ids = false;
         bool cross_call_scheduling = false;
+        bool parallel_speculative = false;
         uint32_t cache_warmup_runs = 0;
         uint32_t parallel_sessions = 1;
         uint32_t scheduler_expert_threads = 0;
@@ -379,6 +382,10 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                 }
                 parallel_sessions = static_cast<uint32_t>(count);
             }
+            else if (argument == "--parallel-speculative")
+            {
+                parallel_speculative = true;
+            }
             else if (argument == "--scheduler-expert-threads")
             {
                 const uint64_t count = std::stoull(ncnn::moe::require_value(argc, argv, index, "--scheduler-expert-threads"));
@@ -464,6 +471,16 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             std::cerr << "model type is " << loaded_model->descriptor().model_type
                       << ", expected " << runner_options.expected_model_type << '\n';
             return 1;
+        }
+        if (parallel_speculative
+            && (parallel_sessions < 2
+                || !generation_options.enable_speculative
+                || loaded_model->ir().speculative_layer_count == 0))
+        {
+            std::cerr
+                << "--parallel-speculative requires multiple Sessions and "
+                   "an enabled model-provided speculative plan\n";
+            return 2;
         }
         std::cout << "loaded " << loaded_model->descriptor().model_type << " in " << ncnn::moe::elapsed_seconds(load_start) << " s, backend " << ncnn::moe::hybrid_mode_name(loaded_model->hybrid_mode()) << '\n';
         const ncnn::moe::ModelMemoryPlan& memory_plan = loaded_model->memory_plan();
@@ -590,6 +607,41 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                 return 1;
             }
             session_generations.front() = std::move(generated).value();
+        }
+        else if (parallel_speculative)
+        {
+            std::mutex stream_mutex;
+            std::vector<std::future<ncnn::moe::Result<ncnn::moe::GenerationResult>>> futures;
+            futures.reserve(parallel_sessions);
+            for (uint32_t session_index = 0; session_index < parallel_sessions; ++session_index)
+            {
+                futures.push_back(std::async(
+                    std::launch::async,
+                    [&, session_index]() {
+                        return active_sessions[session_index]->generate(
+                            prompt,
+                            generation_options,
+                            [&, session_index](const ncnn::moe::StreamToken& token) {
+                                if (stream_token_ids)
+                                {
+                                    std::lock_guard<std::mutex> lock(stream_mutex);
+                                    std::cout << "generated session " << session_index << " token id: " << token.token_id << '\n'
+                                              << std::flush;
+                                }
+                                return true;
+                            });
+                    }));
+            }
+            for (uint32_t session_index = 0; session_index < parallel_sessions; ++session_index)
+            {
+                auto generated = futures[session_index].get();
+                if (!generated)
+                {
+                    std::cerr << "parallel speculative generation failed: " << generated.error().message << '\n';
+                    return 1;
+                }
+                session_generations[session_index] = std::move(generated).value();
+            }
         }
         else
         {
@@ -739,9 +791,29 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         }
         const double generation_seconds = ncnn::moe::elapsed_seconds(generation_start);
         const ncnn::moe::SessionStatistics statistics = active_sessions.front()->statistics();
+        uint64_t speculative_proposals = 0;
+        uint64_t speculative_draft_tokens = 0;
+        uint64_t speculative_accepted_tokens = 0;
+        uint64_t speculative_context_time_microseconds = 0;
+        uint64_t speculative_draft_time_microseconds = 0;
+        uint64_t speculative_verify_time_microseconds = 0;
+        for (const ncnn::moe::SessionPtr& session : active_sessions)
+        {
+            const ncnn::moe::SessionStatistics session_statistics = session->statistics();
+            speculative_proposals += session_statistics.speculative_proposals;
+            speculative_draft_tokens += session_statistics.speculative_draft_tokens;
+            speculative_accepted_tokens += session_statistics.speculative_accepted_tokens;
+            speculative_context_time_microseconds += session_statistics.speculative_context_time_microseconds;
+            speculative_draft_time_microseconds += session_statistics.speculative_draft_time_microseconds;
+            speculative_verify_time_microseconds += session_statistics.speculative_verify_time_microseconds;
+        }
         std::cout << "generated " << generation.tokens.size() << " token(s) in " << generation_seconds << " s\n";
         std::cout << "Parallel sessions: " << parallel_sessions << ", aggregate throughput: " << generation.tokens.size() / generation_seconds << " token/s\n";
-        if (parallel_sessions > 1)
+        if (parallel_sessions > 1 && parallel_speculative)
+        {
+            std::cout << "Parallel generation: independent speculative Sessions\n";
+        }
+        else if (parallel_sessions > 1)
         {
             std::cout
                 << "Parallel prefill: "
@@ -814,12 +886,12 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         std::cout << "Embedding time: " << statistics.embedding_time_microseconds / 1000.0 << " ms\n";
         std::cout << "Final norm time: " << statistics.final_norm_time_microseconds / 1000.0 << " ms\n";
         std::cout << "LM head time: " << statistics.lm_head_time_microseconds / 1000.0 << " ms\n";
-        std::cout << "Speculative decoding: " << statistics.speculative_proposals << " proposal(s), "
-                  << statistics.speculative_draft_tokens << " draft token(s), "
-                  << statistics.speculative_accepted_tokens << " accepted token(s)\n";
-        std::cout << "Speculative time: " << statistics.speculative_context_time_microseconds / 1000.0 << " ms context, "
-                  << statistics.speculative_draft_time_microseconds / 1000.0 << " ms draft, "
-                  << statistics.speculative_verify_time_microseconds / 1000.0 << " ms verify\n";
+        std::cout << "Speculative decoding: " << speculative_proposals << " proposal(s), "
+                  << speculative_draft_tokens << " draft token(s), "
+                  << speculative_accepted_tokens << " accepted token(s)\n";
+        std::cout << "Speculative time: " << speculative_context_time_microseconds / 1000.0 << " ms context, "
+                  << speculative_draft_time_microseconds / 1000.0 << " ms draft, "
+                  << speculative_verify_time_microseconds / 1000.0 << " ms verify\n";
         std::cout << "Expert prefetches: " << statistics.expert_prefetches << " (" << statistics.expert_prefetch_bytes << " bytes hinted)\n";
         std::cout << "Expert route prediction: " << statistics.expert_route_predictions << " prediction(s), " << statistics.expert_route_prediction_matches << " match(es), " << statistics.expert_route_prediction_cache_hits
                   << " cache-ready, " << statistics.expert_route_prediction_cache_misses << " not-ready, "

@@ -25,7 +25,10 @@ def parse_arguments():
         )
     )
     parser.add_argument("runner", help="Path to ncnn_moe_deepseek_v4")
-    parser.add_argument("model", help="Path to DeepSeek-V4-Flash-DSpark")
+    parser.add_argument(
+        "model",
+        help="Path to DeepSeek-V4-Flash or DeepSeek-V4-Flash-DSpark",
+    )
     parser.add_argument("prompt", help="User prompt")
     parser.add_argument("--system", default="", help="Optional system message")
     parser.add_argument(

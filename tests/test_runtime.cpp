@@ -3296,7 +3296,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
     check(static_cast<bool>(std::string(float8_kernel_name()).size() > 0));
 }
 
-void test_deepseek_v4_dspark_descriptor()
+static ModelPackage deepseek_v4_package(const std::string& dspark_fields)
 {
     ModelPackage package;
     package.manifest.model_type = "deepseek_v4";
@@ -3325,10 +3325,7 @@ void test_deepseek_v4_dspark_descriptor()
         "hc_mult": 4,
         "hc_sinkhorn_iters": 20,
         "compress_ratios": [0, 0, 4, 128],
-        "dspark_target_layer_ids": [1, 2, 3],
-        "dspark_block_size": 5,
-        "dspark_noise_token_id": 127,
-        "dspark_markov_rank": 256,
+)" + dspark_fields + R"(
         "expert_dtype": "fp4",
         "scoring_func": "sqrtsoftplus",
         "quant_method": "fp8",
@@ -3340,8 +3337,23 @@ void test_deepseek_v4_dspark_descriptor()
         "swiglu_limit": 10.0,
         "routed_scaling_factor": 1.5
     })";
+    return package;
+}
+
+void test_deepseek_v4_descriptors()
+{
     DeepSeekV4ModelAdapter adapter;
-    auto parsed = adapter.parse_model(package);
+    auto flash = adapter.parse_model(deepseek_v4_package(""));
+    check(static_cast<bool>(flash));
+    check(flash.value().speculative_layer_count == 0);
+    check(flash.value().speculative_target_layer_ids.empty());
+
+    auto parsed = adapter.parse_model(deepseek_v4_package(R"(
+        "dspark_target_layer_ids": [1, 2, 3],
+        "dspark_block_size": 5,
+        "dspark_noise_token_id": 127,
+        "dspark_markov_rank": 256,
+)"));
     check(static_cast<bool>(parsed));
     const MoeIR& descriptor = parsed.value();
     check(descriptor.model_type == "deepseek_v4");
@@ -3362,6 +3374,11 @@ void test_deepseek_v4_dspark_descriptor()
     check(static_cast<bool>(memory));
     check(memory.value().selected_mode == ExpertMemoryMode::OnDemand);
     check(memory.value().estimated_dense_bytes < UINT64_C(10) * 1024 * 1024 * 1024);
+
+    auto partial_dspark = adapter.parse_model(deepseek_v4_package(R"(
+        "dspark_block_size": 5,
+)"));
+    check(!partial_dspark);
 }
 
 static MoeIR gpt_oss_memory_ir(uint32_t layer_count, uint32_t expert_count)
@@ -3999,7 +4016,7 @@ int main()
         ncnn::moe::test_moe_ir_execution_graph_and_scheduler();
         ncnn::moe::test_expert_dispatcher_groups_routes();
         ncnn::moe::test_deepseek_router_and_hyper_connection_kernels();
-        ncnn::moe::test_deepseek_v4_dspark_descriptor();
+        ncnn::moe::test_deepseek_v4_descriptors();
         ncnn::moe::test_automatic_expert_memory_planning();
         ncnn::moe::test_sampling_and_streaming_generation();
         ncnn::moe::test_model_adapter_scopes();

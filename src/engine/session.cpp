@@ -447,6 +447,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 }
                 continue;
             }
+            begin_latent_cache_transaction(state_->speculative_layers);
             auto proposed = executor_->propose_speculative(
                 *model_->compiled_,
                 anchor,
@@ -463,8 +464,13 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                         return sampled.error();
                     return sampled.value().token_id;
                 });
+            auto discarded_draft_cache = finish_latent_cache_transaction(
+                state_->speculative_layers,
+                0);
             if (!proposed)
                 return proposed.error();
+            if (!discarded_draft_cache)
+                return discarded_draft_cache.error();
             size_t draft_count = std::min(
                 proposed.value().token_ids.size(),
                 remaining - 1);
@@ -603,6 +609,19 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 }
                 ++accepted;
             }
+            if (accepted == 0)
+            {
+                auto rolled_back = finish_latent_cache_transaction(
+                    state_->layers,
+                    0);
+                if (!rolled_back)
+                    return rolled_back.error();
+                statistics_scratch_.speculative_verify_time_microseconds += target_verify_microseconds;
+                std::swap(statistics_, statistics_scratch_);
+                update_cache_statistics(statistics_, *state_);
+                speculative_active = false;
+                continue;
+            }
             auto next = [&]() -> Result<SampledToken> {
                 if (accepted < draft_count
                     && options.sampling.temperature > 0.0f)
@@ -704,8 +723,6 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
             std::swap(statistics_, statistics_scratch_);
             sequence_length_ += emitted;
             update_cache_statistics(statistics_, *state_);
-            if (accepted == 0)
-                speculative_active = false;
             if (!continue_generation)
                 break;
         }
