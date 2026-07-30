@@ -12,220 +12,29 @@ Experts across CPU, Vulkan, memory, and storage backends.
 The runtime targets local inference on Desktop and edge-class systems where the
 complete model may be larger than available RAM. The public API is independent
 of a model family, device vendor, and fixed cache size. The distributed release
-includes validated GPT-OSS and DeepSeek-V4-Flash-DSpark adapters for their
-official Safetensors packages.
+includes validated GPT-OSS, DeepSeek-V4-Flash, and
+DeepSeek-V4-Flash-DSpark support for their official Safetensors packages.
 
 [Runtime capabilities](#runtime-capabilities) | [Architecture](#architecture) |
-[Unified performance](#unified-reference-performance) |
+[Supported models and data](#supported-models-and-reference-data) |
 [Quick start](#quick-start)
 
-## Unified reference performance
+## Supported models and reference data
 
-GPT-OSS and DeepSeek-V4-Flash-DSpark use model-specific adapters and prompts,
-while the scheduling, cache, graph, backend, workload, warm-up, and reporting
-contracts remain model-neutral.
+The table is a compact index of the current reference measurements. Values
+are three-run medians on a Ryzen 7 9800X3D, 31.14 GiB RAM, and an RTX 5070 Ti
+16 GiB. Each model report owns the complete cold/warm, short/long,
+multi-Session, memory, cache, and I/O matrix.
 
-Both matrices use a fixed model-valid 16-token prompt, greedy decoding, three
-fresh measured processes per case (and per cache size in the sweep), and
-generated-token parity validation. Short means 32 generated tokens and long
-means 256 generated tokens. Cold uses
-`warmup=0` and `cache-warmup-runs=0`. Warm uses one unreported
-`warmup=1` generation run plus one unreported
-`cache-warmup-runs=1` cache run before the three measured samples;
-it warms the actual execution path but does not promise that every routed
-Expert remains resident.
+| Model | Reference execution | Warm single Session, 32 tokens | Warm service, 32 tokens | Full report |
+| --- | --- | ---: | ---: | --- |
+| GPT-OSS-20B | Hybrid, eager Experts | **14.855 token/s** | n/a | [GPT-OSS performance](models/gpt-oss/README.md#reference-performance) |
+| GPT-OSS-120B | Hybrid, 16 GiB host ARC | **4.718 token/s** | **10.916 aggregate token/s** (2 Sessions) | [GPT-OSS performance](models/gpt-oss/README.md#reference-performance) |
+| DeepSeek-V4-Flash | Hybrid, 16 GiB host ARC | **1.254 token/s** | **3.809 aggregate token/s** (4 staged Sessions) | [Flash performance](models/deepseek-v4/README.md#deepseek-v4-flash-matrix) |
+| DeepSeek-V4-Flash-DSpark | Hybrid, DSpark enabled, 16 GiB host ARC | **1.254 token/s** | **3.594 aggregate token/s** (4 independent Sessions) | [DSpark performance](models/deepseek-v4/README.md#deepseek-v4-flash-dspark-matrix) |
 
-The host is a Ryzen 7 9800X3D with 31.14 GiB RAM, an RTX 5070 Ti 16 GiB,
-AVX-512 MXFP4 Expert kernels, ncnn Vulkan execution, and greedy decoding.
-Throughput is the median of the three measured samples. Multi-session rows
-report aggregate token/s.
-
-Generated matrices use
-`build-reports/performance-matrix/<model-family>/report.json`; runner build
-directories remain independent from report ownership.
-
-### GPT-OSS
-
-![GPT-OSS unified performance matrix](assets/gpt-oss-performance.svg)
-
-The chart uses the same published matrix as the tables below: blue bars are
-cold runs, gray bars are warm runs, and the two read panels separate Runtime
-logical Expert traffic from sampled system physical traffic. The teal panel
-contains the named short-text reference points.
-Regenerate it after a new matrix with
-`python tools\generate_performance_chart.py --family gpt-oss`.
-
-#### Short-text reference points
-
-These representative short-text measurements use their named workload
-settings and are retained alongside the unified matrix. They are not a
-replacement for the fixed 32/256-token cold/warm protocol above.
-
-| Scenario | Median throughput |
-| --- | ---: |
-| GPT-OSS-120B cold start, 1 × 32 | **3.294 token/s** |
-| GPT-OSS-120B warm cache, 1 × 32 | **11.045 token/s** |
-| GPT-OSS-120B concurrent, 2 × 16 | **20.510 aggregate token/s** |
-| GPT-OSS-120B long concurrent, 2 × 96 | **9.778 aggregate token/s** |
-| GPT-OSS-20B eager, 1 × 64 | **16.898 token/s** |
-
-#### Hybrid Runtime
-
-These rows use Vulkan Dense/Attention with CPU Experts, on-demand Expert
-residency, and the Runtime scheduler. The 20B path uses eager Expert
-residency; 120B rows use a bounded host ARC.
-
-| Workload | Window | Warm-up | Throughput | Peak RSS | ARC hit | Runtime reads |
-| --- | --- | --- | ---: | ---: | ---: | ---: |
-| GPT-OSS-20B, one Session | Short | No | **14.103 token/s** | 17.18 GiB | n/a | n/a |
-| GPT-OSS-20B, one Session | Short | Yes | **14.855 token/s** | 17.18 GiB | n/a | n/a |
-| GPT-OSS-20B, one Session | Long | No | **17.069 token/s** | 17.18 GiB | n/a | n/a |
-| GPT-OSS-20B, one Session | Long | Yes | **16.597 token/s** | 17.19 GiB | n/a | n/a |
-| GPT-OSS-120B, one Session | Short | No | **2.885 token/s** | 23.26 GiB | 66.7% | 24.6 GB |
-| GPT-OSS-120B, one Session | Short | Yes | **4.718 token/s** | 23.32 GiB | 84.6% | 11.4 GB |
-| GPT-OSS-120B, one Session | Long | No | **4.971 token/s** | 23.29 GiB | 82.9% | 85.5 GB |
-| GPT-OSS-120B, one Session | Long | Yes | **5.171 token/s** | 23.35 GiB | 84.3% | 78.7 GB |
-| GPT-OSS-120B, two Sessions | Short | No | **5.284 aggregate token/s** | 25.24 GiB | 81.6% | 24.4 GB |
-| GPT-OSS-120B, two Sessions | Short | Yes | **10.916 aggregate token/s** | 25.34 GiB | 96.2% | 2.6 GB |
-| GPT-OSS-120B, two Sessions | Long | No | **9.870 aggregate token/s** | 25.34 GiB | 91.9% | 70.0 GB |
-| GPT-OSS-120B, two Sessions | Long | Yes | **10.295 aggregate token/s** | 25.31 GiB | 93.1% | 55.3 GB |
-
-#### GPT-OSS-120B CPU Expert storage sweep
-
-This control path keeps Expert execution on the CPU and varies the bounded
-ARC cache. Each cache size has the same short/long and cold/warm protocol.
-Runtime reads are Expert-cache logical bytes.
-
-| Window | Warm-up | 1 GiB | 10 GiB | 16 GiB |
-| --- | --- | ---: | ---: | ---: |
-| Short | No | 1.042 token/s | 1.812 token/s | **2.119 token/s** |
-| Short | Yes | 1.050 token/s | 2.006 token/s | **2.444 token/s** |
-| Long | No | 1.143 token/s | 2.145 token/s | **2.637 token/s** |
-| Long | Yes | 1.133 token/s | 2.160 token/s | **2.636 token/s** |
-
-| Window | Warm-up | 1 GiB reads | 10 GiB reads | 16 GiB reads |
-| --- | --- | ---: | ---: | ---: |
-| Short | No | 73.9 GB | 34.7 GB | 26.6 GB |
-| Short | Yes | 73.8 GB | 29.5 GB | 20.8 GB |
-| Long | No | 500.0 GB | 183.7 GB | 115.0 GB |
-| Long | Yes | 500.0 GB | 182.1 GB | 115.4 GB |
-
-Sampled system physical reads for the same sweep were:
-
-| Window | Warm-up | 1 GiB | 10 GiB | 16 GiB |
-| --- | --- | ---: | ---: | ---: |
-| Short | No | 57.8 GB | 26.0 GB | 19.1 GB |
-| Short | Yes | 114.4 GB | 50.6 GB | 37.6 GB |
-| Long | No | 392.1 GB | 140.8 GB | 88.4 GB |
-| Long | Yes | 783.5 GB | 285.5 GB | 174.8 GB |
-
-Peak RSS for the 1/10/16 GiB rows is approximately 4.1/13.2/19.2 GiB.
-The JSON report also records ARC hit rate, process logical reads, and sampled
-system physical reads. System physical reads are a Windows CIM
-one-second total-disk estimate and include unrelated system traffic; they
-are not process-attributed SSD traffic.
-
-Run the complete matrix with:
-
-```powershell
-python tools\benchmark_reference_matrix.py gpt-oss `
-  --runner .\build-ncnn\Release\ncnn_moe_gpt_oss.exe `
-  --model-20b .\models\gpt-oss\gpt-oss-20b `
-  --model-120b .\models\gpt-oss\gpt-oss-120b `
-  --output-dir .\build-reports\performance-matrix\gpt-oss `
-  --repeats 3 --short-tokens 32 --long-tokens 256 `
-  --vulkan-device-index 0
-```
-
-The aggregate JSON is written to
-`build-reports/performance-matrix/gpt-oss/report.json`.
-These are GPT-OSS reference results on the stated Windows/x86 host, not a
-direct cross-hardware comparison with another MoE model.
-
-### DeepSeek-V4-Flash-DSpark
-
-DeepSeek uses 16 repeated BOS token IDs and disables speculative decoding for
-this matrix. Hybrid rows use Vulkan Dense projections with CPU Attention/cache
-logic and CPU Experts, buffered Expert I/O, and a 16 GiB host ARC.
-Four-Session rows force staged scheduling for exact long-window token parity
-and report aggregate throughput.
-
-![DeepSeek V4 Flash DSpark unified performance matrix](assets/deepseek-v4-performance.svg)
-
-The chart contains the complete fixed matrix: Hybrid throughput, CPU storage
-throughput, Runtime logical Expert reads, and sampled system physical reads.
-Regenerate it after a new matrix with
-`python tools\generate_performance_chart.py --family deepseek-v4`.
-
-#### Hybrid Runtime
-
-| Workload | Window | Warm-up | Throughput | Peak RSS | ARC hit | Runtime reads |
-| --- | --- | --- | ---: | ---: | ---: | ---: |
-| One Session | Short | No | **1.144 token/s** | 24.07 GiB | 66.2% | 37.6 GB |
-| One Session | Short | Yes | **1.264 token/s** | 23.85 GiB | 69.4% | 34.0 GB |
-| One Session | Long | No | **1.378 token/s** | 24.02 GiB | 74.8% | 222.8 GB |
-| One Session | Long | Yes | **1.377 token/s** | 23.95 GiB | 75.0% | 221.2 GB |
-| Four Sessions | Short | No | **3.284 aggregate token/s** | 24.06 GiB | 76.3% | 38.4 GB |
-| Four Sessions | Short | Yes | **3.462 aggregate token/s** | 23.86 GiB | 79.0% | 34.1 GB |
-| Four Sessions | Long | No | **3.214 aggregate token/s** | 23.82 GiB | 76.6% | 219.1 GB |
-| Four Sessions | Long | Yes | **3.291 aggregate token/s** | 23.68 GiB | 76.8% | 216.8 GB |
-
-#### CPU Expert storage control
-
-| Window | Warm-up | 1 GiB | 10 GiB | 16 GiB |
-| --- | --- | ---: | ---: | ---: |
-| Short | No | 0.649 token/s | **0.727 token/s** | 0.663 token/s |
-| Short | Yes | 0.650 token/s | **0.780 token/s** | 0.674 token/s |
-| Long | No | 0.710 token/s | **0.812 token/s** | 0.773 token/s |
-| Long | Yes | 0.667 token/s | **0.838 token/s** | 0.807 token/s |
-
-| Window | Warm-up | 1 GiB reads | 10 GiB reads | 16 GiB reads |
-| --- | --- | ---: | ---: | ---: |
-| Short | No | 111.1 GB | 44.9 GB | 39.3 GB |
-| Short | Yes | 111.1 GB | 39.7 GB | 31.0 GB |
-| Long | No | 883.8 GB | 296.0 GB | 216.1 GB |
-| Long | Yes | 883.8 GB | 296.4 GB | 216.3 GB |
-
-Sampled system physical reads for the same cells were:
-
-| Window | Warm-up | 1 GiB | 10 GiB | 16 GiB |
-| --- | --- | ---: | ---: | ---: |
-| Short | No | 32.8 GB | 30.6 GB | 31.7 GB |
-| Short | Yes | 54.7 GB | 57.7 GB | 63.5 GB |
-| Long | No | 196.1 GB | 208.5 GB | 193.6 GB |
-| Long | Yes | 424.1 GB | 428.0 GB | 356.1 GB |
-
-Peak RSS for the 1/10/16 GiB controls was approximately
-8.52/17.54/23.43 GiB. The 10 GiB ARC was fastest in every CPU cell on this
-host. The 16 GiB ARC reduced Runtime logical reads but used about 5.9 GiB more
-peak RSS and remained slower.
-
-The 256-token runs cross the model's 128-token compressed-history boundary
-and retain exact generated-token parity across all three samples. The
-operating-system file cache was not flushed. System physical reads are a
-one-second Windows CIM total-disk estimate and are not process-attributed SSD
-traffic. This is raw-token throughput validation, not official tokenizer,
-chat-template, or text-quality parity. It also does not establish a DSpark
-speedup because speculative decoding is disabled.
-
-Run the complete matrix with:
-
-```powershell
-python tools\benchmark_reference_matrix.py deepseek-v4 `
-  --runner .\build-ncnn\Release\ncnn_moe_deepseek_v4.exe `
-  --model .\models\deepseek-v4\DeepSeek-V4-Flash-DSpark `
-  --output-dir .\build-reports\performance-matrix\deepseek-v4 `
-  --repeats 3 --short-tokens 32 --long-tokens 256 `
-  --parallel-sessions 4 --host-memory-mb 28672 `
-  --expert-cache-mb 16384 `
-  --storage-cache-mb 1024 10240 16384 `
-  --expert-io-workers 4 --vulkan-device-index 0 --resume
-```
-
-The aggregate JSON was written to the build-local
-`build-reports/performance-matrix/deepseek-v4/report.json`.
-See the [DeepSeek execution guide](models/deepseek-v4/README.md) for model
-setup and runtime options.
+Model-specific prompts, kernels, quantization formats, and service policies
+differ, so these rows are reference points rather than a cross-model ranking.
 
 ## Sparse models beyond resident memory
 
@@ -424,7 +233,7 @@ the Runtime API and its public model guides.
 | Capability | Public behavior |
 | --- | --- |
 | Adapter interface | Public `IMoeModelAdapter` to `MoeIR` lowering contract |
-| Built-in reference adapters | GPT-OSS-20B/120B and DeepSeek-V4-Flash-DSpark Safetensors |
+| Built-in reference adapters | GPT-OSS-20B/120B, DeepSeek-V4-Flash, and DeepSeek-V4-Flash-DSpark Safetensors |
 | CPU execution | Complete portable path |
 | Heterogeneous execution | Vulkan Dense/Attention with CPU routing and Experts |
 | Native Vulkan Experts | Optional MXFP4 cache and execution with runtime calibration and CPU fallback |
@@ -433,9 +242,10 @@ the Runtime API and its public model guides.
 | KV cache | CPU FP32/BF16 or mixed-backend FP32 ring |
 | Output | Full logits with native sampling and streaming |
 
-The distributed release includes two validated production adapter families.
-Additional adapters use the same public IR and compiler boundary without adding
-model-family checks to Prefill, Decode, scheduling, or Expert execution.
+The distributed release includes validated GPT-OSS and DeepSeek V4 production
+adapters. Additional adapters use the same public IR and compiler boundary
+without adding model-family checks to Prefill, Decode, scheduling, or Expert
+execution.
 Multi-device placement is layer placement rather than Tensor Parallelism, and
 Vulkan-only execution is not a supported public mode.
 
@@ -447,7 +257,7 @@ definitions:
 
 - [Model catalog and capability matrix](models/README.md)
 - [GPT-OSS-20B/120B execution and performance](models/gpt-oss/README.md)
-- [DeepSeek V4 Flash DSpark execution guide](models/deepseek-v4/README.md)
+- [DeepSeek V4 Flash and DSpark execution and performance](models/deepseek-v4/README.md)
 
 ## Project layout
 
@@ -461,8 +271,7 @@ src/storage/       Mapped files, range I/O, host ARC, Vulkan victim cache, syste
 src/kernels/       Portable CPU Attention/Linear, BF16 helpers, and runtime-selected FP8/MXFP4 SIMD kernels
 src/backends/ncnn/ ncnn CPU/Vulkan operator packaging, mixed Attention, Vulkan contexts, and native MXFP4 Experts
 models/            Model catalog and model-family execution guides
-assets/            Published benchmark visualizations used by this README
-memories/repo/     Maintainer build, architecture, and performance evidence
+assets/            Published benchmark visualizations used by model reports
 examples/          GPT-OSS and DeepSeek reference runners, model inspection, and MXFP4 microbenchmark
 tools/             Fixture, GPT-OSS/DeepSeek text, packed-Expert, and benchmark utilities
 tests/             Deterministic, parity, cache, scheduling, concurrency, and error-path tests

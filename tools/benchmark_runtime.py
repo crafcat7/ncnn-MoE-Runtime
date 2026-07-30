@@ -70,6 +70,28 @@ def parse_arguments():
         action="store_true",
         help="Disable model-specific speculative decoding in the runner.",
     )
+    parser.add_argument(
+        "--speculative-confidence",
+        type=float,
+        default=None,
+        help="Override the runner's speculative confidence threshold.",
+    )
+    parser.add_argument(
+        "--speculative-max-draft",
+        type=int,
+        default=0,
+        help="Limit speculative draft tokens; zero keeps the model block size.",
+    )
+    parser.add_argument(
+        "--parallel-speculative",
+        action="store_true",
+        help="Run parallel Sessions independently so each can use speculation.",
+    )
+    parser.add_argument(
+        "--require-speculative",
+        action="store_true",
+        help="Fail when a measured run has no proposal or draft activity.",
+    )
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument(
         "--cache-warmup-runs",
@@ -306,6 +328,23 @@ def validate_arguments(arguments):
     if arguments.repeats <= 0:
         raise ValueError("--repeats must be positive")
     if (
+        arguments.speculative_confidence is not None
+        and not 0.0 <= arguments.speculative_confidence <= 1.0
+    ):
+        raise ValueError("--speculative-confidence must be between 0 and 1")
+    if arguments.speculative_max_draft < 0:
+        raise ValueError("--speculative-max-draft must be non-negative")
+    if arguments.no_speculative and (
+        arguments.require_speculative or arguments.parallel_speculative
+    ):
+        raise ValueError(
+            "--no-speculative cannot be combined with speculative requirements"
+        )
+    if arguments.parallel_speculative and arguments.parallel_sessions < 2:
+        raise ValueError(
+            "--parallel-speculative requires at least two parallel Sessions"
+        )
+    if (
         arguments.host_memory_mb < 0
         or arguments.expert_cache_mb < 0
         or arguments.expert_gpu_cache_mb < 0
@@ -389,6 +428,22 @@ def runner_command(arguments):
     ]
     if arguments.no_speculative:
         command.append("--no-speculative")
+    if arguments.speculative_confidence is not None:
+        command.extend(
+            [
+                "--speculative-confidence",
+                str(arguments.speculative_confidence),
+            ]
+        )
+    if arguments.speculative_max_draft:
+        command.extend(
+            [
+                "--speculative-max-draft",
+                str(arguments.speculative_max_draft),
+            ]
+        )
+    if arguments.parallel_speculative:
+        command.append("--parallel-speculative")
     if arguments.cache_warmup_runs:
         command.extend(
             ["--cache-warmup-runs", str(arguments.cache_warmup_runs)]
@@ -1004,6 +1059,32 @@ def parse_runner_output(output):
         ),
         "lm_head_ms": extract_number(
             output, r"^LM head time: ([0-9.]+) ms"
+        ),
+        "speculative_proposals": extract_number(
+            output, r"^Speculative decoding: (\d+) proposal", int
+        ),
+        "speculative_draft_tokens": extract_number(
+            output,
+            r"^Speculative decoding: \d+ proposal\(s\), (\d+) draft token",
+            int,
+        ),
+        "speculative_accepted_tokens": extract_number(
+            output,
+            r"^Speculative decoding: \d+ proposal\(s\), \d+ draft token\(s\), "
+            r"(\d+) accepted token",
+            int,
+        ),
+        "speculative_context_ms": extract_number(
+            output, r"^Speculative time: ([0-9.]+) ms context"
+        ),
+        "speculative_draft_ms": extract_number(
+            output,
+            r"^Speculative time: [0-9.]+ ms context, ([0-9.]+) ms draft",
+        ),
+        "speculative_verify_ms": extract_number(
+            output,
+            r"^Speculative time: [0-9.]+ ms context, [0-9.]+ ms draft, "
+            r"([0-9.]+) ms verify",
         ),
         "physical_cpu_core_count": extract_number(
             output, r"^CPU topology: (\d+) physical core", int
@@ -1728,6 +1809,15 @@ def run_cache_sweep(arguments):
                 "system_physical_read_bytes": median[
                     "system_physical_read_bytes"
                 ],
+                "speculative_proposals": median["speculative_proposals"],
+                "speculative_draft_tokens": median[
+                    "speculative_draft_tokens"
+                ],
+                "speculative_accepted_tokens": median[
+                    "speculative_accepted_tokens"
+                ],
+                "speculative_draft_ms": median["speculative_draft_ms"],
+                "speculative_verify_ms": median["speculative_verify_ms"],
             }
         )
 
@@ -1740,6 +1830,10 @@ def run_cache_sweep(arguments):
         "prompt_token_ids": arguments.prompt_token_ids,
         "max_new_tokens": arguments.max_new_tokens,
         "temperature": arguments.temperature,
+        "speculative_enabled": not arguments.no_speculative,
+        "speculative_confidence": arguments.speculative_confidence,
+        "speculative_max_draft": arguments.speculative_max_draft,
+        "parallel_speculative": arguments.parallel_speculative,
         "warmup_runs": arguments.warmup,
         "cache_warmup_runs": arguments.cache_warmup_runs,
         "repeats": arguments.repeats,
@@ -1831,6 +1925,22 @@ def main():
         )
         return 1
 
+    if arguments.require_speculative:
+        inactive_runs = [
+            index
+            for index, sample in enumerate(samples, start=1)
+            if not sample["speculative_proposals"]
+            or not sample["speculative_draft_tokens"]
+        ]
+        if inactive_runs:
+            print(
+                "speculative execution was required but complete proposal "
+                f"and draft activity was not reported in measured run(s): "
+                f"{inactive_runs}",
+                file=sys.stderr,
+            )
+            return 1
+
     report = {
         "schema_version": 2,
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1841,6 +1951,10 @@ def main():
         "prompt_token_ids": arguments.prompt_token_ids,
         "max_new_tokens": arguments.max_new_tokens,
         "temperature": arguments.temperature,
+        "speculative_enabled": not arguments.no_speculative,
+        "speculative_confidence": arguments.speculative_confidence,
+        "speculative_max_draft": arguments.speculative_max_draft,
+        "parallel_speculative": arguments.parallel_speculative,
         "backend": arguments.backend,
         "expert_memory": arguments.expert_memory,
         "host_memory_mb": arguments.host_memory_mb,
@@ -1952,6 +2066,24 @@ def main():
             "embedding_ms": median_field(samples, "embedding_ms"),
             "final_norm_ms": median_field(samples, "final_norm_ms"),
             "lm_head_ms": median_field(samples, "lm_head_ms"),
+            "speculative_proposals": median_field(
+                samples, "speculative_proposals"
+            ),
+            "speculative_draft_tokens": median_field(
+                samples, "speculative_draft_tokens"
+            ),
+            "speculative_accepted_tokens": median_field(
+                samples, "speculative_accepted_tokens"
+            ),
+            "speculative_context_ms": median_field(
+                samples, "speculative_context_ms"
+            ),
+            "speculative_draft_ms": median_field(
+                samples, "speculative_draft_ms"
+            ),
+            "speculative_verify_ms": median_field(
+                samples, "speculative_verify_ms"
+            ),
             "vulkan_compute_submissions": median_field(
                 samples, "vulkan_compute_submissions"
             ),
@@ -2409,6 +2541,13 @@ def main():
             f"{median['system_physical_read_bytes']} bytes"
         )
     print("generated token ids:", *reference_tokens)
+    if median["speculative_proposals"] is not None:
+        print(
+            "median speculative activity: "
+            f"{median['speculative_proposals']} proposal(s), "
+            f"{median['speculative_draft_tokens']} draft token(s), "
+            f"{median['speculative_accepted_tokens']} accepted token(s)"
+        )
     if arguments.json_output:
         print(f"JSON report: {Path(arguments.json_output).resolve()}")
     return 0

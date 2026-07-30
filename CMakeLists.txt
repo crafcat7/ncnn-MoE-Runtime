@@ -247,7 +247,7 @@ if(NCNN_MOE_BUILD_EXAMPLES)
 
     add_executable(
         ncnn_moe_deepseek_v4
-        examples/run_deepseek_v4_flash_dspark.cpp
+        examples/run_deepseek_v4.cpp
         examples/internal/run_model.cpp)
     target_link_libraries(
         ncnn_moe_deepseek_v4
