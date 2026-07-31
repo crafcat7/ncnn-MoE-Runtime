@@ -4,6 +4,7 @@
 #include "ncnn/moe/execution_plan.h"
 #include "ncnn/moe/result.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <span>
@@ -36,6 +37,7 @@ struct CpuSpeculativeProposal
     std::vector<int32_t> token_ids;
     std::vector<std::vector<float>> logits;
     std::vector<float> confidence_logits;
+    size_t committed_context_rows = 0;
 };
 
 using CpuSpeculativeSampler = std::function<Result<int32_t>(const std::vector<float>& logits)>;

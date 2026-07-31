@@ -12,8 +12,8 @@ Experts across CPU, Vulkan, memory, and storage backends.
 The runtime targets local inference on Desktop and edge-class systems where the
 complete model may be larger than available RAM. The public API is independent
 of a model family, device vendor, and fixed cache size. The distributed release
-includes validated GPT-OSS, DeepSeek-V4-Flash, and
-DeepSeek-V4-Flash-DSpark support for their official Safetensors packages.
+includes validated GPT-OSS, DeepSeek-V4-Flash, DeepSeek-V4-Flash-DSpark, and
+Qwen3.6-35B-A3B text-backbone support for their official Safetensors packages.
 
 [Runtime capabilities](#runtime-capabilities) | [Architecture](#architecture) |
 [Supported models and data](#supported-models-and-reference-data) |
@@ -21,17 +21,19 @@ DeepSeek-V4-Flash-DSpark support for their official Safetensors packages.
 
 ## Supported models and reference data
 
-The table is a compact index of the current reference measurements. Values
-are three-run medians on a Ryzen 7 9800X3D, 31.14 GiB RAM, and an RTX 5070 Ti
-16 GiB. Each model report owns the complete cold/warm, short/long,
-multi-Session, memory, cache, and I/O matrix.
+The table is a compact index of the current reference measurements and
+admission status. Published values are three-run medians on a Ryzen 7 9800X3D,
+31.14 GiB RAM, and an RTX 5070 Ti 16 GiB. Each benchmarked model report owns
+the complete cold/warm, short/long, multi-Session, memory, cache, and I/O
+matrix.
 
-| Model | Reference execution | Warm single Session, 32 tokens | Warm service, 32 tokens | Full report |
+| Model | Reference execution | Reference single Session, 32 tokens | Reference service, 32 tokens | Full report |
 | --- | --- | ---: | ---: | --- |
 | GPT-OSS-20B | Hybrid, eager Experts | **14.855 token/s** | n/a | [GPT-OSS performance](models/gpt-oss/README.md#reference-performance) |
 | GPT-OSS-120B | Hybrid, 16 GiB host ARC | **4.718 token/s** | **10.916 aggregate token/s** (2 Sessions) | [GPT-OSS performance](models/gpt-oss/README.md#reference-performance) |
 | DeepSeek-V4-Flash | Hybrid, 16 GiB host ARC | **1.254 token/s** | **3.809 aggregate token/s** (4 staged Sessions) | [Flash performance](models/deepseek-v4/README.md#deepseek-v4-flash-matrix) |
 | DeepSeek-V4-Flash-DSpark | Hybrid, DSpark enabled, 16 GiB host ARC | **1.254 token/s** | **3.594 aggregate token/s** (4 independent Sessions) | [DSpark performance](models/deepseek-v4/README.md#deepseek-v4-flash-dspark-matrix) |
+| Qwen3.6-35B-A3B | Hybrid, compiled MXFP4 Artifact, target only | **8.383 token/s** | **22.435 aggregate token/s** (4 independent Sessions) | [Qwen3.6 performance](models/qwen3.6/README.md#reference-performance) |
 
 Model-specific prompts, kernels, quantization formats, and service policies
 differ, so these rows are reference points rather than a cross-model ranking.
@@ -62,12 +64,12 @@ requiring a resident copy of every routed weight.
 | Area | Release capability |
 | --- | --- |
 | Runtime API | `Runtime`, immutable shared `Model`, per-request `Session`, and cross-Session `BatchScheduler` |
-| Model integration | Public `IMoeModelAdapter` contract and model-neutral `MoeIR`; built-in GPT-OSS and DeepSeek V4 adapters |
+| Model integration | Public `IMoeModelAdapter` contract and model-neutral `MoeIR`; built-in GPT-OSS, DeepSeek V4, and Qwen3.6 text adapters |
 | IR and compiler | Model-neutral `MoeIR` for Attention, Router, ExpertGroup, Combine, KV Cache, and quantization metadata; validation, normalization, weight resolution, and immutable compilation |
 | Execution graph | Tensor and node dependencies, backend candidates and placement, cross-backend events, and topological execution waves |
 | Dense path | Portable CPU with runtime-dispatched FP8 E4M3 scalar/AVX2/AVX-512 Linear, optional ncnn CPU operators, and mixed ncnn Vulkan Dense/Attention execution |
-| Attention | RMSNorm, GQA, full/sliding Attention, latent Attention with learned compressed history, RoPE/YaRN variants, sinks, persistent KV state, fused QKV+RoPE, and adaptive online Decode SDPA |
-| Experts | Stable Top-K regrouping, Softmax/Sigmoid/square-root-Softplus scoring, hash routes, shared Experts, float32/BF16/FP8/INT8 execution, and fused-decode FP4 kernels selected at runtime for scalar, NEON, SVE2, AVX2/FMA, or AVX-512 |
+| Attention | RMSNorm, GQA, full/sliding Attention, Gated DeltaNet, latent Attention with learned compressed history, RoPE/YaRN variants, output gates, sinks, persistent KV/recurrent state, fused QKV+RoPE, and adaptive online Decode SDPA |
+| Experts | Stable Top-K regrouping, Softmax/Sigmoid/square-root-Softplus scoring, hash routes, gated shared Experts, float32/BF16/FP8/INT8 execution, and fused-decode FP4 kernels selected at runtime for scalar, NEON, SVE2, AVX2/FMA, or AVX-512 |
 | Memory and storage | Automatic eager/on-demand planning, per-Session Tensor residency accounting, Expert lifecycle/hotset statistics, byte-bounded host ARC, mmap or asynchronous direct/buffered reads, optional packed Expert storage, and optional Vulkan cache tiers |
 | Heterogeneous execution | CPU Experts by default, optional calibrated native Vulkan MXFP4 Experts, and capability-weighted multi-Vulkan layer placement |
 | Scheduling | Independent Session state, ragged staged Prefill, mHC/Attention/Expert Decode batching, same-Expert and exact-input coalescing, adaptive staged/independent execution, and bounded cross-call micro-batching |
@@ -80,7 +82,9 @@ requiring a resident copy of every routed weight.
   Experts are admitted only when phase-level calibration measures a benefit.
 - **Fused MXFP4 compute.** Expert kernels decode MXFP4 blocks inside the
   compute loop instead of materializing complete FP32 weights. Runtime dispatch
-  selects scalar, NEON, SVE2, AVX2/FMA, or AVX-512 implementations.
+  selects scalar, NEON, SVE2, AVX2/FMA, or AVX-512 implementations. Qwen3.6 can
+  optionally compile its routed BF16 banks into the same fused storage profile
+  without modifying the official shards.
 - **Vectorized FP8 Linear.** E4M3 block-scale projections select scalar,
   AVX2/FMA, or AVX-512 kernels at runtime, share input loads across adjacent
   output rows, and use a data-type-aware CPU thread limit.
@@ -94,6 +98,10 @@ requiring a resident copy of every routed weight.
 - **Reusable execution state.** Persistent KV rings, reusable scratch buffers,
   direct QKV-to-ring writes, command reuse, and online Decode SDPA reduce
   per-token allocation and transfer overhead.
+- **Model-provided speculation.** DSpark and experimental Qwen MTP use
+  transactional Attention/recurrent state and exact fallback commits. DSpark
+  supports batched verification; Qwen currently uses exact sequential target
+  verification and remains opt-in.
 - **Workload-aware scheduling.** Ragged Prefill, cross-Session collection,
   mHC/Attention/Expert batching, and adaptive staged/independent execution
   improve service throughput without fixing policy choices to one device.
@@ -233,7 +241,7 @@ the Runtime API and its public model guides.
 | Capability | Public behavior |
 | --- | --- |
 | Adapter interface | Public `IMoeModelAdapter` to `MoeIR` lowering contract |
-| Built-in reference adapters | GPT-OSS-20B/120B, DeepSeek-V4-Flash, and DeepSeek-V4-Flash-DSpark Safetensors |
+| Built-in reference adapters | GPT-OSS-20B/120B, DeepSeek-V4-Flash/DSpark, and the Qwen3.6-35B-A3B text backbone |
 | CPU execution | Complete portable path |
 | Heterogeneous execution | Vulkan Dense/Attention with CPU routing and Experts |
 | Native Vulkan Experts | Optional MXFP4 cache and execution with runtime calibration and CPU fallback |
@@ -242,10 +250,12 @@ the Runtime API and its public model guides.
 | KV cache | CPU FP32/BF16 or mixed-backend FP32 ring |
 | Output | Full logits with native sampling and streaming |
 
-The distributed release includes validated GPT-OSS and DeepSeek V4 production
-adapters. Additional adapters use the same public IR and compiler boundary
-without adding model-family checks to Prefill, Decode, scheduling, or Expert
-execution.
+The distributed release includes validated GPT-OSS, DeepSeek V4, and Qwen3.6
+text production adapters. The Qwen admission excludes its vision encoder;
+its one-layer MTP payload is admitted with the checkpoint-bound compiled
+Artifact. Additional adapters use the same public IR and
+compiler boundary without adding model-family checks to Prefill, Decode,
+scheduling, or Expert execution.
 Multi-device placement is layer placement rather than Tensor Parallelism, and
 Vulkan-only execution is not a supported public mode.
 
@@ -258,6 +268,7 @@ definitions:
 - [Model catalog and capability matrix](models/README.md)
 - [GPT-OSS-20B/120B execution and performance](models/gpt-oss/README.md)
 - [DeepSeek V4 Flash and DSpark execution and performance](models/deepseek-v4/README.md)
+- [Qwen3.6-35B-A3B text admission and execution](models/qwen3.6/README.md)
 
 ## Project layout
 
@@ -272,8 +283,8 @@ src/kernels/       Portable CPU Attention/Linear, BF16 helpers, and runtime-sele
 src/backends/ncnn/ ncnn CPU/Vulkan operator packaging, mixed Attention, Vulkan contexts, and native MXFP4 Experts
 models/            Model catalog and model-family execution guides
 assets/            Published benchmark visualizations used by model reports
-examples/          GPT-OSS and DeepSeek reference runners, model inspection, and MXFP4 microbenchmark
-tools/             Fixture, GPT-OSS/DeepSeek text, packed-Expert, and benchmark utilities
+examples/          GPT-OSS, DeepSeek, and Qwen reference runners, model inspection, and MXFP4 microbenchmark
+tools/             Fixture, model text wrappers, packed-Expert, and benchmark utilities
 tests/             Deterministic, parity, cache, scheduling, concurrency, and error-path tests
 third_party/ncnn/  Pinned ncnn source submodule
 ```

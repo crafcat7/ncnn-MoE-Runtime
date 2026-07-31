@@ -1,6 +1,7 @@
 #include "cpu_attention.h"
 
 #include "cpu_ops.h"
+#include "cpu_state_cache.h"
 #include "backends/ncnn/ncnn_attention.h"
 #include "backends/ncnn/ncnn_linear.h"
 
@@ -181,6 +182,7 @@ static void append_cache(CpuLayerCache& cache, DType dtype, const CpuBatch& key,
         }
         ++cache.token_count;
     }
+    record_standard_cache_transaction_rows(cache, key.rows());
 }
 
 static float cache_element(const CpuLayerCache& cache, bool key, uint64_t token_index, uint32_t column)
@@ -300,7 +302,7 @@ static float attention_weight_value(const TensorData& tensor, size_t index)
     return bfloat16_to_float(tensor.bfloat16_values()[index]);
 }
 
-static void apply_head_rms_norm(CpuBatch& batch, uint32_t head_count, uint32_t head_dimension, const TensorData& weight, float epsilon)
+static void apply_head_rms_norm(CpuBatch& batch, uint32_t head_count, uint32_t head_dimension, const TensorData& weight, float epsilon, float weight_offset)
 {
     assert(weight.element_count() == head_dimension);
     for (size_t token_index = 0; token_index < batch.rows(); ++token_index)
@@ -317,10 +319,67 @@ static void apply_head_rms_norm(CpuBatch& batch, uint32_t head_count, uint32_t h
             const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(head_dimension) + epsilon);
             for (uint32_t column = 0; column < head_dimension; ++column)
             {
-                values[column] *= inverse_rms * attention_weight_value(weight, column);
+                values[column] *= inverse_rms * (attention_weight_value(weight, column) + weight_offset);
             }
         }
     }
+}
+
+void append_attention_context_into(const WeightTable& weights, const AttentionBlockPlan& plan, float norm_epsilon, DType kv_cache_dtype,
+                                   uint64_t position_offset, CpuLayerCache& cache, CpuAttentionExecutionScratch& scratch, const CpuBatch& hidden)
+{
+    rms_norm_batch_into(hidden, weights.at(plan.pre_attention_norm_weight), norm_epsilon, scratch.normalized, plan.norm_weight_offset);
+    CpuBatch& key = scratch.key;
+    CpuBatch& value = scratch.value;
+    CpuBatch& fused_qkv = scratch.fused_qkv;
+    if ((plan.fused_qkv_gate_bfloat16_operator
+         && plan.fused_qkv_gate_bfloat16_operator->forward(
+             scratch.normalized,
+             fused_qkv))
+        || (plan.fused_qkv_bfloat16_operator
+         && plan.fused_qkv_bfloat16_operator->forward(
+             scratch.normalized,
+             fused_qkv))
+        || (plan.fused_qkv_operator
+            && plan.fused_qkv_operator->forward(
+                scratch.normalized,
+                fused_qkv)))
+    {
+        const uint32_t query_columns = plan.head_count * plan.head_dimension;
+        const uint32_t key_value_columns = plan.kv_head_count * plan.head_dimension;
+        key.reset(hidden.rows(), key_value_columns, false);
+        value.reset(hidden.rows(), key_value_columns, false);
+        for (size_t token_index = 0; token_index < hidden.rows(); ++token_index)
+        {
+            const float* source = fused_qkv.row(token_index) + query_columns;
+            std::copy_n(source, key_value_columns, key.row(token_index));
+            source += key_value_columns;
+            std::copy_n(source, key_value_columns, value.row(token_index));
+        }
+    }
+    else
+    {
+        attention_linear_into(weights, plan.key_weight, plan.key_bias, scratch.normalized, key);
+        attention_linear_into(weights, plan.value_weight, plan.value_bias, scratch.normalized, value);
+    }
+
+    if (has_flag(plan.flags, AttentionBlockQueryKeyNorm))
+    {
+        apply_head_rms_norm(key, plan.kv_head_count, plan.head_dimension, weights.at(plan.key_norm_weight), norm_epsilon, plan.norm_weight_offset);
+    }
+
+    const uint32_t rope_dimension = plan.rope_head_dimension == 0 ? plan.head_dimension : plan.rope_head_dimension;
+    for (size_t token_index = 0; token_index < hidden.rows(); ++token_index)
+    {
+        const uint64_t position = position_offset + token_index;
+        for (uint32_t head = 0; head < plan.kv_head_count; ++head)
+            apply_rope(key.row(token_index) + head * plan.head_dimension, rope_dimension, position, plan);
+    }
+
+    if (cache.token_count == 0)
+        cache.start_position = position_offset;
+    append_cache(cache, kv_cache_dtype, key, value);
+    trim_sliding_cache(cache, plan);
 }
 
 void execute_attention_block_into(const WeightTable& weights, const AttentionBlockPlan& plan, float norm_epsilon, DType kv_cache_dtype,
@@ -332,18 +391,35 @@ void execute_attention_block_into(const WeightTable& weights, const AttentionBlo
         return;
     }
 
-    rms_norm_batch_into(hidden, weights.at(plan.pre_attention_norm_weight), norm_epsilon, scratch.normalized);
+    rms_norm_batch_into(hidden, weights.at(plan.pre_attention_norm_weight), norm_epsilon, scratch.normalized, plan.norm_weight_offset);
     CpuBatch& query = scratch.query;
     CpuBatch& key = scratch.key;
     CpuBatch& value = scratch.value;
     CpuBatch& fused_qkv = scratch.fused_qkv;
-    if (plan.fused_qkv_operator && plan.fused_qkv_operator->forward(scratch.normalized, fused_qkv))
+    const bool fused_output_gate =
+        plan.fused_qkv_gate_bfloat16_operator
+        && plan.fused_qkv_gate_bfloat16_operator->forward(
+            scratch.normalized,
+            fused_qkv);
+    const bool fused_projection =
+        fused_output_gate
+        || (plan.fused_qkv_bfloat16_operator
+            && plan.fused_qkv_bfloat16_operator->forward(
+                scratch.normalized,
+                fused_qkv))
+        || (plan.fused_qkv_operator
+            && plan.fused_qkv_operator->forward(
+                scratch.normalized,
+                fused_qkv));
+    if (fused_projection)
     {
         const uint32_t query_columns = plan.head_count * plan.head_dimension;
         const uint32_t key_value_columns = plan.kv_head_count * plan.head_dimension;
         query.reset(hidden.rows(), query_columns, false);
         key.reset(hidden.rows(), key_value_columns, false);
         value.reset(hidden.rows(), key_value_columns, false);
+        if (fused_output_gate)
+            scratch.gate.reset(hidden.rows(), query_columns, false);
         for (size_t token_index = 0; token_index < hidden.rows(); ++token_index)
         {
             const float* source = fused_qkv.row(token_index);
@@ -352,6 +428,14 @@ void execute_attention_block_into(const WeightTable& weights, const AttentionBlo
             std::copy_n(source, key_value_columns, key.row(token_index));
             source += key_value_columns;
             std::copy_n(source, key_value_columns, value.row(token_index));
+            source += key_value_columns;
+            if (fused_output_gate)
+            {
+                std::copy_n(
+                    source,
+                    query_columns,
+                    scratch.gate.row(token_index));
+            }
         }
     }
     else
@@ -363,17 +447,18 @@ void execute_attention_block_into(const WeightTable& weights, const AttentionBlo
 
     if (has_flag(plan.flags, AttentionBlockQueryKeyNorm))
     {
-        apply_head_rms_norm(query, plan.head_count, plan.head_dimension, weights.at(plan.query_norm_weight), norm_epsilon);
-        apply_head_rms_norm(key, plan.kv_head_count, plan.head_dimension, weights.at(plan.key_norm_weight), norm_epsilon);
+        apply_head_rms_norm(query, plan.head_count, plan.head_dimension, weights.at(plan.query_norm_weight), norm_epsilon, plan.norm_weight_offset);
+        apply_head_rms_norm(key, plan.kv_head_count, plan.head_dimension, weights.at(plan.key_norm_weight), norm_epsilon, plan.norm_weight_offset);
     }
 
+    const uint32_t rope_dimension = plan.rope_head_dimension == 0 ? plan.head_dimension : plan.rope_head_dimension;
     for (size_t token_index = 0; token_index < hidden.rows(); ++token_index)
     {
         const uint64_t position = position_offset + token_index;
         for (uint32_t head = 0; head < plan.head_count; ++head)
-            apply_rope(query.row(token_index) + head * plan.head_dimension, plan.head_dimension, position, plan);
+            apply_rope(query.row(token_index) + head * plan.head_dimension, rope_dimension, position, plan);
         for (uint32_t head = 0; head < plan.kv_head_count; ++head)
-            apply_rope(key.row(token_index) + head * plan.head_dimension, plan.head_dimension, position, plan);
+            apply_rope(key.row(token_index) + head * plan.head_dimension, rope_dimension, position, plan);
     }
 
     if (cache.token_count == 0)
@@ -381,6 +466,27 @@ void execute_attention_block_into(const WeightTable& weights, const AttentionBlo
     append_cache(cache, kv_cache_dtype, key, value);
     scaled_dot_product_attention_into(plan, plan.sinks == invalid_tensor_handle ? nullptr : &weights.at(plan.sinks), position_offset, query, cache,
                                       scratch.attention, scratch.logits);
+    if (has_flag(plan.flags, AttentionBlockOutputGate))
+    {
+        if (!fused_output_gate)
+        {
+            attention_linear_into(
+                weights,
+                plan.output_gate_weight,
+                invalid_tensor_handle,
+                scratch.normalized,
+                scratch.gate);
+        }
+        for (size_t token_index = 0; token_index < scratch.attention.rows(); ++token_index)
+        {
+            float* attention_row = scratch.attention.row(token_index);
+            const float* gate_row = scratch.gate.row(token_index);
+            for (uint32_t column = 0; column < scratch.attention.columns(); ++column)
+            {
+                attention_row[column] *= 1.0f / (1.0f + std::exp(-gate_row[column]));
+            }
+        }
+    }
     attention_linear_into(weights, plan.output_weight, plan.output_bias, scratch.attention, scratch.projected);
     output = hidden;
     add_batch_inplace(output, scratch.projected);

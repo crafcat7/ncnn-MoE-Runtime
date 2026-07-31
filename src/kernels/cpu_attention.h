@@ -15,6 +15,9 @@ void execute_attention_block_into(const WeightTable& weights, const AttentionBlo
                                   uint64_t position_offset, CpuLayerCache& cache, CpuAttentionExecutionScratch& scratch, const CpuBatch& hidden,
                                   CpuBatch& output);
 
+void append_attention_context_into(const WeightTable& weights, const AttentionBlockPlan& plan, float norm_epsilon, DType kv_cache_dtype,
+                                   uint64_t position_offset, CpuLayerCache& cache, CpuAttentionExecutionScratch& scratch, const CpuBatch& hidden);
+
 } // namespace moe
 } // namespace ncnn
 

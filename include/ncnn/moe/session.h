@@ -229,6 +229,7 @@ struct SessionOptions
     LogitsOutputMode logits_output_mode = LogitsOutputMode::FullLogits;
     uint64_t sampling_seed = 0;
     uint32_t prefill_chunk_size = 256;
+    bool enable_speculative_context = true;
 };
 
 class Session
@@ -248,6 +249,7 @@ private:
     std::unique_ptr<IExecutor> executor_;
     std::mt19937_64 random_generator_;
     uint32_t prefill_chunk_size_ = 256;
+    bool speculative_context_enabled_ = true;
     mutable std::mutex mutex_;
 
     friend class Runtime;

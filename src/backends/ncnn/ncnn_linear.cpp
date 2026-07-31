@@ -1011,6 +1011,7 @@ public:
 
     ncnn::Layer* layer = nullptr;
     ncnn::Option option;
+    mutable std::mutex forward_mutex;
     uint32_t input_columns = 0;
     uint32_t output_columns = 0;
     bool pipeline_created = false;
@@ -1448,6 +1449,8 @@ bool NcnnLinearOperator::forward(const CpuBatch& input, CpuBatch& output) const
     }
 #endif
 
+    const std::lock_guard<std::mutex> lock(
+        implementation.forward_mutex);
     ncnn::Mat bottom(static_cast<int>(input.columns()), static_cast<int>(input.rows()), sizeof(float));
     if (bottom.empty())
         return false;
@@ -1477,6 +1480,560 @@ bool NcnnLinearOperator::uses_vulkan() const noexcept
 #if NCNN_MOE_WITH_VULKAN
     return implementation_->vulkan_context != nullptr;
 #else
+    return false;
+#endif
+}
+
+class NcnnVulkanBfloat16Operator::Implementation
+{
+public:
+#if NCNN_MOE_WITH_VULKAN
+    std::shared_ptr<NcnnVulkanContext> vulkan_context;
+    std::unique_ptr<ncnn::VkWeightAllocator> weight_allocator;
+    std::unique_ptr<ncnn::VkWeightStagingAllocator> weight_staging_allocator;
+    std::shared_ptr<ncnn::Pipeline> pipeline;
+    ncnn::VkMat packed;
+    ncnn::VkMat bias;
+    ncnn::Option option;
+#endif
+    uint32_t input_columns = 0;
+    uint32_t output_columns = 0;
+    uint32_t block_count = 0;
+};
+
+#if NCNN_MOE_WITH_VULKAN
+static constexpr char bfloat16_projection_shader[] = R"glsl(
+#version 450
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(binding = 0) readonly buffer input_blob
+{
+    float input_data[];
+};
+layout(binding = 1) readonly buffer packed_blob
+{
+    uint packed_words[];
+};
+layout(binding = 2) readonly buffer bias_blob
+{
+    float bias_data[];
+};
+layout(binding = 3) writeonly buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint input_columns;
+    uint output_columns;
+    uint block_count;
+    uint token_count;
+}
+p;
+
+float decode_bfloat16(uint value)
+{
+    return uintBitsToFloat(value << 16);
+}
+
+#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
+shared float partial_sum[32];
+#endif
+
+void main()
+{
+    const uint output_column = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    const bool valid = output_column < p.output_columns && token < p.token_count;
+    float sum = 0.0;
+    if (valid)
+    {
+        const uint input_row = token * p.input_columns;
+        const uint weight_row = output_column * p.input_columns;
+        for (uint block = 0; block < p.block_count; ++block)
+        {
+            const uint column = block * 128 + lane * 4;
+            const uint first = packed_words[(weight_row + column) >> 1];
+            const uint second = packed_words[(weight_row + column + 2) >> 1];
+            sum += decode_bfloat16(first & 65535) * input_data[input_row + column];
+            sum += decode_bfloat16(first >> 16) * input_data[input_row + column + 1];
+            sum += decode_bfloat16(second & 65535) * input_data[input_row + column + 2];
+            sum += decode_bfloat16(second >> 16) * input_data[input_row + column + 3];
+        }
+    }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const float reduced_sum = subgroupAdd(sum);
+    if (valid && lane == 0)
+        output_data[token * p.output_columns + output_column] = reduced_sum + bias_data[output_column];
+#else
+    partial_sum[lane] = sum;
+    barrier();
+    for (uint stride = 16; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+            partial_sum[lane] += partial_sum[lane + stride];
+        barrier();
+    }
+    if (valid && lane == 0)
+        output_data[token * p.output_columns + output_column] = partial_sum[0] + bias_data[output_column];
+#endif
+}
+)glsl";
+
+static bool create_bfloat16_projection_pipeline(
+    const std::shared_ptr<NcnnVulkanContext>& context,
+    const ncnn::Option& option,
+    std::shared_ptr<ncnn::Pipeline>& destination)
+{
+    const size_t shader_variant = option.use_subgroup_ops ? 1 : 0;
+    static std::array<std::once_flag, 2> compile_once;
+    static std::array<std::vector<uint32_t>, 2> spirv;
+    static std::array<bool, 2> compiled = {false, false};
+    std::call_once(compile_once[shader_variant], [&] {
+        compiled[shader_variant] =
+            ncnn::compile_spirv_module(
+                bfloat16_projection_shader,
+                static_cast<int>(sizeof(bfloat16_projection_shader) - 1),
+                option,
+                spirv[shader_variant])
+                == 0
+            && !spirv[shader_variant].empty();
+    });
+    if (!compiled[shader_variant])
+        return false;
+
+    ncnn::VulkanDevice* device = context->device();
+    static std::mutex cache_mutex;
+    static std::unordered_map<
+        const ncnn::VulkanDevice*,
+        std::weak_ptr<ncnn::Pipeline>>
+        cache;
+    const std::lock_guard<std::mutex> cache_lock(cache_mutex);
+    const auto cached = cache.find(device);
+    if (cached != cache.end())
+    {
+        destination = cached->second.lock();
+        if (destination)
+            return true;
+    }
+    std::unique_ptr<ncnn::Pipeline> pipeline(new ncnn::Pipeline(device));
+    pipeline->set_subgroup_size(32);
+    pipeline->set_local_size_xyz(32, 1, 1);
+    const std::vector<ncnn::vk_specialization_type> specializations;
+    if (pipeline->create(
+            spirv[shader_variant].data(),
+            spirv[shader_variant].size() * sizeof(uint32_t),
+            specializations)
+        != 0)
+    {
+        return false;
+    }
+    destination =
+        std::shared_ptr<ncnn::Pipeline>(
+            pipeline.release(),
+            [context](ncnn::Pipeline* value) {
+                const std::lock_guard<std::mutex> lock(
+                    context->command_mutex());
+                delete value;
+            });
+    cache[device] = destination;
+    return true;
+}
+
+static bool prepare_bfloat16_upload(
+    std::span<const uint16_t> source,
+    ncnn::Mat& destination)
+{
+    if (source.empty()
+        || source.size() > static_cast<size_t>(std::numeric_limits<int>::max()) * 2)
+    {
+        return false;
+    }
+    const size_t word_count = (source.size() + 1) / 2;
+    if (word_count > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return false;
+    destination.create(static_cast<int>(word_count), sizeof(uint32_t));
+    if (destination.empty())
+        return false;
+    uint32_t* words = static_cast<uint32_t*>(destination.data);
+    for (size_t index = 0; index < word_count; ++index)
+    {
+        const size_t first = index * 2;
+        const uint32_t low = source[first];
+        const uint32_t high =
+            first + 1 < source.size() ? source[first + 1] : 0;
+        words[index] = low | high << 16;
+    }
+    return true;
+}
+#endif
+
+NcnnVulkanBfloat16Operator::NcnnVulkanBfloat16Operator()
+    : implementation_(new Implementation)
+{
+}
+
+NcnnVulkanBfloat16Operator::~NcnnVulkanBfloat16Operator() = default;
+
+std::shared_ptr<NcnnVulkanBfloat16Operator>
+NcnnVulkanBfloat16Operator::create(
+    const TensorData& matrix,
+    const TensorData* bias,
+    uint32_t vulkan_device_index)
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (matrix.dtype != DType::BFloat16
+        || matrix.shape.size() != 2
+        || matrix.shape[0] == 0
+        || matrix.shape[1] == 0
+        || matrix.shape[1] % 128 != 0
+        || matrix.shape[0]
+               > static_cast<uint32_t>(
+                   std::numeric_limits<int>::max() / 32)
+        || matrix.shape[1]
+               > static_cast<uint32_t>(std::numeric_limits<int>::max()))
+    {
+        return {};
+    }
+    const uint32_t output_columns = matrix.shape[0];
+    const uint32_t input_columns = matrix.shape[1];
+    const std::span<const uint16_t> weights = matrix.bfloat16_values();
+    if (weights.size() != matrix.element_count())
+        return {};
+    if (bias
+        && (bias->shape.size() != 1
+            || bias->shape[0] != output_columns
+            || (bias->dtype != DType::Float32
+                && bias->dtype != DType::BFloat16)))
+    {
+        return {};
+    }
+
+    std::shared_ptr<NcnnVulkanBfloat16Operator> result(
+        new NcnnVulkanBfloat16Operator);
+    Implementation& implementation = *result->implementation_;
+    implementation.input_columns = input_columns;
+    implementation.output_columns = output_columns;
+    implementation.block_count = input_columns / 128;
+    implementation.vulkan_context =
+        NcnnVulkanContext::acquire(vulkan_device_index);
+    if (!implementation.vulkan_context)
+        return {};
+    ncnn::VulkanDevice* device = implementation.vulkan_context->device();
+    if (device->info.subgroup_size() != 32)
+        return {};
+    implementation.option.use_vulkan_compute = true;
+    implementation.option.use_fp16_packed = false;
+    implementation.option.use_fp16_storage = false;
+    implementation.option.use_fp16_arithmetic = false;
+    implementation.option.use_bf16_packed = false;
+    implementation.option.use_bf16_storage = false;
+    implementation.option.blob_vkallocator =
+        implementation.vulkan_context->blob_allocator();
+    implementation.option.workspace_vkallocator =
+        implementation.vulkan_context->blob_allocator();
+    implementation.option.staging_vkallocator =
+        implementation.vulkan_context->staging_allocator();
+    implementation.option.use_cooperative_matrix =
+        device->info.support_cooperative_matrix();
+    implementation.option.use_subgroup_ops =
+        device->info.support_subgroup_ops();
+
+    const uint64_t weight_bytes =
+        static_cast<uint64_t>(weights.size()) * sizeof(uint16_t);
+    const uint64_t preferred_weight_bytes =
+        weight_bytes
+        + static_cast<uint64_t>(output_columns) * sizeof(float);
+    if (preferred_weight_bytes
+        > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+    {
+        return {};
+    }
+    implementation.weight_allocator.reset(
+        new ncnn::VkWeightAllocator(
+            device,
+            static_cast<size_t>(preferred_weight_bytes)));
+    implementation.weight_staging_allocator.reset(
+        new ncnn::VkWeightStagingAllocator(device));
+
+    ncnn::Mat packed;
+    ncnn::Mat biases;
+    if (!prepare_bfloat16_upload(weights, packed))
+        return {};
+    biases.create(static_cast<int>(output_columns), sizeof(float));
+    if (biases.empty())
+        return {};
+    float* bias_values = static_cast<float*>(biases.data);
+    if (!bias)
+    {
+        std::fill_n(bias_values, output_columns, 0.0f);
+    }
+    else if (bias->dtype == DType::Float32)
+    {
+        const std::span<const float> values = bias->float32_values();
+        if (values.size() != output_columns)
+            return {};
+        std::copy(values.begin(), values.end(), bias_values);
+    }
+    else
+    {
+        const std::span<const uint16_t> values =
+            bias->bfloat16_values();
+        if (values.size() != output_columns)
+            return {};
+        for (uint32_t index = 0; index < output_columns; ++index)
+            bias_values[index] = bfloat16_to_float(values[index]);
+    }
+
+    {
+        const std::lock_guard<std::mutex> lock(
+            implementation.vulkan_context->command_mutex());
+        if (!create_bfloat16_projection_pipeline(
+                implementation.vulkan_context,
+                implementation.option,
+                implementation.pipeline))
+        {
+            return {};
+        }
+    }
+    ncnn::Option upload_option = implementation.option;
+    upload_option.blob_vkallocator =
+        implementation.weight_allocator.get();
+    upload_option.workspace_vkallocator =
+        implementation.weight_allocator.get();
+    upload_option.staging_vkallocator =
+        implementation.weight_staging_allocator.get();
+    bool uploaded = false;
+    {
+        ncnn::VkTransfer command(device);
+        command.record_upload(
+            packed,
+            implementation.packed,
+            upload_option);
+        command.record_upload(
+            biases,
+            implementation.bias,
+            upload_option);
+        uploaded =
+            !implementation.packed.empty()
+            && !implementation.bias.empty()
+            && command.submit_and_wait() == 0;
+    }
+    implementation.weight_staging_allocator.reset();
+    if (!uploaded)
+        return {};
+    return result;
+#else
+    (void)matrix;
+    (void)bias;
+    (void)vulkan_device_index;
+    return {};
+#endif
+}
+
+std::shared_ptr<NcnnVulkanBfloat16Operator>
+NcnnVulkanBfloat16Operator::create_fused(
+    const std::vector<const TensorData*>& matrices,
+    const std::vector<const TensorData*>& biases,
+    uint32_t vulkan_device_index)
+{
+    if (matrices.empty()
+        || matrices.size() != biases.size()
+        || !matrices.front()
+        || matrices.front()->dtype != DType::BFloat16
+        || matrices.front()->shape.size() != 2)
+    {
+        return {};
+    }
+    const uint32_t input_columns = matrices.front()->shape[1];
+    const bool has_bias = biases.front() != nullptr;
+    uint64_t output_columns = 0;
+    uint64_t element_count = 0;
+    for (size_t index = 0; index < matrices.size(); ++index)
+    {
+        const TensorData* matrix = matrices[index];
+        const TensorData* bias = biases[index];
+        if (!matrix
+            || matrix->dtype != DType::BFloat16
+            || matrix->shape.size() != 2
+            || matrix->shape[1] != input_columns
+            || (bias != nullptr) != has_bias
+            || (bias
+                && (bias->shape.size() != 1
+                    || bias->shape[0] != matrix->shape[0]
+                    || (bias->dtype != DType::Float32
+                        && bias->dtype != DType::BFloat16))))
+        {
+            return {};
+        }
+        output_columns += matrix->shape[0];
+        element_count += matrix->element_count();
+    }
+    if (output_columns > std::numeric_limits<uint32_t>::max()
+        || element_count > std::numeric_limits<size_t>::max())
+    {
+        return {};
+    }
+
+    TensorData fused_matrix;
+    fused_matrix.dtype = DType::BFloat16;
+    fused_matrix.shape = {
+        static_cast<uint32_t>(output_columns),
+        input_columns};
+    fused_matrix.bfloat16_data.reserve(
+        static_cast<size_t>(element_count));
+    TensorData fused_bias;
+    fused_bias.dtype = DType::Float32;
+    fused_bias.shape = {static_cast<uint32_t>(output_columns)};
+    if (has_bias)
+        fused_bias.float32_data.reserve(
+            static_cast<size_t>(output_columns));
+    for (size_t index = 0; index < matrices.size(); ++index)
+    {
+        const std::span<const uint16_t> matrix_values =
+            matrices[index]->bfloat16_values();
+        if (matrix_values.size() != matrices[index]->element_count())
+            return {};
+        fused_matrix.bfloat16_data.insert(
+            fused_matrix.bfloat16_data.end(),
+            matrix_values.begin(),
+            matrix_values.end());
+        if (!has_bias)
+            continue;
+        const TensorData& bias = *biases[index];
+        if (bias.dtype == DType::Float32)
+        {
+            const std::span<const float> bias_values =
+                bias.float32_values();
+            fused_bias.float32_data.insert(
+                fused_bias.float32_data.end(),
+                bias_values.begin(),
+                bias_values.end());
+        }
+        else
+        {
+            const std::span<const uint16_t> bias_values =
+                bias.bfloat16_values();
+            for (uint16_t value : bias_values)
+                fused_bias.float32_data.push_back(
+                    bfloat16_to_float(value));
+        }
+    }
+    return create(
+        fused_matrix,
+        has_bias ? &fused_bias : nullptr,
+        vulkan_device_index);
+}
+
+bool NcnnVulkanBfloat16Operator::forward(
+    const CpuBatch& input,
+    CpuBatch& output) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    const Implementation& implementation = *implementation_;
+    if (!implementation.vulkan_context
+        || !implementation.pipeline
+        || input.rows() == 0
+        || input.columns() != implementation.input_columns
+        || input.rows()
+               > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+    {
+        return false;
+    }
+
+    NcnnVulkanTransferLease transfer_lease =
+        implementation.vulkan_context->acquire_transfer_slot();
+    NcnnVulkanTransferSlot& transfer_slot = transfer_lease.slot();
+    if (!fill_staging_upload(
+            input,
+            transfer_slot.upload,
+            transfer_slot.staging_allocator)
+        || !prepare_staging_batch(
+            transfer_slot.download,
+            input.rows(),
+            implementation.output_columns,
+            transfer_slot.staging_allocator))
+    {
+        return false;
+    }
+    output.reset(input.rows(), implementation.output_columns, false);
+
+    std::unique_lock<std::mutex> lock(
+        implementation.vulkan_context->command_mutex());
+    ncnn::VkCompute& command = *transfer_slot.command;
+    if (transfer_slot.command_used)
+    {
+        if (command.reset() != 0)
+            return false;
+        ++current_vulkan_runtime_counters.command_buffer_reuses;
+    }
+    transfer_slot.command_used = true;
+    ncnn::VkMat input_gpu;
+    if (!record_mapped_upload(
+            transfer_slot.upload,
+            input_gpu,
+            command,
+            implementation.option))
+    {
+        return false;
+    }
+    ncnn::VkMat output_gpu;
+    output_gpu.create(
+        static_cast<int>(implementation.output_columns),
+        static_cast<int>(input.rows()),
+        sizeof(float),
+        implementation.vulkan_context->blob_allocator());
+    if (output_gpu.empty())
+        return false;
+
+    std::vector<ncnn::VkMat> bindings(4);
+    bindings[0] = input_gpu;
+    bindings[1] = implementation.packed;
+    bindings[2] = implementation.bias;
+    bindings[3] = output_gpu;
+    std::vector<ncnn::vk_constant_type> constants(4);
+    constants[0].u32 = implementation.input_columns;
+    constants[1].u32 = implementation.output_columns;
+    constants[2].u32 = implementation.block_count;
+    constants[3].u32 = static_cast<uint32_t>(input.rows());
+    ncnn::VkMat dispatcher;
+    dispatcher.w =
+        static_cast<int>(implementation.output_columns * 32);
+    dispatcher.h = static_cast<int>(input.rows());
+    dispatcher.c = 1;
+    command.record_pipeline(
+        implementation.pipeline.get(),
+        bindings,
+        constants,
+        dispatcher);
+    if (!record_prepared_staging_download(
+            output_gpu,
+            input.rows(),
+            implementation.output_columns,
+            transfer_slot.download,
+            command,
+            implementation.option)
+        || submit_compute_and_wait(command) != 0
+        || !copy_staging_to_cpu_batch(
+            transfer_slot.download,
+            output))
+    {
+        return false;
+    }
+    ++current_vulkan_dispatch_count;
+    ++current_vulkan_runtime_counters.compute_submissions;
+    ++current_vulkan_runtime_counters.batch_uploads;
+    ++current_vulkan_runtime_counters.batch_downloads;
+    return true;
+#else
+    (void)input;
+    (void)output;
     return false;
 #endif
 }

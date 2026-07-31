@@ -7,6 +7,7 @@
 #include "compiler/moe_ir.hpp"
 #include "models/builtin_model_adapter.h"
 #include "models/deepseek_v4_model_adapter.h"
+#include "models/qwen3_5_moe_model_adapter.h"
 #include "kernels/cpu_mxfp4.h"
 #include "kernels/cpu_float8.h"
 #include "kernels/cpu_ops.h"
@@ -151,6 +152,7 @@ Runtime::Runtime()
 #endif
     register_adapter(std::make_shared<BuiltinModelAdapter>());
     register_adapter(std::make_shared<DeepSeekV4ModelAdapter>());
+    register_adapter(std::make_shared<Qwen3_5MoeModelAdapter>());
 }
 
 void Runtime::register_adapter(std::shared_ptr<IMoeModelAdapter> adapter)
@@ -366,6 +368,10 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
             {
                 maximum_active_experts = std::max(maximum_active_experts, layer.moe.top_k);
             }
+            for (const CompiledLayerPlan& layer : compiled_model.speculative.layers)
+            {
+                maximum_active_experts = std::max(maximum_active_experts, layer.moe.top_k);
+            }
             const uint32_t exact_and_speculative_budget = maximum_active_experts > std::numeric_limits<uint32_t>::max() / 2
                                                               ? std::numeric_limits<uint32_t>::max()
                                                               : maximum_active_experts * 2;
@@ -463,8 +469,12 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
                 expert_device_indices.push_back(placement_device_index);
             }
             std::vector<uint32_t> residency_group_devices;
-            residency_group_devices.reserve(compiled_model.layers.size());
+            residency_group_devices.reserve(compiled_model.layers.size() + compiled_model.speculative.layers.size());
             for (const CompiledLayerPlan& layer : compiled_model.layers)
+            {
+                residency_group_devices.push_back(layer.vulkan_device_index);
+            }
+            for (const CompiledLayerPlan& layer : compiled_model.speculative.layers)
             {
                 residency_group_devices.push_back(layer.vulkan_device_index);
             }
@@ -481,7 +491,17 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
                 return Error{ErrorCode::UnsupportedModel, "cannot create the Vulkan MXFP4 Expert execution cache/source backend"};
             }
         }
-        compiled_model.expert_cache = std::make_shared<Mxfp4ExpertCache>(plan.expert_cache_bytes, expert_io_workers, std::move(expert_victim_cache), expert_cache_flags, static_cast<uint32_t>(compiled_model.layers.size()));
+        const size_t residency_group_count = compiled_model.layers.size() + compiled_model.speculative.layers.size();
+        if (residency_group_count > std::numeric_limits<uint32_t>::max())
+        {
+            return Error{ErrorCode::InvalidModel, "the total Expert residency-group count overflows"};
+        }
+        compiled_model.expert_cache = std::make_shared<Mxfp4ExpertCache>(
+            plan.expert_cache_bytes,
+            expert_io_workers,
+            std::move(expert_victim_cache),
+            expert_cache_flags,
+            static_cast<uint32_t>(residency_group_count));
     }
 
     auto immutable = std::make_shared<const CompiledModel>(std::move(compiled_model));

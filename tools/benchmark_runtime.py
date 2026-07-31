@@ -9,6 +9,7 @@ import platform
 import re
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,42 @@ DEFAULT_PROMPT_TOKEN_IDS = [
     10220,
     13,
 ]
+QWEN_MXFP4_ARTIFACT = "ncnn-moe-qwen3.6-mxfp4.safetensors"
+
+
+def inspect_compiled_artifact(model):
+    path = Path(model).resolve() / QWEN_MXFP4_ARTIFACT
+    if not path.is_file():
+        return None
+    with path.open("rb") as stream:
+        encoded_length = stream.read(8)
+        if len(encoded_length) != 8:
+            raise ValueError(f"truncated compiled artifact header: {path}")
+        (header_length,) = struct.unpack("<Q", encoded_length)
+        if not 0 < header_length <= 128 * 1024 * 1024:
+            raise ValueError(f"invalid compiled artifact header: {path}")
+        encoded = stream.read(header_length)
+        if len(encoded) != header_length:
+            raise ValueError(f"truncated compiled artifact header: {path}")
+    header = json.loads(encoded)
+    metadata = header.get("__metadata__")
+    if not isinstance(metadata, dict):
+        raise ValueError(f"compiled artifact metadata is missing: {path}")
+    fields = (
+        "format",
+        "model_type",
+        "scope",
+        "quantization",
+        "source_config_sha256",
+        "source_index_sha256",
+        "source_config_fnv1a64",
+        "source_index_fnv1a64",
+    )
+    return {
+        "path": str(path),
+        "size_bytes": path.stat().st_size,
+        "metadata": {field: metadata.get(field) for field in fields},
+    }
 
 
 def parse_arguments():
@@ -86,6 +123,14 @@ def parse_arguments():
         "--parallel-speculative",
         action="store_true",
         help="Run parallel Sessions independently so each can use speculation.",
+    )
+    parser.add_argument(
+        "--parallel-independent",
+        action="store_true",
+        help=(
+            "Run parallel Sessions independently, with or without "
+            "speculation, for like-for-like A/B measurements."
+        ),
     )
     parser.add_argument(
         "--require-speculative",
@@ -340,9 +385,18 @@ def validate_arguments(arguments):
         raise ValueError(
             "--no-speculative cannot be combined with speculative requirements"
         )
-    if arguments.parallel_speculative and arguments.parallel_sessions < 2:
+    if (
+        arguments.parallel_speculative
+        and arguments.parallel_independent
+    ):
         raise ValueError(
-            "--parallel-speculative requires at least two parallel Sessions"
+            "--parallel-speculative and --parallel-independent are mutually exclusive"
+        )
+    if (
+        arguments.parallel_speculative or arguments.parallel_independent
+    ) and arguments.parallel_sessions < 2:
+        raise ValueError(
+            "parallel independent generation requires at least two Sessions"
         )
     if (
         arguments.host_memory_mb < 0
@@ -428,6 +482,8 @@ def runner_command(arguments):
     ]
     if arguments.no_speculative:
         command.append("--no-speculative")
+    else:
+        command.append("--speculative")
     if arguments.speculative_confidence is not None:
         command.extend(
             [
@@ -444,6 +500,8 @@ def runner_command(arguments):
         )
     if arguments.parallel_speculative:
         command.append("--parallel-speculative")
+    if arguments.parallel_independent:
+        command.append("--parallel-independent")
     if arguments.cache_warmup_runs:
         command.extend(
             ["--cache-warmup-runs", str(arguments.cache_warmup_runs)]
@@ -1002,6 +1060,9 @@ def parse_runner_output(output):
     result = {
         "load_seconds": extract_number(
             output, r"^loaded [a-zA-Z0-9_-]+ in ([0-9.]+) s,"
+        ),
+        "routed_expert_format": extract_text(
+            output, r"^Routed Expert format: (.+)$"
         ),
         "generated_tokens": extract_number(
             output, r"^generated (\d+) token\(s\) in", int
@@ -1834,6 +1895,7 @@ def run_cache_sweep(arguments):
         "speculative_confidence": arguments.speculative_confidence,
         "speculative_max_draft": arguments.speculative_max_draft,
         "parallel_speculative": arguments.parallel_speculative,
+        "parallel_independent": arguments.parallel_independent,
         "warmup_runs": arguments.warmup,
         "cache_warmup_runs": arguments.cache_warmup_runs,
         "repeats": arguments.repeats,
@@ -1946,6 +2008,8 @@ def main():
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model": str(Path(arguments.model).resolve()),
         "model_revision": arguments.model_revision or None,
+        "routed_expert_format": samples[0]["routed_expert_format"],
+        "compiled_artifact": inspect_compiled_artifact(arguments.model),
         "runner": str(Path(arguments.runner).resolve()),
         "command": command,
         "prompt_token_ids": arguments.prompt_token_ids,
@@ -1955,6 +2019,7 @@ def main():
         "speculative_confidence": arguments.speculative_confidence,
         "speculative_max_draft": arguments.speculative_max_draft,
         "parallel_speculative": arguments.parallel_speculative,
+        "parallel_independent": arguments.parallel_independent,
         "backend": arguments.backend,
         "expert_memory": arguments.expert_memory,
         "host_memory_mb": arguments.host_memory_mb,

@@ -133,7 +133,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
     {
         std::cerr << "usage: " << runner_options.executable_name << " <model-directory> [token-id ...]"
                      " [--prompt-token-file PATH]"
-                     " [--max-new-tokens N] [--stop-token ID ...] [--temperature T] [--no-speculative]"
+                     " [--max-new-tokens N] [--stop-token ID ...] [--temperature T] [--speculative|--no-speculative]"
                      " [--speculative-confidence P] [--speculative-max-draft N]"
                      " [--top-k K] [--top-p P] [--min-p P] [--seed N]"
                      " [--expert-memory auto|eager|on-demand]"
@@ -158,6 +158,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                      " [--buffered-expert-io]"
                      " [--cache-warmup-runs N]"
                      " [--parallel-sessions N]"
+                     " [--parallel-independent]"
                      " [--parallel-speculative]"
                      " [--scheduler-expert-threads N]"
                      " [--scheduler-staging auto|force|off]"
@@ -175,11 +176,16 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         ncnn::moe::SessionOptions session_options;
         ncnn::moe::GenerationOptions generation_options;
         generation_options.sampling.temperature = 0.0f;
+        generation_options.enable_speculative =
+            runner_options.default_enable_speculative;
         if (runner_options.default_stop_token >= 0)
             generation_options.stop_tokens.push_back(runner_options.default_stop_token);
+        if (runner_options.secondary_default_stop_token >= 0)
+            generation_options.stop_tokens.push_back(runner_options.secondary_default_stop_token);
         std::vector<int32_t> prompt;
         bool stream_token_ids = false;
         bool cross_call_scheduling = false;
+        bool parallel_independent = false;
         bool parallel_speculative = false;
         uint32_t cache_warmup_runs = 0;
         uint32_t parallel_sessions = 1;
@@ -226,6 +232,10 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             else if (argument == "--no-speculative")
             {
                 generation_options.enable_speculative = false;
+            }
+            else if (argument == "--speculative")
+            {
+                generation_options.enable_speculative = true;
             }
             else if (argument == "--speculative-confidence")
             {
@@ -386,6 +396,10 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             {
                 parallel_speculative = true;
             }
+            else if (argument == "--parallel-independent")
+            {
+                parallel_independent = true;
+            }
             else if (argument == "--scheduler-expert-threads")
             {
                 const uint64_t count = std::stoull(ncnn::moe::require_value(argc, argv, index, "--scheduler-expert-threads"));
@@ -454,6 +468,11 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             throw std::invalid_argument("at least one prompt token is required");
         if (generation_options.max_new_tokens == 0)
             throw std::invalid_argument("--max-new-tokens must be greater than zero");
+        session_options.enable_speculative_context =
+            generation_options.enable_speculative
+            && (parallel_sessions == 1
+                || parallel_independent
+                || parallel_speculative);
         runtime_options.expected_concurrency = parallel_sessions;
 
         ncnn::moe::Runtime runtime;
@@ -482,7 +501,37 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                    "an enabled model-provided speculative plan\n";
             return 2;
         }
+        if (parallel_independent && parallel_sessions < 2)
+        {
+            std::cerr
+                << "--parallel-independent requires multiple Sessions\n";
+            return 2;
+        }
         std::cout << "loaded " << loaded_model->descriptor().model_type << " in " << ncnn::moe::elapsed_seconds(load_start) << " s, backend " << ncnn::moe::hybrid_mode_name(loaded_model->hybrid_mode()) << '\n';
+        const auto moe_layer = std::find_if(
+            loaded_model->descriptor().layers.begin(),
+            loaded_model->descriptor().layers.end(),
+            [](const ncnn::moe::LayerDescriptor& layer) {
+                return ncnn::moe::has_flag(layer.flags, ncnn::moe::LayerDescriptorMoe);
+            });
+        if (moe_layer != loaded_model->descriptor().layers.end())
+        {
+            const ncnn::moe::DType dtype = moe_layer->ffn.moe.expert_weight_dtype;
+            const char* format = "unknown";
+            if (dtype == ncnn::moe::DType::Float32)
+                format = "float32-source";
+            else if (dtype == ncnn::moe::DType::BFloat16)
+                format = "bfloat16-source";
+            else if (dtype == ncnn::moe::DType::Int8)
+                format = "int8-source";
+            else if (dtype == ncnn::moe::DType::Float8E4M3)
+                format = "float8-e4m3-source";
+            else if (dtype == ncnn::moe::DType::MxFp4)
+                format = loaded_model->descriptor().model_type == "qwen3_5_moe"
+                             ? "mxfp4-compiled-artifact-v3"
+                             : "mxfp4-source";
+            std::cout << "Routed Expert format: " << format << '\n';
+        }
         const ncnn::moe::ModelMemoryPlan& memory_plan = loaded_model->memory_plan();
         std::cout << "Expert memory: " << ncnn::moe::expert_memory_mode_name(memory_plan.selected_mode) << ", " << memory_plan.estimated_expert_bytes / (1024 * 1024) << " MiB estimated";
         if (ncnn::moe::has_flag(memory_plan.flags, ncnn::moe::ModelMemoryFileBackedExperts))
@@ -608,7 +657,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             }
             session_generations.front() = std::move(generated).value();
         }
-        else if (parallel_speculative)
+        else if (parallel_independent || parallel_speculative)
         {
             std::mutex stream_mutex;
             std::vector<std::future<ncnn::moe::Result<ncnn::moe::GenerationResult>>> futures;
@@ -809,9 +858,15 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         }
         std::cout << "generated " << generation.tokens.size() << " token(s) in " << generation_seconds << " s\n";
         std::cout << "Parallel sessions: " << parallel_sessions << ", aggregate throughput: " << generation.tokens.size() / generation_seconds << " token/s\n";
-        if (parallel_sessions > 1 && parallel_speculative)
+        if (parallel_sessions > 1
+            && (parallel_independent || parallel_speculative))
         {
-            std::cout << "Parallel generation: independent speculative Sessions\n";
+            std::cout
+                << "Parallel generation: independent "
+                << (generation_options.enable_speculative
+                        ? "speculative "
+                        : "")
+                << "Sessions\n";
         }
         else if (parallel_sessions > 1)
         {

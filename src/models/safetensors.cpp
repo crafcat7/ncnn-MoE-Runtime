@@ -124,7 +124,12 @@ static Result<std::vector<uint32_t>> parse_shape(const std::string& text)
     return shape;
 }
 
-static Result<void> parse_header(const std::filesystem::path& path, const std::string& json, uint64_t data_start, std::unordered_map<std::string, SafetensorInfo>& tensors)
+static Result<void> parse_header(
+    const std::filesystem::path& path,
+    const std::string& json,
+    uint64_t data_start,
+    uint64_t file_bytes,
+    std::unordered_map<std::string, SafetensorInfo>& tensors)
 {
     const std::regex dtype_expression("\"dtype\"\\s*:\\s*\"([^\"]+)\"");
     const std::regex shape_expression("\"shape\"\\s*:\\s*\\[([^\\]]*)\\]");
@@ -172,13 +177,45 @@ static Result<void> parse_header(const std::filesystem::path& path, const std::s
         {
             return Error{ErrorCode::InvalidModel, "invalid safetensors data offsets: " + name};
         }
-        if (end < begin || data_start > std::numeric_limits<uint64_t>::max() - begin)
+        if (end < begin
+            || data_start > std::numeric_limits<uint64_t>::max() - end
+            || data_start + end > file_bytes)
             return Error{ErrorCode::InvalidModel, "invalid safetensors data range: " + name};
         if (tensors.contains(name))
             return Error{ErrorCode::InvalidModel, "duplicate safetensors tensor: " + name};
         tensors.emplace(std::move(name), SafetensorInfo{path, dtype_match[1].str(), std::move(shape).value(), data_start + begin, end - begin});
     }
     return {};
+}
+
+static Result<void> open_safetensors_file(
+    const std::filesystem::path& path,
+    std::unordered_map<std::string, SafetensorInfo>& tensors)
+{
+    std::error_code size_error;
+    const uint64_t file_bytes = std::filesystem::file_size(path, size_error);
+    if (size_error)
+        return Error{ErrorCode::IoError, "cannot inspect safetensors shard: " + path.string()};
+
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream)
+        return Error{ErrorCode::IoError, "cannot open safetensors shard: " + path.string()};
+    uint64_t header_length = 0;
+    stream.read(reinterpret_cast<char*>(&header_length), sizeof(header_length));
+    if (!stream || header_length == 0 || header_length > 128 * 1024 * 1024)
+        return Error{ErrorCode::InvalidModel, "invalid safetensors header length: " + path.string()};
+    if (header_length > file_bytes - std::min<uint64_t>(file_bytes, sizeof(header_length)))
+        return Error{ErrorCode::InvalidModel, "truncated safetensors header: " + path.string()};
+    std::string header(static_cast<size_t>(header_length), '\0');
+    stream.read(header.data(), static_cast<std::streamsize>(header_length));
+    if (!stream)
+        return Error{ErrorCode::InvalidModel, "truncated safetensors header: " + path.string()};
+    return parse_header(
+        path,
+        header,
+        sizeof(header_length) + header_length,
+        file_bytes,
+        tensors);
 }
 
 Result<SafetensorsArchive> SafetensorsArchive::open(const std::filesystem::path& root)
@@ -192,23 +229,23 @@ Result<SafetensorsArchive> SafetensorsArchive::open(const std::filesystem::path&
         if (!entry.is_regular_file() || entry.path().extension() != ".safetensors")
             continue;
 
-        std::ifstream stream(entry.path(), std::ios::binary);
-        if (!stream)
-            return Error{ErrorCode::IoError, "cannot open safetensors shard: " + entry.path().string()};
-        uint64_t header_length = 0;
-        stream.read(reinterpret_cast<char*>(&header_length), sizeof(header_length));
-        if (!stream || header_length == 0 || header_length > 128 * 1024 * 1024)
-            return Error{ErrorCode::InvalidModel, "invalid safetensors header length: " + entry.path().string()};
-        std::string header(static_cast<size_t>(header_length), '\0');
-        stream.read(header.data(), static_cast<std::streamsize>(header_length));
-        if (!stream)
-            return Error{ErrorCode::InvalidModel, "truncated safetensors header: " + entry.path().string()};
-        auto status = parse_header(entry.path(), header, sizeof(header_length) + header_length, archive.tensors_);
+        auto status = open_safetensors_file(entry.path(), archive.tensors_);
         if (!status)
             return status.error();
     }
     if (archive.tensors_.empty())
         return Error{ErrorCode::InvalidModel, "model directory contains no safetensors tensors"};
+    return archive;
+}
+
+Result<SafetensorsArchive> SafetensorsArchive::open_file(const std::filesystem::path& path)
+{
+    SafetensorsArchive archive;
+    auto status = open_safetensors_file(path, archive.tensors_);
+    if (!status)
+        return status.error();
+    if (archive.tensors_.empty())
+        return Error{ErrorCode::InvalidModel, "safetensors file contains no tensors: " + path.string()};
     return archive;
 }
 

@@ -236,6 +236,9 @@ Result<MoeIR> DeepSeekV4ModelAdapter::parse_model(const ModelPackage& package) c
     descriptor.hyper_connection_iterations = hyper_iterations.value();
     descriptor.hyper_connection_epsilon = deepseek_optional_float(json, "hc_eps", 1e-6f);
     descriptor.hash_routing_layer_count = hash_layer_count.value();
+    descriptor.speculative_kind = speculative_targets.empty()
+                                      ? SpeculativeModelKind::None
+                                      : SpeculativeModelKind::DSpark;
     descriptor.speculative_layer_count = static_cast<uint32_t>(speculative_targets.size());
     descriptor.speculative_block_size = speculative_block_size;
     descriptor.speculative_noise_token_id = speculative_noise_token_id;

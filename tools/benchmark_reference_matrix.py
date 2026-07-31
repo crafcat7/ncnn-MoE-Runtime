@@ -31,6 +31,44 @@ DEEPSEEK_FAMILIES = (
     "deepseek-v4-flash",
     "deepseek-v4-flash-dspark",
 )
+QWEN_FAMILY = "qwen3.6-35b-a3b"
+QWEN_PROMPT_TEXT = (
+    "Explain the tradeoffs of mixture-of-experts inference in at least "
+    "1000 words."
+)
+QWEN_PROMPT_TOKEN_IDS = [
+    248045,
+    846,
+    198,
+    814,
+    20139,
+    279,
+    6355,
+    31410,
+    314,
+    20340,
+    8404,
+    17830,
+    15089,
+    42903,
+    303,
+    506,
+    3140,
+    220,
+    16,
+    15,
+    15,
+    15,
+    4105,
+    13,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198,
+]
 
 
 def add_common_arguments(parser):
@@ -80,6 +118,19 @@ def parse_arguments():
         deepseek.add_argument("--skip-storage", action="store_true")
         deepseek.add_argument("--skip-single", action="store_true")
         deepseek.add_argument("--skip-service", action="store_true")
+
+    qwen = families.add_parser(QWEN_FAMILY)
+    add_common_arguments(qwen)
+    qwen.add_argument("--model", required=True)
+    qwen.add_argument(
+        "--model-revision",
+        default="",
+        help="Checkpoint revision or commit recorded in each case report.",
+    )
+    qwen.add_argument("--parallel-sessions", type=int, default=4)
+    qwen.add_argument("--skip-cpu", action="store_true")
+    qwen.add_argument("--skip-single", action="store_true")
+    qwen.add_argument("--skip-service", action="store_true")
     return parser.parse_args()
 
 
@@ -98,7 +149,7 @@ def validate_arguments(arguments):
 
     if arguments.family == "gpt-oss":
         model_paths = (arguments.model_20b, arguments.model_120b)
-    else:
+    elif arguments.family in DEEPSEEK_FAMILIES:
         model_paths = (arguments.model,)
         if arguments.host_memory_mb <= 0 or arguments.expert_cache_mb <= 0:
             raise ValueError("memory limits must be positive")
@@ -118,6 +169,10 @@ def validate_arguments(arguments):
             raise ValueError("--expert-io-workers must be between 0 and 64")
         if not 2 <= arguments.parallel_sessions <= 64:
             raise ValueError("--parallel-sessions must be between 2 and 64")
+    else:
+        model_paths = (arguments.model,)
+        if not 2 <= arguments.parallel_sessions <= 64:
+            raise ValueError("--parallel-sessions must be between 2 and 64")
 
     for path in model_paths:
         if not Path(path).is_dir():
@@ -130,23 +185,36 @@ def warmup_options(warmup):
     return ["--warmup", "0", "--cache-warmup-runs", "0"]
 
 
+def prompt_token_ids(family):
+    if family == "gpt-oss":
+        return GPT_OSS_PROMPT_TOKEN_IDS
+    if family == QWEN_FAMILY:
+        return QWEN_PROMPT_TOKEN_IDS
+    return DEEPSEEK_PROMPT_TOKEN_IDS
+
+
 def common_arguments(arguments, model, tokens, warmup, extra):
-    prompt = (
-        GPT_OSS_PROMPT_TOKEN_IDS
-        if arguments.family == "gpt-oss"
-        else DEEPSEEK_PROMPT_TOKEN_IDS
-    )
+    prompt = prompt_token_ids(arguments.family)
     command = [
         sys.executable,
         str(Path(arguments.benchmark).resolve()),
         str(Path(arguments.runner).resolve()),
         str(Path(model).resolve()),
-        "--prompt-token-ids",
-        *[str(token) for token in prompt],
-        "--max-new-tokens",
-        str(tokens),
     ]
-    if arguments.family == "deepseek-v4-flash":
+    if (
+        arguments.family == QWEN_FAMILY
+        and arguments.model_revision
+    ):
+        command.extend(("--model-revision", arguments.model_revision))
+    command.extend(
+        (
+            "--prompt-token-ids",
+            *[str(token) for token in prompt],
+            "--max-new-tokens",
+            str(tokens),
+        )
+    )
+    if arguments.family in ("deepseek-v4-flash", QWEN_FAMILY):
         command.extend(("--temperature", "0", "--no-speculative"))
     elif arguments.family == "deepseek-v4-flash-dspark":
         command.extend(
@@ -421,11 +489,143 @@ def deepseek_cases(arguments):
     return cases
 
 
+def qwen_cases(arguments):
+    cases = []
+    prefix = arguments.family
+    windows = (
+        ("short", arguments.short_tokens),
+        ("long", arguments.long_tokens),
+    )
+    warmups = (("cold", False), ("warm", True))
+    eager_experts = ["--expert-memory", "eager"]
+
+    if not arguments.skip_cpu:
+        for window_name, tokens in windows:
+            for warmup_name, warmup in warmups:
+                cases.append(
+                    {
+                        "name": (
+                            f"{prefix}-single-cpu-{window_name}-"
+                            f"{warmup_name}"
+                        ),
+                        "family": prefix,
+                        "workload": "single-session-cpu-control",
+                        "backend": "cpu",
+                        "scheduler_staging": "auto",
+                        "token_window": window_name,
+                        "generated_tokens": tokens,
+                        "warmup": warmup_name,
+                        "model": arguments.model,
+                        "extra": [
+                            "--backend",
+                            "cpu",
+                            *eager_experts,
+                        ],
+                    }
+                )
+
+    if not arguments.skip_single:
+        for window_name, tokens in windows:
+            for warmup_name, warmup in warmups:
+                cases.append(
+                    {
+                        "name": (
+                            f"{prefix}-single-hybrid-{window_name}-"
+                            f"{warmup_name}"
+                        ),
+                        "family": prefix,
+                        "workload": "single-session",
+                        "backend": "hybrid",
+                        "scheduler_staging": "auto",
+                        "token_window": window_name,
+                        "generated_tokens": tokens,
+                        "warmup": warmup_name,
+                        "model": arguments.model,
+                        "extra": [
+                            "--backend",
+                            "hybrid",
+                            *eager_experts,
+                            "--vulkan-device-index",
+                            str(arguments.vulkan_device_index),
+                        ],
+                    }
+                )
+
+    if not arguments.skip_service:
+        for window_name, tokens in windows:
+            for warmup_name, warmup in warmups:
+                cases.append(
+                    {
+                        "name": (
+                            f"{prefix}-service-"
+                            f"{arguments.parallel_sessions}x"
+                            f"{window_name}-{warmup_name}"
+                        ),
+                        "family": prefix,
+                        "workload": (
+                            f"{arguments.parallel_sessions}-session-service"
+                        ),
+                        "backend": "hybrid",
+                        "scheduler_staging": "force",
+                        "token_window": window_name,
+                        "generated_tokens": tokens,
+                        "warmup": warmup_name,
+                        "model": arguments.model,
+                        "extra": [
+                            "--backend",
+                            "hybrid",
+                            *eager_experts,
+                            "--parallel-sessions",
+                            str(arguments.parallel_sessions),
+                            "--scheduler-staging",
+                            "force",
+                            "--vulkan-device-index",
+                            str(arguments.vulkan_device_index),
+                        ],
+                    }
+                )
+    return cases
+
+
 def load_report(path):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def validate_qwen_results(results):
+    references = {}
+    for result in results:
+        case = result["case"]
+        report = result["report"]
+        sessions = report.get("parallel_sessions", 1)
+        requested_tokens = case["generated_tokens"]
+        tokens = report.get("generated_token_ids", [])
+        expected_tokens = requested_tokens * sessions
+        if len(tokens) != expected_tokens:
+            raise RuntimeError(
+                f"{case['name']} generated {len(tokens)} token(s); "
+                f"expected {expected_tokens}"
+            )
+
+        for session in range(sessions):
+            begin = session * requested_tokens
+            sequence = tokens[begin : begin + requested_tokens]
+            reference = references.setdefault(requested_tokens, sequence)
+            if sequence != reference:
+                first_difference = next(
+                    index
+                    for index, (expected, actual) in enumerate(
+                        zip(reference, sequence)
+                    )
+                    if expected != actual
+                )
+                raise RuntimeError(
+                    f"{case['name']} differs from the Qwen "
+                    f"{requested_tokens}-token reference at token "
+                    f"{first_difference}"
+                )
 
 
 def run_case(arguments, case, output_dir):
@@ -468,11 +668,7 @@ def run_case(arguments, case, output_dir):
 
 
 def write_aggregate(arguments, results, started, output_dir):
-    prompt = (
-        GPT_OSS_PROMPT_TOKEN_IDS
-        if arguments.family == "gpt-oss"
-        else DEEPSEEK_PROMPT_TOKEN_IDS
-    )
+    prompt = prompt_token_ids(arguments.family)
     benchmark = (
         "gpt_oss_performance_matrix"
         if arguments.family == "gpt-oss"
@@ -485,6 +681,15 @@ def write_aggregate(arguments, results, started, output_dir):
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
         ),
         "prompt_token_ids": prompt,
+        "prompt_text": (
+            QWEN_PROMPT_TEXT if arguments.family == QWEN_FAMILY else None
+        ),
+        "model_revision": (
+            arguments.model_revision
+            if arguments.family == QWEN_FAMILY
+            and arguments.model_revision
+            else None
+        ),
         "short_tokens": arguments.short_tokens,
         "long_tokens": arguments.long_tokens,
         "repeats": arguments.repeats,
@@ -512,11 +717,12 @@ def main():
 
     output_dir = Path(arguments.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    cases = (
-        gpt_oss_cases(arguments)
-        if arguments.family == "gpt-oss"
-        else deepseek_cases(arguments)
-    )
+    if arguments.family == "gpt-oss":
+        cases = gpt_oss_cases(arguments)
+    elif arguments.family in DEEPSEEK_FAMILIES:
+        cases = deepseek_cases(arguments)
+    else:
+        cases = qwen_cases(arguments)
     if not cases:
         print("all matrix workloads were skipped", file=sys.stderr)
         return 2
@@ -525,6 +731,8 @@ def main():
     started = time.time()
     for case in cases:
         results.append(run_case(arguments, case, output_dir))
+        if arguments.family == QWEN_FAMILY:
+            validate_qwen_results(results)
         write_aggregate(arguments, results, started, output_dir)
 
     aggregate_path = write_aggregate(arguments, results, started, output_dir)

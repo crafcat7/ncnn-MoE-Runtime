@@ -69,19 +69,30 @@ struct ExpertPlan
 #define NCNN_MOE_ATTN_PLAN_QK_NORM_BIT    1
 #define NCNN_MOE_ATTN_PLAN_LATENT_BIT     2
 #define NCNN_MOE_ATTN_PLAN_COMPRESSED_BIT 3
+#define NCNN_MOE_ATTN_PLAN_DELTA_BIT      4
+#define NCNN_MOE_ATTN_PLAN_GATE_BIT       5
 
 enum AttentionBlockFlag : uint32_t
 {
     AttentionBlockSink = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_SINK_BIT,
     AttentionBlockQueryKeyNorm = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_QK_NORM_BIT,
     AttentionBlockLatent = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_LATENT_BIT,
-    AttentionBlockCompressed = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_COMPRESSED_BIT
+    AttentionBlockCompressed = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_COMPRESSED_BIT,
+    AttentionBlockGatedDeltaNet = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_DELTA_BIT,
+    AttentionBlockOutputGate = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_GATE_BIT
 };
 
 struct AttentionBlockPlan
 {
     std::shared_ptr<NcnnVulkanAttentionOperator> vulkan_attention_operator;
     std::shared_ptr<NcnnLinearOperator> fused_qkv_operator;
+    std::shared_ptr<NcnnVulkanBfloat16Operator>
+        fused_qkv_bfloat16_operator;
+    std::shared_ptr<NcnnVulkanBfloat16Operator>
+        fused_qkv_gate_bfloat16_operator;
+    std::shared_ptr<NcnnLinearOperator> fused_delta_input_operator;
+    std::shared_ptr<NcnnVulkanBfloat16Operator>
+        fused_delta_input_bfloat16_operator;
     TensorHandle pre_attention_norm_weight = invalid_tensor_handle;
     TensorHandle query_weight = invalid_tensor_handle;
     TensorHandle query_bias = invalid_tensor_handle;
@@ -93,7 +104,16 @@ struct AttentionBlockPlan
     TensorHandle value_bias = invalid_tensor_handle;
     TensorHandle output_weight = invalid_tensor_handle;
     TensorHandle output_bias = invalid_tensor_handle;
+    TensorHandle output_gate_weight = invalid_tensor_handle;
     TensorHandle sinks = invalid_tensor_handle;
+    TensorHandle delta_qkv_weight = invalid_tensor_handle;
+    TensorHandle delta_z_weight = invalid_tensor_handle;
+    TensorHandle delta_beta_weight = invalid_tensor_handle;
+    TensorHandle delta_alpha_weight = invalid_tensor_handle;
+    TensorHandle delta_convolution_weight = invalid_tensor_handle;
+    TensorHandle delta_time_bias = invalid_tensor_handle;
+    TensorHandle delta_decay_log = invalid_tensor_handle;
+    TensorHandle delta_norm_weight = invalid_tensor_handle;
     TensorHandle query_a_weight = invalid_tensor_handle;
     TensorHandle query_b_weight = invalid_tensor_handle;
     TensorHandle key_value_weight = invalid_tensor_handle;
@@ -114,6 +134,7 @@ struct AttentionBlockPlan
     uint32_t head_count = 0;
     uint32_t kv_head_count = 0;
     uint32_t head_dimension = 0;
+    uint32_t value_head_dimension = 0;
     uint32_t sliding_window = 0;
     uint32_t initial_context_length = 0;
     uint32_t max_context_length = 0;
@@ -125,11 +146,13 @@ struct AttentionBlockPlan
     uint32_t index_head_count = 0;
     uint32_t index_head_dimension = 0;
     uint32_t index_top_k = 0;
+    uint32_t convolution_kernel_size = 0;
     float rope_theta = 10000.0f;
     float compressed_rope_theta = 10000.0f;
     float rope_scaling_factor = 1.0f;
     float rope_ntk_alpha = 1.0f;
     float rope_ntk_beta = 32.0f;
+    float norm_weight_offset = 0.0f;
     uint32_t flags = 0;
 };
 
@@ -157,6 +180,9 @@ struct MoeBlockPlan
     TensorHandle router_bias = invalid_tensor_handle;
     TensorHandle router_selection_bias = invalid_tensor_handle;
     TensorHandle token_experts = invalid_tensor_handle;
+    TensorHandle shared_expert_gate_weight = invalid_tensor_handle;
+    std::shared_ptr<NcnnVulkanBfloat16Operator>
+        fused_shared_input_bfloat16_operator;
     std::vector<ExpertPlan> experts;
     ExpertPlan shared_expert;
 
@@ -197,6 +223,9 @@ struct SpeculativeModelPlan
 {
     std::vector<CompiledLayerPlan> layers;
     std::vector<uint32_t> target_layer_ids;
+    TensorHandle mtp_embedding_norm_weight = invalid_tensor_handle;
+    TensorHandle mtp_hidden_norm_weight = invalid_tensor_handle;
+    TensorHandle mtp_input_projection_weight = invalid_tensor_handle;
     TensorHandle main_projection_weight = invalid_tensor_handle;
     TensorHandle main_norm_weight = invalid_tensor_handle;
     TensorHandle final_norm_weight = invalid_tensor_handle;
@@ -209,10 +238,13 @@ struct SpeculativeModelPlan
     uint32_t block_size = 0;
     uint32_t noise_token_id = 0;
     uint32_t markov_rank = 0;
+    SpeculativeModelKind kind = SpeculativeModelKind::None;
 
     [[nodiscard]] bool enabled() const noexcept
     {
-        return !layers.empty() && block_size != 0;
+        return kind != SpeculativeModelKind::None
+               && !layers.empty()
+               && block_size != 0;
     }
 };
 

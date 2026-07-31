@@ -72,12 +72,25 @@ Result<MoeGraph> MoeGraphBuilder::build(const MoeModelDescriptor& descriptor) co
         const std::string prefix = "layers." + std::to_string(layer_id) + ".";
         if (has_flag(layer.flags, LayerDescriptorAttention))
         {
-            const MoeIRValueId cache = append_moe_ir_value(graph, prefix + "kv_cache", descriptor.kv_cache_dtype,
-                                                           {
-                                                               0,
-                                                               layer.attention.kv_head_count,
-                                                               layer.attention.head_dimension,
-                                                           },
+            std::vector<uint32_t> cache_shape{
+                0,
+                layer.attention.kv_head_count,
+                layer.attention.head_dimension,
+            };
+            if (layer.attention.kind == AttentionKind::GatedDeltaNet)
+            {
+                cache_shape = {
+                    0,
+                    layer.attention.head_count,
+                    layer.attention.head_dimension,
+                    layer.attention.value_head_dimension,
+                };
+            }
+            const DType cache_dtype = layer.attention.kind == AttentionKind::GatedDeltaNet
+                                          ? DType::Float32
+                                          : descriptor.kv_cache_dtype;
+            const MoeIRValueId cache = append_moe_ir_value(graph, prefix + "kv_cache", cache_dtype,
+                                                           std::move(cache_shape),
                                                            TensorLocation::Automatic, MoeIRValuePersistent | MoeIRValueMutableState | MoeIRValueDynamicShape);
             const MoeIRNodeId cache_node = append_moe_ir_node(graph, MoeIROperator::KvCache, prefix + "kv_cache", layer_id, {}, {cache});
             graph.nodes[cache_node].attention = layer.attention;
@@ -147,6 +160,12 @@ Result<MoeGraph> MoeGraphBuilder::build(const MoeModelDescriptor& descriptor) co
 static void append_attention_descriptor_nodes(LayerDescriptor& layer)
 {
     layer.nodes.push_back({ModelNodeType::RmsNorm});
+    if (layer.attention.kind == AttentionKind::GatedDeltaNet)
+    {
+        layer.nodes.push_back({ModelNodeType::GatedDeltaNet});
+        layer.nodes.push_back({ModelNodeType::Projection});
+        return;
+    }
     layer.nodes.push_back({ModelNodeType::FusedQkv});
     layer.nodes.push_back({ModelNodeType::Rope});
     if (has_flag(layer.attention.flags, AttentionDescriptorSinks))
@@ -256,6 +275,7 @@ static bool attention_matches(const AttentionDescriptor& left, const AttentionDe
            && left.qk_nope_head_dimension == right.qk_nope_head_dimension
            && left.qk_rope_head_dimension == right.qk_rope_head_dimension
            && left.value_head_dimension == right.value_head_dimension
+           && left.convolution_kernel_size == right.convolution_kernel_size
            && left.rope_theta == right.rope_theta
            && left.rope_scaling_factor == right.rope_scaling_factor
            && left.rope_ntk_alpha == right.rope_ntk_alpha
@@ -374,6 +394,7 @@ Result<void> normalize_moe_ir(MoeIR& ir)
         {
             if (!has_flag(layer.flags, LayerDescriptorAttention)
                 && (has_node(layer, ModelNodeType::FusedQkv)
+                    || has_node(layer, ModelNodeType::GatedDeltaNet)
                     || has_node(layer, ModelNodeType::MultiHeadLatentAttention)))
             {
                 layer.flags |= LayerDescriptorAttention;

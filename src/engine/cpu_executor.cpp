@@ -2,10 +2,12 @@
 
 #include "kernels/cpu_attention.h"
 #include "kernels/cpu_batch.h"
+#include "kernels/cpu_gated_delta_net.h"
 #include "kernels/cpu_hyper_connection.h"
 #include "kernels/cpu_latent_attention.h"
 #include "kernels/cpu_ops.h"
 #include "cpu_session_state.h"
+#include "cpu_topology.h"
 #include "expert_backend.h"
 #include "storage/expert_cache.h"
 #include "backends/ncnn/ncnn_attention.h"
@@ -36,6 +38,48 @@ namespace moe {
 
 static constexpr size_t expert_prefetch_limit_bytes = 4 * 1024;
 static constexpr size_t assumed_cache_line_bytes = 64;
+
+class OpenMpHybridTeamLimit
+{
+public:
+    explicit OpenMpHybridTeamLimit(HybridMode mode) noexcept
+    {
+#if defined(_OPENMP)
+        if (mode == HybridMode::CpuOnly)
+            return;
+        // Hybrid execution overlaps CPU kernels with Vulkan submission and
+        // shared-Expert work. Do not request more workers than physical
+        // cores, but preserve a smaller scheduler or application limit.
+        previous_ = omp_get_max_threads();
+        static const uint32_t physical_cores =
+            discover_cpu_topology().physical_core_count;
+        if (physical_cores != 0 && previous_ > static_cast<int>(physical_cores))
+        {
+            omp_set_num_threads(static_cast<int>(physical_cores));
+            changed_ = true;
+        }
+#else
+        (void)mode;
+#endif
+    }
+
+    ~OpenMpHybridTeamLimit()
+    {
+#if defined(_OPENMP)
+        if (changed_)
+            omp_set_num_threads(previous_);
+#endif
+    }
+
+    OpenMpHybridTeamLimit(const OpenMpHybridTeamLimit&) = delete;
+    OpenMpHybridTeamLimit& operator=(const OpenMpHybridTeamLimit&) = delete;
+
+private:
+#if defined(_OPENMP)
+    int previous_ = 1;
+    bool changed_ = false;
+#endif
+};
 
 static void expand_hyper_connections(CpuBatch& hidden, uint32_t multiplier, CpuBatch& scratch)
 {
@@ -413,11 +457,123 @@ static CpuBatch run_expert(const WeightTable& weights, const ExpertPlan& expert,
     return expert_linear(weights.at(expert.down_weight), nullptr, up, metrics);
 }
 
+static CpuBatch run_shared_expert(
+    const CompiledModel& model,
+    const MoeBlockPlan& moe,
+    const CpuBatch& input,
+    ExpertExecutionMetrics& metrics)
+{
+    if (moe.fused_shared_input_bfloat16_operator)
+    {
+        CpuBatch fused;
+        if (moe.fused_shared_input_bfloat16_operator->forward(
+                input,
+                fused))
+        {
+            const ExpertPlan& expert = moe.shared_expert;
+            const uint32_t intermediate =
+                model.weights.at(expert.up_weight).shape[0];
+            const bool has_router_gate =
+                moe.shared_expert_gate_weight
+                != invalid_tensor_handle;
+            const uint32_t expected_columns =
+                intermediate * 2 + (has_router_gate ? 1 : 0);
+            if (fused.columns() == expected_columns)
+            {
+                CpuBatch activated(
+                    fused.rows(),
+                    intermediate);
+                for (size_t token_index = 0;
+                     token_index < fused.rows();
+                     ++token_index)
+                {
+                    const float* source =
+                        fused.row(token_index);
+                    float* destination =
+                        activated.row(token_index);
+                    for (uint32_t column = 0;
+                         column < intermediate;
+                         ++column)
+                    {
+                        destination[column] =
+                            activate(
+                                source[column],
+                                expert.activation,
+                                expert.activation_limit)
+                            * source[intermediate + column];
+                    }
+                }
+                CpuBatch output = expert_linear(
+                    model.weights.at(expert.down_weight),
+                    nullptr,
+                    activated,
+                    metrics);
+                if (has_router_gate)
+                {
+                    for (size_t token_index = 0;
+                         token_index < output.rows();
+                         ++token_index)
+                    {
+                        const float scale =
+                            1.0f
+                            / (1.0f
+                               + std::exp(
+                                   -fused.row(token_index)
+                                       [intermediate * 2]));
+                        float* token = output.row(token_index);
+                        for (uint32_t column = 0;
+                             column < output.columns();
+                             ++column)
+                        {
+                            token[column] *= scale;
+                        }
+                    }
+                }
+                return output;
+            }
+        }
+    }
+
+    CpuBatch output = run_expert(
+        model.weights,
+        moe.shared_expert,
+        nullptr,
+        input,
+        false,
+        metrics);
+    if (moe.shared_expert_gate_weight == invalid_tensor_handle)
+        return output;
+    CpuBatch gate = linear_batch(
+        model.weights.at(moe.shared_expert_gate_weight),
+        input);
+    assert(gate.columns() == 1);
+    for (size_t token_index = 0; token_index < output.rows(); ++token_index)
+    {
+        const float scale = 1.0f / (1.0f + std::exp(-gate.row(token_index)[0]));
+        float* token = output.row(token_index);
+        for (uint32_t column = 0; column < output.columns(); ++column)
+            token[column] *= scale;
+    }
+    return output;
+}
+
 static bool can_overlap_vulkan_shared_expert(const CompiledModel& model, const MoeBlockPlan& moe)
 {
     if (!moe.has_shared_expert)
         return false;
     const ExpertPlan& expert = moe.shared_expert;
+    const auto uses_vulkan = [](const TensorData& tensor) {
+        return tensor.bfloat16_linear_operator
+               || tensor.float8_linear_operator
+               || (tensor.linear_operator
+                   && tensor.linear_operator->uses_vulkan());
+    };
+    if (moe.fused_shared_input_bfloat16_operator)
+    {
+        return expert.down_weight != invalid_tensor_handle
+               && uses_vulkan(
+                   model.weights.at(expert.down_weight));
+    }
     if (expert.gate_up_weight != invalid_tensor_handle
         || expert.gate_weight == invalid_tensor_handle
         || expert.up_weight == invalid_tensor_handle
@@ -428,7 +584,11 @@ static bool can_overlap_vulkan_shared_expert(const CompiledModel& model, const M
     const TensorData& gate = model.weights.at(expert.gate_weight);
     const TensorData& up = model.weights.at(expert.up_weight);
     const TensorData& down = model.weights.at(expert.down_weight);
-    return gate.float8_linear_operator && up.float8_linear_operator && down.float8_linear_operator;
+    if (!uses_vulkan(gate) || !uses_vulkan(up) || !uses_vulkan(down))
+        return false;
+    if (moe.shared_expert_gate_weight == invalid_tensor_handle)
+        return true;
+    return uses_vulkan(model.weights.at(moe.shared_expert_gate_weight));
 }
 
 static void capture_speculative_hidden(
@@ -468,7 +628,7 @@ static OverlappedSharedExpertResult run_overlapped_shared_expert(
     const VulkanExecutionSnapshot vulkan_before = capture_vulkan_execution();
     ExpertExecutionMetrics metrics;
     OverlappedSharedExpertResult result;
-    result.output = run_expert(model.weights, moe.shared_expert, nullptr, input, false, metrics);
+    result.output = run_shared_expert(model, moe, input, metrics);
     result.vulkan = vulkan_execution_delta(vulkan_before);
     return result;
 }
@@ -1458,7 +1618,8 @@ static Result<void> execute_speculative_layer(
     CpuLayerCache& cache,
     CpuBatch& hidden,
     SessionStatistics& statistics,
-    CpuExpertExecutionScratch& scratch)
+    CpuExpertExecutionScratch& scratch,
+    CpuAttentionExecutionScratch& attention_scratch)
 {
     LayerGraphState layer_state;
     const uint32_t multiplier = model.descriptor.hyper_connection_multiplier;
@@ -1475,19 +1636,36 @@ static Result<void> execute_speculative_layer(
         attention_mix = std::move(mixed).value();
         attention_input = &attention_mix.reduced;
     }
-    auto attention = execute_dspark_attention(model.weights, layer.attention, model.descriptor.norm_epsilon, position_offset, cache, *attention_input);
-    if (!attention)
-        return attention.error();
-    if (multiplier > 1)
+    if (model.speculative.kind == SpeculativeModelKind::Mtp)
     {
-        auto connected = hyper_connection_post(attention.value(), hidden, attention_mix, multiplier);
-        if (!connected)
-            return connected.error();
-        hidden = std::move(connected).value();
+        execute_attention_block_into(
+            model.weights,
+            layer.attention,
+            model.descriptor.norm_epsilon,
+            model.descriptor.kv_cache_dtype,
+            position_offset,
+            cache,
+            attention_scratch,
+            *attention_input,
+            attention_scratch.output);
+        hidden.swap(attention_scratch.output);
     }
     else
     {
-        add_batch_inplace(hidden, attention.value());
+        auto attention = execute_dspark_attention(model.weights, layer.attention, model.descriptor.norm_epsilon, position_offset, cache, *attention_input);
+        if (!attention)
+            return attention.error();
+        if (multiplier > 1)
+        {
+            auto connected = hyper_connection_post(attention.value(), hidden, attention_mix, multiplier);
+            if (!connected)
+                return connected.error();
+            hidden = std::move(connected).value();
+        }
+        else
+        {
+            add_batch_inplace(hidden, attention.value());
+        }
     }
     statistics.attention_time_microseconds += elapsed_microseconds(attention_start);
 
@@ -1501,11 +1679,11 @@ static Result<void> execute_speculative_layer(
         if (!mixed)
             return mixed.error();
         layer_state.ffn_hyper_mix = std::move(mixed).value();
-        rms_norm_batch_into(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized);
+        rms_norm_batch_into(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
     }
     else
     {
-        rms_norm_batch_into(hidden, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized);
+        rms_norm_batch_into(hidden, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
     }
     linear_batch_into(model.weights.at(moe.router_weight), layer_state.normalized, layer_state.router_logits);
     ExpertDispatchOptions dispatch_options;
@@ -1561,7 +1739,7 @@ static Result<void> execute_speculative_layer(
     if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0)
     {
         ExpertExecutionMetrics shared_metrics;
-        layer_state.shared_expert_output = run_expert(model.weights, moe.shared_expert, nullptr, layer_state.normalized, false, shared_metrics);
+        layer_state.shared_expert_output = run_shared_expert(model, moe, layer_state.normalized, shared_metrics);
     }
     CpuBatch& moe_output = layer_state.normalized;
     moe_output.reset(hidden.rows(), model.descriptor.hidden_size, true);
@@ -1596,10 +1774,256 @@ static Result<void> execute_speculative_layer(
     return {};
 }
 
+static Result<CpuBatch> prepare_mtp_hidden(
+    const CompiledModel& model,
+    std::span<const int32_t> input_ids,
+    const CpuBatch& target_hidden)
+{
+    if (input_ids.empty()
+        || input_ids.size() != target_hidden.rows()
+        || target_hidden.columns() != model.descriptor.hidden_size)
+    {
+        return Error{
+            ErrorCode::InvalidArgument,
+            "invalid Qwen MTP input batch"};
+    }
+
+    CpuBatch embeddings;
+    embedding_batch_into(
+        model.weights.at(model.token_embedding),
+        input_ids,
+        embeddings);
+    CpuBatch normalized_embeddings = rms_norm_batch(
+        embeddings,
+        model.weights.at(
+            model.speculative.mtp_embedding_norm_weight),
+        model.descriptor.norm_epsilon,
+        model.descriptor.norm_weight_offset);
+    CpuBatch normalized_hidden = rms_norm_batch(
+        target_hidden,
+        model.weights.at(model.speculative.mtp_hidden_norm_weight),
+        model.descriptor.norm_epsilon,
+        model.descriptor.norm_weight_offset);
+    CpuBatch packed(
+        target_hidden.rows(),
+        model.descriptor.hidden_size * 2);
+    for (size_t row = 0; row < target_hidden.rows(); ++row)
+    {
+        std::copy_n(
+            normalized_embeddings.row(row),
+            model.descriptor.hidden_size,
+            packed.row(row));
+        std::copy_n(
+            normalized_hidden.row(row),
+            model.descriptor.hidden_size,
+            packed.row(row) + model.descriptor.hidden_size);
+    }
+    return linear_batch(
+        model.weights.at(
+            model.speculative.mtp_input_projection_weight),
+        packed);
+}
+
+static Result<CpuBatch> execute_mtp_batch(
+    const CompiledModel& model,
+    std::span<const int32_t> input_ids,
+    const CpuBatch& target_hidden,
+    uint64_t position_offset,
+    SessionStatistics& statistics,
+    CpuSessionState& state)
+{
+    if (model.speculative.layers.size() != 1
+        || state.speculative_layers.size() != 1)
+    {
+        return Error{
+            ErrorCode::InvalidArgument,
+            "invalid Qwen MTP execution state"};
+    }
+    auto prepared = prepare_mtp_hidden(
+        model,
+        input_ids,
+        target_hidden);
+    if (!prepared)
+        return prepared.error();
+    CpuBatch hidden = std::move(prepared).value();
+    auto executed = execute_speculative_layer(
+        model,
+        model.speculative.layers.front(),
+        position_offset,
+        state.speculative_layers.front(),
+        hidden,
+        statistics,
+        state.expert_scratch,
+        state.attention_scratch);
+    if (!executed)
+        return executed.error();
+    return rms_norm_batch(
+        hidden,
+        model.weights.at(model.speculative.final_norm_weight),
+        model.descriptor.norm_epsilon,
+        model.descriptor.norm_weight_offset);
+}
+
+static Result<void> append_mtp_context(
+    const CompiledModel& model,
+    std::span<const int32_t> input_ids,
+    const CpuBatch& target_hidden,
+    uint64_t position_offset,
+    CpuSessionState& state)
+{
+    if (model.speculative.layers.size() != 1
+        || state.speculative_layers.size() != 1)
+    {
+        return Error{
+            ErrorCode::InvalidArgument,
+            "invalid Qwen MTP context state"};
+    }
+    auto prepared = prepare_mtp_hidden(
+        model,
+        input_ids,
+        target_hidden);
+    if (!prepared)
+        return prepared.error();
+    append_attention_context_into(
+        model.weights,
+        model.speculative.layers.front().attention,
+        model.descriptor.norm_epsilon,
+        model.descriptor.kv_cache_dtype,
+        position_offset,
+        state.speculative_layers.front(),
+        state.attention_scratch,
+        prepared.value());
+    return {};
+}
+
+static Result<void> update_mtp_context(
+    const CompiledModel& model,
+    CpuSessionState& state)
+{
+    const CpuBatch& target_hidden = state.speculative_main_hidden;
+    if (target_hidden.rows() == 0
+        || target_hidden.columns() != model.descriptor.hidden_size)
+    {
+        return Error{
+            ErrorCode::InternalError,
+            "target execution did not capture Qwen final hidden states"};
+    }
+
+    const bool direct_alignment =
+        !state.speculative_direct_alignment_ids.empty();
+    const std::vector<int32_t>& input_ids =
+        direct_alignment
+            ? state.speculative_direct_alignment_ids
+            : state.speculative_input_ids;
+    if (input_ids.size() != target_hidden.rows())
+    {
+        return Error{
+            ErrorCode::InternalError,
+            "Qwen MTP alignment IDs do not match target hidden states"};
+    }
+    if (direct_alignment
+        && state.mtp_pending_target_hidden.rows() != 0)
+    {
+        return Error{
+            ErrorCode::InternalError,
+            "Qwen MTP direct alignment still has a pending target row"};
+    }
+
+    const bool has_pending =
+        state.mtp_pending_target_hidden.rows() != 0;
+    if (has_pending
+        && (state.mtp_pending_target_hidden.rows() != 1
+            || state.mtp_pending_target_hidden.columns()
+                   != model.descriptor.hidden_size
+            || state.mtp_pending_target_position + 1
+                   != state.speculative_main_hidden_position))
+    {
+        return Error{
+            ErrorCode::InternalError,
+            "Qwen MTP pending target row is out of sequence"};
+    }
+
+    const size_t aligned_rows =
+        direct_alignment
+            ? target_hidden.rows() - 1
+            : (has_pending ? 1 : 0) + target_hidden.rows() - 1;
+    if (aligned_rows != 0)
+    {
+        CpuBatch aligned_hidden(
+            aligned_rows,
+            model.descriptor.hidden_size);
+        std::vector<int32_t> aligned_ids;
+        aligned_ids.reserve(aligned_rows);
+        size_t output_row = 0;
+        uint64_t aligned_position =
+            state.speculative_main_hidden_position;
+        if (!direct_alignment && has_pending)
+        {
+            aligned_position = state.mtp_pending_target_position;
+            std::copy_n(
+                state.mtp_pending_target_hidden.row(0),
+                model.descriptor.hidden_size,
+                aligned_hidden.row(output_row++));
+            aligned_ids.push_back(input_ids.front());
+        }
+        for (size_t row = 0;
+             row + 1 < target_hidden.rows();
+             ++row)
+        {
+            std::copy_n(
+                target_hidden.row(row),
+                model.descriptor.hidden_size,
+                aligned_hidden.row(output_row++));
+            aligned_ids.push_back(
+                input_ids[row + (direct_alignment ? 0 : 1)]);
+        }
+        auto aligned = append_mtp_context(
+            model,
+            aligned_ids,
+            aligned_hidden,
+            aligned_position,
+            state);
+        if (!aligned)
+            return aligned.error();
+    }
+
+    state.mtp_pending_target_hidden.reset(
+        1,
+        model.descriptor.hidden_size,
+        false);
+    std::copy_n(
+        target_hidden.row(target_hidden.rows() - 1),
+        model.descriptor.hidden_size,
+        state.mtp_pending_target_hidden.row(0));
+    state.mtp_pending_target_position =
+        state.speculative_main_hidden_position
+        + target_hidden.rows() - 1;
+    state.speculative_input_ids.clear();
+    state.speculative_direct_alignment_ids.clear();
+    return {};
+}
+
 Result<void> CpuExecutor::update_speculative_context(const CompiledModel& model, SessionStatistics& statistics, CpuSessionState& state) const
 {
-    if (!model.speculative.enabled())
+    const OpenMpHybridTeamLimit team_limit(model.hybrid_mode);
+    if (!model.speculative.enabled()
+        || !state.speculative_context_enabled)
         return {};
+    const auto started = std::chrono::steady_clock::now();
+    const VulkanExecutionSnapshot vulkan_before =
+        capture_vulkan_execution();
+    if (model.speculative.kind == SpeculativeModelKind::Mtp)
+    {
+        auto updated = update_mtp_context(
+            model,
+            state);
+        if (!updated)
+            return updated.error();
+        record_vulkan_execution_delta(statistics, vulkan_before);
+        statistics.speculative_context_time_microseconds +=
+            elapsed_microseconds(started);
+        return {};
+    }
     const uint32_t expected_columns = model.descriptor.hidden_size
                                       * static_cast<uint32_t>(model.speculative.target_layer_ids.size());
     if (state.speculative_main_hidden.rows() == 0
@@ -1609,10 +2033,8 @@ Result<void> CpuExecutor::update_speculative_context(const CompiledModel& model,
             ErrorCode::InternalError,
             "target execution did not capture DSpark context features"};
     }
-    const auto started = std::chrono::steady_clock::now();
-    const VulkanExecutionSnapshot vulkan_before = capture_vulkan_execution();
     CpuBatch projected = linear_batch(model.weights.at(model.speculative.main_projection_weight), state.speculative_main_hidden);
-    projected = rms_norm_batch(projected, model.weights.at(model.speculative.main_norm_weight), model.descriptor.norm_epsilon);
+    projected = rms_norm_batch(projected, model.weights.at(model.speculative.main_norm_weight), model.descriptor.norm_epsilon, model.descriptor.norm_weight_offset);
     if (state.speculative_layers.size() != model.speculative.layers.size())
         state.speculative_layers.resize(model.speculative.layers.size());
     for (size_t layer_index = 0; layer_index < model.speculative.layers.size(); ++layer_index)
@@ -1627,14 +2049,139 @@ Result<void> CpuExecutor::update_speculative_context(const CompiledModel& model,
     return {};
 }
 
+static Result<CpuSpeculativeProposal> propose_mtp(
+    const CompiledModel& model,
+    int32_t input_id,
+    SessionStatistics& statistics,
+    CpuSessionState& state,
+    uint64_t position_offset,
+    const CpuSpeculativeSampler& sampler)
+{
+    if (!sampler)
+    {
+        return Error{
+            ErrorCode::InvalidArgument,
+            "Qwen MTP proposal requires a token sampler"};
+    }
+    if (input_id < 0
+        || static_cast<uint32_t>(input_id)
+               >= model.descriptor.vocabulary_size
+        || state.speculative_layers.size() != 1
+        || state.mtp_pending_target_hidden.rows() != 1
+        || state.mtp_pending_target_hidden.columns()
+               != model.descriptor.hidden_size
+        || position_offset == 0
+        || state.mtp_pending_target_position + 1
+               != position_offset)
+    {
+        return Error{
+            ErrorCode::InvalidArgument,
+            "invalid Qwen MTP proposal state"};
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    const VulkanExecutionSnapshot vulkan_before =
+        capture_vulkan_execution();
+    ExpertCacheStatistics cache_before;
+    if (model.expert_cache)
+        cache_before = model.expert_cache->statistics();
+    ExpertBackendStatistics backend_before;
+    if (model.expert_backend)
+        backend_before = model.expert_backend->statistics();
+
+    CpuSpeculativeProposal proposal;
+    proposal.token_ids.reserve(model.speculative.block_size);
+    proposal.logits.reserve(model.speculative.block_size);
+    proposal.confidence_logits.reserve(
+        model.speculative.block_size);
+    proposal.committed_context_rows = 1;
+    CpuBatch previous_hidden =
+        state.mtp_pending_target_hidden;
+    int32_t previous_token = input_id;
+    for (uint32_t row = 0;
+         row < model.speculative.block_size;
+         ++row)
+    {
+        const std::span<const int32_t> token(
+            &previous_token,
+            1);
+        auto mtp_hidden = execute_mtp_batch(
+            model,
+            token,
+            previous_hidden,
+            state.mtp_pending_target_position + row,
+            statistics,
+            state);
+        if (!mtp_hidden)
+            return mtp_hidden.error();
+        CpuBatch logits = linear_batch(
+            model.weights.at(model.lm_head_weight),
+            mtp_hidden.value());
+        std::vector<float> row_logits(
+            logits.row(0),
+            logits.row(0) + logits.columns());
+        auto sampled = sampler(row_logits);
+        if (!sampled)
+            return sampled.error();
+        previous_token = sampled.value();
+        proposal.token_ids.push_back(previous_token);
+        proposal.logits.push_back(std::move(row_logits));
+        proposal.confidence_logits.push_back(
+            std::numeric_limits<float>::infinity());
+        previous_hidden = std::move(mtp_hidden).value();
+    }
+    state.mtp_pending_target_hidden.clear();
+
+    if (model.expert_cache)
+    {
+        const ExpertCacheStatistics cache_after =
+            model.expert_cache->statistics();
+        statistics.expert_cache_hits +=
+            cache_after.hits - cache_before.hits;
+        statistics.expert_cache_misses +=
+            cache_after.misses - cache_before.misses;
+        statistics.expert_cache_evictions +=
+            cache_after.evictions - cache_before.evictions;
+        statistics.expert_cache_bytes_read +=
+            cache_after.bytes_read - cache_before.bytes_read;
+        statistics.expert_cache_resident_bytes =
+            cache_after.resident_bytes;
+    }
+    if (model.expert_backend)
+    {
+        record_expert_backend_delta(
+            statistics,
+            backend_before,
+            model.expert_backend->statistics());
+    }
+    record_vulkan_execution_delta(statistics, vulkan_before);
+    ++statistics.speculative_proposals;
+    statistics.speculative_draft_tokens +=
+        proposal.token_ids.size();
+    statistics.speculative_draft_time_microseconds +=
+        elapsed_microseconds(started);
+    return proposal;
+}
+
 Result<CpuSpeculativeProposal> CpuExecutor::propose_speculative(const CompiledModel& model, int32_t input_id, SessionStatistics& statistics, CpuSessionState& state, uint64_t position_offset,
                                                                 const CpuSpeculativeSampler& sampler) const
 {
+    const OpenMpHybridTeamLimit team_limit(model.hybrid_mode);
     if (!model.speculative.enabled())
     {
         return Error{
             ErrorCode::UnsupportedModel,
             "the model does not provide a speculative execution plan"};
+    }
+    if (model.speculative.kind == SpeculativeModelKind::Mtp)
+    {
+        return propose_mtp(
+            model,
+            input_id,
+            statistics,
+            state,
+            position_offset,
+            sampler);
     }
     if (!sampler)
     {
@@ -1685,7 +2232,8 @@ Result<CpuSpeculativeProposal> CpuExecutor::propose_speculative(const CompiledMo
             state.speculative_layers[layer_index],
             hidden,
             statistics,
-            state.expert_scratch);
+            state.expert_scratch,
+            state.attention_scratch);
         if (!executed)
             return executed.error();
     }
@@ -1696,7 +2244,7 @@ Result<CpuSpeculativeProposal> CpuExecutor::propose_speculative(const CompiledMo
     if (!headed)
         return headed.error();
     CpuBatch head_hidden = std::move(headed).value();
-    CpuBatch normalized = rms_norm_batch(head_hidden, model.weights.at(model.speculative.final_norm_weight), model.descriptor.norm_epsilon);
+    CpuBatch normalized = rms_norm_batch(head_hidden, model.weights.at(model.speculative.final_norm_weight), model.descriptor.norm_epsilon, model.descriptor.norm_weight_offset);
     CpuBatch base_logits = linear_batch(model.weights.at(model.lm_head_weight), normalized);
 
     CpuSpeculativeProposal proposal;
@@ -1761,6 +2309,7 @@ Result<CpuSpeculativeProposal> CpuExecutor::propose_speculative(const CompiledMo
 
 Result<std::vector<std::vector<float>>> CpuExecutor::execute(const CompiledModel& model, std::span<const int32_t> input_ids, SessionStatistics& statistics, CpuSessionState& state, uint64_t position_offset) const
 {
+    const OpenMpHybridTeamLimit team_limit(model.hybrid_mode);
     const VulkanExecutionSnapshot initial_vulkan_execution = capture_vulkan_execution();
     for (int32_t token_id : input_ids)
     {
@@ -1793,11 +2342,15 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute(const CompiledModel
 
     CpuBatch& hidden = state.hidden;
     hidden.clear();
-    if (model.speculative.enabled())
+    if (model.speculative.enabled()
+        && state.speculative_context_enabled)
     {
-        const uint32_t speculative_hidden_columns = model.descriptor.hidden_size
-                                                    * static_cast<uint32_t>(
-                                                        model.speculative.target_layer_ids.size());
+        const uint32_t speculative_hidden_columns =
+            model.speculative.kind == SpeculativeModelKind::Mtp
+                ? model.descriptor.hidden_size
+                : model.descriptor.hidden_size
+                      * static_cast<uint32_t>(
+                          model.speculative.target_layer_ids.size());
         state.speculative_main_hidden.reset(
             input_ids.size(),
             speculative_hidden_columns,
@@ -1805,6 +2358,13 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute(const CompiledModel
         state.speculative_main_hidden_position = position_offset;
         if (state.speculative_layers.size() != model.speculative.layers.size())
             state.speculative_layers.resize(model.speculative.layers.size());
+        if (model.speculative.kind == SpeculativeModelKind::Mtp)
+        {
+            state.speculative_input_ids.assign(
+                input_ids.begin(),
+                input_ids.end());
+            state.speculative_direct_alignment_ids.clear();
+        }
     }
     else
     {
@@ -1847,8 +2407,19 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute(const CompiledModel
                         return head.error();
                     hidden = std::move(head).value();
                 }
-                rms_norm_batch_into(hidden, model.weights.at(model.final_norm_weight), model.descriptor.norm_epsilon, state.expert_scratch.staged_output);
+                rms_norm_batch_into(hidden, model.weights.at(model.final_norm_weight), model.descriptor.norm_epsilon, state.expert_scratch.staged_output, model.descriptor.norm_weight_offset);
                 hidden.swap(state.expert_scratch.staged_output);
+                if (model.speculative.kind == SpeculativeModelKind::Mtp
+                    && state.speculative_context_enabled)
+                {
+                    for (size_t row = 0; row < hidden.rows(); ++row)
+                    {
+                        std::copy_n(
+                            hidden.row(row),
+                            model.descriptor.hidden_size,
+                            state.speculative_main_hidden.row(row));
+                    }
+                }
                 statistics.final_norm_time_microseconds += elapsed_microseconds(final_norm_start);
                 continue;
             }
@@ -1868,7 +2439,19 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute(const CompiledModel
             if (node->type == ExecutionNodeType::Attention)
             {
                 const auto attention_start = std::chrono::steady_clock::now();
-                if (has_flag(layer.attention.flags, AttentionBlockLatent))
+                if (has_flag(layer.attention.flags, AttentionBlockGatedDeltaNet))
+                {
+                    execute_gated_delta_net_into(
+                        model.weights,
+                        layer.attention,
+                        model.descriptor.norm_epsilon,
+                        state.layers[layer.layer_id],
+                        state.gated_delta_scratch,
+                        hidden,
+                        state.gated_delta_scratch.output);
+                    hidden.swap(state.gated_delta_scratch.output);
+                }
+                else if (has_flag(layer.attention.flags, AttentionBlockLatent))
                 {
                     CpuHyperConnectionMix hyper_mix;
                     const CpuBatch* attention_input = &hidden;
@@ -1942,11 +2525,11 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute(const CompiledModel
                     if (!mixed)
                         return mixed.error();
                     layer_state.ffn_hyper_mix = std::move(mixed).value();
-                    rms_norm_batch_into(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized);
+                    rms_norm_batch_into(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
                 }
                 else
                 {
-                    rms_norm_batch_into(hidden, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized);
+                    rms_norm_batch_into(hidden, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
                 }
                 auto predicted = predict_next_router_routes(
                     model,
@@ -2053,7 +2636,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute(const CompiledModel
                 if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0)
                 {
                     ExpertExecutionMetrics shared_metrics;
-                    layer_state.shared_expert_output = run_expert(model.weights, moe.shared_expert, nullptr, layer_state.normalized, false, shared_metrics);
+                    layer_state.shared_expert_output = run_shared_expert(model, moe, layer_state.normalized, shared_metrics);
                 }
                 CpuBatch& moe_output = layer_state.normalized;
                 moe_output.reset(hidden.rows(), model.descriptor.hidden_size, true);
@@ -2171,6 +2754,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute(const CompiledModel
 
 Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const CompiledModel& model, std::span<const CpuDecodeBatchEntry> entries, CpuDecodeBatchMetrics& metrics) const
 {
+    const OpenMpHybridTeamLimit team_limit(model.hybrid_mode);
     if (entries.empty())
         return Error{ErrorCode::InvalidArgument, "decode batch cannot be empty"};
 
@@ -2215,14 +2799,28 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
     }
     if (model.speculative.enabled())
     {
-        const uint32_t speculative_hidden_columns = model.descriptor.hidden_size * static_cast<uint32_t>(model.speculative.target_layer_ids.size());
+        const uint32_t speculative_hidden_columns =
+            model.speculative.kind == SpeculativeModelKind::Mtp
+                ? model.descriptor.hidden_size
+                : model.descriptor.hidden_size
+                      * static_cast<uint32_t>(
+                          model.speculative.target_layer_ids.size());
         for (const CpuDecodeBatchEntry& entry : entries)
         {
+            if (!entry.state->speculative_context_enabled)
+                continue;
             entry.state->speculative_main_hidden.reset(1, speculative_hidden_columns, true);
             entry.state->speculative_main_hidden_position = entry.position_offset;
             if (entry.state->speculative_layers.size() != model.speculative.layers.size())
             {
                 entry.state->speculative_layers.resize(model.speculative.layers.size());
+            }
+            if (model.speculative.kind == SpeculativeModelKind::Mtp)
+            {
+                entry.state->speculative_input_ids.assign(
+                    1,
+                    entry.input_id);
+                entry.state->speculative_direct_alignment_ids.clear();
             }
         }
     }
@@ -2331,8 +2929,24 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                 {
                     return Error{ErrorCode::InternalError, "cannot merge staged hidden rows"};
                 }
-                rms_norm_batch_into(merged, model.weights.at(model.final_norm_weight), model.descriptor.norm_epsilon, scratch.staged_output);
+                rms_norm_batch_into(merged, model.weights.at(model.final_norm_weight), model.descriptor.norm_epsilon, scratch.staged_output, model.descriptor.norm_weight_offset);
                 split_rows(scratch.staged_output, hidden);
+                if (model.speculative.kind == SpeculativeModelKind::Mtp)
+                {
+                    for (size_t session_index = 0;
+                         session_index < session_count;
+                         ++session_index)
+                    {
+                        CpuSessionState& state =
+                            *entries[session_index].state;
+                        if (!state.speculative_context_enabled)
+                            continue;
+                        std::copy_n(
+                            hidden[session_index].row(0),
+                            model.descriptor.hidden_size,
+                            state.speculative_main_hidden.row(0));
+                    }
+                }
                 const uint64_t elapsed = elapsed_microseconds(start);
                 for (const CpuDecodeBatchEntry& entry : entries)
                     entry.statistics->final_norm_time_microseconds += elapsed;
@@ -2369,7 +2983,28 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
             const MoeBlockPlan& moe = layer.moe;
             if (node->type == ExecutionNodeType::Attention)
             {
-                if (has_flag(layer.attention.flags, AttentionBlockLatent))
+                if (has_flag(layer.attention.flags, AttentionBlockGatedDeltaNet))
+                {
+                    for (size_t session_index = 0; session_index < session_count; ++session_index)
+                    {
+                        CpuSessionState& state = *entries[session_index].state;
+                        const auto start = std::chrono::steady_clock::now();
+                        const VulkanExecutionSnapshot vulkan_before = capture_vulkan_execution();
+                        execute_gated_delta_net_into(
+                            model.weights,
+                            layer.attention,
+                            model.descriptor.norm_epsilon,
+                            state.layers[layer.layer_id],
+                            state.gated_delta_scratch,
+                            hidden[session_index],
+                            state.gated_delta_scratch.output);
+                        hidden[session_index].swap(state.gated_delta_scratch.output);
+                        SessionStatistics& statistics = *entries[session_index].statistics;
+                        statistics.attention_time_microseconds += elapsed_microseconds(start);
+                        record_vulkan_execution_delta(statistics, vulkan_before);
+                    }
+                }
+                else if (has_flag(layer.attention.flags, AttentionBlockLatent))
                 {
                     const auto start = std::chrono::steady_clock::now();
                     const VulkanExecutionSnapshot vulkan_before = capture_vulkan_execution();
@@ -2462,7 +3097,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                     if (!mixed)
                         return mixed.error();
                     CpuHyperConnectionMix merged_mix = std::move(mixed).value();
-                    rms_norm_batch_into(merged_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, merged_hidden);
+                    rms_norm_batch_into(merged_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, merged_hidden, model.descriptor.norm_weight_offset);
                     std::vector<CpuHyperConnectionMix> mixes;
                     split_hyper_mix(merged_mix, mixes);
                     for (size_t session_index = 0; session_index < session_count; ++session_index)
@@ -2473,7 +3108,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                 }
                 else
                 {
-                    rms_norm_batch_into(merged_hyper, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, merged_hidden);
+                    rms_norm_batch_into(merged_hyper, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, merged_hidden, model.descriptor.norm_weight_offset);
                 }
                 std::vector<CpuBatch> normalized;
                 split_rows(merged_hidden, normalized);
@@ -2719,7 +3354,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                     if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0)
                     {
                         ExpertExecutionMetrics shared_metrics;
-                        layer_state.shared_expert_output = run_expert(model.weights, moe.shared_expert, nullptr, layer_state.normalized, false, shared_metrics);
+                        layer_state.shared_expert_output = run_shared_expert(model, moe, layer_state.normalized, shared_metrics);
                     }
                     CpuBatch& moe_output = layer_state.normalized;
                     moe_output.reset(1, model.descriptor.hidden_size, true);
