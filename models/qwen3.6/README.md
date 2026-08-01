@@ -98,14 +98,15 @@ python tools\run_qwen3_6_prompt.py `
   .\build-ncnn\Release\ncnn_moe_qwen3_6.exe `
   .\models\qwen3.6\Qwen3.6-35B-A3B `
   "请简短介绍一下你自己。" `
-  --max-new-tokens 1024 --stream --backend hybrid
+  --max-new-tokens 1024 --stream --backend hybrid --report-throughput
 ```
 
 Thinking mode uses the checkpoint defaults: temperature 1.0, Top-P 0.95,
 Top-K 20, and Min-P 0.0. `--no-thinking` requests the official template's
 direct-answer mode. `--stream-final-only` suppresses reasoning during
 streaming, while `--verbose` exposes prompt IDs, generated IDs, timings, and
-Runtime diagnostics.
+Runtime diagnostics. `--report-throughput` exposes only the optional aggregate
+generation rate in token/s.
 
 The wrapper and native runner default to the faster target-only path, including
 when Artifact v3 is present. Use `--speculative` to opt into experimental MTP,
@@ -123,13 +124,14 @@ The native runner accepts a model directory followed by prompt token IDs:
 ```powershell
 .\build-ncnn\Release\ncnn_moe_qwen3_6.exe `
   .\models\qwen3.6\Qwen3.6-35B-A3B 248044 `
-  --max-new-tokens 16 --no-speculative --hybrid
+  --max-new-tokens 16 --no-speculative --hybrid --report-throughput
 ```
 
 Use `--prompt-token-file PATH` for a whitespace-separated token sequence and
 `--stream-token-ids` for incremental machine-readable IDs. The runner stops on
 both published stop tokens: `<|im_end|>` (`248046`) and `<|endoftext|>`
-(`248044`).
+(`248044`). `--report-throughput` adds the aggregate generation rate in
+token/s; omit it when that optional line is not needed.
 
 ## Execution and memory
 
@@ -253,6 +255,12 @@ Use `--model-revision REVISION` when the local checkpoint revision is known.
 The accepted local directory did not expose a source revision, so this run's
 case reports record `model_revision` as null. The aggregate JSON is
 `build-reports/performance-matrix/qwen3.6-35b-a3b/report.json`.
+For a CPU-only comparison, build the runner with
+`-DNCNN_MOE_USE_VULKAN=OFF`, use a separate output directory, and add
+`--matrix-backend cpu` to the command. Each CPU case records
+`execution_evidence`; the matrix rejects reported GPU execution while keeping
+Vulkan-context initialization and system-wide `nvidia-smi` observations
+explicitly separate.
 
 ### Compiled Artifact admission matrix
 

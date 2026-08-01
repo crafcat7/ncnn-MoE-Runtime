@@ -147,6 +147,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                      " [--disable-forward-aware-cache]"
                      " [--disable-rank-adaptive-prefetch]"
                      " [--disable-cross-expert-read-coalescing]"
+                     " [--release-vulkan-dense-host]"
                      " [--router-prediction] [--async-router-prediction]"
                      " [--forward-aware-cache]"
                      " [--rank-adaptive-prefetch] [--cross-expert-read-coalescing]"
@@ -166,7 +167,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                      " [--scheduler-collection-us N]"
                      " [--scheduler-max-micro-batch N]"
                      " [--cpu|--hybrid|--hybrid-prefetch]"
-                     " [--stream-token-ids]\n";
+                     " [--stream-token-ids] [--report-throughput]\n";
         return 2;
     }
 
@@ -184,6 +185,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             generation_options.stop_tokens.push_back(runner_options.secondary_default_stop_token);
         std::vector<int32_t> prompt;
         bool stream_token_ids = false;
+        bool report_throughput = false;
         bool cross_call_scheduling = false;
         bool parallel_independent = false;
         bool parallel_speculative = false;
@@ -298,6 +300,10 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             {
                 runtime_options.flags &= ~ncnn::moe::RuntimeOptionCrossExpertReadCoalescing;
             }
+            else if (argument == "--release-vulkan-dense-host")
+            {
+                runtime_options.flags |= ncnn::moe::RuntimeOptionReleaseVulkanDenseHostStorage;
+            }
             else if (argument == "--router-prediction")
             {
                 runtime_options.flags |= ncnn::moe::RuntimeOptionRouterPrediction;
@@ -362,6 +368,10 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             else if (argument == "--stream-token-ids")
             {
                 stream_token_ids = true;
+            }
+            else if (argument == "--report-throughput")
+            {
+                report_throughput = true;
             }
             else if (argument == "--mmap-experts")
             {
@@ -545,6 +555,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             std::cout << " of " << memory_plan.physical_memory_bytes / (1024 * 1024) << " MiB detected";
         }
         std::cout << ", dense estimate " << memory_plan.estimated_dense_bytes / (1024 * 1024) << " MiB\n";
+        std::cout << "Vulkan runtime devices: " << runtime.capabilities().vulkan_device_count << '\n';
         if (runtime.capabilities().vulkan_heap_budget_bytes != 0)
         {
             std::cout << "Vulkan heap budget: " << runtime.capabilities().vulkan_heap_budget_bytes / (1024 * 1024) << " MiB\n";
@@ -857,7 +868,11 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             speculative_verify_time_microseconds += session_statistics.speculative_verify_time_microseconds;
         }
         std::cout << "generated " << generation.tokens.size() << " token(s) in " << generation_seconds << " s\n";
-        std::cout << "Parallel sessions: " << parallel_sessions << ", aggregate throughput: " << generation.tokens.size() / generation_seconds << " token/s\n";
+        std::cout << "Parallel sessions: " << parallel_sessions << '\n';
+        if (report_throughput)
+        {
+            std::cout << "Aggregate throughput: " << generation.tokens.size() / generation_seconds << " token/s\n";
+        }
         if (parallel_sessions > 1
             && (parallel_independent || parallel_speculative))
         {
@@ -870,26 +885,29 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         }
         else if (parallel_sessions > 1)
         {
-            std::cout
-                << "Parallel prefill: "
-                << parallel_sessions * prompt.size()
-                << " token(s) in "
-                << parallel_prefill_seconds
-                << " s, "
-                << parallel_sessions * prompt.size()
-                       / parallel_prefill_seconds
-                << " token/s\n";
-            std::cout
-                << "Parallel staged decode: "
-                << parallel_decode_tokens
-                << " token(s) in "
-                << parallel_decode_seconds
-                << " s, "
-                << (parallel_decode_seconds == 0.0
-                        ? 0.0
-                        : parallel_decode_tokens
-                              / parallel_decode_seconds)
-                << " token/s\n";
+            if (report_throughput)
+            {
+                std::cout
+                    << "Parallel prefill: "
+                    << parallel_sessions * prompt.size()
+                    << " token(s) in "
+                    << parallel_prefill_seconds
+                    << " s, "
+                    << parallel_sessions * prompt.size()
+                           / parallel_prefill_seconds
+                    << " token/s\n";
+                std::cout
+                    << "Parallel staged decode: "
+                    << parallel_decode_tokens
+                    << " token(s) in "
+                    << parallel_decode_seconds
+                    << " s, "
+                    << (parallel_decode_seconds == 0.0
+                            ? 0.0
+                            : parallel_decode_tokens
+                                  / parallel_decode_seconds)
+                    << " token/s\n";
+            }
             std::cout << "Scheduler: " << scheduler_statistics.worker_count << " worker(s), " << scheduler_statistics.expert_threads_per_worker << " Expert thread(s) per worker, " << scheduler_statistics.max_in_flight << " max in flight\n";
             std::cout
                 << "Scheduler prefill staging: "

@@ -278,6 +278,7 @@ struct CompiledModel
 #define NCNN_MOE_BACKEND_CAP_VULKAN_ATTN_BIT      2
 #define NCNN_MOE_BACKEND_CAP_MXFP4_CPU_BIT        3
 #define NCNN_MOE_BACKEND_CAP_RETAIN_CPU_DENSE_BIT 4
+#define NCNN_MOE_BACKEND_CAP_RELEASE_DENSE_BIT     5
 
 class ModelCompiler
 {
@@ -288,7 +289,8 @@ public:
         BackendCapabilityVulkanDense = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_VULKAN_DENSE_BIT,
         BackendCapabilityVulkanAttention = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_VULKAN_ATTN_BIT,
         BackendCapabilityMxfp4CpuKernel = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_MXFP4_CPU_BIT,
-        BackendCapabilityRetainCpuDenseCopies = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_RETAIN_CPU_DENSE_BIT
+        BackendCapabilityRetainCpuDenseCopies = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_RETAIN_CPU_DENSE_BIT,
+        BackendCapabilityReleaseVulkanDenseHostStorage = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_RELEASE_DENSE_BIT
     };
 
     struct BackendCapabilities

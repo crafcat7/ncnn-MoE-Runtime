@@ -18,6 +18,7 @@
 #include "ncnn/moe/session.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <exception>
@@ -47,9 +48,7 @@ public:
 #if defined(_OPENMP)
         if (mode == HybridMode::CpuOnly)
             return;
-        // Hybrid execution overlaps CPU kernels with Vulkan submission and
-        // shared-Expert work. Do not request more workers than physical
-        // cores, but preserve a smaller scheduler or application limit.
+        // Bound hybrid OpenMP work to physical cores.
         previous_ = omp_get_max_threads();
         static const uint32_t physical_cores =
             discover_cpu_topology().physical_core_count;
@@ -777,11 +776,10 @@ static ExpertVictimExecutionMetadata victim_metadata(const CompiledModel& model,
 
 static void collect_ranked_experts(
     const ExpertDispatchPlan& plan,
-    uint32_t top_k,
-    std::vector<uint32_t>& ranked)
+    std::span<uint32_t> ranked)
 {
     const uint32_t invalid_expert = std::numeric_limits<uint32_t>::max();
-    ranked.assign(top_k, invalid_expert);
+    std::fill(ranked.begin(), ranked.end(), invalid_expert);
     for (const ExpertBatch& batch : plan.batches)
     {
         for (const ExpertRoute& route : batch.routes)
@@ -869,8 +867,22 @@ static void resolve_router_predictions(
 
     const uint32_t invalid_expert = std::numeric_limits<uint32_t>::max();
     CpuLayerCache& cache = state.layers[layer.layer_id];
-    std::vector<uint32_t> actual_experts;
-    collect_ranked_experts(plan, layer.moe.top_k, actual_experts);
+    std::array<uint32_t, maximum_expert_route_ranks> actual_storage;
+    std::vector<uint32_t> actual_fallback;
+    std::span<const uint32_t> actual_experts;
+    if (layer.moe.top_k <= actual_storage.size())
+    {
+        const std::span<uint32_t> ranked =
+            std::span<uint32_t>(actual_storage).first(layer.moe.top_k);
+        collect_ranked_experts(plan, ranked);
+        actual_experts = ranked;
+    }
+    else
+    {
+        actual_fallback.resize(layer.moe.top_k);
+        collect_ranked_experts(plan, actual_fallback);
+        actual_experts = actual_fallback;
+    }
 
     for (uint32_t rank = 0; rank < actual_experts.size() && rank < cache.predicted_expert_ids.size(); ++rank)
     {
@@ -1036,11 +1048,22 @@ static Result<RouterPredictionOutcome> run_router_prediction(
         return dispatched.error();
 
     const uint32_t invalid_expert = std::numeric_limits<uint32_t>::max();
-    std::vector<uint32_t> predicted_experts;
-    collect_ranked_experts(
-        predicted_plan,
-        next_layer.moe.top_k,
-        predicted_experts);
+    std::array<uint32_t, maximum_expert_route_ranks> predicted_storage;
+    std::vector<uint32_t> predicted_fallback;
+    std::span<const uint32_t> predicted_experts;
+    if (next_layer.moe.top_k <= predicted_storage.size())
+    {
+        const std::span<uint32_t> ranked =
+            std::span<uint32_t>(predicted_storage).first(next_layer.moe.top_k);
+        collect_ranked_experts(predicted_plan, ranked);
+        predicted_experts = ranked;
+    }
+    else
+    {
+        predicted_fallback.resize(next_layer.moe.top_k);
+        collect_ranked_experts(predicted_plan, predicted_fallback);
+        predicted_experts = predicted_fallback;
+    }
     RouterPredictionOutcome outcome;
     outcome.target_layer_id = next_layer.layer_id;
     outcome.predicted_expert_ids.assign(

@@ -84,6 +84,7 @@ struct ExpertCachePairRequest
 #define NCNN_MOE_EXPERT_CACHE_BUFFERED_IO_BIT 2
 #define NCNN_MOE_EXPERT_CACHE_FORWARD_ARC_BIT 3
 #define NCNN_MOE_EXPERT_CACHE_READ_MERGE_BIT  4
+#define NCNN_MOE_EXPERT_CACHE_SPECULATIVE_EVICT_BIT 5
 
 enum ExpertCacheOptionFlag : uint32_t
 {
@@ -91,7 +92,8 @@ enum ExpertCacheOptionFlag : uint32_t
     ExpertCacheDirectReads = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_DIRECT_IO_BIT,
     ExpertCacheBufferedReads = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_BUFFERED_IO_BIT,
     ExpertCacheForwardAwareEviction = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_FORWARD_ARC_BIT,
-    ExpertCacheCrossExpertReadCoalescing = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_READ_MERGE_BIT
+    ExpertCacheCrossExpertReadCoalescing = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_READ_MERGE_BIT,
+    ExpertCacheAllowSpeculativeEviction = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_SPECULATIVE_EVICT_BIT
 };
 
 class Mxfp4ExpertCache

@@ -115,7 +115,7 @@ public:
                 request_indices[backend_index].push_back(request_index);
             }
         }
-        return std::unique_ptr<IExpertBackendBatchSubmission>(new Submission(this, requests, std::move(request_indices)));
+        return std::make_unique<Submission>(this, requests, std::move(request_indices));
     }
 
     void observe_cpu(uint32_t token_count, uint64_t weight_bytes, uint64_t elapsed_microseconds) override

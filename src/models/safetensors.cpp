@@ -32,6 +32,11 @@ static Result<std::vector<uint8_t>> read_range(const std::filesystem::path& path
     return bytes;
 }
 
+static std::string packed_tensor_name(const std::string& name)
+{
+    return "__ncnn_moe_packed__." + name;
+}
+
 static bool parse_json_string(const std::string& json, size_t& position, std::string& value)
 {
     while (position < json.size() && std::isspace(static_cast<unsigned char>(json[position])))
@@ -366,6 +371,17 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_tensor(const std::string& bloc
 {
     const SafetensorInfo* blocks = find(blocks_name);
     const SafetensorInfo* scales = find(scales_name);
+    const SafetensorInfo* packed_blocks = find(packed_tensor_name(blocks_name));
+    const SafetensorInfo* packed_scales = find(packed_tensor_name(scales_name));
+    if ((packed_blocks == nullptr) != (packed_scales == nullptr))
+    {
+        return Error{ErrorCode::InvalidModel, "incomplete packed MXFP4 tensor pair: " + blocks_name};
+    }
+    if (packed_blocks)
+    {
+        blocks = packed_blocks;
+        scales = packed_scales;
+    }
     if (!blocks || !scales || blocks->dtype != "I8" || scales->dtype != "F8_E8M0"
         || columns % 32 != 0
         || blocks->shape != std::vector<uint32_t>{rows, columns / 2}
@@ -421,6 +437,25 @@ Result<TensorData> SafetensorsArchive::load_interleaved_mxfp4_tensor(const std::
         const SafetensorInfo* gate_scales = find(gate_scales_name);
         const SafetensorInfo* up_blocks = find(up_blocks_name);
         const SafetensorInfo* up_scales = find(up_scales_name);
+        const SafetensorInfo* packed_gate_blocks = find(packed_tensor_name(gate_blocks_name));
+        const SafetensorInfo* packed_gate_scales = find(packed_tensor_name(gate_scales_name));
+        const SafetensorInfo* packed_up_blocks = find(packed_tensor_name(up_blocks_name));
+        const SafetensorInfo* packed_up_scales = find(packed_tensor_name(up_scales_name));
+        const bool any_packed = packed_gate_blocks || packed_gate_scales
+                                || packed_up_blocks || packed_up_scales;
+        const bool all_packed = packed_gate_blocks && packed_gate_scales
+                                && packed_up_blocks && packed_up_scales;
+        if (any_packed && !all_packed)
+        {
+            return Error{ErrorCode::InvalidModel, "incomplete packed interleaved MXFP4 tensor: " + gate_blocks_name};
+        }
+        if (all_packed)
+        {
+            gate_blocks = packed_gate_blocks;
+            gate_scales = packed_gate_scales;
+            up_blocks = packed_up_blocks;
+            up_scales = packed_up_scales;
+        }
         if (!gate_blocks || !gate_scales || !up_blocks || !up_scales
             || gate_blocks->dtype != "I8" || up_blocks->dtype != "I8"
             || gate_scales->dtype != "F8_E8M0" || up_scales->dtype != "F8_E8M0"

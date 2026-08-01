@@ -91,6 +91,13 @@ static Result<uint64_t> latent_fp8_dense_bytes(const MoeIR& ir)
         const LayerDescriptor& layer = ir.layers[layer_id];
         const AttentionDescriptor& attention = layer.attention;
         const MoeDescriptor& moe = layer.ffn.moe;
+        if (attention.kind != AttentionKind::MultiHeadLatent
+            || attention.projection_weight_dtype != DType::Float8E4M3
+            || attention.output_group_count == 0
+            || attention.head_count % attention.output_group_count != 0)
+        {
+            return Error{ErrorCode::InvalidModel, "invalid DeepSeek latent attention dimensions"};
+        }
         const uint64_t mix_count = (2 + multiplier) * multiplier;
         for (uint32_t block = 0; block < 2; ++block)
         {
@@ -175,15 +182,107 @@ static Result<uint64_t> latent_fp8_dense_bytes(const MoeIR& ir)
             status = add_vector_bytes(moe.expert_count, 4, "DeepSeek router bias", total);
         if (!status)
             return status.error();
-        for (uint32_t projection = 0; projection < 2; ++projection)
-        {
-            status = add_matrix_bytes(moe.intermediate_size, ir.hidden_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert input", total);
-            if (!status)
-                return status.error();
-        }
+        status = add_matrix_bytes(moe.intermediate_size, ir.hidden_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert input", total);
+        if (!status)
+            return status.error();
+        status = add_matrix_bytes(moe.intermediate_size, ir.hidden_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert input", total);
+        if (!status)
+            return status.error();
         status = add_matrix_bytes(ir.hidden_size, moe.intermediate_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert output", total);
         if (!status)
             return status.error();
+    }
+    return total;
+}
+
+static Result<uint64_t> latent_vulkan_releasable_dense_bytes(const MoeIR& ir)
+{
+    if (ir.layers.empty()
+        || ir.hyper_connection_multiplier <= 1
+        || ir.layers.front().attention.kind != AttentionKind::MultiHeadLatent
+        || ir.layers.front().attention.projection_weight_dtype != DType::Float8E4M3)
+    {
+        return uint64_t{0};
+    }
+
+    uint64_t total = 0;
+    Result<void> status = add_matrix_bytes(
+        ir.vocabulary_size,
+        ir.hidden_size,
+        DType::BFloat16,
+        "Vulkan LM head",
+        total);
+    if (!status)
+        return status.error();
+
+    for (const LayerDescriptor& layer : ir.layers)
+    {
+        const AttentionDescriptor& attention = layer.attention;
+        if (attention.kind != AttentionKind::MultiHeadLatent
+            || attention.projection_weight_dtype != DType::Float8E4M3
+            || attention.output_group_count == 0
+            || attention.head_count % attention.output_group_count != 0)
+        {
+            return uint64_t{0};
+        }
+        const uint64_t group_input = static_cast<uint64_t>(attention.head_count) * attention.head_dimension / attention.output_group_count;
+        const std::pair<uint64_t, uint64_t> matrices[] = {
+            {attention.query_lora_rank, ir.hidden_size},
+            {static_cast<uint64_t>(attention.head_count) * attention.head_dimension, attention.query_lora_rank},
+            {attention.head_dimension, ir.hidden_size},
+            {static_cast<uint64_t>(attention.output_group_count) * attention.output_lora_rank, group_input},
+            {ir.hidden_size, static_cast<uint64_t>(attention.output_group_count) * attention.output_lora_rank},
+        };
+        for (const auto& matrix : matrices)
+        {
+            status = add_matrix_bytes(
+                matrix.first,
+                matrix.second,
+                DType::Float8E4M3,
+                "Vulkan latent projection",
+                total);
+            if (!status)
+                return status.error();
+        }
+        if (attention.compression_ratio == 4)
+        {
+            status = add_matrix_bytes(
+                static_cast<uint64_t>(attention.index_head_count) * attention.index_head_dimension,
+                attention.query_lora_rank,
+                DType::Float8E4M3,
+                "Vulkan index query",
+                total);
+            if (!status)
+                return status.error();
+        }
+
+        if (layer.ffn.moe.shared_expert_count != 0)
+        {
+            status = add_matrix_bytes(
+                layer.ffn.moe.intermediate_size,
+                ir.hidden_size,
+                layer.ffn.moe.shared_expert_weight_dtype,
+                "Vulkan shared Expert input",
+                total);
+            if (!status)
+                return status.error();
+            status = add_matrix_bytes(
+                layer.ffn.moe.intermediate_size,
+                ir.hidden_size,
+                layer.ffn.moe.shared_expert_weight_dtype,
+                "Vulkan shared Expert input",
+                total);
+            if (!status)
+                return status.error();
+            status = add_matrix_bytes(
+                ir.hidden_size,
+                layer.ffn.moe.intermediate_size,
+                layer.ffn.moe.shared_expert_weight_dtype,
+                "Vulkan shared Expert output",
+                total);
+            if (!status)
+                return status.error();
+        }
     }
     return total;
 }
@@ -489,7 +588,8 @@ static Result<uint64_t> expert_pair_bytes(const MoeIR& ir, DType dtype)
     return checked_add(gate_up.value(), down.value(), "expert pair");
 }
 
-Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeOptions& options, uint64_t physical_memory_bytes)
+Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeOptions& options, uint64_t physical_memory_bytes,
+                                          bool release_vulkan_dense_host_storage)
 {
     ModelMemoryPlan plan;
     plan.requested_mode = options.expert_memory_mode;
@@ -595,6 +695,22 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeOptions&
     if (!file_backed_expert_encoding)
     {
         return Error{ErrorCode::UnsupportedModel, "on-demand mode requires a file-backed Expert encoding"};
+    }
+
+    if (release_vulkan_dense_host_storage)
+    {
+        auto releasable = latent_vulkan_releasable_dense_bytes(ir);
+        if (!releasable)
+            return releasable.error();
+        plan.estimated_dense_bytes = releasable.value() >= plan.estimated_dense_bytes
+                                         ? 0
+                                         : plan.estimated_dense_bytes - releasable.value();
+        eager_capacity = 0;
+        if (plan.host_memory_budget_bytes > plan.estimated_dense_bytes
+            && plan.host_memory_budget_bytes - plan.estimated_dense_bytes > safety_reserve)
+        {
+            eager_capacity = plan.host_memory_budget_bytes - plan.estimated_dense_bytes - safety_reserve;
+        }
     }
     if (eager_capacity < plan.minimum_active_expert_bytes)
     {

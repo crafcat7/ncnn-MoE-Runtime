@@ -286,7 +286,7 @@ private:
             slot.command = new ncnn::VkCompute(device);
     }
 
-    // ncnn owns Vulkan teardown through atexit.
+    // ncnn owns Vulkan teardown through atexit; transfer commands share that lifetime.
 
     ncnn::VulkanDevice* device_ = nullptr;
     ncnn::VkAllocator* blob_allocator_ = nullptr;
@@ -4676,7 +4676,7 @@ public:
                 execution_available_.notify_one();
             }
         }
-        return std::unique_ptr<IExpertBackendBatchSubmission>(new Submission(std::move(work)));
+        return std::make_unique<Submission>(std::move(work));
     }
 
     void observe_cpu(uint32_t token_count, uint64_t weight_bytes, uint64_t elapsed_microseconds) override

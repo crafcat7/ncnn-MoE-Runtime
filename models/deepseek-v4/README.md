@@ -56,7 +56,7 @@ python tools\run_deepseek_v4_prompt.py `
   .\build-ncnn\Release\ncnn_moe_deepseek_v4.exe `
   .\models\deepseek-v4\DeepSeek-V4-Flash `
   "请简短介绍一下你自己。" `
-  --max-new-tokens 1024 --stream --backend hybrid
+  --max-new-tokens 1024 --stream --backend hybrid --report-throughput
 ```
 
 By default, the wrapper prints only the human-readable `[reasoning]` and
@@ -64,7 +64,8 @@ By default, the wrapper prints only the human-readable `[reasoning]` and
 statistics are suppressed unless `--verbose` is present. The reply limit
 defaults to 1024 tokens; reaching it before EOS produces a warning.
 `--thinking-mode chat` requests a direct answer, and `--stream-final-only`
-suppresses reasoning during streaming.
+suppresses reasoning during streaming. `--report-throughput` prints only the
+optional aggregate generation rate without enabling full native diagnostics.
 
 ## Run token IDs
 
@@ -74,12 +75,14 @@ token IDs:
 ```powershell
 .\build-ncnn\Release\ncnn_moe_deepseek_v4.exe `
   .\models\deepseek-v4\DeepSeek-V4-Flash 0 `
-  --max-new-tokens 64 --hybrid
+  --max-new-tokens 64 --hybrid --report-throughput
 ```
 
 Use `--prompt-token-file PATH` for long whitespace-separated token sequences.
 Use `--stream-token-ids` to print generated IDs as they become available. The
 final machine-readable line is `generated token ids:`.
+`--report-throughput` adds the aggregate generation rate in token/s; omit it
+when that optional line is not needed.
 `ncnn_moe_deepseek_v4` and `ncnn_moe_gpt_oss` use the same native runner
 implementation and option parser; their entry points only select the expected
 adapter and model-specific default EOS.
@@ -291,6 +294,12 @@ python tools\benchmark_reference_matrix.py deepseek-v4-flash `
 
 The aggregate JSON is
 `build-reports/performance-matrix/deepseek-v4-flash/report.json`.
+For a CPU-only comparison, build the runner with
+`-DNCNN_MOE_USE_VULKAN=OFF`, use a separate output directory, and add
+`--matrix-backend cpu` to the command. Each CPU case records
+`execution_evidence`; the matrix rejects reported GPU execution while keeping
+Vulkan-context initialization and system-wide `nvidia-smi` observations
+explicitly separate.
 
 ### DeepSeek-V4-Flash-DSpark matrix
 

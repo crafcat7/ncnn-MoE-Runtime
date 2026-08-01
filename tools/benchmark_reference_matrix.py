@@ -77,6 +77,15 @@ def add_common_arguments(parser):
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--short-tokens", type=int, default=32)
     parser.add_argument("--long-tokens", type=int, default=256)
+    parser.add_argument(
+        "--matrix-backend",
+        choices=("hybrid", "cpu"),
+        default="hybrid",
+        help=(
+            "Backend used by the matrix workloads. CPU mode omits Vulkan "
+            "device and GPU-cache options."
+        ),
+    )
     parser.add_argument("--vulkan-device-index", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
 
@@ -185,6 +194,16 @@ def warmup_options(warmup):
     return ["--warmup", "0", "--cache-warmup-runs", "0"]
 
 
+def backend_options(arguments, backend=None):
+    selected_backend = backend or arguments.matrix_backend
+    options = ["--backend", selected_backend]
+    if selected_backend == "hybrid":
+        options.extend(
+            ("--vulkan-device-index", str(arguments.vulkan_device_index))
+        )
+    return options
+
+
 def prompt_token_ids(family):
     if family == "gpt-oss":
         return GPT_OSS_PROMPT_TOKEN_IDS
@@ -239,6 +258,7 @@ def common_arguments(arguments, model, tokens, warmup, extra):
 
 def gpt_oss_cases(arguments):
     cases = []
+    backend = arguments.matrix_backend
     windows = (("short", arguments.short_tokens), ("long", arguments.long_tokens))
     warmups = (("cold", False), ("warm", True))
 
@@ -250,17 +270,15 @@ def gpt_oss_cases(arguments):
                         "name": f"gpt-oss-20b-single-{window_name}-{warmup_name}",
                         "family": "gpt-oss-20b",
                         "workload": "single-session",
+                        "backend": backend,
                         "token_window": window_name,
                         "generated_tokens": tokens,
                         "warmup": warmup_name,
                         "model": arguments.model_20b,
                         "extra": [
-                            "--backend",
-                            "hybrid",
+                            *backend_options(arguments),
                             "--expert-memory",
                             "eager",
-                            "--vulkan-device-index",
-                            str(arguments.vulkan_device_index),
                         ],
                     }
                 )
@@ -273,13 +291,13 @@ def gpt_oss_cases(arguments):
                         "name": f"gpt-oss-120b-single-{window_name}-{warmup_name}",
                         "family": "gpt-oss-120b",
                         "workload": "single-session",
+                        "backend": backend,
                         "token_window": window_name,
                         "generated_tokens": tokens,
                         "warmup": warmup_name,
                         "model": arguments.model_120b,
                         "extra": [
-                            "--backend",
-                            "hybrid",
+                            *backend_options(arguments),
                             "--expert-memory",
                             "on-demand",
                             "--host-memory-mb",
@@ -289,8 +307,6 @@ def gpt_oss_cases(arguments):
                             "--expert-io-workers",
                             "4",
                             "--direct-expert-io",
-                            "--vulkan-device-index",
-                            str(arguments.vulkan_device_index),
                         ],
                     }
                 )
@@ -306,25 +322,19 @@ def gpt_oss_cases(arguments):
                         ),
                         "family": "gpt-oss-120b",
                         "workload": "two-session-service",
+                        "backend": backend,
                         "token_window": window_name,
                         "generated_tokens": tokens,
                         "warmup": warmup_name,
                         "model": arguments.model_120b,
                         "extra": [
-                            "--backend",
-                            "hybrid",
+                            *backend_options(arguments),
                             "--expert-memory",
                             "on-demand",
                             "--host-memory-mb",
                             "28672",
                             "--expert-cache-mb",
                             "22528",
-                            "--expert-gpu-cache-mb",
-                            "512",
-                            "--expert-gpu-victim-cache-mb",
-                            "2560",
-                            "--expert-gpu-victim-reuse-probe",
-                            "1",
                             "--expert-io-workers",
                             "4",
                             "--parallel-sessions",
@@ -333,8 +343,18 @@ def gpt_oss_cases(arguments):
                             "8",
                             "--scheduler-cross-call",
                             "--direct-expert-io",
-                            "--vulkan-device-index",
-                            str(arguments.vulkan_device_index),
+                            *(
+                                [
+                                    "--expert-gpu-cache-mb",
+                                    "512",
+                                    "--expert-gpu-victim-cache-mb",
+                                    "2560",
+                                    "--expert-gpu-victim-reuse-probe",
+                                    "1",
+                                ]
+                                if backend == "hybrid"
+                                else []
+                            ),
                         ],
                     }
                 )
@@ -347,13 +367,13 @@ def gpt_oss_cases(arguments):
                         "name": f"gpt-oss-120b-offload-{window_name}-{warmup_name}",
                         "family": "gpt-oss-120b",
                         "workload": "cpu-expert-cache-sweep",
+                        "backend": "cpu",
                         "token_window": window_name,
                         "generated_tokens": tokens,
                         "warmup": warmup_name,
                         "model": arguments.model_120b,
                         "extra": [
-                            "--backend",
-                            "cpu",
+                            *backend_options(arguments, "cpu"),
                             "--expert-memory",
                             "on-demand",
                             "--host-memory-mb",
@@ -373,6 +393,7 @@ def gpt_oss_cases(arguments):
 
 def deepseek_cases(arguments):
     cases = []
+    backend = arguments.matrix_backend
     prefix = arguments.family
     speculative = arguments.family == "deepseek-v4-flash-dspark"
     windows = (("short", arguments.short_tokens), ("long", arguments.long_tokens))
@@ -395,20 +416,17 @@ def deepseek_cases(arguments):
                         "name": f"{prefix}-single-{window_name}-{warmup_name}",
                         "family": prefix,
                         "workload": "single-session",
-                        "backend": "hybrid",
+                        "backend": backend,
                         "scheduler_staging": "auto",
                         "token_window": window_name,
                         "generated_tokens": tokens,
                         "warmup": warmup_name,
                         "model": arguments.model,
                         "extra": [
-                            "--backend",
-                            "hybrid",
+                            *backend_options(arguments),
                             *storage,
                             "--expert-cache-mb",
                             str(arguments.expert_cache_mb),
-                            "--vulkan-device-index",
-                            str(arguments.vulkan_device_index),
                         ],
                     }
                 )
@@ -431,7 +449,7 @@ def deepseek_cases(arguments):
                             if speculative
                             else f"{arguments.parallel_sessions}-session-service"
                         ),
-                        "backend": "hybrid",
+                        "backend": backend,
                         "scheduler_staging": (
                             "independent-speculative"
                             if speculative
@@ -442,8 +460,7 @@ def deepseek_cases(arguments):
                         "warmup": warmup_name,
                         "model": arguments.model,
                         "extra": [
-                            "--backend",
-                            "hybrid",
+                            *backend_options(arguments),
                             *storage,
                             "--expert-cache-mb",
                             str(arguments.expert_cache_mb),
@@ -454,8 +471,6 @@ def deepseek_cases(arguments):
                                 if speculative
                                 else ["--scheduler-staging", "force"]
                             ),
-                            "--vulkan-device-index",
-                            str(arguments.vulkan_device_index),
                         ],
                     }
                 )
@@ -475,8 +490,7 @@ def deepseek_cases(arguments):
                         "warmup": warmup_name,
                         "model": arguments.model,
                         "extra": [
-                            "--backend",
-                            "cpu",
+                            *backend_options(arguments, "cpu"),
                             *storage,
                             "--expert-cache-sweep-mb",
                             *[
@@ -491,6 +505,7 @@ def deepseek_cases(arguments):
 
 def qwen_cases(arguments):
     cases = []
+    backend = arguments.matrix_backend
     prefix = arguments.family
     windows = (
         ("short", arguments.short_tokens),
@@ -499,7 +514,7 @@ def qwen_cases(arguments):
     warmups = (("cold", False), ("warm", True))
     eager_experts = ["--expert-memory", "eager"]
 
-    if not arguments.skip_cpu:
+    if backend == "hybrid" and not arguments.skip_cpu:
         for window_name, tokens in windows:
             for warmup_name, warmup in warmups:
                 cases.append(
@@ -517,36 +532,36 @@ def qwen_cases(arguments):
                         "warmup": warmup_name,
                         "model": arguments.model,
                         "extra": [
-                            "--backend",
-                            "cpu",
+                            *backend_options(arguments, "cpu"),
                             *eager_experts,
                         ],
                     }
                 )
 
-    if not arguments.skip_single:
+    if not arguments.skip_single and not (backend == "cpu" and arguments.skip_cpu):
         for window_name, tokens in windows:
             for warmup_name, warmup in warmups:
                 cases.append(
                     {
                         "name": (
-                            f"{prefix}-single-hybrid-{window_name}-"
+                            f"{prefix}-single-{backend}-{window_name}-"
                             f"{warmup_name}"
                         ),
                         "family": prefix,
-                        "workload": "single-session",
-                        "backend": "hybrid",
+                        "workload": (
+                            "single-session"
+                            if backend == "hybrid"
+                            else "single-session-cpu-control"
+                        ),
+                        "backend": backend,
                         "scheduler_staging": "auto",
                         "token_window": window_name,
                         "generated_tokens": tokens,
                         "warmup": warmup_name,
                         "model": arguments.model,
                         "extra": [
-                            "--backend",
-                            "hybrid",
+                            *backend_options(arguments),
                             *eager_experts,
-                            "--vulkan-device-index",
-                            str(arguments.vulkan_device_index),
                         ],
                     }
                 )
@@ -565,22 +580,19 @@ def qwen_cases(arguments):
                         "workload": (
                             f"{arguments.parallel_sessions}-session-service"
                         ),
-                        "backend": "hybrid",
+                        "backend": backend,
                         "scheduler_staging": "force",
                         "token_window": window_name,
                         "generated_tokens": tokens,
                         "warmup": warmup_name,
                         "model": arguments.model,
                         "extra": [
-                            "--backend",
-                            "hybrid",
+                            *backend_options(arguments),
                             *eager_experts,
                             "--parallel-sessions",
                             str(arguments.parallel_sessions),
                             "--scheduler-staging",
                             "force",
-                            "--vulkan-device-index",
-                            str(arguments.vulkan_device_index),
                         ],
                     }
                 )
@@ -628,6 +640,31 @@ def validate_qwen_results(results):
                 )
 
 
+def validate_backend_result(case, report):
+    expected_backend = case.get("backend")
+    if expected_backend is None:
+        return
+    if report.get("backend") != expected_backend:
+        raise RuntimeError(
+            f"{case['name']} reported backend {report.get('backend')!r}; "
+            f"expected {expected_backend!r}"
+        )
+    if expected_backend == "cpu":
+        evidence = report.get("execution_evidence")
+        if evidence is None:
+            raise RuntimeError(
+                f"{case['name']} has no CPU-only execution evidence; "
+                "rebuild the runner with the current diagnostics"
+            )
+        if not evidence.get("cpu_only_execution_verified", False):
+            raise RuntimeError(
+                f"{case['name']} was requested as CPU-only but reported "
+                f"GPU execution (runtime backend: "
+                f"{evidence.get('runtime_backend')!r}, Vulkan context: "
+                f"{evidence.get('vulkan_context_initialized')!r})"
+            )
+
+
 def run_case(arguments, case, output_dir):
     output_path = output_dir / f"{case['name']}.json"
     command = common_arguments(
@@ -640,6 +677,7 @@ def run_case(arguments, case, output_dir):
     if arguments.resume and output_path.is_file():
         report = load_report(output_path)
         if report is not None:
+            validate_backend_result(case, report)
             print(f"\n=== {case['name']} (reused) ===", flush=True)
             return {
                 "case": case,
@@ -659,6 +697,7 @@ def run_case(arguments, case, output_dir):
     report = load_report(output_path)
     if report is None:
         raise RuntimeError(f"benchmark did not write valid JSON: {output_path}")
+    validate_backend_result(case, report)
     return {
         "case": case,
         "command": command,
@@ -675,7 +714,7 @@ def write_aggregate(arguments, results, started, output_dir):
         else f"{arguments.family.replace('-', '_')}_performance_matrix"
     )
     aggregate = {
-        "schema_version": 1,
+        "schema_version": 3,
         "benchmark": benchmark,
         "timestamp_utc": time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
@@ -693,6 +732,10 @@ def write_aggregate(arguments, results, started, output_dir):
         "short_tokens": arguments.short_tokens,
         "long_tokens": arguments.long_tokens,
         "repeats": arguments.repeats,
+        "matrix_backend": arguments.matrix_backend,
+        "case_backends": sorted(
+            {result["case"].get("backend") for result in results} - {None}
+        ),
         "speculative_enabled": (
             arguments.family == "deepseek-v4-flash-dspark"
         ),

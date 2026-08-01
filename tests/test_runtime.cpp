@@ -1413,6 +1413,20 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 check_near(backend_output.row(0)[column], backend_expected.row(0)[column], 1e-3f);
             }
         }
+        auto backend_gate_up_second = std::make_shared<TensorData>(expert_gate_up);
+        auto backend_down_second = std::make_shared<TensorData>(expert_down);
+        backend_gate_up_second->mxfp4_blocks[0] ^= 1;
+        backend_down_second->mxfp4_blocks[0] ^= 1;
+        expert_backend->admit("test-expert-second", backend_gate_up_second, &expert_gate_up_bias, backend_down_second, &expert_down_bias, 0, 1, expert_activation_limit);
+        expert_backend->admit("test-expert-second", backend_gate_up_second, &expert_gate_up_bias, backend_down_second, &expert_down_bias, 0, 1, expert_activation_limit);
+        const auto second_admission_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (expert_backend->statistics().stores < 2 && std::chrono::steady_clock::now() < second_admission_deadline)
+        {
+            std::this_thread::yield();
+        }
+        check(static_cast<bool>(expert_backend->statistics().stores == 2));
+        const CpuBatch backend_second_activated = fused_mxfp4_gate_up_batch(*backend_gate_up_second, &expert_gate_up_bias, backend_input, ExpertActivation::GptOssSwiGlu, expert_activation_limit);
+        const CpuBatch backend_second_expected = linear_batch(*backend_down_second, expert_down_bias, backend_second_activated);
         CpuBatch backend_batch_output_first;
         CpuBatch backend_batch_output_second;
         const std::array<ExpertBackendRequest, 2> backend_requests = {{
@@ -1422,7 +1436,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 &backend_batch_output_first,
             },
             {
-                "test-expert",
+                "test-expert-second",
                 &backend_input,
                 &backend_batch_output_second,
             },
@@ -1433,12 +1447,10 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         {
             check(static_cast<bool>(result == ExpertBackendExecutionResult ::Executed));
         }
-        for (const CpuBatch* batch_output : {&backend_batch_output_first, &backend_batch_output_second})
+        for (uint32_t column = 0; column < backend_expected.columns(); ++column)
         {
-            for (uint32_t column = 0; column < backend_expected.columns(); ++column)
-            {
-                check_near(batch_output->row(0)[column], backend_expected.row(0)[column], 1e-3f);
-            }
+            check_near(backend_batch_output_first.row(0)[column], backend_expected.row(0)[column], 1e-3f);
+            check_near(backend_batch_output_second.row(0)[column], backend_second_expected.row(0)[column], 1e-3f);
         }
         const ExpertBackendStatistics backend_statistics = expert_backend->statistics();
         check(static_cast<bool>(backend_statistics.executions == 5));
@@ -2432,6 +2444,17 @@ void test_file_backed_mxfp4_expert_cache()
     auto exhausted = pressure.acquire_pair(gate_one, down_one);
     check(static_cast<bool>(!exhausted));
     check(static_cast<bool>(exhausted.error().code == ErrorCode::InvalidArgument));
+
+    Mxfp4ExpertCache speculative_eviction(34, 1, {}, ExpertCacheAllowSpeculativeEviction);
+    {
+        auto resident = speculative_eviction.acquire_pair(gate_zero, down_zero);
+        check(static_cast<bool>(resident));
+    }
+    check(static_cast<bool>(speculative_eviction.prefetch_pair(gate_one, down_one)));
+    speculative_eviction.wait_for_background_work();
+    check(static_cast<bool>(speculative_eviction.is_ready(gate_one, down_one)));
+    check(static_cast<bool>(speculative_eviction.statistics().speculative_reads == 1));
+    check(static_cast<bool>(speculative_eviction.statistics().dropped_speculative_admissions == 0));
 
     Mxfp4ExpertCache variable_size(52, 1);
     const TensorData small_gate = file_backed(0, 0, 8);
@@ -4810,6 +4833,24 @@ void test_float_scaled_add()
         check_near(output[index], expected[index], 1e-6f);
 }
 
+void test_float_dot()
+{
+    std::array<float, 137> left = {};
+    std::array<float, 137> right = {};
+    float expected = 0.0f;
+    for (size_t index = 0; index < left.size(); ++index)
+    {
+        left[index] = static_cast<float>(static_cast<int>(index % 19) - 9) * 0.125f;
+        right[index] = static_cast<float>(static_cast<int>(index % 11) - 5) * 0.0625f;
+        expected += left[index] * right[index];
+    }
+    check_near(
+        float_dot(left.data(), right.data(), static_cast<uint32_t>(left.size())),
+        expected,
+        1e-4f);
+    check_near(float_dot(left.data(), right.data(), 0), 0.0f, 1e-6f);
+}
+
 } // namespace moe
 } // namespace ncnn
 
@@ -4820,6 +4861,7 @@ int main()
         ncnn::moe::test_flag_defaults();
         ncnn::moe::test_cpu_task_worker();
         ncnn::moe::test_float_scaled_add();
+        ncnn::moe::test_float_dot();
         ncnn::moe::test_ncnn_linear_operator();
         ncnn::moe::test_ncnn_vulkan_bfloat16_operator();
         ncnn::moe::test_ncnn_vulkan_float8_operator();

@@ -53,6 +53,11 @@ def parse_arguments():
         help="Print encoded prompt IDs and native runner diagnostics.",
     )
     parser.add_argument(
+        "--report-throughput",
+        action="store_true",
+        help="Print the optional aggregate generation rate in token/s.",
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=1024,
@@ -77,6 +82,11 @@ def parse_arguments():
     )
     parser.add_argument("--host-memory-mb", type=int, default=0)
     parser.add_argument("--expert-cache-mb", type=int, default=0)
+    parser.add_argument(
+        "--release-vulkan-dense-host",
+        action="store_true",
+        help="Drop host copies of dense tensors after Vulkan operators take ownership.",
+    )
     parser.add_argument("--expert-gpu-cache-mb", type=int, default=0)
     parser.add_argument("--expert-gpu-victim-cache-mb", type=int, default=0)
     parser.add_argument("--expert-io-workers", type=int, default=4)
@@ -184,6 +194,8 @@ def build_runner_command(arguments, runner, model, prompt_file):
         command.extend(["--host-memory-mb", str(arguments.host_memory_mb)])
     if arguments.expert_cache_mb:
         command.extend(["--expert-cache-mb", str(arguments.expert_cache_mb)])
+    if arguments.release_vulkan_dense_host:
+        command.append("--release-vulkan-dense-host")
     if arguments.expert_gpu_cache_mb:
         command.extend(
             ["--expert-gpu-cache-mb", str(arguments.expert_gpu_cache_mb)]
@@ -203,6 +215,8 @@ def build_runner_command(arguments, runner, model, prompt_file):
         command.append("--buffered-expert-io")
     if arguments.stream:
         command.append("--stream-token-ids")
+    if arguments.report_throughput:
+        command.append("--report-throughput")
     return command
 
 
@@ -211,6 +225,20 @@ def parse_generated_tokens(stdout):
     if not match:
         raise RuntimeError("runner did not report generated token IDs")
     return [int(token) for token in match.group(1).split()]
+
+
+def print_reported_throughput(output):
+    match = re.search(
+        r"^(?:Parallel sessions: \d+, aggregate throughput: "
+        r"|Aggregate throughput: )([0-9.eE+-]+) token/s$",
+        output,
+        re.MULTILINE,
+    )
+    if match:
+        print(
+            f"Aggregate throughput: {match.group(1)} token/s",
+            file=sys.stderr,
+        )
 
 
 def strip_eos(text, tokenizer):
@@ -346,6 +374,8 @@ def run_streaming(command, tokenizer, arguments):
 
     return_code = process.wait()
     streamer.finish()
+    if return_code == 0 and arguments.report_throughput and not arguments.verbose:
+        print_reported_throughput("".join(diagnostics))
     if return_code != 0:
         sys.stderr.write("".join(diagnostics))
     return return_code, streamer.tokens, streamer
@@ -421,6 +451,8 @@ def main():
         if arguments.verbose:
             sys.stderr.write(completed.stdout)
             sys.stderr.write(completed.stderr)
+        elif arguments.report_throughput:
+            print_reported_throughput(completed.stdout)
         try:
             completion_tokens = parse_generated_tokens(completed.stdout)
         except RuntimeError as error:

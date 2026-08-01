@@ -48,6 +48,11 @@ def parse_arguments():
         action="store_true",
         help="Print encoded token IDs and native runner diagnostics.",
     )
+    parser.add_argument(
+        "--report-throughput",
+        action="store_true",
+        help="Print the optional aggregate generation rate in token/s.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=20)
@@ -185,6 +190,8 @@ def build_runner_command(arguments, runner, model, prompt_file):
         command.extend(["--host-memory-mb", str(arguments.host_memory_mb)])
     if arguments.stream:
         command.append("--stream-token-ids")
+    if arguments.report_throughput:
+        command.append("--report-throughput")
     return command
 
 
@@ -193,6 +200,20 @@ def parse_generated_tokens(stdout):
     if not match:
         raise RuntimeError("runner did not report generated token IDs")
     return [int(token) for token in match.group(1).split()]
+
+
+def print_reported_throughput(output):
+    match = re.search(
+        r"^(?:Parallel sessions: \d+, aggregate throughput: "
+        r"|Aggregate throughput: )([0-9.eE+-]+) token/s$",
+        output,
+        re.MULTILINE,
+    )
+    if match:
+        print(
+            f"Aggregate throughput: {match.group(1)} token/s",
+            file=sys.stderr,
+        )
 
 
 def strip_stop_tokens(tokens, stop_tokens):
@@ -287,6 +308,8 @@ def run_streaming(command, tokenizer, arguments, stop_tokens):
                 sys.stderr.flush()
     return_code = process.wait()
     streamer.finish()
+    if return_code == 0 and arguments.report_throughput and not arguments.verbose:
+        print_reported_throughput("".join(diagnostics))
     if return_code != 0:
         sys.stderr.write("".join(diagnostics))
     return return_code, streamer.tokens, streamer
@@ -379,6 +402,8 @@ def main():
         if arguments.verbose:
             sys.stderr.write(completed.stdout)
             sys.stderr.write(completed.stderr)
+        elif arguments.report_throughput:
+            print_reported_throughput(completed.stdout)
         try:
             completion_tokens = parse_generated_tokens(completed.stdout)
         except RuntimeError as error:

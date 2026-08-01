@@ -26,6 +26,7 @@ namespace moe {
 #define NCNN_MOE_RUNTIME_RANK_ADAPT_BIT          6
 #define NCNN_MOE_RUNTIME_READ_MERGE_BIT          7
 #define NCNN_MOE_RUNTIME_ASYNC_ROUTER_PRED_BIT   8
+#define NCNN_MOE_RUNTIME_RELEASE_DENSE_BIT       9
 
 enum RuntimeOptionFlag : uint32_t
 {
@@ -37,7 +38,8 @@ enum RuntimeOptionFlag : uint32_t
     RuntimeOptionForwardAwareCache = UINT32_C(1) << NCNN_MOE_RUNTIME_FORWARD_ARC_BIT,
     RuntimeOptionRankAdaptivePrefetch = UINT32_C(1) << NCNN_MOE_RUNTIME_RANK_ADAPT_BIT,
     RuntimeOptionCrossExpertReadCoalescing = UINT32_C(1) << NCNN_MOE_RUNTIME_READ_MERGE_BIT,
-    RuntimeOptionAsyncRouterPrediction = UINT32_C(1) << NCNN_MOE_RUNTIME_ASYNC_ROUTER_PRED_BIT
+    RuntimeOptionAsyncRouterPrediction = UINT32_C(1) << NCNN_MOE_RUNTIME_ASYNC_ROUTER_PRED_BIT,
+    RuntimeOptionReleaseVulkanDenseHostStorage = UINT32_C(1) << NCNN_MOE_RUNTIME_RELEASE_DENSE_BIT
 };
 
 struct RuntimeOptions

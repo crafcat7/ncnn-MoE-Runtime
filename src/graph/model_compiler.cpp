@@ -627,6 +627,93 @@ static uint64_t tensor_storage_bytes(const TensorData& tensor)
     return bytes;
 }
 
+static bool uses_vulkan_dense_operator(const TensorData& tensor)
+{
+    return tensor.bfloat16_linear_operator
+           || tensor.float8_linear_operator
+           || (tensor.linear_operator && tensor.linear_operator->uses_vulkan());
+}
+
+static void release_tensor_host_storage(TensorData& tensor)
+{
+    if (tensor.dtype == DType::Float32)
+    {
+        std::vector<float>().swap(tensor.float32_data);
+    }
+    else if (tensor.dtype == DType::BFloat16)
+    {
+        std::vector<uint16_t>().swap(tensor.bfloat16_data);
+    }
+    else if (tensor.dtype == DType::Float8E4M3)
+    {
+        std::vector<float>().swap(tensor.quantization_scales);
+    }
+    else
+    {
+        return;
+    }
+    tensor.mapped_data.reset();
+    tensor.mapped_byte_count = 0;
+}
+
+static void release_vulkan_dense_handle(CompiledModel& compiled, TensorHandle handle)
+{
+    if (handle == invalid_tensor_handle)
+        return;
+    release_tensor_host_storage(compiled.weights.at_mutable(handle));
+}
+
+static void release_vulkan_dense_host_copies(CompiledModel& compiled)
+{
+    for (TensorHandle handle = 0; handle < compiled.weights.size(); ++handle)
+    {
+        TensorData& tensor = compiled.weights.at_mutable(handle);
+        if (uses_vulkan_dense_operator(tensor))
+            release_tensor_host_storage(tensor);
+    }
+
+    const auto release_fused_layer_handles = [&compiled](CompiledLayerPlan& layer) {
+        AttentionBlockPlan& attention = layer.attention;
+        const bool qkv_fused = attention.fused_qkv_operator
+                               || attention.fused_qkv_bfloat16_operator
+                               || attention.fused_qkv_gate_bfloat16_operator;
+        if (qkv_fused)
+        {
+            release_vulkan_dense_handle(compiled, attention.query_weight);
+            release_vulkan_dense_handle(compiled, attention.key_weight);
+            release_vulkan_dense_handle(compiled, attention.value_weight);
+        }
+        if (attention.fused_qkv_gate_bfloat16_operator)
+            release_vulkan_dense_handle(compiled, attention.output_gate_weight);
+
+        if (attention.fused_delta_input_operator || attention.fused_delta_input_bfloat16_operator)
+        {
+            release_vulkan_dense_handle(compiled, attention.delta_qkv_weight);
+            release_vulkan_dense_handle(compiled, attention.delta_z_weight);
+            release_vulkan_dense_handle(compiled, attention.delta_beta_weight);
+            release_vulkan_dense_handle(compiled, attention.delta_alpha_weight);
+        }
+
+        if (attention.vulkan_attention_operator)
+        {
+            release_vulkan_dense_handle(compiled, attention.pre_attention_norm_weight);
+            release_vulkan_dense_handle(compiled, attention.sinks);
+        }
+
+        if (layer.moe.fused_shared_input_bfloat16_operator)
+        {
+            release_vulkan_dense_handle(compiled, layer.moe.shared_expert.gate_weight);
+            release_vulkan_dense_handle(compiled, layer.moe.shared_expert.up_weight);
+            release_vulkan_dense_handle(compiled, layer.moe.shared_expert_gate_weight);
+        }
+    };
+
+    for (CompiledLayerPlan& layer : compiled.layers)
+        release_fused_layer_handles(layer);
+    for (CompiledLayerPlan& layer : compiled.speculative.layers)
+        release_fused_layer_handles(layer);
+}
+
 static uint64_t expert_weight_bytes(const WeightTable& weights, const ExpertPlan& expert)
 {
     const uint32_t handles[] = {
@@ -2257,6 +2344,8 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
     auto graph = build_compiled_execution_graph(compiled, capabilities);
     if (!graph)
         return graph.error();
+    if (has_flag(capabilities.flags, BackendCapabilityReleaseVulkanDenseHostStorage))
+        release_vulkan_dense_host_copies(compiled);
     return compiled;
 }
 

@@ -50,7 +50,7 @@ python tools\run_gpt_oss_prompt.py `
   .\build-ncnn\Release\ncnn_moe_gpt_oss.exe `
   .\models\gpt-oss\gpt-oss-20b `
   "Reply with exactly: OK" `
-  --max-new-tokens 1024 --stream --backend hybrid
+  --max-new-tokens 1024 --stream --backend hybrid --report-throughput
 ```
 
 By default, the text wrapper prints only the human-readable
@@ -58,7 +58,8 @@ By default, the text wrapper prints only the human-readable
 timings, and cache statistics are suppressed unless `--verbose` is present.
 The reply limit defaults to 1024 tokens; reaching it before a Harmony stop
 token produces a warning. `--stream-final-only` remains available when only
-the answer is wanted.
+the answer is wanted. `--report-throughput` prints only the optional aggregate
+generation rate without enabling the full native diagnostic output.
 
 ## Run token IDs
 
@@ -68,13 +69,15 @@ token IDs:
 ```powershell
 .\build-ncnn\Release\ncnn_moe_gpt_oss.exe `
   .\models\gpt-oss\gpt-oss-20b 0 `
-  --max-new-tokens 64 --hybrid
+  --max-new-tokens 64 --hybrid --report-throughput
 ```
 
 Use `--stream-token-ids` to print generated IDs as they become available. The
 final report includes backend dispatch counts, phase timings, cache statistics,
 and the complete generated sequence. For long whitespace-separated token
 sequences, use `--prompt-token-file PATH` instead of positional IDs.
+`--report-throughput` adds the aggregate generation rate in token/s; omit it
+when that optional line is not needed.
 `ncnn_moe_gpt_oss` and `ncnn_moe_deepseek_v4` use the same native runner
 implementation and option parser; their entry points only select the expected
 adapter and model-specific default EOS.
@@ -282,6 +285,12 @@ python tools\benchmark_reference_matrix.py gpt-oss `
 
 The aggregate report is
 `build-reports/performance-matrix/gpt-oss/report.json`.
+For a CPU-only comparison, build the runner with
+`-DNCNN_MOE_USE_VULKAN=OFF`, use a separate output directory, and add
+`--matrix-backend cpu` to the command. Each CPU case records
+`execution_evidence`; the matrix rejects reported GPU execution while keeping
+Vulkan-context initialization and system-wide `nvidia-smi` observations
+explicitly separate.
 Use `tools/benchmark_runtime.py` directly for a custom prompt or token
 window. Keep the model path, warm-up policy, memory budgets, Session count, and
 backend fixed when comparing implementation changes. Public reference commands
