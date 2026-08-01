@@ -70,6 +70,8 @@ def parse_arguments():
             "gpt-oss",
             "deepseek-v4-flash",
             "deepseek-v4-flash-dspark",
+            "qwen3.6-35b-a3b",
+            "qwen3.6-35b-a3b-mxfp4-v2",
         ),
         default="gpt-oss",
         help="Published matrix family; defaults to GPT-OSS.",
@@ -248,6 +250,80 @@ def deepseek_from_report(path, family):
                         "warm": warm["system_physical_read_bytes"] / 1e9,
                     }
                 )
+
+        return {
+            "hybrid": hybrid,
+            "storage": storage,
+            "logical_reads": logical_reads,
+            "physical_reads": physical_reads,
+        }
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        print(
+            f"cannot parse {path}: {error}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def qwen_from_report(path, family):
+    if not path.is_file():
+        return None
+
+    try:
+        aggregate = json.loads(path.read_text(encoding="utf-8"))
+        base_family = family.split("-mxfp4-", 1)[0]
+        benchmark = f"{base_family.replace('-', '_')}_performance_matrix"
+        if aggregate["benchmark"] != benchmark:
+            raise ValueError(f"not a {family} performance matrix")
+        results = {
+            result["case"]["name"]: result["report"]
+            for result in aggregate["results"]
+        }
+
+        def throughput_case(name, label):
+            cold = results[f"{base_family}-{name}-cold"]["median"]
+            warm = results[f"{base_family}-{name}-warm"]["median"]
+            return {
+                "label": label,
+                "cold": cold["decode_tokens_per_second"],
+                "warm": warm["decode_tokens_per_second"],
+            }
+
+        hybrid = [
+            throughput_case("single-hybrid-short", "1S · 32 tok"),
+            throughput_case("single-hybrid-long", "1S · 256 tok"),
+            throughput_case("service-4xshort", "4S · 32 tok"),
+            throughput_case("service-4xlong", "4S · 256 tok"),
+        ]
+        storage = [
+            throughput_case("single-cpu-short", "CPU · 1S · 32 tok"),
+            throughput_case("single-cpu-long", "CPU · 1S · 256 tok"),
+        ]
+
+        logical_reads = []
+        physical_reads = []
+        for name, label in (
+            ("single-hybrid-short", "1S · 32 tok"),
+            ("single-hybrid-long", "1S · 256 tok"),
+            ("service-4xshort", "4S · 32 tok"),
+            ("service-4xlong", "4S · 256 tok"),
+        ):
+            cold = results[f"{base_family}-{name}-cold"]["median"]
+            warm = results[f"{base_family}-{name}-warm"]["median"]
+            logical_reads.append(
+                {
+                    "label": label,
+                    "cold": cold["runtime_logical_read_bytes"] / 1e9,
+                    "warm": warm["runtime_logical_read_bytes"] / 1e9,
+                }
+            )
+            physical_reads.append(
+                {
+                    "label": label,
+                    "cold": cold["system_physical_read_bytes"] / 1e9,
+                    "warm": warm["system_physical_read_bytes"] / 1e9,
+                }
+            )
 
         return {
             "hybrid": hybrid,
@@ -458,14 +534,15 @@ def build_gpt_oss_svg(data):
 
 
 def panel_maximum(rows):
-    return max(
+    maximum = max(
         float(row[series])
         for row in rows
         for series in ("cold", "warm")
-    ) * 1.15
+    )
+    return max(maximum * 1.15, 1.0)
 
 
-def build_deepseek_svg(data, family):
+def build_matrix_svg(data, title, subtitle, footer):
     width = 1400
     height = 1130
     margin = 42
@@ -473,10 +550,6 @@ def build_deepseek_svg(data, family):
     panel_width = (width - margin * 2 - gap) / 2
     panel_height = 460
     lower_y = 585
-    dspark = family == "deepseek-v4-flash-dspark"
-    model_name = "DeepSeek V4 Flash DSpark" if dspark else "DeepSeek V4 Flash"
-    title = f"{model_name} performance matrix"
-    mode = "DSpark enabled" if dspark else "target-only"
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
         f'height="{height}" viewBox="0 0 {width} {height}" role="img" '
@@ -484,14 +557,13 @@ def build_deepseek_svg(data, family):
         f'<title id="chart-title">{title}</title>',
         '<desc id="chart-desc">Cold and warm throughput, Runtime logical '
         'Expert reads, and sampled system physical reads for the '
-        f'{model_name} benchmark matrix.</desc>',
+        f'{escape(title)}.</desc>',
         f'<rect width="{width}" height="{height}" fill="#ffffff"/>',
         svg_text(margin, 44, title, size=27, weight=600),
         svg_text(
             margin,
             70,
-            "Ryzen 7 9800X3D · 31.14 GiB RAM · RTX 5070 Ti 16 GiB · "
-            f"fixed 16-token prompt · three-run medians · {mode}",
+            subtitle,
             size=13,
             fill=COLORS["muted"],
         ),
@@ -544,14 +616,40 @@ def build_deepseek_svg(data, family):
         svg_text(
             margin,
             height - 21,
-            "Short = 32 tokens · long = 256 tokens · 4S throughput is "
-            "aggregate · operating-system file cache not flushed",
+            footer,
             size=12,
             fill=COLORS["muted"],
         ),
         "</svg>",
     ]
     return "\n".join(parts) + "\n"
+
+
+def build_deepseek_svg(data, family):
+    dspark = family == "deepseek-v4-flash-dspark"
+    model_name = "DeepSeek V4 Flash DSpark" if dspark else "DeepSeek V4 Flash"
+    mode = "DSpark enabled" if dspark else "target-only"
+    return build_matrix_svg(
+        data,
+        f"{model_name} performance matrix",
+        "Ryzen 7 9800X3D · 31.14 GiB RAM · RTX 5070 Ti 16 GiB · "
+        f"fixed 16-token prompt · three-run medians · {mode}",
+        "Short = 32 tokens · long = 256 tokens · 4S throughput is "
+        "aggregate · operating-system file cache not flushed",
+    )
+
+
+def build_qwen_svg(data, family):
+    artifact = family.endswith("-mxfp4-v2")
+    profile = "compiled MXFP4 Artifact" if artifact else "BF16 source"
+    return build_matrix_svg(
+        data,
+        f"Qwen3.6-35B-A3B {profile} matrix",
+        "Ryzen 7 9800X3D · 31.14 GiB RAM · RTX 5070 Ti 16 GiB · "
+        f"31-token prompt · three-run medians · {profile}",
+        "Short = 32 tokens · long = 256 tokens · 4S throughput is "
+        "aggregate · operating-system file cache not flushed",
+    )
 
 
 def main():
@@ -566,6 +664,17 @@ def main():
         report_path = Path(arguments.report or default_report)
         data = report_loader(report_path) or reference_data
         svg = build_gpt_oss_svg(data)
+    elif arguments.family.startswith("qwen3.6-35b-a3b"):
+        default_report = (
+            "build-reports/performance-matrix/"
+            f"{arguments.family}/report.json"
+        )
+        default_output = f"assets/{arguments.family}-performance.svg"
+        report_path = Path(arguments.report or default_report)
+        data = qwen_from_report(report_path, arguments.family)
+        if data is None:
+            return 1
+        svg = build_qwen_svg(data, arguments.family)
     else:
         default_report = (
             "build-reports/performance-matrix/"

@@ -197,6 +197,14 @@ storage I/O is not the bottleneck for this eager profile.
 
 ### BF16 source admission matrix
 
+![Qwen3.6-35B-A3B BF16 source performance matrix](../../assets/qwen3.6-35b-a3b-performance.svg)
+
+Regenerate the chart from the matrix JSON with:
+
+```powershell
+python tools\generate_performance_chart.py --family qwen3.6-35b-a3b
+```
+
 The accepted BF16 matrix uses the official chat template for the fixed prompt
 `Explain the tradeoffs of mixture-of-experts inference in at least 1000
 words.`. It encodes to 31 input tokens. Every cell uses greedy decoding with
@@ -263,6 +271,14 @@ Vulkan-context initialization and system-wide `nvidia-smi` observations
 explicitly separate.
 
 ### Compiled Artifact admission matrix
+
+![Qwen3.6-35B-A3B compiled Artifact performance matrix](../../assets/qwen3.6-35b-a3b-mxfp4-v2-performance.svg)
+
+Regenerate the chart from the Artifact matrix JSON with:
+
+```powershell
+python tools\generate_performance_chart.py --family qwen3.6-35b-a3b-mxfp4-v2
+```
 
 The optional Artifact completed the same 12-cell matrix with speculation
 disabled. The recorded full matrix used Artifact v2; Artifact v3 preserves the
