@@ -60,6 +60,40 @@ static TensorData make_matrix(uint32_t output_columns, uint32_t input_columns)
     return matrix;
 }
 
+static TensorData decode_bfloat16_matrix(const TensorData& matrix)
+{
+    if (matrix.dtype != DType::MxFp4 || matrix.shape.size() != 2 || matrix.shape[1] % 32 != 0)
+        throw std::invalid_argument("MXFP4 matrix is invalid");
+
+    static constexpr float magnitudes[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const uint32_t output_columns = matrix.shape[0];
+    const uint32_t input_columns = matrix.shape[1];
+    const uint32_t block_count = input_columns / 32;
+    TensorData decoded;
+    decoded.dtype = DType::BFloat16;
+    decoded.shape = matrix.shape;
+    decoded.bfloat16_data.resize(static_cast<size_t>(output_columns) * input_columns);
+    for (uint32_t output = 0; output < output_columns; ++output)
+    {
+        const size_t packed_row = static_cast<size_t>(output) * block_count * 16;
+        const size_t scale_row = static_cast<size_t>(output) * block_count;
+        uint16_t* destination = decoded.bfloat16_data.data() + static_cast<size_t>(output) * input_columns;
+        for (uint32_t block = 0; block < block_count; ++block)
+        {
+            const uint8_t encoded_scale = matrix.mxfp4_scales[scale_row + block];
+            const float scale = std::ldexp(1.0f, encoded_scale == 0 ? -127 : static_cast<int>(encoded_scale) - 127);
+            for (uint32_t lane = 0; lane < 32; ++lane)
+            {
+                const uint8_t packed = matrix.mxfp4_blocks[packed_row + static_cast<size_t>(block) * 16 + lane / 2];
+                const uint8_t value = (lane & 1) == 0 ? packed & 15 : packed >> 4;
+                const float magnitude = magnitudes[value & 7];
+                destination[block * 32 + lane] = float_to_bfloat16((value & 8) == 0 ? magnitude * scale : -magnitude * scale);
+            }
+        }
+    }
+    return decoded;
+}
+
 static CpuBatch make_input(uint32_t token_count, uint32_t columns)
 {
     CpuBatch input(token_count, columns);
@@ -184,6 +218,7 @@ int main(int argc, char** argv)
         }
 
         ncnn::moe::TensorData matrix = ncnn::moe::make_matrix(output_columns, input_columns);
+        ncnn::moe::TensorData bfloat16_matrix = ncnn::moe::decode_bfloat16_matrix(matrix);
         const ncnn::moe::CpuBatch input = ncnn::moe::make_input(token_count, input_columns);
         ncnn::moe::CpuBatch cpu_output = ncnn::moe::linear_batch(matrix, input);
         std::vector<double> cpu_times;
@@ -195,10 +230,30 @@ int main(int argc, char** argv)
             cpu_times.push_back(ncnn::moe::elapsed_milliseconds(started));
         }
 
-        auto vulkan = ncnn::moe::NcnnVulkanMxfp4Operator ::create(matrix, nullptr, device_index);
+        auto vulkan = ncnn::moe::NcnnVulkanMxfp4Operator::create(matrix, nullptr, device_index);
         if (!vulkan)
         {
             std::cout << "Vulkan MXFP4 projection unavailable\n";
+            return 0;
+        }
+        auto bfloat16_vulkan = ncnn::moe::NcnnLinearOperator::create(
+            bfloat16_matrix,
+            nullptr,
+            ncnn::moe::NcnnLinearDevice::Vulkan,
+            device_index);
+        if (!bfloat16_vulkan)
+        {
+            std::cout << "Vulkan BF16-source projection unavailable\n";
+            return 0;
+        }
+        auto packed_bfloat16_vulkan =
+            ncnn::moe::NcnnVulkanBfloat16Operator::create(
+                bfloat16_matrix,
+                nullptr,
+                device_index);
+        if (!packed_bfloat16_vulkan)
+        {
+            std::cout << "Vulkan packed-BF16 projection unavailable\n";
             return 0;
         }
         ncnn::moe::CpuBatch vulkan_output;
@@ -207,8 +262,26 @@ int main(int argc, char** argv)
             std::cerr << "Vulkan MXFP4 warm-up failed\n";
             return 1;
         }
+        ncnn::moe::CpuBatch bfloat16_vulkan_output;
+        if (!bfloat16_vulkan->forward(input, bfloat16_vulkan_output))
+        {
+            std::cerr << "Vulkan BF16-source warm-up failed\n";
+            return 1;
+        }
+        ncnn::moe::CpuBatch packed_bfloat16_vulkan_output;
+        if (!packed_bfloat16_vulkan->forward(
+                input,
+                packed_bfloat16_vulkan_output))
+        {
+            std::cerr << "Vulkan packed-BF16 warm-up failed\n";
+            return 1;
+        }
         std::vector<double> vulkan_times;
+        std::vector<double> bfloat16_vulkan_times;
+        std::vector<double> packed_bfloat16_vulkan_times;
         vulkan_times.reserve(repeats);
+        bfloat16_vulkan_times.reserve(repeats);
+        packed_bfloat16_vulkan_times.reserve(repeats);
         for (uint32_t repeat = 0; repeat < repeats; ++repeat)
         {
             const auto started = std::chrono::steady_clock::now();
@@ -218,34 +291,92 @@ int main(int argc, char** argv)
                 return 1;
             }
             vulkan_times.push_back(ncnn::moe::elapsed_milliseconds(started));
+
+            const auto bfloat16_started = std::chrono::steady_clock::now();
+            if (!bfloat16_vulkan->forward(input, bfloat16_vulkan_output))
+            {
+                std::cerr << "Vulkan BF16-source projection failed\n";
+                return 1;
+            }
+            bfloat16_vulkan_times.push_back(ncnn::moe::elapsed_milliseconds(bfloat16_started));
+
+            const auto packed_bfloat16_started =
+                std::chrono::steady_clock::now();
+            if (!packed_bfloat16_vulkan->forward(
+                    input,
+                    packed_bfloat16_vulkan_output))
+            {
+                std::cerr << "Vulkan packed-BF16 projection failed\n";
+                return 1;
+            }
+            packed_bfloat16_vulkan_times.push_back(
+                ncnn::moe::elapsed_milliseconds(
+                    packed_bfloat16_started));
         }
 
         float maximum_error = 0.0f;
+        float maximum_bfloat16_error = 0.0f;
+        float maximum_packed_bfloat16_error = 0.0f;
         std::vector<float> row_errors(cpu_output.rows(), 0.0f);
         for (size_t row = 0; row < cpu_output.rows(); ++row)
         {
             for (uint32_t column = 0; column < cpu_output.columns(); ++column)
             {
                 maximum_error = std::max(maximum_error, std::abs(cpu_output.row(row)[column] - vulkan_output.row(row)[column]));
+                maximum_bfloat16_error =
+                    std::max(maximum_bfloat16_error, std::abs(cpu_output.row(row)[column] - bfloat16_vulkan_output.row(row)[column]));
+                maximum_packed_bfloat16_error =
+                    std::max(
+                        maximum_packed_bfloat16_error,
+                        std::abs(
+                            cpu_output.row(row)[column]
+                            - packed_bfloat16_vulkan_output.row(row)[column]));
                 row_errors[row] = std::max(row_errors[row], std::abs(cpu_output.row(row)[column] - vulkan_output.row(row)[column]));
             }
         }
         const uint64_t weight_bytes = matrix.mxfp4_blocks.size() + matrix.mxfp4_scales.size();
+        const uint64_t bfloat16_source_bytes = bfloat16_matrix.bfloat16_data.size() * sizeof(uint16_t);
+        const uint64_t bfloat16_device_bytes = bfloat16_matrix.bfloat16_data.size() * sizeof(float);
         const double cpu_ms = ncnn::moe::median_milliseconds(cpu_times);
         const double vulkan_ms = ncnn::moe::median_milliseconds(vulkan_times);
+        const double bfloat16_vulkan_ms = ncnn::moe::median_milliseconds(bfloat16_vulkan_times);
+        const double packed_bfloat16_vulkan_ms =
+            ncnn::moe::median_milliseconds(
+                packed_bfloat16_vulkan_times);
         const auto bandwidth = [weight_bytes, token_count](double milliseconds) { return static_cast<double>(weight_bytes) * token_count / (1024.0 * 1024.0 * 1024.0) / (milliseconds / 1000.0); };
+        const auto bfloat16_bandwidth = [bfloat16_device_bytes, token_count](double milliseconds) {
+            return static_cast<double>(bfloat16_device_bytes) * token_count / (1024.0 * 1024.0 * 1024.0) / (milliseconds / 1000.0);
+        };
         std::cout << "shape: " << token_count << " x " << input_columns << " -> " << output_columns << '\n';
         std::cout << "Vulkan device: " << (device_index == ncnn::moe::automatic_vulkan_device_index ? -1 : static_cast<int64_t>(device_index)) << '\n';
-        std::cout << "weight bytes: " << weight_bytes << '\n';
+        std::cout << "MXFP4 weight bytes: " << weight_bytes << '\n';
+        std::cout << "BF16 source/device weight bytes: " << bfloat16_source_bytes << " / " << bfloat16_device_bytes << '\n';
         std::cout << "CPU median: " << cpu_ms << " ms, " << bandwidth(cpu_ms) << " effective GiB/s\n";
-        std::cout << "Vulkan median: " << vulkan_ms << " ms, " << bandwidth(vulkan_ms) << " effective GiB/s\n";
-        std::cout << "speedup: " << cpu_ms / vulkan_ms << "x\n";
-        std::cout << "maximum absolute error: " << maximum_error << '\n';
+        std::cout << "Vulkan MXFP4 median: " << vulkan_ms << " ms, " << bandwidth(vulkan_ms) << " effective GiB/s\n";
+        std::cout << "Vulkan BF16-source median: " << bfloat16_vulkan_ms << " ms, " << bfloat16_bandwidth(bfloat16_vulkan_ms) << " effective GiB/s\n";
+        std::cout << "Vulkan packed-BF16 median: "
+                  << packed_bfloat16_vulkan_ms << " ms, "
+                  << static_cast<double>(bfloat16_source_bytes) * token_count
+                         / (1024.0 * 1024.0 * 1024.0)
+                         / (packed_bfloat16_vulkan_ms / 1000.0)
+                  << " effective GiB/s\n";
+        std::cout << "MXFP4 speedup over CPU: " << cpu_ms / vulkan_ms << "x\n";
+        std::cout << "MXFP4 speedup over Vulkan BF16-source: " << bfloat16_vulkan_ms / vulkan_ms << "x\n";
+        std::cout << "packed-BF16 speedup over Vulkan BF16-source: "
+                  << bfloat16_vulkan_ms / packed_bfloat16_vulkan_ms
+                  << "x\n";
+        std::cout << "maximum MXFP4 absolute error: " << maximum_error << '\n';
+        std::cout << "maximum BF16-source absolute error: " << maximum_bfloat16_error << '\n';
+        std::cout << "maximum packed-BF16 absolute error: "
+                  << maximum_packed_bfloat16_error << '\n';
         std::cout << "row maximum errors:";
         for (float error : row_errors)
             std::cout << ' ' << error;
         std::cout << '\n';
-        return maximum_error <= 1e-3f ? 0 : 1;
+        return maximum_error <= 1e-3f
+                       && maximum_packed_bfloat16_error <= 1e-3f
+                   ? 0
+                   : 1;
     }
     catch (const std::exception& error)
     {

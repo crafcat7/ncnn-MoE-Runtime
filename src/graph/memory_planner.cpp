@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <limits>
 #include <string>
+#include <utility>
 
 namespace ncnn {
 namespace moe {
@@ -90,6 +91,13 @@ static Result<uint64_t> latent_fp8_dense_bytes(const MoeIR& ir)
         const LayerDescriptor& layer = ir.layers[layer_id];
         const AttentionDescriptor& attention = layer.attention;
         const MoeDescriptor& moe = layer.ffn.moe;
+        if (attention.kind != AttentionKind::MultiHeadLatent
+            || attention.projection_weight_dtype != DType::Float8E4M3
+            || attention.output_group_count == 0
+            || attention.head_count % attention.output_group_count != 0)
+        {
+            return Error{ErrorCode::InvalidModel, "invalid DeepSeek latent attention dimensions"};
+        }
         const uint64_t mix_count = (2 + multiplier) * multiplier;
         for (uint32_t block = 0; block < 2; ++block)
         {
@@ -174,15 +182,107 @@ static Result<uint64_t> latent_fp8_dense_bytes(const MoeIR& ir)
             status = add_vector_bytes(moe.expert_count, 4, "DeepSeek router bias", total);
         if (!status)
             return status.error();
-        for (uint32_t projection = 0; projection < 2; ++projection)
-        {
-            status = add_matrix_bytes(moe.intermediate_size, ir.hidden_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert input", total);
-            if (!status)
-                return status.error();
-        }
+        status = add_matrix_bytes(moe.intermediate_size, ir.hidden_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert input", total);
+        if (!status)
+            return status.error();
+        status = add_matrix_bytes(moe.intermediate_size, ir.hidden_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert input", total);
+        if (!status)
+            return status.error();
         status = add_matrix_bytes(ir.hidden_size, moe.intermediate_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert output", total);
         if (!status)
             return status.error();
+    }
+    return total;
+}
+
+static Result<uint64_t> latent_vulkan_releasable_dense_bytes(const MoeIR& ir)
+{
+    if (ir.layers.empty()
+        || ir.hyper_connection_multiplier <= 1
+        || ir.layers.front().attention.kind != AttentionKind::MultiHeadLatent
+        || ir.layers.front().attention.projection_weight_dtype != DType::Float8E4M3)
+    {
+        return uint64_t{0};
+    }
+
+    uint64_t total = 0;
+    Result<void> status = add_matrix_bytes(
+        ir.vocabulary_size,
+        ir.hidden_size,
+        DType::BFloat16,
+        "Vulkan LM head",
+        total);
+    if (!status)
+        return status.error();
+
+    for (const LayerDescriptor& layer : ir.layers)
+    {
+        const AttentionDescriptor& attention = layer.attention;
+        if (attention.kind != AttentionKind::MultiHeadLatent
+            || attention.projection_weight_dtype != DType::Float8E4M3
+            || attention.output_group_count == 0
+            || attention.head_count % attention.output_group_count != 0)
+        {
+            return uint64_t{0};
+        }
+        const uint64_t group_input = static_cast<uint64_t>(attention.head_count) * attention.head_dimension / attention.output_group_count;
+        const std::pair<uint64_t, uint64_t> matrices[] = {
+            {attention.query_lora_rank, ir.hidden_size},
+            {static_cast<uint64_t>(attention.head_count) * attention.head_dimension, attention.query_lora_rank},
+            {attention.head_dimension, ir.hidden_size},
+            {static_cast<uint64_t>(attention.output_group_count) * attention.output_lora_rank, group_input},
+            {ir.hidden_size, static_cast<uint64_t>(attention.output_group_count) * attention.output_lora_rank},
+        };
+        for (const auto& matrix : matrices)
+        {
+            status = add_matrix_bytes(
+                matrix.first,
+                matrix.second,
+                DType::Float8E4M3,
+                "Vulkan latent projection",
+                total);
+            if (!status)
+                return status.error();
+        }
+        if (attention.compression_ratio == 4)
+        {
+            status = add_matrix_bytes(
+                static_cast<uint64_t>(attention.index_head_count) * attention.index_head_dimension,
+                attention.query_lora_rank,
+                DType::Float8E4M3,
+                "Vulkan index query",
+                total);
+            if (!status)
+                return status.error();
+        }
+
+        if (layer.ffn.moe.shared_expert_count != 0)
+        {
+            status = add_matrix_bytes(
+                layer.ffn.moe.intermediate_size,
+                ir.hidden_size,
+                layer.ffn.moe.shared_expert_weight_dtype,
+                "Vulkan shared Expert input",
+                total);
+            if (!status)
+                return status.error();
+            status = add_matrix_bytes(
+                layer.ffn.moe.intermediate_size,
+                ir.hidden_size,
+                layer.ffn.moe.shared_expert_weight_dtype,
+                "Vulkan shared Expert input",
+                total);
+            if (!status)
+                return status.error();
+            status = add_matrix_bytes(
+                ir.hidden_size,
+                layer.ffn.moe.intermediate_size,
+                layer.ffn.moe.shared_expert_weight_dtype,
+                "Vulkan shared Expert output",
+                total);
+            if (!status)
+                return status.error();
+        }
     }
     return total;
 }
@@ -225,7 +325,7 @@ static Result<uint64_t> dense_bytes(const MoeIR& ir)
                 key_value = checked_multiply(key_value_size, ir.hidden_size * 2ull, "key/value projections");
                 output = checked_multiply(ir.hidden_size, query_size, "attention output projection");
             }
-            else
+            else if (attention.kind == AttentionKind::MultiHeadLatent)
             {
                 const uint64_t qk_size = static_cast<uint64_t>(attention.head_count) * (attention.qk_nope_head_dimension + attention.qk_rope_head_dimension);
                 const uint64_t kv_a_size = attention.kv_lora_rank + attention.qk_rope_head_dimension;
@@ -239,6 +339,22 @@ static Result<uint64_t> dense_bytes(const MoeIR& ir)
                 query = checked_add(query_a_elements, query_b_elements, "MLA query projections");
                 key_value = checked_add(static_cast<uint64_t>(ir.hidden_size) * kv_a_size + attention.kv_lora_rank, static_cast<uint64_t>(attention.kv_lora_rank) * kv_b_size, "MLA key/value projections");
                 output = checked_multiply(ir.hidden_size, static_cast<uint64_t>(attention.head_count) * attention.value_head_dimension, "MLA output projection");
+            }
+            else
+            {
+                const uint64_t linear_key_size = static_cast<uint64_t>(attention.kv_head_count) * attention.head_dimension;
+                const uint64_t linear_value_size = static_cast<uint64_t>(attention.head_count) * attention.value_head_dimension;
+                const uint64_t convolution_size = linear_key_size * 2 + linear_value_size;
+                query = checked_multiply(convolution_size + linear_value_size + attention.head_count * 2ull, ir.hidden_size, "gated DeltaNet projections");
+                key_value = checked_multiply(convolution_size, attention.convolution_kernel_size, "gated DeltaNet convolution");
+                if (key_value)
+                {
+                    key_value = checked_add(
+                        key_value.value(),
+                        attention.head_count * 2ull + attention.value_head_dimension,
+                        "gated DeltaNet parameters");
+                }
+                output = checked_multiply(ir.hidden_size, linear_value_size, "gated DeltaNet output projection");
             }
             if (!query)
                 return query.error();
@@ -280,6 +396,16 @@ static Result<uint64_t> dense_bytes(const MoeIR& ir)
                     return with_qk_norm.error();
                 layer_elements = with_qk_norm.value();
             }
+            if (has_flag(layer.attention.flags, AttentionDescriptorOutputGate))
+            {
+                auto output_gate = checked_multiply(query_size, ir.hidden_size, "attention output gate");
+                if (!output_gate)
+                    return output_gate.error();
+                auto with_output_gate = checked_add(layer_elements, output_gate.value(), "attention output gate");
+                if (!with_output_gate)
+                    return with_output_gate.error();
+                layer_elements = with_output_gate.value();
+            }
         }
 
         if (has_flag(layer.flags, LayerDescriptorMoe))
@@ -318,6 +444,13 @@ static Result<uint64_t> dense_bytes(const MoeIR& ir)
                 if (!with_shared)
                     return with_shared.error();
                 layer_elements = with_shared.value();
+                if (has_flag(layer.ffn.moe.flags, MoeDescriptorSharedExpertGate))
+                {
+                    auto with_shared_gate = checked_add(layer_elements, ir.hidden_size, "shared Expert gate");
+                    if (!with_shared_gate)
+                        return with_shared_gate.error();
+                    layer_elements = with_shared_gate.value();
+                }
             }
         }
         else if (has_flag(layer.flags, LayerDescriptorDenseFfn))
@@ -340,6 +473,80 @@ static Result<uint64_t> dense_bytes(const MoeIR& ir)
         total = with_layer.value();
     }
 
+    if (ir.speculative_kind == SpeculativeModelKind::Mtp)
+    {
+        if (ir.speculative_layer_count != 1
+            || ir.layers.empty()
+            || ir.layers.back().attention.kind != AttentionKind::Standard)
+        {
+            return Error{ErrorCode::InvalidModel, "invalid MTP dense-memory configuration"};
+        }
+        const LayerDescriptor& layer = ir.layers.back();
+        const AttentionDescriptor& attention = layer.attention;
+        const MoeDescriptor& moe = layer.ffn.moe;
+        const uint64_t query_size = static_cast<uint64_t>(attention.head_count) * attention.head_dimension;
+        const uint64_t key_value_size = static_cast<uint64_t>(attention.kv_head_count) * attention.head_dimension;
+        uint64_t mtp_elements = 0;
+        auto add_elements = [&mtp_elements](uint64_t elements, const char* name) -> Result<void> {
+            auto added = checked_add(mtp_elements, elements, name);
+            if (!added)
+                return added.error();
+            mtp_elements = added.value();
+            return {};
+        };
+        auto matrix_elements = [](uint64_t rows, uint64_t columns, const char* name) {
+            return checked_multiply(rows, columns, name);
+        };
+
+        Result<void> status = add_elements(ir.hidden_size * 5ull, "MTP norms");
+        if (!status)
+            return status.error();
+        const std::pair<uint64_t, uint64_t> matrices[] = {
+            {ir.hidden_size, ir.hidden_size * 2ull},
+            {query_size * 2ull, ir.hidden_size},
+            {key_value_size * 2ull, ir.hidden_size},
+            {ir.hidden_size, query_size},
+            {moe.expert_count, ir.hidden_size},
+        };
+        for (const auto& matrix : matrices)
+        {
+            auto elements = matrix_elements(matrix.first, matrix.second, "MTP matrix");
+            if (!elements)
+                return elements.error();
+            status = add_elements(elements.value(), "MTP matrix");
+            if (!status)
+                return status.error();
+        }
+        status = add_elements(attention.head_dimension * 2ull, "MTP query/key norms");
+        if (!status)
+            return status.error();
+        if (moe.shared_expert_count != 0)
+        {
+            auto shared = matrix_elements(
+                static_cast<uint64_t>(ir.hidden_size) * moe.intermediate_size * 3ull,
+                moe.shared_expert_count,
+                "MTP shared Expert");
+            if (!shared)
+                return shared.error();
+            status = add_elements(shared.value(), "MTP shared Expert");
+            if (!status)
+                return status.error();
+            if (has_flag(moe.flags, MoeDescriptorSharedExpertGate))
+            {
+                status = add_elements(ir.hidden_size, "MTP shared Expert gate");
+                if (!status)
+                    return status.error();
+            }
+        }
+        auto mtp_bytes = checked_multiply(mtp_elements, element_bytes, "MTP dense weights");
+        if (!mtp_bytes)
+            return mtp_bytes.error();
+        auto with_mtp = checked_add(total, mtp_bytes.value(), "dense weights");
+        if (!with_mtp)
+            return with_mtp.error();
+        total = with_mtp.value();
+    }
+
     auto final_norm = checked_multiply(ir.hidden_size, element_bytes, "final norm");
     if (!final_norm)
         return final_norm.error();
@@ -360,7 +567,29 @@ static Result<uint64_t> mxfp4_pair_bytes(const MoeIR& ir)
     return encoded.value() / 32;
 }
 
-Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeOptions& options, uint64_t physical_memory_bytes)
+static Result<uint64_t> expert_pair_bytes(const MoeIR& ir, DType dtype)
+{
+    if (dtype == DType::MxFp4)
+        return mxfp4_pair_bytes(ir);
+    auto gate_up = matrix_storage_bytes(
+        static_cast<uint64_t>(ir.intermediate_size) * 2,
+        ir.hidden_size,
+        dtype,
+        "expert gate/up");
+    if (!gate_up)
+        return gate_up.error();
+    auto down = matrix_storage_bytes(
+        ir.hidden_size,
+        ir.intermediate_size,
+        dtype,
+        "expert down");
+    if (!down)
+        return down.error();
+    return checked_add(gate_up.value(), down.value(), "expert pair");
+}
+
+Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeOptions& options, uint64_t physical_memory_bytes,
+                                          bool release_vulkan_dense_host_storage)
 {
     ModelMemoryPlan plan;
     plan.requested_mode = options.expert_memory_mode;
@@ -399,20 +628,11 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeOptions&
             first_moe_layer = &layer;
         ++moe_layer_count;
     }
+    moe_layer_count += ir.speculative_layer_count;
     if (!first_moe_layer)
         return Error{ErrorCode::InvalidModel, "memory planner requires at least one MoE layer"};
     const MoeDescriptor& moe = first_moe_layer->ffn.moe;
-    if (moe.expert_weight_dtype != DType::MxFp4)
-    {
-        plan.selected_mode = ExpertMemoryMode::Eager;
-        if (options.expert_memory_mode == ExpertMemoryMode::OnDemand || options.expert_cache_bytes != 0)
-        {
-            return Error{ErrorCode::UnsupportedModel, "on-demand expert storage currently requires MXFP4 experts"};
-        }
-        return plan;
-    }
-
-    auto pair_bytes = mxfp4_pair_bytes(ir);
+    auto pair_bytes = expert_pair_bytes(ir, moe.expert_weight_dtype);
     if (!pair_bytes)
         return pair_bytes.error();
     plan.expert_pair_bytes = pair_bytes.value();
@@ -427,6 +647,15 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeOptions&
     if (!expert_bytes)
         return expert_bytes.error();
     plan.estimated_expert_bytes = expert_bytes.value();
+    if (moe.expert_weight_dtype != DType::MxFp4)
+    {
+        plan.selected_mode = ExpertMemoryMode::Eager;
+        if (options.expert_memory_mode == ExpertMemoryMode::OnDemand || options.expert_cache_bytes != 0)
+        {
+            return Error{ErrorCode::UnsupportedModel, "on-demand expert storage currently requires MXFP4 experts"};
+        }
+        return plan;
+    }
 
     const uint64_t safety_reserve = std::max(2 * gibibyte, physical_memory_bytes == 0 ? 2 * gibibyte : physical_memory_bytes / 8);
     uint64_t eager_capacity = 0;
@@ -466,6 +695,22 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeOptions&
     if (!file_backed_expert_encoding)
     {
         return Error{ErrorCode::UnsupportedModel, "on-demand mode requires a file-backed Expert encoding"};
+    }
+
+    if (release_vulkan_dense_host_storage)
+    {
+        auto releasable = latent_vulkan_releasable_dense_bytes(ir);
+        if (!releasable)
+            return releasable.error();
+        plan.estimated_dense_bytes = releasable.value() >= plan.estimated_dense_bytes
+                                         ? 0
+                                         : plan.estimated_dense_bytes - releasable.value();
+        eager_capacity = 0;
+        if (plan.host_memory_budget_bytes > plan.estimated_dense_bytes
+            && plan.host_memory_budget_bytes - plan.estimated_dense_bytes > safety_reserve)
+        {
+            eager_capacity = plan.host_memory_budget_bytes - plan.estimated_dense_bytes - safety_reserve;
+        }
     }
     if (eager_capacity < plan.minimum_active_expert_bytes)
     {

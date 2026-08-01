@@ -255,9 +255,15 @@ static int openmp_linear_team_size(uint64_t operation_count, DType dtype) noexce
 {
 #if defined(_OPENMP)
     // Scale the OpenMP team by operation count.
+    // A one-row 256 x 4096 FP32/BF16 router sits exactly at one million
+    // operations. Spawning four workers for that shape costs more than the
+    // dot products, while the packed FP8 path still benefits at this size.
     static constexpr uint64_t minimum_parallel_operations = 1024 * 1024;
+    static constexpr uint64_t minimum_dense_parallel_operations = 2 * 1024 * 1024;
     static constexpr uint64_t full_team_operations = 8 * 1024 * 1024;
-    if (omp_in_parallel() != 0 || operation_count < minimum_parallel_operations)
+    const uint64_t minimum_operations =
+        dtype == DType::Float8E4M3 ? minimum_parallel_operations : minimum_dense_parallel_operations;
+    if (omp_in_parallel() != 0 || operation_count < minimum_operations)
     {
         return 1;
     }
@@ -308,7 +314,9 @@ void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch
     const uint32_t input_columns = matrix.shape[1];
     assert(input.columns() == input_columns);
 
-    if ((matrix.float8_linear_operator && matrix.float8_linear_operator->forward(input, output))
+    if ((matrix.bfloat16_linear_operator
+         && matrix.bfloat16_linear_operator->forward(input, output))
+        || (matrix.float8_linear_operator && matrix.float8_linear_operator->forward(input, output))
         || (matrix.linear_operator && matrix.linear_operator->forward(input, output)))
         return;
     output.reset(input.rows(), output_columns, false);
@@ -482,7 +490,8 @@ CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* b
                 gate = std::min(gate, activation_limit);
                 linear = std::clamp(linear, -activation_limit, activation_limit);
             }
-            if (activation == ExpertActivation::DeepSeekSwiGlu)
+            if (activation == ExpertActivation::Silu
+                || activation == ExpertActivation::DeepSeekSwiGlu)
             {
                 const float silu = gate / (1.0f + std::exp(-gate));
                 output.row(0)[column] = silu * linear;
@@ -508,7 +517,8 @@ CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* b
                     gate = std::min(gate, activation_limit);
                     up = std::clamp(up, -activation_limit, activation_limit);
                 }
-                if (activation == ExpertActivation::DeepSeekSwiGlu)
+                if (activation == ExpertActivation::Silu
+                    || activation == ExpertActivation::DeepSeekSwiGlu)
                 {
                     const float silu = gate / (1.0f + std::exp(-gate));
                     output.row(token_index)[column] = silu * up;
@@ -664,7 +674,8 @@ static bool mxfp4_expert_decode(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* 
                     gate = std::min(gate, task.activation_limit);
                     linear = std::clamp(linear, -task.activation_limit, task.activation_limit);
                 }
-                if (task.activation == ExpertActivation::DeepSeekSwiGlu)
+                if (task.activation == ExpertActivation::Silu
+                    || task.activation == ExpertActivation::DeepSeekSwiGlu)
                 {
                     const float silu = gate / (1.0f + std::exp(-gate));
                     activated[task_index].row(0)[column] = silu * linear;
@@ -748,7 +759,9 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch)
     bool single_token = true;
     for (const Mxfp4Task& task : tasks)
     {
-        if (task.activation != ExpertActivation::GptOssSwiGlu && task.activation != ExpertActivation::DeepSeekSwiGlu)
+        if (task.activation != ExpertActivation::Silu
+            && task.activation != ExpertActivation::GptOssSwiGlu
+            && task.activation != ExpertActivation::DeepSeekSwiGlu)
             return false;
         if (!task.input || task.input->rows() != 1)
             single_token = false;
@@ -969,8 +982,9 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch)
                         gate = std::min(gate, task.activation_limit);
                         up = std::clamp(up, -task.activation_limit, task.activation_limit);
                     }
-                    if (task.activation
-                        == ExpertActivation::DeepSeekSwiGlu)
+                    if (task.activation == ExpertActivation::Silu
+                        || task.activation
+                               == ExpertActivation::DeepSeekSwiGlu)
                     {
                         const float silu = gate
                                            / (1.0f + std::exp(-gate));
@@ -1078,7 +1092,9 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch)
 
 void linear_batch_into(const TensorData& matrix, const TensorData& bias, const CpuBatch& input, CpuBatch& output)
 {
-    if ((matrix.float8_linear_operator && matrix.float8_linear_operator->forward(input, output))
+    if ((matrix.bfloat16_linear_operator
+         && matrix.bfloat16_linear_operator->forward(input, output))
+        || (matrix.float8_linear_operator && matrix.float8_linear_operator->forward(input, output))
         || (matrix.linear_operator && matrix.linear_operator->forward(input, output)))
     {
         return;
@@ -1100,7 +1116,7 @@ CpuBatch linear_batch(const TensorData& matrix, const TensorData& bias, const Cp
     return output;
 }
 
-void rms_norm_batch_into(const CpuBatch& input, const TensorData& weight, float epsilon, CpuBatch& output)
+void rms_norm_batch_into(const CpuBatch& input, const TensorData& weight, float epsilon, CpuBatch& output, float weight_offset)
 {
     assert(weight.element_count() == input.columns());
     output.reset(input.rows(), input.columns(), false);
@@ -1113,14 +1129,14 @@ void rms_norm_batch_into(const CpuBatch& input, const TensorData& weight, float 
             sum_of_squares += source[column] * source[column];
         const float inverse_rms = 1.0f / std::sqrt(sum_of_squares / static_cast<float>(input.columns()) + epsilon);
         for (uint32_t column = 0; column < input.columns(); ++column)
-            destination[column] = source[column] * inverse_rms * tensor_value(weight, column);
+            destination[column] = source[column] * inverse_rms * (tensor_value(weight, column) + weight_offset);
     }
 }
 
-CpuBatch rms_norm_batch(const CpuBatch& input, const TensorData& weight, float epsilon)
+CpuBatch rms_norm_batch(const CpuBatch& input, const TensorData& weight, float epsilon, float weight_offset)
 {
     CpuBatch output;
-    rms_norm_batch_into(input, weight, epsilon, output);
+    rms_norm_batch_into(input, weight, epsilon, output, weight_offset);
     return output;
 }
 

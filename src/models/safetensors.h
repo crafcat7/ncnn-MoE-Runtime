@@ -36,6 +36,7 @@ private:
 
 public:
     [[nodiscard]] static Result<SafetensorsArchive> open(const std::filesystem::path& root);
+    [[nodiscard]] static Result<SafetensorsArchive> open_file(const std::filesystem::path& path);
     [[nodiscard]] const SafetensorInfo* find(const std::string& name) const noexcept;
     [[nodiscard]] Result<TensorData> load_tensor(const std::string& name) const;
     [[nodiscard]] Result<TensorData> load_bfloat16_slice(const std::string& name, uint32_t index, std::vector<uint32_t> shape) const;

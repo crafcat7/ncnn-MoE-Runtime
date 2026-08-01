@@ -11,6 +11,8 @@ struct ExampleRunnerOptions
     const char* executable_name = nullptr;
     const char* expected_model_type = nullptr;
     int32_t default_stop_token = -1;
+    int32_t secondary_default_stop_token = -1;
+    bool default_enable_speculative = true;
 };
 
 int run_model_example(int argc, char** argv, const ExampleRunnerOptions& runner_options);

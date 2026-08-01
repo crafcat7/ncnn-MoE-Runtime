@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Create a read-optimized MXFP4 Expert sidecar.
 
-The sidecar is a normal Safetensors file. It keeps each Expert's gate/up and
-down blocks/scales adjacent so the runtime can satisfy a cache miss with one
-large range read instead of four random range reads. Original model shards are
+The sidecar is a normal Safetensors file. It keeps each Expert's MXFP4
+blocks/scales adjacent so the runtime can satisfy a cache miss with one large
+range read instead of several random range reads. Original model shards are
 never modified.
 """
 
@@ -40,12 +40,13 @@ class CopyRange:
     source_offset: int
     byte_count: int
     shape: tuple[int, ...]
+    dtype: str
 
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Pack GPT-OSS MXFP4 Expert slices into a read-optimized "
+            "Pack GPT-OSS or DeepSeek MXFP4 Expert slices into a read-optimized "
             "Safetensors sidecar."
         )
     )
@@ -59,6 +60,14 @@ def parse_arguments() -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="Replace an existing sidecar",
+    )
+    parser.add_argument(
+        "--layers",
+        help="Optional layer IDs or inclusive ranges, for example 0,2,5-7",
+    )
+    parser.add_argument(
+        "--experts",
+        help="Optional Expert IDs or inclusive ranges, for example 0,3,8-15",
     )
     return parser.parse_args()
 
@@ -146,13 +155,71 @@ def require_u8_expert_tensor(
     return tensor
 
 
+def require_deepseek_tensor(
+    tensors: dict[str, TensorRange],
+    name: str,
+    dtype: str,
+    rank: int = 2,
+) -> TensorRange:
+    tensor = tensors.get(name)
+    if tensor is None:
+        raise ValueError(f"missing Expert tensor: {name}")
+    if tensor.dtype != dtype or len(tensor.shape) != rank:
+        raise ValueError(f"invalid DeepSeek MXFP4 tensor: {name}")
+    expected_bytes = 1
+    for dimension in tensor.shape:
+        expected_bytes *= dimension
+    if tensor.byte_count != expected_bytes:
+        raise ValueError(f"invalid DeepSeek MXFP4 byte count: {name}")
+    return tensor
+
+
+def parse_selection(
+    value: str | None,
+    maximum: int,
+    option: str,
+) -> list[int]:
+    if value is None:
+        return list(range(maximum))
+    selected: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            raise ValueError(f"{option} contains an empty item")
+        if "-" in item:
+            begin_text, end_text = item.split("-", 1)
+            try:
+                begin = int(begin_text)
+                end = int(end_text)
+            except ValueError as error:
+                raise ValueError(f"invalid {option} item: {item}") from error
+            if end < begin:
+                raise ValueError(f"invalid {option} range: {item}")
+            values = range(begin, end + 1)
+        else:
+            try:
+                values = (int(item),)
+            except ValueError as error:
+                raise ValueError(f"invalid {option} item: {item}") from error
+        for index in values:
+            if index < 0 or index >= maximum:
+                raise ValueError(
+                    f"{option} index {index} is outside [0, {maximum})"
+                )
+            selected.add(index)
+    if not selected:
+        raise ValueError(f"{option} must select at least one index")
+    return sorted(selected)
+
+
 def build_gpt_oss_copy_plan(
     tensors: dict[str, TensorRange],
-    layer_count: int,
+    layer_ids: list[int],
     expert_count: int,
+    expert_ids: list[int],
 ) -> list[CopyRange]:
     plan: list[CopyRange] = []
-    for layer_id in range(layer_count):
+    for layer_id in layer_ids:
         prefix = f"model.layers.{layer_id}.mlp.experts."
         names = (
             prefix + "gate_up_proj_blocks",
@@ -164,7 +231,7 @@ def build_gpt_oss_copy_plan(
             require_u8_expert_tensor(tensors, name, expert_count)
             for name in names
         )
-        for expert_id in range(expert_count):
+        for expert_id in expert_ids:
             for name, source in zip(names, sources, strict=True):
                 slice_bytes = source.byte_count // expert_count
                 plan.append(
@@ -174,6 +241,52 @@ def build_gpt_oss_copy_plan(
                         source_offset=source.offset + expert_id * slice_bytes,
                         byte_count=slice_bytes,
                         shape=source.shape[1:],
+                        dtype=source.dtype,
+                    )
+                )
+    return plan
+
+
+def build_deepseek_copy_plan(
+    tensors: dict[str, TensorRange],
+    layer_ids: list[int],
+    expert_ids: list[int],
+) -> list[CopyRange]:
+    plan: list[CopyRange] = []
+    for layer_id in layer_ids:
+        prefix = f"layers.{layer_id}.ffn.experts."
+        for expert_id in expert_ids:
+            expert_prefix = f"{prefix}{expert_id}."
+            names = (
+                expert_prefix + "w1.weight",
+                expert_prefix + "w1.scale",
+                expert_prefix + "w3.weight",
+                expert_prefix + "w3.scale",
+                expert_prefix + "w2.weight",
+                expert_prefix + "w2.scale",
+            )
+            sources = (
+                require_deepseek_tensor(tensors, names[0], "I8"),
+                require_deepseek_tensor(tensors, names[1], "F8_E8M0"),
+                require_deepseek_tensor(tensors, names[2], "I8"),
+                require_deepseek_tensor(tensors, names[3], "F8_E8M0"),
+                require_deepseek_tensor(tensors, names[4], "I8"),
+                require_deepseek_tensor(tensors, names[5], "F8_E8M0"),
+            )
+            if sources[0].shape != sources[2].shape \
+                    or sources[1].shape != sources[3].shape:
+                raise ValueError(
+                    f"w1/w3 shape mismatch for layer {layer_id}, Expert {expert_id}"
+                )
+            for name, source in zip(names, sources, strict=True):
+                plan.append(
+                    CopyRange(
+                        name=f"{PACKED_PREFIX}{name}",
+                        source=source,
+                        source_offset=source.offset,
+                        byte_count=source.byte_count,
+                        shape=source.shape,
+                        dtype=source.dtype,
                     )
                 )
     return plan
@@ -189,7 +302,7 @@ def encode_header(plan: list[CopyRange], model_type: str) -> bytes:
     offset = 0
     for item in plan:
         header[item.name] = {
-            "dtype": "U8",
+            "dtype": item.dtype,
             "shape": list(item.shape),
             "data_offsets": [offset, offset + item.byte_count],
         }
@@ -226,6 +339,7 @@ def write_sidecar(
     overwrite: bool,
     layer_count: int,
     expert_count: int,
+    ranges_per_expert: int,
 ) -> None:
     if output.exists() and not overwrite:
         raise FileExistsError(
@@ -242,7 +356,7 @@ def write_sidecar(
         with temporary.open("wb") as destination:
             destination.write(struct.pack("<Q", len(header)))
             destination.write(header)
-            ranges_per_layer = expert_count * 4
+            ranges_per_layer = expert_count * ranges_per_expert
             for index, item in enumerate(plan):
                 source = handles.get(item.source.path)
                 if source is None:
@@ -292,26 +406,43 @@ def main() -> int:
         with config_path.open("r", encoding="utf-8") as stream:
             config = json.load(stream)
         model_type = config.get("model_type")
-        if model_type != "gpt_oss":
+        if model_type == "gpt_oss":
+            layer_count = int(config["num_hidden_layers"])
+            expert_count = int(config["num_local_experts"])
+        elif model_type == "deepseek_v4":
+            layer_count = int(config["num_hidden_layers"])
+            expert_count = int(config["n_routed_experts"])
+        else:
             raise ValueError(
-                "the current packer supports GPT-OSS source layouts; "
+                "the packer supports GPT-OSS and DeepSeek-V4 source layouts; "
                 f"found model_type={model_type!r}"
             )
-        layer_count = int(config["num_hidden_layers"])
-        expert_count = int(config["num_local_experts"])
         if layer_count <= 0 or expert_count <= 0:
-            raise ValueError("invalid GPT-OSS layer or Expert count")
+            raise ValueError("invalid layer or Expert count")
+
+        layer_ids = parse_selection(arguments.layers, layer_count, "--layers")
+        expert_ids = parse_selection(arguments.experts, expert_count, "--experts")
 
         tensors = scan_tensors(model, output)
-        plan = build_gpt_oss_copy_plan(
-            tensors,
-            layer_count,
-            expert_count,
-        )
+        if model_type == "gpt_oss":
+            plan = build_gpt_oss_copy_plan(
+                tensors,
+                layer_ids,
+                expert_count,
+                expert_ids,
+            )
+            ranges_per_expert = 4
+        else:
+            plan = build_deepseek_copy_plan(
+                tensors,
+                layer_ids,
+                expert_ids,
+            )
+            ranges_per_expert = 6
         header = encode_header(plan, model_type)
         packed_bytes = sum(item.byte_count for item in plan)
         print(
-            f"packing {layer_count * expert_count} Experts "
+            f"packing {len(layer_ids) * len(expert_ids)} Experts "
             f"({packed_bytes / (1024 ** 3):.2f} GiB) into {output}",
             flush=True,
         )
@@ -320,8 +451,9 @@ def main() -> int:
             plan,
             header,
             arguments.overwrite,
-            layer_count,
-            expert_count,
+            len(layer_ids),
+            len(expert_ids),
+            ranges_per_expert,
         )
         print(f"packed Expert sidecar: {output}", flush=True)
         return 0

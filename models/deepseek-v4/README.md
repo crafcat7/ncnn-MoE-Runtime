@@ -56,7 +56,7 @@ python tools\run_deepseek_v4_prompt.py `
   .\build-ncnn\Release\ncnn_moe_deepseek_v4.exe `
   .\models\deepseek-v4\DeepSeek-V4-Flash `
   "请简短介绍一下你自己。" `
-  --max-new-tokens 1024 --stream --backend hybrid
+  --max-new-tokens 1024 --stream --backend hybrid --report-throughput
 ```
 
 By default, the wrapper prints only the human-readable `[reasoning]` and
@@ -64,7 +64,8 @@ By default, the wrapper prints only the human-readable `[reasoning]` and
 statistics are suppressed unless `--verbose` is present. The reply limit
 defaults to 1024 tokens; reaching it before EOS produces a warning.
 `--thinking-mode chat` requests a direct answer, and `--stream-final-only`
-suppresses reasoning during streaming.
+suppresses reasoning during streaming. `--report-throughput` prints only the
+optional aggregate generation rate without enabling full native diagnostics.
 
 ## Run token IDs
 
@@ -74,12 +75,14 @@ token IDs:
 ```powershell
 .\build-ncnn\Release\ncnn_moe_deepseek_v4.exe `
   .\models\deepseek-v4\DeepSeek-V4-Flash 0 `
-  --max-new-tokens 64 --hybrid
+  --max-new-tokens 64 --hybrid --report-throughput
 ```
 
 Use `--prompt-token-file PATH` for long whitespace-separated token sequences.
 Use `--stream-token-ids` to print generated IDs as they become available. The
 final machine-readable line is `generated token ids:`.
+`--report-throughput` adds the aggregate generation rate in token/s; omit it
+when that optional line is not needed.
 `ncnn_moe_deepseek_v4` and `ncnn_moe_gpt_oss` use the same native runner
 implementation and option parser; their entry points only select the expected
 adapter and model-specific default EOS.
@@ -184,6 +187,43 @@ traffic; they are not process-attributed SSD bytes. The operating-system file
 cache is not flushed. These measurements validate raw-token execution and
 parity, not official tokenizer, chat-template, or text-quality behavior.
 
+### 2026-07-31 focused single-Session measurements
+
+These measurements use greedy target decoding, one outer warm-up process, one
+in-process cache warm-up, and three measured processes on the reference host.
+The resident profile uses one BOS token and four generated tokens. The
+sustained profile uses sixteen BOS tokens, 32 generated tokens, and a 16 GiB
+host ARC.
+
+| Profile | Expert I/O | Median throughput | Samples | Expert cache | Runtime reads | Token validation |
+| --- | --- | ---: | --- | ---: | ---: | --- |
+| Resident, 4 tokens | Direct | **4.367 token/s** | 4.106 / 4.367 / 4.395 | 100% hit | 0 B | `5 223 643 27` in every sample |
+| Sustained, 32 tokens | Direct | **1.505 token/s** | 1.485 / 1.505 / 1.524 | 69.4% hit | 31.69 GiB | Identical sequence in every sample |
+
+No repeatable 5 token/s resident result was established by this protocol. In
+the accepted resident run, Attention used about 109 ms/token, Experts used
+about 104 ms/token, and the Runtime submitted 130 Vulkan command buffers per
+token. The sustained run completed with no Expert-I/O fallback.
+
+Reproduce the accepted resident cell from the repository root:
+
+```powershell
+python tools\benchmark_runtime.py `
+  .\build-ncnn\Release\ncnn_moe_deepseek_v4.exe `
+  .\models\deepseek-v4\DeepSeek-V4-Flash `
+  --prompt-token-ids 0 --max-new-tokens 4 --temperature 0 `
+  --no-speculative --warmup 1 --cache-warmup-runs 1 --repeats 3 `
+  --backend hybrid --expert-memory on-demand `
+  --host-memory-mb 28672 --expert-cache-mb 16384 `
+  --expert-io-workers 4 --direct-expert-io --vulkan-device-index 0
+```
+
+This checkpoint has no DSpark plan, so these are target-model results.
+The next single-Session ceiling work is persistent Vulkan latent-Attention
+state and fewer projection/submission boundaries, followed by CPU MXFP4
+bandwidth and thread-placement stabilization. The sustained path additionally
+needs earlier Expert availability.
+
 ### DeepSeek-V4-Flash matrix
 
 ![DeepSeek V4 Flash performance matrix](../../assets/deepseek-v4-flash-performance.svg)
@@ -254,6 +294,12 @@ python tools\benchmark_reference_matrix.py deepseek-v4-flash `
 
 The aggregate JSON is
 `build-reports/performance-matrix/deepseek-v4-flash/report.json`.
+For a CPU-only comparison, build the runner with
+`-DNCNN_MOE_USE_VULKAN=OFF`, use a separate output directory, and add
+`--matrix-backend cpu` to the command. Each CPU case records
+`execution_evidence`; the matrix rejects reported GPU execution while keeping
+Vulkan-context initialization and system-wide `nvidia-smi` observations
+explicitly separate.
 
 ### DeepSeek-V4-Flash-DSpark matrix
 

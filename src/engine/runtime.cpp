@@ -7,6 +7,7 @@
 #include "compiler/moe_ir.hpp"
 #include "models/builtin_model_adapter.h"
 #include "models/deepseek_v4_model_adapter.h"
+#include "models/qwen3_5_moe_model_adapter.h"
 #include "kernels/cpu_mxfp4.h"
 #include "kernels/cpu_float8.h"
 #include "kernels/cpu_ops.h"
@@ -151,6 +152,7 @@ Runtime::Runtime()
 #endif
     register_adapter(std::make_shared<BuiltinModelAdapter>());
     register_adapter(std::make_shared<DeepSeekV4ModelAdapter>());
+    register_adapter(std::make_shared<Qwen3_5MoeModelAdapter>());
 }
 
 void Runtime::register_adapter(std::shared_ptr<IMoeModelAdapter> adapter)
@@ -285,7 +287,14 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
     if (!normalized_ir)
         return normalized_ir.error();
 
-    auto memory_plan = plan_model_memory(parsed_ir.value(), options, capabilities_.physical_memory_bytes);
+    const bool use_vulkan_dense = resolved_mode == HybridMode::HybridExperts || resolved_mode == HybridMode::VulkanWithCpuPrefetch;
+    const bool release_vulkan_dense_host_storage =
+        use_vulkan_dense && has_flag(options.flags, RuntimeOptionReleaseVulkanDenseHostStorage);
+    auto memory_plan = plan_model_memory(
+        parsed_ir.value(),
+        options,
+        capabilities_.physical_memory_bytes,
+        release_vulkan_dense_host_storage);
     if (!memory_plan)
         return memory_plan.error();
     ModelMemoryPlan plan = std::move(memory_plan).value();
@@ -293,7 +302,6 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
     if (file_backed_experts)
         package.flags |= ModelPackageDeferMxfp4Experts;
 
-    const bool use_vulkan_dense = resolved_mode == HybridMode::HybridExperts || resolved_mode == HybridMode::VulkanWithCpuPrefetch;
     if (options.expert_gpu_cache_bytes > std::numeric_limits<uint64_t>::max() - options.expert_gpu_victim_cache_bytes)
     {
         return Error{ErrorCode::InvalidArgument, "the combined Expert GPU cache capacity overflows"};
@@ -349,6 +357,8 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityMxfp4CpuKernel;
     if (!file_backed_experts)
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityRetainCpuDenseCopies;
+    if (release_vulkan_dense_host_storage && file_backed_experts)
+        compiler_capabilities.flags |= ModelCompiler::BackendCapabilityReleaseVulkanDenseHostStorage;
     auto compiled = compiler.compile(std::move(parsed_ir).value(), std::move(weights).value(), resolved_mode, compiler_capabilities);
     if (!compiled)
         return compiled.error();
@@ -363,6 +373,10 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
         {
             uint32_t maximum_active_experts = 1;
             for (const CompiledLayerPlan& layer : compiled_model.layers)
+            {
+                maximum_active_experts = std::max(maximum_active_experts, layer.moe.top_k);
+            }
+            for (const CompiledLayerPlan& layer : compiled_model.speculative.layers)
             {
                 maximum_active_experts = std::max(maximum_active_experts, layer.moe.top_k);
             }
@@ -388,6 +402,10 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
         if (has_flag(options.flags, RuntimeOptionForwardAwareCache))
         {
             expert_cache_flags |= ExpertCacheForwardAwareEviction;
+        }
+        if (has_flag(options.flags, RuntimeOptionRouterPrediction))
+        {
+            expert_cache_flags |= ExpertCacheAllowSpeculativeEviction;
         }
         if (has_flag(options.flags, RuntimeOptionCrossExpertReadCoalescing))
         {
@@ -463,8 +481,12 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
                 expert_device_indices.push_back(placement_device_index);
             }
             std::vector<uint32_t> residency_group_devices;
-            residency_group_devices.reserve(compiled_model.layers.size());
+            residency_group_devices.reserve(compiled_model.layers.size() + compiled_model.speculative.layers.size());
             for (const CompiledLayerPlan& layer : compiled_model.layers)
+            {
+                residency_group_devices.push_back(layer.vulkan_device_index);
+            }
+            for (const CompiledLayerPlan& layer : compiled_model.speculative.layers)
             {
                 residency_group_devices.push_back(layer.vulkan_device_index);
             }
@@ -481,7 +503,17 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
                 return Error{ErrorCode::UnsupportedModel, "cannot create the Vulkan MXFP4 Expert execution cache/source backend"};
             }
         }
-        compiled_model.expert_cache = std::make_shared<Mxfp4ExpertCache>(plan.expert_cache_bytes, expert_io_workers, std::move(expert_victim_cache), expert_cache_flags, static_cast<uint32_t>(compiled_model.layers.size()));
+        const size_t residency_group_count = compiled_model.layers.size() + compiled_model.speculative.layers.size();
+        if (residency_group_count > std::numeric_limits<uint32_t>::max())
+        {
+            return Error{ErrorCode::InvalidModel, "the total Expert residency-group count overflows"};
+        }
+        compiled_model.expert_cache = std::make_shared<Mxfp4ExpertCache>(
+            plan.expert_cache_bytes,
+            expert_io_workers,
+            std::move(expert_victim_cache),
+            expert_cache_flags,
+            static_cast<uint32_t>(residency_group_count));
     }
 
     auto immutable = std::make_shared<const CompiledModel>(std::move(compiled_model));

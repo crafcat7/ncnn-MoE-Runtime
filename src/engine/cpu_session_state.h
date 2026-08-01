@@ -117,9 +117,23 @@ struct CpuAttentionExecutionScratch
     CpuBatch value;
     CpuBatch fused_qkv;
     CpuBatch attention;
+    CpuBatch gate;
     CpuBatch projected;
     CpuBatch output;
     std::vector<float> logits;
+};
+
+struct CpuGatedDeltaExecutionScratch
+{
+    CpuBatch normalized;
+    CpuBatch fused_input;
+    CpuBatch qkv;
+    CpuBatch z;
+    CpuBatch beta;
+    CpuBatch alpha;
+    CpuBatch recurrent_output;
+    CpuBatch projected;
+    CpuBatch output;
 };
 
 struct CpuLatentVectorUndo
@@ -161,6 +175,43 @@ struct CpuLatentCacheUndo
     }
 };
 
+struct CpuStateCacheSnapshot
+{
+    std::vector<float> gated_delta_convolution;
+    std::vector<float> gated_delta_recurrent;
+
+    [[nodiscard]] uint64_t allocated_bytes() const noexcept
+    {
+        return static_cast<uint64_t>(
+                   gated_delta_convolution.capacity()
+                   + gated_delta_recurrent.capacity())
+               * sizeof(float);
+    }
+};
+
+struct CpuStateCacheTransaction
+{
+    CpuStateCacheSnapshot initial;
+    std::vector<CpuStateCacheSnapshot> rows;
+    uint64_t initial_start_position = 0;
+    uint64_t initial_token_count = 0;
+    uint64_t initial_first_slot = 0;
+    uint64_t initial_gated_delta_token_count = 0;
+    size_t expected_rows = 0;
+    size_t recorded_rows = 0;
+    bool active = false;
+
+    [[nodiscard]] uint64_t allocated_bytes() const noexcept
+    {
+        uint64_t bytes = initial.allocated_bytes()
+                         + static_cast<uint64_t>(rows.capacity())
+                               * sizeof(CpuStateCacheSnapshot);
+        for (const CpuStateCacheSnapshot& row : rows)
+            bytes += row.allocated_bytes();
+        return bytes;
+    }
+};
+
 struct RouterPrefetchState
 {
     uint32_t target_top_k = 0;
@@ -181,6 +232,8 @@ struct CpuLayerCache
     std::vector<float> values;
     std::vector<uint16_t> bfloat16_keys;
     std::vector<uint16_t> bfloat16_values;
+    std::vector<float> gated_delta_convolution;
+    std::vector<float> gated_delta_recurrent;
     std::vector<float> latent_window;
     std::vector<float> latent_compressed;
     std::vector<float> latent_index_compressed;
@@ -209,6 +262,7 @@ struct CpuLayerCache
     uint64_t first_slot = 0;
     uint64_t capacity_tokens = 0;
     uint64_t latent_token_count = 0;
+    uint64_t gated_delta_token_count = 0;
     uint32_t columns = 0;
     DType dtype = DType::Float32;
     bool latent_cache = false;
@@ -216,6 +270,7 @@ struct CpuLayerCache
     std::vector<uint32_t> predicted_expert_ids;
     RouterPrefetchState next_router_prediction;
     std::vector<CpuLatentCacheUndo> latent_transaction_undo;
+    CpuStateCacheTransaction state_transaction;
     uint64_t device_allocated_bytes = 0;
     bool latent_transaction_active = false;
 
@@ -225,6 +280,7 @@ struct CpuLayerCache
         for (const CpuLatentCacheUndo& undo : latent_transaction_undo)
             transaction_bytes += undo.allocated_bytes();
         return static_cast<uint64_t>(keys.capacity() + values.capacity()
+                                     + gated_delta_convolution.capacity() + gated_delta_recurrent.capacity()
                                      + latent_window.capacity() + latent_compressed.capacity() + latent_index_compressed.capacity()
                                      + compressor_pending_values.capacity() + compressor_pending_scores.capacity()
                                      + compressor_previous_values.capacity() + compressor_previous_scores.capacity()
@@ -240,7 +296,8 @@ struct CpuLayerCache
                + static_cast<uint64_t>(latent_scored_indices.capacity()) * sizeof(LatentScoredIndex)
                + static_cast<uint64_t>(latent_selected_indices.capacity()) * sizeof(uint32_t)
                + static_cast<uint64_t>(predicted_expert_ids.capacity()) * sizeof(uint32_t)
-               + transaction_bytes + device_allocated_bytes;
+               + transaction_bytes + state_transaction.allocated_bytes()
+               + device_allocated_bytes;
     }
 
     [[nodiscard]] uint64_t logical_bytes() const noexcept
@@ -249,6 +306,10 @@ struct CpuLayerCache
         {
             const uint64_t window_tokens = std::min(latent_token_count, capacity_tokens);
             return (window_tokens * columns + latent_compressed.size() + latent_index_compressed.size()) * sizeof(float);
+        }
+        if (!gated_delta_convolution.empty() || !gated_delta_recurrent.empty())
+        {
+            return static_cast<uint64_t>(gated_delta_convolution.size() + gated_delta_recurrent.size()) * sizeof(float);
         }
         const uint64_t element_size = dtype == DType::BFloat16 ? sizeof(uint16_t) : sizeof(float);
         return token_count * columns * element_size * 2;
@@ -269,10 +330,16 @@ public:
     MemoryManager memory_manager;
     CpuExpertExecutionScratch expert_scratch;
     CpuAttentionExecutionScratch attention_scratch;
+    CpuGatedDeltaExecutionScratch gated_delta_scratch;
     std::unique_ptr<CpuTaskWorker> router_prediction_worker;
     CpuBatch hidden;
     CpuBatch speculative_main_hidden;
+    CpuBatch mtp_pending_target_hidden;
+    std::vector<int32_t> speculative_input_ids;
+    std::vector<int32_t> speculative_direct_alignment_ids;
     uint64_t speculative_main_hidden_position = 0;
+    uint64_t mtp_pending_target_position = 0;
+    bool speculative_context_enabled = true;
 
     [[nodiscard]] uint64_t kv_cache_allocated_bytes() const noexcept
     {

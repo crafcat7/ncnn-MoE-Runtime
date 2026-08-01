@@ -9,6 +9,7 @@ import platform
 import re
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,42 @@ DEFAULT_PROMPT_TOKEN_IDS = [
     10220,
     13,
 ]
+QWEN_MXFP4_ARTIFACT = "ncnn-moe-qwen3.6-mxfp4.safetensors"
+
+
+def inspect_compiled_artifact(model):
+    path = Path(model).resolve() / QWEN_MXFP4_ARTIFACT
+    if not path.is_file():
+        return None
+    with path.open("rb") as stream:
+        encoded_length = stream.read(8)
+        if len(encoded_length) != 8:
+            raise ValueError(f"truncated compiled artifact header: {path}")
+        (header_length,) = struct.unpack("<Q", encoded_length)
+        if not 0 < header_length <= 128 * 1024 * 1024:
+            raise ValueError(f"invalid compiled artifact header: {path}")
+        encoded = stream.read(header_length)
+        if len(encoded) != header_length:
+            raise ValueError(f"truncated compiled artifact header: {path}")
+    header = json.loads(encoded)
+    metadata = header.get("__metadata__")
+    if not isinstance(metadata, dict):
+        raise ValueError(f"compiled artifact metadata is missing: {path}")
+    fields = (
+        "format",
+        "model_type",
+        "scope",
+        "quantization",
+        "source_config_sha256",
+        "source_index_sha256",
+        "source_config_fnv1a64",
+        "source_index_fnv1a64",
+    )
+    return {
+        "path": str(path),
+        "size_bytes": path.stat().st_size,
+        "metadata": {field: metadata.get(field) for field in fields},
+    }
 
 
 def parse_arguments():
@@ -86,6 +123,14 @@ def parse_arguments():
         "--parallel-speculative",
         action="store_true",
         help="Run parallel Sessions independently so each can use speculation.",
+    )
+    parser.add_argument(
+        "--parallel-independent",
+        action="store_true",
+        help=(
+            "Run parallel Sessions independently, with or without "
+            "speculation, for like-for-like A/B measurements."
+        ),
     )
     parser.add_argument(
         "--require-speculative",
@@ -182,6 +227,13 @@ def parse_arguments():
         ),
     )
     parser.add_argument("--disable-router-prediction", action="store_true")
+    parser.add_argument(
+        "--release-vulkan-dense-host",
+        action="store_true",
+        help=(
+            "Drop host copies of dense tensors after Vulkan operators take ownership."
+        ),
+    )
     parser.add_argument(
         "--disable-async-router-prediction", action="store_true"
     )
@@ -340,9 +392,18 @@ def validate_arguments(arguments):
         raise ValueError(
             "--no-speculative cannot be combined with speculative requirements"
         )
-    if arguments.parallel_speculative and arguments.parallel_sessions < 2:
+    if (
+        arguments.parallel_speculative
+        and arguments.parallel_independent
+    ):
         raise ValueError(
-            "--parallel-speculative requires at least two parallel Sessions"
+            "--parallel-speculative and --parallel-independent are mutually exclusive"
+        )
+    if (
+        arguments.parallel_speculative or arguments.parallel_independent
+    ) and arguments.parallel_sessions < 2:
+        raise ValueError(
+            "parallel independent generation requires at least two Sessions"
         )
     if (
         arguments.host_memory_mb < 0
@@ -425,9 +486,12 @@ def runner_command(arguments):
         str(arguments.max_new_tokens),
         "--temperature",
         str(arguments.temperature),
+        "--report-throughput",
     ]
     if arguments.no_speculative:
         command.append("--no-speculative")
+    else:
+        command.append("--speculative")
     if arguments.speculative_confidence is not None:
         command.extend(
             [
@@ -444,6 +508,8 @@ def runner_command(arguments):
         )
     if arguments.parallel_speculative:
         command.append("--parallel-speculative")
+    if arguments.parallel_independent:
+        command.append("--parallel-independent")
     if arguments.cache_warmup_runs:
         command.extend(
             ["--cache-warmup-runs", str(arguments.cache_warmup_runs)]
@@ -506,6 +572,8 @@ def runner_command(arguments):
         )
     if arguments.disable_router_prediction:
         command.append("--disable-router-prediction")
+    if arguments.release_vulkan_dense_host:
+        command.append("--release-vulkan-dense-host")
     if arguments.disable_async_router_prediction:
         command.append("--disable-async-router-prediction")
     if arguments.disable_forward_aware_cache:
@@ -1003,6 +1071,13 @@ def parse_runner_output(output):
         "load_seconds": extract_number(
             output, r"^loaded [a-zA-Z0-9_-]+ in ([0-9.]+) s,"
         ),
+        "runtime_backend": extract_text(
+            output,
+            r"^loaded [a-zA-Z0-9_-]+ in [0-9.]+ s, backend (.+)$",
+        ),
+        "routed_expert_format": extract_text(
+            output, r"^Routed Expert format: (.+)$"
+        ),
         "generated_tokens": extract_number(
             output, r"^generated (\d+) token\(s\) in", int
         ),
@@ -1011,8 +1086,8 @@ def parse_runner_output(output):
         ),
         "reported_aggregate_tokens_per_second": extract_number(
             output,
-            r"^Parallel sessions: \d+, aggregate throughput: "
-            r"([0-9.]+) token/s",
+            r"^(?:Parallel sessions: \d+, aggregate throughput: "
+            r"|Aggregate throughput: )([0-9.]+) token/s",
         ),
         "generation_seconds": extract_number(
             output, r"^generated \d+ token\(s\) in ([0-9.]+) s"
@@ -1109,8 +1184,25 @@ def parse_runner_output(output):
         "activation_kernel": extract_text(
             output, r"^Activation CPU kernel: (.+)$"
         ),
+        "vulkan_runtime_device_count": extract_number(
+            output, r"^Vulkan runtime devices: (\d+)", int
+        ),
+        "vulkan_heap_budget_mib": extract_number(
+            output, r"^Vulkan heap budget: (\d+) MiB", int
+        ),
+        "vulkan_linear_dispatches": extract_number(
+            output, r"^Vulkan linear dispatches: (\d+)", int
+        ),
         "vulkan_compute_submissions": extract_number(
             output, r"^Vulkan compute submissions: (\d+)", int
+        ),
+        "vulkan_batch_uploads": extract_number(
+            output, r"^Vulkan batch transfers: (\d+) upload", int
+        ),
+        "vulkan_batch_downloads": extract_number(
+            output,
+            r"^Vulkan batch transfers: \d+ upload\(s\), (\d+) download",
+            int,
         ),
         "vulkan_submit_wait_ms": extract_number(
             output, r"^Vulkan submit/wait time: ([0-9.eE+-]+) ms", float
@@ -1599,6 +1691,29 @@ def parse_runner_output(output):
         "expert_static_hotsets": hotsets,
         "generated_token_ids": tokens,
     }
+    def has_positive(field):
+        return (result[field] or 0) > 0
+
+    result["gpu_compute_detected"] = any(
+        has_positive(field)
+        for field in (
+            "vulkan_linear_dispatches",
+            "vulkan_compute_submissions",
+            "vulkan_attention_blocks",
+            "expert_gpu_executions",
+            "expert_gpu_device_source_executions",
+        )
+    )
+    result["gpu_transfer_detected"] = any(
+        has_positive(field)
+        for field in (
+            "vulkan_batch_uploads",
+            "vulkan_batch_downloads",
+            "vulkan_auxiliary_uploads",
+            "expert_gpu_cache_bytes_uploaded",
+            "expert_gpu_victim_cache_bytes_uploaded",
+        )
+    )
     if result["generation_seconds"] and result["generated_tokens"]:
         result["decode_tokens_per_second"] = (
             result["generated_tokens"] / result["generation_seconds"]
@@ -1627,6 +1742,119 @@ def parse_runner_output(output):
         else None
     )
     return result
+
+
+def summarize_execution_evidence(arguments, observations, maximum):
+    runtime_backends = sorted(
+        {
+            observation["runtime_backend"]
+            for observation in observations
+            if observation["runtime_backend"] is not None
+        }
+    )
+    runtime_device_counts = [
+        observation["vulkan_runtime_device_count"]
+        for observation in observations
+    ]
+    vulkan_context_initialized = (
+        None
+        if any(count is None for count in runtime_device_counts)
+        else any(count > 0 for count in runtime_device_counts)
+    )
+    model_vulkan_devices = any(
+        observation["vulkan_model_devices"]
+        for observation in observations
+    )
+    gpu_compute_detected = any(
+        observation["gpu_compute_detected"]
+        for observation in observations
+    )
+    gpu_transfer_detected = any(
+        observation["gpu_transfer_detected"]
+        for observation in observations
+    )
+    strict_no_vulkan_context_verified = (
+        None
+        if any(count is None for count in runtime_device_counts)
+        else arguments.backend == "cpu"
+        and all(count == 0 for count in runtime_device_counts)
+    )
+    cpu_only_execution_verified = (
+        arguments.backend == "cpu"
+        and bool(runtime_backends)
+        and all(
+            backend in ("cpu", "cpu-only")
+            for backend in runtime_backends
+        )
+        and not model_vulkan_devices
+        and not gpu_compute_detected
+        and not gpu_transfer_detected
+    )
+    return {
+        "requested_backend": arguments.backend,
+        "runtime_backends": runtime_backends,
+        "runtime_backend": observations[0]["runtime_backend"],
+        "vulkan_runtime_device_count": observations[0][
+            "vulkan_runtime_device_count"
+        ],
+        "vulkan_context_initialized": vulkan_context_initialized,
+        "model_vulkan_devices_present": model_vulkan_devices,
+        "gpu_compute_detected": gpu_compute_detected,
+        "gpu_transfer_detected": gpu_transfer_detected,
+        "cpu_only_execution_verified": cpu_only_execution_verified,
+        "strict_no_vulkan_context_verified": strict_no_vulkan_context_verified,
+        "gpu_memory_observation": {
+            "source": "nvidia-smi query-gpu=memory.used",
+            "scope": "whole GPU, not child-process attribution",
+            "peak_mib": maximum["peak_gpu_mib"],
+            "peak_delta_mib": maximum["peak_gpu_delta_mib"],
+            "observed": maximum["peak_gpu_mib"] is not None,
+            "attributed_to_process": False,
+        },
+    }
+
+
+def build_execution_evidence(arguments, samples, maximum):
+    return summarize_execution_evidence(
+        arguments,
+        [
+            {
+                "runtime_backend": sample["runtime_backend"],
+                "vulkan_runtime_device_count": sample[
+                    "vulkan_runtime_device_count"
+                ],
+                "vulkan_model_devices": sample["vulkan_model_devices"],
+                "gpu_compute_detected": sample["gpu_compute_detected"],
+                "gpu_transfer_detected": sample["gpu_transfer_detected"],
+            }
+            for sample in samples
+        ],
+        maximum,
+    )
+
+
+def build_cache_sweep_execution_evidence(arguments, reports, maximum):
+    observations = []
+    for report in reports:
+        evidence = report.get("execution_evidence")
+        if evidence is None:
+            raise ValueError(
+                "cache sweep child report is missing execution_evidence"
+            )
+        observations.append(
+            {
+                "runtime_backend": evidence["runtime_backend"],
+                "vulkan_runtime_device_count": evidence[
+                    "vulkan_runtime_device_count"
+                ],
+                "vulkan_model_devices": evidence[
+                    "model_vulkan_devices_present"
+                ],
+                "gpu_compute_detected": evidence["gpu_compute_detected"],
+                "gpu_transfer_detected": evidence["gpu_transfer_detected"],
+            }
+        )
+    return summarize_execution_evidence(arguments, observations, maximum)
 
 
 def execute_sample(command, gpu_index, sample_interval_ms):
@@ -1821,8 +2049,36 @@ def run_cache_sweep(arguments):
             }
         )
 
+    maximum = {
+        "peak_rss_mib": max(
+            report["maximum"]["peak_rss_mib"] for report in reports
+        ),
+        "peak_gpu_mib": max(
+            (
+                report["maximum"]["peak_gpu_mib"]
+                for report in reports
+                if report["maximum"]["peak_gpu_mib"] is not None
+            ),
+            default=None,
+        ),
+        "peak_gpu_delta_mib": max(
+            (
+                report["maximum"]["peak_gpu_delta_mib"]
+                for report in reports
+                if report["maximum"]["peak_gpu_delta_mib"] is not None
+            ),
+            default=None,
+        ),
+    }
+    try:
+        execution_evidence = build_cache_sweep_execution_evidence(
+            arguments, reports, maximum
+        )
+    except (KeyError, ValueError) as error:
+        print(f"invalid cache sweep child report: {error}", file=sys.stderr)
+        return 1
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "benchmark": "runtime_expert_cache_sweep",
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model": str(Path(arguments.model).resolve()),
@@ -1834,11 +2090,15 @@ def run_cache_sweep(arguments):
         "speculative_confidence": arguments.speculative_confidence,
         "speculative_max_draft": arguments.speculative_max_draft,
         "parallel_speculative": arguments.parallel_speculative,
+        "parallel_independent": arguments.parallel_independent,
+        "backend": arguments.backend,
+        "execution_evidence": execution_evidence,
         "warmup_runs": arguments.warmup,
         "cache_warmup_runs": arguments.cache_warmup_runs,
         "repeats": arguments.repeats,
         "cache_sizes_mb": arguments.expert_cache_sweep_mb,
         "rows": rows,
+        "maximum": maximum,
         "reports": reports,
     }
     rendered = json.dumps(report, ensure_ascii=False, indent=2)
@@ -1941,11 +2201,36 @@ def main():
             )
             return 1
 
+    maximum = {
+        "peak_rss_mib": max(sample["peak_rss_mib"] for sample in samples),
+        "peak_gpu_mib": max(
+            (
+                sample["peak_gpu_mib"]
+                for sample in samples
+                if sample["peak_gpu_mib"] is not None
+            ),
+            default=None,
+        ),
+        "peak_gpu_delta_mib": max(
+            (
+                sample["peak_gpu_delta_mib"]
+                for sample in samples
+                if sample["peak_gpu_delta_mib"] is not None
+            ),
+            default=None,
+        ),
+    }
+    execution_evidence = build_execution_evidence(
+        arguments, samples, maximum
+    )
+
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model": str(Path(arguments.model).resolve()),
         "model_revision": arguments.model_revision or None,
+        "routed_expert_format": samples[0]["routed_expert_format"],
+        "compiled_artifact": inspect_compiled_artifact(arguments.model),
         "runner": str(Path(arguments.runner).resolve()),
         "command": command,
         "prompt_token_ids": arguments.prompt_token_ids,
@@ -1955,7 +2240,9 @@ def main():
         "speculative_confidence": arguments.speculative_confidence,
         "speculative_max_draft": arguments.speculative_max_draft,
         "parallel_speculative": arguments.parallel_speculative,
+        "parallel_independent": arguments.parallel_independent,
         "backend": arguments.backend,
+        "execution_evidence": execution_evidence,
         "expert_memory": arguments.expert_memory,
         "host_memory_mb": arguments.host_memory_mb,
         "expert_cache_mb": arguments.expert_cache_mb,
@@ -1979,6 +2266,11 @@ def main():
             ],
             "activation_kernel": samples[0]["activation_kernel"],
             "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+            "runtime_backend": samples[0]["runtime_backend"],
+            "vulkan_runtime_device_count": samples[0][
+                "vulkan_runtime_device_count"
+            ],
+            "vulkan_heap_budget_mib": samples[0]["vulkan_heap_budget_mib"],
             "gpu_index": arguments.gpu_index,
             "vulkan_device_index": arguments.vulkan_device_index,
             "vulkan_device_indices": arguments.vulkan_device_indices,
@@ -2021,6 +2313,9 @@ def main():
             "generation_seconds": median_field(samples, "generation_seconds"),
             "decode_tokens_per_second": median_field(
                 samples, "decode_tokens_per_second"
+            ),
+            "reported_aggregate_tokens_per_second": median_field(
+                samples, "reported_aggregate_tokens_per_second"
             ),
             "attention_ms": median_field(samples, "attention_ms"),
             "router_ms": median_field(samples, "router_ms"),
@@ -2084,8 +2379,17 @@ def main():
             "speculative_verify_ms": median_field(
                 samples, "speculative_verify_ms"
             ),
+            "vulkan_linear_dispatches": median_field(
+                samples, "vulkan_linear_dispatches"
+            ),
             "vulkan_compute_submissions": median_field(
                 samples, "vulkan_compute_submissions"
+            ),
+            "vulkan_batch_uploads": median_field(
+                samples, "vulkan_batch_uploads"
+            ),
+            "vulkan_batch_downloads": median_field(
+                samples, "vulkan_batch_downloads"
             ),
             "vulkan_submit_wait_ms": median_field(
                 samples, "vulkan_submit_wait_ms"
@@ -2446,25 +2750,7 @@ def main():
                 samples, "expert_gpu_arc_frequent_ghost_bytes"
             ),
         },
-        "maximum": {
-            "peak_rss_mib": max(sample["peak_rss_mib"] for sample in samples),
-            "peak_gpu_mib": max(
-                (
-                    sample["peak_gpu_mib"]
-                    for sample in samples
-                    if sample["peak_gpu_mib"] is not None
-                ),
-                default=None,
-            ),
-            "peak_gpu_delta_mib": max(
-                (
-                    sample["peak_gpu_delta_mib"]
-                    for sample in samples
-                    if sample["peak_gpu_delta_mib"] is not None
-                ),
-                default=None,
-            ),
-        },
+        "maximum": maximum,
         "read_traffic": {
             "runtime_logical": "Expert cache bytes read",
             "process_logical": samples[0]["logical_read_source"],
@@ -2518,6 +2804,20 @@ def main():
         print(
             f"peak NVIDIA memory: {maximum['peak_gpu_mib']} MiB "
             f"(+{maximum['peak_gpu_delta_mib']} MiB)"
+        )
+    if arguments.backend == "cpu":
+        print(
+            "CPU-only execution: "
+            f"{'verified' if execution_evidence['cpu_only_execution_verified'] else 'not verified'}; "
+            f"Vulkan context initialized: "
+            f"{execution_evidence['vulkan_context_initialized']}; "
+            f"GPU compute: {execution_evidence['gpu_compute_detected']}; "
+            f"GPU transfers: {execution_evidence['gpu_transfer_detected']}"
+        )
+        print(
+            "GPU memory observation: system-wide nvidia-smi total; "
+            f"attributed to process: "
+            f"{execution_evidence['gpu_memory_observation']['attributed_to_process']}"
         )
     if median["runtime_logical_read_bytes"] is not None:
         print(

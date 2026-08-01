@@ -49,8 +49,8 @@ void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch
 void linear_batch_into(const TensorData& matrix, const TensorData& bias, const CpuBatch& input, CpuBatch& output);
 [[nodiscard]] CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* bias, const CpuBatch& input, ExpertActivation activation, float activation_limit);
 [[nodiscard]] bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch = nullptr);
-[[nodiscard]] CpuBatch rms_norm_batch(const CpuBatch& input, const TensorData& weight, float epsilon);
-void rms_norm_batch_into(const CpuBatch& input, const TensorData& weight, float epsilon, CpuBatch& output);
+[[nodiscard]] CpuBatch rms_norm_batch(const CpuBatch& input, const TensorData& weight, float epsilon, float weight_offset = 0.0f);
+void rms_norm_batch_into(const CpuBatch& input, const TensorData& weight, float epsilon, CpuBatch& output, float weight_offset = 0.0f);
 void add_bias_inplace(CpuBatch& destination, const TensorData& bias);
 void add_batch_inplace(CpuBatch& destination, const CpuBatch& source);
 [[nodiscard]] std::vector<std::vector<float>> batch_to_vectors(const CpuBatch& batch);

@@ -70,6 +70,28 @@ public:
     [[nodiscard]] bool uses_vulkan() const noexcept;
 };
 
+class NcnnVulkanBfloat16Operator
+{
+private:
+    class Implementation;
+
+    NcnnVulkanBfloat16Operator();
+    std::unique_ptr<Implementation> implementation_;
+
+public:
+    ~NcnnVulkanBfloat16Operator();
+
+    [[nodiscard]] static std::shared_ptr<NcnnVulkanBfloat16Operator> create(
+        const TensorData& matrix,
+        const TensorData* bias = nullptr,
+        uint32_t vulkan_device_index = automatic_vulkan_device_index);
+    [[nodiscard]] static std::shared_ptr<NcnnVulkanBfloat16Operator> create_fused(
+        const std::vector<const TensorData*>& matrices,
+        const std::vector<const TensorData*>& biases,
+        uint32_t vulkan_device_index = automatic_vulkan_device_index);
+    [[nodiscard]] bool forward(const CpuBatch& input, CpuBatch& output) const;
+};
+
 class NcnnVulkanFloat8Operator
 {
 private:

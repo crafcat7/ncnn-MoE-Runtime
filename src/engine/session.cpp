@@ -4,6 +4,7 @@
 #include "engine/cpu_session_state.h"
 #include "engine/session_batch.h"
 #include "kernels/cpu_latent_attention.h"
+#include "kernels/cpu_state_cache.h"
 
 #include <algorithm>
 #include <array>
@@ -189,8 +190,12 @@ Session::Session(ModelPtr model, const SessionOptions& options)
       state_(new CpuSessionState(model_->execution_graph())),
       executor_(new CpuExecutor),
       random_generator_(options.sampling_seed),
-      prefill_chunk_size_(options.prefill_chunk_size)
+      prefill_chunk_size_(options.prefill_chunk_size),
+      speculative_context_enabled_(
+          options.enable_speculative_context)
 {
+    state_->speculative_context_enabled =
+        speculative_context_enabled_;
     statistics_.expert_token_counts.resize(model_->descriptor().expert_count, 0);
 }
 
@@ -362,6 +367,20 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
     if (!valid_sampling)
         return valid_sampling.error();
 
+    const bool enable_speculative_context =
+        speculative_context_enabled_
+        && options.enable_speculative
+        && model_->compiled_->speculative.enabled();
+    if (enable_speculative_context
+        && !state_->speculative_context_enabled
+        && sequence_length_ != 0)
+    {
+        return Error{
+            ErrorCode::InvalidArgument,
+            "cannot enable speculative context after non-speculative decoding"};
+    }
+    state_->speculative_context_enabled =
+        enable_speculative_context;
     auto prefill_result = prefill_unlocked(input_ids);
     if (!prefill_result)
         return prefill_result.error();
@@ -369,9 +388,38 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
     LogitsOutput logits = std::move(prefill_result).value().logits;
     GenerationResult result;
     result.tokens.reserve(options.max_new_tokens);
-    if (options.enable_speculative
-        && model_->compiled_->speculative.enabled())
+    if (enable_speculative_context)
     {
+        const bool state_cache_transactions =
+            model_->compiled_->speculative.kind
+            == SpeculativeModelKind::Mtp;
+        const auto begin_cache_transaction =
+            [state_cache_transactions](
+                std::span<CpuLayerCache> caches,
+                size_t expected_rows) {
+                if (state_cache_transactions)
+                {
+                    begin_state_cache_transaction(
+                        caches,
+                        expected_rows);
+                }
+                else
+                {
+                    begin_latent_cache_transaction(caches);
+                }
+            };
+        const auto finish_cache_transaction =
+            [state_cache_transactions](
+                std::span<CpuLayerCache> caches,
+                size_t committed_rows) -> Result<void> {
+                return state_cache_transactions
+                           ? finish_state_cache_transaction(
+                                 caches,
+                                 committed_rows)
+                           : finish_latent_cache_transaction(
+                                 caches,
+                                 committed_rows);
+            };
         auto initial = sample_unlocked(logits, options.sampling);
         if (!initial)
             return initial.error();
@@ -447,7 +495,9 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 }
                 continue;
             }
-            begin_latent_cache_transaction(state_->speculative_layers);
+            begin_cache_transaction(
+                state_->speculative_layers,
+                model_->compiled_->speculative.block_size);
             auto proposed = executor_->propose_speculative(
                 *model_->compiled_,
                 anchor,
@@ -464,9 +514,11 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                         return sampled.error();
                     return sampled.value().token_id;
                 });
-            auto discarded_draft_cache = finish_latent_cache_transaction(
+            auto discarded_draft_cache = finish_cache_transaction(
                 state_->speculative_layers,
-                0);
+                proposed
+                    ? proposed.value().committed_context_rows
+                    : 0);
             if (!proposed)
                 return proposed.error();
             if (!discarded_draft_cache)
@@ -481,7 +533,8 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                     static_cast<size_t>(
                         options.speculative_max_draft_tokens));
             }
-            if (options.speculative_confidence_threshold > 0.0f)
+            if (options.speculative_confidence_threshold > 0.0f
+                && !proposed.value().confidence_logits.empty())
             {
                 draft_count = std::min(
                     draft_count,
@@ -514,17 +567,67 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 proposed.value().token_ids.begin() + draft_count);
 
             statistics_scratch_ = statistics_;
-            begin_latent_cache_transaction(state_->layers);
+            begin_cache_transaction(
+                state_->layers,
+                verify_input_ids.size());
             const auto verify_started = std::chrono::steady_clock::now();
-            auto target_logits = executor_->execute(
-                *model_->compiled_,
-                verify_input_ids,
-                statistics_scratch_,
-                *state_,
-                sequence_length_);
+            auto execute_target_verify =
+                [&]() -> Result<std::vector<std::vector<float>>> {
+                if (!state_cache_transactions)
+                {
+                    return executor_->execute(
+                        *model_->compiled_,
+                        verify_input_ids,
+                        statistics_scratch_,
+                        *state_,
+                        sequence_length_);
+                }
+
+                std::vector<std::vector<float>> logits;
+                logits.reserve(verify_input_ids.size());
+                CpuBatch verified_hidden(
+                    verify_input_ids.size(),
+                    model_->compiled_->descriptor.hidden_size);
+                for (size_t index = 0;
+                     index < verify_input_ids.size();
+                     ++index)
+                {
+                    const std::span<const int32_t> input(
+                        &verify_input_ids[index],
+                        1);
+                    auto row_logits = executor_->execute(
+                        *model_->compiled_,
+                        input,
+                        statistics_scratch_,
+                        *state_,
+                        sequence_length_ + index);
+                    if (!row_logits)
+                        return row_logits.error();
+                    std::vector<std::vector<float>> rows =
+                        std::move(row_logits).value();
+                    if (rows.size() != 1
+                        || state_->speculative_main_hidden.rows() != 1)
+                    {
+                        return Error{
+                            ErrorCode::InternalError,
+                            "sequential MTP verification produced invalid rows"};
+                    }
+                    logits.push_back(std::move(rows.front()));
+                    std::copy_n(
+                        state_->speculative_main_hidden.row(0),
+                        model_->compiled_->descriptor.hidden_size,
+                        verified_hidden.row(index));
+                }
+                state_->speculative_main_hidden =
+                    std::move(verified_hidden);
+                state_->speculative_main_hidden_position =
+                    sequence_length_;
+                return logits;
+            };
+            auto target_logits = execute_target_verify();
             if (!target_logits)
             {
-                (void)finish_latent_cache_transaction(
+                (void)finish_cache_transaction(
                     state_->layers,
                     0);
                 return target_logits.error();
@@ -546,7 +649,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                         options.sampling);
                     if (!target_token)
                     {
-                        (void)finish_latent_cache_transaction(
+                        (void)finish_cache_transaction(
                             state_->layers,
                             0);
                         return target_token.error();
@@ -568,7 +671,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                         options.sampling);
                     if (!target_distribution || !draft_distribution)
                     {
-                        (void)finish_latent_cache_transaction(
+                        (void)finish_cache_transaction(
                             state_->layers,
                             0);
                         return !target_distribution
@@ -584,7 +687,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                         token_id);
                     if (draft_probability <= 0.0f)
                     {
-                        (void)finish_latent_cache_transaction(
+                        (void)finish_cache_transaction(
                             state_->layers,
                             0);
                         return Error{
@@ -609,9 +712,9 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 }
                 ++accepted;
             }
-            if (accepted == 0)
+            if (accepted == 0 && !state_cache_transactions)
             {
-                auto rolled_back = finish_latent_cache_transaction(
+                auto rolled_back = finish_cache_transaction(
                     state_->layers,
                     0);
                 if (!rolled_back)
@@ -638,7 +741,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
             }();
             if (!next)
             {
-                (void)finish_latent_cache_transaction(
+                (void)finish_cache_transaction(
                     state_->layers,
                     0);
                 return next.error();
@@ -670,7 +773,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 lock.lock();
                 if (sequence_length_ != expected_sequence_length)
                 {
-                    (void)finish_latent_cache_transaction(
+                    (void)finish_cache_transaction(
                         state_->layers,
                         0);
                     return Error{
@@ -698,7 +801,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 }
             }
 
-            auto committed = finish_latent_cache_transaction(
+            auto committed = finish_cache_transaction(
                 state_->layers,
                 emitted);
             if (!committed)
@@ -709,6 +812,16 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 emitted,
                 state_->speculative_main_hidden.columns(),
                 false);
+            if (state_cache_transactions)
+            {
+                state_->speculative_direct_alignment_ids.resize(
+                    emitted);
+                for (size_t index = 0; index < emitted; ++index)
+                {
+                    state_->speculative_direct_alignment_ids[index] =
+                        output_tokens[index].token_id;
+                }
+            }
             auto speculative_context = executor_->update_speculative_context(
                 *model_->compiled_,
                 statistics_scratch_,
@@ -782,6 +895,8 @@ Result<void> Session::reset()
     statistics_scratch_ = {};
     statistics_scratch_.expert_token_counts.resize(model_->descriptor().expert_count, 0);
     state_.reset(new CpuSessionState(model_->execution_graph()));
+    state_->speculative_context_enabled =
+        speculative_context_enabled_;
     return {};
 }
 

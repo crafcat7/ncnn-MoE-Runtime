@@ -407,9 +407,7 @@ static bool select_compressed_indices(
         for (uint32_t head = 0; head < plan.index_head_count; ++head)
         {
             const float* query_head = query.row(0) + static_cast<size_t>(head) * plan.index_head_dimension;
-            float dot = 0.0f;
-            for (uint32_t column = 0; column < plan.index_head_dimension; ++column)
-                dot += query_head[column] * key[column];
+            const float dot = float_dot(query_head, key, plan.index_head_dimension);
             scores[compressed_index] += std::max(0.0f, dot) * projected_weights.row(0)[head] * index_scale;
         }
     }
@@ -613,9 +611,7 @@ static Result<CpuBatch> execute_latent_attention_rows(
                 const uint32_t compressed_index = context.selected_compressed_indices ? context.compressed_indices[compressed_offset] : compressed_offset;
                 candidate_key = cache.latent_compressed.data() + static_cast<size_t>(compressed_index) * plan.head_dimension;
             }
-            float dot = 0.0f;
-            for (uint32_t column = 0; column < plan.head_dimension; ++column)
-                dot += query_head[column] * candidate_key[column];
+            const float dot = float_dot(query_head, candidate_key, plan.head_dimension);
             logits[candidate] = dot * softmax_scale;
             maximum = std::max(maximum, logits[candidate]);
         }
@@ -870,9 +866,7 @@ Result<CpuBatch> execute_dspark_attention(
                                                    % plan.sliding_window)
                                                    * plan.head_dimension
                                        : key_value.row(candidate - window_count);
-                float dot = 0.0f;
-                for (uint32_t column = 0; column < plan.head_dimension; ++column)
-                    dot += query_head[column] * key[column];
+                const float dot = float_dot(query_head, key, plan.head_dimension);
                 logits[candidate] = dot * softmax_scale;
                 maximum = std::max(maximum, logits[candidate]);
             }

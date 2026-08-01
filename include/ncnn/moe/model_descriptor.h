@@ -14,6 +14,7 @@ enum class ModelNodeType
 {
     RmsNorm,
     FusedQkv,
+    GatedDeltaNet,
     MultiHeadLatentAttention,
     Rope,
     AttentionSink,
@@ -36,18 +37,21 @@ struct ModelNodeDescriptor
 #define NCNN_MOE_ATTN_SINK_BIT             1
 #define NCNN_MOE_ATTN_QK_NORM_BIT          2
 #define NCNN_MOE_ATTN_INTERLEAVED_ROPE_BIT 3
+#define NCNN_MOE_ATTN_OUTPUT_GATE_BIT      4
 
 enum AttentionDescriptorFlag : uint32_t
 {
     AttentionDescriptorBias = UINT32_C(1) << NCNN_MOE_ATTN_BIAS_BIT,
     AttentionDescriptorSinks = UINT32_C(1) << NCNN_MOE_ATTN_SINK_BIT,
     AttentionDescriptorQueryKeyNorm = UINT32_C(1) << NCNN_MOE_ATTN_QK_NORM_BIT,
-    AttentionDescriptorRopeInterleaved = UINT32_C(1) << NCNN_MOE_ATTN_INTERLEAVED_ROPE_BIT
+    AttentionDescriptorRopeInterleaved = UINT32_C(1) << NCNN_MOE_ATTN_INTERLEAVED_ROPE_BIT,
+    AttentionDescriptorOutputGate = UINT32_C(1) << NCNN_MOE_ATTN_OUTPUT_GATE_BIT
 };
 
 enum class AttentionKind
 {
     Standard,
+    GatedDeltaNet,
     MultiHeadLatent
 };
 
@@ -71,6 +75,7 @@ struct AttentionDescriptor
     uint32_t index_head_count = 0;
     uint32_t index_head_dimension = 0;
     uint32_t index_top_k = 0;
+    uint32_t convolution_kernel_size = 0;
 
     float rope_theta = 10000.0f;
     float compressed_rope_theta = 10000.0f;
@@ -86,6 +91,7 @@ struct AttentionDescriptor
 #define NCNN_MOE_DESC_EXPERT_BIAS_BIT     2
 #define NCNN_MOE_DESC_ROUTER_BIAS_BIT     3
 #define NCNN_MOE_DESC_PROJECTION_BIAS_BIT 4
+#define NCNN_MOE_DESC_SHARED_GATE_BIT     5
 
 enum MoeDescriptorFlag : uint32_t
 {
@@ -93,7 +99,8 @@ enum MoeDescriptorFlag : uint32_t
     MoeDescriptorSharedExpert = UINT32_C(1) << NCNN_MOE_DESC_SHARED_EXPERT_BIT,
     MoeDescriptorExpertBias = UINT32_C(1) << NCNN_MOE_DESC_EXPERT_BIAS_BIT,
     MoeDescriptorRouterBias = UINT32_C(1) << NCNN_MOE_DESC_ROUTER_BIAS_BIT,
-    MoeDescriptorProjectionBias = UINT32_C(1) << NCNN_MOE_DESC_PROJECTION_BIAS_BIT
+    MoeDescriptorProjectionBias = UINT32_C(1) << NCNN_MOE_DESC_PROJECTION_BIAS_BIT,
+    MoeDescriptorSharedExpertGate = UINT32_C(1) << NCNN_MOE_DESC_SHARED_GATE_BIT
 };
 
 struct MoeDescriptor
@@ -145,6 +152,13 @@ struct LayerDescriptor
     uint32_t flags = LayerDescriptorMoe;
 };
 
+enum class SpeculativeModelKind
+{
+    None,
+    DSpark,
+    Mtp
+};
+
 struct MoeModelDescriptor
 {
     std::string model_type;
@@ -164,10 +178,12 @@ struct MoeModelDescriptor
     DType activation_dtype = DType::Float32;
     DType kv_cache_dtype = DType::Float32;
     float norm_epsilon = 1e-5f;
+    float norm_weight_offset = 0.0f;
     uint32_t hyper_connection_multiplier = 1;
     uint32_t hyper_connection_iterations = 0;
     float hyper_connection_epsilon = 1e-6f;
     uint32_t hash_routing_layer_count = 0;
+    SpeculativeModelKind speculative_kind = SpeculativeModelKind::None;
     uint32_t speculative_layer_count = 0;
     uint32_t speculative_block_size = 0;
     uint32_t speculative_noise_token_id = 0;

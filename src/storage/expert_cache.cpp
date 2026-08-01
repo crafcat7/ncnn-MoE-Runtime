@@ -1430,7 +1430,9 @@ Mxfp4ExpertCache::Entry* Mxfp4ExpertCache::find_victim_locked(
     for (Entry* entry : list)
     {
         const bool speculative_requires_speculative_victim =
-            speculative && !has_flag(flags_, ExpertCacheForwardAwareEviction);
+            speculative
+            && !has_flag(flags_, ExpertCacheForwardAwareEviction)
+            && !has_flag(flags_, ExpertCacheAllowSpeculativeEviction);
         if (!entry
             || entry->state != Entry::State::Ready
             || (speculative_requires_speculative_victim
@@ -1774,9 +1776,27 @@ void Mxfp4ExpertCache::worker_loop()
         }
         return false;
     };
+
+    std::vector<std::shared_ptr<Entry>> entries;
+    std::vector<std::optional<ExpertVictimPair>> loaded_pairs;
+    std::vector<std::optional<Error>> errors;
+    std::vector<uint8_t> restored;
+    std::vector<uint64_t> entry_mapped_ranges;
+    std::vector<uint64_t> entry_mapped_bytes;
+    std::vector<std::shared_ptr<Entry>> disk_entries;
+    std::vector<size_t> disk_slots;
+    entries.reserve(maximum_coalesced_experts);
+    loaded_pairs.reserve(maximum_coalesced_experts);
+    errors.reserve(maximum_coalesced_experts);
+    restored.reserve(maximum_coalesced_experts);
+    entry_mapped_ranges.reserve(maximum_coalesced_experts);
+    entry_mapped_bytes.reserve(maximum_coalesced_experts);
+    disk_entries.reserve(maximum_coalesced_experts);
+    disk_slots.reserve(maximum_coalesced_experts);
+
     for (;;)
     {
-        std::vector<std::shared_ptr<Entry>> entries;
+        entries.clear();
         {
             std::unique_lock<std::mutex> lock(mutex_);
             work_available_.wait(lock, [this] {
@@ -1841,15 +1861,15 @@ void Mxfp4ExpertCache::worker_loop()
             active_jobs_ += static_cast<uint32_t>(entries.size());
         }
 
-        std::vector<std::optional<ExpertVictimPair>> loaded_pairs(entries.size());
-        std::vector<std::optional<Error>> errors(entries.size());
-        std::vector<uint8_t> restored(entries.size(), 0);
-        std::vector<uint64_t> entry_mapped_ranges(entries.size(), 0);
-        std::vector<uint64_t> entry_mapped_bytes(entries.size(), 0);
-        std::vector<std::shared_ptr<Entry>> disk_entries;
-        std::vector<size_t> disk_slots;
-        disk_entries.reserve(entries.size());
-        disk_slots.reserve(entries.size());
+        loaded_pairs.clear();
+        loaded_pairs.resize(entries.size());
+        errors.clear();
+        errors.resize(entries.size());
+        restored.assign(entries.size(), 0);
+        entry_mapped_ranges.assign(entries.size(), 0);
+        entry_mapped_bytes.assign(entries.size(), 0);
+        disk_entries.clear();
+        disk_slots.clear();
         for (size_t index = 0; index < entries.size(); ++index)
         {
             if (victim_cache_)
@@ -1988,6 +2008,13 @@ void Mxfp4ExpertCache::worker_loop()
                 idle_.notify_all();
         }
         entries.clear();
+        loaded_pairs.clear();
+        errors.clear();
+        restored.clear();
+        entry_mapped_ranges.clear();
+        entry_mapped_bytes.clear();
+        disk_entries.clear();
+        disk_slots.clear();
         ready_.notify_all();
     }
 }

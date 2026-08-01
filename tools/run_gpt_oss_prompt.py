@@ -102,6 +102,11 @@ def parse_arguments():
         action="store_true",
         help="Print native runner diagnostics.",
     )
+    parser.add_argument(
+        "--report-throughput",
+        action="store_true",
+        help="Print the optional aggregate generation rate in token/s.",
+    )
     io_group = parser.add_mutually_exclusive_group()
     io_group.add_argument("--mmap-experts", action="store_true")
     io_group.add_argument("--direct-expert-io", action="store_true")
@@ -115,6 +120,20 @@ def decode_tokens(encoding, tokens):
         return text.decode("utf-8", errors="ignore") if isinstance(text, bytes) else text
     except (AttributeError, UnicodeDecodeError, ValueError):
         return ""
+
+
+def print_reported_throughput(output):
+    match = re.search(
+        r"^(?:Parallel sessions: \d+, aggregate throughput: "
+        r"|Aggregate throughput: )([0-9.eE+-]+) token/s$",
+        output,
+        re.MULTILINE,
+    )
+    if match:
+        print(
+            f"Aggregate throughput: {match.group(1)} token/s",
+            file=sys.stderr,
+        )
 
 
 def stream_harmony_token(encoding, token, stream_state):
@@ -297,6 +316,8 @@ def main():
         command.extend(["--stop-token", str(token)])
     if arguments.backend != "auto":
         command.append(f"--{arguments.backend}")
+    if arguments.report_throughput:
+        command.append("--report-throughput")
 
     if arguments.stream:
         command.append("--stream-token-ids")
@@ -369,6 +390,9 @@ def main():
         if not arguments.verbose:
             sys.stderr.write("".join(diagnostics))
         return return_code
+
+    if arguments.report_throughput and not arguments.verbose:
+        print_reported_throughput(completed_stdout)
 
     match = re.search(r"^generated token ids:(.*)$", completed_stdout, re.MULTILINE)
     if not match:

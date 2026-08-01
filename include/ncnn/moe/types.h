@@ -33,6 +33,7 @@ namespace moe {
 inline constexpr uint32_t automatic_vulkan_device_index = std::numeric_limits<uint32_t>::max();
 
 class NcnnLinearOperator;
+class NcnnVulkanBfloat16Operator;
 class NcnnVulkanFloat8Operator;
 class NcnnVulkanAttentionOperator;
 class MappedFileRange;
@@ -339,6 +340,8 @@ struct TensorData
     uint64_t mapped_byte_count = 0;
     std::shared_ptr<const MxFp4FileStorage> mxfp4_file_storage;
     std::shared_ptr<NcnnLinearOperator> linear_operator;
+    std::shared_ptr<NcnnVulkanBfloat16Operator>
+        bfloat16_linear_operator;
     std::shared_ptr<NcnnVulkanFloat8Operator> float8_linear_operator;
 
     [[nodiscard]] uint64_t element_count() const noexcept;
