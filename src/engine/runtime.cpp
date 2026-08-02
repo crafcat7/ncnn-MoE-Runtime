@@ -366,6 +366,19 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
     compiled_model.memory_plan = plan;
     compiled_model.runtime_option_flags = options.flags;
     compiled_model.expected_concurrency = options.expected_concurrency;
+    compiled_model.effective_runtime_options.hybrid_mode = compiled_model.hybrid_mode;
+    compiled_model.effective_runtime_options.requested_expert_memory_mode = plan.requested_mode;
+    compiled_model.effective_runtime_options.selected_expert_memory_mode = plan.selected_mode;
+    compiled_model.effective_runtime_options.host_memory_budget_bytes = plan.host_memory_budget_bytes;
+    compiled_model.effective_runtime_options.expert_cache_bytes = plan.expert_cache_bytes;
+    compiled_model.effective_runtime_options.expert_gpu_cache_bytes = options.expert_gpu_cache_bytes;
+    compiled_model.effective_runtime_options.expert_gpu_victim_cache_bytes = options.expert_gpu_victim_cache_bytes;
+    compiled_model.effective_runtime_options.expert_gpu_victim_reuse_probe_interval = options.expert_gpu_victim_reuse_probe_interval;
+    compiled_model.effective_runtime_options.vulkan_device_index = compiled_model.vulkan_device_index;
+    compiled_model.effective_runtime_options.vulkan_device_indices = compiled_model.vulkan_device_indices;
+    compiled_model.effective_runtime_options.flags = options.flags;
+    compiled_model.effective_runtime_options.expected_concurrency = options.expected_concurrency;
+    compiled_model.effective_runtime_options.file_backed_experts = file_backed_experts;
     if (file_backed_experts)
     {
         uint32_t expert_io_workers = options.expert_io_workers;
@@ -386,6 +399,7 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
             const uint32_t io_core_budget = std::max(1u, capabilities_.physical_cpu_core_count);
             expert_io_workers = std::min(exact_and_speculative_budget, io_core_budget);
         }
+        compiled_model.effective_runtime_options.expert_io_workers = expert_io_workers;
         uint32_t expert_cache_flags = 0;
         if (has_flag(options.flags, RuntimeOptionMemoryMapExperts))
         {

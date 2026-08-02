@@ -4495,6 +4495,14 @@ void test_backend_capabilities_and_hybrid_execution()
     check(static_cast<bool>(runtime.synchronize_model_caches(automatic_model.value())));
     check(static_cast<bool>(automatic_model.value()->hybrid_mode() == (automatic_uses_vulkan ? HybridMode::HybridExperts : HybridMode::CpuOnly)));
     check(static_cast<bool>(automatic_model.value()->vulkan_device_index() == (automatic_uses_vulkan ? automatic_device_index : automatic_vulkan_device_index)));
+    const EffectiveRuntimeOptions& automatic_effective = automatic_model.value()->effective_runtime_options();
+    check(static_cast<bool>(automatic_effective.hybrid_mode == automatic_model.value()->hybrid_mode()));
+    check(static_cast<bool>(automatic_effective.requested_expert_memory_mode == automatic_model.value()->memory_plan().requested_mode));
+    check(static_cast<bool>(automatic_effective.selected_expert_memory_mode == automatic_model.value()->memory_plan().selected_mode));
+    check(static_cast<bool>(automatic_effective.host_memory_budget_bytes == automatic_model.value()->memory_plan().host_memory_budget_bytes));
+    check(static_cast<bool>(automatic_effective.expert_cache_bytes == automatic_model.value()->memory_plan().expert_cache_bytes));
+    check(static_cast<bool>(automatic_effective.expected_concurrency == automatic_options.expected_concurrency));
+    check(static_cast<bool>(automatic_effective.vulkan_device_indices == automatic_model.value()->vulkan_device_indices()));
     auto automatic_session = runtime.create_session(automatic_model.value());
     check(static_cast<bool>(automatic_session));
     const std::vector<int32_t> packed_prompt = {0, 1, 2, 3};

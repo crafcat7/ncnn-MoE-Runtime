@@ -36,51 +36,50 @@ hf download openai/gpt-oss-120b --local-dir .\models\gpt-oss\gpt-oss-120b
 ```
 
 Each directory must contain `config.json`, `model.safetensors.index.json`, and
-every shard referenced by the index. Build the Release runner by following the
-root [Quick start](../../README.md#quick-start).
+every shard referenced by the index. Build the examples by following the root
+[Quick start](../../README.md#quick-start), then build `ncnn_moe_worker` for
+normal text and chat usage.
 
-## Run a text prompt
+## Run text or chat
 
-The Harmony wrapper provides official prompt formatting and token decoding
-without adding a tokenizer dependency to the C++ runtime:
+The unified CLI applies the official Harmony formatting and token decoding while
+the native worker remains tokenizer-free:
 
 ```powershell
-python -m pip install openai-harmony
-python tools\run_gpt_oss_prompt.py `
-  .\build-ncnn\Release\ncnn_moe_gpt_oss.exe `
-  .\models\gpt-oss\gpt-oss-20b `
-  "Reply with exactly: OK" `
-  --max-new-tokens 1024 --stream --backend hybrid --report-throughput
+python -m pip install -e ".[gpt-oss]"
+python tools\ncnn_moe.py run `
+  --model .\models\gpt-oss\gpt-oss-20b `
+  --prompt "Reply with exactly: OK" `
+  --max-new-tokens 1024 --stream --backend hybrid
+python tools\ncnn_moe.py chat `
+  --model .\models\gpt-oss\gpt-oss-20b
 ```
 
-By default, the text wrapper prints only the human-readable
-`[reasoning]` and `[answer]` sections. Native runner diagnostics, token IDs,
-timings, and cache statistics are suppressed unless `--verbose` is present.
-The reply limit defaults to 1024 tokens; reaching it before a Harmony stop
-token produces a warning. `--stream-final-only` remains available when only
-the answer is wanted. `--report-throughput` prints only the optional aggregate
-generation rate without enabling the full native diagnostic output.
+`run` streams tokens and metrics; `chat` keeps a persistent conversation and
+supports `/context`, `/compact`, `/reset`, `/new`, `/stats`, and `/tune`. Use
+`--show-reasoning` or `/reasoning` when the hidden reasoning channel is needed.
+The CLI locates `ncnn_moe_worker` in common build directories, or accepts an
+explicit path with `--worker`. Scripted runs can add `--no-metrics` to suppress
+periodic metrics events while retaining final statistics.
 
-## Run token IDs
+## Run token IDs with the reference runner
 
-The native runner accepts a model directory followed by one or more prompt
+Applications that already own tokenization can use the model-named native
+reference target. It accepts a model directory followed by one or more prompt
 token IDs:
 
 ```powershell
+cmake -S . -B build-ncnn -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON
+cmake --build build-ncnn --config Release --target ncnn_moe_gpt_oss --parallel
 .\build-ncnn\Release\ncnn_moe_gpt_oss.exe `
   .\models\gpt-oss\gpt-oss-20b 0 `
   --max-new-tokens 64 --hybrid --report-throughput
 ```
 
-Use `--stream-token-ids` to print generated IDs as they become available. The
-final report includes backend dispatch counts, phase timings, cache statistics,
-and the complete generated sequence. For long whitespace-separated token
-sequences, use `--prompt-token-file PATH` instead of positional IDs.
-`--report-throughput` adds the aggregate generation rate in token/s; omit it
-when that optional line is not needed.
-`ncnn_moe_gpt_oss` and `ncnn_moe_deepseek_v4` use the same native runner
-implementation and option parser; their entry points only select the expected
-adapter and model-specific default EOS.
+Use `--stream-token-ids` to print generated IDs as they become available. For
+long whitespace-separated sequences, use `--prompt-token-file PATH`. These
+reference targets are retained for the benchmark harness and CTest fixture;
+normal text and chat usage should use `ncnn_moe.py`.
 
 ## Sampling
 
@@ -176,13 +175,13 @@ layout optimization, not a required model conversion.
 ## GPT-OSS-120B on a constrained-memory host
 
 This configuration is suitable as a starting point for a machine with about
-32 GiB RAM and a 16 GiB Vulkan device:
+32 GiB RAM and a 16 GiB Vulkan device. The same resource overrides are accepted
+by the unified CLI:
 
 ```powershell
-python tools\run_gpt_oss_prompt.py `
-  .\build-ncnn\Release\ncnn_moe_gpt_oss.exe `
-  .\models\gpt-oss\gpt-oss-120b `
-  "Reply with exactly: OK" `
+python tools\ncnn_moe.py run `
+  --model .\models\gpt-oss\gpt-oss-120b `
+  --prompt "Reply with exactly: OK" `
   --backend hybrid --expert-memory on-demand `
   --host-memory-mb 24576 --expert-cache-mb 16384 `
   --expert-io-workers 4 `
@@ -269,6 +268,11 @@ physical reads are sampled total-disk counters and include unrelated system
 traffic; use the JSON report for process and Runtime logical counters.
 
 ## Reproduce the benchmark
+
+The matrix driver intentionally uses the reference runner because it exercises
+token-ID files, independent Sessions, and benchmark-only scheduler controls.
+Configure with `-DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON` before building that
+target. Use the unified CLI above for normal text and chat.
 
 The matrix driver validates parity for every case, runs the cold and warm
 policies, and writes per-case reports plus one aggregate JSON file:

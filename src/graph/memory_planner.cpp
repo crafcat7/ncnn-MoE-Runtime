@@ -112,7 +112,7 @@ static Result<uint64_t> latent_fp8_dense_bytes(const MoeIR& ir)
         if (!status)
             return status.error();
 
-        status = add_matrix_bytes(attention.query_lora_rank, ir.hidden_size, attention.projection_weight_dtype, "DeepSeek query A", total);
+        status = add_matrix_bytes(attention.query_lora_rank, ir.hidden_size, attention.projection_weight _dtype, "DeepSeek query A", total);
         if (!status)
             return status.error();
         status = add_matrix_bytes(static_cast<uint64_t>(attention.head_count) * attention.head_dimension, attention.query_lora_rank, attention.projection_weight_dtype, "DeepSeek query B", total);

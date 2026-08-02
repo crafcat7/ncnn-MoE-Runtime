@@ -5,11 +5,31 @@ project(ncnn_moe_runtime VERSION 0.1.0 LANGUAGES CXX)
 option(NCNN_BUILD_MOE_RUNTIME "Build the ncnn MoE transformer runtime" ON)
 option(NCNN_MOE_BUILD_TESTS "Build ncnn_moe tests" ON)
 option(NCNN_MOE_BUILD_EXAMPLES "Build ncnn_moe examples" ON)
+option(
+    NCNN_MOE_BUILD_REFERENCE_RUNNERS
+    "Build model-specific token-ID reference runners used by benchmarks and CTest"
+    OFF
+)
+option(
+    NCNN_MOE_BUILD_MXFP4_BENCHMARK
+    "Build the standalone MXFP4 microbenchmark"
+    OFF
+)
+option(
+    NCNN_MOE_ENABLE_MSVC_MP
+    "Enable MSVC multiprocessor compilation"
+    ON
+)
 set(NCNN_MOE_USE_NCNN_DEFAULT ON)
 option(NCNN_MOE_USE_NCNN "Use ncnn optimized CPU operators when available" ${NCNN_MOE_USE_NCNN_DEFAULT})
 set(NCNN_MOE_USE_VULKAN_DEFAULT ON)
 option(NCNN_MOE_USE_VULKAN "Build ncnn with Vulkan support" ${NCNN_MOE_USE_VULKAN_DEFAULT})
 option(NCNN_MOE_ENABLE_EXPERIMENTAL_MACOS_VULKAN "Enable the experimental MoltenVK hybrid backend on macOS" ON)
+include(GNUInstallDirs)
+
+if(MSVC AND NCNN_MOE_ENABLE_MSVC_MP)
+    add_compile_options(/MP)
+endif()
 
 if(NOT NCNN_BUILD_MOE_RUNTIME)
     return()
@@ -241,63 +261,129 @@ if(NCNN_MOE_BUILD_TESTS)
 endif()
 
 if(NCNN_MOE_BUILD_EXAMPLES)
-    add_executable(
-        ncnn_moe_gpt_oss
-        examples/run_gpt_oss.cpp
-        examples/internal/run_model.cpp)
-    target_link_libraries(ncnn_moe_gpt_oss PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_gpt_oss PRIVATE cxx_std_20)
+    if(NCNN_MOE_BUILD_REFERENCE_RUNNERS)
+        add_library(
+            ncnn_moe_reference_runner
+            STATIC
+            examples/internal/run_model.cpp)
+        target_link_libraries(
+            ncnn_moe_reference_runner
+            PUBLIC ncnn::moe)
+        target_compile_features(
+            ncnn_moe_reference_runner
+            PRIVATE cxx_std_20)
+
+        add_executable(
+            ncnn_moe_gpt_oss
+            examples/run_gpt_oss.cpp)
+        target_link_libraries(
+            ncnn_moe_gpt_oss
+            PRIVATE ncnn_moe_reference_runner)
+        target_compile_features(
+            ncnn_moe_gpt_oss
+            PRIVATE cxx_std_20)
+
+        add_executable(
+            ncnn_moe_deepseek_v4
+            examples/run_deepseek_v4.cpp)
+        target_link_libraries(
+            ncnn_moe_deepseek_v4
+            PRIVATE ncnn_moe_reference_runner)
+        target_compile_features(
+            ncnn_moe_deepseek_v4
+            PRIVATE cxx_std_20)
+
+        add_executable(
+            ncnn_moe_qwen3_6
+            examples/run_qwen3_6.cpp)
+        target_link_libraries(
+            ncnn_moe_qwen3_6
+            PRIVATE ncnn_moe_reference_runner)
+        target_compile_features(
+            ncnn_moe_qwen3_6
+            PRIVATE cxx_std_20)
+    endif()
 
     add_executable(
-        ncnn_moe_deepseek_v4
-        examples/run_deepseek_v4.cpp
-        examples/internal/run_model.cpp)
+        ncnn_moe_worker
+        examples/ncnn_moe_worker.cpp
+        examples/internal/gpu_telemetry.cpp)
     target_link_libraries(
-        ncnn_moe_deepseek_v4
+        ncnn_moe_worker
         PRIVATE ncnn::moe)
     target_compile_features(
-        ncnn_moe_deepseek_v4
+        ncnn_moe_worker
         PRIVATE cxx_std_20)
+    if(WIN32)
+        target_link_libraries(ncnn_moe_worker PRIVATE psapi)
+    endif()
+    if(CMAKE_DL_LIBS)
+        target_link_libraries(ncnn_moe_worker PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+    install(TARGETS ncnn_moe_worker
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-    add_executable(
-        ncnn_moe_qwen3_6
-        examples/run_qwen3_6.cpp
-        examples/internal/run_model.cpp)
-    target_link_libraries(
-        ncnn_moe_qwen3_6
-        PRIVATE ncnn::moe)
-    target_compile_features(
-        ncnn_moe_qwen3_6
-        PRIVATE cxx_std_20)
-
-    add_executable(
-        ncnn_moe_mxfp4_bench
-        examples/benchmark_mxfp4.cpp)
-    target_link_libraries(
-        ncnn_moe_mxfp4_bench
-        PRIVATE ncnn::moe)
-    target_compile_features(
-        ncnn_moe_mxfp4_bench
-        PRIVATE cxx_std_20)
-    target_include_directories(
-        ncnn_moe_mxfp4_bench
-        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(NCNN_MOE_BUILD_MXFP4_BENCHMARK)
+        add_executable(
+            ncnn_moe_mxfp4_bench
+            examples/benchmark_mxfp4.cpp)
+        target_link_libraries(
+            ncnn_moe_mxfp4_bench
+            PRIVATE ncnn::moe)
+        target_compile_features(
+            ncnn_moe_mxfp4_bench
+            PRIVATE cxx_std_20)
+        target_include_directories(
+            ncnn_moe_mxfp4_bench
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    endif()
 endif()
 
 if(NCNN_MOE_BUILD_TESTS AND NCNN_MOE_BUILD_EXAMPLES)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        if(NCNN_MOE_BUILD_REFERENCE_RUNNERS)
+            add_test(
+                NAME ncnn_moe_gpt_oss_fixture
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/create_gpt_oss_fixture.py
+                    ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
+                    --verify-runner $<TARGET_FILE:ncnn_moe_gpt_oss>
+            )
+        else()
+            add_test(
+                NAME ncnn_moe_gpt_oss_fixture
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/create_gpt_oss_fixture.py
+                    ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
+            )
+        endif()
         add_test(
-            NAME ncnn_moe_gpt_oss_fixture
+            NAME ncnn_moe_python_fixture
             COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tools/create_gpt_oss_fixture.py
-                ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
-                --verify-runner $<TARGET_FILE:ncnn_moe_gpt_oss>
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ncnn_moe.py
+                --worker $<TARGET_FILE:ncnn_moe_worker>
+                --model ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
+        )
+        set_tests_properties(
+            ncnn_moe_python_fixture
+            PROPERTIES DEPENDS ncnn_moe_gpt_oss_fixture
+        )
+        add_test(
+            NAME ncnn_moe_python_auto_fixture
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ncnn_moe.py
+                --auto
+                --worker $<TARGET_FILE:ncnn_moe_worker>
+                --model ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
+        )
+        set_tests_properties(
+            ncnn_moe_python_auto_fixture
+            PROPERTIES DEPENDS ncnn_moe_gpt_oss_fixture
         )
     endif()
 endif()
 
-include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 set(NCNN_MOE_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/ncnn_moe")
 

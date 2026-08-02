@@ -77,51 +77,52 @@ storage formats.
 
 ## Build
 
-The first-class native runner is built with the other examples:
+The first-class user-facing native target is the long-lived worker:
 
 ```powershell
 cmake -S . -B build-ncnn
 cmake --build build-ncnn --config Release `
-  --target ncnn_moe_qwen3_6 --parallel
+  --target ncnn_moe_worker --parallel
 ```
 
 Use `-DNCNN_MOE_USE_VULKAN=OFF` for a portable CPU-only build.
 
-## Run a text prompt
+## Run text or chat
 
-The wrapper applies the checkpoint's official tokenizer and chat template,
-then passes token IDs to the native C++ runner:
+The unified CLI applies the checkpoint's official tokenizer and chat template,
+then streams through `ncnn_moe_worker`:
 
 ```powershell
-python -m pip install -U transformers jinja2
-python tools\run_qwen3_6_prompt.py `
-  .\build-ncnn\Release\ncnn_moe_qwen3_6.exe `
-  .\models\qwen3.6\Qwen3.6-35B-A3B `
-  "请简短介绍一下你自己。" `
-  --max-new-tokens 1024 --stream --backend hybrid --report-throughput
+python -m pip install -e ".[hf]"
+python tools\ncnn_moe.py run `
+  --model .\models\qwen3.6\Qwen3.6-35B-A3B `
+  --prompt "Briefly explain mixture-of-experts models." `
+  --max-new-tokens 1024 --stream --backend hybrid --no-speculative
+python tools\ncnn_moe.py chat `
+  --model .\models\qwen3.6\Qwen3.6-35B-A3B
 ```
 
 Thinking mode uses the checkpoint defaults: temperature 1.0, Top-P 0.95,
 Top-K 20, and Min-P 0.0. `--no-thinking` requests the official template's
-direct-answer mode. `--stream-final-only` suppresses reasoning during
-streaming, while `--verbose` exposes prompt IDs, generated IDs, timings, and
-Runtime diagnostics. `--report-throughput` exposes only the optional aggregate
-generation rate in token/s.
-
-The wrapper and native runner default to the faster target-only path, including
-when Artifact v3 is present. Use `--speculative` to opt into experimental MTP,
-`--no-speculative` for an explicit target-only A/B control, and
-`--speculative-max-draft 1` to cap the draft window.
+direct-answer mode. `--show-reasoning` or `/reasoning` expands the hidden
+reasoning channel. `--no-speculative` selects the target-only path, and
+`--speculative-max-draft N` caps the model-provided draft window when the
+checkpoint exposes one. The CLI locates `ncnn_moe_worker` automatically or
+accepts `--worker PATH`. Scripted runs can add `--no-metrics` to suppress
+periodic metrics events while retaining final statistics.
 
 The Runtime does not currently expose the checkpoint's recommended presence
 penalty. Applications that require exact sampling-policy parity should account
 for that difference.
 
-## Run token IDs
+## Run token IDs with the reference runner
 
-The native runner accepts a model directory followed by prompt token IDs:
+Applications that already own tokenization can use the model-named native
+reference target:
 
 ```powershell
+cmake -S . -B build-ncnn -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON
+cmake --build build-ncnn --config Release --target ncnn_moe_qwen3_6 --parallel
 .\build-ncnn\Release\ncnn_moe_qwen3_6.exe `
   .\models\qwen3.6\Qwen3.6-35B-A3B 248044 `
   --max-new-tokens 16 --no-speculative --hybrid --report-throughput
@@ -130,8 +131,8 @@ The native runner accepts a model directory followed by prompt token IDs:
 Use `--prompt-token-file PATH` for a whitespace-separated token sequence and
 `--stream-token-ids` for incremental machine-readable IDs. The runner stops on
 both published stop tokens: `<|im_end|>` (`248046`) and `<|endoftext|>`
-(`248044`). `--report-throughput` adds the aggregate generation rate in
-token/s; omit it when that optional line is not needed.
+(`248044`). These reference targets are retained for the benchmark harness and
+CTest fixture; normal text and chat usage should use `ncnn_moe.py`.
 
 ## Execution and memory
 
@@ -157,6 +158,11 @@ each speculative target verification uses transactional standard KV and
 Gated DeltaNet state so rejected trailing rows are rolled back exactly.
 
 ## Reference performance
+
+The reproduction commands in this section intentionally use the reference
+runner for fixed token-ID workloads and multi-Session scheduling. Configure
+with `-DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON` before building that target. Use
+the unified CLI above for normal text and chat.
 
 The current accepted high-throughput profile uses the checkpoint-bound MXFP4
 routed-Expert Artifact, official BF16 non-Expert weights, Hybrid CPU/Vulkan

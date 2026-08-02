@@ -61,6 +61,10 @@ public:
     {
         return compiled_->memory_plan;
     }
+    [[nodiscard]] const EffectiveRuntimeOptions& effective_runtime_options() const noexcept
+    {
+        return compiled_->effective_runtime_options;
+    }
     [[nodiscard]] const ExpertStore& expert_store() const noexcept
     {
         return *compiled_->expert_store;

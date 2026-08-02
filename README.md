@@ -108,27 +108,72 @@ requiring a resident copy of every routed weight.
 
 ## Quick start
 
-Requirements: a C++20 compiler, CMake 3.20 or newer, Python 3, and Git.
+Requirements: a C++20 compiler, CMake 3.21 or newer, Python 3, and Git.
 
 ```powershell
 git clone --recurse-submodules https://github.com/crafcat7/ncnn-MoE-Runtime.git
 cd ncnn-MoE-Runtime
-cmake -S . -B build-ncnn
-cmake --build build-ncnn --config Release --parallel
-ctest --test-dir build-ncnn -C Release --output-on-failure
+cmake -S . -B build-ncnn `
+  -DNCNN_MOE_BUILD_TESTS=OFF `
+  -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=OFF `
+  -DNCNN_MOE_BUILD_MXFP4_BENCHMARK=OFF
+cmake --build build-ncnn --config Release --target ncnn_moe_worker --parallel
+```
+
+The worker build is the fast default for the unified CLI. CMake does not build
+the model-specific reference runners or the MXFP4 microbenchmark unless they
+are explicitly enabled. MSVC builds use multiprocessor compilation by default;
+set `-DNCNN_MOE_ENABLE_MSVC_MP=OFF` only when a toolchain does not support it.
+
+For the full development and CTest targets, use a separate build directory:
+
+```powershell
+cmake -S . -B build-test `
+  -DNCNN_MOE_BUILD_TESTS=ON `
+  -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON
+cmake --build build-test --config Release `
+  --target ncnn_moe_tests ncnn_moe_worker ncnn_moe_gpt_oss --parallel
+ctest --test-dir build-test -C Release --output-on-failure
 ```
 
 For a single-config generator:
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNCNN_MOE_BUILD_TESTS=ON
+cmake --build build --target ncnn_moe_tests ncnn_moe_worker --parallel
 ctest --test-dir build --output-on-failure
 ```
 
 The pinned ncnn submodule is built with the runtime. Restore it with
 `git submodule update --init --recursive` when necessary. A CPU-only build can
 be selected with `-DNCNN_MOE_USE_VULKAN=OFF`.
+
+## Unified examples
+
+The supported user-facing example entry point is the Python CLI:
+
+```powershell
+python tools\ncnn_moe.py inspect --model .\models\gpt-oss\gpt-oss-20b
+python tools\ncnn_moe.py run --model .\models\gpt-oss\gpt-oss-20b `
+  --prompt "Reply with exactly: OK" --stream
+python tools\ncnn_moe.py chat --model .\models\gpt-oss\gpt-oss-20b
+```
+
+Build `ncnn_moe_worker` with the examples. The worker owns Runtime/Model and
+Session lifetime and communicates through token-ID JSONL; the Python adapters
+own tokenizers, chat templates, reasoning channels, persistent history, and
+TUI presentation. `inspect` reports the detected hardware and the effective
+backend, memory, Expert-cache, and I/O plan. `chat` adds resumable sessions,
+context budgeting, compaction, and live token/CPU/GPU/I/O metrics. Install
+`openai-harmony` for GPT-OSS or `transformers` and `jinja2` for the Hugging
+Face-backed adapters; `rich` and `prompt-toolkit` are optional TUI upgrades.
+Persistent session history, user configuration, and tuning profiles are stored
+under `.ncnn-moe/` in the project root; use `--config-dir` when another
+location is required. Native KV and runtime cache state remain in memory.
+
+See [examples/README.md](examples/README.md) for the protocol boundary and
+common commands. The model guides document model-specific package preparation
+and adapter options.
 
 ## Runtime API
 
@@ -164,8 +209,10 @@ ncnn::moe::Result<ncnn::moe::GenerationResult> run(
 Applications add model families that map to the supported `MoeIR` node set
 through `IMoeModelAdapter::can_load`, `parse_model`, and `map_weights`;
 execution code consumes only the compiled model-neutral representation. The
-generic token-ID runner, GPT-OSS Harmony text wrapper, and model-specific
-commands are documented in the model guides.
+unified Python CLI is the text and conversation entry point, while
+`ncnn_moe_worker` is the tokenizer-neutral token-ID protocol boundary.
+Model-specific tokenization, chat templates, reasoning/final-channel decoding,
+and stop-token policy stay in Python adapters.
 
 ## Architecture
 
@@ -283,8 +330,8 @@ src/kernels/       Portable CPU Attention/Linear, BF16 helpers, and runtime-sele
 src/backends/ncnn/ ncnn CPU/Vulkan operator packaging, mixed Attention, Vulkan contexts, and native MXFP4 Experts
 models/            Model catalog and model-family execution guides
 assets/            Published benchmark visualizations used by model reports
-examples/          GPT-OSS, DeepSeek, and Qwen reference runners, model inspection, and MXFP4 microbenchmark
-tools/             Fixture, model text wrappers, packed-Expert, and benchmark utilities
+examples/          Unified worker, benchmark/reference runners, protocol helpers, and MXFP4 microbenchmark
+tools/             Unified CLI/adapters, fixture, packed-Expert, and benchmark utilities
 tests/             Deterministic, parity, cache, scheduling, concurrency, and error-path tests
 third_party/ncnn/  Pinned ncnn source submodule
 ```
