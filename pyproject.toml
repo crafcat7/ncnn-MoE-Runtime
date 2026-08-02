@@ -11,7 +11,7 @@ dependencies = []
 
 [project.optional-dependencies]
 gpt-oss = ["openai-harmony"]
-hf = ["transformers", "tokenizers", "jinja2"]
+hf = ["transformers", "tokenizers", "jinja2", "huggingface-hub", "numpy"]
 tui = ["rich", "prompt-toolkit"]
 telemetry = ["psutil", "pynvml"]
 

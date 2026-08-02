@@ -42,7 +42,10 @@ The directory must contain `config.json`, `tokenizer.json`,
 `encoding/encoding_dsv4.py`, and every Safetensors shard referenced by the
 index. DSpark metadata and prediction tensors are required only for the DSpark
 package. DeepSeek-V4-Flash's conventional `mtp.0` payload is not used by the
-target-model runtime. Build the examples by following the root
+target-model runtime. The encoding file is loaded from the checkpoint and uses
+only the Python standard library; this project does not require the official
+PyTorch inference dependencies such as `torch`, `tilelang`, or
+`fast_hadamard_transform`. Build the examples by following the root
 [Quick start](../../README.md#quick-start), then build `ncnn_moe_worker` for
 normal text and chat usage.
 

@@ -116,11 +116,25 @@ human-readable formatting remain in the Python adapters and CLI.
 
 ## Optional Python dependencies
 
+For a complete local Example setup, run this from the repository root:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+This installs all supported adapter, model-download, Qwen artifact-build, TUI,
+and telemetry dependencies. The DeepSeek-V4 `encoding/encoding_dsv4.py` file
+is supplied by the checkpoint and is self-contained; the ncnn Runtime CLI does
+not require the model repository's PyTorch inference stack. The minimal and
+grouped installations remain available when a smaller environment is
+preferred:
+
 ```powershell
 python -m pip install -e .
 python -m pip install -e ".[tui]"
 python -m pip install -e ".[gpt-oss]"
 python -m pip install -e ".[hf]"
+python -m pip install -e ".[telemetry]"
 ```
 
 The `ncnn-moe` console script is equivalent to

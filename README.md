@@ -108,7 +108,22 @@ requiring a resident copy of every routed weight.
 
 ## Quick start
 
-Requirements: a C++20 compiler, CMake 3.21 or newer, Python 3, and Git.
+Requirements: a C++20 compiler, CMake 3.21 or newer, Python 3.10+, and Git.
+
+Install the complete Python environment for the unified examples from the
+repository root:
+
+```powershell
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+This installs the GPT-OSS Harmony adapter, Hugging Face-backed adapters,
+DeepSeek/Qwen model-download and artifact-build tools, the optional
+Rich/prompt-toolkit UI, and CPU/GPU telemetry providers. The file delegates to
+the extras in `pyproject.toml`, so the dependency groups have a single source
+of truth. For a smaller installation, use only the required extra, for example
+`python -m pip install -e ".[gpt-oss]"`.
 
 ```powershell
 git clone --recurse-submodules https://github.com/crafcat7/ncnn-MoE-Runtime.git
@@ -130,7 +145,7 @@ For the full development and CTest targets, use a separate build directory:
 ```powershell
 cmake -S . -B build-test `
   -DNCNN_MOE_BUILD_TESTS=ON `
-  -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON
+  -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON `
 cmake --build build-test --config Release `
   --target ncnn_moe_tests ncnn_moe_worker ncnn_moe_gpt_oss --parallel
 ctest --test-dir build-test -C Release --output-on-failure
@@ -172,8 +187,8 @@ own tokenizers, chat templates, reasoning channels, persistent history, and
 TUI presentation. `inspect` reports the detected hardware and the effective
 backend, memory, Expert-cache, and I/O plan. `chat` adds resumable sessions,
 context budgeting, compaction, and live token/CPU/GPU/I/O metrics. Install
-`openai-harmony` for GPT-OSS or `transformers` and `jinja2` for the Hugging
-Face-backed adapters; `rich` and `prompt-toolkit` are optional TUI upgrades.
+`openai-harmony` for GPT-OSS or `transformers` and the Hugging Face packages
+for DeepSeek/Qwen; `rich` and `prompt-toolkit` are optional TUI upgrades.
 While the worker is loading, the CLI renders native `init` lifecycle progress
 on stderr so JSONL stdout remains machine-readable.
 Human-readable resource sizes in `inspect` and metrics use decimal `GB`; the
