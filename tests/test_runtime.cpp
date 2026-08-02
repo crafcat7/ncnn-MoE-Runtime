@@ -532,8 +532,18 @@ void test_prefill_decode_and_reset()
     check(static_cast<bool>(runtime.capabilities().float8_linear_thread_limit >= 1));
     check(static_cast<bool>(runtime.capabilities().float8_linear_row_group_size == 1 || runtime.capabilities().float8_linear_row_group_size == 2
                             || runtime.capabilities().float8_linear_row_group_size == 4));
-    auto model = runtime.load_model(package.path());
+    std::vector<RuntimeLoadProgress> load_progress;
+    auto model = runtime.load_model(
+        package.path(),
+        RuntimeConfig{},
+        [&load_progress](const RuntimeLoadProgress& progress) {
+            load_progress.push_back(progress);
+        });
     check(static_cast<bool>(model));
+    check(static_cast<bool>(load_progress.size() >= 2));
+    check(static_cast<bool>(load_progress.front().completed_steps == 0));
+    check(static_cast<bool>(load_progress.back().completed_steps == load_progress.back().total_steps));
+    check(static_cast<bool>(load_progress.back().phase == "ready"));
     check(static_cast<bool>(model.value()->descriptor().model_type == "test_moe"));
     check(static_cast<bool>(model.value()->descriptor().layer_count == 1));
 
@@ -4368,6 +4378,15 @@ void test_sampling_and_streaming_generation()
     check(static_cast<bool>(streamed.size() == 3));
     check(static_cast<bool>(generated.value().tokens[0].text == "<" + std::to_string(generated.value().tokens[0].token_id) + ">"));
     check(static_cast<bool>(session.value()->sequence_length() == 3));
+    const SessionMetrics metrics = session.value()->metrics();
+    check(static_cast<bool>(!metrics.timing.active));
+    check(static_cast<bool>(metrics.timing.input_tokens == 1));
+    check(static_cast<bool>(metrics.timing.output_tokens == 3));
+    check(static_cast<bool>(metrics.timing.ttft_microseconds.has_value()));
+    check(static_cast<bool>(metrics.timing.tpot_microseconds.has_value()));
+    check(static_cast<bool>(metrics.timing.decode_tokens_per_second.has_value()));
+    check(static_cast<bool>(metrics.generation.prefill_tokens == 1));
+    check(static_cast<bool>(metrics.cumulative.prefill_tokens >= metrics.generation.prefill_tokens));
 
     auto stopped_session = runtime.create_session(model.value(), session_options);
     check(static_cast<bool>(stopped_session));
@@ -4495,6 +4514,14 @@ void test_backend_capabilities_and_hybrid_execution()
     check(static_cast<bool>(runtime.synchronize_model_caches(automatic_model.value())));
     check(static_cast<bool>(automatic_model.value()->hybrid_mode() == (automatic_uses_vulkan ? HybridMode::HybridExperts : HybridMode::CpuOnly)));
     check(static_cast<bool>(automatic_model.value()->vulkan_device_index() == (automatic_uses_vulkan ? automatic_device_index : automatic_vulkan_device_index)));
+    const EffectiveRuntimeOptions& automatic_effective = automatic_model.value()->effective_runtime_options();
+    check(static_cast<bool>(automatic_effective.hybrid_mode == automatic_model.value()->hybrid_mode()));
+    check(static_cast<bool>(automatic_effective.requested_expert_memory_mode == automatic_model.value()->memory_plan().requested_mode));
+    check(static_cast<bool>(automatic_effective.selected_expert_memory_mode == automatic_model.value()->memory_plan().selected_mode));
+    check(static_cast<bool>(automatic_effective.host_memory_budget_bytes == automatic_model.value()->memory_plan().host_memory_budget_bytes));
+    check(static_cast<bool>(automatic_effective.expert_cache_bytes == automatic_model.value()->memory_plan().expert_cache_bytes));
+    check(static_cast<bool>(automatic_effective.expected_concurrency == automatic_options.expected_concurrency));
+    check(static_cast<bool>(automatic_effective.vulkan_device_indices == automatic_model.value()->vulkan_device_indices()));
     auto automatic_session = runtime.create_session(automatic_model.value());
     check(static_cast<bool>(automatic_session));
     const std::vector<int32_t> packed_prompt = {0, 1, 2, 3};

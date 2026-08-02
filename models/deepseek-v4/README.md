@@ -42,50 +42,53 @@ The directory must contain `config.json`, `tokenizer.json`,
 `encoding/encoding_dsv4.py`, and every Safetensors shard referenced by the
 index. DSpark metadata and prediction tensors are required only for the DSpark
 package. DeepSeek-V4-Flash's conventional `mtp.0` payload is not used by the
-target-model runtime. Build the Release runner by following the root
-[Quick start](../../README.md#quick-start).
+target-model runtime. The encoding file is loaded from the checkpoint and uses
+only the Python standard library; this project does not require the official
+PyTorch inference dependencies such as `torch`, `tilelang`, or
+`fast_hadamard_transform`. Build the examples by following the root
+[Quick start](../../README.md#quick-start), then build `ncnn_moe_worker` for
+normal text and chat usage.
 
-## Run a text prompt
+## Run text or chat
 
-The text wrapper applies the checkpoint's official DeepSeek message encoding
-and tokenizer without adding a tokenizer dependency to the C++ runtime:
+The unified CLI applies the checkpoint's official message encoding and tokenizer
+while the native worker remains tokenizer-free:
 
 ```powershell
-python -m pip install -U transformers
-python tools\run_deepseek_v4_prompt.py `
-  .\build-ncnn\Release\ncnn_moe_deepseek_v4.exe `
-  .\models\deepseek-v4\DeepSeek-V4-Flash `
-  "请简短介绍一下你自己。" `
-  --max-new-tokens 1024 --stream --backend hybrid --report-throughput
+python -m pip install -e ".[hf]"
+python tools\ncnn_moe.py run `
+  --model .\models\deepseek-v4\DeepSeek-V4-Flash `
+  --prompt "Briefly introduce yourself." `
+  --max-new-tokens 1024 --stream --backend hybrid
+python tools\ncnn_moe.py chat `
+  --model .\models\deepseek-v4\DeepSeek-V4-Flash
 ```
 
-By default, the wrapper prints only the human-readable `[reasoning]` and
-`[answer]` sections. Native runner diagnostics, token IDs, timings, and cache
-statistics are suppressed unless `--verbose` is present. The reply limit
-defaults to 1024 tokens; reaching it before EOS produces a warning.
-`--thinking-mode chat` requests a direct answer, and `--stream-final-only`
-suppresses reasoning during streaming. `--report-throughput` prints only the
-optional aggregate generation rate without enabling full native diagnostics.
+`run` streams tokens and metrics; `chat` keeps a persistent conversation and
+supports `/context`, `/compact`, `/reset`, `/new`, `/stats`, and `/tune`.
+`--thinking-mode chat` requests a direct answer, while
+`--show-reasoning` or `/reasoning` expands the hidden reasoning channel. The
+CLI locates `ncnn_moe_worker` in common build directories, or accepts an
+explicit path with `--worker`. Scripted runs can add `--no-metrics` to suppress
+periodic metrics events while retaining final statistics.
 
-## Run token IDs
+## Run token IDs with the reference runner
 
-The native runner accepts a model directory followed by one or more prompt
-token IDs:
+Applications that already own tokenization can use the model-named native
+reference target. It accepts a model directory followed by prompt token IDs:
 
 ```powershell
+cmake -S . -B build-ncnn -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON
+cmake --build build-ncnn --config Release --target ncnn_moe_deepseek_v4 --parallel
 .\build-ncnn\Release\ncnn_moe_deepseek_v4.exe `
   .\models\deepseek-v4\DeepSeek-V4-Flash 0 `
   --max-new-tokens 64 --hybrid --report-throughput
 ```
 
-Use `--prompt-token-file PATH` for long whitespace-separated token sequences.
-Use `--stream-token-ids` to print generated IDs as they become available. The
-final machine-readable line is `generated token ids:`.
-`--report-throughput` adds the aggregate generation rate in token/s; omit it
-when that optional line is not needed.
-`ncnn_moe_deepseek_v4` and `ncnn_moe_gpt_oss` use the same native runner
-implementation and option parser; their entry points only select the expected
-adapter and model-specific default EOS.
+Use `--prompt-token-file PATH` for long whitespace-separated sequences and
+`--stream-token-ids` for incremental machine-readable IDs. These reference
+targets are retained for the benchmark harness and CTest fixture; normal text
+and chat usage should use `ncnn_moe.py`.
 
 ## Sampling
 
@@ -117,14 +120,13 @@ falls back to CPU-only for a software CPU Vulkan implementation.
 
 ## Expert memory and storage
 
-The DeepSeek text wrapper defaults to on-demand Expert residency with four I/O
-workers. Runtime auto-sizing can be overridden for a known host:
+The unified CLI can override the automatically sized Expert residency and I/O
+plan for a known host:
 
 ```powershell
-python tools\run_deepseek_v4_prompt.py `
-  .\build-ncnn\Release\ncnn_moe_deepseek_v4.exe `
-  .\models\deepseek-v4\DeepSeek-V4-Flash `
-  "请简短介绍一下你自己。" `
+python tools\ncnn_moe.py run `
+  --model .\models\deepseek-v4\DeepSeek-V4-Flash `
+  --prompt "Briefly introduce yourself." `
   --backend hybrid --expert-memory on-demand `
   --host-memory-mb 28672 --expert-cache-mb 16384 `
   --expert-io-workers 4 --buffered-expert-io `
@@ -165,6 +167,11 @@ then executes its own speculative transaction concurrently. The staged
 operations directly rather than calling `Session::generate`.
 
 ## Reference performance
+
+The reproduction commands in this section intentionally use the reference
+runner for fixed token-ID workloads and Session scheduling. Configure with
+`-DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON` before building that target. Use the
+unified CLI above for normal text and chat.
 
 Both package matrices use the same fixed 16-token repeated-BOS prompt, greedy
 decoding, three measured processes per cell, and generated-token parity

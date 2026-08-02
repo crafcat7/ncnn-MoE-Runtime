@@ -6,6 +6,7 @@
 #include "ncnn/moe/memory_plan.h"
 #include "ncnn/moe/moe_ir.h"
 #include "ncnn/moe/result.h"
+#include "ncnn/moe/runtime_config.h"
 #include "ncnn/moe/types.h"
 
 #include <cstdint>
@@ -271,6 +272,7 @@ struct CompiledModel
     std::vector<uint32_t> vulkan_device_indices;
     uint32_t runtime_option_flags = 0;
     uint32_t expected_concurrency = 1;
+    EffectiveRuntimeOptions effective_runtime_options;
 };
 
 #define NCNN_MOE_BACKEND_CAP_CPU_BIT              0

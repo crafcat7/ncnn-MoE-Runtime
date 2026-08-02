@@ -173,7 +173,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
 
     try
     {
-        ncnn::moe::RuntimeOptions runtime_options;
+        ncnn::moe::RuntimeConfig runtime_options;
         ncnn::moe::SessionOptions session_options;
         ncnn::moe::GenerationOptions generation_options;
         generation_options.sampling.temperature = 0.0f;
@@ -518,6 +518,11 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             return 2;
         }
         std::cout << "loaded " << loaded_model->descriptor().model_type << " in " << ncnn::moe::elapsed_seconds(load_start) << " s, backend " << ncnn::moe::hybrid_mode_name(loaded_model->hybrid_mode()) << '\n';
+        const ncnn::moe::EffectiveRuntimeConfig& effective_runtime = loaded_model->effective_runtime_config();
+        std::cout << "Effective runtime: backend " << ncnn::moe::hybrid_mode_name(effective_runtime.hybrid_mode)
+                  << ", host budget " << effective_runtime.host_memory_budget_bytes / (1024 * 1024) << " MiB"
+                  << ", Expert cache " << effective_runtime.expert_cache_bytes / (1024 * 1024) << " MiB"
+                  << ", Expert IO workers " << effective_runtime.expert_io_workers << '\n';
         const auto moe_layer = std::find_if(
             loaded_model->descriptor().layers.begin(),
             loaded_model->descriptor().layers.end(),

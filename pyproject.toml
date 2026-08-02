@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ncnn-moe"
+version = "0.1.0"
+description = "Unified CLI and TUI for the ncnn MoE runtime examples"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+gpt-oss = ["openai-harmony"]
+hf = ["transformers", "tokenizers", "jinja2", "huggingface-hub", "numpy"]
+tui = ["rich", "prompt-toolkit"]
+telemetry = ["psutil", "pynvml"]
+
+[project.scripts]
+ncnn-moe = "tools.ncnn_moe:main"
+
+[tool.setuptools.packages.find]
+include = ["tools*"]

@@ -61,6 +61,16 @@ public:
     {
         return compiled_->memory_plan;
     }
+    [[nodiscard]] const EffectiveRuntimeConfig& effective_runtime_config() const noexcept
+    {
+        return compiled_->effective_runtime_options;
+    }
+
+    // Compatibility name for applications built against the pre-RuntimeConfig API.
+    [[nodiscard]] const EffectiveRuntimeOptions& effective_runtime_options() const noexcept
+    {
+        return effective_runtime_config();
+    }
     [[nodiscard]] const ExpertStore& expert_store() const noexcept
     {
         return *compiled_->expert_store;
