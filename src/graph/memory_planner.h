@@ -10,9 +10,9 @@
 namespace ncnn {
 namespace moe {
 
-struct RuntimeOptions;
+struct RuntimeConfig;
 
-[[nodiscard]] Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeOptions& options, uint64_t physical_memory_bytes,
+[[nodiscard]] Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& config, uint64_t physical_memory_bytes,
                                                         bool release_vulkan_dense_host_storage = false);
 
 } // namespace moe

@@ -72,6 +72,14 @@ public:
         value_ += std::to_string(value);
     }
 
+    void add_optional_uint(std::string_view name, const std::optional<uint64_t>& value)
+    {
+        if (value)
+            add_uint(name, *value);
+        else
+            add_null(name);
+    }
+
     void add_int(std::string_view name, int64_t value)
     {
         key(name);
@@ -95,6 +103,14 @@ public:
         std::ostringstream stream;
         stream << std::setprecision(10) << value;
         value_ += stream.str();
+    }
+
+    void add_optional_double(std::string_view name, const std::optional<double>& value)
+    {
+        if (value)
+            add_double(name, *value);
+        else
+            add_null(name);
     }
 
     void add_null(std::string_view name)
@@ -127,6 +143,21 @@ static std::string uint_array(const std::vector<uint32_t>& values)
     }
     result.push_back(']');
     return result;
+}
+
+static void emit_initialization_progress(
+    uint32_t completed_steps,
+    uint32_t total_steps,
+    std::string_view phase,
+    std::string_view message)
+{
+    JsonObject result;
+    result.add_string("event", "init");
+    result.add_uint("completed_steps", completed_steps);
+    result.add_uint("total_steps", total_steps);
+    result.add_string("phase", phase);
+    result.add_string("message", message);
+    std::cout << result.finish() << '\n' << std::flush;
 }
 
 static const char* error_code_name(ErrorCode code) noexcept
@@ -204,56 +235,87 @@ static std::string devices_json(const std::vector<VulkanDeviceCapabilities>& dev
     return result;
 }
 
-static std::string stats_json(const SessionStatistics& statistics)
+static std::string expert_metrics_json(const RuntimeMetricCounters& counters)
 {
     JsonObject result;
-    result.add_uint("prefill_tokens", statistics.prefill_tokens);
-    result.add_uint("decode_tokens", statistics.decode_tokens);
-    result.add_uint("expert_assignments", statistics.expert_assignments);
-    result.add_uint("expert_batches", statistics.expert_batches);
-    result.add_uint("expert_prefetches", statistics.expert_prefetches);
-    result.add_uint("expert_prefetch_bytes", statistics.expert_prefetch_bytes);
-    result.add_uint("expert_cache_hits", statistics.expert_cache_hits);
-    result.add_uint("expert_cache_misses", statistics.expert_cache_misses);
-    result.add_uint("expert_cache_evictions", statistics.expert_cache_evictions);
-    result.add_uint("expert_cache_bytes_read", statistics.expert_cache_bytes_read);
-    result.add_uint("expert_cache_resident_bytes", statistics.expert_cache_resident_bytes);
-    result.add_uint("expert_cache_queued_reads", statistics.expert_cache_queued_reads);
-    result.add_uint("expert_cache_mapped_bytes", statistics.expert_cache_mapped_bytes);
-    result.add_uint("expert_cache_direct_read_bytes", statistics.expert_cache_direct_read_bytes);
-    result.add_uint("expert_cache_buffered_read_bytes", statistics.expert_cache_buffered_read_bytes);
-    result.add_uint("expert_cache_coalesced_read_batches", statistics.expert_cache_coalesced_read_batches);
-    result.add_uint("expert_gpu_cache_hits", statistics.expert_gpu_cache_hits);
-    result.add_uint("expert_gpu_cache_misses", statistics.expert_gpu_cache_misses);
-    result.add_uint("expert_gpu_cache_resident_bytes", statistics.expert_gpu_cache_resident_bytes);
-    result.add_uint("expert_gpu_executions", statistics.expert_gpu_executions);
-    result.add_uint("expert_gpu_execution_failures", statistics.expert_gpu_execution_failures);
-    result.add_uint("expert_gpu_execution_time_microseconds", statistics.expert_gpu_execution_time_microseconds);
-    result.add_uint("vulkan_linear_dispatches", statistics.vulkan_linear_dispatches);
-    result.add_uint("vulkan_attention_blocks", statistics.vulkan_attention_blocks);
-    result.add_uint("vulkan_compute_submissions", statistics.vulkan_compute_submissions);
-    result.add_uint("vulkan_submit_wait_time_microseconds", statistics.vulkan_submit_wait_time_microseconds);
-    result.add_uint("vulkan_batch_uploads", statistics.vulkan_batch_uploads);
-    result.add_uint("vulkan_batch_downloads", statistics.vulkan_batch_downloads);
-    result.add_uint("attention_time_microseconds", statistics.attention_time_microseconds);
-    result.add_uint("router_time_microseconds", statistics.router_time_microseconds);
-    result.add_uint("expert_time_microseconds", statistics.expert_time_microseconds);
-    result.add_uint("expert_cache_wait_time_microseconds", statistics.expert_cache_wait_time_microseconds);
-    result.add_uint("expert_engine_time_microseconds", statistics.expert_engine_time_microseconds);
-    result.add_uint("expert_compute_time_microseconds", statistics.expert_compute_time_microseconds);
-    result.add_uint("embedding_time_microseconds", statistics.embedding_time_microseconds);
-    result.add_uint("final_norm_time_microseconds", statistics.final_norm_time_microseconds);
-    result.add_uint("lm_head_time_microseconds", statistics.lm_head_time_microseconds);
-    result.add_uint("speculative_proposals", statistics.speculative_proposals);
-    result.add_uint("speculative_draft_tokens", statistics.speculative_draft_tokens);
-    result.add_uint("speculative_accepted_tokens", statistics.speculative_accepted_tokens);
-    result.add_uint("kv_cache_logical_bytes", statistics.kv_cache_logical_bytes);
-    result.add_uint("kv_cache_allocated_bytes", statistics.kv_cache_allocated_bytes);
-    const uint64_t cache_requests = statistics.expert_cache_hits + statistics.expert_cache_misses;
+    result.add_uint("cache_hit", counters.expert_cache_hits);
+    result.add_uint("cache_miss", counters.expert_cache_misses);
+    result.add_uint("io_bytes", counters.expert_io_bytes);
+    result.add_uint("cache_resident_bytes", counters.expert_cache_resident_bytes);
+    const uint64_t cache_requests = counters.expert_cache_hits + counters.expert_cache_misses;
     if (cache_requests == 0)
-        result.add_null("expert_cache_hit_rate");
+        result.add_null("cache_hit_rate");
     else
-        result.add_double("expert_cache_hit_rate", static_cast<double>(statistics.expert_cache_hits) / static_cast<double>(cache_requests));
+        result.add_double("cache_hit_rate", static_cast<double>(counters.expert_cache_hits) / static_cast<double>(cache_requests));
+    return result.finish();
+}
+
+static std::string cpu_metrics_json(const RuntimeMetricCounters& counters)
+{
+    JsonObject result;
+    result.add_uint("expert_compute_time_microseconds", counters.expert_compute_time_microseconds);
+    return result.finish();
+}
+
+static std::string gpu_metrics_json(const RuntimeMetricCounters& counters, bool available)
+{
+    JsonObject result;
+    result.add_bool("available", available);
+    if (available)
+    {
+        result.add_uint("submit_count", counters.gpu_submit_count);
+        result.add_uint("wait_time_microseconds", counters.gpu_wait_time_microseconds);
+    }
+    else
+    {
+        result.add_null("submit_count");
+        result.add_null("wait_time_microseconds");
+    }
+    if (available && counters.gpu_kernel_time_available)
+        result.add_uint("kernel_time_microseconds", counters.gpu_kernel_time_microseconds);
+    else
+        result.add_null("kernel_time_microseconds");
+    result.add_bool("kernel_time_available", counters.gpu_kernel_time_available);
+    if (available)
+        result.add_string("reason", counters.gpu_kernel_time_available ? "" : "gpu_expert_execution_not_observed");
+    else
+        result.add_string("reason", "runtime_backend_cpu_only");
+    return result.finish();
+}
+
+static std::string generation_timing_json(const GenerationTimingMetrics& timing)
+{
+    JsonObject result;
+    result.add_bool("active", timing.active);
+    result.add_uint("input_tokens", timing.input_tokens);
+    result.add_uint("output_tokens", timing.output_tokens);
+    result.add_uint("elapsed_microseconds", timing.elapsed_microseconds);
+    result.add_optional_uint("ttft_microseconds", timing.ttft_microseconds);
+    result.add_optional_double("tpot_microseconds", timing.tpot_microseconds);
+    result.add_optional_double("decode_tokens_per_second", timing.decode_tokens_per_second);
+    return result.finish();
+}
+
+static std::string stats_json(const SessionMetrics& metrics)
+{
+    JsonObject result;
+    result.add_raw("generation", expert_metrics_json(metrics.generation));
+    result.add_raw("generation_cpu", cpu_metrics_json(metrics.generation));
+    result.add_raw("generation_gpu", gpu_metrics_json(metrics.generation, metrics.gpu_available));
+    result.add_raw("cumulative", expert_metrics_json(metrics.cumulative));
+    result.add_raw("cumulative_cpu", cpu_metrics_json(metrics.cumulative));
+    result.add_raw("cumulative_gpu", gpu_metrics_json(metrics.cumulative, metrics.gpu_available));
+    result.add_raw("timing", generation_timing_json(metrics.timing));
+    result.add_bool("gpu_available", metrics.gpu_available);
+    result.add_uint("kv_cache_logical_bytes", metrics.cumulative.kv_cache_logical_bytes);
+    result.add_uint("kv_cache_allocated_bytes", metrics.cumulative.kv_cache_allocated_bytes);
+
+    // Compatibility aliases for clients written against the first worker
+    // schema. New clients should use generation/cumulative groups above.
+    result.add_uint("expert_cache_hits", metrics.cumulative.expert_cache_hits);
+    result.add_uint("expert_cache_misses", metrics.cumulative.expert_cache_misses);
+    result.add_uint("expert_cache_bytes_read", metrics.cumulative.expert_io_bytes);
+    result.add_uint("vulkan_compute_submissions", metrics.cumulative.gpu_submit_count);
     return result.finish();
 }
 
@@ -460,40 +522,25 @@ static std::string gpu_telemetry_json(const GpuTelemetrySampler& sampler)
 static std::string runtime_metrics_json(
     ProcessTelemetrySampler& sampler,
     const GpuTelemetrySampler& gpu_sampler,
-    const SessionStatistics& statistics,
-    const RuntimeCapabilities& capabilities,
-    double elapsed_seconds)
+    const SessionMetrics& metrics)
 {
     JsonObject result;
-    result.add_double("tokens_per_second", elapsed_seconds > 0.0 ? static_cast<double>(statistics.decode_tokens) / elapsed_seconds : 0.0);
-    result.add_double("token_per_second", elapsed_seconds > 0.0 ? static_cast<double>(statistics.decode_tokens) / elapsed_seconds : 0.0);
-    result.add_null("prefill_time_microseconds");
-    result.add_null("decode_time_microseconds");
-    result.add_string("phase_timing_reason", "session_statistics_exposes_component_timings_only");
-    result.add_uint("prefill_tokens", statistics.prefill_tokens);
-    result.add_uint("decode_tokens", statistics.decode_tokens);
-    result.add_uint("kv_cache_logical_bytes", statistics.kv_cache_logical_bytes);
-    result.add_uint("kv_cache_allocated_bytes", statistics.kv_cache_allocated_bytes);
-    result.add_uint("expert_cache_hits", statistics.expert_cache_hits);
-    result.add_uint("expert_cache_misses", statistics.expert_cache_misses);
-    const uint64_t cache_requests = statistics.expert_cache_hits + statistics.expert_cache_misses;
-    if (cache_requests == 0)
-        result.add_null("expert_cache_hit_rate");
-    else
-        result.add_double("expert_cache_hit_rate", static_cast<double>(statistics.expert_cache_hits) / static_cast<double>(cache_requests));
-    result.add_uint("expert_cache_resident_bytes", statistics.expert_cache_resident_bytes);
-    result.add_uint("expert_cache_bytes_read", statistics.expert_cache_bytes_read);
-    result.add_uint("expert_gpu_cache_hits", statistics.expert_gpu_cache_hits);
-    result.add_uint("expert_gpu_cache_misses", statistics.expert_gpu_cache_misses);
-    result.add_uint("expert_gpu_cache_resident_bytes", statistics.expert_gpu_cache_resident_bytes);
-    result.add_uint("expert_gpu_executions", statistics.expert_gpu_executions);
-    result.add_uint("expert_io_wait_microseconds", statistics.expert_cache_wait_time_microseconds);
-    result.add_uint("vulkan_dispatches", statistics.vulkan_linear_dispatches + statistics.vulkan_attention_blocks);
-    result.add_uint("vulkan_compute_submissions", statistics.vulkan_compute_submissions);
-    result.add_uint("vulkan_wait_microseconds", statistics.vulkan_submit_wait_time_microseconds);
+    result.add_optional_double("decode_tok_per_second", metrics.timing.decode_tokens_per_second);
+    result.add_optional_double("tokens_per_second", metrics.timing.decode_tokens_per_second);
+    result.add_optional_double("token_per_second", metrics.timing.decode_tokens_per_second);
+    result.add_optional_uint("ttft_microseconds", metrics.timing.ttft_microseconds);
+    result.add_optional_double("tpot_microseconds", metrics.timing.tpot_microseconds);
+    result.add_uint("input_tokens", metrics.timing.input_tokens);
+    result.add_uint("output_tokens", metrics.timing.output_tokens);
+    result.add_uint("elapsed_microseconds", metrics.timing.elapsed_microseconds);
+    result.add_raw("expert", expert_metrics_json(metrics.generation));
+    result.add_raw("cpu", cpu_metrics_json(metrics.generation));
+    result.add_raw("gpu", gpu_metrics_json(metrics.generation, metrics.gpu_available));
     result.add_raw("process", process_telemetry_json(sampler));
-    result.add_raw("gpu", gpu_telemetry_json(gpu_sampler));
-    result.add_uint("vulkan_device_count", capabilities.vulkan_device_count);
+    result.add_raw("gpu_device", gpu_telemetry_json(gpu_sampler));
+    result.add_raw("cumulative", expert_metrics_json(metrics.cumulative));
+    result.add_raw("cumulative_cpu", cpu_metrics_json(metrics.cumulative));
+    result.add_raw("cumulative_gpu", gpu_metrics_json(metrics.cumulative, metrics.gpu_available));
     return result.finish();
 }
 
@@ -546,9 +593,9 @@ static ExpertMemoryMode parse_expert_memory_mode(const std::string& value)
     throw std::invalid_argument("unknown Expert memory mode: " + value);
 }
 
-static RuntimeOptions parse_runtime_options(int argc, char** argv, int first_argument)
+static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argument)
 {
-    RuntimeOptions result;
+    RuntimeConfig result;
     for (int index = first_argument; index < argc; ++index)
     {
         const std::string argument = argv[index];
@@ -712,7 +759,7 @@ private:
             result.add_string("request_id", request_id);
         result.add_string("session_id", session_id);
         result.add_uint("sequence_length", session->sequence_length());
-        result.add_raw("stats", stats_json(session->statistics()));
+        result.add_raw("stats", stats_json(session->metrics()));
         result.add_raw("memory", memory_statistics_json(session->memory_statistics()));
         emit(result.finish());
     }
@@ -720,7 +767,7 @@ private:
     void emit_ready()
     {
         const RuntimeCapabilities& capabilities = runtime_.capabilities();
-        const ncnn::moe::EffectiveRuntimeOptions& effective = model_->effective_runtime_options();
+        const ncnn::moe::EffectiveRuntimeConfig& effective = model_->effective_runtime_config();
         const ncnn::moe::ModelMemoryPlan& memory_plan = model_->memory_plan();
         JsonObject model;
         model.add_string("model_type", model_->descriptor().model_type);
@@ -844,7 +891,6 @@ private:
             }
             else
             {
-                const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
                 const ncnn::moe::GenerationResult& generation = generated.value();
                 JsonObject done;
                 done.add_string("event", "done");
@@ -856,10 +902,15 @@ private:
                 done.add_bool("stopped_by_stop_token", generation.stopped_by_stop_token);
                 done.add_bool("stopped_by_callback", generation.stopped_by_callback);
                 done.add_bool("cancelled", generation.stopped_by_callback && cancel_requested_.load());
-                done.add_double("elapsed_seconds", elapsed);
-                done.add_double("tokens_per_second", elapsed > 0.0 ? static_cast<double>(generation.tokens.size()) / elapsed : 0.0);
+                const SessionMetrics metrics = session->metrics();
+                done.add_double("elapsed_seconds", static_cast<double>(metrics.timing.elapsed_microseconds) / 1000000.0);
+                done.add_optional_double("tokens_per_second", metrics.timing.decode_tokens_per_second);
+                done.add_optional_double("decode_tok_per_second", metrics.timing.decode_tokens_per_second);
+                done.add_optional_uint("ttft_microseconds", metrics.timing.ttft_microseconds);
+                done.add_optional_double("tpot_microseconds", metrics.timing.tpot_microseconds);
                 done.add_uint("sequence_length", session->sequence_length());
-                done.add_raw("stats", stats_json(session->statistics()));
+                done.add_raw("metrics", runtime_metrics_json(telemetry_sampler_, gpu_telemetry_sampler_, metrics));
+                done.add_raw("stats", stats_json(metrics));
                 done.add_raw("memory", memory_statistics_json(session->memory_statistics()));
                 done.add_raw("telemetry", process_telemetry_json(telemetry_sampler_));
                 done.add_raw("gpu", gpu_telemetry_json(gpu_telemetry_sampler_));
@@ -886,12 +937,13 @@ private:
     void emit_runtime_metrics(const GenerateRequest& request, const SessionPtr& session, std::chrono::steady_clock::time_point started)
     {
         const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        const SessionMetrics metrics = session->metrics();
         JsonObject event;
         event.add_string("event", "metrics");
         event.add_string("request_id", request.request_id);
         event.add_string("session_id", request.session_id);
         event.add_double("elapsed_seconds", elapsed);
-        event.add_raw("metrics", runtime_metrics_json(telemetry_sampler_, gpu_telemetry_sampler_, session->statistics(), runtime_.capabilities(), elapsed));
+        event.add_raw("metrics", runtime_metrics_json(telemetry_sampler_, gpu_telemetry_sampler_, metrics));
         emit(event.finish());
     }
 
@@ -1033,7 +1085,7 @@ private:
 
 public:
     Worker(Runtime& runtime, ModelPtr model)
-        : runtime_(runtime), model_(std::move(model)), gpu_telemetry_sampler_(runtime.capabilities(), model_->effective_runtime_options())
+        : runtime_(runtime), model_(std::move(model)), gpu_telemetry_sampler_(runtime.capabilities(), model_->effective_runtime_config())
     {
         (void)telemetry_sampler_.sample();
         emit_ready();
@@ -1119,9 +1171,20 @@ int main(int argc, char** argv)
     }
     try
     {
-        const ncnn::moe::RuntimeOptions options = ncnn::moe::parse_runtime_options(argc, argv, 2);
+        const ncnn::moe::RuntimeConfig config = ncnn::moe::parse_runtime_config(argc, argv, 2);
+        ncnn::moe::emit_initialization_progress(0, 10, "hardware", "Detecting CPU and Vulkan devices");
         ncnn::moe::Runtime runtime;
-        auto model = runtime.load_model(std::filesystem::path(argv[1]), options);
+        ncnn::moe::emit_initialization_progress(1, 10, "hardware", "CPU and Vulkan capabilities detected");
+        auto model = runtime.load_model(
+            std::filesystem::path(argv[1]),
+            config,
+            [](const ncnn::moe::RuntimeLoadProgress& progress) {
+                ncnn::moe::emit_initialization_progress(
+                    progress.completed_steps + 1,
+                    progress.total_steps + 1,
+                    progress.phase,
+                    progress.message);
+            });
         if (!model)
         {
             ncnn::moe::JsonObject error;
@@ -1131,6 +1194,7 @@ int main(int argc, char** argv)
             std::cout << error.finish() << '\n' << std::flush;
             return 1;
         }
+        ncnn::moe::emit_initialization_progress(10, 10, "worker", "Starting JSONL worker");
         ncnn::moe::Worker worker(runtime, std::move(model).value());
         return worker.run();
     }

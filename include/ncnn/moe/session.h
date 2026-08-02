@@ -6,10 +6,12 @@
 #include "ncnn/moe/result.h"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
@@ -42,6 +44,8 @@ struct DecodeResult
     uint64_t sequence_length = 0;
 };
 
+// Model-neutral token-ID distribution controls.  This is intentionally not a
+// tokenizer, chat-template, or conversation policy.
 struct SamplingOptions
 {
     float temperature = 1.0f;
@@ -61,10 +65,14 @@ struct StreamToken
     uint32_t index = 0;
     int32_t token_id = -1;
     float probability = 0.0f;
+    // Compatibility convenience for native callers.  The worker leaves this
+    // empty and decodes token IDs in the application layer.
     std::string text;
     bool is_stop_token = false;
 };
 
+// Token-ID generation controls and stop IDs.  High-level chat policy remains
+// outside Runtime.
 struct GenerationOptions
 {
     uint32_t max_new_tokens = 1;
@@ -82,6 +90,8 @@ struct GenerationResult
     bool stopped_by_callback = false;
 };
 
+// Legacy native convenience hook.  Text decoding is not used by the worker;
+// applications should normally decode the returned token IDs themselves.
 using TokenTextDecoder = std::function<std::string(int32_t token_id)>;
 using TokenStreamCallback = std::function<bool(const StreamToken& token)>;
 
@@ -224,6 +234,49 @@ struct SessionStatistics
     std::vector<uint64_t> expert_token_counts;
 };
 
+// Stable, model-neutral counters intended for applications and examples.
+// SessionStatistics remains available for detailed runtime diagnostics, while
+// this view avoids exposing cache/backend implementation names at the native
+// application boundary.
+struct RuntimeMetricCounters
+{
+    uint64_t prefill_tokens = 0;
+    uint64_t decode_tokens = 0;
+    uint64_t expert_cache_hits = 0;
+    uint64_t expert_cache_misses = 0;
+    uint64_t expert_io_bytes = 0;
+    uint64_t expert_compute_time_microseconds = 0;
+    uint64_t gpu_submit_count = 0;
+    uint64_t gpu_wait_time_microseconds = 0;
+    // Wall time measured by the GPU Expert backend. Vulkan device timestamp
+    // queries are not required by the public API, so this is not a full-GPU
+    // kernel timeline.
+    uint64_t gpu_kernel_time_microseconds = 0;
+    bool gpu_kernel_time_available = false;
+    uint64_t expert_cache_resident_bytes = 0;
+    uint64_t kv_cache_logical_bytes = 0;
+    uint64_t kv_cache_allocated_bytes = 0;
+};
+
+struct GenerationTimingMetrics
+{
+    bool active = false;
+    uint64_t input_tokens = 0;
+    uint64_t output_tokens = 0;
+    uint64_t elapsed_microseconds = 0;
+    std::optional<uint64_t> ttft_microseconds;
+    std::optional<double> tpot_microseconds;
+    std::optional<double> decode_tokens_per_second;
+};
+
+struct SessionMetrics
+{
+    RuntimeMetricCounters generation;
+    RuntimeMetricCounters cumulative;
+    GenerationTimingMetrics timing;
+    bool gpu_available = false;
+};
+
 struct SessionOptions
 {
     LogitsOutputMode logits_output_mode = LogitsOutputMode::FullLogits;
@@ -250,7 +303,17 @@ private:
     std::mt19937_64 random_generator_;
     uint32_t prefill_chunk_size_ = 256;
     bool speculative_context_enabled_ = true;
+    SessionStatistics generation_start_statistics_;
+    bool generation_active_ = false;
+    uint64_t generation_input_tokens_ = 0;
+    uint64_t generation_output_tokens_ = 0;
+    uint64_t generation_elapsed_microseconds_ = 0;
+    bool generation_has_first_token_ = false;
+    std::chrono::steady_clock::time_point generation_started_;
+    std::chrono::steady_clock::time_point generation_first_token_ready_;
     mutable std::mutex mutex_;
+
+    [[nodiscard]] SessionMetrics metrics_unlocked() const;
 
     friend class Runtime;
     friend class SessionBatchAccess;
@@ -274,6 +337,7 @@ public:
         const std::lock_guard<std::mutex> lock(mutex_);
         return statistics_;
     }
+    [[nodiscard]] SessionMetrics metrics() const;
     [[nodiscard]] MemoryManagerStatistics memory_statistics() const;
 };
 

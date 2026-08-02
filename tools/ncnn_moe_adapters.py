@@ -343,7 +343,12 @@ class QwenAdapter(ModelAdapter):
         return _normalize_token_ids(encoded)
 
     def decode_text(self, tokens: list[int]) -> str:
-        return str(self.tokenizer.decode(tokens, skip_special_tokens=False))
+        text = str(self.tokenizer.decode(tokens, skip_special_tokens=True))
+        if tokens and tokens[-1] in self.stop_tokens:
+            # Qwen may expose an incomplete trailing byte as U+FFFD directly
+            # before its EOS token. It is tokenizer framing, not user text.
+            text = text.rstrip().rstrip("\ufffd").rstrip()
+        return text
 
 
 def create_adapter(model: Path, **options: Any) -> ModelAdapter:

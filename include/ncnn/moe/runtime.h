@@ -5,58 +5,19 @@
 #include "ncnn/moe/model_adapter.h"
 #include "ncnn/moe/memory_plan.h"
 #include "ncnn/moe/result.h"
+#include "ncnn/moe/runtime_config.h"
 #include "ncnn/moe/scheduler.h"
 #include "ncnn/moe/session.h"
 #include "ncnn/moe/types.h"
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace ncnn {
 namespace moe {
-
-#define NCNN_MOE_RUNTIME_MMAP_EXPERT_BIT         0
-#define NCNN_MOE_RUNTIME_DIRECT_IO_BIT           1
-#define NCNN_MOE_RUNTIME_BUFFERED_IO_BIT         2
-#define NCNN_MOE_RUNTIME_DISABLE_VICTIM_EXEC_BIT 3
-#define NCNN_MOE_RUNTIME_ROUTER_PRED_BIT         4
-#define NCNN_MOE_RUNTIME_FORWARD_ARC_BIT         5
-#define NCNN_MOE_RUNTIME_RANK_ADAPT_BIT          6
-#define NCNN_MOE_RUNTIME_READ_MERGE_BIT          7
-#define NCNN_MOE_RUNTIME_ASYNC_ROUTER_PRED_BIT   8
-#define NCNN_MOE_RUNTIME_RELEASE_DENSE_BIT       9
-
-enum RuntimeOptionFlag : uint32_t
-{
-    RuntimeOptionMemoryMapExperts = UINT32_C(1) << NCNN_MOE_RUNTIME_MMAP_EXPERT_BIT,
-    RuntimeOptionDirectExpertIo = UINT32_C(1) << NCNN_MOE_RUNTIME_DIRECT_IO_BIT,
-    RuntimeOptionBufferedExpertIo = UINT32_C(1) << NCNN_MOE_RUNTIME_BUFFERED_IO_BIT,
-    RuntimeOptionDisableGpuVictimExecution = UINT32_C(1) << NCNN_MOE_RUNTIME_DISABLE_VICTIM_EXEC_BIT,
-    RuntimeOptionRouterPrediction = UINT32_C(1) << NCNN_MOE_RUNTIME_ROUTER_PRED_BIT,
-    RuntimeOptionForwardAwareCache = UINT32_C(1) << NCNN_MOE_RUNTIME_FORWARD_ARC_BIT,
-    RuntimeOptionRankAdaptivePrefetch = UINT32_C(1) << NCNN_MOE_RUNTIME_RANK_ADAPT_BIT,
-    RuntimeOptionCrossExpertReadCoalescing = UINT32_C(1) << NCNN_MOE_RUNTIME_READ_MERGE_BIT,
-    RuntimeOptionAsyncRouterPrediction = UINT32_C(1) << NCNN_MOE_RUNTIME_ASYNC_ROUTER_PRED_BIT,
-    RuntimeOptionReleaseVulkanDenseHostStorage = UINT32_C(1) << NCNN_MOE_RUNTIME_RELEASE_DENSE_BIT
-};
-
-struct RuntimeOptions
-{
-    HybridMode hybrid_mode = HybridMode::Auto;
-    ExpertMemoryMode expert_memory_mode = ExpertMemoryMode::Auto;
-    uint64_t host_memory_budget_bytes = 0;
-    uint64_t expert_cache_bytes = 0;
-    uint64_t expert_gpu_cache_bytes = 0;
-    uint64_t expert_gpu_victim_cache_bytes = 0;
-    uint32_t expert_gpu_victim_reuse_probe_interval = 1;
-    uint32_t expert_io_workers = 0;
-    uint32_t vulkan_device_index = automatic_vulkan_device_index;
-    uint32_t expected_concurrency = 1;
-    std::vector<uint32_t> vulkan_device_indices;
-    uint32_t flags = 0;
-};
 
 #define NCNN_MOE_RUNTIME_CAP_CPU_BIT              0
 #define NCNN_MOE_RUNTIME_CAP_NCNN_LINEAR_BIT      1
@@ -146,6 +107,20 @@ struct RuntimeCapabilities
     std::vector<VulkanDeviceCapabilities> vulkan_devices;
 };
 
+// Stable, model-neutral progress reported while Runtime prepares a model.
+// The phase/message are intentionally descriptive rather than implementation
+// details so CLI, TUI, and future frontends can render the same initialization
+// lifecycle.
+struct RuntimeLoadProgress
+{
+    uint32_t completed_steps = 0;
+    uint32_t total_steps = 0;
+    std::string phase;
+    std::string message;
+};
+
+using RuntimeLoadProgressCallback = std::function<void(const RuntimeLoadProgress&)>;
+
 class Runtime
 {
 private:
@@ -162,7 +137,10 @@ public:
 
     void register_adapter(std::shared_ptr<IMoeModelAdapter> adapter);
 
-    [[nodiscard]] Result<ModelPtr> load_model(const std::filesystem::path& model_path, const RuntimeOptions& options = {});
+    [[nodiscard]] Result<ModelPtr> load_model(
+        const std::filesystem::path& model_path,
+        const RuntimeConfig& config = {},
+        RuntimeLoadProgressCallback on_progress = {});
 
     // Synchronization point for warm-up and traffic transitions.
     [[nodiscard]] Result<void> synchronize_model_caches(const ModelPtr& model);

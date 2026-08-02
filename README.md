@@ -155,9 +155,16 @@ The supported user-facing example entry point is the Python CLI:
 ```powershell
 python tools\ncnn_moe.py inspect --model .\models\gpt-oss\gpt-oss-20b
 python tools\ncnn_moe.py run --model .\models\gpt-oss\gpt-oss-20b `
-  --prompt "Reply with exactly: OK" --stream
+  --prompt "Reply with exactly: OK"
 python tools\ncnn_moe.py chat --model .\models\gpt-oss\gpt-oss-20b
 ```
+
+The CLI uses `build-ncnn` as its fixed default build directory. On the
+multi-config Windows generator the default worker is
+`build-ncnn/Release/ncnn_moe_worker.exe`; on single-config platforms it is
+`build-ncnn/ncnn_moe_worker`. It does not scan other build directories or
+`PATH`. Use `--worker PATH` or `NCNN_MOE_WORKER=PATH` only when selecting a
+different build explicitly.
 
 Build `ncnn_moe_worker` with the examples. The worker owns Runtime/Model and
 Session lifetime and communicates through token-ID JSONL; the Python adapters
@@ -167,9 +174,16 @@ backend, memory, Expert-cache, and I/O plan. `chat` adds resumable sessions,
 context budgeting, compaction, and live token/CPU/GPU/I/O metrics. Install
 `openai-harmony` for GPT-OSS or `transformers` and `jinja2` for the Hugging
 Face-backed adapters; `rich` and `prompt-toolkit` are optional TUI upgrades.
+While the worker is loading, the CLI renders native `init` lifecycle progress
+on stderr so JSONL stdout remains machine-readable.
+Human-readable resource sizes in `inspect` and metrics use decimal `GB`; the
+machine-readable JSONL fields retain their exact byte values.
 Persistent session history, user configuration, and tuning profiles are stored
 under `.ncnn-moe/` in the project root; use `--config-dir` when another
 location is required. Native KV and runtime cache state remain in memory.
+Text generation streams by default, reasoning is shown by default, and the
+periodic metrics trace is disabled by default. Use `--no-stream`,
+`--hide-reasoning`, or `--metrics` to override these choices for one command.
 
 See [examples/README.md](examples/README.md) for the protocol boundary and
 common commands. The model guides document model-specific package preparation

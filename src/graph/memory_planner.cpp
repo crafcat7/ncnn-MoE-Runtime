@@ -112,7 +112,7 @@ static Result<uint64_t> latent_fp8_dense_bytes(const MoeIR& ir)
         if (!status)
             return status.error();
 
-        status = add_matrix_bytes(attention.query_lora_rank, ir.hidden_size, attention.projection_weight _dtype, "DeepSeek query A", total);
+        status = add_matrix_bytes(attention.query_lora_rank, ir.hidden_size, attention.projection_weight_dtype, "DeepSeek query A", total);
         if (!status)
             return status.error();
         status = add_matrix_bytes(static_cast<uint64_t>(attention.head_count) * attention.head_dimension, attention.query_lora_rank, attention.projection_weight_dtype, "DeepSeek query B", total);
@@ -588,19 +588,19 @@ static Result<uint64_t> expert_pair_bytes(const MoeIR& ir, DType dtype)
     return checked_add(gate_up.value(), down.value(), "expert pair");
 }
 
-Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeOptions& options, uint64_t physical_memory_bytes,
+Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& config, uint64_t physical_memory_bytes,
                                           bool release_vulkan_dense_host_storage)
 {
     ModelMemoryPlan plan;
-    plan.requested_mode = options.expert_memory_mode;
+    plan.requested_mode = config.expert_memory_mode;
     plan.physical_memory_bytes = physical_memory_bytes;
-    if (options.host_memory_budget_bytes != 0)
+    if (config.host_memory_budget_bytes != 0)
     {
-        if (physical_memory_bytes != 0 && options.host_memory_budget_bytes > physical_memory_bytes)
+        if (physical_memory_bytes != 0 && config.host_memory_budget_bytes > physical_memory_bytes)
         {
             return Error{ErrorCode::InvalidArgument, "host memory budget exceeds detected physical memory"};
         }
-        plan.host_memory_budget_bytes = options.host_memory_budget_bytes;
+        plan.host_memory_budget_bytes = config.host_memory_budget_bytes;
     }
     else if (physical_memory_bytes != 0)
     {
@@ -650,7 +650,7 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeOptions&
     if (moe.expert_weight_dtype != DType::MxFp4)
     {
         plan.selected_mode = ExpertMemoryMode::Eager;
-        if (options.expert_memory_mode == ExpertMemoryMode::OnDemand || options.expert_cache_bytes != 0)
+        if (config.expert_memory_mode == ExpertMemoryMode::OnDemand || config.expert_cache_bytes != 0)
         {
             return Error{ErrorCode::UnsupportedModel, "on-demand expert storage currently requires MXFP4 experts"};
         }
@@ -664,21 +664,21 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeOptions&
         eager_capacity = plan.host_memory_budget_bytes - plan.estimated_dense_bytes - safety_reserve;
     }
 
-    if (options.expert_cache_bytes != 0)
+    if (config.expert_cache_bytes != 0)
     {
-        if (options.expert_memory_mode == ExpertMemoryMode::Eager)
+        if (config.expert_memory_mode == ExpertMemoryMode::Eager)
         {
             return Error{ErrorCode::InvalidArgument, "an explicit expert cache conflicts with eager expert mode"};
         }
         plan.selected_mode = ExpertMemoryMode::OnDemand;
     }
-    else if (options.expert_memory_mode == ExpertMemoryMode::Auto)
+    else if (config.expert_memory_mode == ExpertMemoryMode::Auto)
     {
         plan.selected_mode = plan.estimated_expert_bytes <= eager_capacity ? ExpertMemoryMode::Eager : ExpertMemoryMode::OnDemand;
     }
     else
     {
-        plan.selected_mode = options.expert_memory_mode;
+        plan.selected_mode = config.expert_memory_mode;
     }
 
     if (plan.selected_mode == ExpertMemoryMode::Eager)
@@ -718,7 +718,7 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeOptions&
     }
 
     const uint64_t automatic_target = physical_memory_bytes == 0 ? 2 * gibibyte : eager_capacity;
-    plan.expert_cache_bytes = options.expert_cache_bytes != 0 ? options.expert_cache_bytes : std::min(automatic_target, eager_capacity);
+    plan.expert_cache_bytes = config.expert_cache_bytes != 0 ? config.expert_cache_bytes : std::min(automatic_target, eager_capacity);
     if (plan.expert_cache_bytes > plan.host_memory_budget_bytes - plan.estimated_dense_bytes)
     {
         return Error{ErrorCode::InvalidArgument, "expert cache and dense weights exceed the host memory budget"};

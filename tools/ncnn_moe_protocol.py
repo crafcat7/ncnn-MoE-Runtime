@@ -1,4 +1,7 @@
-"""Client for the ncnn_moe_worker stdio JSONL protocol."""
+"""Client for the ncnn_moe_worker stdio JSONL protocol.
+
+Startup ``init`` events are consumed before the first ``ready`` event.
+"""
 
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ class WorkerClient:
         model: Path,
         runtime_args: Iterable[str] = (),
         *,
+        startup_callback: EventCallback | None = None,
         verbose: bool = False,
     ) -> None:
         self.worker = Path(worker).resolve()
@@ -48,12 +52,18 @@ class WorkerClient:
         )
         self._closed = False
         try:
-            ready = self._read_event()
-            if ready.get("event") == "error":
-                raise WorkerError(ready.get("message", "worker failed to load the model"), ready)
-            if ready.get("event") != "ready":
-                raise WorkerError(f"worker did not send ready event: {ready}", ready)
-            self.ready = ready
+            while True:
+                ready = self._read_event()
+                if ready.get("event") == "init":
+                    if startup_callback is not None:
+                        startup_callback(ready)
+                    continue
+                if ready.get("event") == "error":
+                    raise WorkerError(ready.get("message", "worker failed to load the model"), ready)
+                if ready.get("event") != "ready":
+                    raise WorkerError(f"worker did not send ready event: {ready}", ready)
+                self.ready = ready
+                break
         except BaseException:
             self._terminate()
             raise

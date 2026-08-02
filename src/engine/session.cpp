@@ -35,6 +35,28 @@ struct LogitOrder
     }
 };
 
+class ScopeExit
+{
+private:
+    std::function<void()> function_;
+    bool active_ = true;
+
+public:
+    explicit ScopeExit(std::function<void()> function)
+        : function_(std::move(function))
+    {
+    }
+
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+
+    ~ScopeExit()
+    {
+        if (active_)
+            function_();
+    }
+};
+
 static bool contains_token(const std::vector<int32_t>& tokens, int32_t token)
 {
     return std::find(tokens.begin(), tokens.end(), token) != tokens.end();
@@ -185,6 +207,83 @@ static void update_cache_statistics(SessionStatistics& statistics, const CpuSess
     statistics.kv_cache_allocated_bytes = state.kv_cache_allocated_bytes();
 }
 
+static uint64_t counter_delta(uint64_t current, uint64_t baseline) noexcept
+{
+    return current >= baseline ? current - baseline : 0;
+}
+
+static RuntimeMetricCounters runtime_metric_counters(
+    const SessionStatistics& statistics,
+    const SessionStatistics* baseline)
+{
+    const SessionStatistics empty;
+    const SessionStatistics& start = baseline == nullptr ? empty : *baseline;
+    RuntimeMetricCounters result;
+    result.prefill_tokens = counter_delta(statistics.prefill_tokens, start.prefill_tokens);
+    result.decode_tokens = counter_delta(statistics.decode_tokens, start.decode_tokens);
+    result.expert_cache_hits = counter_delta(statistics.expert_cache_hits, start.expert_cache_hits);
+    result.expert_cache_misses = counter_delta(statistics.expert_cache_misses, start.expert_cache_misses);
+    result.expert_io_bytes = counter_delta(statistics.expert_cache_bytes_read, start.expert_cache_bytes_read);
+    result.expert_compute_time_microseconds = counter_delta(
+        statistics.expert_compute_time_microseconds,
+        start.expert_compute_time_microseconds);
+    result.gpu_submit_count = counter_delta(
+        statistics.vulkan_compute_submissions,
+        start.vulkan_compute_submissions);
+    result.gpu_wait_time_microseconds = counter_delta(
+        statistics.vulkan_submit_wait_time_microseconds,
+        start.vulkan_submit_wait_time_microseconds);
+    result.gpu_kernel_time_microseconds = counter_delta(
+        statistics.expert_gpu_execution_time_microseconds,
+        start.expert_gpu_execution_time_microseconds);
+    result.gpu_kernel_time_available = counter_delta(
+                                            statistics.expert_gpu_executions,
+                                            start.expert_gpu_executions)
+                                        != 0;
+    result.expert_cache_resident_bytes = statistics.expert_cache_resident_bytes;
+    result.kv_cache_logical_bytes = statistics.kv_cache_logical_bytes;
+    result.kv_cache_allocated_bytes = statistics.kv_cache_allocated_bytes;
+    return result;
+}
+
+SessionMetrics Session::metrics_unlocked() const
+{
+    SessionMetrics result;
+    result.generation = runtime_metric_counters(statistics_, &generation_start_statistics_);
+    result.cumulative = runtime_metric_counters(statistics_, nullptr);
+    result.gpu_available = model_->hybrid_mode() != HybridMode::CpuOnly;
+    result.timing.active = generation_active_;
+    result.timing.input_tokens = generation_input_tokens_;
+    result.timing.output_tokens = generation_output_tokens_;
+
+    uint64_t elapsed_microseconds = generation_elapsed_microseconds_;
+    if (generation_active_)
+    {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - generation_started_);
+        elapsed_microseconds = static_cast<uint64_t>(elapsed.count());
+    }
+    result.timing.elapsed_microseconds = elapsed_microseconds;
+
+    uint64_t ttft_microseconds = 0;
+    if (generation_has_first_token_)
+    {
+        const auto ttft = std::chrono::duration_cast<std::chrono::microseconds>(
+            generation_first_token_ready_ - generation_started_);
+        ttft_microseconds = static_cast<uint64_t>(ttft.count());
+        result.timing.ttft_microseconds = ttft_microseconds;
+    }
+
+    if (generation_has_first_token_ && generation_output_tokens_ > 1 && elapsed_microseconds > ttft_microseconds)
+    {
+        const uint64_t decode_elapsed_microseconds = elapsed_microseconds - ttft_microseconds;
+        const uint64_t decode_tokens = generation_output_tokens_ - 1;
+        result.timing.tpot_microseconds = static_cast<double>(decode_elapsed_microseconds) / static_cast<double>(decode_tokens);
+        result.timing.decode_tokens_per_second = static_cast<double>(decode_tokens) * 1000000.0 / static_cast<double>(decode_elapsed_microseconds);
+    }
+    return result;
+}
+
 Session::Session(ModelPtr model, const SessionOptions& options)
     : model_(std::move(model)),
       state_(new CpuSessionState(model_->execution_graph())),
@@ -247,7 +346,10 @@ Result<PrefillResult> Session::prefill_unlocked(std::span<const int32_t> input_i
 Result<PrefillResult> Session::prefill(std::span<const int32_t> input_ids)
 {
     const std::lock_guard<std::mutex> lock(mutex_);
-    return prefill_unlocked(input_ids);
+    auto result = prefill_unlocked(input_ids);
+    if (result)
+        generation_start_statistics_ = statistics_;
+    return result;
 }
 
 Result<DecodeResult> Session::decode_unlocked(int32_t input_id)
@@ -282,7 +384,10 @@ Result<DecodeResult> Session::decode_unlocked(int32_t input_id)
 Result<DecodeResult> Session::decode(int32_t input_id)
 {
     const std::lock_guard<std::mutex> lock(mutex_);
-    return decode_unlocked(input_id);
+    auto result = decode_unlocked(input_id);
+    if (result)
+        generation_start_statistics_ = statistics_;
+    return result;
 }
 
 Result<SampledToken> Session::sample_unlocked(
@@ -367,6 +472,32 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
     if (!valid_sampling)
         return valid_sampling.error();
 
+    generation_active_ = true;
+    generation_input_tokens_ = input_ids.size();
+    generation_output_tokens_ = 0;
+    generation_elapsed_microseconds_ = 0;
+    generation_has_first_token_ = false;
+    generation_started_ = std::chrono::steady_clock::now();
+    generation_first_token_ready_ = {};
+    generation_start_statistics_ = statistics_;
+    const auto finish_generation_metrics = [this]() {
+        if (!generation_active_)
+            return;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - generation_started_);
+        generation_elapsed_microseconds_ = static_cast<uint64_t>(elapsed.count());
+        generation_active_ = false;
+    };
+    const ScopeExit generation_metrics_scope(finish_generation_metrics);
+    const auto mark_token_ready = [this]() {
+        if (!generation_has_first_token_)
+        {
+            generation_has_first_token_ = true;
+            generation_first_token_ready_ = std::chrono::steady_clock::now();
+        }
+        ++generation_output_tokens_;
+    };
+
     const bool enable_speculative_context =
         speculative_context_enabled_
         && options.enable_speculative
@@ -429,6 +560,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
         initial_token.probability = initial.value().probability;
         initial_token.is_stop_token = contains_token(options.stop_tokens, initial_token.token_id);
         const uint64_t initial_sequence_length = sequence_length_;
+        mark_token_ready();
         lock.unlock();
         if (decode_text)
             initial_token.text = decode_text(initial_token.token_id);
@@ -471,6 +603,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 token.probability = sampled.value().probability;
                 token.is_stop_token = contains_token(options.stop_tokens, token.token_id);
                 const uint64_t expected_sequence_length = sequence_length_;
+                mark_token_ready();
                 lock.unlock();
                 if (decode_text)
                     token.text = decode_text(token.token_id);
@@ -766,6 +899,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 token.probability = sampled.probability;
                 token.is_stop_token = contains_token(options.stop_tokens, token.token_id);
                 const uint64_t expected_sequence_length = sequence_length_;
+                mark_token_ready();
                 lock.unlock();
                 if (decode_text)
                     token.text = decode_text(token.token_id);
@@ -854,6 +988,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
         token.is_stop_token = contains_token(options.stop_tokens, token.token_id);
 
         const uint64_t expected_sequence_length = sequence_length_;
+        mark_token_ready();
         lock.unlock();
         if (decode_text)
             token.text = decode_text(token.token_id);
@@ -897,7 +1032,21 @@ Result<void> Session::reset()
     state_.reset(new CpuSessionState(model_->execution_graph()));
     state_->speculative_context_enabled =
         speculative_context_enabled_;
+    generation_start_statistics_ = {};
+    generation_active_ = false;
+    generation_input_tokens_ = 0;
+    generation_output_tokens_ = 0;
+    generation_elapsed_microseconds_ = 0;
+    generation_has_first_token_ = false;
+    generation_started_ = {};
+    generation_first_token_ready_ = {};
     return {};
+}
+
+SessionMetrics Session::metrics() const
+{
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return metrics_unlocked();
 }
 
 MemoryManagerStatistics Session::memory_statistics() const

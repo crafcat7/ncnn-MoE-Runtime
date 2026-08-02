@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import shlex
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -67,9 +66,102 @@ def _format_gpu_utilization(value: Any) -> str:
         return "N/A (unavailable)"
     utilization = value.get("utilization_percent")
     if utilization is not None:
-        return str(utilization)
+        return f"{float(utilization):.1f}%"
     reason = value.get("reason") or "unavailable"
     return f"N/A ({reason})"
+
+
+def _format_duration_microseconds(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "N/A"
+    microseconds = float(value)
+    if microseconds >= 1_000_000:
+        return f"{microseconds / 1_000_000:.2f} s"
+    return f"{microseconds / 1_000:.2f} ms"
+
+
+def _format_bytes_gb(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "N/A"
+    return f"{float(value) / 1_000_000_000:.2f} GB"
+
+
+def _format_metric_count(value: Any, *, available: bool = True) -> str:
+    if not available or not isinstance(value, (int, float)):
+        return "N/A"
+    return f"{int(value):,}"
+
+
+def _format_rate(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "N/A"
+    return f"{float(value):.2f}"
+
+
+def _format_runtime_metrics(metrics: Any) -> str:
+    if not isinstance(metrics, dict):
+        return "metrics\n  unavailable"
+    expert = metrics.get("expert", {})
+    if not isinstance(expert, dict) or "cache_hit" not in expert:
+        expert = {
+            "cache_hit": metrics.get("expert_cache_hits"),
+            "cache_miss": metrics.get("expert_cache_misses"),
+            "io_bytes": metrics.get("expert_cache_bytes_read"),
+        }
+    cache_hit_rate = expert.get("cache_hit_rate") if isinstance(expert, dict) else None
+    if not isinstance(cache_hit_rate, (int, float)) and isinstance(expert, dict):
+        cache_hit = expert.get("cache_hit")
+        cache_miss = expert.get("cache_miss")
+        if isinstance(cache_hit, (int, float)) and isinstance(cache_miss, (int, float)) and cache_hit + cache_miss:
+            cache_hit_rate = cache_hit / (cache_hit + cache_miss)
+    cpu = metrics.get("cpu", {})
+    if not isinstance(cpu, dict):
+        cpu = {"expert_compute_time_microseconds": metrics.get("expert_compute_time_microseconds")}
+    gpu = metrics.get("gpu", {})
+    if not isinstance(gpu, dict):
+        gpu = {}
+    gpu_device = metrics.get("gpu_device", {})
+    if not isinstance(gpu_device, dict) or not gpu_device:
+        gpu_device = metrics.get("gpu", {}) if isinstance(metrics.get("gpu"), dict) else {}
+    process = metrics.get("process", {})
+    gpu_available = bool(gpu.get("available", gpu_device.get("active", False)))
+    process_cpu = process.get("cpu_percent") if isinstance(process, dict) else None
+    process_cpu_text = (
+        f"{float(process_cpu):.1f}%"
+        if isinstance(process_cpu, (int, float))
+        else "N/A"
+    )
+    cache_hit_text = _format_metric_count(expert.get("cache_hit") if isinstance(expert, dict) else None)
+    if isinstance(cache_hit_rate, (int, float)):
+        cache_hit_text += f" ({float(cache_hit_rate) * 100:.1f}%)"
+    return "\n".join(
+        (
+            "metrics",
+            "  Decode tok/s "
+            f"{_format_rate(metrics.get('decode_tok_per_second', metrics.get('tokens_per_second')))}"
+            " · TTFT "
+            f"{_format_duration_microseconds(metrics.get('ttft_microseconds'))}"
+            " · TPOT "
+            f"{_format_duration_microseconds(metrics.get('tpot_microseconds'))}",
+            "  Expert: cache hit "
+            f"{cache_hit_text}"
+            " · cache miss "
+            f"{_format_metric_count(expert.get('cache_miss') if isinstance(expert, dict) else None)}"
+            " · IO "
+            f"{_format_bytes_gb(expert.get('io_bytes') if isinstance(expert, dict) else None)}",
+            "  CPU: expert compute "
+            f"{_format_duration_microseconds(cpu.get('expert_compute_time_microseconds') if isinstance(cpu, dict) else None)}"
+            f" · process {process_cpu_text}",
+            "  GPU: submit "
+            f"{_format_metric_count(gpu.get('submit_count') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " · wait "
+            f"{_format_duration_microseconds(gpu.get('wait_time_microseconds') if isinstance(gpu, dict) and gpu_available else None)}"
+            " · kernel "
+            f"{_format_duration_microseconds(gpu.get('kernel_time_microseconds') if isinstance(gpu, dict) and gpu_available and gpu.get('kernel_time_available', False) else None)}"
+            " · utilization "
+            f"{_format_gpu_utilization(gpu_device)}",
+        )
+    )
 
 
 def _add_model_position(parser: argparse.ArgumentParser) -> None:
@@ -78,7 +170,10 @@ def _add_model_position(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_worker_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--worker", help="Path to ncnn_moe_worker")
+    parser.add_argument(
+        "--worker",
+        help="Override the default worker under build-ncnn",
+    )
     parser.add_argument("--config-dir", help="Override the persistent configuration directory")
     parser.add_argument("--backend", choices=("auto", "cpu", "vulkan", "hybrid", "hybrid-prefetch"))
     backend_group = parser.add_mutually_exclusive_group()
@@ -107,6 +202,29 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--verbose", action="store_true")
 
 
+def _add_metrics_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--metrics-interval-ms",
+        type=int,
+        default=1000,
+        help="Periodic metrics event interval; 0 disables the metrics trace",
+    )
+    metrics_group = parser.add_mutually_exclusive_group()
+    metrics_group.add_argument(
+        "--metrics",
+        dest="metrics_enabled",
+        action="store_true",
+        help="Enable periodic metrics events",
+    )
+    metrics_group.add_argument(
+        "--no-metrics",
+        dest="metrics_enabled",
+        action="store_false",
+        help="Disable periodic metrics events while retaining final statistics",
+    )
+    parser.set_defaults(metrics_enabled=False)
+
+
 def _add_generation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float)
@@ -117,24 +235,18 @@ def _add_generation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-speculative", action="store_true")
     parser.add_argument("--speculative-confidence", type=float, default=0.5)
     parser.add_argument("--speculative-max-draft", type=int, default=0)
-    parser.add_argument(
-        "--metrics-interval-ms",
-        type=int,
-        default=1000,
-        help="Periodic metrics event interval; 0 disables the metrics trace",
-    )
-    parser.add_argument(
-        "--no-metrics",
-        dest="metrics_enabled",
-        action="store_false",
-        default=True,
-        help="Disable periodic metrics events while retaining final statistics",
-    )
+    _add_metrics_options(parser)
     parser.add_argument("--context-tokens", type=int, default=0)
     parser.add_argument("--prefill-chunk-size", type=int, default=256)
-    parser.add_argument("--stream", action="store_true")
+    stream_group = parser.add_mutually_exclusive_group()
+    stream_group.add_argument("--stream", dest="stream", action="store_true", help="Stream generated text (default)")
+    stream_group.add_argument("--no-stream", dest="stream", action="store_false", help="Print the completed response only")
+    parser.set_defaults(stream=True)
     parser.add_argument("--stream-final-only", action="store_true")
-    parser.add_argument("--show-reasoning", action="store_true")
+    reasoning_group = parser.add_mutually_exclusive_group()
+    reasoning_group.add_argument("--show-reasoning", dest="show_reasoning", action="store_true", help="Show reasoning (default)")
+    reasoning_group.add_argument("--hide-reasoning", dest="show_reasoning", action="store_false", help="Hide reasoning from the display")
+    parser.set_defaults(show_reasoning=True)
 
 
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
@@ -183,19 +295,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     tune.add_argument("--context-tokens", type=int, default=0)
     tune.add_argument("--prefill-chunk-size", type=int, default=256)
     tune.add_argument("--seed", type=int, default=0)
-    tune.add_argument(
-        "--metrics-interval-ms",
-        type=int,
-        default=1000,
-        help="Periodic metrics event interval; 0 disables the metrics trace",
-    )
-    tune.add_argument(
-        "--no-metrics",
-        dest="metrics_enabled",
-        action="store_false",
-        default=True,
-        help="Disable periodic metrics events while retaining final statistics",
-    )
+    _add_metrics_options(tune)
     _add_worker_options(tune)
 
     sessions = subparsers.add_parser("sessions", help="List, rename, or delete persistent sessions")
@@ -230,45 +330,39 @@ def resolve_prompt(arguments: argparse.Namespace, *, required: bool = True) -> s
     return value
 
 
-def _build_vulkan_state(build_dir: Path) -> bool | None:
-    cache = build_dir / "CMakeCache.txt"
-    try:
-        for line in cache.read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("NCNN_MOE_USE_VULKAN:BOOL="):
-                return line.rsplit("=", 1)[-1].strip().upper() == "ON"
-    except OSError:
-        pass
-    return None
+def default_worker_path(root: Path) -> Path:
+    """Return the one conventional worker location used by the CLI."""
+    worker_name = "ncnn_moe_worker.exe" if os.name == "nt" else "ncnn_moe_worker"
+    build_dir = root / "build-ncnn"
+    if os.name == "nt":
+        return build_dir / "Release" / worker_name
+    return build_dir / worker_name
 
 
 def find_worker(explicit: str | None, root: Path) -> Path:
-    candidates: list[Path] = []
+    """Resolve an explicitly selected worker or the fixed build-ncnn default."""
+    source = "default"
     if explicit:
-        candidates.append(Path(explicit).expanduser())
-    environment = os.environ.get("NCNN_MOE_WORKER")
-    if environment:
-        candidates.append(Path(environment))
-    names = ("ncnn_moe_worker.exe", "ncnn_moe_worker")
-    build_candidates: list[tuple[int, str, Path]] = []
-    for build_dir in sorted(root.glob("build*")):
-        vulkan_state = _build_vulkan_state(build_dir)
-        # Auto should prefer a build that can actually expose Vulkan. An
-        # explicit --worker or NCNN_MOE_WORKER remains authoritative.
-        priority = 0 if vulkan_state is True else 2 if vulkan_state is False else 1
-        for name in names:
-            build_candidates.append((priority, build_dir.name, build_dir / "Release" / name))
-            build_candidates.append((priority, build_dir.name, build_dir / name))
-    candidates.extend(candidate for _, _, candidate in sorted(build_candidates, key=lambda item: (item[0], item[1], str(item[2]))))
-    for name in names:
-        found = shutil.which(name)
-        if found:
-            candidates.append(Path(found))
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-    raise ValueError(
-        "ncnn_moe_worker was not found; build the examples or pass --worker PATH"
-    )
+        candidate = Path(explicit).expanduser()
+        source = "--worker"
+    else:
+        environment = os.environ.get("NCNN_MOE_WORKER")
+        if environment:
+            candidate = Path(environment).expanduser()
+            source = "NCNN_MOE_WORKER"
+        else:
+            candidate = default_worker_path(root)
+
+    if candidate.is_file():
+        return candidate.resolve()
+
+    resolved = candidate.resolve()
+    if source == "default":
+        raise ValueError(
+            f"default worker was not found at {resolved}; build ncnn_moe_worker "
+            "in build-ncnn or pass --worker PATH"
+        )
+    raise ValueError(f"worker from {source} was not found at {resolved}")
 
 
 def lightweight_model_fingerprint(model: Path) -> str:
@@ -338,12 +432,18 @@ def open_worker(
     adapter: ModelAdapter | None = None,
     session: dict[str, Any] | None = None,
 ) -> tuple[WorkerClient, dict[str, Any], dict[str, Any] | None]:
-    root = Path(__file__).resolve().parents[1]
+    source_root = Path(__file__).resolve().parents[1]
+    root = source_root if (source_root / "CMakeLists.txt").is_file() else Path.cwd().resolve()
     worker = find_worker(getattr(arguments, "worker", None), root)
     user = user_runtime_settings(store)
     cli = cli_runtime_settings(arguments)
     initial = merge_runtime_settings(cli=cli, session=session.get("settings", {}) if session else None, profile=None, user=user)
-    client = WorkerClient(worker, model, runtime_args_from_settings(initial), verbose=getattr(arguments, "verbose", False))
+    client = start_worker_client(
+        worker,
+        model,
+        runtime_args_from_settings(initial),
+        verbose=getattr(arguments, "verbose", False),
+    )
     model_fingerprint = adapter.model_fingerprint if adapter else lightweight_model_fingerprint(model)
     budget = context_budget(adapter, arguments, client.ready) if adapter else int(getattr(arguments, "context_tokens", 0) or 0)
     budget = budget or int(client.ready.get("model", {}).get("max_context_tokens", 0) or 0)
@@ -365,7 +465,12 @@ def open_worker(
     )
     if merged != initial:
         client.close()
-        client = WorkerClient(worker, model, runtime_args_from_settings(merged), verbose=getattr(arguments, "verbose", False))
+        client = start_worker_client(
+            worker,
+            model,
+            runtime_args_from_settings(merged),
+            verbose=getattr(arguments, "verbose", False),
+        )
     return client, merged, profile_record
 
 
@@ -414,6 +519,61 @@ def validate_generation_arguments(arguments: argparse.Namespace) -> None:
 
 def metrics_trace_enabled(arguments: argparse.Namespace) -> bool:
     return bool(getattr(arguments, "metrics_enabled", True)) and getattr(arguments, "metrics_interval_ms", 1000) > 0
+
+
+class StartupProgress:
+    """Render native worker initialization without polluting JSON stdout."""
+
+    def __init__(self) -> None:
+        self.started = time.monotonic()
+        self.last_width = 0
+        self.last_phase = ""
+        self.is_tty = bool(getattr(sys.stderr, "isatty", lambda: False)())
+
+    def __call__(self, event: dict[str, Any]) -> None:
+        completed = int(event.get("completed_steps", 0) or 0)
+        total = max(1, int(event.get("total_steps", 0) or 0))
+        percent = max(0.0, min(100.0, completed * 100.0 / total))
+        width = 24
+        filled = min(width, int(width * percent / 100.0))
+        bar = "=" * filled + "-" * (width - filled)
+        elapsed = time.monotonic() - self.started
+        message = str(event.get("message", event.get("phase", "initializing")))
+        text = f"Init [{bar}] {percent:5.1f}% · {message} · {elapsed:.1f}s"
+        if self.is_tty:
+            padding = max(0, self.last_width - len(text))
+            sys.stderr.write("\r" + text + (" " * padding))
+            sys.stderr.flush()
+            self.last_width = len(text)
+        elif event.get("phase") != self.last_phase or completed == total:
+            print(text, file=sys.stderr)
+        self.last_phase = str(event.get("phase", ""))
+
+    def finish(self) -> None:
+        if self.is_tty and self.last_width:
+            sys.stderr.write("\r" + (" " * self.last_width) + "\r")
+            sys.stderr.flush()
+        self.last_width = 0
+
+
+def start_worker_client(
+    worker: Path,
+    model: Path,
+    runtime_args: list[str],
+    *,
+    verbose: bool,
+) -> WorkerClient:
+    progress = StartupProgress()
+    try:
+        return WorkerClient(
+            worker,
+            model,
+            runtime_args,
+            startup_callback=progress,
+            verbose=verbose,
+        )
+    finally:
+        progress.finish()
 
 
 class ConversationApp:
@@ -632,14 +792,7 @@ class ConversationApp:
         if event.get("event") == "metrics":
             streamed["metrics"] = json.dumps(event.get("metrics", {}), ensure_ascii=False)
             self.last_metrics = event.get("metrics", {})
-            metrics = self.last_metrics
-            process = metrics.get("process", {}) if isinstance(metrics, dict) else {}
-            self._status(
-                f"metrics · {metrics.get('tokens_per_second', 'N/A')} token/s · "
-                f"CPU {process.get('cpu_percent', 'N/A')} · "
-                f"GPU {_format_gpu_utilization(metrics.get('gpu'))} · "
-                f"IO {process.get('read_bytes', 'N/A')}/{process.get('write_bytes', 'N/A')} bytes"
-            )
+            self._status(_format_runtime_metrics(self.last_metrics))
             return
         if event.get("event") != "token" or not self.arguments.stream:
             return
@@ -714,21 +867,15 @@ class ConversationApp:
             print(completion.reasoning)
 
     def status_after(self, done: dict[str, Any], reused: bool) -> None:
-        stats = done.get("stats", {})
-        metrics = done.get("telemetry", {})
-        tokens = done.get("generated_tokens", 0)
-        rate = done.get("tokens_per_second")
-        cache_hits = stats.get("expert_cache_hits", 0)
-        cache_misses = stats.get("expert_cache_misses", 0)
-        hit_rate = None if cache_hits + cache_misses == 0 else cache_hits / (cache_hits + cache_misses)
-        parts = [
-            f"{tokens} tokens · {rate:.2f} token/s" if isinstance(rate, (int, float)) else f"{tokens} tokens",
-            f"context {len(self.native_context_tokens)}/{self.context_limit or 'auto'}",
-            f"cache {hit_rate:.0%}" if hit_rate is not None else "cache N/A",
-            f"CPU {metrics.get('cpu_percent', 'N/A')}",
-            f"prefix {'reused' if reused else 'replayed'}",
-        ]
-        self._status(" · ".join(parts))
+        metrics = done.get("metrics", {})
+        self.last_metrics = metrics if isinstance(metrics, dict) else {}
+        self._status(
+            _format_runtime_metrics(self.last_metrics)
+            + "\n  Context "
+            + f"{len(self.native_context_tokens)}/{self.context_limit or 'auto'}"
+            + " tokens"
+            + f" · prefix {'reused' if reused else 'replayed'}"
+        )
 
     def show_context(self) -> None:
         tokens = self.adapter.encode_messages(self.messages) if self.messages else []
@@ -963,14 +1110,17 @@ def inspect_command(arguments: argparse.Namespace) -> int:
             telemetry = ready.get("telemetry", {})
             print(f"model: {model_info.get('model_type', 'N/A')}")
             print(f"backend: {resources.get('backend', 'N/A')}")
-            print(f"host memory: {resources.get('host_memory_budget_bytes', 'N/A')} bytes")
-            print(f"Expert cache: {resources.get('expert_cache_bytes', 'N/A')} bytes")
+            print(f"host memory: {_format_bytes_gb(resources.get('host_memory_budget_bytes'))}")
+            print(f"Expert cache: {_format_bytes_gb(resources.get('expert_cache_bytes'))}")
             print(f"Expert IO workers: {resources.get('expert_io_workers', 'N/A')}")
             print(f"CPU: {capabilities.get('physical_cpu_core_count', 'N/A')} physical / {capabilities.get('logical_cpu_count', 'N/A')} logical")
             print(f"Vulkan devices: {capabilities.get('vulkan_device_count', 0)}")
             print(f"GPU telemetry: {_format_gpu_utilization(telemetry)}")
             for device in capabilities.get("vulkan_devices", []):
-                print(f"  [{device.get('index')}] {device.get('name')} ({device.get('type')}) heap={device.get('heap_budget_bytes')} bytes")
+                print(
+                    f"  [{device.get('index')}] {device.get('name')} "
+                    f"({device.get('type')}) heap={_format_bytes_gb(device.get('heap_budget_bytes'))}"
+                )
         return 0
     finally:
         client.close()

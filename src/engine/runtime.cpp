@@ -161,27 +161,43 @@ void Runtime::register_adapter(std::shared_ptr<IMoeModelAdapter> adapter)
         adapters_.push_back(std::move(adapter));
 }
 
-Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, const RuntimeOptions& options)
+Result<ModelPtr> Runtime::load_model(
+    const std::filesystem::path& model_path,
+    const RuntimeConfig& config,
+    RuntimeLoadProgressCallback on_progress)
 {
-    if (has_flag(options.flags, RuntimeOptionMemoryMapExperts)
-        && (has_flag(options.flags, RuntimeOptionDirectExpertIo)
-            || has_flag(options.flags, RuntimeOptionBufferedExpertIo)))
+    constexpr uint32_t total_load_steps = 9;
+    const auto report_progress = [&](uint32_t completed_steps, std::string_view phase, std::string_view message) {
+        if (!on_progress)
+            return;
+        RuntimeLoadProgress progress;
+        progress.completed_steps = completed_steps;
+        progress.total_steps = total_load_steps;
+        progress.phase = phase;
+        progress.message = message;
+        on_progress(progress);
+    };
+
+    report_progress(0, "validate", "Validating runtime configuration");
+    if (has_flag(config.flags, RuntimeOptionMemoryMapExperts)
+        && (has_flag(config.flags, RuntimeOptionDirectExpertIo)
+            || has_flag(config.flags, RuntimeOptionBufferedExpertIo)))
     {
         return Error{ErrorCode::InvalidArgument, "memory-mapped and explicit Expert I/O modes are mutually exclusive"};
     }
-    if (has_flag(options.flags, RuntimeOptionDirectExpertIo) && has_flag(options.flags, RuntimeOptionBufferedExpertIo))
+    if (has_flag(config.flags, RuntimeOptionDirectExpertIo) && has_flag(config.flags, RuntimeOptionBufferedExpertIo))
     {
         return Error{ErrorCode::InvalidArgument, "direct and buffered Expert I/O are mutually exclusive"};
     }
-    if (options.expert_gpu_victim_reuse_probe_interval == 0 || options.expert_gpu_victim_reuse_probe_interval > 1024)
+    if (config.expert_gpu_victim_reuse_probe_interval == 0 || config.expert_gpu_victim_reuse_probe_interval > 1024)
     {
         return Error{ErrorCode::InvalidArgument, "Expert GPU victim reuse-probe interval must be between 1 and 1024"};
     }
-    if (options.expected_concurrency == 0 || options.expected_concurrency > 1024)
+    if (config.expected_concurrency == 0 || config.expected_concurrency > 1024)
     {
         return Error{ErrorCode::InvalidArgument, "expected_concurrency must be between 1 and 1024"};
     }
-    HybridMode resolved_mode = options.hybrid_mode;
+    HybridMode resolved_mode = config.hybrid_mode;
     if (resolved_mode == HybridMode::Auto)
         resolved_mode = has_flag(capabilities_.flags, RuntimeCapabilityVulkanCpuMix) ? HybridMode::HybridExperts : HybridMode::CpuOnly;
     if (resolved_mode == HybridMode::VulkanOnly)
@@ -195,19 +211,19 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
         return Error{ErrorCode::UnsupportedModel, "VulkanWithCpuPrefetch requires a Vulkan device and Vulkan-enabled ncnn"};
     }
     std::vector<uint32_t> selected_vulkan_device_indices;
-    if (!options.vulkan_device_indices.empty())
+    if (!config.vulkan_device_indices.empty())
     {
-        if (options.vulkan_device_index != automatic_vulkan_device_index && options.vulkan_device_index != options.vulkan_device_indices.front())
+        if (config.vulkan_device_index != automatic_vulkan_device_index && config.vulkan_device_index != config.vulkan_device_indices.front())
         {
             return Error{ErrorCode::InvalidArgument, "vulkan_device_index must match the first explicit Vulkan device"};
         }
-        selected_vulkan_device_indices = options.vulkan_device_indices;
+        selected_vulkan_device_indices = config.vulkan_device_indices;
     }
     else
     {
-        if (options.vulkan_device_index != automatic_vulkan_device_index)
+        if (config.vulkan_device_index != automatic_vulkan_device_index)
         {
-            selected_vulkan_device_indices.push_back(options.vulkan_device_index);
+            selected_vulkan_device_indices.push_back(config.vulkan_device_index);
         }
         else if (!capabilities_.vulkan_devices.empty())
         {
@@ -232,7 +248,7 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
     const VulkanDeviceCapabilities* selected_vulkan_device = selected_vulkan_device_index < capabilities_.vulkan_devices.size()
                                                                  ? &capabilities_.vulkan_devices[selected_vulkan_device_index]
                                                                  : nullptr;
-    if (options.hybrid_mode == HybridMode::Auto && (!selected_vulkan_device || selected_vulkan_device->type == VulkanDeviceType::Cpu))
+    if (config.hybrid_mode == HybridMode::Auto && (!selected_vulkan_device || selected_vulkan_device->type == VulkanDeviceType::Cpu))
     {
         resolved_mode = HybridMode::CpuOnly;
     }
@@ -247,6 +263,7 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
         }
     }
 
+    report_progress(1, "hardware", "Selecting CPU and Vulkan execution devices");
     std::filesystem::path root = model_path;
     std::filesystem::path manifest_path;
     std::error_code filesystem_error;
@@ -258,6 +275,7 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
         root = model_path.parent_path();
     }
 
+    report_progress(2, "manifest", "Reading model manifest");
     auto manifest_text = read_text_file(manifest_path);
     if (!manifest_text)
         return manifest_text.error();
@@ -280,6 +298,7 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
     if (!selected_adapter)
         return Error{ErrorCode::UnsupportedModel, "no adapter registered for model_type: " + package.manifest.model_type};
 
+    report_progress(3, "architecture", "Parsing model architecture");
     auto parsed_ir = selected_adapter->parse_model(package);
     if (!parsed_ir)
         return parsed_ir.error();
@@ -289,10 +308,11 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
 
     const bool use_vulkan_dense = resolved_mode == HybridMode::HybridExperts || resolved_mode == HybridMode::VulkanWithCpuPrefetch;
     const bool release_vulkan_dense_host_storage =
-        use_vulkan_dense && has_flag(options.flags, RuntimeOptionReleaseVulkanDenseHostStorage);
+        use_vulkan_dense && has_flag(config.flags, RuntimeOptionReleaseVulkanDenseHostStorage);
+    report_progress(4, "memory", "Planning host memory and Expert cache");
     auto memory_plan = plan_model_memory(
         parsed_ir.value(),
-        options,
+        config,
         capabilities_.physical_memory_bytes,
         release_vulkan_dense_host_storage);
     if (!memory_plan)
@@ -302,11 +322,11 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
     if (file_backed_experts)
         package.flags |= ModelPackageDeferMxfp4Experts;
 
-    if (options.expert_gpu_cache_bytes > std::numeric_limits<uint64_t>::max() - options.expert_gpu_victim_cache_bytes)
+    if (config.expert_gpu_cache_bytes > std::numeric_limits<uint64_t>::max() - config.expert_gpu_victim_cache_bytes)
     {
         return Error{ErrorCode::InvalidArgument, "the combined Expert GPU cache capacity overflows"};
     }
-    const uint64_t requested_expert_gpu_bytes = options.expert_gpu_cache_bytes + options.expert_gpu_victim_cache_bytes;
+    const uint64_t requested_expert_gpu_bytes = config.expert_gpu_cache_bytes + config.expert_gpu_victim_cache_bytes;
     if (requested_expert_gpu_bytes != 0)
     {
         if (!file_backed_experts)
@@ -323,6 +343,7 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
         }
     }
 
+    report_progress(5, "weights", "Mapping model weights");
     auto weights = selected_adapter->map_weights(package, parsed_ir.value());
     if (!weights)
         return weights.error();
@@ -332,7 +353,7 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
     compiler_capabilities.flags = 0;
     compiler_capabilities.cpu_parallelism = capabilities_.openmp_thread_count;
     compiler_capabilities.vulkan_device_index = selected_vulkan_device_index;
-    compiler_capabilities.expected_concurrency = options.expected_concurrency;
+    compiler_capabilities.expected_concurrency = config.expected_concurrency;
     compiler_capabilities.vulkan_device_indices = selected_vulkan_device_indices;
     compiler_capabilities.vulkan_device_scores.reserve(selected_vulkan_device_indices.size());
     for (uint32_t device_index : selected_vulkan_device_indices)
@@ -359,29 +380,31 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityRetainCpuDenseCopies;
     if (release_vulkan_dense_host_storage && file_backed_experts)
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityReleaseVulkanDenseHostStorage;
+    report_progress(6, "compile", "Compiling execution graph");
     auto compiled = compiler.compile(std::move(parsed_ir).value(), std::move(weights).value(), resolved_mode, compiler_capabilities);
     if (!compiled)
         return compiled.error();
     CompiledModel compiled_model = std::move(compiled).value();
     compiled_model.memory_plan = plan;
-    compiled_model.runtime_option_flags = options.flags;
-    compiled_model.expected_concurrency = options.expected_concurrency;
+    compiled_model.runtime_option_flags = config.flags;
+    compiled_model.expected_concurrency = config.expected_concurrency;
     compiled_model.effective_runtime_options.hybrid_mode = compiled_model.hybrid_mode;
     compiled_model.effective_runtime_options.requested_expert_memory_mode = plan.requested_mode;
     compiled_model.effective_runtime_options.selected_expert_memory_mode = plan.selected_mode;
     compiled_model.effective_runtime_options.host_memory_budget_bytes = plan.host_memory_budget_bytes;
     compiled_model.effective_runtime_options.expert_cache_bytes = plan.expert_cache_bytes;
-    compiled_model.effective_runtime_options.expert_gpu_cache_bytes = options.expert_gpu_cache_bytes;
-    compiled_model.effective_runtime_options.expert_gpu_victim_cache_bytes = options.expert_gpu_victim_cache_bytes;
-    compiled_model.effective_runtime_options.expert_gpu_victim_reuse_probe_interval = options.expert_gpu_victim_reuse_probe_interval;
+    compiled_model.effective_runtime_options.expert_gpu_cache_bytes = config.expert_gpu_cache_bytes;
+    compiled_model.effective_runtime_options.expert_gpu_victim_cache_bytes = config.expert_gpu_victim_cache_bytes;
+    compiled_model.effective_runtime_options.expert_gpu_victim_reuse_probe_interval = config.expert_gpu_victim_reuse_probe_interval;
     compiled_model.effective_runtime_options.vulkan_device_index = compiled_model.vulkan_device_index;
     compiled_model.effective_runtime_options.vulkan_device_indices = compiled_model.vulkan_device_indices;
-    compiled_model.effective_runtime_options.flags = options.flags;
-    compiled_model.effective_runtime_options.expected_concurrency = options.expected_concurrency;
+    compiled_model.effective_runtime_options.flags = config.flags;
+    compiled_model.effective_runtime_options.expected_concurrency = config.expected_concurrency;
     compiled_model.effective_runtime_options.file_backed_experts = file_backed_experts;
+    report_progress(7, "cache", "Preparing Expert storage and caches");
     if (file_backed_experts)
     {
-        uint32_t expert_io_workers = options.expert_io_workers;
+        uint32_t expert_io_workers = config.expert_io_workers;
         if (expert_io_workers == 0)
         {
             uint32_t maximum_active_experts = 1;
@@ -401,35 +424,35 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
         }
         compiled_model.effective_runtime_options.expert_io_workers = expert_io_workers;
         uint32_t expert_cache_flags = 0;
-        if (has_flag(options.flags, RuntimeOptionMemoryMapExperts))
+        if (has_flag(config.flags, RuntimeOptionMemoryMapExperts))
         {
             expert_cache_flags |= ExpertCacheMemoryMapRanges;
         }
-        if (has_flag(options.flags, RuntimeOptionDirectExpertIo))
+        if (has_flag(config.flags, RuntimeOptionDirectExpertIo))
         {
             expert_cache_flags |= ExpertCacheDirectReads;
         }
-        if (has_flag(options.flags, RuntimeOptionBufferedExpertIo))
+        if (has_flag(config.flags, RuntimeOptionBufferedExpertIo))
         {
             expert_cache_flags |= ExpertCacheBufferedReads;
         }
-        if (has_flag(options.flags, RuntimeOptionForwardAwareCache))
+        if (has_flag(config.flags, RuntimeOptionForwardAwareCache))
         {
             expert_cache_flags |= ExpertCacheForwardAwareEviction;
         }
-        if (has_flag(options.flags, RuntimeOptionRouterPrediction))
+        if (has_flag(config.flags, RuntimeOptionRouterPrediction))
         {
             expert_cache_flags |= ExpertCacheAllowSpeculativeEviction;
         }
-        if (has_flag(options.flags, RuntimeOptionCrossExpertReadCoalescing))
+        if (has_flag(config.flags, RuntimeOptionCrossExpertReadCoalescing))
         {
             expert_cache_flags |= ExpertCacheCrossExpertReadCoalescing;
         }
         const std::vector<uint32_t>& expert_vulkan_device_indices = compiled_model.vulkan_device_indices;
-        auto executable_capacities_result = distribute_gpu_capacity(options.expert_gpu_cache_bytes, plan.expert_pair_bytes, expert_vulkan_device_indices, capabilities_.vulkan_devices, "the executable Expert GPU cache");
+        auto executable_capacities_result = distribute_gpu_capacity(config.expert_gpu_cache_bytes, plan.expert_pair_bytes, expert_vulkan_device_indices, capabilities_.vulkan_devices, "the executable Expert GPU cache");
         if (!executable_capacities_result)
             return executable_capacities_result.error();
-        auto victim_capacities_result = distribute_gpu_capacity(options.expert_gpu_victim_cache_bytes, plan.expert_pair_bytes, expert_vulkan_device_indices, capabilities_.vulkan_devices, "the Expert GPU victim cache");
+        auto victim_capacities_result = distribute_gpu_capacity(config.expert_gpu_victim_cache_bytes, plan.expert_pair_bytes, expert_vulkan_device_indices, capabilities_.vulkan_devices, "the Expert GPU victim cache");
         if (!victim_capacities_result)
             return victim_capacities_result.error();
         std::vector<uint64_t> executable_capacities = std::move(executable_capacities_result).value();
@@ -450,7 +473,7 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
         }
         std::vector<std::shared_ptr<IExpertVictimCache>> expert_victim_cache_shards;
         std::shared_ptr<IExpertVictimCache> expert_victim_cache;
-        if (options.expert_gpu_victim_cache_bytes != 0)
+        if (config.expert_gpu_victim_cache_bytes != 0)
         {
             expert_victim_cache_shards.reserve(expert_vulkan_device_indices.size());
             for (size_t index = 0; index < expert_vulkan_device_indices.size(); ++index)
@@ -469,13 +492,13 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
             {
                 return Error{ErrorCode::UnsupportedModel, "cannot create the sharded Expert GPU victim cache"};
             }
-            if (options.expert_gpu_victim_reuse_probe_interval > 1)
+            if (config.expert_gpu_victim_reuse_probe_interval > 1)
             {
-                expert_victim_cache = create_reuse_victim_cache(std::move(expert_victim_cache), options.expert_gpu_victim_reuse_probe_interval);
+                expert_victim_cache = create_reuse_victim_cache(std::move(expert_victim_cache), config.expert_gpu_victim_reuse_probe_interval);
             }
         }
-        const bool use_victim_device_source = !has_flag(options.flags, RuntimeOptionDisableGpuVictimExecution) && !expert_victim_cache_shards.empty();
-        if (options.expert_gpu_cache_bytes != 0 || use_victim_device_source)
+        const bool use_victim_device_source = !has_flag(config.flags, RuntimeOptionDisableGpuVictimExecution) && !expert_victim_cache_shards.empty();
+        if (config.expert_gpu_cache_bytes != 0 || use_victim_device_source)
         {
             std::vector<std::shared_ptr<IExpertExecutionBackend>> device_backends;
             std::vector<uint32_t> expert_device_indices;
@@ -530,7 +553,9 @@ Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, co
             static_cast<uint32_t>(residency_group_count));
     }
 
+    report_progress(8, "finalize", "Finalizing runtime model");
     auto immutable = std::make_shared<const CompiledModel>(std::move(compiled_model));
+    report_progress(9, "ready", "Model initialization complete");
     return ModelPtr(new Model(std::move(immutable)));
 }
 
