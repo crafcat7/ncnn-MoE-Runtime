@@ -2,6 +2,7 @@
 #define NCNN_MOE_EXPERT_VICTIM_CACHE_H
 
 #include "ncnn/moe/types.h"
+#include "ncnn/moe/vulkan_context.h"
 
 #include <cstdint>
 #include <limits>
@@ -62,7 +63,9 @@ public:
     [[nodiscard]] virtual uint64_t capacity_bytes() const noexcept = 0;
 };
 
-[[nodiscard]] std::shared_ptr<IExpertVictimCache> create_vulkan_victim_cache(uint64_t capacity_bytes, uint32_t vulkan_device_index = automatic_vulkan_device_index);
+[[nodiscard]] std::shared_ptr<IExpertVictimCache> create_vulkan_victim_cache(uint64_t capacity_bytes, uint32_t vulkan_device_index,
+                                                                               const NcnnVulkanContextInstancePtr& context_instance,
+                                                                               uint64_t optimization_flags);
 
 // Payload-bounded reuse filter for upper-cache evictions.
 [[nodiscard]] std::shared_ptr<IExpertVictimCache> create_reuse_victim_cache(std::shared_ptr<IExpertVictimCache> inner, uint32_t reuse_probe_interval);

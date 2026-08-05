@@ -348,6 +348,15 @@ public:
                 coalesced_expert_routes_.fetch_add(
                     metrics.coalesced_expert_routes,
                     std::memory_order_relaxed);
+                vulkan_attention_batch_submissions_.fetch_add(
+                    metrics.vulkan_attention_batch_submissions,
+                    std::memory_order_relaxed);
+                vulkan_attention_batch_rows_.fetch_add(
+                    metrics.vulkan_attention_batch_rows,
+                    std::memory_order_relaxed);
+                vulkan_attention_batch_avoided_submissions_.fetch_add(
+                    metrics.vulkan_attention_batch_avoided_submissions,
+                    std::memory_order_relaxed);
                 update_max(
                     max_coalesced_expert_batch_size_,
                     metrics.max_expert_batch_size);
@@ -573,6 +582,9 @@ public:
                         coalesced_expert_batches_.fetch_add(metrics.logical_expert_batches - metrics.physical_expert_batches, std::memory_order_relaxed);
                     }
                     coalesced_expert_routes_.fetch_add(metrics.coalesced_expert_routes, std::memory_order_relaxed);
+                    vulkan_attention_batch_submissions_.fetch_add(metrics.vulkan_attention_batch_submissions, std::memory_order_relaxed);
+                    vulkan_attention_batch_rows_.fetch_add(metrics.vulkan_attention_batch_rows, std::memory_order_relaxed);
+                    vulkan_attention_batch_avoided_submissions_.fetch_add(metrics.vulkan_attention_batch_avoided_submissions, std::memory_order_relaxed);
                     update_max(max_coalesced_expert_batch_size_, metrics.max_expert_batch_size);
                     if (!decoded)
                     {
@@ -685,6 +697,9 @@ public:
         result.coalesced_expert_batches = coalesced_expert_batches_.load(std::memory_order_relaxed);
         result.coalesced_expert_routes = coalesced_expert_routes_.load(std::memory_order_relaxed);
         result.max_coalesced_expert_batch_size = max_coalesced_expert_batch_size_.load(std::memory_order_relaxed);
+        result.vulkan_attention_batch_submissions = vulkan_attention_batch_submissions_.load(std::memory_order_relaxed);
+        result.vulkan_attention_batch_rows = vulkan_attention_batch_rows_.load(std::memory_order_relaxed);
+        result.vulkan_attention_batch_avoided_submissions = vulkan_attention_batch_avoided_submissions_.load(std::memory_order_relaxed);
         result.adaptive_staged_decisions = adaptive_staged_decisions_.load(std::memory_order_relaxed);
         result.adaptive_independent_decisions = adaptive_independent_decisions_.load(std::memory_order_relaxed);
         result.adaptive_probe_decisions = adaptive_probe_decisions_.load(std::memory_order_relaxed);
@@ -1289,6 +1304,9 @@ private:
     std::atomic<uint64_t> coalesced_expert_batches_{0};
     std::atomic<uint64_t> coalesced_expert_routes_{0};
     std::atomic<uint64_t> max_coalesced_expert_batch_size_{0};
+    std::atomic<uint64_t> vulkan_attention_batch_submissions_{0};
+    std::atomic<uint64_t> vulkan_attention_batch_rows_{0};
+    std::atomic<uint64_t> vulkan_attention_batch_avoided_submissions_{0};
     std::atomic<uint64_t> adaptive_staged_decisions_{0};
     std::atomic<uint64_t> adaptive_independent_decisions_{0};
     std::atomic<uint64_t> adaptive_probe_decisions_{0};

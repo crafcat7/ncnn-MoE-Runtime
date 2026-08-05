@@ -32,6 +32,7 @@ struct ModelMemoryPlan
     uint64_t minimum_active_expert_bytes = 0;
     uint64_t expert_cache_bytes = 0;
     uint32_t flags = 0;
+    uint64_t available_memory_bytes = 0;
 };
 
 } // namespace moe

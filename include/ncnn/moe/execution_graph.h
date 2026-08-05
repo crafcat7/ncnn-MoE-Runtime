@@ -2,6 +2,7 @@
 #define NCNN_MOE_EXECUTION_GRAPH_H
 
 #include "ncnn/moe/result.h"
+#include "ncnn/moe/compiled_layer_plan.h"
 #include "ncnn/moe/types.h"
 
 #include <cstddef>
@@ -36,6 +37,7 @@ enum class ExecutionNodeType
     ExpertDispatch,
     Expert,
     ExpertGroup,
+    SharedExpertGroup,
     Combine,
     FinalNorm,
     LmHead
@@ -52,11 +54,13 @@ enum ExecutionBackendMask : uint32_t
 
 #define NCNN_MOE_NODE_CONDITIONAL_BIT 0
 #define NCNN_MOE_NODE_ASYNC_BIT       1
+#define NCNN_MOE_NODE_CPU_PREFETCH_BIT 2
 
 enum ExecutionNodeFlag : uint32_t
 {
     ExecutionNodeConditional = UINT32_C(1) << NCNN_MOE_NODE_CONDITIONAL_BIT,
-    ExecutionNodeAsync = UINT32_C(1) << NCNN_MOE_NODE_ASYNC_BIT
+    ExecutionNodeAsync = UINT32_C(1) << NCNN_MOE_NODE_ASYNC_BIT,
+    ExecutionNodeCpuPrefetch = UINT32_C(1) << NCNN_MOE_NODE_CPU_PREFETCH_BIT
 };
 
 #define NCNN_MOE_TENSOR_PERSISTENT_BIT 0
@@ -96,8 +100,13 @@ struct ExecutionNode
     ExecutionNodeType type = ExecutionNodeType::TokenEmbedding;
     ExecutionBackend backend = ExecutionBackend::Cpu;
     uint32_t backend_mask = ExecutionBackendCpu;
-    uint32_t layer_id = invalid_execution_layer_id;
+    // Index into ExecutionGraph::layer_plans.  The graph owns both execution
+    // order and the immutable layer payload consumed by the executor.
+    uint32_t layer_plan_index = invalid_execution_layer_id;
     uint32_t expert_id = invalid_execution_expert_id;
+    // WeightStore handles consumed by non-layer nodes.  Layer nodes resolve
+    // their complete operator payload through layer_plan_index instead.
+    std::vector<TensorHandle> weight_inputs;
     uint32_t flags = 0;
     std::string name;
     std::vector<ExecutionNodeId> dependencies;
@@ -112,6 +121,7 @@ struct ExecutionGraph
     std::vector<ExecutionTensor> tensors;
     std::vector<ExecutionNode> nodes;
     std::vector<ExecutionEvent> events;
+    std::vector<CompiledLayerPlan> layer_plans;
 
     [[nodiscard]] Result<void> validate() const;
     [[nodiscard]] const ExecutionNode* find(ExecutionNodeId id) const noexcept;
@@ -125,12 +135,25 @@ struct ExecutionWave
     std::vector<ExecutionNodeId> vulkan_nodes;
 };
 
+// A contiguous backend run in the immutable execution reservation.  The
+// scheduler owns the order; executors must not reconstruct it from the graph
+// or from layer metadata at execution time.
+struct ExecutionBackendRun
+{
+    ExecutionBackend backend = ExecutionBackend::Cpu;
+    uint32_t first_node = 0;
+    uint32_t node_count = 0;
+};
+
 struct ExecutionSchedule
 {
     std::vector<ExecutionWave> waves;
-    std::vector<ExecutionEvent> events;
+    std::vector<ExecutionNodeId> node_order;
+    std::vector<ExecutionBackendRun> backend_runs;
     uint32_t cpu_parallelism = 1;
     uint32_t vulkan_queue_count = 0;
+
+    [[nodiscard]] Result<void> validate(const ExecutionGraph& graph) const;
 };
 
 class MoeScheduler

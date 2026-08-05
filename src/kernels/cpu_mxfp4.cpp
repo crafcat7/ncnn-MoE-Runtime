@@ -1,5 +1,7 @@
 #include "cpu_mxfp4.h"
+#include "cpu_bfloat16.h"
 #include "engine/cpu_features.h"
+#include "ncnn/moe/runtime.h"
 
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
 #include "cpu_mxfp4_msvc.h"
@@ -14,7 +16,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -33,8 +34,6 @@
 
 namespace ncnn {
 namespace moe {
-
-static volatile float mxfp4_benchmark_sink = 0.0f;
 
 static std::array<float, 256> make_scale_table()
 {
@@ -619,77 +618,27 @@ static KernelDispatch select_kernel() noexcept
     }
 #endif
 
-    const char* override_name = nullptr;
-#if defined(_MSC_VER)
-    std::array<char, 16> override_storage = {};
-    size_t override_length = 0;
-    if (getenv_s(&override_length, override_storage.data(), override_storage.size(), "NCNN_MOE_MXFP4_KERNEL") == 0 && override_length > 1
-        && override_length <= override_storage.size())
-    {
-        override_name = override_storage.data();
-    }
-#else
-    override_name = std::getenv("NCNN_MOE_MXFP4_KERNEL");
-#endif
-    if (override_name && override_name[0] != '\0')
+    // Do not benchmark kernels during process initialization. The old
+    // micro-benchmark was sensitive to the CPU frequency state and could
+    // select AVX2 after Vulkan initialization but AVX512 in CPU-only mode,
+    // making the same process path nondeterministically slower. Select the
+    // highest ISA that passed the feature check and keep the choice stable.
+    constexpr std::array<MxFp4KernelKind, 5> preference = {
+        MxFp4KernelKind::X86Avx512,
+        MxFp4KernelKind::ArmSve2,
+        MxFp4KernelKind::X86Avx2,
+        MxFp4KernelKind::ArmNeon,
+        MxFp4KernelKind::Scalar,
+    };
+    for (const MxFp4KernelKind preferred : preference)
     {
         for (size_t index = 0; index < candidate_count; ++index)
         {
-            const bool selected = (std::strcmp(override_name, "scalar") == 0 && candidates[index].kind == MxFp4KernelKind::Scalar)
-                                  || (std::strcmp(override_name, "neon") == 0 && candidates[index].kind == MxFp4KernelKind::ArmNeon)
-                                  || (std::strcmp(override_name, "sve2") == 0 && candidates[index].kind == MxFp4KernelKind::ArmSve2)
-                                  || (std::strcmp(override_name, "avx2") == 0 && candidates[index].kind == MxFp4KernelKind::X86Avx2)
-                                  || (std::strcmp(override_name, "avx512") == 0 && candidates[index].kind == MxFp4KernelKind::X86Avx512);
-            if (selected)
+            if (candidates[index].kind == preferred)
                 return candidates[index];
         }
     }
-    if (candidate_count == 1)
-        return candidates[0];
-
-    static constexpr uint32_t benchmark_blocks = 64;
-    static constexpr uint32_t benchmark_repeats = 96;
-    std::array<uint8_t, benchmark_blocks * 16 * 2> packed = {};
-    std::array<uint8_t, benchmark_blocks * 2> scales = {};
-    std::array<float, benchmark_blocks * 32> input = {};
-    for (size_t index = 0; index < packed.size(); ++index)
-    {
-        packed[index] = static_cast<uint8_t>(((index * 5 + 1) & 0x0f) | (((index * 7 + 3) & 0x0f) << 4));
-    }
-    for (size_t index = 0; index < scales.size(); ++index)
-        scales[index] = static_cast<uint8_t>(124 + index % 7);
-    for (size_t index = 0; index < input.size(); ++index)
-    {
-        input[index] = static_cast<float>(static_cast<int>(index % 31) - 15) * 0.03125f;
-    }
-
-    std::array<int64_t, 3> elapsed = {};
-    volatile float sink = 0.0f;
-    for (uint32_t round = 0; round < 5; ++round)
-    {
-        for (size_t order = 0; order < candidate_count; ++order)
-        {
-            const size_t index = round % 2 == 0 ? order : candidate_count - order - 1;
-            float first = 0.0f;
-            float second = 0.0f;
-            const auto started = std::chrono::steady_clock::now();
-            for (uint32_t repeat = 0; repeat < benchmark_repeats; ++repeat)
-            {
-                candidates[index].matmul_rows2(packed.data(), scales.data(), packed.data() + benchmark_blocks * 16, scales.data() + benchmark_blocks,
-                                               benchmark_blocks, input.data(), input.size(), 1, &first, 1, &second, 1);
-                sink = first + second;
-            }
-            elapsed[index] += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
-        }
-    }
-    (void)sink;
-    size_t selected_index = 0;
-    for (size_t index = 1; index < candidate_count; ++index)
-    {
-        if (elapsed[index] < elapsed[selected_index])
-            selected_index = index;
-    }
-    return candidates[selected_index];
+    return candidates[0];
 }
 
 static const KernelDispatch& kernel_dispatch() noexcept
@@ -749,32 +698,13 @@ static int64_t measure_decode_group(bool grouped, bool parallel, const KernelDis
             }
         }
     }
-    mxfp4_benchmark_sink = first.back() + second.back();
+    volatile float benchmark_sink = first.back() + second.back();
+    (void)benchmark_sink;
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
 }
 
 static uint32_t select_decode_group_size() noexcept
 {
-    const char* override_name = nullptr;
-#if defined(_MSC_VER)
-    std::array<char, 8> override_storage = {};
-    size_t override_length = 0;
-    if (getenv_s(&override_length, override_storage.data(), override_storage.size(), "NCNN_MOE_MXFP4_DECODE_GROUP") == 0 && override_length > 1
-        && override_length <= override_storage.size())
-    {
-        override_name = override_storage.data();
-    }
-#else
-    override_name = std::getenv("NCNN_MOE_MXFP4_DECODE_GROUP");
-#endif
-    if (override_name)
-    {
-        if (std::strcmp(override_name, "1") == 0)
-            return 1;
-        if (std::strcmp(override_name, "2") == 0)
-            return 2;
-    }
-
     constexpr uint32_t block_count = 90;
     constexpr uint32_t pair_count = 128;
     constexpr uint32_t rounds = 5;

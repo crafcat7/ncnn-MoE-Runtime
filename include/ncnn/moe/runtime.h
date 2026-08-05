@@ -105,6 +105,10 @@ struct RuntimeCapabilities
     std::string cpu_isa;
     std::string activation_kernel;
     std::vector<VulkanDeviceCapabilities> vulkan_devices;
+    std::string bfloat16_dot_kernel;
+    std::string cpu_small_bfloat16_linear_policy;
+    uint64_t available_memory_bytes = 0;
+    std::string bfloat16_batched_linear_kernel;
 };
 
 // Stable, model-neutral progress reported while Runtime prepares a model.

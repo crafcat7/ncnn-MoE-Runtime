@@ -22,36 +22,48 @@ void begin_latent_cache_transaction(
     size_t committed_rows);
 
 [[nodiscard]] Result<CpuBatch> execute_latent_attention(
-    const WeightTable& weights,
+    const WeightStore& weights,
+    const CompiledOperatorTable& operators,
     const AttentionBlockPlan& plan,
+    ExecutionBackend backend,
     float norm_epsilon,
     uint64_t position_offset,
     CpuLayerCache& cache,
-    const CpuBatch& input);
+    const CpuBatch& input,
+    uint64_t optimization_flags);
 
 [[nodiscard]] Result<CpuBatch> execute_latent_attention_batch(
-    const WeightTable& weights,
+    const WeightStore& weights,
+    const CompiledOperatorTable& operators,
     const AttentionBlockPlan& plan,
+    ExecutionBackend backend,
     float norm_epsilon,
     std::span<const uint64_t> positions,
     std::span<CpuLayerCache* const> caches,
-    const CpuBatch& input);
+    const CpuBatch& input,
+    uint64_t optimization_flags);
 
 [[nodiscard]] Result<void> append_dspark_attention_context(
-    const WeightTable& weights,
+    const WeightStore& weights,
+    const CompiledOperatorTable& operators,
     const AttentionBlockPlan& plan,
+    ExecutionBackend backend,
     float norm_epsilon,
     uint64_t position_offset,
     CpuLayerCache& cache,
-    const CpuBatch& input);
+    const CpuBatch& input,
+    uint64_t optimization_flags);
 
 [[nodiscard]] Result<CpuBatch> execute_dspark_attention(
-    const WeightTable& weights,
+    const WeightStore& weights,
+    const CompiledOperatorTable& operators,
     const AttentionBlockPlan& plan,
+    ExecutionBackend backend,
     float norm_epsilon,
     uint64_t position_offset,
     const CpuLayerCache& cache,
-    const CpuBatch& input);
+    const CpuBatch& input,
+    uint64_t optimization_flags);
 
 } // namespace moe
 } // namespace ncnn

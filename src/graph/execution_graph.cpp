@@ -37,6 +37,9 @@ static Result<void> validate_graph(const ExecutionGraph& graph)
 
     std::vector<uint32_t> indegrees(graph.nodes.size(), 0);
     std::vector<std::vector<ExecutionNodeId>> dependents(graph.nodes.size());
+    std::vector<uint8_t> referenced_layer_plans(
+        graph.layer_plans.size(),
+        0);
     for (size_t node_index = 0; node_index < graph.nodes.size(); ++node_index)
     {
         const ExecutionNode& node = graph.nodes[node_index];
@@ -90,16 +93,77 @@ static Result<void> validate_graph(const ExecutionGraph& graph)
                 return Error{ErrorCode::InvalidModel, "execution output tensor does not list its producer"};
             }
         }
+        const bool layer_bound =
+            node.type == ExecutionNodeType::Attention
+            || node.type == ExecutionNodeType::Router
+            || node.type == ExecutionNodeType::ExpertDispatch
+            || node.type == ExecutionNodeType::Expert
+            || node.type == ExecutionNodeType::ExpertGroup
+            || node.type == ExecutionNodeType::SharedExpertGroup
+            || node.type == ExecutionNodeType::Combine;
+        if (layer_bound
+            ? node.layer_plan_index == invalid_execution_layer_id
+            : node.layer_plan_index != invalid_execution_layer_id)
+        {
+            return Error{ErrorCode::InvalidModel, "execution graph node has an invalid layer plan binding"};
+        }
+        if (node.layer_plan_index != invalid_execution_layer_id
+            && node.layer_plan_index >= graph.layer_plans.size())
+        {
+            return Error{ErrorCode::InvalidModel, "execution graph node layer plan is out of range"};
+        }
+        if (node.layer_plan_index != invalid_execution_layer_id)
+            referenced_layer_plans[node.layer_plan_index] = 1;
+        const bool weight_bound =
+            node.type == ExecutionNodeType::TokenEmbedding
+            || node.type == ExecutionNodeType::FinalNorm
+            || node.type == ExecutionNodeType::LmHead;
+        if (weight_bound && node.weight_inputs.empty())
+        {
+            return Error{
+                ErrorCode::InvalidModel,
+                "execution graph weight-bound node has no weight inputs"};
+        }
+        if (!weight_bound && !node.weight_inputs.empty())
+        {
+            return Error{
+                ErrorCode::InvalidModel,
+                "execution graph layer node cannot own weight inputs"};
+        }
+        for (TensorHandle weight : node.weight_inputs)
+        {
+            if (weight == invalid_tensor_handle)
+            {
+                return Error{
+                    ErrorCode::InvalidModel,
+                    "execution graph contains an invalid weight input"};
+            }
+        }
         if (node.type == ExecutionNodeType::Expert
-            && (node.layer_id == invalid_execution_layer_id
+            && (node.layer_plan_index == invalid_execution_layer_id
                 || node.expert_id == invalid_execution_expert_id
                 || !has_flag(node.flags, ExecutionNodeConditional)))
         {
             return Error{ErrorCode::InvalidModel, "execution graph Expert nodes require layer, expert, and conditional metadata"};
         }
-        if (node.type == ExecutionNodeType::ExpertGroup && (node.layer_id == invalid_execution_layer_id || node.expert_id != invalid_execution_expert_id))
+        if ((node.type == ExecutionNodeType::ExpertGroup
+             || node.type == ExecutionNodeType::SharedExpertGroup)
+            && (node.layer_plan_index == invalid_execution_layer_id
+                || node.expert_id != invalid_execution_expert_id))
         {
             return Error{ErrorCode::InvalidModel, "execution graph ExpertGroup nodes require layer metadata and dynamic expert selection"};
+        }
+    }
+
+    for (size_t plan_index = 0;
+         plan_index < referenced_layer_plans.size();
+         ++plan_index)
+    {
+        if (referenced_layer_plans[plan_index] == 0)
+        {
+            return Error{
+                ErrorCode::InvalidModel,
+                "execution graph contains an unbound layer plan"};
         }
     }
 
@@ -175,6 +239,109 @@ const ExecutionTensor* ExecutionGraph::find_tensor(ExecutionTensorId id) const n
     return id < tensors.size() && tensors[id].id == id ? &tensors[id] : nullptr;
 }
 
+Result<void> ExecutionSchedule::validate(const ExecutionGraph& graph) const
+{
+    if (graph.nodes.empty())
+        return Error{ErrorCode::InvalidModel, "execution schedule cannot reference an empty graph"};
+    if (cpu_parallelism == 0)
+        return Error{ErrorCode::InvalidModel, "execution schedule cpu parallelism must be non-zero"};
+    if (node_order.size() != graph.nodes.size())
+        return Error{ErrorCode::InvalidModel, "execution schedule node order is incomplete"};
+
+    std::vector<uint32_t> positions(graph.nodes.size(), invalid_execution_layer_id);
+    for (size_t order_index = 0; order_index < node_order.size(); ++order_index)
+    {
+        const ExecutionNodeId node_id = node_order[order_index];
+        if (node_id >= graph.nodes.size())
+            return Error{ErrorCode::InvalidModel, "execution schedule node order is out of range"};
+        if (positions[node_id] != invalid_execution_layer_id)
+            return Error{ErrorCode::InvalidModel, "execution schedule contains a duplicate node"};
+        positions[node_id] = static_cast<uint32_t>(order_index);
+        for (ExecutionNodeId dependency : graph.nodes[node_id].dependencies)
+        {
+            if (dependency >= graph.nodes.size()
+                || positions[dependency] == invalid_execution_layer_id
+                || positions[dependency] >= order_index)
+            {
+                return Error{ErrorCode::InvalidModel, "execution schedule violates a node dependency"};
+            }
+        }
+    }
+
+    uint32_t covered_nodes = 0;
+    ExecutionBackend previous_backend = ExecutionBackend::Cpu;
+    bool has_previous_backend = false;
+    for (const ExecutionBackendRun& run : backend_runs)
+    {
+        if (run.node_count == 0
+            || run.first_node != covered_nodes
+            || run.node_count > node_order.size() - covered_nodes)
+        {
+            return Error{ErrorCode::InvalidModel, "execution schedule backend runs are not contiguous"};
+        }
+        if (has_previous_backend && run.backend == previous_backend)
+            return Error{ErrorCode::InvalidModel, "execution schedule contains adjacent backend runs"};
+        for (uint32_t offset = 0; offset < run.node_count; ++offset)
+        {
+            const ExecutionNodeId node_id = node_order[run.first_node + offset];
+            const ExecutionBackend node_backend = graph.nodes[node_id].backend;
+            if (node_backend != run.backend)
+                return Error{ErrorCode::InvalidModel, "execution schedule backend run disagrees with node placement"};
+        }
+        covered_nodes += run.node_count;
+        previous_backend = run.backend;
+        has_previous_backend = true;
+    }
+    if (covered_nodes != node_order.size())
+        return Error{ErrorCode::InvalidModel, "execution schedule backend runs do not cover the graph"};
+
+    std::vector<uint8_t> wave_seen(graph.nodes.size(), 0);
+    std::vector<uint8_t> wave_partition_seen(graph.nodes.size(), 0);
+    size_t wave_order_index = 0;
+    for (const ExecutionWave& wave : waves)
+    {
+        if (wave.nodes.empty())
+            return Error{ErrorCode::InvalidModel, "execution schedule contains an empty wave"};
+        if (wave.cpu_nodes.size() + wave.vulkan_nodes.size() != wave.nodes.size())
+            return Error{ErrorCode::InvalidModel, "execution schedule wave backend partition is incomplete"};
+        for (ExecutionNodeId node_id : wave.nodes)
+        {
+            if (node_id >= graph.nodes.size()
+                || wave_seen[node_id] != 0
+                || wave_order_index >= node_order.size()
+                || node_order[wave_order_index] != node_id)
+            {
+                return Error{ErrorCode::InvalidModel, "execution schedule waves disagree with node order"};
+            }
+            wave_seen[node_id] = 1;
+            ++wave_order_index;
+        }
+        for (ExecutionNodeId node_id : wave.cpu_nodes)
+        {
+            if (node_id >= graph.nodes.size()
+                || wave_partition_seen[node_id] != 0
+                || graph.nodes[node_id].backend != ExecutionBackend::Cpu)
+            {
+                return Error{ErrorCode::InvalidModel, "execution schedule CPU wave partition is invalid"};
+            }
+            wave_partition_seen[node_id] = 1;
+        }
+        for (ExecutionNodeId node_id : wave.vulkan_nodes)
+        {
+            if (node_id >= graph.nodes.size()
+                || wave_partition_seen[node_id] != 0
+                || graph.nodes[node_id].backend != ExecutionBackend::Vulkan)
+            {
+                return Error{ErrorCode::InvalidModel, "execution schedule Vulkan wave partition is invalid"};
+            }
+            wave_partition_seen[node_id] = 1;
+        }
+    }
+    if (wave_order_index != node_order.size())
+        return Error{ErrorCode::InvalidModel, "execution schedule waves do not cover the graph"};
+    return {};
+}
+
 Result<ExecutionSchedule> MoeScheduler::schedule(const ExecutionGraph& graph) const
 {
     auto valid = validate_graph(graph);
@@ -198,12 +365,14 @@ Result<ExecutionSchedule> MoeScheduler::schedule(const ExecutionGraph& graph) co
     }
 
     ExecutionSchedule result;
+    result.node_order.reserve(graph.nodes.size());
     while (!ready.empty())
     {
         ExecutionWave wave;
         wave.nodes = ready;
         for (ExecutionNodeId node_id : ready)
         {
+            result.node_order.push_back(node_id);
             if (graph.nodes[node_id].backend == ExecutionBackend::Vulkan)
             {
                 wave.vulkan_nodes.push_back(node_id);
@@ -226,7 +395,30 @@ Result<ExecutionSchedule> MoeScheduler::schedule(const ExecutionGraph& graph) co
         }
         ready = std::move(next);
     }
-    result.events = graph.events;
+
+    result.backend_runs.reserve(result.node_order.size());
+    for (uint32_t order_index = 0;
+         order_index < result.node_order.size();
+         ++order_index)
+    {
+        const ExecutionBackend backend =
+            graph.nodes[result.node_order[order_index]].backend;
+        if (result.backend_runs.empty()
+            || result.backend_runs.back().backend != backend)
+        {
+            result.backend_runs.push_back({
+                backend,
+                order_index,
+                1});
+        }
+        else
+        {
+            ++result.backend_runs.back().node_count;
+        }
+    }
+    auto scheduled = result.validate(graph);
+    if (!scheduled)
+        return scheduled.error();
     return result;
 }
 
@@ -330,6 +522,9 @@ Result<ScheduledExecutionGraph> RuntimeScheduler::compile(ExecutionGraph graph, 
     result.schedule = std::move(schedule).value();
     result.schedule.cpu_parallelism = options.cpu_parallelism;
     result.schedule.vulkan_queue_count = options.vulkan_queue_count;
+    auto scheduled = result.schedule.validate(result.graph);
+    if (!scheduled)
+        return scheduled.error();
     return result;
 }
 

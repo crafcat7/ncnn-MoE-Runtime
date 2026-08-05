@@ -1,13 +1,10 @@
 #include "mapped_file.h"
 
-#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <limits>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
-#include <unordered_map>
 
 #if defined(_WIN32)
 #if !defined(NOMINMAX)
@@ -134,46 +131,13 @@ private:
 #endif
 };
 
-struct MappedFileCache
-{
-    std::shared_mutex mutex;
-    std::unordered_map<std::string, std::weak_ptr<MappedFile>> files;
-};
-
-static MappedFileCache& mapped_file_cache()
-{
-    static MappedFileCache cache;
-    return cache;
-}
-
 static Result<std::shared_ptr<MappedFile>> acquire_mapped_file(const std::filesystem::path& path)
 {
-    MappedFileCache& cache = mapped_file_cache();
-    const std::string key = path.lexically_normal().string();
-    {
-        std::shared_lock<std::shared_mutex> lock(cache.mutex);
-        const auto existing = cache.files.find(key);
-        if (existing != cache.files.end())
-        {
-            std::shared_ptr<MappedFile> file = existing->second.lock();
-            if (file)
-                return file;
-        }
-    }
-    auto opened = MappedFile::open(path);
-    if (!opened)
-        return opened.error();
-    std::shared_ptr<MappedFile> file = std::move(opened).value();
-    std::unique_lock<std::shared_mutex> lock(cache.mutex);
-    const auto existing = cache.files.find(key);
-    if (existing != cache.files.end())
-    {
-        std::shared_ptr<MappedFile> shared = existing->second.lock();
-        if (shared)
-            return shared;
-    }
-    cache.files.insert_or_assign(key, file);
-    return file;
+    // Mapping ownership is deliberately scoped to each MappedFileRange.  A
+    // process-global weak cache made independent Runtime instances share file
+    // handles and lifetime indirectly, which was incompatible with instance
+    // isolation and made teardown depend on unrelated models.
+    return MappedFile::open(path);
 }
 
 Result<std::shared_ptr<MappedFileRange>> MappedFileRange::open(const std::filesystem::path& path, uint64_t offset, uint64_t byte_count)
@@ -269,7 +233,6 @@ std::shared_ptr<const uint8_t> MappedFileRange::share_data()
 
 void MappedFileRange::prefault() const noexcept
 {
-    static std::atomic<uint8_t> sink{0};
 #if !defined(_WIN32) && defined(MADV_WILLNEED)
     (void)madvise(view_, view_size_, MADV_WILLNEED);
 #endif
@@ -278,7 +241,8 @@ void MappedFileRange::prefault() const noexcept
     for (size_t offset = 0; offset < size_; offset += page_size)
         checksum ^= data_[offset];
     checksum ^= data_[size_ - 1];
-    sink.fetch_xor(checksum, std::memory_order_relaxed);
+    volatile uint8_t sink = checksum;
+    (void)sink;
 }
 
 } // namespace moe

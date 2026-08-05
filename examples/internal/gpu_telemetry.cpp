@@ -116,7 +116,7 @@ struct GpuTelemetrySampler::Impl
     NvmlDevice device = nullptr;
     bool initialized = false;
 
-    Impl(const RuntimeCapabilities& capabilities, const EffectiveRuntimeOptions& effective)
+    Impl(const RuntimeCapabilities& capabilities, const EffectiveRuntimeConfig& effective)
     {
         base.active = effective.hybrid_mode != HybridMode::CpuOnly;
         if (!base.active)
@@ -293,7 +293,7 @@ struct GpuTelemetrySampler::Impl
     }
 };
 
-GpuTelemetrySampler::GpuTelemetrySampler(const RuntimeCapabilities& capabilities, const EffectiveRuntimeOptions& effective)
+GpuTelemetrySampler::GpuTelemetrySampler(const RuntimeCapabilities& capabilities, const EffectiveRuntimeConfig& effective)
     : impl_(std::make_unique<Impl>(capabilities, effective))
 {
 }

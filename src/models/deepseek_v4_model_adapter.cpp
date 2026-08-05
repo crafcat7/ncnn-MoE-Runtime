@@ -298,18 +298,6 @@ Result<MoeIR> DeepSeekV4ModelAdapter::parse_model(const ModelPackage& package) c
         layer.ffn.moe = moe;
         if (layer_id >= descriptor.hash_routing_layer_count)
             layer.ffn.moe.flags |= MoeDescriptorRouterBias;
-        layer.nodes = {
-            {ModelNodeType::RmsNorm},
-            {ModelNodeType::MultiHeadLatentAttention},
-            {ModelNodeType::AttentionSink},
-            {ModelNodeType::Projection},
-            {ModelNodeType::RmsNorm},
-            {ModelNodeType::Router},
-            {ModelNodeType::TopK},
-            {ModelNodeType::ExpertGroup},
-            {ModelNodeType::SharedExpertGroup},
-            {ModelNodeType::Combine},
-        };
     }
     return descriptor;
 }

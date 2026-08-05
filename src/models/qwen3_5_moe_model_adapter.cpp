@@ -454,36 +454,6 @@ Result<MoeIR> Qwen3_5MoeModelAdapter::parse_model(const ModelPackage& package) c
         layer.pre_ffn_norm = NormType::RmsNorm;
         layer.attention = layer_type == "linear_attention" ? linear_attention : full_attention;
         layer.ffn.moe = moe;
-        if (layer.attention.kind == AttentionKind::GatedDeltaNet)
-        {
-            layer.nodes = {
-                {ModelNodeType::RmsNorm},
-                {ModelNodeType::GatedDeltaNet},
-                {ModelNodeType::Projection},
-                {ModelNodeType::RmsNorm},
-                {ModelNodeType::Router},
-                {ModelNodeType::TopK},
-                {ModelNodeType::ExpertGroup},
-                {ModelNodeType::SharedExpertGroup},
-                {ModelNodeType::Combine},
-            };
-        }
-        else
-        {
-            layer.nodes = {
-                {ModelNodeType::RmsNorm},
-                {ModelNodeType::FusedQkv},
-                {ModelNodeType::Rope},
-                {ModelNodeType::Sdpa},
-                {ModelNodeType::Projection},
-                {ModelNodeType::RmsNorm},
-                {ModelNodeType::Router},
-                {ModelNodeType::TopK},
-                {ModelNodeType::ExpertGroup},
-                {ModelNodeType::SharedExpertGroup},
-                {ModelNodeType::Combine},
-            };
-        }
     }
     return descriptor;
 }

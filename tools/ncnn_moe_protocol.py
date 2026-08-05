@@ -123,7 +123,7 @@ class WorkerClient:
         session_id: str,
         *,
         seed: int = 0,
-        prefill_chunk_size: int = 256,
+        prefill_chunk_size: int = 512,
         enable_speculative_context: bool = True,
     ) -> dict[str, Any]:
         return self.request(

@@ -2,6 +2,7 @@
 
 #include "engine/cpu_features.h"
 #include "ncnn/moe/runtime.h"
+#include "ncnn/moe/runtime_config.h"
 
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
 #include "cpu_float8_msvc.h"
@@ -12,7 +13,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -317,29 +317,6 @@ static Float8KernelDispatch select_float8_kernel() noexcept
     (void)isa;
 #endif
 
-    const char* override_name = nullptr;
-#if defined(_MSC_VER)
-    std::array<char, 16> override_storage = {};
-    size_t override_length = 0;
-    if (getenv_s(&override_length, override_storage.data(), override_storage.size(), "NCNN_MOE_FLOAT8_KERNEL") == 0 && override_length > 1
-        && override_length <= override_storage.size())
-    {
-        override_name = override_storage.data();
-    }
-#else
-    override_name = std::getenv("NCNN_MOE_FLOAT8_KERNEL");
-#endif
-    if (override_name && override_name[0] != '\0')
-    {
-        for (size_t index = 0; index < candidate_count; ++index)
-        {
-            const bool selected = (std::strcmp(override_name, "scalar") == 0 && candidates[index].kind == Float8KernelKind::Scalar)
-                                  || (std::strcmp(override_name, "avx2") == 0 && candidates[index].kind == Float8KernelKind::X86Avx2)
-                                  || (std::strcmp(override_name, "avx512") == 0 && candidates[index].kind == Float8KernelKind::X86Avx512);
-            if (selected)
-                return candidates[index];
-        }
-    }
     return candidates[candidate_count - 1];
 }
 
@@ -360,6 +337,150 @@ void float8_e4m3_block_dot_rows4(const uint8_t* weights, uint32_t weight_row_str
     float8_kernel_dispatch().rows4(weights, weight_row_stride, scales, input, count, block_size, row_count, output);
 }
 
+static bool select_bfloat16_float8_linear_dot(uint64_t optimization_flags) noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    if ((detect_cpu_isa_capabilities().flags & CpuIsaX86Avx512Bf16) == 0)
+        return false;
+    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationCpuFloat8Bf16Dot);
+#else
+    return false;
+#endif
+}
+
+static bool use_bfloat16_float8_linear_dot(uint64_t optimization_flags) noexcept
+{
+    return select_bfloat16_float8_linear_dot(optimization_flags);
+}
+
+static bool use_float8_batch_tile(uint64_t optimization_flags) noexcept
+{
+    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationCpuFloat8BatchTile);
+}
+
+float float8_e4m3_quantized_input_dot(const uint8_t* weights,
+                                      const float* scales,
+                                      const float* input,
+                                      uint32_t count,
+                                      uint32_t block_size,
+                                      uint64_t optimization_flags) noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    if (use_bfloat16_float8_linear_dot(optimization_flags))
+    {
+        return msvc_avx512_bfloat16_float8_e4m3_block_dot(
+            weights, scales, input, count, block_size);
+    }
+#endif
+    return float8_e4m3_block_dot(weights, scales, input, count, block_size);
+}
+
+void float8_e4m3_quantized_input_dot_rows(
+    const uint8_t* weights,
+    uint32_t weight_row_stride,
+    const float* scales,
+    const float* input,
+    uint32_t count,
+    uint32_t block_size,
+    uint32_t row_count,
+    float* output,
+    uint64_t optimization_flags) noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    if (use_bfloat16_float8_linear_dot(optimization_flags))
+    {
+        for (uint32_t first_row = 0; first_row < row_count; first_row += 8)
+        {
+            msvc_avx512_bfloat16_float8_e4m3_block_dot_rows(
+                weights + static_cast<size_t>(first_row) * weight_row_stride,
+                weight_row_stride, scales, input, count, block_size,
+                std::min<uint32_t>(8, row_count - first_row),
+                output + first_row);
+        }
+        return;
+    }
+#endif
+    for (uint32_t first_row = 0; first_row < row_count; first_row += 4)
+    {
+        float8_e4m3_block_dot_rows4(
+            weights + static_cast<size_t>(first_row) * weight_row_stride,
+            weight_row_stride, scales, input, count, block_size,
+            std::min<uint32_t>(4, row_count - first_row), output + first_row);
+    }
+}
+
+void float8_e4m3_quantized_input_dot_rows_batch(
+    const uint8_t* weights,
+    uint32_t weight_row_stride,
+    const float* scales,
+    const float* input,
+    size_t input_stride,
+    uint32_t count,
+    uint32_t block_size,
+    uint32_t row_count,
+    size_t output_stride,
+    size_t token_count,
+    float* output,
+    uint64_t optimization_flags) noexcept
+{
+    if (row_count == 0 || token_count == 0)
+        return;
+    for (size_t token = 0; token < token_count; ++token)
+    {
+        for (uint32_t row = 0; row < row_count; ++row)
+            output[token * output_stride + row] = 0.0f;
+    }
+
+    if (!use_float8_batch_tile(optimization_flags))
+    {
+        for (uint32_t first_row = 0; first_row < row_count; first_row += 4)
+        {
+            const uint32_t rows = std::min<uint32_t>(
+                4, row_count - first_row);
+            for (size_t token = 0; token < token_count; ++token)
+            {
+                float8_e4m3_quantized_input_dot_rows(
+                    weights
+                        + static_cast<size_t>(first_row) * weight_row_stride,
+                    weight_row_stride, scales,
+                    input + token * input_stride, count, block_size, rows,
+                    output + token * output_stride + first_row, optimization_flags);
+            }
+        }
+        return;
+    }
+
+    for (uint32_t first_row = 0; first_row < row_count; first_row += 4)
+    {
+        const uint32_t rows = std::min<uint32_t>(4, row_count - first_row);
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+        if (use_bfloat16_float8_linear_dot(optimization_flags))
+        {
+            for (size_t first_token = 0; first_token < token_count;
+                 first_token += 4)
+            {
+                const size_t tokens = std::min<size_t>(4, token_count - first_token);
+                msvc_avx512_bfloat16_float8_e4m3_block_dot_rows_batch(
+                    weights + static_cast<size_t>(first_row) * weight_row_stride,
+                    weight_row_stride, scales,
+                    input + first_token * input_stride, input_stride, count,
+                    block_size, rows, output_stride, tokens,
+                    output + first_token * output_stride + first_row);
+            }
+            continue;
+        }
+#endif
+        for (size_t token = 0; token < token_count; ++token)
+        {
+            float8_e4m3_quantized_input_dot_rows(
+                weights + static_cast<size_t>(first_row) * weight_row_stride,
+                weight_row_stride, scales, input + token * input_stride,
+                count, block_size, rows,
+                output + token * output_stride + first_row, optimization_flags);
+        }
+    }
+}
+
 const char* float8_kernel_name() noexcept
 {
     switch (float8_kernel_dispatch().kind)
@@ -371,55 +492,70 @@ const char* float8_kernel_name() noexcept
     return "scalar";
 }
 
-static uint32_t select_float8_linear_row_group_size() noexcept
+const char* float8_linear_kernel_name(uint64_t optimization_flags) noexcept
 {
-    const char* override_name = nullptr;
-#if defined(_MSC_VER)
-    std::array<char, 8> override_storage = {};
-    size_t override_length = 0;
-    if (getenv_s(&override_length, override_storage.data(), override_storage.size(), "NCNN_MOE_FLOAT8_ROW_GROUP") == 0 && override_length > 1
-        && override_length <= override_storage.size())
-    {
-        override_name = override_storage.data();
-    }
+    return use_bfloat16_float8_linear_dot(optimization_flags)
+               ? "x86-avx512-bf16-dpbf16"
+               : float8_kernel_name();
+}
+
+static uint32_t select_float8_linear_row_group_size(uint64_t optimization_flags) noexcept
+{
+    return use_bfloat16_float8_linear_dot(optimization_flags) ? 8 : 4;
+}
+
+uint32_t float8_linear_row_group_size(uint64_t optimization_flags) noexcept
+{
+    return select_float8_linear_row_group_size(optimization_flags);
+}
+
+static bool simd_float8_quantization_enabled(uint64_t optimization_flags) noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    return (detect_cpu_isa_capabilities().flags & CpuIsaX86Avx512) != 0
+           && runtime_optimization_enabled(optimization_flags,
+               RuntimeOptimizationCpuFloat8SimdQuantize);
 #else
-    override_name = std::getenv("NCNN_MOE_FLOAT8_ROW_GROUP");
+    return false;
 #endif
-    if (override_name)
+}
+
+void quantize_float8_e4m3(const float* source, float* values, uint32_t count,
+                          uint32_t block_size, bool power_of_two_scale,
+                          uint64_t optimization_flags) noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    if (simd_float8_quantization_enabled(optimization_flags))
     {
-        if (std::strcmp(override_name, "1") == 0)
-            return 1;
-        if (std::strcmp(override_name, "2") == 0)
-            return 2;
-        if (std::strcmp(override_name, "4") == 0)
-            return 4;
+        msvc_avx512_quantize_float8_e4m3(
+            source, values, count, block_size, power_of_two_scale);
+        return;
     }
-    return 4;
-}
-
-uint32_t float8_linear_row_group_size() noexcept
-{
-    static const uint32_t group_size = select_float8_linear_row_group_size();
-    return group_size;
-}
-
-void quantize_float8_e4m3_inplace(float* values, uint32_t count, uint32_t block_size, bool power_of_two_scale) noexcept
-{
+#endif
     for (uint32_t block_begin = 0; block_begin < count; block_begin += block_size)
     {
         const uint32_t block_end = std::min(count, block_begin + block_size);
         float maximum = 1e-4f;
         for (uint32_t index = block_begin; index < block_end; ++index)
-            maximum = std::max(maximum, std::fabs(values[index]));
+            maximum = std::max(maximum, std::fabs(source[index]));
         float scale = maximum / 448.0f;
         if (power_of_two_scale)
             scale = std::exp2(std::ceil(std::log2(scale)));
         for (uint32_t index = block_begin; index < block_end; ++index)
         {
-            const float normalized = std::clamp(values[index] / scale, -448.0f, 448.0f);
+            const float normalized = std::clamp(source[index] / scale, -448.0f, 448.0f);
             values[index] = float8_e4m3_to_float(float_to_float8_e4m3(normalized)) * scale;
         }
     }
+}
+
+void quantize_float8_e4m3_inplace(float* values, uint32_t count,
+                                  uint32_t block_size,
+                                  bool power_of_two_scale,
+                                  uint64_t optimization_flags) noexcept
+{
+    quantize_float8_e4m3(values, values, count, block_size,
+                         power_of_two_scale, optimization_flags);
 }
 
 void quantize_float4_e2m1_inplace(float* values, uint32_t count, uint32_t block_size) noexcept

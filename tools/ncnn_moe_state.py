@@ -168,6 +168,7 @@ def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
         ("expert_io_workers", "--expert-io-workers"),
         ("expert_memory", "--expert-memory"),
         ("expected_concurrency", "--expected-concurrency"),
+        ("optimization_flags", "--optimization-flags"),
     ):
         value = settings.get(key)
         if value is not None and value != 0:

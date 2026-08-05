@@ -1,10 +1,12 @@
 #include "cpu_mxfp4_msvc.h"
 
+#include <bit>
+#include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
+#include <vector>
 
 namespace ncnn {
 namespace moe {
@@ -25,19 +27,12 @@ static const std::array<float, 256>& avx512_scale_table()
 
 static bool avx512_batch2_enabled() noexcept
 {
-    char value[8] = {};
-    size_t length = 0;
-    if (getenv_s(&length, value, sizeof(value), "NCNN_MOE_MXFP4_BATCH2_ROW_GROUP") == 0 && length > 1)
-    {
-        return value[0] != '0';
-    }
     return true;
 }
 
 static bool use_avx512_batch2_row_group() noexcept
 {
-    static const bool enabled = avx512_batch2_enabled();
-    return enabled;
+    return avx512_batch2_enabled();
 }
 
 static __m512 avx512_decode_half(__m128i indices) noexcept
@@ -98,8 +93,57 @@ static __forceinline void avx512_accumulate_contiguous_rows4_tokens2_block(const
 
 float msvc_avx512_bfloat16_dot(const uint16_t* weights, const float* input, uint32_t count) noexcept
 {
-    __m512 accumulator = _mm512_setzero_ps();
+    __m512 accumulator0 = _mm512_setzero_ps();
+    __m512 accumulator1 = _mm512_setzero_ps();
+    __m512 accumulator2 = _mm512_setzero_ps();
+    __m512 accumulator3 = _mm512_setzero_ps();
     uint32_t index = 0;
+    for (; index + 64 <= count; index += 64)
+    {
+        const __m256i packed0 = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(weights + index));
+        const __m256i packed1 = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(weights + index + 16));
+        const __m256i packed2 = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(weights + index + 32));
+        const __m256i packed3 = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(weights + index + 48));
+        const __m512 values0 = _mm512_castsi512_ps(
+            _mm512_slli_epi32(
+                _mm512_cvtepu16_epi32(packed0),
+                16));
+        const __m512 values1 = _mm512_castsi512_ps(
+            _mm512_slli_epi32(
+                _mm512_cvtepu16_epi32(packed1),
+                16));
+        const __m512 values2 = _mm512_castsi512_ps(
+            _mm512_slli_epi32(
+                _mm512_cvtepu16_epi32(packed2),
+                16));
+        const __m512 values3 = _mm512_castsi512_ps(
+            _mm512_slli_epi32(
+                _mm512_cvtepu16_epi32(packed3),
+                16));
+        accumulator0 = _mm512_fmadd_ps(
+            values0,
+            _mm512_loadu_ps(input + index),
+            accumulator0);
+        accumulator1 = _mm512_fmadd_ps(
+            values1,
+            _mm512_loadu_ps(input + index + 16),
+            accumulator1);
+        accumulator2 = _mm512_fmadd_ps(
+            values2,
+            _mm512_loadu_ps(input + index + 32),
+            accumulator2);
+        accumulator3 = _mm512_fmadd_ps(
+            values3,
+            _mm512_loadu_ps(input + index + 48),
+            accumulator3);
+    }
+    __m512 accumulator = _mm512_add_ps(
+        _mm512_add_ps(accumulator0, accumulator1),
+        _mm512_add_ps(accumulator2, accumulator3));
     for (; index + 16 <= count; index += 16)
     {
         const __m256i packed = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights + index));
@@ -115,6 +159,251 @@ float msvc_avx512_bfloat16_dot(const uint16_t* weights, const float* input, uint
         sum += weight * input[index];
     }
     return sum;
+}
+
+void msvc_avx512_float_to_bfloat16_array(
+    uint16_t* output,
+    const float* input,
+    uint32_t count) noexcept
+{
+    uint32_t index = 0;
+    for (; index + 16 <= count; index += 16)
+    {
+        const __m256i packed = (__m256i)_mm512_cvtneps_pbh(
+            _mm512_loadu_ps(input + index));
+        _mm256_storeu_si256(
+            reinterpret_cast<__m256i*>(output + index),
+            packed);
+    }
+    for (; index < count; ++index)
+    {
+        uint32_t bits = 0;
+        std::memcpy(&bits, input + index, sizeof(bits));
+        const uint32_t rounding = 0x7fffu + ((bits >> 16) & 1u);
+        output[index] = static_cast<uint16_t>((bits + rounding) >> 16);
+    }
+}
+
+float msvc_avx512_bfloat16_pair_dot(
+    const uint16_t* left,
+    const uint16_t* right,
+    uint32_t count) noexcept
+{
+    __m512 accumulator = _mm512_setzero_ps();
+    uint32_t index = 0;
+    for (; index + 32 <= count; index += 32)
+    {
+        accumulator = _mm512_dpbf16_ps(
+            accumulator,
+            (__m512bh)_mm512_loadu_si512(left + index),
+            (__m512bh)_mm512_loadu_si512(right + index));
+    }
+    float sum = _mm512_reduce_add_ps(accumulator);
+    for (; index < count; ++index)
+    {
+        const float left_value =
+            std::bit_cast<float>(static_cast<uint32_t>(left[index]) << 16);
+        const float right_value =
+            std::bit_cast<float>(static_cast<uint32_t>(right[index]) << 16);
+        sum += left_value * right_value;
+    }
+    return sum;
+}
+
+void msvc_avx512_bfloat16_scaled_add(float* output, const uint16_t* input, float scale, uint32_t count) noexcept
+{
+    const __m512 scale_vector = _mm512_set1_ps(scale);
+    uint32_t index = 0;
+    for (; index + 16 <= count; index += 16)
+    {
+        const __m256i packed = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + index));
+        const __m512 values = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(packed), 16));
+        _mm512_storeu_ps(output + index, _mm512_fmadd_ps(values, scale_vector, _mm512_loadu_ps(output + index)));
+    }
+    for (; index < count; ++index)
+    {
+        const uint32_t bits = static_cast<uint32_t>(input[index]) << 16;
+        float value = 0.0f;
+        std::memcpy(&value, &bits, sizeof(value));
+        output[index] += scale * value;
+    }
+}
+
+static __forceinline void avx512_bfloat16_linear_tile4x4(const uint16_t* weights,
+                                                         const uint16_t* input,
+                                                         size_t input_stride,
+                                                         uint32_t input_columns,
+                                                         float* output,
+                                                         size_t output_stride,
+                                                         size_t valid_rows) noexcept
+{
+    __m512 sum00 = _mm512_setzero_ps();
+    __m512 sum01 = _mm512_setzero_ps();
+    __m512 sum02 = _mm512_setzero_ps();
+    __m512 sum03 = _mm512_setzero_ps();
+    __m512 sum10 = _mm512_setzero_ps();
+    __m512 sum11 = _mm512_setzero_ps();
+    __m512 sum12 = _mm512_setzero_ps();
+    __m512 sum13 = _mm512_setzero_ps();
+    __m512 sum20 = _mm512_setzero_ps();
+    __m512 sum21 = _mm512_setzero_ps();
+    __m512 sum22 = _mm512_setzero_ps();
+    __m512 sum23 = _mm512_setzero_ps();
+    __m512 sum30 = _mm512_setzero_ps();
+    __m512 sum31 = _mm512_setzero_ps();
+    __m512 sum32 = _mm512_setzero_ps();
+    __m512 sum33 = _mm512_setzero_ps();
+    for (uint32_t column = 0; column < input_columns; column += 32)
+    {
+        const __m512bh input0 = (__m512bh)_mm512_loadu_si512(input + column);
+        const __m512bh input1 = (__m512bh)_mm512_loadu_si512(input + input_stride + column);
+        const __m512bh input2 = (__m512bh)_mm512_loadu_si512(input + input_stride * 2 + column);
+        const __m512bh input3 = (__m512bh)_mm512_loadu_si512(input + input_stride * 3 + column);
+        const __m512bh weight0 = (__m512bh)_mm512_loadu_si512(weights + column);
+        const __m512bh weight1 = (__m512bh)_mm512_loadu_si512(weights + input_columns + column);
+        const __m512bh weight2 = (__m512bh)_mm512_loadu_si512(weights + static_cast<size_t>(input_columns) * 2 + column);
+        const __m512bh weight3 = (__m512bh)_mm512_loadu_si512(weights + static_cast<size_t>(input_columns) * 3 + column);
+        sum00 = _mm512_dpbf16_ps(sum00, input0, weight0);
+        sum01 = _mm512_dpbf16_ps(sum01, input0, weight1);
+        sum02 = _mm512_dpbf16_ps(sum02, input0, weight2);
+        sum03 = _mm512_dpbf16_ps(sum03, input0, weight3);
+        sum10 = _mm512_dpbf16_ps(sum10, input1, weight0);
+        sum11 = _mm512_dpbf16_ps(sum11, input1, weight1);
+        sum12 = _mm512_dpbf16_ps(sum12, input1, weight2);
+        sum13 = _mm512_dpbf16_ps(sum13, input1, weight3);
+        sum20 = _mm512_dpbf16_ps(sum20, input2, weight0);
+        sum21 = _mm512_dpbf16_ps(sum21, input2, weight1);
+        sum22 = _mm512_dpbf16_ps(sum22, input2, weight2);
+        sum23 = _mm512_dpbf16_ps(sum23, input2, weight3);
+        sum30 = _mm512_dpbf16_ps(sum30, input3, weight0);
+        sum31 = _mm512_dpbf16_ps(sum31, input3, weight1);
+        sum32 = _mm512_dpbf16_ps(sum32, input3, weight2);
+        sum33 = _mm512_dpbf16_ps(sum33, input3, weight3);
+    }
+    output[0] = _mm512_reduce_add_ps(sum00);
+    output[1] = _mm512_reduce_add_ps(sum01);
+    output[2] = _mm512_reduce_add_ps(sum02);
+    output[3] = _mm512_reduce_add_ps(sum03);
+    if (valid_rows > 1)
+    {
+        output[output_stride] = _mm512_reduce_add_ps(sum10);
+        output[output_stride + 1] = _mm512_reduce_add_ps(sum11);
+        output[output_stride + 2] = _mm512_reduce_add_ps(sum12);
+        output[output_stride + 3] = _mm512_reduce_add_ps(sum13);
+    }
+    if (valid_rows > 2)
+    {
+        output[output_stride * 2] = _mm512_reduce_add_ps(sum20);
+        output[output_stride * 2 + 1] = _mm512_reduce_add_ps(sum21);
+        output[output_stride * 2 + 2] = _mm512_reduce_add_ps(sum22);
+        output[output_stride * 2 + 3] = _mm512_reduce_add_ps(sum23);
+    }
+    if (valid_rows > 3)
+    {
+        output[output_stride * 3] = _mm512_reduce_add_ps(sum30);
+        output[output_stride * 3 + 1] = _mm512_reduce_add_ps(sum31);
+        output[output_stride * 3 + 2] = _mm512_reduce_add_ps(sum32);
+        output[output_stride * 3 + 3] = _mm512_reduce_add_ps(sum33);
+    }
+}
+
+static __forceinline void avx512_bfloat16_linear_tile1x4(
+    const uint16_t* weights,
+    const uint16_t* input,
+    uint32_t input_columns,
+    float* output) noexcept
+{
+    __m512 sum0 = _mm512_setzero_ps();
+    __m512 sum1 = _mm512_setzero_ps();
+    __m512 sum2 = _mm512_setzero_ps();
+    __m512 sum3 = _mm512_setzero_ps();
+    for (uint32_t column = 0; column < input_columns; column += 32)
+    {
+        const __m512bh input_values =
+            (__m512bh)_mm512_loadu_si512(input + column);
+        const __m512bh weight0 =
+            (__m512bh)_mm512_loadu_si512(weights + column);
+        const __m512bh weight1 = (__m512bh)_mm512_loadu_si512(
+            weights + input_columns + column);
+        const __m512bh weight2 = (__m512bh)_mm512_loadu_si512(
+            weights + static_cast<size_t>(input_columns) * 2 + column);
+        const __m512bh weight3 = (__m512bh)_mm512_loadu_si512(
+            weights + static_cast<size_t>(input_columns) * 3 + column);
+        sum0 = _mm512_dpbf16_ps(sum0, input_values, weight0);
+        sum1 = _mm512_dpbf16_ps(sum1, input_values, weight1);
+        sum2 = _mm512_dpbf16_ps(sum2, input_values, weight2);
+        sum3 = _mm512_dpbf16_ps(sum3, input_values, weight3);
+    }
+    output[0] = _mm512_reduce_add_ps(sum0);
+    output[1] = _mm512_reduce_add_ps(sum1);
+    output[2] = _mm512_reduce_add_ps(sum2);
+    output[3] = _mm512_reduce_add_ps(sum3);
+}
+
+void msvc_avx512_bfloat16_batched_linear(const uint16_t* weights,
+                                         const float* input,
+                                         size_t input_stride,
+                                         size_t token_count,
+                                         uint32_t output_columns,
+                                         uint32_t input_columns,
+                                         float* output,
+                                         size_t output_stride,
+                                         int thread_count,
+                                         std::vector<uint16_t>& packed_input)
+{
+    const size_t padded_token_count = token_count == 1
+        ? size_t{1}
+        : (token_count + 3) & ~size_t{3};
+    packed_input.resize(padded_token_count * input_columns);
+    for (size_t token = 0; token < token_count; ++token)
+    {
+        const float* source = input + token * input_stride;
+        uint16_t* destination = packed_input.data() + token * input_columns;
+        for (uint32_t column = 0; column < input_columns; column += 16)
+        {
+            const __m256i packed = (__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(source + column));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(destination + column), packed);
+        }
+    }
+    std::fill(packed_input.begin() + token_count * input_columns,
+              packed_input.end(),
+              uint16_t{0});
+
+    const uint16_t* packed_input_data = packed_input.data();
+    const int64_t output_groups = output_columns / 4;
+    if (token_count == 1)
+    {
+#pragma omp parallel for num_threads(thread_count) if (thread_count > 1)
+        for (int64_t output_group = 0; output_group < output_groups;
+             ++output_group)
+        {
+            const uint32_t first_output =
+                static_cast<uint32_t>(output_group) * 4;
+            avx512_bfloat16_linear_tile1x4(
+                weights + static_cast<size_t>(first_output) * input_columns,
+                packed_input_data,
+                input_columns,
+                output + first_output);
+        }
+        return;
+    }
+#pragma omp parallel for num_threads(thread_count) if (thread_count > 1)
+    for (int64_t output_group = 0; output_group < output_groups; ++output_group)
+    {
+        const uint32_t first_output = static_cast<uint32_t>(output_group) * 4;
+        const uint16_t* group_weights = weights + static_cast<size_t>(first_output) * input_columns;
+        for (size_t token = 0; token < token_count; token += 4)
+        {
+            const size_t valid_rows = std::min<size_t>(4, token_count - token);
+            avx512_bfloat16_linear_tile4x4(group_weights,
+                                           packed_input_data + token * input_columns,
+                                           input_columns,
+                                           input_columns,
+                                           output + token * output_stride + first_output,
+                                           output_stride,
+                                           valid_rows);
+        }
+    }
 }
 
 float msvc_avx512_mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input) noexcept

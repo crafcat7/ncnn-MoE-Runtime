@@ -2,6 +2,7 @@
 
 #include "engine/cpu_executor.h"
 #include "engine/cpu_session_state.h"
+#include "engine/expert_backend.h"
 #include "engine/session_batch.h"
 #include "kernels/cpu_latent_attention.h"
 #include "kernels/cpu_state_cache.h"
@@ -23,12 +24,25 @@ struct SamplingCandidate
     float probability = 0.0f;
 };
 
+struct SamplingScratch
+{
+    std::vector<int32_t> token_ids;
+    std::array<std::vector<SamplingCandidate>, 2> candidates;
+    std::vector<float> residual;
+};
+
 struct LogitOrder
 {
     std::span<const float> values;
 
     bool operator()(int32_t left, int32_t right) const
     {
+        const bool left_finite = std::isfinite(values[left]);
+        const bool right_finite = std::isfinite(values[right]);
+        if (left_finite != right_finite)
+            return left_finite;
+        if (!left_finite)
+            return left < right;
         if (values[left] == values[right])
             return left < right;
         return values[left] > values[right];
@@ -57,6 +71,30 @@ public:
     }
 };
 
+class ScopedSessionExpertBackendForeground
+{
+public:
+    explicit ScopedSessionExpertBackendForeground(
+        const std::shared_ptr<IExpertExecutionBackend>& backend) noexcept
+        : backend_(backend)
+    {
+        if (backend_)
+            backend_->set_foreground_active(true);
+    }
+
+    ~ScopedSessionExpertBackendForeground()
+    {
+        if (backend_)
+            backend_->set_foreground_active(false);
+    }
+
+    ScopedSessionExpertBackendForeground(const ScopedSessionExpertBackendForeground&) = delete;
+    ScopedSessionExpertBackendForeground& operator=(const ScopedSessionExpertBackendForeground&) = delete;
+
+private:
+    std::shared_ptr<IExpertExecutionBackend> backend_;
+};
+
 static bool contains_token(const std::vector<int32_t>& tokens, int32_t token)
 {
     return std::find(tokens.begin(), tokens.end(), token) != tokens.end();
@@ -73,22 +111,53 @@ static Result<void> validate_sampling_options(const SamplingOptions& options)
     return {};
 }
 
-static Result<std::vector<SamplingCandidate>> sampling_distribution(
+static Result<void> sampling_distribution_into(
     std::span<const float> logits,
-    const SamplingOptions& options)
+    const SamplingOptions& options,
+    std::vector<SamplingCandidate>& candidates,
+    std::vector<int32_t>& token_ids)
 {
-    std::vector<int32_t> token_ids(logits.size());
-    std::iota(token_ids.begin(), token_ids.end(), 0);
-    std::stable_sort(token_ids.begin(), token_ids.end(), LogitOrder{logits});
+    candidates.clear();
 
-    if (!std::isfinite(logits[token_ids.front()]))
+    float maximum_logit = -std::numeric_limits<float>::infinity();
+    for (float logit : logits)
+    {
+        if (std::isfinite(logit))
+            maximum_logit = std::max(maximum_logit, logit);
+    }
+    if (!std::isfinite(maximum_logit))
         return Error{ErrorCode::InvalidArgument, "sampling requires at least one finite logit"};
-    if (options.top_k > 0 && options.top_k < token_ids.size())
-        token_ids.resize(options.top_k);
 
-    const float maximum = logits[token_ids.front()] / options.temperature;
-    std::vector<SamplingCandidate> candidates;
+    const bool has_top_k = options.top_k > 0 && options.top_k < logits.size();
+    const bool needs_order = options.top_p < 1.0f;
+    if (has_top_k)
+    {
+        token_ids.resize(options.top_k);
+        std::iota(token_ids.begin(), token_ids.end(), 0);
+        std::make_heap(token_ids.begin(), token_ids.end(), LogitOrder{logits});
+        for (size_t token_id = options.top_k; token_id < logits.size(); ++token_id)
+        {
+            const int32_t candidate = static_cast<int32_t>(token_id);
+            if (LogitOrder{logits}(candidate, token_ids.front()))
+            {
+                std::pop_heap(token_ids.begin(), token_ids.end(), LogitOrder{logits});
+                token_ids.back() = candidate;
+                std::push_heap(token_ids.begin(), token_ids.end(), LogitOrder{logits});
+            }
+        }
+        if (needs_order)
+            std::sort(token_ids.begin(), token_ids.end(), LogitOrder{logits});
+    }
+    else
+    {
+        token_ids.resize(logits.size());
+        std::iota(token_ids.begin(), token_ids.end(), 0);
+        if (needs_order)
+            std::sort(token_ids.begin(), token_ids.end(), LogitOrder{logits});
+    }
+
     candidates.reserve(token_ids.size());
+    const float maximum = maximum_logit / options.temperature;
     float normalizer = 0.0f;
     for (int32_t token_id : token_ids)
     {
@@ -106,7 +175,10 @@ static Result<std::vector<SamplingCandidate>> sampling_distribution(
 
     if (options.min_p > 0.0f)
     {
-        const float threshold = candidates.front().probability * options.min_p;
+        float maximum_probability = 0.0f;
+        for (const SamplingCandidate& candidate : candidates)
+            maximum_probability = std::max(maximum_probability, candidate.probability);
+        const float threshold = maximum_probability * options.min_p;
         size_t count = 0;
         for (const SamplingCandidate& candidate : candidates)
         {
@@ -116,23 +188,28 @@ static Result<std::vector<SamplingCandidate>> sampling_distribution(
         candidates.resize(count);
     }
 
-    float cumulative_probability = 0.0f;
-    size_t top_p_count = 0;
-    for (const SamplingCandidate& candidate : candidates)
+    if (options.top_p < 1.0f)
     {
-        cumulative_probability += candidate.probability;
-        ++top_p_count;
-        if (cumulative_probability >= options.top_p)
-            break;
+        float cumulative_probability = 0.0f;
+        size_t top_p_count = 0;
+        for (const SamplingCandidate& candidate : candidates)
+        {
+            cumulative_probability += candidate.probability;
+            ++top_p_count;
+            if (cumulative_probability >= options.top_p)
+                break;
+        }
+        candidates.resize(top_p_count);
     }
-    candidates.resize(top_p_count);
 
     normalizer = 0.0f;
     for (const SamplingCandidate& candidate : candidates)
         normalizer += candidate.probability;
+    if (!std::isfinite(normalizer) || normalizer <= 0.0f)
+        return Error{ErrorCode::InvalidArgument, "sampling distribution is invalid"};
     for (SamplingCandidate& candidate : candidates)
         candidate.probability /= normalizer;
-    return candidates;
+    return {};
 }
 
 static float candidate_probability(
@@ -151,9 +228,10 @@ static Result<SampledToken> sample_residual_distribution(
     std::span<const SamplingCandidate> target,
     std::span<const SamplingCandidate> draft,
     size_t vocabulary_size,
+    std::vector<float>& residual,
     std::mt19937_64& random_generator)
 {
-    std::vector<float> residual(vocabulary_size, 0.0f);
+    residual.assign(vocabulary_size, 0.0f);
     for (const SamplingCandidate& candidate : target)
         residual[candidate.token_id] = candidate.probability;
     for (const SamplingCandidate& candidate : draft)
@@ -240,6 +318,104 @@ static RuntimeMetricCounters runtime_metric_counters(
                                             statistics.expert_gpu_executions,
                                             start.expert_gpu_executions)
                                         != 0;
+    result.vulkan_linear_dispatches = counter_delta(
+        statistics.vulkan_linear_dispatches,
+        start.vulkan_linear_dispatches);
+    result.vulkan_attention_blocks = counter_delta(
+        statistics.vulkan_attention_blocks,
+        start.vulkan_attention_blocks);
+    result.vulkan_batch_uploads = counter_delta(
+        statistics.vulkan_batch_uploads,
+        start.vulkan_batch_uploads);
+    result.vulkan_batch_downloads = counter_delta(
+        statistics.vulkan_batch_downloads,
+        start.vulkan_batch_downloads);
+    result.vulkan_attention_qkv_rope_fusions = counter_delta(
+        statistics.vulkan_attention_qkv_rope_fusions,
+        start.vulkan_attention_qkv_rope_fusions);
+    result.vulkan_attention_device_rope_fusions = counter_delta(
+        statistics.vulkan_attention_device_rope_fusions,
+        start.vulkan_attention_device_rope_fusions);
+    result.vulkan_attention_qkv_ring_fusions = counter_delta(
+        statistics.vulkan_attention_qkv_ring_fusions,
+        start.vulkan_attention_qkv_ring_fusions);
+    result.vulkan_attention_qkv_rope_pipeline_failures = counter_delta(
+        statistics.vulkan_attention_qkv_rope_pipeline_failures,
+        start.vulkan_attention_qkv_rope_pipeline_failures);
+    result.vulkan_attention_qkv_rope_shape_failures = counter_delta(
+        statistics.vulkan_attention_qkv_rope_shape_failures,
+        start.vulkan_attention_qkv_rope_shape_failures);
+    result.vulkan_attention_qkv_rope_source_failures = counter_delta(
+        statistics.vulkan_attention_qkv_rope_source_failures,
+        start.vulkan_attention_qkv_rope_source_failures);
+    result.vulkan_attention_qkv_rope_norm_failures = counter_delta(
+        statistics.vulkan_attention_qkv_rope_norm_failures,
+        start.vulkan_attention_qkv_rope_norm_failures);
+    result.vulkan_attention_qkv_rope_ring_failures = counter_delta(
+        statistics.vulkan_attention_qkv_rope_ring_failures,
+        start.vulkan_attention_qkv_rope_ring_failures);
+    result.vulkan_attention_qkv_rope_allocation_failures = counter_delta(
+        statistics.vulkan_attention_qkv_rope_allocation_failures,
+        start.vulkan_attention_qkv_rope_allocation_failures);
+    result.vulkan_attention_precondition_failures = counter_delta(
+        statistics.vulkan_attention_precondition_failures,
+        start.vulkan_attention_precondition_failures);
+    result.vulkan_attention_staging_failures = counter_delta(
+        statistics.vulkan_attention_staging_failures,
+        start.vulkan_attention_staging_failures);
+    result.vulkan_attention_norm_failures = counter_delta(
+        statistics.vulkan_attention_norm_failures,
+        start.vulkan_attention_norm_failures);
+    result.vulkan_attention_qkv_failures = counter_delta(
+        statistics.vulkan_attention_qkv_failures,
+        start.vulkan_attention_qkv_failures);
+    result.vulkan_attention_cache_failures = counter_delta(
+        statistics.vulkan_attention_cache_failures,
+        start.vulkan_attention_cache_failures);
+    result.vulkan_attention_sdpa_failures = counter_delta(
+        statistics.vulkan_attention_sdpa_failures,
+        start.vulkan_attention_sdpa_failures);
+    result.vulkan_attention_projection_failures = counter_delta(
+        statistics.vulkan_attention_projection_failures,
+        start.vulkan_attention_projection_failures);
+    result.vulkan_attention_output_failures = counter_delta(
+        statistics.vulkan_attention_output_failures,
+        start.vulkan_attention_output_failures);
+    result.vulkan_attention_submit_failures = counter_delta(
+        statistics.vulkan_attention_submit_failures,
+        start.vulkan_attention_submit_failures);
+    result.vulkan_attention_cache_materializations = counter_delta(
+        statistics.vulkan_attention_cache_materializations,
+        start.vulkan_attention_cache_materializations);
+    result.vulkan_attention_cpu_fallbacks = counter_delta(
+        statistics.vulkan_attention_cpu_fallbacks,
+        start.vulkan_attention_cpu_fallbacks);
+    result.expert_gpu_cache_hits = counter_delta(
+        statistics.expert_gpu_cache_hits,
+        start.expert_gpu_cache_hits);
+    result.expert_gpu_cache_misses = counter_delta(
+        statistics.expert_gpu_cache_misses,
+        start.expert_gpu_cache_misses);
+    result.expert_gpu_cache_admissions = counter_delta(
+        statistics.expert_gpu_cache_admissions,
+        start.expert_gpu_cache_admissions);
+    result.expert_gpu_cache_stores = counter_delta(
+        statistics.expert_gpu_cache_stores,
+        start.expert_gpu_cache_stores);
+    result.expert_gpu_cache_dropped_admissions = counter_delta(
+        statistics.expert_gpu_cache_dropped_admissions,
+        start.expert_gpu_cache_dropped_admissions);
+    result.expert_gpu_cache_resident_bytes = statistics.expert_gpu_cache_resident_bytes;
+    result.expert_gpu_cache_pending_bytes = statistics.expert_gpu_cache_pending_bytes;
+    result.expert_gpu_executions = counter_delta(
+        statistics.expert_gpu_executions,
+        start.expert_gpu_executions);
+    result.expert_gpu_execution_failures = counter_delta(
+        statistics.expert_gpu_execution_failures,
+        start.expert_gpu_execution_failures);
+    result.expert_gpu_cpu_preferred = counter_delta(
+        statistics.expert_gpu_cpu_preferred,
+        start.expert_gpu_cpu_preferred);
     result.expert_cache_resident_bytes = statistics.expert_cache_resident_bytes;
     result.kv_cache_logical_bytes = statistics.kv_cache_logical_bytes;
     result.kv_cache_allocated_bytes = statistics.kv_cache_allocated_bytes;
@@ -291,7 +467,8 @@ Session::Session(ModelPtr model, const SessionOptions& options)
       random_generator_(options.sampling_seed),
       prefill_chunk_size_(options.prefill_chunk_size),
       speculative_context_enabled_(
-          options.enable_speculative_context)
+          options.enable_speculative_context),
+      sampling_scratch_(new SamplingScratch)
 {
     state_->speculative_context_enabled =
         speculative_context_enabled_;
@@ -422,23 +599,29 @@ Result<SampledToken> Session::sample_unlocked(
         }
         return SampledToken{selected_token, 1.0f};
     }
-    auto candidates = sampling_distribution(logits, options);
-    if (!candidates)
-        return candidates.error();
+    SamplingScratch& scratch = *sampling_scratch_;
+    auto distribution_result = sampling_distribution_into(
+        logits,
+        options,
+        scratch.candidates[0],
+        scratch.token_ids);
+    if (!distribution_result)
+        return distribution_result.error();
+    const std::vector<SamplingCandidate>& candidates = scratch.candidates[0];
 
-    if (candidates.value().size() == 1)
-        return SampledToken{candidates.value().front().token_id, 1.0f};
+    if (candidates.size() == 1)
+        return SampledToken{candidates.front().token_id, 1.0f};
 
     std::uniform_real_distribution<float> distribution(0.0f, 1.0f);
     const float sample_value = distribution(random_generator_);
     float cumulative_probability = 0.0f;
-    for (const SamplingCandidate& candidate : candidates.value())
+    for (const SamplingCandidate& candidate : candidates)
     {
         cumulative_probability += candidate.probability;
         if (sample_value < cumulative_probability)
             return SampledToken{candidate.token_id, candidate.probability};
     }
-    const SamplingCandidate& final_candidate = candidates.value().back();
+    const SamplingCandidate& final_candidate = candidates.back();
     return SampledToken{final_candidate.token_id, final_candidate.probability};
 }
 
@@ -471,6 +654,13 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
     auto valid_sampling = validate_sampling_options(options.sampling);
     if (!valid_sampling)
         return valid_sampling.error();
+
+    // Keep the device-weight admission worker out of the Vulkan foreground
+    // path for the complete generation transaction, not just one executor
+    // dispatch.  Executor scopes remain useful for direct prefill/decode and
+    // are nested safely by the backend's foreground depth counter.
+    const ScopedSessionExpertBackendForeground expert_backend_foreground(
+        model_->compiled_->expert_backend);
 
     generation_active_ = true;
     generation_input_tokens_ = input_ids.size();
@@ -527,17 +717,15 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
         const auto begin_cache_transaction =
             [state_cache_transactions](
                 std::span<CpuLayerCache> caches,
-                size_t expected_rows) {
+                size_t expected_rows) -> Result<void> {
                 if (state_cache_transactions)
                 {
-                    begin_state_cache_transaction(
+                    return begin_state_cache_transaction(
                         caches,
                         expected_rows);
                 }
-                else
-                {
-                    begin_latent_cache_transaction(caches);
-                }
+                begin_latent_cache_transaction(caches);
+                return {};
             };
         const auto finish_cache_transaction =
             [state_cache_transactions](
@@ -594,7 +782,9 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 auto decoded = decode_unlocked(anchor);
                 if (!decoded)
                     return decoded.error();
-                auto sampled = sample_unlocked(decoded.value().logits, options.sampling);
+                auto sampled = sample_unlocked(
+                    decoded.value().logits,
+                    options.sampling);
                 if (!sampled)
                     return sampled.error();
                 StreamToken token;
@@ -628,9 +818,11 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 }
                 continue;
             }
-            begin_cache_transaction(
+            auto draft_transaction = begin_cache_transaction(
                 state_->speculative_layers,
                 model_->compiled_->speculative.block_size);
+            if (!draft_transaction)
+                return draft_transaction.error();
             auto proposed = executor_->propose_speculative(
                 *model_->compiled_,
                 anchor,
@@ -652,10 +844,10 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 proposed
                     ? proposed.value().committed_context_rows
                     : 0);
-            if (!proposed)
-                return proposed.error();
             if (!discarded_draft_cache)
                 return discarded_draft_cache.error();
+            if (!proposed)
+                return proposed.error();
             size_t draft_count = std::min(
                 proposed.value().token_ids.size(),
                 remaining - 1);
@@ -700,9 +892,11 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 proposed.value().token_ids.begin() + draft_count);
 
             statistics_scratch_ = statistics_;
-            begin_cache_transaction(
+            auto target_transaction = begin_cache_transaction(
                 state_->layers,
                 verify_input_ids.size());
+            if (!target_transaction)
+                return target_transaction.error();
             const auto verify_started = std::chrono::steady_clock::now();
             auto execute_target_verify =
                 [&]() -> Result<std::vector<std::vector<float>>> {
@@ -760,9 +954,11 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
             auto target_logits = execute_target_verify();
             if (!target_logits)
             {
-                (void)finish_cache_transaction(
+                auto rolled_back = finish_cache_transaction(
                     state_->layers,
                     0);
+                if (!rolled_back)
+                    return rolled_back.error();
                 return target_logits.error();
             }
             const auto target_verify_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -782,9 +978,11 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                         options.sampling);
                     if (!target_token)
                     {
-                        (void)finish_cache_transaction(
+                        auto rolled_back = finish_cache_transaction(
                             state_->layers,
                             0);
+                        if (!rolled_back)
+                            return rolled_back.error();
                         return target_token.error();
                     }
                     if (target_token.value().token_id
@@ -796,33 +994,42 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 }
                 else
                 {
-                    auto target_distribution = sampling_distribution(
+                    SamplingScratch& sampling_scratch = *sampling_scratch_;
+                    auto target_distribution = sampling_distribution_into(
                         target_logits.value()[accepted],
-                        options.sampling);
-                    auto draft_distribution = sampling_distribution(
+                        options.sampling,
+                        sampling_scratch.candidates[0],
+                        sampling_scratch.token_ids);
+                    auto draft_distribution = sampling_distribution_into(
                         proposed.value().logits[accepted],
-                        options.sampling);
+                        options.sampling,
+                        sampling_scratch.candidates[1],
+                        sampling_scratch.token_ids);
                     if (!target_distribution || !draft_distribution)
                     {
-                        (void)finish_cache_transaction(
+                        auto rolled_back = finish_cache_transaction(
                             state_->layers,
                             0);
+                        if (!rolled_back)
+                            return rolled_back.error();
                         return !target_distribution
                                    ? target_distribution.error()
                                    : draft_distribution.error();
                     }
                     const int32_t token_id = proposed.value().token_ids[accepted];
                     const float target_probability = candidate_probability(
-                        target_distribution.value(),
+                        sampling_scratch.candidates[0],
                         token_id);
                     const float draft_probability = candidate_probability(
-                        draft_distribution.value(),
+                        sampling_scratch.candidates[1],
                         token_id);
                     if (draft_probability <= 0.0f)
                     {
-                        (void)finish_cache_transaction(
+                        auto rolled_back = finish_cache_transaction(
                             state_->layers,
                             0);
+                        if (!rolled_back)
+                            return rolled_back.error();
                         return Error{
                             ErrorCode::InternalError,
                             "sampled draft token has zero probability"};
@@ -836,8 +1043,12 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                     if (distribution(random_generator_)
                         >= acceptance_probability)
                     {
-                        rejected_target_distribution = std::move(target_distribution).value();
-                        rejected_draft_distribution = std::move(draft_distribution).value();
+                        rejected_target_distribution.assign(
+                            sampling_scratch.candidates[0].begin(),
+                            sampling_scratch.candidates[0].end());
+                        rejected_draft_distribution.assign(
+                            sampling_scratch.candidates[1].begin(),
+                            sampling_scratch.candidates[1].end());
                         break;
                     }
                     accepted_probabilities.push_back(
@@ -866,6 +1077,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                         rejected_target_distribution,
                         rejected_draft_distribution,
                         target_logits.value()[accepted].size(),
+                        sampling_scratch_->residual,
                         random_generator_);
                 }
                 return sample_unlocked(
@@ -874,9 +1086,11 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
             }();
             if (!next)
             {
-                (void)finish_cache_transaction(
+                auto rolled_back = finish_cache_transaction(
                     state_->layers,
                     0);
+                if (!rolled_back)
+                    return rolled_back.error();
                 return next.error();
             }
 
@@ -907,9 +1121,11 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 lock.lock();
                 if (sequence_length_ != expected_sequence_length)
                 {
-                    (void)finish_cache_transaction(
+                    auto rolled_back = finish_cache_transaction(
                         state_->layers,
                         0);
+                    if (!rolled_back)
+                        return rolled_back.error();
                     return Error{
                         ErrorCode::InvalidArgument,
                         "generation callback modified the Session"};
@@ -1195,6 +1411,12 @@ Result<std::vector<PrefillResult>> SessionBatchAccess::prefill(
         metrics.logical_expert_batches += execution_metrics.logical_expert_batches;
         metrics.physical_expert_batches += execution_metrics.physical_expert_batches;
         metrics.coalesced_expert_routes += execution_metrics.coalesced_expert_routes;
+        metrics.vulkan_attention_batch_submissions +=
+            execution_metrics.vulkan_attention_batch_submissions;
+        metrics.vulkan_attention_batch_rows +=
+            execution_metrics.vulkan_attention_batch_rows;
+        metrics.vulkan_attention_batch_avoided_submissions +=
+            execution_metrics.vulkan_attention_batch_avoided_submissions;
         metrics.max_expert_batch_size = std::max(
             metrics.max_expert_batch_size,
             execution_metrics.max_expert_batch_size);
@@ -1336,6 +1558,12 @@ Result<std::vector<DecodeResult>> SessionBatchAccess::decode(std::span<Session* 
     metrics.logical_expert_batches += execution_metrics.logical_expert_batches;
     metrics.physical_expert_batches += execution_metrics.physical_expert_batches;
     metrics.coalesced_expert_routes += execution_metrics.coalesced_expert_routes;
+    metrics.vulkan_attention_batch_submissions +=
+        execution_metrics.vulkan_attention_batch_submissions;
+    metrics.vulkan_attention_batch_rows +=
+        execution_metrics.vulkan_attention_batch_rows;
+    metrics.vulkan_attention_batch_avoided_submissions +=
+        execution_metrics.vulkan_attention_batch_avoided_submissions;
     metrics.max_expert_batch_size = std::max(metrics.max_expert_batch_size, execution_metrics.max_expert_batch_size);
     return results;
 }

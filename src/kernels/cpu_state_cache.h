@@ -11,7 +11,7 @@ namespace moe {
 
 struct CpuLayerCache;
 
-void begin_state_cache_transaction(
+[[nodiscard]] Result<void> begin_state_cache_transaction(
     std::span<CpuLayerCache> caches,
     size_t expected_rows);
 
