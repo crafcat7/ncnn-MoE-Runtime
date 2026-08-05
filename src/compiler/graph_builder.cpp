@@ -93,12 +93,10 @@ Result<MoeGraph> MoeGraphBuilder::build(const MoeModelDescriptor& descriptor) co
                                                            std::move(cache_shape),
                                                            TensorLocation::Automatic, MoeIRValuePersistent | MoeIRValueMutableState | MoeIRValueDynamicShape);
             const MoeIRNodeId cache_node = append_moe_ir_node(graph, MoeIROperator::KvCache, prefix + "kv_cache", layer_id, {}, {cache});
-            graph.nodes[cache_node].attention = layer.attention;
             graph.nodes[cache_node].flags |= MoeIRNodeStateful;
 
             const MoeIRValueId attention_output = append_moe_ir_value(graph, prefix + "attention.hidden", descriptor.activation_dtype, {0, descriptor.hidden_size}, TensorLocation::Automatic, MoeIRValueDynamicShape);
             const MoeIRNodeId attention_node = append_moe_ir_node(graph, MoeIROperator::Attention, prefix + "attention", layer_id, {hidden, cache}, {attention_output});
-            graph.nodes[attention_node].attention = layer.attention;
             graph.nodes[attention_node].flags |= MoeIRNodeStateful;
             hidden = attention_output;
         }
@@ -110,9 +108,7 @@ Result<MoeGraph> MoeGraphBuilder::build(const MoeModelDescriptor& descriptor) co
             (void)append_moe_ir_node(graph, MoeIROperator::Router, prefix + "router", layer_id, {hidden}, {router_scores});
 
             const MoeIRValueId expert_output = append_moe_ir_value(graph, prefix + "experts.output", descriptor.activation_dtype, {0, descriptor.hidden_size}, TensorLocation::Cpu, MoeIRValueDynamicShape);
-            const MoeIRNodeId expert_node = append_moe_ir_node(graph, MoeIROperator::ExpertGroup, prefix + "experts", layer_id, {hidden, router_scores}, {expert_output});
-            graph.nodes[expert_node].experts = moe;
-            graph.nodes[expert_node].quantization = quant_config_for_dtype(moe.expert_weight_dtype);
+            (void)append_moe_ir_node(graph, MoeIROperator::ExpertGroup, prefix + "experts", layer_id, {hidden, router_scores}, {expert_output});
 
             std::vector<MoeIRValueId> combine_inputs{
                 hidden,
@@ -121,9 +117,7 @@ Result<MoeGraph> MoeGraphBuilder::build(const MoeModelDescriptor& descriptor) co
             if (moe.shared_expert_count != 0)
             {
                 const MoeIRValueId shared_output = append_moe_ir_value(graph, prefix + "shared_experts.output", descriptor.activation_dtype, {0, descriptor.hidden_size}, TensorLocation::Cpu, MoeIRValueDynamicShape);
-                const MoeIRNodeId shared_node = append_moe_ir_node(graph, MoeIROperator::SharedExpertGroup, prefix + "shared_experts", layer_id, {hidden}, {shared_output});
-                graph.nodes[shared_node].experts = moe;
-                graph.nodes[shared_node].quantization = quant_config_for_dtype(moe.expert_weight_dtype);
+                (void)append_moe_ir_node(graph, MoeIROperator::SharedExpertGroup, prefix + "shared_experts", layer_id, {hidden}, {shared_output});
                 combine_inputs.push_back(shared_output);
             }
 
@@ -134,8 +128,7 @@ Result<MoeGraph> MoeGraphBuilder::build(const MoeModelDescriptor& descriptor) co
         else if (has_flag(layer.flags, LayerDescriptorDenseFfn))
         {
             const MoeIRValueId dense_output = append_moe_ir_value(graph, prefix + "dense_ffn.hidden", descriptor.activation_dtype, {0, descriptor.hidden_size}, TensorLocation::Automatic, MoeIRValueDynamicShape);
-            const MoeIRNodeId dense_node = append_moe_ir_node(graph, MoeIROperator::DenseFfn, prefix + "dense_ffn", layer_id, {hidden}, {dense_output});
-            graph.nodes[dense_node].intermediate_size = layer.ffn.dense_intermediate_size;
+            (void)append_moe_ir_node(graph, MoeIROperator::DenseFfn, prefix + "dense_ffn", layer_id, {hidden}, {dense_output});
             hidden = dense_output;
         }
         else
@@ -157,150 +150,6 @@ Result<MoeGraph> MoeGraphBuilder::build(const MoeModelDescriptor& descriptor) co
     return graph;
 }
 
-static void append_attention_descriptor_nodes(LayerDescriptor& layer)
-{
-    layer.nodes.push_back({ModelNodeType::RmsNorm});
-    if (layer.attention.kind == AttentionKind::GatedDeltaNet)
-    {
-        layer.nodes.push_back({ModelNodeType::GatedDeltaNet});
-        layer.nodes.push_back({ModelNodeType::Projection});
-        return;
-    }
-    layer.nodes.push_back({ModelNodeType::FusedQkv});
-    layer.nodes.push_back({ModelNodeType::Rope});
-    if (has_flag(layer.attention.flags, AttentionDescriptorSinks))
-    {
-        layer.nodes.push_back({ModelNodeType::AttentionSink});
-    }
-    layer.nodes.push_back({ModelNodeType::Sdpa});
-    layer.nodes.push_back({ModelNodeType::Projection});
-}
-
-static void append_expert_descriptor_nodes(LayerDescriptor& layer)
-{
-    layer.nodes.push_back({ModelNodeType::RmsNorm});
-    layer.nodes.push_back({ModelNodeType::Router});
-    layer.nodes.push_back({ModelNodeType::TopK});
-    layer.nodes.push_back({ModelNodeType::ExpertGroup});
-    if (layer.ffn.moe.shared_expert_count != 0)
-    {
-        layer.nodes.push_back({ModelNodeType::SharedExpertGroup});
-    }
-    layer.nodes.push_back({ModelNodeType::Combine});
-}
-
-static void append_dense_ffn_descriptor_nodes(LayerDescriptor& layer)
-{
-    layer.nodes.push_back({ModelNodeType::RmsNorm});
-    layer.nodes.push_back({ModelNodeType::DenseFfn});
-}
-
-static Result<void> materialize_layers_from_graph(MoeIR& ir)
-{
-    ir.layers.resize(ir.layer_count);
-    std::vector<bool> attention_seen(ir.layer_count, false);
-    std::vector<bool> experts_seen(ir.layer_count, false);
-    std::vector<bool> dense_ffn_seen(ir.layer_count, false);
-    for (const MoeIRNode& node : ir.graph.nodes)
-    {
-        if (node.layer_id == invalid_moe_ir_layer_id)
-            continue;
-        if (node.layer_id >= ir.layer_count)
-        {
-            return Error{ErrorCode::InvalidModel, "MoeIR node layer is out of range"};
-        }
-        LayerDescriptor& layer = ir.layers[node.layer_id];
-        if (node.operation == MoeIROperator::Attention)
-        {
-            if (attention_seen[node.layer_id])
-            {
-                return Error{ErrorCode::InvalidModel, "MoeIR layer contains duplicate Attention"};
-            }
-            attention_seen[node.layer_id] = true;
-            layer.flags |= LayerDescriptorAttention;
-            layer.pre_attention_norm = NormType::RmsNorm;
-            layer.attention = node.attention;
-        }
-        else if (node.operation == MoeIROperator::ExpertGroup)
-        {
-            if (experts_seen[node.layer_id])
-            {
-                return Error{ErrorCode::InvalidModel, "MoeIR layer contains duplicate ExpertGroup"};
-            }
-            experts_seen[node.layer_id] = true;
-            layer.flags |= LayerDescriptorMoe;
-            layer.pre_ffn_norm = NormType::RmsNorm;
-            layer.ffn.moe = node.experts;
-        }
-        else if (node.operation == MoeIROperator::DenseFfn)
-        {
-            if (dense_ffn_seen[node.layer_id])
-            {
-                return Error{ErrorCode::InvalidModel, "MoeIR layer contains duplicate DenseFfn"};
-            }
-            dense_ffn_seen[node.layer_id] = true;
-            layer.flags |= LayerDescriptorDenseFfn;
-            layer.pre_ffn_norm = NormType::RmsNorm;
-            layer.ffn.dense_intermediate_size = node.intermediate_size;
-        }
-    }
-    for (uint32_t layer_id = 0; layer_id < ir.layer_count; ++layer_id)
-    {
-        if (experts_seen[layer_id] == dense_ffn_seen[layer_id])
-        {
-            return Error{ErrorCode::InvalidModel, "MoeIR layer requires exactly one FFN kind"};
-        }
-        LayerDescriptor& layer = ir.layers[layer_id];
-        if (attention_seen[layer_id])
-            append_attention_descriptor_nodes(layer);
-        if (experts_seen[layer_id])
-            append_expert_descriptor_nodes(layer);
-        else
-            append_dense_ffn_descriptor_nodes(layer);
-    }
-    return {};
-}
-
-static bool attention_matches(const AttentionDescriptor& left, const AttentionDescriptor& right)
-{
-    return left.kind == right.kind
-           && left.head_count == right.head_count
-           && left.kv_head_count == right.kv_head_count
-           && left.head_dimension == right.head_dimension
-           && left.sliding_window == right.sliding_window
-           && left.initial_context_length == right.initial_context_length
-           && left.max_context_length == right.max_context_length
-           && left.query_lora_rank == right.query_lora_rank
-           && left.kv_lora_rank == right.kv_lora_rank
-           && left.qk_nope_head_dimension == right.qk_nope_head_dimension
-           && left.qk_rope_head_dimension == right.qk_rope_head_dimension
-           && left.value_head_dimension == right.value_head_dimension
-           && left.convolution_kernel_size == right.convolution_kernel_size
-           && left.rope_theta == right.rope_theta
-           && left.rope_scaling_factor == right.rope_scaling_factor
-           && left.rope_ntk_alpha == right.rope_ntk_alpha
-           && left.rope_ntk_beta == right.rope_ntk_beta
-           && left.flags == right.flags;
-}
-
-static bool experts_match(const MoeDescriptor& left, const MoeDescriptor& right)
-{
-    return left.expert_count == right.expert_count
-           && left.top_k == right.top_k
-           && left.intermediate_size == right.intermediate_size
-           && left.shared_expert_count == right.shared_expert_count
-           && left.router_group_count == right.router_group_count
-           && left.router_top_k_groups == right.router_top_k_groups
-           && left.score_function == right.score_function
-           && left.normalization == right.normalization
-           && left.activation == right.activation
-           && left.layout == right.layout
-           && left.expert_weight_dtype == right.expert_weight_dtype
-           && left.activation_limit == right.activation_limit
-           && left.routed_scaling_factor == right.routed_scaling_factor
-           && left.flags == right.flags;
-}
-
 static Result<void> validate_graph_descriptor_consistency(const MoeIR& ir)
 {
     std::vector<uint32_t> attention_counts(ir.layer_count, 0);
@@ -319,34 +168,40 @@ static Result<void> validate_graph_descriptor_consistency(const MoeIR& ir)
         if (node.operation == MoeIROperator::Attention)
         {
             ++attention_counts[node.layer_id];
-            if (!attention_matches(node.attention, layer.attention))
+            if (!has_flag(layer.flags, LayerDescriptorAttention))
             {
-                return Error{ErrorCode::InvalidModel, "MoeIR Attention does not match its layer descriptor"};
+                return Error{ErrorCode::InvalidModel, "MoeIR Attention is not declared by its layer descriptor"};
             }
         }
         else if (node.operation == MoeIROperator::ExpertGroup)
         {
             ++expert_counts[node.layer_id];
-            if (!experts_match(node.experts, layer.ffn.moe))
+            if (!has_flag(layer.flags, LayerDescriptorMoe))
             {
-                return Error{ErrorCode::InvalidModel, "MoeIR ExpertGroup does not match its layer descriptor"};
+                return Error{ErrorCode::InvalidModel, "MoeIR ExpertGroup is not declared by its layer descriptor"};
             }
         }
         else if (node.operation == MoeIROperator::SharedExpertGroup)
         {
             ++shared_expert_counts[node.layer_id];
-            if (!experts_match(node.experts, layer.ffn.moe))
+            if (!has_flag(layer.flags, LayerDescriptorMoe)
+                || layer.ffn.moe.shared_expert_count == 0)
             {
-                return Error{ErrorCode::InvalidModel, "MoeIR SharedExpertGroup does not match its layer descriptor"};
+                return Error{ErrorCode::InvalidModel, "MoeIR SharedExpertGroup is not declared by its layer descriptor"};
             }
         }
         else if (node.operation == MoeIROperator::DenseFfn)
         {
             ++dense_ffn_counts[node.layer_id];
-            if (node.intermediate_size != layer.ffn.dense_intermediate_size)
+            if (!has_flag(layer.flags, LayerDescriptorDenseFfn))
             {
-                return Error{ErrorCode::InvalidModel, "MoeIR DenseFfn does not match its layer descriptor"};
+                return Error{ErrorCode::InvalidModel, "MoeIR DenseFfn is not declared by its layer descriptor"};
             }
+        }
+        else if (node.operation == MoeIROperator::KvCache
+                 && !has_flag(layer.flags, LayerDescriptorAttention))
+        {
+            return Error{ErrorCode::InvalidModel, "MoeIR KV Cache is not declared by its layer descriptor"};
         }
     }
     for (uint32_t layer_id = 0; layer_id < ir.layer_count; ++layer_id)
@@ -376,60 +231,21 @@ static Result<void> validate_graph_descriptor_consistency(const MoeIR& ir)
     return {};
 }
 
-static bool has_node(const LayerDescriptor& layer, ModelNodeType type)
-{
-    for (const ModelNodeDescriptor& node : layer.nodes)
-    {
-        if (node.type == type)
-            return true;
-    }
-    return false;
-}
-
 Result<void> normalize_moe_ir(MoeIR& ir)
 {
     if (ir.graph.nodes.empty())
     {
-        for (LayerDescriptor& layer : ir.layers)
-        {
-            if (!has_flag(layer.flags, LayerDescriptorAttention)
-                && (has_node(layer, ModelNodeType::FusedQkv)
-                    || has_node(layer, ModelNodeType::GatedDeltaNet)
-                    || has_node(layer, ModelNodeType::MultiHeadLatentAttention)))
-            {
-                layer.flags |= LayerDescriptorAttention;
-            }
-            if (!has_flag(layer.flags, LayerDescriptorMoe) && !has_flag(layer.flags, LayerDescriptorDenseFfn))
-            {
-                if (has_node(layer, ModelNodeType::ExpertGroup))
-                    layer.flags |= LayerDescriptorMoe;
-                else if (has_node(layer, ModelNodeType::DenseFfn))
-                    layer.flags |= LayerDescriptorDenseFfn;
-            }
-        }
         MoeGraphBuilder builder;
         auto graph = builder.build(ir);
         if (!graph)
             return graph.error();
         ir.graph = std::move(graph).value();
     }
-    bool graph_driven_layers = !ir.layers.empty();
-    for (const LayerDescriptor& layer : ir.layers)
-    {
-        if (has_flag(layer.flags, LayerDescriptorMoe) || has_flag(layer.flags, LayerDescriptorDenseFfn))
-        {
-            graph_driven_layers = false;
-            break;
-        }
-    }
-    if (graph_driven_layers)
-        ir.layers.clear();
-    if (ir.layers.empty())
-    {
-        auto materialized = materialize_layers_from_graph(ir);
-        if (!materialized)
-            return materialized.error();
-    }
+    // The model adapter descriptor is input metadata only.  Once the graph
+    // exists, it is the sole topology source; never materialize layers back
+    // from the graph or reconcile two competing operator lists.
+    if (ir.layers.size() != ir.layer_count)
+        return Error{ErrorCode::InvalidModel, "canonical MoeIR requires layer metadata for every graph layer"};
     ir.activation_quantization = quant_config_for_dtype(ir.activation_dtype);
     ir.kv_cache_quantization = quant_config_for_dtype(ir.kv_cache_dtype);
     if (ir.expert_quantization.scheme == QuantizationScheme::None)
@@ -495,7 +311,7 @@ static ExecutionTensorId append_execution_tensor(ExecutionGraph& graph, std::str
 }
 
 static ExecutionNodeId append_execution_node(ExecutionGraph& graph, ExecutionNodeType type, ExecutionBackend backend, uint32_t backend_mask, std::string name, std::vector<ExecutionNodeId> dependencies, std::vector<ExecutionTensorId> inputs,
-                                             std::vector<ExecutionTensorId> outputs, uint32_t layer_id, uint32_t expert_id, uint32_t flags)
+                                             std::vector<ExecutionTensorId> outputs, uint32_t layer_plan_index, uint32_t expert_id, uint32_t flags)
 {
     const ExecutionNodeId node_id = static_cast<ExecutionNodeId>(graph.nodes.size());
     ExecutionNode node;
@@ -503,7 +319,7 @@ static ExecutionNodeId append_execution_node(ExecutionGraph& graph, ExecutionNod
     node.type = type;
     node.backend = backend;
     node.backend_mask = backend_mask;
-    node.layer_id = layer_id;
+    node.layer_plan_index = layer_plan_index;
     node.expert_id = expert_id;
     node.flags = flags;
     node.name = std::move(name);
@@ -518,19 +334,334 @@ static ExecutionNodeId append_execution_node(ExecutionGraph& graph, ExecutionNod
     return node_id;
 }
 
+static bool has_vulkan_dense_operator(const CompiledOperator& operator_entry) noexcept
+{
+    return operator_entry.linear || operator_entry.bfloat16 || operator_entry.float8;
+}
+
+static bool standard_attention_supports_vulkan(
+    const CompiledModel& compiled,
+    const CompiledLayerPlan& layer) noexcept
+{
+    if (compiled.hybrid_mode == HybridMode::CpuOnly
+        || layer.layer_id >= compiled.descriptor.layers.size()
+        || compiled.descriptor.layers[layer.layer_id].attention.kind != AttentionKind::Standard)
+    {
+        return false;
+    }
+
+    const AttentionBlockPlan& attention = layer.attention;
+    if (attention.vulkan_attention_operator != invalid_compiled_operator_handle
+        && compiled.operators.at(attention.vulkan_attention_operator).attention)
+    {
+        return true;
+    }
+
+    const TensorHandle dense_handles[] = {
+        attention.query_weight,
+        attention.key_weight,
+        attention.value_weight,
+        attention.output_weight,
+        attention.query_a_weight,
+        attention.query_b_weight,
+        attention.key_value_weight,
+        attention.output_a_weight,
+        attention.output_b_weight,
+    };
+    for (TensorHandle handle : dense_handles)
+    {
+        if (handle != invalid_tensor_handle
+            && has_vulkan_dense_operator(compiled.operators.at_weight(handle)))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool speculative_attention_supports_vulkan(
+    const CompiledModel& compiled,
+    const AttentionBlockPlan& attention) noexcept
+{
+    if (compiled.hybrid_mode == HybridMode::CpuOnly)
+        return false;
+    if (attention.gated_delta_vulkan_operator != invalid_compiled_operator_handle
+        && compiled.operators.at(attention.gated_delta_vulkan_operator).gated_delta)
+    {
+        return true;
+    }
+    if (attention.vulkan_attention_operator != invalid_compiled_operator_handle
+        && compiled.operators.at(attention.vulkan_attention_operator).attention)
+    {
+        return true;
+    }
+
+    const TensorHandle dense_handles[] = {
+        attention.query_weight,
+        attention.key_weight,
+        attention.value_weight,
+        attention.output_weight,
+        attention.query_a_weight,
+        attention.query_b_weight,
+        attention.key_value_weight,
+        attention.output_a_weight,
+        attention.output_b_weight,
+    };
+    for (TensorHandle handle : dense_handles)
+    {
+        if (handle != invalid_tensor_handle
+            && has_vulkan_dense_operator(compiled.operators.at_weight(handle)))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static Result<void> build_speculative_execution_graph(
+    CompiledModel& compiled,
+    const ModelCompiler::BackendCapabilities& capabilities)
+{
+    if (!compiled.speculative.enabled())
+        return {};
+
+    ExecutionGraph graph;
+    graph.layer_plans = std::move(compiled.speculative.graph.layer_plans);
+    const uint32_t dynamic_tensor = ExecutionTensorDynamic;
+    ExecutionTensorId hidden = append_execution_tensor(
+        graph,
+        "speculative.input.hidden",
+        compiled.descriptor.activation_dtype,
+        {0, compiled.descriptor.hidden_size},
+        TensorLocation::Cpu,
+        dynamic_tensor);
+    ExecutionNodeId previous = append_execution_node(
+        graph,
+        ExecutionNodeType::TokenEmbedding,
+        ExecutionBackend::Cpu,
+        ExecutionBackendCpu,
+        "speculative.input",
+        {},
+        {},
+        {hidden},
+        invalid_execution_layer_id,
+        invalid_execution_expert_id,
+        0);
+    graph.nodes[previous].weight_inputs = {compiled.token_embedding};
+
+    for (size_t plan_index = 0; plan_index < graph.layer_plans.size(); ++plan_index)
+    {
+        const CompiledLayerPlan& layer = graph.layer_plans[plan_index];
+        const std::string prefix = "speculative.layers." + std::to_string(plan_index) + ".";
+        if (has_flag(layer.flags, CompiledLayerAttention))
+        {
+            const bool supports_vulkan_attention = speculative_attention_supports_vulkan(compiled, layer.attention);
+            const ExecutionBackend backend = supports_vulkan_attention ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
+            const uint32_t backend_mask = supports_vulkan_attention ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
+            const TensorLocation cache_location = backend == ExecutionBackend::Vulkan ? TensorLocation::Vulkan : TensorLocation::Cpu;
+            std::vector<uint32_t> cache_shape{
+                0,
+                layer.attention.kv_head_count,
+                layer.attention.head_dimension,
+            };
+            if (has_flag(layer.attention.flags, AttentionBlockGatedDeltaNet))
+            {
+                cache_shape = {
+                    0,
+                    layer.attention.head_count,
+                    layer.attention.head_dimension,
+                    layer.attention.value_head_dimension,
+                };
+            }
+            const ExecutionTensorId cache = append_execution_tensor(
+                graph,
+                prefix + "kv_cache",
+                has_flag(layer.attention.flags, AttentionBlockGatedDeltaNet) ? DType::Float32 : compiled.descriptor.kv_cache_dtype,
+                std::move(cache_shape),
+                cache_location,
+                ExecutionTensorPersistent | ExecutionTensorDynamic);
+            uint32_t attention_tensor_flags = ExecutionTensorDynamic;
+            if (backend == ExecutionBackend::Vulkan)
+                attention_tensor_flags |= ExecutionTensorTransferBoundary;
+            const ExecutionTensorId attention_output = append_execution_tensor(
+                graph,
+                prefix + "attention.hidden",
+                compiled.descriptor.activation_dtype,
+                {0, compiled.descriptor.hidden_size},
+                TensorLocation::Cpu,
+                attention_tensor_flags);
+            previous = append_execution_node(
+                graph,
+                ExecutionNodeType::Attention,
+                backend,
+                backend_mask,
+                prefix + "attention",
+                {previous},
+                {hidden},
+                {attention_output, cache},
+                static_cast<uint32_t>(plan_index),
+                invalid_execution_expert_id,
+                0);
+            hidden = attention_output;
+        }
+
+        const ExecutionTensorId router_scores = append_execution_tensor(
+            graph,
+            prefix + "router.scores",
+            DType::Float32,
+            {0, static_cast<uint32_t>(layer.moe.experts.size())},
+            TensorLocation::Cpu,
+            ExecutionTensorDynamic);
+        const ExecutionNodeId router = append_execution_node(
+            graph,
+            ExecutionNodeType::Router,
+            ExecutionBackend::Cpu,
+            ExecutionBackendCpu,
+            prefix + "router",
+            {previous},
+            {hidden},
+            {router_scores},
+            static_cast<uint32_t>(plan_index),
+            invalid_execution_expert_id,
+            0);
+        const ExecutionTensorId assignments = append_execution_tensor(
+            graph,
+            prefix + "expert_dispatch.assignments",
+            DType::Int32,
+            {0, 3},
+            TensorLocation::Cpu,
+            ExecutionTensorDynamic);
+        const ExecutionNodeId dispatch = append_execution_node(
+            graph,
+            ExecutionNodeType::ExpertDispatch,
+            ExecutionBackend::Cpu,
+            ExecutionBackendCpu,
+            prefix + "expert_dispatch",
+            {router},
+            {router_scores},
+            {assignments},
+            static_cast<uint32_t>(plan_index),
+            invalid_execution_expert_id,
+            0);
+
+        const bool can_use_vulkan_experts = compiled.hybrid_mode != HybridMode::CpuOnly
+                                             && has_flag(capabilities.flags, ModelCompiler::BackendCapabilityVulkanExperts)
+                                             && !layer.moe.experts.empty()
+                                             && layer.moe.experts.front().gate_up_weight != invalid_tensor_handle
+                                             && compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype == DType::MxFp4;
+        const ExecutionBackend expert_backend = can_use_vulkan_experts ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
+        const uint32_t expert_backend_mask = can_use_vulkan_experts ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
+        const uint32_t expert_flags = compiled.hybrid_mode == HybridMode::VulkanWithCpuPrefetch
+                                          ? ExecutionNodeCpuPrefetch
+                                          : 0u;
+        const ExecutionTensorId expert_output = append_execution_tensor(
+            graph,
+            prefix + "experts.output",
+            compiled.descriptor.activation_dtype,
+            {0, compiled.descriptor.hidden_size},
+            TensorLocation::Cpu,
+            ExecutionTensorDynamic);
+        const ExecutionNodeId expert_group = append_execution_node(
+            graph,
+            ExecutionNodeType::ExpertGroup,
+            expert_backend,
+            expert_backend_mask,
+            prefix + "experts",
+            {dispatch},
+            {hidden, assignments},
+            {expert_output},
+            static_cast<uint32_t>(plan_index),
+            invalid_execution_expert_id,
+            expert_flags);
+
+        const ExecutionTensorId combined = append_execution_tensor(
+            graph,
+            prefix + "combine.hidden",
+            compiled.descriptor.activation_dtype,
+            {0, compiled.descriptor.hidden_size},
+            TensorLocation::Cpu,
+            ExecutionTensorDynamic);
+        std::vector<ExecutionTensorId> combine_inputs = {hidden, expert_output};
+        std::vector<ExecutionNodeId> combine_dependencies = {expert_group};
+        if (layer.moe.has_shared_expert)
+        {
+            const bool shared_vulkan = compiled.hybrid_mode != HybridMode::CpuOnly
+                                        && layer.moe.fused_shared_input_bfloat16_operator != invalid_compiled_operator_handle
+                                        && compiled.operators.at(layer.moe.fused_shared_input_bfloat16_operator).bfloat16;
+            const ExecutionBackend shared_backend = shared_vulkan ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
+            const uint32_t shared_backend_mask = shared_vulkan ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
+            const ExecutionTensorId shared_output = append_execution_tensor(
+                graph,
+                prefix + "shared_experts.output",
+                compiled.descriptor.activation_dtype,
+                {0, compiled.descriptor.hidden_size},
+                TensorLocation::Cpu,
+                ExecutionTensorDynamic);
+            const ExecutionNodeId shared_node = append_execution_node(
+                graph,
+                ExecutionNodeType::SharedExpertGroup,
+                shared_backend,
+                shared_backend_mask,
+                prefix + "shared_experts",
+                {expert_group},
+                {hidden},
+                {shared_output},
+                static_cast<uint32_t>(plan_index),
+                invalid_execution_expert_id,
+                0);
+            combine_dependencies.push_back(shared_node);
+            combine_inputs.push_back(shared_output);
+        }
+        previous = append_execution_node(
+            graph,
+            ExecutionNodeType::Combine,
+            ExecutionBackend::Cpu,
+            ExecutionBackendCpu,
+            prefix + "combine",
+            std::move(combine_dependencies),
+            std::move(combine_inputs),
+            {combined},
+            static_cast<uint32_t>(plan_index),
+            invalid_execution_expert_id,
+            0);
+        hidden = combined;
+    }
+
+    RuntimeSchedulingOptions options;
+    options.available_backends = ExecutionBackendCpu;
+    options.cpu_parallelism = capabilities.cpu_parallelism;
+    if (compiled.hybrid_mode != HybridMode::CpuOnly)
+    {
+        options.available_backends |= ExecutionBackendVulkan;
+        options.vulkan_queue_count = std::max(1u, capabilities.vulkan_queue_count);
+    }
+    RuntimeScheduler scheduler;
+    auto scheduled = scheduler.compile(std::move(graph), options);
+    if (!scheduled)
+        return scheduled.error();
+    ScheduledExecutionGraph result = std::move(scheduled).value();
+    compiled.speculative.graph = std::move(result.graph);
+    compiled.speculative.schedule = std::move(result.schedule);
+    return {};
+}
+
 Result<void> build_compiled_execution_graph(CompiledModel& compiled, const ModelCompiler::BackendCapabilities& capabilities)
 {
     ExecutionGraph graph;
+    graph.layer_plans = std::move(compiled.graph.layer_plans);
     const uint32_t dynamic_tensor = ExecutionTensorDynamic;
     ExecutionTensorId hidden = append_execution_tensor(graph, "embedding.hidden", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size}, TensorLocation::Cpu, dynamic_tensor);
     ExecutionNodeId previous = append_execution_node(graph, ExecutionNodeType::TokenEmbedding, ExecutionBackend::Cpu, ExecutionBackendCpu, "token_embedding", {}, {}, {hidden}, invalid_execution_layer_id, invalid_execution_expert_id, 0);
+    graph.nodes[previous].weight_inputs = {compiled.token_embedding};
 
-    for (const CompiledLayerPlan& layer : compiled.layers)
+    for (size_t plan_index = 0; plan_index < graph.layer_plans.size(); ++plan_index)
     {
+        const CompiledLayerPlan& layer = graph.layer_plans[plan_index];
         const std::string prefix = "layers." + std::to_string(layer.layer_id) + ".";
         if (has_flag(layer.flags, CompiledLayerAttention))
         {
-            const ExecutionBackend backend = layer.nodes.empty() ? ExecutionBackend::Cpu : layer.nodes.front().backend;
+            const bool supports_vulkan_attention = standard_attention_supports_vulkan(compiled, layer);
+            const ExecutionBackend backend = supports_vulkan_attention ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
             const TensorLocation cache_location = backend == ExecutionBackend::Vulkan ? TensorLocation::Vulkan : TensorLocation::Cpu;
             const ExecutionTensorId cache = append_execution_tensor(graph, prefix + "kv_cache", compiled.descriptor.kv_cache_dtype,
                                                                     {
@@ -548,7 +679,7 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
             previous = append_execution_node(
                 graph, ExecutionNodeType::Attention, backend, backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, prefix + "attention",
                 {previous}, {hidden}, {attention_output, cache},
-                layer.layer_id, invalid_execution_expert_id, 0);
+                static_cast<uint32_t>(plan_index), invalid_execution_expert_id, 0);
             hidden = attention_output;
         }
 
@@ -556,24 +687,50 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
         const ExecutionNodeId router = append_execution_node(
             graph, ExecutionNodeType::Router, ExecutionBackend::Cpu, ExecutionBackendCpu, prefix + "router",
             {previous}, {hidden}, {router_scores},
-            layer.layer_id, invalid_execution_expert_id, 0);
+            static_cast<uint32_t>(plan_index), invalid_execution_expert_id, 0);
         const ExecutionTensorId assignments = append_execution_tensor(graph, prefix + "expert_dispatch.assignments", DType::Int32, {0, 3}, TensorLocation::Cpu, ExecutionTensorDynamic);
         const ExecutionNodeId dispatch = append_execution_node(
             graph, ExecutionNodeType::ExpertDispatch, ExecutionBackend::Cpu, ExecutionBackendCpu, prefix + "expert_dispatch",
             {router}, {router_scores}, {assignments},
-            layer.layer_id, invalid_execution_expert_id, 0);
+            static_cast<uint32_t>(plan_index), invalid_execution_expert_id, 0);
 
+        const bool can_use_vulkan_experts = compiled.hybrid_mode != HybridMode::CpuOnly
+                                             && has_flag(capabilities.flags, ModelCompiler::BackendCapabilityVulkanExperts)
+                                             && !layer.moe.experts.empty()
+                                             && layer.moe.experts.front().gate_up_weight != invalid_tensor_handle
+                                             && compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype == DType::MxFp4;
+        const ExecutionBackend expert_backend = can_use_vulkan_experts ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
+        const uint32_t expert_backend_mask = can_use_vulkan_experts ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
+        const uint32_t expert_flags = compiled.hybrid_mode == HybridMode::VulkanWithCpuPrefetch
+                                          ? ExecutionNodeCpuPrefetch
+                                          : 0u;
         const ExecutionTensorId expert_output = append_execution_tensor(graph, prefix + "experts.output", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size}, TensorLocation::Cpu, ExecutionTensorDynamic);
         const ExecutionNodeId expert_group = append_execution_node(
-            graph, ExecutionNodeType::ExpertGroup, ExecutionBackend::Cpu, ExecutionBackendCpu, prefix + "experts",
+            graph, ExecutionNodeType::ExpertGroup, expert_backend, expert_backend_mask, prefix + "experts",
             {dispatch}, {hidden, assignments}, {expert_output},
-            layer.layer_id, invalid_execution_expert_id, 0);
+            static_cast<uint32_t>(plan_index), invalid_execution_expert_id, expert_flags);
 
         const ExecutionTensorId combined = append_execution_tensor(graph, prefix + "combine.hidden", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size}, TensorLocation::Cpu, ExecutionTensorDynamic);
+        std::vector<ExecutionTensorId> combine_inputs = {hidden, expert_output};
+        std::vector<ExecutionNodeId> combine_dependencies = {expert_group};
+        if (layer.moe.has_shared_expert)
+        {
+            const bool shared_vulkan = compiled.hybrid_mode != HybridMode::CpuOnly
+                                        && layer.moe.fused_shared_input_bfloat16_operator != invalid_compiled_operator_handle
+                                        && compiled.operators.at(layer.moe.fused_shared_input_bfloat16_operator).bfloat16;
+            const ExecutionBackend shared_backend = shared_vulkan ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
+            const uint32_t shared_backend_mask = shared_vulkan ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
+            const ExecutionTensorId shared_output = append_execution_tensor(graph, prefix + "shared_experts.output", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size}, TensorLocation::Cpu, ExecutionTensorDynamic);
+            const ExecutionNodeId shared_node = append_execution_node(
+                graph, ExecutionNodeType::SharedExpertGroup, shared_backend, shared_backend_mask, prefix + "shared_experts",
+                {expert_group}, {hidden}, {shared_output}, static_cast<uint32_t>(plan_index), invalid_execution_expert_id, 0);
+            combine_dependencies.push_back(shared_node);
+            combine_inputs.push_back(shared_output);
+        }
         previous = append_execution_node(
             graph, ExecutionNodeType::Combine, ExecutionBackend::Cpu, ExecutionBackendCpu, prefix + "combine",
-            {expert_group}, {hidden, expert_output}, {combined},
-            layer.layer_id, invalid_execution_expert_id, 0);
+            std::move(combine_dependencies), std::move(combine_inputs), {combined},
+            static_cast<uint32_t>(plan_index), invalid_execution_expert_id, 0);
         hidden = combined;
     }
 
@@ -582,16 +739,22 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
         graph, ExecutionNodeType::FinalNorm, ExecutionBackend::Cpu, ExecutionBackendCpu, "final_norm",
         {previous}, {hidden}, {normalized},
         invalid_execution_layer_id, invalid_execution_expert_id, 0);
+    graph.nodes[previous].weight_inputs = {
+        compiled.final_norm_weight,
+        compiled.lm_head_weight};
 
     const ExecutionBackend lm_head_backend = compiled.hybrid_mode == HybridMode::CpuOnly ? ExecutionBackend::Cpu : ExecutionBackend::Vulkan;
     uint32_t logits_tensor_flags = ExecutionTensorDynamic;
     if (lm_head_backend == ExecutionBackend::Vulkan)
         logits_tensor_flags |= ExecutionTensorTransferBoundary;
     const ExecutionTensorId logits = append_execution_tensor(graph, "logits", DType::Float32, {0, compiled.descriptor.vocabulary_size}, TensorLocation::Cpu, logits_tensor_flags);
-    (void)append_execution_node(
+    const ExecutionNodeId lm_head_node = append_execution_node(
         graph, ExecutionNodeType::LmHead, lm_head_backend, lm_head_backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, "lm_head",
         {previous}, {normalized}, {logits},
         invalid_execution_layer_id, invalid_execution_expert_id, 0);
+    graph.nodes[lm_head_node].weight_inputs = {
+        compiled.lm_head_weight,
+        compiled.final_norm_weight};
 
     RuntimeSchedulingOptions options;
     options.available_backends = ExecutionBackendCpu;
@@ -608,7 +771,7 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
     ScheduledExecutionGraph result = std::move(scheduled).value();
     compiled.graph = std::move(result.graph);
     compiled.schedule = std::move(result.schedule);
-    return {};
+    return build_speculative_execution_graph(compiled, capabilities);
 }
 
 } // namespace moe

@@ -26,6 +26,7 @@ class SessionBatchAccess;
 
 class CpuSessionState;
 class IExecutor;
+struct SamplingScratch;
 
 struct LogitsOutput
 {
@@ -65,8 +66,7 @@ struct StreamToken
     uint32_t index = 0;
     int32_t token_id = -1;
     float probability = 0.0f;
-    // Compatibility convenience for native callers.  The worker leaves this
-    // empty and decodes token IDs in the application layer.
+    // Optional decoded text supplied by a caller-owned tokenizer boundary.
     std::string text;
     bool is_stop_token = false;
 };
@@ -90,8 +90,8 @@ struct GenerationResult
     bool stopped_by_callback = false;
 };
 
-// Legacy native convenience hook.  Text decoding is not used by the worker;
-// applications should normally decode the returned token IDs themselves.
+// Token text decoding stays outside the model runtime and is supplied by the
+// application boundary when a caller wants decoded text in the result.
 using TokenTextDecoder = std::function<std::string(int32_t token_id)>;
 using TokenStreamCallback = std::function<bool(const StreamToken& token)>;
 
@@ -205,9 +205,31 @@ struct SessionStatistics
     uint64_t vulkan_staging_slot_acquisitions = 0;
     uint64_t vulkan_staging_slot_contentions = 0;
     uint64_t vulkan_command_buffer_reuses = 0;
+    uint64_t vulkan_command_graph_submissions = 0;
+    uint64_t vulkan_command_graph_operations = 0;
+    uint64_t vulkan_direct_host_input_bindings = 0;
+    uint64_t vulkan_direct_host_output_bindings = 0;
     uint64_t vulkan_attention_qkv_rope_fusions = 0;
+    uint64_t vulkan_attention_device_rope_fusions = 0;
     uint64_t vulkan_attention_qkv_ring_fusions = 0;
+    uint64_t vulkan_attention_qkv_rope_pipeline_failures = 0;
+    uint64_t vulkan_attention_qkv_rope_shape_failures = 0;
+    uint64_t vulkan_attention_qkv_rope_source_failures = 0;
+    uint64_t vulkan_attention_qkv_rope_norm_failures = 0;
+    uint64_t vulkan_attention_qkv_rope_ring_failures = 0;
+    uint64_t vulkan_attention_qkv_rope_allocation_failures = 0;
+    uint64_t vulkan_attention_precondition_failures = 0;
+    uint64_t vulkan_attention_staging_failures = 0;
+    uint64_t vulkan_attention_norm_failures = 0;
+    uint64_t vulkan_attention_qkv_failures = 0;
+    uint64_t vulkan_attention_cache_failures = 0;
+    uint64_t vulkan_attention_sdpa_failures = 0;
+    uint64_t vulkan_attention_projection_failures = 0;
+    uint64_t vulkan_attention_output_failures = 0;
+    uint64_t vulkan_attention_submit_failures = 0;
     uint64_t vulkan_attention_decode_sdpa_fusions = 0;
+    uint64_t vulkan_attention_cache_materializations = 0;
+    uint64_t vulkan_attention_cpu_fallbacks = 0;
     uint64_t vulkan_kv_ring_appends = 0;
     uint64_t vulkan_kv_ring_resizes = 0;
     uint64_t vulkan_kv_ring_wrapped_views = 0;
@@ -232,6 +254,29 @@ struct SessionStatistics
     uint64_t kv_cache_logical_bytes = 0;
     uint64_t kv_cache_allocated_bytes = 0;
     std::vector<uint64_t> expert_token_counts;
+    uint32_t expert_cache_io_worker_count = 0;
+    uint32_t expert_cache_adaptive_io_workers = 0;
+    uint64_t expert_cache_io_read_samples = 0;
+    uint64_t expert_cache_io_read_time_microseconds = 0;
+    uint64_t expert_gpu_route_aggregation_batches = 0;
+    uint64_t expert_gpu_route_aggregation_routes = 0;
+    uint64_t expert_gpu_route_aggregation_bytes_saved = 0;
+    uint64_t vulkan_shared_expert_swiglu_fusions = 0;
+    uint64_t vulkan_gated_delta_fusions = 0;
+    uint64_t vulkan_gated_delta_submissions = 0;
+    uint64_t vulkan_rms_norm_linear_fusions = 0;
+    uint64_t vulkan_kv_cache_promotions = 0;
+    uint64_t vulkan_kv_cache_promotion_bytes = 0;
+    uint64_t vulkan_bfloat16_cooperative_matrix_dispatches = 0;
+    uint64_t cpu_bfloat16_batched_linear_dispatches = 0;
+    uint64_t vulkan_command_dispatches = 0;
+    uint64_t vulkan_command_pipeline_binds = 0;
+    uint64_t vulkan_command_redundant_pipeline_binds = 0;
+    uint64_t vulkan_command_descriptor_bindings = 0;
+    uint64_t vulkan_command_push_constant_updates = 0;
+    uint64_t vulkan_command_resource_barrier_calls = 0;
+    uint64_t vulkan_command_buffer_resource_barriers = 0;
+    uint64_t vulkan_command_image_resource_barriers = 0;
 };
 
 // Stable, model-neutral counters intended for applications and examples.
@@ -253,6 +298,40 @@ struct RuntimeMetricCounters
     // kernel timeline.
     uint64_t gpu_kernel_time_microseconds = 0;
     bool gpu_kernel_time_available = false;
+    uint64_t vulkan_linear_dispatches = 0;
+    uint64_t vulkan_attention_blocks = 0;
+    uint64_t vulkan_batch_uploads = 0;
+    uint64_t vulkan_batch_downloads = 0;
+    uint64_t vulkan_attention_qkv_rope_fusions = 0;
+    uint64_t vulkan_attention_device_rope_fusions = 0;
+    uint64_t vulkan_attention_qkv_ring_fusions = 0;
+    uint64_t vulkan_attention_qkv_rope_pipeline_failures = 0;
+    uint64_t vulkan_attention_qkv_rope_shape_failures = 0;
+    uint64_t vulkan_attention_qkv_rope_source_failures = 0;
+    uint64_t vulkan_attention_qkv_rope_norm_failures = 0;
+    uint64_t vulkan_attention_qkv_rope_ring_failures = 0;
+    uint64_t vulkan_attention_qkv_rope_allocation_failures = 0;
+    uint64_t vulkan_attention_precondition_failures = 0;
+    uint64_t vulkan_attention_staging_failures = 0;
+    uint64_t vulkan_attention_norm_failures = 0;
+    uint64_t vulkan_attention_qkv_failures = 0;
+    uint64_t vulkan_attention_cache_failures = 0;
+    uint64_t vulkan_attention_sdpa_failures = 0;
+    uint64_t vulkan_attention_projection_failures = 0;
+    uint64_t vulkan_attention_output_failures = 0;
+    uint64_t vulkan_attention_submit_failures = 0;
+    uint64_t vulkan_attention_cache_materializations = 0;
+    uint64_t vulkan_attention_cpu_fallbacks = 0;
+    uint64_t expert_gpu_cache_hits = 0;
+    uint64_t expert_gpu_cache_misses = 0;
+    uint64_t expert_gpu_cache_admissions = 0;
+    uint64_t expert_gpu_cache_stores = 0;
+    uint64_t expert_gpu_cache_dropped_admissions = 0;
+    uint64_t expert_gpu_cache_resident_bytes = 0;
+    uint64_t expert_gpu_cache_pending_bytes = 0;
+    uint64_t expert_gpu_executions = 0;
+    uint64_t expert_gpu_execution_failures = 0;
+    uint64_t expert_gpu_cpu_preferred = 0;
     uint64_t expert_cache_resident_bytes = 0;
     uint64_t kv_cache_logical_bytes = 0;
     uint64_t kv_cache_allocated_bytes = 0;
@@ -281,7 +360,7 @@ struct SessionOptions
 {
     LogitsOutputMode logits_output_mode = LogitsOutputMode::FullLogits;
     uint64_t sampling_seed = 0;
-    uint32_t prefill_chunk_size = 256;
+    uint32_t prefill_chunk_size = 512;
     bool enable_speculative_context = true;
 };
 
@@ -301,7 +380,7 @@ private:
     std::unique_ptr<CpuSessionState> state_;
     std::unique_ptr<IExecutor> executor_;
     std::mt19937_64 random_generator_;
-    uint32_t prefill_chunk_size_ = 256;
+    uint32_t prefill_chunk_size_ = 512;
     bool speculative_context_enabled_ = true;
     SessionStatistics generation_start_statistics_;
     bool generation_active_ = false;
@@ -312,6 +391,7 @@ private:
     std::chrono::steady_clock::time_point generation_started_;
     std::chrono::steady_clock::time_point generation_first_token_ready_;
     mutable std::mutex mutex_;
+    std::unique_ptr<SamplingScratch> sampling_scratch_;
 
     [[nodiscard]] SessionMetrics metrics_unlocked() const;
 

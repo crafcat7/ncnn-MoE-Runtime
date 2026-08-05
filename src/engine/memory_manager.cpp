@@ -54,11 +54,21 @@ Result<void> MemoryManager::transition(ExecutionTensorId tensor_id, TensorLocati
     return transition_unlocked(tensor_id, location);
 }
 
-Result<void> MemoryManager::record_execution(const ExecutionGraph& graph)
+Result<void> MemoryManager::record_execution(
+    const ExecutionGraph& graph,
+    const ExecutionSchedule& schedule)
 {
+    // The compiled model owns an immutable, already-validated reservation.
+    // Do only the cheap shape checks here; rebuilding validation vectors on
+    // every decode token would put the scheduler back on the hot path.
+    if (schedule.node_order.size() != graph.nodes.size())
+        return Error{ErrorCode::InternalError, "execution reservation does not cover the graph"};
     const std::lock_guard<std::mutex> lock(mutex_);
-    for (const ExecutionNode& node : graph.nodes)
+    for (ExecutionNodeId node_id : schedule.node_order)
     {
+        if (node_id >= graph.nodes.size())
+            return Error{ErrorCode::InternalError, "execution reservation references an invalid node"};
+        const ExecutionNode& node = graph.nodes[node_id];
         for (ExecutionTensorId input : node.inputs)
         {
             const ExecutionTensor* tensor = graph.find_tensor(input);

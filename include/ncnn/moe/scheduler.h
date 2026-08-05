@@ -104,6 +104,9 @@ struct SchedulerStatistics
     bool automatic_topology_affinity = false;
     uint32_t worker_count = 0;
     uint32_t expert_threads_per_worker = 0;
+    uint64_t vulkan_attention_batch_submissions = 0;
+    uint64_t vulkan_attention_batch_rows = 0;
+    uint64_t vulkan_attention_batch_avoided_submissions = 0;
 };
 
 class BatchScheduler

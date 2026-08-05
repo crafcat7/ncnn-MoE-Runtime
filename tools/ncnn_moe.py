@@ -102,12 +102,8 @@ def _format_runtime_metrics(metrics: Any) -> str:
     if not isinstance(metrics, dict):
         return "metrics\n  unavailable"
     expert = metrics.get("expert", {})
-    if not isinstance(expert, dict) or "cache_hit" not in expert:
-        expert = {
-            "cache_hit": metrics.get("expert_cache_hits"),
-            "cache_miss": metrics.get("expert_cache_misses"),
-            "io_bytes": metrics.get("expert_cache_bytes_read"),
-        }
+    if not isinstance(expert, dict):
+        expert = {}
     cache_hit_rate = expert.get("cache_hit_rate") if isinstance(expert, dict) else None
     if not isinstance(cache_hit_rate, (int, float)) and isinstance(expert, dict):
         cache_hit = expert.get("cache_hit")
@@ -149,6 +145,18 @@ def _format_runtime_metrics(metrics: Any) -> str:
             f"{_format_metric_count(expert.get('cache_miss') if isinstance(expert, dict) else None)}"
             " · IO "
             f"{_format_bytes_gb(expert.get('io_bytes') if isinstance(expert, dict) else None)}",
+            "  GPU Expert: cache hit "
+            f"{_format_metric_count(expert.get('gpu_cache_hit') if isinstance(expert, dict) else None)}"
+            " / miss "
+            f"{_format_metric_count(expert.get('gpu_cache_miss') if isinstance(expert, dict) else None)}"
+            " / exec "
+            f"{_format_metric_count(expert.get('gpu_executions') if isinstance(expert, dict) else None)}"
+            " / CPU-preferred "
+            f"{_format_metric_count(expert.get('gpu_cpu_preferred') if isinstance(expert, dict) else None)}"
+            " / resident "
+            f"{_format_bytes_gb(expert.get('gpu_cache_resident_bytes') if isinstance(expert, dict) else None)}"
+            " / dropped "
+            f"{_format_metric_count(expert.get('gpu_cache_dropped_admissions') if isinstance(expert, dict) else None)}",
             "  CPU: expert compute "
             f"{_format_duration_microseconds(cpu.get('expert_compute_time_microseconds') if isinstance(cpu, dict) else None)}"
             f" · process {process_cpu_text}",
@@ -159,7 +167,55 @@ def _format_runtime_metrics(metrics: Any) -> str:
             " · kernel "
             f"{_format_duration_microseconds(gpu.get('kernel_time_microseconds') if isinstance(gpu, dict) and gpu_available and gpu.get('kernel_time_available', False) else None)}"
             " · utilization "
-            f"{_format_gpu_utilization(gpu_device)}",
+            f"{_format_gpu_utilization(gpu_device)}"
+            " / attention "
+            f"{_format_metric_count(gpu.get('attention_blocks') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / linear "
+            f"{_format_metric_count(gpu.get('linear_dispatches') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / upload/download "
+            f"{_format_metric_count(gpu.get('batch_uploads') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('batch_downloads') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / qkv-rope/device-rope/ring "
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_fusions') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_device_rope_fusions') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_qkv_ring_fusions') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / qkv-fail P/S/R/N/G/A "
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_pipeline_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_shape_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_source_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_norm_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_ring_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_allocation_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / fail pre/stage/norm/qkv/cache "
+            f"{_format_metric_count(gpu.get('attention_precondition_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_staging_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_norm_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_qkv_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_cache_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / fail sdpa/proj/out/submit "
+            f"{_format_metric_count(gpu.get('attention_sdpa_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_projection_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_output_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_submit_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / kv-materialize "
+            f"{_format_metric_count(gpu.get('attention_cache_materializations') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / attention-cpu-fallback "
+            f"{_format_metric_count(gpu.get('attention_cpu_fallbacks') if isinstance(gpu, dict) else None, available=gpu_available)}",
         )
     )
 
@@ -189,6 +245,7 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vulkan-device", type=int)
     parser.add_argument("--vulkan-devices", help="Comma-separated Vulkan device indices")
     parser.add_argument("--expected-concurrency", type=int)
+    parser.add_argument("--optimization-flags", type=lambda value: int(value, 0))
     parser.add_argument("--mmap-experts", action="store_true", default=None)
     parser.add_argument("--direct-expert-io", action="store_true", default=None)
     parser.add_argument("--buffered-expert-io", action="store_true", default=None)
@@ -237,7 +294,7 @@ def _add_generation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--speculative-max-draft", type=int, default=0)
     _add_metrics_options(parser)
     parser.add_argument("--context-tokens", type=int, default=0)
-    parser.add_argument("--prefill-chunk-size", type=int, default=256)
+    parser.add_argument("--prefill-chunk-size", type=int, default=512)
     stream_group = parser.add_mutually_exclusive_group()
     stream_group.add_argument("--stream", dest="stream", action="store_true", help="Stream generated text (default)")
     stream_group.add_argument("--no-stream", dest="stream", action="store_false", help="Print the completed response only")
@@ -293,7 +350,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     tune.add_argument("--no-thinking", action="store_true")
     tune.add_argument("--max-new-tokens", type=int, default=64)
     tune.add_argument("--context-tokens", type=int, default=0)
-    tune.add_argument("--prefill-chunk-size", type=int, default=256)
+    tune.add_argument("--prefill-chunk-size", type=int, default=512)
     tune.add_argument("--seed", type=int, default=0)
     _add_metrics_options(tune)
     _add_worker_options(tune)
@@ -391,6 +448,7 @@ def cli_runtime_settings(arguments: argparse.Namespace) -> dict[str, Any]:
         "vulkan_device",
         "vulkan_devices",
         "expected_concurrency",
+        "optimization_flags",
         "mmap_experts",
         "direct_expert_io",
         "buffered_expert_io",

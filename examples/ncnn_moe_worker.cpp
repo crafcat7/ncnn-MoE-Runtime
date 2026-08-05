@@ -228,6 +228,8 @@ static std::string devices_json(const std::vector<VulkanDeviceCapabilities>& dev
         item.add_uint("compute_queue_count", device.compute_queue_count);
         item.add_uint("transfer_queue_count", device.transfer_queue_count);
         item.add_uint("heap_budget_bytes", device.heap_budget_bytes);
+        item.add_uint("heap_usage_bytes", device.heap_usage_bytes);
+        item.add_uint("heap_available_bytes", device.heap_available_bytes);
         item.add_uint("flags", device.flags);
         result += item.finish();
     }
@@ -242,6 +244,16 @@ static std::string expert_metrics_json(const RuntimeMetricCounters& counters)
     result.add_uint("cache_miss", counters.expert_cache_misses);
     result.add_uint("io_bytes", counters.expert_io_bytes);
     result.add_uint("cache_resident_bytes", counters.expert_cache_resident_bytes);
+    result.add_uint("gpu_cache_hit", counters.expert_gpu_cache_hits);
+    result.add_uint("gpu_cache_miss", counters.expert_gpu_cache_misses);
+    result.add_uint("gpu_cache_admissions", counters.expert_gpu_cache_admissions);
+    result.add_uint("gpu_cache_stores", counters.expert_gpu_cache_stores);
+    result.add_uint("gpu_cache_dropped_admissions", counters.expert_gpu_cache_dropped_admissions);
+    result.add_uint("gpu_cache_resident_bytes", counters.expert_gpu_cache_resident_bytes);
+    result.add_uint("gpu_cache_pending_bytes", counters.expert_gpu_cache_pending_bytes);
+    result.add_uint("gpu_executions", counters.expert_gpu_executions);
+    result.add_uint("gpu_execution_failures", counters.expert_gpu_execution_failures);
+    result.add_uint("gpu_cpu_preferred", counters.expert_gpu_cpu_preferred);
     const uint64_t cache_requests = counters.expert_cache_hits + counters.expert_cache_misses;
     if (cache_requests == 0)
         result.add_null("cache_hit_rate");
@@ -276,6 +288,30 @@ static std::string gpu_metrics_json(const RuntimeMetricCounters& counters, bool 
     else
         result.add_null("kernel_time_microseconds");
     result.add_bool("kernel_time_available", counters.gpu_kernel_time_available);
+    result.add_uint("linear_dispatches", counters.vulkan_linear_dispatches);
+    result.add_uint("attention_blocks", counters.vulkan_attention_blocks);
+    result.add_uint("batch_uploads", counters.vulkan_batch_uploads);
+    result.add_uint("batch_downloads", counters.vulkan_batch_downloads);
+    result.add_uint("attention_qkv_rope_fusions", counters.vulkan_attention_qkv_rope_fusions);
+    result.add_uint("attention_device_rope_fusions", counters.vulkan_attention_device_rope_fusions);
+    result.add_uint("attention_qkv_ring_fusions", counters.vulkan_attention_qkv_ring_fusions);
+    result.add_uint("attention_qkv_rope_pipeline_failures", counters.vulkan_attention_qkv_rope_pipeline_failures);
+    result.add_uint("attention_qkv_rope_shape_failures", counters.vulkan_attention_qkv_rope_shape_failures);
+    result.add_uint("attention_qkv_rope_source_failures", counters.vulkan_attention_qkv_rope_source_failures);
+    result.add_uint("attention_qkv_rope_norm_failures", counters.vulkan_attention_qkv_rope_norm_failures);
+    result.add_uint("attention_qkv_rope_ring_failures", counters.vulkan_attention_qkv_rope_ring_failures);
+    result.add_uint("attention_qkv_rope_allocation_failures", counters.vulkan_attention_qkv_rope_allocation_failures);
+    result.add_uint("attention_precondition_failures", counters.vulkan_attention_precondition_failures);
+    result.add_uint("attention_staging_failures", counters.vulkan_attention_staging_failures);
+    result.add_uint("attention_norm_failures", counters.vulkan_attention_norm_failures);
+    result.add_uint("attention_qkv_failures", counters.vulkan_attention_qkv_failures);
+    result.add_uint("attention_cache_failures", counters.vulkan_attention_cache_failures);
+    result.add_uint("attention_sdpa_failures", counters.vulkan_attention_sdpa_failures);
+    result.add_uint("attention_projection_failures", counters.vulkan_attention_projection_failures);
+    result.add_uint("attention_output_failures", counters.vulkan_attention_output_failures);
+    result.add_uint("attention_submit_failures", counters.vulkan_attention_submit_failures);
+    result.add_uint("attention_cache_materializations", counters.vulkan_attention_cache_materializations);
+    result.add_uint("attention_cpu_fallbacks", counters.vulkan_attention_cpu_fallbacks);
     if (available)
         result.add_string("reason", counters.gpu_kernel_time_available ? "" : "gpu_expert_execution_not_observed");
     else
@@ -310,12 +346,6 @@ static std::string stats_json(const SessionMetrics& metrics)
     result.add_uint("kv_cache_logical_bytes", metrics.cumulative.kv_cache_logical_bytes);
     result.add_uint("kv_cache_allocated_bytes", metrics.cumulative.kv_cache_allocated_bytes);
 
-    // Compatibility aliases for clients written against the first worker
-    // schema. New clients should use generation/cumulative groups above.
-    result.add_uint("expert_cache_hits", metrics.cumulative.expert_cache_hits);
-    result.add_uint("expert_cache_misses", metrics.cumulative.expert_cache_misses);
-    result.add_uint("expert_cache_bytes_read", metrics.cumulative.expert_io_bytes);
-    result.add_uint("vulkan_compute_submissions", metrics.cumulative.gpu_submit_count);
     return result.finish();
 }
 
@@ -623,6 +653,8 @@ static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argum
             result.expert_io_workers = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expert-io-workers")));
         else if (argument == "--expert-memory")
             result.expert_memory_mode = parse_expert_memory_mode(require_value(argc, argv, index, "--expert-memory"));
+        else if (argument == "--optimization-flags")
+            result.optimization_flags = std::stoull(require_value(argc, argv, index, "--optimization-flags"), nullptr, 0);
         else if (argument == "--vulkan-device")
             result.vulkan_device_index = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--vulkan-device")));
         else if (argument == "--vulkan-devices")
@@ -637,6 +669,8 @@ static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argum
             result.flags |= ncnn::moe::RuntimeOptionBufferedExpertIo;
         else if (argument == "--disable-gpu-victim-execution")
             result.flags |= ncnn::moe::RuntimeOptionDisableGpuVictimExecution;
+        else if (argument == "--disable-gpu-expert-execution")
+            result.flags |= ncnn::moe::RuntimeOptionDisableGpuExpertExecution;
         else if (argument == "--router-prediction")
             result.flags |= ncnn::moe::RuntimeOptionRouterPrediction;
         else if (argument == "--async-router-prediction")
@@ -789,6 +823,7 @@ private:
         resources.add_uint("expert_io_workers", effective.expert_io_workers);
         resources.add_uint("expected_concurrency", effective.expected_concurrency);
         resources.add_uint("flags", effective.flags);
+        resources.add_uint("optimization_flags", effective.optimization_flags);
         resources.add_bool("file_backed_experts", effective.file_backed_experts);
         if (effective.vulkan_device_index == ncnn::moe::automatic_vulkan_device_index)
             resources.add_null("vulkan_device_index");
@@ -806,6 +841,9 @@ private:
         capabilities_json.add_uint("openmp_thread_count", capabilities.openmp_thread_count);
         capabilities_json.add_uint("flags", capabilities.flags);
         capabilities_json.add_string("cpu_isa", capabilities.cpu_isa);
+        capabilities_json.add_string(
+            "bfloat16_batched_linear_kernel",
+            capabilities.bfloat16_batched_linear_kernel);
         capabilities_json.add_uint("vulkan_device_count", capabilities.vulkan_device_count);
         capabilities_json.add_uint("selected_vulkan_device_index", capabilities.selected_vulkan_device_index);
         capabilities_json.add_raw("vulkan_devices", devices_json(capabilities.vulkan_devices));
@@ -1155,8 +1193,10 @@ static void print_usage(const char* executable)
               << "  runtime: --backend auto|cpu|vulkan|hybrid|hybrid-prefetch, --host-memory-mb N,\n"
               << "           --expert-cache-mb N, --expert-gpu-cache-mb N, --expert-io-workers N,\n"
               << "           --expert-memory auto|eager|on-demand, --vulkan-device N, --vulkan-devices N[,N...]\n"
+              << "           --optimization-flags MASK\n"
               << "  io/cache: --mmap-experts, --direct-expert-io, --buffered-expert-io,\n"
-              << "            --release-vulkan-dense-host, --expected-concurrency N\n";
+              << "            --release-vulkan-dense-host, --disable-gpu-expert-execution,\n"
+              << "            --expected-concurrency N\n";
 }
 
 } // namespace moe

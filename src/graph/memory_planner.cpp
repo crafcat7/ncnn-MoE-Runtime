@@ -589,11 +589,13 @@ static Result<uint64_t> expert_pair_bytes(const MoeIR& ir, DType dtype)
 }
 
 Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& config, uint64_t physical_memory_bytes,
-                                          bool release_vulkan_dense_host_storage)
+                                          bool release_vulkan_dense_host_storage,
+                                          uint64_t available_memory_bytes)
 {
     ModelMemoryPlan plan;
     plan.requested_mode = config.expert_memory_mode;
     plan.physical_memory_bytes = physical_memory_bytes;
+    plan.available_memory_bytes = available_memory_bytes;
     if (config.host_memory_budget_bytes != 0)
     {
         if (physical_memory_bytes != 0 && config.host_memory_budget_bytes > physical_memory_bytes)
@@ -605,6 +607,17 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
     else if (physical_memory_bytes != 0)
     {
         plan.host_memory_budget_bytes = physical_memory_bytes / 4 * 3;
+        if (available_memory_bytes != 0)
+        {
+            const uint64_t system_reserve = 2 * gibibyte;
+            const uint64_t available_budget =
+                available_memory_bytes > system_reserve
+                    ? available_memory_bytes - system_reserve
+                    : available_memory_bytes / 2;
+            plan.host_memory_budget_bytes = std::min(
+                plan.host_memory_budget_bytes,
+                available_budget);
+        }
     }
     else
     {

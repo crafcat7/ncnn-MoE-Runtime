@@ -43,11 +43,6 @@ struct ThreadReadEvent
     HANDLE handle = nullptr;
 };
 
-static HANDLE thread_read_event()
-{
-    static thread_local ThreadReadEvent event;
-    return event.handle;
-}
 #endif
 
 #define NCNN_MOE_CACHE_ENTRY_SPECULATIVE_BIT 0
@@ -249,6 +244,13 @@ struct Mxfp4ExpertCache::FileRangeReader
 #if defined(_WIN32)
     Result<MxFp4ByteBuffer> read_direct(const std::string& path, uint64_t offset, uint64_t byte_count)
     {
+        ThreadReadEvent read_event;
+        if (read_event.handle == nullptr)
+        {
+            return Error{
+                ErrorCode::IoError,
+                "cannot create direct Expert read event: " + path};
+        }
         static constexpr uint64_t direct_alignment = 64 * 1024;
         const uint64_t aligned_offset = offset - offset % direct_alignment;
         const uint64_t prefix = offset - aligned_offset;
@@ -294,7 +296,7 @@ struct Mxfp4ExpertCache::FileRangeReader
         OVERLAPPED operation{};
         operation.Offset = static_cast<DWORD>(aligned_offset);
         operation.OffsetHigh = static_cast<DWORD>(aligned_offset >> 32);
-        operation.hEvent = thread_read_event();
+        operation.hEvent = read_event.handle;
         if (operation.hEvent == nullptr || !ResetEvent(operation.hEvent))
         {
             return Error{
@@ -324,6 +326,15 @@ struct Mxfp4ExpertCache::FileRangeReader
 
     Result<void> read(const std::string& path, uint64_t offset, MxFp4ByteBuffer& destination)
     {
+#if defined(_WIN32)
+        ThreadReadEvent read_event;
+        if (read_event.handle == nullptr)
+        {
+            return Error{
+                ErrorCode::IoError,
+                "cannot create expert shard read event: " + path};
+        }
+#endif
         auto handle_result = handle_for(path);
         if (!handle_result)
             return handle_result.error();
@@ -339,13 +350,7 @@ struct Mxfp4ExpertCache::FileRangeReader
             OVERLAPPED operation{};
             operation.Offset = static_cast<DWORD>(current_offset);
             operation.OffsetHigh = static_cast<DWORD>(current_offset >> 32);
-            operation.hEvent = thread_read_event();
-            if (operation.hEvent == nullptr)
-            {
-                return Error{
-                    ErrorCode::IoError,
-                    "cannot create expert shard read event: " + path};
-            }
+            operation.hEvent = read_event.handle;
             if (!ResetEvent(operation.hEvent))
             {
                 return Error{
@@ -528,9 +533,11 @@ Mxfp4ExpertCache::Mxfp4ExpertCache(
         const uint32_t hardware = std::max(1u, std::thread::hardware_concurrency());
         io_worker_count = std::min(4u, hardware);
     }
-    workers_.reserve(io_worker_count);
-    for (uint32_t worker = 0; worker < io_worker_count; ++worker)
-        workers_.emplace_back(&Mxfp4ExpertCache::worker_loop, this);
+    io_worker_count_ = std::max(1u, io_worker_count);
+    adaptive_io_workers_ = io_worker_count_;
+    workers_.reserve(io_worker_count_);
+    for (uint32_t worker = 0; worker < io_worker_count_; ++worker)
+        workers_.emplace_back(&Mxfp4ExpertCache::worker_loop, this, worker);
 }
 
 Mxfp4ExpertCache::~Mxfp4ExpertCache()
@@ -1641,7 +1648,10 @@ Result<std::shared_ptr<Mxfp4ExpertCache::Entry>> Mxfp4ExpertCache::enqueue_pair(
             ++misses_;
             if (!has_flag(entry->flags, Entry::JobStarted))
                 high_priority_.push_back(entry);
-            work_available_.notify_one();
+            // Adaptive worker throttling is keyed by worker index.  Wake all
+            // workers so an inactive worker cannot consume the only signal
+            // while every eligible worker remains asleep.
+            work_available_.notify_all();
         }
         return entry;
     }
@@ -1692,7 +1702,9 @@ Result<std::shared_ptr<Mxfp4ExpertCache::Entry>> Mxfp4ExpertCache::enqueue_pair(
         ++misses_;
         high_priority_.push_back(entry);
     }
-    work_available_.notify_one();
+    // See the worker predicate in worker_loop(): after adaptive shrinkage a
+    // notify_one() may select an ineligible worker and strand this request.
+    work_available_.notify_all();
     return entry;
 }
 
@@ -1723,7 +1735,7 @@ Result<bool> Mxfp4ExpertCache::prefetch_pair(
     return already_ready;
 }
 
-void Mxfp4ExpertCache::worker_loop()
+void Mxfp4ExpertCache::worker_loop(uint32_t worker_index)
 {
     static constexpr size_t maximum_coalesced_experts = 8;
     struct PhysicalRange
@@ -1799,8 +1811,11 @@ void Mxfp4ExpertCache::worker_loop()
         entries.clear();
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            work_available_.wait(lock, [this] {
-                return stopping_ || !high_priority_.empty() || !low_priority_.empty();
+            work_available_.wait(lock, [this, worker_index] {
+                return stopping_
+                       || (worker_index < adaptive_io_workers_
+                           && (!high_priority_.empty()
+                               || !low_priority_.empty()));
             });
             if (stopping_ && high_priority_.empty() && low_priority_.empty())
                 return;
@@ -1861,6 +1876,7 @@ void Mxfp4ExpertCache::worker_loop()
             active_jobs_ += static_cast<uint32_t>(entries.size());
         }
 
+        const auto io_started = std::chrono::steady_clock::now();
         loaded_pairs.clear();
         loaded_pairs.resize(entries.size());
         errors.clear();
@@ -1939,6 +1955,37 @@ void Mxfp4ExpertCache::worker_loop()
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (!disk_entries.empty())
+            {
+                const auto elapsed =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - io_started);
+                const uint64_t elapsed_nanoseconds =
+                    std::max<int64_t>(1, elapsed.count());
+                ++io_read_samples_;
+                io_read_time_nanoseconds_ += elapsed_nanoseconds;
+                if (io_read_samples_ >= 8 && io_read_samples_ % 8 == 0)
+                {
+                    const uint64_t average =
+                        io_read_time_nanoseconds_ / io_read_samples_;
+                    const uint32_t previous_workers = adaptive_io_workers_;
+                    const size_t queued =
+                        high_priority_.size() + low_priority_.size();
+                    if (average > UINT64_C(25000000)
+                        && adaptive_io_workers_ > 1)
+                    {
+                        --adaptive_io_workers_;
+                    }
+                    else if (average < UINT64_C(8000000)
+                             && adaptive_io_workers_ < io_worker_count_
+                             && queued > adaptive_io_workers_)
+                    {
+                        ++adaptive_io_workers_;
+                    }
+                    if (adaptive_io_workers_ != previous_workers)
+                        work_available_.notify_all();
+                }
+            }
             if (coalesced)
             {
                 ++coalesced_read_batches_;
@@ -2265,6 +2312,11 @@ ExpertCacheStatistics Mxfp4ExpertCache::statistics() const
         result.arc_frequent_ghost_hits = arc_frequent_ghost_hits_;
         result.mapped_ranges = mapped_ranges_;
         result.mapped_bytes = mapped_bytes_;
+        result.io_worker_count = io_worker_count_;
+        result.adaptive_io_workers = adaptive_io_workers_;
+        result.io_read_samples = io_read_samples_;
+        result.io_read_time_microseconds =
+            (io_read_time_nanoseconds_ + 999) / 1000;
         victim_cache = victim_cache_;
     }
     reader_->populate_statistics(result);

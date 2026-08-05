@@ -8,6 +8,7 @@
 #include "models/builtin_model_adapter.h"
 #include "models/deepseek_v4_model_adapter.h"
 #include "models/qwen3_5_moe_model_adapter.h"
+#include "kernels/cpu_bfloat16.h"
 #include "kernels/cpu_mxfp4.h"
 #include "kernels/cpu_float8.h"
 #include "kernels/cpu_ops.h"
@@ -96,9 +97,55 @@ static Result<std::vector<uint64_t>> distribute_gpu_capacity(uint64_t total_capa
     return capacities;
 }
 
+static std::vector<uint64_t> automatic_gpu_expert_capacities(
+    uint64_t expert_pair_bytes,
+    const std::vector<uint32_t>& device_indices,
+    const std::vector<VulkanDeviceCapabilities>& devices)
+{
+    constexpr uint64_t kAutomaticExpertCachePercent = 85;
+    constexpr uint64_t kPercentageBase = 100;
+
+    std::vector<uint64_t> capacities(device_indices.size(), 0);
+    if (expert_pair_bytes == 0 || device_indices.empty())
+        return capacities;
+
+    // The memory-budget extension reports both the heap budget and current
+    // usage. After dense operators have been compiled, only the unoccupied
+    // portion is available to the executable Expert cache. Keep 15% of that
+    // available portion for dynamic activation, KV, and Vulkan workspace. The
+    // cache remains demand-paged, so this is a per-instance capacity limit,
+    // not an eager allocation of the entire heap.
+    for (size_t index = 0; index < device_indices.size(); ++index)
+    {
+        if (device_indices[index] >= devices.size())
+            return {};
+        const VulkanDeviceCapabilities& device = devices[device_indices[index]];
+        const uint64_t available = device.heap_available_bytes;
+        const uint64_t available_whole_percent = available / kPercentageBase;
+        const uint64_t available_remainder = available % kPercentageBase;
+        const uint64_t cache_budget = available_whole_percent * kAutomaticExpertCachePercent
+                                      + available_remainder * kAutomaticExpertCachePercent / kPercentageBase;
+        capacities[index] = cache_budget - cache_budget % expert_pair_bytes;
+    }
+    return capacities;
+}
+
+static uint64_t sum_capacities(const std::vector<uint64_t>& capacities) noexcept
+{
+    uint64_t total = 0;
+    for (uint64_t capacity : capacities)
+    {
+        if (capacity > std::numeric_limits<uint64_t>::max() - total)
+            return std::numeric_limits<uint64_t>::max();
+        total += capacity;
+    }
+    return total;
+}
+
 Runtime::Runtime()
 {
     capabilities_.physical_memory_bytes = physical_memory_bytes();
+    capabilities_.available_memory_bytes = available_memory_bytes();
     capabilities_.logical_cpu_count = std::max(1u, std::thread::hardware_concurrency());
     const CpuTopology cpu_topology = discover_cpu_topology();
     capabilities_.physical_cpu_core_count = cpu_topology.physical_core_count == 0 ? capabilities_.logical_cpu_count : cpu_topology.physical_core_count;
@@ -106,12 +153,19 @@ Runtime::Runtime()
     capabilities_.cpu_isa_flags = cpu_isa.flags;
     capabilities_.cpu_isa = cpu_isa.names;
     capabilities_.mxfp4_kernel = mxfp4_kernel_name();
-    capabilities_.float8_kernel = float8_kernel_name();
+    capabilities_.float8_kernel = float8_linear_kernel_name(RuntimeOptimizationDefaultFlags);
+    capabilities_.bfloat16_dot_kernel = bfloat16_dot_kernel_name();
+    capabilities_.bfloat16_batched_linear_kernel =
+        bfloat16_batched_linear_kernel_name(RuntimeOptimizationDefaultFlags);
+    capabilities_.cpu_small_bfloat16_linear_policy =
+        NcnnLinearOperator::cpu_small_bfloat16_linear_policy(
+            RuntimeOptimizationDefaultFlags);
     capabilities_.cpu_linear_thread_limit = cpu_linear_thread_limit();
     capabilities_.float8_linear_thread_limit = float8_linear_thread_limit();
-    capabilities_.float8_linear_row_group_size = float8_linear_row_group_size();
+    capabilities_.float8_linear_row_group_size = float8_linear_row_group_size(RuntimeOptimizationDefaultFlags);
     capabilities_.mxfp4_decode_row_pair_group_size = mxfp4_decode_row_pair_group_size();
-    capabilities_.activation_kernel = scaled_silu_kernel_name();
+    capabilities_.activation_kernel =
+        scaled_silu_kernel_name(RuntimeOptimizationDefaultFlags);
     const MxFp4KernelKind kernel = mxfp4_kernel_kind();
     if (kernel == MxFp4KernelKind::ArmNeon)
         capabilities_.flags |= RuntimeCapabilityMxfp4ArmNeon;
@@ -310,11 +364,13 @@ Result<ModelPtr> Runtime::load_model(
     const bool release_vulkan_dense_host_storage =
         use_vulkan_dense && has_flag(config.flags, RuntimeOptionReleaseVulkanDenseHostStorage);
     report_progress(4, "memory", "Planning host memory and Expert cache");
+    const uint64_t current_available_memory_bytes = available_memory_bytes();
     auto memory_plan = plan_model_memory(
         parsed_ir.value(),
         config,
         capabilities_.physical_memory_bytes,
-        release_vulkan_dense_host_storage);
+        release_vulkan_dense_host_storage,
+        current_available_memory_bytes);
     if (!memory_plan)
         return memory_plan.error();
     ModelMemoryPlan plan = std::move(memory_plan).value();
@@ -327,6 +383,14 @@ Result<ModelPtr> Runtime::load_model(
         return Error{ErrorCode::InvalidArgument, "the combined Expert GPU cache capacity overflows"};
     }
     const uint64_t requested_expert_gpu_bytes = config.expert_gpu_cache_bytes + config.expert_gpu_victim_cache_bytes;
+    if (has_flag(config.flags, RuntimeOptionDisableGpuExpertExecution) && requested_expert_gpu_bytes != 0)
+    {
+        return Error{ErrorCode::InvalidArgument, "GPU Expert execution cannot be disabled while an Expert GPU cache is configured"};
+    }
+    const bool automatic_gpu_expert_cache =
+        resolved_mode == HybridMode::HybridExperts
+        && !has_flag(config.flags, RuntimeOptionDisableGpuExpertExecution)
+        && requested_expert_gpu_bytes == 0;
     if (requested_expert_gpu_bytes != 0)
     {
         if (!file_backed_experts)
@@ -349,11 +413,15 @@ Result<ModelPtr> Runtime::load_model(
         return weights.error();
 
     ModelCompiler compiler;
+    const NcnnVulkanContextInstancePtr context_instance =
+        create_ncnn_vulkan_context_instance();
     ModelCompiler::BackendCapabilities compiler_capabilities;
     compiler_capabilities.flags = 0;
     compiler_capabilities.cpu_parallelism = capabilities_.openmp_thread_count;
     compiler_capabilities.vulkan_device_index = selected_vulkan_device_index;
     compiler_capabilities.expected_concurrency = config.expected_concurrency;
+    compiler_capabilities.optimization_flags = config.optimization_flags;
+    compiler_capabilities.vulkan_context_instance = context_instance;
     compiler_capabilities.vulkan_device_indices = selected_vulkan_device_indices;
     compiler_capabilities.vulkan_device_scores.reserve(selected_vulkan_device_indices.size());
     for (uint32_t device_index : selected_vulkan_device_indices)
@@ -372,7 +440,12 @@ Result<ModelPtr> Runtime::load_model(
     }
     if (use_vulkan_dense && has_flag(capabilities_.flags, RuntimeCapabilityVulkanAttention))
     {
-        compiler_capabilities.flags |= ModelCompiler::BackendCapabilityVulkanAttention;
+        if (has_flag(config.optimization_flags, RuntimeOptimizationVulkanAttention))
+            compiler_capabilities.flags |= ModelCompiler::BackendCapabilityVulkanAttention;
+    }
+    if (requested_expert_gpu_bytes != 0 || (automatic_gpu_expert_cache && file_backed_experts))
+    {
+        compiler_capabilities.flags |= ModelCompiler::BackendCapabilityVulkanExperts;
     }
     if (has_flag(capabilities_.flags, RuntimeCapabilityMxfp4CpuKernel))
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityMxfp4CpuKernel;
@@ -387,20 +460,56 @@ Result<ModelPtr> Runtime::load_model(
     CompiledModel compiled_model = std::move(compiled).value();
     compiled_model.memory_plan = plan;
     compiled_model.runtime_option_flags = config.flags;
+    compiled_model.optimization_flags = config.optimization_flags;
     compiled_model.expected_concurrency = config.expected_concurrency;
-    compiled_model.effective_runtime_options.hybrid_mode = compiled_model.hybrid_mode;
-    compiled_model.effective_runtime_options.requested_expert_memory_mode = plan.requested_mode;
-    compiled_model.effective_runtime_options.selected_expert_memory_mode = plan.selected_mode;
-    compiled_model.effective_runtime_options.host_memory_budget_bytes = plan.host_memory_budget_bytes;
-    compiled_model.effective_runtime_options.expert_cache_bytes = plan.expert_cache_bytes;
-    compiled_model.effective_runtime_options.expert_gpu_cache_bytes = config.expert_gpu_cache_bytes;
-    compiled_model.effective_runtime_options.expert_gpu_victim_cache_bytes = config.expert_gpu_victim_cache_bytes;
-    compiled_model.effective_runtime_options.expert_gpu_victim_reuse_probe_interval = config.expert_gpu_victim_reuse_probe_interval;
-    compiled_model.effective_runtime_options.vulkan_device_index = compiled_model.vulkan_device_index;
-    compiled_model.effective_runtime_options.vulkan_device_indices = compiled_model.vulkan_device_indices;
-    compiled_model.effective_runtime_options.flags = config.flags;
-    compiled_model.effective_runtime_options.expected_concurrency = config.expected_concurrency;
-    compiled_model.effective_runtime_options.file_backed_experts = file_backed_experts;
+    uint64_t expert_gpu_cache_bytes = config.expert_gpu_cache_bytes;
+    uint64_t expert_gpu_victim_cache_bytes = config.expert_gpu_victim_cache_bytes;
+    std::vector<VulkanDeviceCapabilities> cache_devices = capabilities_.vulkan_devices;
+#if defined(NCNN_MOE_WITH_VULKAN) && NCNN_MOE_WITH_VULKAN
+    if (automatic_gpu_expert_cache && file_backed_experts)
+    {
+        // Dense weights have already been allocated by the compiler.  Use a
+        // fresh budget snapshot so automatic Expert capacity reflects the
+        // memory that is actually available to this model instance.
+        const std::vector<VulkanDeviceCapabilities> live_devices = NcnnLinearOperator::vulkan_device_capabilities();
+        if (live_devices.size() == cache_devices.size())
+            cache_devices = live_devices;
+    }
+#endif
+    std::vector<uint64_t> automatic_executable_capacities;
+    if (automatic_gpu_expert_cache && file_backed_experts)
+    {
+        automatic_executable_capacities = automatic_gpu_expert_capacities(
+            plan.expert_pair_bytes,
+            compiled_model.vulkan_device_indices,
+            cache_devices);
+        const bool every_device_can_hold_one_pair =
+            !automatic_executable_capacities.empty()
+            && std::all_of(
+                automatic_executable_capacities.begin(),
+                automatic_executable_capacities.end(),
+                [pair_bytes = plan.expert_pair_bytes](uint64_t capacity) {
+                    return capacity >= pair_bytes;
+                });
+        if (every_device_can_hold_one_pair)
+            expert_gpu_cache_bytes = sum_capacities(automatic_executable_capacities);
+        else
+            automatic_executable_capacities.clear();
+    }
+    compiled_model.effective_runtime_config.hybrid_mode = compiled_model.hybrid_mode;
+    compiled_model.effective_runtime_config.requested_expert_memory_mode = plan.requested_mode;
+    compiled_model.effective_runtime_config.selected_expert_memory_mode = plan.selected_mode;
+    compiled_model.effective_runtime_config.host_memory_budget_bytes = plan.host_memory_budget_bytes;
+    compiled_model.effective_runtime_config.expert_cache_bytes = plan.expert_cache_bytes;
+    compiled_model.effective_runtime_config.expert_gpu_cache_bytes = expert_gpu_cache_bytes;
+    compiled_model.effective_runtime_config.expert_gpu_victim_cache_bytes = expert_gpu_victim_cache_bytes;
+    compiled_model.effective_runtime_config.expert_gpu_victim_reuse_probe_interval = config.expert_gpu_victim_reuse_probe_interval;
+    compiled_model.effective_runtime_config.vulkan_device_index = compiled_model.vulkan_device_index;
+    compiled_model.effective_runtime_config.vulkan_device_indices = compiled_model.vulkan_device_indices;
+    compiled_model.effective_runtime_config.flags = config.flags;
+    compiled_model.effective_runtime_config.optimization_flags = config.optimization_flags;
+    compiled_model.effective_runtime_config.expected_concurrency = config.expected_concurrency;
+    compiled_model.effective_runtime_config.file_backed_experts = file_backed_experts;
     report_progress(7, "cache", "Preparing Expert storage and caches");
     if (file_backed_experts)
     {
@@ -408,11 +517,11 @@ Result<ModelPtr> Runtime::load_model(
         if (expert_io_workers == 0)
         {
             uint32_t maximum_active_experts = 1;
-            for (const CompiledLayerPlan& layer : compiled_model.layers)
+            for (const CompiledLayerPlan& layer : compiled_model.graph.layer_plans)
             {
                 maximum_active_experts = std::max(maximum_active_experts, layer.moe.top_k);
             }
-            for (const CompiledLayerPlan& layer : compiled_model.speculative.layers)
+            for (const CompiledLayerPlan& layer : compiled_model.speculative.graph.layer_plans)
             {
                 maximum_active_experts = std::max(maximum_active_experts, layer.moe.top_k);
             }
@@ -422,7 +531,7 @@ Result<ModelPtr> Runtime::load_model(
             const uint32_t io_core_budget = std::max(1u, capabilities_.physical_cpu_core_count);
             expert_io_workers = std::min(exact_and_speculative_budget, io_core_budget);
         }
-        compiled_model.effective_runtime_options.expert_io_workers = expert_io_workers;
+        compiled_model.effective_runtime_config.expert_io_workers = expert_io_workers;
         uint32_t expert_cache_flags = 0;
         if (has_flag(config.flags, RuntimeOptionMemoryMapExperts))
         {
@@ -449,10 +558,24 @@ Result<ModelPtr> Runtime::load_model(
             expert_cache_flags |= ExpertCacheCrossExpertReadCoalescing;
         }
         const std::vector<uint32_t>& expert_vulkan_device_indices = compiled_model.vulkan_device_indices;
-        auto executable_capacities_result = distribute_gpu_capacity(config.expert_gpu_cache_bytes, plan.expert_pair_bytes, expert_vulkan_device_indices, capabilities_.vulkan_devices, "the executable Expert GPU cache");
+        auto executable_capacities_result = [&]() -> Result<std::vector<uint64_t>> {
+            if (!automatic_executable_capacities.empty())
+                return std::move(automatic_executable_capacities);
+            return distribute_gpu_capacity(
+                expert_gpu_cache_bytes,
+                plan.expert_pair_bytes,
+                expert_vulkan_device_indices,
+                cache_devices,
+                "the executable Expert GPU cache");
+        }();
         if (!executable_capacities_result)
             return executable_capacities_result.error();
-        auto victim_capacities_result = distribute_gpu_capacity(config.expert_gpu_victim_cache_bytes, plan.expert_pair_bytes, expert_vulkan_device_indices, capabilities_.vulkan_devices, "the Expert GPU victim cache");
+        auto victim_capacities_result = distribute_gpu_capacity(
+            expert_gpu_victim_cache_bytes,
+            plan.expert_pair_bytes,
+            expert_vulkan_device_indices,
+            cache_devices,
+            "the Expert GPU victim cache");
         if (!victim_capacities_result)
             return victim_capacities_result.error();
         std::vector<uint64_t> executable_capacities = std::move(executable_capacities_result).value();
@@ -465,22 +588,26 @@ Result<ModelPtr> Runtime::load_model(
             {
                 return Error{ErrorCode::InvalidArgument, "the combined per-device Expert GPU cache capacity overflows"};
             }
-            const uint64_t maximum_safe_capacity = capabilities_.vulkan_devices[expert_vulkan_device_indices[index]].heap_budget_bytes / 4;
+            const uint64_t maximum_safe_capacity = cache_devices[expert_vulkan_device_indices[index]].heap_budget_bytes;
             if (maximum_safe_capacity == 0 || executable_capacity + victim_capacity > maximum_safe_capacity)
             {
-                return Error{ErrorCode::InvalidArgument, "combined per-device Expert GPU caches exceed one quarter of the Vulkan heap budget"};
+                return Error{ErrorCode::InvalidArgument, "combined per-device Expert GPU caches exceed the Vulkan heap budget"};
             }
         }
         std::vector<std::shared_ptr<IExpertVictimCache>> expert_victim_cache_shards;
         std::shared_ptr<IExpertVictimCache> expert_victim_cache;
-        if (config.expert_gpu_victim_cache_bytes != 0)
+        if (expert_gpu_victim_cache_bytes != 0)
         {
             expert_victim_cache_shards.reserve(expert_vulkan_device_indices.size());
             for (size_t index = 0; index < expert_vulkan_device_indices.size(); ++index)
             {
                 const uint32_t device_index = expert_vulkan_device_indices[index];
                 const uint64_t capacity = victim_capacities[index];
-                auto shard = create_vulkan_victim_cache(capacity, device_index);
+                auto shard = create_vulkan_victim_cache(
+                    capacity,
+                    device_index,
+                    compiled_model.vulkan_context_instance,
+                    config.optimization_flags);
                 if (!shard)
                 {
                     return Error{ErrorCode::UnsupportedModel, "cannot create an Expert GPU victim-cache shard"};
@@ -498,7 +625,7 @@ Result<ModelPtr> Runtime::load_model(
             }
         }
         const bool use_victim_device_source = !has_flag(config.flags, RuntimeOptionDisableGpuVictimExecution) && !expert_victim_cache_shards.empty();
-        if (config.expert_gpu_cache_bytes != 0 || use_victim_device_source)
+        if (expert_gpu_cache_bytes != 0 || use_victim_device_source)
         {
             std::vector<std::shared_ptr<IExpertExecutionBackend>> device_backends;
             std::vector<uint32_t> expert_device_indices;
@@ -509,7 +636,9 @@ Result<ModelPtr> Runtime::load_model(
                 auto backend = create_vulkan_mxfp4_expert_backend(
                     capacity,
                     placement_device_index,
-                    !use_victim_device_source ? std::shared_ptr<IExpertVictimCache>() : expert_victim_cache_shards[index]);
+                    !use_victim_device_source ? std::shared_ptr<IExpertVictimCache>() : expert_victim_cache_shards[index],
+                    compiled_model.vulkan_context_instance,
+                    config.optimization_flags);
                 if (!backend)
                 {
                     return Error{ErrorCode::UnsupportedModel, "cannot create a Vulkan MXFP4 Expert execution cache/source backend"};
@@ -518,12 +647,12 @@ Result<ModelPtr> Runtime::load_model(
                 expert_device_indices.push_back(placement_device_index);
             }
             std::vector<uint32_t> residency_group_devices;
-            residency_group_devices.reserve(compiled_model.layers.size() + compiled_model.speculative.layers.size());
-            for (const CompiledLayerPlan& layer : compiled_model.layers)
+            residency_group_devices.reserve(compiled_model.graph.layer_plans.size() + compiled_model.speculative.graph.layer_plans.size());
+            for (const CompiledLayerPlan& layer : compiled_model.graph.layer_plans)
             {
                 residency_group_devices.push_back(layer.vulkan_device_index);
             }
-            for (const CompiledLayerPlan& layer : compiled_model.speculative.layers)
+            for (const CompiledLayerPlan& layer : compiled_model.speculative.graph.layer_plans)
             {
                 residency_group_devices.push_back(layer.vulkan_device_index);
             }
@@ -540,7 +669,7 @@ Result<ModelPtr> Runtime::load_model(
                 return Error{ErrorCode::UnsupportedModel, "cannot create the Vulkan MXFP4 Expert execution cache/source backend"};
             }
         }
-        const size_t residency_group_count = compiled_model.layers.size() + compiled_model.speculative.layers.size();
+        const size_t residency_group_count = compiled_model.graph.layer_plans.size() + compiled_model.speculative.graph.layer_plans.size();
         if (residency_group_count > std::numeric_limits<uint32_t>::max())
         {
             return Error{ErrorCode::InvalidModel, "the total Expert residency-group count overflows"};

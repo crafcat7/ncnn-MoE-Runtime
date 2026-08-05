@@ -223,7 +223,7 @@ def parse_arguments():
         action="store_true",
         help=(
             "Disable in-place execution from the Vulkan victim tier for an "
-            "A/B control or compatibility fallback."
+            "A/B control run."
         ),
     )
     parser.add_argument("--disable-router-prediction", action="store_true")
@@ -1178,6 +1178,15 @@ def parse_runner_output(output):
         "mxfp4_kernel": extract_text(
             output, r"^MXFP4 CPU kernel: (.+)$"
         ),
+        "bfloat16_dot_kernel": extract_text(
+            output, r"^BF16 CPU dot kernel: (.+)$"
+        ),
+        "bfloat16_batched_linear_kernel": extract_text(
+            output, r"^BF16 batched CPU Linear kernel: (.+)$"
+        ),
+        "cpu_small_bfloat16_linear_policy": extract_text(
+            output, r"^BF16 small CPU Linear policy: (.+)$"
+        ),
         "mxfp4_decode_row_pair_group_size": extract_number(
             output, r"^MXFP4 decode row-pair group: (\d+)", int
         ),
@@ -1190,18 +1199,36 @@ def parse_runner_output(output):
         "vulkan_heap_budget_mib": extract_number(
             output, r"^Vulkan heap budget: (\d+) MiB", int
         ),
+        "available_memory_mib": extract_number(
+            output, r"^Host memory budget:.*?, (\d+) MiB available"
+        ),
         "vulkan_linear_dispatches": extract_number(
             output, r"^Vulkan linear dispatches: (\d+)", int
+        ),
+        "cpu_bfloat16_batched_linear_dispatches": extract_number(
+            output, r"^CPU BF16 batched Linear dispatches: (\d+)", int
         ),
         "vulkan_compute_submissions": extract_number(
             output, r"^Vulkan compute submissions: (\d+)", int
         ),
         "vulkan_batch_uploads": extract_number(
-            output, r"^Vulkan batch transfers: (\d+) upload", int
+            output,
+            r"^Vulkan batch (?:transfers|boundary requests): (\d+) (?:upload|host->device)",
+            int,
         ),
         "vulkan_batch_downloads": extract_number(
             output,
-            r"^Vulkan batch transfers: \d+ upload\(s\), (\d+) download",
+            r"^Vulkan batch (?:transfers|boundary requests): \d+ (?:upload\(s\)|host->device), (\d+) (?:download|device->host)",
+            int,
+        ),
+        "vulkan_direct_host_input_bindings": extract_number(
+            output,
+            r"^Vulkan direct host bind(?:ings|ing attempts): (\d+) input",
+            int,
+        ),
+        "vulkan_direct_host_output_bindings": extract_number(
+            output,
+            r"^Vulkan direct host bind(?:ings|ing attempts): \d+ input\(s\), (\d+) output",
             int,
         ),
         "vulkan_submit_wait_ms": extract_number(
@@ -1229,6 +1256,19 @@ def parse_runner_output(output):
         "vulkan_attention_blocks": extract_number(
             output, r"^Vulkan attention blocks: (\d+)", int
         ),
+        "vulkan_attention_batch_submissions": extract_number(
+            output, r"^Vulkan attention batching: (\d+) submission", int
+        ),
+        "vulkan_attention_batch_rows": extract_number(
+            output,
+            r"^Vulkan attention batching: \d+ submission\(s\), (\d+) row",
+            int,
+        ),
+        "vulkan_attention_batch_avoided_submissions": extract_number(
+            output,
+            r"^Vulkan attention batching: \d+ submission\(s\), \d+ row\(s\), (\d+) submission",
+            int,
+        ),
         "vulkan_kernel_features": extract_text(
             output, r"^Vulkan kernel features: (.+)$"
         ),
@@ -1237,19 +1277,73 @@ def parse_runner_output(output):
             r"^Vulkan command buffer reuses: (\d+)",
             int,
         ),
+        "vulkan_command_dispatches": extract_number(
+            output, r"^Vulkan command recording: (\d+) dispatch", int
+        ),
+        "vulkan_command_pipeline_binds": extract_number(
+            output,
+            r"^Vulkan command recording: \d+ dispatch\(es\), (\d+) pipeline bind",
+            int,
+        ),
+        "vulkan_command_descriptor_bindings": extract_number(
+            output,
+            r"^Vulkan command recording: \d+ dispatch\(es\), \d+ pipeline bind\(s\), (\d+) descriptor binding",
+            int,
+        ),
+        "vulkan_command_push_constant_updates": extract_number(
+            output,
+            r"^Vulkan command recording: \d+ dispatch\(es\), \d+ pipeline bind\(s\), \d+ descriptor binding\(s\), (\d+) push constant update",
+            int,
+        ),
+        "vulkan_command_resource_barrier_calls": extract_number(
+            output,
+            r"^Vulkan command recording: .*?, (\d+) resource barrier call",
+            int,
+        ),
+        "vulkan_command_buffer_resource_barriers": extract_number(
+            output,
+            r"^Vulkan command recording: .*?, (\d+) buffer barrier",
+            int,
+        ),
+        "vulkan_command_image_resource_barriers": extract_number(
+            output,
+            r"^Vulkan command recording: .*?, (\d+) image barrier",
+            int,
+        ),
+        "vulkan_command_redundant_pipeline_binds": extract_number(
+            output,
+            r"^Vulkan command recording: .*?, (\d+) redundant pipeline bind candidate",
+            int,
+        ),
         "vulkan_attention_qkv_rope_fusions": extract_number(
             output,
             r"^Vulkan attention fusion: (\d+) QKV\+RoPE block",
             int,
         ),
+        "vulkan_attention_device_rope_fusions": extract_number(
+            output,
+            r"^Vulkan attention fusion: \d+ QKV\+RoPE block\(s\), (\d+) device-RoPE block",
+            int,
+        ),
         "vulkan_attention_qkv_ring_fusions": extract_number(
             output,
-            r"^Vulkan attention fusion: \d+ QKV\+RoPE block\(s\), (\d+) QKV->ring block",
+            r"^Vulkan attention fusion: \d+ QKV\+RoPE block\(s\), \d+ device-RoPE block\(s\), (\d+) QKV->ring block",
             int,
         ),
         "vulkan_attention_decode_sdpa_fusions": extract_number(
             output,
-            r"^Vulkan attention fusion: \d+ QKV\+RoPE block\(s\), \d+ QKV->ring block\(s\), (\d+) Decode-SDPA block",
+            r"^Vulkan attention fusion: \d+ QKV\+RoPE block\(s\), \d+ device-RoPE block\(s\), \d+ QKV->ring block\(s\), (\d+) Decode-SDPA block",
+            int,
+        ),
+        "vulkan_gated_delta_fusions": extract_number(
+            output, r"^Vulkan Gated DeltaNet fusions: (\d+)", int
+        ),
+        "vulkan_shared_expert_swiglu_fusions": extract_number(
+            output, r"^Vulkan shared Expert SwiGLU fusions: (\d+)", int
+        ),
+        "vulkan_bfloat16_cooperative_matrix_dispatches": extract_number(
+            output,
+            r"^Vulkan BF16 cooperative matrix dispatches: (\d+)",
             int,
         ),
         "vulkan_kv_ring_appends": extract_number(
@@ -1261,6 +1355,14 @@ def parse_runner_output(output):
         "vulkan_kv_ring_wrapped_views": extract_number(
             output,
             r"^Vulkan KV ring: \d+ append\(s\), \d+ resize\(s\), (\d+) wrapped",
+            int,
+        ),
+        "vulkan_kv_cache_promotions": extract_number(
+            output, r"^Vulkan KV cache promotion: (\d+) promotion", int
+        ),
+        "vulkan_kv_cache_promotion_bytes": extract_number(
+            output,
+            r"^Vulkan KV cache promotion: \d+ promotion\(s\), (\d+) bytes",
             int,
         ),
         "scheduler_staged_batches": extract_number(
@@ -1549,6 +1651,18 @@ def parse_runner_output(output):
         "expert_cache_coalesced_read_ranges_saved": extract_number(
             output, r"^Expert I/O policy:.*?(\d+) physical range\(s\) saved", int
         ),
+        "expert_cache_io_worker_count": extract_number(
+            output, r"^Expert I/O policy:.*?io workers: (\d+) target", int
+        ),
+        "expert_cache_adaptive_io_workers": extract_number(
+            output, r"^Expert I/O policy:.*?io workers: \d+ target (\d+)", int
+        ),
+        "expert_cache_io_read_samples": extract_number(
+            output, r"^Expert I/O policy:.*?target \d+, (\d+) sample", int
+        ),
+        "expert_cache_io_read_time_ms": extract_number(
+            output, r"^Expert I/O policy:.*?sample\(s\), ([0-9.]+) ms observed", float
+        ),
         "expert_gpu_cache_hits": extract_number(
             output, r"^Expert GPU execution cache: (\d+) hit", int
         ),
@@ -1658,6 +1772,19 @@ def parse_runner_output(output):
         ),
         "expert_gpu_execution_ms": extract_number(
             output, r"^Expert GPU execution:.*?([0-9.]+) ms executing"
+        ),
+        "expert_gpu_route_aggregation_batches": extract_number(
+            output, r"^Expert GPU route aggregation: (\d+) batch", int
+        ),
+        "expert_gpu_route_aggregation_routes": extract_number(
+            output,
+            r"^Expert GPU route aggregation: \d+ batch\(es\), (\d+) route",
+            int,
+        ),
+        "expert_gpu_route_aggregation_bytes_saved": extract_number(
+            output,
+            r"^Expert GPU route aggregation:.*?(\d+) CPU aggregation byte",
+            int,
         ),
         "expert_gpu_device_source_hits": extract_number(
             output, r"^Expert GPU device source: (\d+) hit", int
@@ -2260,6 +2387,13 @@ def main():
                 "runtime_openmp_thread_count"
             ],
             "mxfp4_kernel": samples[0]["mxfp4_kernel"],
+            "bfloat16_dot_kernel": samples[0]["bfloat16_dot_kernel"],
+            "bfloat16_batched_linear_kernel": samples[0][
+                "bfloat16_batched_linear_kernel"
+            ],
+            "cpu_small_bfloat16_linear_policy": samples[0][
+                "cpu_small_bfloat16_linear_policy"
+            ],
             "cpu_isa": samples[0]["cpu_isa"],
             "mxfp4_decode_row_pair_group_size": samples[0][
                 "mxfp4_decode_row_pair_group_size"
@@ -2271,6 +2405,7 @@ def main():
                 "vulkan_runtime_device_count"
             ],
             "vulkan_heap_budget_mib": samples[0]["vulkan_heap_budget_mib"],
+            "available_memory_mib": samples[0]["available_memory_mib"],
             "gpu_index": arguments.gpu_index,
             "vulkan_device_index": arguments.vulkan_device_index,
             "vulkan_device_indices": arguments.vulkan_device_indices,
@@ -2382,6 +2517,9 @@ def main():
             "vulkan_linear_dispatches": median_field(
                 samples, "vulkan_linear_dispatches"
             ),
+            "cpu_bfloat16_batched_linear_dispatches": median_field(
+                samples, "cpu_bfloat16_batched_linear_dispatches"
+            ),
             "vulkan_compute_submissions": median_field(
                 samples, "vulkan_compute_submissions"
             ),
@@ -2390,6 +2528,12 @@ def main():
             ),
             "vulkan_batch_downloads": median_field(
                 samples, "vulkan_batch_downloads"
+            ),
+            "vulkan_direct_host_input_bindings": median_field(
+                samples, "vulkan_direct_host_input_bindings"
+            ),
+            "vulkan_direct_host_output_bindings": median_field(
+                samples, "vulkan_direct_host_output_bindings"
             ),
             "vulkan_submit_wait_ms": median_field(
                 samples, "vulkan_submit_wait_ms"
@@ -2403,8 +2547,35 @@ def main():
             "vulkan_command_buffer_reuses": median_field(
                 samples, "vulkan_command_buffer_reuses"
             ),
+            "vulkan_command_dispatches": median_field(
+                samples, "vulkan_command_dispatches"
+            ),
+            "vulkan_command_pipeline_binds": median_field(
+                samples, "vulkan_command_pipeline_binds"
+            ),
+            "vulkan_command_descriptor_bindings": median_field(
+                samples, "vulkan_command_descriptor_bindings"
+            ),
+            "vulkan_command_push_constant_updates": median_field(
+                samples, "vulkan_command_push_constant_updates"
+            ),
+            "vulkan_command_resource_barrier_calls": median_field(
+                samples, "vulkan_command_resource_barrier_calls"
+            ),
+            "vulkan_command_buffer_resource_barriers": median_field(
+                samples, "vulkan_command_buffer_resource_barriers"
+            ),
+            "vulkan_command_image_resource_barriers": median_field(
+                samples, "vulkan_command_image_resource_barriers"
+            ),
+            "vulkan_command_redundant_pipeline_binds": median_field(
+                samples, "vulkan_command_redundant_pipeline_binds"
+            ),
             "vulkan_attention_qkv_rope_fusions": median_field(
                 samples, "vulkan_attention_qkv_rope_fusions"
+            ),
+            "vulkan_attention_device_rope_fusions": median_field(
+                samples, "vulkan_attention_device_rope_fusions"
             ),
             "vulkan_attention_qkv_ring_fusions": median_field(
                 samples, "vulkan_attention_qkv_ring_fusions"
@@ -2415,6 +2586,24 @@ def main():
             "vulkan_attention_blocks": median_field(
                 samples, "vulkan_attention_blocks"
             ),
+            "vulkan_attention_batch_submissions": median_field(
+                samples, "vulkan_attention_batch_submissions"
+            ),
+            "vulkan_attention_batch_rows": median_field(
+                samples, "vulkan_attention_batch_rows"
+            ),
+            "vulkan_attention_batch_avoided_submissions": median_field(
+                samples, "vulkan_attention_batch_avoided_submissions"
+            ),
+            "vulkan_gated_delta_fusions": median_field(
+                samples, "vulkan_gated_delta_fusions"
+            ),
+            "vulkan_shared_expert_swiglu_fusions": median_field(
+                samples, "vulkan_shared_expert_swiglu_fusions"
+            ),
+            "vulkan_bfloat16_cooperative_matrix_dispatches": median_field(
+                samples, "vulkan_bfloat16_cooperative_matrix_dispatches"
+            ),
             "vulkan_kv_ring_appends": median_field(
                 samples, "vulkan_kv_ring_appends"
             ),
@@ -2423,6 +2612,12 @@ def main():
             ),
             "vulkan_kv_ring_wrapped_views": median_field(
                 samples, "vulkan_kv_ring_wrapped_views"
+            ),
+            "vulkan_kv_cache_promotions": median_field(
+                samples, "vulkan_kv_cache_promotions"
+            ),
+            "vulkan_kv_cache_promotion_bytes": median_field(
+                samples, "vulkan_kv_cache_promotion_bytes"
             ),
             "scheduler_staged_batches": median_field(
                 samples, "scheduler_staged_batches"
@@ -2632,6 +2827,18 @@ def main():
             "expert_cache_coalesced_read_ranges_saved": median_field(
                 samples, "expert_cache_coalesced_read_ranges_saved"
             ),
+            "expert_cache_io_worker_count": median_field(
+                samples, "expert_cache_io_worker_count"
+            ),
+            "expert_cache_adaptive_io_workers": median_field(
+                samples, "expert_cache_adaptive_io_workers"
+            ),
+            "expert_cache_io_read_samples": median_field(
+                samples, "expert_cache_io_read_samples"
+            ),
+            "expert_cache_io_read_time_ms": median_field(
+                samples, "expert_cache_io_read_time_ms"
+            ),
             "expert_gpu_cache_hits": median_field(
                 samples, "expert_gpu_cache_hits"
             ),
@@ -2722,6 +2929,15 @@ def main():
             "expert_gpu_execution_ms": median_field(
                 samples, "expert_gpu_execution_ms"
             ),
+            "expert_gpu_route_aggregation_batches": median_field(
+                samples, "expert_gpu_route_aggregation_batches"
+            ),
+            "expert_gpu_route_aggregation_routes": median_field(
+                samples, "expert_gpu_route_aggregation_routes"
+            ),
+            "expert_gpu_route_aggregation_bytes_saved": median_field(
+                samples, "expert_gpu_route_aggregation_bytes_saved"
+            ),
             "expert_gpu_device_source_hits": median_field(
                 samples, "expert_gpu_device_source_hits"
             ),
@@ -2784,6 +3000,14 @@ def main():
             f"{median['expert_gpu_cache_hits']:.0f} hit(s), "
             f"{median['expert_gpu_executions']:.0f} execution(s), "
             f"{median['expert_gpu_cpu_preferred']:.0f} CPU-preferred"
+        )
+    if median["expert_gpu_route_aggregation_batches"] is not None:
+        print(
+            "median GPU Expert route aggregation: "
+            f"{median['expert_gpu_route_aggregation_batches']:.0f} batch(es), "
+            f"{median['expert_gpu_route_aggregation_routes']:.0f} route(s), "
+            f"{median['expert_gpu_route_aggregation_bytes_saved']:.0f} "
+            "CPU aggregation byte(s) saved"
         )
     if median["expert_gpu_victim_cache_hits"] is not None:
         print(

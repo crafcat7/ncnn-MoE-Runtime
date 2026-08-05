@@ -91,6 +91,8 @@ static Result<DType> parse_dtype(const std::string& value)
 {
     if (value == "float32")
         return DType::Float32;
+    if (value == "bfloat16")
+        return DType::BFloat16;
     if (value == "int8")
         return DType::Int8;
     return Error{ErrorCode::InvalidModel, "unsupported expert_weight_dtype: " + value};
@@ -150,6 +152,17 @@ public:
             tensor.float32_data.resize(count);
             std::memcpy(tensor.float32_data.data(), bytes_.data() + offset_, count * sizeof(float));
             offset_ += count * sizeof(float);
+        }
+        else if (dtype == DType::BFloat16)
+        {
+            if (count > remaining() / sizeof(uint16_t))
+                return Error{ErrorCode::InvalidModel, "weight file ends before bfloat16 tensor: " + name};
+            tensor.bfloat16_data.resize(count);
+            std::memcpy(
+                tensor.bfloat16_data.data(),
+                bytes_.data() + offset_,
+                count * sizeof(uint16_t));
+            offset_ += count * sizeof(uint16_t);
         }
         else if (dtype == DType::Int8)
         {
@@ -302,7 +315,6 @@ Result<MoeIR> FixtureModelAdapter::parse_model(const ModelPackage& package) cons
         LayerDescriptor& layer = descriptor.layers[layer_id];
         layer.ffn.moe = moe;
         layer.flags = layer_flags;
-        layer.nodes.push_back({ModelNodeType::RmsNorm});
         if (has_flag(layer_flags, LayerDescriptorAttention))
         {
             layer.pre_attention_norm = NormType::RmsNorm;
@@ -320,21 +332,7 @@ Result<MoeIR> FixtureModelAdapter::parse_model(const ModelPackage& package) cons
                 layer.attention.flags |= AttentionDescriptorBias;
             if (optional_bool(json, "attention_sinks", true))
                 layer.attention.flags |= AttentionDescriptorSinks;
-            layer.nodes = {
-                {ModelNodeType::RmsNorm},
-                {ModelNodeType::FusedQkv},
-                {ModelNodeType::Rope},
-            };
-            if (has_flag(layer.attention.flags, AttentionDescriptorSinks))
-                layer.nodes.push_back({ModelNodeType::AttentionSink});
-            layer.nodes.push_back({ModelNodeType::Sdpa});
-            layer.nodes.push_back({ModelNodeType::Projection});
-            layer.nodes.push_back({ModelNodeType::RmsNorm});
         }
-        layer.nodes.push_back({ModelNodeType::Router});
-        layer.nodes.push_back({ModelNodeType::TopK});
-        layer.nodes.push_back({ModelNodeType::ExpertGroup});
-        layer.nodes.push_back({ModelNodeType::Combine});
     }
 
     return descriptor;

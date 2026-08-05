@@ -83,16 +83,14 @@ enum MoeIRNodeFlag : uint32_t
 
 struct MoeIRNode
 {
+    // Nodes describe topology only. Layer semantics live in MoeIR::layers;
+    // keeping them out of the graph prevents two mutable copies of a layer.
     MoeIRNodeId id = invalid_moe_ir_node_id;
     MoeIROperator operation = MoeIROperator::TokenEmbedding;
     std::string name;
     uint32_t layer_id = invalid_moe_ir_layer_id;
     std::vector<MoeIRValueId> inputs;
     std::vector<MoeIRValueId> outputs;
-    uint32_t intermediate_size = 0;
-    AttentionDescriptor attention;
-    MoeDescriptor experts;
-    QuantConfig quantization;
     uint32_t flags = 0;
 };
 

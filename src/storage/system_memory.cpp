@@ -33,5 +33,24 @@ uint64_t physical_memory_bytes() noexcept
 #endif
 }
 
+uint64_t available_memory_bytes() noexcept
+{
+#if defined(_WIN32)
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) ? static_cast<uint64_t>(status.ullAvailPhys) : 0;
+#elif defined(__APPLE__)
+    // macOS does not expose a stable cross-version equivalent of
+    // ullAvailPhys through sysctl.  The planner falls back to total memory.
+    return 0;
+#else
+    const long pages = sysconf(_SC_AVPHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page_size <= 0)
+        return 0;
+    return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+#endif
+}
+
 } // namespace moe
 } // namespace ncnn

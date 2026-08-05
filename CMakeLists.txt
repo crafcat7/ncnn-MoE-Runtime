@@ -71,6 +71,7 @@ set(NCNN_MOE_SOURCES
     src/storage/expert_victim_cache.cpp
     src/storage/mapped_file.cpp
     src/storage/system_memory.cpp
+    src/storage/weight_store.cpp
 )
 add_library(ncnn_moe STATIC ${NCNN_MOE_SOURCES})
 source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_SOURCES})
@@ -252,6 +253,12 @@ if(NCNN_MOE_BUILD_TESTS)
     target_include_directories(ncnn_moe_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(ncnn_moe_tests PRIVATE NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>)
     add_test(NAME ncnn_moe_tests COMMAND ncnn_moe_tests)
+    if(NCNN_MOE_WITH_VULKAN)
+        add_test(
+            NAME ncnn_moe_pipeline_bind_elision_disabled
+            COMMAND ncnn_moe_tests --disable-vulkan-pipeline-bind-elision
+        )
+    endif()
     add_test(
         NAME ncnn_moe_style
         COMMAND ${CMAKE_COMMAND}
