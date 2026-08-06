@@ -45,7 +45,7 @@ void main()
 {
     const uint lane = gl_LocalInvocationID.x;
     const uint head = gl_WorkGroupID.z;
-    if (head >= p.head_count || lane >= 128)
+    if (head >= p.head_count)
         return;
 
     const uint heads_per_group = p.head_count / p.key_value_head_count;
@@ -73,7 +73,7 @@ void main()
         }
         reduction[lane] = partial;
         barrier();
-        for (uint stride = 64; stride > 0; stride >>= 1)
+        for (uint stride = gl_WorkGroupSize.x >> 1; stride > 0; stride >>= 1)
         {
             if (lane < stride)
                 reduction[lane] += reduction[lane + stride];
