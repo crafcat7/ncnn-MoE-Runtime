@@ -1,4 +1,5 @@
 #include "compiler/moe_ir.hpp"
+#include "ncnn/moe/runtime_config.h"
 
 #include <algorithm>
 #include <string>
@@ -339,18 +340,36 @@ static bool has_vulkan_dense_operator(const CompiledOperator& operator_entry) no
     return operator_entry.linear || operator_entry.bfloat16 || operator_entry.float8;
 }
 
-static bool standard_attention_supports_vulkan(
+static bool attention_supports_vulkan(
     const CompiledModel& compiled,
     const CompiledLayerPlan& layer) noexcept
 {
     if (compiled.hybrid_mode == HybridMode::CpuOnly
-        || layer.layer_id >= compiled.descriptor.layers.size()
-        || compiled.descriptor.layers[layer.layer_id].attention.kind != AttentionKind::Standard)
+        || layer.layer_id >= compiled.descriptor.layers.size())
     {
         return false;
     }
 
     const AttentionBlockPlan& attention = layer.attention;
+    const AttentionKind kind =
+        compiled.descriptor.layers[layer.layer_id].attention.kind;
+    if (kind == AttentionKind::GatedDeltaNet)
+    {
+        if (attention.gated_delta_vulkan_operator == invalid_compiled_operator_handle)
+            return false;
+        const CompiledOperator& gated_delta_operator =
+            compiled.operators.at(attention.gated_delta_vulkan_operator);
+        return runtime_optimization_enabled(
+                   compiled.optimization_flags,
+                   RuntimeOptimizationVulkanGatedDeltaNet)
+               && gated_delta_operator.gated_delta;
+    }
+    if (kind != AttentionKind::Standard
+        && kind != AttentionKind::MultiHeadLatent)
+    {
+        return false;
+    }
+
     if (attention.vulkan_attention_operator != invalid_compiled_operator_handle
         && compiled.operators.at(attention.vulkan_attention_operator).attention)
     {
@@ -660,18 +679,40 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
         const std::string prefix = "layers." + std::to_string(layer.layer_id) + ".";
         if (has_flag(layer.flags, CompiledLayerAttention))
         {
-            const bool supports_vulkan_attention = standard_attention_supports_vulkan(compiled, layer);
+            const bool latent_attention =
+                compiled.descriptor.layers[layer.layer_id].attention.kind == AttentionKind::MultiHeadLatent;
+            const bool gated_delta_attention =
+                compiled.descriptor.layers[layer.layer_id].attention.kind == AttentionKind::GatedDeltaNet;
+            const bool supports_vulkan_attention = attention_supports_vulkan(compiled, layer);
             const ExecutionBackend backend = supports_vulkan_attention ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
-            const TensorLocation cache_location = backend == ExecutionBackend::Vulkan ? TensorLocation::Vulkan : TensorLocation::Cpu;
-            const ExecutionTensorId cache = append_execution_tensor(graph, prefix + "kv_cache", compiled.descriptor.kv_cache_dtype,
-                                                                    {
-                                                                        0,
-                                                                        layer.attention.kv_head_count,
-                                                                        layer.attention.head_dimension,
-                                                                    },
+            const TensorLocation cache_location =
+                latent_attention
+                    ? TensorLocation::Cpu
+                    : backend == ExecutionBackend::Vulkan
+                          ? TensorLocation::Vulkan
+                          : TensorLocation::Cpu;
+            std::vector<uint32_t> cache_shape{
+                0,
+                layer.attention.kv_head_count,
+                layer.attention.head_dimension,
+            };
+            if (gated_delta_attention)
+            {
+                cache_shape = {
+                    0,
+                    layer.attention.head_count,
+                    layer.attention.head_dimension,
+                    layer.attention.value_head_dimension,
+                };
+            }
+            const ExecutionTensorId cache = append_execution_tensor(
+                graph,
+                prefix + "kv_cache",
+                gated_delta_attention ? DType::Float32 : compiled.descriptor.kv_cache_dtype,
+                std::move(cache_shape),
                                                                     cache_location, ExecutionTensorPersistent | ExecutionTensorDynamic);
             uint32_t attention_tensor_flags = ExecutionTensorDynamic;
-            if (backend == ExecutionBackend::Vulkan)
+            if (backend == ExecutionBackend::Vulkan && !latent_attention)
             {
                 attention_tensor_flags |= ExecutionTensorTransferBoundary;
             }

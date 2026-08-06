@@ -91,6 +91,64 @@ static __forceinline void avx512_accumulate_contiguous_rows4_tokens2_block(const
     }
 }
 
+static __forceinline int32_t avx512_reduce_8_epi32(__m256i values) noexcept
+{
+    __m128i sum = _mm_add_epi32(
+        _mm256_castsi256_si128(values),
+        _mm256_extracti128_si256(values, 1));
+    sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(2, 3, 0, 1)));
+    sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(1, 0, 3, 2)));
+    return _mm_cvtsi128_si32(sum);
+}
+
+// The persistent sidecar stores eight rows per MXFP4 block as
+// [8 scales][8 bytes for row 0..7 of chunk 0][8 bytes for row 0..7 of chunk 1].
+// Decode the two rows in each 128-bit lane together, then use madd_epi16 to
+// produce two independent eight-term integer dot products.
+static __forceinline void avx512_mxfp4_q8_packed_chunk_dot(
+    const uint8_t* packed,
+    const int8_t* input,
+    int32_t (&dots)[8]) noexcept
+{
+    const __m512i bytes = _mm512_loadu_si512(reinterpret_cast<const void*>(packed));
+    const __m512i nibble_mask = _mm512_set1_epi8(0x0f);
+    const __m512i low = _mm512_and_si512(bytes, nibble_mask);
+    const __m512i high = _mm512_and_si512(_mm512_srli_epi16(bytes, 4), nibble_mask);
+    const __m128i value_table_128 = _mm_setr_epi8(
+        0, 1, 2, 3, 4, 6, 8, 12,
+        0, -1, -2, -3, -4, -6, -8, -12);
+    const __m512i value_table = _mm512_broadcast_i32x4(value_table_128);
+    const __m512i even_rows = _mm512_shuffle_epi8(
+        value_table,
+        _mm512_unpacklo_epi8(low, high));
+    const __m512i odd_rows = _mm512_shuffle_epi8(
+        value_table,
+        _mm512_unpackhi_epi8(low, high));
+    const __m128i input_values_128 = _mm_loadu_si128(
+        reinterpret_cast<const __m128i*>(input));
+    const __m512i input_values = _mm512_cvtepi8_epi16(
+        _mm256_set_m128i(input_values_128, input_values_128));
+
+#define NCNN_MOE_AVX512_PACKED_ROW_LANE(lane) \
+    { \
+        const __m128i even_values = _mm512_extracti32x4_epi32(even_rows, lane); \
+        const __m128i odd_values = _mm512_extracti32x4_epi32(odd_rows, lane); \
+        const __m256i values = _mm256_set_m128i(odd_values, even_values); \
+        const __m512i products = _mm512_madd_epi16( \
+            _mm512_cvtepi8_epi16(values), \
+            input_values); \
+        dots[(lane) * 2] = avx512_reduce_8_epi32( \
+            _mm512_castsi512_si256(products)); \
+        dots[(lane) * 2 + 1] = avx512_reduce_8_epi32( \
+            _mm512_extracti64x4_epi64(products, 1)); \
+    }
+    NCNN_MOE_AVX512_PACKED_ROW_LANE(0);
+    NCNN_MOE_AVX512_PACKED_ROW_LANE(1);
+    NCNN_MOE_AVX512_PACKED_ROW_LANE(2);
+    NCNN_MOE_AVX512_PACKED_ROW_LANE(3);
+#undef NCNN_MOE_AVX512_PACKED_ROW_LANE
+}
+
 float msvc_avx512_bfloat16_dot(const uint16_t* weights, const float* input, uint32_t count) noexcept
 {
     __m512 accumulator0 = _mm512_setzero_ps();
@@ -419,6 +477,73 @@ float msvc_avx512_mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32
         total = _mm512_fmadd_ps(accumulator, _mm512_set1_ps(0.5f * scales_by_exponent[scales[block_index]]), total);
     }
     return _mm512_reduce_add_ps(total);
+}
+
+void msvc_avx512_mxfp4_q8_packed_gemm(
+    const uint8_t* packed,
+    uint32_t row_count,
+    uint32_t block_count,
+    uint32_t tile_rows,
+    const int8_t* input,
+    size_t input_stride,
+    const float* input_scales,
+    size_t scale_stride,
+    size_t token_count,
+    float* output,
+    size_t output_stride) noexcept
+{
+    if (!packed || !input || !input_scales || !output || row_count == 0
+        || block_count == 0 || tile_rows != 8 || token_count == 0)
+        return;
+
+    constexpr size_t block_bytes = 8 * 17;
+    const size_t group_stride = static_cast<size_t>(block_count) * block_bytes;
+    const size_t group_count = (static_cast<size_t>(row_count) + 7) / 8;
+    const std::array<float, 256>& scales_by_exponent = avx512_scale_table();
+    for (size_t token = 0; token < token_count; ++token)
+    {
+        std::fill(
+            output + token * output_stride,
+            output + token * output_stride + row_count,
+            0.0f);
+    }
+
+    for (size_t group = 0; group < group_count; ++group)
+    {
+        for (uint32_t block = 0; block < block_count; ++block)
+        {
+            const uint8_t* packed_block = packed
+                + group * group_stride
+                + static_cast<size_t>(block) * block_bytes;
+            const uint8_t* packed_values = packed_block + 8;
+            for (size_t token = 0; token < token_count; ++token)
+            {
+                const int8_t* input_block = input
+                    + token * input_stride
+                    + static_cast<size_t>(block) * 32;
+                const float input_scale = input_scales[
+                    token * scale_stride + block];
+                for (uint32_t chunk = 0; chunk < 2; ++chunk)
+                {
+                    int32_t dots[8] = {};
+                    avx512_mxfp4_q8_packed_chunk_dot(
+                        packed_values + static_cast<size_t>(chunk) * 64,
+                        input_block + chunk * 16,
+                        dots);
+                    for (uint32_t row = 0; row < 8; ++row)
+                    {
+                        const size_t matrix_row = group * 8 + row;
+                        if (matrix_row >= row_count)
+                            continue;
+                        output[token * output_stride + matrix_row] +=
+                            static_cast<float>(dots[row])
+                            * (0.5f * scales_by_exponent[packed_block[row]])
+                            * input_scale;
+                    }
+                }
+            }
+        }
+    }
 }
 
 void msvc_avx512_mxfp4_gemm_row(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input, size_t input_stride, size_t token_count,

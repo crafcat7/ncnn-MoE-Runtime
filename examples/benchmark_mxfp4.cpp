@@ -321,6 +321,122 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
     return maximum_normalized_error <= 1e-4f ? 0 : 1;
 }
 
+static int benchmark_cpu_mxfp4_q8_expert(
+    uint32_t input_columns,
+    uint32_t intermediate_columns,
+    uint32_t token_count,
+    uint32_t repeats)
+{
+    if (!mxfp4_q8_packed_kernel_available())
+    {
+        std::cout << "CPU MXFP4-Q8 packed kernel unavailable; exact kernel retained\n";
+        return 0;
+    }
+    constexpr uint64_t base_optimization_flags = RuntimeOptimizationDefaultFlags;
+    constexpr uint64_t reference_optimization_flags =
+        base_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8;
+    constexpr uint64_t q8_optimization_flags =
+        base_optimization_flags | RuntimeOptimizationCpuMxfp4Q8;
+    TensorData gate_up = make_matrix(intermediate_columns * 2, input_columns);
+    TensorData down = make_matrix(input_columns, intermediate_columns);
+    const CpuBatch input = make_input(token_count, input_columns);
+    const std::array<Mxfp4Task, 1> task_template = {{
+        Mxfp4Task{
+            &gate_up,
+            nullptr,
+            &down,
+            nullptr,
+            &input,
+            nullptr,
+            ExpertActivation::GptOssSwiGlu,
+            7.0f}}};
+
+    CpuBatch reference;
+    CpuBatch candidate;
+    Mxfp4Scratch reference_scratch;
+    Mxfp4Scratch candidate_scratch;
+    auto run = [&](uint64_t flags,
+                   CpuBatch& output,
+                   Mxfp4Scratch& scratch) {
+        Mxfp4Task task = task_template[0];
+        task.output = &output;
+        const std::array<Mxfp4Task, 1> tasks = {task};
+        if (!mxfp4_expert_batch(tasks, &scratch, flags))
+            throw std::runtime_error("CPU MXFP4 expert failed");
+    };
+    for (uint32_t warmup = 0; warmup < 3; ++warmup)
+    {
+        run(reference_optimization_flags, reference, reference_scratch);
+        run(q8_optimization_flags, candidate, candidate_scratch);
+    }
+
+    std::vector<double> reference_times;
+    std::vector<double> candidate_times;
+    reference_times.reserve(repeats);
+    candidate_times.reserve(repeats);
+    for (uint32_t repeat = 0; repeat < repeats; ++repeat)
+    {
+        auto run_reference = [&]() {
+            const auto started = std::chrono::steady_clock::now();
+            run(reference_optimization_flags, reference, reference_scratch);
+            reference_times.push_back(elapsed_milliseconds(started));
+        };
+        auto run_candidate = [&]() {
+            const auto started = std::chrono::steady_clock::now();
+            run(q8_optimization_flags, candidate, candidate_scratch);
+            candidate_times.push_back(elapsed_milliseconds(started));
+        };
+        if ((repeat & 1) == 0)
+        {
+            run_reference();
+            run_candidate();
+        }
+        else
+        {
+            run_candidate();
+            run_reference();
+        }
+    }
+
+    float maximum_error = 0.0f;
+    float maximum_normalized_error = 0.0f;
+    for (size_t row = 0; row < reference.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < reference.columns(); ++column)
+        {
+            const float error =
+                std::abs(candidate.row(row)[column] - reference.row(row)[column]);
+            maximum_error = std::max(maximum_error, error);
+            maximum_normalized_error = std::max(
+                maximum_normalized_error,
+                error / std::max(1.0f, std::abs(reference.row(row)[column])));
+        }
+    }
+    const double reference_ms = median_milliseconds(reference_times);
+    const double candidate_ms = median_milliseconds(candidate_times);
+    const uint64_t weight_bytes =
+        gate_up.mxfp4_blocks.size() + gate_up.mxfp4_scales.size()
+        + down.mxfp4_blocks.size() + down.mxfp4_scales.size();
+    auto bandwidth = [weight_bytes, token_count](double milliseconds) {
+        return static_cast<double>(weight_bytes) * token_count
+               / (1024.0 * 1024.0 * 1024.0)
+               / (milliseconds / 1000.0);
+    };
+    std::cout << "CPU MXFP4-Q8 expert shape: " << token_count << " x "
+              << input_columns << " -> " << intermediate_columns << " -> "
+              << input_columns << '\n';
+    std::cout << "MXFP4 CPU kernel: " << mxfp4_kernel_name()
+              << ", Q8 activation: int8 per-32-element block\n";
+    std::cout << "exact median: " << reference_ms << " ms, "
+              << bandwidth(reference_ms) << " effective GiB/s\n";
+    std::cout << "Q8 median: " << candidate_ms << " ms, "
+              << bandwidth(candidate_ms) << " effective GiB/s\n";
+    std::cout << "Q8 speedup: " << reference_ms / candidate_ms << "x\n";
+    std::cout << "maximum absolute/normalized error: " << maximum_error
+              << " / " << maximum_normalized_error << '\n';
+    return 0;
+}
+
 static int benchmark_bfloat16_projection(
     uint32_t input_columns,
     uint32_t output_columns,
@@ -748,10 +864,18 @@ int main(int argc, char** argv)
                 token_count,
                 repeats);
         }
+        if (mode == "cpu-mxfp4-q8-expert")
+        {
+            return ncnn::moe::benchmark_cpu_mxfp4_q8_expert(
+                input_columns,
+                output_columns,
+                token_count,
+                repeats);
+        }
         if (mode != "projection")
         {
             throw std::invalid_argument(
-                "mode must be projection, bfloat16, cpu-bfloat16, cpu-float8-expert, or expert");
+                "mode must be projection, bfloat16, cpu-bfloat16, cpu-float8-expert, cpu-mxfp4-q8-expert, or expert");
         }
 
         ncnn::moe::TensorData matrix = ncnn::moe::make_matrix(output_columns, input_columns);

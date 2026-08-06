@@ -390,6 +390,12 @@ static RuntimeMetricCounters runtime_metric_counters(
     result.vulkan_attention_cpu_fallbacks = counter_delta(
         statistics.vulkan_attention_cpu_fallbacks,
         start.vulkan_attention_cpu_fallbacks);
+    result.vulkan_gated_delta_fusions = counter_delta(
+        statistics.vulkan_gated_delta_fusions,
+        start.vulkan_gated_delta_fusions);
+    result.vulkan_gated_delta_submissions = counter_delta(
+        statistics.vulkan_gated_delta_submissions,
+        start.vulkan_gated_delta_submissions);
     result.expert_gpu_cache_hits = counter_delta(
         statistics.expert_gpu_cache_hits,
         start.expert_gpu_cache_hits);
@@ -416,6 +422,15 @@ static RuntimeMetricCounters runtime_metric_counters(
     result.expert_gpu_cpu_preferred = counter_delta(
         statistics.expert_gpu_cpu_preferred,
         start.expert_gpu_cpu_preferred);
+    result.expert_gpu_route_aggregation_batches = counter_delta(
+        statistics.expert_gpu_route_aggregation_batches,
+        start.expert_gpu_route_aggregation_batches);
+    result.expert_gpu_route_aggregation_routes = counter_delta(
+        statistics.expert_gpu_route_aggregation_routes,
+        start.expert_gpu_route_aggregation_routes);
+    result.expert_gpu_route_aggregation_bytes_saved = counter_delta(
+        statistics.expert_gpu_route_aggregation_bytes_saved,
+        start.expert_gpu_route_aggregation_bytes_saved);
     result.expert_cache_resident_bytes = statistics.expert_cache_resident_bytes;
     result.kv_cache_logical_bytes = statistics.kv_cache_logical_bytes;
     result.kv_cache_allocated_bytes = statistics.kv_cache_allocated_bytes;

@@ -30,6 +30,96 @@ static float scalar_float_dot(const float* left, const float* right, uint32_t co
     return result;
 }
 
+static void scalar_float_gemm_4x4(
+    const float* weights,
+    size_t weight_stride,
+    const float* input,
+    size_t input_stride,
+    uint32_t input_columns,
+    uint32_t output_count,
+    uint32_t token_count,
+    float* output,
+    size_t output_stride) noexcept
+{
+    float accumulators[4][4] = {};
+    for (uint32_t column = 0; column < input_columns; ++column)
+    {
+        for (uint32_t token = 0; token < token_count; ++token)
+        {
+            const float value = input[static_cast<size_t>(token) * input_stride + column];
+            for (uint32_t output_index = 0; output_index < output_count; ++output_index)
+            {
+                accumulators[token][output_index] +=
+                    value * weights[static_cast<size_t>(output_index) * weight_stride + column];
+            }
+        }
+    }
+    for (uint32_t token = 0; token < token_count; ++token)
+        for (uint32_t output_index = 0; output_index < output_count; ++output_index)
+            output[static_cast<size_t>(token) * output_stride + output_index] = accumulators[token][output_index];
+}
+
+static void scalar_float_gemm_4x8(
+    const float* weights,
+    size_t weight_stride,
+    const float* input,
+    size_t input_stride,
+    uint32_t input_columns,
+    uint32_t output_count,
+    uint32_t token_count,
+    float* output,
+    size_t output_stride) noexcept
+{
+    float accumulators[4][8] = {};
+    for (uint32_t column = 0; column < input_columns; ++column)
+    {
+        float input_values[4] = {};
+        for (uint32_t token = 0; token < token_count; ++token)
+            input_values[token] = input[static_cast<size_t>(token) * input_stride + column];
+        for (uint32_t output_index = 0; output_index < output_count; ++output_index)
+        {
+            const float weight = weights[static_cast<size_t>(output_index) * weight_stride + column];
+            for (uint32_t token = 0; token < token_count; ++token)
+                accumulators[token][output_index] += input_values[token] * weight;
+        }
+    }
+    for (uint32_t token = 0; token < token_count; ++token)
+        for (uint32_t output_index = 0; output_index < output_count; ++output_index)
+            output[static_cast<size_t>(token) * output_stride + output_index] = accumulators[token][output_index];
+}
+
+static void scalar_bfloat16_gemm_4x8(
+    const uint16_t* weights,
+    size_t weight_stride,
+    const float* input,
+    size_t input_stride,
+    uint32_t input_columns,
+    uint32_t output_count,
+    uint32_t token_count,
+    float* output,
+    size_t output_stride) noexcept
+{
+    float accumulators[4][8] = {};
+    for (uint32_t column = 0; column < input_columns; ++column)
+    {
+        float input_values[4] = {};
+        for (uint32_t token = 0; token < token_count; ++token)
+            input_values[token] = input[static_cast<size_t>(token) * input_stride + column];
+        for (uint32_t output_index = 0; output_index < output_count; ++output_index)
+        {
+            const uint32_t bits = static_cast<uint32_t>(
+                weights[static_cast<size_t>(output_index) * weight_stride + column])
+                                  << 16;
+            const float weight = std::bit_cast<float>(bits);
+            for (uint32_t token = 0; token < token_count; ++token)
+                accumulators[token][output_index] += input_values[token] * weight;
+        }
+    }
+    for (uint32_t token = 0; token < token_count; ++token)
+        for (uint32_t output_index = 0; output_index < output_count; ++output_index)
+            output[static_cast<size_t>(token) * output_stride + output_index] = accumulators[token][output_index];
+}
+
 static float scalar_int8_float_dot(
     const int8_t* left,
     const float* right,
@@ -207,6 +297,126 @@ float float_dot(const float* left, const float* right, uint32_t count) noexcept
 {
     static const FloatDotFunction function = select_float_dot();
     return function(left, right, count);
+}
+
+void float_gemm_4x4(
+    const float* weights,
+    size_t weight_stride,
+    const float* input,
+    size_t input_stride,
+    uint32_t input_columns,
+    uint32_t output_count,
+    uint32_t token_count,
+    float* output,
+    size_t output_stride) noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    if ((isa & CpuIsaX86Avx512) != 0)
+    {
+        msvc_avx512_float_gemm_4x4(
+            weights,
+            weight_stride,
+            input,
+            input_stride,
+            input_columns,
+            output_count,
+            token_count,
+            output,
+            output_stride);
+        return;
+    }
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+    {
+        msvc_avx2_float_gemm_4x4(
+            weights,
+            weight_stride,
+            input,
+            input_stride,
+            input_columns,
+            output_count,
+            token_count,
+            output,
+            output_stride);
+        return;
+    }
+#endif
+    scalar_float_gemm_4x4(
+        weights,
+        weight_stride,
+        input,
+        input_stride,
+        input_columns,
+        output_count,
+        token_count,
+        output,
+        output_stride);
+}
+
+void float_gemm_4x8(
+    const float* weights,
+    size_t weight_stride,
+    const float* input,
+    size_t input_stride,
+    uint32_t input_columns,
+    uint32_t output_count,
+    uint32_t token_count,
+    float* output,
+    size_t output_stride) noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    if ((isa & CpuIsaX86Avx512) != 0)
+    {
+        msvc_avx512_float_gemm_4x8(
+            weights, weight_stride, input, input_stride, input_columns,
+            output_count, token_count, output, output_stride);
+        return;
+    }
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+    {
+        msvc_avx2_float_gemm_4x8(
+            weights, weight_stride, input, input_stride, input_columns,
+            output_count, token_count, output, output_stride);
+        return;
+    }
+#endif
+    scalar_float_gemm_4x8(
+        weights, weight_stride, input, input_stride, input_columns,
+        output_count, token_count, output, output_stride);
+}
+
+void bfloat16_gemm_4x8(
+    const uint16_t* weights,
+    size_t weight_stride,
+    const float* input,
+    size_t input_stride,
+    uint32_t input_columns,
+    uint32_t output_count,
+    uint32_t token_count,
+    float* output,
+    size_t output_stride) noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    if ((isa & CpuIsaX86Avx512) != 0)
+    {
+        msvc_avx512_bfloat16_gemm_4x8(
+            weights, weight_stride, input, input_stride, input_columns,
+            output_count, token_count, output, output_stride);
+        return;
+    }
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+    {
+        msvc_avx2_bfloat16_gemm_4x8(
+            weights, weight_stride, input, input_stride, input_columns,
+            output_count, token_count, output, output_stride);
+        return;
+    }
+#endif
+    scalar_bfloat16_gemm_4x8(
+        weights, weight_stride, input, input_stride, input_columns,
+        output_count, token_count, output, output_stride);
 }
 
 void float_exp_inplace(float* values, uint32_t count) noexcept

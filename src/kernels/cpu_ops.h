@@ -2,6 +2,7 @@
 #define NCNN_MOE_CPU_OPS_H
 
 #include "cpu_batch.h"
+#include "cpu_mxfp4.h"
 
 #include "ncnn/moe/types.h"
 #include "ncnn/moe/compiled_operator.h"
@@ -30,6 +31,11 @@ struct Mxfp4Scratch
 {
     std::vector<CpuBatch> activated;
     std::vector<CpuBatch> linear;
+    // Temporary full gate/up output used when the immutable MXFP4 weights
+    // have a persistent 4/8-row Q8 packed sidecar.  The sidecar itself lives
+    // on TensorData; these buffers are reused by the caller's scratch.
+    std::vector<CpuBatch> packed_gate_up;
+    std::vector<Mxfp4Q8Batch> q8_activated;
     std::vector<CpuBatch> unique_input;
     std::vector<CpuBatch> unique_output;
     std::vector<std::vector<uint32_t>> unique_row_maps;

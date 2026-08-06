@@ -20,7 +20,7 @@ one-layer MTP payload as an experimental speculative-decoding option.
 | Full Attention | GQA, partial RoPE, shifted Q/K RMSNorm, output gate, and persistent KV state |
 | Experts | 256 BF16 routed Experts by default, or an optional compiled MXFP4 routed-Expert Artifact; normalized Softmax Top-8, one gated BF16 shared Expert per layer, and SiLU activation |
 | Norms | Qwen shifted RMSNorm weights for the text backbone |
-| Mixed execution | Vulkan Dense projections with CPU recurrent state, Attention/cache logic, routing, and BF16 Experts |
+| Mixed execution | Vulkan Dense projections with CPU recurrent state by default; optional device-resident Vulkan Gated DeltaNet for calibrated GPUs, with routing and BF16 Experts on CPU |
 | Speculation | One experimental Qwen MTP layer with sequential target verification and transactional Gated DeltaNet/KV state; opt-in and available only with Artifact v3 |
 | Generation | Greedy, temperature, Top-K, Top-P, Min-P, stop tokens, token-ID streaming, and optional MTP |
 | Text input | Official tokenizer and `chat_template.jinja` through the Python wrapper |
@@ -143,6 +143,7 @@ CTest fixture; normal text and chat usage should use `ncnn_moe.py`.
 | `--hybrid-prefetch` | Same placement with explicit CPU prefetch coordination |
 | `--vulkan-device N` | Select one Vulkan device |
 | `--host-memory-mb N` | Override the automatic host-memory planning budget |
+| `--enable-vulkan-gated-delta` | Experimental device-resident Gated DeltaNet state and fused recurrent update; validate token parity on the target GPU |
 
 The official package contains about 60 GiB of routed BF16 Expert tensors.
 Without the optional Artifact, these tensors are mapped directly from
@@ -156,6 +157,16 @@ Vulkan MXFP4 Expert backend, so the Artifact does not silently enable a
 different GPU arithmetic path. Artifact v3 also contains the MTP routed bank;
 each speculative target verification uses transactional standard KV and
 Gated DeltaNet state so rejected trailing rows are rolled back exactly.
+
+The optional `--enable-vulkan-gated-delta` path uses fused BF16 input
+projection, device-resident FP32 convolution/recurrent state, one
+workgroup-owned sequential state transition, and Vulkan output projection. It
+reduces attention wall time substantially on
+the RTX 5070 Ti, but GPU transcendental functions and reduction order can
+eventually drift from the CPU reference during long greedy generations. It is
+therefore excluded from `RuntimeOptimizationDefaultFlags` until a target GPU
+parity policy is selected. Use it for calibrated performance experiments, not
+as the default quality/parity profile.
 
 ## Reference performance
 
@@ -196,10 +207,11 @@ zero Runtime logical Expert-read bytes.
 The current high-throughput path uses packed official-BF16 Vulkan Linear
 operators and fuses projections that consume the same activation. The next
 single-Session ceiling work is to keep the shared-Expert activation and Down
-projection resident on Vulkan, keep recurrent Gated DeltaNet state closer to
-the device execution chain, reduce full-Attention and residual/RMSNorm command
-boundaries, and add prefill-specific recurrent and matrix kernels. Direct
-storage I/O is not the bottleneck for this eager profile.
+projection resident on Vulkan, reduce full-Attention and residual/RMSNorm
+command boundaries, and add prefill-specific recurrent and matrix kernels.
+Direct storage I/O is not the bottleneck for this eager profile. The
+device-resident DeltaNet path above is available separately for calibrated
+performance runs.
 
 ### BF16 source admission matrix
 

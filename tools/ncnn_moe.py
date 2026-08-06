@@ -172,6 +172,8 @@ def _format_runtime_metrics(metrics: Any) -> str:
             f"{_format_metric_count(gpu.get('attention_blocks') if isinstance(gpu, dict) else None, available=gpu_available)}"
             " / linear "
             f"{_format_metric_count(gpu.get('linear_dispatches') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / gated-delta "
+            f"{_format_metric_count(gpu.get('gated_delta_fusions') if isinstance(gpu, dict) else None, available=gpu_available)}"
             " / upload/download "
             f"{_format_metric_count(gpu.get('batch_uploads') if isinstance(gpu, dict) else None, available=gpu_available)}"
             "/"
@@ -246,6 +248,7 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vulkan-devices", help="Comma-separated Vulkan device indices")
     parser.add_argument("--expected-concurrency", type=int)
     parser.add_argument("--optimization-flags", type=lambda value: int(value, 0))
+    parser.add_argument("--enable-vulkan-gated-delta", action="store_true", default=None)
     parser.add_argument("--mmap-experts", action="store_true", default=None)
     parser.add_argument("--direct-expert-io", action="store_true", default=None)
     parser.add_argument("--buffered-expert-io", action="store_true", default=None)
@@ -449,6 +452,7 @@ def cli_runtime_settings(arguments: argparse.Namespace) -> dict[str, Any]:
         "vulkan_devices",
         "expected_concurrency",
         "optimization_flags",
+        "enable_vulkan_gated_delta",
         "mmap_experts",
         "direct_expert_io",
         "buffered_expert_io",

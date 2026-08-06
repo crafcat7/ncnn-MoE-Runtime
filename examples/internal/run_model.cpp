@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -124,6 +125,11 @@ static std::string vulkan_kernel_features(const VulkanDeviceCapabilities& device
     return result.empty() ? "baseline-fp32" : result;
 }
 
+// The native runner does not own a tokenizer.  This label records the exact
+// benchmark prompt while token IDs remain externally supplied.
+static constexpr const char* kP0BenchmarkPrompt =
+    "\xE4\xBD\xA0\xE5\xA5\xBD\xEF\xBC\x8C\xE4\xBD\xA0\xE8\x83\xBD\xE5\x81\x9A\xE4\xBB\x80\xE4\xB9\x88\xEF\xBC\x81\xE4\xBD\xA0\xE7\x9A\x84\xE7\x9F\xA5\xE8\xAF\x86\xE5\xBA\x93\xE6\x98\xAF\xE4\xBB\x80\xE4\xB9\x88\xE6\x97\xB6\xE5\x80\x99\xE7\x9A\x84\xE7\x89\x88\xE6\x9C\xAC";
+
 } // namespace moe
 } // namespace ncnn
 
@@ -133,6 +139,8 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
     {
         std::cerr << "usage: " << runner_options.executable_name << " <model-directory> [token-id ...]"
                      " [--prompt-token-file PATH]"
+                     " [--prompt-text TEXT|--benchmark-prompt]"
+                     " [--baseline-token-per-second N]"
                      " [--max-new-tokens N] [--stop-token ID ...] [--temperature T] [--speculative|--no-speculative]"
                      " [--speculative-confidence P] [--speculative-max-draft N]"
                      " [--top-k K] [--top-p P] [--min-p P] [--seed N]"
@@ -142,6 +150,8 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                      " [--expert-gpu-victim-cache-mb N]"
                      " [--expert-gpu-victim-reuse-probe N]"
                      " [--optimization-flags MASK]"
+                     " [--enable-vulkan-gated-delta]"
+                     " [--disable-vulkan-indexed-experts]"
                      " [--disable-gpu-expert-execution]"
                      " [--disable-gpu-victim-execution]"
                      " [--disable-router-prediction]"
@@ -186,6 +196,9 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         if (runner_options.secondary_default_stop_token >= 0)
             generation_options.stop_tokens.push_back(runner_options.secondary_default_stop_token);
         std::vector<int32_t> prompt;
+        std::string prompt_text;
+        double baseline_token_per_second = 0.0;
+        bool has_baseline_token_per_second = false;
         bool stream_token_ids = false;
         bool report_throughput = false;
         bool cross_call_scheduling = false;
@@ -204,6 +217,25 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             if (argument == "--prompt-token-file")
             {
                 prompt_token_file = ncnn::moe::require_value(argc, argv, index, "--prompt-token-file");
+            }
+            else if (argument == "--prompt-text")
+            {
+                prompt_text = ncnn::moe::require_value(argc, argv, index, "--prompt-text");
+                if (prompt_text.empty())
+                    throw std::invalid_argument("--prompt-text must not be empty");
+            }
+            else if (argument == "--benchmark-prompt")
+            {
+                if (!prompt_text.empty())
+                    throw std::invalid_argument("--benchmark-prompt cannot be combined with --prompt-text");
+                prompt_text = ncnn::moe::kP0BenchmarkPrompt;
+            }
+            else if (argument == "--baseline-token-per-second")
+            {
+                baseline_token_per_second = std::stod(ncnn::moe::require_value(argc, argv, index, "--baseline-token-per-second"));
+                if (!std::isfinite(baseline_token_per_second) || baseline_token_per_second <= 0.0)
+                    throw std::invalid_argument("--baseline-token-per-second must be finite and greater than zero");
+                has_baseline_token_per_second = true;
             }
             else if (argument == "--max-new-tokens")
             {
@@ -292,6 +324,15 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                         "--optimization-flags"),
                     nullptr,
                     0);
+            }
+            else if (argument == "--enable-vulkan-gated-delta")
+            {
+                runtime_options.optimization_flags |=
+                    ncnn::moe::RuntimeOptimizationVulkanGatedDeltaNet;
+            }
+            else if (argument == "--disable-vulkan-indexed-experts")
+            {
+                runtime_options.optimization_flags &= ~ncnn::moe::RuntimeOptimizationVulkanIndexedExperts;
             }
             else if (argument == "--disable-gpu-victim-execution")
             {
@@ -893,6 +934,9 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             generation.tokens.insert(generation.tokens.end(), session_generation.tokens.begin(), session_generation.tokens.end());
         }
         const double generation_seconds = ncnn::moe::elapsed_seconds(generation_start);
+        const double aggregate_token_per_second = generation_seconds > 0.0
+                                                     ? static_cast<double>(generation.tokens.size()) / generation_seconds
+                                                     : 0.0;
         const ncnn::moe::SessionStatistics statistics = active_sessions.front()->statistics();
         uint64_t speculative_proposals = 0;
         uint64_t speculative_draft_tokens = 0;
@@ -911,10 +955,27 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             speculative_verify_time_microseconds += session_statistics.speculative_verify_time_microseconds;
         }
         std::cout << "generated " << generation.tokens.size() << " token(s) in " << generation_seconds << " s\n";
+        if (!prompt_text.empty())
+        {
+            std::cout << "Benchmark prompt: " << prompt_text << '\n';
+            std::cout << "Benchmark prompt token IDs: externally supplied ("
+                      << prompt.size() << "); native runner does not tokenize text\n";
+        }
         std::cout << "Parallel sessions: " << parallel_sessions << '\n';
         if (report_throughput)
         {
-            std::cout << "Aggregate throughput: " << generation.tokens.size() / generation_seconds << " token/s\n";
+            std::cout << "Aggregate throughput: " << aggregate_token_per_second << " token/s\n";
+            if (has_baseline_token_per_second)
+            {
+                const double ratio = aggregate_token_per_second / baseline_token_per_second;
+                std::cout << "Token/s improvement ratio: " << ratio << "x ("
+                          << (ratio - 1.0) * 100.0 << "%) vs baseline "
+                          << baseline_token_per_second << " token/s\n";
+            }
+            else if (!prompt_text.empty())
+            {
+                std::cout << "Token/s improvement ratio: unavailable (pass --baseline-token-per-second)\n";
+            }
         }
         if (parallel_sessions > 1
             && (parallel_independent || parallel_speculative))

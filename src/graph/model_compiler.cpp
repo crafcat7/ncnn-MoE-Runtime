@@ -1972,6 +1972,9 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 if (!prepared)
                     return prepared.error();
                 if (attention_device == NcnnLinearDevice::Vulkan
+                    && runtime_optimization_enabled(
+                           compiled.optimization_flags,
+                           RuntimeOptimizationVulkanGatedDeltaNet)
                     && plan.fused_delta_input_bfloat16_operator != invalid_compiled_operator_handle)
                 {
                     const CompiledOperator& output_operator =

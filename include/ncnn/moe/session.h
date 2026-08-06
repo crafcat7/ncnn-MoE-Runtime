@@ -322,6 +322,8 @@ struct RuntimeMetricCounters
     uint64_t vulkan_attention_submit_failures = 0;
     uint64_t vulkan_attention_cache_materializations = 0;
     uint64_t vulkan_attention_cpu_fallbacks = 0;
+    uint64_t vulkan_gated_delta_fusions = 0;
+    uint64_t vulkan_gated_delta_submissions = 0;
     uint64_t expert_gpu_cache_hits = 0;
     uint64_t expert_gpu_cache_misses = 0;
     uint64_t expert_gpu_cache_admissions = 0;
@@ -332,6 +334,9 @@ struct RuntimeMetricCounters
     uint64_t expert_gpu_executions = 0;
     uint64_t expert_gpu_execution_failures = 0;
     uint64_t expert_gpu_cpu_preferred = 0;
+    uint64_t expert_gpu_route_aggregation_batches = 0;
+    uint64_t expert_gpu_route_aggregation_routes = 0;
+    uint64_t expert_gpu_route_aggregation_bytes_saved = 0;
     uint64_t expert_cache_resident_bytes = 0;
     uint64_t kv_cache_logical_bytes = 0;
     uint64_t kv_cache_allocated_bytes = 0;

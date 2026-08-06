@@ -42,6 +42,7 @@ set(NCNN_MOE_SOURCES
     src/engine/cpu_executor.cpp
     src/engine/cpu_features.cpp
     src/engine/cpu_task_worker.cpp
+    src/engine/cpu_thread_budget.cpp
     src/engine/cpu_topology.cpp
     src/engine/expert_backend.cpp
     src/engine/memory_manager.cpp
