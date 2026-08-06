@@ -90,6 +90,11 @@ enum RuntimeOptionFlag : uint32_t
 #define NCNN_MOE_OPT_CPU_LATENT_VECTOR_SOFTMAX_BIT    45
 #define NCNN_MOE_OPT_VULKAN_LATENT_INPUT_RMS_NORM_BIT  46
 #define NCNN_MOE_OPT_VULKAN_EXPERT_GPU_PRIORITY_BIT   47
+#define NCNN_MOE_OPT_CPU_MXFP4_Q8_BIT                 48
+#define NCNN_MOE_OPT_CPU_FLASH_ATTENTION_BIT          49
+#define NCNN_MOE_OPT_CPU_SPLIT_KV_ATTENTION_BIT       50
+#define NCNN_MOE_OPT_VULKAN_INDEXED_EXPERTS_BIT       51
+#define NCNN_MOE_OPT_VULKAN_GATED_DELTA_NET_BIT       52
 
 enum RuntimeOptimizationFlag : uint64_t
 {
@@ -139,12 +144,21 @@ enum RuntimeOptimizationFlag : uint64_t
     RuntimeOptimizationVulkanCommandGraph = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_COMMAND_GRAPH_BIT,
     RuntimeOptimizationCpuLatentVectorSoftmax = UINT64_C(1) << NCNN_MOE_OPT_CPU_LATENT_VECTOR_SOFTMAX_BIT,
     RuntimeOptimizationVulkanLatentInputRmsNorm = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_LATENT_INPUT_RMS_NORM_BIT,
-    RuntimeOptimizationVulkanExpertGpuPriority = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_EXPERT_GPU_PRIORITY_BIT
+    RuntimeOptimizationVulkanExpertGpuPriority = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_EXPERT_GPU_PRIORITY_BIT,
+    RuntimeOptimizationCpuMxfp4Q8 = UINT64_C(1) << NCNN_MOE_OPT_CPU_MXFP4_Q8_BIT,
+    RuntimeOptimizationCpuFlashAttention = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLASH_ATTENTION_BIT,
+    RuntimeOptimizationCpuSplitKvAttention = UINT64_C(1) << NCNN_MOE_OPT_CPU_SPLIT_KV_ATTENTION_BIT,
+    RuntimeOptimizationVulkanIndexedExperts = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_INDEXED_EXPERTS_BIT,
+    // The device-resident recurrent state is available for calibrated runs;
+    // keep CPU DeltaNet as the reproducible default until a numerical parity
+    // policy is selected for a target GPU/math library.
+    RuntimeOptimizationVulkanGatedDeltaNet = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_GATED_DELTA_NET_BIT
 };
 
 inline constexpr uint64_t RuntimeOptimizationDefaultFlags =
     RuntimeOptimizationCpuSimdRmsNorm
     | RuntimeOptimizationCpuFastSilu
+    | RuntimeOptimizationCpuMxfp4RowPairs
     | RuntimeOptimizationCpuFloat8FusedGateUp
     | RuntimeOptimizationCpuFloat8Bf16Dot
     | RuntimeOptimizationCpuFloat8BatchTile
@@ -153,11 +167,14 @@ inline constexpr uint64_t RuntimeOptimizationDefaultFlags =
     | RuntimeOptimizationCpuBfloat16Batched
     | RuntimeOptimizationCpuRopeCache
     | RuntimeOptimizationCpuBf16DirectAttention
+    | RuntimeOptimizationCpuFlashAttention
+    | RuntimeOptimizationCpuSplitKvAttention
     | RuntimeOptimizationCpuGatedDeltaSimd
     | RuntimeOptimizationCpuLatentPreparedRope
     | RuntimeOptimizationCpuLatentSimdNorm
     | RuntimeOptimizationCpuLatentOnlineSoftmax
     | RuntimeOptimizationCpuLatentOutputGroups
+    | RuntimeOptimizationCpuMxfp4Q8
     | RuntimeOptimizationNcnnCpuBfloat16Linear
     | RuntimeOptimizationVulkanBfloat16CoopMatrix
     | RuntimeOptimizationVulkanAttention
@@ -177,7 +194,8 @@ inline constexpr uint64_t RuntimeOptimizationDefaultFlags =
     | RuntimeOptimizationVulkanCommandGraph
     | RuntimeOptimizationCpuLatentVectorSoftmax
     | RuntimeOptimizationVulkanLatentInputRmsNorm
-    | RuntimeOptimizationVulkanExpertGpuPriority;
+    | RuntimeOptimizationVulkanExpertGpuPriority
+    | RuntimeOptimizationVulkanIndexedExperts;
 
 [[nodiscard]] inline bool runtime_optimization_enabled(
     uint64_t optimization_flags,

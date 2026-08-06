@@ -228,6 +228,14 @@ def parse_arguments():
     )
     parser.add_argument("--disable-router-prediction", action="store_true")
     parser.add_argument(
+        "--enable-vulkan-gated-delta",
+        action="store_true",
+        help=(
+            "Enable the experimental device-resident Qwen Gated DeltaNet "
+            "path; validate generated-token parity for the target GPU."
+        ),
+    )
+    parser.add_argument(
         "--release-vulkan-dense-host",
         action="store_true",
         help=(
@@ -572,6 +580,8 @@ def runner_command(arguments):
         )
     if arguments.disable_router_prediction:
         command.append("--disable-router-prediction")
+    if arguments.enable_vulkan_gated_delta:
+        command.append("--enable-vulkan-gated-delta")
     if arguments.release_vulkan_dense_host:
         command.append("--release-vulkan-dense-host")
     if arguments.disable_async_router_prediction:

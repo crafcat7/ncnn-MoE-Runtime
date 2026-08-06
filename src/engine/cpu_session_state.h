@@ -127,6 +127,10 @@ struct CpuAttentionExecutionScratch
     std::vector<float> value_cache;
     std::vector<float> logits;
     std::vector<uint16_t> query_bfloat16;
+    std::vector<uint16_t> flash_query_bfloat16;
+    std::vector<float> flash_partial_max;
+    std::vector<float> flash_partial_sum;
+    std::vector<float> flash_partial_output;
     std::vector<float> rope_cosine;
     std::vector<float> rope_sine;
 };

@@ -12,6 +12,7 @@
 #include "kernels/cpu_hyper_connection.h"
 #include "engine/cpu_executor.h"
 #include "engine/cpu_task_worker.h"
+#include "engine/cpu_thread_budget.h"
 #include "engine/expert_backend.h"
 #include "engine/cpu_session_state.h"
 #include "engine/cpu_topology.h"
@@ -52,6 +53,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
 
 namespace ncnn {
 namespace moe {
@@ -1069,6 +1071,87 @@ void test_ncnn_linear_operator()
 #endif
 }
 
+void test_dense_mxn_tiles()
+{
+    TensorData float_matrix;
+    float_matrix.dtype = DType::Float32;
+    float_matrix.shape = {8, 32};
+    float_matrix.float32_data.resize(float_matrix.element_count());
+    for (size_t index = 0; index < float_matrix.float32_data.size(); ++index)
+    {
+        float_matrix.float32_data[index] =
+            static_cast<float>(static_cast<int>((index * 13 + 3) % 41) - 20)
+            * 0.03125f;
+    }
+    CpuBatch input(8, 32);
+    for (size_t index = 0; index < input.rows() * input.columns(); ++index)
+    {
+        input.row(index / input.columns())[index % input.columns()] =
+            static_cast<float>(static_cast<int>((index * 7 + 5) % 37) - 18)
+            * 0.015625f;
+    }
+    const CpuBatch float_output = linear_batch(
+        float_matrix,
+        input,
+        kTestOptimizationFlags);
+    for (size_t token = 0; token < input.rows(); ++token)
+    {
+        for (uint32_t output_column = 0;
+             output_column < float_matrix.shape[0];
+             ++output_column)
+        {
+            float expected = 0.0f;
+            for (uint32_t input_column = 0;
+                 input_column < input.columns();
+                 ++input_column)
+            {
+                expected += float_matrix.float32_data[
+                                static_cast<size_t>(output_column) * input.columns()
+                                + input_column]
+                            * input.row(token)[input_column];
+            }
+            check_near(
+                float_output.row(token)[output_column],
+                expected,
+                1e-4f);
+        }
+    }
+
+    TensorData bfloat_matrix;
+    bfloat_matrix.dtype = DType::BFloat16;
+    bfloat_matrix.shape = float_matrix.shape;
+    bfloat_matrix.bfloat16_data.reserve(float_matrix.float32_data.size());
+    for (float value : float_matrix.float32_data)
+        bfloat_matrix.bfloat16_data.push_back(float_to_bfloat16(value));
+    const CpuBatch bfloat_output = linear_batch(
+        bfloat_matrix,
+        input,
+        kTestOptimizationFlags);
+    for (size_t token = 0; token < input.rows(); ++token)
+    {
+        for (uint32_t output_column = 0;
+             output_column < bfloat_matrix.shape[0];
+             ++output_column)
+        {
+            float expected = 0.0f;
+            for (uint32_t input_column = 0;
+                 input_column < input.columns();
+                 ++input_column)
+            {
+                expected += bfloat16_to_float(
+                                bfloat_matrix.bfloat16_data[
+                                    static_cast<size_t>(output_column) * input.columns()
+                                    + input_column])
+                            * input.row(token)[input_column];
+            }
+            check_near(
+                bfloat_output.row(token)[output_column],
+                expected,
+                1e-4f);
+        }
+    }
+}
+
 void test_released_dense_host_storage_guard()
 {
     CpuBatch input(1, 2);
@@ -1755,7 +1838,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     const CpuBatch projected = linear_batch(
         matrix,
         input,
-        kTestOptimizationFlags);
+        kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
     for (size_t input_row = 0; input_row < input.rows(); ++input_row)
     {
         for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row)
@@ -1763,6 +1846,11 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             check_near(projected.row(input_row)[matrix_row], scalar_row(matrix_row, input_row), 1e-5f);
         }
     }
+    const uint64_t q8_flags = kTestOptimizationFlags | RuntimeOptimizationCpuMxfp4Q8;
+    const CpuBatch q8_projected = linear_batch(matrix, input, q8_flags);
+    for (size_t input_row = 0; input_row < input.rows(); ++input_row)
+        for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row)
+            check_near(q8_projected.row(input_row)[matrix_row], scalar_row(matrix_row, input_row), 0.15f);
     auto vulkan_projection = NcnnVulkanMxfp4Operator::create(
         matrix,
         nullptr,
@@ -1794,7 +1882,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         const CpuBatch four_row_cpu = linear_batch(
             matrix,
             four_row_input,
-            kTestOptimizationFlags);
+            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
         CpuBatch four_row_vulkan;
         check(static_cast<bool>(vulkan_projection->forward(four_row_input, four_row_vulkan)));
         for (size_t row = 0; row < four_row_input.rows(); ++row)
@@ -1815,7 +1903,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     const CpuBatch decoded = linear_batch(
         matrix,
         decode_input,
-        kTestOptimizationFlags);
+        kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
     for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row)
     {
         check_near(decoded.row(0)[matrix_row], scalar_row(matrix_row, 0), 1e-5f);
@@ -1827,7 +1915,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     const CpuBatch odd_projected = linear_batch(
         odd_matrix,
         input,
-        kTestOptimizationFlags);
+        kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
     check(static_cast<bool>(odd_projected.columns() == 3));
     for (size_t input_row = 0; input_row < input.rows(); ++input_row)
     {
@@ -1870,7 +1958,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         input,
         ExpertActivation::GptOssSwiGlu,
         7.0f,
-        kTestOptimizationFlags);
+        kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
     check(static_cast<bool>(fused.rows() == input.rows()));
     check(static_cast<bool>(fused.columns() == 2));
     for (float sigmoid_scale : {1.0f, 1.702f})
@@ -2016,6 +2104,30 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 1e-5f);
         }
     }
+    const uint64_t q8_expert_flags =
+        kTestOptimizationFlags | RuntimeOptimizationCpuMxfp4Q8;
+    CpuBatch q8_repeated_output;
+    Mxfp4Scratch q8_repeated_scratch;
+    repeated_task.output = &q8_repeated_output;
+    check(static_cast<bool>(
+        mxfp4_expert_batch(
+            std::span<const Mxfp4Task>(&repeated_task, 1),
+            &q8_repeated_scratch,
+            q8_expert_flags)));
+    check(q8_repeated_output.rows() == repeated_reference.rows());
+    check(q8_repeated_output.columns() == repeated_reference.columns());
+    for (size_t row = 0; row < q8_repeated_output.rows(); ++row)
+    {
+        for (uint32_t column = 0;
+             column < q8_repeated_output.columns();
+             ++column)
+        {
+            check_near(
+                q8_repeated_output.row(row)[column],
+                repeated_reference.row(row)[column],
+                2.0f);
+        }
+    }
     for (size_t token_count : {size_t(1), repeated_expert_input.rows()})
     {
         CpuBatch silu_input(token_count, repeated_expert_input.columns());
@@ -2032,11 +2144,11 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             silu_input,
             ExpertActivation::Silu,
             0.0f,
-            kTestOptimizationFlags);
+            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
         const CpuBatch silu_reference = linear_batch(
             expert_down,
             silu_activated,
-            kTestOptimizationFlags);
+            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
         CpuBatch silu_output;
         Mxfp4Task silu_task;
         silu_task.gate_up = &expert_gate_up;
@@ -2049,7 +2161,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             mxfp4_expert_batch(
                 std::span<const Mxfp4Task>(&silu_task, 1),
                 &silu_scratch,
-                kTestOptimizationFlags)));
+                kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8)));
         check(silu_output.rows() == silu_reference.rows());
         check(silu_output.columns() == silu_reference.columns());
         for (size_t row = 0; row < silu_output.rows(); ++row)
@@ -2104,12 +2216,12 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 expert_input,
                 ExpertActivation::GptOssSwiGlu,
                 expert_activation_limit,
-                kTestOptimizationFlags);
+                kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
             const CpuBatch cpu_expert = linear_batch(
                 expert_down,
                 expert_down_bias,
                 cpu_activated,
-                kTestOptimizationFlags);
+                kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
             CpuBatch vulkan_expert_output;
             check(static_cast<bool>(vulkan_expert->forward(expert_input, vulkan_expert_output)));
             check(static_cast<bool>(vulkan_expert_output.rows() == cpu_expert.rows()));
@@ -2142,12 +2254,12 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             silu_input,
             ExpertActivation::Silu,
             expert_activation_limit,
-            kTestOptimizationFlags);
+            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
         const CpuBatch silu_expected = linear_batch(
             expert_down,
             expert_down_bias,
             silu_activated,
-            kTestOptimizationFlags);
+            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
         CpuBatch silu_actual;
         check(static_cast<bool>(silu_vulkan_expert->forward(silu_input, silu_actual)));
         for (uint32_t column = 0; column < silu_expected.columns(); ++column)
@@ -2173,12 +2285,12 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             deepseek_input,
             ExpertActivation::DeepSeekSwiGlu,
             expert_activation_limit,
-            kTestOptimizationFlags);
+            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
         const CpuBatch deepseek_expected = linear_batch(
             expert_down,
             expert_down_bias,
             deepseek_activated,
-            kTestOptimizationFlags);
+            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
         CpuBatch deepseek_actual;
         check(static_cast<bool>(deepseek_vulkan_expert->forward(deepseek_input, deepseek_actual)));
         for (uint32_t column = 0; column < deepseek_expected.columns(); ++column)
@@ -2228,12 +2340,12 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             backend_input,
             ExpertActivation::GptOssSwiGlu,
             expert_activation_limit,
-            kTestOptimizationFlags);
+            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
         const CpuBatch backend_expected = linear_batch(
             expert_down,
             expert_down_bias,
             backend_activated,
-            kTestOptimizationFlags);
+            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
         for (uint32_t sample = 0; sample < 3; ++sample)
         {
             CpuBatch backend_output;
@@ -2261,12 +2373,12 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             backend_input,
             ExpertActivation::GptOssSwiGlu,
             expert_activation_limit,
-            kTestOptimizationFlags);
+            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
         const CpuBatch backend_second_expected = linear_batch(
             *backend_down_second,
             expert_down_bias,
             backend_second_activated,
-            kTestOptimizationFlags);
+            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
         CpuBatch backend_batch_output_first;
         CpuBatch backend_batch_output_second;
         const std::array<ExpertBackendRequest, 2> backend_requests = {{
@@ -2492,6 +2604,83 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         check_near(paired_bulk_output[token * bulk_output_stride + 2], reference_dot(second_packed, second_scales, token), 1e-4f);
         check_near(paired_bulk_output[token * bulk_output_stride + 3], reference_dot(second_packed, second_scales, token), 1e-4f);
         check_near(paired_bulk_output[token * bulk_output_stride + 4], reference_dot(first_packed, first_scales, token), 1e-4f);
+    }
+
+    constexpr size_t packed_matrix_rows = 13;
+    std::vector<uint8_t> matrix_packed(packed_matrix_rows * test_block_count * 16);
+    std::vector<uint8_t> matrix_scales(packed_matrix_rows * test_block_count);
+    for (size_t row = 0; row < packed_matrix_rows; ++row)
+    {
+        for (uint32_t block = 0; block < test_block_count; ++block)
+        {
+            matrix_scales[row * test_block_count + block] =
+                static_cast<uint8_t>(123 + ((row * 3 + block * 5) % 9));
+            for (uint32_t byte = 0; byte < 16; ++byte)
+            {
+                const size_t offset = (row * test_block_count + block) * 16 + byte;
+                matrix_packed[offset] = static_cast<uint8_t>(
+                    ((row * 7 + block * 11 + byte * 3) % 16)
+                    | (((row * 13 + block * 5 + byte * 9) % 16) << 4));
+            }
+        }
+    }
+    Mxfp4Q8PackedMatrix packed_matrix;
+    check(static_cast<bool>(mxfp4_q8_pack_weights(
+        matrix_packed.data(),
+        matrix_scales.data(),
+        test_block_count,
+        packed_matrix_rows,
+        packed_matrix)));
+    check(static_cast<bool>(packed_matrix.valid()));
+    Mxfp4Q8Batch quantized_input;
+    mxfp4_q8_quantize_batch(
+        strided_input.data(),
+        test_input_stride,
+        test_token_count,
+        test_input_columns,
+        quantized_input);
+    std::vector<float> packed_gemm_output(test_token_count * (packed_matrix_rows + 2), -999.0f);
+    mxfp4_q8_packed_gemm(
+        packed_matrix,
+        quantized_input.row(0),
+        quantized_input.columns,
+        quantized_input.row_scales(0),
+        (quantized_input.columns + 31) / 32,
+        test_token_count,
+        packed_gemm_output.data(),
+        packed_matrix_rows + 2);
+    for (size_t token = 0; token < test_token_count; ++token)
+    {
+        for (size_t row = 0; row < packed_matrix_rows; ++row)
+        {
+            check_near(
+                packed_gemm_output[token * (packed_matrix_rows + 2) + row],
+                mxfp4_q8_dot(
+                    matrix_packed.data() + row * test_block_count * 16,
+                    matrix_scales.data() + row * test_block_count,
+                    test_block_count,
+                    quantized_input.row(token),
+                    quantized_input.row_scales(token)),
+                1e-4f);
+        }
+    }
+    std::vector<float> packed_gemv_output(packed_matrix_rows, -999.0f);
+    mxfp4_q8_packed_gemv(
+        packed_matrix,
+        quantized_input.row(1),
+        quantized_input.row_scales(1),
+        packed_gemv_output.data());
+    for (size_t row = 0; row < packed_matrix_rows; ++row)
+    {
+        check_near(
+            packed_gemv_output[row],
+            mxfp4_q8_dot(
+                matrix_packed.data() + row * test_block_count * 16,
+                matrix_scales.data() + row * test_block_count,
+                test_block_count,
+                quantized_input.row(1),
+                quantized_input.row_scales(1)),
+            1e-4f);
     }
 
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -3604,6 +3793,12 @@ void test_cross_session_batch_scheduler()
     const SchedulerStatistics statistics = scheduler.value()->statistics();
     check(static_cast<bool>(statistics.worker_count == 2));
     check(static_cast<bool>(statistics.expert_threads_per_worker >= 1));
+    check(static_cast<bool>(statistics.logical_cpu_count >= 1));
+    check(static_cast<bool>(statistics.physical_cpu_count >= 1));
+    check(static_cast<bool>(statistics.reserved_io_threads >= 1));
+    check(static_cast<bool>(statistics.reserved_service_threads >= 1));
+    check(static_cast<bool>(statistics.compute_thread_budget >= 1));
+    check(static_cast<bool>(statistics.worker_count <= statistics.compute_thread_budget));
     check(static_cast<bool>(
         statistics.submitted_prefill_batches == 1));
     check(static_cast<bool>(
@@ -4198,6 +4393,128 @@ void test_attention_graph_without_bias_or_sink()
     check(full_cache.first_slot == context_cache.first_slot);
     check(full_cache.keys == context_cache.keys);
     check(full_cache.values == context_cache.values);
+
+    CpuBatch long_hidden(80, 2);
+    for (size_t row = 0; row < long_hidden.rows(); ++row)
+    {
+        long_hidden.row(row)[0] = static_cast<float>(static_cast<int>(row % 13) - 6) * 0.0625f;
+        long_hidden.row(row)[1] = static_cast<float>(static_cast<int>((row * 3) % 17) - 8) * 0.03125f;
+    }
+    const uint64_t attention_reference_flags =
+        kTestOptimizationFlags
+        & ~RuntimeOptimizationCpuFlashAttention
+        & ~RuntimeOptimizationCpuSplitKvAttention;
+    CpuLayerCache reference_long_cache;
+    CpuLayerCache flash_long_cache;
+    CpuAttentionExecutionScratch reference_long_scratch;
+    CpuAttentionExecutionScratch flash_long_scratch;
+    CpuBatch reference_long_output;
+    CpuBatch flash_long_output;
+    auto reference_long = execute_attention_block_into(
+        compiled.weights,
+        compiled.operators,
+        compiled.graph.layer_plans.front().attention,
+        ExecutionBackend::Cpu,
+        compiled.descriptor.norm_epsilon,
+        compiled.descriptor.kv_cache_dtype,
+        0,
+        reference_long_cache,
+        reference_long_scratch,
+        long_hidden,
+        reference_long_output,
+        attention_reference_flags);
+    auto flash_long = execute_attention_block_into(
+        compiled.weights,
+        compiled.operators,
+        compiled.graph.layer_plans.front().attention,
+        ExecutionBackend::Cpu,
+        compiled.descriptor.norm_epsilon,
+        compiled.descriptor.kv_cache_dtype,
+        0,
+        flash_long_cache,
+        flash_long_scratch,
+        long_hidden,
+        flash_long_output,
+        kTestOptimizationFlags);
+    check(static_cast<bool>(reference_long));
+    check(static_cast<bool>(flash_long));
+    check(static_cast<bool>(reference_long_output.rows() == flash_long_output.rows()));
+    check(static_cast<bool>(reference_long_output.columns() == flash_long_output.columns()));
+    for (size_t row = 0; row < reference_long_output.rows(); ++row)
+        for (uint32_t column = 0; column < reference_long_output.columns(); ++column)
+            check_near(flash_long_output.row(row)[column], reference_long_output.row(row)[column], 1e-4f);
+
+    CpuBatch split_prefix(512, 2);
+    for (size_t row = 0; row < split_prefix.rows(); ++row)
+    {
+        split_prefix.row(row)[0] = static_cast<float>(static_cast<int>(row % 19) - 9) * 0.015625f;
+        split_prefix.row(row)[1] = static_cast<float>(static_cast<int>((row * 5) % 23) - 11) * 0.015625f;
+    }
+    CpuLayerCache reference_split_cache;
+    CpuLayerCache split_kv_cache;
+    CpuAttentionExecutionScratch reference_split_scratch;
+    CpuAttentionExecutionScratch split_kv_scratch;
+    auto reference_context = append_attention_context_into(
+        compiled.weights,
+        compiled.operators,
+        compiled.graph.layer_plans.front().attention,
+        ExecutionBackend::Cpu,
+        compiled.descriptor.norm_epsilon,
+        compiled.descriptor.kv_cache_dtype,
+        0,
+        reference_split_cache,
+        reference_split_scratch,
+        split_prefix,
+        attention_reference_flags);
+    auto split_context = append_attention_context_into(
+        compiled.weights,
+        compiled.operators,
+        compiled.graph.layer_plans.front().attention,
+        ExecutionBackend::Cpu,
+        compiled.descriptor.norm_epsilon,
+        compiled.descriptor.kv_cache_dtype,
+        0,
+        split_kv_cache,
+        split_kv_scratch,
+        split_prefix,
+        kTestOptimizationFlags);
+    check(static_cast<bool>(reference_context));
+    check(static_cast<bool>(split_context));
+    CpuBatch split_token(1, 2);
+    split_token.row(0)[0] = 0.125f;
+    split_token.row(0)[1] = -0.0625f;
+    CpuBatch reference_split_output;
+    CpuBatch split_kv_output;
+    auto reference_decode = execute_attention_block_into(
+        compiled.weights,
+        compiled.operators,
+        compiled.graph.layer_plans.front().attention,
+        ExecutionBackend::Cpu,
+        compiled.descriptor.norm_epsilon,
+        compiled.descriptor.kv_cache_dtype,
+        512,
+        reference_split_cache,
+        reference_split_scratch,
+        split_token,
+        reference_split_output,
+        attention_reference_flags);
+    auto split_decode = execute_attention_block_into(
+        compiled.weights,
+        compiled.operators,
+        compiled.graph.layer_plans.front().attention,
+        ExecutionBackend::Cpu,
+        compiled.descriptor.norm_epsilon,
+        compiled.descriptor.kv_cache_dtype,
+        512,
+        split_kv_cache,
+        split_kv_scratch,
+        split_token,
+        split_kv_output,
+        kTestOptimizationFlags);
+    check(static_cast<bool>(reference_decode));
+    check(static_cast<bool>(split_decode));
+    for (uint32_t column = 0; column < reference_split_output.columns(); ++column)
+        check_near(split_kv_output.row(0)[column], reference_split_output.row(0)[column], 1e-4f);
 
     AttentionBlockPlan sliding_plan =
         compiled.graph.layer_plans.front().attention;
@@ -7027,6 +7344,29 @@ void benchmark_bfloat16_attention_kernels()
               << " checksum_delta=" << std::abs(baseline_checksum - direct_checksum) << '\n';
 }
 
+void test_cpu_resource_coordination()
+{
+    const CpuThreadBudget budget = resolve_cpu_thread_budget(1, 1, 2);
+    check(budget.logical_threads >= 1);
+    check(budget.physical_cores >= 1);
+    check(budget.compute_threads >= 1);
+    check(budget.compute_threads <= budget.physical_cores);
+    check(budget.max_compute_threads >= budget.compute_threads);
+    check(choose_cpu_team_size(0, 8, 4, budget.compute_threads) == 1);
+    check(choose_cpu_team_size(1024, 8, 4, budget.compute_threads) >= 1);
+
+    CpuThreadBudgetController controller(budget);
+    auto compute = controller.try_acquire_compute(1, false);
+    check(compute.size() == 1);
+    const CpuThreadBudgetSnapshot active = controller.snapshot();
+    check(active.active_compute_threads == 1);
+    compute = {};
+    const CpuThreadBudgetSnapshot returned = controller.snapshot();
+    check(returned.active_compute_threads == 0);
+    check(returned.compute_acquisitions == returned.compute_returns);
+
+}
+
 } // namespace moe
 } // namespace ncnn
 
@@ -7041,6 +7381,7 @@ int main(int argc, char** argv)
         }
         ncnn::moe::test_flag_defaults();
         ncnn::moe::test_cpu_task_worker();
+        ncnn::moe::test_cpu_resource_coordination();
         ncnn::moe::test_float_scaled_add();
         ncnn::moe::test_float_scale_inplace_and_scaled_add();
         ncnn::moe::test_float_dot();
@@ -7052,6 +7393,7 @@ int main(int argc, char** argv)
         ncnn::moe::test_float_to_bfloat16_array();
         ncnn::moe::test_bfloat16_batched_linear_kernel();
         ncnn::moe::test_ncnn_linear_operator();
+        ncnn::moe::test_dense_mxn_tiles();
         ncnn::moe::test_released_dense_host_storage_guard();
         ncnn::moe::test_ncnn_vulkan_bfloat16_operator();
         ncnn::moe::test_ncnn_vulkan_float8_operator();

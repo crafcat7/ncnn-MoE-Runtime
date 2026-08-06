@@ -18,6 +18,51 @@ void msvc_avx2_float_to_bfloat16_array(
 void msvc_avx2_bfloat16_scaled_add(float* output, const uint16_t* input, float scale, uint32_t count) noexcept;
 
 [[nodiscard]] float msvc_avx2_mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input) noexcept;
+[[nodiscard]] float msvc_avx2_mxfp4_q8_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count,
+                                           const int8_t* input, const float* input_scales) noexcept;
+void msvc_avx2_mxfp4_q8_matmul_rows2(
+    const uint8_t* first_packed,
+    const uint8_t* first_scales,
+    const uint8_t* second_packed,
+    const uint8_t* second_scales,
+    uint32_t block_count,
+    const int8_t* input,
+    size_t input_stride,
+    const float* input_scales,
+    size_t scale_stride,
+    size_t token_count,
+    float* first_output,
+    size_t first_output_stride,
+    float* second_output,
+    size_t second_output_stride) noexcept;
+
+// The packed layout is group-major:
+// [tile_rows scales][chunk 0 for each row][chunk 1 for each row]...
+void msvc_avx2_mxfp4_q8_packed_gemm(
+    const uint8_t* packed,
+    uint32_t row_count,
+    uint32_t block_count,
+    uint32_t tile_rows,
+    const int8_t* input,
+    size_t input_stride,
+    const float* input_scales,
+    size_t scale_stride,
+    size_t token_count,
+    float* output,
+    size_t output_stride) noexcept;
+
+void msvc_avx512_mxfp4_q8_packed_gemm(
+    const uint8_t* packed,
+    uint32_t row_count,
+    uint32_t block_count,
+    uint32_t tile_rows,
+    const int8_t* input,
+    size_t input_stride,
+    const float* input_scales,
+    size_t scale_stride,
+    size_t token_count,
+    float* output,
+    size_t output_stride) noexcept;
 
 void msvc_avx2_mxfp4_gemm_row(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input, size_t input_stride, size_t token_count,
                               float* output, size_t output_stride) noexcept;

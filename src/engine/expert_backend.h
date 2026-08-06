@@ -10,6 +10,7 @@
 #include "ncnn/moe/vulkan_context.h"
 
 #include <cstdint>
+#include <cstddef>
 #include <memory>
 #include <span>
 #include <string>
@@ -28,6 +29,15 @@ enum class ExpertBackendExecutionResult
     Executed,
     Failed
 };
+
+// Static CPU/GPU placement boundary for routed Experts. A resident Expert may
+// execute any non-empty routed batch, including single-row decode. This is
+// deliberately not calibrated at runtime.
+inline constexpr size_t vulkan_expert_gpu_min_rows = 1;
+
+// Cold single-row requests are admitted asynchronously as well; the executor
+// keeps the CPU fallback available while the fixed GPU cache pipeline uploads.
+inline constexpr size_t vulkan_expert_gpu_admission_min_rows = 1;
 
 struct ExpertBackendStatistics
 {
@@ -77,6 +87,10 @@ struct ExpertBackendRequest
         std::span<const ExpertRoute> routes;
         uint32_t token_count = 0;
         uint8_t* completed = nullptr;
+        // Some callers can combine a partial GPU result with CPU fallback.
+        // Those callers must disable aggregation unless every request in the
+        // batch was selected for the same GPU submission.
+        bool require_all_requests = false;
     };
 
     std::string_view key;

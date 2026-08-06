@@ -689,7 +689,7 @@ static int latent_output_group_team_size(
         1,
         std::min({static_cast<int>(maximum),
                   static_cast<int>(row_count * group_count),
-                  omp_get_max_threads()}));
+                  static_cast<int>(cpu_linear_thread_limit())}));
 #else
     (void)row_count;
     (void)group_count;
@@ -1295,7 +1295,7 @@ static Result<CpuBatch> execute_latent_attention_rows(
             prepare_attention_row(row_index);
         const int64_t task_count = static_cast<int64_t>(input.rows()) * plan.head_count;
 #if defined(_OPENMP)
-        const int attention_team_size = std::max(1, std::min(static_cast<int>(task_count), omp_get_max_threads()));
+        const int attention_team_size = std::max(1, std::min(static_cast<int>(task_count), static_cast<int>(cpu_linear_thread_limit())));
 #pragma omp parallel for schedule(static) num_threads(attention_team_size) if (attention_team_size > 1)
 #endif
         for (int64_t task = 0; task < task_count; ++task)

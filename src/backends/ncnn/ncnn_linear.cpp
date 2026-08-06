@@ -344,6 +344,8 @@ struct NcnnVulkanTransferSlot
     bool command_used = false;
     ncnn::VkMat upload;
     ncnn::VkMat download;
+    ncnn::VkMat expert_slots;
+    ncnn::VkMat expert_row_offsets;
     ncnn::VkMat route_offsets;
     ncnn::VkMat route_rows;
     ncnn::VkMat route_weights;
@@ -9227,11 +9229,19 @@ public:
     std::unique_ptr<ncnn::VkWeightAllocator> weight_allocator;
     std::unique_ptr<ncnn::VkWeightStagingAllocator> weight_staging_allocator;
     std::shared_ptr<ncnn::Pipeline> pipeline;
+    // Keep the three read-only MXFP4 projection inputs in one device buffer.
+    // Besides reducing allocator fragmentation, this gives the indexed MoE
+    // shaders one descriptor per Expert instead of one descriptor for every
+    // packed/scales/bias tensor.
+    ncnn::VkMat storage;
     ncnn::VkMat packed;
     ncnn::VkMat scales;
     ncnn::VkMat bias;
     ncnn::Option option;
     uint64_t optimization_flags = RuntimeOptimizationDefaultFlags;
+    bool indexed_storage = false;
+    uint32_t indexed_scales_word_offset = 0;
+    uint32_t indexed_bias_word_offset = 0;
 #endif
     uint32_t input_columns = 0;
     uint32_t output_columns = 0;
@@ -9241,6 +9251,11 @@ public:
 #if NCNN_MOE_WITH_VULKAN
 static constexpr char mxfp4_projection_shader[] = R"glsl(
 #version 450
+
+#ifdef NCNN_fp16_arithmetic
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
 #extension GL_KHR_shader_subgroup_basic : enable
@@ -9302,6 +9317,15 @@ float decode_scale(uint value)
     return uintBitsToFloat(value == 0 ? 0x00400000u : value << 23);
 }
 
+float mxfp4_product(float value, float input_value, float scale)
+{
+#ifdef NCNN_fp16_arithmetic
+    return float(float16_t(value) * float16_t(input_value) * float16_t(scale));
+#else
+    return value * input_value * scale;
+#endif
+}
+
 #if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
 shared float partial_sum[32];
 #endif
@@ -9323,7 +9347,10 @@ void main()
             const float scale = decode_scale(scale_byte(scale_row + block));
             const uint value = packed_byte(packed_row + block * 16 + lane / 2);
             const uint nibble = (lane & 1) == 0 ? value & 15 : value >> 4;
-            sum += decode_mxfp4(nibble) * input_data[input_row + block * 32 + lane] * scale;
+            sum += mxfp4_product(
+                decode_mxfp4(nibble),
+                input_data[input_row + block * 32 + lane],
+                scale);
         }
     }
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
@@ -9518,6 +9545,45 @@ std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create_with_al
         }
     }
 
+    const size_t packed_bytes = packed.total() * packed.elemsize;
+    const size_t scales_bytes = scales.total() * scales.elemsize;
+    const size_t bias_bytes = biases.total() * biases.elemsize;
+    const size_t storage_alignment = std::max<size_t>(
+        4,
+        device->info.buffer_offset_alignment());
+    const auto aligned_segment = [storage_alignment](size_t bytes) -> size_t {
+        const size_t remainder = bytes % storage_alignment;
+        if (remainder == 0)
+            return bytes;
+        const size_t padding = storage_alignment - remainder;
+        if (bytes > std::numeric_limits<size_t>::max() - padding)
+            return 0;
+        return bytes + padding;
+    };
+    const size_t packed_segment_bytes = aligned_segment(packed_bytes);
+    const size_t scales_segment_bytes = aligned_segment(scales_bytes);
+    const size_t bias_segment_bytes = aligned_segment(bias_bytes);
+    if (packed_segment_bytes == 0 || scales_segment_bytes == 0 || bias_segment_bytes == 0
+        || packed_segment_bytes > std::numeric_limits<size_t>::max() - scales_segment_bytes
+        || packed_segment_bytes + scales_segment_bytes > std::numeric_limits<size_t>::max() - bias_segment_bytes)
+    {
+        return {};
+    }
+    const size_t scales_offset = packed_segment_bytes;
+    const size_t bias_offset = packed_segment_bytes + scales_segment_bytes;
+    const size_t storage_bytes = bias_offset + bias_segment_bytes;
+    if (storage_bytes == 0 || storage_bytes > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return {};
+
+    ncnn::Mat combined;
+    combined.create(static_cast<int>(storage_bytes), sizeof(uint8_t));
+    if (combined.empty())
+        return {};
+    std::memset(combined.data, 0, storage_bytes);
+    std::memcpy(combined.data, packed.data, packed_bytes);
+    std::memcpy(static_cast<std::byte*>(combined.data) + scales_offset, scales.data, scales_bytes);
+    std::memcpy(static_cast<std::byte*>(combined.data) + bias_offset, biases.data, bias_bytes);
+
     {
         const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
         if (!create_mxfp4_projection_pipeline(implementation.vulkan_context, implementation.option, implementation.pipeline))
@@ -9538,16 +9604,38 @@ std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create_with_al
         const std::lock_guard<std::mutex> lock(
             implementation.vulkan_context->command_mutex());
         ncnn::VkTransfer command(device);
-        command.record_upload(packed, implementation.packed, upload_option);
-        command.record_upload(scales, implementation.scales, upload_option);
-        command.record_upload(biases, implementation.bias, upload_option);
-        uploaded = !implementation.packed.empty() && !implementation.scales.empty() && !implementation.bias.empty() && command.submit_and_wait() == 0;
+        command.record_upload(combined, implementation.storage, upload_option);
+        uploaded = !implementation.storage.empty() && command.submit_and_wait() == 0;
     }
     implementation.weight_staging_allocator.reset();
     if (!uploaded)
     {
         return {};
     }
+
+    const auto storage_view = [&implementation](size_t offset, size_t bytes) {
+        ncnn::VkMat view = implementation.storage;
+        view.dims = 1;
+        view.w = static_cast<int>(bytes);
+        view.h = 1;
+        view.d = 1;
+        view.c = 1;
+        view.elemsize = sizeof(uint8_t);
+        view.elempack = 1;
+        view.cstep = bytes;
+#if NCNN_BATCH
+        view.n = 1;
+        view.nstep = bytes;
+#endif
+        view.offset += offset;
+        return view;
+    };
+    implementation.packed = storage_view(0, packed_bytes);
+    implementation.scales = storage_view(scales_offset, scales_bytes);
+    implementation.bias = storage_view(bias_offset, bias_bytes);
+    implementation.indexed_storage = true;
+    implementation.indexed_scales_word_offset = static_cast<uint32_t>(scales_offset / sizeof(uint32_t));
+    implementation.indexed_bias_word_offset = static_cast<uint32_t>(bias_offset / sizeof(uint32_t));
     return result;
 #else
     (void)matrix;
@@ -9686,6 +9774,11 @@ public:
 static constexpr char mxfp4_gate_up_shader[] = R"glsl(
 #version 450
 
+#ifdef NCNN_fp16_arithmetic
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
@@ -9747,6 +9840,15 @@ float decode_scale(uint value)
     return uintBitsToFloat(value == 0 ? 0x00400000u : value << 23);
 }
 
+float mxfp4_product(float value, float input_value, float scale)
+{
+#ifdef NCNN_fp16_arithmetic
+    return float(float16_t(value) * float16_t(input_value) * float16_t(scale));
+#else
+    return value * input_value * scale;
+#endif
+}
+
 #if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
 shared float gate_partial[32];
 shared float up_partial[32];
@@ -9777,8 +9879,14 @@ void main()
             const uint gate_nibble = (lane & 1) == 0 ? gate_value & 15 : gate_value >> 4;
             const uint up_nibble = (lane & 1) == 0 ? up_value & 15 : up_value >> 4;
             const float input_value = input_data[input_row + block * 32 + lane];
-            gate_sum += decode_mxfp4(gate_nibble) * input_value * decode_scale(scale_byte(gate_scale_row + block));
-            up_sum += decode_mxfp4(up_nibble) * input_value * decode_scale(scale_byte(up_scale_row + block));
+            gate_sum += mxfp4_product(
+                decode_mxfp4(gate_nibble),
+                input_value,
+                decode_scale(scale_byte(gate_scale_row + block)));
+            up_sum += mxfp4_product(
+                decode_mxfp4(up_nibble),
+                input_value,
+                decode_scale(scale_byte(up_scale_row + block)));
         }
     }
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
@@ -9990,12 +10098,14 @@ static bool route_aggregation_enabled(
     if (!enabled)
         return false;
 
+    bool require_all_requests = false;
     for (size_t request_index : selected_indices)
     {
         if (request_index >= requests.size())
             return false;
         const ExpertBackendRequest& request = requests[request_index];
         const ExpertBackendRequest::RouteAggregation& aggregation = request.route_aggregation;
+        require_all_requests = require_all_requests || aggregation.require_all_requests;
         if (!request.input || !aggregation.output || !aggregation.completed || aggregation.token_count == 0
             || aggregation.routes.size() != request.input->rows()
             || aggregation.output->rows() != aggregation.token_count
@@ -10016,6 +10126,9 @@ static bool route_aggregation_enabled(
                 return false;
         }
     }
+
+    if (require_all_requests && selected_indices.size() != requests.size())
+        return false;
 
     // Aggregating only pays when the selected GPU routes contain more rows
     // than the final token output.  For decode, the metadata upload and one
@@ -10043,24 +10156,6 @@ static bool route_aggregation_enabled(
     const uint64_t saved_output_bytes =
         saved_rows * static_cast<uint64_t>(output_columns) * sizeof(float);
     return saved_output_bytes >= minimum_saved_output_bytes;
-}
-
-static bool vulkan_expert_eager_admission_enabled(
-    uint32_t token_count,
-    uint64_t optimization_flags) noexcept
-{
-    if (runtime_optimization_enabled(
-            optimization_flags,
-            RuntimeOptimizationVulkanExpertEagerAdmission))
-        return true;
-
-    // A physical batch has enough independent rows to amortize a first
-    // device admission.  Single-token decode remains reuse-driven by default;
-    // the batch-admission bit controls this automatic policy.
-    return runtime_optimization_enabled(
-               optimization_flags,
-               RuntimeOptimizationVulkanExpertBatchAdmission)
-           && token_count >= 2;
 }
 
 static bool build_route_aggregation_metadata(
@@ -10118,6 +10213,446 @@ static bool build_route_aggregation_metadata(
     }
     return true;
 }
+
+// This is the ncnn-side equivalent of llama.cpp's MUL_MAT_ID path.  The
+// selected Expert matrices are exposed as one storage-buffer binding per
+// Expert, while expert_ids selects the matrix for each routed input row.  A
+// single shader dispatch therefore covers all selected Experts in the batch.
+// Eight bindings keep the descriptor set small enough for older Vulkan
+// implementations; larger physical batches continue through forward_batch's
+// descriptor-per-Expert fallback below.
+static constexpr uint32_t mxfp4_indexed_max_experts = 8;
+
+static constexpr char mxfp4_indexed_shader[] = R"glsl(
+#version 450
+
+#ifdef NCNN_fp16_arithmetic
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(binding = 0) readonly buffer input_blob
+{
+    float input_data[];
+};
+layout(binding = 1) readonly buffer expert_blob_0
+{
+    uint expert_words_0[];
+};
+layout(binding = 2) readonly buffer expert_blob_1
+{
+    uint expert_words_1[];
+};
+layout(binding = 3) readonly buffer expert_blob_2
+{
+    uint expert_words_2[];
+};
+layout(binding = 4) readonly buffer expert_blob_3
+{
+    uint expert_words_3[];
+};
+layout(binding = 5) readonly buffer expert_blob_4
+{
+    uint expert_words_4[];
+};
+layout(binding = 6) readonly buffer expert_blob_5
+{
+    uint expert_words_5[];
+};
+layout(binding = 7) readonly buffer expert_blob_6
+{
+    uint expert_words_6[];
+};
+layout(binding = 8) readonly buffer expert_blob_7
+{
+    uint expert_words_7[];
+};
+layout(binding = 9) readonly buffer expert_id_blob
+{
+    uint expert_ids[];
+};
+layout(binding = 10) writeonly buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint gate_input_columns;
+    uint gate_output_columns;
+    uint down_input_columns;
+    uint down_output_columns;
+    uint gate_block_count;
+    uint down_block_count;
+    uint token_count;
+    uint expert_count;
+    uint gate_packed_word_offset;
+    uint gate_scale_word_offset;
+    uint gate_bias_word_offset;
+    uint down_packed_word_offset;
+    uint down_scale_word_offset;
+    uint down_bias_word_offset;
+    uint mode;
+    uint activation;
+    float activation_limit;
+    uint tile_mode;
+}
+p;
+
+uint expert_word(uint slot, uint index)
+{
+    switch (slot)
+    {
+    case 0u:
+        return expert_words_0[index];
+    case 1u:
+        return expert_words_1[index];
+    case 2u:
+        return expert_words_2[index];
+    case 3u:
+        return expert_words_3[index];
+    case 4u:
+        return expert_words_4[index];
+    case 5u:
+        return expert_words_5[index];
+    case 6u:
+        return expert_words_6[index];
+    case 7u:
+        return expert_words_7[index];
+    default:
+        return 0u;
+    }
+}
+
+uint packed_byte(uint slot, uint index)
+{
+    const uint word_offset = p.mode == 0u
+                                 ? p.gate_packed_word_offset
+                                 : p.down_packed_word_offset;
+    const uint word = expert_word(slot, word_offset + (index >> 2));
+    return (word >> ((index & 3u) * 8u)) & 255u;
+}
+
+uint scale_byte(uint slot, uint index)
+{
+    const uint word_offset = p.mode == 0u
+                                 ? p.gate_scale_word_offset
+                                 : p.down_scale_word_offset;
+    const uint word = expert_word(slot, word_offset + (index >> 2));
+    return (word >> ((index & 3u) * 8u)) & 255u;
+}
+
+float bias_value(uint slot, uint index)
+{
+    const uint word_offset = p.mode == 0u
+                                 ? p.gate_bias_word_offset
+                                 : p.down_bias_word_offset;
+    return uintBitsToFloat(expert_word(slot, word_offset + index));
+}
+
+float decode_mxfp4(uint value)
+{
+    const float magnitudes[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    const float magnitude = magnitudes[value & 7u];
+    return (value & 8u) == 0u ? magnitude : -magnitude;
+}
+
+float decode_scale(uint value)
+{
+    return uintBitsToFloat(value == 0u ? 0x00400000u : value << 23);
+}
+
+float mxfp4_product(float value, float input_value, float scale)
+{
+#ifdef NCNN_fp16_arithmetic
+    return float(float16_t(value) * float16_t(input_value) * float16_t(scale));
+#else
+    return value * input_value * scale;
+#endif
+}
+
+#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
+shared float partial_sum_0[32];
+shared float partial_sum_1[32];
+shared float partial_sum_2[32];
+shared float partial_sum_3[32];
+#endif
+
+void accumulate_indexed_row(
+    uint slot,
+    uint row,
+    uint output_column,
+    bool gate_mode,
+    uint matrix_input_columns,
+    uint block_count,
+    inout float sum_0,
+    inout float sum_1)
+{
+    const uint weight_row = gate_mode ? output_column * 2u : output_column;
+    const uint packed_row_base = weight_row * block_count * 16u;
+    const uint scale_row_base = weight_row * block_count;
+    const uint input_row = row * matrix_input_columns;
+    for (uint block = 0u; block < block_count; ++block)
+    {
+        const uint packed_index = block * 16u + gl_LocalInvocationID.x / 2u;
+        const uint input_index = input_row + block * 32u + gl_LocalInvocationID.x;
+        const float input_value = input_data[input_index];
+        const float scale_0 = decode_scale(scale_byte(slot, scale_row_base + block));
+        const uint value_0 = packed_byte(slot, packed_row_base + packed_index);
+        const uint nibble_0 = (gl_LocalInvocationID.x & 1u) == 0u ? value_0 & 15u : value_0 >> 4u;
+        sum_0 += mxfp4_product(decode_mxfp4(nibble_0), input_value, scale_0);
+        if (gate_mode)
+        {
+            const float scale_1 = decode_scale(scale_byte(slot, scale_row_base + block_count + block));
+            const uint value_1 = packed_byte(slot, packed_row_base + block_count * 16u + packed_index);
+            const uint nibble_1 = (gl_LocalInvocationID.x & 1u) == 0u ? value_1 & 15u : value_1 >> 4u;
+            sum_1 += mxfp4_product(decode_mxfp4(nibble_1), input_value, scale_1);
+        }
+    }
+}
+
+void store_indexed_result(uint slot, uint row, uint output_column, float sum_0, float sum_1)
+{
+    if (p.mode == 1u)
+    {
+        output_data[row * p.down_output_columns + output_column] =
+            sum_0 + bias_value(slot, output_column);
+        return;
+    }
+
+    float gate = sum_0 + bias_value(slot, output_column * 2u);
+    float up = sum_1 + bias_value(slot, output_column * 2u + 1u);
+    if (p.activation_limit > 0.0)
+    {
+        gate = min(gate, p.activation_limit);
+        up = clamp(up, -p.activation_limit, p.activation_limit);
+    }
+    const float silu = p.activation == 0u
+                           ? gate / (1.0 + exp(-1.702 * gate))
+                           : gate / (1.0 + exp(-gate));
+    output_data[row * (p.gate_output_columns / 2u) + output_column] =
+        p.activation == 0u ? silu * (up + 1.0) : silu * up;
+}
+
+void main()
+{
+    const bool gate_mode = p.mode == 0u;
+    const uint output_column = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+
+    // Layout 1 is the tiled MUL_MAT_ID-style path.  The selected Expert
+    // rows are contiguous in input/output order, so one workgroup processes
+    // two rows for one Expert while each row keeps the scalar accumulation
+    // order. This is deliberately kept in the same pipeline as the scalar
+    // path so devices with unusual subgroup capabilities retain the proven
+    // fallback.
+    if (p.tile_mode == 1u)
+    {
+        const uint slot = gl_WorkGroupID.z;
+        const uint row_tile = gl_WorkGroupID.y;
+        const uint row_begin = expert_ids[slot] + row_tile * 2u;
+        const uint row_end = expert_ids[slot + 1u];
+        const bool output_valid = output_column < (gate_mode ? p.gate_output_columns / 2u : p.down_output_columns);
+        const bool row_0_valid = slot < p.expert_count && row_begin < row_end && row_begin < p.token_count;
+        const bool row_1_valid = slot < p.expert_count && row_begin + 1u < row_end && row_begin + 1u < p.token_count;
+        const uint matrix_input_columns = gate_mode ? p.gate_input_columns : p.down_input_columns;
+        const uint block_count = gate_mode ? p.gate_block_count : p.down_block_count;
+        float tile_sum_0 = 0.0;
+        float tile_sum_1 = 0.0;
+        float tile_sum_2 = 0.0;
+        float tile_sum_3 = 0.0;
+        if (output_valid && (row_0_valid || row_1_valid))
+        {
+            if (row_0_valid)
+                accumulate_indexed_row(slot, row_begin, output_column, gate_mode, matrix_input_columns, block_count, tile_sum_0, tile_sum_1);
+            if (row_1_valid)
+                accumulate_indexed_row(slot, row_begin + 1u, output_column, gate_mode, matrix_input_columns, block_count, tile_sum_2, tile_sum_3);
+        }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+        const float reduced_tile_0 = subgroupAdd(tile_sum_0);
+        const float reduced_tile_1 = subgroupAdd(tile_sum_1);
+        const float reduced_tile_2 = subgroupAdd(tile_sum_2);
+        const float reduced_tile_3 = subgroupAdd(tile_sum_3);
+        if (lane == 0u && output_valid)
+        {
+            if (row_0_valid)
+                store_indexed_result(slot, row_begin, output_column, reduced_tile_0, reduced_tile_1);
+            if (row_1_valid)
+                store_indexed_result(slot, row_begin + 1u, output_column, reduced_tile_2, reduced_tile_3);
+        }
+#else
+        partial_sum_0[lane] = tile_sum_0;
+        partial_sum_1[lane] = tile_sum_1;
+        partial_sum_2[lane] = tile_sum_2;
+        partial_sum_3[lane] = tile_sum_3;
+        barrier();
+        for (uint stride = 16u; stride > 0u; stride >>= 1u)
+        {
+            if (lane < stride)
+            {
+                partial_sum_0[lane] += partial_sum_0[lane + stride];
+                partial_sum_1[lane] += partial_sum_1[lane + stride];
+                partial_sum_2[lane] += partial_sum_2[lane + stride];
+                partial_sum_3[lane] += partial_sum_3[lane + stride];
+            }
+            barrier();
+        }
+        if (lane == 0u && output_valid)
+        {
+            if (row_0_valid)
+                store_indexed_result(slot, row_begin, output_column, partial_sum_0[0], partial_sum_1[0]);
+            if (row_1_valid)
+                store_indexed_result(slot, row_begin + 1u, output_column, partial_sum_2[0], partial_sum_3[0]);
+        }
+#endif
+        return;
+    }
+
+    const uint matrix_input_columns = gate_mode ? p.gate_input_columns : p.down_input_columns;
+    const uint block_count = gate_mode ? p.gate_block_count : p.down_block_count;
+    const uint slot = token < p.token_count ? expert_ids[token] : 0u;
+    const bool valid = output_column < (gate_mode ? p.gate_output_columns / 2u : p.down_output_columns)
+                       && token < p.token_count
+                       && slot < p.expert_count;
+    float sum_0 = 0.0;
+    float sum_1 = 0.0;
+    if (valid && lane < 32u)
+    {
+        const uint input_row = token * matrix_input_columns;
+        const uint row_0 = gate_mode ? output_column * 2u : output_column;
+        const uint row_1 = row_0 + 1u;
+        const uint row_0_packed = row_0 * block_count * 16u;
+        const uint row_1_packed = row_1 * block_count * 16u;
+        const uint row_0_scale = row_0 * block_count;
+        const uint row_1_scale = row_1 * block_count;
+        for (uint block = 0u; block < block_count; ++block)
+        {
+            const uint packed_index = block * 16u + lane / 2u;
+            const uint input_index = input_row + block * 32u + lane;
+            const float input_value = input_data[input_index];
+            const float scale_0 = decode_scale(scale_byte(slot, row_0_scale + block));
+            const uint value_0 = packed_byte(slot, row_0_packed + packed_index);
+            const uint nibble_0 = (lane & 1u) == 0u ? value_0 & 15u : value_0 >> 4u;
+            sum_0 += mxfp4_product(decode_mxfp4(nibble_0), input_value, scale_0);
+            if (gate_mode)
+            {
+                const float scale_1 = decode_scale(scale_byte(slot, row_1_scale + block));
+                const uint value_1 = packed_byte(slot, row_1_packed + packed_index);
+                const uint nibble_1 = (lane & 1u) == 0u ? value_1 & 15u : value_1 >> 4u;
+                sum_1 += mxfp4_product(decode_mxfp4(nibble_1), input_value, scale_1);
+            }
+        }
+    }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const float reduced_0 = subgroupAdd(sum_0);
+    const float reduced_1 = subgroupAdd(sum_1);
+    if (valid && lane == 0u)
+    {
+        if (!gate_mode)
+        {
+            output_data[token * p.down_output_columns + output_column] =
+                reduced_0 + bias_value(slot, output_column);
+        }
+        else
+        {
+            float gate = reduced_0 + bias_value(slot, output_column * 2u);
+            float up = reduced_1 + bias_value(slot, output_column * 2u + 1u);
+            if (p.activation_limit > 0.0)
+            {
+                gate = min(gate, p.activation_limit);
+                up = clamp(up, -p.activation_limit, p.activation_limit);
+            }
+            const float silu = p.activation == 0u
+                                   ? gate / (1.0 + exp(-1.702 * gate))
+                                   : gate / (1.0 + exp(-gate));
+            output_data[token * (p.gate_output_columns / 2u) + output_column] =
+                p.activation == 0u ? silu * (up + 1.0) : silu * up;
+        }
+    }
+#else
+    partial_sum_0[lane] = sum_0;
+    partial_sum_1[lane] = sum_1;
+    barrier();
+    for (uint stride = 16u; stride > 0u; stride >>= 1u)
+    {
+        if (lane < stride)
+        {
+            partial_sum_0[lane] += partial_sum_0[lane + stride];
+            partial_sum_1[lane] += partial_sum_1[lane + stride];
+        }
+        barrier();
+    }
+    if (valid && lane == 0u)
+    {
+        if (!gate_mode)
+        {
+            output_data[token * p.down_output_columns + output_column] =
+                partial_sum_0[0] + bias_value(slot, output_column);
+        }
+        else
+        {
+            float gate = partial_sum_0[0] + bias_value(slot, output_column * 2u);
+            float up = partial_sum_1[0] + bias_value(slot, output_column * 2u + 1u);
+            if (p.activation_limit > 0.0)
+            {
+                gate = min(gate, p.activation_limit);
+                up = clamp(up, -p.activation_limit, p.activation_limit);
+            }
+            const float silu = p.activation == 0u
+                                   ? gate / (1.0 + exp(-1.702 * gate))
+                                   : gate / (1.0 + exp(-gate));
+            output_data[token * (p.gate_output_columns / 2u) + output_column] =
+                p.activation == 0u ? silu * (up + 1.0) : silu * up;
+        }
+    }
+#endif
+}
+)glsl";
+
+static bool create_mxfp4_indexed_pipeline(
+    const std::shared_ptr<NcnnVulkanContext>& context,
+    const ncnn::Option& option,
+    std::shared_ptr<ncnn::Pipeline>& destination)
+{
+    const std::shared_ptr<const std::vector<uint32_t>> spirv =
+        context->shader_binary(
+            mxfp4_indexed_shader,
+            static_cast<int>(sizeof(mxfp4_indexed_shader) - 1),
+            option,
+            0);
+    if (!spirv || spirv->empty())
+        return false;
+
+    const size_t pipeline_key = option.use_subgroup_ops ? 1u : 0u;
+    destination = context->find_pipeline(mxfp4_indexed_shader, pipeline_key);
+    if (destination)
+        return true;
+    std::unique_ptr<ncnn::Pipeline> pipeline(new ncnn::Pipeline(context->device()));
+    pipeline->set_optimal_local_size_xyz(32, 1, 1);
+    const std::vector<ncnn::vk_specialization_type> specializations;
+    if (pipeline->create(
+            spirv->data(),
+            spirv->size() * sizeof(uint32_t),
+            specializations)
+        != 0)
+    {
+        return false;
+    }
+    destination = std::shared_ptr<ncnn::Pipeline>(
+        pipeline.release(),
+        [context](ncnn::Pipeline* value) {
+            const std::lock_guard<std::mutex> lock(context->command_mutex());
+            delete value;
+        });
+    context->cache_pipeline(mxfp4_indexed_shader, pipeline_key, destination);
+    return true;
+}
 #endif
 
 NcnnVulkanMxfp4ExpertOperator::NcnnVulkanMxfp4ExpertOperator()
@@ -10160,6 +10695,7 @@ std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> NcnnVulkanMxfp4ExpertOperator::cr
     {
         return {};
     }
+
     std::shared_ptr<NcnnVulkanMxfp4Operator> gate_up_projection = NcnnVulkanMxfp4Operator::create_with_allocator(
         gate_up,
         gate_up_bias,
@@ -10599,35 +11135,11 @@ public:
         admission.activation_limit = activation_limit;
         admission.activation = activation;
         admission.residency_group = residency_group;
-        admission.timing_bucket = timing_bucket(token_count);
         admission.bytes = bytes;
-        const bool eager_admission = vulkan_expert_eager_admission_enabled(
-            token_count,
-            vulkan_context_ ? vulkan_context_->optimization_flags() : RuntimeOptimizationDefaultFlags);
+        (void)token_count;
 
         const std::lock_guard<std::mutex> lock(mutex_);
         if (stopping_ || entries_.find(admission.key) != entries_.end() || pending_keys_.find(admission.key) != pending_keys_.end())
-        {
-            return;
-        }
-        const PhaseTiming& phase = phase_timings_[admission.timing_bucket];
-        if (phase.cpu_samples >= 3 && phase.hybrid_samples >= 8 && !phase.hybrid_enabled)
-        {
-            return;
-        }
-        if (phase.hybrid_samples < 8 && !eager_admission)
-        {
-            const uint64_t calibration_capacity = std::min<uint64_t>(capacity_bytes_, bytes > UINT64_MAX / 4 ? UINT64_MAX : bytes * 4);
-            if (bytes > calibration_capacity || resident_bytes_ + pending_bytes_ > calibration_capacity - bytes)
-            {
-                return;
-            }
-        }
-        const bool ghost = recent_ghost_index_.find(admission.key) != recent_ghost_index_.end()
-                           || frequent_ghost_index_.find(admission.key) != frequent_ghost_index_.end();
-        if (!ghost
-            && admission_candidates_.insert(admission.key).second
-            && !eager_admission)
         {
             return;
         }
@@ -10729,40 +11241,22 @@ public:
         work->selected.reserve(requests.size());
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            // During a Session foreground transaction the admission worker
-            // is suspended by foreground_depth_. Pending bytes then belong
-            // to future cache work and cannot contend with this dispatch;
-            // allow the result to calibrate the per-instance GPU policy.
-            work->uncontended_sample = pending_bytes_ == 0 || foreground_depth_ != 0;
+            // Admission is asynchronous and bounded; resident selection
+            // below applies the fixed route-row policy for device execution.
             std::vector<Selection>& candidates = work->selected;
-            double cpu_baseline_microseconds = 0.0;
-            bool cpu_prediction_ready = !requests.empty();
-            size_t phase_bucket = 0;
             for (size_t request_index = 0; request_index < requests.size(); ++request_index)
             {
                 const ExpertBackendRequest& request = requests[request_index];
                 if (!request.input || !request.output || request.input->rows() == 0)
                 {
                     work->planned[request_index] = ExpertBackendExecutionResult ::Failed;
-                    cpu_prediction_ready = false;
                     continue;
-                }
-                const size_t bucket = timing_bucket(request.input->rows());
-                phase_bucket = std::max(phase_bucket, bucket);
-                const uint64_t requested_bytes = request.weight_bytes;
-                const Timing& timing = timings_[bucket];
-                if (timing.cpu_samples < 3)
-                {
-                    cpu_prediction_ready = false;
-                }
-                else if (requested_bytes != 0)
-                {
-                    cpu_baseline_microseconds += timing.cpu_microseconds_per_byte * static_cast<double>(requested_bytes);
                 }
                 auto existing = entries_.find(request.key);
                 if (existing == entries_.end())
                 {
-                    const bool source_allowed = request.weight_bytes == 0 || allow_device_source_locked(bucket);
+                    const bool source_allowed = request.weight_bytes == 0
+                                                || request.input->rows() >= vulkan_expert_gpu_admission_min_rows;
                     std::optional<VulkanExpertVictimCache::DeviceOperationLease> device_lease;
                     const std::shared_ptr<VulkanExpertVictimCache> device_weight_source = device_weight_source_;
                     if (device_weight_source && source_allowed)
@@ -10797,14 +11291,9 @@ public:
                         entry->device_source = true;
                         ++hits_;
                         ++device_source_hits_;
-                        if (requested_bytes == 0 && timing.cpu_samples >= 3)
-                        {
-                            cpu_baseline_microseconds += timing.cpu_microseconds_per_byte * static_cast<double>(entry->bytes);
-                        }
                         candidates.push_back({
                             request_index,
                             std::move(entry),
-                            bucket,
                         });
                         continue;
                     }
@@ -10812,26 +11301,13 @@ public:
                 std::shared_ptr<Entry> entry = existing->second;
                 touch_locked(*entry, true);
                 ++hits_;
-                if (requested_bytes == 0 && timing.cpu_samples >= 3)
-                {
-                    cpu_baseline_microseconds += timing.cpu_microseconds_per_byte * static_cast<double>(entry->bytes);
-                }
                 candidates.push_back({
                     request_index,
                     std::move(entry),
-                    bucket,
                 });
             }
 
             size_t selected_count = 0;
-            const bool phase_allows_hybrid = candidates.empty() || allow_hybrid_phase_locked(phase_bucket);
-            // Foreground admission is paused for the whole Session
-            // transaction. A non-zero pending total can therefore only
-            // describe other weights queued for the next phase; it must not
-            // prevent already resident candidates from executing now.
-            // Keep the conservative barrier for direct/background backend
-            // callers, where an upload may actually compete with execution.
-            const bool cache_warming = pending_bytes_ != 0 && foreground_depth_ == 0;
             bool direct_resident_execution = foreground_depth_ == 0 && !candidates.empty();
             if (direct_resident_execution)
             {
@@ -10844,120 +11320,33 @@ public:
                     }
                 }
             }
-            size_t gpu_priority_count = 0;
-            if (!candidates.empty())
-            {
-                const auto stable_gpu_end = std::stable_partition(
-                    candidates.begin(),
-                    candidates.end(),
-                    [this](const Selection& selection) {
-                        const Timing& timing = timings_[selection.bucket];
-                        return timing.cpu_samples >= 3
-                               && timing.gpu_samples >= 3
-                               && timing.gpu_preferred;
-                    });
-                gpu_priority_count = static_cast<size_t>(
-                    std::distance(candidates.begin(), stable_gpu_end));
-            }
-            if (!phase_allows_hybrid || cache_warming)
-            {
-                // Admission is intentionally allowed to continue in the
-                // background, but execution must not compete with the host
-                // cache/IO pipeline while device weights are still arriving.
-                // Once pending_bytes_ reaches zero, the same per-instance
-                // reservation policy can use the resident GPU set again.
-                selected_count = 0;
-            }
-            else if (direct_resident_execution)
+            if (direct_resident_execution)
             {
                 // The weight-less backend API is an explicit resident
                 // operation used by backend clients and validation. It must
-                // not be mistaken for a model execution request whose
-                // transfer cost is available to the hybrid policy.
+                // execute every explicitly requested resident Expert.
                 selected_count = candidates.size();
             }
             else if (runtime_optimization_enabled(
                          optimization_flags_,
-                         RuntimeOptimizationVulkanExpertGpuPriority)
-                     && gpu_priority_count != 0)
+                         RuntimeOptimizationVulkanExpertGpuPriority))
             {
-                // A resident Expert already paid the admission and upload
-                // cost. Keep the calibrated GPU winners on Vulkan so one
-                // submission can batch physical requests without making an
-                // uncalibrated or CPU-preferred bucket block them. Single-row
-                // decode is still gated by the same per-instance timing
-                // samples, so this path only runs after its transfer boundary
-                // has proved profitable.
-                selected_count = gpu_priority_count;
-            }
-            else if (!candidates.empty() && !cpu_prediction_ready)
-            {
-                // Establish the host baseline before dispatching any GPU
-                // Expert. This avoids turning a cold admission into a
-                // latency sample and lets the per-instance policy decide
-                // whether the physical batch amortizes its transfer cost.
-                selected_count = 0;
-            }
-            else if (!candidates.empty())
-            {
-                auto cold = candidates.end();
-                for (auto candidate = candidates.begin(); candidate != candidates.end(); ++candidate)
-                {
-                    if (timings_[candidate->bucket].gpu_samples < 3)
-                    {
-                        cold = candidate;
-                        break;
-                    }
-                }
-                // A direct backend probe is part of the public backend
-                // contract and must be allowed to establish a GPU sample
-                // even for one row. During an actual foreground generation,
-                // the one-row transfer boundary is intentionally kept on
-                // CPU until the per-instance timing policy proves a win.
-                const bool allow_single_row_cold_probe = foreground_depth_ == 0;
-                if (cold != candidates.end()
-                    && (phase_bucket != 0 || allow_single_row_cold_probe))
-                {
-                    std::iter_swap(candidates.begin(), cold);
-                    selected_count = 1;
-                }
-                else if (cold == candidates.end())
-                {
-                    std::sort(candidates.begin(), candidates.end(), SelectionOrder{this, requests});
-                    double cpu_microseconds = cpu_baseline_microseconds;
-                    double gpu_microseconds = 0.0;
-                    double best_phase_microseconds = cpu_baseline_microseconds;
-                    for (size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index)
-                    {
-                        const Selection& selection = candidates[candidate_index];
-                        const ExpertBackendRequest& request = requests[selection.request_index];
-                        const uint64_t bytes = request.weight_bytes == 0 ? selection.entry->bytes : request.weight_bytes;
-                        const Timing& timing = timings_[selection.bucket];
-                        cpu_microseconds = std::max(0.0, cpu_microseconds - timing.cpu_microseconds_per_byte * static_cast<double>(bytes));
-                        gpu_microseconds += timing.gpu_microseconds_per_byte * static_cast<double>(bytes);
-                        const double phase_microseconds = std::max(cpu_microseconds, gpu_microseconds);
-                        if (phase_microseconds < best_phase_microseconds * 0.98)
-                        {
-                            best_phase_microseconds = phase_microseconds;
-                            selected_count = candidate_index + 1;
-                        }
-                    }
-
-                    if (selected_count == 0)
-                    {
-                        for (size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index)
-                        {
-                            Timing& timing = timings_[candidates[candidate_index].bucket];
-                            ++timing.cpu_decisions;
-                            if (timing.cpu_decisions % 64 == 0)
-                            {
-                                std::iter_swap(candidates.begin(), candidates.begin() + candidate_index);
-                                selected_count = 1;
-                                break;
-                            }
-                        }
-                    }
-                }
+                // Deterministic policy: only resident Experts with enough
+                // routed rows amortize the host/device boundary.  The
+                // threshold is fixed, so no CPU/GPU probe or timing sample
+                // is needed to decide whether the request uses Vulkan.
+                const auto gpu_end = std::stable_partition(
+                    candidates.begin(),
+                    candidates.end(),
+                    [&requests](const Selection& selection) {
+                        const ExpertBackendRequest& request =
+                            requests[selection.request_index];
+                        return request.input
+                               && request.input->rows()
+                                      >= vulkan_expert_gpu_min_rows;
+                    });
+                selected_count = static_cast<size_t>(
+                    std::distance(candidates.begin(), gpu_end));
             }
 
             for (size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index)
@@ -10974,22 +11363,6 @@ public:
                 }
             }
             work->selected.resize(selected_count);
-            uint64_t source_accelerated_bytes = 0;
-            for (const Selection& selection : work->selected)
-            {
-                if (selection.entry->device_source)
-                {
-                    source_accelerated_bytes += selection.entry->bytes;
-                }
-            }
-            if (source_accelerated_bytes == 0)
-            {
-                source_accelerated_bytes_ = 0;
-            }
-            else
-            {
-                source_accelerated_bytes_ = source_accelerated_bytes;
-            }
             if (work->selected.empty())
             {
                 work->final = work->planned;
@@ -11006,83 +11379,20 @@ public:
 
     void observe_cpu(uint32_t token_count, uint64_t weight_bytes, uint64_t elapsed_microseconds) override
     {
-        if (token_count == 0 || weight_bytes == 0 || elapsed_microseconds == 0)
-        {
-            return;
-        }
-        const std::lock_guard<std::mutex> lock(mutex_);
-        Timing& timing = timings_[timing_bucket(token_count)];
-        observe_timing(timing.cpu_microseconds_per_byte, timing.cpu_samples, elapsed_microseconds, weight_bytes);
-        update_preference_locked(timing_bucket(token_count));
+        // GPU/CPU placement is deterministic; runtime timing never changes it.
+        (void)token_count;
+        (void)weight_bytes;
+        (void)elapsed_microseconds;
     }
 
     void observe_phase(uint32_t token_count, uint64_t total_weight_bytes, uint64_t accelerated_weight_bytes, uint64_t elapsed_microseconds) override
     {
-        if (token_count == 0 || total_weight_bytes == 0 || elapsed_microseconds == 0)
-        {
-            return;
-        }
-        const size_t bucket = timing_bucket(token_count);
-        const std::lock_guard<std::mutex> lock(mutex_);
-        PhaseTiming& phase = phase_timings_[bucket];
-        if (accelerated_weight_bytes == 0)
-        {
-            source_accelerated_bytes_ = 0;
-            observe_timing(phase.cpu_microseconds_per_byte, phase.cpu_samples, elapsed_microseconds, total_weight_bytes);
-        }
-        else
-        {
-            observe_timing(phase.hybrid_microseconds_per_byte, phase.hybrid_samples, elapsed_microseconds, total_weight_bytes);
-        }
-        if (source_accelerated_bytes_ != 0)
-        {
-            SourcePhaseTiming& source_phase = source_phase_timings_[bucket];
-            observe_timing(source_phase.hybrid_microseconds_per_byte, source_phase.hybrid_samples, elapsed_microseconds, total_weight_bytes);
-            source_accelerated_bytes_ = 0;
-            if (phase.cpu_samples >= 3 && source_phase.hybrid_samples >= 3)
-            {
-                if (source_phase.hybrid_enabled && source_phase.hybrid_microseconds_per_byte > phase.cpu_microseconds_per_byte * 1.02)
-                {
-                    source_phase.hybrid_enabled = false;
-                    source_phase.cpu_decisions = 0;
-                }
-                else if (!source_phase.hybrid_enabled && source_phase.hybrid_microseconds_per_byte < phase.cpu_microseconds_per_byte * 0.90)
-                {
-                    source_phase.hybrid_enabled = true;
-                    source_phase.cpu_decisions = 0;
-                }
-            }
-        }
-        if (phase.cpu_samples < 3 || phase.hybrid_samples < 8)
-        {
-            return;
-        }
-        if (phase.hybrid_enabled && phase.hybrid_microseconds_per_byte > phase.cpu_microseconds_per_byte * 1.02)
-        {
-            phase.hybrid_enabled = false;
-            phase.cpu_decisions = 0;
-            for (auto pending = pending_.begin(); pending != pending_.end();)
-            {
-                if (pending->timing_bucket != bucket)
-                {
-                    ++pending;
-                    continue;
-                }
-                pending_bytes_ -= pending->bytes;
-                pending_keys_.erase(pending->key);
-                pending = pending_.erase(pending);
-                ++dropped_admissions_;
-            }
-            if (pending_.empty() && active_admissions_ == 0)
-            {
-                admission_idle_.notify_all();
-            }
-        }
-        else if (!phase.hybrid_enabled && phase.hybrid_microseconds_per_byte < phase.cpu_microseconds_per_byte * 0.90)
-        {
-            phase.hybrid_enabled = true;
-            phase.cpu_decisions = 0;
-        }
+        // Keep the interface for backend composition, but do not spend work
+        // collecting samples or changing the static placement policy.
+        (void)token_count;
+        (void)total_weight_bytes;
+        (void)accelerated_weight_bytes;
+        (void)elapsed_microseconds;
     }
 
     void wait_for_background_work() override
@@ -11160,7 +11470,6 @@ private:
     {
         size_t request_index = 0;
         std::shared_ptr<Entry> entry;
-        size_t bucket = 0;
     };
 
     struct WorkItem
@@ -11173,7 +11482,6 @@ private:
         std::vector<Selection> selected;
         std::vector<ExpertBackendExecutionResult> planned;
         std::vector<ExpertBackendExecutionResult> final;
-        bool uncontended_sample = false;
         std::mutex mutex;
         std::condition_variable completed;
         bool done = false;
@@ -11289,7 +11597,6 @@ private:
         float activation_limit = 0.0f;
         ExpertActivation activation = ExpertActivation::GptOssSwiGlu;
         uint32_t residency_group = 0;
-        size_t timing_bucket = 0;
         uint64_t bytes = 0;
     };
 
@@ -11300,45 +11607,6 @@ private:
     };
     using GhostList = std::list<Ghost>;
     using GhostIndex = std::unordered_map<std::string, GhostList::iterator, TransparentStringHash, std::equal_to<>>;
-
-    struct Timing
-    {
-        double cpu_microseconds_per_byte = 0.0;
-        double gpu_microseconds_per_byte = 0.0;
-        uint64_t cpu_samples = 0;
-        uint64_t gpu_samples = 0;
-        uint64_t cpu_decisions = 0;
-        bool gpu_preferred = true;
-    };
-
-    struct SelectionOrder
-    {
-        const VulkanMxfp4ExpertBackend* backend = nullptr;
-        std::span<const ExpertBackendRequest> requests;
-
-        bool operator()(const Selection& left, const Selection& right) const
-        {
-            return backend->benefit_ratio(left, requests) > backend->benefit_ratio(right, requests);
-        }
-    };
-
-    struct PhaseTiming
-    {
-        double cpu_microseconds_per_byte = 0.0;
-        double hybrid_microseconds_per_byte = 0.0;
-        uint64_t cpu_samples = 0;
-        uint64_t hybrid_samples = 0;
-        uint64_t cpu_decisions = 0;
-        bool hybrid_enabled = false;
-    };
-
-    struct SourcePhaseTiming
-    {
-        double hybrid_microseconds_per_byte = 0.0;
-        uint64_t hybrid_samples = 0;
-        uint64_t cpu_decisions = 0;
-        bool hybrid_enabled = false;
-    };
 
     static uint64_t mxfp4_bytes(const TensorData& tensor)
     {
@@ -11354,106 +11622,6 @@ private:
         if (tensor->dtype == DType::BFloat16)
             return tensor->bfloat16_values().size() * sizeof(uint16_t);
         return 0;
-    }
-
-    static size_t timing_bucket(size_t token_count)
-    {
-        if (token_count <= 1)
-            return 0;
-        if (token_count <= 3)
-            return 1;
-        if (token_count <= 7)
-            return 2;
-        return 3;
-    }
-
-    double benefit_ratio(const Selection& selection, std::span<const ExpertBackendRequest> requests) const
-    {
-        const ExpertBackendRequest& request = requests[selection.request_index];
-        const uint64_t bytes = request.weight_bytes == 0 ? selection.entry->bytes : request.weight_bytes;
-        const Timing& timing = timings_[selection.bucket];
-        const double gpu_cost = timing.gpu_microseconds_per_byte * static_cast<double>(bytes);
-        const double cpu_cost = timing.cpu_microseconds_per_byte * static_cast<double>(bytes);
-        return cpu_cost / std::max(gpu_cost, 1e-9);
-    }
-
-    static void observe_timing(double& average, uint64_t& samples, uint64_t elapsed_microseconds, uint64_t bytes)
-    {
-        if (bytes == 0)
-            return;
-        const double observation = static_cast<double>(elapsed_microseconds) / static_cast<double>(bytes);
-        if (samples == 0)
-            average = observation;
-        else
-            average = average * 0.8 + observation * 0.2;
-        ++samples;
-    }
-
-    bool prefer_gpu_locked(size_t bucket)
-    {
-        Timing& timing = timings_[bucket];
-        if (timing.gpu_samples < 3 || timing.cpu_samples < 3)
-        {
-            return true;
-        }
-        if (!timing.gpu_preferred)
-        {
-            ++timing.cpu_decisions;
-            // Sparse probes adapt to changing device conditions.
-            return timing.cpu_decisions % 64 == 0;
-        }
-        return true;
-    }
-
-    void update_preference_locked(size_t bucket)
-    {
-        Timing& timing = timings_[bucket];
-        if (timing.gpu_samples < 3 || timing.cpu_samples < 3)
-        {
-            return;
-        }
-        if (timing.gpu_preferred)
-        {
-            if (timing.gpu_microseconds_per_byte > timing.cpu_microseconds_per_byte * 1.1)
-            {
-                timing.gpu_preferred = false;
-                timing.cpu_decisions = 0;
-            }
-        }
-        else if (timing.gpu_microseconds_per_byte < timing.cpu_microseconds_per_byte * 0.9)
-        {
-            timing.gpu_preferred = true;
-            timing.cpu_decisions = 0;
-        }
-    }
-
-    bool allow_hybrid_phase_locked(size_t bucket)
-    {
-        PhaseTiming& phase = phase_timings_[bucket];
-        if (phase.cpu_samples < 3)
-        {
-            // Direct clients may not provide a host baseline.
-            return phase.cpu_samples == 0 && phase.hybrid_samples == 0;
-        }
-        // A phase-wide CPU veto is not a valid admission policy. The
-        // observation includes cache waits and every non-resident CPU
-        // fallback in the layer, so it can disable GPU execution even when
-        // the requested Expert is already resident on the device. Keep the
-        // phase open and let submit_batch make the per-request decision;
-        // non-resident entries and execution failures still fall back to CPU.
-        return true;
-    }
-
-    bool allow_device_source_locked(size_t bucket)
-    {
-        const PhaseTiming& phase = phase_timings_[bucket];
-        SourcePhaseTiming& source = source_phase_timings_[bucket];
-        if (phase.cpu_samples < 3)
-            return false;
-        if (source.hybrid_enabled)
-            return true;
-        ++source.cpu_decisions;
-        return source.cpu_decisions % 64 == 0;
     }
 
     void touch_locked(Entry& entry, bool repeated)
@@ -11664,6 +11832,532 @@ private:
         view.h = static_cast<int>(rows);
         view.offset += first_row * static_cast<size_t>(source.w) * source.elemsize;
         return view;
+    }
+
+    enum class IndexedBatchResult
+    {
+        NotSupported,
+        Executed,
+        Failed
+    };
+
+    IndexedBatchResult forward_indexed_batch(
+        std::span<const ExpertBackendRequest> requests,
+        std::span<const Selection> selected)
+    {
+        // The indexed shader pays for a runtime Expert-buffer selector.  Keep
+        // the tuned per-Expert kernel until a batch has enough distinct
+        // Experts to amortize that cost.
+        if (selected.size() < 4 || selected.size() > mxfp4_indexed_max_experts)
+            return IndexedBatchResult::NotSupported;
+
+        const NcnnVulkanMxfp4ExpertOperator::Implementation& first_expert =
+            *selected.front().entry->operation->implementation_;
+        if (!first_expert.gate_up || !first_expert.down || !first_expert.gate_up->implementation_->indexed_storage
+            || !first_expert.down->implementation_->indexed_storage)
+        {
+            return IndexedBatchResult::NotSupported;
+        }
+        const NcnnVulkanMxfp4Operator::Implementation& first_gate =
+            *first_expert.gate_up->implementation_;
+        const NcnnVulkanMxfp4Operator::Implementation& first_down =
+            *first_expert.down->implementation_;
+        if (!first_gate.vulkan_context || first_gate.vulkan_context != first_down.vulkan_context
+            || first_gate.storage.empty() || first_down.storage.empty())
+        {
+            return IndexedBatchResult::NotSupported;
+        }
+
+        const uint32_t input_columns = first_gate.input_columns;
+        const uint32_t intermediate_columns = first_gate.output_columns / 2;
+        const uint32_t output_columns = first_down.output_columns;
+        if (input_columns == 0 || intermediate_columns == 0 || output_columns == 0
+            || first_gate.output_columns % 2 != 0
+            || first_down.input_columns != intermediate_columns)
+        {
+            return IndexedBatchResult::NotSupported;
+        }
+
+        size_t total_rows = 0;
+        size_t maximum_request_rows = 0;
+        std::vector<uint32_t> row_slots;
+        std::vector<uint32_t> expert_row_offsets(selected.size() + 1, 0);
+        std::vector<size_t> selected_request_indices;
+        selected_request_indices.reserve(selected.size());
+        for (size_t slot = 0; slot < selected.size(); ++slot)
+        {
+            const Selection& selection = selected[slot];
+            if (selection.request_index >= requests.size())
+                return IndexedBatchResult::NotSupported;
+            const ExpertBackendRequest& request = requests[selection.request_index];
+            if (!request.input || !request.output || request.input->rows() == 0
+                || request.input->columns() != input_columns
+                || request.input->dtype() != DType::Float32
+                || total_rows > static_cast<size_t>(std::numeric_limits<int>::max()) - request.input->rows()
+                || total_rows > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) - request.input->rows())
+            {
+                return IndexedBatchResult::NotSupported;
+            }
+            const NcnnVulkanMxfp4ExpertOperator::Implementation& expert =
+                *selection.entry->operation->implementation_;
+            if (!expert.gate_up || !expert.down
+                || expert.activation != first_expert.activation
+                || expert.activation_limit != first_expert.activation_limit)
+            {
+                return IndexedBatchResult::NotSupported;
+            }
+            const NcnnVulkanMxfp4Operator::Implementation& gate =
+                *expert.gate_up->implementation_;
+            const NcnnVulkanMxfp4Operator::Implementation& down =
+                *expert.down->implementation_;
+            if (!gate.indexed_storage || !down.indexed_storage
+                || gate.storage.empty() || down.storage.empty()
+                || gate.vulkan_context != first_gate.vulkan_context
+                || down.vulkan_context != first_gate.vulkan_context
+                || gate.input_columns != input_columns
+                || gate.output_columns != first_gate.output_columns
+                || gate.block_count != first_gate.block_count
+                || down.input_columns != intermediate_columns
+                || down.output_columns != output_columns
+                || down.block_count != first_down.block_count
+                || gate.indexed_scales_word_offset != first_gate.indexed_scales_word_offset
+                || gate.indexed_bias_word_offset != first_gate.indexed_bias_word_offset
+                || down.indexed_scales_word_offset != first_down.indexed_scales_word_offset
+                || down.indexed_bias_word_offset != first_down.indexed_bias_word_offset)
+            {
+                return IndexedBatchResult::NotSupported;
+            }
+            expert_row_offsets[slot] = static_cast<uint32_t>(total_rows);
+            maximum_request_rows = std::max(maximum_request_rows, request.input->rows());
+            total_rows += request.input->rows();
+            selected_request_indices.push_back(selection.request_index);
+        }
+        if (total_rows == 0 || total_rows > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+            return IndexedBatchResult::Failed;
+        expert_row_offsets[selected.size()] = static_cast<uint32_t>(total_rows);
+
+        // With at least two rows in the largest selected Expert, use the
+        // MUL_MAT_ID-style row tile.  Single-row decode batches remain on the
+        // scalar indexed kernel because there is no row reuse to amortize.
+        const bool use_tiled_indexed = maximum_request_rows >= 2;
+
+        if (!indexed_pipeline_
+            && !create_mxfp4_indexed_pipeline(
+                first_gate.vulkan_context,
+                first_gate.option,
+                indexed_pipeline_))
+        {
+            return IndexedBatchResult::NotSupported;
+        }
+
+        ActivationBuffer* aggregated_output = nullptr;
+        uint32_t aggregated_token_count = 0;
+        const bool use_route_aggregation = route_aggregation_enabled(
+            requests,
+            selected_request_indices,
+            output_columns,
+            aggregated_output,
+            aggregated_token_count,
+            first_gate.optimization_flags);
+        std::vector<uint32_t> route_offsets;
+        std::vector<uint32_t> route_rows;
+        std::vector<float> route_weights;
+        if (use_route_aggregation
+            && !build_route_aggregation_metadata(
+                requests,
+                selected_request_indices,
+                route_offsets,
+                route_rows,
+                route_weights))
+        {
+            return IndexedBatchResult::Failed;
+        }
+
+        NcnnVulkanRuntimeState& runtime_state =
+            first_gate.vulkan_context->runtime_state();
+        NcnnVulkanTransferLease transfer_lease =
+            first_gate.vulkan_context->acquire_transfer_slot();
+        NcnnVulkanTransferSlot& transfer_slot = transfer_lease.slot();
+        if (!prepare_staging_batch(
+                transfer_slot.upload,
+                total_rows,
+                input_columns,
+                transfer_slot.staging_allocator,
+                runtime_state,
+                sizeof(float)))
+        {
+            return IndexedBatchResult::Failed;
+        }
+        ncnn::Mat mapped_input = transfer_slot.upload.mapped();
+        if (mapped_input.empty() || mapped_input.dims != 2
+            || mapped_input.w != static_cast<int>(input_columns)
+            || mapped_input.h != static_cast<int>(total_rows)
+            || mapped_input.elemsize != sizeof(float)
+            || mapped_input.elempack != 1)
+        {
+            return IndexedBatchResult::Failed;
+        }
+
+        row_slots.assign(total_rows, 0);
+        size_t row_offset = 0;
+        auto* mapped_input_bytes = static_cast<std::byte*>(mapped_input.data);
+        for (size_t slot = 0; slot < selected.size(); ++slot)
+        {
+            const ExpertBackendRequest& request =
+                requests[selected[slot].request_index];
+            const ActivationBuffer& input = *request.input;
+            if (input.bytes().size() != input.rows() * static_cast<size_t>(input_columns) * sizeof(float))
+                return IndexedBatchResult::Failed;
+            std::memcpy(
+                mapped_input_bytes + row_offset * static_cast<size_t>(input_columns) * sizeof(float),
+                input.bytes().data(),
+                input.bytes().size());
+            std::fill(
+                row_slots.begin() + static_cast<std::ptrdiff_t>(row_offset),
+                row_slots.begin() + static_cast<std::ptrdiff_t>(row_offset + input.rows()),
+                static_cast<uint32_t>(slot));
+            row_offset += input.rows();
+        }
+        transfer_slot.upload.allocator->flush(transfer_slot.upload.data);
+        transfer_slot.upload.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
+        transfer_slot.upload.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
+
+        const bool direct_host_input = direct_host_input_enabled(
+            *first_gate.vulkan_context,
+            total_rows * input_columns * sizeof(float),
+            DType::Float32);
+        const bool direct_host_output = !use_route_aggregation
+                                        && direct_host_output_enabled(
+                                            *first_gate.vulkan_context,
+                                            total_rows * output_columns * sizeof(float),
+                                            DType::Float32);
+        const size_t download_rows = use_route_aggregation ? aggregated_token_count : total_rows;
+        if (!prepare_staging_batch(
+                transfer_slot.download,
+                download_rows,
+                output_columns,
+                transfer_slot.staging_allocator,
+                runtime_state)
+            || !fill_staging_values(
+                row_slots.data(),
+                row_slots.size(),
+                sizeof(uint32_t),
+                transfer_slot.expert_slots,
+                transfer_slot.staging_allocator,
+                runtime_state)
+            || !fill_staging_values(
+                expert_row_offsets.data(),
+                expert_row_offsets.size(),
+                sizeof(uint32_t),
+                transfer_slot.expert_row_offsets,
+                transfer_slot.staging_allocator,
+                runtime_state))
+        {
+            return IndexedBatchResult::Failed;
+        }
+        if (use_route_aggregation
+            && (!fill_staging_values(
+                    route_offsets.data(),
+                    route_offsets.size(),
+                    sizeof(uint32_t),
+                    transfer_slot.route_offsets,
+                    transfer_slot.staging_allocator,
+                    runtime_state)
+                || !fill_staging_values(
+                    route_rows.data(),
+                    route_rows.size(),
+                    sizeof(uint32_t),
+                    transfer_slot.route_rows,
+                    transfer_slot.staging_allocator,
+                    runtime_state)
+                || !fill_staging_values(
+                    route_weights.data(),
+                    route_weights.size(),
+                    sizeof(float),
+                    transfer_slot.route_weights,
+                    transfer_slot.staging_allocator,
+                    runtime_state)))
+        {
+            return IndexedBatchResult::Failed;
+        }
+
+        ActivationBuffer combined_output;
+        if (!use_route_aggregation)
+            combined_output.reset(total_rows, output_columns, false);
+
+        std::unique_lock<std::mutex> lock(
+            first_gate.vulkan_context->command_mutex());
+        ncnn::VkCompute& command = *transfer_slot.command;
+        if (transfer_slot.command_used)
+        {
+            if (command.reset() != 0)
+                return IndexedBatchResult::Failed;
+            ++runtime_state.command_buffer_reuses;
+        }
+        transfer_slot.command_used = true;
+
+        ncnn::VkMat input_gpu;
+        if (direct_host_input)
+            input_gpu = bind_direct_host_input(transfer_slot.upload, runtime_state);
+        else if (!record_mapped_upload(
+                     transfer_slot.upload,
+                     input_gpu,
+                     command,
+                     first_gate.option))
+        {
+            return IndexedBatchResult::Failed;
+        }
+        ncnn::VkMat expert_ids_gpu;
+        if (!record_mapped_upload(
+                transfer_slot.expert_slots,
+                expert_ids_gpu,
+                command,
+                first_gate.option))
+        {
+            return IndexedBatchResult::Failed;
+        }
+        ncnn::VkMat expert_row_offsets_gpu;
+        if (!record_mapped_upload(
+                transfer_slot.expert_row_offsets,
+                expert_row_offsets_gpu,
+                command,
+                first_gate.option))
+        {
+            return IndexedBatchResult::Failed;
+        }
+
+        ncnn::VkMat intermediate_gpu;
+        intermediate_gpu.create(
+            static_cast<int>(intermediate_columns),
+            static_cast<int>(total_rows),
+            sizeof(float),
+            first_gate.vulkan_context->blob_allocator());
+        if (intermediate_gpu.empty())
+            return IndexedBatchResult::Failed;
+
+        ncnn::VkMat output_gpu;
+        if (direct_host_output)
+        {
+            output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        }
+        else
+        {
+            output_gpu.create(
+                static_cast<int>(output_columns),
+                static_cast<int>(total_rows),
+                sizeof(float),
+                first_gate.vulkan_context->blob_allocator());
+        }
+        if (output_gpu.empty())
+            return IndexedBatchResult::Failed;
+
+        const auto make_constants = [&](uint32_t mode) {
+            std::vector<ncnn::vk_constant_type> constants(18);
+            constants[0].u32 = first_gate.input_columns;
+            constants[1].u32 = first_gate.output_columns;
+            constants[2].u32 = first_down.input_columns;
+            constants[3].u32 = first_down.output_columns;
+            constants[4].u32 = first_gate.block_count;
+            constants[5].u32 = first_down.block_count;
+            constants[6].u32 = static_cast<uint32_t>(total_rows);
+            constants[7].u32 = static_cast<uint32_t>(selected.size());
+            constants[8].u32 = 0;
+            constants[9].u32 = first_gate.indexed_scales_word_offset;
+            constants[10].u32 = first_gate.indexed_bias_word_offset;
+            constants[11].u32 = 0;
+            constants[12].u32 = first_down.indexed_scales_word_offset;
+            constants[13].u32 = first_down.indexed_bias_word_offset;
+            constants[14].u32 = mode;
+            constants[15].u32 = first_expert.activation == ExpertActivation::GptOssSwiGlu ? 0u : 1u;
+            constants[16].f = first_expert.activation_limit;
+            constants[17].u32 = use_tiled_indexed ? 1u : 0u;
+            return constants;
+        };
+
+        std::vector<ncnn::VkMat> gate_bindings;
+        gate_bindings.reserve(mxfp4_indexed_max_experts + 3);
+        gate_bindings.push_back(input_gpu);
+        for (uint32_t slot = 0; slot < mxfp4_indexed_max_experts; ++slot)
+        {
+            if (slot < selected.size())
+            {
+                gate_bindings.push_back(
+                    selected[slot].entry->operation->implementation_->gate_up->implementation_->storage);
+            }
+            else
+            {
+                gate_bindings.emplace_back();
+            }
+        }
+        gate_bindings.push_back(use_tiled_indexed ? expert_row_offsets_gpu : expert_ids_gpu);
+        gate_bindings.push_back(intermediate_gpu);
+        std::vector<unsigned char> readonly_bindings(gate_bindings.size(), 1);
+        readonly_bindings.back() = 0;
+        ncnn::VkMat gate_dispatcher;
+        gate_dispatcher.w = static_cast<int>(intermediate_columns * 32);
+        gate_dispatcher.h = static_cast<int>(use_tiled_indexed ? (maximum_request_rows + 1) / 2 : total_rows);
+        gate_dispatcher.c = static_cast<int>(use_tiled_indexed ? selected.size() : 1);
+        command.record_pipeline_readonly(
+            indexed_pipeline_.get(),
+            gate_bindings,
+            readonly_bindings,
+            make_constants(0),
+            gate_dispatcher);
+
+        std::vector<ncnn::VkMat> down_bindings;
+        down_bindings.reserve(mxfp4_indexed_max_experts + 3);
+        down_bindings.push_back(intermediate_gpu);
+        for (uint32_t slot = 0; slot < mxfp4_indexed_max_experts; ++slot)
+        {
+            if (slot < selected.size())
+            {
+                down_bindings.push_back(
+                    selected[slot].entry->operation->implementation_->down->implementation_->storage);
+            }
+            else
+            {
+                down_bindings.emplace_back();
+            }
+        }
+        down_bindings.push_back(use_tiled_indexed ? expert_row_offsets_gpu : expert_ids_gpu);
+        down_bindings.push_back(output_gpu);
+        readonly_bindings.assign(down_bindings.size(), 1);
+        readonly_bindings.back() = 0;
+        ncnn::VkMat down_dispatcher;
+        down_dispatcher.w = static_cast<int>(output_columns * 32);
+        down_dispatcher.h = static_cast<int>(use_tiled_indexed ? (maximum_request_rows + 1) / 2 : total_rows);
+        down_dispatcher.c = static_cast<int>(use_tiled_indexed ? selected.size() : 1);
+        command.record_pipeline_readonly(
+            indexed_pipeline_.get(),
+            down_bindings,
+            readonly_bindings,
+            make_constants(1),
+            down_dispatcher);
+
+        if (use_route_aggregation)
+        {
+            ncnn::VkMat route_offsets_gpu;
+            ncnn::VkMat route_rows_gpu;
+            ncnn::VkMat route_weights_gpu;
+            if (!record_mapped_upload(
+                    transfer_slot.route_offsets,
+                    route_offsets_gpu,
+                    command,
+                    first_gate.option)
+                || !record_mapped_upload(
+                    transfer_slot.route_rows,
+                    route_rows_gpu,
+                    command,
+                    first_gate.option)
+                || !record_mapped_upload(
+                    transfer_slot.route_weights,
+                    route_weights_gpu,
+                    command,
+                    first_gate.option))
+            {
+                return IndexedBatchResult::Failed;
+            }
+            if (!route_aggregation_pipeline_
+                && !create_mxfp4_route_aggregation_pipeline(
+                    first_gate.vulkan_context,
+                    first_gate.option,
+                    route_aggregation_pipeline_))
+            {
+                return IndexedBatchResult::Failed;
+            }
+            ncnn::VkMat aggregated_output_gpu;
+            aggregated_output_gpu.create(
+                static_cast<int>(output_columns),
+                static_cast<int>(aggregated_token_count),
+                sizeof(float),
+                first_gate.vulkan_context->blob_allocator());
+            if (aggregated_output_gpu.empty())
+                return IndexedBatchResult::Failed;
+            std::vector<ncnn::VkMat> aggregation_bindings = {
+                output_gpu,
+                route_offsets_gpu,
+                route_rows_gpu,
+                route_weights_gpu,
+                aggregated_output_gpu,
+            };
+            std::vector<ncnn::vk_constant_type> aggregation_constants(2);
+            aggregation_constants[0].u32 = output_columns;
+            aggregation_constants[1].u32 = aggregated_token_count;
+            ncnn::VkMat aggregation_dispatcher;
+            aggregation_dispatcher.w = static_cast<int>(output_columns * 128);
+            aggregation_dispatcher.h = static_cast<int>(aggregated_token_count);
+            aggregation_dispatcher.c = 1;
+            command.record_pipeline(
+                route_aggregation_pipeline_.get(),
+                aggregation_bindings,
+                aggregation_constants,
+                aggregation_dispatcher);
+            if (!record_prepared_activation_staging_download(
+                    aggregated_output_gpu,
+                    aggregated_token_count,
+                    output_columns,
+                    transfer_slot.download,
+                    command,
+                    first_down.vulkan_context->device(),
+                    first_down.option,
+                    aggregated_output->dtype())
+                || submit_compute_and_wait(command, runtime_state) != 0
+                || !copy_staging_to_cpu_batch(transfer_slot.download, *aggregated_output))
+            {
+                return IndexedBatchResult::Failed;
+            }
+        }
+        else if ((!direct_host_output
+                  && !record_prepared_activation_staging_download(
+                      output_gpu,
+                      total_rows,
+                      output_columns,
+                      transfer_slot.download,
+                      command,
+                      first_down.vulkan_context->device(),
+                      first_down.option,
+                      combined_output.dtype()))
+                 || submit_compute_and_wait(command, runtime_state) != 0
+                 || !copy_staging_to_cpu_batch(transfer_slot.download, combined_output))
+        {
+            return IndexedBatchResult::Failed;
+        }
+        lock.unlock();
+
+        if (use_route_aggregation)
+        {
+            for (const Selection& selection : selected)
+            {
+                const ExpertBackendRequest& request =
+                    requests[selection.request_index];
+                if (request.route_aggregation.completed)
+                    *request.route_aggregation.completed = 1;
+            }
+        }
+        else
+        {
+            row_offset = 0;
+            for (const Selection& selection : selected)
+            {
+                const ExpertBackendRequest& request =
+                    requests[selection.request_index];
+                request.output->reset(request.input->rows(), output_columns, false);
+                for (size_t row = 0; row < request.input->rows(); ++row)
+                {
+                    std::copy_n(
+                        combined_output.row(row_offset + row),
+                        output_columns,
+                        request.output->row(row));
+                }
+                row_offset += request.input->rows();
+            }
+        }
+        runtime_state.dispatches +=
+            2 + static_cast<uint64_t>(use_route_aggregation);
+        ++runtime_state.compute_submissions;
+        ++runtime_state.batch_uploads;
+        ++runtime_state.batch_downloads;
+        return IndexedBatchResult::Executed;
     }
 
     bool forward_batch(std::span<const ExpertBackendRequest> requests, std::span<const Selection> selected)
@@ -12007,7 +12701,13 @@ private:
     void execute_work_item(const std::shared_ptr<WorkItem>& work)
     {
         const auto started = std::chrono::steady_clock::now();
-        const bool executed = forward_batch(work->requests, work->selected);
+        const IndexedBatchResult indexed_result = runtime_optimization_enabled(
+                                                     optimization_flags_,
+                                                     RuntimeOptimizationVulkanIndexedExperts)
+                                                     ? forward_indexed_batch(work->requests, work->selected)
+                                                     : IndexedBatchResult::NotSupported;
+        const bool executed = indexed_result == IndexedBatchResult::Executed
+                              || forward_batch(work->requests, work->selected);
         const uint64_t elapsed = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
         uint64_t route_aggregation_routes = 0;
         uint32_t route_aggregation_token_count = 0;
@@ -12067,28 +12767,11 @@ private:
                     route_aggregation_routes_ += route_aggregation_routes;
                     route_aggregation_bytes_saved_ += route_aggregation_bytes_saved;
                 }
-                uint64_t selected_bytes = 0;
                 for (const Selection& selection : work->selected)
                 {
                     if (selection.entry->device_source)
                     {
                         ++device_source_executions_;
-                    }
-                    selected_bytes += selection.entry->bytes;
-                }
-                if (work->uncontended_sample && selected_bytes != 0)
-                {
-                    std::array<bool, 4> observed = {};
-                    for (const Selection& selection : work->selected)
-                    {
-                        if (observed[selection.bucket])
-                        {
-                            continue;
-                        }
-                        observed[selection.bucket] = true;
-                        Timing& timing = timings_[selection.bucket];
-                        observe_timing(timing.gpu_microseconds_per_byte, timing.gpu_samples, elapsed, selected_bytes);
-                        update_preference_locked(selection.bucket);
                     }
                 }
             }
@@ -12162,7 +12845,14 @@ private:
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 work_available_.wait(lock, [this] {
-                    return stopping_ || (!pending_.empty() && foreground_depth_ == 0);
+                    // Admission is an asynchronous upload/compile stage.  It
+                    // must keep making progress while a foreground Session
+                    // is executing; otherwise every Expert admitted by that
+                    // Session remains pending until the whole transaction
+                    // completes, making Hybrid mode permanently CPU-only for
+                    // cold Experts.  The worker remains bounded to one
+                    // admission at a time.
+                    return stopping_ || !pending_.empty();
                 });
                 if (stopping_)
                     return;
@@ -12253,6 +12943,7 @@ private:
     const uint64_t maximum_pending_bytes_;
     std::shared_ptr<NcnnVulkanContext> vulkan_context_;
     std::unique_ptr<ncnn::VkBlobAllocator> expert_weight_allocator_;
+    std::shared_ptr<ncnn::Pipeline> indexed_pipeline_;
     std::shared_ptr<ncnn::Pipeline> route_aggregation_pipeline_;
     std::shared_ptr<VulkanExpertVictimCache> device_weight_source_;
     mutable std::mutex mutex_;
@@ -12264,7 +12955,6 @@ private:
     std::deque<PendingAdmission> pending_;
     std::deque<std::shared_ptr<WorkItem>> execution_pending_;
     std::unordered_set<std::string, TransparentStringHash, std::equal_to<>> pending_keys_;
-    std::unordered_set<std::string, TransparentStringHash, std::equal_to<>> admission_candidates_;
     uint64_t pending_bytes_ = 0;
     uint32_t active_admissions_ = 0;
     std::unordered_map<std::string, std::shared_ptr<Entry>, TransparentStringHash, std::equal_to<>> entries_;
@@ -12280,9 +12970,6 @@ private:
     GhostIndex frequent_ghost_index_;
     uint64_t recent_ghost_bytes_ = 0;
     uint64_t frequent_ghost_bytes_ = 0;
-    std::array<Timing, 4> timings_;
-    std::array<PhaseTiming, 4> phase_timings_;
-    std::array<SourcePhaseTiming, 4> source_phase_timings_;
     std::vector<uint64_t> residency_group_bytes_;
     uint64_t resident_bytes_ = 0;
     uint64_t hits_ = 0;
@@ -12303,7 +12990,6 @@ private:
     uint64_t route_aggregation_batches_ = 0;
     uint64_t route_aggregation_routes_ = 0;
     uint64_t route_aggregation_bytes_saved_ = 0;
-    uint64_t source_accelerated_bytes_ = 0;
     std::thread worker_;
     std::thread execution_worker_;
 };

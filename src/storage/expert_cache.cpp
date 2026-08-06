@@ -1964,27 +1964,11 @@ void Mxfp4ExpertCache::worker_loop(uint32_t worker_index)
                     std::max<int64_t>(1, elapsed.count());
                 ++io_read_samples_;
                 io_read_time_nanoseconds_ += elapsed_nanoseconds;
-                if (io_read_samples_ >= 8 && io_read_samples_ % 8 == 0)
-                {
-                    const uint64_t average =
-                        io_read_time_nanoseconds_ / io_read_samples_;
-                    const uint32_t previous_workers = adaptive_io_workers_;
-                    const size_t queued =
-                        high_priority_.size() + low_priority_.size();
-                    if (average > UINT64_C(25000000)
-                        && adaptive_io_workers_ > 1)
-                    {
-                        --adaptive_io_workers_;
-                    }
-                    else if (average < UINT64_C(8000000)
-                             && adaptive_io_workers_ < io_worker_count_
-                             && queued > adaptive_io_workers_)
-                    {
-                        ++adaptive_io_workers_;
-                    }
-                    if (adaptive_io_workers_ != previous_workers)
-                        work_available_.notify_all();
-                }
+                // The runtime thread budget is the single ownership boundary
+                // for I/O concurrency.  Keep an explicit worker count stable;
+                // changing it from sampled read latency is a calibration loop
+                // and can starve the CPU Expert path exactly when a prompt is
+                // already waiting on cold weights.
             }
             if (coalesced)
             {

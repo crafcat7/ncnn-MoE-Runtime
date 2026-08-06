@@ -409,6 +409,56 @@ void float8_e4m3_quantized_input_dot_rows(
     }
 }
 
+#if !defined(NCNN_MOE_MSVC_X86_SIMD)
+static void float8_e4m3_quantized_input_dot_rows_batch_tile(
+    const uint8_t* weights,
+    uint32_t weight_row_stride,
+    const float* scales,
+    const float* input,
+    size_t input_stride,
+    uint32_t count,
+    uint32_t block_size,
+    uint32_t row_count,
+    size_t output_stride,
+    size_t token_count,
+    float* output)
+{
+    const uint32_t input_blocks = (count + block_size - 1) / block_size;
+    for (uint32_t first_row = 0; first_row < row_count; first_row += 4)
+    {
+        const uint32_t rows = std::min<uint32_t>(4, row_count - first_row);
+        for (size_t first_token = 0; first_token < token_count; first_token += 4)
+        {
+            const size_t tokens = std::min<size_t>(4, token_count - first_token);
+            float accum[4][4] = {};
+            for (uint32_t block = 0; block < input_blocks; ++block)
+            {
+                const uint32_t block_begin = block * block_size;
+                const uint32_t block_end = std::min(count, block_begin + block_size);
+                for (uint32_t column = block_begin; column < block_end; ++column)
+                {
+                    float inputs[4] = {};
+                    for (size_t token = 0; token < tokens; ++token)
+                        inputs[token] = input[(first_token + token) * input_stride + column];
+                    for (uint32_t row = 0; row < rows; ++row)
+                    {
+                        const uint32_t matrix_row = first_row + row;
+                        const float weight = float8_e4m3_to_float(
+                            weights[static_cast<size_t>(matrix_row) * weight_row_stride + column]);
+                        const float scale = scales[static_cast<size_t>(matrix_row / block_size) * input_blocks + block];
+                        for (size_t token = 0; token < tokens; ++token)
+                            accum[token][row] += weight * scale * inputs[token];
+                    }
+                }
+            }
+            for (size_t token = 0; token < tokens; ++token)
+                for (uint32_t row = 0; row < rows; ++row)
+                    output[(first_token + token) * output_stride + first_row + row] = accum[token][row];
+        }
+    }
+}
+#endif
+
 void float8_e4m3_quantized_input_dot_rows_batch(
     const uint8_t* weights,
     uint32_t weight_row_stride,
@@ -430,6 +480,28 @@ void float8_e4m3_quantized_input_dot_rows_batch(
         for (uint32_t row = 0; row < row_count; ++row)
             output[token * output_stride + row] = 0.0f;
     }
+
+#if !defined(NCNN_MOE_MSVC_X86_SIMD)
+    if (use_float8_batch_tile(optimization_flags)
+        && token_count >= 4
+        && row_count >= 4
+        && count >= block_size)
+    {
+        float8_e4m3_quantized_input_dot_rows_batch_tile(
+            weights,
+            weight_row_stride,
+            scales,
+            input,
+            input_stride,
+            count,
+            block_size,
+            row_count,
+            output_stride,
+            token_count,
+            output);
+        return;
+    }
+#endif
 
     if (!use_float8_batch_tile(optimization_flags))
     {

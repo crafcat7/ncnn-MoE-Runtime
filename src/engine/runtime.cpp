@@ -2,6 +2,7 @@
 
 #include "ncnn/moe/execution_plan.h"
 #include "cpu_features.h"
+#include "cpu_thread_budget.h"
 #include "cpu_topology.h"
 #include "expert_backend.h"
 #include "compiler/moe_ir.hpp"
@@ -100,9 +101,12 @@ static Result<std::vector<uint64_t>> distribute_gpu_capacity(uint64_t total_capa
 static std::vector<uint64_t> automatic_gpu_expert_capacities(
     uint64_t expert_pair_bytes,
     const std::vector<uint32_t>& device_indices,
-    const std::vector<VulkanDeviceCapabilities>& devices)
+    const std::vector<VulkanDeviceCapabilities>& devices,
+    uint32_t expected_concurrency)
 {
-    constexpr uint64_t kAutomaticExpertCachePercent = 85;
+    constexpr uint64_t kConservativeExpertCachePercent = 85;
+    constexpr uint64_t kResourceRichSingleSessionCachePercent = 92;
+    constexpr uint64_t kResourceRichHeapBudgetBytes = UINT64_C(12) * 1024 * 1024 * 1024;
     constexpr uint64_t kPercentageBase = 100;
 
     std::vector<uint64_t> capacities(device_indices.size(), 0);
@@ -111,20 +115,27 @@ static std::vector<uint64_t> automatic_gpu_expert_capacities(
 
     // The memory-budget extension reports both the heap budget and current
     // usage. After dense operators have been compiled, only the unoccupied
-    // portion is available to the executable Expert cache. Keep 15% of that
-    // available portion for dynamic activation, KV, and Vulkan workspace. The
-    // cache remains demand-paged, so this is a per-instance capacity limit,
-    // not an eager allocation of the entire heap.
+    // portion is available to the executable Expert cache. A multi-session
+    // process keeps 15% of that available portion for dynamic activation, KV,
+    // and Vulkan workspace. A single session on a resource-rich device keeps
+    // 8% instead: its larger cache reduces Expert uploads and CPU fallback,
+    // while the cache remains demand-paged rather than eagerly allocating the
+    // entire heap.
     for (size_t index = 0; index < device_indices.size(); ++index)
     {
         if (device_indices[index] >= devices.size())
             return {};
         const VulkanDeviceCapabilities& device = devices[device_indices[index]];
+        const bool resource_rich_single_session = expected_concurrency == 1
+                                                  && device.heap_budget_bytes >= kResourceRichHeapBudgetBytes;
+        const uint64_t cache_percent = resource_rich_single_session
+                                           ? kResourceRichSingleSessionCachePercent
+                                           : kConservativeExpertCachePercent;
         const uint64_t available = device.heap_available_bytes;
         const uint64_t available_whole_percent = available / kPercentageBase;
         const uint64_t available_remainder = available % kPercentageBase;
-        const uint64_t cache_budget = available_whole_percent * kAutomaticExpertCachePercent
-                                      + available_remainder * kAutomaticExpertCachePercent / kPercentageBase;
+        const uint64_t cache_budget = available_whole_percent * cache_percent
+                                      + available_remainder * cache_percent / kPercentageBase;
         capacities[index] = cache_budget - cache_budget % expert_pair_bytes;
     }
     return capacities;
@@ -482,7 +493,8 @@ Result<ModelPtr> Runtime::load_model(
         automatic_executable_capacities = automatic_gpu_expert_capacities(
             plan.expert_pair_bytes,
             compiled_model.vulkan_device_indices,
-            cache_devices);
+            cache_devices,
+            config.expected_concurrency);
         const bool every_device_can_hold_one_pair =
             !automatic_executable_capacities.empty()
             && std::all_of(
@@ -528,8 +540,20 @@ Result<ModelPtr> Runtime::load_model(
             const uint32_t exact_and_speculative_budget = maximum_active_experts > std::numeric_limits<uint32_t>::max() / 2
                                                               ? std::numeric_limits<uint32_t>::max()
                                                               : maximum_active_experts * 2;
-            const uint32_t io_core_budget = std::max(1u, capabilities_.physical_cpu_core_count);
-            expert_io_workers = std::min(exact_and_speculative_budget, io_core_budget);
+            // Both CPU-only and HybridExperts benefit from a moderate reader
+            // pool: file-backed Expert loads are latency-bound, while the
+            // Vulkan admission path can overlap those reads with uploads.
+            // The compute side is independently capped by the thread-local
+            // OpenMP budget, and an explicit expert_io_workers value remains
+            // authoritative when a deployment has different contention.
+            const CpuThreadBudget thread_budget = resolve_cpu_thread_budget();
+            expert_io_workers = std::min(exact_and_speculative_budget, thread_budget.reserved_io_threads);
+        }
+        else
+        {
+            expert_io_workers = std::min(
+                expert_io_workers,
+                resolve_cpu_thread_budget(expert_io_workers).reserved_io_threads);
         }
         compiled_model.effective_runtime_config.expert_io_workers = expert_io_workers;
         uint32_t expert_cache_flags = 0;
@@ -720,6 +744,10 @@ Result<BatchSchedulerPtr> Runtime::create_scheduler(const SchedulerOptions& opti
         return Error{ErrorCode::InvalidArgument, "scheduler worker_count exceeds 1024"};
     if (options.expert_threads_per_worker > 1024)
         return Error{ErrorCode::InvalidArgument, "scheduler expert_threads_per_worker exceeds 1024"};
+    if (options.reserved_io_threads > 1024)
+        return Error{ErrorCode::InvalidArgument, "scheduler reserved_io_threads exceeds 1024"};
+    if (options.reserved_service_threads > 1024)
+        return Error{ErrorCode::InvalidArgument, "scheduler reserved_service_threads exceeds 1024"};
     if (options.adaptive_probe_interval > 1000000)
     {
         return Error{ErrorCode::InvalidArgument, "scheduler adaptive_probe_interval exceeds 1000000"};

@@ -16,6 +16,10 @@
 #include <numbers>
 #include <vector>
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 namespace ncnn {
 namespace moe {
 
@@ -268,6 +272,10 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                                               const CpuLayerCache& cache, CpuBatch& output, std::vector<float>& logits,
                                               std::vector<float>& key_cache, std::vector<float>& value_cache,
                                               std::vector<uint16_t>& query_bfloat16,
+                                              std::vector<uint16_t>& flash_query_bfloat16,
+                                              std::vector<float>& flash_partial_max,
+                                              std::vector<float>& flash_partial_sum,
+                                              std::vector<float>& flash_partial_output,
                                               uint64_t optimization_flags)
 {
     const uint32_t head_count = plan.head_count;
@@ -358,6 +366,301 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
         }
         key_values = key_cache.data();
         value_values = value_cache.data();
+    }
+
+    const bool flash_prefill_enabled =
+        runtime_optimization_enabled(
+            optimization_flags,
+            RuntimeOptimizationCpuFlashAttention)
+        && query.rows() > 1
+        && cache.token_count >= 64;
+    int attention_team_size = 1;
+#if defined(_OPENMP)
+    if (omp_in_parallel() == 0)
+        attention_team_size = static_cast<int>(cpu_linear_thread_limit());
+#endif
+    const bool split_kv_enabled =
+        runtime_optimization_enabled(
+            optimization_flags,
+            RuntimeOptimizationCpuSplitKvAttention)
+        && query.rows() == 1
+        && cache.token_count >= 512
+        && attention_team_size > 1;
+
+    if (flash_prefill_enabled || split_kv_enabled)
+    {
+        const auto valid_key = [&](size_t query_index, uint64_t key_index) {
+            if (decode_all_keys_valid)
+                return true;
+            const uint64_t query_position = position_offset + query_index;
+            const uint64_t key_position = cache.start_position + key_index;
+            return key_position <= query_position
+                   && (plan.sliding_window == 0
+                       || key_position + plan.sliding_window > query_position);
+        };
+        const auto key_dot = [&](uint32_t query_head, const float* query_vector, const uint16_t* query_bfloat16_values, uint64_t key_index) {
+            const uint32_t kv_head = query_head / heads_per_group;
+            if (direct_bfloat16)
+            {
+                const uint64_t slot = direct_bfloat16_contiguous
+                                          ? cache.first_slot + key_index
+                                          : cache_slot(cache, key_index);
+                const uint16_t* key_vector =
+                    bfloat16_key_values + static_cast<size_t>(slot) * cache.columns
+                    + static_cast<size_t>(kv_head) * head_dimension;
+                return pair_dot
+                           ? bfloat16_pair_dot(
+                                 key_vector,
+                                 query_bfloat16_values,
+                                 head_dimension)
+                           : bfloat16_dot(
+                                 key_vector,
+                                 query_vector,
+                                 head_dimension);
+            }
+            const float* key_vector =
+                key_values + static_cast<size_t>(key_index) * cache.columns
+                + static_cast<size_t>(kv_head) * head_dimension;
+            return float_dot(query_vector, key_vector, head_dimension);
+        };
+        const auto add_value = [&](uint32_t query_head, float* destination, float weight, uint64_t key_index) {
+            const uint32_t kv_head = query_head / heads_per_group;
+            if (direct_bfloat16)
+            {
+                const uint64_t slot = direct_bfloat16_contiguous
+                                          ? cache.first_slot + key_index
+                                          : cache_slot(cache, key_index);
+                const uint16_t* value_vector =
+                    bfloat16_value_values + static_cast<size_t>(slot) * cache.columns
+                    + static_cast<size_t>(kv_head) * head_dimension;
+                bfloat16_scaled_add(destination, value_vector, weight, head_dimension);
+            }
+            else
+            {
+                const float* value_vector =
+                    value_values + static_cast<size_t>(key_index) * cache.columns
+                    + static_cast<size_t>(kv_head) * head_dimension;
+                float_scaled_add(destination, value_vector, weight, head_dimension);
+            }
+        };
+        const auto sink_value = [&](uint32_t query_head) {
+            if (!sinks)
+                return -std::numeric_limits<float>::infinity();
+            return sinks->dtype == DType::Float32
+                       ? sinks->float32_values()[query_head]
+                       : bfloat16_to_float(sinks->bfloat16_values()[query_head]);
+        };
+
+        if (pair_dot)
+        {
+            flash_query_bfloat16.resize(static_cast<size_t>(head_count) * head_dimension);
+            for (uint32_t query_head = 0; query_head < head_count; ++query_head)
+            {
+                float_to_bfloat16_array(
+                    flash_query_bfloat16.data() + static_cast<size_t>(query_head) * head_dimension,
+                    query.row(0) + static_cast<size_t>(query_head) * head_dimension,
+                    head_dimension);
+            }
+            if (query.rows() > 1)
+            {
+                flash_query_bfloat16.resize(static_cast<size_t>(query.rows()) * head_count * head_dimension);
+                for (size_t query_index = 0; query_index < query.rows(); ++query_index)
+                    for (uint32_t query_head = 0; query_head < head_count; ++query_head)
+                        float_to_bfloat16_array(
+                            flash_query_bfloat16.data() + (query_index * head_count + query_head) * head_dimension,
+                            query.row(query_index) + static_cast<size_t>(query_head) * head_dimension,
+                            head_dimension);
+            }
+        }
+
+        if (flash_prefill_enabled)
+        {
+            const uint64_t job_count = static_cast<uint64_t>(query.rows()) * head_count;
+            const auto process_flash_job = [&](uint64_t job, std::vector<float>& running, std::vector<float>& tile_output) {
+                const size_t query_index = static_cast<size_t>(job / head_count);
+                const uint32_t query_head = static_cast<uint32_t>(job % head_count);
+                const float* query_vector = query.row(query_index) + static_cast<size_t>(query_head) * head_dimension;
+                const uint16_t* query_bfloat16_values = pair_dot
+                                                            ? flash_query_bfloat16.data() + (query_index * head_count + query_head) * head_dimension
+                                                            : nullptr;
+                std::fill(running.begin(), running.end(), 0.0f);
+                float maximum = sink_value(query_head);
+                float normalizer = sinks ? 1.0f : 0.0f;
+                constexpr uint64_t key_tile_size = 64;
+                for (uint64_t tile_begin = 0; tile_begin < cache.token_count; tile_begin += key_tile_size)
+                {
+                    const uint64_t tile_end = std::min(cache.token_count, tile_begin + key_tile_size);
+                    float tile_maximum = -std::numeric_limits<float>::infinity();
+                    for (uint64_t key_index = tile_begin; key_index < tile_end; ++key_index)
+                    {
+                        if (valid_key(query_index, key_index))
+                            tile_maximum = std::max(tile_maximum, key_dot(query_head, query_vector, query_bfloat16_values, key_index) * scale);
+                    }
+                    if (!std::isfinite(tile_maximum))
+                        continue;
+                    std::fill(tile_output.begin(), tile_output.end(), 0.0f);
+                    float tile_normalizer = 0.0f;
+                    for (uint64_t key_index = tile_begin; key_index < tile_end; ++key_index)
+                    {
+                        if (!valid_key(query_index, key_index))
+                            continue;
+                        const float probability = std::exp(key_dot(query_head, query_vector, query_bfloat16_values, key_index) * scale - tile_maximum);
+                        tile_normalizer += probability;
+                        add_value(query_head, tile_output.data(), probability, key_index);
+                    }
+                    const float new_maximum = std::max(maximum, tile_maximum);
+                    const float old_scale = std::isfinite(maximum) ? std::exp(maximum - new_maximum) : 0.0f;
+                    const float tile_scale = std::exp(tile_maximum - new_maximum);
+                    for (uint32_t column = 0; column < head_dimension; ++column)
+                        running[column] = running[column] * old_scale + tile_output[column] * tile_scale;
+                    normalizer = normalizer * old_scale + tile_normalizer * tile_scale;
+                    maximum = new_maximum;
+                }
+                if (normalizer > 0.0f)
+                {
+                    float* destination = output.row(query_index) + static_cast<size_t>(query_head) * head_dimension;
+                    for (uint32_t column = 0; column < head_dimension; ++column)
+                        destination[column] = running[column] / normalizer;
+                }
+            };
+#if defined(_OPENMP)
+            if (attention_team_size > 1)
+            {
+#pragma omp parallel num_threads(attention_team_size)
+                {
+                    std::vector<float> running(head_dimension);
+                    std::vector<float> tile_output(head_dimension);
+#pragma omp for schedule(static)
+                    for (int64_t job = 0; job < static_cast<int64_t>(job_count); ++job)
+                        process_flash_job(static_cast<uint64_t>(job), running, tile_output);
+                }
+            }
+            else
+#endif
+            {
+                std::vector<float> running(head_dimension);
+                std::vector<float> tile_output(head_dimension);
+                for (uint64_t job = 0; job < job_count; ++job)
+                    process_flash_job(job, running, tile_output);
+            }
+            return;
+        }
+
+        const uint32_t split_team_size = static_cast<uint32_t>(attention_team_size);
+        const uint64_t key_chunk_size = 256;
+        const uint64_t chunk_count = (cache.token_count + key_chunk_size - 1) / key_chunk_size;
+        flash_partial_max.assign(static_cast<size_t>(head_count) * split_team_size, -std::numeric_limits<float>::infinity());
+        flash_partial_sum.assign(static_cast<size_t>(head_count) * split_team_size, 0.0f);
+        flash_partial_output.assign(static_cast<size_t>(head_count) * split_team_size * head_dimension, 0.0f);
+        const auto compute_split_chunk = [&](uint32_t query_head, uint64_t chunk, float& local_maximum, float& local_normalizer, float* local_output) {
+            const uint64_t begin = chunk * key_chunk_size;
+            const uint64_t end = std::min(cache.token_count, begin + key_chunk_size);
+            const float* query_vector = query.row(0) + static_cast<size_t>(query_head) * head_dimension;
+            const uint16_t* query_bfloat16_values = pair_dot
+                                                        ? flash_query_bfloat16.data() + static_cast<size_t>(query_head) * head_dimension
+                                                        : nullptr;
+            local_maximum = -std::numeric_limits<float>::infinity();
+            local_normalizer = 0.0f;
+            std::fill(local_output, local_output + head_dimension, 0.0f);
+            for (uint64_t key_index = begin; key_index < end; ++key_index)
+            {
+                if (valid_key(0, key_index))
+                    local_maximum = std::max(local_maximum, key_dot(query_head, query_vector, query_bfloat16_values, key_index) * scale);
+            }
+            if (!std::isfinite(local_maximum))
+                return;
+            for (uint64_t key_index = begin; key_index < end; ++key_index)
+            {
+                if (!valid_key(0, key_index))
+                    continue;
+                const float probability = std::exp(key_dot(query_head, query_vector, query_bfloat16_values, key_index) * scale - local_maximum);
+                local_normalizer += probability;
+                add_value(query_head, local_output, probability, key_index);
+            }
+        };
+        const auto merge_split_chunk = [&](uint32_t query_head, uint32_t thread_index, float local_maximum, float local_normalizer, const float* local_output) {
+            const size_t partial_index = static_cast<size_t>(query_head) * split_team_size + thread_index;
+            float& partial_maximum = flash_partial_max[partial_index];
+            float& partial_normalizer = flash_partial_sum[partial_index];
+            float* partial_output = flash_partial_output.data() + partial_index * head_dimension;
+            if (!std::isfinite(local_maximum))
+                return;
+            const float new_maximum = std::max(partial_maximum, local_maximum);
+            const float old_scale = std::isfinite(partial_maximum) ? std::exp(partial_maximum - new_maximum) : 0.0f;
+            const float local_scale = std::exp(local_maximum - new_maximum);
+            for (uint32_t column = 0; column < head_dimension; ++column)
+                partial_output[column] = partial_output[column] * old_scale + local_output[column] * local_scale;
+            partial_normalizer = partial_normalizer * old_scale + local_normalizer * local_scale;
+            partial_maximum = new_maximum;
+        };
+        const auto reduce_split_head = [&](uint32_t query_head) {
+            float maximum = sink_value(query_head);
+            float normalizer = sinks ? 1.0f : 0.0f;
+            std::vector<float> reduced(head_dimension, 0.0f);
+            for (uint32_t thread_index = 0; thread_index < split_team_size; ++thread_index)
+            {
+                const size_t partial_index = static_cast<size_t>(query_head) * split_team_size + thread_index;
+                const float local_maximum = flash_partial_max[partial_index];
+                if (!std::isfinite(local_maximum))
+                    continue;
+                const float new_maximum = std::max(maximum, local_maximum);
+                const float old_scale = std::isfinite(maximum) ? std::exp(maximum - new_maximum) : 0.0f;
+                const float local_scale = std::exp(local_maximum - new_maximum);
+                const float* partial_output = flash_partial_output.data() + partial_index * head_dimension;
+                for (uint32_t column = 0; column < head_dimension; ++column)
+                    reduced[column] = reduced[column] * old_scale + partial_output[column] * local_scale;
+                normalizer = normalizer * old_scale + flash_partial_sum[partial_index] * local_scale;
+                maximum = new_maximum;
+            }
+            if (normalizer > 0.0f)
+            {
+                float* destination = output.row(0) + static_cast<size_t>(query_head) * head_dimension;
+                for (uint32_t column = 0; column < head_dimension; ++column)
+                    destination[column] = reduced[column] / normalizer;
+            }
+        };
+#if defined(_OPENMP)
+#pragma omp parallel num_threads(split_team_size)
+        {
+            const uint32_t thread_index = static_cast<uint32_t>(omp_get_thread_num());
+            std::vector<float> local_output(head_dimension);
+            for (uint32_t query_head = 0; query_head < head_count; ++query_head)
+            {
+                const size_t partial_index = static_cast<size_t>(query_head) * split_team_size + thread_index;
+                flash_partial_max[partial_index] = -std::numeric_limits<float>::infinity();
+                flash_partial_sum[partial_index] = 0.0f;
+                std::fill(flash_partial_output.data() + partial_index * head_dimension,
+                          flash_partial_output.data() + (partial_index + 1) * head_dimension,
+                          0.0f);
+#pragma omp for schedule(static)
+                for (int64_t chunk = 0; chunk < static_cast<int64_t>(chunk_count); ++chunk)
+                {
+                    float local_maximum = -std::numeric_limits<float>::infinity();
+                    float local_normalizer = 0.0f;
+                    compute_split_chunk(query_head, static_cast<uint64_t>(chunk), local_maximum, local_normalizer, local_output.data());
+                    merge_split_chunk(query_head, thread_index, local_maximum, local_normalizer, local_output.data());
+                }
+#pragma omp barrier
+                if (thread_index == 0)
+                    reduce_split_head(query_head);
+#pragma omp barrier
+            }
+        }
+#else
+        for (uint32_t query_head = 0; query_head < head_count; ++query_head)
+        {
+            for (uint64_t chunk = 0; chunk < chunk_count; ++chunk)
+            {
+                float local_maximum = -std::numeric_limits<float>::infinity();
+                float local_normalizer = 0.0f;
+                std::vector<float> local_output(head_dimension);
+                compute_split_chunk(query_head, chunk, local_maximum, local_normalizer, local_output.data());
+                merge_split_chunk(query_head, 0, local_maximum, local_normalizer, local_output.data());
+            }
+            reduce_split_head(query_head);
+        }
+#endif
+        return;
     }
 
     for (size_t query_index = 0; query_index < query.rows(); ++query_index)
@@ -919,6 +1222,10 @@ Result<void> execute_attention_block_into(
         scratch.key_cache,
         scratch.value_cache,
         scratch.query_bfloat16,
+        scratch.flash_query_bfloat16,
+        scratch.flash_partial_max,
+        scratch.flash_partial_sum,
+        scratch.flash_partial_output,
         optimization_flags);
     if (has_flag(plan.flags, AttentionBlockOutputGate))
     {

@@ -34,6 +34,7 @@ inline constexpr uint32_t automatic_vulkan_device_index = std::numeric_limits<ui
 
 class MappedFileRange;
 class Mxfp4ExpertCache;
+struct Mxfp4Q8PackedMatrix;
 
 [[nodiscard]] inline bool has_flag(uint32_t flags, uint32_t flag) noexcept
 {
@@ -337,6 +338,10 @@ struct TensorData
     std::shared_ptr<const uint8_t> mapped_data;
     uint64_t mapped_byte_count = 0;
     std::shared_ptr<const MxFp4FileStorage> mxfp4_file_storage;
+    // Immutable CPU MXFP4 weights can share one ISA-specific packed sidecar
+    // across all GEMV/GEMM calls. Initialization is performed atomically by
+    // the CPU kernel dispatcher.
+    mutable std::shared_ptr<const Mxfp4Q8PackedMatrix> mxfp4_q8_packed;
     [[nodiscard]] uint64_t element_count() const noexcept;
     [[nodiscard]] std::span<const float> float32_values() const noexcept;
     [[nodiscard]] std::span<const uint16_t> bfloat16_values() const noexcept;
