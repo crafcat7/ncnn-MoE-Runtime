@@ -460,9 +460,8 @@ static void scalar_packed_gemm(const Mxfp4Q8PackedMatrix& weights, const int8_t*
                         if (matrix_row >= weights.rows)
                             continue;
                         const uint8_t* row_values = packed_values + (static_cast<size_t>(chunk) * tile_rows + row) * chunk_bytes;
-                        output[token * output_stride + matrix_row] +=
-                            static_cast<float>(scalar_packed_chunk_dot(row_values, input_chunk, chunk_bytes))
-                            * (0.5f * scales_by_exponent[packed_block[row]]) * input_scale;
+                        output[token * output_stride + matrix_row] += static_cast<float>(scalar_packed_chunk_dot(row_values, input_chunk, chunk_bytes))
+                                                                      * (0.5f * scales_by_exponent[packed_block[row]]) * input_scale;
                     }
                 }
             }
@@ -483,9 +482,7 @@ bool mxfp4_q8_packed_kernel_available() noexcept
     return mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
            || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512;
 #elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
-    // There is no compiler-guarded interleaved Q8 kernel on the GCC/Clang
-    // path yet; keep the sidecar available for future backends without
-    // selecting its scalar implementation in production.
+    // Keep the interleaved sidecar available until the compiler-specific kernel lands.
     return false;
 #else
     return false;
@@ -1080,11 +1077,7 @@ static KernelDispatch select_kernel() noexcept
     }
 #endif
 
-    // Do not benchmark kernels during process initialization. The old
-    // micro-benchmark was sensitive to the CPU frequency state and could
-    // select AVX2 after Vulkan initialization but AVX512 in CPU-only mode,
-    // making the same process path nondeterministically slower. Select the
-    // highest ISA that passed the feature check and keep the choice stable.
+    // Select the highest supported ISA without an initialization benchmark.
     constexpr std::array<MxFp4KernelKind, 5> preference = {
         MxFp4KernelKind::X86Avx512,
         MxFp4KernelKind::ArmSve2,
@@ -1129,9 +1122,7 @@ const char* mxfp4_kernel_name() noexcept
 
 uint32_t mxfp4_decode_row_pair_group_size() noexcept
 {
-    // The x86 row-pair kernel already has a fixed two-pair inner tile.  Keep
-    // this choice static: decode must not spend its first request running a
-    // benchmark or change placement based on noisy process state.
+    // Keep the row-pair tile static; decode must not benchmark on first use.
     return mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
                    || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512
                ? 2

@@ -130,8 +130,7 @@ static VulkanExecutionSnapshot capture_vulkan_execution(
     const NcnnVulkanContextInstancePtr& context_instance)
 {
     VulkanExecutionSnapshot snapshot;
-    const NcnnVulkanExecutionSnapshot captured =
-        NcnnLinearOperator::vulkan_execution_snapshot(context_instance);
+    const NcnnVulkanExecutionSnapshot captured = NcnnLinearOperator::vulkan_execution_snapshot(context_instance);
     snapshot.dispatches = captured.dispatches;
     snapshot.attention_blocks = captured.attention_blocks;
     snapshot.counters = captured.counters;
@@ -143,15 +142,13 @@ static VulkanExecutionSnapshot vulkan_execution_delta(
     const NcnnVulkanContextInstancePtr& context_instance)
 {
     VulkanExecutionSnapshot delta;
-    const NcnnVulkanExecutionSnapshot after_snapshot =
-        NcnnLinearOperator::vulkan_execution_snapshot(context_instance);
+    const NcnnVulkanExecutionSnapshot after_snapshot = NcnnLinearOperator::vulkan_execution_snapshot(context_instance);
     delta.dispatches = after_snapshot.dispatches - before.dispatches;
     delta.attention_blocks = after_snapshot.attention_blocks - before.attention_blocks;
     const NcnnVulkanRuntimeCounters& after = after_snapshot.counters;
     delta.counters.compute_submissions = after.compute_submissions - before.counters.compute_submissions;
-    delta.counters.submit_wait_time_microseconds =
-        after.submit_wait_time_microseconds
-        - before.counters.submit_wait_time_microseconds;
+    delta.counters.submit_wait_time_microseconds = after.submit_wait_time_microseconds
+                                                   - before.counters.submit_wait_time_microseconds;
     delta.counters.batch_uploads = after.batch_uploads - before.counters.batch_uploads;
     delta.counters.batch_downloads = after.batch_downloads - before.counters.batch_downloads;
     delta.counters.auxiliary_uploads = after.auxiliary_uploads - before.counters.auxiliary_uploads;
@@ -161,12 +158,10 @@ static VulkanExecutionSnapshot vulkan_execution_delta(
     delta.counters.staging_slot_acquisitions = after.staging_slot_acquisitions - before.counters.staging_slot_acquisitions;
     delta.counters.staging_slot_contentions = after.staging_slot_contentions - before.counters.staging_slot_contentions;
     delta.counters.command_buffer_reuses = after.command_buffer_reuses - before.counters.command_buffer_reuses;
-    delta.counters.command_graph_submissions =
-        after.command_graph_submissions
-        - before.counters.command_graph_submissions;
-    delta.counters.command_graph_operations =
-        after.command_graph_operations
-        - before.counters.command_graph_operations;
+    delta.counters.command_graph_submissions = after.command_graph_submissions
+                                               - before.counters.command_graph_submissions;
+    delta.counters.command_graph_operations = after.command_graph_operations
+                                              - before.counters.command_graph_operations;
     delta.counters.direct_host_input_bindings = after.direct_host_input_bindings - before.counters.direct_host_input_bindings;
     delta.counters.direct_host_output_bindings = after.direct_host_output_bindings - before.counters.direct_host_output_bindings;
     delta.counters.attention_qkv_rope_fusions = after.attention_qkv_rope_fusions - before.counters.attention_qkv_rope_fusions;
@@ -188,12 +183,10 @@ static VulkanExecutionSnapshot vulkan_execution_delta(
     delta.counters.attention_output_failures = after.attention_output_failures - before.counters.attention_output_failures;
     delta.counters.attention_submit_failures = after.attention_submit_failures - before.counters.attention_submit_failures;
     delta.counters.attention_decode_sdpa_fusions = after.attention_decode_sdpa_fusions - before.counters.attention_decode_sdpa_fusions;
-    delta.counters.attention_cache_materializations =
-        after.attention_cache_materializations
-        - before.counters.attention_cache_materializations;
-    delta.counters.attention_cpu_fallbacks =
-        after.attention_cpu_fallbacks
-        - before.counters.attention_cpu_fallbacks;
+    delta.counters.attention_cache_materializations = after.attention_cache_materializations
+                                                      - before.counters.attention_cache_materializations;
+    delta.counters.attention_cpu_fallbacks = after.attention_cpu_fallbacks
+                                             - before.counters.attention_cpu_fallbacks;
     delta.counters.shared_expert_swiglu_fusions = after.shared_expert_swiglu_fusions - before.counters.shared_expert_swiglu_fusions;
     delta.counters.gated_delta_fusions = after.gated_delta_fusions - before.counters.gated_delta_fusions;
     delta.counters.gated_delta_submissions = after.gated_delta_submissions - before.counters.gated_delta_submissions;
@@ -203,32 +196,23 @@ static VulkanExecutionSnapshot vulkan_execution_delta(
     delta.counters.kv_ring_wrapped_views = after.kv_ring_wrapped_views - before.counters.kv_ring_wrapped_views;
     delta.counters.kv_cache_promotions = after.kv_cache_promotions - before.counters.kv_cache_promotions;
     delta.counters.kv_cache_promotion_bytes = after.kv_cache_promotion_bytes - before.counters.kv_cache_promotion_bytes;
-    delta.counters.bfloat16_cooperative_matrix_dispatches =
-        after.bfloat16_cooperative_matrix_dispatches
-        - before.counters.bfloat16_cooperative_matrix_dispatches;
-    delta.counters.command_dispatches =
-        after.command_dispatches - before.counters.command_dispatches;
-    delta.counters.command_pipeline_binds =
-        after.command_pipeline_binds
-        - before.counters.command_pipeline_binds;
-    delta.counters.command_redundant_pipeline_binds =
-        after.command_redundant_pipeline_binds
-        - before.counters.command_redundant_pipeline_binds;
-    delta.counters.command_descriptor_bindings =
-        after.command_descriptor_bindings
-        - before.counters.command_descriptor_bindings;
-    delta.counters.command_push_constant_updates =
-        after.command_push_constant_updates
-        - before.counters.command_push_constant_updates;
-    delta.counters.command_resource_barrier_calls =
-        after.command_resource_barrier_calls
-        - before.counters.command_resource_barrier_calls;
-    delta.counters.command_buffer_resource_barriers =
-        after.command_buffer_resource_barriers
-        - before.counters.command_buffer_resource_barriers;
-    delta.counters.command_image_resource_barriers =
-        after.command_image_resource_barriers
-        - before.counters.command_image_resource_barriers;
+    delta.counters.bfloat16_cooperative_matrix_dispatches = after.bfloat16_cooperative_matrix_dispatches
+                                                            - before.counters.bfloat16_cooperative_matrix_dispatches;
+    delta.counters.command_dispatches = after.command_dispatches - before.counters.command_dispatches;
+    delta.counters.command_pipeline_binds = after.command_pipeline_binds
+                                            - before.counters.command_pipeline_binds;
+    delta.counters.command_redundant_pipeline_binds = after.command_redundant_pipeline_binds
+                                                      - before.counters.command_redundant_pipeline_binds;
+    delta.counters.command_descriptor_bindings = after.command_descriptor_bindings
+                                                 - before.counters.command_descriptor_bindings;
+    delta.counters.command_push_constant_updates = after.command_push_constant_updates
+                                                   - before.counters.command_push_constant_updates;
+    delta.counters.command_resource_barrier_calls = after.command_resource_barrier_calls
+                                                    - before.counters.command_resource_barrier_calls;
+    delta.counters.command_buffer_resource_barriers = after.command_buffer_resource_barriers
+                                                      - before.counters.command_buffer_resource_barriers;
+    delta.counters.command_image_resource_barriers = after.command_image_resource_barriers
+                                                     - before.counters.command_image_resource_barriers;
     return delta;
 }
 
@@ -237,8 +221,7 @@ static void record_captured_vulkan_execution_delta(SessionStatistics& statistics
     statistics.vulkan_linear_dispatches += delta.dispatches;
     statistics.vulkan_attention_blocks += delta.attention_blocks;
     statistics.vulkan_compute_submissions += delta.counters.compute_submissions;
-    statistics.vulkan_submit_wait_time_microseconds +=
-        delta.counters.submit_wait_time_microseconds;
+    statistics.vulkan_submit_wait_time_microseconds += delta.counters.submit_wait_time_microseconds;
     statistics.vulkan_batch_uploads += delta.counters.batch_uploads;
     statistics.vulkan_batch_downloads += delta.counters.batch_downloads;
     statistics.vulkan_auxiliary_uploads += delta.counters.auxiliary_uploads;
@@ -248,10 +231,8 @@ static void record_captured_vulkan_execution_delta(SessionStatistics& statistics
     statistics.vulkan_staging_slot_acquisitions += delta.counters.staging_slot_acquisitions;
     statistics.vulkan_staging_slot_contentions += delta.counters.staging_slot_contentions;
     statistics.vulkan_command_buffer_reuses += delta.counters.command_buffer_reuses;
-    statistics.vulkan_command_graph_submissions +=
-        delta.counters.command_graph_submissions;
-    statistics.vulkan_command_graph_operations +=
-        delta.counters.command_graph_operations;
+    statistics.vulkan_command_graph_submissions += delta.counters.command_graph_submissions;
+    statistics.vulkan_command_graph_operations += delta.counters.command_graph_operations;
     statistics.vulkan_direct_host_input_bindings += delta.counters.direct_host_input_bindings;
     statistics.vulkan_direct_host_output_bindings += delta.counters.direct_host_output_bindings;
     statistics.vulkan_attention_qkv_rope_fusions += delta.counters.attention_qkv_rope_fusions;
@@ -273,10 +254,8 @@ static void record_captured_vulkan_execution_delta(SessionStatistics& statistics
     statistics.vulkan_attention_output_failures += delta.counters.attention_output_failures;
     statistics.vulkan_attention_submit_failures += delta.counters.attention_submit_failures;
     statistics.vulkan_attention_decode_sdpa_fusions += delta.counters.attention_decode_sdpa_fusions;
-    statistics.vulkan_attention_cache_materializations +=
-        delta.counters.attention_cache_materializations;
-    statistics.vulkan_attention_cpu_fallbacks +=
-        delta.counters.attention_cpu_fallbacks;
+    statistics.vulkan_attention_cache_materializations += delta.counters.attention_cache_materializations;
+    statistics.vulkan_attention_cpu_fallbacks += delta.counters.attention_cpu_fallbacks;
     statistics.vulkan_shared_expert_swiglu_fusions += delta.counters.shared_expert_swiglu_fusions;
     statistics.vulkan_gated_delta_fusions += delta.counters.gated_delta_fusions;
     statistics.vulkan_gated_delta_submissions += delta.counters.gated_delta_submissions;
@@ -286,24 +265,15 @@ static void record_captured_vulkan_execution_delta(SessionStatistics& statistics
     statistics.vulkan_kv_ring_wrapped_views += delta.counters.kv_ring_wrapped_views;
     statistics.vulkan_kv_cache_promotions += delta.counters.kv_cache_promotions;
     statistics.vulkan_kv_cache_promotion_bytes += delta.counters.kv_cache_promotion_bytes;
-    statistics.vulkan_bfloat16_cooperative_matrix_dispatches +=
-        delta.counters.bfloat16_cooperative_matrix_dispatches;
-    statistics.vulkan_command_dispatches +=
-        delta.counters.command_dispatches;
-    statistics.vulkan_command_pipeline_binds +=
-        delta.counters.command_pipeline_binds;
-    statistics.vulkan_command_redundant_pipeline_binds +=
-        delta.counters.command_redundant_pipeline_binds;
-    statistics.vulkan_command_descriptor_bindings +=
-        delta.counters.command_descriptor_bindings;
-    statistics.vulkan_command_push_constant_updates +=
-        delta.counters.command_push_constant_updates;
-    statistics.vulkan_command_resource_barrier_calls +=
-        delta.counters.command_resource_barrier_calls;
-    statistics.vulkan_command_buffer_resource_barriers +=
-        delta.counters.command_buffer_resource_barriers;
-    statistics.vulkan_command_image_resource_barriers +=
-        delta.counters.command_image_resource_barriers;
+    statistics.vulkan_bfloat16_cooperative_matrix_dispatches += delta.counters.bfloat16_cooperative_matrix_dispatches;
+    statistics.vulkan_command_dispatches += delta.counters.command_dispatches;
+    statistics.vulkan_command_pipeline_binds += delta.counters.command_pipeline_binds;
+    statistics.vulkan_command_redundant_pipeline_binds += delta.counters.command_redundant_pipeline_binds;
+    statistics.vulkan_command_descriptor_bindings += delta.counters.command_descriptor_bindings;
+    statistics.vulkan_command_push_constant_updates += delta.counters.command_push_constant_updates;
+    statistics.vulkan_command_resource_barrier_calls += delta.counters.command_resource_barrier_calls;
+    statistics.vulkan_command_buffer_resource_barriers += delta.counters.command_buffer_resource_barriers;
+    statistics.vulkan_command_image_resource_barriers += delta.counters.command_image_resource_barriers;
 }
 
 static void record_vulkan_execution_delta(
@@ -506,11 +476,11 @@ static CpuBatch run_expert(const WeightStore& weights, const CompiledOperatorTab
                     const float gate = source[column];
                     const float up = source[activated.columns() + column];
                     destination[column] = activate(
-                        gate,
-                        expert.activation,
-                        expert.activation_limit,
-                        optimization_flags)
-                                         * up;
+                                              gate,
+                                              expert.activation,
+                                              expert.activation_limit,
+                                              optimization_flags)
+                                          * up;
                 }
             }
         }
@@ -559,8 +529,7 @@ static CpuBatch run_expert(const WeightStore& weights, const CompiledOperatorTab
         {
             if (prefetch)
             {
-                metrics.hinted_bytes +=
-                    prefetch_weight(weights, expert.gate_weight);
+                metrics.hinted_bytes += prefetch_weight(weights, expert.gate_weight);
                 gate_prefetched = true;
             }
             CpuBatch activated;
@@ -577,8 +546,7 @@ static CpuBatch run_expert(const WeightStore& weights, const CompiledOperatorTab
             {
                 if (prefetch)
                 {
-                    metrics.hinted_bytes +=
-                        prefetch_weight(weights, expert.down_weight);
+                    metrics.hinted_bytes += prefetch_weight(weights, expert.down_weight);
                 }
                 return expert_linear(down_weight, nullptr, &down_operator, activated, metrics, optimization_flags);
             }
@@ -632,18 +600,15 @@ static CpuBatch run_shared_expert(
     uint64_t optimization_flags)
 {
     const ExpertPlan& expert = moe.shared_expert;
-    const bool has_router_gate =
-        moe.shared_expert_gate_weight != invalid_tensor_handle;
-    const CompiledOperator& fused_shared_operator =
-        model.operators.at(moe.fused_shared_input_bfloat16_operator);
+    const bool has_router_gate = moe.shared_expert_gate_weight != invalid_tensor_handle;
+    const CompiledOperator& fused_shared_operator = model.operators.at(moe.fused_shared_input_bfloat16_operator);
     if (fused_shared_operator.bfloat16
         && expert.down_weight != invalid_tensor_handle)
     {
         const CompiledOperator& down_operator = model.operators.at_weight(expert.down_weight);
         if (down_operator.bfloat16)
         {
-            const uint32_t intermediate =
-                model.weights.at(expert.up_weight).shape[0];
+            const uint32_t intermediate = model.weights.at(expert.up_weight).shape[0];
             CpuBatch output;
             if (fused_shared_operator.bfloat16->forward_swiglu_chain(
                     input,
@@ -665,10 +630,8 @@ static CpuBatch run_shared_expert(
                 input,
                 fused))
         {
-            const uint32_t intermediate =
-                model.weights.at(expert.up_weight).shape[0];
-            const uint32_t expected_columns =
-                intermediate * 2 + (has_router_gate ? 1 : 0);
+            const uint32_t intermediate = model.weights.at(expert.up_weight).shape[0];
+            const uint32_t expected_columns = intermediate * 2 + (has_router_gate ? 1 : 0);
             if (fused.columns() == expected_columns)
             {
                 CpuBatch activated(
@@ -678,21 +641,18 @@ static CpuBatch run_shared_expert(
                      token_index < fused.rows();
                      ++token_index)
                 {
-                    const float* source =
-                        fused.row(token_index);
-                    float* destination =
-                        activated.row(token_index);
+                    const float* source = fused.row(token_index);
+                    float* destination = activated.row(token_index);
                     for (uint32_t column = 0;
                          column < intermediate;
                          ++column)
                     {
-                        destination[column] =
-                            activate(
-                                source[column],
-                                expert.activation,
-                                expert.activation_limit,
-                                optimization_flags)
-                            * source[intermediate + column];
+                        destination[column] = activate(
+                                                  source[column],
+                                                  expert.activation,
+                                                  expert.activation_limit,
+                                                  optimization_flags)
+                                              * source[intermediate + column];
                     }
                 }
                 CpuBatch output = expert_linear(
@@ -708,12 +668,11 @@ static CpuBatch run_shared_expert(
                          token_index < output.rows();
                          ++token_index)
                     {
-                        const float scale =
-                            1.0f
-                            / (1.0f
-                               + std::exp(
-                                   -fused.row(token_index)
-                                       [intermediate * 2]));
+                        const float scale = 1.0f
+                                            / (1.0f
+                                               + std::exp(
+                                                   -fused.row(token_index)
+                                                        [intermediate * 2]));
                         float* token = output.row(token_index);
                         for (uint32_t column = 0;
                              column < output.columns();
@@ -826,8 +785,7 @@ static size_t hybrid_block_end(
         return begin;
 
     const uint32_t first_token = routes[begin].token_index;
-    const uint64_t token_limit =
-        static_cast<uint64_t>(first_token) + token_block_size;
+    const uint64_t token_limit = static_cast<uint64_t>(first_token) + token_block_size;
     size_t end = begin;
     while (end < routes.size()
            && static_cast<uint64_t>(routes[end].token_index) < token_limit)
@@ -870,10 +828,7 @@ static uint64_t run_hybrid_cpu_blocks(
     if (groups.empty())
         return 0;
 
-    // One Expert often owns several token blocks in a long prefill.  Gather
-    // those CPU fallback blocks once so MXFP4 uses its batched/GEMM path and
-    // the weights are decoded only once for the group.  Single-block groups
-    // keep the zero-copy fast path.
+    // Gather multiple CPU blocks per Expert for the batched kernel.
     for (HybridCpuBlockGroup& group : groups)
     {
         if (group.block_indices.size() <= 1)
@@ -905,8 +860,7 @@ static uint64_t run_hybrid_cpu_blocks(
     team_size = std::min(static_cast<int>(groups.size()), static_cast<int>(cpu_linear_thread_limit()));
     parallelize = team_size > 1;
 #endif
-    Bfloat16BatchedLinearExecutionCounter* const bfloat16_counter =
-        current_bfloat16_batched_linear_execution_counter();
+    Bfloat16BatchedLinearExecutionCounter* const bfloat16_counter = current_bfloat16_batched_linear_execution_counter();
     const int64_t group_count = static_cast<int64_t>(groups.size());
 #pragma omp parallel for schedule(dynamic, 1) num_threads(team_size) if (parallelize)
     for (int64_t group_index = 0; group_index < group_count; ++group_index)
@@ -914,8 +868,7 @@ static uint64_t run_hybrid_cpu_blocks(
         HybridCpuBlockGroup& group = groups[static_cast<size_t>(group_index)];
         const ScopedBfloat16BatchedLinearExecutionCounter bfloat16_scope(
             bfloat16_counter);
-        ActiveExpertExecution& active =
-            layer_state.active_experts[group.active_index];
+        ActiveExpertExecution& active = layer_state.active_experts[group.active_index];
         const ExpertPlan& expert = moe.experts[active.batch.expert_id];
         if (group.block_indices.size() == 1)
         {
@@ -975,8 +928,7 @@ static uint64_t run_hybrid_cpu_blocks(
         {
             if (!group.executed)
                 continue;
-            const ActiveExpertExecution& active =
-                layer_state.active_experts[group.active_index];
+            const ActiveExpertExecution& active = layer_state.active_experts[group.active_index];
             uint64_t group_rows = 0;
             for (size_t block_index : group.block_indices)
                 group_rows += blocks[block_index].input.rows();
@@ -1005,8 +957,7 @@ static void assemble_hybrid_outputs(
             continue;
         }
 
-        ActiveExpertExecution& active =
-            layer_state.active_experts[block.active_index];
+        ActiveExpertExecution& active = layer_state.active_experts[block.active_index];
         if (initialized[block.active_index] == 0)
         {
             active.output.reset(
@@ -1110,8 +1061,7 @@ static uint64_t run_experts(
     parallelize_experts = expert_team_size > 1;
 #endif
     const int64_t parallel_expert_count = static_cast<int64_t>(active_indices.size());
-    Bfloat16BatchedLinearExecutionCounter* const bfloat16_counter =
-        current_bfloat16_batched_linear_execution_counter();
+    Bfloat16BatchedLinearExecutionCounter* const bfloat16_counter = current_bfloat16_batched_linear_execution_counter();
 #pragma omp parallel for schedule(dynamic, 1) num_threads(expert_team_size) if (parallelize_experts)
     for (int64_t task_index = 0; task_index < parallel_expert_count; ++task_index)
     {
@@ -1205,8 +1155,7 @@ collect_speculative_layer_execution_nodes(const CompiledModel& model)
                 ErrorCode::InternalError,
                 "speculative node layer binding is out of range"};
         }
-        SpeculativeLayerExecutionNodes& layer =
-            layers[node->layer_plan_index];
+        SpeculativeLayerExecutionNodes& layer = layers[node->layer_plan_index];
         if (layer.layer_plan_index == invalid_execution_layer_id)
             layer.layer_plan_index = node->layer_plan_index;
         const ExecutionNode** target = nullptr;
@@ -1273,11 +1222,7 @@ static ExpertVictimExecutionMetadata victim_metadata(const CompiledModel& model,
     return metadata;
 }
 
-// Prefill has enough independent route rows to expose a second scheduling
-// dimension: one expert can be split into token blocks while another block is
-// being evaluated on the device.  The legacy path remains the fallback for
-// decode and small prompts because a block-sized Vulkan submission would only
-// add staging and command overhead there.
+// Use block scheduling only for sufficiently large prefill waves.
 static bool should_use_hybrid_expert_blocks(
     const CompiledModel& model,
     const MoeBlockPlan& moe,
@@ -1328,9 +1273,7 @@ static Result<void> run_hybrid_expert_blocks(
     const auto cache_management_start = std::chrono::steady_clock::now();
     const auto compute_start = std::chrono::steady_clock::now();
 
-    // The legacy path gathers expert inputs immediately before it starts
-    // cache/backend planning.  The block path is selected at the top of
-    // run_moe, so it has to establish the same invariant itself.
+    // Establish the same gathered-input invariant as the legacy path.
     for (ActiveExpertExecution& active : layer_state.active_experts)
     {
         gather_tokens(layer_state.normalized, active.batch.routes, active.input);
@@ -1356,9 +1299,7 @@ static Result<void> run_hybrid_expert_blocks(
     std::vector<size_t> cpu_active_indices;
     cpu_active_indices.reserve(active_expert_count);
 
-    // Build contiguous route blocks.  Dispatcher output is token ordered, so
-    // each block can reuse a subspan of the original route metadata and a
-    // contiguous slice of the already gathered CPU input.
+    // Build contiguous route blocks from the dispatcher order.
     for (size_t active_index = 0; active_index < active_expert_count; ++active_index)
     {
         ActiveExpertExecution& active = layer_state.active_experts[active_index];
@@ -1406,14 +1347,12 @@ static Result<void> run_hybrid_expert_blocks(
             leases.resize(active_indices.size());
             for (size_t active_index : active_indices)
             {
-                const ExpertPlan& expert = moe.experts[
-                    layer_state.active_experts[active_index].batch.expert_id];
-                cache_requests.push_back({
-                    &model.weights.at(expert.gate_up_weight),
-                    &model.weights.at(expert.down_weight),
-                    residency_group,
-                    expert.cache_key,
-                    victim_metadata(model, expert)});
+                const ExpertPlan& expert = moe.experts[layer_state.active_experts[active_index].batch.expert_id];
+                cache_requests.push_back({&model.weights.at(expert.gate_up_weight),
+                                          &model.weights.at(expert.down_weight),
+                                          residency_group,
+                                          expert.cache_key,
+                                          victim_metadata(model, expert)});
             }
             auto acquired = model.expert_cache->wait_acquire_ready_pairs(
                 cache_requests,
@@ -1455,8 +1394,7 @@ static Result<void> run_hybrid_expert_blocks(
     for (size_t block_index = 0; block_index < blocks.size(); ++block_index)
     {
         HybridBlockState& block = blocks[block_index];
-        const ActiveExpertExecution& active =
-            layer_state.active_experts[block.active_index];
+        const ActiveExpertExecution& active = layer_state.active_experts[block.active_index];
         const ExpertPlan& expert = moe.experts[active.batch.expert_id];
         ExpertBackendRequest request{
             expert.cache_key,
@@ -1464,9 +1402,7 @@ static Result<void> run_hybrid_expert_blocks(
             &block.output,
             expert.weight_bytes};
         request.route_aggregation.output = &scratch.backend_aggregated_output;
-        request.route_aggregation.routes = std::span<const ExpertRoute>(active.batch.routes).subspan(
-            block.input_begin,
-            block.input.rows());
+        request.route_aggregation.routes = std::span<const ExpertRoute>(active.batch.routes).subspan(block.input_begin, block.input.rows());
         request.route_aggregation.token_count = static_cast<uint32_t>(layer_state.normalized.rows());
         request.route_aggregation.completed = &route_aggregation_completed;
         request.route_aggregation.require_all_requests = true;
@@ -1474,13 +1410,11 @@ static Result<void> run_hybrid_expert_blocks(
     }
 
     const auto backend_execution_start = std::chrono::steady_clock::now();
-    std::unique_ptr<IExpertBackendBatchSubmission> submission =
-        model.expert_backend->submit_batch(requests);
+    std::unique_ptr<IExpertBackendBatchSubmission> submission = model.expert_backend->submit_batch(requests);
     if (!submission)
         return Error{ErrorCode::InternalError, "hybrid expert block submission failed"};
 
-    const std::span<const ExpertBackendExecutionResult> planned =
-        submission->reservations();
+    const std::span<const ExpertBackendExecutionResult> planned = submission->reservations();
     if (planned.size() != requests.size())
     {
         submission->abort();
@@ -1493,8 +1427,7 @@ static Result<void> run_hybrid_expert_blocks(
     for (size_t request_index = 0; request_index < planned.size(); ++request_index)
     {
         HybridBlockState& block = blocks[request_index];
-        const ActiveExpertExecution& active =
-            layer_state.active_experts[block.active_index];
+        const ActiveExpertExecution& active = layer_state.active_experts[block.active_index];
         const ExpertPlan& expert = moe.experts[active.batch.expert_id];
         backend_max_token_count = std::max<uint32_t>(
             backend_max_token_count,
@@ -1515,9 +1448,7 @@ static Result<void> run_hybrid_expert_blocks(
         }
     }
 
-    // Acquire only the experts that have a CPU block.  Device-resident blocks
-    // can proceed without touching the host cache; CPU fallback blocks share
-    // one pair lease per expert.
+    // Acquire host weights only for CPU blocks.
     std::vector<size_t> pending_cpu;
     pending_cpu.reserve(cpu_active_indices.size());
     for (size_t active_index : cpu_active_indices)
@@ -1525,8 +1456,8 @@ static Result<void> run_hybrid_expert_blocks(
         ActiveExpertExecution& active = layer_state.active_experts[active_index];
         const ExpertPlan& expert = moe.experts[active.batch.expert_id];
         const TensorData* gate_up = expert.gate_up_weight == invalid_tensor_handle
-                                         ? nullptr
-                                         : &model.weights.at(expert.gate_up_weight);
+                                        ? nullptr
+                                        : &model.weights.at(expert.gate_up_weight);
         const TensorData& down = model.weights.at(expert.down_weight);
         if (!model.expert_cache || !gate_up
             || (!gate_up->mxfp4_file_storage && !down.mxfp4_file_storage))
@@ -1545,8 +1476,7 @@ static Result<void> run_hybrid_expert_blocks(
             return acquired.error();
         }
     }
-    statistics.expert_cache_management_time_microseconds +=
-        elapsed_microseconds(cache_management_start);
+    statistics.expert_cache_management_time_microseconds += elapsed_microseconds(cache_management_start);
 
     const uint64_t initial_cpu_time = run_hybrid_cpu_blocks(
         model,
@@ -1593,18 +1523,16 @@ static Result<void> run_hybrid_expert_blocks(
         HybridBlockState& block = blocks[request_index];
         if (!block.gpu_planned)
             continue;
-        const ExpertBackendExecutionResult result =
-            request_index < results.size()
-                ? results[request_index]
-                : ExpertBackendExecutionResult::Failed;
+        const ExpertBackendExecutionResult result = request_index < results.size()
+                                                        ? results[request_index]
+                                                        : ExpertBackendExecutionResult::Failed;
         if (committed && result == ExpertBackendExecutionResult::Executed)
         {
             block.gpu_executed = true;
             if (active_accelerated[block.active_index] == 2)
             {
                 active_accelerated[block.active_index] = 1;
-                backend_accelerated_weight_bytes +=
-                    moe.experts[layer_state.active_experts[block.active_index].batch.expert_id].weight_bytes;
+                backend_accelerated_weight_bytes += moe.experts[layer_state.active_experts[block.active_index].batch.expert_id].weight_bytes;
             }
         }
         else
@@ -1615,18 +1543,14 @@ static Result<void> run_hybrid_expert_blocks(
         }
     }
 
-    // require_all_requests makes a nonzero completion flag equivalent to a
-    // complete aggregation for every block in this submission.
+    // Aggregation is published only after every block completes.
     if (committed && route_aggregation_completed != 0)
         std::fill(
             scratch.backend_aggregated.begin(),
             scratch.backend_aggregated.end(),
             uint8_t{1});
 
-    // A block can fail after reservation (for example after a command-buffer
-    // or staging error).  Acquire CPU weights for those newly created fallback
-    // blocks, then reuse the same CPU block executor without recomputing the
-    // blocks that already completed.
+    // Retry failed blocks on CPU without recomputing completed blocks.
     pending_cpu.clear();
     for (size_t active_index : cpu_active_indices)
     {
@@ -1635,8 +1559,8 @@ static Result<void> run_hybrid_expert_blocks(
         const ActiveExpertExecution& active = layer_state.active_experts[active_index];
         const ExpertPlan& expert = moe.experts[active.batch.expert_id];
         const TensorData* gate_up = expert.gate_up_weight == invalid_tensor_handle
-                                         ? nullptr
-                                         : &model.weights.at(expert.gate_up_weight);
+                                        ? nullptr
+                                        : &model.weights.at(expert.gate_up_weight);
         const TensorData& down = model.weights.at(expert.down_weight);
         if (!model.expert_cache || !gate_up
             || (!gate_up->mxfp4_file_storage && !down.mxfp4_file_storage))
@@ -1816,8 +1740,7 @@ static void resolve_router_predictions(
     std::span<const uint32_t> actual_experts;
     if (layer.moe.top_k <= actual_storage.size())
     {
-        const std::span<uint32_t> ranked =
-            std::span<uint32_t>(actual_storage).first(layer.moe.top_k);
+        const std::span<uint32_t> ranked = std::span<uint32_t>(actual_storage).first(layer.moe.top_k);
         collect_ranked_experts(plan, ranked);
         actual_experts = ranked;
     }
@@ -1977,8 +1900,7 @@ static Result<RouterPredictionOutcome> run_router_prediction(
     options.routed_scaling_factor = next_layer.moe.routed_scaling_factor;
     if (next_layer.moe.router_selection_bias != invalid_tensor_handle)
     {
-        options.selection_bias =
-            model.weights.at(next_layer.moe.router_selection_bias).float32_values();
+        options.selection_bias = model.weights.at(next_layer.moe.router_selection_bias).float32_values();
     }
     options.flags = has_flag(next_layer.moe.flags, MoeBlockNormalizeTopKWeights)
                         ? static_cast<uint32_t>(ExpertDispatchNormalizeTopKWeights)
@@ -1999,8 +1921,7 @@ static Result<RouterPredictionOutcome> run_router_prediction(
     std::span<const uint32_t> predicted_experts;
     if (next_layer.moe.top_k <= predicted_storage.size())
     {
-        const std::span<uint32_t> ranked =
-            std::span<uint32_t>(predicted_storage).first(next_layer.moe.top_k);
+        const std::span<uint32_t> ranked = std::span<uint32_t>(predicted_storage).first(next_layer.moe.top_k);
         collect_ranked_experts(predicted_plan, ranked);
         predicted_experts = ranked;
     }
@@ -2066,12 +1987,10 @@ static Result<void> apply_router_prediction(
         ++statistics.expert_route_predictions;
         ++statistics.expert_route_rank_predictions[rank];
     }
-    state.layers[outcome.target_layer_id].predicted_expert_ids =
-        std::move(outcome.predicted_expert_ids);
+    state.layers[outcome.target_layer_id].predicted_expert_ids = std::move(outcome.predicted_expert_ids);
     statistics.expert_route_prediction_cache_hits += outcome.cache_hits;
     statistics.expert_route_prediction_cache_misses += outcome.cache_misses;
-    statistics.expert_route_prediction_time_microseconds +=
-        outcome.predictor_time_microseconds;
+    statistics.expert_route_prediction_time_microseconds += outcome.predictor_time_microseconds;
     return {};
 }
 
@@ -2191,8 +2110,7 @@ static Result<void> complete_router_prediction(
             ErrorCode::InternalError,
             "Router prediction worker failed"};
     }
-    statistics.expert_route_prediction_wait_time_microseconds +=
-        elapsed_microseconds(wait_started);
+    statistics.expert_route_prediction_wait_time_microseconds += elapsed_microseconds(wait_started);
     pending.target_layer_id = std::numeric_limits<uint32_t>::max();
     if (!completed)
         return completed.error();
@@ -2206,10 +2124,7 @@ static Result<void> complete_router_prediction(
 
     if (layer_id < model.graph.layer_plans.size())
     {
-        // Route prediction used to warm only the CPU Expert cache. Once the
-        // host pair is ready, hand the same immutable weights to the static
-        // GPU admission queue before the predicted layer dispatches. This is
-        // a deterministic prefetch path; it never probes CPU/GPU timings.
+        // Admit predicted weights to the GPU queue after the host pair is ready.
         admit_ready_router_prediction(
             model,
             model.graph.layer_plans[layer_id],
@@ -2244,18 +2159,15 @@ static Result<void> predict_next_router_routes(
         {
             if (!state.router_prediction_worker)
             {
-                state.router_prediction_worker =
-                    std::make_unique<CpuTaskWorker>(2);
+                state.router_prediction_worker = std::make_unique<CpuTaskWorker>(2);
             }
             CpuBatch copied_input = router_input;
             auto promise = std::make_shared<
                 std::promise<Result<RouterPredictionOutcome>>>();
-            std::future<Result<RouterPredictionOutcome>> future =
-                promise->get_future();
+            std::future<Result<RouterPredictionOutcome>> future = promise->get_future();
             const CompiledLayerPlan* next_layer = target.layer;
             const uint32_t prefetch_width = target.prefetch_width;
-            Bfloat16BatchedLinearExecutionCounter* const bfloat16_counter =
-                current_bfloat16_batched_linear_execution_counter();
+            Bfloat16BatchedLinearExecutionCounter* const bfloat16_counter = current_bfloat16_batched_linear_execution_counter();
             submitted = state.router_prediction_worker->try_submit(
                 [&model,
                  next_layer,
@@ -2427,9 +2339,7 @@ static Result<void> run_moe(
             backend_reservation_shape_valid = planned.size() == backend_indices.size();
             if (!backend_reservation_shape_valid)
             {
-                // A batch submission owns one reservation/result per request.
-                // Any cardinality violation invalidates the whole reservation;
-                // the caller will execute every request on the CPU.
+                // A shape mismatch invalidates the batch and enables CPU retry.
                 backend_submission->abort();
             }
             else
@@ -2824,12 +2734,10 @@ static Result<void> execute_speculative_layer(
             ErrorCode::InternalError,
             "speculative execution graph has an incomplete layer binding"};
     }
-    const CompiledLayerPlan& layer =
-        model.speculative.graph.layer_plans[execution.layer_plan_index];
+    const CompiledLayerPlan& layer = model.speculative.graph.layer_plans[execution.layer_plan_index];
     const ExecutionBackend attention_backend = execution.attention->backend;
     const ExecutionBackend expert_backend = execution.expert_group->backend;
-    const bool cpu_prefetch =
-        has_flag(execution.expert_group->flags, ExecutionNodeCpuPrefetch);
+    const bool cpu_prefetch = has_flag(execution.expert_group->flags, ExecutionNodeCpuPrefetch);
 
     LayerGraphState layer_state;
     const uint32_t multiplier = model.descriptor.hyper_connection_multiplier;
@@ -3038,7 +2946,7 @@ static Result<CpuBatch> prepare_mtp_hidden(
     CpuBatch normalized_embeddings = rms_norm_batch(
         embeddings,
         model.weights.at(
-        model.speculative.mtp_embedding_norm_weight),
+            model.speculative.mtp_embedding_norm_weight),
         model.descriptor.norm_epsilon,
         model.descriptor.norm_weight_offset,
         model.optimization_flags);
@@ -3137,10 +3045,8 @@ static Result<void> append_mtp_context(
         target_hidden);
     if (!prepared)
         return prepared.error();
-    const SpeculativeLayerExecutionNodes& execution =
-        layer_nodes.value().front();
-    const CompiledLayerPlan& layer =
-        model.speculative.graph.layer_plans[execution.layer_plan_index];
+    const SpeculativeLayerExecutionNodes& execution = layer_nodes.value().front();
+    const CompiledLayerPlan& layer = model.speculative.graph.layer_plans[execution.layer_plan_index];
     auto appended = append_attention_context_into(
         model.weights,
         model.operators,
@@ -3169,12 +3075,10 @@ static Result<void> update_mtp_context(
             "target execution did not capture Qwen final hidden states"};
     }
 
-    const bool direct_alignment =
-        !state.speculative_direct_alignment_ids.empty();
-    const std::vector<int32_t>& input_ids =
-        direct_alignment
-            ? state.speculative_direct_alignment_ids
-            : state.speculative_input_ids;
+    const bool direct_alignment = !state.speculative_direct_alignment_ids.empty();
+    const std::vector<int32_t>& input_ids = direct_alignment
+                                                ? state.speculative_direct_alignment_ids
+                                                : state.speculative_input_ids;
     if (input_ids.size() != target_hidden.rows())
     {
         return Error{
@@ -3189,8 +3093,7 @@ static Result<void> update_mtp_context(
             "Qwen MTP direct alignment still has a pending target row"};
     }
 
-    const bool has_pending =
-        state.mtp_pending_target_hidden.rows() != 0;
+    const bool has_pending = state.mtp_pending_target_hidden.rows() != 0;
     if (has_pending
         && (state.mtp_pending_target_hidden.rows() != 1
             || state.mtp_pending_target_hidden.columns()
@@ -3203,10 +3106,9 @@ static Result<void> update_mtp_context(
             "Qwen MTP pending target row is out of sequence"};
     }
 
-    const size_t aligned_rows =
-        direct_alignment
-            ? target_hidden.rows() - 1
-            : (has_pending ? 1 : 0) + target_hidden.rows() - 1;
+    const size_t aligned_rows = direct_alignment
+                                    ? target_hidden.rows() - 1
+                                    : (has_pending ? 1 : 0) + target_hidden.rows() - 1;
     if (aligned_rows != 0)
     {
         CpuBatch aligned_hidden(
@@ -3215,8 +3117,7 @@ static Result<void> update_mtp_context(
         std::vector<int32_t> aligned_ids;
         aligned_ids.reserve(aligned_rows);
         size_t output_row = 0;
-        uint64_t aligned_position =
-            state.speculative_main_hidden_position;
+        uint64_t aligned_position = state.speculative_main_hidden_position;
         if (!direct_alignment && has_pending)
         {
             aligned_position = state.mtp_pending_target_position;
@@ -3255,9 +3156,8 @@ static Result<void> update_mtp_context(
         target_hidden.row(target_hidden.rows() - 1),
         model.descriptor.hidden_size,
         state.mtp_pending_target_hidden.row(0));
-    state.mtp_pending_target_position =
-        state.speculative_main_hidden_position
-        + target_hidden.rows() - 1;
+    state.mtp_pending_target_position = state.speculative_main_hidden_position
+                                        + target_hidden.rows() - 1;
     state.speculative_input_ids.clear();
     state.speculative_direct_alignment_ids.clear();
     return {};
@@ -3272,8 +3172,7 @@ Result<void> CpuExecutor::update_speculative_context(const CompiledModel& model,
     const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(
         &cpu_bfloat16_execution);
     const auto started = std::chrono::steady_clock::now();
-    const VulkanExecutionSnapshot vulkan_before =
-        capture_vulkan_execution(model.vulkan_context_instance);
+    const VulkanExecutionSnapshot vulkan_before = capture_vulkan_execution(model.vulkan_context_instance);
     if (model.speculative.kind == SpeculativeModelKind::Mtp)
     {
         auto updated = update_mtp_context(
@@ -3282,10 +3181,8 @@ Result<void> CpuExecutor::update_speculative_context(const CompiledModel& model,
         if (!updated)
             return updated.error();
         record_vulkan_execution_delta(statistics, vulkan_before, model.vulkan_context_instance);
-        statistics.cpu_bfloat16_batched_linear_dispatches +=
-            cpu_bfloat16_execution.dispatch_count();
-        statistics.speculative_context_time_microseconds +=
-            elapsed_microseconds(started);
+        statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
+        statistics.speculative_context_time_microseconds += elapsed_microseconds(started);
         return {};
     }
     const uint32_t expected_columns = model.descriptor.hidden_size
@@ -3310,24 +3207,21 @@ Result<void> CpuExecutor::update_speculative_context(const CompiledModel& model,
         state.speculative_layers.resize(layer_nodes.value().size());
     for (size_t layer_index = 0; layer_index < layer_nodes.value().size(); ++layer_index)
     {
-        const SpeculativeLayerExecutionNodes& execution =
-            layer_nodes.value()[layer_index];
-        const CompiledLayerPlan& layer =
-            model.speculative.graph.layer_plans[execution.layer_plan_index];
+        const SpeculativeLayerExecutionNodes& execution = layer_nodes.value()[layer_index];
+        const CompiledLayerPlan& layer = model.speculative.graph.layer_plans[execution.layer_plan_index];
         auto appended = append_dspark_attention_context(
-                                                        model.weights,
-                                                        model.operators,
-                                                        layer.attention,
-                                                        execution.attention->backend,
-                                                        model.descriptor.norm_epsilon,
-                                                        state.speculative_main_hidden_position, state.speculative_layers[layer_index], projected,
-                                                        model.optimization_flags);
+            model.weights,
+            model.operators,
+            layer.attention,
+            execution.attention->backend,
+            model.descriptor.norm_epsilon,
+            state.speculative_main_hidden_position, state.speculative_layers[layer_index], projected,
+            model.optimization_flags);
         if (!appended)
             return appended.error();
     }
     record_vulkan_execution_delta(statistics, vulkan_before, model.vulkan_context_instance);
-    statistics.cpu_bfloat16_batched_linear_dispatches +=
-        cpu_bfloat16_execution.dispatch_count();
+    statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
     statistics.speculative_context_time_microseconds += elapsed_microseconds(started);
     return {};
 }
@@ -3363,8 +3257,7 @@ static Result<CpuSpeculativeProposal> propose_mtp(
     }
 
     const auto started = std::chrono::steady_clock::now();
-    const VulkanExecutionSnapshot vulkan_before =
-        capture_vulkan_execution(model.vulkan_context_instance);
+    const VulkanExecutionSnapshot vulkan_before = capture_vulkan_execution(model.vulkan_context_instance);
     ExpertCacheStatistics cache_before;
     if (model.expert_cache)
         cache_before = model.expert_cache->statistics();
@@ -3378,8 +3271,7 @@ static Result<CpuSpeculativeProposal> propose_mtp(
     proposal.confidence_logits.reserve(
         model.speculative.block_size);
     proposal.committed_context_rows = 1;
-    CpuBatch previous_hidden =
-        state.mtp_pending_target_hidden;
+    CpuBatch previous_hidden = state.mtp_pending_target_hidden;
     int32_t previous_token = input_id;
     for (uint32_t row = 0;
          row < model.speculative.block_size;
@@ -3419,25 +3311,17 @@ static Result<CpuSpeculativeProposal> propose_mtp(
 
     if (model.expert_cache)
     {
-        const ExpertCacheStatistics cache_after =
-            model.expert_cache->statistics();
-        statistics.expert_cache_hits +=
-            cache_after.hits - cache_before.hits;
-        statistics.expert_cache_misses +=
-            cache_after.misses - cache_before.misses;
-        statistics.expert_cache_evictions +=
-            cache_after.evictions - cache_before.evictions;
-        statistics.expert_cache_bytes_read +=
-            cache_after.bytes_read - cache_before.bytes_read;
+        const ExpertCacheStatistics cache_after = model.expert_cache->statistics();
+        statistics.expert_cache_hits += cache_after.hits - cache_before.hits;
+        statistics.expert_cache_misses += cache_after.misses - cache_before.misses;
+        statistics.expert_cache_evictions += cache_after.evictions - cache_before.evictions;
+        statistics.expert_cache_bytes_read += cache_after.bytes_read - cache_before.bytes_read;
         statistics.expert_cache_io_worker_count = cache_after.io_worker_count;
         statistics.expert_cache_adaptive_io_workers = cache_after.adaptive_io_workers;
-        statistics.expert_cache_io_read_samples +=
-            cache_after.io_read_samples - cache_before.io_read_samples;
-        statistics.expert_cache_io_read_time_microseconds +=
-            cache_after.io_read_time_microseconds
-            - cache_before.io_read_time_microseconds;
-        statistics.expert_cache_resident_bytes =
-            cache_after.resident_bytes;
+        statistics.expert_cache_io_read_samples += cache_after.io_read_samples - cache_before.io_read_samples;
+        statistics.expert_cache_io_read_time_microseconds += cache_after.io_read_time_microseconds
+                                                             - cache_before.io_read_time_microseconds;
+        statistics.expert_cache_resident_bytes = cache_after.resident_bytes;
     }
     if (model.expert_backend)
     {
@@ -3448,10 +3332,8 @@ static Result<CpuSpeculativeProposal> propose_mtp(
     }
     record_vulkan_execution_delta(statistics, vulkan_before, model.vulkan_context_instance);
     ++statistics.speculative_proposals;
-    statistics.speculative_draft_tokens +=
-        proposal.token_ids.size();
-    statistics.speculative_draft_time_microseconds +=
-        elapsed_microseconds(started);
+    statistics.speculative_draft_tokens += proposal.token_ids.size();
+    statistics.speculative_draft_time_microseconds += elapsed_microseconds(started);
     return proposal;
 }
 
@@ -3478,8 +3360,7 @@ Result<CpuSpeculativeProposal> CpuExecutor::propose_speculative(const CompiledMo
             sampler);
         if (proposal)
         {
-            statistics.cpu_bfloat16_batched_linear_dispatches +=
-                cpu_bfloat16_execution.dispatch_count();
+            statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
         }
         return proposal;
     }
@@ -3617,8 +3498,7 @@ Result<CpuSpeculativeProposal> CpuExecutor::propose_speculative(const CompiledMo
         record_expert_backend_delta(statistics, backend_before, model.expert_backend->statistics());
     }
     record_vulkan_execution_delta(statistics, vulkan_before, model.vulkan_context_instance);
-    statistics.cpu_bfloat16_batched_linear_dispatches +=
-        cpu_bfloat16_execution.dispatch_count();
+    statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
     ++statistics.speculative_proposals;
     statistics.speculative_draft_tokens += proposal.token_ids.size();
     statistics.speculative_draft_time_microseconds += elapsed_microseconds(started);
@@ -3689,12 +3569,11 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute(
     if (model.speculative.enabled()
         && state.speculative_context_enabled)
     {
-        const uint32_t speculative_hidden_columns =
-            model.speculative.kind == SpeculativeModelKind::Mtp
-                ? model.descriptor.hidden_size
-                : model.descriptor.hidden_size
-                      * static_cast<uint32_t>(
-                          model.speculative.target_layer_ids.size());
+        const uint32_t speculative_hidden_columns = model.speculative.kind == SpeculativeModelKind::Mtp
+                                                        ? model.descriptor.hidden_size
+                                                        : model.descriptor.hidden_size
+                                                              * static_cast<uint32_t>(
+                                                                  model.speculative.target_layer_ids.size());
         state.speculative_main_hidden.reset(
             input_ids.size(),
             speculative_hidden_columns,
@@ -3728,8 +3607,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute(
         {
             if (backend_run.first_node + run_offset >= model.schedule.node_order.size())
                 return Error{ErrorCode::InternalError, "execution backend run exceeds the execution reservation"};
-            const ExecutionNodeId node_id =
-                model.schedule.node_order[backend_run.first_node + run_offset];
+            const ExecutionNodeId node_id = model.schedule.node_order[backend_run.first_node + run_offset];
             if (node_id >= model.graph.nodes.size())
                 return Error{ErrorCode::InternalError, "execution schedule references an invalid node"};
             const ExecutionNode* node = &model.graph.nodes[node_id];
@@ -3755,9 +3633,8 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute(
             {
                 if (node->weight_inputs.size() != 2)
                     return Error{ErrorCode::InternalError, "final norm node has an invalid weight binding"};
-                const CompiledOperator& lm_head_operator =
-                    model.operators.at_weight(
-                        node->weight_inputs[1]);
+                const CompiledOperator& lm_head_operator = model.operators.at_weight(
+                    node->weight_inputs[1]);
                 if (model.descriptor.hyper_connection_multiplier == 1
                     && !state.speculative_context_enabled
                     && lm_head_operator.bfloat16
@@ -3810,8 +3687,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute(
                     return Error{ErrorCode::InternalError, "LM head node has an invalid weight binding"};
                 const auto lm_head_start = std::chrono::steady_clock::now();
                 const auto& lm_head = model.weights.at(node->weight_inputs[0]);
-                const CompiledOperator& lm_head_operator =
-                    model.operators.at_weight(node->weight_inputs[0]);
+                const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weight_inputs[0]);
                 if (deferred_final_norm
                     && try_fused_rms_norm_linear(
                         lm_head_operator,
@@ -4218,11 +4094,10 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute(
         statistics,
         initial_vulkan_execution,
         model.vulkan_context_instance);
-    statistics.cpu_bfloat16_batched_linear_dispatches +=
-        cpu_bfloat16_execution.dispatch_count();
-        auto residency = state.memory_manager.record_execution(
-            model.graph,
-            model.schedule);
+    statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
+    auto residency = state.memory_manager.record_execution(
+        model.graph,
+        model.schedule);
     if (!residency)
         return residency.error();
     return logits;
@@ -4253,6 +4128,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
     const float hyper_epsilon = model.descriptor.hyper_connection_epsilon;
     std::vector<CpuBatch> hidden(session_count);
     std::vector<std::vector<float>> logits(session_count);
+    CpuExpertExecutionScratch& batch_scratch = entries.front().state->expert_scratch;
     for (const CpuDecodeBatchEntry& entry : entries)
     {
         if (!entry.statistics || !entry.state)
@@ -4288,12 +4164,11 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
     }
     if (model.speculative.enabled())
     {
-        const uint32_t speculative_hidden_columns =
-            model.speculative.kind == SpeculativeModelKind::Mtp
-                ? model.descriptor.hidden_size
-                : model.descriptor.hidden_size
-                      * static_cast<uint32_t>(
-                          model.speculative.target_layer_ids.size());
+        const uint32_t speculative_hidden_columns = model.speculative.kind == SpeculativeModelKind::Mtp
+                                                        ? model.descriptor.hidden_size
+                                                        : model.descriptor.hidden_size
+                                                              * static_cast<uint32_t>(
+                                                                  model.speculative.target_layer_ids.size());
         for (const CpuDecodeBatchEntry& entry : entries)
         {
             if (!entry.state->speculative_context_enabled)
@@ -4366,9 +4241,8 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
     bool speculative_context_enabled = false;
     for (const CpuDecodeBatchEntry& entry : entries)
     {
-        speculative_context_enabled =
-            speculative_context_enabled
-            || entry.state->speculative_context_enabled;
+        speculative_context_enabled = speculative_context_enabled
+                                      || entry.state->speculative_context_enabled;
     }
     bool deferred_final_norm = false;
     ExecutionEventRuntime event_runtime(model.graph.events);
@@ -4382,8 +4256,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
             {
                 return Error{ErrorCode::InternalError, "execution backend run exceeds the execution reservation"};
             }
-            const ExecutionNodeId node_id =
-                model.schedule.node_order[backend_run.first_node + run_offset];
+            const ExecutionNodeId node_id = model.schedule.node_order[backend_run.first_node + run_offset];
             if (node_id >= model.graph.nodes.size())
             {
                 return Error{ErrorCode::InternalError, "execution schedule references an invalid node"};
@@ -4424,9 +4297,8 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
             {
                 if (node->weight_inputs.size() != 2)
                     return Error{ErrorCode::InternalError, "final norm node has an invalid weight binding"};
-                const CompiledOperator& lm_head_operator =
-                    model.operators.at_weight(
-                        node->weight_inputs[1]);
+                const CompiledOperator& lm_head_operator = model.operators.at_weight(
+                    node->weight_inputs[1]);
                 if (hyper_multiplier == 1
                     && !speculative_context_enabled
                     && lm_head_operator.bfloat16
@@ -4467,8 +4339,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                          session_index < session_count;
                          ++session_index)
                     {
-                        CpuSessionState& state =
-                            *entries[session_index].state;
+                        CpuSessionState& state = *entries[session_index].state;
                         if (!state.speculative_context_enabled)
                             continue;
                         std::copy_n(
@@ -4495,8 +4366,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                 }
                 const VulkanExecutionSnapshot vulkan_before = capture_vulkan_execution(model.vulkan_context_instance);
                 const auto& lm_head = model.weights.at(node->weight_inputs[0]);
-                const CompiledOperator& lm_head_operator =
-                    model.operators.at_weight(node->weight_inputs[0]);
+                const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weight_inputs[0]);
                 if (deferred_final_norm
                     && try_fused_rms_norm_linear(
                         lm_head_operator,
@@ -4559,7 +4429,8 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
             {
                 if (has_flag(layer.attention.flags, AttentionBlockGatedDeltaNet))
                 {
-                    std::vector<CpuGatedDeltaBatchEntry> gated_delta_entries(session_count);
+                    std::vector<CpuGatedDeltaBatchEntry>& gated_delta_entries = batch_scratch.gated_delta_entries;
+                    gated_delta_entries.resize(session_count);
                     for (size_t session_index = 0; session_index < session_count; ++session_index)
                     {
                         CpuSessionState& state = *entries[session_index].state;
@@ -4578,6 +4449,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                             node->backend,
                             model.descriptor.norm_epsilon,
                             gated_delta_entries,
+                            batch_scratch.gated_delta_batch,
                             model.optimization_flags))
                     {
                         return Error{
@@ -4598,9 +4470,11 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                 {
                     const auto start = std::chrono::steady_clock::now();
                     const VulkanExecutionSnapshot vulkan_before = capture_vulkan_execution(model.vulkan_context_instance);
-                    std::vector<uint64_t> positions(session_count);
-                    std::vector<CpuLayerCache*> caches(session_count);
-                    CpuExpertExecutionScratch& scratch = entries.front().state->expert_scratch;
+                    std::vector<uint64_t>& positions = batch_scratch.staged_attention_positions;
+                    std::vector<CpuLayerCache*>& caches = batch_scratch.staged_attention_caches;
+                    positions.resize(session_count);
+                    caches.resize(session_count);
+                    CpuExpertExecutionScratch& scratch = batch_scratch;
                     CpuBatch& merged_hidden = scratch.staged_merged;
                     if (!merge_rows_into(hidden, merged_hidden))
                     {
@@ -4627,7 +4501,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                         caches[session_index] = &state.layers[layer.layer_id];
                     }
                     auto merged_output = execute_latent_attention_batch(model.weights, model.operators, layer.attention, node->backend, model.descriptor.norm_epsilon, positions, caches,
-                                                                         *attention_input, model.optimization_flags);
+                                                                        *attention_input, model.optimization_flags);
                     if (!merged_output)
                         return merged_output.error();
                     if (hyper_multiplier > 1)
@@ -4639,7 +4513,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                     }
                     else
                     {
-                        std::vector<CpuBatch> attention_outputs;
+                        std::vector<CpuBatch>& attention_outputs = batch_scratch.staged_batches;
                         split_rows(merged_output.value(), attention_outputs);
                         for (size_t session_index = 0; session_index < session_count; ++session_index)
                         {
@@ -4655,8 +4529,8 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                 }
                 else
                 {
-                    std::vector<CpuAttentionBatchEntry> attention_entries(
-                        session_count);
+                    std::vector<CpuAttentionBatchEntry>& attention_entries = batch_scratch.attention_batch_entries;
+                    attention_entries.resize(session_count);
                     for (size_t session_index = 0;
                          session_index < session_count;
                          ++session_index)
@@ -4669,36 +4543,30 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                             &hidden[session_index],
                             &state.attention_scratch.output};
                     }
-                    const auto batch_start =
-                        std::chrono::steady_clock::now();
-                    const VulkanExecutionSnapshot batch_vulkan_before =
-                        capture_vulkan_execution(model.vulkan_context_instance);
+                    const auto batch_start = std::chrono::steady_clock::now();
+                    const VulkanExecutionSnapshot batch_vulkan_before = capture_vulkan_execution(model.vulkan_context_instance);
                     auto batched = execute_attention_block_batch_into(
-                            model.operators,
-                            layer.attention,
-                            node->backend,
-                            attention_entries,
-                            model.optimization_flags);
+                        model.operators,
+                        layer.attention,
+                        node->backend,
+                        attention_entries,
+                        model.optimization_flags);
                     if (!batched)
                         return batched.error();
                     if (batched.value())
                     {
-                        const uint64_t elapsed =
-                            elapsed_microseconds(batch_start);
+                        const uint64_t elapsed = elapsed_microseconds(batch_start);
                         ++metrics.vulkan_attention_batch_submissions;
                         metrics.vulkan_attention_batch_rows += session_count;
-                        metrics.vulkan_attention_batch_avoided_submissions +=
-                            session_count - 1;
+                        metrics.vulkan_attention_batch_avoided_submissions += session_count - 1;
                         for (size_t session_index = 0;
                              session_index < session_count;
                              ++session_index)
                         {
-                            CpuSessionState& state =
-                                *entries[session_index].state;
+                            CpuSessionState& state = *entries[session_index].state;
                             hidden[session_index].swap(
                                 state.attention_scratch.output);
-                            SessionStatistics& statistics =
-                                *entries[session_index].statistics;
+                            SessionStatistics& statistics = *entries[session_index].statistics;
                             statistics.attention_time_microseconds += elapsed;
                             record_vulkan_execution_delta(
                                 statistics,
@@ -4711,12 +4579,9 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                              session_index < session_count;
                              ++session_index)
                         {
-                            CpuSessionState& state =
-                                *entries[session_index].state;
-                            const auto start =
-                                std::chrono::steady_clock::now();
-                            const VulkanExecutionSnapshot vulkan_before =
-                                capture_vulkan_execution(model.vulkan_context_instance);
+                            CpuSessionState& state = *entries[session_index].state;
+                            const auto start = std::chrono::steady_clock::now();
+                            const VulkanExecutionSnapshot vulkan_before = capture_vulkan_execution(model.vulkan_context_instance);
                             auto attention = execute_attention_block_into(
                                 model.weights,
                                 model.operators,
@@ -4736,20 +4601,15 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                                      affected_index < session_count;
                                      ++affected_index)
                                 {
-                                    CpuLayerCache& affected_cache =
-                                        entries[affected_index].state->layers[
-                                            layer.layer_id];
-                                    affected_cache.vulkan_attention_state_unknown =
-                                        true;
+                                    CpuLayerCache& affected_cache = entries[affected_index].state->layers[layer.layer_id];
+                                    affected_cache.vulkan_attention_state_unknown = true;
                                 }
                                 return attention.error();
                             }
                             hidden[session_index].swap(
                                 state.attention_scratch.output);
-                            SessionStatistics& statistics =
-                                *entries[session_index].statistics;
-                            statistics.attention_time_microseconds +=
-                                elapsed_microseconds(start);
+                            SessionStatistics& statistics = *entries[session_index].statistics;
+                            statistics.attention_time_microseconds += elapsed_microseconds(start);
                             record_vulkan_execution_delta(
                                 statistics,
                                 vulkan_before, model.vulkan_context_instance);
@@ -4780,7 +4640,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                     CpuHyperConnectionMix merged_mix = std::move(mixed).value();
                     rms_norm_batch_into(merged_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, merged_hidden,
                                         model.descriptor.norm_weight_offset, model.optimization_flags);
-                    std::vector<CpuHyperConnectionMix> mixes;
+                    std::vector<CpuHyperConnectionMix>& mixes = batch_scratch.staged_hyper_mixes;
                     split_hyper_mix(merged_mix, mixes);
                     for (size_t session_index = 0; session_index < session_count; ++session_index)
                     {
@@ -4793,7 +4653,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                     rms_norm_batch_into(merged_hyper, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, merged_hidden,
                                         model.descriptor.norm_weight_offset, model.optimization_flags);
                 }
-                std::vector<CpuBatch> normalized;
+                std::vector<CpuBatch>& normalized = batch_scratch.staged_batches;
                 split_rows(merged_hidden, normalized);
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
                 {
@@ -4842,7 +4702,8 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                         const TensorData& selection_bias = model.weights.at(moe.router_selection_bias);
                         options.selection_bias = selection_bias.float32_values();
                     }
-                    std::vector<uint32_t> explicit_expert_ids;
+                    std::vector<uint32_t>& explicit_expert_ids = batch_scratch.staged_expert_ids;
+                    explicit_expert_ids.clear();
                     if (moe.token_experts != invalid_tensor_handle)
                     {
                         const std::span<const int64_t> table = model.weights.at(moe.token_experts).int64_values();
@@ -4881,12 +4742,6 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
             }
             if (node->type == ExecutionNodeType::Expert || node->type == ExecutionNodeType::ExpertGroup)
             {
-                struct RouteOrigin
-                {
-                    size_t session_index = 0;
-                    size_t active_index = 0;
-                    size_t route_index = 0;
-                };
                 LayerGraphState combined;
                 combined.normalized.reset(session_count, model.descriptor.hidden_size, false);
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
@@ -4895,8 +4750,10 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                     std::copy_n(layer_state.normalized.row(0), combined.normalized.columns(), combined.normalized.row(session_index));
                 }
                 const size_t missing = std::numeric_limits<size_t>::max();
-                std::vector<size_t> combined_by_expert(moe.experts.size(), missing);
-                std::vector<std::vector<RouteOrigin>> origins;
+                std::vector<size_t>& combined_by_expert = batch_scratch.combined_by_expert;
+                combined_by_expert.assign(moe.experts.size(), missing);
+                std::vector<std::vector<CpuDecodeRouteOrigin>>& origins = batch_scratch.staged_route_origins;
+                origins.clear();
                 uint64_t logical_batches = 0;
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
                 {
@@ -4923,7 +4780,8 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                             ExpertRoute route = source.batch.routes[route_index];
                             route.token_index = static_cast<uint32_t>(session_index);
                             destination.batch.routes.push_back(route);
-                            origins[combined_index].push_back({session_index, active_index, route_index});
+                            origins[combined_index].push_back(
+                                {session_index, active_index, route_index});
                         }
                     }
                 }
@@ -4944,40 +4802,30 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                 if (!executed)
                     return executed.error();
 
-                // run_moe may aggregate the selected Vulkan Expert routes
-                // directly into the combined token rows. In that case those
-                // Experts intentionally have no per-route source.output to
-                // scatter below. Snapshot the combined result before reusing
-                // session zero's scratch, then propagate one aggregate row
-                // and the corresponding skip flags to every Session.
-                const CpuExpertExecutionScratch& combined_scratch =
-                    entries.front().state->expert_scratch;
-                const std::vector<uint8_t> combined_backend_aggregated =
-                    combined_scratch.backend_aggregated;
-                const bool has_combined_backend_aggregation =
-                    std::any_of(
-                        combined_backend_aggregated.begin(),
-                        combined_backend_aggregated.end(),
-                        [](uint8_t value) { return value != 0; })
-                    && combined_scratch.backend_aggregated_output.rows()
-                           == session_count
-                    && combined_scratch.backend_aggregated_output.columns()
-                           == model.descriptor.hidden_size;
-                CpuBatch combined_backend_aggregated_output;
+                // Snapshot aggregated output before reusing session zero's scratch.
+                const CpuExpertExecutionScratch& combined_scratch = entries.front().state->expert_scratch;
+                std::vector<uint8_t>& combined_backend_aggregated = batch_scratch.combined_backend_aggregated;
+                combined_backend_aggregated = combined_scratch.backend_aggregated;
+                const bool has_combined_backend_aggregation = std::any_of(
+                                                                  combined_backend_aggregated.begin(),
+                                                                  combined_backend_aggregated.end(),
+                                                                  [](uint8_t value) { return value != 0; })
+                                                              && combined_scratch.backend_aggregated_output.rows()
+                                                                     == session_count
+                                                              && combined_scratch.backend_aggregated_output.columns()
+                                                                     == model.descriptor.hidden_size;
+                CpuBatch& combined_backend_aggregated_output = batch_scratch.combined_backend_aggregated_output;
+                combined_backend_aggregated_output.clear();
                 if (has_combined_backend_aggregation)
                 {
-                    combined_backend_aggregated_output =
-                        combined_scratch.backend_aggregated_output;
+                    combined_backend_aggregated_output = combined_scratch.backend_aggregated_output;
                 }
                 for (size_t session_index = 0;
                      session_index < session_count;
                      ++session_index)
                 {
-                    CpuExpertExecutionScratch& session_scratch =
-                        entries[session_index].state->expert_scratch;
-                    const LayerGraphState& session_layer =
-                        entries[session_index].state->execution_layers[
-                            layer.layer_id];
+                    CpuExpertExecutionScratch& session_scratch = entries[session_index].state->expert_scratch;
+                    const LayerGraphState& session_layer = entries[session_index].state->execution_layers[layer.layer_id];
                     session_scratch.backend_aggregated.assign(
                         session_layer.active_experts.size(),
                         0);
@@ -5056,27 +4904,24 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                         statistics.mxfp4_prefill_gemm_rows += logical_metrics.mxfp4_prefill_gemm_rows;
                         statistics.mxfp4_paired_rows += logical_metrics.mxfp4_paired_rows;
                         statistics.mxfp4_fused_gate_up_rows += logical_metrics.mxfp4_fused_gate_up_rows;
-                }
+                    }
                     layer_state.experts_executed = true;
                 }
                 for (size_t combined_index = 0; combined_index < combined.active_experts.size(); ++combined_index)
                 {
                     const ActiveExpertExecution& source = combined.active_experts[combined_index];
-                    const bool backend_aggregated =
-                        has_combined_backend_aggregation
-                        && combined_index
-                               < combined_backend_aggregated.size()
-                        && combined_backend_aggregated[combined_index] != 0;
+                    const bool backend_aggregated = has_combined_backend_aggregation
+                                                    && combined_index
+                                                           < combined_backend_aggregated.size()
+                                                    && combined_backend_aggregated[combined_index] != 0;
                     for (size_t route_index = 0; route_index < origins[combined_index].size(); ++route_index)
                     {
-                        const RouteOrigin& origin = origins[combined_index][route_index];
+                        const CpuDecodeRouteOrigin& origin = origins[combined_index][route_index];
                         ActiveExpertExecution& destination = entries[origin.session_index].state->execution_layers[layer.layer_id].active_experts[origin.active_index];
                         if (backend_aggregated)
                         {
-                            CpuExpertExecutionScratch& origin_scratch =
-                                entries[origin.session_index].state->expert_scratch;
-                            origin_scratch.backend_aggregated[
-                                origin.active_index] = 1;
+                            CpuExpertExecutionScratch& origin_scratch = entries[origin.session_index].state->expert_scratch;
+                            origin_scratch.backend_aggregated[origin.active_index] = 1;
                             continue;
                         }
                         std::copy_n(
@@ -5095,8 +4940,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                 shared_input.reset(session_count, model.descriptor.hidden_size, false);
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
                 {
-                    const CpuBatch& normalized =
-                        entries[session_index].state->execution_layers[layer.layer_id].normalized;
+                    const CpuBatch& normalized = entries[session_index].state->execution_layers[layer.layer_id].normalized;
                     if (normalized.rows() != 1 || normalized.columns() != model.descriptor.hidden_size)
                         return Error{ErrorCode::InternalError, "Shared Expert input has an invalid shape"};
                     std::copy_n(normalized.row(0), normalized.columns(), shared_input.row(session_index));
@@ -5112,8 +4956,7 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                 const uint64_t shared_elapsed = elapsed_microseconds(shared_start);
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
                 {
-                    LayerGraphState& layer_state =
-                        entries[session_index].state->execution_layers[layer.layer_id];
+                    LayerGraphState& layer_state = entries[session_index].state->execution_layers[layer.layer_id];
                     layer_state.shared_expert_output.reset(1, shared_output.columns(), false);
                     std::copy_n(shared_output.row(session_index), shared_output.columns(), layer_state.shared_expert_output.row(0));
                     entries[session_index].statistics->expert_compute_time_microseconds += shared_elapsed;
@@ -5123,7 +4966,8 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
             if (node->type == ExecutionNodeType::Combine)
             {
                 const auto combine_start = std::chrono::steady_clock::now();
-                std::vector<CpuBatch> moe_outputs(session_count);
+                std::vector<CpuBatch>& moe_outputs = batch_scratch.staged_batches;
+                moe_outputs.resize(session_count);
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
                 {
                     LayerGraphState& layer_state = entries[session_index].state->execution_layers[layer.layer_id];
@@ -5172,7 +5016,8 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
                     CpuBatch merged_branch;
                     CpuBatch merged_residual;
                     CpuHyperConnectionMix merged_mix;
-                    std::vector<CpuHyperConnectionMix> mixes(session_count);
+                    std::vector<CpuHyperConnectionMix>& mixes = batch_scratch.staged_hyper_mixes;
+                    mixes.resize(session_count);
                     for (size_t session_index = 0; session_index < session_count; ++session_index)
                     {
                         LayerGraphState& layer_state = entries[session_index].state->execution_layers[layer.layer_id];
@@ -5267,12 +5112,10 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
         if (!residency)
             return residency.error();
     }
-    const uint64_t cpu_bfloat16_dispatches =
-        cpu_bfloat16_execution.dispatch_count();
+    const uint64_t cpu_bfloat16_dispatches = cpu_bfloat16_execution.dispatch_count();
     for (const CpuDecodeBatchEntry& entry : entries)
     {
-        entry.statistics->cpu_bfloat16_batched_linear_dispatches +=
-            cpu_bfloat16_dispatches;
+        entry.statistics->cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_dispatches;
     }
     return logits;
 }

@@ -209,26 +209,26 @@ static void apply_rope(float* values, uint32_t dimension, uint64_t position, con
 static bool prepared_latent_rope_enabled(uint64_t optimization_flags) noexcept
 {
     return runtime_optimization_enabled(optimization_flags,
-        RuntimeOptimizationCpuLatentPreparedRope);
+                                        RuntimeOptimizationCpuLatentPreparedRope);
 }
 
 static bool simd_latent_norm_enabled(uint64_t optimization_flags) noexcept
 {
     return simd_rms_norm_enabled(optimization_flags)
            && runtime_optimization_enabled(optimization_flags,
-               RuntimeOptimizationCpuLatentSimdNorm);
+                                           RuntimeOptimizationCpuLatentSimdNorm);
 }
 
 static bool online_latent_softmax_enabled(uint64_t optimization_flags) noexcept
 {
     return runtime_optimization_enabled(optimization_flags,
-        RuntimeOptimizationCpuLatentOnlineSoftmax);
+                                        RuntimeOptimizationCpuLatentOnlineSoftmax);
 }
 
 static bool vector_latent_softmax_enabled(uint64_t optimization_flags) noexcept
 {
     return runtime_optimization_enabled(optimization_flags,
-               RuntimeOptimizationCpuLatentVectorSoftmax)
+                                        RuntimeOptimizationCpuLatentVectorSoftmax)
            && float_exp_simd_available();
 }
 
@@ -237,7 +237,7 @@ static constexpr uint32_t vector_latent_softmax_min_candidates = 64;
 static bool parallel_latent_output_groups_enabled(uint64_t optimization_flags) noexcept
 {
     return runtime_optimization_enabled(optimization_flags,
-        RuntimeOptimizationCpuLatentOutputGroups);
+                                        RuntimeOptimizationCpuLatentOutputGroups);
 }
 
 static void prepare_rope_coefficients(
@@ -265,9 +265,7 @@ static void prepare_rope_coefficients(
     sines.resize(pair_count);
     for (uint32_t pair = 0; pair < pair_count; ++pair)
     {
-        float frequency = 1.0f / std::pow(
-            base,
-            static_cast<float>(pair * 2) / static_cast<float>(dimension));
+        float frequency = 1.0f / std::pow(base, static_cast<float>(pair * 2) / static_cast<float>(dimension));
         if (yarn)
         {
             const float ramp_denominator = correction_low == correction_high
@@ -395,8 +393,7 @@ static void normalize_unit_prepared_rope(
                                            sum += values[index] * values[index];
                                        return sum;
                                    }();
-    const float inverse_rms =
-        1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
+    const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
     const uint32_t rope_offset = count - rope_dimension;
     for (uint32_t index = 0; index < rope_offset; ++index)
         values[index] *= inverse_rms;
@@ -427,7 +424,7 @@ static bool vulkan_latent_compressor_enabled(
 {
     return backend == ExecutionBackend::Vulkan
            && runtime_optimization_enabled(optimization_flags,
-        RuntimeOptimizationVulkanLatentCompressor);
+                                           RuntimeOptimizationVulkanLatentCompressor);
 }
 
 static void append_compressed_value(
@@ -455,18 +452,16 @@ static void append_compressed_value(
     const TensorData& gate_weight = weights.at(gate_handle);
     const CompiledOperator& value_operator = operators.at_weight(value_handle);
     const CompiledOperator& gate_operator = operators.at_weight(gate_handle);
-    const bool has_projected_pair =
-        projected_values_override && projected_scores_override;
-    const bool used_vulkan_pair =
-        !has_projected_pair
-        && vulkan_latent_compressor_enabled(backend, optimization_flags)
-        && value_operator.bfloat16
-        && gate_operator.bfloat16
-        && value_operator.bfloat16->forward_parallel(
-            input,
-            *gate_operator.bfloat16,
-            cache.compressor_values,
-            cache.compressor_scores);
+    const bool has_projected_pair = projected_values_override && projected_scores_override;
+    const bool used_vulkan_pair = !has_projected_pair
+                                  && vulkan_latent_compressor_enabled(backend, optimization_flags)
+                                  && value_operator.bfloat16
+                                  && gate_operator.bfloat16
+                                  && value_operator.bfloat16->forward_parallel(
+                                      input,
+                                      *gate_operator.bfloat16,
+                                      cache.compressor_values,
+                                      cache.compressor_scores);
     if (!has_projected_pair
         && !used_vulkan_pair
         && !float8_linear_pair_batch_into(
@@ -678,9 +673,8 @@ static int latent_output_group_team_size(
     uint64_t optimization_flags) noexcept
 {
 #if defined(_OPENMP)
-    const uint64_t operations =
-        static_cast<uint64_t>(row_count) * group_count * group_columns
-        * rank;
+    const uint64_t operations = static_cast<uint64_t>(row_count) * group_count * group_columns
+                                * rank;
     if (!parallel_latent_output_groups_enabled(optimization_flags)
         || operations < 1024 * 1024)
         return 1;
@@ -774,9 +768,9 @@ static Result<CpuBatch> execute_latent_attention_rows(
         && plan.compression_ratio == 4)
     {
         const auto add_compressor_pair = [&](TensorHandle value_handle,
-                                              TensorHandle gate_handle,
-                                              CpuBatch& value_output,
-                                              CpuBatch& gate_output) {
+                                             TensorHandle gate_handle,
+                                             CpuBatch& value_output,
+                                             CpuBatch& gate_output) {
             if (value_handle == invalid_tensor_handle
                 || gate_handle == invalid_tensor_handle)
                 return;
@@ -786,12 +780,10 @@ static Result<CpuBatch> execute_latent_attention_rows(
                 || !gate_operator.bfloat16
                 || fused_compressor_count + 2 > fused_compressor_operators.size())
                 return;
-            fused_compressor_operators[fused_compressor_count] =
-                value_operator.bfloat16.get();
+            fused_compressor_operators[fused_compressor_count] = value_operator.bfloat16.get();
             fused_compressor_outputs[fused_compressor_count] = &value_output;
             ++fused_compressor_count;
-            fused_compressor_operators[fused_compressor_count] =
-                gate_operator.bfloat16.get();
+            fused_compressor_operators[fused_compressor_count] = gate_operator.bfloat16.get();
             fused_compressor_outputs[fused_compressor_count] = &gate_output;
             ++fused_compressor_count;
         };
@@ -838,7 +830,7 @@ static Result<CpuBatch> execute_latent_attention_rows(
             {
                 if (plan.compression_ratio == 0
                     && runtime_optimization_enabled(optimization_flags,
-                        RuntimeOptimizationVulkanLatentInputRmsNorm))
+                                                    RuntimeOptimizationVulkanLatentInputRmsNorm))
                 {
                     chained_query = query_a_operator.float8->forward_input_rms_norm_chain_parallel(
                         input,
@@ -870,13 +862,13 @@ static Result<CpuBatch> execute_latent_attention_rows(
                     input,
                     weights.at(plan.pre_attention_norm_weight),
                     norm_epsilon, 0.0f, optimization_flags);
-                chained_query = query_a_operator.float8->forward_rms_norm_chain(normalized, *query_b_operator.float8, query);
+            chained_query = query_a_operator.float8->forward_rms_norm_chain(normalized, *query_b_operator.float8, query);
         }
     }
     if (!chained_query
         && backend == ExecutionBackend::Vulkan
         && runtime_optimization_enabled(optimization_flags,
-            RuntimeOptimizationVulkanCommandGraph)
+                                        RuntimeOptimizationVulkanCommandGraph)
         && query_rank_not_required
         && query_a_operator.linear
         && query_b_operator.linear
@@ -1047,17 +1039,17 @@ static Result<CpuBatch> execute_latent_attention_rows(
                         fused_values = fused_index_compressor_values.row(row_index);
                         fused_scores = fused_index_compressor_scores.row(row_index);
                     }
-                append_compressed_value(
-                    weights,
-                    operators,
-                    plan,
-                    backend,
-                    token_input,
-                    position,
-                    norm_epsilon,
-                    true,
-                    cache,
-                    optimization_flags,
+                    append_compressed_value(
+                        weights,
+                        operators,
+                        plan,
+                        backend,
+                        token_input,
+                        position,
+                        norm_epsilon,
+                        true,
+                        cache,
+                        optimization_flags,
                         fused_values,
                         fused_scores);
                 }
@@ -1073,9 +1065,8 @@ static Result<CpuBatch> execute_latent_attention_rows(
             context.window_count = static_cast<uint32_t>(position + 1 - context.window_begin);
             const uint32_t selected_count = context.selected_compressed_indices ? static_cast<uint32_t>(context.compressed_indices.size()) : context.compressed_count;
             const uint32_t candidate_count = context.window_count + selected_count;
-            const bool vector_softmax_for_row =
-                use_vector_latent_softmax
-                && candidate_count >= vector_latent_softmax_min_candidates;
+            const bool vector_softmax_for_row = use_vector_latent_softmax
+                                                && candidate_count >= vector_latent_softmax_min_candidates;
             if (use_online_latent_softmax && !vector_softmax_for_row)
             {
                 cache.latent_attention_logits.clear();
@@ -1120,9 +1111,8 @@ static Result<CpuBatch> execute_latent_attention_rows(
         }
         float* output_head = attention_output.row(row_index)
                              + static_cast<size_t>(head) * plan.head_dimension;
-        const bool use_vector_softmax =
-            use_vector_latent_softmax
-            && candidate_count >= vector_latent_softmax_min_candidates;
+        const bool use_vector_softmax = use_vector_latent_softmax
+                                        && candidate_count >= vector_latent_softmax_min_candidates;
         if (use_online_latent_softmax && !use_vector_softmax)
         {
             // The latent attention value is the same vector used as its key.
@@ -1136,8 +1126,7 @@ static Result<CpuBatch> execute_latent_attention_rows(
                 const float* candidate_key = nullptr;
                 if (candidate < context.window_count)
                 {
-                    const uint64_t candidate_position =
-                        context.window_begin + candidate;
+                    const uint64_t candidate_position = context.window_begin + candidate;
                     candidate_key = cache.latent_window.data()
                                     + static_cast<size_t>(
                                           candidate_position
@@ -1146,19 +1135,17 @@ static Result<CpuBatch> execute_latent_attention_rows(
                 }
                 else
                 {
-                    const uint32_t compressed_offset =
-                        candidate - context.window_count;
-                    const uint32_t compressed_index =
-                        context.selected_compressed_indices
-                            ? context.compressed_indices[compressed_offset]
-                            : compressed_offset;
+                    const uint32_t compressed_offset = candidate - context.window_count;
+                    const uint32_t compressed_index = context.selected_compressed_indices
+                                                          ? context.compressed_indices[compressed_offset]
+                                                          : compressed_offset;
                     candidate_key = cache.latent_compressed.data()
                                     + static_cast<size_t>(compressed_index)
                                           * plan.head_dimension;
                 }
                 const float score = float_dot(
-                                       query_head, candidate_key,
-                                       plan.head_dimension)
+                                        query_head, candidate_key,
+                                        plan.head_dimension)
                                     * softmax_scale;
                 if (score > maximum)
                 {
@@ -1334,7 +1321,7 @@ static Result<CpuBatch> execute_latent_attention_rows(
             plan.output_lora_rank, optimization_flags);
         const int64_t output_tasks = static_cast<int64_t>(input.rows())
                                      * plan.output_group_count;
-#pragma omp parallel for schedule(static) num_threads(output_team_size) if(output_team_size > 1)
+#pragma omp parallel for schedule(static) num_threads(output_team_size) if (output_team_size > 1)
 #else
         const int64_t output_tasks = static_cast<int64_t>(input.rows())
                                      * plan.output_group_count;
@@ -1482,7 +1469,7 @@ Result<CpuBatch> execute_dspark_attention(
         if (key_value_operator.float8)
         {
             if (runtime_optimization_enabled(optimization_flags,
-                    RuntimeOptimizationVulkanLatentInputRmsNorm))
+                                             RuntimeOptimizationVulkanLatentInputRmsNorm))
             {
                 chained_query = query_a_operator.float8->forward_input_rms_norm_chain_parallel(
                     input,
@@ -1557,9 +1544,8 @@ Result<CpuBatch> execute_dspark_attention(
     const uint32_t window_count = static_cast<uint32_t>(std::min<uint64_t>(cache.latent_token_count, plan.sliding_window));
     const uint64_t window_begin = cache.latent_token_count - window_count;
     const uint32_t candidate_count = window_count + static_cast<uint32_t>(input.rows());
-    const bool use_vector_softmax =
-        vector_latent_softmax_enabled(optimization_flags)
-        && candidate_count >= vector_latent_softmax_min_candidates;
+    const bool use_vector_softmax = vector_latent_softmax_enabled(optimization_flags)
+                                    && candidate_count >= vector_latent_softmax_min_candidates;
     std::vector<float> logits(candidate_count);
     for (size_t row = 0; row < input.rows(); ++row)
     {
@@ -1643,7 +1629,7 @@ Result<CpuBatch> execute_dspark_attention(
             plan.output_lora_rank, optimization_flags);
         const int64_t output_tasks = static_cast<int64_t>(input.rows())
                                      * plan.output_group_count;
-#pragma omp parallel for schedule(static) num_threads(output_team_size) if(output_team_size > 1)
+#pragma omp parallel for schedule(static) num_threads(output_team_size) if (output_team_size > 1)
 #else
         const int64_t output_tasks = static_cast<int64_t>(input.rows())
                                      * plan.output_group_count;

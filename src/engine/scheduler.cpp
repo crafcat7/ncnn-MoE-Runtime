@@ -115,15 +115,11 @@ public:
         worker_count_ = std::max(1u, std::min(worker_count_, compute_thread_budget_));
         if (cross_call_max_batch_size_ == 0)
         {
-            // Cross-call aggregation is bounded by requested session
-            // concurrency, not by the number of scheduler workers. Workers
-            // are capped by the CPU budget, while Vulkan Expert batches still
-            // benefit from collecting more independent rows. Keep a small
-            // ceiling so an omitted option cannot create an unbounded burst.
+            // Bound implicit cross-call aggregation by worker concurrency.
             constexpr uint32_t default_cross_call_batch_ceiling = 16;
             const uint32_t requested_concurrency = options.worker_count == 0
-                                                        ? worker_count_
-                                                        : options.worker_count;
+                                                       ? worker_count_
+                                                       : options.worker_count;
             cross_call_max_batch_size_ = std::max(
                 worker_count_,
                 std::min(default_cross_call_batch_ceiling, requested_concurrency));
@@ -576,7 +572,7 @@ public:
                 CpuOpenMpThreadLimitScope thread_limit;
                 CpuThreadBudgetController::Lease extra_compute;
                 const uint64_t work_units = static_cast<uint64_t>(requests.size())
-                                             * std::max(1u, expert_threads_per_worker_);
+                                            * std::max(1u, expert_threads_per_worker_);
                 const uint32_t team_size = prepare_staging_team(
                     work_units,
                     static_cast<uint32_t>(requests.size()),

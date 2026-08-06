@@ -236,18 +236,15 @@ void msvc_avx2_mxfp4_q8_matmul_rows2(
         avx2_decode_block(
             second_packed + static_cast<size_t>(block) * 16,
             second_decoded);
-        const float first_weight_scale =
-            0.5f * scales_by_exponent[first_scales[block]];
-        const float second_weight_scale =
-            0.5f * scales_by_exponent[second_scales[block]];
+        const float first_weight_scale = 0.5f * scales_by_exponent[first_scales[block]];
+        const float second_weight_scale = 0.5f * scales_by_exponent[second_scales[block]];
         const __m256i first_low_weights = _mm256_cvtepi8_epi16(first_decoded[0]);
         const __m256i first_high_weights = _mm256_cvtepi8_epi16(first_decoded[1]);
         const __m256i second_low_weights = _mm256_cvtepi8_epi16(second_decoded[0]);
         const __m256i second_high_weights = _mm256_cvtepi8_epi16(second_decoded[1]);
         for (size_t token = 0; token < token_count; ++token)
         {
-            const int8_t* input_block =
-                input + token * input_stride + static_cast<size_t>(block) * 32;
+            const int8_t* input_block = input + token * input_stride + static_cast<size_t>(block) * 32;
             const __m256i input_low = _mm256_cvtepi8_epi16(
                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(input_block)));
             const __m256i input_high = _mm256_cvtepi8_epi16(
@@ -260,14 +257,11 @@ void msvc_avx2_mxfp4_q8_matmul_rows2(
                 _mm256_add_epi32(
                     _mm256_madd_epi16(second_low_weights, input_low),
                     _mm256_madd_epi16(second_high_weights, input_high)));
-            const float input_scale =
-                input_scales[token * scale_stride + block];
-            first_output[token * first_output_stride] +=
-                static_cast<float>(first_integer_sum)
-                * first_weight_scale * input_scale;
-            second_output[token * second_output_stride] +=
-                static_cast<float>(second_integer_sum)
-                * second_weight_scale * input_scale;
+            const float input_scale = input_scales[token * scale_stride + block];
+            first_output[token * first_output_stride] += static_cast<float>(first_integer_sum)
+                                                         * first_weight_scale * input_scale;
+            second_output[token * second_output_stride] += static_cast<float>(second_integer_sum)
+                                                           * second_weight_scale * input_scale;
         }
     }
 }
@@ -362,9 +356,8 @@ void msvc_avx2_mxfp4_q8_packed_gemm(
                         if (matrix_row >= row_count)
                             continue;
                         const uint8_t* row_values = packed_values + (static_cast<size_t>(chunk) * 8 + row) * 8;
-                        output[token * output_stride + matrix_row] +=
-                            static_cast<float>(msvc_avx2_mxfp4_q8_packed_chunk_dot(row_values, input_chunk))
-                            * (0.5f * scales_by_exponent[packed_block[row]]) * input_scale;
+                        output[token * output_stride + matrix_row] += static_cast<float>(msvc_avx2_mxfp4_q8_packed_chunk_dot(row_values, input_chunk))
+                                                                      * (0.5f * scales_by_exponent[packed_block[row]]) * input_scale;
                     }
                 }
             }

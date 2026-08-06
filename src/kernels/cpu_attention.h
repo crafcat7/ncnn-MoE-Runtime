@@ -12,15 +12,6 @@
 namespace ncnn {
 namespace moe {
 
-struct CpuAttentionBatchEntry
-{
-    uint64_t position_offset = 0;
-    CpuLayerCache* cache = nullptr;
-    CpuAttentionExecutionScratch* scratch = nullptr;
-    const CpuBatch* hidden = nullptr;
-    CpuBatch* output = nullptr;
-};
-
 [[nodiscard]] Result<bool> execute_attention_block_batch_into(
     const CompiledOperatorTable& operators,
     const AttentionBlockPlan& plan,

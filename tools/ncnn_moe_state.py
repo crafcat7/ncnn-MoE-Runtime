@@ -191,7 +191,6 @@ def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
         ("rank_adaptive_prefetch", "--rank-adaptive-prefetch"),
         ("cross_expert_read_coalescing", "--cross-expert-read-coalescing"),
         ("release_vulkan_dense_host", "--release-vulkan-dense-host"),
-        ("enable_vulkan_gated_delta", "--enable-vulkan-gated-delta"),
     ):
         if settings.get(key):
             args.append(option)

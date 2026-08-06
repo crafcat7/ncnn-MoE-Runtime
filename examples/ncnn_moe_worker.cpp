@@ -157,7 +157,8 @@ static void emit_initialization_progress(
     result.add_uint("total_steps", total_steps);
     result.add_string("phase", phase);
     result.add_string("message", message);
-    std::cout << result.finish() << '\n' << std::flush;
+    std::cout << result.finish() << '\n'
+              << std::flush;
 }
 
 static const char* error_code_name(ErrorCode code) noexcept
@@ -442,9 +443,9 @@ public:
         if (getrusage(RUSAGE_SELF, &usage) == 0)
         {
             const uint64_t cpu_microseconds = static_cast<uint64_t>(usage.ru_utime.tv_sec) * 1000000
-                                               + static_cast<uint64_t>(usage.ru_utime.tv_usec)
-                                               + static_cast<uint64_t>(usage.ru_stime.tv_sec) * 1000000
-                                               + static_cast<uint64_t>(usage.ru_stime.tv_usec);
+                                              + static_cast<uint64_t>(usage.ru_utime.tv_usec)
+                                              + static_cast<uint64_t>(usage.ru_stime.tv_sec) * 1000000
+                                              + static_cast<uint64_t>(usage.ru_stime.tv_usec);
             const auto now = Clock::now();
             const uint64_t wall_microseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - previous_wall_).count());
             if (has_previous_cpu_ && wall_microseconds != 0)
@@ -631,6 +632,9 @@ static ExpertMemoryMode parse_expert_memory_mode(const std::string& value)
 static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argument)
 {
     RuntimeConfig result;
+    const auto set_expert_io_mode = [&result](uint32_t mode) {
+        result.flags = (result.flags & ~RuntimeOptionExpertIoMask) | mode;
+    };
     for (int index = first_argument; index < argc; ++index)
     {
         const std::string argument = argv[index];
@@ -660,8 +664,6 @@ static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argum
             result.expert_memory_mode = parse_expert_memory_mode(require_value(argc, argv, index, "--expert-memory"));
         else if (argument == "--optimization-flags")
             result.optimization_flags = std::stoull(require_value(argc, argv, index, "--optimization-flags"), nullptr, 0);
-        else if (argument == "--enable-vulkan-gated-delta")
-            result.optimization_flags |= RuntimeOptimizationVulkanGatedDeltaNet;
         else if (argument == "--vulkan-device")
             result.vulkan_device_index = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--vulkan-device")));
         else if (argument == "--vulkan-devices")
@@ -669,11 +671,11 @@ static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argum
         else if (argument == "--expected-concurrency")
             result.expected_concurrency = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expected-concurrency")));
         else if (argument == "--mmap-experts")
-            result.flags |= ncnn::moe::RuntimeOptionMemoryMapExperts;
+            set_expert_io_mode(RuntimeOptionMemoryMapExperts);
         else if (argument == "--direct-expert-io")
-            result.flags |= ncnn::moe::RuntimeOptionDirectExpertIo;
+            set_expert_io_mode(RuntimeOptionDirectExpertIo);
         else if (argument == "--buffered-expert-io")
-            result.flags |= ncnn::moe::RuntimeOptionBufferedExpertIo;
+            set_expert_io_mode(RuntimeOptionBufferedExpertIo);
         else if (argument == "--disable-gpu-victim-execution")
             result.flags |= ncnn::moe::RuntimeOptionDisableGpuVictimExecution;
         else if (argument == "--disable-gpu-expert-execution")
@@ -762,7 +764,8 @@ private:
     void emit(std::string value)
     {
         const std::lock_guard<std::mutex> lock(output_mutex_);
-        std::cout << value << '\n' << std::flush;
+        std::cout << value << '\n'
+                  << std::flush;
     }
 
     void emit_error(std::string_view request_id, std::string_view message, std::string_view code = "invalid_request")
@@ -1200,7 +1203,7 @@ static void print_usage(const char* executable)
               << "  runtime: --backend auto|cpu|vulkan|hybrid|hybrid-prefetch, --host-memory-mb N,\n"
               << "           --expert-cache-mb N, --expert-gpu-cache-mb N, --expert-io-workers N,\n"
               << "           --expert-memory auto|eager|on-demand, --vulkan-device N, --vulkan-devices N[,N...]\n"
-              << "           --optimization-flags MASK, --enable-vulkan-gated-delta\n"
+              << "           --optimization-flags MASK\n"
               << "  io/cache: --mmap-experts, --direct-expert-io, --buffered-expert-io,\n"
               << "            --release-vulkan-dense-host, --disable-gpu-expert-execution,\n"
               << "            --expected-concurrency N\n";
@@ -1238,7 +1241,8 @@ int main(int argc, char** argv)
             error.add_string("event", "error");
             error.add_string("code", ncnn::moe::error_code_name(model.error().code));
             error.add_string("message", model.error().message);
-            std::cout << error.finish() << '\n' << std::flush;
+            std::cout << error.finish() << '\n'
+                      << std::flush;
             return 1;
         }
         ncnn::moe::emit_initialization_progress(10, 10, "worker", "Starting JSONL worker");
@@ -1251,7 +1255,8 @@ int main(int argc, char** argv)
         error.add_string("event", "error");
         error.add_string("code", "invalid_arguments");
         error.add_string("message", exception.what());
-        std::cout << error.finish() << '\n' << std::flush;
+        std::cout << error.finish() << '\n'
+                  << std::flush;
         return 2;
     }
 }

@@ -30,13 +30,10 @@ enum class ExpertBackendExecutionResult
     Failed
 };
 
-// Static CPU/GPU placement boundary for routed Experts. A resident Expert may
-// execute any non-empty routed batch, including single-row decode. This is
-// deliberately not calibrated at runtime.
+// Static CPU/GPU placement threshold for resident Experts.
 inline constexpr size_t vulkan_expert_gpu_min_rows = 1;
 
-// Cold single-row requests are admitted asynchronously as well; the executor
-// keeps the CPU fallback available while the fixed GPU cache pipeline uploads.
+// Admission is asynchronous; CPU remains available while weights upload.
 inline constexpr size_t vulkan_expert_gpu_admission_min_rows = 1;
 
 struct ExpertBackendStatistics
@@ -87,9 +84,7 @@ struct ExpertBackendRequest
         std::span<const ExpertRoute> routes;
         uint32_t token_count = 0;
         uint8_t* completed = nullptr;
-        // Some callers can combine a partial GPU result with CPU fallback.
-        // Those callers must disable aggregation unless every request in the
-        // batch was selected for the same GPU submission.
+        // Require a complete batch before publishing an aggregate result.
         bool require_all_requests = false;
     };
 

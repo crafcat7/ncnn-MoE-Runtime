@@ -1436,10 +1436,9 @@ Mxfp4ExpertCache::Entry* Mxfp4ExpertCache::find_victim_locked(
     uint32_t selected_distance = 0;
     for (Entry* entry : list)
     {
-        const bool speculative_requires_speculative_victim =
-            speculative
-            && !has_flag(flags_, ExpertCacheForwardAwareEviction)
-            && !has_flag(flags_, ExpertCacheAllowSpeculativeEviction);
+        const bool speculative_requires_speculative_victim = speculative
+                                                             && !has_flag(flags_, ExpertCacheForwardAwareEviction)
+                                                             && !has_flag(flags_, ExpertCacheAllowSpeculativeEviction);
         if (!entry
             || entry->state != Entry::State::Ready
             || (speculative_requires_speculative_victim
@@ -1505,8 +1504,8 @@ bool Mxfp4ExpertCache::evict_one_locked(bool incoming_from_frequent_ghost, bool 
     }
 
     const uint32_t forward_anchor = has_flag(flags_, ExpertCacheForwardAwareEviction)
-                                            ? incoming_group
-                                            : invalid_residency_group;
+                                        ? incoming_group
+                                        : invalid_residency_group;
     if (forward_anchor != invalid_residency_group)
         preferred_group = invalid_residency_group;
     Entry* victim = prefer_recent
@@ -1957,11 +1956,9 @@ void Mxfp4ExpertCache::worker_loop(uint32_t worker_index)
             std::lock_guard<std::mutex> lock(mutex_);
             if (!disk_entries.empty())
             {
-                const auto elapsed =
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - io_started);
-                const uint64_t elapsed_nanoseconds =
-                    std::max<int64_t>(1, elapsed.count());
+                const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - io_started);
+                const uint64_t elapsed_nanoseconds = std::max<int64_t>(1, elapsed.count());
                 ++io_read_samples_;
                 io_read_time_nanoseconds_ += elapsed_nanoseconds;
                 // The runtime thread budget is the single ownership boundary
@@ -2299,8 +2296,7 @@ ExpertCacheStatistics Mxfp4ExpertCache::statistics() const
         result.io_worker_count = io_worker_count_;
         result.adaptive_io_workers = adaptive_io_workers_;
         result.io_read_samples = io_read_samples_;
-        result.io_read_time_microseconds =
-            (io_read_time_nanoseconds_ + 999) / 1000;
+        result.io_read_time_microseconds = (io_read_time_nanoseconds_ + 999) / 1000;
         victim_cache = victim_cache_;
     }
     reader_->populate_statistics(result);
