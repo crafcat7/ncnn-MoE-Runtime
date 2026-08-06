@@ -1,0 +1,176 @@
+#version 450
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(binding = 0) readonly buffer input_blob
+{
+    float input_data[];
+};
+layout(binding = 1) readonly buffer packed_blob
+{
+    uint packed_words[];
+};
+layout(binding = 2) readonly buffer scale_blob
+{
+    float scale_data[];
+};
+layout(binding = 3) readonly buffer bias_blob
+{
+    float bias_data[];
+};
+layout(binding = 4) writeonly buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint matrix_input_columns;
+    uint logical_input_columns;
+    uint output_columns;
+    uint output_columns_per_group;
+    uint block_count;
+    uint token_count;
+}
+p;
+
+float decode_float8_e4m3(uint value)
+{
+    const uint magnitude = value & 127;
+    const uint exponent = magnitude >> 3;
+    const uint mantissa = magnitude & 7;
+    float decoded = 0.0;
+    if (exponent == 0)
+        decoded = float(mantissa) * 0.001953125;
+    else
+        decoded = uintBitsToFloat(((exponent + 120) << 23) | (mantissa << 20));
+    return (value & 128) == 0 ? decoded : -decoded;
+}
+
+#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
+shared float partial_sum0[32];
+shared float partial_sum1[32];
+shared float partial_sum2[32];
+shared float partial_sum3[32];
+#endif
+
+void main()
+{
+    const uint output_base = gl_WorkGroupID.x * 4;
+    const uint token = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    const bool token_valid = token < p.token_count;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    float sum2 = 0.0;
+    float sum3 = 0.0;
+
+    for (uint block = 0; block < p.block_count; ++block)
+    {
+        const uint block_begin = block * 128;
+        const uint input_column = lane * 4;
+        const float input0 = token_valid && block_begin + input_column < p.matrix_input_columns
+            ? input_data[token * p.logical_input_columns + block_begin + input_column]
+            : 0.0;
+        const float input1 = token_valid && block_begin + input_column + 1 < p.matrix_input_columns
+            ? input_data[token * p.logical_input_columns + block_begin + input_column + 1]
+            : 0.0;
+        const float input2 = token_valid && block_begin + input_column + 2 < p.matrix_input_columns
+            ? input_data[token * p.logical_input_columns + block_begin + input_column + 2]
+            : 0.0;
+        const float input3 = token_valid && block_begin + input_column + 3 < p.matrix_input_columns
+            ? input_data[token * p.logical_input_columns + block_begin + input_column + 3]
+            : 0.0;
+
+        if (token_valid)
+        {
+            const uint output0 = output_base;
+            const uint output1 = output_base + 1;
+            const uint output2 = output_base + 2;
+            const uint output3 = output_base + 3;
+            const uint word_base0 = (output0 * p.matrix_input_columns + block_begin + input_column) >> 2;
+            const uint word_base1 = (output1 * p.matrix_input_columns + block_begin + input_column) >> 2;
+            const uint word_base2 = (output2 * p.matrix_input_columns + block_begin + input_column) >> 2;
+            const uint word_base3 = (output3 * p.matrix_input_columns + block_begin + input_column) >> 2;
+            const float scale0 = output0 < p.output_columns
+                ? scale_data[(output0 / 128) * p.block_count + block]
+                : 0.0;
+            const float scale1 = output1 < p.output_columns
+                ? scale_data[(output1 / 128) * p.block_count + block]
+                : 0.0;
+            const float scale2 = output2 < p.output_columns
+                ? scale_data[(output2 / 128) * p.block_count + block]
+                : 0.0;
+            const float scale3 = output3 < p.output_columns
+                ? scale_data[(output3 / 128) * p.block_count + block]
+                : 0.0;
+            for (uint offset = 0; offset < 4; ++offset)
+            {
+                const float input_value = offset == 0
+                    ? input0
+                    : offset == 1
+                        ? input1
+                        : offset == 2
+                            ? input2
+                            : input3;
+                if (output0 < p.output_columns)
+                    sum0 += decode_float8_e4m3((packed_words[word_base0 + (offset >> 2)] >> ((offset & 3) * 8)) & 255) * input_value * scale0;
+                if (output1 < p.output_columns)
+                    sum1 += decode_float8_e4m3((packed_words[word_base1 + (offset >> 2)] >> ((offset & 3) * 8)) & 255) * input_value * scale1;
+                if (output2 < p.output_columns)
+                    sum2 += decode_float8_e4m3((packed_words[word_base2 + (offset >> 2)] >> ((offset & 3) * 8)) & 255) * input_value * scale2;
+                if (output3 < p.output_columns)
+                sum3 += decode_float8_e4m3((packed_words[word_base3 + (offset >> 2)] >> ((offset & 3) * 8)) & 255) * input_value * scale3;
+            }
+        }
+    }
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const float reduced_sum0 = subgroupAdd(sum0);
+    const float reduced_sum1 = subgroupAdd(sum1);
+    const float reduced_sum2 = subgroupAdd(sum2);
+    const float reduced_sum3 = subgroupAdd(sum3);
+    if (token_valid && lane == 0)
+    {
+        if (output_base < p.output_columns)
+            output_data[token * p.output_columns + output_base] = reduced_sum0 + bias_data[output_base];
+        if (output_base + 1 < p.output_columns)
+            output_data[token * p.output_columns + output_base + 1] = reduced_sum1 + bias_data[output_base + 1];
+        if (output_base + 2 < p.output_columns)
+            output_data[token * p.output_columns + output_base + 2] = reduced_sum2 + bias_data[output_base + 2];
+        if (output_base + 3 < p.output_columns)
+            output_data[token * p.output_columns + output_base + 3] = reduced_sum3 + bias_data[output_base + 3];
+    }
+#else
+    partial_sum0[lane] = sum0;
+    partial_sum1[lane] = sum1;
+    partial_sum2[lane] = sum2;
+    partial_sum3[lane] = sum3;
+    barrier();
+    for (uint stride = 16; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+        {
+            partial_sum0[lane] += partial_sum0[lane + stride];
+            partial_sum1[lane] += partial_sum1[lane + stride];
+            partial_sum2[lane] += partial_sum2[lane + stride];
+            partial_sum3[lane] += partial_sum3[lane + stride];
+        }
+        barrier();
+    }
+    if (token_valid && lane == 0)
+    {
+        if (output_base < p.output_columns)
+            output_data[token * p.output_columns + output_base] = partial_sum0[0] + bias_data[output_base];
+        if (output_base + 1 < p.output_columns)
+            output_data[token * p.output_columns + output_base + 1] = partial_sum1[0] + bias_data[output_base + 1];
+        if (output_base + 2 < p.output_columns)
+            output_data[token * p.output_columns + output_base + 2] = partial_sum2[0] + bias_data[output_base + 2];
+        if (output_base + 3 < p.output_columns)
+            output_data[token * p.output_columns + output_base + 3] = partial_sum3[0] + bias_data[output_base + 3];
+    }
+#endif
+}

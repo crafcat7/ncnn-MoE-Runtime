@@ -1,0 +1,137 @@
+#version 450
+
+layout(binding = 0) readonly buffer fused_qkv_blob
+{
+    float fused_qkv_data[];
+};
+layout(binding = 1) readonly buffer cosine_blob
+{
+    float cosine_data[];
+};
+layout(binding = 2) readonly buffer sine_blob
+{
+    float sine_data[];
+};
+layout(binding = 3) writeonly buffer query_blob
+{
+    float query_data[];
+};
+layout(binding = 4) writeonly buffer key_blob
+{
+    sfp key_data[];
+};
+layout(binding = 5) writeonly buffer value_blob
+{
+    sfp value_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint total_columns;
+    uint query_columns;
+    uint key_value_columns;
+    uint head_dimension;
+    uint token_count;
+    uint query_cstep;
+    uint key_cstep;
+    uint value_cstep;
+    uint work_items;
+    uint direct_ring;
+    uint ring_capacity;
+    uint destination_start;
+    uint device_rope;
+    uint position_offset;
+    float rope_concentration;
+}
+p;
+
+void main()
+{
+    const uint index = gl_GlobalInvocationID.x;
+    if (index >= p.work_items)
+        return;
+
+    const uint half_dimension = p.head_dimension / 2;
+    const uint query_heads = p.query_columns / p.head_dimension;
+    const uint key_value_heads = p.key_value_columns / p.head_dimension;
+    const uint query_pairs = p.token_count * query_heads * half_dimension;
+    const uint key_pairs = p.token_count * key_value_heads * half_dimension;
+    const uint value_elements = p.token_count * p.key_value_columns;
+
+    if (index < query_pairs)
+    {
+        const uint pair = index % half_dimension;
+        const uint head_token = index / half_dimension;
+        const uint head = head_token % query_heads;
+        const uint token = head_token / query_heads;
+        const uint source = token * p.total_columns + head * p.head_dimension + pair;
+        const uint destination = head * p.query_cstep + token * p.head_dimension + pair;
+        const uint cache = token * half_dimension + pair;
+        const float angle = float(p.position_offset + token)
+            * cosine_data[pair];
+        const float cosine = p.device_rope != 0
+            ? cos(angle) * p.rope_concentration
+            : cosine_data[cache];
+        const float sine = p.device_rope != 0
+            ? sin(angle) * p.rope_concentration
+            : sine_data[cache];
+        const float first = fused_qkv_data[source];
+        const float second = fused_qkv_data[source + half_dimension];
+        query_data[destination] = first * cosine - second * sine;
+        query_data[destination + half_dimension] = first * sine + second * cosine;
+        return;
+    }
+
+    const uint key_index = index - query_pairs;
+    if (key_index < key_pairs)
+    {
+        const uint pair = key_index % half_dimension;
+        const uint head_token = key_index / half_dimension;
+        const uint head = head_token % key_value_heads;
+        const uint token = head_token / key_value_heads;
+        const uint source = token * p.total_columns + p.query_columns + head * p.head_dimension + pair;
+        const uint destination_row = p.direct_ring != 0 ? (p.destination_start + token) % p.ring_capacity : token;
+        const uint destination = head * p.key_cstep + destination_row * p.head_dimension + pair;
+        const uint cache = token * half_dimension + pair;
+        const float angle = float(p.position_offset + token)
+            * cosine_data[pair];
+        const float cosine = p.device_rope != 0
+            ? cos(angle) * p.rope_concentration
+            : cosine_data[cache];
+        const float sine = p.device_rope != 0
+            ? sin(angle) * p.rope_concentration
+            : sine_data[cache];
+        const float first = fused_qkv_data[source];
+        const float second = fused_qkv_data[source + half_dimension];
+        const float rotated_first = first * cosine - second * sine;
+        const float rotated_second = first * sine + second * cosine;
+        buffer_st1(key_data, destination, rotated_first);
+        buffer_st1(key_data, destination + half_dimension, rotated_second);
+        if (p.direct_ring != 0)
+        {
+            const uint duplicate = destination + p.ring_capacity * p.head_dimension;
+            buffer_st1(key_data, duplicate, rotated_first);
+            buffer_st1(key_data, duplicate + half_dimension, rotated_second);
+        }
+        return;
+    }
+
+    const uint value_index = key_index - key_pairs;
+    if (value_index >= value_elements)
+        return;
+    const uint dimension = value_index % p.head_dimension;
+    const uint head_token = value_index / p.head_dimension;
+    const uint head = head_token % key_value_heads;
+    const uint token = head_token / key_value_heads;
+    const uint source = token * p.total_columns + p.query_columns + p.key_value_columns + head * p.head_dimension + dimension;
+    const uint destination_row = p.direct_ring != 0 ? (p.destination_start + token) % p.ring_capacity : token;
+    const uint destination = head * p.value_cstep + destination_row * p.head_dimension + dimension;
+    buffer_st1(value_data, destination, fused_qkv_data[source]);
+    if (p.direct_ring != 0)
+    {
+        buffer_st1(
+            value_data,
+            destination + p.ring_capacity * p.head_dimension,
+            fused_qkv_data[source]);
+    }
+}

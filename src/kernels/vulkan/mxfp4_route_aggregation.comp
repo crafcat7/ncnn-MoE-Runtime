@@ -1,0 +1,49 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer expert_output_blob
+{
+    float expert_output[];
+};
+layout(binding = 1) readonly buffer route_offset_blob
+{
+    uint route_offsets[];
+};
+layout(binding = 2) readonly buffer route_row_blob
+{
+    uint route_rows[];
+};
+layout(binding = 3) readonly buffer route_weight_blob
+{
+    float route_weights[];
+};
+layout(binding = 4) writeonly buffer aggregate_output_blob
+{
+    float aggregate_output[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint output_columns;
+    uint token_count;
+}
+p;
+
+void main()
+{
+    const uint token = gl_WorkGroupID.y;
+    const uint column = gl_WorkGroupID.x * 128u + gl_LocalInvocationID.x;
+    if (token >= p.token_count || column >= p.output_columns)
+        return;
+
+    const uint begin = route_offsets[token];
+    const uint end = route_offsets[token + 1u];
+    float sum = 0.0;
+    for (uint route = begin; route < end; ++route)
+    {
+        const uint row = route_rows[route];
+        sum += route_weights[route] * expert_output[row * p.output_columns + column];
+    }
+    aggregate_output[token * p.output_columns + column] = sum;
+}

@@ -1,0 +1,185 @@
+#version 450
+
+#ifdef NCNN_fp16_arithmetic
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(binding = 0) readonly buffer input_blob
+{
+    float input_data[];
+};
+layout(binding = 1) readonly buffer packed_blob
+{
+    uint packed_words[];
+};
+layout(binding = 2) readonly buffer scale_blob
+{
+    uint scale_words[];
+};
+layout(binding = 3) readonly buffer bias_blob
+{
+    float bias_data[];
+};
+layout(binding = 4) writeonly buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint input_columns;
+    uint intermediate_columns;
+    uint block_count;
+    uint token_count;
+    uint activation;
+    float activation_limit;
+}
+p;
+
+uint packed_byte(uint index)
+{
+    const uint word = packed_words[index >> 2];
+    return (word >> ((index & 3) * 8)) & 255;
+}
+
+uint scale_byte(uint index)
+{
+    const uint word = scale_words[index >> 2];
+    return (word >> ((index & 3) * 8)) & 255;
+}
+
+float decode_mxfp4(uint value)
+{
+    const float magnitudes[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    const float magnitude = magnitudes[value & 7];
+    return (value & 8) == 0 ? magnitude : -magnitude;
+}
+
+float decode_scale(uint value)
+{
+    return uintBitsToFloat(value == 0 ? 0x00400000u : value << 23);
+}
+
+float mxfp4_product(float value, float input_value, float scale)
+{
+#ifdef NCNN_fp16_arithmetic
+    return float(float16_t(value) * float16_t(input_value) * float16_t(scale));
+#else
+    return value * input_value * scale;
+#endif
+}
+
+#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
+shared float gate_partial[32];
+shared float up_partial[32];
+#endif
+
+void main()
+{
+    const uint intermediate_column = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    const bool valid = intermediate_column < p.intermediate_columns && token < p.token_count;
+    float gate_sum = 0.0;
+    float up_sum = 0.0;
+    if (valid && lane < 32)
+    {
+        const uint gate_row = intermediate_column * 2;
+        const uint up_row = gate_row + 1;
+        const uint gate_packed_row = gate_row * p.block_count * 16;
+        const uint up_packed_row = up_row * p.block_count * 16;
+        const uint gate_scale_row = gate_row * p.block_count;
+        const uint up_scale_row = up_row * p.block_count;
+        const uint input_row = token * p.input_columns;
+        for (uint block = 0; block < p.block_count; ++block)
+        {
+            const uint packed_index = block * 16 + lane / 2;
+            const uint gate_value = packed_byte(gate_packed_row + packed_index);
+            const uint up_value = packed_byte(up_packed_row + packed_index);
+            const uint gate_nibble = (lane & 1) == 0 ? gate_value & 15 : gate_value >> 4;
+            const uint up_nibble = (lane & 1) == 0 ? up_value & 15 : up_value >> 4;
+            const float input_value = input_data[input_row + block * 32 + lane];
+            gate_sum += mxfp4_product(
+                decode_mxfp4(gate_nibble),
+                input_value,
+                decode_scale(scale_byte(gate_scale_row + block)));
+            up_sum += mxfp4_product(
+                decode_mxfp4(up_nibble),
+                input_value,
+                decode_scale(scale_byte(up_scale_row + block)));
+        }
+    }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const float reduced_gate = subgroupAdd(gate_sum);
+    const float reduced_up = subgroupAdd(up_sum);
+    if (valid && lane == 0)
+    {
+        float gate = reduced_gate + bias_data[intermediate_column * 2];
+        float up = reduced_up + bias_data[intermediate_column * 2 + 1];
+        if (p.activation_limit > 0.0)
+        {
+            gate = min(gate, p.activation_limit);
+            up = clamp(up, -p.activation_limit, p.activation_limit);
+        }
+        if (p.activation == 2)
+        {
+            const float silu = gate / (1.0 + exp(-gate));
+            output_data[token * p.intermediate_columns + intermediate_column] = silu * up;
+        }
+        else if (p.activation == 1)
+        {
+            const float silu = gate / (1.0 + exp(-gate));
+            output_data[token * p.intermediate_columns + intermediate_column] = silu * up;
+        }
+        else
+        {
+            const float silu = gate / (1.0 + exp(-1.702 * gate));
+            output_data[token * p.intermediate_columns + intermediate_column] = silu * (up + 1.0);
+        }
+    }
+#else
+    gate_partial[lane] = gate_sum;
+    up_partial[lane] = up_sum;
+    barrier();
+    for (uint stride = 16; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+        {
+            gate_partial[lane] += gate_partial[lane + stride];
+            up_partial[lane] += up_partial[lane + stride];
+        }
+        barrier();
+    }
+    if (valid && lane == 0)
+    {
+        float gate = gate_partial[0] + bias_data[intermediate_column * 2];
+        float up = up_partial[0] + bias_data[intermediate_column * 2 + 1];
+        if (p.activation_limit > 0.0)
+        {
+            gate = min(gate, p.activation_limit);
+            up = clamp(up, -p.activation_limit, p.activation_limit);
+        }
+        if (p.activation == 2)
+        {
+            const float silu = gate / (1.0 + exp(-gate));
+            output_data[token * p.intermediate_columns + intermediate_column] = silu * up;
+        }
+        else if (p.activation == 1)
+        {
+            const float silu = gate / (1.0 + exp(-gate));
+            output_data[token * p.intermediate_columns + intermediate_column] = silu * up;
+        }
+        else
+        {
+            const float silu = gate / (1.0 + exp(-1.702 * gate));
+            output_data[token * p.intermediate_columns + intermediate_column] = silu * (up + 1.0);
+        }
+    }
+#endif
+}
