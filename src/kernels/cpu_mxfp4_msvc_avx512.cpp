@@ -129,18 +129,18 @@ static __forceinline void avx512_mxfp4_q8_packed_chunk_dot(
     const __m512i input_values = _mm512_cvtepi8_epi16(
         _mm256_set_m128i(input_values_128, input_values_128));
 
-#define NCNN_MOE_AVX512_PACKED_ROW_LANE(lane) \
-    { \
+#define NCNN_MOE_AVX512_PACKED_ROW_LANE(lane)                                   \
+    {                                                                           \
         const __m128i even_values = _mm512_extracti32x4_epi32(even_rows, lane); \
-        const __m128i odd_values = _mm512_extracti32x4_epi32(odd_rows, lane); \
-        const __m256i values = _mm256_set_m128i(odd_values, even_values); \
-        const __m512i products = _mm512_madd_epi16( \
-            _mm512_cvtepi8_epi16(values), \
-            input_values); \
-        dots[(lane) * 2] = avx512_reduce_8_epi32( \
-            _mm512_castsi512_si256(products)); \
-        dots[(lane) * 2 + 1] = avx512_reduce_8_epi32( \
-            _mm512_extracti64x4_epi64(products, 1)); \
+        const __m128i odd_values = _mm512_extracti32x4_epi32(odd_rows, lane);   \
+        const __m256i values = _mm256_set_m128i(odd_values, even_values);       \
+        const __m512i products = _mm512_madd_epi16(                             \
+            _mm512_cvtepi8_epi16(values),                                       \
+            input_values);                                                      \
+        dots[(lane) * 2] = avx512_reduce_8_epi32(                               \
+            _mm512_castsi512_si256(products));                                  \
+        dots[(lane) * 2 + 1] = avx512_reduce_8_epi32(                           \
+            _mm512_extracti64x4_epi64(products, 1));                            \
     }
     NCNN_MOE_AVX512_PACKED_ROW_LANE(0);
     NCNN_MOE_AVX512_PACKED_ROW_LANE(1);
@@ -259,10 +259,8 @@ float msvc_avx512_bfloat16_pair_dot(
     float sum = _mm512_reduce_add_ps(accumulator);
     for (; index < count; ++index)
     {
-        const float left_value =
-            std::bit_cast<float>(static_cast<uint32_t>(left[index]) << 16);
-        const float right_value =
-            std::bit_cast<float>(static_cast<uint32_t>(right[index]) << 16);
+        const float left_value = std::bit_cast<float>(static_cast<uint32_t>(left[index]) << 16);
+        const float right_value = std::bit_cast<float>(static_cast<uint32_t>(right[index]) << 16);
         sum += left_value * right_value;
     }
     return sum;
@@ -377,10 +375,8 @@ static __forceinline void avx512_bfloat16_linear_tile1x4(
     __m512 sum3 = _mm512_setzero_ps();
     for (uint32_t column = 0; column < input_columns; column += 32)
     {
-        const __m512bh input_values =
-            (__m512bh)_mm512_loadu_si512(input + column);
-        const __m512bh weight0 =
-            (__m512bh)_mm512_loadu_si512(weights + column);
+        const __m512bh input_values = (__m512bh)_mm512_loadu_si512(input + column);
+        const __m512bh weight0 = (__m512bh)_mm512_loadu_si512(weights + column);
         const __m512bh weight1 = (__m512bh)_mm512_loadu_si512(
             weights + input_columns + column);
         const __m512bh weight2 = (__m512bh)_mm512_loadu_si512(
@@ -410,8 +406,8 @@ void msvc_avx512_bfloat16_batched_linear(const uint16_t* weights,
                                          std::vector<uint16_t>& packed_input)
 {
     const size_t padded_token_count = token_count == 1
-        ? size_t{1}
-        : (token_count + 3) & ~size_t{3};
+                                          ? size_t{1}
+                                          : (token_count + 3) & ~size_t{3};
     packed_input.resize(padded_token_count * input_columns);
     for (size_t token = 0; token < token_count; ++token)
     {
@@ -435,8 +431,7 @@ void msvc_avx512_bfloat16_batched_linear(const uint16_t* weights,
         for (int64_t output_group = 0; output_group < output_groups;
              ++output_group)
         {
-            const uint32_t first_output =
-                static_cast<uint32_t>(output_group) * 4;
+            const uint32_t first_output = static_cast<uint32_t>(output_group) * 4;
             avx512_bfloat16_linear_tile1x4(
                 weights + static_cast<size_t>(first_output) * input_columns,
                 packed_input_data,
@@ -513,16 +508,15 @@ void msvc_avx512_mxfp4_q8_packed_gemm(
         for (uint32_t block = 0; block < block_count; ++block)
         {
             const uint8_t* packed_block = packed
-                + group * group_stride
-                + static_cast<size_t>(block) * block_bytes;
+                                          + group * group_stride
+                                          + static_cast<size_t>(block) * block_bytes;
             const uint8_t* packed_values = packed_block + 8;
             for (size_t token = 0; token < token_count; ++token)
             {
                 const int8_t* input_block = input
-                    + token * input_stride
-                    + static_cast<size_t>(block) * 32;
-                const float input_scale = input_scales[
-                    token * scale_stride + block];
+                                            + token * input_stride
+                                            + static_cast<size_t>(block) * 32;
+                const float input_scale = input_scales[token * scale_stride + block];
                 for (uint32_t chunk = 0; chunk < 2; ++chunk)
                 {
                     int32_t dots[8] = {};
@@ -535,10 +529,9 @@ void msvc_avx512_mxfp4_q8_packed_gemm(
                         const size_t matrix_row = group * 8 + row;
                         if (matrix_row >= row_count)
                             continue;
-                        output[token * output_stride + matrix_row] +=
-                            static_cast<float>(dots[row])
-                            * (0.5f * scales_by_exponent[packed_block[row]])
-                            * input_scale;
+                        output[token * output_stride + matrix_row] += static_cast<float>(dots[row])
+                                                                      * (0.5f * scales_by_exponent[packed_block[row]])
+                                                                      * input_scale;
                     }
                 }
             }

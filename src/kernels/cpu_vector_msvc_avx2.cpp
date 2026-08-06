@@ -69,9 +69,9 @@ void msvc_avx2_float_silu_mul(float* output, const float* gate, const float* up,
         const __m256 silu = _mm256_div_ps(
             gate_values,
             _mm256_add_ps(one, msvc_avx2_expf(_mm256_sub_ps(
-                                      zero, _mm256_mul_ps(scale, gate_values)))));
+                                   zero, _mm256_mul_ps(scale, gate_values)))));
         _mm256_storeu_ps(output + index,
-                          _mm256_mul_ps(silu, _mm256_add_ps(_mm256_loadu_ps(up + index), offset)));
+                         _mm256_mul_ps(silu, _mm256_add_ps(_mm256_loadu_ps(up + index), offset)));
     }
     for (; index < count; ++index)
     {
@@ -155,8 +155,7 @@ void msvc_avx2_float_gemm_4x4(
     float results[4][4] = {};
     for (uint32_t token = 0; token < token_count; ++token)
         for (uint32_t output_index = 0; output_index < output_count; ++output_index)
-            results[token][output_index] =
-                msvc_avx2_horizontal_sum(accumulators[token][output_index]);
+            results[token][output_index] = msvc_avx2_horizontal_sum(accumulators[token][output_index]);
 
     for (; column < input_columns; ++column)
     {
@@ -166,7 +165,7 @@ void msvc_avx2_float_gemm_4x4(
             for (uint32_t output_index = 0; output_index < output_count; ++output_index)
             {
                 results[token][output_index] += value
-                    * weights[static_cast<size_t>(output_index) * weight_stride + column];
+                                                * weights[static_cast<size_t>(output_index) * weight_stride + column];
             }
         }
     }
@@ -218,7 +217,7 @@ void msvc_avx2_float_gemm_4x8(
             const float value = input[static_cast<size_t>(token) * input_stride + column];
             for (uint32_t output_index = 0; output_index < output_count; ++output_index)
                 results[token][output_index] += value
-                    * weights[static_cast<size_t>(output_index) * weight_stride + column];
+                                                * weights[static_cast<size_t>(output_index) * weight_stride + column];
         }
     }
     for (uint32_t token = 0; token < token_count; ++token)
@@ -273,7 +272,8 @@ void msvc_avx2_bfloat16_gemm_4x8(
             for (uint32_t output_index = 0; output_index < output_count; ++output_index)
             {
                 const float weight = std::bit_cast<float>(static_cast<uint32_t>(
-                    weights[static_cast<size_t>(output_index) * weight_stride + column]) << 16);
+                                                              weights[static_cast<size_t>(output_index) * weight_stride + column])
+                                                          << 16);
                 results[token][output_index] += value * weight;
             }
         }

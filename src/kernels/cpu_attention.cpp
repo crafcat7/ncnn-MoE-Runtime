@@ -265,7 +265,7 @@ static bool bfloat16_attention_pair_dot_enabled(uint64_t optimization_flags) noe
 {
     return bfloat16_pair_dot_available()
            && runtime_optimization_enabled(optimization_flags,
-               RuntimeOptimizationCpuBf16AttentionDot);
+                                           RuntimeOptimizationCpuBf16AttentionDot);
 }
 
 static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, const TensorData* sinks, uint64_t position_offset, const CpuBatch& query,
@@ -298,21 +298,16 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                                  && cache.capacity_tokens > 0
                                  && cache.bfloat16_keys.size() >= cache_capacity_elements
                                  && cache.bfloat16_values.size() >= cache_capacity_elements;
-    const bool direct_bfloat16_contiguous =
-        direct_bfloat16
-        && cache.first_slot <= cache.capacity_tokens
-        && cache.token_count <= cache.capacity_tokens - cache.first_slot;
-    // Decode appends the current token before SDPA.  When the cache ends at
-    // that token, no key can be future; retaining at most one sliding window
-    // also proves that no key is too old.  Prefill and wrapped/transactional
-    // states deliberately keep the fully guarded path below.
-    const bool decode_all_keys_valid =
-        query.rows() == 1
-        && cache.token_count != 0
-        && cache.start_position <= position_offset
-        && cache.token_count - 1 <= position_offset - cache.start_position
-        && (plan.sliding_window == 0
-            || cache.token_count <= plan.sliding_window);
+    const bool direct_bfloat16_contiguous = direct_bfloat16
+                                            && cache.first_slot <= cache.capacity_tokens
+                                            && cache.token_count <= cache.capacity_tokens - cache.first_slot;
+    // Decode can use the short SDPA path only when the cache has no future key.
+    const bool decode_all_keys_valid = query.rows() == 1
+                                       && cache.token_count != 0
+                                       && cache.start_position <= position_offset
+                                       && cache.token_count - 1 <= position_offset - cache.start_position
+                                       && (plan.sliding_window == 0
+                                           || cache.token_count <= plan.sliding_window);
     const bool pair_dot = direct_bfloat16
                           && bfloat16_attention_pair_dot_enabled(optimization_flags);
     if (pair_dot)
@@ -323,8 +318,8 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
         bfloat16_value_values = cache.bfloat16_values.data();
     }
     else if (cache.dtype == DType::Float32 && cache.first_slot == 0
-        && cache.keys.size() >= cache_elements
-        && cache.values.size() >= cache_elements)
+             && cache.keys.size() >= cache_elements
+             && cache.values.size() >= cache_elements)
     {
         key_values = cache.keys.data();
         value_values = cache.values.data();
@@ -336,16 +331,12 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
         for (uint64_t token_index = 0; token_index < cache.token_count; ++token_index)
         {
             const uint64_t slot = cache_slot(cache, token_index);
-            float* key_destination =
-                key_cache.data() + static_cast<size_t>(token_index) * cache.columns;
-            float* value_destination =
-                value_cache.data() + static_cast<size_t>(token_index) * cache.columns;
+            float* key_destination = key_cache.data() + static_cast<size_t>(token_index) * cache.columns;
+            float* value_destination = value_cache.data() + static_cast<size_t>(token_index) * cache.columns;
             if (cache.dtype == DType::BFloat16)
             {
-                const uint16_t* key_source =
-                    cache.bfloat16_keys.data() + static_cast<size_t>(slot) * cache.columns;
-                const uint16_t* value_source =
-                    cache.bfloat16_values.data() + static_cast<size_t>(slot) * cache.columns;
+                const uint16_t* key_source = cache.bfloat16_keys.data() + static_cast<size_t>(slot) * cache.columns;
+                const uint16_t* value_source = cache.bfloat16_values.data() + static_cast<size_t>(slot) * cache.columns;
                 for (uint32_t column = 0; column < cache.columns; ++column)
                 {
                     key_destination[column] = bfloat16_to_float(key_source[column]);
@@ -368,24 +359,22 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
         value_values = value_cache.data();
     }
 
-    const bool flash_prefill_enabled =
-        runtime_optimization_enabled(
-            optimization_flags,
-            RuntimeOptimizationCpuFlashAttention)
-        && query.rows() > 1
-        && cache.token_count >= 64;
+    const bool flash_prefill_enabled = runtime_optimization_enabled(
+                                           optimization_flags,
+                                           RuntimeOptimizationCpuFlashAttention)
+                                       && query.rows() > 1
+                                       && cache.token_count >= 64;
     int attention_team_size = 1;
 #if defined(_OPENMP)
     if (omp_in_parallel() == 0)
         attention_team_size = static_cast<int>(cpu_linear_thread_limit());
 #endif
-    const bool split_kv_enabled =
-        runtime_optimization_enabled(
-            optimization_flags,
-            RuntimeOptimizationCpuSplitKvAttention)
-        && query.rows() == 1
-        && cache.token_count >= 512
-        && attention_team_size > 1;
+    const bool split_kv_enabled = runtime_optimization_enabled(
+                                      optimization_flags,
+                                      RuntimeOptimizationCpuSplitKvAttention)
+                                  && query.rows() == 1
+                                  && cache.token_count >= 512
+                                  && attention_team_size > 1;
 
     if (flash_prefill_enabled || split_kv_enabled)
     {
@@ -405,9 +394,8 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                 const uint64_t slot = direct_bfloat16_contiguous
                                           ? cache.first_slot + key_index
                                           : cache_slot(cache, key_index);
-                const uint16_t* key_vector =
-                    bfloat16_key_values + static_cast<size_t>(slot) * cache.columns
-                    + static_cast<size_t>(kv_head) * head_dimension;
+                const uint16_t* key_vector = bfloat16_key_values + static_cast<size_t>(slot) * cache.columns
+                                             + static_cast<size_t>(kv_head) * head_dimension;
                 return pair_dot
                            ? bfloat16_pair_dot(
                                  key_vector,
@@ -418,9 +406,8 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                                  query_vector,
                                  head_dimension);
             }
-            const float* key_vector =
-                key_values + static_cast<size_t>(key_index) * cache.columns
-                + static_cast<size_t>(kv_head) * head_dimension;
+            const float* key_vector = key_values + static_cast<size_t>(key_index) * cache.columns
+                                      + static_cast<size_t>(kv_head) * head_dimension;
             return float_dot(query_vector, key_vector, head_dimension);
         };
         const auto add_value = [&](uint32_t query_head, float* destination, float weight, uint64_t key_index) {
@@ -430,16 +417,14 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                 const uint64_t slot = direct_bfloat16_contiguous
                                           ? cache.first_slot + key_index
                                           : cache_slot(cache, key_index);
-                const uint16_t* value_vector =
-                    bfloat16_value_values + static_cast<size_t>(slot) * cache.columns
-                    + static_cast<size_t>(kv_head) * head_dimension;
+                const uint16_t* value_vector = bfloat16_value_values + static_cast<size_t>(slot) * cache.columns
+                                               + static_cast<size_t>(kv_head) * head_dimension;
                 bfloat16_scaled_add(destination, value_vector, weight, head_dimension);
             }
             else
             {
-                const float* value_vector =
-                    value_values + static_cast<size_t>(key_index) * cache.columns
-                    + static_cast<size_t>(kv_head) * head_dimension;
+                const float* value_vector = value_values + static_cast<size_t>(key_index) * cache.columns
+                                            + static_cast<size_t>(kv_head) * head_dimension;
                 float_scaled_add(destination, value_vector, weight, head_dimension);
             }
         };
@@ -693,9 +678,8 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                         const uint64_t slot = direct_bfloat16_contiguous
                                                   ? cache.first_slot + key_index
                                                   : cache_slot(cache, key_index);
-                        const uint16_t* key_vector =
-                            bfloat16_key_values + static_cast<size_t>(slot) * cache.columns
-                            + static_cast<size_t>(kv_head) * head_dimension;
+                        const uint16_t* key_vector = bfloat16_key_values + static_cast<size_t>(slot) * cache.columns
+                                                     + static_cast<size_t>(kv_head) * head_dimension;
                         dot = pair_dot
                                   ? bfloat16_pair_dot(
                                         key_vector,
@@ -708,9 +692,8 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                     }
                     else
                     {
-                        const float* key_vector =
-                            key_values + static_cast<size_t>(key_index) * cache.columns
-                            + static_cast<size_t>(kv_head) * head_dimension;
+                        const float* key_vector = key_values + static_cast<size_t>(key_index) * cache.columns
+                                                  + static_cast<size_t>(kv_head) * head_dimension;
                         dot = float_dot(query_vector, key_vector, head_dimension);
                     }
                     logits[key_index] = dot * scale;
@@ -736,24 +719,22 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                         const uint64_t slot = direct_bfloat16_contiguous
                                                   ? cache.first_slot + key_index
                                                   : cache_slot(cache, key_index);
-                        const uint16_t* key_vector =
-                            bfloat16_key_values + static_cast<size_t>(slot) * cache.columns
-                            + static_cast<size_t>(kv_head) * head_dimension;
+                        const uint16_t* key_vector = bfloat16_key_values + static_cast<size_t>(slot) * cache.columns
+                                                     + static_cast<size_t>(kv_head) * head_dimension;
                         dot = pair_dot
-                            ? bfloat16_pair_dot(
-                                  key_vector,
-                                  query_bfloat16.data(),
-                                  head_dimension)
-                            : bfloat16_dot(
-                                  key_vector,
-                                  query_vector,
-                                  head_dimension);
+                                  ? bfloat16_pair_dot(
+                                        key_vector,
+                                        query_bfloat16.data(),
+                                        head_dimension)
+                                  : bfloat16_dot(
+                                        key_vector,
+                                        query_vector,
+                                        head_dimension);
                     }
                     else
                     {
-                        const float* key_vector =
-                            key_values + static_cast<size_t>(key_index) * cache.columns
-                            + static_cast<size_t>(kv_head) * head_dimension;
+                        const float* key_vector = key_values + static_cast<size_t>(key_index) * cache.columns
+                                                  + static_cast<size_t>(kv_head) * head_dimension;
                         dot = float_dot(query_vector, key_vector, head_dimension);
                     }
                     logits[key_index] = dot * scale;
@@ -789,16 +770,14 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                     const uint64_t slot = direct_bfloat16_contiguous
                                               ? cache.first_slot + key_index
                                               : cache_slot(cache, key_index);
-                    const uint16_t* value_vector =
-                        bfloat16_value_values + static_cast<size_t>(slot) * cache.columns
-                        + static_cast<size_t>(kv_head) * head_dimension;
+                    const uint16_t* value_vector = bfloat16_value_values + static_cast<size_t>(slot) * cache.columns
+                                                   + static_cast<size_t>(kv_head) * head_dimension;
                     bfloat16_scaled_add(output_vector, value_vector, probability, head_dimension);
                 }
                 else
                 {
-                    const float* value_vector =
-                        value_values + static_cast<size_t>(key_index) * cache.columns
-                        + static_cast<size_t>(kv_head) * head_dimension;
+                    const float* value_vector = value_values + static_cast<size_t>(key_index) * cache.columns
+                                                + static_cast<size_t>(kv_head) * head_dimension;
                     float_scaled_add(output_vector, value_vector, probability, head_dimension);
                 }
             }
@@ -902,8 +881,7 @@ Result<void> append_attention_context_into(
 {
     if (cache.vulkan_attention_cache)
     {
-        const CompiledOperator& attention_operator =
-            operators.at(plan.vulkan_attention_operator);
+        const CompiledOperator& attention_operator = operators.at(plan.vulkan_attention_operator);
         if (cache.vulkan_attention_state_unknown
             || !attention_operator.attention
             || !attention_operator.attention->materialize_device_cache(cache))
@@ -929,17 +907,17 @@ Result<void> append_attention_context_into(
     const CompiledOperator& fused_qkv_linear_operator = operators.at(plan.fused_qkv_operator);
     if (backend == ExecutionBackend::Vulkan
         && ((fused_qkv_gate_operator.bfloat16
-         && fused_qkv_gate_operator.bfloat16->forward(
-             scratch.normalized,
-             fused_qkv))
-        || (fused_qkv_bfloat16_operator.bfloat16
-         && fused_qkv_bfloat16_operator.bfloat16->forward(
-             scratch.normalized,
-             fused_qkv))
-         || (fused_qkv_linear_operator.linear
-             && fused_qkv_linear_operator.linear->forward(
+             && fused_qkv_gate_operator.bfloat16->forward(
                  scratch.normalized,
-                 fused_qkv))))
+                 fused_qkv))
+            || (fused_qkv_bfloat16_operator.bfloat16
+                && fused_qkv_bfloat16_operator.bfloat16->forward(
+                    scratch.normalized,
+                    fused_qkv))
+            || (fused_qkv_linear_operator.linear
+                && fused_qkv_linear_operator.linear->forward(
+                    scratch.normalized,
+                    fused_qkv))))
     {
         const uint32_t query_columns = plan.head_count * plan.head_dimension;
         const uint32_t key_value_columns = plan.kv_head_count * plan.head_dimension;
@@ -1025,15 +1003,13 @@ Result<bool> execute_attention_block_batch_into(
         }
         if (entry.cache->transaction.active)
             return false;
-        device_entries.push_back({
-            entry.position_offset,
-            entry.cache,
-            entry.hidden,
-            entry.output});
+        device_entries.push_back({entry.position_offset,
+                                  entry.cache,
+                                  entry.hidden,
+                                  entry.output});
     }
 
-    const NcnnVulkanAttentionBatchResult result =
-        attention_operator.attention->forward_batch(device_entries);
+    const NcnnVulkanAttentionBatchResult result = attention_operator.attention->forward_batch(device_entries);
     if (result == NcnnVulkanAttentionBatchResult::Executed)
         return true;
     if (result == NcnnVulkanAttentionBatchResult::Failed)
@@ -1090,10 +1066,7 @@ Result<void> execute_attention_block_into(
                 && attention_operator.attention->materialize_device_cache(
                     cache))
             {
-                // The failed dispatch was building a separate ring or failed
-                // before mutating the old one.  The operator has restored the
-                // authoritative rows to the CPU cache; continue through the
-                // existing CPU Attention implementation below.
+                // The failed dispatch restored the CPU cache; use CPU Attention.
             }
             else
             {
@@ -1112,24 +1085,22 @@ Result<void> execute_attention_block_into(
     const CompiledOperator& fused_qkv_gate_operator = operators.at(plan.fused_qkv_gate_bfloat16_operator);
     const CompiledOperator& fused_qkv_bfloat16_operator = operators.at(plan.fused_qkv_bfloat16_operator);
     const CompiledOperator& fused_qkv_linear_operator = operators.at(plan.fused_qkv_operator);
-    const bool fused_output_gate =
-        backend == ExecutionBackend::Vulkan
-        && fused_qkv_gate_operator.bfloat16
-        && fused_qkv_gate_operator.bfloat16->forward(
-            scratch.normalized,
-            fused_qkv);
-    const bool fused_projection =
-        fused_output_gate
-        || (backend == ExecutionBackend::Vulkan
-            && fused_qkv_bfloat16_operator.bfloat16
-            && fused_qkv_bfloat16_operator.bfloat16->forward(
-                scratch.normalized,
-                fused_qkv))
-        || (backend == ExecutionBackend::Vulkan
-            && fused_qkv_linear_operator.linear
-            && fused_qkv_linear_operator.linear->forward(
-                scratch.normalized,
-                fused_qkv));
+    const bool fused_output_gate = backend == ExecutionBackend::Vulkan
+                                   && fused_qkv_gate_operator.bfloat16
+                                   && fused_qkv_gate_operator.bfloat16->forward(
+                                       scratch.normalized,
+                                       fused_qkv);
+    const bool fused_projection = fused_output_gate
+                                  || (backend == ExecutionBackend::Vulkan
+                                      && fused_qkv_bfloat16_operator.bfloat16
+                                      && fused_qkv_bfloat16_operator.bfloat16->forward(
+                                          scratch.normalized,
+                                          fused_qkv))
+                                  || (backend == ExecutionBackend::Vulkan
+                                      && fused_qkv_linear_operator.linear
+                                      && fused_qkv_linear_operator.linear->forward(
+                                          scratch.normalized,
+                                          fused_qkv));
     if (fused_projection)
     {
         const uint32_t query_columns = plan.head_count * plan.head_dimension;

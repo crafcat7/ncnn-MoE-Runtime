@@ -113,14 +113,7 @@ static std::vector<uint64_t> automatic_gpu_expert_capacities(
     if (expert_pair_bytes == 0 || device_indices.empty())
         return capacities;
 
-    // The memory-budget extension reports both the heap budget and current
-    // usage. After dense operators have been compiled, only the unoccupied
-    // portion is available to the executable Expert cache. A multi-session
-    // process keeps 15% of that available portion for dynamic activation, KV,
-    // and Vulkan workspace. A single session on a resource-rich device keeps
-    // 8% instead: its larger cache reduces Expert uploads and CPU fallback,
-    // while the cache remains demand-paged rather than eagerly allocating the
-    // entire heap.
+    // Leave headroom for activations, KV, and Vulkan workspace.
     for (size_t index = 0; index < device_indices.size(); ++index)
     {
         if (device_indices[index] >= devices.size())
@@ -166,17 +159,14 @@ Runtime::Runtime()
     capabilities_.mxfp4_kernel = mxfp4_kernel_name();
     capabilities_.float8_kernel = float8_linear_kernel_name(RuntimeOptimizationDefaultFlags);
     capabilities_.bfloat16_dot_kernel = bfloat16_dot_kernel_name();
-    capabilities_.bfloat16_batched_linear_kernel =
-        bfloat16_batched_linear_kernel_name(RuntimeOptimizationDefaultFlags);
-    capabilities_.cpu_small_bfloat16_linear_policy =
-        NcnnLinearOperator::cpu_small_bfloat16_linear_policy(
-            RuntimeOptimizationDefaultFlags);
+    capabilities_.bfloat16_batched_linear_kernel = bfloat16_batched_linear_kernel_name(RuntimeOptimizationDefaultFlags);
+    capabilities_.cpu_small_bfloat16_linear_policy = NcnnLinearOperator::cpu_small_bfloat16_linear_policy(
+        RuntimeOptimizationDefaultFlags);
     capabilities_.cpu_linear_thread_limit = cpu_linear_thread_limit();
     capabilities_.float8_linear_thread_limit = float8_linear_thread_limit();
     capabilities_.float8_linear_row_group_size = float8_linear_row_group_size(RuntimeOptimizationDefaultFlags);
     capabilities_.mxfp4_decode_row_pair_group_size = mxfp4_decode_row_pair_group_size();
-    capabilities_.activation_kernel =
-        scaled_silu_kernel_name(RuntimeOptimizationDefaultFlags);
+    capabilities_.activation_kernel = scaled_silu_kernel_name(RuntimeOptimizationDefaultFlags);
     const MxFp4KernelKind kernel = mxfp4_kernel_kind();
     if (kernel == MxFp4KernelKind::ArmNeon)
         capabilities_.flags |= RuntimeCapabilityMxfp4ArmNeon;
@@ -372,8 +362,7 @@ Result<ModelPtr> Runtime::load_model(
         return normalized_ir.error();
 
     const bool use_vulkan_dense = resolved_mode == HybridMode::HybridExperts || resolved_mode == HybridMode::VulkanWithCpuPrefetch;
-    const bool release_vulkan_dense_host_storage =
-        use_vulkan_dense && has_flag(config.flags, RuntimeOptionReleaseVulkanDenseHostStorage);
+    const bool release_vulkan_dense_host_storage = use_vulkan_dense && has_flag(config.flags, RuntimeOptionReleaseVulkanDenseHostStorage);
     report_progress(4, "memory", "Planning host memory and Expert cache");
     const uint64_t current_available_memory_bytes = available_memory_bytes();
     auto memory_plan = plan_model_memory(
@@ -398,10 +387,9 @@ Result<ModelPtr> Runtime::load_model(
     {
         return Error{ErrorCode::InvalidArgument, "GPU Expert execution cannot be disabled while an Expert GPU cache is configured"};
     }
-    const bool automatic_gpu_expert_cache =
-        resolved_mode == HybridMode::HybridExperts
-        && !has_flag(config.flags, RuntimeOptionDisableGpuExpertExecution)
-        && requested_expert_gpu_bytes == 0;
+    const bool automatic_gpu_expert_cache = resolved_mode == HybridMode::HybridExperts
+                                            && !has_flag(config.flags, RuntimeOptionDisableGpuExpertExecution)
+                                            && requested_expert_gpu_bytes == 0;
     if (requested_expert_gpu_bytes != 0)
     {
         if (!file_backed_experts)
@@ -424,8 +412,7 @@ Result<ModelPtr> Runtime::load_model(
         return weights.error();
 
     ModelCompiler compiler;
-    const NcnnVulkanContextInstancePtr context_instance =
-        create_ncnn_vulkan_context_instance();
+    const NcnnVulkanContextInstancePtr context_instance = create_ncnn_vulkan_context_instance();
     ModelCompiler::BackendCapabilities compiler_capabilities;
     compiler_capabilities.flags = 0;
     compiler_capabilities.cpu_parallelism = capabilities_.openmp_thread_count;
@@ -479,9 +466,7 @@ Result<ModelPtr> Runtime::load_model(
 #if defined(NCNN_MOE_WITH_VULKAN) && NCNN_MOE_WITH_VULKAN
     if (automatic_gpu_expert_cache && file_backed_experts)
     {
-        // Dense weights have already been allocated by the compiler.  Use a
-        // fresh budget snapshot so automatic Expert capacity reflects the
-        // memory that is actually available to this model instance.
+        // Re-read the budget after dense weights are allocated.
         const std::vector<VulkanDeviceCapabilities> live_devices = NcnnLinearOperator::vulkan_device_capabilities();
         if (live_devices.size() == cache_devices.size())
             cache_devices = live_devices;
@@ -495,14 +480,13 @@ Result<ModelPtr> Runtime::load_model(
             compiled_model.vulkan_device_indices,
             cache_devices,
             config.expected_concurrency);
-        const bool every_device_can_hold_one_pair =
-            !automatic_executable_capacities.empty()
-            && std::all_of(
-                automatic_executable_capacities.begin(),
-                automatic_executable_capacities.end(),
-                [pair_bytes = plan.expert_pair_bytes](uint64_t capacity) {
-                    return capacity >= pair_bytes;
-                });
+        const bool every_device_can_hold_one_pair = !automatic_executable_capacities.empty()
+                                                    && std::all_of(
+                                                        automatic_executable_capacities.begin(),
+                                                        automatic_executable_capacities.end(),
+                                                        [pair_bytes = plan.expert_pair_bytes](uint64_t capacity) {
+                                                            return capacity >= pair_bytes;
+                                                        });
         if (every_device_can_hold_one_pair)
             expert_gpu_cache_bytes = sum_capacities(automatic_executable_capacities);
         else
@@ -540,12 +524,7 @@ Result<ModelPtr> Runtime::load_model(
             const uint32_t exact_and_speculative_budget = maximum_active_experts > std::numeric_limits<uint32_t>::max() / 2
                                                               ? std::numeric_limits<uint32_t>::max()
                                                               : maximum_active_experts * 2;
-            // Both CPU-only and HybridExperts benefit from a moderate reader
-            // pool: file-backed Expert loads are latency-bound, while the
-            // Vulkan admission path can overlap those reads with uploads.
-            // The compute side is independently capped by the thread-local
-            // OpenMP budget, and an explicit expert_io_workers value remains
-            // authoritative when a deployment has different contention.
+            // Keep file-backed reads inside the reserved I/O pool.
             const CpuThreadBudget thread_budget = resolve_cpu_thread_budget();
             expert_io_workers = std::min(exact_and_speculative_budget, thread_budget.reserved_io_threads);
         }

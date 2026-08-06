@@ -248,10 +248,10 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vulkan-devices", help="Comma-separated Vulkan device indices")
     parser.add_argument("--expected-concurrency", type=int)
     parser.add_argument("--optimization-flags", type=lambda value: int(value, 0))
-    parser.add_argument("--enable-vulkan-gated-delta", action="store_true", default=None)
-    parser.add_argument("--mmap-experts", action="store_true", default=None)
-    parser.add_argument("--direct-expert-io", action="store_true", default=None)
-    parser.add_argument("--buffered-expert-io", action="store_true", default=None)
+    expert_io_group = parser.add_mutually_exclusive_group()
+    expert_io_group.add_argument("--mmap-experts", action="store_true", default=None)
+    expert_io_group.add_argument("--direct-expert-io", action="store_true", default=None)
+    expert_io_group.add_argument("--buffered-expert-io", action="store_true", default=None)
     parser.add_argument("--disable-gpu-victim-execution", action="store_true", default=None)
     parser.add_argument("--router-prediction", action="store_true", default=None)
     parser.add_argument("--async-router-prediction", action="store_true", default=None)
@@ -452,7 +452,6 @@ def cli_runtime_settings(arguments: argparse.Namespace) -> dict[str, Any]:
         "vulkan_devices",
         "expected_concurrency",
         "optimization_flags",
-        "enable_vulkan_gated_delta",
         "mmap_experts",
         "direct_expert_io",
         "buffered_expert_io",

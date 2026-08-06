@@ -315,9 +315,9 @@ static RuntimeMetricCounters runtime_metric_counters(
         statistics.expert_gpu_execution_time_microseconds,
         start.expert_gpu_execution_time_microseconds);
     result.gpu_kernel_time_available = counter_delta(
-                                            statistics.expert_gpu_executions,
-                                            start.expert_gpu_executions)
-                                        != 0;
+                                           statistics.expert_gpu_executions,
+                                           start.expert_gpu_executions)
+                                       != 0;
     result.vulkan_linear_dispatches = counter_delta(
         statistics.vulkan_linear_dispatches,
         start.vulkan_linear_dispatches);
@@ -485,8 +485,7 @@ Session::Session(ModelPtr model, const SessionOptions& options)
           options.enable_speculative_context),
       sampling_scratch_(new SamplingScratch)
 {
-    state_->speculative_context_enabled =
-        speculative_context_enabled_;
+    state_->speculative_context_enabled = speculative_context_enabled_;
     statistics_.expert_token_counts.resize(model_->descriptor().expert_count, 0);
 }
 
@@ -670,10 +669,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
     if (!valid_sampling)
         return valid_sampling.error();
 
-    // Keep the device-weight admission worker out of the Vulkan foreground
-    // path for the complete generation transaction, not just one executor
-    // dispatch.  Executor scopes remain useful for direct prefill/decode and
-    // are nested safely by the backend's foreground depth counter.
+    // Keep device-weight admission out of the foreground generation path.
     const ScopedSessionExpertBackendForeground expert_backend_foreground(
         model_->compiled_->expert_backend);
 
@@ -703,10 +699,9 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
         ++generation_output_tokens_;
     };
 
-    const bool enable_speculative_context =
-        speculative_context_enabled_
-        && options.enable_speculative
-        && model_->compiled_->speculative.enabled();
+    const bool enable_speculative_context = speculative_context_enabled_
+                                            && options.enable_speculative
+                                            && model_->compiled_->speculative.enabled();
     if (enable_speculative_context
         && !state_->speculative_context_enabled
         && sequence_length_ != 0)
@@ -715,8 +710,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
             ErrorCode::InvalidArgument,
             "cannot enable speculative context after non-speculative decoding"};
     }
-    state_->speculative_context_enabled =
-        enable_speculative_context;
+    state_->speculative_context_enabled = enable_speculative_context;
     auto prefill_result = prefill_unlocked(input_ids);
     if (!prefill_result)
         return prefill_result.error();
@@ -726,34 +720,33 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
     result.tokens.reserve(options.max_new_tokens);
     if (enable_speculative_context)
     {
-        const bool state_cache_transactions =
-            model_->compiled_->speculative.kind
-            == SpeculativeModelKind::Mtp;
+        const bool state_cache_transactions = model_->compiled_->speculative.kind
+                                              == SpeculativeModelKind::Mtp;
         const auto begin_cache_transaction =
             [state_cache_transactions](
                 std::span<CpuLayerCache> caches,
                 size_t expected_rows) -> Result<void> {
-                if (state_cache_transactions)
-                {
-                    return begin_state_cache_transaction(
-                        caches,
-                        expected_rows);
-                }
-                begin_latent_cache_transaction(caches);
-                return {};
-            };
+            if (state_cache_transactions)
+            {
+                return begin_state_cache_transaction(
+                    caches,
+                    expected_rows);
+            }
+            begin_latent_cache_transaction(caches);
+            return {};
+        };
         const auto finish_cache_transaction =
             [state_cache_transactions](
                 std::span<CpuLayerCache> caches,
                 size_t committed_rows) -> Result<void> {
-                return state_cache_transactions
-                           ? finish_state_cache_transaction(
-                                 caches,
-                                 committed_rows)
-                           : finish_latent_cache_transaction(
-                                 caches,
-                                 committed_rows);
-            };
+            return state_cache_transactions
+                       ? finish_state_cache_transaction(
+                             caches,
+                             committed_rows)
+                       : finish_latent_cache_transaction(
+                             caches,
+                             committed_rows);
+        };
         auto initial = sample_unlocked(logits, options.sampling);
         if (!initial)
             return initial.error();
@@ -945,8 +938,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                         sequence_length_ + index);
                     if (!row_logits)
                         return row_logits.error();
-                    std::vector<std::vector<float>> rows =
-                        std::move(row_logits).value();
+                    std::vector<std::vector<float>> rows = std::move(row_logits).value();
                     if (rows.size() != 1
                         || state_->speculative_main_hidden.rows() != 1)
                     {
@@ -960,10 +952,8 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                         model_->compiled_->descriptor.hidden_size,
                         verified_hidden.row(index));
                 }
-                state_->speculative_main_hidden =
-                    std::move(verified_hidden);
-                state_->speculative_main_hidden_position =
-                    sequence_length_;
+                state_->speculative_main_hidden = std::move(verified_hidden);
+                state_->speculative_main_hidden_position = sequence_length_;
                 return logits;
             };
             auto target_logits = execute_target_verify();
@@ -1183,8 +1173,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                     emitted);
                 for (size_t index = 0; index < emitted; ++index)
                 {
-                    state_->speculative_direct_alignment_ids[index] =
-                        output_tokens[index].token_id;
+                    state_->speculative_direct_alignment_ids[index] = output_tokens[index].token_id;
                 }
             }
             auto speculative_context = executor_->update_speculative_context(
@@ -1261,8 +1250,7 @@ Result<void> Session::reset()
     statistics_scratch_ = {};
     statistics_scratch_.expert_token_counts.resize(model_->descriptor().expert_count, 0);
     state_.reset(new CpuSessionState(model_->execution_graph()));
-    state_->speculative_context_enabled =
-        speculative_context_enabled_;
+    state_->speculative_context_enabled = speculative_context_enabled_;
     generation_start_statistics_ = {};
     generation_active_ = false;
     generation_input_tokens_ = 0;
@@ -1426,12 +1414,9 @@ Result<std::vector<PrefillResult>> SessionBatchAccess::prefill(
         metrics.logical_expert_batches += execution_metrics.logical_expert_batches;
         metrics.physical_expert_batches += execution_metrics.physical_expert_batches;
         metrics.coalesced_expert_routes += execution_metrics.coalesced_expert_routes;
-        metrics.vulkan_attention_batch_submissions +=
-            execution_metrics.vulkan_attention_batch_submissions;
-        metrics.vulkan_attention_batch_rows +=
-            execution_metrics.vulkan_attention_batch_rows;
-        metrics.vulkan_attention_batch_avoided_submissions +=
-            execution_metrics.vulkan_attention_batch_avoided_submissions;
+        metrics.vulkan_attention_batch_submissions += execution_metrics.vulkan_attention_batch_submissions;
+        metrics.vulkan_attention_batch_rows += execution_metrics.vulkan_attention_batch_rows;
+        metrics.vulkan_attention_batch_avoided_submissions += execution_metrics.vulkan_attention_batch_avoided_submissions;
         metrics.max_expert_batch_size = std::max(
             metrics.max_expert_batch_size,
             execution_metrics.max_expert_batch_size);
@@ -1573,12 +1558,9 @@ Result<std::vector<DecodeResult>> SessionBatchAccess::decode(std::span<Session* 
     metrics.logical_expert_batches += execution_metrics.logical_expert_batches;
     metrics.physical_expert_batches += execution_metrics.physical_expert_batches;
     metrics.coalesced_expert_routes += execution_metrics.coalesced_expert_routes;
-    metrics.vulkan_attention_batch_submissions +=
-        execution_metrics.vulkan_attention_batch_submissions;
-    metrics.vulkan_attention_batch_rows +=
-        execution_metrics.vulkan_attention_batch_rows;
-    metrics.vulkan_attention_batch_avoided_submissions +=
-        execution_metrics.vulkan_attention_batch_avoided_submissions;
+    metrics.vulkan_attention_batch_submissions += execution_metrics.vulkan_attention_batch_submissions;
+    metrics.vulkan_attention_batch_rows += execution_metrics.vulkan_attention_batch_rows;
+    metrics.vulkan_attention_batch_avoided_submissions += execution_metrics.vulkan_attention_batch_avoided_submissions;
     metrics.max_expert_batch_size = std::max(metrics.max_expert_batch_size, execution_metrics.max_expert_batch_size);
     return results;
 }

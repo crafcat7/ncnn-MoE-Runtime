@@ -113,8 +113,7 @@ static void execute_depthwise_convolution_row(
     }
     for (uint32_t channel = 0; channel < columns; ++channel)
     {
-        float* history =
-            state.data() + static_cast<size_t>(channel) * kernel_size;
+        float* history = state.data() + static_cast<size_t>(channel) * kernel_size;
         std::move(history + 1, history + kernel_size, history);
         history[kernel_size - 1] = values[channel];
         float sum = 0.0f;
@@ -157,8 +156,7 @@ static void execute_gated_delta_recurrence_row(
     // multiplies for every replicated value head.
     for (uint32_t key_head = 0; key_head < plan.kv_head_count; ++key_head)
     {
-        float* query =
-            qkv + static_cast<size_t>(key_head) * plan.head_dimension;
+        float* query = qkv + static_cast<size_t>(key_head) * plan.head_dimension;
         float* key = qkv + key_size
                      + static_cast<size_t>(key_head) * plan.head_dimension;
         float query_square_sum = 0.0f;
@@ -176,10 +174,8 @@ static void execute_gated_delta_recurrence_row(
                 key_square_sum += key[column] * key[column];
             }
         }
-        const float query_inverse_norm =
-            1.0f / std::sqrt(query_square_sum + 1e-6f);
-        const float key_inverse_norm =
-            1.0f / std::sqrt(key_square_sum + 1e-6f);
+        const float query_inverse_norm = 1.0f / std::sqrt(query_square_sum + 1e-6f);
+        const float key_inverse_norm = 1.0f / std::sqrt(key_square_sum + 1e-6f);
         if (vectorized)
         {
             float_scale_inplace(query, query_inverse_norm, plan.head_dimension);
@@ -204,8 +200,7 @@ static void execute_gated_delta_recurrence_row(
     for (uint32_t value_head = 0; value_head < plan.head_count; ++value_head)
     {
         const uint32_t key_head = value_head / head_ratio;
-        const float* query =
-            qkv + static_cast<size_t>(key_head) * plan.head_dimension;
+        const float* query = qkv + static_cast<size_t>(key_head) * plan.head_dimension;
         const float* key = qkv + key_size
                            + static_cast<size_t>(key_head)
                                  * plan.head_dimension;
@@ -218,14 +213,12 @@ static void execute_gated_delta_recurrence_row(
             * gated_delta_softplus(
                 alpha_values[value_head]
                 + gated_delta_tensor_value(time_bias, value_head)));
-        float* recurrent =
-            cache.gated_delta_recurrent.data()
-            + static_cast<size_t>(value_head) * plan.head_dimension
-                  * plan.value_head_dimension;
-        float* head_output =
-            recurrent_output
-            + static_cast<size_t>(value_head)
-                  * plan.value_head_dimension;
+        float* recurrent = cache.gated_delta_recurrent.data()
+                           + static_cast<size_t>(value_head) * plan.head_dimension
+                                 * plan.value_head_dimension;
+        float* head_output = recurrent_output
+                             + static_cast<size_t>(value_head)
+                                   * plan.value_head_dimension;
         if (vectorized)
         {
             // Keep the state in its public [key][value] layout, but traverse it
@@ -250,8 +243,7 @@ static void execute_gated_delta_recurrence_row(
                  value_column < plan.value_head_dimension;
                  ++value_column)
             {
-                delta[value_column] =
-                    (value[value_column] - memory[value_column]) * beta;
+                delta[value_column] = (value[value_column] - memory[value_column]) * beta;
             }
             for (uint32_t key_column = 0;
                  key_column < plan.head_dimension;
@@ -291,10 +283,9 @@ static void execute_gated_delta_recurrence_row(
                  key_column < plan.head_dimension;
                  ++key_column)
             {
-                float* recurrent_row =
-                    recurrent
-                    + static_cast<size_t>(key_column)
-                          * plan.value_head_dimension;
+                float* recurrent_row = recurrent
+                                       + static_cast<size_t>(key_column)
+                                             * plan.value_head_dimension;
                 for (uint32_t value_column = 0;
                      value_column < plan.value_head_dimension;
                      ++value_column)
@@ -311,33 +302,29 @@ static void execute_gated_delta_recurrence_row(
                      key_column < plan.head_dimension;
                      ++key_column)
                 {
-                    memory_value +=
-                        recurrent[static_cast<size_t>(key_column)
-                                      * plan.value_head_dimension
-                                  + value_column]
-                        * key[key_column];
+                    memory_value += recurrent[static_cast<size_t>(key_column)
+                                                  * plan.value_head_dimension
+                                              + value_column]
+                                    * key[key_column];
                 }
-                const float value_delta =
-                    (value[value_column] - memory_value) * beta;
+                const float value_delta = (value[value_column] - memory_value) * beta;
                 for (uint32_t key_column = 0;
                      key_column < plan.head_dimension;
                      ++key_column)
                 {
                     recurrent[static_cast<size_t>(key_column)
                                   * plan.value_head_dimension
-                              + value_column] +=
-                        key[key_column] * value_delta;
+                              + value_column] += key[key_column] * value_delta;
                 }
                 float output_value = 0.0f;
                 for (uint32_t key_column = 0;
                      key_column < plan.head_dimension;
                      ++key_column)
                 {
-                    output_value +=
-                        recurrent[static_cast<size_t>(key_column)
-                                      * plan.value_head_dimension
-                                  + value_column]
-                        * query[key_column];
+                    output_value += recurrent[static_cast<size_t>(key_column)
+                                                  * plan.value_head_dimension
+                                              + value_column]
+                                    * query[key_column];
                 }
                 head_output[value_column] = output_value * query_scale;
             }
@@ -355,23 +342,18 @@ static void execute_gated_delta_recurrence_row(
                  value_column < plan.value_head_dimension;
                  ++value_column)
             {
-                square_sum +=
-                    head_output[value_column] * head_output[value_column];
+                square_sum += head_output[value_column] * head_output[value_column];
             }
         }
-        const float inverse_rms =
-            1.0f
-            / std::sqrt(
-                square_sum
-                    / static_cast<float>(plan.value_head_dimension)
-                + norm_epsilon);
-        const float* head_gate =
-            z + static_cast<size_t>(value_head)
-                    * plan.value_head_dimension;
-        const bool vectorized_norm =
-            vectorized
-            && (norm_weight.dtype == DType::Float32
-                || norm_weight.dtype == DType::BFloat16);
+        const float inverse_rms = 1.0f
+                                  / std::sqrt(
+                                      square_sum
+                                          / static_cast<float>(plan.value_head_dimension)
+                                      + norm_epsilon);
+        const float* head_gate = z + static_cast<size_t>(value_head) * plan.value_head_dimension;
+        const bool vectorized_norm = vectorized
+                                     && (norm_weight.dtype == DType::Float32
+                                         || norm_weight.dtype == DType::BFloat16);
         if (vectorized_norm && norm_weight.dtype == DType::Float32)
         {
             float_weighted_scale(
@@ -398,17 +380,15 @@ static void execute_gated_delta_recurrence_row(
         {
             if (vectorized_norm)
             {
-                head_output[value_column] *=
-                    head_gate[value_column]
-                    * gated_delta_sigmoid(head_gate[value_column]);
+                head_output[value_column] *= head_gate[value_column]
+                                             * gated_delta_sigmoid(head_gate[value_column]);
             }
             else
             {
-                head_output[value_column] *=
-                    inverse_rms
-                    * gated_delta_tensor_value(norm_weight, value_column)
-                    * (head_gate[value_column]
-                       * gated_delta_sigmoid(head_gate[value_column]));
+                head_output[value_column] *= inverse_rms
+                                             * gated_delta_tensor_value(norm_weight, value_column)
+                                             * (head_gate[value_column]
+                                                * gated_delta_sigmoid(head_gate[value_column]));
             }
         }
     }
@@ -427,16 +407,14 @@ Result<void> execute_gated_delta_net_into(
     uint64_t optimization_flags)
 {
     const CompiledOperator& gated_delta_operator = operators.at(plan.gated_delta_vulkan_operator);
-    const bool device_state_available =
-        backend == ExecutionBackend::Vulkan
-        && gated_delta_operator.gated_delta
-        && (cache.gated_delta_device_state
-            || hidden.rows() == 1);
+    const bool device_state_available = backend == ExecutionBackend::Vulkan
+                                        && gated_delta_operator.gated_delta
+                                        && (cache.gated_delta_device_state
+                                            || hidden.rows() == 1);
     bool normalized_ready = false;
     if (device_state_available)
     {
-        const bool device_input_rms_norm =
-            gated_delta_operator.gated_delta->has_input_rms_norm();
+        const bool device_input_rms_norm = gated_delta_operator.gated_delta->has_input_rms_norm();
         if (!device_input_rms_norm)
         {
             rms_norm_batch_into(
@@ -449,14 +427,14 @@ Result<void> execute_gated_delta_net_into(
             normalized_ready = true;
         }
         const bool device_executed = device_input_rms_norm
-                                          ? gated_delta_operator.gated_delta->forward_input_rms_norm(
-                                                hidden,
-                                                cache,
-                                                scratch.projected)
-                                          : gated_delta_operator.gated_delta->forward(
-                                                scratch.normalized,
-                                                cache,
-                                                scratch.projected);
+                                         ? gated_delta_operator.gated_delta->forward_input_rms_norm(
+                                               hidden,
+                                               cache,
+                                               scratch.projected)
+                                         : gated_delta_operator.gated_delta->forward(
+                                               scratch.normalized,
+                                               cache,
+                                               scratch.projected);
         if (device_executed)
         {
             output = hidden;
@@ -467,8 +445,7 @@ Result<void> execute_gated_delta_net_into(
                 record_gated_delta_cache_transaction_row(cache);
             cache.gated_delta_token_count += hidden.rows();
             if (cache.gated_delta_device_state)
-                cache.device_allocated_bytes =
-                    cache.gated_delta_device_state->allocated_bytes();
+                cache.device_allocated_bytes = cache.gated_delta_device_state->allocated_bytes();
             return {};
         }
 
@@ -517,29 +494,25 @@ Result<void> execute_gated_delta_net_into(
 
     configure_gated_delta_cache(cache, plan);
     const uint32_t key_size = plan.kv_head_count * plan.head_dimension;
-    const uint32_t value_size =
-        plan.head_count * plan.value_head_dimension;
+    const uint32_t value_size = plan.head_count * plan.value_head_dimension;
     const uint32_t convolution_size = key_size * 2 + value_size;
-    const uint32_t fused_columns =
-        convolution_size + value_size + plan.head_count * 2;
+    const uint32_t fused_columns = convolution_size + value_size + plan.head_count * 2;
     const CompiledOperator& fused_delta_bfloat16_operator = operators.at(plan.fused_delta_input_bfloat16_operator);
     const CompiledOperator& fused_delta_linear_operator = operators.at(plan.fused_delta_input_operator);
-    bool fused_input =
-        (backend == ExecutionBackend::Vulkan
-         && fused_delta_bfloat16_operator.bfloat16
-         && fused_delta_bfloat16_operator.bfloat16->forward(
-             scratch.normalized,
-             scratch.fused_input))
-        || (backend == ExecutionBackend::Vulkan
-            && fused_delta_linear_operator.linear
-            && fused_delta_linear_operator.linear->forward(
-                scratch.normalized,
-                scratch.fused_input));
+    bool fused_input = (backend == ExecutionBackend::Vulkan
+                        && fused_delta_bfloat16_operator.bfloat16
+                        && fused_delta_bfloat16_operator.bfloat16->forward(
+                            scratch.normalized,
+                            scratch.fused_input))
+                       || (backend == ExecutionBackend::Vulkan
+                           && fused_delta_linear_operator.linear
+                           && fused_delta_linear_operator.linear->forward(
+                               scratch.normalized,
+                               scratch.fused_input));
     if (fused_input)
     {
-        fused_input =
-            scratch.fused_input.rows() == hidden.rows()
-            && scratch.fused_input.columns() == fused_columns;
+        fused_input = scratch.fused_input.rows() == hidden.rows()
+                      && scratch.fused_input.columns() == fused_columns;
     }
     if (!fused_input)
     {
@@ -621,6 +594,7 @@ bool execute_gated_delta_net_batch_into(
     ExecutionBackend backend,
     float norm_epsilon,
     std::span<CpuGatedDeltaBatchEntry> entries,
+    CpuGatedDeltaBatchScratch& scratch,
     uint64_t optimization_flags)
 {
     if (entries.empty())
@@ -651,7 +625,8 @@ bool execute_gated_delta_net_batch_into(
         return true;
     }
 
-    std::vector<NcnnVulkanGatedDeltaBatchEntry> device_entries;
+    std::vector<NcnnVulkanGatedDeltaBatchEntry>& device_entries = scratch.device_entries;
+    device_entries.clear();
     device_entries.reserve(entries.size());
     for (CpuGatedDeltaBatchEntry& entry : entries)
     {
@@ -668,19 +643,16 @@ bool execute_gated_delta_net_batch_into(
             entry.scratch->normalized,
             plan.norm_weight_offset,
             optimization_flags);
-        device_entries.push_back({
-            &entry.scratch->normalized,
-            entry.cache,
-            &entry.scratch->projected});
+        device_entries.push_back({&entry.scratch->normalized,
+                                  entry.cache,
+                                  &entry.scratch->projected});
     }
 
-    NcnnVulkanGatedDeltaBatchResult batch_result =
-        NcnnVulkanGatedDeltaBatchResult::NotExecuted;
+    NcnnVulkanGatedDeltaBatchResult batch_result = NcnnVulkanGatedDeltaBatchResult::NotExecuted;
     if (!device_entries.empty()
         && device_entries.size() == entries.size())
     {
-        batch_result =
-            gated_delta_operator.gated_delta->forward_batch(device_entries);
+        batch_result = gated_delta_operator.gated_delta->forward_batch(device_entries);
     }
     if (batch_result == NcnnVulkanGatedDeltaBatchResult::Executed)
     {

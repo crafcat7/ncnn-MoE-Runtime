@@ -15,9 +15,7 @@ struct CpuThreadBudget
     uint32_t reserved_io_threads = 1;
     uint32_t reserved_service_threads = 1;
     uint32_t compute_threads = 1;
-    // The hard compute cap includes reservations that can be borrowed while
-    // their owning pool is idle. An explicit compute request also acts as a
-    // cap, so callers can keep the previous fixed-budget behavior.
+    // Idle I/O and service reservations may be borrowed by compute.
     uint32_t max_compute_threads = 1;
 };
 
@@ -26,9 +24,7 @@ struct CpuThreadBudget
     uint32_t requested_service_threads = 1,
     uint32_t requested_compute_threads = 0) noexcept;
 
-// OpenMP's process-level thread setting is not isolated reliably by every
-// Windows runtime. Keep the scheduler's execution cap in a thread-local
-// override so a worker cannot lower the limit seen by an unrelated session.
+// Per-thread OpenMP limit used by scheduler workers.
 class CpuOpenMpThreadLimitScope
 {
 public:
@@ -45,8 +41,7 @@ private:
     uint32_t previous_ = 0;
 };
 
-// Returns the current thread's OpenMP team limit before topology clipping.
-// A zero scope override falls back to the runtime's configured limit.
+// Returns the current thread's OpenMP limit.
 [[nodiscard]] uint32_t cpu_openmp_thread_limit() noexcept;
 
 struct CpuThreadBudgetSnapshot
@@ -64,9 +59,7 @@ struct CpuThreadBudgetSnapshot
     uint64_t compute_returns = 0;
 };
 
-// A small in-process coordinator for scheduler work. It does not create
-// threads; it only leases the already configured CPU budget. Compute leases
-// may borrow idle I/O/service reservations and return them on destruction.
+// Leases the configured CPU budget without creating threads.
 class CpuThreadBudgetController
 {
 public:
@@ -89,8 +82,10 @@ public:
         Lease(Lease&& other) noexcept;
         Lease& operator=(Lease&& other) noexcept;
 
-        [[nodiscard]] uint32_t size() const noexcept { return count_; }
-        [[nodiscard]] bool empty() const noexcept { return count_ == 0; }
+        [[nodiscard]] uint32_t size() const noexcept
+        { return count_; }
+        [[nodiscard]] bool empty() const noexcept
+        { return count_ == 0; }
 
     private:
         friend class CpuThreadBudgetController;
@@ -114,17 +109,16 @@ public:
 
     explicit CpuThreadBudgetController(CpuThreadBudget budget) noexcept;
 
-    [[nodiscard]] const CpuThreadBudget& budget() const noexcept { return budget_; }
+    [[nodiscard]] const CpuThreadBudget& budget() const noexcept
+    { return budget_; }
 
-    // The blocking form waits only for the minimum requested progress. It may
-    // return fewer than requested when another pool is temporarily active.
+    // Blocking acquisition for the requested minimum.
     [[nodiscard]] Lease acquire_compute(
         uint32_t requested,
         bool allow_idle_reservations = true,
         uint32_t minimum = 1);
 
-    // The non-blocking form is used by a running team to reclaim currently
-    // idle capacity without making scheduler workers wait on one another.
+    // Non-blocking acquisition for already-running teams.
     [[nodiscard]] Lease try_acquire_compute(
         uint32_t requested,
         bool allow_idle_reservations = true) noexcept;
@@ -154,9 +148,7 @@ private:
     uint64_t compute_returns_ = 0;
 };
 
-// Select a useful team from a normalized work shape. independent_work_items
-// describes parallel request/row groups; work_units lets short shapes use a
-// smaller team while larger shapes can reach threads_per_work_item.
+// Select a team size for the given work shape.
 [[nodiscard]] uint32_t choose_cpu_team_size(
     uint64_t work_units,
     uint32_t independent_work_items,

@@ -25,10 +25,7 @@ CpuThreadBudget resolve_cpu_thread_budget(
 {
     const uint32_t logical_threads = std::max(1u, std::thread::hardware_concurrency());
     const uint32_t physical_cores = std::max(1u, discover_cpu_topology().physical_core_count);
-    // File-backed Expert loads are latency-bound and the cache has its own
-    // adaptive shrink path.  Starting with one worker prevents that policy
-    // from ever discovering useful parallel reads; reserve a moderate
-    // physical-core fraction instead of competing with every OpenMP lane.
+    // Keep I/O parallelism bounded so it does not consume the compute pool.
     const uint32_t automatic_io = std::min(
         physical_cores,
         std::min(6u, std::max(2u, physical_cores / 2u)));

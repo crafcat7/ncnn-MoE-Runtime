@@ -586,7 +586,7 @@ static bool simd_float8_quantization_enabled(uint64_t optimization_flags) noexce
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
     return (detect_cpu_isa_capabilities().flags & CpuIsaX86Avx512) != 0
            && runtime_optimization_enabled(optimization_flags,
-               RuntimeOptimizationCpuFloat8SimdQuantize);
+                                           RuntimeOptimizationCpuFloat8SimdQuantize);
 #else
     return false;
 #endif

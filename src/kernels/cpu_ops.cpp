@@ -202,9 +202,7 @@ static uint32_t select_cpu_linear_thread_limit() noexcept
 
 uint32_t cpu_linear_thread_limit() noexcept
 {
-    // Scheduler workers install a thread-local execution cap. Do not cache
-    // the process-wide OpenMP value here, or a nested Linear/Attention call
-    // would recreate the oversubscription that the scheduler budget prevents.
+    // Honor the scheduler's thread-local OpenMP cap.
     return select_cpu_linear_thread_limit();
 }
 
@@ -217,14 +215,10 @@ static int openmp_linear_team_size(uint64_t operation_count, DType dtype) noexce
 {
 #if defined(_OPENMP)
     // Scale the OpenMP team by operation count.
-    // A one-row 256 x 4096 FP32/BF16 router sits exactly at one million
-    // operations. Spawning four workers for that shape costs more than the
-    // dot products, while the packed FP8 path still benefits at this size.
     static constexpr uint64_t minimum_parallel_operations = 1024 * 1024;
     static constexpr uint64_t minimum_dense_parallel_operations = 2 * 1024 * 1024;
     static constexpr uint64_t full_team_operations = 8 * 1024 * 1024;
-    const uint64_t minimum_operations =
-        dtype == DType::Float8E4M3 ? minimum_parallel_operations : minimum_dense_parallel_operations;
+    const uint64_t minimum_operations = dtype == DType::Float8E4M3 ? minimum_parallel_operations : minimum_dense_parallel_operations;
     if (omp_in_parallel() != 0 || operation_count < minimum_operations)
     {
         return 1;
@@ -271,8 +265,7 @@ static float expert_activation(
                * (1.0f + std::erf(value / std::sqrt(2.0f)));
     case ExpertActivation::ClampedSilu:
     {
-        const float clamped =
-            limit > 0.0f ? std::clamp(value, -limit, limit) : value;
+        const float clamped = limit > 0.0f ? std::clamp(value, -limit, limit) : value;
         return scaled_silu(clamped, 1.0f, optimization_flags);
     }
     case ExpertActivation::DeepSeekSwiGlu:
@@ -312,10 +305,7 @@ static void apply_float8_gate_up_activation(
             up_value = std::clamp(up_value, -activation_limit,
                                   activation_limit);
         }
-        output[column] =
-            up_value * expert_activation(gate[column], activation,
-                                          activation_limit,
-                                          optimization_flags);
+        output[column] = up_value * expert_activation(gate[column], activation, activation_limit, optimization_flags);
     }
 }
 
@@ -335,9 +325,7 @@ void embedding_batch_into(const TensorData& embedding, std::span<const int32_t> 
 
 static void prepare_float8_input(CpuBatch& scratch, const CpuBatch& input)
 {
-    // The FP8 CPU kernel quantizes the activation before every projection.
-    // Ownership stays with the operation caller so separate Sessions and
-    // worker teams cannot observe or reuse one another's scratch storage.
+    // Quantized activation scratch belongs to the operation caller.
     scratch.reset(input.rows(), input.columns(), false);
     for (size_t row = 0; row < input.rows(); ++row)
     {
@@ -358,7 +346,7 @@ static void prepare_quantized_float8_input(CpuBatch& scratch, const CpuBatch& in
 static bool cpu_float8_fused_projections_enabled(uint64_t optimization_flags) noexcept
 {
     return runtime_optimization_enabled(optimization_flags,
-        RuntimeOptimizationCpuFloat8FusedProjections);
+                                        RuntimeOptimizationCpuFloat8FusedProjections);
 }
 
 static void float8_linear_group_into(
@@ -373,12 +361,10 @@ static void float8_linear_group_into(
 {
     const uint32_t input_columns = matrix.shape[1];
     const std::span<const uint8_t> matrix_values = matrix.float8_values();
-    const uint8_t* weights =
-        matrix_values.data()
-        + static_cast<size_t>(first_output_column) * input_columns;
-    const float* scales =
-        matrix.quantization_scales.data()
-        + static_cast<size_t>(first_output_column / block_size) * input_blocks;
+    const uint8_t* weights = matrix_values.data()
+                             + static_cast<size_t>(first_output_column) * input_columns;
+    const float* scales = matrix.quantization_scales.data()
+                          + static_cast<size_t>(first_output_column / block_size) * input_blocks;
     if (quantized_input.rows() > 1)
     {
         float8_e4m3_quantized_input_dot_rows_batch(
@@ -393,10 +379,9 @@ static void float8_linear_group_into(
     {
         if (group_size == 1)
         {
-            output.row(token_index)[first_output_column] =
-                float8_e4m3_quantized_input_dot(
-                    weights, scales, quantized_input.row(token_index),
-                    input_columns, block_size, optimization_flags);
+            output.row(token_index)[first_output_column] = float8_e4m3_quantized_input_dot(
+                weights, scales, quantized_input.row(token_index),
+                input_columns, block_size, optimization_flags);
         }
         else
         {
@@ -425,10 +410,8 @@ static void float8_linear_quantized_into(
     const uint32_t input_columns = matrix.shape[1];
     assert(quantized_input.columns() == input_columns);
     constexpr uint32_t block_size = 128;
-    const uint32_t input_blocks =
-        (input_columns + block_size - 1) / block_size;
-    const uint32_t output_blocks =
-        (output_columns + block_size - 1) / block_size;
+    const uint32_t input_blocks = (input_columns + block_size - 1) / block_size;
+    const uint32_t output_blocks = (output_columns + block_size - 1) / block_size;
     const std::span<const uint8_t> matrix_values = matrix.float8_values();
     assert(matrix_values.size() == matrix.element_count());
     assert(matrix.quantization_scales.size()
@@ -436,14 +419,11 @@ static void float8_linear_quantized_into(
     (void)output_blocks;
 
     output.reset(quantized_input.rows(), output_columns, false);
-    const uint64_t operation_count =
-        static_cast<uint64_t>(output_columns) * input_columns
-        * quantized_input.rows();
-    const int linear_team_size =
-        openmp_linear_team_size(operation_count, matrix.dtype);
+    const uint64_t operation_count = static_cast<uint64_t>(output_columns) * input_columns
+                                     * quantized_input.rows();
+    const int linear_team_size = openmp_linear_team_size(operation_count, matrix.dtype);
     const bool parallelize_linear = linear_team_size > 1;
-    const int64_t parallel_output_columns =
-        static_cast<int64_t>(output_columns);
+    const int64_t parallel_output_columns = static_cast<int64_t>(output_columns);
 
     const uint32_t row_group_size = float8_linear_row_group_size_for_shape(
         matrix, quantized_input.rows(), optimization_flags);
@@ -453,15 +433,13 @@ static void float8_linear_quantized_into(
                             / row_group_size;
          ++output_group)
     {
-        const uint32_t first_output_column =
-            static_cast<uint32_t>(output_group) * row_group_size;
-        const uint32_t group_size =
-            std::min(row_group_size,
-                     output_columns - first_output_column);
+        const uint32_t first_output_column = static_cast<uint32_t>(output_group) * row_group_size;
+        const uint32_t group_size = std::min(row_group_size,
+                                             output_columns - first_output_column);
         float8_linear_group_into(
             matrix, quantized_input, output, first_output_column, group_size,
             input_blocks, block_size, optimization_flags);
-}
+    }
 }
 
 static bool float32_linear_gemm_tile_into(
@@ -470,9 +448,7 @@ static bool float32_linear_gemm_tile_into(
     CpuBatch& output,
     int team_size)
 {
-    // M=1 is a GEMV and remains on the row-parallel fallback.  M>=2 uses a
-    // small MxN tile so the input vector is loaded once for several output
-    // rows; prefill naturally walks the same tile over all token groups.
+    // GEMV stays row-parallel; larger batches use an MxN tile.
     if (input.rows() < 2 || matrix.shape[0] < 2 || matrix.shape[1] < 16)
         return false;
     const uint32_t output_columns = matrix.shape[0];
@@ -567,8 +543,7 @@ static uint32_t float8_linear_row_group_size_for_shape(
     const uint32_t kernel_group = float8_linear_row_group_size(optimization_flags);
     if (token_count == 1 || matrix.shape[0] < 8)
         return kernel_group;
-    // Keep decode small and use a wider output tile for small-batch/prefill
-    // calls so the quantized activation block is reused across more rows.
+    // Use a wider output tile when activation reuse is available.
     return std::max(8u, kernel_group);
 }
 
@@ -598,14 +573,10 @@ bool float8_linear_pair_batch_into(
 
     // Keep the paired path free of decoded-weight side storage.
     constexpr uint32_t block_size = 128;
-    const uint32_t first_input_blocks =
-        (first.shape[1] + block_size - 1) / block_size;
-    const uint32_t second_input_blocks =
-        (second.shape[1] + block_size - 1) / block_size;
-    const uint32_t first_output_blocks =
-        (first.shape[0] + block_size - 1) / block_size;
-    const uint32_t second_output_blocks =
-        (second.shape[0] + block_size - 1) / block_size;
+    const uint32_t first_input_blocks = (first.shape[1] + block_size - 1) / block_size;
+    const uint32_t second_input_blocks = (second.shape[1] + block_size - 1) / block_size;
+    const uint32_t first_output_blocks = (first.shape[0] + block_size - 1) / block_size;
+    const uint32_t second_output_blocks = (second.shape[0] + block_size - 1) / block_size;
     if (first.float8_values().size() != first.element_count()
         || second.float8_values().size() != second.element_count()
         || first.quantization_scales.size()
@@ -624,18 +595,14 @@ bool float8_linear_pair_batch_into(
     prepare_quantized_float8_input(quantized_input, input, optimization_flags);
 
     const uint32_t row_group_size = float8_linear_row_group_size(optimization_flags);
-    const int64_t first_group_count =
-        (static_cast<int64_t>(first.shape[0]) + row_group_size - 1)
-        / row_group_size;
-    const int64_t second_group_count =
-        (static_cast<int64_t>(second.shape[0]) + row_group_size - 1)
-        / row_group_size;
-    uint64_t operation_count =
-        static_cast<uint64_t>(first.shape[0]) * first.shape[1]
-        * input.rows();
-    const uint64_t second_operations =
-        static_cast<uint64_t>(second.shape[0]) * second.shape[1]
-        * input.rows();
+    const int64_t first_group_count = (static_cast<int64_t>(first.shape[0]) + row_group_size - 1)
+                                      / row_group_size;
+    const int64_t second_group_count = (static_cast<int64_t>(second.shape[0]) + row_group_size - 1)
+                                       / row_group_size;
+    uint64_t operation_count = static_cast<uint64_t>(first.shape[0]) * first.shape[1]
+                               * input.rows();
+    const uint64_t second_operations = static_cast<uint64_t>(second.shape[0]) * second.shape[1]
+                                       * input.rows();
     if (operation_count > std::numeric_limits<uint64_t>::max()
                               - second_operations)
     {
@@ -645,8 +612,7 @@ bool float8_linear_pair_batch_into(
     {
         operation_count += second_operations;
     }
-    const int team_size =
-        openmp_linear_team_size(operation_count, DType::Float8E4M3);
+    const int team_size = openmp_linear_team_size(operation_count, DType::Float8E4M3);
     const bool parallelize = team_size > 1;
 #pragma omp parallel num_threads(team_size) if (parallelize)
     {
@@ -654,11 +620,9 @@ bool float8_linear_pair_batch_into(
         for (int64_t output_group = 0; output_group < first_group_count;
              ++output_group)
         {
-            const uint32_t first_output_column =
-                static_cast<uint32_t>(output_group) * row_group_size;
-            const uint32_t group_size =
-                std::min(row_group_size,
-                         first.shape[0] - first_output_column);
+            const uint32_t first_output_column = static_cast<uint32_t>(output_group) * row_group_size;
+            const uint32_t group_size = std::min(row_group_size,
+                                                 first.shape[0] - first_output_column);
             float8_linear_group_into(
                 first, quantized_input, first_output, first_output_column,
                 group_size, first_input_blocks, block_size, optimization_flags);
@@ -667,11 +631,9 @@ bool float8_linear_pair_batch_into(
         for (int64_t output_group = 0; output_group < second_group_count;
              ++output_group)
         {
-            const uint32_t first_output_column =
-                static_cast<uint32_t>(output_group) * row_group_size;
-            const uint32_t group_size =
-                std::min(row_group_size,
-                         second.shape[0] - first_output_column);
+            const uint32_t first_output_column = static_cast<uint32_t>(output_group) * row_group_size;
+            const uint32_t group_size = std::min(row_group_size,
+                                                 second.shape[0] - first_output_column);
             float8_linear_group_into(
                 second, quantized_input, second_output, first_output_column,
                 group_size, second_input_blocks, block_size, optimization_flags);
@@ -710,14 +672,13 @@ bool float8_linear_rms_norm_batch_into(
         const float* source = input.row(token_index);
         float* destination = quantized_input.row(token_index);
         const float square_sum = use_simd
-                                    ? float_dot(source, source,
-                                                input.columns())
-                                    : std::inner_product(
-                                          source,
-                                          source + input.columns(), source,
-                                          0.0f);
-        const float inverse_rms = 1.0f / std::sqrt(
-            square_sum / static_cast<float>(input.columns()) + epsilon);
+                                     ? float_dot(source, source,
+                                                 input.columns())
+                                     : std::inner_product(
+                                           source,
+                                           source + input.columns(), source,
+                                           0.0f);
+        const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(input.columns()) + epsilon);
         if (norm_weight.dtype == DType::Float32)
         {
             if (use_simd)
@@ -728,11 +689,9 @@ bool float8_linear_rms_norm_batch_into(
             }
             else
             {
-                const std::span<const float> weights =
-                    norm_weight.float32_values();
+                const std::span<const float> weights = norm_weight.float32_values();
                 for (uint32_t column = 0; column < input.columns(); ++column)
-                    destination[column] =
-                        source[column] * inverse_rms * weights[column];
+                    destination[column] = source[column] * inverse_rms * weights[column];
             }
         }
         else if (use_simd)
@@ -743,13 +702,11 @@ bool float8_linear_rms_norm_batch_into(
         }
         else
         {
-            const std::span<const uint16_t> weights =
-                norm_weight.bfloat16_values();
+            const std::span<const uint16_t> weights = norm_weight.bfloat16_values();
             for (uint32_t column = 0; column < input.columns(); ++column)
             {
-                destination[column] =
-                    source[column] * inverse_rms
-                    * bfloat16_to_float(weights[column]);
+                destination[column] = source[column] * inverse_rms
+                                      * bfloat16_to_float(weights[column]);
             }
         }
         quantize_float8_e4m3_inplace(
@@ -765,18 +722,15 @@ static std::shared_ptr<const Mxfp4Q8PackedMatrix> get_mxfp4_q8_packed_weights(
     uint32_t block_count,
     size_t row_count)
 {
-    // The sidecar is immutable after publication.  A small striped lock only
-    // protects the first build, so six routed Experts cannot all reorder the
-    // same weight tensor concurrently on a cold decode.
+    // Protect the first immutable sidecar build.
     static std::mutex build_locks[64];
     const uintptr_t storage_key = reinterpret_cast<uintptr_t>(
         matrix.mxfp4_blocks.data());
     std::lock_guard<std::mutex> build_lock(
         build_locks[(storage_key >> 6) & 63u]);
-    std::shared_ptr<const Mxfp4Q8PackedMatrix> cached =
-        std::atomic_load_explicit(
-            &matrix.mxfp4_q8_packed,
-            std::memory_order_acquire);
+    std::shared_ptr<const Mxfp4Q8PackedMatrix> cached = std::atomic_load_explicit(
+        &matrix.mxfp4_q8_packed,
+        std::memory_order_acquire);
     if (cached && cached->valid()
         && cached->rows == row_count
         && cached->block_count == block_count)
@@ -811,9 +765,9 @@ void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch
 
     if (backend == ExecutionBackend::Vulkan
         && ((executable && executable->bfloat16
-         && executable->bfloat16->forward(input, output))
-        || (executable && executable->float8 && executable->float8->forward(input, output))
-        || (executable && executable->linear && executable->linear->forward(input, output))))
+             && executable->bfloat16->forward(input, output))
+            || (executable && executable->float8 && executable->float8->forward(input, output))
+            || (executable && executable->linear && executable->linear->forward(input, output))))
         return;
     require_dense_host_storage(matrix, "linear weight");
     output.reset(input.rows(), output_columns, false);
@@ -867,12 +821,11 @@ void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch
              output_column < parallel_output_columns; ++output_column)
         {
             const uint16_t* weights = matrix_values.data()
-                + static_cast<size_t>(output_column) * input_columns;
+                                      + static_cast<size_t>(output_column) * input_columns;
             for (size_t token_index = 0; token_index < input.rows(); ++token_index)
             {
                 const float* token = input.row(token_index);
-                output.row(token_index)[output_column] =
-                    bfloat16_dot(weights, token, input_columns);
+                output.row(token_index)[output_column] = bfloat16_dot(weights, token, input_columns);
             }
         }
     }
@@ -893,8 +846,7 @@ void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch
             for (size_t token_index = 0; token_index < input.rows(); ++token_index)
             {
                 const float* token = input.row(token_index);
-                output.row(token_index)[output_column] =
-                    int8_float_dot(weights, token, input_columns) * scale;
+                output.row(token_index)[output_column] = int8_float_dot(weights, token, input_columns) * scale;
             }
         }
     }
@@ -914,17 +866,13 @@ void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch
                 input_columns,
                 q8_input);
 
-            // Repack once per immutable weight tensor.  The packed path is
-            // deliberately limited to complete matrices; small tails keep
-            // the established row-pair fallback rather than paying a sidecar
-            // allocation for a one-off tiny operation.
+            // Repack complete matrices; small tails keep the row-pair path.
             if (output_columns >= 4 && mxfp4_q8_packed_kernel_available())
             {
-                const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_weights =
-                    get_mxfp4_q8_packed_weights(
-                        matrix,
-                        blocks_per_row,
-                        output_columns);
+                const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_weights = get_mxfp4_q8_packed_weights(
+                    matrix,
+                    blocks_per_row,
+                    output_columns);
                 if (packed_weights)
                 {
                     mxfp4_q8_packed_gemm(
@@ -1044,10 +992,8 @@ bool fused_float8_gate_up_batch(const TensorData& gate,
     constexpr uint32_t block_size = 128;
     const uint32_t output_columns = gate.shape[0];
     const uint32_t input_columns = gate.shape[1];
-    const uint32_t input_blocks =
-        (input_columns + block_size - 1) / block_size;
-    const uint32_t output_blocks =
-        (output_columns + block_size - 1) / block_size;
+    const uint32_t input_blocks = (input_columns + block_size - 1) / block_size;
+    const uint32_t output_blocks = (output_columns + block_size - 1) / block_size;
     if (gate.float8_values().size() != gate.element_count()
         || up.float8_values().size() != up.element_count()
         || gate.quantization_scales.size()
@@ -1063,14 +1009,11 @@ bool fused_float8_gate_up_batch(const TensorData& gate,
 
     output.reset(input.rows(), output_columns, false);
     const uint32_t row_group_size = float8_linear_row_group_size(optimization_flags);
-    const int64_t output_group_count =
-        (static_cast<int64_t>(output_columns) + row_group_size - 1)
-        / row_group_size;
-    const uint64_t operation_count =
-        static_cast<uint64_t>(output_columns) * input_columns * input.rows()
-        * 2;
-    const int team_size =
-        openmp_linear_team_size(operation_count, DType::Float8E4M3);
+    const int64_t output_group_count = (static_cast<int64_t>(output_columns) + row_group_size - 1)
+                                       / row_group_size;
+    const uint64_t operation_count = static_cast<uint64_t>(output_columns) * input_columns * input.rows()
+                                     * 2;
+    const int team_size = openmp_linear_team_size(operation_count, DType::Float8E4M3);
     const bool parallelize = team_size > 1;
     const std::span<const uint8_t> gate_values = gate.float8_values();
     const std::span<const uint8_t> up_values = up.float8_values();
@@ -1078,24 +1021,18 @@ bool fused_float8_gate_up_batch(const TensorData& gate,
     for (int64_t output_group = 0; output_group < output_group_count;
          ++output_group)
     {
-        const uint32_t first_output_column =
-            static_cast<uint32_t>(output_group) * row_group_size;
-        const uint32_t group_size =
-            std::min(row_group_size, output_columns - first_output_column);
-        const uint8_t* gate_weights =
-            gate_values.data()
-            + static_cast<size_t>(first_output_column) * input_columns;
-        const uint8_t* up_weights =
-            up_values.data()
-            + static_cast<size_t>(first_output_column) * input_columns;
-        const float* gate_scales =
-            gate.quantization_scales.data()
-            + static_cast<size_t>(first_output_column / block_size)
-                  * input_blocks;
-        const float* up_scales =
-            up.quantization_scales.data()
-            + static_cast<size_t>(first_output_column / block_size)
-                  * input_blocks;
+        const uint32_t first_output_column = static_cast<uint32_t>(output_group) * row_group_size;
+        const uint32_t group_size = std::min(row_group_size, output_columns - first_output_column);
+        const uint8_t* gate_weights = gate_values.data()
+                                      + static_cast<size_t>(first_output_column) * input_columns;
+        const uint8_t* up_weights = up_values.data()
+                                    + static_cast<size_t>(first_output_column) * input_columns;
+        const float* gate_scales = gate.quantization_scales.data()
+                                   + static_cast<size_t>(first_output_column / block_size)
+                                         * input_blocks;
+        const float* up_scales = up.quantization_scales.data()
+                                 + static_cast<size_t>(first_output_column / block_size)
+                                       * input_blocks;
         for (size_t token_index = 0; token_index < input.rows();
              ++token_index)
         {
@@ -1138,8 +1075,7 @@ CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* b
 {
     assert(matrix.dtype == DType::MxFp4 && matrix.shape.size() == 2);
     assert(matrix.shape[0] % 2 == 0 && matrix.shape[1] == input.columns());
-    const bool approximate_activation =
-        cpu_fast_silu_enabled(optimization_flags);
+    const bool approximate_activation = cpu_fast_silu_enabled(optimization_flags);
     const uint32_t intermediate_size = matrix.shape[0] / 2;
     const uint32_t input_columns = matrix.shape[1];
     const uint32_t blocks_per_row = input_columns / 32;
@@ -1258,25 +1194,18 @@ CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* b
         }
     };
 
-    // Separate the GEMV row tile from the activation epilogue. The
-    // previous path called rows2 once per output column, which repeatedly
-    // paid the dispatch/loop setup cost for a one-token decode. Keep the
-    // tuned row-pair kernel as the producer and apply the epilogue in chunks
-    // so the contract is useful for both exact and SIMD activation paths.
+    // Keep the row-pair producer and apply the activation epilogue in chunks.
     if (input.rows() == 1 && cpu_mxfp4_bulk_row_pairs_enabled(optimization_flags))
     {
         std::vector<float> linear(intermediate_size);
         const uint32_t pair_chunk_size = 16;
-        const int64_t pair_group_count =
-            (static_cast<int64_t>(intermediate_size) + pair_chunk_size - 1)
-            / pair_chunk_size;
+        const int64_t pair_group_count = (static_cast<int64_t>(intermediate_size) + pair_chunk_size - 1)
+                                         / pair_chunk_size;
 #pragma omp parallel for if (allow_openmp_parallel_region())
         for (int64_t pair_group = 0; pair_group < pair_group_count; ++pair_group)
         {
-            const uint32_t first_column =
-                static_cast<uint32_t>(pair_group) * pair_chunk_size;
-            const uint32_t pair_count =
-                std::min(pair_chunk_size, intermediate_size - first_column);
+            const uint32_t first_column = static_cast<uint32_t>(pair_group) * pair_chunk_size;
+            const uint32_t pair_count = std::min(pair_chunk_size, intermediate_size - first_column);
             const size_t first_row = static_cast<size_t>(first_column) * 2;
             matmul_row_pairs(
                 matrix.mxfp4_blocks.data() + first_row * input_columns / 2,
@@ -1300,10 +1229,8 @@ CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* b
                     || activation == ExpertActivation::DeepSeekSwiGlu
                     || activation == ExpertActivation::GptOssSwiGlu))
             {
-                const float sigmoid_scale =
-                    activation == ExpertActivation::GptOssSwiGlu ? 1.702f : 1.0f;
-                const float up_offset =
-                    activation == ExpertActivation::GptOssSwiGlu ? 1.0f : 0.0f;
+                const float sigmoid_scale = activation == ExpertActivation::GptOssSwiGlu ? 1.702f : 1.0f;
+                const float up_offset = activation == ExpertActivation::GptOssSwiGlu ? 1.0f : 0.0f;
                 float_silu_mul(
                     output.row(0) + first_column,
                     output.row(0) + first_column,
@@ -1335,14 +1262,12 @@ CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* b
                 if (activation == ExpertActivation::Silu
                     || activation == ExpertActivation::DeepSeekSwiGlu)
                 {
-                    output.row(0)[column] =
-                        gate / (1.0f + std::exp(-gate)) * up;
+                    output.row(0)[column] = gate / (1.0f + std::exp(-gate)) * up;
                 }
                 else
                 {
-                    output.row(0)[column] =
-                        selected_scaled_silu(gate, 1.702f, approximate_activation)
-                        * (up + 1.0f);
+                    output.row(0)[column] = selected_scaled_silu(gate, 1.702f, approximate_activation)
+                                            * (up + 1.0f);
                 }
             }
         }
@@ -1376,7 +1301,7 @@ CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* b
         {
             float gate = 0.0f;
             float linear = 0.0f;
-        matmul_rows2(gate_blocks, gate_scales, up_blocks, up_scales, blocks_per_row, input.row(0), input.columns(), 1, &gate, 1, &linear, 1);
+            matmul_rows2(gate_blocks, gate_scales, up_blocks, up_scales, blocks_per_row, input.row(0), input.columns(), 1, &gate, 1, &linear, 1);
             gate += gate_bias;
             linear += up_bias;
             if (activation_limit > 0.0f)
@@ -1403,8 +1328,7 @@ CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* b
             if (parallel_enabled)
                 scratch_worker = static_cast<size_t>(omp_get_thread_num());
 #endif
-            float* linear =
-                linear_scratch.data() + scratch_worker * input.rows();
+            float* linear = linear_scratch.data() + scratch_worker * input.rows();
             matmul_rows2(gate_blocks, gate_scales, up_blocks, up_scales, blocks_per_row, input.row(0), input.columns(), input.rows(),
                          output.row(0) + column, output.columns(), linear, 1);
             for (size_t token_index = 0; token_index < input.rows(); ++token_index)
@@ -1471,8 +1395,8 @@ static size_t find_shared_q8_input_owner(
         return task_index;
 
     const size_t row_bytes = task.input->rows() == 1
-        ? static_cast<size_t>(task.input->columns()) * sizeof(float)
-        : 0;
+                                 ? static_cast<size_t>(task.input->columns()) * sizeof(float)
+                                 : 0;
     for (size_t previous = 0; previous < task_index; ++previous)
     {
         if (owners[previous] == invalid_owner || !tasks[previous].input)
@@ -1502,10 +1426,7 @@ static bool mxfp4_expert_decode(
     std::vector<CpuBatch>& activated = buffers.activated;
     std::vector<CpuBatch>& packed_gate_up = buffers.packed_gate_up;
     std::vector<Mxfp4Q8Batch> q8_inputs;
-    // A single-token AVX512 decode is already covered by the wider float
-    // row-pair kernel.  Keep Q8/packed available for batched paths and
-    // explicit kernel tests, but do not make the current integer GEMV a
-    // default regression for the latency-critical single-session path.
+    // Keep Q8/packed for batched paths; single-token AVX512 uses row pairs.
     const bool use_q8 = cpu_mxfp4_q8_enabled(optimization_flags)
                         && mxfp4_kernel_kind() != MxFp4KernelKind::X86Avx512;
     const size_t invalid_q8_owner = tasks.size();
@@ -1517,8 +1438,7 @@ static bool mxfp4_expert_decode(
     std::vector<uint8_t> q8_down_packed(tasks.size(), 0);
     if (use_q8)
         q8_inputs.resize(tasks.size());
-    const bool approximate_activation =
-        cpu_fast_silu_enabled(optimization_flags);
+    const bool approximate_activation = cpu_fast_silu_enabled(optimization_flags);
     const uint32_t pair_group_size = mxfp4_decode_row_pair_group_size();
     uint64_t gate_pair_group_count = 0;
     uint64_t down_pair_group_count = 0;
@@ -1551,11 +1471,10 @@ static bool mxfp4_expert_decode(
             q8_down_enabled[task_index] = 1;
             if (task.down->shape[0] >= 4 && mxfp4_q8_packed_kernel_available())
             {
-                const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_weights =
-                    get_mxfp4_q8_packed_weights(
-                        *task.down,
-                        intermediate_size / 32,
-                        task.down->shape[0]);
+                const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_weights = get_mxfp4_q8_packed_weights(
+                    *task.down,
+                    intermediate_size / 32,
+                    task.down->shape[0]);
                 q8_down_packed[task_index] = packed_weights ? 1 : 0;
             }
         }
@@ -1578,10 +1497,7 @@ static bool mxfp4_expert_decode(
             }
             if (task.gate_up->shape[0] >= 4 && mxfp4_q8_packed_kernel_available())
             {
-                // The immutable sidecar lookup and GEMV are completed by the
-                // fixed Expert team below.  Keeping this flag here preserves
-                // the packed fast path without serializing six Experts per
-                // decode layer before the OpenMP region starts.
+                // The fixed Expert team completes the sidecar GEMV below.
                 q8_gate_packed[task_index] = 1;
             }
         }
@@ -1636,11 +1552,10 @@ static bool mxfp4_expert_decode(
                 continue;
             const Mxfp4Task& task = tasks[static_cast<size_t>(task_index)];
             const size_t input_owner = q8_input_owner[static_cast<size_t>(task_index)];
-            const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_weights =
-                get_mxfp4_q8_packed_weights(
-                    *task.gate_up,
-                    task.input->columns() / 32,
-                    task.gate_up->shape[0]);
+            const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_weights = get_mxfp4_q8_packed_weights(
+                *task.gate_up,
+                task.input->columns() / 32,
+                task.gate_up->shape[0]);
             if (!packed_weights)
             {
                 q8_gate_packed[static_cast<size_t>(task_index)] = 0;
@@ -1760,8 +1675,7 @@ static bool mxfp4_expert_decode(
             {
                 if (q8_down_enabled[static_cast<size_t>(task_index)])
                 {
-                    const CpuBatch& task_activated =
-                        activated[static_cast<size_t>(task_index)];
+                    const CpuBatch& task_activated = activated[static_cast<size_t>(task_index)];
                     mxfp4_q8_quantize_batch(
                         task_activated.row(0),
                         task_activated.columns(),
@@ -1780,11 +1694,10 @@ static bool mxfp4_expert_decode(
             if (!q8_down_packed[static_cast<size_t>(task_index)])
                 continue;
             const Mxfp4Task& task = tasks[static_cast<size_t>(task_index)];
-            const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_weights =
-                get_mxfp4_q8_packed_weights(
-                    *task.down,
-                    task.down->shape[1] / 32,
-                    task.down->shape[0]);
+            const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_weights = get_mxfp4_q8_packed_weights(
+                *task.down,
+                task.down->shape[1] / 32,
+                task.down->shape[0]);
             if (!packed_weights)
             {
                 q8_down_packed[static_cast<size_t>(task_index)] = 0;
@@ -2041,8 +1954,7 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
     std::vector<CpuBatch>& activated = buffers.activated;
     std::vector<CpuBatch>& linear = buffers.linear;
     std::vector<Mxfp4Q8Batch>& q8_activated = buffers.q8_activated;
-    const bool approximate_activation =
-        cpu_fast_silu_enabled(optimization_flags);
+    const bool approximate_activation = cpu_fast_silu_enabled(optimization_flags);
     uint64_t gate_column_count = 0;
     uint64_t down_row_pair_count = 0;
     uint64_t operation_count = 0;
@@ -2189,10 +2101,8 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
                         || task.activation == ExpertActivation::DeepSeekSwiGlu
                         || task.activation == ExpertActivation::GptOssSwiGlu))
                 {
-                    const float sigmoid_scale =
-                        task.activation == ExpertActivation::GptOssSwiGlu ? 1.702f : 1.0f;
-                    const float up_offset =
-                        task.activation == ExpertActivation::GptOssSwiGlu ? 1.0f : 0.0f;
+                    const float sigmoid_scale = task.activation == ExpertActivation::GptOssSwiGlu ? 1.702f : 1.0f;
+                    const float up_offset = task.activation == ExpertActivation::GptOssSwiGlu ? 1.0f : 0.0f;
                     float_silu_mul(
                         gate_values + local_begin,
                         gate_values + local_begin,
@@ -2238,7 +2148,6 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
             }
             task_begin = task_end;
         }
-
     }
 
     if (use_q8)
@@ -2414,9 +2323,9 @@ void linear_batch_into(const TensorData& matrix, const TensorData& bias, const C
 {
     if (backend == ExecutionBackend::Vulkan
         && ((executable && executable->bfloat16
-         && executable->bfloat16->forward(input, output))
-        || (executable && executable->float8 && executable->float8->forward(input, output))
-        || (executable && executable->linear && executable->linear->forward(input, output))))
+             && executable->bfloat16->forward(input, output))
+            || (executable && executable->float8 && executable->float8->forward(input, output))
+            || (executable && executable->linear && executable->linear->forward(input, output))))
     {
         return;
     }
@@ -2468,11 +2377,8 @@ void rms_norm_batch_into(const CpuBatch& input, const TensorData& weight, float 
             && (weight.dtype == DType::Float32
                 || weight.dtype == DType::BFloat16))
         {
-            const float sum_of_squares =
-                float_dot(source, source, input.columns());
-            const float inverse_rms = 1.0f / std::sqrt(
-                sum_of_squares / static_cast<float>(input.columns())
-                + epsilon);
+            const float sum_of_squares = float_dot(source, source, input.columns());
+            const float inverse_rms = 1.0f / std::sqrt(sum_of_squares / static_cast<float>(input.columns()) + epsilon);
             if (weight.dtype == DType::Float32)
             {
                 float_weighted_scale(

@@ -2,6 +2,7 @@
 #define NCNN_MOE_CPU_SESSION_STATE_H
 
 #include "kernels/cpu_ops.h"
+#include "kernels/cpu_gated_delta_net.h"
 #include "kernels/cpu_hyper_connection.h"
 #include "engine/cpu_task_worker.h"
 #include "engine/expert_backend.h"
@@ -25,6 +26,24 @@ namespace moe {
 
 class NcnnVulkanAttentionCache;
 class NcnnVulkanGatedDeltaState;
+struct CpuAttentionExecutionScratch;
+struct CpuLayerCache;
+
+struct CpuAttentionBatchEntry
+{
+    uint64_t position_offset = 0;
+    CpuLayerCache* cache = nullptr;
+    CpuAttentionExecutionScratch* scratch = nullptr;
+    const CpuBatch* hidden = nullptr;
+    CpuBatch* output = nullptr;
+};
+
+struct CpuDecodeRouteOrigin
+{
+    size_t session_index = 0;
+    size_t active_index = 0;
+    size_t route_index = 0;
+};
 
 struct ExpertExecutionMetrics
 {
@@ -110,6 +129,18 @@ struct CpuExpertExecutionScratch
     CpuBatch staged_output;
     CpuBatch staged_router_logits;
     std::vector<int32_t> staged_input_ids;
+    std::vector<uint32_t> staged_expert_ids;
+    std::vector<CpuGatedDeltaBatchEntry> gated_delta_entries;
+    CpuGatedDeltaBatchScratch gated_delta_batch;
+    std::vector<uint64_t> staged_attention_positions;
+    std::vector<CpuLayerCache*> staged_attention_caches;
+    std::vector<CpuAttentionBatchEntry> attention_batch_entries;
+    std::vector<CpuBatch> staged_batches;
+    std::vector<CpuHyperConnectionMix> staged_hyper_mixes;
+    std::vector<size_t> combined_by_expert;
+    std::vector<std::vector<CpuDecodeRouteOrigin>> staged_route_origins;
+    std::vector<uint8_t> combined_backend_aggregated;
+    CpuBatch combined_backend_aggregated_output;
 };
 
 struct CpuAttentionExecutionScratch
@@ -203,9 +234,7 @@ struct CpuStateCacheSnapshot
     }
 };
 
-// Transactional ownership belongs to the Session state boundary.  It records
-// the reversible portion of KV, Gated DeltaNet, and latent state without
-// making any of those state stores own transaction policy.
+// Session transactions record reversible KV, DeltaNet, and latent state.
 struct CpuSessionStateTransaction
 {
     CpuStateCacheSnapshot initial;
@@ -235,10 +264,7 @@ struct CpuSessionStateTransaction
     }
 };
 
-// Persistent attention state is kept in an explicit component.  The
-// inheritance is intentional here: existing kernel code can access the
-// component fields without a compatibility mirror, while ownership and
-// accounting remain separated by state domain.
+// Persistent attention state is kept in an explicit component.
 struct CpuKvState
 {
     std::vector<float> keys;
@@ -256,8 +282,7 @@ struct CpuKvState
     bool vulkan_attention_state_unknown = false;
 };
 
-// Recurrent state and its transactional device mirror are independent from
-// KV/MLA storage.  This is the unit that Gated DeltaNet snapshots and commits.
+// Recurrent state and its device mirror are independent from KV/MLA storage.
 struct CpuGatedDeltaState
 {
     std::vector<float> gated_delta_convolution;
@@ -273,8 +298,7 @@ struct CpuLatentScoredIndex
     float score = 0.0f;
 };
 
-// MLA compression/index state and its undo records have their own lifetime;
-// they are not KV entries and must not participate in recurrent transactions.
+// MLA compression/index state has its own undo records.
 struct CpuLatentState
 {
     std::vector<float> latent_window;

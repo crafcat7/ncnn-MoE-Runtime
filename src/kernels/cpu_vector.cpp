@@ -49,8 +49,7 @@ static void scalar_float_gemm_4x4(
             const float value = input[static_cast<size_t>(token) * input_stride + column];
             for (uint32_t output_index = 0; output_index < output_count; ++output_index)
             {
-                accumulators[token][output_index] +=
-                    value * weights[static_cast<size_t>(output_index) * weight_stride + column];
+                accumulators[token][output_index] += value * weights[static_cast<size_t>(output_index) * weight_stride + column];
             }
         }
     }
@@ -108,7 +107,7 @@ static void scalar_bfloat16_gemm_4x8(
         for (uint32_t output_index = 0; output_index < output_count; ++output_index)
         {
             const uint32_t bits = static_cast<uint32_t>(
-                weights[static_cast<size_t>(output_index) * weight_stride + column])
+                                      weights[static_cast<size_t>(output_index) * weight_stride + column])
                                   << 16;
             const float weight = std::bit_cast<float>(bits);
             for (uint32_t token = 0; token < token_count; ++token)
@@ -462,8 +461,7 @@ void float_scale_inplace_and_scaled_add(
     float output_scale,
     uint32_t count) noexcept
 {
-    static const FloatScaleInplaceAndScaledAddFunction function =
-        select_float_scale_inplace_and_scaled_add();
+    static const FloatScaleInplaceAndScaledAddFunction function = select_float_scale_inplace_and_scaled_add();
     function(values, value_scale, output, output_scale, count);
 }
 

@@ -345,24 +345,22 @@ static bool attention_supports_vulkan(
     const CompiledLayerPlan& layer) noexcept
 {
     if (compiled.hybrid_mode == HybridMode::CpuOnly
+        || !runtime_optimization_enabled(
+            compiled.optimization_flags,
+            RuntimeOptimizationVulkanAttention)
         || layer.layer_id >= compiled.descriptor.layers.size())
     {
         return false;
     }
 
     const AttentionBlockPlan& attention = layer.attention;
-    const AttentionKind kind =
-        compiled.descriptor.layers[layer.layer_id].attention.kind;
+    const AttentionKind kind = compiled.descriptor.layers[layer.layer_id].attention.kind;
     if (kind == AttentionKind::GatedDeltaNet)
     {
         if (attention.gated_delta_vulkan_operator == invalid_compiled_operator_handle)
             return false;
-        const CompiledOperator& gated_delta_operator =
-            compiled.operators.at(attention.gated_delta_vulkan_operator);
-        return runtime_optimization_enabled(
-                   compiled.optimization_flags,
-                   RuntimeOptimizationVulkanGatedDeltaNet)
-               && gated_delta_operator.gated_delta;
+        const CompiledOperator& gated_delta_operator = compiled.operators.at(attention.gated_delta_vulkan_operator);
+        return static_cast<bool>(gated_delta_operator.gated_delta);
     }
     if (kind != AttentionKind::Standard
         && kind != AttentionKind::MultiHeadLatent)
@@ -402,7 +400,10 @@ static bool speculative_attention_supports_vulkan(
     const CompiledModel& compiled,
     const AttentionBlockPlan& attention) noexcept
 {
-    if (compiled.hybrid_mode == HybridMode::CpuOnly)
+    if (compiled.hybrid_mode == HybridMode::CpuOnly
+        || !runtime_optimization_enabled(
+            compiled.optimization_flags,
+            RuntimeOptimizationVulkanAttention))
         return false;
     if (attention.gated_delta_vulkan_operator != invalid_compiled_operator_handle
         && compiled.operators.at(attention.gated_delta_vulkan_operator).gated_delta)
@@ -564,10 +565,10 @@ static Result<void> build_speculative_execution_graph(
             0);
 
         const bool can_use_vulkan_experts = compiled.hybrid_mode != HybridMode::CpuOnly
-                                             && has_flag(capabilities.flags, ModelCompiler::BackendCapabilityVulkanExperts)
-                                             && !layer.moe.experts.empty()
-                                             && layer.moe.experts.front().gate_up_weight != invalid_tensor_handle
-                                             && compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype == DType::MxFp4;
+                                            && has_flag(capabilities.flags, ModelCompiler::BackendCapabilityVulkanExperts)
+                                            && !layer.moe.experts.empty()
+                                            && layer.moe.experts.front().gate_up_weight != invalid_tensor_handle
+                                            && compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype == DType::MxFp4;
         const ExecutionBackend expert_backend = can_use_vulkan_experts ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
         const uint32_t expert_backend_mask = can_use_vulkan_experts ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
         const uint32_t expert_flags = compiled.hybrid_mode == HybridMode::VulkanWithCpuPrefetch
@@ -605,8 +606,8 @@ static Result<void> build_speculative_execution_graph(
         if (layer.moe.has_shared_expert)
         {
             const bool shared_vulkan = compiled.hybrid_mode != HybridMode::CpuOnly
-                                        && layer.moe.fused_shared_input_bfloat16_operator != invalid_compiled_operator_handle
-                                        && compiled.operators.at(layer.moe.fused_shared_input_bfloat16_operator).bfloat16;
+                                       && layer.moe.fused_shared_input_bfloat16_operator != invalid_compiled_operator_handle
+                                       && compiled.operators.at(layer.moe.fused_shared_input_bfloat16_operator).bfloat16;
             const ExecutionBackend shared_backend = shared_vulkan ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
             const uint32_t shared_backend_mask = shared_vulkan ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
             const ExecutionTensorId shared_output = append_execution_tensor(
@@ -679,18 +680,15 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
         const std::string prefix = "layers." + std::to_string(layer.layer_id) + ".";
         if (has_flag(layer.flags, CompiledLayerAttention))
         {
-            const bool latent_attention =
-                compiled.descriptor.layers[layer.layer_id].attention.kind == AttentionKind::MultiHeadLatent;
-            const bool gated_delta_attention =
-                compiled.descriptor.layers[layer.layer_id].attention.kind == AttentionKind::GatedDeltaNet;
+            const bool latent_attention = compiled.descriptor.layers[layer.layer_id].attention.kind == AttentionKind::MultiHeadLatent;
+            const bool gated_delta_attention = compiled.descriptor.layers[layer.layer_id].attention.kind == AttentionKind::GatedDeltaNet;
             const bool supports_vulkan_attention = attention_supports_vulkan(compiled, layer);
             const ExecutionBackend backend = supports_vulkan_attention ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
-            const TensorLocation cache_location =
-                latent_attention
-                    ? TensorLocation::Cpu
-                    : backend == ExecutionBackend::Vulkan
-                          ? TensorLocation::Vulkan
-                          : TensorLocation::Cpu;
+            const TensorLocation cache_location = latent_attention
+                                                      ? TensorLocation::Cpu
+                                                  : backend == ExecutionBackend::Vulkan
+                                                      ? TensorLocation::Vulkan
+                                                      : TensorLocation::Cpu;
             std::vector<uint32_t> cache_shape{
                 0,
                 layer.attention.kv_head_count,
@@ -710,7 +708,7 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
                 prefix + "kv_cache",
                 gated_delta_attention ? DType::Float32 : compiled.descriptor.kv_cache_dtype,
                 std::move(cache_shape),
-                                                                    cache_location, ExecutionTensorPersistent | ExecutionTensorDynamic);
+                cache_location, ExecutionTensorPersistent | ExecutionTensorDynamic);
             uint32_t attention_tensor_flags = ExecutionTensorDynamic;
             if (backend == ExecutionBackend::Vulkan && !latent_attention)
             {
@@ -736,10 +734,10 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
             static_cast<uint32_t>(plan_index), invalid_execution_expert_id, 0);
 
         const bool can_use_vulkan_experts = compiled.hybrid_mode != HybridMode::CpuOnly
-                                             && has_flag(capabilities.flags, ModelCompiler::BackendCapabilityVulkanExperts)
-                                             && !layer.moe.experts.empty()
-                                             && layer.moe.experts.front().gate_up_weight != invalid_tensor_handle
-                                             && compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype == DType::MxFp4;
+                                            && has_flag(capabilities.flags, ModelCompiler::BackendCapabilityVulkanExperts)
+                                            && !layer.moe.experts.empty()
+                                            && layer.moe.experts.front().gate_up_weight != invalid_tensor_handle
+                                            && compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype == DType::MxFp4;
         const ExecutionBackend expert_backend = can_use_vulkan_experts ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
         const uint32_t expert_backend_mask = can_use_vulkan_experts ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
         const uint32_t expert_flags = compiled.hybrid_mode == HybridMode::VulkanWithCpuPrefetch
@@ -757,8 +755,8 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
         if (layer.moe.has_shared_expert)
         {
             const bool shared_vulkan = compiled.hybrid_mode != HybridMode::CpuOnly
-                                        && layer.moe.fused_shared_input_bfloat16_operator != invalid_compiled_operator_handle
-                                        && compiled.operators.at(layer.moe.fused_shared_input_bfloat16_operator).bfloat16;
+                                       && layer.moe.fused_shared_input_bfloat16_operator != invalid_compiled_operator_handle
+                                       && compiled.operators.at(layer.moe.fused_shared_input_bfloat16_operator).bfloat16;
             const ExecutionBackend shared_backend = shared_vulkan ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
             const uint32_t shared_backend_mask = shared_vulkan ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
             const ExecutionTensorId shared_output = append_execution_tensor(graph, prefix + "shared_experts.output", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size}, TensorLocation::Cpu, ExecutionTensorDynamic);

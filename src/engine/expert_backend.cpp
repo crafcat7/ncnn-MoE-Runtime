@@ -91,18 +91,15 @@ public:
 
     ExpertBackendExecutionResult try_execute(const std::string& key, const ActivationBuffer& input, ActivationBuffer& output) override
     {
-        const ExpertBackendRequest request{
-            key,
-            &input,
-            &output,
-            0,
-        };
-        std::vector<ExpertBackendExecutionResult> results = try_execute_batch(std::span<const ExpertBackendRequest>(&request, 1));
-        return results.empty() ? ExpertBackendExecutionResult::Failed : results.front();
+        if (backends_.empty())
+            return ExpertBackendExecutionResult::Failed;
+        return backends_[backend_for_key(key)]->try_execute(key, input, output);
     }
 
     std::vector<ExpertBackendExecutionResult> try_execute_batch(std::span<const ExpertBackendRequest> requests) override
     {
+        if (backends_.size() == 1)
+            return backends_.front()->try_execute_batch(requests);
         auto submission = submit_batch(requests);
         if (!submission)
             return std::vector<ExpertBackendExecutionResult>(requests.size(), ExpertBackendExecutionResult::Failed);
@@ -240,6 +237,13 @@ public:
     }
 
 private:
+    size_t backend_for_key(std::string_view key) const
+    {
+        const std::lock_guard<std::mutex> lock(placement_mutex_);
+        const auto placed = key_placements_.find(key);
+        return placed == key_placements_.end() ? fallback_backend(key) : placed->second;
+    }
+
     void publish_accelerated_bytes(std::vector<uint64_t> bytes)
     {
         const std::lock_guard<std::mutex> lock(phase_mutex_);
@@ -279,9 +283,7 @@ private:
                 {
                     ExpertBackendRequest child_request = requests[request_index];
                     child_request.output = &private_outputs_[request_index];
-                    // A multi-device batch cannot safely have several child
-                    // queues write the same aggregate target.  Let the
-                    // framework combine child outputs on the CPU instead.
+                    // Let the framework combine multi-device outputs on CPU.
                     child_request.route_aggregation = {};
                     child.requests.push_back(child_request);
                 }
