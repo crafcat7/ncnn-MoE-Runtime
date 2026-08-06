@@ -1,0 +1,104 @@
+#version 450
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(binding = 0) buffer gate_blob
+{
+    float gate_data[];
+};
+layout(binding = 1) readonly buffer up_blob
+{
+    float up_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint columns;
+    uint token_count;
+    float activation_limit;
+}
+p;
+
+#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
+shared float maxima[32];
+#endif
+
+float quantize_float8_e4m3(float value)
+{
+    const float sign_value = value < 0.0 ? -1.0 : 1.0;
+    const float magnitude = min(abs(value), 448.0);
+    if (magnitude < 0.015625)
+    {
+        const float mantissa = min(7.0, floor(magnitude * 512.0 + 0.5));
+        return sign_value * mantissa * 0.001953125;
+    }
+    float exponent = floor(log2(magnitude));
+    float encoded_exponent = exponent + 7.0;
+    float mantissa = floor((magnitude * exp2(-exponent) - 1.0) * 8.0 + 0.5);
+    if (mantissa >= 8.0)
+    {
+        mantissa = 0.0;
+        encoded_exponent += 1.0;
+    }
+    if (encoded_exponent >= 15.0)
+    {
+        encoded_exponent = 15.0;
+        mantissa = min(mantissa, 6.0);
+    }
+    const float decoded = encoded_exponent == 0.0
+        ? mantissa * 0.001953125
+        : (1.0 + mantissa * 0.125) * exp2(encoded_exponent - 7.0);
+    return sign_value * decoded;
+}
+
+void main()
+{
+    const uint block = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint block_begin = block * 128;
+    float maximum = 0.0001;
+    for (uint offset = lane; offset < 128; offset += 32)
+    {
+        const uint column = block_begin + offset;
+        if (token < p.token_count && column < p.columns)
+        {
+            const uint index = token * p.columns + column;
+            float gate = gate_data[index];
+            float up = up_data[index];
+            if (p.activation_limit > 0.0)
+            {
+                gate = min(gate, p.activation_limit);
+                up = clamp(up, -p.activation_limit, p.activation_limit);
+            }
+            gate_data[index] = gate / (1.0 + exp(-gate)) * up;
+            maximum = max(maximum, abs(gate_data[index]));
+        }
+    }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const float block_maximum = subgroupMax(maximum);
+    const float scale = exp2(ceil(log2(block_maximum / 448.0)));
+#else
+    maxima[lane] = maximum;
+    barrier();
+    for (uint stride = 16; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+            maxima[lane] = max(maxima[lane], maxima[lane + stride]);
+        barrier();
+    }
+    const float scale = exp2(ceil(log2(maxima[0] / 448.0)));
+#endif
+    for (uint offset = lane; offset < 128; offset += 32)
+    {
+        const uint column = block_begin + offset;
+        if (token < p.token_count && column < p.columns)
+        {
+            const uint index = token * p.columns + column;
+            gate_data[index] = quantize_float8_e4m3(clamp(gate_data[index] / scale, -448.0, 448.0)) * scale;
+        }
+    }
+}

@@ -1,0 +1,148 @@
+#version 450
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(binding = 0) readonly buffer input_blob
+{
+    sfp input_data[];
+};
+layout(binding = 1) readonly buffer packed_blob
+{
+    uint packed_words[];
+};
+layout(binding = 2) readonly buffer bias_blob
+{
+    sfp bias_data[];
+};
+layout(binding = 3) readonly buffer norm_blob
+{
+    sfp norm_weight[];
+};
+layout(binding = 4) writeonly buffer output_blob
+{
+    sfp output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint input_columns;
+    uint output_columns;
+    uint block_count;
+    uint token_count;
+    float norm_epsilon;
+    uint output_subgroups;
+}
+p;
+
+float decode_bfloat16(uint value)
+{
+    return uintBitsToFloat(value << 16);
+}
+
+#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
+shared float partial_sum[256];
+#endif
+
+void main()
+{
+    const uint local_id = gl_LocalInvocationID.x;
+    const uint lane = local_id & 31;
+    const uint subgroup = local_id >> 5;
+    // ncnn injects the actual local size after GLSL compilation. Keep the
+    // output-tile mapping in push constants instead of relying on the
+    // gl_WorkGroupSize built-in surviving that injection path.
+    const uint output_column =
+        gl_WorkGroupID.x * p.output_subgroups + subgroup;
+    const uint token = gl_WorkGroupID.y;
+    const bool token_valid = token < p.token_count;
+    const bool output_valid = token_valid && output_column < p.output_columns;
+    float square_sum = 0.0;
+    if (token_valid)
+    {
+        const uint input_row = token * p.input_columns;
+        for (uint block = 0; block < p.block_count; ++block)
+        {
+            const uint column = block * 128 + lane * 4;
+            if (column >= p.input_columns)
+                continue;
+            const float first = buffer_ld1(input_data, input_row + column);
+            const float second = buffer_ld1(input_data, input_row + column + 1);
+            const float third = buffer_ld1(input_data, input_row + column + 2);
+            const float fourth = buffer_ld1(input_data, input_row + column + 3);
+            square_sum += first * first + second * second
+                          + third * third + fourth * fourth;
+        }
+    }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const float reduced_square_sum = subgroupAdd(square_sum);
+    const float inverse_rms = 1.0 / sqrt(
+        reduced_square_sum / float(p.input_columns) + p.norm_epsilon);
+#else
+    partial_sum[local_id] = square_sum;
+    barrier();
+    const uint partial_base = subgroup * 32;
+    for (uint stride = 16; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+            partial_sum[partial_base + lane] += partial_sum[partial_base + lane + stride];
+        barrier();
+    }
+    const float inverse_rms = 1.0 / sqrt(
+        partial_sum[partial_base] / float(p.input_columns)
+        + p.norm_epsilon);
+#endif
+
+    float sum = 0.0;
+    if (output_valid)
+    {
+        const uint input_row = token * p.input_columns;
+        const uint weight_row = output_column * p.input_columns;
+        for (uint block = 0; block < p.block_count; ++block)
+        {
+            const uint column = block * 128 + lane * 4;
+            if (column >= p.input_columns)
+                continue;
+            const uint first = packed_words[(weight_row + column) >> 1];
+            const uint second = packed_words[(weight_row + column + 2) >> 1];
+            sum += decode_bfloat16(first & 65535)
+                       * buffer_ld1(input_data, input_row + column)
+                       * buffer_ld1(norm_weight, column) * inverse_rms;
+            sum += decode_bfloat16(first >> 16)
+                       * buffer_ld1(input_data, input_row + column + 1)
+                       * buffer_ld1(norm_weight, column + 1) * inverse_rms;
+            sum += decode_bfloat16(second & 65535)
+                       * buffer_ld1(input_data, input_row + column + 2)
+                       * buffer_ld1(norm_weight, column + 2) * inverse_rms;
+            sum += decode_bfloat16(second >> 16)
+                       * buffer_ld1(input_data, input_row + column + 3)
+                       * buffer_ld1(norm_weight, column + 3) * inverse_rms;
+        }
+    }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const float reduced_sum = subgroupAdd(sum);
+    if (output_valid && lane == 0)
+        buffer_st1(
+            output_data,
+            token * p.output_columns + output_column,
+            reduced_sum + buffer_ld1(bias_data, output_column));
+#else
+    partial_sum[local_id] = sum;
+    barrier();
+    const uint output_partial_base = subgroup * 32;
+    for (uint stride = 16; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+            partial_sum[output_partial_base + lane] += partial_sum[output_partial_base + lane + stride];
+        barrier();
+    }
+    if (output_valid && lane == 0)
+        buffer_st1(
+            output_data,
+            token * p.output_columns + output_column,
+            partial_sum[output_partial_base]
+                + buffer_ld1(bias_data, output_column));
+#endif
+}

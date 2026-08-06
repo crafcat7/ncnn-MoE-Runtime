@@ -1,0 +1,384 @@
+#version 450
+
+#ifdef NCNN_fp16_arithmetic
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(binding = 0) readonly buffer input_blob
+{
+    float input_data[];
+};
+layout(binding = 1) readonly buffer expert_blob_0
+{
+    uint expert_words_0[];
+};
+layout(binding = 2) readonly buffer expert_blob_1
+{
+    uint expert_words_1[];
+};
+layout(binding = 3) readonly buffer expert_blob_2
+{
+    uint expert_words_2[];
+};
+layout(binding = 4) readonly buffer expert_blob_3
+{
+    uint expert_words_3[];
+};
+layout(binding = 5) readonly buffer expert_blob_4
+{
+    uint expert_words_4[];
+};
+layout(binding = 6) readonly buffer expert_blob_5
+{
+    uint expert_words_5[];
+};
+layout(binding = 7) readonly buffer expert_blob_6
+{
+    uint expert_words_6[];
+};
+layout(binding = 8) readonly buffer expert_blob_7
+{
+    uint expert_words_7[];
+};
+layout(binding = 9) readonly buffer expert_id_blob
+{
+    uint expert_ids[];
+};
+layout(binding = 10) writeonly buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint gate_input_columns;
+    uint gate_output_columns;
+    uint down_input_columns;
+    uint down_output_columns;
+    uint gate_block_count;
+    uint down_block_count;
+    uint token_count;
+    uint expert_count;
+    uint gate_packed_word_offset;
+    uint gate_scale_word_offset;
+    uint gate_bias_word_offset;
+    uint down_packed_word_offset;
+    uint down_scale_word_offset;
+    uint down_bias_word_offset;
+    uint mode;
+    uint activation;
+    float activation_limit;
+    uint tile_mode;
+}
+p;
+
+uint expert_word(uint slot, uint index)
+{
+    switch (slot)
+    {
+    case 0u:
+        return expert_words_0[index];
+    case 1u:
+        return expert_words_1[index];
+    case 2u:
+        return expert_words_2[index];
+    case 3u:
+        return expert_words_3[index];
+    case 4u:
+        return expert_words_4[index];
+    case 5u:
+        return expert_words_5[index];
+    case 6u:
+        return expert_words_6[index];
+    case 7u:
+        return expert_words_7[index];
+    default:
+        return 0u;
+    }
+}
+
+uint packed_byte(uint slot, uint index)
+{
+    const uint word_offset = p.mode == 0u
+                                 ? p.gate_packed_word_offset
+                                 : p.down_packed_word_offset;
+    const uint word = expert_word(slot, word_offset + (index >> 2));
+    return (word >> ((index & 3u) * 8u)) & 255u;
+}
+
+uint scale_byte(uint slot, uint index)
+{
+    const uint word_offset = p.mode == 0u
+                                 ? p.gate_scale_word_offset
+                                 : p.down_scale_word_offset;
+    const uint word = expert_word(slot, word_offset + (index >> 2));
+    return (word >> ((index & 3u) * 8u)) & 255u;
+}
+
+float bias_value(uint slot, uint index)
+{
+    const uint word_offset = p.mode == 0u
+                                 ? p.gate_bias_word_offset
+                                 : p.down_bias_word_offset;
+    return uintBitsToFloat(expert_word(slot, word_offset + index));
+}
+
+float decode_mxfp4(uint value)
+{
+    const float magnitudes[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    const float magnitude = magnitudes[value & 7u];
+    return (value & 8u) == 0u ? magnitude : -magnitude;
+}
+
+float decode_scale(uint value)
+{
+    return uintBitsToFloat(value == 0u ? 0x00400000u : value << 23);
+}
+
+float mxfp4_product(float value, float input_value, float scale)
+{
+#ifdef NCNN_fp16_arithmetic
+    return float(float16_t(value) * float16_t(input_value) * float16_t(scale));
+#else
+    return value * input_value * scale;
+#endif
+}
+
+#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
+shared float partial_sum_0[32];
+shared float partial_sum_1[32];
+shared float partial_sum_2[32];
+shared float partial_sum_3[32];
+#endif
+
+void accumulate_indexed_row(
+    uint slot,
+    uint row,
+    uint output_column,
+    bool gate_mode,
+    uint matrix_input_columns,
+    uint block_count,
+    inout float sum_0,
+    inout float sum_1)
+{
+    const uint weight_row = gate_mode ? output_column * 2u : output_column;
+    const uint packed_row_base = weight_row * block_count * 16u;
+    const uint scale_row_base = weight_row * block_count;
+    const uint input_row = row * matrix_input_columns;
+    for (uint block = 0u; block < block_count; ++block)
+    {
+        const uint packed_index = block * 16u + gl_LocalInvocationID.x / 2u;
+        const uint input_index = input_row + block * 32u + gl_LocalInvocationID.x;
+        const float input_value = input_data[input_index];
+        const float scale_0 = decode_scale(scale_byte(slot, scale_row_base + block));
+        const uint value_0 = packed_byte(slot, packed_row_base + packed_index);
+        const uint nibble_0 = (gl_LocalInvocationID.x & 1u) == 0u ? value_0 & 15u : value_0 >> 4u;
+        sum_0 += mxfp4_product(decode_mxfp4(nibble_0), input_value, scale_0);
+        if (gate_mode)
+        {
+            const float scale_1 = decode_scale(scale_byte(slot, scale_row_base + block_count + block));
+            const uint value_1 = packed_byte(slot, packed_row_base + block_count * 16u + packed_index);
+            const uint nibble_1 = (gl_LocalInvocationID.x & 1u) == 0u ? value_1 & 15u : value_1 >> 4u;
+            sum_1 += mxfp4_product(decode_mxfp4(nibble_1), input_value, scale_1);
+        }
+    }
+}
+
+void store_indexed_result(uint slot, uint row, uint output_column, float sum_0, float sum_1)
+{
+    if (p.mode == 1u)
+    {
+        output_data[row * p.down_output_columns + output_column] =
+            sum_0 + bias_value(slot, output_column);
+        return;
+    }
+
+    float gate = sum_0 + bias_value(slot, output_column * 2u);
+    float up = sum_1 + bias_value(slot, output_column * 2u + 1u);
+    if (p.activation_limit > 0.0)
+    {
+        gate = min(gate, p.activation_limit);
+        up = clamp(up, -p.activation_limit, p.activation_limit);
+    }
+    const float silu = p.activation == 0u
+                           ? gate / (1.0 + exp(-1.702 * gate))
+                           : gate / (1.0 + exp(-gate));
+    output_data[row * (p.gate_output_columns / 2u) + output_column] =
+        p.activation == 0u ? silu * (up + 1.0) : silu * up;
+}
+
+void main()
+{
+    const bool gate_mode = p.mode == 0u;
+    const uint output_column = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+
+    // Layout 1 tiles adjacent rows; the scalar layout remains the fallback.
+    if (p.tile_mode == 1u)
+    {
+        const uint slot = gl_WorkGroupID.z;
+        const uint row_tile = gl_WorkGroupID.y;
+        const uint row_begin = expert_ids[slot] + row_tile * 2u;
+        const uint row_end = expert_ids[slot + 1u];
+        const bool output_valid = output_column < (gate_mode ? p.gate_output_columns / 2u : p.down_output_columns);
+        const bool row_0_valid = slot < p.expert_count && row_begin < row_end && row_begin < p.token_count;
+        const bool row_1_valid = slot < p.expert_count && row_begin + 1u < row_end && row_begin + 1u < p.token_count;
+        const uint matrix_input_columns = gate_mode ? p.gate_input_columns : p.down_input_columns;
+        const uint block_count = gate_mode ? p.gate_block_count : p.down_block_count;
+        float tile_sum_0 = 0.0;
+        float tile_sum_1 = 0.0;
+        float tile_sum_2 = 0.0;
+        float tile_sum_3 = 0.0;
+        if (output_valid && (row_0_valid || row_1_valid))
+        {
+            if (row_0_valid)
+                accumulate_indexed_row(slot, row_begin, output_column, gate_mode, matrix_input_columns, block_count, tile_sum_0, tile_sum_1);
+            if (row_1_valid)
+                accumulate_indexed_row(slot, row_begin + 1u, output_column, gate_mode, matrix_input_columns, block_count, tile_sum_2, tile_sum_3);
+        }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+        const float reduced_tile_0 = subgroupAdd(tile_sum_0);
+        const float reduced_tile_1 = subgroupAdd(tile_sum_1);
+        const float reduced_tile_2 = subgroupAdd(tile_sum_2);
+        const float reduced_tile_3 = subgroupAdd(tile_sum_3);
+        if (lane == 0u && output_valid)
+        {
+            if (row_0_valid)
+                store_indexed_result(slot, row_begin, output_column, reduced_tile_0, reduced_tile_1);
+            if (row_1_valid)
+                store_indexed_result(slot, row_begin + 1u, output_column, reduced_tile_2, reduced_tile_3);
+        }
+#else
+        partial_sum_0[lane] = tile_sum_0;
+        partial_sum_1[lane] = tile_sum_1;
+        partial_sum_2[lane] = tile_sum_2;
+        partial_sum_3[lane] = tile_sum_3;
+        barrier();
+        for (uint stride = 16u; stride > 0u; stride >>= 1u)
+        {
+            if (lane < stride)
+            {
+                partial_sum_0[lane] += partial_sum_0[lane + stride];
+                partial_sum_1[lane] += partial_sum_1[lane + stride];
+                partial_sum_2[lane] += partial_sum_2[lane + stride];
+                partial_sum_3[lane] += partial_sum_3[lane + stride];
+            }
+            barrier();
+        }
+        if (lane == 0u && output_valid)
+        {
+            if (row_0_valid)
+                store_indexed_result(slot, row_begin, output_column, partial_sum_0[0], partial_sum_1[0]);
+            if (row_1_valid)
+                store_indexed_result(slot, row_begin + 1u, output_column, partial_sum_2[0], partial_sum_3[0]);
+        }
+#endif
+        return;
+    }
+
+    const uint matrix_input_columns = gate_mode ? p.gate_input_columns : p.down_input_columns;
+    const uint block_count = gate_mode ? p.gate_block_count : p.down_block_count;
+    const uint slot = token < p.token_count ? expert_ids[token] : 0u;
+    const bool valid = output_column < (gate_mode ? p.gate_output_columns / 2u : p.down_output_columns)
+                       && token < p.token_count
+                       && slot < p.expert_count;
+    float sum_0 = 0.0;
+    float sum_1 = 0.0;
+    if (valid && lane < 32u)
+    {
+        const uint input_row = token * matrix_input_columns;
+        const uint row_0 = gate_mode ? output_column * 2u : output_column;
+        const uint row_1 = row_0 + 1u;
+        const uint row_0_packed = row_0 * block_count * 16u;
+        const uint row_1_packed = row_1 * block_count * 16u;
+        const uint row_0_scale = row_0 * block_count;
+        const uint row_1_scale = row_1 * block_count;
+        for (uint block = 0u; block < block_count; ++block)
+        {
+            const uint packed_index = block * 16u + lane / 2u;
+            const uint input_index = input_row + block * 32u + lane;
+            const float input_value = input_data[input_index];
+            const float scale_0 = decode_scale(scale_byte(slot, row_0_scale + block));
+            const uint value_0 = packed_byte(slot, row_0_packed + packed_index);
+            const uint nibble_0 = (lane & 1u) == 0u ? value_0 & 15u : value_0 >> 4u;
+            sum_0 += mxfp4_product(decode_mxfp4(nibble_0), input_value, scale_0);
+            if (gate_mode)
+            {
+                const float scale_1 = decode_scale(scale_byte(slot, row_1_scale + block));
+                const uint value_1 = packed_byte(slot, row_1_packed + packed_index);
+                const uint nibble_1 = (lane & 1u) == 0u ? value_1 & 15u : value_1 >> 4u;
+                sum_1 += mxfp4_product(decode_mxfp4(nibble_1), input_value, scale_1);
+            }
+        }
+    }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const float reduced_0 = subgroupAdd(sum_0);
+    const float reduced_1 = subgroupAdd(sum_1);
+    if (valid && lane == 0u)
+    {
+        if (!gate_mode)
+        {
+            output_data[token * p.down_output_columns + output_column] =
+                reduced_0 + bias_value(slot, output_column);
+        }
+        else
+        {
+            float gate = reduced_0 + bias_value(slot, output_column * 2u);
+            float up = reduced_1 + bias_value(slot, output_column * 2u + 1u);
+            if (p.activation_limit > 0.0)
+            {
+                gate = min(gate, p.activation_limit);
+                up = clamp(up, -p.activation_limit, p.activation_limit);
+            }
+            const float silu = p.activation == 0u
+                                   ? gate / (1.0 + exp(-1.702 * gate))
+                                   : gate / (1.0 + exp(-gate));
+            output_data[token * (p.gate_output_columns / 2u) + output_column] =
+                p.activation == 0u ? silu * (up + 1.0) : silu * up;
+        }
+    }
+#else
+    partial_sum_0[lane] = sum_0;
+    partial_sum_1[lane] = sum_1;
+    barrier();
+    for (uint stride = 16u; stride > 0u; stride >>= 1u)
+    {
+        if (lane < stride)
+        {
+            partial_sum_0[lane] += partial_sum_0[lane + stride];
+            partial_sum_1[lane] += partial_sum_1[lane + stride];
+        }
+        barrier();
+    }
+    if (valid && lane == 0u)
+    {
+        if (!gate_mode)
+        {
+            output_data[token * p.down_output_columns + output_column] =
+                partial_sum_0[0] + bias_value(slot, output_column);
+        }
+        else
+        {
+            float gate = partial_sum_0[0] + bias_value(slot, output_column * 2u);
+            float up = partial_sum_1[0] + bias_value(slot, output_column * 2u + 1u);
+            if (p.activation_limit > 0.0)
+            {
+                gate = min(gate, p.activation_limit);
+                up = clamp(up, -p.activation_limit, p.activation_limit);
+            }
+            const float silu = p.activation == 0u
+                                   ? gate / (1.0 + exp(-1.702 * gate))
+                                   : gate / (1.0 + exp(-gate));
+            output_data[token * (p.gate_output_columns / 2u) + output_column] =
+                p.activation == 0u ? silu * (up + 1.0) : silu * up;
+        }
+    }
+#endif
+}

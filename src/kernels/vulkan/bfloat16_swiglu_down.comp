@@ -1,0 +1,107 @@
+#version 450
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(binding = 0) readonly buffer fused_input_blob
+{
+    sfp input_data[];
+};
+layout(binding = 1) readonly buffer packed_blob
+{
+    uint packed_words[];
+};
+layout(binding = 2) readonly buffer bias_blob
+{
+    sfp bias_data[];
+};
+layout(binding = 3) writeonly buffer output_blob
+{
+    sfp output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint intermediate_columns;
+    uint fused_columns;
+    uint output_columns;
+    uint token_count;
+    uint apply_router_gate;
+}
+p;
+
+float decode_bfloat16(uint value)
+{
+    return uintBitsToFloat(value << 16);
+}
+
+float sigmoid(float value)
+{
+    return 1.0 / (1.0 + exp(-value));
+}
+
+#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
+shared float partial_sum[32];
+#endif
+
+void main()
+{
+    const uint output_column = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    const bool valid = output_column < p.output_columns && token < p.token_count;
+    float sum = 0.0;
+    if (valid)
+    {
+        const uint input_row = token * p.fused_columns;
+        const uint weight_row = output_column * p.intermediate_columns;
+        for (uint block = 0; block < p.intermediate_columns / 128; ++block)
+        {
+            const uint column = block * 128 + lane * 4;
+            const uint first = packed_words[(weight_row + column) >> 1];
+            const uint second = packed_words[(weight_row + column + 2) >> 1];
+            const float first_gate = buffer_ld1(input_data, input_row + column);
+            const float first_up = buffer_ld1(input_data, input_row + p.intermediate_columns + column);
+            const float second_gate = buffer_ld1(input_data, input_row + column + 2);
+            const float second_up = buffer_ld1(input_data, input_row + p.intermediate_columns + column + 2);
+            const float first_value = first_gate * sigmoid(first_gate) * first_up;
+            const float second_value = second_gate * sigmoid(second_gate) * second_up;
+            const float third_gate = buffer_ld1(input_data, input_row + column + 1);
+            const float third_up = buffer_ld1(input_data, input_row + p.intermediate_columns + column + 1);
+            const float fourth_gate = buffer_ld1(input_data, input_row + column + 3);
+            const float fourth_up = buffer_ld1(input_data, input_row + p.intermediate_columns + column + 3);
+            sum += decode_bfloat16(first & 65535) * first_value;
+            sum += decode_bfloat16(first >> 16) * (third_gate * sigmoid(third_gate) * third_up);
+            sum += decode_bfloat16(second & 65535) * second_value;
+            sum += decode_bfloat16(second >> 16) * (fourth_gate * sigmoid(fourth_gate) * fourth_up);
+        }
+    }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const float reduced_sum = subgroupAdd(sum);
+    if (valid && lane == 0)
+    {
+        float result = reduced_sum + buffer_ld1(bias_data, output_column);
+        if (p.apply_router_gate != 0)
+            result *= sigmoid(buffer_ld1(input_data, token * p.fused_columns + p.intermediate_columns * 2));
+        buffer_st1(output_data, token * p.output_columns + output_column, result);
+    }
+#else
+    partial_sum[lane] = sum;
+    barrier();
+    for (uint stride = 16; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+            partial_sum[lane] += partial_sum[lane + stride];
+        barrier();
+    }
+    if (valid && lane == 0)
+    {
+        float result = partial_sum[0] + buffer_ld1(bias_data, output_column);
+        if (p.apply_router_gate != 0)
+            result *= sigmoid(buffer_ld1(input_data, token * p.fused_columns + p.intermediate_columns * 2));
+        buffer_st1(output_data, token * p.output_columns + output_column, result);
+    }
+#endif
+}
