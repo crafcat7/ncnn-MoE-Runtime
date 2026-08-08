@@ -1,5 +1,6 @@
 #include "cpu_attention.h"
 
+#include "cpu_fast_math.h"
 #include "cpu_ops.h"
 #include "cpu_bfloat16.h"
 #include "cpu_state_cache.h"
@@ -9,6 +10,7 @@
 #include "ncnn/moe/runtime_config.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -112,15 +114,8 @@ static void apply_prepared_rope(
     const std::vector<float>& cosine,
     const std::vector<float>& sine)
 {
-    const uint32_t half_dimension = dimension / 2;
-    assert(cosine.size() >= half_dimension && sine.size() >= half_dimension);
-    for (uint32_t index = 0; index < half_dimension; ++index)
-    {
-        const float first = vector[index];
-        const float second = vector[half_dimension + index];
-        vector[index] = first * cosine[index] - second * sine[index];
-        vector[half_dimension + index] = second * cosine[index] + first * sine[index];
-    }
+    assert(cosine.size() >= dimension / 2 && sine.size() >= dimension / 2);
+    float_rope_inplace(vector, cosine.data(), sine.data(), dimension);
 }
 
 static uint64_t cache_slot(const CpuLayerCache& cache, uint64_t token_index)
@@ -460,52 +455,117 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
 
         if (flash_prefill_enabled)
         {
-            const uint64_t job_count = static_cast<uint64_t>(query.rows()) * head_count;
-            const auto process_flash_job = [&](uint64_t job, std::vector<float>& running, std::vector<float>& tile_output) {
-                const size_t query_index = static_cast<size_t>(job / head_count);
+            const uint64_t query_group_count = (query.rows() + 3) / 4;
+            const uint64_t job_count = query_group_count * head_count;
+            constexpr uint64_t key_tile_size = 64;
+            constexpr uint32_t query_tile_size = 4;
+            constexpr uint32_t key_gemm_tile_size = 8;
+            const auto process_flash_group = [&](uint64_t job,
+                                                 std::vector<float>& running,
+                                                 std::vector<float>& tile_output,
+                                                 std::vector<float>& tile_logits) {
+                const size_t query_group = static_cast<size_t>(job / head_count) * query_tile_size;
                 const uint32_t query_head = static_cast<uint32_t>(job % head_count);
-                const float* query_vector = query.row(query_index) + static_cast<size_t>(query_head) * head_dimension;
-                const uint16_t* query_bfloat16_values = pair_dot
-                                                            ? flash_query_bfloat16.data() + (query_index * head_count + query_head) * head_dimension
-                                                            : nullptr;
-                std::fill(running.begin(), running.end(), 0.0f);
-                float maximum = sink_value(query_head);
-                float normalizer = sinks ? 1.0f : 0.0f;
-                constexpr uint64_t key_tile_size = 64;
+                const uint32_t query_count = static_cast<uint32_t>(std::min<size_t>(
+                    query_tile_size,
+                    query.rows() - query_group));
+                const uint32_t kv_head = query_head / heads_per_group;
+                const float* query_values = query.row(query_group) + static_cast<size_t>(query_head) * head_dimension;
+                const float* key_values_for_head = key_values + static_cast<size_t>(kv_head) * head_dimension;
+                std::array<float, query_tile_size> maximum = {};
+                std::array<float, query_tile_size> normalizer = {};
+                for (uint32_t query_offset = 0; query_offset < query_count; ++query_offset)
+                {
+                    std::fill(
+                        running.begin() + static_cast<size_t>(query_offset) * head_dimension,
+                        running.begin() + static_cast<size_t>(query_offset + 1) * head_dimension,
+                        0.0f);
+                    maximum[query_offset] = sink_value(query_head);
+                    normalizer[query_offset] = sinks ? 1.0f : 0.0f;
+                }
                 for (uint64_t tile_begin = 0; tile_begin < cache.token_count; tile_begin += key_tile_size)
                 {
                     const uint64_t tile_end = std::min(cache.token_count, tile_begin + key_tile_size);
-                    float tile_maximum = -std::numeric_limits<float>::infinity();
-                    for (uint64_t key_index = tile_begin; key_index < tile_end; ++key_index)
+                    std::array<float, query_tile_size> tile_maximum;
+                    tile_maximum.fill(-std::numeric_limits<float>::infinity());
+                    for (uint64_t key_begin = tile_begin; key_begin < tile_end; key_begin += key_gemm_tile_size)
                     {
-                        if (valid_key(query_index, key_index))
-                            tile_maximum = std::max(tile_maximum, key_dot(query_head, query_vector, query_bfloat16_values, key_index) * scale);
+                        const uint32_t key_count = static_cast<uint32_t>(std::min<uint64_t>(
+                            key_gemm_tile_size,
+                            tile_end - key_begin));
+                        float_gemm_4x8(
+                            key_values_for_head + static_cast<size_t>(key_begin) * cache.columns,
+                            cache.columns,
+                            query_values,
+                            query.columns(),
+                            head_dimension,
+                            key_count,
+                            query_count,
+                            tile_logits.data() + static_cast<size_t>(key_begin - tile_begin),
+                            key_tile_size);
+                        for (uint32_t query_offset = 0; query_offset < query_count; ++query_offset)
+                        {
+                            for (uint32_t key_offset = 0; key_offset < key_count; ++key_offset)
+                            {
+                                const uint64_t key_index = key_begin + key_offset;
+                                float& score = tile_logits[static_cast<size_t>(query_offset) * key_tile_size
+                                                            + static_cast<size_t>(key_index - tile_begin)];
+                                if (valid_key(query_group + query_offset, key_index))
+                                {
+                                    score *= scale;
+                                    tile_maximum[query_offset] = std::max(tile_maximum[query_offset], score);
+                                }
+                                else
+                                {
+                                    score = -std::numeric_limits<float>::infinity();
+                                }
+                            }
+                        }
                     }
-                    if (!std::isfinite(tile_maximum))
-                        continue;
-                    std::fill(tile_output.begin(), tile_output.end(), 0.0f);
-                    float tile_normalizer = 0.0f;
-                    for (uint64_t key_index = tile_begin; key_index < tile_end; ++key_index)
+                    for (uint32_t query_offset = 0; query_offset < query_count; ++query_offset)
                     {
-                        if (!valid_key(query_index, key_index))
+                        if (!std::isfinite(tile_maximum[query_offset]))
                             continue;
-                        const float probability = std::exp(key_dot(query_head, query_vector, query_bfloat16_values, key_index) * scale - tile_maximum);
-                        tile_normalizer += probability;
-                        add_value(query_head, tile_output.data(), probability, key_index);
+                        float* query_tile_output = tile_output.data() + static_cast<size_t>(query_offset) * head_dimension;
+                        std::fill(query_tile_output, query_tile_output + head_dimension, 0.0f);
+                        float tile_normalizer = 0.0f;
+                        for (uint64_t key_index = tile_begin; key_index < tile_end; ++key_index)
+                        {
+                            const float score = tile_logits[static_cast<size_t>(query_offset) * key_tile_size
+                                                            + static_cast<size_t>(key_index - tile_begin)];
+                            if (!std::isfinite(score))
+                                continue;
+                            const float probability = float_approximate_exp(score - tile_maximum[query_offset]);
+                            tile_normalizer += probability;
+                            add_value(query_head, query_tile_output, probability, key_index);
+                        }
+                        const float new_maximum = std::max(maximum[query_offset], tile_maximum[query_offset]);
+                        const float old_scale = std::isfinite(maximum[query_offset])
+                                                    ? float_approximate_exp(maximum[query_offset] - new_maximum)
+                                                    : 0.0f;
+                        const float tile_scale = float_approximate_exp(tile_maximum[query_offset] - new_maximum);
+                        float_scale_add(
+                            running.data() + static_cast<size_t>(query_offset) * head_dimension,
+                            old_scale,
+                            query_tile_output,
+                            tile_scale,
+                            head_dimension);
+                        normalizer[query_offset] = normalizer[query_offset] * old_scale + tile_normalizer * tile_scale;
+                        maximum[query_offset] = new_maximum;
                     }
-                    const float new_maximum = std::max(maximum, tile_maximum);
-                    const float old_scale = std::isfinite(maximum) ? std::exp(maximum - new_maximum) : 0.0f;
-                    const float tile_scale = std::exp(tile_maximum - new_maximum);
-                    for (uint32_t column = 0; column < head_dimension; ++column)
-                        running[column] = running[column] * old_scale + tile_output[column] * tile_scale;
-                    normalizer = normalizer * old_scale + tile_normalizer * tile_scale;
-                    maximum = new_maximum;
                 }
-                if (normalizer > 0.0f)
+                for (uint32_t query_offset = 0; query_offset < query_count; ++query_offset)
                 {
-                    float* destination = output.row(query_index) + static_cast<size_t>(query_head) * head_dimension;
-                    for (uint32_t column = 0; column < head_dimension; ++column)
-                        destination[column] = running[column] / normalizer;
+                    if (normalizer[query_offset] > 0.0f)
+                    {
+                        float* destination = output.row(query_group + query_offset)
+                                             + static_cast<size_t>(query_head) * head_dimension;
+                        std::copy_n(
+                            running.data() + static_cast<size_t>(query_offset) * head_dimension,
+                            head_dimension,
+                            destination);
+                        float_scale_inplace(destination, 1.0f / normalizer[query_offset], head_dimension);
+                    }
                 }
             };
 #if defined(_OPENMP)
@@ -513,20 +573,22 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
             {
 #pragma omp parallel num_threads(attention_team_size)
                 {
-                    std::vector<float> running(head_dimension);
-                    std::vector<float> tile_output(head_dimension);
+                    std::vector<float> running(query_tile_size * head_dimension);
+                    std::vector<float> tile_output(query_tile_size * head_dimension);
+                    std::vector<float> tile_logits(query_tile_size * key_tile_size);
 #pragma omp for schedule(static)
-                    for (int64_t job = 0; job < static_cast<int64_t>(job_count); ++job)
-                        process_flash_job(static_cast<uint64_t>(job), running, tile_output);
+                for (int64_t job = 0; job < static_cast<int64_t>(job_count); ++job)
+                        process_flash_group(static_cast<uint64_t>(job), running, tile_output, tile_logits);
                 }
             }
             else
 #endif
             {
-                std::vector<float> running(head_dimension);
-                std::vector<float> tile_output(head_dimension);
+                std::vector<float> running(query_tile_size * head_dimension);
+                std::vector<float> tile_output(query_tile_size * head_dimension);
+                std::vector<float> tile_logits(query_tile_size * key_tile_size);
                 for (uint64_t job = 0; job < job_count; ++job)
-                    process_flash_job(job, running, tile_output);
+                    process_flash_group(job, running, tile_output, tile_logits);
             }
             return;
         }
@@ -537,7 +599,12 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
         flash_partial_max.assign(static_cast<size_t>(head_count) * split_team_size, -std::numeric_limits<float>::infinity());
         flash_partial_sum.assign(static_cast<size_t>(head_count) * split_team_size, 0.0f);
         flash_partial_output.assign(static_cast<size_t>(head_count) * split_team_size * head_dimension, 0.0f);
-        const auto compute_split_chunk = [&](uint32_t query_head, uint64_t chunk, float& local_maximum, float& local_normalizer, float* local_output) {
+        const auto compute_split_chunk = [&](uint32_t query_head,
+                                             uint64_t chunk,
+                                             float& local_maximum,
+                                             float& local_normalizer,
+                                             float* local_output,
+                                             float* local_logits) {
             const uint64_t begin = chunk * key_chunk_size;
             const uint64_t end = std::min(cache.token_count, begin + key_chunk_size);
             const float* query_vector = query.row(0) + static_cast<size_t>(query_head) * head_dimension;
@@ -549,16 +616,26 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
             std::fill(local_output, local_output + head_dimension, 0.0f);
             for (uint64_t key_index = begin; key_index < end; ++key_index)
             {
+                const size_t chunk_offset = static_cast<size_t>(key_index - begin);
                 if (valid_key(0, key_index))
-                    local_maximum = std::max(local_maximum, key_dot(query_head, query_vector, query_bfloat16_values, key_index) * scale);
+                {
+                    const float score = key_dot(query_head, query_vector, query_bfloat16_values, key_index) * scale;
+                    local_logits[chunk_offset] = score;
+                    local_maximum = std::max(local_maximum, score);
+                }
+                else
+                {
+                    local_logits[chunk_offset] = -std::numeric_limits<float>::infinity();
+                }
             }
             if (!std::isfinite(local_maximum))
                 return;
             for (uint64_t key_index = begin; key_index < end; ++key_index)
             {
-                if (!valid_key(0, key_index))
+                const float score = local_logits[static_cast<size_t>(key_index - begin)];
+                if (!std::isfinite(score))
                     continue;
-                const float probability = std::exp(key_dot(query_head, query_vector, query_bfloat16_values, key_index) * scale - local_maximum);
+                const float probability = float_approximate_exp(score - local_maximum);
                 local_normalizer += probability;
                 add_value(query_head, local_output, probability, key_index);
             }
@@ -571,17 +648,16 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
             if (!std::isfinite(local_maximum))
                 return;
             const float new_maximum = std::max(partial_maximum, local_maximum);
-            const float old_scale = std::isfinite(partial_maximum) ? std::exp(partial_maximum - new_maximum) : 0.0f;
-            const float local_scale = std::exp(local_maximum - new_maximum);
-            for (uint32_t column = 0; column < head_dimension; ++column)
-                partial_output[column] = partial_output[column] * old_scale + local_output[column] * local_scale;
+            const float old_scale = std::isfinite(partial_maximum) ? float_approximate_exp(partial_maximum - new_maximum) : 0.0f;
+            const float local_scale = float_approximate_exp(local_maximum - new_maximum);
+            float_scale_add(partial_output, old_scale, local_output, local_scale, head_dimension);
             partial_normalizer = partial_normalizer * old_scale + local_normalizer * local_scale;
             partial_maximum = new_maximum;
         };
         const auto reduce_split_head = [&](uint32_t query_head) {
             float maximum = sink_value(query_head);
             float normalizer = sinks ? 1.0f : 0.0f;
-            std::vector<float> reduced(head_dimension, 0.0f);
+            float* reduced = output.row(0) + static_cast<size_t>(query_head) * head_dimension;
             for (uint32_t thread_index = 0; thread_index < split_team_size; ++thread_index)
             {
                 const size_t partial_index = static_cast<size_t>(query_head) * split_team_size + thread_index;
@@ -589,26 +665,22 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                 if (!std::isfinite(local_maximum))
                     continue;
                 const float new_maximum = std::max(maximum, local_maximum);
-                const float old_scale = std::isfinite(maximum) ? std::exp(maximum - new_maximum) : 0.0f;
-                const float local_scale = std::exp(local_maximum - new_maximum);
+                const float old_scale = std::isfinite(maximum) ? float_approximate_exp(maximum - new_maximum) : 0.0f;
+                const float local_scale = float_approximate_exp(local_maximum - new_maximum);
                 const float* partial_output = flash_partial_output.data() + partial_index * head_dimension;
-                for (uint32_t column = 0; column < head_dimension; ++column)
-                    reduced[column] = reduced[column] * old_scale + partial_output[column] * local_scale;
+                float_scale_add(reduced, old_scale, partial_output, local_scale, head_dimension);
                 normalizer = normalizer * old_scale + flash_partial_sum[partial_index] * local_scale;
                 maximum = new_maximum;
             }
             if (normalizer > 0.0f)
-            {
-                float* destination = output.row(0) + static_cast<size_t>(query_head) * head_dimension;
-                for (uint32_t column = 0; column < head_dimension; ++column)
-                    destination[column] = reduced[column] / normalizer;
-            }
+                float_scale_inplace(reduced, 1.0f / normalizer, head_dimension);
         };
 #if defined(_OPENMP)
 #pragma omp parallel num_threads(split_team_size)
         {
             const uint32_t thread_index = static_cast<uint32_t>(omp_get_thread_num());
             std::vector<float> local_output(head_dimension);
+            std::vector<float> local_logits(key_chunk_size);
             for (uint32_t query_head = 0; query_head < head_count; ++query_head)
             {
                 const size_t partial_index = static_cast<size_t>(query_head) * split_team_size + thread_index;
@@ -622,7 +694,12 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                 {
                     float local_maximum = -std::numeric_limits<float>::infinity();
                     float local_normalizer = 0.0f;
-                    compute_split_chunk(query_head, static_cast<uint64_t>(chunk), local_maximum, local_normalizer, local_output.data());
+                    compute_split_chunk(query_head,
+                                        static_cast<uint64_t>(chunk),
+                                        local_maximum,
+                                        local_normalizer,
+                                        local_output.data(),
+                                        local_logits.data());
                     merge_split_chunk(query_head, thread_index, local_maximum, local_normalizer, local_output.data());
                 }
 #pragma omp barrier
@@ -634,12 +711,18 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
 #else
         for (uint32_t query_head = 0; query_head < head_count; ++query_head)
         {
+            std::vector<float> local_output(head_dimension);
+            std::vector<float> local_logits(key_chunk_size);
             for (uint64_t chunk = 0; chunk < chunk_count; ++chunk)
             {
                 float local_maximum = -std::numeric_limits<float>::infinity();
                 float local_normalizer = 0.0f;
-                std::vector<float> local_output(head_dimension);
-                compute_split_chunk(query_head, chunk, local_maximum, local_normalizer, local_output.data());
+                compute_split_chunk(query_head,
+                                    chunk,
+                                    local_maximum,
+                                    local_normalizer,
+                                    local_output.data(),
+                                    local_logits.data());
                 merge_split_chunk(query_head, 0, local_maximum, local_normalizer, local_output.data());
             }
             reduce_split_head(query_head);
@@ -746,13 +829,13 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
             if (sinks)
             {
                 const float sink_value = sinks->dtype == DType::Float32 ? sinks->float32_values()[query_head] : bfloat16_to_float(sinks->bfloat16_values()[query_head]);
-                normalizer = std::exp(sink_value - maximum);
+                normalizer = float_approximate_exp(sink_value - maximum);
             }
             for (uint64_t key_index = 0; key_index < cache.token_count; ++key_index)
             {
                 if (std::isfinite(logits[key_index]))
                 {
-                    logits[key_index] = std::exp(logits[key_index] - maximum);
+                    logits[key_index] = float_approximate_exp(logits[key_index] - maximum);
                     normalizer += logits[key_index];
                 }
                 else
@@ -830,34 +913,34 @@ static void apply_head_rms_norm(CpuBatch& batch, uint32_t head_count, uint32_t h
         for (uint32_t head = 0; head < head_count; ++head)
         {
             float* values = token + head * head_dimension;
-            const float square_sum = float_dot(values, values, head_dimension);
-            const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(head_dimension) + epsilon);
             if (simd_rms_norm_enabled(optimization_flags)
-                && (weight.dtype == DType::Float32
-                    || weight.dtype == DType::BFloat16))
+                && weight.dtype == DType::Float32)
             {
-                if (weight.dtype == DType::Float32)
-                {
-                    float_weighted_scale(
-                        values,
-                        values,
-                        weight.float32_values().data(),
-                        inverse_rms,
-                        weight_offset,
-                        head_dimension);
-                }
-                else
-                {
-                    bfloat16_weighted_scale(
-                        values,
-                        values,
-                        weight.bfloat16_values().data(),
-                        inverse_rms,
-                        weight_offset,
-                        head_dimension);
-                }
+                float_rms_norm(
+                    values,
+                    values,
+                    weight.float32_values().data(),
+                    epsilon,
+                    weight_offset,
+                    head_dimension);
                 continue;
             }
+            if (simd_rms_norm_enabled(optimization_flags)
+                && weight.dtype == DType::BFloat16)
+            {
+                bfloat16_rms_norm(
+                    values,
+                    values,
+                    weight.bfloat16_values().data(),
+                    epsilon,
+                    weight_offset,
+                    head_dimension);
+                continue;
+            }
+            float square_sum = 0.0f;
+            for (uint32_t column = 0; column < head_dimension; ++column)
+                square_sum += values[column] * values[column];
+            const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(head_dimension) + epsilon);
             for (uint32_t column = 0; column < head_dimension; ++column)
             {
                 values[column] *= inverse_rms * (attention_weight_value(weight, column) + weight_offset);
@@ -1215,9 +1298,18 @@ Result<void> execute_attention_block_into(
         {
             float* attention_row = scratch.attention.row(token_index);
             const float* gate_row = scratch.gate.row(token_index);
-            for (uint32_t column = 0; column < scratch.attention.columns(); ++column)
+            if (cpu_fast_silu_enabled(optimization_flags))
             {
-                attention_row[column] *= 1.0f / (1.0f + std::exp(-gate_row[column]));
+                float_sigmoid_mul(
+                    attention_row,
+                    gate_row,
+                    attention_row,
+                    scratch.attention.columns());
+            }
+            else
+            {
+                for (uint32_t column = 0; column < scratch.attention.columns(); ++column)
+                    attention_row[column] *= 1.0f / (1.0f + float_approximate_exp(-gate_row[column]));
             }
         }
     }

@@ -39,6 +39,12 @@ private:
         case DType::Int8:
             return sizeof(uint8_t);
         case DType::MxFp4:
+        case DType::Q2K:
+        case DType::Q3K:
+        case DType::Q4K:
+        case DType::Q5K:
+        case DType::Q6K:
+        case DType::Q8K:
             return 0;
         }
         return 0;

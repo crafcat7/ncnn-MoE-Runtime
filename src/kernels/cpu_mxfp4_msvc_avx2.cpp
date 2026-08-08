@@ -1,5 +1,6 @@
 #include "cpu_mxfp4_msvc.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -20,6 +21,79 @@ static const std::array<float, 256>& avx2_scale_table()
 {
     static const std::array<float, 256> values = make_avx2_scale_table();
     return values;
+}
+
+static float avx2_horizontal_max(__m256 values) noexcept
+{
+    const __m128 halves = _mm_max_ps(
+        _mm256_castps256_ps128(values),
+        _mm256_extractf128_ps(values, 1));
+    const __m128 pairs = _mm_max_ps(halves, _mm_movehl_ps(halves, halves));
+    const __m128 result = _mm_max_ss(pairs, _mm_movehdup_ps(pairs));
+    return _mm_cvtss_f32(result);
+}
+
+void msvc_avx2_mxfp4_q8_quantize(
+    const float* source,
+    int8_t* values,
+    float* scales,
+    uint32_t columns) noexcept
+{
+    if (!source || !values || !scales || columns == 0)
+        return;
+
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    const __m256 lower_bound = _mm256_set1_ps(-127.0f);
+    const __m256 upper_bound = _mm256_set1_ps(127.0f);
+    const uint32_t block_count = (columns + 31) / 32;
+    for (uint32_t block = 0; block < block_count; ++block)
+    {
+        const uint32_t begin = block * 32;
+        const uint32_t end = (columns < begin + 32) ? columns : begin + 32;
+        const uint32_t count = end - begin;
+        __m256 maximum_values = zero;
+        uint32_t index = 0;
+        for (; index + 8 <= count; index += 8)
+        {
+            const __m256 current = _mm256_loadu_ps(source + begin + index);
+            maximum_values = _mm256_max_ps(
+                maximum_values,
+                _mm256_andnot_ps(sign_mask, current));
+        }
+        float maximum = avx2_horizontal_max(maximum_values);
+        for (; index < count; ++index)
+            maximum = std::max(maximum, std::fabs(source[begin + index]));
+
+        const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+        scales[block] = scale;
+        const __m256 inverse_scale = _mm256_set1_ps(1.0f / scale);
+        index = 0;
+        for (; index + 8 <= count; index += 8)
+        {
+            __m256 normalized = _mm256_mul_ps(
+                _mm256_loadu_ps(source + begin + index),
+                inverse_scale);
+            normalized = _mm256_max_ps(
+                lower_bound,
+                _mm256_min_ps(upper_bound, normalized));
+            const __m256i quantized = _mm256_cvtps_epi32(normalized);
+            alignas(32) int32_t quantized_values[8];
+            _mm256_storeu_si256(
+                reinterpret_cast<__m256i*>(quantized_values),
+                quantized);
+            for (uint32_t lane = 0; lane < 8; ++lane)
+                values[begin + index + lane] = static_cast<int8_t>(quantized_values[lane]);
+        }
+        for (; index < count; ++index)
+        {
+            const float normalized = std::clamp(
+                source[begin + index] / scale,
+                -127.0f,
+                127.0f);
+            values[begin + index] = static_cast<int8_t>(std::lrintf(normalized));
+        }
+    }
 }
 
 static void avx2_decode_block(const uint8_t* packed, __m128i decoded[2]) noexcept

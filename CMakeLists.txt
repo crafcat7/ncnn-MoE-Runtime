@@ -60,6 +60,7 @@ set(NCNN_MOE_SOURCES
     src/kernels/cpu_hyper_connection.cpp
     src/kernels/cpu_latent_attention.cpp
     src/kernels/cpu_mxfp4.cpp
+    src/kernels/cpu_qnk.cpp
     src/kernels/cpu_ops.cpp
     src/kernels/cpu_state_cache.cpp
     src/kernels/cpu_vector.cpp
@@ -83,6 +84,8 @@ if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
         src/kernels/cpu_float8_msvc_avx512.cpp
         src/kernels/cpu_mxfp4_msvc_avx2.cpp
         src/kernels/cpu_mxfp4_msvc_avx512.cpp
+        src/kernels/cpu_qnk_msvc_avx2.cpp
+        src/kernels/cpu_qnk_msvc_avx512.cpp
         src/kernels/cpu_vector_msvc_avx2.cpp
         src/kernels/cpu_vector_msvc_avx512.cpp
     )
@@ -91,12 +94,14 @@ if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
     set_source_files_properties(
         src/kernels/cpu_float8_msvc_avx2.cpp
         src/kernels/cpu_mxfp4_msvc_avx2.cpp
+        src/kernels/cpu_qnk_msvc_avx2.cpp
         src/kernels/cpu_vector_msvc_avx2.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX2"
     )
     set_source_files_properties(
         src/kernels/cpu_float8_msvc_avx512.cpp
         src/kernels/cpu_mxfp4_msvc_avx512.cpp
+        src/kernels/cpu_qnk_msvc_avx512.cpp
         src/kernels/cpu_vector_msvc_avx512.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX512"
     )

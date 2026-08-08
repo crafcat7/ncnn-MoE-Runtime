@@ -69,7 +69,7 @@ requiring a resident copy of every routed weight.
 | Execution graph | Tensor and node dependencies, backend candidates and placement, cross-backend events, and topological execution waves |
 | Dense path | Portable CPU with runtime-dispatched FP8 E4M3 scalar/AVX2/AVX-512 Linear, optional ncnn CPU operators, and mixed ncnn Vulkan Dense/Attention execution |
 | Attention | RMSNorm, GQA, full/sliding Attention, Gated DeltaNet, latent Attention with learned compressed history, RoPE/YaRN variants, output gates, sinks, persistent KV/recurrent state, fused QKV+RoPE, and adaptive online Decode SDPA |
-| Experts | Stable Top-K regrouping, Softmax/Sigmoid/square-root-Softplus scoring, hash routes, gated shared Experts, float32/BF16/FP8/INT8 execution, and fused-decode FP4 kernels selected at runtime for scalar, NEON, SVE2, AVX2/FMA, or AVX-512 |
+| Experts | Stable Top-K regrouping, Softmax/Sigmoid/square-root-Softplus scoring, hash routes, gated shared Experts, float32/BF16/FP8/INT8/Q2_K-Q6_K execution, and fused-decode FP4 kernels selected at runtime for scalar, NEON, SVE2, AVX2/FMA, or AVX-512 |
 | Memory and storage | Automatic eager/on-demand planning, per-Session Tensor residency accounting, Expert lifecycle/hotset statistics, byte-bounded host ARC, mmap or asynchronous direct/buffered reads, optional packed Expert storage, and optional Vulkan cache tiers |
 | Heterogeneous execution | CPU Experts by default, optional calibrated native Vulkan MXFP4 Experts, and capability-weighted multi-Vulkan layer placement |
 | Scheduling | Independent Session state, ragged staged Prefill, mHC/Attention/Expert Decode batching, same-Expert and exact-input coalescing, adaptive staged/independent execution, and bounded cross-call micro-batching |
@@ -203,6 +203,45 @@ periodic metrics trace is disabled by default. Use `--no-stream`,
 See [examples/README.md](examples/README.md) for the protocol boundary and
 common commands. The model guides document model-specific package preparation
 and adapter options.
+
+## Qn_K CPU weights and pack sidecar
+
+The CPU path accepts llama.cpp-compatible Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, and
+Q8_K blocks. Q2_K-Q6_K use the exact 256-element super-block layouts; Q8_K is
+available for activation/block interchange. A `TensorData` loaded through
+`SafetensorsArchive::load_qnk_tensor()` or `load_qnk_expert()` keeps the raw
+bytes lossless and builds an 8-row CPU tile pack on first linear execution.
+The x86 build dispatches Q2_K-Q8_K to direct SIMD bit-decode dot kernels: AVX2
+handles all formats, while AVX-512 uses 16-lane Q4_K/Q5_K/Q6_K kernels and the
+validated AVX2 kernels for the remaining formats. The scalar decoder remains
+the portability and correctness fallback.
+
+The deterministic Qn_K reference comparison can be run from the CPU test
+binary:
+
+```powershell
+build-cpu\Release\ncnn_moe_tests.exe --benchmark-qnk
+```
+
+It reports the scalar-decode/SIMD-float-dot reference time, direct SIMD time,
+speedup, and checksum delta for all six formats.
+
+For Expert banks stored as one contiguous U8 tensor, create an optional read-
+optimized sidecar without modifying the source shards:
+
+```powershell
+python tools\pack_qnk_experts.py D:\Models\my-model `
+  --tensor model.layers.0.mlp.experts.gate.weight `
+  --tensor model.layers.0.mlp.experts.up.weight `
+  --dtype q5_k --rows 4096 --columns 4096 --expert-count 32 `
+  --output D:\Models\my-model\ncnn-moe-packed-qnk.safetensors
+```
+
+The source tensors must contain `expert_count * rows * (columns / 256) *
+block_bytes` bytes, where `block_bytes` is the canonical Qn_K block size. The
+runtime prefers sidecar names of the form
+`__ncnn_moe_packed__.{expert}.{tensor}`. Packing only copies/reorders storage;
+it does not requantize weights or introduce an additional numerical error.
 
 ## Runtime API
 
@@ -355,12 +394,12 @@ src/graph/         Model compilation, execution-graph scheduling, Expert dispatc
 src/engine/        Runtime Core, Sessions, batch scheduling, MemoryManager, CPU execution, and Expert-backend coordination
 src/models/        Built-in model adapters, package loading, packed-sidecar selection, and canonical Tensor names
 src/storage/       Mapped files, range I/O, host ARC, Vulkan victim cache, system-memory discovery, and Expert lifecycle
-src/kernels/       Portable CPU Attention/Linear, BF16 helpers, and runtime-selected FP8/MXFP4 SIMD kernels
+src/kernels/       Portable CPU Attention/Linear, BF16 helpers, Qn_K pack/decode, and runtime-selected FP8/MXFP4 SIMD kernels
 src/backends/ncnn/ ncnn CPU/Vulkan operator packaging, mixed Attention, Vulkan contexts, and native MXFP4 Experts
 models/            Model catalog and model-family execution guides
 assets/            Published benchmark visualizations used by model reports
 examples/          Unified worker, benchmark/reference runners, protocol helpers, and MXFP4 microbenchmark
-tools/             Unified CLI/adapters, fixture, packed-Expert, and benchmark utilities
+tools/             Unified CLI/adapters, fixture, packed-Expert/Qn_K, and benchmark utilities
 tests/             Deterministic, parity, cache, scheduling, concurrency, and error-path tests
 third_party/ncnn/  Pinned ncnn source submodule
 ```

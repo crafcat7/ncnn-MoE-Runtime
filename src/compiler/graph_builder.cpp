@@ -1,6 +1,8 @@
 #include "compiler/moe_ir.hpp"
 #include "ncnn/moe/runtime_config.h"
 
+#include "kernels/cpu_qnk.h"
+
 #include <algorithm>
 #include <string>
 #include <utility>
@@ -23,6 +25,11 @@ static QuantConfig quant_config_for_dtype(DType dtype)
     {
         config.scheme = QuantizationScheme::BlockWise;
         config.block_size = 32;
+    }
+    else if (is_qnk_dtype(dtype))
+    {
+        config.scheme = QuantizationScheme::BlockWise;
+        config.block_size = qnk_block_elements;
     }
     return config;
 }
@@ -277,6 +284,12 @@ static uint64_t dtype_size(DType dtype)
     case DType::Float8E4M3:
     case DType::Int8: return 1;
     case DType::MxFp4: return 0;
+    case DType::Q2K:
+    case DType::Q3K:
+    case DType::Q4K:
+    case DType::Q5K:
+    case DType::Q6K:
+    case DType::Q8K: return 0;
     }
     return 0;
 }

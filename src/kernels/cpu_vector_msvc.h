@@ -71,12 +71,32 @@ void msvc_avx512_bfloat16_gemm_4x8(
     size_t output_stride) noexcept;
 void msvc_avx2_float_exp_inplace(float* values, uint32_t count) noexcept;
 void msvc_avx512_float_exp_inplace(float* values, uint32_t count) noexcept;
+void msvc_avx2_float_silu_inplace(float* values, uint32_t count) noexcept;
+void msvc_avx512_float_silu_inplace(float* values, uint32_t count) noexcept;
+void msvc_avx2_float_l2_scale_inplace(float* values, float epsilon, uint32_t count) noexcept;
+void msvc_avx512_float_l2_scale_inplace(float* values, float epsilon, uint32_t count) noexcept;
+void msvc_avx2_float_rms_scale_inplace(float* values, float epsilon, uint32_t count) noexcept;
+void msvc_avx512_float_rms_scale_inplace(float* values, float epsilon, uint32_t count) noexcept;
+void msvc_avx2_float_rms_norm(float* output, const float* input, const float* weight,
+                              float epsilon, float weight_offset, uint32_t count) noexcept;
+void msvc_avx512_float_rms_norm(float* output, const float* input, const float* weight,
+                                float epsilon, float weight_offset, uint32_t count) noexcept;
+void msvc_avx2_bfloat16_rms_norm(float* output, const float* input, const uint16_t* weight,
+                                 float epsilon, float weight_offset, uint32_t count) noexcept;
+void msvc_avx512_bfloat16_rms_norm(float* output, const float* input, const uint16_t* weight,
+                                   float epsilon, float weight_offset, uint32_t count) noexcept;
+void msvc_avx2_float_rope_inplace(float* values, const float* cosine, const float* sine,
+                                  uint32_t dimension) noexcept;
+void msvc_avx512_float_rope_inplace(float* values, const float* cosine, const float* sine,
+                                    uint32_t dimension) noexcept;
 float msvc_avx2_int8_float_dot(const int8_t* left, const float* right, uint32_t count) noexcept;
 float msvc_avx512_int8_float_dot(const int8_t* left, const float* right, uint32_t count) noexcept;
 void msvc_avx2_float_scale_inplace(float* values, float scale, uint32_t count) noexcept;
 void msvc_avx512_float_scale_inplace(float* values, float scale, uint32_t count) noexcept;
 void msvc_avx2_float_scaled_add(float* output, const float* input, float scale, uint32_t count) noexcept;
 void msvc_avx512_float_scaled_add(float* output, const float* input, float scale, uint32_t count) noexcept;
+void msvc_avx2_float_scale_add(float* output, float output_scale, const float* input, float input_scale, uint32_t count) noexcept;
+void msvc_avx512_float_scale_add(float* output, float output_scale, const float* input, float input_scale, uint32_t count) noexcept;
 void msvc_avx2_float_scale_inplace_and_scaled_add(
     float* values,
     float value_scale,
@@ -93,10 +113,24 @@ void msvc_avx2_float_weighted_scale(float* output, const float* input, const flo
 void msvc_avx512_float_weighted_scale(float* output, const float* input, const float* weight, float scale, float weight_offset, uint32_t count) noexcept;
 void msvc_avx2_bfloat16_weighted_scale(float* output, const float* input, const uint16_t* weight, float scale, float weight_offset, uint32_t count) noexcept;
 void msvc_avx512_bfloat16_weighted_scale(float* output, const float* input, const uint16_t* weight, float scale, float weight_offset, uint32_t count) noexcept;
+void msvc_avx2_float_sigmoid_mul(float* output, const float* gate, const float* input, uint32_t count) noexcept;
+void msvc_avx512_float_sigmoid_mul(float* output, const float* gate, const float* input, uint32_t count) noexcept;
 void msvc_avx2_float_silu_mul(float* output, const float* gate, const float* up,
                               float sigmoid_scale, float up_offset, uint32_t count) noexcept;
 void msvc_avx512_float_silu_mul(float* output, const float* gate, const float* up,
                                 float sigmoid_scale, float up_offset, uint32_t count) noexcept;
+void msvc_avx2_float_hc_pre_4(float* output, const float* input,
+                              float scale0, float scale1, float scale2, float scale3,
+                              uint32_t hidden_size) noexcept;
+void msvc_avx512_float_hc_pre_4(float* output, const float* input,
+                                float scale0, float scale1, float scale2, float scale3,
+                                uint32_t hidden_size) noexcept;
+void msvc_avx2_float_hc_post_4(float* output, const float* branch, const float* residual,
+                               const float* post, const float* combine,
+                               uint32_t hidden_size) noexcept;
+void msvc_avx512_float_hc_post_4(float* output, const float* branch, const float* residual,
+                                 const float* post, const float* combine,
+                                 uint32_t hidden_size) noexcept;
 
 } // namespace moe
 } // namespace ncnn

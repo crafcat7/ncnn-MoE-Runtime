@@ -20,6 +20,7 @@ void msvc_avx2_bfloat16_scaled_add(float* output, const uint16_t* input, float s
 [[nodiscard]] float msvc_avx2_mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input) noexcept;
 [[nodiscard]] float msvc_avx2_mxfp4_q8_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count,
                                            const int8_t* input, const float* input_scales) noexcept;
+void msvc_avx2_mxfp4_q8_quantize(const float* source, int8_t* values, float* scales, uint32_t columns) noexcept;
 void msvc_avx2_mxfp4_q8_matmul_rows2(
     const uint8_t* first_packed,
     const uint8_t* first_scales,
@@ -94,6 +95,7 @@ void msvc_avx512_bfloat16_batched_linear(const uint16_t* weights, const float* i
                                          std::vector<uint16_t>& packed_input);
 
 [[nodiscard]] float msvc_avx512_mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input) noexcept;
+void msvc_avx512_mxfp4_q8_quantize(const float* source, int8_t* values, float* scales, uint32_t columns) noexcept;
 
 void msvc_avx512_mxfp4_gemm_row(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input, size_t input_stride, size_t token_count,
                                 float* output, size_t output_stride) noexcept;

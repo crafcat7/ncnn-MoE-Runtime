@@ -1,5 +1,6 @@
 #include "cpu_gated_delta_net.h"
 
+#include "cpu_fast_math.h"
 #include "cpu_bfloat16.h"
 #include "cpu_ops.h"
 #include "cpu_vector.h"
@@ -26,8 +27,8 @@ static float gated_delta_tensor_value(const TensorData& tensor, size_t index)
 static float gated_delta_sigmoid(float value)
 {
     if (value >= 0.0f)
-        return 1.0f / (1.0f + std::exp(-value));
-    const float exponential = std::exp(value);
+        return 1.0f / (1.0f + float_approximate_exp(-value));
+    const float exponential = float_approximate_exp(value);
     return exponential / (1.0f + exponential);
 }
 
@@ -36,8 +37,8 @@ static float gated_delta_softplus(float value)
     if (value > 20.0f)
         return value;
     if (value < -20.0f)
-        return std::exp(value);
-    return std::log1p(std::exp(value));
+        return float_approximate_exp(value);
+    return std::log1p(float_approximate_exp(value));
 }
 
 static bool gated_delta_simd_enabled(uint64_t optimization_flags) noexcept
@@ -67,7 +68,8 @@ static void execute_depthwise_convolution_row(
     uint32_t kernel_size,
     std::vector<float>& state,
     float* values,
-    uint32_t columns)
+    uint32_t columns,
+    bool vectorized)
 {
     assert(weight.shape.size() == 3);
     assert(weight.shape[0] == columns);
@@ -88,8 +90,13 @@ static void execute_depthwise_convolution_row(
             sum += history[1] * taps[1];
             sum += history[2] * taps[2];
             sum += history[3] * taps[3];
-            values[channel] = sum * gated_delta_sigmoid(sum);
+            values[channel] = sum;
         }
+        if (vectorized)
+            float_silu_inplace(values, columns);
+        else
+            for (uint32_t channel = 0; channel < columns; ++channel)
+                values[channel] *= gated_delta_sigmoid(values[channel]);
         return;
     }
     if (kernel_size == 4 && weight.dtype == DType::BFloat16)
@@ -107,8 +114,13 @@ static void execute_depthwise_convolution_row(
             sum += history[1] * bfloat16_to_float(filter[offset + 1]);
             sum += history[2] * bfloat16_to_float(filter[offset + 2]);
             sum += history[3] * bfloat16_to_float(filter[offset + 3]);
-            values[channel] = sum * gated_delta_sigmoid(sum);
+            values[channel] = sum;
         }
+        if (vectorized)
+            float_silu_inplace(values, columns);
+        else
+            for (uint32_t channel = 0; channel < columns; ++channel)
+                values[channel] *= gated_delta_sigmoid(values[channel]);
         return;
     }
     for (uint32_t channel = 0; channel < columns; ++channel)
@@ -125,8 +137,13 @@ static void execute_depthwise_convolution_row(
                        static_cast<size_t>(channel) * kernel_size
                            + tap);
         }
-        values[channel] = sum * gated_delta_sigmoid(sum);
+        values[channel] = sum;
     }
+    if (vectorized)
+        float_silu_inplace(values, columns);
+    else
+        for (uint32_t channel = 0; channel < columns; ++channel)
+            values[channel] *= gated_delta_sigmoid(values[channel]);
 }
 
 static void execute_gated_delta_recurrence_row(
@@ -159,30 +176,22 @@ static void execute_gated_delta_recurrence_row(
         float* query = qkv + static_cast<size_t>(key_head) * plan.head_dimension;
         float* key = qkv + key_size
                      + static_cast<size_t>(key_head) * plan.head_dimension;
-        float query_square_sum = 0.0f;
-        float key_square_sum = 0.0f;
         if (vectorized)
         {
-            query_square_sum = float_dot(query, query, plan.head_dimension);
-            key_square_sum = float_dot(key, key, plan.head_dimension);
+            float_l2_scale_inplace(query, 1e-6f, plan.head_dimension);
+            float_l2_scale_inplace(key, 1e-6f, plan.head_dimension);
         }
         else
         {
+            float query_square_sum = 0.0f;
+            float key_square_sum = 0.0f;
             for (uint32_t column = 0; column < plan.head_dimension; ++column)
             {
                 query_square_sum += query[column] * query[column];
                 key_square_sum += key[column] * key[column];
             }
-        }
-        const float query_inverse_norm = 1.0f / std::sqrt(query_square_sum + 1e-6f);
-        const float key_inverse_norm = 1.0f / std::sqrt(key_square_sum + 1e-6f);
-        if (vectorized)
-        {
-            float_scale_inplace(query, query_inverse_norm, plan.head_dimension);
-            float_scale_inplace(key, key_inverse_norm, plan.head_dimension);
-        }
-        else
-        {
+            const float query_inverse_norm = 1.0f / std::sqrt(query_square_sum + 1e-6f);
+            const float key_inverse_norm = 1.0f / std::sqrt(key_square_sum + 1e-6f);
             for (uint32_t column = 0; column < plan.head_dimension; ++column)
             {
                 query[column] *= query_inverse_norm;
@@ -208,8 +217,8 @@ static void execute_gated_delta_recurrence_row(
                              + static_cast<size_t>(value_head)
                                    * plan.value_head_dimension;
         const float beta = gated_delta_sigmoid(beta_values[value_head]);
-        const float decay = std::exp(
-            -std::exp(gated_delta_tensor_value(decay_log, value_head))
+        const float decay = float_approximate_exp(
+            -float_approximate_exp(gated_delta_tensor_value(decay_log, value_head))
             * gated_delta_softplus(
                 alpha_values[value_head]
                 + gated_delta_tensor_value(time_bias, value_head)));
@@ -330,60 +339,64 @@ static void execute_gated_delta_recurrence_row(
             }
         }
 
-        float square_sum = vectorized
-                               ? float_dot(
-                                     head_output,
-                                     head_output,
-                                     plan.value_head_dimension)
-                               : 0.0f;
-        if (!vectorized)
-        {
-            for (uint32_t value_column = 0;
-                 value_column < plan.value_head_dimension;
-                 ++value_column)
-            {
-                square_sum += head_output[value_column] * head_output[value_column];
-            }
-        }
-        const float inverse_rms = 1.0f
-                                  / std::sqrt(
-                                      square_sum
-                                          / static_cast<float>(plan.value_head_dimension)
-                                      + norm_epsilon);
-        const float* head_gate = z + static_cast<size_t>(value_head) * plan.value_head_dimension;
         const bool vectorized_norm = vectorized
                                      && (norm_weight.dtype == DType::Float32
                                          || norm_weight.dtype == DType::BFloat16);
         if (vectorized_norm && norm_weight.dtype == DType::Float32)
         {
-            float_weighted_scale(
+            float_rms_norm(
                 head_output,
                 head_output,
                 norm_weight.float32_values().data(),
-                inverse_rms,
+                norm_epsilon,
                 0.0f,
                 plan.value_head_dimension);
         }
         else if (vectorized_norm)
         {
-            bfloat16_weighted_scale(
+            bfloat16_rms_norm(
                 head_output,
                 head_output,
                 norm_weight.bfloat16_values().data(),
-                inverse_rms,
+                norm_epsilon,
                 0.0f,
                 plan.value_head_dimension);
         }
-        for (uint32_t value_column = 0;
-             value_column < plan.value_head_dimension;
-             ++value_column)
+        if (vectorized_norm)
         {
-            if (vectorized_norm)
-            {
-                head_output[value_column] *= head_gate[value_column]
-                                             * gated_delta_sigmoid(head_gate[value_column]);
-            }
-            else
+            const float* head_gate = z + static_cast<size_t>(value_head) * plan.value_head_dimension;
+            float_silu_mul(
+                head_output,
+                head_gate,
+                head_output,
+                1.0f,
+                0.0f,
+                plan.value_head_dimension);
+        }
+        else
+        {
+            const float square_sum = vectorized
+                                         ? float_dot(
+                                               head_output,
+                                               head_output,
+                                               plan.value_head_dimension)
+                                         : [&]() {
+                                               float sum = 0.0f;
+                                               for (uint32_t value_column = 0;
+                                                    value_column < plan.value_head_dimension;
+                                                    ++value_column)
+                                                   sum += head_output[value_column] * head_output[value_column];
+                                               return sum;
+                                           }();
+            const float inverse_rms = 1.0f
+                                      / std::sqrt(
+                                          square_sum
+                                              / static_cast<float>(plan.value_head_dimension)
+                                          + norm_epsilon);
+            const float* head_gate = z + static_cast<size_t>(value_head) * plan.value_head_dimension;
+            for (uint32_t value_column = 0;
+                 value_column < plan.value_head_dimension;
+                 ++value_column)
             {
                 head_output[value_column] *= inverse_rms
                                              * gated_delta_tensor_value(norm_weight, value_column)
@@ -564,7 +577,8 @@ Result<void> execute_gated_delta_net_into(
             plan.convolution_kernel_size,
             cache.gated_delta_convolution,
             qkv,
-            convolution_size);
+            convolution_size,
+            gated_delta_simd_enabled(optimization_flags));
         execute_gated_delta_recurrence_row(
             weights,
             plan,

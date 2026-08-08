@@ -1,4 +1,5 @@
 #include "safetensors.h"
+#include "kernels/cpu_qnk.h"
 #include "storage/mapped_file.h"
 
 #include <algorithm>
@@ -326,6 +327,89 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) cons
     {
         return Error{ErrorCode::UnsupportedModel, "unsupported safetensors dtype for tensor: " + name};
     }
+    return tensor;
+}
+
+Result<TensorData> SafetensorsArchive::load_qnk_tensor(
+    const std::string& name,
+    DType dtype,
+    uint32_t rows,
+    uint32_t columns) const
+{
+    if (!qnk_shape_supported(dtype, rows, columns))
+        return Error{ErrorCode::InvalidArgument, "invalid Qn_K tensor shape: " + name};
+    const uint64_t expected_bytes = qnk_storage_bytes(dtype, rows, columns);
+    const SafetensorInfo* source = find(packed_tensor_name(name));
+    if (!source)
+        source = find(name);
+    if (!source || source->dtype != "U8" || source->byte_count != expected_bytes)
+        return Error{ErrorCode::InvalidModel, "invalid Qn_K safetensors tensor: " + name};
+
+    TensorData tensor;
+    tensor.dtype = dtype;
+    tensor.shape = {rows, columns};
+    auto mapped = MappedFileRange::open(source->path, source->offset, source->byte_count);
+    if (mapped)
+    {
+        mapped.value()->prefault();
+        tensor.mapped_data = mapped.value()->share_data();
+        tensor.mapped_byte_count = source->byte_count;
+        return tensor;
+    }
+    auto bytes = read_range(source->path, source->offset, source->byte_count);
+    if (!bytes)
+        return bytes.error();
+    tensor.quantized_data = std::move(bytes).value();
+    return tensor;
+}
+
+Result<TensorData> SafetensorsArchive::load_qnk_expert(
+    const std::string& name,
+    DType dtype,
+    uint32_t expert_id,
+    uint32_t expert_count,
+    uint32_t rows,
+    uint32_t columns) const
+{
+    if (expert_count == 0 || expert_id >= expert_count || !qnk_shape_supported(dtype, rows, columns))
+        return Error{ErrorCode::InvalidArgument, "invalid Qn_K Expert shape: " + name};
+    const uint64_t expert_bytes = qnk_storage_bytes(dtype, rows, columns);
+    const std::string packed_name = "__ncnn_moe_packed__." + std::to_string(expert_id) + "." + name;
+    const SafetensorInfo* source = find(packed_name);
+    uint64_t offset = 0;
+    if (source)
+    {
+        if (source->dtype != "U8" || source->byte_count != expert_bytes)
+            return Error{ErrorCode::InvalidModel, "invalid packed Qn_K Expert tensor: " + name};
+        offset = source->offset;
+    }
+    else
+    {
+        source = find(name);
+        if (!source || source->dtype != "U8"
+            || expert_bytes > std::numeric_limits<uint64_t>::max() / expert_count
+            || source->byte_count != expert_bytes * expert_count)
+        {
+            return Error{ErrorCode::InvalidModel, "invalid Qn_K Expert tensor: " + name};
+        }
+        offset = source->offset + expert_id * expert_bytes;
+    }
+
+    TensorData tensor;
+    tensor.dtype = dtype;
+    tensor.shape = {rows, columns};
+    auto mapped = MappedFileRange::open(source->path, offset, expert_bytes);
+    if (mapped)
+    {
+        mapped.value()->prefault();
+        tensor.mapped_data = mapped.value()->share_data();
+        tensor.mapped_byte_count = expert_bytes;
+        return tensor;
+    }
+    auto bytes = read_range(source->path, offset, expert_bytes);
+    if (!bytes)
+        return bytes.error();
+    tensor.quantized_data = std::move(bytes).value();
     return tensor;
 }
 

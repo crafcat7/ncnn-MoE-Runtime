@@ -41,6 +41,14 @@ public:
     [[nodiscard]] Result<TensorData> load_tensor(const std::string& name) const;
     [[nodiscard]] Result<TensorData> load_bfloat16_slice(const std::string& name, uint32_t index, std::vector<uint32_t> shape) const;
     [[nodiscard]] Result<TensorData> load_float8_tensor(const std::string& weight_name, const std::string& scale_name) const;
+    // Load a logical [rows, columns] matrix encoded as raw llama.cpp Qn_K
+    // blocks.  A __ncnn_moe_packed__.NAME sidecar tensor is preferred when
+    // present, so the same API works with the optional pack tool output.
+    [[nodiscard]] Result<TensorData> load_qnk_tensor(const std::string& name, DType dtype, uint32_t rows, uint32_t columns) const;
+    // Load one Expert slice from a U8 tensor whose first dimension is the
+    // Expert count.  The pack tool emits matching per-Expert sidecar names.
+    [[nodiscard]] Result<TensorData> load_qnk_expert(const std::string& name, DType dtype, uint32_t expert_id, uint32_t expert_count,
+                                                     uint32_t rows, uint32_t columns) const;
     [[nodiscard]] Result<TensorData> load_mxfp4_tensor(const std::string& blocks_name, const std::string& scales_name, uint32_t rows, uint32_t columns, uint32_t flags = 0) const;
     [[nodiscard]] Result<TensorData> load_interleaved_mxfp4_tensor(const std::string& gate_blocks_name, const std::string& gate_scales_name,
                                                                    const std::string& up_blocks_name, const std::string& up_scales_name,

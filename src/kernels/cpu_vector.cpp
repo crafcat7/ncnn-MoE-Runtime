@@ -1,5 +1,6 @@
 #include "cpu_vector.h"
 
+#include "cpu_fast_math.h"
 #include "engine/cpu_features.h"
 #include "ncnn/moe/runtime.h"
 
@@ -18,9 +19,17 @@ using FloatExpInplaceFunction = void (*)(float*, uint32_t) noexcept;
 using Int8FloatDotFunction = float (*)(const int8_t*, const float*, uint32_t) noexcept;
 using FloatScaleFunction = void (*)(float*, float, uint32_t) noexcept;
 using FloatScaledAddFunction = void (*)(float*, const float*, float, uint32_t) noexcept;
+using FloatScaleAddFunction = void (*)(float*, float, const float*, float, uint32_t) noexcept;
 using FloatScaleInplaceAndScaledAddFunction = void (*)(float*, float, float*, float, uint32_t) noexcept;
 using FloatWeightedScaleFunction = void (*)(float*, const float*, const float*, float, float, uint32_t) noexcept;
 using Bfloat16WeightedScaleFunction = void (*)(float*, const float*, const uint16_t*, float, float, uint32_t) noexcept;
+using FloatRmsScaleFunction = void (*)(float*, float, uint32_t) noexcept;
+using FloatL2ScaleFunction = void (*)(float*, float, uint32_t) noexcept;
+using FloatRmsNormFunction = void (*)(float*, const float*, const float*, float, float, uint32_t) noexcept;
+using Bfloat16RmsNormFunction = void (*)(float*, const float*, const uint16_t*, float, float, uint32_t) noexcept;
+using FloatRopeFunction = void (*)(float*, const float*, const float*, uint32_t) noexcept;
+using FloatHcPre4Function = void (*)(float*, const float*, float, float, float, float, uint32_t) noexcept;
+using FloatHcPost4Function = void (*)(float*, const float*, const float*, const float*, const float*, uint32_t) noexcept;
 
 static float scalar_float_dot(const float* left, const float* right, uint32_t count) noexcept
 {
@@ -142,6 +151,41 @@ static void scalar_float_scale_inplace(float* values, float scale, uint32_t coun
         values[index] *= scale;
 }
 
+static void scalar_float_rms_scale_inplace(float* values, float epsilon, uint32_t count) noexcept
+{
+    if (count == 0)
+        return;
+    float square_sum = 0.0f;
+    for (uint32_t index = 0; index < count; ++index)
+        square_sum += values[index] * values[index];
+    const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
+    for (uint32_t index = 0; index < count; ++index)
+        values[index] *= inverse_rms;
+}
+
+static void scalar_float_l2_scale_inplace(float* values, float epsilon, uint32_t count) noexcept
+{
+    if (count == 0)
+        return;
+    float square_sum = 0.0f;
+    for (uint32_t index = 0; index < count; ++index)
+        square_sum += values[index] * values[index];
+    const float inverse_norm = 1.0f / std::sqrt(square_sum + epsilon);
+    for (uint32_t index = 0; index < count; ++index)
+        values[index] *= inverse_norm;
+}
+
+static void scalar_float_scale_add(
+    float* output,
+    float output_scale,
+    const float* input,
+    float input_scale,
+    uint32_t count) noexcept
+{
+    for (uint32_t index = 0; index < count; ++index)
+        output[index] = output[index] * output_scale + input[index] * input_scale;
+}
+
 static void scalar_float_scale_inplace_and_scaled_add(
     float* values,
     float value_scale,
@@ -171,14 +215,130 @@ static void scalar_bfloat16_weighted_scale(float* output, const float* input, co
     }
 }
 
+static void scalar_float_rms_norm(
+    float* output,
+    const float* input,
+    const float* weight,
+    float epsilon,
+    float weight_offset,
+    uint32_t count) noexcept
+{
+    if (count == 0)
+        return;
+    float square_sum = 0.0f;
+    for (uint32_t index = 0; index < count; ++index)
+        square_sum += input[index] * input[index];
+    const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
+    for (uint32_t index = 0; index < count; ++index)
+        output[index] = input[index] * inverse_rms * (weight[index] + weight_offset);
+}
+
+static void scalar_bfloat16_rms_norm(
+    float* output,
+    const float* input,
+    const uint16_t* weight,
+    float epsilon,
+    float weight_offset,
+    uint32_t count) noexcept
+{
+    if (count == 0)
+        return;
+    float square_sum = 0.0f;
+    for (uint32_t index = 0; index < count; ++index)
+        square_sum += input[index] * input[index];
+    const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        const float weight_value = std::bit_cast<float>(static_cast<uint32_t>(weight[index]) << 16);
+        output[index] = input[index] * inverse_rms * (weight_value + weight_offset);
+    }
+}
+
+static void scalar_float_rope_inplace(
+    float* values,
+    const float* cosine,
+    const float* sine,
+    uint32_t dimension) noexcept
+{
+    const uint32_t half_dimension = dimension / 2;
+    for (uint32_t index = 0; index < half_dimension; ++index)
+    {
+        const float first = values[index];
+        const float second = values[half_dimension + index];
+        values[index] = first * cosine[index] - second * sine[index];
+        values[half_dimension + index] = second * cosine[index] + first * sine[index];
+    }
+}
+
+static void scalar_float_hc_pre_4(
+    float* output,
+    const float* input,
+    float scale0,
+    float scale1,
+    float scale2,
+    float scale3,
+    uint32_t hidden_size) noexcept
+{
+    const float* input1 = input + hidden_size;
+    const float* input2 = input1 + hidden_size;
+    const float* input3 = input2 + hidden_size;
+    for (uint32_t index = 0; index < hidden_size; ++index)
+        output[index] = input[index] * scale0
+                        + input1[index] * scale1
+                        + input2[index] * scale2
+                        + input3[index] * scale3;
+}
+
+static void scalar_float_hc_post_4(
+    float* output,
+    const float* branch,
+    const float* residual,
+    const float* post,
+    const float* combine,
+    uint32_t hidden_size) noexcept
+{
+    for (uint32_t index = 0; index < hidden_size; ++index)
+    {
+        for (uint32_t output_index = 0; output_index < 4; ++output_index)
+        {
+            float value = branch[index] * post[output_index];
+            for (uint32_t residual_index = 0; residual_index < 4; ++residual_index)
+            {
+                value += residual[static_cast<size_t>(residual_index) * hidden_size + index]
+                         * combine[residual_index * 4 + output_index];
+            }
+            output[static_cast<size_t>(output_index) * hidden_size + index] = value;
+        }
+    }
+}
+
+static void scalar_float_sigmoid_mul(
+    float* output,
+    const float* gate,
+    const float* input,
+    uint32_t count) noexcept
+{
+    for (uint32_t index = 0; index < count; ++index)
+        output[index] = input[index] / (1.0f + float_approximate_exp(-gate[index]));
+}
+
 static void scalar_float_silu_mul(float* output, const float* gate, const float* up,
                                   float sigmoid_scale, float up_offset, uint32_t count) noexcept
 {
     for (uint32_t index = 0; index < count; ++index)
     {
         const float gate_value = gate[index];
-        output[index] = gate_value / (1.0f + std::exp(-sigmoid_scale * gate_value))
+        output[index] = gate_value / (1.0f + float_approximate_exp(-sigmoid_scale * gate_value))
                         * (up[index] + up_offset);
+    }
+}
+
+static void scalar_float_silu_inplace(float* values, uint32_t count) noexcept
+{
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        const float value = values[index];
+        values[index] = value / (1.0f + float_approximate_exp(-value));
     }
 }
 
@@ -242,6 +402,18 @@ static FloatScaleFunction select_float_scale() noexcept
     return scalar_float_scale_inplace;
 }
 
+static FloatScaleAddFunction select_float_scale_add() noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    if ((isa & CpuIsaX86Avx512) != 0)
+        return msvc_avx512_float_scale_add;
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+        return msvc_avx2_float_scale_add;
+#endif
+    return scalar_float_scale_add;
+}
+
 static FloatScaleInplaceAndScaledAddFunction select_float_scale_inplace_and_scaled_add() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
@@ -278,7 +450,105 @@ static Bfloat16WeightedScaleFunction select_bfloat16_weighted_scale() noexcept
     return scalar_bfloat16_weighted_scale;
 }
 
+static FloatRmsScaleFunction select_float_rms_scale() noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    if ((isa & CpuIsaX86Avx512) != 0)
+        return msvc_avx512_float_rms_scale_inplace;
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+        return msvc_avx2_float_rms_scale_inplace;
+#endif
+    return scalar_float_rms_scale_inplace;
+}
+
+static FloatL2ScaleFunction select_float_l2_scale() noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    if ((isa & CpuIsaX86Avx512) != 0)
+        return msvc_avx512_float_l2_scale_inplace;
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+        return msvc_avx2_float_l2_scale_inplace;
+#endif
+    return scalar_float_l2_scale_inplace;
+}
+
+static FloatRmsNormFunction select_float_rms_norm() noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    if ((isa & CpuIsaX86Avx512) != 0)
+        return msvc_avx512_float_rms_norm;
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+        return msvc_avx2_float_rms_norm;
+#endif
+    return scalar_float_rms_norm;
+}
+
+static Bfloat16RmsNormFunction select_bfloat16_rms_norm() noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    if ((isa & CpuIsaX86Avx512) != 0)
+        return msvc_avx512_bfloat16_rms_norm;
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+        return msvc_avx2_bfloat16_rms_norm;
+#endif
+    return scalar_bfloat16_rms_norm;
+}
+
+static FloatRopeFunction select_float_rope() noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    if ((isa & CpuIsaX86Avx512) != 0)
+        return msvc_avx512_float_rope_inplace;
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+        return msvc_avx2_float_rope_inplace;
+#endif
+    return scalar_float_rope_inplace;
+}
+
+static FloatHcPre4Function select_float_hc_pre_4() noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    if ((isa & CpuIsaX86Avx512) != 0)
+        return msvc_avx512_float_hc_pre_4;
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+        return msvc_avx2_float_hc_pre_4;
+#endif
+    return scalar_float_hc_pre_4;
+}
+
+static FloatHcPost4Function select_float_hc_post_4() noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    if ((isa & CpuIsaX86Avx512) != 0)
+        return msvc_avx512_float_hc_post_4;
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+        return msvc_avx2_float_hc_post_4;
+#endif
+    return scalar_float_hc_post_4;
+}
+
+using FloatSigmoidMulFunction = void (*)(float*, const float*, const float*, uint32_t) noexcept;
 using FloatSiluMulFunction = void (*)(float*, const float*, const float*, float, float, uint32_t) noexcept;
+using FloatSiluInplaceFunction = void (*)(float*, uint32_t) noexcept;
+
+static FloatSigmoidMulFunction select_float_sigmoid_mul() noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    if ((isa & CpuIsaX86Avx512) != 0)
+        return msvc_avx512_float_sigmoid_mul;
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+        return msvc_avx2_float_sigmoid_mul;
+#endif
+    return scalar_float_sigmoid_mul;
+}
 
 static FloatSiluMulFunction select_float_silu_mul() noexcept
 {
@@ -290,6 +560,18 @@ static FloatSiluMulFunction select_float_silu_mul() noexcept
         return msvc_avx2_float_silu_mul;
 #endif
     return scalar_float_silu_mul;
+}
+
+static FloatSiluInplaceFunction select_float_silu_inplace() noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    if ((isa & CpuIsaX86Avx512) != 0)
+        return msvc_avx512_float_silu_inplace;
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+        return msvc_avx2_float_silu_inplace;
+#endif
+    return scalar_float_silu_inplace;
 }
 
 float float_dot(const float* left, const float* right, uint32_t count) noexcept
@@ -427,7 +709,7 @@ void float_exp_inplace(float* values, uint32_t count) noexcept
         return;
     }
     for (uint32_t index = 0; index < count; ++index)
-        values[index] = std::exp(values[index]);
+        values[index] = float_approximate_exp(values[index]);
 }
 
 bool float_exp_simd_available() noexcept
@@ -442,6 +724,39 @@ float int8_float_dot(const int8_t* left, const float* right, uint32_t count) noe
     return function(left, right, count);
 }
 
+void float_l2_scale_inplace(float* values, float epsilon, uint32_t count) noexcept
+{
+    static const FloatL2ScaleFunction function = select_float_l2_scale();
+    function(values, epsilon, count);
+}
+
+void float_rms_scale_inplace(float* values, float epsilon, uint32_t count) noexcept
+{
+    static const FloatRmsScaleFunction function = select_float_rms_scale();
+    function(values, epsilon, count);
+}
+
+void float_rms_norm(float* output, const float* input, const float* weight,
+                    float epsilon, float weight_offset, uint32_t count) noexcept
+{
+    static const FloatRmsNormFunction function = select_float_rms_norm();
+    function(output, input, weight, epsilon, weight_offset, count);
+}
+
+void bfloat16_rms_norm(float* output, const float* input, const uint16_t* weight,
+                       float epsilon, float weight_offset, uint32_t count) noexcept
+{
+    static const Bfloat16RmsNormFunction function = select_bfloat16_rms_norm();
+    function(output, input, weight, epsilon, weight_offset, count);
+}
+
+void float_rope_inplace(float* values, const float* cosine, const float* sine,
+                        uint32_t dimension) noexcept
+{
+    static const FloatRopeFunction function = select_float_rope();
+    function(values, cosine, sine, dimension);
+}
+
 void float_scale_inplace(float* values, float scale, uint32_t count) noexcept
 {
     static const FloatScaleFunction function = select_float_scale();
@@ -452,6 +767,17 @@ void float_scaled_add(float* output, const float* input, float scale, uint32_t c
 {
     static const FloatScaledAddFunction function = select_float_scaled_add();
     function(output, input, scale, count);
+}
+
+void float_scale_add(
+    float* output,
+    float output_scale,
+    const float* input,
+    float input_scale,
+    uint32_t count) noexcept
+{
+    static const FloatScaleAddFunction function = select_float_scale_add();
+    function(output, output_scale, input, input_scale, count);
 }
 
 void float_scale_inplace_and_scaled_add(
@@ -477,11 +803,43 @@ void bfloat16_weighted_scale(float* output, const float* input, const uint16_t* 
     function(output, input, weight, scale, weight_offset, count);
 }
 
+void float_sigmoid_mul(
+    float* output,
+    const float* gate,
+    const float* input,
+    uint32_t count) noexcept
+{
+    static const FloatSigmoidMulFunction function = select_float_sigmoid_mul();
+    function(output, gate, input, count);
+}
+
 void float_silu_mul(float* output, const float* gate, const float* up,
                     float sigmoid_scale, float up_offset, uint32_t count) noexcept
 {
     static const FloatSiluMulFunction function = select_float_silu_mul();
     function(output, gate, up, sigmoid_scale, up_offset, count);
+}
+
+void float_silu_inplace(float* values, uint32_t count) noexcept
+{
+    static const FloatSiluInplaceFunction function = select_float_silu_inplace();
+    function(values, count);
+}
+
+void float_hc_pre_4(float* output, const float* input,
+                    float scale0, float scale1, float scale2, float scale3,
+                    uint32_t hidden_size) noexcept
+{
+    static const FloatHcPre4Function function = select_float_hc_pre_4();
+    function(output, input, scale0, scale1, scale2, scale3, hidden_size);
+}
+
+void float_hc_post_4(float* output, const float* branch, const float* residual,
+                     const float* post, const float* combine,
+                     uint32_t hidden_size) noexcept
+{
+    static const FloatHcPost4Function function = select_float_hc_post_4();
+    function(output, branch, residual, post, combine, hidden_size);
 }
 
 } // namespace moe

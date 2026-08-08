@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ncnn_moe_adapters import QwenAdapter, _normalize_token_ids, create_adapter  # noqa: E402
-from ncnn_moe import _format_bytes_gb, default_worker_path, find_worker, parse_arguments  # noqa: E402
+from ncnn_moe import _format_bytes_gb, _format_runtime_metrics, default_worker_path, find_worker, parse_arguments  # noqa: E402
 from ncnn_moe_protocol import WorkerClient, WorkerError  # noqa: E402
 
 
@@ -28,6 +28,21 @@ def main() -> int:
 
     assert _format_bytes_gb(1_000_000_000) == "1.00 GB"
     assert _format_bytes_gb(None) == "N/A"
+    formatted_metrics = _format_runtime_metrics(
+        {
+            "decode_tok_per_second": None,
+            "tokens_per_second": None,
+            "tpot_microseconds": 75_030.0,
+            "gpu": {
+                "available": True,
+                "kernel_time_available": False,
+                "reason": "gpu_expert_execution_not_observed",
+            },
+            "gpu_device": {},
+        }
+    )
+    assert "Decode tok/s 13.33" in formatted_metrics
+    assert "kernel N/A (no GPU Expert execution)" in formatted_metrics
 
     defaults = parse_arguments(["run", "--model", "model", "--prompt", "hello"])
     assert defaults.stream is True

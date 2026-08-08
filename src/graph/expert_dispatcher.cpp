@@ -1,5 +1,7 @@
 #include "ncnn/moe/expert_dispatcher.h"
 
+#include "kernels/cpu_fast_math.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -26,14 +28,14 @@ static float stable_softplus(float value)
     if (value > 20.0f)
         return value;
     if (value < -20.0f)
-        return std::exp(value);
-    return std::log1p(std::exp(value));
+        return float_approximate_exp(value);
+    return std::log1p(float_approximate_exp(value));
 }
 
 static float score_router_logit(float logit, RouterScoreFunction score_function)
 {
     if (score_function == RouterScoreFunction::Sigmoid)
-        return 1.0f / (1.0f + std::exp(-logit));
+        return 1.0f / (1.0f + float_approximate_exp(-logit));
     return std::sqrt(stable_softplus(logit));
 }
 
@@ -46,7 +48,7 @@ static void router_scores(const float* logits, uint32_t size, RouterScoreFunctio
         float sum = 0.0f;
         for (uint32_t index = 0; index < size; ++index)
         {
-            scores[index] = std::exp(logits[index] - maximum);
+            scores[index] = float_approximate_exp(logits[index] - maximum);
             sum += scores[index];
         }
         for (float& score : scores)
@@ -201,12 +203,12 @@ Result<void> ExpertDispatcher::dispatch_into(std::span<const float> router_logit
     {
         softmax_denominator = 0.0f;
         for (float logit : router_logits)
-            softmax_denominator += std::exp(logit - maximum);
+            softmax_denominator += float_approximate_exp(logit - maximum);
     }
     const auto score_for_expert = [&](uint32_t expert_id) {
         const float logit = router_logits[expert_id];
         return options.score_function == RouterScoreFunction::Softmax
-                   ? std::exp(logit - maximum) / softmax_denominator
+                   ? float_approximate_exp(logit - maximum) / softmax_denominator
                    : score_router_logit(logit, options.score_function);
     };
 

@@ -1,6 +1,7 @@
 #include "cpu_latent_attention.h"
 
 #include "backends/ncnn/ncnn_linear.h"
+#include "cpu_fast_math.h"
 #include "cpu_float8.h"
 #include "cpu_ops.h"
 #include "cpu_vector.h"
@@ -328,6 +329,28 @@ static void hadamard_rotate(float* values, uint32_t count)
 
 static void normalize_vector(float* values, uint32_t count, const TensorData& weight, float epsilon, uint64_t optimization_flags)
 {
+    if (simd_latent_norm_enabled(optimization_flags) && weight.dtype == DType::BFloat16)
+    {
+        bfloat16_rms_norm(
+            values,
+            values,
+            weight.bfloat16_values().data(),
+            epsilon,
+            0.0f,
+            count);
+        return;
+    }
+    if (simd_latent_norm_enabled(optimization_flags) && weight.dtype == DType::Float32)
+    {
+        float_rms_norm(
+            values,
+            values,
+            weight.float32_values().data(),
+            epsilon,
+            0.0f,
+            count);
+        return;
+    }
     float square_sum = 0.0f;
     if (simd_latent_norm_enabled(optimization_flags))
         square_sum = float_dot(values, values, count);
@@ -363,17 +386,16 @@ static void normalize_vector(float* values, uint32_t count, const TensorData& we
 
 static void normalize_unit(float* values, uint32_t count, float epsilon, uint64_t optimization_flags)
 {
-    float square_sum = 0.0f;
     if (simd_latent_norm_enabled(optimization_flags))
-        square_sum = float_dot(values, values, count);
-    else
     {
-        for (uint32_t index = 0; index < count; ++index)
-            square_sum += values[index] * values[index];
+        float_rms_scale_inplace(values, epsilon, count);
+        return;
     }
-    const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
+    float square_sum = 0.0f;
     for (uint32_t index = 0; index < count; ++index)
-        values[index] *= inverse_rms;
+        square_sum += values[index] * values[index];
+    const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
+    float_scale_inplace(values, inverse_rms, count);
 }
 
 static void normalize_unit_prepared_rope(
@@ -385,6 +407,23 @@ static void normalize_unit_prepared_rope(
     std::span<const float> sines,
     uint64_t optimization_flags)
 {
+    if (simd_latent_norm_enabled(optimization_flags))
+    {
+        float_rms_scale_inplace(values, epsilon, count);
+        const uint32_t rope_offset = count - rope_dimension;
+        const uint32_t pair_count = rope_dimension / 2;
+        assert(cosines.size() >= pair_count && sines.size() >= pair_count);
+        for (uint32_t pair = 0; pair < pair_count; ++pair)
+        {
+            const float cosine = cosines[pair];
+            const float sine = sines[pair];
+            const float real = values[rope_offset + pair * 2];
+            const float imaginary = values[rope_offset + pair * 2 + 1];
+            values[rope_offset + pair * 2] = real * cosine - imaginary * sine;
+            values[rope_offset + pair * 2 + 1] = real * sine + imaginary * cosine;
+        }
+        return;
+    }
     const float square_sum = simd_latent_norm_enabled(optimization_flags)
                                  ? float_dot(values, values, count)
                                  : [&]() {
@@ -395,8 +434,7 @@ static void normalize_unit_prepared_rope(
                                    }();
     const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
     const uint32_t rope_offset = count - rope_dimension;
-    for (uint32_t index = 0; index < rope_offset; ++index)
-        values[index] *= inverse_rms;
+    float_scale_inplace(values, inverse_rms, rope_offset);
 
     const uint32_t pair_count = rope_dimension / 2;
     assert(cosines.size() >= pair_count && sines.size() >= pair_count);
@@ -529,7 +567,7 @@ static void append_compressed_value(
         float denominator = 0.0f;
         for (float& score : exponentials)
         {
-            score = std::exp(score - maximum);
+            score = float_approximate_exp(score - maximum);
             denominator += score;
         }
         for (uint32_t token = 0; token < candidate_count; ++token)
@@ -1149,13 +1187,13 @@ static Result<CpuBatch> execute_latent_attention_rows(
                                     * softmax_scale;
                 if (score > maximum)
                 {
-                    const float rescale = std::exp(maximum - score);
+                    const float rescale = float_approximate_exp(maximum - score);
                     float_scale_inplace(
                         output_head, rescale, plan.head_dimension);
                     denominator *= rescale;
                     maximum = score;
                 }
-                const float weight = std::exp(score - maximum);
+                    const float weight = float_approximate_exp(score - maximum);
                 denominator += weight;
                 float_scaled_add(
                     output_head, candidate_key, weight,
@@ -1206,7 +1244,7 @@ static Result<CpuBatch> execute_latent_attention_rows(
             logits[candidate] = dot * softmax_scale;
             maximum = std::max(maximum, logits[candidate]);
         }
-        float denominator = std::exp(sinks[head] - maximum);
+        float denominator = float_approximate_exp(sinks[head] - maximum);
         for (uint32_t candidate = 0; candidate < candidate_count; ++candidate)
             logits[candidate] -= maximum;
         if (use_vector_softmax)
@@ -1214,7 +1252,7 @@ static Result<CpuBatch> execute_latent_attention_rows(
         else
         {
             for (uint32_t candidate = 0; candidate < candidate_count; ++candidate)
-                logits[candidate] = std::exp(logits[candidate]);
+                logits[candidate] = float_approximate_exp(logits[candidate]);
         }
         for (uint32_t candidate = 0; candidate < candidate_count; ++candidate)
             denominator += logits[candidate];
@@ -1569,7 +1607,7 @@ Result<CpuBatch> execute_dspark_attention(
                 logits[candidate] = dot * softmax_scale;
                 maximum = std::max(maximum, logits[candidate]);
             }
-            float denominator = std::exp(sinks[head] - maximum);
+            float denominator = float_approximate_exp(sinks[head] - maximum);
             for (float& logit : logits)
                 logit -= maximum;
             if (use_vector_softmax)
@@ -1577,7 +1615,7 @@ Result<CpuBatch> execute_dspark_attention(
             else
             {
                 for (float& logit : logits)
-                    logit = std::exp(logit);
+                    logit = float_approximate_exp(logit);
             }
             for (float logit : logits)
                 denominator += logit;

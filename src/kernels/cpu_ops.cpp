@@ -1,8 +1,10 @@
 #include "cpu_ops.h"
 
 #include "cpu_bfloat16.h"
+#include "cpu_fast_math.h"
 #include "cpu_float8.h"
 #include "cpu_mxfp4.h"
+#include "cpu_qnk.h"
 #include "cpu_vector.h"
 #include "backends/ncnn/ncnn_linear.h"
 #include "engine/cpu_thread_budget.h"
@@ -10,7 +12,6 @@
 #include "ncnn/moe/runtime_config.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cmath>
@@ -106,39 +107,7 @@ static float tensor_value(const TensorData& tensor, size_t index)
 
 static float exact_scaled_silu(float value, float sigmoid_scale) noexcept
 {
-    return value / (1.0f + std::exp(-sigmoid_scale * value));
-}
-
-static float approximate_exp(float value) noexcept
-{
-    if (value <= -80.0f)
-        return 0.0f;
-    value = std::min(value, 0.0f);
-    constexpr float inverse_log_two = 1.4426950408889634f;
-    constexpr float log_two = 0.6931471805599453f;
-    const float scaled = value * inverse_log_two;
-    int exponent = static_cast<int>(scaled);
-    if (static_cast<float>(exponent) > scaled)
-        --exponent;
-    const float remainder = value - static_cast<float>(exponent) * log_two;
-    const float polynomial = 1.0f
-                             + remainder
-                                   * (1.0f
-                                      + remainder
-                                            * (0.5f
-                                               + remainder
-                                                     * (0.16666666666666667f
-                                                        + remainder
-                                                              * (0.04166666666666667f
-                                                                 + remainder
-                                                                       * (0.008333333333333333f
-                                                                          + remainder
-                                                                                * (0.001388888888888889f
-                                                                                   + remainder * 0.0001984126984126984f))))));
-    const uint32_t exponent_bits = static_cast<uint32_t>(exponent + 127) << 23;
-    float power_of_two = 0.0f;
-    std::memcpy(&power_of_two, &exponent_bits, sizeof(power_of_two));
-    return power_of_two * polynomial;
+    return value / (1.0f + float_approximate_exp(-sigmoid_scale * value));
 }
 
 // Degree-7 approximation over one range-reduced log2 interval.
@@ -146,8 +115,8 @@ float approximate_scaled_silu(float value, float sigmoid_scale) noexcept
 {
     const float scaled_value = sigmoid_scale * value;
     if (scaled_value >= 0.0f)
-        return value / (1.0f + approximate_exp(-scaled_value));
-    const float exponential = approximate_exp(scaled_value);
+        return value / (1.0f + float_approximate_exp(-scaled_value));
+    const float exponential = float_approximate_exp(scaled_value);
     return value * exponential / (1.0f + exponential);
 }
 
@@ -171,7 +140,7 @@ const char* scaled_silu_kernel_name(uint64_t optimization_flags) noexcept
 {
     return cpu_fast_silu_enabled(optimization_flags)
                ? "polynomial"
-               : "libm";
+               : "ncnn-fast-exp";
 }
 
 static bool allow_openmp_parallel_region() noexcept
@@ -671,42 +640,39 @@ bool float8_linear_rms_norm_batch_into(
     {
         const float* source = input.row(token_index);
         float* destination = quantized_input.row(token_index);
-        const float square_sum = use_simd
-                                     ? float_dot(source, source,
-                                                 input.columns())
-                                     : std::inner_product(
-                                           source,
-                                           source + input.columns(), source,
-                                           0.0f);
-        const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(input.columns()) + epsilon);
-        if (norm_weight.dtype == DType::Float32)
+        if (use_simd && norm_weight.dtype == DType::Float32)
         {
-            if (use_simd)
-            {
-                float_weighted_scale(
-                    destination, source, norm_weight.float32_values().data(),
-                    inverse_rms, 0.0f, input.columns());
-            }
-            else
-            {
-                const std::span<const float> weights = norm_weight.float32_values();
-                for (uint32_t column = 0; column < input.columns(); ++column)
-                    destination[column] = source[column] * inverse_rms * weights[column];
-            }
+            float_rms_norm(
+                destination,
+                source,
+                norm_weight.float32_values().data(),
+                epsilon,
+                0.0f,
+                input.columns());
         }
-        else if (use_simd)
+        else if (use_simd && norm_weight.dtype == DType::BFloat16)
         {
-            bfloat16_weighted_scale(
-                destination, source, norm_weight.bfloat16_values().data(),
-                inverse_rms, 0.0f, input.columns());
+            bfloat16_rms_norm(
+                destination,
+                source,
+                norm_weight.bfloat16_values().data(),
+                epsilon,
+                0.0f,
+                input.columns());
         }
         else
         {
-            const std::span<const uint16_t> weights = norm_weight.bfloat16_values();
+            const float square_sum = std::inner_product(
+                source,
+                source + input.columns(), source,
+                0.0f);
+            const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(input.columns()) + epsilon);
             for (uint32_t column = 0; column < input.columns(); ++column)
             {
-                destination[column] = source[column] * inverse_rms
-                                      * bfloat16_to_float(weights[column]);
+                const float weight_value = norm_weight.dtype == DType::Float32
+                                                ? norm_weight.float32_values()[column]
+                                                : bfloat16_to_float(norm_weight.bfloat16_values()[column]);
+                destination[column] = source[column] * inverse_rms * weight_value;
             }
         }
         quantize_float8_e4m3_inplace(
@@ -728,9 +694,7 @@ static std::shared_ptr<const Mxfp4Q8PackedMatrix> get_mxfp4_q8_packed_weights(
         matrix.mxfp4_blocks.data());
     std::lock_guard<std::mutex> build_lock(
         build_locks[(storage_key >> 6) & 63u]);
-    std::shared_ptr<const Mxfp4Q8PackedMatrix> cached = std::atomic_load_explicit(
-        &matrix.mxfp4_q8_packed,
-        std::memory_order_acquire);
+    std::shared_ptr<const Mxfp4Q8PackedMatrix> cached = matrix.mxfp4_q8_packed;
     if (cached && cached->valid()
         && cached->rows == row_count
         && cached->block_count == block_count)
@@ -749,10 +713,7 @@ static std::shared_ptr<const Mxfp4Q8PackedMatrix> get_mxfp4_q8_packed_weights(
         return {};
     }
     std::shared_ptr<const Mxfp4Q8PackedMatrix> desired = packed;
-    std::atomic_store_explicit(
-        &matrix.mxfp4_q8_packed,
-        desired,
-        std::memory_order_release);
+    matrix.mxfp4_q8_packed = desired;
     return desired;
 }
 
@@ -762,6 +723,12 @@ void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch
     const uint32_t output_columns = matrix.shape[0];
     const uint32_t input_columns = matrix.shape[1];
     assert(input.columns() == input_columns);
+
+    if (is_qnk_dtype(matrix.dtype)
+        && qnk_linear_batch_into(matrix, input, output))
+    {
+        return;
+    }
 
     if (backend == ExecutionBackend::Vulkan
         && ((executable && executable->bfloat16
@@ -1262,7 +1229,7 @@ CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* b
                 if (activation == ExpertActivation::Silu
                     || activation == ExpertActivation::DeepSeekSwiGlu)
                 {
-                    output.row(0)[column] = gate / (1.0f + std::exp(-gate)) * up;
+                    output.row(0)[column] = gate / (1.0f + float_approximate_exp(-gate)) * up;
                 }
                 else
                 {
@@ -1312,7 +1279,7 @@ CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* b
             if (activation == ExpertActivation::Silu
                 || activation == ExpertActivation::DeepSeekSwiGlu)
             {
-                const float silu = gate / (1.0f + std::exp(-gate));
+                const float silu = gate / (1.0f + float_approximate_exp(-gate));
                 output.row(0)[column] = silu * linear;
             }
             else
@@ -1343,7 +1310,7 @@ CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* b
                 if (activation == ExpertActivation::Silu
                     || activation == ExpertActivation::DeepSeekSwiGlu)
                 {
-                    const float silu = gate / (1.0f + std::exp(-gate));
+                    const float silu = gate / (1.0f + float_approximate_exp(-gate));
                     output.row(token_index)[column] = silu * up;
                 }
                 else
@@ -1655,7 +1622,7 @@ static bool mxfp4_expert_decode(
                 if (task.activation == ExpertActivation::Silu
                     || task.activation == ExpertActivation::DeepSeekSwiGlu)
                 {
-                    const float silu = gate / (1.0f + std::exp(-gate));
+                    const float silu = gate / (1.0f + float_approximate_exp(-gate));
                     activated[task_index].row(0)[column] = silu * linear;
                 }
                 else
@@ -2133,7 +2100,7 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
                                == ExpertActivation::DeepSeekSwiGlu)
                     {
                         const float silu = gate
-                                           / (1.0f + std::exp(-gate));
+                                           / (1.0f + float_approximate_exp(-gate));
                         gate_values[column] = silu * up;
                     }
                     else
@@ -2377,25 +2344,23 @@ void rms_norm_batch_into(const CpuBatch& input, const TensorData& weight, float 
             && (weight.dtype == DType::Float32
                 || weight.dtype == DType::BFloat16))
         {
-            const float sum_of_squares = float_dot(source, source, input.columns());
-            const float inverse_rms = 1.0f / std::sqrt(sum_of_squares / static_cast<float>(input.columns()) + epsilon);
             if (weight.dtype == DType::Float32)
             {
-                float_weighted_scale(
+                float_rms_norm(
                     destination,
                     source,
                     weight.float32_values().data(),
-                    inverse_rms,
+                    epsilon,
                     weight_offset,
                     input.columns());
             }
             else
             {
-                bfloat16_weighted_scale(
+                bfloat16_rms_norm(
                     destination,
                     source,
                     weight.bfloat16_values().data(),
-                    inverse_rms,
+                    epsilon,
                     weight_offset,
                     input.columns());
             }
