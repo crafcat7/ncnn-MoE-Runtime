@@ -35,6 +35,7 @@ inline constexpr uint32_t automatic_vulkan_device_index = std::numeric_limits<ui
 class MappedFileRange;
 class Mxfp4ExpertCache;
 struct Mxfp4Q8PackedMatrix;
+struct QnKPack;
 
 [[nodiscard]] inline bool has_flag(uint32_t flags, uint32_t flag) noexcept
 {
@@ -201,8 +202,20 @@ enum class DType
     Int32,
     Int64,
     Int8,
-    MxFp4
+    MxFp4,
+    Q2K,
+    Q3K,
+    Q4K,
+    Q5K,
+    Q6K,
+    Q8K
 };
+
+[[nodiscard]] inline constexpr bool is_qnk_dtype(DType dtype) noexcept
+{
+    return dtype == DType::Q2K || dtype == DType::Q3K || dtype == DType::Q4K
+           || dtype == DType::Q5K || dtype == DType::Q6K || dtype == DType::Q8K;
+}
 
 enum class NormType
 {
@@ -332,6 +345,10 @@ struct TensorData
     std::vector<uint16_t> bfloat16_data;
     std::vector<int64_t> int64_data;
     std::vector<int8_t> int8_data;
+    // Raw Qn_K super-blocks.  The logical shape remains
+    // [output_rows, input_columns]; the encoded byte count is derived from
+    // the dtype and the 256-element super-block layout.
+    std::vector<uint8_t> quantized_data;
     std::vector<float> quantization_scales;
     MxFp4ByteBuffer mxfp4_blocks;
     MxFp4ByteBuffer mxfp4_scales;
@@ -340,12 +357,15 @@ struct TensorData
     std::shared_ptr<const MxFp4FileStorage> mxfp4_file_storage;
     // Immutable CPU MXFP4 weights may share an ISA-specific packed sidecar.
     mutable std::shared_ptr<const Mxfp4Q8PackedMatrix> mxfp4_q8_packed;
+    // Immutable CPU Qn_K weights may share an ISA-specific 8-row sidecar.
+    mutable std::shared_ptr<const QnKPack> qnk_packed;
     [[nodiscard]] uint64_t element_count() const noexcept;
     [[nodiscard]] std::span<const float> float32_values() const noexcept;
     [[nodiscard]] std::span<const uint16_t> bfloat16_values() const noexcept;
     [[nodiscard]] std::span<const uint8_t> float8_values() const noexcept;
     [[nodiscard]] std::span<const int64_t> int64_values() const noexcept;
     [[nodiscard]] std::span<const int8_t> int8_values() const noexcept;
+    [[nodiscard]] std::span<const uint8_t> qnk_values() const noexcept;
 };
 
 struct WeightMapping
@@ -412,6 +432,17 @@ inline std::span<const int8_t> TensorData::int8_values() const noexcept
         return {};
     }
     return {reinterpret_cast<const int8_t*>(mapped_data.get()), static_cast<size_t>(mapped_byte_count)};
+}
+
+inline std::span<const uint8_t> TensorData::qnk_values() const noexcept
+{
+    if (!is_qnk_dtype(dtype))
+        return {};
+    if (!quantized_data.empty())
+        return quantized_data;
+    if (!mapped_data)
+        return {};
+    return {mapped_data.get(), static_cast<size_t>(mapped_byte_count)};
 }
 
 } // namespace moe

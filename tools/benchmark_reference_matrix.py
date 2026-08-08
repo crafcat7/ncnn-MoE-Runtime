@@ -405,7 +405,9 @@ def deepseek_cases(arguments):
         str(arguments.host_memory_mb),
         "--expert-io-workers",
         str(arguments.expert_io_workers),
-        "--buffered-expert-io",
+        # Direct reads avoid an extra buffered copy for the packed Expert
+        # ranges on Windows; POSIX readers keep their normal pread path.
+        "--direct-expert-io",
     ]
 
     if not arguments.skip_single:

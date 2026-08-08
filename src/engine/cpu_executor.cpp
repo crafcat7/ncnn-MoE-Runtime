@@ -1,5 +1,6 @@
 #include "cpu_executor.h"
 
+#include "kernels/cpu_fast_math.h"
 #include "kernels/cpu_attention.h"
 #include "kernels/cpu_batch.h"
 #include "kernels/cpu_bfloat16.h"
@@ -389,6 +390,11 @@ static uint64_t prefetch_tensor(const TensorData& tensor)
     {
         return prefetch_buffer(tensor.mxfp4_blocks.data(), tensor.mxfp4_blocks.size()) + prefetch_buffer(tensor.mxfp4_scales.data(), tensor.mxfp4_scales.size());
     }
+    if (is_qnk_dtype(tensor.dtype))
+    {
+        const std::span<const uint8_t> values = tensor.qnk_values();
+        return prefetch_buffer(values.data(), values.size());
+    }
     return 0;
 }
 
@@ -670,7 +676,7 @@ static CpuBatch run_shared_expert(
                     {
                         const float scale = 1.0f
                                             / (1.0f
-                                               + std::exp(
+                                               + float_approximate_exp(
                                                    -fused.row(token_index)
                                                         [intermediate * 2]));
                         float* token = output.row(token_index);
@@ -706,7 +712,7 @@ static CpuBatch run_shared_expert(
     assert(gate.columns() == 1);
     for (size_t token_index = 0; token_index < output.rows(); ++token_index)
     {
-        const float scale = 1.0f / (1.0f + std::exp(-gate.row(token_index)[0]));
+        const float scale = 1.0f / (1.0f + float_approximate_exp(-gate.row(token_index)[0]));
         float* token = output.row(token_index);
         for (uint32_t column = 0; column < output.columns(); ++column)
             token[column] *= scale;

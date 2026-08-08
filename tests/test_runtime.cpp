@@ -3,8 +3,10 @@
 #include "compiler/moe_ir.hpp"
 #include "kernels/cpu_attention.h"
 #include "kernels/cpu_bfloat16.h"
+#include "kernels/cpu_fast_math.h"
 #include "kernels/cpu_gated_delta_net.h"
 #include "kernels/cpu_mxfp4.h"
+#include "kernels/cpu_qnk.h"
 #include "kernels/cpu_ops.h"
 #include "kernels/cpu_state_cache.h"
 #include "kernels/cpu_float8.h"
@@ -2567,6 +2569,40 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         packed_matrix_rows,
         packed_matrix)));
     check(static_cast<bool>(packed_matrix.valid()));
+
+    std::array<float, 37> q8_reference_input = {};
+    for (size_t index = 0; index < q8_reference_input.size(); ++index)
+        q8_reference_input[index] = (static_cast<float>((index * 13) % 23) - 11.0f) * 0.37f;
+    q8_reference_input[7] = 9.75f;
+    q8_reference_input[34] = -4.5f;
+    std::array<int8_t, 37> q8_reference_values = {};
+    std::array<float, 2> q8_reference_scales = {};
+    mxfp4_q8_quantize(
+        q8_reference_input.data(),
+        q8_reference_values.data(),
+        q8_reference_scales.data(),
+        static_cast<uint32_t>(q8_reference_input.size()));
+    for (uint32_t block = 0; block < q8_reference_scales.size(); ++block)
+    {
+        const uint32_t begin = block * 32;
+        const uint32_t end = std::min<uint32_t>(
+            static_cast<uint32_t>(q8_reference_input.size()),
+            begin + 32);
+        float maximum = 0.0f;
+        for (uint32_t index = begin; index < end; ++index)
+            maximum = std::max(maximum, std::fabs(q8_reference_input[index]));
+        const float expected_scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+        check_near(q8_reference_scales[block], expected_scale, 1e-7f);
+        for (uint32_t index = begin; index < end; ++index)
+        {
+            const float normalized = std::clamp(
+                q8_reference_input[index] / expected_scale,
+                -127.0f,
+                127.0f);
+            check(q8_reference_values[index] == static_cast<int8_t>(std::lrintf(normalized)));
+        }
+    }
+
     Mxfp4Q8Batch quantized_input;
     mxfp4_q8_quantize_batch(
         strided_input.data(),
@@ -2624,6 +2660,133 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     check(static_cast<bool>(std::string(mxfp4_kernel_name()).size() > 0));
     const std::string activation_kernel = scaled_silu_kernel_name(kTestOptimizationFlags);
     check(!activation_kernel.empty());
+}
+
+void test_qnk_cpu_kernel_and_pack()
+{
+    constexpr uint32_t columns = 512;
+    constexpr size_t rows = 9;
+    constexpr size_t input_rows = 3;
+    const std::array<DType, 6> dtypes = {
+        DType::Q2K,
+        DType::Q3K,
+        DType::Q4K,
+        DType::Q5K,
+        DType::Q6K,
+        DType::Q8K,
+    };
+
+    CpuBatch input(input_rows, columns);
+    for (size_t row = 0; row < input.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < input.columns(); ++column)
+            input.row(row)[column] = static_cast<float>(static_cast<int>(column % 17) - 8) * 0.01f * static_cast<float>(row + 1);
+    }
+
+    std::vector<uint8_t> q8_row(static_cast<size_t>(qnk_storage_bytes(DType::Q8K, 1, columns)));
+    qnk_q8k_quantize(input.row(0), q8_row.data(), columns);
+    alignas(64) float q8_decoded[qnk_block_elements];
+    qnk_dequantize_block(DType::Q8K, q8_row.data(), q8_decoded);
+    float q8_scale = 0.0f;
+    std::memcpy(&q8_scale, q8_row.data(), sizeof(q8_scale));
+    check(std::isfinite(q8_scale));
+    check(std::fabs(q8_scale) > 0.0f);
+    for (uint32_t column = 0; column < qnk_block_elements; ++column)
+        check(std::fabs(q8_decoded[column] - input.row(0)[column]) <= std::fabs(q8_scale) * 0.6f);
+    std::vector<uint8_t> q8_batch;
+    qnk_q8k_quantize_batch(input.row(0), input.columns(), input.rows(), columns, q8_batch);
+    check(q8_batch.size() == input.rows() * qnk_storage_bytes(DType::Q8K, 1, columns));
+
+    for (const DType dtype : dtypes)
+    {
+        const size_t block_bytes = qnk_block_bytes(dtype);
+        const uint32_t block_count = columns / qnk_block_elements;
+        std::vector<uint8_t> raw(static_cast<size_t>(qnk_storage_bytes(dtype, rows, columns)));
+        for (size_t index = 0; index < raw.size(); ++index)
+            raw[index] = static_cast<uint8_t>((index * 37u + static_cast<uint32_t>(dtype) * 11u + 5u) & 0xffu);
+
+        for (size_t row = 0; row < rows; ++row)
+        {
+            for (uint32_t block = 0; block < block_count; ++block)
+            {
+                uint8_t* encoded = raw.data() + (row * block_count + block) * block_bytes;
+                if (dtype == DType::Q2K)
+                {
+                    std::fill_n(encoded, 16, uint8_t{1});
+                    encoded[80] = 0x00;
+                    encoded[81] = 0x3c;
+                    encoded[82] = 0;
+                    encoded[83] = 0;
+                }
+                else if (dtype == DType::Q3K)
+                {
+                    std::fill_n(encoded + 96, 12, uint8_t{0});
+                    encoded[108] = 0x00;
+                    encoded[109] = 0x3c;
+                }
+                else if (dtype == DType::Q4K || dtype == DType::Q5K)
+                {
+                    encoded[0] = 0x00;
+                    encoded[1] = 0x3c;
+                    encoded[2] = 0;
+                    encoded[3] = 0;
+                    std::fill_n(encoded + 4, 4, uint8_t{1});
+                    std::fill_n(encoded + 8, 4, uint8_t{0});
+                }
+                else if (dtype == DType::Q6K)
+                {
+                    std::fill_n(encoded + 192, 16, uint8_t{1});
+                    encoded[208] = 0x00;
+                    encoded[209] = 0x3c;
+                }
+                else
+                {
+                    const float scale = 1.0f;
+                    std::memcpy(encoded, &scale, sizeof(scale));
+                }
+            }
+        }
+
+        QnKPack packed;
+        check(qnk_pack_weights(raw.data(), raw.size(), dtype, rows, columns, packed));
+        check(packed.valid());
+        check(packed.block_count == block_count);
+        check(packed.storage.size() == ((rows + 7) / 8) * block_count * 8 * block_bytes);
+        for (size_t row = 0; row < rows; ++row)
+        {
+            for (uint32_t block = 0; block < block_count; ++block)
+            {
+                const uint8_t* original = raw.data() + (row * block_count + block) * block_bytes;
+                check(std::memcmp(qnk_packed_block(packed, row, block), original, block_bytes) == 0);
+            }
+        }
+
+        TensorData matrix;
+        matrix.dtype = dtype;
+        matrix.shape = {static_cast<uint32_t>(rows), columns};
+        matrix.quantized_data = raw;
+        CpuBatch projected;
+        linear_batch_into(matrix, input, projected, 0);
+        check(projected.rows() == input_rows);
+        check(projected.columns() == rows);
+
+        alignas(64) float decoded[qnk_block_elements];
+        for (size_t token = 0; token < input_rows; ++token)
+        {
+            for (size_t row = 0; row < rows; ++row)
+            {
+                float expected = 0.0f;
+                for (uint32_t block = 0; block < block_count; ++block)
+                {
+                    const uint8_t* encoded = raw.data() + (row * block_count + block) * block_bytes;
+                    qnk_dequantize_block(dtype, encoded, decoded);
+                    for (uint32_t column = 0; column < qnk_block_elements; ++column)
+                        expected += decoded[column] * input.row(token)[block * qnk_block_elements + column];
+                }
+                check_near(projected.row(token)[row], expected, 0.1f);
+            }
+        }
+    }
 }
 
 class TestExpertVictimCache final : public IExpertVictimCache
@@ -2905,6 +3068,51 @@ void test_safetensors_packed_mxfp4_expert()
     check(static_cast<bool>(pair));
     check(static_cast<bool>(pair.value().gate_up->mxfp4_blocks.front() == 9));
     check(static_cast<bool>(pair.value().gate_up->mxfp4_scales.front() == 123));
+
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
+void test_safetensors_packed_qnk_expert()
+{
+    const std::filesystem::path directory = create_unique_test_directory("ncnn_moe_safetensors_qnk_packed_test_");
+    const auto write_archive = [](const std::filesystem::path& path, std::string header, const std::vector<uint8_t>& data) {
+        while (header.size() % 8 != 0)
+            header.push_back(' ');
+        const uint64_t header_size = header.size();
+        std::ofstream stream(path, std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(&header_size), sizeof(header_size));
+        stream.write(header.data(), static_cast<std::streamsize>(header.size()));
+        stream.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    };
+    constexpr uint32_t expert_count = 2;
+    constexpr uint32_t rows = 2;
+    constexpr uint32_t columns = 256;
+    const size_t expert_bytes = static_cast<size_t>(qnk_storage_bytes(DType::Q4K, rows, columns));
+    std::vector<uint8_t> source(expert_count * expert_bytes, 3);
+    write_archive(
+        directory / "model.safetensors",
+        R"({"experts":{"dtype":"U8","shape":[2,2,1,144],"data_offsets":[0,576]}})",
+        source);
+    std::vector<uint8_t> packed(expert_bytes * 2, 91);
+    write_archive(
+        directory / "ncnn-moe-packed-qnk.safetensors",
+        R"({"__ncnn_moe_packed__.1.experts":{"dtype":"U8","shape":[2,1,144],"data_offsets":[0,288]},"__ncnn_moe_packed__.matrix":{"dtype":"U8","shape":[2,1,144],"data_offsets":[288,576]}})",
+        packed);
+
+    auto archive = SafetensorsArchive::open(directory);
+    check(static_cast<bool>(archive));
+    auto expert = archive.value().load_qnk_expert("experts", DType::Q4K, 1, expert_count, rows, columns);
+    check(static_cast<bool>(expert));
+    check(expert.value().dtype == DType::Q4K);
+    check(expert.value().shape == std::vector<uint32_t>{rows, columns});
+    check(expert.value().qnk_values().size() == expert_bytes);
+    check(expert.value().qnk_values().front() == 91);
+    check(expert.value().qnk_values().back() == 91);
+    auto matrix = archive.value().load_qnk_tensor("matrix", DType::Q4K, rows, columns);
+    check(static_cast<bool>(matrix));
+    check(matrix.value().qnk_values().size() == expert_bytes);
+    check(matrix.value().qnk_values().front() == 91);
 
     std::error_code ignored;
     std::filesystem::remove_all(directory, ignored);
@@ -4871,6 +5079,25 @@ void test_deepseek_router_and_hyper_connection_kernels()
     check_near(connected.value().row(0)[0], 14.0f, 1e-5f);
     check_near(connected.value().row(0)[1], 20.0f, 1e-5f);
 
+    CpuBatch four_way_branch(1, 2);
+    four_way_branch.row(0)[0] = 10.0f;
+    four_way_branch.row(0)[1] = 20.0f;
+    CpuBatch four_way_residual(1, 8);
+    const std::array<float, 8> four_way_values = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+    std::copy_n(four_way_values.data(), four_way_values.size(), four_way_residual.row(0));
+    CpuHyperConnectionMix four_way_mix;
+    four_way_mix.post = {1.0f, 2.0f, 3.0f, 4.0f};
+    four_way_mix.combine = {
+        1.0f, 2.0f, 3.0f, 4.0f,
+        5.0f, 6.0f, 7.0f, 8.0f,
+        9.0f, 10.0f, 11.0f, 12.0f,
+        13.0f, 14.0f, 15.0f, 16.0f};
+    connected = hyper_connection_post(four_way_branch, four_way_residual, four_way_mix, 4);
+    check(static_cast<bool>(connected));
+    const std::array<float, 8> four_way_expected = {162.0f, 200.0f, 188.0f, 240.0f, 214.0f, 280.0f, 240.0f, 320.0f};
+    for (size_t index = 0; index < four_way_expected.size(); ++index)
+        check_near(connected.value().row(0)[index], four_way_expected[index], 1e-4f);
+
     for (float value : std::array<float, 7>{-448.0f, -1.5f, -0.001f, 0.0f, 0.5f, 6.0f, 448.0f})
     {
         const float round_trip = float8_e4m3_to_float(float_to_float8_e4m3(value));
@@ -6812,6 +7039,30 @@ void test_float_scale_inplace_and_scaled_add()
     }
 }
 
+void test_float_scale_add()
+{
+    std::array<float, 23> output = {};
+    std::array<float, 23> input = {};
+    constexpr float output_scale = -0.375f;
+    constexpr float input_scale = 0.625f;
+    for (size_t index = 0; index < output.size(); ++index)
+    {
+        output[index] = static_cast<float>(static_cast<int>(index % 13) - 6) * 0.125f;
+        input[index] = static_cast<float>(static_cast<int>(index % 17) - 8) * 0.0625f;
+    }
+    std::array<float, 23> expected = output;
+    for (size_t index = 0; index < expected.size(); ++index)
+        expected[index] = expected[index] * output_scale + input[index] * input_scale;
+    float_scale_add(
+        output.data(),
+        output_scale,
+        input.data(),
+        input_scale,
+        static_cast<uint32_t>(output.size()));
+    for (size_t index = 0; index < output.size(); ++index)
+        check_near(output[index], expected[index], 1e-6f);
+}
+
 void test_float_dot()
 {
     std::array<float, 137> left = {};
@@ -6843,6 +7094,20 @@ void test_float_exp_inplace()
     for (size_t index = 0; index < values.size(); ++index)
         check_near(values[index], expected[index], 2e-4f);
     float_exp_inplace(values.data(), 0);
+}
+
+void test_float_approximate_exp()
+{
+    for (int step = -80; step <= 80; ++step)
+    {
+        const float value = static_cast<float>(step) * 0.25f;
+        const float expected = std::exp(value);
+        const float tolerance = std::max(1e-6f, std::abs(expected) * 5e-4f);
+        check_near(float_approximate_exp(value), expected, tolerance);
+    }
+    check(std::isinf(float_approximate_exp(104.0f)));
+    check(float_approximate_exp(-104.0f) == 0.0f);
+    check(std::isnan(float_approximate_exp(std::numeric_limits<float>::quiet_NaN())));
 }
 
 void test_int8_float_dot()
@@ -6907,6 +7172,145 @@ void test_weighted_scale()
         check_near(input[index], float_output[index], 1e-6f);
 }
 
+void test_rms_vector_kernels()
+{
+    constexpr uint32_t count = 137;
+    constexpr float epsilon = 1e-5f;
+    constexpr float weight_offset = 0.125f;
+    std::array<float, count> input = {};
+    std::array<float, count> float_weight = {};
+    std::array<uint16_t, count> bfloat16_weight = {};
+    std::array<float, count> float_output = {};
+    std::array<float, count> bfloat16_output = {};
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        input[index] = static_cast<float>(static_cast<int>(index % 23) - 11) * 0.0625f;
+        float_weight[index] = static_cast<float>(static_cast<int>(index % 17) - 8) * 0.03125f;
+        bfloat16_weight[index] = float_to_bfloat16(float_weight[index]);
+    }
+    float square_sum = 0.0f;
+    for (float value : input)
+        square_sum += value * value;
+    const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
+    float_rms_norm(
+        float_output.data(), input.data(), float_weight.data(), epsilon,
+        weight_offset, count);
+    bfloat16_rms_norm(
+        bfloat16_output.data(), input.data(), bfloat16_weight.data(), epsilon,
+        weight_offset, count);
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        check_near(
+            float_output[index],
+            input[index] * inverse_rms * (float_weight[index] + weight_offset),
+            2e-4f);
+        check_near(
+            bfloat16_output[index],
+            input[index] * inverse_rms
+                * (bfloat16_to_float(bfloat16_weight[index]) + weight_offset),
+            2e-4f);
+    }
+
+    std::array<float, count> normalized = input;
+    float_rms_scale_inplace(normalized.data(), epsilon, count);
+    for (uint32_t index = 0; index < count; ++index)
+        check_near(normalized[index], input[index] * inverse_rms, 2e-4f);
+    float_rms_scale_inplace(normalized.data(), epsilon, 0);
+}
+
+void test_l2_vector_kernel()
+{
+    constexpr uint32_t count = 137;
+    constexpr float epsilon = 1e-6f;
+    std::array<float, count> values = {};
+    for (uint32_t index = 0; index < count; ++index)
+        values[index] = static_cast<float>(static_cast<int>(index % 19) - 9) * 0.125f;
+    float square_sum = 0.0f;
+    for (float value : values)
+        square_sum += value * value;
+    const float inverse_norm = 1.0f / std::sqrt(square_sum + epsilon);
+    const std::array<float, count> input = values;
+    float_l2_scale_inplace(values.data(), epsilon, count);
+    for (uint32_t index = 0; index < count; ++index)
+        check_near(values[index], input[index] * inverse_norm, 2e-5f);
+    float_l2_scale_inplace(values.data(), epsilon, 0);
+}
+
+void test_hyper_connection_vector_kernels()
+{
+    constexpr uint32_t hidden_size = 19;
+    std::array<float, hidden_size * 4> input = {};
+    std::array<float, hidden_size> reduced = {};
+    constexpr std::array<float, 4> pre = {0.25f, -0.5f, 0.75f, 1.25f};
+    for (size_t index = 0; index < input.size(); ++index)
+        input[index] = static_cast<float>(static_cast<int>(index % 13) - 6) * 0.125f;
+    float_hc_pre_4(
+        reduced.data(), input.data(), pre[0], pre[1], pre[2], pre[3], hidden_size);
+    for (uint32_t index = 0; index < hidden_size; ++index)
+    {
+        float expected = 0.0f;
+        for (uint32_t copy = 0; copy < 4; ++copy)
+            expected += input[static_cast<size_t>(copy) * hidden_size + index] * pre[copy];
+        check_near(reduced[index], expected, 2e-5f);
+    }
+
+    std::array<float, hidden_size> branch = {};
+    std::array<float, hidden_size * 4> residual = {};
+    std::array<float, 4> post = {0.5f, 1.0f, -0.75f, 1.5f};
+    std::array<float, 16> combine = {};
+    std::array<float, hidden_size * 4> output = {};
+    for (uint32_t index = 0; index < hidden_size; ++index)
+        branch[index] = static_cast<float>(static_cast<int>(index % 7) - 3) * 0.25f;
+    for (size_t index = 0; index < residual.size(); ++index)
+        residual[index] = static_cast<float>(static_cast<int>(index % 11) - 5) * 0.125f;
+    for (size_t index = 0; index < combine.size(); ++index)
+        combine[index] = static_cast<float>(static_cast<int>(index % 9) - 4) * 0.0625f;
+    float_hc_post_4(
+        output.data(), branch.data(), residual.data(), post.data(), combine.data(), hidden_size);
+    for (uint32_t output_index = 0; output_index < 4; ++output_index)
+    {
+        for (uint32_t index = 0; index < hidden_size; ++index)
+        {
+            float expected = branch[index] * post[output_index];
+            for (uint32_t residual_index = 0; residual_index < 4; ++residual_index)
+                expected += residual[static_cast<size_t>(residual_index) * hidden_size + index]
+                            * combine[residual_index * 4 + output_index];
+            check_near(
+                output[static_cast<size_t>(output_index) * hidden_size + index],
+                expected,
+                2e-5f);
+        }
+    }
+}
+
+void test_float_rope_kernel()
+{
+    constexpr uint32_t dimension = 34;
+    constexpr uint32_t half_dimension = dimension / 2;
+    std::array<float, dimension> values = {};
+    std::array<float, half_dimension> cosine = {};
+    std::array<float, half_dimension> sine = {};
+    std::array<float, dimension> expected = {};
+    for (uint32_t index = 0; index < dimension; ++index)
+        values[index] = static_cast<float>(static_cast<int>(index % 17) - 8) * 0.125f;
+    for (uint32_t index = 0; index < half_dimension; ++index)
+    {
+        cosine[index] = 0.75f + static_cast<float>(index % 5) * 0.03125f;
+        sine[index] = static_cast<float>(static_cast<int>(index % 7) - 3) * 0.0625f;
+    }
+    expected = values;
+    for (uint32_t index = 0; index < half_dimension; ++index)
+    {
+        const float first = values[index];
+        const float second = values[half_dimension + index];
+        expected[index] = first * cosine[index] - second * sine[index];
+        expected[half_dimension + index] = second * cosine[index] + first * sine[index];
+    }
+    float_rope_inplace(values.data(), cosine.data(), sine.data(), dimension);
+    for (uint32_t index = 0; index < dimension; ++index)
+        check_near(values[index], expected[index], 2e-5f);
+}
+
 void test_float_silu_mul()
 {
     std::array<float, 97> gate = {};
@@ -6929,6 +7333,28 @@ void test_float_silu_mul()
                                * (up[index] + up_offset);
         check_near(output[index], expected, 5e-4f);
     }
+}
+
+void test_float_sigmoid_mul()
+{
+    std::array<float, 97> gate = {};
+    std::array<float, 97> input = {};
+    std::array<float, 97> output = {};
+    for (size_t index = 0; index < gate.size(); ++index)
+    {
+        gate[index] = -7.0f + static_cast<float>(index % 29) * 0.5f;
+        input[index] = static_cast<float>(static_cast<int>(index % 17) - 8) * 0.125f;
+    }
+    float_sigmoid_mul(
+        output.data(),
+        gate.data(),
+        input.data(),
+        static_cast<uint32_t>(output.size()));
+    for (size_t index = 0; index < output.size(); ++index)
+        check_near(
+            output[index],
+            input[index] / (1.0f + std::exp(-gate[index])),
+            5e-4f);
 }
 
 void test_bfloat16_vector_kernels()
@@ -7226,6 +7652,157 @@ void benchmark_bfloat16_attention_kernels()
               << " checksum_delta=" << std::abs(baseline_checksum - direct_checksum) << '\n';
 }
 
+void benchmark_qnk_gemm()
+{
+    constexpr uint32_t columns = 4096;
+    constexpr size_t rows = 32;
+    constexpr size_t token_count = 8;
+    constexpr uint32_t iterations = 24;
+    const std::array<DType, 6> dtypes = {
+        DType::Q2K,
+        DType::Q3K,
+        DType::Q4K,
+        DType::Q5K,
+        DType::Q6K,
+        DType::Q8K,
+    };
+
+    CpuBatch input(token_count, columns);
+    for (size_t token = 0; token < token_count; ++token)
+    {
+        for (uint32_t column = 0; column < columns; ++column)
+        {
+            input.row(token)[column] = static_cast<float>(static_cast<int>((column + token * 3) % 31) - 15)
+                                       * 0.03125f;
+        }
+    }
+
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "qnk_gemm_kernel=" << mxfp4_kernel_name() << '\n';
+    for (const DType dtype : dtypes)
+    {
+        const size_t raw_bytes = static_cast<size_t>(qnk_storage_bytes(dtype, rows, columns));
+        std::vector<uint8_t> raw(raw_bytes, 0);
+        const size_t row_bytes = raw_bytes / rows;
+        const size_t block_bytes = qnk_block_bytes(dtype);
+        const uint32_t block_count = columns / qnk_block_elements;
+        for (size_t row = 0; row < rows; ++row)
+        {
+            for (uint32_t block = 0; block < block_count; ++block)
+            {
+                uint8_t* encoded = raw.data() + row * row_bytes + static_cast<size_t>(block) * block_bytes;
+                if (dtype == DType::Q2K)
+                {
+                    std::fill_n(encoded, 16, uint8_t{1});
+                    encoded[80] = 0x00;
+                    encoded[81] = 0x3c;
+                    encoded[82] = 0;
+                    encoded[83] = 0;
+                    for (uint32_t index = 0; index < 64; ++index)
+                        encoded[16 + index] = static_cast<uint8_t>(index * 7u + row + block);
+                }
+                else if (dtype == DType::Q3K)
+                {
+                    std::fill_n(encoded + 96, 12, uint8_t{0});
+                    encoded[108] = 0x00;
+                    encoded[109] = 0x3c;
+                    for (uint32_t index = 0; index < 32; ++index)
+                        encoded[index] = static_cast<uint8_t>(index * 5u + row);
+                    for (uint32_t index = 0; index < 64; ++index)
+                        encoded[32 + index] = static_cast<uint8_t>(index * 11u + row + block);
+                }
+                else if (dtype == DType::Q4K || dtype == DType::Q5K)
+                {
+                    encoded[0] = 0x00;
+                    encoded[1] = 0x3c;
+                    encoded[2] = 0;
+                    encoded[3] = 0;
+                    std::fill_n(encoded + 4, 8, uint8_t{1});
+                    for (uint32_t index = 0; index < 128; ++index)
+                        encoded[(dtype == DType::Q4K ? 16u : 48u) + index] = static_cast<uint8_t>(index * 13u + row + block);
+                }
+                else if (dtype == DType::Q6K)
+                {
+                    std::fill_n(encoded + 192, 16, uint8_t{1});
+                    encoded[208] = 0x00;
+                    encoded[209] = 0x3c;
+                    for (uint32_t index = 0; index < 128; ++index)
+                        encoded[index] = static_cast<uint8_t>(index * 7u + row + block);
+                    for (uint32_t index = 0; index < 64; ++index)
+                        encoded[128 + index] = static_cast<uint8_t>(index * 5u + row);
+                }
+                else
+                {
+                    const float scale = 1.0f;
+                    std::memcpy(encoded, &scale, sizeof(scale));
+                    for (uint32_t index = 0; index < qnk_block_elements; ++index)
+                        encoded[4 + index] = static_cast<uint8_t>(index * 9u + row + block);
+                }
+            }
+        }
+
+        TensorData matrix;
+        matrix.dtype = dtype;
+        matrix.shape = {static_cast<uint32_t>(rows), columns};
+        matrix.quantized_data = std::move(raw);
+        CpuBatch output;
+        linear_batch_into(matrix, input, output, 0);
+        for (uint32_t iteration = 0; iteration < 2; ++iteration)
+            linear_batch_into(matrix, input, output, 0);
+
+        const std::span<const uint8_t> raw_view = matrix.qnk_values();
+        float reference_checksum = 0.0f;
+        std::vector<float> reference_output(token_count * rows, 0.0f);
+        alignas(64) float decoded[qnk_block_elements];
+        const auto baseline_start = std::chrono::steady_clock::now();
+        for (uint32_t iteration = 0; iteration < iterations; ++iteration)
+        {
+            for (size_t row = 0; row < rows; ++row)
+            {
+                for (size_t token = 0; token < token_count; ++token)
+                {
+                    float sum = 0.0f;
+                    for (uint32_t block = 0; block < block_count; ++block)
+                    {
+                        const uint8_t* encoded = raw_view.data()
+                                                 + (row * static_cast<size_t>(block_count) + block) * block_bytes;
+                        qnk_dequantize_block(dtype, encoded, decoded);
+                        sum += float_dot(
+                            decoded,
+                            input.row(token) + static_cast<size_t>(block) * qnk_block_elements,
+                            qnk_block_elements);
+                    }
+                    reference_output[token * rows + row] = sum;
+                }
+            }
+            reference_checksum += reference_output[(iteration % token_count) * rows + iteration % rows];
+        }
+        const auto baseline_end = std::chrono::steady_clock::now();
+
+        float checksum = 0.0f;
+        const auto start = std::chrono::steady_clock::now();
+        for (uint32_t iteration = 0; iteration < iterations; ++iteration)
+        {
+            linear_batch_into(matrix, input, output, 0);
+            checksum += output.row(iteration % token_count)[iteration % rows];
+        }
+        const auto end = std::chrono::steady_clock::now();
+        const double baseline_ms = std::chrono::duration<double, std::milli>(baseline_end - baseline_start).count();
+        const double milliseconds = std::chrono::duration<double, std::milli>(end - start).count();
+        std::cout << "qnk_gemm dtype=" << static_cast<int>(dtype)
+                  << " rows=" << rows
+                  << " columns=" << columns
+                  << " tokens=" << token_count
+                  << " iterations=" << iterations
+                  << " baseline_ms=" << baseline_ms
+                  << " ms=" << milliseconds
+                  << " per_iter_ms=" << (milliseconds / iterations)
+                  << " speedup=" << (baseline_ms / milliseconds)
+                  << " checksum_delta=" << std::abs(reference_checksum - checksum)
+                  << " checksum=" << checksum << '\n';
+    }
+}
+
 void test_cpu_resource_coordination()
 {
     const CpuThreadBudget budget = resolve_cpu_thread_budget(1, 1, 2);
@@ -7260,16 +7837,28 @@ int main(int argc, char** argv)
             ncnn::moe::benchmark_bfloat16_attention_kernels();
             return 0;
         }
+        if (argc > 1 && std::string(argv[1]) == "--benchmark-qnk")
+        {
+            ncnn::moe::benchmark_qnk_gemm();
+            return 0;
+        }
         ncnn::moe::test_flag_defaults();
         ncnn::moe::test_cpu_task_worker();
         ncnn::moe::test_cpu_resource_coordination();
         ncnn::moe::test_float_scaled_add();
         ncnn::moe::test_float_scale_inplace_and_scaled_add();
+        ncnn::moe::test_float_scale_add();
         ncnn::moe::test_float_dot();
         ncnn::moe::test_float_exp_inplace();
+        ncnn::moe::test_float_approximate_exp();
         ncnn::moe::test_int8_float_dot();
         ncnn::moe::test_weighted_scale();
+        ncnn::moe::test_rms_vector_kernels();
+        ncnn::moe::test_l2_vector_kernel();
+        ncnn::moe::test_hyper_connection_vector_kernels();
+        ncnn::moe::test_float_rope_kernel();
         ncnn::moe::test_float_silu_mul();
+        ncnn::moe::test_float_sigmoid_mul();
         ncnn::moe::test_bfloat16_vector_kernels();
         ncnn::moe::test_float_to_bfloat16_array();
         ncnn::moe::test_bfloat16_batched_linear_kernel();
@@ -7279,10 +7868,12 @@ int main(int argc, char** argv)
         ncnn::moe::test_ncnn_vulkan_bfloat16_operator();
         ncnn::moe::test_ncnn_vulkan_float8_operator();
         ncnn::moe::test_mxfp4_cpu_kernel_and_fused_gate_up();
+        ncnn::moe::test_qnk_cpu_kernel_and_pack();
         ncnn::moe::test_sharded_expert_victim_cache();
         ncnn::moe::test_mapped_file_range_and_shared_buffer();
         ncnn::moe::test_safetensors_dense_mmap();
         ncnn::moe::test_safetensors_packed_mxfp4_expert();
+        ncnn::moe::test_safetensors_packed_qnk_expert();
         ncnn::moe::test_file_backed_mxfp4_expert_cache();
         ncnn::moe::test_cpu_topology_parsing_and_partitioning();
         ncnn::moe::test_cross_session_batch_scheduler();

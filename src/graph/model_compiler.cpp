@@ -2,6 +2,7 @@
 
 #include "compiler/moe_ir.hpp"
 #include "kernels/cpu_mxfp4.h"
+#include "kernels/cpu_qnk.h"
 #include "models/internal/tensor_names.h"
 #include "backends/ncnn/ncnn_attention.h"
 #include "backends/ncnn/ncnn_linear.h"
@@ -200,6 +201,23 @@ static Result<TensorHandle> require_tensor(const WeightStore& weights, const std
             || !tensor.quantization_scales.empty()
             || tensor.mapped_data)
             return Error{ErrorCode::InvalidModel, "MXFP4 tensor contains unrelated storage: " + name};
+    }
+    else if (is_qnk_dtype(dtype))
+    {
+        if (tensor.shape.size() != 2 || !qnk_shape_supported(dtype, tensor.shape[0], tensor.shape[1])
+            || tensor.qnk_values().size() != qnk_storage_bytes(dtype, tensor.shape[0], tensor.shape[1]))
+        {
+            return Error{ErrorCode::InvalidModel, "invalid Qn_K tensor storage: " + name};
+        }
+        if (!tensor.float32_data.empty()
+            || !tensor.bfloat16_data.empty()
+            || !tensor.int8_data.empty()
+            || !tensor.quantization_scales.empty()
+            || !tensor.mxfp4_blocks.empty()
+            || !tensor.mxfp4_scales.empty())
+        {
+            return Error{ErrorCode::InvalidModel, "Qn_K tensor contains unrelated storage: " + name};
+        }
     }
     else
     {
@@ -592,6 +610,7 @@ static uint64_t tensor_storage_bytes(const TensorData& tensor)
     bytes += static_cast<uint64_t>(tensor.bfloat16_data.size()) * sizeof(uint16_t);
     bytes += static_cast<uint64_t>(tensor.int64_data.size()) * sizeof(int64_t);
     bytes += tensor.int8_data.size();
+    bytes += tensor.quantized_data.size();
     bytes += static_cast<uint64_t>(tensor.quantization_scales.size()) * sizeof(float);
     bytes += tensor.mxfp4_blocks.size();
     bytes += tensor.mxfp4_scales.size();
@@ -1698,8 +1717,9 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
         if (moe.expert_weight_dtype != DType::Float32
             && moe.expert_weight_dtype != DType::BFloat16
             && moe.expert_weight_dtype != DType::Int8
-            && moe.expert_weight_dtype != DType::MxFp4)
-            return Error{ErrorCode::UnsupportedModel, "expert weights must use float32, bfloat16, int8, or MXFP4"};
+            && moe.expert_weight_dtype != DType::MxFp4
+            && !is_qnk_dtype(moe.expert_weight_dtype))
+            return Error{ErrorCode::UnsupportedModel, "expert weights must use float32, bfloat16, int8, MXFP4, or Qn_K"};
         if (moe.expert_weight_dtype == DType::MxFp4 && !has_flag(capabilities.flags, BackendCapabilityMxfp4CpuKernel))
         {
             return Error{ErrorCode::UnsupportedModel, "backend capabilities do not provide an MXFP4 CPU expert kernel"};

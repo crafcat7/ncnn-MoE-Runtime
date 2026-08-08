@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shlex
 import sys
@@ -98,6 +99,34 @@ def _format_rate(value: Any) -> str:
     return f"{float(value):.2f}"
 
 
+def _numeric_metric(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    return numeric if math.isfinite(numeric) else None
+
+
+def _decode_rate(metrics: dict[str, Any]) -> float | None:
+    for name in ("decode_tok_per_second", "tokens_per_second", "token_per_second"):
+        value = _numeric_metric(metrics.get(name))
+        if value is not None:
+            return value
+    tpot_microseconds = _numeric_metric(metrics.get("tpot_microseconds"))
+    if tpot_microseconds is not None and tpot_microseconds > 0.0:
+        return 1_000_000.0 / tpot_microseconds
+    return None
+
+
+def _format_gpu_kernel_time(gpu: dict[str, Any], available: bool) -> str:
+    if not available:
+        return "N/A (CPU-only)"
+    if gpu.get("kernel_time_available", False):
+        return _format_duration_microseconds(gpu.get("kernel_time_microseconds"))
+    if gpu.get("reason") == "gpu_expert_execution_not_observed":
+        return "N/A (no GPU Expert execution)"
+    return "N/A"
+
+
 def _format_runtime_metrics(metrics: Any) -> str:
     if not isinstance(metrics, dict):
         return "metrics\n  unavailable"
@@ -134,7 +163,7 @@ def _format_runtime_metrics(metrics: Any) -> str:
         (
             "metrics",
             "  Decode tok/s "
-            f"{_format_rate(metrics.get('decode_tok_per_second', metrics.get('tokens_per_second')))}"
+            f"{_format_rate(_decode_rate(metrics))}"
             " · TTFT "
             f"{_format_duration_microseconds(metrics.get('ttft_microseconds'))}"
             " · TPOT "
@@ -165,7 +194,7 @@ def _format_runtime_metrics(metrics: Any) -> str:
             " · wait "
             f"{_format_duration_microseconds(gpu.get('wait_time_microseconds') if isinstance(gpu, dict) and gpu_available else None)}"
             " · kernel "
-            f"{_format_duration_microseconds(gpu.get('kernel_time_microseconds') if isinstance(gpu, dict) and gpu_available and gpu.get('kernel_time_available', False) else None)}"
+            f"{_format_gpu_kernel_time(gpu, gpu_available)}"
             " · utilization "
             f"{_format_gpu_utilization(gpu_device)}"
             " / attention "

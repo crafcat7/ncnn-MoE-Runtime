@@ -2,6 +2,8 @@
 
 #include "ncnn/moe/runtime.h"
 
+#include "kernels/cpu_qnk.h"
+
 #include <algorithm>
 #include <limits>
 #include <string>
@@ -35,6 +37,15 @@ static Result<uint64_t> matrix_storage_bytes(uint64_t rows, uint64_t columns, DT
     {
         const uint64_t scale_count = ((rows + 127) / 128) * ((columns + 127) / 128);
         return checked_add(elements.value(), scale_count, name);
+    }
+    if (is_qnk_dtype(dtype))
+    {
+        if (rows > std::numeric_limits<uint32_t>::max() || columns > std::numeric_limits<uint32_t>::max())
+            return Error{ErrorCode::InvalidModel, std::string(name) + " Qn_K dimensions exceed uint32"};
+        const uint64_t bytes = qnk_storage_bytes(dtype, static_cast<size_t>(rows), static_cast<uint32_t>(columns));
+        if (bytes == 0)
+            return Error{ErrorCode::InvalidModel, std::string(name) + " has invalid Qn_K dimensions"};
+        return bytes;
     }
     const uint64_t element_bytes = dtype == DType::Int64 ? 8 : dtype == DType::BFloat16 ? 2
                                                                                         : 4;

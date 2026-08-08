@@ -153,7 +153,7 @@ void Mxfp4Q8Batch::reset(size_t row_count, uint32_t column_count)
     scales.resize(row_count * block_count);
 }
 
-void mxfp4_q8_quantize(const float* source, int8_t* values, float* scales, uint32_t columns) noexcept
+static void scalar_mxfp4_q8_quantize(const float* source, int8_t* values, float* scales, uint32_t columns) noexcept
 {
     const uint32_t block_count = (columns + 31) / 32;
     for (uint32_t block = 0; block < block_count; ++block)
@@ -174,6 +174,23 @@ void mxfp4_q8_quantize(const float* source, int8_t* values, float* scales, uint3
         for (uint32_t column = end; column < begin + 32 && column < columns; ++column)
             values[column] = 0;
     }
+}
+
+void mxfp4_q8_quantize(const float* source, int8_t* values, float* scales, uint32_t columns) noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
+    {
+        msvc_avx512_mxfp4_q8_quantize(source, values, scales, columns);
+        return;
+    }
+    if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
+    {
+        msvc_avx2_mxfp4_q8_quantize(source, values, scales, columns);
+        return;
+    }
+#endif
+    scalar_mxfp4_q8_quantize(source, values, scales, columns);
 }
 
 void mxfp4_q8_quantize_batch(const float* source, size_t input_stride, size_t rows, uint32_t columns, Mxfp4Q8Batch& output) noexcept

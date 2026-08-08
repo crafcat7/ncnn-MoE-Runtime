@@ -25,6 +25,67 @@ static const std::array<float, 256>& avx512_scale_table()
     return values;
 }
 
+void msvc_avx512_mxfp4_q8_quantize(
+    const float* source,
+    int8_t* values,
+    float* scales,
+    uint32_t columns) noexcept
+{
+    if (!source || !values || !scales || columns == 0)
+        return;
+
+    const __m512 zero = _mm512_setzero_ps();
+    const __m512 sign_mask = _mm512_set1_ps(-0.0f);
+    const __m512 lower_bound = _mm512_set1_ps(-127.0f);
+    const __m512 upper_bound = _mm512_set1_ps(127.0f);
+    const uint32_t block_count = (columns + 31) / 32;
+    for (uint32_t block = 0; block < block_count; ++block)
+    {
+        const uint32_t begin = block * 32;
+        const uint32_t end = (columns < begin + 32) ? columns : begin + 32;
+        const uint32_t count = end - begin;
+        __m512 maximum_values = zero;
+        uint32_t index = 0;
+        for (; index + 16 <= count; index += 16)
+        {
+            const __m512 current = _mm512_loadu_ps(source + begin + index);
+            maximum_values = _mm512_max_ps(
+                maximum_values,
+                _mm512_andnot_ps(sign_mask, current));
+        }
+        float maximum = _mm512_reduce_max_ps(maximum_values);
+        for (; index < count; ++index)
+            maximum = std::max(maximum, std::fabs(source[begin + index]));
+
+        const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+        scales[block] = scale;
+        const __m512 inverse_scale = _mm512_set1_ps(1.0f / scale);
+        index = 0;
+        for (; index + 16 <= count; index += 16)
+        {
+            __m512 normalized = _mm512_mul_ps(
+                _mm512_loadu_ps(source + begin + index),
+                inverse_scale);
+            normalized = _mm512_max_ps(
+                lower_bound,
+                _mm512_min_ps(upper_bound, normalized));
+            const __m512i quantized = _mm512_cvtps_epi32(normalized);
+            alignas(64) int32_t quantized_values[16];
+            _mm512_storeu_si512(quantized_values, quantized);
+            for (uint32_t lane = 0; lane < 16; ++lane)
+                values[begin + index + lane] = static_cast<int8_t>(quantized_values[lane]);
+        }
+        for (; index < count; ++index)
+        {
+            const float normalized = std::clamp(
+                source[begin + index] / scale,
+                -127.0f,
+                127.0f);
+            values[begin + index] = static_cast<int8_t>(std::lrintf(normalized));
+        }
+    }
+}
+
 static bool avx512_batch2_enabled() noexcept
 {
     return true;

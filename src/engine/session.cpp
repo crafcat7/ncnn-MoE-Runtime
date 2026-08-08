@@ -1,5 +1,6 @@
 #include "ncnn/moe/session.h"
 
+#include "kernels/cpu_fast_math.h"
 #include "engine/cpu_executor.h"
 #include "engine/cpu_session_state.h"
 #include "engine/expert_backend.h"
@@ -164,7 +165,7 @@ static Result<void> sampling_distribution_into(
         const float logit = logits[token_id];
         if (!std::isfinite(logit))
             continue;
-        const float probability = std::exp(logit / options.temperature - maximum);
+        const float probability = float_approximate_exp(logit / options.temperature - maximum);
         candidates.push_back(SamplingCandidate{token_id, probability});
         normalizer += probability;
     }
@@ -876,7 +877,7 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
                 {
                     const float confidence = 1.0f
                                              / (1.0f
-                                                + std::exp(
+                                                + float_approximate_exp(
                                                     -proposed.value().confidence_logits[index]));
                     if (confidence
                         < options.speculative_confidence_threshold)

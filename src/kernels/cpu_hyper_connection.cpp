@@ -1,5 +1,6 @@
 #include "cpu_hyper_connection.h"
 
+#include "cpu_fast_math.h"
 #include "cpu_ops.h"
 #include "cpu_vector.h"
 
@@ -12,7 +13,7 @@ namespace moe {
 
 static float hyper_sigmoid(float value)
 {
-    return 1.0f / (1.0f + std::exp(-value));
+    return 1.0f / (1.0f + float_approximate_exp(-value));
 }
 
 static Result<void> validate_hyper_tensors(const CpuBatch& input, const TensorData& function, const TensorData& scale, const TensorData& base,
@@ -48,10 +49,8 @@ Result<CpuHyperConnectionMix> hyper_connection_pre(const CpuBatch& input, const 
     {
         const float* source = input.row(row_index);
         float* target = normalized.row(row_index);
-        const float square_sum = float_dot(source, source, input.columns());
-        const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(input.columns()) + norm_epsilon);
-        for (uint32_t column = 0; column < input.columns(); ++column)
-            target[column] = source[column] * inverse_rms;
+        std::copy_n(source, input.columns(), target);
+        float_rms_scale_inplace(target, norm_epsilon, input.columns());
     }
     CpuBatch mixes = linear_batch(function, normalized, optimization_flags);
     const std::span<const float> scales = scale.float32_values();
@@ -69,15 +68,30 @@ Result<CpuHyperConnectionMix> hyper_connection_pre(const CpuBatch& input, const 
         float* reduced = result.reduced.row(row_index);
         float* post = result.post.data() + row_index * multiplier;
         float* combine = result.combine.data() + row_index * multiplier * multiplier;
-        for (uint32_t copy = 0; copy < multiplier; ++copy)
+        if (multiplier == 4)
         {
-            const float pre = hyper_sigmoid(mixed[copy] * scales[0] + bases[copy]) + hyper_epsilon;
-            post[copy] = 2.0f * hyper_sigmoid(mixed[multiplier + copy] * scales[1] + bases[multiplier + copy]);
-            float_scaled_add(
-                reduced,
-                source + static_cast<size_t>(copy) * hidden_size,
-                pre,
-                hidden_size);
+            const float pre0 = hyper_sigmoid(mixed[0] * scales[0] + bases[0]) + hyper_epsilon;
+            const float pre1 = hyper_sigmoid(mixed[1] * scales[0] + bases[1]) + hyper_epsilon;
+            const float pre2 = hyper_sigmoid(mixed[2] * scales[0] + bases[2]) + hyper_epsilon;
+            const float pre3 = hyper_sigmoid(mixed[3] * scales[0] + bases[3]) + hyper_epsilon;
+            post[0] = 2.0f * hyper_sigmoid(mixed[4] * scales[1] + bases[4]);
+            post[1] = 2.0f * hyper_sigmoid(mixed[5] * scales[1] + bases[5]);
+            post[2] = 2.0f * hyper_sigmoid(mixed[6] * scales[1] + bases[6]);
+            post[3] = 2.0f * hyper_sigmoid(mixed[7] * scales[1] + bases[7]);
+            float_hc_pre_4(reduced, source, pre0, pre1, pre2, pre3, hidden_size);
+        }
+        else
+        {
+            for (uint32_t copy = 0; copy < multiplier; ++copy)
+            {
+                const float pre = hyper_sigmoid(mixed[copy] * scales[0] + bases[copy]) + hyper_epsilon;
+                post[copy] = 2.0f * hyper_sigmoid(mixed[multiplier + copy] * scales[1] + bases[multiplier + copy]);
+                float_scaled_add(
+                    reduced,
+                    source + static_cast<size_t>(copy) * hidden_size,
+                    pre,
+                    hidden_size);
+            }
         }
 
         const uint32_t combine_offset = 2 * multiplier;
@@ -94,7 +108,7 @@ Result<CpuHyperConnectionMix> hyper_connection_pre(const CpuBatch& input, const 
             for (uint32_t residual = 0; residual < multiplier; ++residual)
             {
                 const uint32_t index = output * multiplier + residual;
-                combine[index] = std::exp(combine[index] - maximum);
+                combine[index] = float_approximate_exp(combine[index] - maximum);
                 sum += combine[index];
             }
             for (uint32_t residual = 0; residual < multiplier; ++residual)
@@ -161,14 +175,23 @@ Result<CpuBatch> hyper_connection_post(const CpuBatch& branch, const CpuBatch& r
         const float* post = mix.post.data() + row_index * multiplier;
         const float* combine = mix.combine.data() + row_index * multiplier * multiplier;
         float* destination = output.row(row_index);
-        for (uint32_t copy = 0; copy < multiplier; ++copy)
+        if (multiplier == 4)
         {
-            for (uint32_t column = 0; column < branch.columns(); ++column)
+            float_hc_post_4(destination, branch_row, residual_row, post, combine, branch.columns());
+        }
+        else
+        {
+            for (uint32_t copy = 0; copy < multiplier; ++copy)
             {
-                float value = post[copy] * branch_row[column];
+                float* output_row = destination + static_cast<size_t>(copy) * branch.columns();
+                std::copy_n(branch_row, branch.columns(), output_row);
+                float_scale_inplace(output_row, post[copy], branch.columns());
                 for (uint32_t residual_copy = 0; residual_copy < multiplier; ++residual_copy)
-                    value += combine[residual_copy * multiplier + copy] * residual_row[static_cast<size_t>(residual_copy) * branch.columns() + column];
-                destination[static_cast<size_t>(copy) * branch.columns() + column] = value;
+                    float_scaled_add(
+                        output_row,
+                        residual_row + static_cast<size_t>(residual_copy) * branch.columns(),
+                        combine[residual_copy * multiplier + copy],
+                        branch.columns());
             }
         }
     }
@@ -190,10 +213,8 @@ Result<CpuBatch> hyper_connection_head(const CpuBatch& input, const TensorData& 
     {
         const float* source = input.row(row_index);
         float* target = normalized.row(row_index);
-        const float square_sum = float_dot(source, source, input.columns());
-        const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(input.columns()) + norm_epsilon);
-        for (uint32_t column = 0; column < input.columns(); ++column)
-            target[column] = source[column] * inverse_rms;
+        std::copy_n(source, input.columns(), target);
+        float_rms_scale_inplace(target, norm_epsilon, input.columns());
     }
     CpuBatch mixes = linear_batch(function, normalized, optimization_flags);
     CpuBatch output(input.rows(), hidden_size);
@@ -204,14 +225,25 @@ Result<CpuBatch> hyper_connection_head(const CpuBatch& input, const TensorData& 
         const float* source = input.row(row_index);
         const float* mixed = mixes.row(row_index);
         float* destination = output.row(row_index);
-        for (uint32_t copy = 0; copy < multiplier; ++copy)
+        if (multiplier == 4)
         {
-            const float pre = hyper_sigmoid(mixed[copy] * scale_value + bases[copy]) + hyper_epsilon;
-            float_scaled_add(
-                destination,
-                source + static_cast<size_t>(copy) * hidden_size,
-                pre,
-                hidden_size);
+            const float pre0 = hyper_sigmoid(mixed[0] * scale_value + bases[0]) + hyper_epsilon;
+            const float pre1 = hyper_sigmoid(mixed[1] * scale_value + bases[1]) + hyper_epsilon;
+            const float pre2 = hyper_sigmoid(mixed[2] * scale_value + bases[2]) + hyper_epsilon;
+            const float pre3 = hyper_sigmoid(mixed[3] * scale_value + bases[3]) + hyper_epsilon;
+            float_hc_pre_4(destination, source, pre0, pre1, pre2, pre3, hidden_size);
+        }
+        else
+        {
+            for (uint32_t copy = 0; copy < multiplier; ++copy)
+            {
+                const float pre = hyper_sigmoid(mixed[copy] * scale_value + bases[copy]) + hyper_epsilon;
+                float_scaled_add(
+                    destination,
+                    source + static_cast<size_t>(copy) * hidden_size,
+                    pre,
+                    hidden_size);
+            }
         }
     }
     return output;
