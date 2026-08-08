@@ -349,6 +349,12 @@ struct TensorData
     // [output_rows, input_columns]; the encoded byte count is derived from
     // the dtype and the 256-element super-block layout.
     std::vector<uint8_t> quantized_data;
+    // Qn_K gate/up Expert matrices may store gate and up rows either
+    // interleaved (gate0, up0, gate1, up1, ...) or packed (all gate rows,
+    // then all up rows).  Standalone Qn_K matrices default to the historical
+    // interleaved Expert convention; model compilation overrides this for
+    // PackedGateUpDown descriptors.
+    bool qnk_interleave_rows = true;
     std::vector<float> quantization_scales;
     MxFp4ByteBuffer mxfp4_blocks;
     MxFp4ByteBuffer mxfp4_scales;

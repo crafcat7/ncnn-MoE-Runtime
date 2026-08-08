@@ -581,7 +581,11 @@ static Result<void> build_speculative_execution_graph(
                                             && has_flag(capabilities.flags, ModelCompiler::BackendCapabilityVulkanExperts)
                                             && !layer.moe.experts.empty()
                                             && layer.moe.experts.front().gate_up_weight != invalid_tensor_handle
-                                            && compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype == DType::MxFp4;
+                                            && (compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype == DType::MxFp4
+                                                || (runtime_optimization_enabled(
+                                                        capabilities.optimization_flags,
+                                                        RuntimeOptimizationVulkanQnK)
+                                                    && is_qnk_dtype(compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype)));
         const ExecutionBackend expert_backend = can_use_vulkan_experts ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
         const uint32_t expert_backend_mask = can_use_vulkan_experts ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
         const uint32_t expert_flags = compiled.hybrid_mode == HybridMode::VulkanWithCpuPrefetch
@@ -750,7 +754,11 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
                                             && has_flag(capabilities.flags, ModelCompiler::BackendCapabilityVulkanExperts)
                                             && !layer.moe.experts.empty()
                                             && layer.moe.experts.front().gate_up_weight != invalid_tensor_handle
-                                            && compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype == DType::MxFp4;
+                                            && (compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype == DType::MxFp4
+                                                || (runtime_optimization_enabled(
+                                                        capabilities.optimization_flags,
+                                                        RuntimeOptimizationVulkanQnK)
+                                                    && is_qnk_dtype(compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype)));
         const ExecutionBackend expert_backend = can_use_vulkan_experts ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
         const uint32_t expert_backend_mask = can_use_vulkan_experts ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
         const uint32_t expert_flags = compiled.hybrid_mode == HybridMode::VulkanWithCpuPrefetch

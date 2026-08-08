@@ -94,6 +94,7 @@ inline constexpr uint32_t RuntimeOptionExpertIoMask = RuntimeOptionMemoryMapExpe
 #define NCNN_MOE_OPT_CPU_FLASH_ATTENTION_BIT             49
 #define NCNN_MOE_OPT_CPU_SPLIT_KV_ATTENTION_BIT          50
 #define NCNN_MOE_OPT_VULKAN_INDEXED_EXPERTS_BIT          51
+#define NCNN_MOE_OPT_VULKAN_QNK_BIT                     52
 
 enum RuntimeOptimizationFlag : uint64_t
 {
@@ -147,7 +148,8 @@ enum RuntimeOptimizationFlag : uint64_t
     RuntimeOptimizationCpuMxfp4Q8 = UINT64_C(1) << NCNN_MOE_OPT_CPU_MXFP4_Q8_BIT,
     RuntimeOptimizationCpuFlashAttention = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLASH_ATTENTION_BIT,
     RuntimeOptimizationCpuSplitKvAttention = UINT64_C(1) << NCNN_MOE_OPT_CPU_SPLIT_KV_ATTENTION_BIT,
-    RuntimeOptimizationVulkanIndexedExperts = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_INDEXED_EXPERTS_BIT
+    RuntimeOptimizationVulkanIndexedExperts = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_INDEXED_EXPERTS_BIT,
+    RuntimeOptimizationVulkanQnK = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_QNK_BIT
 };
 
 inline constexpr uint64_t RuntimeOptimizationDefaultFlags = RuntimeOptimizationCpuSimdRmsNorm

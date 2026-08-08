@@ -258,6 +258,24 @@ static Result<void> prepare_linear_operator(
         }
         return {};
     }
+    if (is_qnk_dtype(matrix.dtype))
+    {
+        if (device == NcnnLinearDevice::Vulkan
+            && runtime_optimization_enabled(
+                optimization_flags,
+                RuntimeOptimizationVulkanQnK))
+        {
+            compiled_operator.qnk = NcnnVulkanQnkOperator::create(
+                matrix,
+                bias,
+                vulkan_device_index,
+                context_instance,
+                optimization_flags);
+            if (!compiled_operator.qnk)
+                return Error{ErrorCode::InternalError, "failed to create Vulkan Qn_K Linear operator"};
+        }
+        return {};
+    }
     if (matrix.dtype != DType::Float32 && matrix.dtype != DType::BFloat16)
         return {};
     if (device == NcnnLinearDevice::Cpu && !retain_cpu_dense_copy)
@@ -1137,6 +1155,11 @@ static Result<void> compile_mtp_speculative_model(
             expert.gate_up_weight);
         if (!status)
             return status.error();
+        if (is_qnk_dtype(compiled.weights.at(expert.gate_up_weight).dtype))
+        {
+            compiled.weights.at_mutable(expert.gate_up_weight).qnk_interleave_rows =
+                moe.layout == ExpertLayout::InterleavedGateUpDown;
+        }
         status = assign_required_tensor(
             compiled.weights,
             prefix + "down.weight",
@@ -1150,6 +1173,8 @@ static Result<void> compile_mtp_speculative_model(
         const TensorData& down_weight = compiled.weights.at(expert.down_weight);
         if (gate_up_weight.mxfp4_file_storage && down_weight.mxfp4_file_storage)
             expert.cache_key = Mxfp4ExpertCache::make_pair_key(gate_up_weight, down_weight);
+        else if (is_qnk_dtype(gate_up_weight.dtype) && gate_up_weight.dtype == down_weight.dtype)
+            expert.cache_key = "qnk:" + prefix;
         compiled_moe.experts.push_back(std::move(expert));
     }
     speculative.graph.layer_plans.push_back(std::move(layer_plan));
@@ -2436,6 +2461,11 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 if (!gate_up)
                     return gate_up.error();
                 expert.gate_up_weight = gate_up.value();
+                if (is_qnk_dtype(compiled.weights.at(expert.gate_up_weight).dtype))
+                {
+                    compiled.weights.at_mutable(expert.gate_up_weight).qnk_interleave_rows =
+                        moe.layout == ExpertLayout::InterleavedGateUpDown;
+                }
             }
             else if (has_flag(expert.flags, ExpertPlanGated))
             {
@@ -2490,6 +2520,10 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 if (gate_up_weight.mxfp4_file_storage && down_weight.mxfp4_file_storage)
                 {
                     expert.cache_key = Mxfp4ExpertCache::make_pair_key(gate_up_weight, down_weight);
+                }
+                else if (is_qnk_dtype(gate_up_weight.dtype) && gate_up_weight.dtype == down_weight.dtype)
+                {
+                    expert.cache_key = "qnk:" + prefix;
                 }
             }
             const bool file_backed = down_weight.mxfp4_file_storage

@@ -2789,6 +2789,450 @@ void test_qnk_cpu_kernel_and_pack()
     }
 }
 
+void test_ncnn_vulkan_qnk_operator()
+{
+    constexpr uint32_t columns = 512;
+    constexpr size_t rows = 5;
+    constexpr size_t input_rows = 3;
+    const std::array<DType, 6> dtypes = {
+        DType::Q2K,
+        DType::Q3K,
+        DType::Q4K,
+        DType::Q5K,
+        DType::Q6K,
+        DType::Q8K,
+    };
+    const NcnnVulkanContextInstancePtr context_instance = create_ncnn_vulkan_context_instance();
+    CpuBatch input(input_rows, columns);
+    for (size_t row = 0; row < input.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < input.columns(); ++column)
+            input.row(row)[column] = static_cast<float>(static_cast<int>((column * 7 + row * 13) % 29) - 14) * 0.03125f;
+    }
+
+    for (const DType dtype : dtypes)
+    {
+        const size_t block_bytes = qnk_block_bytes(dtype);
+        const uint32_t block_count = columns / qnk_block_elements;
+        std::vector<uint8_t> raw(static_cast<size_t>(qnk_storage_bytes(dtype, rows, columns)));
+        for (size_t index = 0; index < raw.size(); ++index)
+            raw[index] = static_cast<uint8_t>((index * 37u + static_cast<uint32_t>(dtype) * 11u + 5u) & 0xffu);
+        for (size_t row = 0; row < rows; ++row)
+        {
+            for (uint32_t block = 0; block < block_count; ++block)
+            {
+                uint8_t* encoded = raw.data() + (row * block_count + block) * block_bytes;
+                if (dtype == DType::Q2K)
+                {
+                    std::fill_n(encoded, 16, uint8_t{1});
+                    encoded[80] = 0x00;
+                    encoded[81] = 0x3c;
+                    encoded[82] = 0;
+                    encoded[83] = 0;
+                }
+                else if (dtype == DType::Q3K)
+                {
+                    std::fill_n(encoded + 96, 12, uint8_t{0});
+                    encoded[108] = 0x00;
+                    encoded[109] = 0x3c;
+                }
+                else if (dtype == DType::Q4K || dtype == DType::Q5K)
+                {
+                    encoded[0] = 0x00;
+                    encoded[1] = 0x3c;
+                    encoded[2] = 0;
+                    encoded[3] = 0;
+                    std::fill_n(encoded + 4, 4, uint8_t{1});
+                    std::fill_n(encoded + 8, 4, uint8_t{0});
+                }
+                else if (dtype == DType::Q6K)
+                {
+                    std::fill_n(encoded + 192, 16, uint8_t{1});
+                    encoded[208] = 0x00;
+                    encoded[209] = 0x3c;
+                }
+                else
+                {
+                    const float scale = 1.0f;
+                    std::memcpy(encoded, &scale, sizeof(scale));
+                }
+            }
+        }
+
+        TensorData matrix;
+        matrix.dtype = dtype;
+        matrix.shape = {static_cast<uint32_t>(rows), columns};
+        matrix.quantized_data = std::move(raw);
+        const CpuBatch expected = linear_batch(matrix, input, 0);
+        auto vulkan = NcnnVulkanQnkOperator::create(
+            matrix,
+            nullptr,
+            automatic_vulkan_device_index,
+            context_instance,
+            kTestOptimizationFlags | RuntimeOptimizationVulkanQnK);
+        if (NcnnLinearOperator::vulkan_device_count() == 0)
+        {
+            check(static_cast<bool>(!vulkan));
+            continue;
+        }
+        check(static_cast<bool>(vulkan));
+        check(vulkan->dtype() == dtype);
+        check(vulkan->input_columns() == columns);
+        check(vulkan->output_columns() == rows);
+        CpuBatch actual;
+        check(static_cast<bool>(vulkan->forward(input, actual)));
+        check(actual.rows() == expected.rows());
+        check(actual.columns() == expected.columns());
+        for (size_t token = 0; token < input_rows; ++token)
+        {
+            for (size_t row = 0; row < rows; ++row)
+                check_near(actual.row(token)[row], expected.row(token)[row], 0.2f);
+        }
+    }
+}
+
+void test_ncnn_vulkan_qnk_expert_operator()
+{
+    const uint32_t hidden_columns = 512;
+    const uint32_t intermediate_columns = 256;
+    const size_t input_rows = 3;
+    const uint32_t qnk_columns = hidden_columns;
+    const DType dtype = DType::Q4K;
+    const auto make_q4k = [](size_t rows, uint32_t columns, uint32_t seed) {
+        std::vector<uint8_t> raw(static_cast<size_t>(qnk_storage_bytes(DType::Q4K, rows, columns)));
+        const size_t block_bytes = qnk_block_bytes(DType::Q4K);
+        const uint32_t block_count = columns / qnk_block_elements;
+        for (size_t row = 0; row < rows; ++row)
+        {
+            for (uint32_t block = 0; block < block_count; ++block)
+            {
+                uint8_t* encoded = raw.data() + (row * block_count + block) * block_bytes;
+                encoded[0] = 0x00;
+                encoded[1] = 0x3c;
+                encoded[2] = 0x00;
+                encoded[3] = 0x3c;
+                for (uint32_t index = 0; index < 8; ++index)
+                    encoded[4 + index] = static_cast<uint8_t>(1u + ((seed + row + block + index) & 1u));
+                for (uint32_t index = 0; index < 64; ++index)
+                    encoded[16 + index] = static_cast<uint8_t>(0x11u + ((seed + row + block + index) & 0x22u));
+            }
+        }
+        return raw;
+    };
+
+    TensorData gate_up;
+    gate_up.dtype = dtype;
+    gate_up.shape = {intermediate_columns * 2, qnk_columns};
+    gate_up.quantized_data = make_q4k(gate_up.shape[0], qnk_columns, 7);
+    TensorData down;
+    down.dtype = dtype;
+    down.shape = {hidden_columns, intermediate_columns};
+    down.quantized_data = make_q4k(down.shape[0], intermediate_columns, 19);
+
+    CpuBatch input(input_rows, hidden_columns);
+    for (size_t row = 0; row < input.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < input.columns(); ++column)
+            input.row(row)[column] = static_cast<float>(static_cast<int>((row * 17 + column * 5) % 31) - 15) * 0.015625f;
+    }
+
+    const NcnnVulkanContextInstancePtr context_instance = create_ncnn_vulkan_context_instance();
+    const std::array<ExpertActivation, 3> activations = {
+        ExpertActivation::Silu,
+        ExpertActivation::DeepSeekSwiGlu,
+        ExpertActivation::GptOssSwiGlu,
+    };
+    for (const ExpertActivation activation : activations)
+    {
+        const CpuBatch gate_up_output = linear_batch(gate_up, input, 0);
+        CpuBatch activated(input_rows, intermediate_columns);
+        for (size_t row = 0; row < input_rows; ++row)
+        {
+            for (uint32_t column = 0; column < intermediate_columns; ++column)
+            {
+                const float gate = gate_up_output.row(row)[column * 2];
+                const float up = gate_up_output.row(row)[column * 2 + 1];
+                if (activation == ExpertActivation::GptOssSwiGlu)
+                {
+                    const float silu = gate / (1.0f + std::exp(-1.702f * gate));
+                    activated.row(row)[column] = silu * (up + 1.0f);
+                }
+                else
+                {
+                    const float silu = gate / (1.0f + std::exp(-gate));
+                    activated.row(row)[column] = silu * up;
+                }
+            }
+        }
+        const CpuBatch expected = linear_batch(down, activated, 0);
+        auto vulkan = NcnnVulkanQnkExpertOperator::create(
+            gate_up,
+            nullptr,
+            down,
+            nullptr,
+            0.0f,
+            automatic_vulkan_device_index,
+            activation,
+            context_instance,
+            kTestOptimizationFlags | RuntimeOptimizationVulkanQnK);
+        if (NcnnLinearOperator::vulkan_device_count() == 0)
+        {
+            check(static_cast<bool>(!vulkan));
+            continue;
+        }
+        check(static_cast<bool>(vulkan));
+        CpuBatch actual;
+        check(static_cast<bool>(vulkan->forward(input, actual)));
+        check(actual.rows() == expected.rows());
+        check(actual.columns() == expected.columns());
+        for (size_t row = 0; row < actual.rows(); ++row)
+        {
+            for (uint32_t column = 0; column < actual.columns(); ++column)
+                check_near(actual.row(row)[column], expected.row(row)[column], 0.2f);
+        }
+    }
+
+    TensorData packed_gate_up = gate_up;
+    packed_gate_up.qnk_interleave_rows = false;
+    packed_gate_up.qnk_packed.reset();
+    const size_t qnk_block_bytes_value = qnk_block_bytes(dtype);
+    const uint32_t qnk_block_count = qnk_columns / qnk_block_elements;
+    const uint32_t packed_intermediate_rows = intermediate_columns;
+    for (uint32_t packed_row = 0; packed_row < packed_intermediate_rows * 2; ++packed_row)
+    {
+        const uint32_t source_row = packed_row < packed_intermediate_rows
+                                        ? packed_row * 2
+                                        : (packed_row - packed_intermediate_rows) * 2 + 1;
+        for (uint32_t block = 0; block < qnk_block_count; ++block)
+        {
+            const size_t destination_offset =
+                (static_cast<size_t>(packed_row) * qnk_block_count + block) * qnk_block_bytes_value;
+            const size_t source_offset =
+                (static_cast<size_t>(source_row) * qnk_block_count + block) * qnk_block_bytes_value;
+            std::memcpy(
+                packed_gate_up.quantized_data.data() + destination_offset,
+                gate_up.quantized_data.data() + source_offset,
+                qnk_block_bytes_value);
+        }
+    }
+    const CpuBatch packed_gate_output = linear_batch(packed_gate_up, input, 0);
+    CpuBatch packed_activated(input_rows, intermediate_columns);
+    for (size_t row = 0; row < input_rows; ++row)
+    {
+        for (uint32_t column = 0; column < intermediate_columns; ++column)
+        {
+            const float gate = packed_gate_output.row(row)[column];
+            const float up = packed_gate_output.row(row)[intermediate_columns + column];
+            const float silu = gate / (1.0f + std::exp(-1.702f * gate));
+            packed_activated.row(row)[column] = silu * (up + 1.0f);
+        }
+    }
+    const CpuBatch packed_expected = linear_batch(down, packed_activated, 0);
+    auto packed_vulkan = NcnnVulkanQnkExpertOperator::create(
+        packed_gate_up,
+        nullptr,
+        down,
+        nullptr,
+        0.0f,
+        automatic_vulkan_device_index,
+        ExpertActivation::GptOssSwiGlu,
+        context_instance,
+        kTestOptimizationFlags | RuntimeOptimizationVulkanQnK);
+    if (NcnnLinearOperator::vulkan_device_count() == 0)
+    {
+        check(static_cast<bool>(!packed_vulkan));
+    }
+    else
+    {
+        check(static_cast<bool>(packed_vulkan));
+        CpuBatch packed_actual;
+        check(static_cast<bool>(packed_vulkan->forward(input, packed_actual)));
+        check(packed_actual.rows() == packed_expected.rows());
+        check(packed_actual.columns() == packed_expected.columns());
+        for (size_t row = 0; row < packed_actual.rows(); ++row)
+        {
+            for (uint32_t column = 0; column < packed_actual.columns(); ++column)
+            {
+                check_near(packed_actual.row(row)[column], packed_expected.row(row)[column], 0.2f);
+            }
+        }
+    }
+
+    if (NcnnLinearOperator::vulkan_device_count() == 0)
+        return;
+    CpuBatch gate_up_output = linear_batch(gate_up, input, 0);
+    CpuBatch activated(input_rows, intermediate_columns);
+    for (size_t row = 0; row < input_rows; ++row)
+    {
+        for (uint32_t column = 0; column < intermediate_columns; ++column)
+        {
+            const float gate = gate_up_output.row(row)[column * 2];
+            const float up = gate_up_output.row(row)[column * 2 + 1];
+            const float silu = gate / (1.0f + std::exp(-1.702f * gate));
+            activated.row(row)[column] = silu * (up + 1.0f);
+        }
+    }
+    const CpuBatch expected = linear_batch(down, activated, 0);
+    const uint64_t qnk_pair_bytes = gate_up.quantized_data.size() + down.quantized_data.size();
+    const uint64_t backend_flags = kTestOptimizationFlags
+                                   | RuntimeOptimizationVulkanQnK
+                                   | RuntimeOptimizationVulkanRouteAggregationForce;
+    const auto backend = create_vulkan_mxfp4_expert_backend(
+        qnk_pair_bytes * 2 + 4096,
+        automatic_vulkan_device_index,
+        nullptr,
+        context_instance,
+        backend_flags);
+    check(static_cast<bool>(backend));
+    const auto backend_gate_up = std::make_shared<TensorData>(gate_up);
+    const auto backend_down = std::make_shared<TensorData>(down);
+    backend->admit(
+        "qnk-expert",
+        backend_gate_up,
+        nullptr,
+        backend_down,
+        nullptr,
+        0,
+        static_cast<uint32_t>(input.rows()),
+        0.0f,
+        ExpertActivation::GptOssSwiGlu);
+    backend->wait_for_background_work();
+    check(backend->statistics().stores == 1);
+    CpuBatch actual;
+    check(backend->try_execute("qnk-expert", input, actual) == ExpertBackendExecutionResult::Executed);
+    check(actual.rows() == expected.rows());
+    check(actual.columns() == expected.columns());
+    for (size_t row = 0; row < actual.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < actual.columns(); ++column)
+            check_near(actual.row(row)[column], expected.row(row)[column], 0.2f);
+    }
+
+    auto backend_gate_up_second = std::make_shared<TensorData>(gate_up);
+    auto backend_down_second = std::make_shared<TensorData>(down);
+    const CpuBatch second_gate_up_output = linear_batch(*backend_gate_up_second, input, 0);
+    CpuBatch second_activated(input_rows, intermediate_columns);
+    for (size_t row = 0; row < input_rows; ++row)
+    {
+        for (uint32_t column = 0; column < intermediate_columns; ++column)
+        {
+            const float gate = second_gate_up_output.row(row)[column * 2];
+            const float up = second_gate_up_output.row(row)[column * 2 + 1];
+            const float silu = gate / (1.0f + std::exp(-1.702f * gate));
+            second_activated.row(row)[column] = silu * (up + 1.0f);
+        }
+    }
+    const CpuBatch second_expected = linear_batch(*backend_down_second, second_activated, 0);
+    auto direct_second = NcnnVulkanQnkExpertOperator::create(
+        *backend_gate_up_second,
+        nullptr,
+        *backend_down_second,
+        nullptr,
+        0.0f,
+        automatic_vulkan_device_index,
+        ExpertActivation::GptOssSwiGlu,
+        context_instance,
+        kTestOptimizationFlags | RuntimeOptimizationVulkanQnK);
+    CpuBatch direct_second_output;
+    check(static_cast<bool>(direct_second));
+    check(static_cast<bool>(direct_second->forward(input, direct_second_output)));
+    backend->admit(
+        "qnk-expert-second",
+        backend_gate_up_second,
+        nullptr,
+        backend_down_second,
+        nullptr,
+        0,
+        static_cast<uint32_t>(input.rows()),
+        0.0f,
+        ExpertActivation::GptOssSwiGlu);
+    backend->wait_for_background_work();
+    check(backend->statistics().stores == 2);
+
+    CpuBatch second_single_output;
+    check(backend->try_execute("qnk-expert-second", input, second_single_output) == ExpertBackendExecutionResult::Executed);
+    for (size_t row = 0; row < input.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < expected.columns(); ++column)
+        {
+            check_near(second_single_output.row(row)[column], second_expected.row(row)[column], 0.2f);
+        }
+    }
+
+    CpuBatch batch_output_first;
+    CpuBatch batch_output_second;
+    const std::array<ExpertBackendRequest, 2> batch_requests = {{
+        {"qnk-expert", &input, &batch_output_first},
+        {"qnk-expert-second", &input, &batch_output_second},
+    }};
+    const auto batch_results = backend->try_execute_batch(batch_requests);
+    check(batch_results.size() == batch_requests.size());
+    check(batch_results[0] == ExpertBackendExecutionResult::Executed);
+    check(batch_results[1] == ExpertBackendExecutionResult::Executed);
+    for (size_t row = 0; row < input.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < expected.columns(); ++column)
+        {
+            check_near(batch_output_first.row(row)[column], expected.row(row)[column], 0.2f);
+            check_near(batch_output_second.row(row)[column], second_expected.row(row)[column], 0.2f);
+        }
+    }
+
+    ActivationBuffer aggregated_output(1, expected.columns());
+    std::vector<ExpertRoute> first_routes = {
+        {0, 0, 0.15f},
+        {0, 1, 0.25f},
+        {0, 2, 0.10f},
+    };
+    std::vector<ExpertRoute> second_routes = {
+        {0, 0, 0.20f},
+        {0, 1, 0.15f},
+        {0, 2, 0.15f},
+    };
+    CpuBatch aggregation_output_first;
+    CpuBatch aggregation_output_second;
+    uint8_t first_completed = 0;
+    uint8_t second_completed = 0;
+    std::array<ExpertBackendRequest, 2> aggregation_requests = {{
+        {"qnk-expert", &input, &aggregation_output_first},
+        {"qnk-expert-second", &input, &aggregation_output_second},
+    }};
+    aggregation_requests[0].route_aggregation = {
+        &aggregated_output,
+        first_routes,
+        1,
+        &first_completed,
+        true,
+    };
+    aggregation_requests[1].route_aggregation = {
+        &aggregated_output,
+        second_routes,
+        1,
+        &second_completed,
+        true,
+    };
+    auto aggregation_submission = backend->submit_batch(aggregation_requests);
+    check(static_cast<bool>(aggregation_submission));
+    const auto aggregation_results = aggregation_submission->wait();
+    check(aggregation_submission->commit());
+    check(aggregation_results.size() == aggregation_requests.size());
+    check(aggregation_results[0] == ExpertBackendExecutionResult::Executed);
+    check(aggregation_results[1] == ExpertBackendExecutionResult::Executed);
+    check(first_completed == 1);
+    check(second_completed == 1);
+    for (uint32_t column = 0; column < expected.columns(); ++column)
+    {
+        float expected_aggregation = 0.0f;
+        for (size_t row = 0; row < input.rows(); ++row)
+        {
+            expected_aggregation += first_routes[row].weight * expected.row(row)[column];
+            expected_aggregation += second_routes[row].weight * second_expected.row(row)[column];
+        }
+        check_near(aggregated_output.row(0)[column], expected_aggregation, 0.2f);
+    }
+    check(backend->statistics().route_aggregation_batches >= 1);
+}
+
 class TestExpertVictimCache final : public IExpertVictimCache
 {
 public:
@@ -7803,6 +8247,288 @@ void benchmark_qnk_gemm()
     }
 }
 
+void benchmark_vulkan_qnk()
+{
+    constexpr uint32_t columns = 4096;
+    constexpr size_t rows = 256;
+    constexpr size_t token_count = 64;
+    constexpr uint32_t iterations = 8;
+    const std::array<DType, 6> dtypes = {
+        DType::Q2K,
+        DType::Q3K,
+        DType::Q4K,
+        DType::Q5K,
+        DType::Q6K,
+        DType::Q8K,
+    };
+    const NcnnVulkanContextInstancePtr context_instance = create_ncnn_vulkan_context_instance();
+    if (NcnnLinearOperator::vulkan_device_count() == 0)
+    {
+        std::cout << "vulkan_qnk unavailable\n";
+        return;
+    }
+
+    CpuBatch input(token_count, columns);
+    for (size_t token = 0; token < input.rows(); ++token)
+    {
+        for (uint32_t column = 0; column < input.columns(); ++column)
+            input.row(token)[column] = static_cast<float>(static_cast<int>((column * 7 + token * 13) % 29) - 14) * 0.03125f;
+    }
+
+    std::cout << std::fixed << std::setprecision(3);
+    for (const DType dtype : dtypes)
+    {
+        const size_t raw_bytes = static_cast<size_t>(qnk_storage_bytes(dtype, rows, columns));
+        const size_t row_bytes = raw_bytes / rows;
+        const size_t block_bytes = qnk_block_bytes(dtype);
+        const uint32_t block_count = columns / qnk_block_elements;
+        std::vector<uint8_t> raw(raw_bytes);
+        for (size_t index = 0; index < raw.size(); ++index)
+            raw[index] = static_cast<uint8_t>((index * 37u + static_cast<uint32_t>(dtype) * 11u + 5u) & 0xffu);
+        for (size_t row = 0; row < rows; ++row)
+        {
+            for (uint32_t block = 0; block < block_count; ++block)
+            {
+                uint8_t* encoded = raw.data() + row * row_bytes + static_cast<size_t>(block) * block_bytes;
+                if (dtype == DType::Q2K)
+                {
+                    std::fill_n(encoded, 16, uint8_t{1});
+                    encoded[80] = 0x00;
+                    encoded[81] = 0x3c;
+                    encoded[82] = 0;
+                    encoded[83] = 0;
+                }
+                else if (dtype == DType::Q3K)
+                {
+                    std::fill_n(encoded + 96, 12, uint8_t{0});
+                    encoded[108] = 0x00;
+                    encoded[109] = 0x3c;
+                }
+                else if (dtype == DType::Q4K || dtype == DType::Q5K)
+                {
+                    encoded[0] = 0x00;
+                    encoded[1] = 0x3c;
+                    encoded[2] = 0;
+                    encoded[3] = 0;
+                    std::fill_n(encoded + 4, 8, uint8_t{1});
+                }
+                else if (dtype == DType::Q6K)
+                {
+                    std::fill_n(encoded + 192, 16, uint8_t{1});
+                    encoded[208] = 0x00;
+                    encoded[209] = 0x3c;
+                }
+                else
+                {
+                    const float scale = 1.0f;
+                    std::memcpy(encoded, &scale, sizeof(scale));
+                }
+            }
+        }
+
+        TensorData matrix;
+        matrix.dtype = dtype;
+        matrix.shape = {static_cast<uint32_t>(rows), columns};
+        matrix.quantized_data = std::move(raw);
+        CpuBatch cpu_output;
+        linear_batch_into(matrix, input, cpu_output, 0);
+        auto vulkan = NcnnVulkanQnkOperator::create(
+            matrix,
+            nullptr,
+            automatic_vulkan_device_index,
+            context_instance,
+            kTestOptimizationFlags | RuntimeOptimizationVulkanQnK);
+        if (!vulkan)
+        {
+            std::cout << "vulkan_qnk dtype=" << static_cast<int>(dtype) << " create=failed\n";
+            continue;
+        }
+        CpuBatch gpu_output;
+        for (uint32_t iteration = 0; iteration < 2; ++iteration)
+        {
+            linear_batch_into(matrix, input, cpu_output, 0);
+            if (!vulkan->forward(input, gpu_output))
+            {
+                std::cout << "vulkan_qnk dtype=" << static_cast<int>(dtype) << " forward=failed\n";
+                gpu_output.clear();
+                break;
+            }
+        }
+        if (gpu_output.rows() == 0)
+            continue;
+
+        const auto cpu_start = std::chrono::steady_clock::now();
+        float cpu_checksum = 0.0f;
+        for (uint32_t iteration = 0; iteration < iterations; ++iteration)
+        {
+            linear_batch_into(matrix, input, cpu_output, 0);
+            cpu_checksum += cpu_output.row(iteration % token_count)[iteration % rows];
+        }
+        const double cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpu_start).count();
+
+        const auto gpu_start = std::chrono::steady_clock::now();
+        float gpu_checksum = 0.0f;
+        for (uint32_t iteration = 0; iteration < iterations; ++iteration)
+        {
+            if (!vulkan->forward(input, gpu_output))
+            {
+                gpu_output.clear();
+                break;
+            }
+            gpu_checksum += gpu_output.row(iteration % token_count)[iteration % rows];
+        }
+        const double gpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gpu_start).count();
+        if (gpu_output.rows() == 0)
+        {
+            std::cout << "vulkan_qnk dtype=" << static_cast<int>(dtype) << " forward=failed\n";
+            continue;
+        }
+        float max_error = 0.0f;
+        for (size_t token = 0; token < token_count; ++token)
+        {
+            for (size_t row = 0; row < rows; ++row)
+                max_error = std::max(max_error, std::fabs(gpu_output.row(token)[row] - cpu_output.row(token)[row]));
+        }
+        std::cout << "vulkan_qnk dtype=" << static_cast<int>(dtype)
+                  << " rows=" << rows
+                  << " columns=" << columns
+                  << " tokens=" << token_count
+                  << " iterations=" << iterations
+                  << " cpu_ms=" << cpu_ms
+                  << " gpu_ms=" << gpu_ms
+                  << " speedup=" << (cpu_ms / gpu_ms)
+                  << " max_error=" << max_error
+                  << " checksum_delta=" << std::fabs(cpu_checksum - gpu_checksum)
+                  << '\n';
+    }
+}
+
+void benchmark_vulkan_qnk_expert()
+{
+    constexpr uint32_t hidden_columns = 512;
+    constexpr uint32_t intermediate_columns = 256;
+    constexpr size_t token_count = 64;
+    constexpr uint32_t iterations = 8;
+    const NcnnVulkanContextInstancePtr context_instance = create_ncnn_vulkan_context_instance();
+    if (NcnnLinearOperator::vulkan_device_count() == 0)
+    {
+        std::cout << "vulkan_qnk_expert unavailable\n";
+        return;
+    }
+
+    const auto make_q4k = [](size_t rows, uint32_t columns, uint32_t seed) {
+        std::vector<uint8_t> raw(static_cast<size_t>(qnk_storage_bytes(DType::Q4K, rows, columns)));
+        const size_t block_bytes = qnk_block_bytes(DType::Q4K);
+        const uint32_t block_count = columns / qnk_block_elements;
+        for (size_t row = 0; row < rows; ++row)
+        {
+            for (uint32_t block = 0; block < block_count; ++block)
+            {
+                uint8_t* encoded = raw.data() + (row * block_count + block) * block_bytes;
+                encoded[0] = 0x00;
+                encoded[1] = 0x3c;
+                encoded[2] = 0x00;
+                encoded[3] = 0x3c;
+                std::fill_n(encoded + 4, 8, uint8_t{1});
+                for (uint32_t index = 0; index < 64; ++index)
+                    encoded[16 + index] = static_cast<uint8_t>(0x11u + ((seed + row + block + index) & 0x0fu));
+            }
+        }
+        return raw;
+    };
+
+    TensorData gate_up;
+    gate_up.dtype = DType::Q4K;
+    gate_up.shape = {intermediate_columns * 2, hidden_columns};
+    gate_up.quantized_data = make_q4k(gate_up.shape[0], hidden_columns, 7);
+    TensorData down;
+    down.dtype = DType::Q4K;
+    down.shape = {hidden_columns, intermediate_columns};
+    down.quantized_data = make_q4k(down.shape[0], intermediate_columns, 19);
+
+    CpuBatch input(token_count, hidden_columns);
+    for (size_t row = 0; row < input.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < input.columns(); ++column)
+            input.row(row)[column] = static_cast<float>(static_cast<int>((row * 17 + column * 5) % 31) - 15) * 0.015625f;
+    }
+
+    auto vulkan = NcnnVulkanQnkExpertOperator::create(
+        gate_up,
+        nullptr,
+        down,
+        nullptr,
+        0.0f,
+        automatic_vulkan_device_index,
+        ExpertActivation::GptOssSwiGlu,
+        context_instance,
+        kTestOptimizationFlags | RuntimeOptimizationVulkanQnK);
+    if (!vulkan)
+    {
+        std::cout << "vulkan_qnk_expert create=failed\n";
+        return;
+    }
+
+    const auto cpu_forward = [&]() {
+        const CpuBatch gate_up_output = linear_batch(gate_up, input, 0);
+        CpuBatch activated(token_count, intermediate_columns);
+        for (size_t row = 0; row < token_count; ++row)
+        {
+            for (uint32_t column = 0; column < intermediate_columns; ++column)
+            {
+                const float gate = gate_up_output.row(row)[column * 2];
+                const float up = gate_up_output.row(row)[column * 2 + 1];
+                const float silu = gate / (1.0f + std::exp(-1.702f * gate));
+                activated.row(row)[column] = silu * (up + 1.0f);
+            }
+        }
+        return linear_batch(down, activated, 0);
+    };
+
+    CpuBatch cpu_output = cpu_forward();
+    CpuBatch gpu_output;
+    for (uint32_t iteration = 0; iteration < 2; ++iteration)
+    {
+        cpu_output = cpu_forward();
+        check(static_cast<bool>(vulkan->forward(input, gpu_output)));
+    }
+
+    const auto cpu_start = std::chrono::steady_clock::now();
+    float cpu_checksum = 0.0f;
+    for (uint32_t iteration = 0; iteration < iterations; ++iteration)
+    {
+        cpu_output = cpu_forward();
+        cpu_checksum += cpu_output.row(iteration % token_count)[iteration % hidden_columns];
+    }
+    const double cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpu_start).count();
+
+    const auto gpu_start = std::chrono::steady_clock::now();
+    float gpu_checksum = 0.0f;
+    for (uint32_t iteration = 0; iteration < iterations; ++iteration)
+    {
+        check(static_cast<bool>(vulkan->forward(input, gpu_output)));
+        gpu_checksum += gpu_output.row(iteration % token_count)[iteration % hidden_columns];
+    }
+    const double gpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gpu_start).count();
+    float max_error = 0.0f;
+    for (size_t row = 0; row < token_count; ++row)
+    {
+        for (uint32_t column = 0; column < hidden_columns; ++column)
+            max_error = std::max(max_error, std::fabs(gpu_output.row(row)[column] - cpu_output.row(row)[column]));
+    }
+    std::cout << std::fixed << std::setprecision(3)
+              << "vulkan_qnk_expert rows=" << hidden_columns
+              << " intermediate=" << intermediate_columns
+              << " tokens=" << token_count
+              << " iterations=" << iterations
+              << " cpu_ms=" << cpu_ms
+              << " gpu_ms=" << gpu_ms
+              << " speedup=" << (cpu_ms / gpu_ms)
+              << " max_error=" << max_error
+              << " checksum_delta=" << std::fabs(cpu_checksum - gpu_checksum)
+              << '\n';
+}
+
 void test_cpu_resource_coordination()
 {
     const CpuThreadBudget budget = resolve_cpu_thread_budget(1, 1, 2);
@@ -7842,6 +8568,16 @@ int main(int argc, char** argv)
             ncnn::moe::benchmark_qnk_gemm();
             return 0;
         }
+        if (argc > 1 && std::string(argv[1]) == "--benchmark-vulkan-qnk")
+        {
+            ncnn::moe::benchmark_vulkan_qnk();
+            return 0;
+        }
+        if (argc > 1 && std::string(argv[1]) == "--benchmark-vulkan-qnk-expert")
+        {
+            ncnn::moe::benchmark_vulkan_qnk_expert();
+            return 0;
+        }
         ncnn::moe::test_flag_defaults();
         ncnn::moe::test_cpu_task_worker();
         ncnn::moe::test_cpu_resource_coordination();
@@ -7869,6 +8605,8 @@ int main(int argc, char** argv)
         ncnn::moe::test_ncnn_vulkan_float8_operator();
         ncnn::moe::test_mxfp4_cpu_kernel_and_fused_gate_up();
         ncnn::moe::test_qnk_cpu_kernel_and_pack();
+        ncnn::moe::test_ncnn_vulkan_qnk_operator();
+        ncnn::moe::test_ncnn_vulkan_qnk_expert_operator();
         ncnn::moe::test_sharded_expert_victim_cache();
         ncnn::moe::test_mapped_file_range_and_shared_buffer();
         ncnn::moe::test_safetensors_dense_mmap();

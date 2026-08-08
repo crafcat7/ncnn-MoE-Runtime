@@ -724,16 +724,24 @@ void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch
     const uint32_t input_columns = matrix.shape[1];
     assert(input.columns() == input_columns);
 
-    if (is_qnk_dtype(matrix.dtype)
-        && qnk_linear_batch_into(matrix, input, output))
+    if (is_qnk_dtype(matrix.dtype))
     {
-        return;
+        if (backend == ExecutionBackend::Vulkan
+            && executable
+            && executable->qnk
+            && executable->qnk->forward(input, output))
+        {
+            return;
+        }
+        if (qnk_linear_batch_into(matrix, input, output))
+            return;
     }
 
     if (backend == ExecutionBackend::Vulkan
         && ((executable && executable->bfloat16
              && executable->bfloat16->forward(input, output))
             || (executable && executable->float8 && executable->float8->forward(input, output))
+            || (executable && executable->qnk && executable->qnk->forward(input, output))
             || (executable && executable->linear && executable->linear->forward(input, output))))
         return;
     require_dense_host_storage(matrix, "linear weight");
@@ -2292,6 +2300,7 @@ void linear_batch_into(const TensorData& matrix, const TensorData& bias, const C
         && ((executable && executable->bfloat16
              && executable->bfloat16->forward(input, output))
             || (executable && executable->float8 && executable->float8->forward(input, output))
+            || (executable && executable->qnk && executable->qnk->forward(input, output))
             || (executable && executable->linear && executable->linear->forward(input, output))))
     {
         return;

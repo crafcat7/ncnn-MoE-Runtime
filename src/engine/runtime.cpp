@@ -441,7 +441,10 @@ Result<ModelPtr> Runtime::load_model(
         if (has_flag(config.optimization_flags, RuntimeOptimizationVulkanAttention))
             compiler_capabilities.flags |= ModelCompiler::BackendCapabilityVulkanAttention;
     }
-    if (requested_expert_gpu_bytes != 0 || (automatic_gpu_expert_cache && file_backed_experts))
+    if (requested_expert_gpu_bytes != 0
+        || (automatic_gpu_expert_cache && file_backed_experts)
+        || (use_vulkan_dense
+            && has_flag(config.optimization_flags, RuntimeOptimizationVulkanQnK)))
     {
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityVulkanExperts;
     }
@@ -683,6 +686,55 @@ Result<ModelPtr> Runtime::load_model(
             std::move(expert_victim_cache),
             expert_cache_flags,
             static_cast<uint32_t>(residency_group_count));
+    }
+
+    bool has_resident_qnk_experts = false;
+    uint64_t maximum_qnk_pair_bytes = 0;
+    uint32_t maximum_qnk_top_k = 1;
+    const auto inspect_qnk_graph = [&](const ExecutionGraph& graph) {
+        for (const CompiledLayerPlan& layer : graph.layer_plans)
+        {
+            maximum_qnk_top_k = std::max(maximum_qnk_top_k, layer.moe.top_k);
+            for (const ExpertPlan& expert : layer.moe.experts)
+            {
+                if (expert.gate_up_weight == invalid_tensor_handle
+                    || expert.down_weight == invalid_tensor_handle)
+                {
+                    continue;
+                }
+                const TensorData& gate_up = compiled_model.weights.at(expert.gate_up_weight);
+                const TensorData& down = compiled_model.weights.at(expert.down_weight);
+                if (is_qnk_dtype(gate_up.dtype) && gate_up.dtype == down.dtype)
+                {
+                    has_resident_qnk_experts = true;
+                    maximum_qnk_pair_bytes = std::max(maximum_qnk_pair_bytes, expert.weight_bytes);
+                }
+            }
+        }
+    };
+    inspect_qnk_graph(compiled_model.graph);
+    inspect_qnk_graph(compiled_model.speculative.graph);
+    if (has_resident_qnk_experts
+        && use_vulkan_dense
+        && has_flag(config.optimization_flags, RuntimeOptimizationVulkanQnK)
+        && !compiled_model.expert_backend)
+    {
+        if (maximum_qnk_pair_bytes == 0
+            || maximum_qnk_pair_bytes > std::numeric_limits<uint64_t>::max() / maximum_qnk_top_k)
+        {
+            return Error{ErrorCode::InvalidArgument, "resident Qn_K Expert GPU capacity overflows"};
+        }
+        const uint64_t qnk_capacity = maximum_qnk_pair_bytes * maximum_qnk_top_k;
+        auto backend = create_vulkan_mxfp4_expert_backend(
+            qnk_capacity,
+            selected_vulkan_device_index,
+            nullptr,
+            compiled_model.vulkan_context_instance,
+            config.optimization_flags);
+        if (!backend)
+            return Error{ErrorCode::UnsupportedModel, "cannot create the Vulkan Qn_K Expert execution backend"};
+        compiled_model.expert_backend = std::move(backend);
+        compiled_model.effective_runtime_config.expert_gpu_cache_bytes = qnk_capacity;
     }
 
     report_progress(8, "finalize", "Finalizing runtime model");

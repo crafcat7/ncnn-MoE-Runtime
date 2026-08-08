@@ -264,6 +264,8 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/mxfp4_indexed.comp
         src/kernels/vulkan/mxfp4_projection.comp
         src/kernels/vulkan/mxfp4_route_aggregation.comp
+        src/kernels/vulkan/qnk_projection.comp
+        src/kernels/vulkan/qnk_swiglu.comp
     )
     set(NCNN_MOE_VULKAN_SHADER_HEADERS)
     foreach(NCNN_MOE_SHADER_SOURCE IN LISTS NCNN_MOE_VULKAN_SHADER_SOURCES)

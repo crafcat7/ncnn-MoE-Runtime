@@ -8,6 +8,7 @@
 #include "kernels/cpu_hyper_connection.h"
 #include "kernels/cpu_latent_attention.h"
 #include "kernels/cpu_ops.h"
+#include "kernels/cpu_qnk.h"
 #include "cpu_session_state.h"
 #include "cpu_thread_budget.h"
 #include "cpu_topology.h"
@@ -1091,17 +1092,38 @@ static uint64_t run_experts(
     return elapsed;
 }
 
-static bool can_run_vulkan_expert(const ExpertPlan& expert, const TensorData& gate_up, const TensorData& down)
+static bool can_run_vulkan_expert(
+    const ExpertPlan& expert,
+    const TensorData& gate_up,
+    const TensorData& down,
+    uint64_t optimization_flags)
 {
-    return (expert.activation == ExpertActivation::Silu
-            || expert.activation == ExpertActivation::GptOssSwiGlu
-            || expert.activation == ExpertActivation::DeepSeekSwiGlu)
-           && gate_up.dtype == DType::MxFp4
-           && down.dtype == DType::MxFp4
-           && gate_up.shape.size() == 2
-           && down.shape.size() == 2
-           && gate_up.shape[0] % 2 == 0
-           && down.shape[1] == gate_up.shape[0] / 2;
+    if ((expert.activation != ExpertActivation::Silu
+         && expert.activation != ExpertActivation::GptOssSwiGlu
+         && expert.activation != ExpertActivation::DeepSeekSwiGlu)
+        || gate_up.shape.size() != 2
+        || down.shape.size() != 2
+        || gate_up.shape[0] % 2 != 0
+        || down.shape[1] != gate_up.shape[0] / 2)
+    {
+        return false;
+    }
+    if (gate_up.dtype == DType::MxFp4 && down.dtype == DType::MxFp4)
+        return true;
+    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationVulkanQnK)
+           && is_qnk_dtype(gate_up.dtype)
+           && gate_up.dtype == down.dtype
+           && qnk_shape_supported(gate_up.dtype, gate_up.shape[0], gate_up.shape[1])
+           && qnk_shape_supported(down.dtype, down.shape[0], down.shape[1]);
+}
+
+// Resident Qn_K weights are owned by CompiledModel::weights.  The Vulkan
+// backend only needs a temporary shared handle while its asynchronous
+// admission worker copies the bytes to device storage; the model outlives
+// the backend, so this non-owning handle avoids copying a large raw tensor.
+static std::shared_ptr<const TensorData> borrow_resident_tensor(const TensorData& tensor)
+{
+    return std::shared_ptr<const TensorData>(&tensor, [](const TensorData*) {});
 }
 
 static void admit_vulkan_expert(
@@ -1116,7 +1138,7 @@ static void admit_vulkan_expert(
         || !model.expert_backend
         || !lease.gate_up
         || !lease.down
-        || !can_run_vulkan_expert(expert, *lease.gate_up, *lease.down))
+        || !can_run_vulkan_expert(expert, *lease.gate_up, *lease.down, model.optimization_flags))
     {
         return;
     }
@@ -1216,7 +1238,13 @@ static ExpertVictimExecutionMetadata victim_metadata(const CompiledModel& model,
     ExpertVictimExecutionMetadata metadata;
     if (expert.gate_up_weight == invalid_tensor_handle
         || expert.down_weight == invalid_tensor_handle
-        || !can_run_vulkan_expert(expert, model.weights.at(expert.gate_up_weight), model.weights.at(expert.down_weight)))
+        || model.weights.at(expert.gate_up_weight).dtype != DType::MxFp4
+        || model.weights.at(expert.down_weight).dtype != DType::MxFp4
+        || !can_run_vulkan_expert(
+               expert,
+               model.weights.at(expert.gate_up_weight),
+               model.weights.at(expert.down_weight),
+               model.optimization_flags))
     {
         return metadata;
     }
@@ -1253,10 +1281,13 @@ static bool should_use_hybrid_expert_blocks(
         const ExpertPlan& expert = moe.experts[active.batch.expert_id];
         if (expert.gate_up_weight == invalid_tensor_handle
             || expert.down_weight == invalid_tensor_handle
+            || model.weights.at(expert.gate_up_weight).dtype != DType::MxFp4
+            || model.weights.at(expert.down_weight).dtype != DType::MxFp4
             || !can_run_vulkan_expert(
-                expert,
-                model.weights.at(expert.gate_up_weight),
-                model.weights.at(expert.down_weight)))
+                   expert,
+                   model.weights.at(expert.gate_up_weight),
+                   model.weights.at(expert.down_weight),
+                   model.optimization_flags))
         {
             return false;
         }
@@ -2042,7 +2073,7 @@ static void admit_ready_router_prediction(
         const TensorData& down = model.weights.at(expert.down_weight);
         if (!gate_up.mxfp4_file_storage
             || !down.mxfp4_file_storage
-            || !can_run_vulkan_expert(expert, gate_up, down))
+            || !can_run_vulkan_expert(expert, gate_up, down, model.optimization_flags))
         {
             continue;
         }
@@ -2320,12 +2351,38 @@ static Result<void> run_moe(
             ActiveExpertExecution& active = layer_state.active_experts[active_index];
             const ExpertPlan& expert = moe.experts[active.batch.expert_id];
             if (expert.gate_up_weight == invalid_tensor_handle
+                || expert.down_weight == invalid_tensor_handle
                 || !can_run_vulkan_expert(
-                    expert,
-                    model.weights.at(expert.gate_up_weight),
-                    model.weights.at(expert.down_weight)))
+                   expert,
+                   model.weights.at(expert.gate_up_weight),
+                   model.weights.at(expert.down_weight),
+                   model.optimization_flags))
             {
                 continue;
+            }
+            const TensorData& gate_up_weight = model.weights.at(expert.gate_up_weight);
+            const TensorData& down_weight = model.weights.at(expert.down_weight);
+            if (is_qnk_dtype(gate_up_weight.dtype)
+                && expert.cache_key.empty())
+            {
+                continue;
+            }
+            if (is_qnk_dtype(gate_up_weight.dtype))
+            {
+                model.expert_backend->admit(
+                    expert.cache_key,
+                    borrow_resident_tensor(gate_up_weight),
+                    expert.gate_up_bias == invalid_tensor_handle
+                        ? nullptr
+                        : &model.weights.at(expert.gate_up_bias),
+                    borrow_resident_tensor(down_weight),
+                    expert.down_bias == invalid_tensor_handle
+                        ? nullptr
+                        : &model.weights.at(expert.down_bias),
+                    residency_group,
+                    static_cast<uint32_t>(active.input.rows()),
+                    expert.activation_limit,
+                    expert.activation);
             }
             backend_indices.push_back(active_index);
             backend_max_token_count = std::max<uint32_t>(backend_max_token_count, static_cast<uint32_t>(active.input.rows()));

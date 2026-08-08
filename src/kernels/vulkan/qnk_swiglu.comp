@@ -1,0 +1,56 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer gate_up_blob
+{
+    float gate_up_data[];
+};
+layout(binding = 1) writeonly buffer activated_blob
+{
+    float activated_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint intermediate_columns;
+    uint token_count;
+    uint activation;
+    float activation_limit;
+    uint packed_gate_up;
+}
+p;
+
+void main()
+{
+    const uint column = gl_GlobalInvocationID.x;
+    const uint token = gl_GlobalInvocationID.y;
+    if (column >= p.intermediate_columns || token >= p.token_count)
+        return;
+
+    const uint base = token * p.intermediate_columns * 2u;
+    const uint gate_index = p.packed_gate_up != 0u
+                                ? base + column
+                                : base + column * 2u;
+    const uint up_index = p.packed_gate_up != 0u
+                              ? base + p.intermediate_columns + column
+                              : base + column * 2u + 1u;
+    float gate = gate_up_data[gate_index];
+    float up = gate_up_data[up_index];
+    if (p.activation_limit > 0.0)
+    {
+        gate = min(gate, p.activation_limit);
+        up = clamp(up, -p.activation_limit, p.activation_limit);
+    }
+
+    if (p.activation == 0u)
+    {
+        const float silu = gate / (1.0 + exp(-1.702 * gate));
+        activated_data[token * p.intermediate_columns + column] = silu * (up + 1.0);
+    }
+    else
+    {
+        const float silu = gate / (1.0 + exp(-gate));
+        activated_data[token * p.intermediate_columns + column] = silu * up;
+    }
+}

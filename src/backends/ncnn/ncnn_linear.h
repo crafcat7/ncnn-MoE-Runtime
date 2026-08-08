@@ -449,6 +449,86 @@ public:
     [[nodiscard]] uint32_t output_columns() const noexcept;
 };
 
+// Experimental Vulkan projection for raw Q2_K-Q8_K
+// matrices.  The operator keeps the canonical block bytes on device and
+// performs dequantization inside the projection shader; callers can fall
+// back to the CPU Qn_K path when creation or execution fails.
+class NcnnVulkanQnkOperator
+{
+private:
+    friend class NcnnVulkanQnkExpertOperator;
+
+    [[nodiscard]] static std::shared_ptr<NcnnVulkanQnkOperator> create_with_allocator(
+        const TensorData& matrix,
+        const TensorData* bias,
+        uint32_t vulkan_device_index,
+        ncnn::VkAllocator* weight_allocator,
+        const NcnnVulkanContextInstancePtr& context_instance,
+        uint64_t optimization_flags);
+    class Implementation;
+
+    NcnnVulkanQnkOperator();
+    std::unique_ptr<Implementation> implementation_;
+
+public:
+    ~NcnnVulkanQnkOperator();
+
+    [[nodiscard]] static std::shared_ptr<NcnnVulkanQnkOperator> create(
+        const TensorData& matrix,
+        const TensorData* bias,
+        uint32_t vulkan_device_index,
+        const NcnnVulkanContextInstancePtr& context_instance,
+        uint64_t optimization_flags);
+    [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
+    [[nodiscard]] DType dtype() const noexcept;
+    [[nodiscard]] uint32_t input_columns() const noexcept;
+    [[nodiscard]] uint32_t output_columns() const noexcept;
+};
+
+// Fused Vulkan Qn_K Expert chain.  Gate/up and down projections remain
+// quantized on device; only the final Expert output crosses the transfer
+// boundary.  CPU execution remains the caller's fallback on failure.
+class NcnnVulkanQnkExpertOperator
+{
+private:
+    friend class VulkanMxfp4ExpertBackend;
+
+    [[nodiscard]] static std::shared_ptr<NcnnVulkanQnkExpertOperator> create_with_allocator(
+        const TensorData& gate_up,
+        const TensorData* gate_up_bias,
+        const TensorData& down,
+        const TensorData* down_bias,
+        float activation_limit,
+        uint32_t vulkan_device_index,
+        ncnn::VkAllocator* weight_allocator,
+        ExpertActivation activation,
+        const NcnnVulkanContextInstancePtr& context_instance,
+        uint64_t optimization_flags);
+    [[nodiscard]] static bool forward_batch(
+        std::span<const NcnnVulkanQnkExpertOperator*> experts,
+        std::span<const ActivationBuffer*> inputs,
+        std::span<ActivationBuffer*> outputs);
+    class Implementation;
+
+    NcnnVulkanQnkExpertOperator();
+    std::unique_ptr<Implementation> implementation_;
+
+public:
+    ~NcnnVulkanQnkExpertOperator();
+
+    [[nodiscard]] static std::shared_ptr<NcnnVulkanQnkExpertOperator> create(
+        const TensorData& gate_up,
+        const TensorData* gate_up_bias,
+        const TensorData& down,
+        const TensorData* down_bias,
+        float activation_limit,
+        uint32_t vulkan_device_index,
+        ExpertActivation activation,
+        const NcnnVulkanContextInstancePtr& context_instance,
+        uint64_t optimization_flags);
+    [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
+};
+
 struct NcnnVulkanMxfp4DeviceMatrixView
 {
     uint32_t output_columns = 0;

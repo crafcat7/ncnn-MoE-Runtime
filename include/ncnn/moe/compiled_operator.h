@@ -16,6 +16,7 @@ namespace moe {
 class NcnnLinearOperator;
 class NcnnVulkanBfloat16Operator;
 class NcnnVulkanFloat8Operator;
+class NcnnVulkanQnkOperator;
 class NcnnVulkanAttentionOperator;
 class NcnnVulkanGatedDeltaNetOperator;
 
@@ -30,6 +31,7 @@ struct CompiledOperator
     std::shared_ptr<NcnnLinearOperator> linear;
     std::shared_ptr<NcnnVulkanBfloat16Operator> bfloat16;
     std::shared_ptr<NcnnVulkanFloat8Operator> float8;
+    std::shared_ptr<NcnnVulkanQnkOperator> qnk;
     std::shared_ptr<NcnnVulkanAttentionOperator> attention;
     std::shared_ptr<NcnnVulkanGatedDeltaNetOperator> gated_delta;
 };
