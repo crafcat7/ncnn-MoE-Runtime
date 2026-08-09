@@ -124,6 +124,7 @@ struct CpuExpertExecutionScratch
     std::vector<size_t> backend_indices;
     std::vector<ExpertBackendRequest> backend_requests;
     std::vector<size_t> failed_indices;
+    bool backend_aggregated_output_valid = false;
     CpuBatch backend_aggregated_output;
     CpuBatch staged_merged;
     CpuBatch staged_output;
@@ -140,6 +141,7 @@ struct CpuExpertExecutionScratch
     std::vector<size_t> combined_by_expert;
     std::vector<std::vector<CpuDecodeRouteOrigin>> staged_route_origins;
     std::vector<uint8_t> combined_backend_aggregated;
+    bool combined_backend_aggregated_output_valid = false;
     CpuBatch combined_backend_aggregated_output;
 };
 

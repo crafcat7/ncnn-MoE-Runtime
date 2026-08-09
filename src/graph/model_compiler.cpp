@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <utility>
 
@@ -752,6 +753,56 @@ static uint64_t expert_weight_bytes(const WeightStore& weights, const ExpertPlan
             bytes += tensor_storage_bytes(weights.at(handle));
     }
     return bytes;
+}
+
+static Result<void> combine_qnk_gate_up_weights(
+    WeightStore& weights,
+    TensorHandle gate_handle,
+    TensorHandle up_handle,
+    uint32_t rows,
+    uint32_t columns)
+{
+    if (gate_handle == invalid_tensor_handle || up_handle == invalid_tensor_handle)
+        return Error{ErrorCode::InvalidArgument, "Qn_K gate/up handles cannot be invalid"};
+
+    const TensorData& gate = weights.at(gate_handle);
+    const TensorData& up = weights.at(up_handle);
+    if (!is_qnk_dtype(gate.dtype)
+        || gate.dtype != up.dtype
+        || gate.shape != std::vector<uint32_t>{rows, columns}
+        || up.shape != std::vector<uint32_t>{rows, columns}
+        || !qnk_shape_supported(gate.dtype, rows, columns))
+    {
+        return Error{ErrorCode::InvalidModel, "Qn_K gate/up tensors cannot be packed"};
+    }
+
+    const uint64_t row_bytes = qnk_storage_bytes(gate.dtype, 1, columns);
+    if (row_bytes == 0
+        || rows > std::numeric_limits<uint32_t>::max() / 2
+        || row_bytes > std::numeric_limits<size_t>::max() / rows
+        || row_bytes * rows > std::numeric_limits<size_t>::max() / 2)
+    {
+        return Error{ErrorCode::InvalidModel, "Qn_K gate/up tensor size overflows"};
+    }
+
+    const size_t source_bytes = static_cast<size_t>(row_bytes * rows);
+    const std::span<const uint8_t> gate_data = gate.qnk_values();
+    const std::span<const uint8_t> up_data = up.qnk_values();
+    if (gate_data.size() != source_bytes || up_data.size() != source_bytes)
+    {
+        return Error{ErrorCode::InvalidModel, "Qn_K gate/up tensor byte count does not match its shape"};
+    }
+
+    TensorData combined;
+    combined.dtype = gate.dtype;
+    combined.shape = {rows * 2, columns};
+    combined.qnk_interleave_rows = false;
+    combined.quantized_data.reserve(source_bytes * 2);
+    combined.quantized_data.insert(combined.quantized_data.end(), gate_data.begin(), gate_data.end());
+    combined.quantized_data.insert(combined.quantized_data.end(), up_data.begin(), up_data.end());
+    weights.at_mutable(gate_handle) = std::move(combined);
+    weights.at_mutable(up_handle) = TensorData{};
+    return {};
 }
 
 static ExpertKernel selected_expert_kernel(DType dtype)
@@ -2444,6 +2495,9 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
         layer_plan.moe.experts.reserve(moe.expert_count);
         const bool prepare_routed_dense_operators = moe.expert_weight_dtype != DType::BFloat16
                                                     || moe.expert_count <= 64;
+        const bool fuse_qnk_gate_up = runtime_optimization_enabled(
+            compiled.optimization_flags,
+            RuntimeOptimizationVulkanQnK);
         for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
         {
             ExpertPlan expert;
@@ -2473,10 +2527,6 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 if (!gate)
                     return gate.error();
                 expert.gate_weight = gate.value();
-                if (prepare_routed_dense_operators)
-                    (void)prepare_linear_operator(compiled.weights, compiled.operators, expert.gate_weight, invalid_tensor_handle, NcnnLinearDevice::Cpu,
-                                                  retain_cpu_dense_copies, layer_plan.vulkan_device_index,
-                                                  compiled.vulkan_context_instance, compiled.optimization_flags);
             }
 
             if (moe.layout != ExpertLayout::InterleavedGateUpDown && moe.layout != ExpertLayout::PackedGateUpDown)
@@ -2485,7 +2535,42 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 if (!up)
                     return up.error();
                 expert.up_weight = up.value();
-                if (prepare_routed_dense_operators)
+            }
+
+            bool qnk_gate_up_fused = false;
+            if (fuse_qnk_gate_up
+                && moe.layout == ExpertLayout::GateUpDown
+                && expert.gate_weight != invalid_tensor_handle
+                && expert.up_weight != invalid_tensor_handle)
+            {
+                auto fused = combine_qnk_gate_up_weights(
+                    compiled.weights,
+                    expert.gate_weight,
+                    expert.up_weight,
+                    moe.intermediate_size,
+                    compiled.descriptor.hidden_size);
+                if (fused)
+                {
+                    expert.gate_up_weight = expert.gate_weight;
+                    expert.gate_weight = invalid_tensor_handle;
+                    expert.up_weight = invalid_tensor_handle;
+                    expert.flags |= ExpertPlanPackedGateUp;
+                    qnk_gate_up_fused = true;
+                }
+                else if (is_qnk_dtype(compiled.weights.at(expert.gate_weight).dtype)
+                         && is_qnk_dtype(compiled.weights.at(expert.up_weight).dtype))
+                {
+                    return fused.error();
+                }
+            }
+
+            if (prepare_routed_dense_operators && !qnk_gate_up_fused)
+            {
+                if (expert.gate_weight != invalid_tensor_handle)
+                    (void)prepare_linear_operator(compiled.weights, compiled.operators, expert.gate_weight, invalid_tensor_handle, NcnnLinearDevice::Cpu,
+                                                  retain_cpu_dense_copies, layer_plan.vulkan_device_index,
+                                                  compiled.vulkan_context_instance, compiled.optimization_flags);
+                if (expert.up_weight != invalid_tensor_handle)
                     (void)prepare_linear_operator(compiled.weights, compiled.operators, expert.up_weight, invalid_tensor_handle, NcnnLinearDevice::Cpu,
                                                   retain_cpu_dense_copies, layer_plan.vulkan_device_index,
                                                   compiled.vulkan_context_instance, compiled.optimization_flags);

@@ -34,6 +34,83 @@ static QuantConfig quant_config_for_dtype(DType dtype)
     return config;
 }
 
+static bool expert_activation_supported_by_vulkan(ExpertActivation activation) noexcept
+{
+    return activation == ExpertActivation::Silu
+           || activation == ExpertActivation::GptOssSwiGlu
+           || activation == ExpertActivation::DeepSeekSwiGlu;
+}
+
+static bool vulkan_expert_layer_supported(
+    const CompiledModel& compiled,
+    const CompiledLayerPlan& layer,
+    uint32_t capability_flags) noexcept
+{
+    if (compiled.hybrid_mode == HybridMode::CpuOnly
+        || !has_flag(capability_flags, ModelCompiler::BackendCapabilityVulkanExperts)
+        || layer.moe.experts.empty())
+    {
+        return false;
+    }
+
+    DType qnk_dtype = DType::Float32;
+    bool has_qnk_dtype = false;
+    for (const ExpertPlan& expert : layer.moe.experts)
+    {
+        if (expert.gate_up_weight == invalid_tensor_handle
+            || expert.down_weight == invalid_tensor_handle
+            || !expert_activation_supported_by_vulkan(expert.activation))
+        {
+            return false;
+        }
+
+        const TensorData& gate_up = compiled.weights.at(expert.gate_up_weight);
+        const TensorData& down = compiled.weights.at(expert.down_weight);
+        if (gate_up.shape.size() != 2
+            || down.shape.size() != 2
+            || gate_up.shape[0] == 0
+            || gate_up.shape[0] % 2 != 0
+            || down.shape[0] == 0
+            || down.shape[1] != gate_up.shape[0] / 2)
+        {
+            return false;
+        }
+
+        if (gate_up.dtype == DType::MxFp4 && down.dtype == DType::MxFp4)
+        {
+            if (gate_up.shape[1] == 0
+                || down.shape[1] == 0
+                || gate_up.shape[1] % 32 != 0
+                || down.shape[1] % 32 != 0)
+            {
+                return false;
+            }
+            continue;
+        }
+
+        if (!runtime_optimization_enabled(compiled.optimization_flags, RuntimeOptimizationVulkanQnK)
+            || !is_qnk_dtype(gate_up.dtype)
+            || gate_up.dtype != down.dtype
+            || !qnk_shape_supported(gate_up.dtype, gate_up.shape[0], gate_up.shape[1])
+            || !qnk_shape_supported(down.dtype, down.shape[0], down.shape[1]))
+        {
+            return false;
+        }
+
+        if (!has_qnk_dtype)
+        {
+            qnk_dtype = gate_up.dtype;
+            has_qnk_dtype = true;
+        }
+        else if (qnk_dtype != gate_up.dtype)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static MoeIRValueId append_moe_ir_value(MoeGraph& graph, std::string name, DType dtype, std::vector<uint32_t> shape, TensorLocation preferred_location, uint32_t flags)
 {
     const MoeIRValueId id = static_cast<MoeIRValueId>(graph.values.size());
@@ -577,15 +654,7 @@ static Result<void> build_speculative_execution_graph(
             invalid_execution_expert_id,
             0);
 
-        const bool can_use_vulkan_experts = compiled.hybrid_mode != HybridMode::CpuOnly
-                                            && has_flag(capabilities.flags, ModelCompiler::BackendCapabilityVulkanExperts)
-                                            && !layer.moe.experts.empty()
-                                            && layer.moe.experts.front().gate_up_weight != invalid_tensor_handle
-                                            && (compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype == DType::MxFp4
-                                                || (runtime_optimization_enabled(
-                                                        capabilities.optimization_flags,
-                                                        RuntimeOptimizationVulkanQnK)
-                                                    && is_qnk_dtype(compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype)));
+        const bool can_use_vulkan_experts = vulkan_expert_layer_supported(compiled, layer, capabilities.flags);
         const ExecutionBackend expert_backend = can_use_vulkan_experts ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
         const uint32_t expert_backend_mask = can_use_vulkan_experts ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
         const uint32_t expert_flags = compiled.hybrid_mode == HybridMode::VulkanWithCpuPrefetch
@@ -750,15 +819,7 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
             {router}, {router_scores}, {assignments},
             static_cast<uint32_t>(plan_index), invalid_execution_expert_id, 0);
 
-        const bool can_use_vulkan_experts = compiled.hybrid_mode != HybridMode::CpuOnly
-                                            && has_flag(capabilities.flags, ModelCompiler::BackendCapabilityVulkanExperts)
-                                            && !layer.moe.experts.empty()
-                                            && layer.moe.experts.front().gate_up_weight != invalid_tensor_handle
-                                            && (compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype == DType::MxFp4
-                                                || (runtime_optimization_enabled(
-                                                        capabilities.optimization_flags,
-                                                        RuntimeOptimizationVulkanQnK)
-                                                    && is_qnk_dtype(compiled.weights.at(layer.moe.experts.front().gate_up_weight).dtype)));
+        const bool can_use_vulkan_experts = vulkan_expert_layer_supported(compiled, layer, capabilities.flags);
         const ExecutionBackend expert_backend = can_use_vulkan_experts ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
         const uint32_t expert_backend_mask = can_use_vulkan_experts ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
         const uint32_t expert_flags = compiled.hybrid_mode == HybridMode::VulkanWithCpuPrefetch

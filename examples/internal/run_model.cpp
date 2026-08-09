@@ -148,7 +148,6 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                                                                     " [--expert-gpu-cache-mb N]"
                                                                     " [--expert-gpu-victim-cache-mb N]"
                                                                     " [--expert-gpu-victim-reuse-probe N]"
-                                                                    " [--optimization-flags MASK]"
                                                                     " [--disable-vulkan-indexed-experts]"
                                                                     " [--disable-gpu-expert-execution]"
                                                                     " [--disable-gpu-victim-execution]"
@@ -313,17 +312,6 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             else if (argument == "--expert-gpu-victim-reuse-probe")
             {
                 runtime_options.expert_gpu_victim_reuse_probe_interval = static_cast<uint32_t>(std::stoul(ncnn::moe::require_value(argc, argv, index, "--expert-gpu-victim-reuse-probe")));
-            }
-            else if (argument == "--optimization-flags")
-            {
-                runtime_options.optimization_flags = std::stoull(
-                    ncnn::moe::require_value(
-                        argc,
-                        argv,
-                        index,
-                        "--optimization-flags"),
-                    nullptr,
-                    0);
             }
             else if (argument == "--disable-vulkan-indexed-experts")
             {

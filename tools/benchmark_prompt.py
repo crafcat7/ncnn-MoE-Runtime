@@ -61,11 +61,6 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="explicit GPU Expert victim cache capacity in MiB",
     )
-    parser.add_argument(
-        "--cross-expert-read-coalescing",
-        action="store_true",
-        help="coalesce adjacent file-backed Expert ranges during prompt loading",
-    )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument(
         "--prompt-token-ids",
@@ -74,15 +69,20 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="use these native token IDs directly; useful for model-specific prompt tests",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=16)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=0,
+        help="maximum generated tokens; 0 runs until EOS/stop or model context limit",
+    )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--prefill-chunk-size", type=int, default=512)
     parser.add_argument(
-        "--optimization-flags",
-        type=lambda value: int(value, 0),
-        default=None,
-        help="override the native RuntimeOptimization mask (accepts decimal or 0x...)",
+        "--expert-memory",
+        choices=("auto", "eager", "on-demand"),
+        default="eager",
+        help="Expert residency mode passed to the ncnn-MoE worker",
     )
     parser.add_argument("--enable-speculative", action="store_true")
     parser.add_argument("--json", action="store_true", dest="json_output")
@@ -108,18 +108,21 @@ def _runtime_args(arguments: argparse.Namespace) -> list[str]:
         runtime_args.extend(["--expert-gpu-cache-mb", str(arguments.expert_gpu_cache_mb)])
     if arguments.expert_gpu_victim_cache_mb > 0:
         runtime_args.extend(["--expert-gpu-victim-cache-mb", str(arguments.expert_gpu_victim_cache_mb)])
-    if arguments.cross_expert_read_coalescing:
-        runtime_args.append("--cross-expert-read-coalescing")
-    if arguments.optimization_flags is not None:
-        runtime_args.extend(["--optimization-flags", hex(arguments.optimization_flags)])
+    if arguments.expert_memory:
+        runtime_args.extend(["--expert-memory", arguments.expert_memory])
     return runtime_args
 
 
 def _summary(done_events: list[dict[str, Any]], generated: list[list[int]]) -> dict[str, Any]:
-    tok_s = [
-        float(event["decode_tok_per_second"])
+    prompt_tok_s = [
+        float(event["prompt_tok_per_second"])
         for event in done_events
-        if event.get("decode_tok_per_second") is not None
+        if event.get("prompt_tok_per_second") is not None
+    ]
+    generation_tok_s = [
+        float(event.get("generation_tok_per_second", event.get("decode_tok_per_second")))
+        for event in done_events
+        if event.get("generation_tok_per_second", event.get("decode_tok_per_second")) is not None
     ]
     elapsed = [float(event["elapsed_seconds"]) for event in done_events]
     ttft = [
@@ -141,8 +144,13 @@ def _summary(done_events: list[dict[str, Any]], generated: list[list[int]]) -> d
     sequence_match = bool(generated) and all(token_ids == generated[0] for token_ids in generated[1:])
     return {
         "runs": len(done_events),
-        "decode_tokens_per_second": tok_s,
-        "median_decode_tokens_per_second": statistics.median(tok_s) if tok_s else None,
+        "prompt_tokens_per_second": prompt_tok_s,
+        "median_prompt_tokens_per_second": statistics.median(prompt_tok_s) if prompt_tok_s else None,
+        "generation_tokens_per_second": generation_tok_s,
+        "median_generation_tokens_per_second": statistics.median(generation_tok_s) if generation_tok_s else None,
+        # Backward-compatible alias.
+        "decode_tokens_per_second": generation_tok_s,
+        "median_decode_tokens_per_second": statistics.median(generation_tok_s) if generation_tok_s else None,
         "elapsed_seconds": elapsed,
         "median_elapsed_seconds": statistics.median(elapsed),
         "ttft_seconds": ttft,
@@ -182,8 +190,8 @@ def _format_metric(value: float | None) -> str:
 
 def main() -> int:
     arguments = _parse_args()
-    if arguments.max_new_tokens <= 0 or arguments.warmup < 0 or arguments.runs <= 0:
-        raise SystemExit("--max-new-tokens and --runs must be positive; --warmup cannot be negative")
+    if arguments.max_new_tokens < 0 or arguments.warmup < 0 or arguments.runs <= 0:
+        raise SystemExit("--max-new-tokens must be non-negative; --runs must be positive; --warmup cannot be negative")
     if (
         arguments.host_memory_mb < 0
         or arguments.expert_cache_mb < 0
@@ -249,8 +257,10 @@ def main() -> int:
         else:
             print(f"prompt: {result['prompt']}")
         print(f"backend: {result['backend']}, prompt tokens: {len(prompt_tokens)}, generated: {result['generated_tokens']}")
-        print(f"decode Token/s: {result['decode_tokens_per_second']}")
-        print(f"median Token/s: {_format_metric(result['median_decode_tokens_per_second'])}")
+        print(f"prompt Token/s: {result['prompt_tokens_per_second']}")
+        print(f"median Prompt Token/s: {_format_metric(result['median_prompt_tokens_per_second'])}")
+        print(f"generation Token/s: {result['generation_tokens_per_second']}")
+        print(f"median Generation Token/s: {_format_metric(result['median_generation_tokens_per_second'])}")
         print(
             "median TTFT: "
             f"{_format_metric(result['median_ttft_seconds'])} s, median TPOT: "

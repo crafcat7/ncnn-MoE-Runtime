@@ -449,10 +449,7 @@ public:
     [[nodiscard]] uint32_t output_columns() const noexcept;
 };
 
-// Experimental Vulkan projection for raw Q2_K-Q8_K
-// matrices.  The operator keeps the canonical block bytes on device and
-// performs dequantization inside the projection shader; callers can fall
-// back to the CPU Qn_K path when creation or execution fails.
+// Vulkan Qn_K projection with CPU fallback.
 class NcnnVulkanQnkOperator
 {
 private:
@@ -485,9 +482,7 @@ public:
     [[nodiscard]] uint32_t output_columns() const noexcept;
 };
 
-// Fused Vulkan Qn_K Expert chain.  Gate/up and down projections remain
-// quantized on device; only the final Expert output crosses the transfer
-// boundary.  CPU execution remains the caller's fallback on failure.
+// Fused Vulkan Qn_K Expert chain.
 class NcnnVulkanQnkExpertOperator
 {
 private:

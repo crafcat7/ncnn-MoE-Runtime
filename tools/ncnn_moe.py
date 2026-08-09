@@ -106,8 +106,29 @@ def _numeric_metric(value: Any) -> float | None:
     return numeric if math.isfinite(numeric) else None
 
 
-def _decode_rate(metrics: dict[str, Any]) -> float | None:
-    for name in ("decode_tok_per_second", "tokens_per_second", "token_per_second"):
+def _prompt_rate(metrics: dict[str, Any]) -> float | None:
+    for name in ("prompt_tok_per_second", "prompt_tokens_per_second"):
+        value = _numeric_metric(metrics.get(name))
+        if value is not None:
+            return value
+    prompt_elapsed_microseconds = _numeric_metric(metrics.get("prompt_elapsed_microseconds"))
+    input_tokens = _numeric_metric(metrics.get("input_tokens"))
+    if prompt_elapsed_microseconds is not None and prompt_elapsed_microseconds > 0.0 and input_tokens:
+        return input_tokens * 1_000_000.0 / prompt_elapsed_microseconds
+    ttft_microseconds = _numeric_metric(metrics.get("ttft_microseconds"))
+    if ttft_microseconds is not None and ttft_microseconds > 0.0 and input_tokens:
+        return input_tokens * 1_000_000.0 / ttft_microseconds
+    return None
+
+
+def _generation_rate(metrics: dict[str, Any]) -> float | None:
+    for name in (
+        "generation_tok_per_second",
+        "generation_tokens_per_second",
+        "decode_tok_per_second",
+        "tokens_per_second",
+        "token_per_second",
+    ):
         value = _numeric_metric(metrics.get(name))
         if value is not None:
             return value
@@ -115,6 +136,11 @@ def _decode_rate(metrics: dict[str, Any]) -> float | None:
     if tpot_microseconds is not None and tpot_microseconds > 0.0:
         return 1_000_000.0 / tpot_microseconds
     return None
+
+
+def _decode_rate(metrics: dict[str, Any]) -> float | None:
+    """Legacy decode-rate alias."""
+    return _generation_rate(metrics)
 
 
 def _format_gpu_kernel_time(gpu: dict[str, Any], available: bool) -> str:
@@ -162,8 +188,9 @@ def _format_runtime_metrics(metrics: Any) -> str:
     return "\n".join(
         (
             "metrics",
-            "  Decode tok/s "
-            f"{_format_rate(_decode_rate(metrics))}"
+            "  Prompt: "
+            f"{_format_rate(_prompt_rate(metrics))} t/s | Generation: "
+            f"{_format_rate(_generation_rate(metrics))} t/s"
             " · TTFT "
             f"{_format_duration_microseconds(metrics.get('ttft_microseconds'))}"
             " · TPOT "
@@ -276,17 +303,11 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vulkan-device", type=int)
     parser.add_argument("--vulkan-devices", help="Comma-separated Vulkan device indices")
     parser.add_argument("--expected-concurrency", type=int)
-    parser.add_argument("--optimization-flags", type=lambda value: int(value, 0))
     expert_io_group = parser.add_mutually_exclusive_group()
     expert_io_group.add_argument("--mmap-experts", action="store_true", default=None)
     expert_io_group.add_argument("--direct-expert-io", action="store_true", default=None)
     expert_io_group.add_argument("--buffered-expert-io", action="store_true", default=None)
     parser.add_argument("--disable-gpu-victim-execution", action="store_true", default=None)
-    parser.add_argument("--router-prediction", action="store_true", default=None)
-    parser.add_argument("--async-router-prediction", action="store_true", default=None)
-    parser.add_argument("--forward-aware-cache", action="store_true", default=None)
-    parser.add_argument("--rank-adaptive-prefetch", action="store_true", default=None)
-    parser.add_argument("--cross-expert-read-coalescing", action="store_true", default=None)
     parser.add_argument("--release-vulkan-dense-host", action="store_true", default=None)
     parser.add_argument("--verbose", action="store_true")
 
@@ -480,16 +501,10 @@ def cli_runtime_settings(arguments: argparse.Namespace) -> dict[str, Any]:
         "vulkan_device",
         "vulkan_devices",
         "expected_concurrency",
-        "optimization_flags",
         "mmap_experts",
         "direct_expert_io",
         "buffered_expert_io",
         "disable_gpu_victim_execution",
-        "router_prediction",
-        "async_router_prediction",
-        "forward_aware_cache",
-        "rank_adaptive_prefetch",
-        "cross_expert_read_coalescing",
         "release_vulkan_dense_host",
     )
     return {key: getattr(arguments, key) for key in keys if getattr(arguments, key, None) is not None}

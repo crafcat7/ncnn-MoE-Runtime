@@ -12,19 +12,14 @@ namespace moe {
 
 class CpuBatch;
 
-// These sizes define the Qn_K QK_K=256 block layouts.  Q8_K is included as the
-// canonical activation format for Q2_K..Q6_K dot products, even though this
-// runtime normally keeps activations as float32 CpuBatch rows.
+// Qn_K uses 256-value blocks; Q8_K is the activation format for dot products.
 inline constexpr uint32_t qnk_block_elements = 256;
 
 [[nodiscard]] size_t qnk_block_bytes(DType dtype) noexcept;
 [[nodiscard]] uint64_t qnk_storage_bytes(DType dtype, size_t rows, uint32_t columns) noexcept;
 [[nodiscard]] bool qnk_shape_supported(DType dtype, size_t rows, uint32_t columns) noexcept;
 
-// The persistent CPU layout is group-major:
-//   [8-row tile][super-block][row in tile][raw Qn_K block]
-// Rows in the final tile are zero-padded.  Keeping the raw block bytes in the
-// sidecar means the pack is lossless and can be discarded/rebuilt per ISA.
+// Packed layout: [8-row tile][block][row][raw block].
 struct QnKPack
 {
     std::vector<uint8_t> storage;
@@ -62,8 +57,6 @@ struct QnKPack
     return weights.storage.data() + offset;
 }
 
-// Decodes exactly one Qn_K super-block.  This is also the scalar correctness
-// oracle used by the x86 SIMD implementations.
 void qnk_dequantize_block(DType dtype, const uint8_t* block, float* output) noexcept;
 
 [[nodiscard]] float qnk_dot_block(
@@ -71,9 +64,7 @@ void qnk_dequantize_block(DType dtype, const uint8_t* block, float* output) noex
     const uint8_t* block,
     const float* input) noexcept;
 
-// Quantizes float32 activation rows into the Q8_K activation block layout used
-// by the Q2_K..Q6_K dot kernels.  The output contains
-// [float d][256 int8 qs][16 int16 bsums] for every 256-value block.
+// Quantize float32 activations to Q8_K blocks.
 void qnk_q8k_quantize(
     const float* source,
     uint8_t* output,

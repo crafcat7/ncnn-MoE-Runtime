@@ -2789,6 +2789,92 @@ void test_qnk_cpu_kernel_and_pack()
     }
 }
 
+void test_qnk_graph_gate_up_fusion()
+{
+    constexpr uint32_t vocabulary_size = 256;
+    constexpr uint32_t hidden_size = 256;
+    constexpr uint32_t intermediate_size = 256;
+    constexpr uint32_t expert_count = 2;
+    const std::array<DType, 6> dtypes = {
+        DType::Q2K,
+        DType::Q3K,
+        DType::Q4K,
+        DType::Q5K,
+        DType::Q6K,
+        DType::Q8K,
+    };
+
+    for (const DType dtype : dtypes)
+    {
+        MoeIR descriptor;
+        descriptor.model_type = "qnk_graph_fusion_test";
+        descriptor.vocabulary_size = vocabulary_size;
+        descriptor.hidden_size = hidden_size;
+        descriptor.intermediate_size = intermediate_size;
+        descriptor.layer_count = 1;
+        descriptor.expert_count = expert_count;
+        descriptor.experts_per_token = 1;
+        descriptor.activation_dtype = DType::Float32;
+        descriptor.kv_cache_dtype = DType::Float32;
+        descriptor.norm_epsilon = 1e-5f;
+        descriptor.layers.resize(1);
+        descriptor.layers.front().flags = LayerDescriptorMoe;
+        descriptor.layers.front().pre_ffn_norm = NormType::RmsNorm;
+        MoeDescriptor& moe = descriptor.layers.front().ffn.moe;
+        moe.expert_count = expert_count;
+        moe.top_k = 1;
+        moe.intermediate_size = intermediate_size;
+        moe.activation = ExpertActivation::Silu;
+        moe.layout = ExpertLayout::GateUpDown;
+        moe.expert_weight_dtype = dtype;
+
+        WeightMapping mapping;
+        auto add_float = [&mapping](const std::string& name, std::vector<uint32_t> shape) {
+            TensorData tensor;
+            tensor.dtype = DType::Float32;
+            tensor.shape = std::move(shape);
+            tensor.float32_data.assign(static_cast<size_t>(tensor.element_count()), 0.0f);
+            mapping.tensors.emplace(name, std::move(tensor));
+        };
+        auto add_qnk = [&mapping, dtype](const std::string& name, uint32_t rows, uint32_t columns) {
+            TensorData tensor;
+            tensor.dtype = dtype;
+            tensor.shape = {rows, columns};
+            tensor.quantized_data.resize(static_cast<size_t>(qnk_storage_bytes(dtype, rows, columns)), 0);
+            mapping.tensors.emplace(name, std::move(tensor));
+        };
+
+        add_float("token_embedding.weight", {vocabulary_size, hidden_size});
+        add_float("final_norm.weight", {hidden_size});
+        add_float("lm_head.weight", {vocabulary_size, hidden_size});
+        add_float("layers.0.pre_ffn_norm.weight", {hidden_size});
+        add_float("layers.0.router.weight", {expert_count, hidden_size});
+        for (uint32_t expert_id = 0; expert_id < expert_count; ++expert_id)
+        {
+            const std::string prefix = "layers.0.experts." + std::to_string(expert_id) + ".";
+            add_qnk(prefix + "gate.weight", intermediate_size, hidden_size);
+            add_qnk(prefix + "up.weight", intermediate_size, hidden_size);
+            add_qnk(prefix + "down.weight", hidden_size, intermediate_size);
+        }
+
+        ModelCompiler compiler;
+        auto compiled = compiler.compile(std::move(descriptor), std::move(mapping), HybridMode::CpuOnly);
+        check(static_cast<bool>(compiled));
+        const CompiledModel& model = compiled.value();
+        check(static_cast<bool>(model.graph.layer_plans.size() == 1));
+        const ExpertPlan& expert = model.graph.layer_plans.front().moe.experts.front();
+        check(static_cast<bool>(expert.gate_up_weight != invalid_tensor_handle));
+        check(static_cast<bool>(expert.gate_weight == invalid_tensor_handle));
+        check(static_cast<bool>(expert.up_weight == invalid_tensor_handle));
+        check(static_cast<bool>(has_flag(expert.flags, ExpertPlanPackedGateUp)));
+        const TensorData& gate_up = model.weights.at(expert.gate_up_weight);
+        check(static_cast<bool>(gate_up.dtype == dtype));
+        check(static_cast<bool>(gate_up.shape == std::vector<uint32_t>{intermediate_size * 2, hidden_size}));
+        check(static_cast<bool>(!gate_up.qnk_interleave_rows));
+        check(static_cast<bool>(gate_up.qnk_values().size() == qnk_storage_bytes(dtype, intermediate_size * 2, hidden_size)));
+    }
+}
+
 void test_ncnn_vulkan_qnk_operator()
 {
     constexpr uint32_t columns = 512;
@@ -3546,6 +3632,12 @@ void test_safetensors_packed_qnk_expert()
 
     auto archive = SafetensorsArchive::open(directory);
     check(static_cast<bool>(archive));
+    const auto detected_dtype = archive.value().find_qnk_expert_dtype(
+        "experts",
+        expert_count,
+        rows,
+        columns);
+    check(static_cast<bool>(detected_dtype && detected_dtype.value() == DType::Q4K));
     auto expert = archive.value().load_qnk_expert("experts", DType::Q4K, 1, expert_count, rows, columns);
     check(static_cast<bool>(expert));
     check(expert.value().dtype == DType::Q4K);
@@ -6850,9 +6942,14 @@ void test_sampling_and_streaming_generation()
     check(static_cast<bool>(!metrics.timing.active));
     check(static_cast<bool>(metrics.timing.input_tokens == 1));
     check(static_cast<bool>(metrics.timing.output_tokens == 3));
+    check(static_cast<bool>(metrics.timing.prompt_elapsed_microseconds.has_value()));
+    check(static_cast<bool>(metrics.timing.generation_elapsed_microseconds.has_value()));
+    check(static_cast<bool>(metrics.timing.prompt_tokens_per_second.has_value()));
+    check(static_cast<bool>(metrics.timing.generation_tokens_per_second.has_value()));
     check(static_cast<bool>(metrics.timing.ttft_microseconds.has_value()));
     check(static_cast<bool>(metrics.timing.tpot_microseconds.has_value()));
     check(static_cast<bool>(metrics.timing.decode_tokens_per_second.has_value()));
+    check(static_cast<bool>(metrics.timing.generation_tokens_per_second == metrics.timing.decode_tokens_per_second));
     check(static_cast<bool>(metrics.generation.prefill_tokens == 1));
     check(static_cast<bool>(metrics.cumulative.prefill_tokens >= metrics.generation.prefill_tokens));
 
@@ -7355,7 +7452,23 @@ void test_flag_defaults()
     check(static_cast<bool>(has_flag(
         RuntimeOptimizationDefaultFlags,
         RuntimeOptimizationVulkanLatentInputRmsNorm)));
+    check(static_cast<bool>(has_flag(
+        RuntimeOptimizationDefaultFlags,
+        RuntimeOptimizationCpuSimdRmsNorm)));
+    check(static_cast<bool>(has_flag(
+        RuntimeOptimizationDefaultFlags,
+        RuntimeOptimizationVulkanRouteAggregation)));
+    check(static_cast<bool>(has_flag(
+        RuntimeOptimizationDefaultFlags,
+        RuntimeOptimizationVulkanExpertGpuPriority)));
+    check(static_cast<bool>(has_flag(
+        RuntimeOptimizationDefaultFlags,
+        RuntimeOptimizationVulkanIndexedExperts)));
+    check(static_cast<bool>(has_flag(
+        RuntimeOptimizationDefaultFlags,
+        RuntimeOptimizationVulkanQnK)));
     RuntimeConfig runtime;
+    check(static_cast<bool>(runtime.optimization_flags == RuntimeOptimizationDefaultFlags));
     check(static_cast<bool>(!has_flag(runtime.flags, RuntimeOptionMemoryMapExperts)));
     check(static_cast<bool>(!has_flag(runtime.flags, RuntimeOptionRouterPrediction)));
     check(static_cast<bool>(!has_flag(runtime.flags, RuntimeOptionForwardAwareCache)));
@@ -8605,6 +8718,7 @@ int main(int argc, char** argv)
         ncnn::moe::test_ncnn_vulkan_float8_operator();
         ncnn::moe::test_mxfp4_cpu_kernel_and_fused_gate_up();
         ncnn::moe::test_qnk_cpu_kernel_and_pack();
+        ncnn::moe::test_qnk_graph_gate_up_fusion();
         ncnn::moe::test_ncnn_vulkan_qnk_operator();
         ncnn::moe::test_ncnn_vulkan_qnk_expert_operator();
         ncnn::moe::test_sharded_expert_victim_cache();

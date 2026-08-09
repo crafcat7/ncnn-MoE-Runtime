@@ -3,6 +3,7 @@
 #include "storage/mapped_file.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstring>
 #include <fstream>
@@ -259,6 +260,50 @@ const SafetensorInfo* SafetensorsArchive::find(const std::string& name) const no
 {
     const auto iterator = tensors_.find(name);
     return iterator == tensors_.end() ? nullptr : &iterator->second;
+}
+
+std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(
+    const std::string& name,
+    uint32_t expert_count,
+    uint32_t rows,
+    uint32_t columns) const noexcept
+{
+    if (expert_count == 0 || !qnk_shape_supported(DType::Q2K, rows, columns))
+        return {};
+
+    const SafetensorInfo* source = find(name);
+    const SafetensorInfo* packed_expert_zero = find("__ncnn_moe_packed__.0." + name);
+    const std::array<DType, 6> dtypes = {
+        DType::Q2K,
+        DType::Q3K,
+        DType::Q4K,
+        DType::Q5K,
+        DType::Q6K,
+        DType::Q8K,
+    };
+    for (const DType dtype : dtypes)
+    {
+        const uint64_t expert_bytes = qnk_storage_bytes(dtype, rows, columns);
+        if (expert_bytes == 0
+            || expert_bytes > std::numeric_limits<uint64_t>::max() / expert_count)
+        {
+            continue;
+        }
+        const uint64_t bank_bytes = expert_bytes * expert_count;
+        if (source
+            && source->dtype == "U8"
+            && source->byte_count == bank_bytes)
+        {
+            return dtype;
+        }
+        if (packed_expert_zero
+            && packed_expert_zero->dtype == "U8"
+            && packed_expert_zero->byte_count == expert_bytes)
+        {
+            return dtype;
+        }
+    }
+    return {};
 }
 
 Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) const

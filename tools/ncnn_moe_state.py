@@ -168,7 +168,6 @@ def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
         ("expert_io_workers", "--expert-io-workers"),
         ("expert_memory", "--expert-memory"),
         ("expected_concurrency", "--expected-concurrency"),
-        ("optimization_flags", "--optimization-flags"),
     ):
         value = settings.get(key)
         if value is not None and value != 0:
@@ -185,11 +184,6 @@ def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
         ("direct_expert_io", "--direct-expert-io"),
         ("buffered_expert_io", "--buffered-expert-io"),
         ("disable_gpu_victim_execution", "--disable-gpu-victim-execution"),
-        ("router_prediction", "--router-prediction"),
-        ("async_router_prediction", "--async-router-prediction"),
-        ("forward_aware_cache", "--forward-aware-cache"),
-        ("rank_adaptive_prefetch", "--rank-adaptive-prefetch"),
-        ("cross_expert_read_coalescing", "--cross-expert-read-coalescing"),
         ("release_vulkan_dense_host", "--release-vulkan-dense-host"),
     ):
         if settings.get(key):

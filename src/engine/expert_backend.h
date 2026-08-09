@@ -30,11 +30,12 @@ enum class ExpertBackendExecutionResult
     Failed
 };
 
-// Static CPU/GPU placement threshold for resident Experts.
-inline constexpr size_t vulkan_expert_gpu_min_rows = 1;
+inline constexpr size_t vulkan_expert_gpu_min_rows = 2;
 
 // Admission is asynchronous; CPU remains available while weights upload.
-inline constexpr size_t vulkan_expert_gpu_admission_min_rows = 1;
+inline constexpr size_t vulkan_expert_gpu_admission_min_rows = 2;
+
+inline constexpr size_t vulkan_expert_gpu_victim_min_rows = 32;
 
 struct ExpertBackendStatistics
 {

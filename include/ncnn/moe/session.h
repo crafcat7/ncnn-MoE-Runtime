@@ -348,8 +348,13 @@ struct GenerationTimingMetrics
     uint64_t input_tokens = 0;
     uint64_t output_tokens = 0;
     uint64_t elapsed_microseconds = 0;
+    std::optional<uint64_t> prompt_elapsed_microseconds;
+    std::optional<uint64_t> generation_elapsed_microseconds;
+    std::optional<double> prompt_tokens_per_second;
+    std::optional<double> generation_tokens_per_second;
     std::optional<uint64_t> ttft_microseconds;
     std::optional<double> tpot_microseconds;
+    // Compatibility alias.
     std::optional<double> decode_tokens_per_second;
 };
 

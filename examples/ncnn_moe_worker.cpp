@@ -332,6 +332,10 @@ static std::string generation_timing_json(const GenerationTimingMetrics& timing)
     result.add_uint("input_tokens", timing.input_tokens);
     result.add_uint("output_tokens", timing.output_tokens);
     result.add_uint("elapsed_microseconds", timing.elapsed_microseconds);
+    result.add_optional_uint("prompt_elapsed_microseconds", timing.prompt_elapsed_microseconds);
+    result.add_optional_uint("generation_elapsed_microseconds", timing.generation_elapsed_microseconds);
+    result.add_optional_double("prompt_tokens_per_second", timing.prompt_tokens_per_second);
+    result.add_optional_double("generation_tokens_per_second", timing.generation_tokens_per_second);
     result.add_optional_uint("ttft_microseconds", timing.ttft_microseconds);
     result.add_optional_double("tpot_microseconds", timing.tpot_microseconds);
     result.add_optional_double("decode_tokens_per_second", timing.decode_tokens_per_second);
@@ -561,9 +565,15 @@ static std::string runtime_metrics_json(
     const SessionMetrics& metrics)
 {
     JsonObject result;
+    result.add_optional_double("prompt_tok_per_second", metrics.timing.prompt_tokens_per_second);
+    result.add_optional_double("prompt_tokens_per_second", metrics.timing.prompt_tokens_per_second);
+    result.add_optional_double("generation_tok_per_second", metrics.timing.generation_tokens_per_second);
+    result.add_optional_double("generation_tokens_per_second", metrics.timing.generation_tokens_per_second);
     result.add_optional_double("decode_tok_per_second", metrics.timing.decode_tokens_per_second);
     result.add_optional_double("tokens_per_second", metrics.timing.decode_tokens_per_second);
     result.add_optional_double("token_per_second", metrics.timing.decode_tokens_per_second);
+    result.add_optional_uint("prompt_elapsed_microseconds", metrics.timing.prompt_elapsed_microseconds);
+    result.add_optional_uint("generation_elapsed_microseconds", metrics.timing.generation_elapsed_microseconds);
     result.add_optional_uint("ttft_microseconds", metrics.timing.ttft_microseconds);
     result.add_optional_double("tpot_microseconds", metrics.timing.tpot_microseconds);
     result.add_uint("input_tokens", metrics.timing.input_tokens);
@@ -662,8 +672,6 @@ static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argum
             result.expert_io_workers = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expert-io-workers")));
         else if (argument == "--expert-memory")
             result.expert_memory_mode = parse_expert_memory_mode(require_value(argc, argv, index, "--expert-memory"));
-        else if (argument == "--optimization-flags")
-            result.optimization_flags = std::stoull(require_value(argc, argv, index, "--optimization-flags"), nullptr, 0);
         else if (argument == "--vulkan-device")
             result.vulkan_device_index = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--vulkan-device")));
         else if (argument == "--vulkan-devices")
@@ -680,16 +688,6 @@ static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argum
             result.flags |= ncnn::moe::RuntimeOptionDisableGpuVictimExecution;
         else if (argument == "--disable-gpu-expert-execution")
             result.flags |= ncnn::moe::RuntimeOptionDisableGpuExpertExecution;
-        else if (argument == "--router-prediction")
-            result.flags |= ncnn::moe::RuntimeOptionRouterPrediction;
-        else if (argument == "--async-router-prediction")
-            result.flags |= ncnn::moe::RuntimeOptionAsyncRouterPrediction;
-        else if (argument == "--forward-aware-cache")
-            result.flags |= ncnn::moe::RuntimeOptionForwardAwareCache;
-        else if (argument == "--rank-adaptive-prefetch")
-            result.flags |= ncnn::moe::RuntimeOptionRankAdaptivePrefetch;
-        else if (argument == "--cross-expert-read-coalescing")
-            result.flags |= ncnn::moe::RuntimeOptionCrossExpertReadCoalescing;
         else if (argument == "--release-vulkan-dense-host")
             result.flags |= ncnn::moe::RuntimeOptionReleaseVulkanDenseHostStorage;
         else
@@ -952,8 +950,14 @@ private:
                 done.add_bool("cancelled", generation.stopped_by_callback && cancel_requested_.load());
                 const SessionMetrics metrics = session->metrics();
                 done.add_double("elapsed_seconds", static_cast<double>(metrics.timing.elapsed_microseconds) / 1000000.0);
+                done.add_optional_double("prompt_tok_per_second", metrics.timing.prompt_tokens_per_second);
+                done.add_optional_double("prompt_tokens_per_second", metrics.timing.prompt_tokens_per_second);
+                done.add_optional_double("generation_tok_per_second", metrics.timing.generation_tokens_per_second);
+                done.add_optional_double("generation_tokens_per_second", metrics.timing.generation_tokens_per_second);
                 done.add_optional_double("tokens_per_second", metrics.timing.decode_tokens_per_second);
                 done.add_optional_double("decode_tok_per_second", metrics.timing.decode_tokens_per_second);
+                done.add_optional_uint("prompt_elapsed_microseconds", metrics.timing.prompt_elapsed_microseconds);
+                done.add_optional_uint("generation_elapsed_microseconds", metrics.timing.generation_elapsed_microseconds);
                 done.add_optional_uint("ttft_microseconds", metrics.timing.ttft_microseconds);
                 done.add_optional_double("tpot_microseconds", metrics.timing.tpot_microseconds);
                 done.add_uint("sequence_length", session->sequence_length());
@@ -1107,6 +1111,14 @@ private:
         const auto iterator = sessions_.find(parsed.session_id);
         if (iterator == sessions_.end())
             throw std::invalid_argument("unknown session: " + parsed.session_id);
+        if (parsed.options.max_new_tokens == 0)
+        {
+            const uint32_t max_context = maximum_context_tokens();
+            const uint64_t sequence_length = iterator->second->sequence_length();
+            if (max_context == 0 || sequence_length >= max_context)
+                throw std::invalid_argument("unlimited generation requires remaining model context");
+            parsed.options.max_new_tokens = static_cast<uint32_t>(max_context - sequence_length);
+        }
         {
             const std::lock_guard<std::mutex> lock(generation_state_mutex_);
             active_request_id_ = parsed.request_id;
@@ -1203,7 +1215,6 @@ static void print_usage(const char* executable)
               << "  runtime: --backend auto|cpu|vulkan|hybrid|hybrid-prefetch, --host-memory-mb N,\n"
               << "           --expert-cache-mb N, --expert-gpu-cache-mb N, --expert-io-workers N,\n"
               << "           --expert-memory auto|eager|on-demand, --vulkan-device N, --vulkan-devices N[,N...]\n"
-              << "           --optimization-flags MASK\n"
               << "  io/cache: --mmap-experts, --direct-expert-io, --buffered-expert-io,\n"
               << "            --release-vulkan-dense-host, --disable-gpu-expert-execution,\n"
               << "            --expected-concurrency N\n";

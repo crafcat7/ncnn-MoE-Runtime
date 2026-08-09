@@ -91,21 +91,27 @@ Runtime internals:
 
 ```text
 metrics
-  Decode tok/s 3.50 · TTFT 1.20 s · TPOT 250.00 ms
+  Prompt: 3.70 t/s | Generation: 7.30 t/s · TTFT 1.20 s · TPOT 250.00 ms
   Expert: cache hit 12 · cache miss 3 · IO 1.23 GB
   CPU: expert compute 890.00 ms · process 759.1%
   GPU: submit 42 · wait 12.00 ms · kernel 8.00 ms · utilization 4.0%
 ```
 
-The JSONL payload keeps exact microseconds and bytes for tooling. `IO` in the
+The JSONL payload also exposes `prompt_tokens_per_second` and
+`generation_tokens_per_second` (plus the shorter `prompt_tok_per_second` and
+`generation_tok_per_second` aliases) for internal benchmark tooling. It keeps
+exact microseconds and bytes for tooling. `IO` in the
 CLI is the Runtime's logical Expert-cache read volume, while process-level
 read/write counters remain under `process` for diagnostics. `GPU kernel time`
 is the Expert GPU backend wall time; Vulkan device timestamp queries are not
 assumed, so it is not presented as a complete device-wide kernel timeline.
 When the selected backend is CPU-only, GPU runtime counters are emitted as
 `null` with a reason rather than as zero-valued measurements.
-`TTFT` starts when native generation begins, and `TPOT`/`Decode tok/s` measure
-the output-token interval after the first token.
+`Prompt` measures input-token prefill throughput until the first generated token
+is ready. `Generation` measures steady-state output throughput after that first
+token; it is also exposed under the compatibility field
+`decode_tokens_per_second`. `TTFT` uses the same prompt boundary and `TPOT`
+is the average interval for the remaining output tokens.
 
 The native public boundary is `RuntimeConfig`, token IDs, token-ID generation
 config, Session state, and the stable `SessionMetrics` view. The generic

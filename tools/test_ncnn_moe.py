@@ -30,8 +30,8 @@ def main() -> int:
     assert _format_bytes_gb(None) == "N/A"
     formatted_metrics = _format_runtime_metrics(
         {
-            "decode_tok_per_second": None,
-            "tokens_per_second": None,
+            "prompt_tok_per_second": 3.7,
+            "generation_tok_per_second": 13.33,
             "tpot_microseconds": 75_030.0,
             "gpu": {
                 "available": True,
@@ -41,7 +41,7 @@ def main() -> int:
             "gpu_device": {},
         }
     )
-    assert "Decode tok/s 13.33" in formatted_metrics
+    assert "Prompt: 3.70 t/s | Generation: 13.33 t/s" in formatted_metrics
     assert "kernel N/A (no GPU Expert execution)" in formatted_metrics
 
     defaults = parse_arguments(["run", "--model", "model", "--prompt", "hello"])
@@ -147,6 +147,8 @@ def main() -> int:
         assert len(tokens) == 3
         assert not any(event.get("event") == "metrics" for event in events)
         assert "metrics" in done
+        assert "prompt_tok_per_second" in done["metrics"]
+        assert "generation_tok_per_second" in done["metrics"]
         assert "expert" in done["metrics"]
         assert "ttft_microseconds" in done["metrics"]
         assert "tpot_microseconds" in done["metrics"]

@@ -191,7 +191,8 @@ inline constexpr uint64_t RuntimeOptimizationDefaultFlags = RuntimeOptimizationC
                                                             | RuntimeOptimizationCpuLatentVectorSoftmax
                                                             | RuntimeOptimizationVulkanLatentInputRmsNorm
                                                             | RuntimeOptimizationVulkanExpertGpuPriority
-                                                            | RuntimeOptimizationVulkanIndexedExperts;
+                                                            | RuntimeOptimizationVulkanIndexedExperts
+                                                            | RuntimeOptimizationVulkanQnK;
 
 [[nodiscard]] inline bool runtime_optimization_enabled(
     uint64_t optimization_flags,

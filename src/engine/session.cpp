@@ -463,15 +463,27 @@ SessionMetrics Session::metrics_unlocked() const
         const auto ttft = std::chrono::duration_cast<std::chrono::microseconds>(
             generation_first_token_ready_ - generation_started_);
         ttft_microseconds = static_cast<uint64_t>(ttft.count());
+        result.timing.prompt_elapsed_microseconds = ttft_microseconds;
         result.timing.ttft_microseconds = ttft_microseconds;
+        if (generation_input_tokens_ != 0 && ttft_microseconds != 0)
+        {
+            result.timing.prompt_tokens_per_second =
+                static_cast<double>(generation_input_tokens_) * 1000000.0
+                / static_cast<double>(ttft_microseconds);
+        }
     }
 
-    if (generation_has_first_token_ && generation_output_tokens_ > 1 && elapsed_microseconds > ttft_microseconds)
+    if (generation_has_first_token_ && elapsed_microseconds >= ttft_microseconds)
     {
         const uint64_t decode_elapsed_microseconds = elapsed_microseconds - ttft_microseconds;
-        const uint64_t decode_tokens = generation_output_tokens_ - 1;
-        result.timing.tpot_microseconds = static_cast<double>(decode_elapsed_microseconds) / static_cast<double>(decode_tokens);
-        result.timing.decode_tokens_per_second = static_cast<double>(decode_tokens) * 1000000.0 / static_cast<double>(decode_elapsed_microseconds);
+        result.timing.generation_elapsed_microseconds = decode_elapsed_microseconds;
+        if (generation_output_tokens_ > 1 && decode_elapsed_microseconds != 0)
+        {
+            const uint64_t decode_tokens = generation_output_tokens_ - 1;
+            result.timing.tpot_microseconds = static_cast<double>(decode_elapsed_microseconds) / static_cast<double>(decode_tokens);
+            result.timing.generation_tokens_per_second = static_cast<double>(decode_tokens) * 1000000.0 / static_cast<double>(decode_elapsed_microseconds);
+            result.timing.decode_tokens_per_second = result.timing.generation_tokens_per_second;
+        }
     }
     return result;
 }

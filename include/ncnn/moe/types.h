@@ -345,9 +345,7 @@ struct TensorData
     std::vector<uint16_t> bfloat16_data;
     std::vector<int64_t> int64_data;
     std::vector<int8_t> int8_data;
-    // Raw Qn_K super-blocks.  The logical shape remains
-    // [output_rows, input_columns]; the encoded byte count is derived from
-    // the dtype and the 256-element super-block layout.
+    // Raw Qn_K data; logical shape is [output_rows, input_columns].
     std::vector<uint8_t> quantized_data;
     // Qn_K gate/up Expert matrices may store gate and up rows either
     // interleaved (gate0, up0, gate1, up1, ...) or packed (all gate rows,
@@ -363,7 +361,7 @@ struct TensorData
     std::shared_ptr<const MxFp4FileStorage> mxfp4_file_storage;
     // Immutable CPU MXFP4 weights may share an ISA-specific packed sidecar.
     mutable std::shared_ptr<const Mxfp4Q8PackedMatrix> mxfp4_q8_packed;
-    // Immutable CPU Qn_K weights may share an ISA-specific 8-row sidecar.
+    // Optional ISA-specific packed sidecar.
     mutable std::shared_ptr<const QnKPack> qnk_packed;
     [[nodiscard]] uint64_t element_count() const noexcept;
     [[nodiscard]] std::span<const float> float32_values() const noexcept;
