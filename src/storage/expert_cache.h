@@ -135,6 +135,7 @@ private:
         uint64_t& ranges_saved,
         bool& coalesced);
     [[nodiscard]] static Result<uint64_t> stored_bytes(const TensorData& tensor);
+    [[nodiscard]] static Result<uint64_t> packed_weight_bytes(const TensorData& tensor);
     [[nodiscard]] Result<std::shared_ptr<Entry>> enqueue_pair(
         const TensorData& gate_up,
         const TensorData& down,
@@ -209,6 +210,7 @@ private:
     std::unique_ptr<FileRangeReader> reader_;
     std::shared_ptr<IExpertVictimCache> victim_cache_;
     uint32_t flags_ = 0;
+    bool reserve_cpu_packed_weights_ = false;
 
 public:
     explicit Mxfp4ExpertCache(
@@ -216,7 +218,8 @@ public:
         uint32_t io_worker_count = 0,
         std::shared_ptr<IExpertVictimCache> victim_cache = {},
         uint32_t flags = 0,
-        uint32_t residency_group_count = 0);
+        uint32_t residency_group_count = 0,
+        bool reserve_cpu_packed_weights = false);
     ~Mxfp4ExpertCache();
 
     Mxfp4ExpertCache(const Mxfp4ExpertCache&) = delete;

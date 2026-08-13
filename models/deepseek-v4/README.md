@@ -136,6 +136,7 @@ python tools\ncnn_moe.py run `
 | Option | Effect |
 | --- | --- |
 | `--expert-memory auto\|eager\|on-demand` | Select Expert residency |
+| `--cpu-packed-weights auto\|on\|off` | Control the persistent in-memory MXFP4-Q8 CPU weight pack |
 | `--host-memory-mb N` | Override the detected host-memory budget |
 | `--expert-cache-mb N` | Bound resident Expert pairs in RAM |
 | `--expert-io-workers N` | Set asynchronous read concurrency |

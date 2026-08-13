@@ -210,11 +210,23 @@ The CPU path accepts the portable Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, and
 Q8_K blocks. Q2_K-Q6_K use the exact 256-element super-block layouts; Q8_K is
 available for activation/block interchange. A `TensorData` loaded through
 `SafetensorsArchive::load_qnk_tensor()` or `load_qnk_expert()` keeps the raw
-bytes lossless and builds an 8-row CPU tile pack on first linear execution.
+bytes lossless and can build an 8-row CPU tile pack on first linear execution.
 The x86 build dispatches Q2_K-Q8_K to direct SIMD bit-decode dot kernels: AVX2
 handles all formats, while AVX-512 uses 16-lane Q4_K/Q5_K/Q6_K kernels and the
 validated AVX2 kernels for the remaining formats. The scalar decoder remains
 the portability and correctness fallback.
+
+`--cpu-packed-weights auto|on|off` controls the persistent in-memory CPU tile
+pack for both Qn_K and MXFP4-Q8 weights. `auto` keeps the tuned default when the
+active model and CPU path support it, but falls back to `off` rather than turn
+an otherwise-Eager model into an on-demand model. `on` requests the packed path
+explicitly, and `off` executes directly from the original raw weight layout
+without creating a sidecar. Packed sidecar reservations participate in Eager
+admission and Expert-cache capacity accounting, so explicit `on` can make
+`--expert-memory auto` select on-demand residency; it fails when an explicit
+Eager/cache budget cannot hold the reservation. The `off` mode is useful for
+low-memory systems and controlled A/B measurements; it never rebuilds a
+temporary pack per call.
 
 The deterministic Qn_K reference comparison can be run from the CPU test
 binary:

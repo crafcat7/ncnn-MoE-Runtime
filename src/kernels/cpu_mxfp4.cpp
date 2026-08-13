@@ -493,6 +493,30 @@ uint32_t mxfp4_q8_packed_tile_rows(size_t row_count) noexcept
     return 4;
 }
 
+uint64_t mxfp4_q8_packed_storage_bytes(
+    size_t row_count,
+    uint32_t block_count,
+    uint32_t tile_rows) noexcept
+{
+    if (row_count == 0 || block_count == 0)
+        return 0;
+    if (tile_rows == 0)
+        tile_rows = mxfp4_q8_packed_tile_rows(row_count);
+    if ((tile_rows != 4 && tile_rows != 8)
+        || row_count > std::numeric_limits<size_t>::max() - (tile_rows - 1))
+    {
+        return 0;
+    }
+    const uint64_t group_count = (row_count + tile_rows - 1) / tile_rows;
+    const uint64_t bytes_per_block = static_cast<uint64_t>(tile_rows) * 17;
+    if (group_count > std::numeric_limits<uint64_t>::max() / block_count
+        || group_count * block_count > std::numeric_limits<uint64_t>::max() / bytes_per_block)
+    {
+        return 0;
+    }
+    return group_count * block_count * bytes_per_block;
+}
+
 bool mxfp4_q8_packed_kernel_available() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
@@ -522,12 +546,23 @@ bool mxfp4_q8_pack_weights(const uint8_t* packed, const uint8_t* scales, uint32_
         return false;
     }
 
+    const uint64_t storage_bytes = mxfp4_q8_packed_storage_bytes(
+        row_count,
+        block_count,
+        tile_rows);
+    if (storage_bytes == 0
+        || storage_bytes > std::numeric_limits<size_t>::max())
+    {
+        output.clear();
+        return false;
+    }
+
     const size_t group_count = (row_count + tile_rows - 1) / tile_rows;
     const size_t block_bytes = mxfp4_q8_packed_block_bytes(tile_rows);
     const size_t group_stride = static_cast<size_t>(block_count) * block_bytes;
     try
     {
-        output.storage.assign(group_count * group_stride, 0);
+        output.storage.assign(static_cast<size_t>(storage_bytes), 0);
     }
     catch (...)
     {

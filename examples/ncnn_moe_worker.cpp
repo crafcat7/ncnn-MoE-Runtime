@@ -198,6 +198,17 @@ static const char* expert_memory_mode_name(ExpertMemoryMode mode) noexcept
     return "unknown";
 }
 
+static const char* cpu_packed_weight_mode_name(CpuPackedWeightMode mode) noexcept
+{
+    switch (mode)
+    {
+    case CpuPackedWeightMode::Auto: return "auto";
+    case CpuPackedWeightMode::Enabled: return "on";
+    case CpuPackedWeightMode::Disabled: return "off";
+    }
+    return "unknown";
+}
+
 static const char* vulkan_type_name(VulkanDeviceType type) noexcept
 {
     switch (type)
@@ -639,6 +650,14 @@ static ExpertMemoryMode parse_expert_memory_mode(const std::string& value)
     throw std::invalid_argument("unknown Expert memory mode: " + value);
 }
 
+static CpuPackedWeightMode parse_cpu_packed_weight_mode(const std::string& value)
+{
+    if (value == "auto") return CpuPackedWeightMode::Auto;
+    if (value == "on") return CpuPackedWeightMode::Enabled;
+    if (value == "off") return CpuPackedWeightMode::Disabled;
+    throw std::invalid_argument("unknown CPU packed-weight mode: " + value);
+}
+
 static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argument)
 {
     RuntimeConfig result;
@@ -672,6 +691,8 @@ static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argum
             result.expert_io_workers = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expert-io-workers")));
         else if (argument == "--expert-memory")
             result.expert_memory_mode = parse_expert_memory_mode(require_value(argc, argv, index, "--expert-memory"));
+        else if (argument == "--cpu-packed-weights")
+            result.cpu_packed_weight_mode = parse_cpu_packed_weight_mode(require_value(argc, argv, index, "--cpu-packed-weights"));
         else if (argument == "--vulkan-device")
             result.vulkan_device_index = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--vulkan-device")));
         else if (argument == "--vulkan-devices")
@@ -824,6 +845,8 @@ private:
         resources.add_string("backend", hybrid_mode_name(effective.hybrid_mode));
         resources.add_string("requested_expert_memory", expert_memory_mode_name(effective.requested_expert_memory_mode));
         resources.add_string("selected_expert_memory", expert_memory_mode_name(effective.selected_expert_memory_mode));
+        resources.add_string("requested_cpu_packed_weights", cpu_packed_weight_mode_name(effective.requested_cpu_packed_weight_mode));
+        resources.add_string("selected_cpu_packed_weights", cpu_packed_weight_mode_name(effective.selected_cpu_packed_weight_mode));
         resources.add_uint("host_memory_budget_bytes", effective.host_memory_budget_bytes);
         resources.add_uint("expert_cache_bytes", effective.expert_cache_bytes);
         resources.add_uint("expert_gpu_cache_bytes", effective.expert_gpu_cache_bytes);
@@ -840,6 +863,10 @@ private:
         resources.add_raw("vulkan_device_indices", uint_array(effective.vulkan_device_indices));
         resources.add_uint("estimated_dense_bytes", memory_plan.estimated_dense_bytes);
         resources.add_uint("estimated_expert_bytes", memory_plan.estimated_expert_bytes);
+        resources.add_uint("expert_pair_bytes", memory_plan.expert_pair_bytes);
+        resources.add_uint("expert_pair_resident_bytes", memory_plan.expert_pair_resident_bytes);
+        resources.add_uint("estimated_cpu_packed_expert_bytes", memory_plan.estimated_cpu_packed_expert_bytes);
+        resources.add_uint("estimated_expert_resident_bytes", memory_plan.estimated_expert_resident_bytes);
         resources.add_uint("minimum_active_expert_bytes", memory_plan.minimum_active_expert_bytes);
 
         JsonObject capabilities_json;
@@ -1214,7 +1241,8 @@ static void print_usage(const char* executable)
     std::cerr << "usage: " << executable << " <model-directory> [runtime options]\n"
               << "  runtime: --backend auto|cpu|vulkan|hybrid|hybrid-prefetch, --host-memory-mb N,\n"
               << "           --expert-cache-mb N, --expert-gpu-cache-mb N, --expert-io-workers N,\n"
-              << "           --expert-memory auto|eager|on-demand, --vulkan-device N, --vulkan-devices N[,N...]\n"
+              << "           --expert-memory auto|eager|on-demand, --cpu-packed-weights auto|on|off,\n"
+              << "           --vulkan-device N, --vulkan-devices N[,N...]\n"
               << "  io/cache: --mmap-experts, --direct-expert-io, --buffered-expert-io,\n"
               << "            --release-vulkan-dense-host, --disable-gpu-expert-execution,\n"
               << "            --expected-concurrency N\n";

@@ -1,4 +1,5 @@
 #include "expert_cache.h"
+#include "kernels/cpu_mxfp4.h"
 #include "storage/mapped_file.h"
 
 #include <algorithm>
@@ -76,7 +77,8 @@ struct Mxfp4ExpertCache::Entry
 
     State state = State::Loading;
     std::string key;
-    uint64_t bytes = 0;
+    uint64_t resident_bytes = 0;
+    uint64_t stored_bytes = 0;
     uint64_t exact_accesses = 0;
     uint32_t residency_group = Mxfp4ExpertCache::invalid_residency_group;
     ArcList arc_list = ArcList::None;
@@ -521,12 +523,14 @@ Mxfp4ExpertCache::Mxfp4ExpertCache(
     uint32_t io_worker_count,
     std::shared_ptr<IExpertVictimCache> victim_cache,
     uint32_t flags,
-    uint32_t residency_group_count)
+    uint32_t residency_group_count,
+    bool reserve_cpu_packed_weights)
     : capacity_bytes_(capacity_bytes),
       residency_group_bytes_(residency_group_count, 0),
       reader_(std::make_unique<FileRangeReader>()),
       victim_cache_(std::move(victim_cache)),
-      flags_(flags)
+      flags_(flags),
+      reserve_cpu_packed_weights_(reserve_cpu_packed_weights)
 {
     if (io_worker_count == 0)
     {
@@ -670,6 +674,29 @@ Result<uint64_t> Mxfp4ExpertCache::stored_bytes(const TensorData& tensor)
     if (source.secondary_scales_bytes > std::numeric_limits<uint64_t>::max() - bytes)
         return Error{ErrorCode::InvalidModel, "file-backed MXFP4 tensor byte count overflows"};
     return bytes + source.secondary_scales_bytes;
+}
+
+Result<uint64_t> Mxfp4ExpertCache::packed_weight_bytes(const TensorData& tensor)
+{
+    if (tensor.dtype != DType::MxFp4 || tensor.shape.size() != 2)
+        return Error{ErrorCode::InvalidArgument, "packed Expert reservation requires an MXFP4 matrix"};
+    const uint64_t rows = tensor.shape[0];
+    const uint64_t columns = tensor.shape[1];
+    if (rows < 4)
+        return uint64_t{0};
+    if (rows > std::numeric_limits<size_t>::max()
+        || columns == 0
+        || columns > std::numeric_limits<uint32_t>::max()
+        || columns % 32 != 0)
+    {
+        return Error{ErrorCode::InvalidModel, "packed Expert reservation requires MXFP4 columns divisible by 32"};
+    }
+    const uint64_t bytes = mxfp4_q8_packed_storage_bytes(
+        static_cast<size_t>(rows),
+        static_cast<uint32_t>(columns / 32));
+    if (bytes == 0)
+        return Error{ErrorCode::InvalidModel, "packed Expert byte count overflows"};
+    return bytes;
 }
 
 std::string Mxfp4ExpertCache::make_pair_key(const TensorData& gate_up, const TensorData& down)
@@ -1261,19 +1288,19 @@ void Mxfp4ExpertCache::insert_resident_locked(Entry& entry, bool frequent)
         arc_frequent_.push_back(&entry);
         entry.arc_position = std::prev(arc_frequent_.end());
         entry.arc_list = Entry::ArcList::Frequent;
-        arc_frequent_bytes_ += entry.bytes;
+        arc_frequent_bytes_ += entry.resident_bytes;
     }
     else
     {
         arc_recent_.push_back(&entry);
         entry.arc_position = std::prev(arc_recent_.end());
         entry.arc_list = Entry::ArcList::Recent;
-        arc_recent_bytes_ += entry.bytes;
+        arc_recent_bytes_ += entry.resident_bytes;
     }
-    resident_bytes_ += entry.bytes;
+    resident_bytes_ += entry.resident_bytes;
     if (entry.residency_group < residency_group_bytes_.size())
     {
-        residency_group_bytes_[entry.residency_group] += entry.bytes;
+        residency_group_bytes_[entry.residency_group] += entry.resident_bytes;
     }
 }
 
@@ -1282,11 +1309,11 @@ void Mxfp4ExpertCache::touch_resident_locked(Entry& entry, bool repeated)
     if (entry.arc_list == Entry::ArcList::Recent && repeated)
     {
         arc_recent_.erase(entry.arc_position);
-        arc_recent_bytes_ -= entry.bytes;
+        arc_recent_bytes_ -= entry.resident_bytes;
         arc_frequent_.push_back(&entry);
         entry.arc_position = std::prev(arc_frequent_.end());
         entry.arc_list = Entry::ArcList::Frequent;
-        arc_frequent_bytes_ += entry.bytes;
+        arc_frequent_bytes_ += entry.resident_bytes;
         return;
     }
     if (entry.arc_list == Entry::ArcList::Recent)
@@ -1316,20 +1343,20 @@ void Mxfp4ExpertCache::add_ghost_locked(const Entry& entry)
     erase_ghost_locked(arc_recent_ghost_index_, arc_recent_ghost_, arc_recent_ghost_bytes_, entry.key);
     erase_ghost_locked(arc_frequent_ghost_index_, arc_frequent_ghost_, arc_frequent_ghost_bytes_, entry.key);
 
-    GhostRecord record{entry.key, entry.bytes};
+    GhostRecord record{entry.key, entry.resident_bytes};
     if (entry.arc_list == Entry::ArcList::Recent)
     {
         arc_recent_ghost_.push_back(std::move(record));
         const auto position = std::prev(arc_recent_ghost_.end());
         arc_recent_ghost_index_[position->key] = position;
-        arc_recent_ghost_bytes_ += entry.bytes;
+        arc_recent_ghost_bytes_ += entry.resident_bytes;
     }
     else if (entry.arc_list == Entry::ArcList::Frequent)
     {
         arc_frequent_ghost_.push_back(std::move(record));
         const auto position = std::prev(arc_frequent_ghost_.end());
         arc_frequent_ghost_index_[position->key] = position;
-        arc_frequent_ghost_bytes_ += entry.bytes;
+        arc_frequent_ghost_bytes_ += entry.resident_bytes;
     }
     trim_ghosts_locked();
 }
@@ -1367,17 +1394,17 @@ void Mxfp4ExpertCache::remove_resident_locked(Entry& entry, bool add_ghost)
     if (entry.arc_list == Entry::ArcList::Recent)
     {
         arc_recent_.erase(entry.arc_position);
-        arc_recent_bytes_ -= entry.bytes;
+        arc_recent_bytes_ -= entry.resident_bytes;
     }
     else
     {
         arc_frequent_.erase(entry.arc_position);
-        arc_frequent_bytes_ -= entry.bytes;
+        arc_frequent_bytes_ -= entry.resident_bytes;
     }
-    resident_bytes_ -= entry.bytes;
+    resident_bytes_ -= entry.resident_bytes;
     if (entry.residency_group < residency_group_bytes_.size())
     {
-        residency_group_bytes_[entry.residency_group] -= entry.bytes;
+        residency_group_bytes_[entry.residency_group] -= entry.resident_bytes;
     }
     entry.arc_list = Entry::ArcList::None;
 }
@@ -1600,7 +1627,23 @@ Result<std::shared_ptr<Mxfp4ExpertCache::Entry>> Mxfp4ExpertCache::enqueue_pair(
         return down_bytes.error();
     if (down_bytes.value() > std::numeric_limits<uint64_t>::max() - gate_bytes.value())
         return Error{ErrorCode::InvalidModel, "expert pair byte count overflows"};
-    const uint64_t required = gate_bytes.value() + down_bytes.value();
+    const uint64_t stored_required = gate_bytes.value() + down_bytes.value();
+    uint64_t required = stored_required;
+    if (reserve_cpu_packed_weights_)
+    {
+        auto packed_gate_bytes = packed_weight_bytes(gate_up);
+        if (!packed_gate_bytes)
+            return packed_gate_bytes.error();
+        auto packed_down_bytes = packed_weight_bytes(down);
+        if (!packed_down_bytes)
+            return packed_down_bytes.error();
+        if (packed_gate_bytes.value() > std::numeric_limits<uint64_t>::max() - required)
+            return Error{ErrorCode::InvalidModel, "packed expert pair byte count overflows"};
+        required += packed_gate_bytes.value();
+        if (packed_down_bytes.value() > std::numeric_limits<uint64_t>::max() - required)
+            return Error{ErrorCode::InvalidModel, "packed expert pair byte count overflows"};
+        required += packed_down_bytes.value();
+    }
     if (required > capacity_bytes_)
     {
         if (speculative)
@@ -1611,7 +1654,7 @@ Result<std::shared_ptr<Mxfp4ExpertCache::Entry>> Mxfp4ExpertCache::enqueue_pair(
         }
         return Error{
             ErrorCode::InvalidArgument,
-            "expert cache is smaller than one MXFP4 expert pair"};
+            "expert cache is smaller than one resident MXFP4 expert pair"};
     }
 
     std::string generated_key;
@@ -1679,7 +1722,8 @@ Result<std::shared_ptr<Mxfp4ExpertCache::Entry>> Mxfp4ExpertCache::enqueue_pair(
 
     auto entry = std::make_shared<Entry>();
     entry->key.assign(key);
-    entry->bytes = required;
+    entry->resident_bytes = required;
+    entry->stored_bytes = stored_required;
     entry->residency_group = residency_group;
     if (speculative)
         entry->flags |= Entry::Speculative;
@@ -1993,7 +2037,7 @@ void Mxfp4ExpertCache::worker_loop(uint32_t worker_index)
                 {
                     if (!restored[index])
                     {
-                        bytes_read_ += entry->bytes;
+                        bytes_read_ += entry->stored_bytes;
                         mapped_ranges_ += entry_mapped_ranges[index];
                         mapped_bytes_ += entry_mapped_bytes[index];
                     }
@@ -2026,7 +2070,7 @@ void Mxfp4ExpertCache::worker_loop(uint32_t worker_index)
                 entry->state = Entry::State::Ready;
                 if (!restored[index])
                 {
-                    bytes_read_ += entry->bytes;
+                    bytes_read_ += entry->stored_bytes;
                     mapped_ranges_ += entry_mapped_ranges[index];
                     mapped_bytes_ += entry_mapped_bytes[index];
                 }
@@ -2078,7 +2122,7 @@ Result<ExpertCacheLease> Mxfp4ExpertCache::acquire_pair(
     lease.gate_up = entry->gate_up;
     lease.down = entry->down;
     lease.cache_hit = cache_hit;
-    lease.bytes_read = cache_hit ? 0 : entry->bytes;
+    lease.bytes_read = cache_hit ? 0 : entry->stored_bytes;
     lease.pin = entry;
     return lease;
 }
@@ -2148,7 +2192,7 @@ Result<bool> Mxfp4ExpertCache::try_acquire_ready_pairs(
         lease.gate_up = entry->gate_up;
         lease.down = entry->down;
         lease.cache_hit = cache_hit;
-        lease.bytes_read = cache_hit ? 0 : entry->bytes;
+        lease.bytes_read = cache_hit ? 0 : entry->stored_bytes;
         lease.pin = entry;
     }
     return true;
@@ -2244,7 +2288,7 @@ Result<size_t> Mxfp4ExpertCache::wait_acquire_ready_pairs(
         lease.gate_up = entry->gate_up;
         lease.down = entry->down;
         lease.cache_hit = cache_hit;
-        lease.bytes_read = cache_hit ? 0 : entry->bytes;
+        lease.bytes_read = cache_hit ? 0 : entry->stored_bytes;
         lease.pin = entry;
         ++acquired;
     }

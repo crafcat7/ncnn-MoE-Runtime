@@ -44,6 +44,15 @@ static const char* expert_memory_mode_name(ExpertMemoryMode mode)
     return "auto";
 }
 
+static const char* cpu_packed_weight_mode_name(CpuPackedWeightMode mode)
+{
+    if (mode == CpuPackedWeightMode::Enabled)
+        return "on";
+    if (mode == CpuPackedWeightMode::Disabled)
+        return "off";
+    return "auto";
+}
+
 static const char* require_value(int argc, char** argv, int& index, const char* option)
 {
     if (++index >= argc)
@@ -144,6 +153,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                                                                     " [--speculative-confidence P] [--speculative-max-draft N]"
                                                                     " [--top-k K] [--top-p P] [--min-p P] [--seed N]"
                                                                     " [--expert-memory auto|eager|on-demand]"
+                                                                    " [--cpu-packed-weights auto|on|off]"
                                                                     " [--host-memory-mb N] [--expert-cache-mb N]"
                                                                     " [--expert-gpu-cache-mb N]"
                                                                     " [--expert-gpu-victim-cache-mb N]"
@@ -387,6 +397,27 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                     return 2;
                 }
             }
+            else if (argument == "--cpu-packed-weights")
+            {
+                const std::string mode = ncnn::moe::require_value(argc, argv, index, "--cpu-packed-weights");
+                if (mode == "auto")
+                {
+                    runtime_options.cpu_packed_weight_mode = ncnn::moe::CpuPackedWeightMode::Auto;
+                }
+                else if (mode == "on")
+                {
+                    runtime_options.cpu_packed_weight_mode = ncnn::moe::CpuPackedWeightMode::Enabled;
+                }
+                else if (mode == "off")
+                {
+                    runtime_options.cpu_packed_weight_mode = ncnn::moe::CpuPackedWeightMode::Disabled;
+                }
+                else
+                {
+                    std::cerr << "--cpu-packed-weights must be auto, on, or off\n";
+                    return 2;
+                }
+            }
             else if (argument == "--expert-io-workers")
             {
                 const uint64_t workers = std::stoull(ncnn::moe::require_value(argc, argv, index, "--expert-io-workers"));
@@ -558,6 +589,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         std::cout << "Effective runtime: backend " << ncnn::moe::hybrid_mode_name(effective_runtime.hybrid_mode)
                   << ", host budget " << effective_runtime.host_memory_budget_bytes / (1024 * 1024) << " MiB"
                   << ", Expert cache " << effective_runtime.expert_cache_bytes / (1024 * 1024) << " MiB"
+                  << ", CPU packed weights " << ncnn::moe::cpu_packed_weight_mode_name(effective_runtime.selected_cpu_packed_weight_mode)
                   << ", Expert IO workers " << effective_runtime.expert_io_workers
                   << ", optimization flags 0x" << std::hex
                   << effective_runtime.optimization_flags << std::dec << '\n';
@@ -586,7 +618,10 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             std::cout << "Routed Expert format: " << format << '\n';
         }
         const ncnn::moe::ModelMemoryPlan& memory_plan = loaded_model->memory_plan();
-        std::cout << "Expert memory: " << ncnn::moe::expert_memory_mode_name(memory_plan.selected_mode) << ", " << memory_plan.estimated_expert_bytes / (1024 * 1024) << " MiB estimated";
+        std::cout << "Expert memory: " << ncnn::moe::expert_memory_mode_name(memory_plan.selected_mode)
+                  << ", " << memory_plan.estimated_expert_bytes / (1024 * 1024) << " MiB raw"
+                  << ", " << memory_plan.estimated_cpu_packed_expert_bytes / (1024 * 1024) << " MiB packed estimate"
+                  << ", " << memory_plan.estimated_expert_resident_bytes / (1024 * 1024) << " MiB resident estimate";
         if (ncnn::moe::has_flag(memory_plan.flags, ncnn::moe::ModelMemoryFileBackedExperts))
         {
             std::cout << ", " << memory_plan.expert_cache_bytes / (1024 * 1024) << " MiB cache";

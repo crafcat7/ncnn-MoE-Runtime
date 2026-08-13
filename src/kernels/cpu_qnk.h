@@ -17,6 +17,7 @@ inline constexpr uint32_t qnk_block_elements = 256;
 
 [[nodiscard]] size_t qnk_block_bytes(DType dtype) noexcept;
 [[nodiscard]] uint64_t qnk_storage_bytes(DType dtype, size_t rows, uint32_t columns) noexcept;
+[[nodiscard]] uint64_t qnk_packed_storage_bytes(DType dtype, size_t rows, uint32_t columns) noexcept;
 [[nodiscard]] bool qnk_shape_supported(DType dtype, size_t rows, uint32_t columns) noexcept;
 
 // Packed layout: [8-row tile][block][row][raw block].
@@ -88,7 +89,8 @@ void qnk_q8k_quantize_batch(
 [[nodiscard]] bool qnk_linear_batch_into(
     const TensorData& matrix,
     const CpuBatch& input,
-    CpuBatch& output) noexcept;
+    CpuBatch& output,
+    bool use_packed_weights) noexcept;
 
 } // namespace moe
 } // namespace ncnn

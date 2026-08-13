@@ -283,6 +283,39 @@ static void qnk_gemm_scalar(
     }
 }
 
+static void qnk_gemm_raw(
+    const uint8_t* weights,
+    DType dtype,
+    size_t rows,
+    uint32_t columns,
+    const float* input,
+    size_t input_stride,
+    size_t token_count,
+    float* output,
+    size_t output_stride) noexcept
+{
+    const uint32_t block_count = columns / qnk_block_elements;
+    const size_t block_bytes = qnk_block_bytes(dtype);
+    for (size_t row = 0; row < rows; ++row)
+    {
+        for (size_t token = 0; token < token_count; ++token)
+        {
+            const float* token_input = input + token * input_stride;
+            float sum = 0.0f;
+            for (uint32_t block = 0; block < block_count; ++block)
+            {
+                const uint8_t* encoded = weights
+                                         + ((row * static_cast<size_t>(block_count) + block) * block_bytes);
+                sum += qnk_dot_block(
+                    dtype,
+                    encoded,
+                    token_input + static_cast<size_t>(block) * qnk_block_elements);
+            }
+            output[token * output_stride + row] = sum;
+        }
+    }
+}
+
 static void scalar_qnk_q8k_quantize(
     const float* source,
     uint8_t* output,
@@ -377,6 +410,24 @@ uint64_t qnk_storage_bytes(DType dtype, size_t rows, uint32_t columns) noexcept
     return row_bytes * rows;
 }
 
+uint64_t qnk_packed_storage_bytes(DType dtype, size_t rows, uint32_t columns) noexcept
+{
+    if (!qnk_shape_supported(dtype, rows, columns)
+        || rows > std::numeric_limits<size_t>::max() - 7)
+    {
+        return 0;
+    }
+    const uint64_t padded_rows = (rows + 7) / 8 * 8;
+    const uint64_t block_count = columns / qnk_block_elements;
+    const uint64_t block_bytes = qnk_block_bytes(dtype);
+    if (padded_rows > std::numeric_limits<uint64_t>::max() / block_count
+        || padded_rows * block_count > std::numeric_limits<uint64_t>::max() / block_bytes)
+    {
+        return 0;
+    }
+    return padded_rows * block_count * block_bytes;
+}
+
 bool qnk_shape_supported(DType dtype, size_t rows, uint32_t columns) noexcept
 {
     return is_qnk_dtype(dtype) && rows != 0 && columns != 0 && columns % qnk_block_elements == 0
@@ -403,11 +454,12 @@ float qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexc
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
     if ((dtype == DType::Q2K || dtype == DType::Q3K || dtype == DType::Q4K
-         || dtype == DType::Q5K || dtype == DType::Q6K || dtype == DType::Q8K)
-        && (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
-            || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512))
+         || dtype == DType::Q5K || dtype == DType::Q6K || dtype == DType::Q8K))
     {
-        return msvc_avx2_qnk_dot_block(dtype, block, input);
+        if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
+            return msvc_avx512_qnk_dot_block(dtype, block, input);
+        if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
+            return msvc_avx2_qnk_dot_block(dtype, block, input);
     }
 #endif
     alignas(64) float decoded[qnk_block_elements];
@@ -464,23 +516,20 @@ bool qnk_pack_weights(
     QnKPack& output) noexcept
 {
     const uint64_t expected = qnk_storage_bytes(dtype, rows, columns);
-    if (!raw || expected == 0 || expected != raw_bytes || rows > std::numeric_limits<size_t>::max() - 7)
+    const uint64_t packed_bytes = qnk_packed_storage_bytes(dtype, rows, columns);
+    if (!raw || expected == 0 || expected != raw_bytes || packed_bytes == 0
+        || packed_bytes > std::numeric_limits<size_t>::max())
         return false;
     const uint32_t block_count = columns / qnk_block_elements;
     const size_t tile_count = (rows + 7) / 8;
     const size_t block_bytes = qnk_block_bytes(dtype);
-    if (tile_count > std::numeric_limits<size_t>::max() / block_count
-        || tile_count * block_count > std::numeric_limits<size_t>::max() / (8 * block_bytes))
-    {
-        return false;
-    }
     QnKPack packed;
     packed.dtype = dtype;
     packed.rows = rows;
     packed.columns = columns;
     packed.block_count = block_count;
     packed.tile_rows = 8;
-    packed.storage.resize(tile_count * static_cast<size_t>(block_count) * 8 * block_bytes, 0);
+    packed.storage.resize(static_cast<size_t>(packed_bytes), 0);
     for (size_t tile = 0; tile < tile_count; ++tile)
     {
         for (uint32_t block = 0; block < block_count; ++block)
@@ -503,7 +552,11 @@ bool qnk_pack_weights(
     return true;
 }
 
-bool qnk_linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch& output) noexcept
+bool qnk_linear_batch_into(
+    const TensorData& matrix,
+    const CpuBatch& input,
+    CpuBatch& output,
+    bool use_packed_weights) noexcept
 {
     if (!is_qnk_dtype(matrix.dtype) || matrix.shape.size() != 2)
         return false;
@@ -514,11 +567,25 @@ bool qnk_linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuB
     const std::span<const uint8_t> raw = matrix.qnk_values();
     if (raw.size() != qnk_storage_bytes(matrix.dtype, rows, columns))
         return false;
+    output.reset(input.rows(), static_cast<uint32_t>(rows), false);
+    if (!use_packed_weights)
+    {
+        qnk_gemm_raw(
+            raw.data(),
+            matrix.dtype,
+            rows,
+            columns,
+            input.row(0),
+            columns,
+            input.rows(),
+            output.row(0),
+            output.columns());
+        return true;
+    }
     const std::shared_ptr<const QnKPack> packed = get_qnk_packed_weights(matrix, rows, columns);
     if (!packed)
         return false;
 
-    output.reset(input.rows(), static_cast<uint32_t>(rows), false);
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
     if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
     {

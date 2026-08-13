@@ -167,6 +167,7 @@ def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
         ("expert_gpu_victim_cache_mb", "--expert-gpu-victim-cache-mb"),
         ("expert_io_workers", "--expert-io-workers"),
         ("expert_memory", "--expert-memory"),
+        ("cpu_packed_weights", "--cpu-packed-weights"),
         ("expected_concurrency", "--expected-concurrency"),
     ):
         value = settings.get(key)

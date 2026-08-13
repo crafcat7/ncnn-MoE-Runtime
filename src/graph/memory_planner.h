@@ -14,7 +14,8 @@ struct RuntimeConfig;
 
 [[nodiscard]] Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& config, uint64_t physical_memory_bytes,
                                                         bool release_vulkan_dense_host_storage = false,
-                                                        uint64_t available_memory_bytes = 0);
+                                                        uint64_t available_memory_bytes = 0,
+                                                        bool reserve_cpu_packed_weights = false);
 
 } // namespace moe
 } // namespace ncnn

@@ -295,6 +295,7 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
     backend_group.add_argument("--hybrid", dest="backend", action="store_const", const="hybrid")
     backend_group.add_argument("--hybrid-prefetch", dest="backend", action="store_const", const="hybrid-prefetch")
     parser.add_argument("--expert-memory", choices=("auto", "eager", "on-demand"))
+    parser.add_argument("--cpu-packed-weights", choices=("auto", "on", "off"))
     parser.add_argument("--host-memory-mb", type=int)
     parser.add_argument("--expert-cache-mb", type=int)
     parser.add_argument("--expert-gpu-cache-mb", type=int)
@@ -493,6 +494,7 @@ def cli_runtime_settings(arguments: argparse.Namespace) -> dict[str, Any]:
     keys = (
         "backend",
         "expert_memory",
+        "cpu_packed_weights",
         "host_memory_mb",
         "expert_cache_mb",
         "expert_gpu_cache_mb",
@@ -1217,6 +1219,8 @@ def inspect_command(arguments: argparse.Namespace) -> int:
             print(f"backend: {resources.get('backend', 'N/A')}")
             print(f"host memory: {_format_bytes_gb(resources.get('host_memory_budget_bytes'))}")
             print(f"Expert cache: {_format_bytes_gb(resources.get('expert_cache_bytes'))}")
+            print(f"CPU packed weights: {resources.get('selected_cpu_packed_weights', 'N/A')}")
+            print(f"CPU packed Expert estimate: {_format_bytes_gb(resources.get('estimated_cpu_packed_expert_bytes'))}")
             print(f"Expert IO workers: {resources.get('expert_io_workers', 'N/A')}")
             print(f"CPU: {capabilities.get('physical_cpu_core_count', 'N/A')} physical / {capabilities.get('logical_cpu_count', 'N/A')} logical")
             print(f"Vulkan devices: {capabilities.get('vulkan_device_count', 0)}")

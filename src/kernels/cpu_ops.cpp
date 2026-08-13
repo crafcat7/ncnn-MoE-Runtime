@@ -53,6 +53,13 @@ static bool cpu_mxfp4_q8_enabled(uint64_t optimization_flags) noexcept
            && mxfp4_q8_packed_kernel_available();
 }
 
+static bool cpu_packed_weights_enabled(uint64_t optimization_flags) noexcept
+{
+    return runtime_optimization_enabled(
+        optimization_flags,
+        RuntimeOptimizationCpuPackedWeights);
+}
+
 static bool dense_host_storage_available(const TensorData& tensor) noexcept
 {
     if (tensor.dtype == DType::Float32)
@@ -733,7 +740,11 @@ void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch
         {
             return;
         }
-        if (qnk_linear_batch_into(matrix, input, output))
+        if (qnk_linear_batch_into(
+                matrix,
+                input,
+                output,
+                cpu_packed_weights_enabled(optimization_flags)))
             return;
     }
 
@@ -842,7 +853,9 @@ void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch
                 q8_input);
 
             // Repack complete matrices; small tails keep the row-pair path.
-            if (output_columns >= 4 && mxfp4_q8_packed_kernel_available())
+            if (cpu_packed_weights_enabled(optimization_flags)
+                && output_columns >= 4
+                && mxfp4_q8_packed_kernel_available())
             {
                 const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_weights = get_mxfp4_q8_packed_weights(
                     matrix,
@@ -1444,7 +1457,9 @@ static bool mxfp4_expert_decode(
         if (use_q8 && intermediate_size % 32 == 0)
         {
             q8_down_enabled[task_index] = 1;
-            if (task.down->shape[0] >= 4 && mxfp4_q8_packed_kernel_available())
+            if (cpu_packed_weights_enabled(optimization_flags)
+                && task.down->shape[0] >= 4
+                && mxfp4_q8_packed_kernel_available())
             {
                 const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_weights = get_mxfp4_q8_packed_weights(
                     *task.down,
@@ -1470,7 +1485,9 @@ static bool mxfp4_expert_decode(
                     task.input->columns(),
                     q8_inputs[input_owner]);
             }
-            if (task.gate_up->shape[0] >= 4 && mxfp4_q8_packed_kernel_available())
+            if (cpu_packed_weights_enabled(optimization_flags)
+                && task.gate_up->shape[0] >= 4
+                && mxfp4_q8_packed_kernel_available())
             {
                 // The fixed Expert team completes the sidecar GEMV below.
                 q8_gate_packed[task_index] = 1;

@@ -94,7 +94,8 @@ inline constexpr uint32_t RuntimeOptionExpertIoMask = RuntimeOptionMemoryMapExpe
 #define NCNN_MOE_OPT_CPU_FLASH_ATTENTION_BIT             49
 #define NCNN_MOE_OPT_CPU_SPLIT_KV_ATTENTION_BIT          50
 #define NCNN_MOE_OPT_VULKAN_INDEXED_EXPERTS_BIT          51
-#define NCNN_MOE_OPT_VULKAN_QNK_BIT                     52
+#define NCNN_MOE_OPT_VULKAN_QNK_BIT                      52
+#define NCNN_MOE_OPT_CPU_PACKED_WEIGHTS_BIT              53
 
 enum RuntimeOptimizationFlag : uint64_t
 {
@@ -149,7 +150,8 @@ enum RuntimeOptimizationFlag : uint64_t
     RuntimeOptimizationCpuFlashAttention = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLASH_ATTENTION_BIT,
     RuntimeOptimizationCpuSplitKvAttention = UINT64_C(1) << NCNN_MOE_OPT_CPU_SPLIT_KV_ATTENTION_BIT,
     RuntimeOptimizationVulkanIndexedExperts = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_INDEXED_EXPERTS_BIT,
-    RuntimeOptimizationVulkanQnK = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_QNK_BIT
+    RuntimeOptimizationVulkanQnK = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_QNK_BIT,
+    RuntimeOptimizationCpuPackedWeights = UINT64_C(1) << NCNN_MOE_OPT_CPU_PACKED_WEIGHTS_BIT
 };
 
 inline constexpr uint64_t RuntimeOptimizationDefaultFlags = RuntimeOptimizationCpuSimdRmsNorm
@@ -192,7 +194,8 @@ inline constexpr uint64_t RuntimeOptimizationDefaultFlags = RuntimeOptimizationC
                                                             | RuntimeOptimizationVulkanLatentInputRmsNorm
                                                             | RuntimeOptimizationVulkanExpertGpuPriority
                                                             | RuntimeOptimizationVulkanIndexedExperts
-                                                            | RuntimeOptimizationVulkanQnK;
+                                                            | RuntimeOptimizationVulkanQnK
+                                                            | RuntimeOptimizationCpuPackedWeights;
 
 [[nodiscard]] inline bool runtime_optimization_enabled(
     uint64_t optimization_flags,
@@ -204,10 +207,18 @@ inline constexpr uint64_t RuntimeOptimizationDefaultFlags = RuntimeOptimizationC
 // User-supplied runtime configuration. Zero-valued memory settings and Auto
 // enum values leave hardware- and model-specific decisions to Runtime.
 // Tokenizer, prompt, chat, and sampling state deliberately do not belong here.
+enum class CpuPackedWeightMode
+{
+    Auto,
+    Enabled,
+    Disabled
+};
+
 struct RuntimeConfig
 {
     HybridMode hybrid_mode = HybridMode::Auto;
     ExpertMemoryMode expert_memory_mode = ExpertMemoryMode::Auto;
+    CpuPackedWeightMode cpu_packed_weight_mode = CpuPackedWeightMode::Auto;
     uint64_t host_memory_budget_bytes = 0;
     uint64_t expert_cache_bytes = 0;
     uint64_t expert_gpu_cache_bytes = 0;
@@ -227,6 +238,8 @@ struct EffectiveRuntimeConfig
     HybridMode hybrid_mode = HybridMode::CpuOnly;
     ExpertMemoryMode requested_expert_memory_mode = ExpertMemoryMode::Auto;
     ExpertMemoryMode selected_expert_memory_mode = ExpertMemoryMode::Eager;
+    CpuPackedWeightMode requested_cpu_packed_weight_mode = CpuPackedWeightMode::Auto;
+    CpuPackedWeightMode selected_cpu_packed_weight_mode = CpuPackedWeightMode::Disabled;
     uint64_t host_memory_budget_bytes = 0;
     uint64_t expert_cache_bytes = 0;
     uint64_t expert_gpu_cache_bytes = 0;

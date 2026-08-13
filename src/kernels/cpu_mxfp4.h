@@ -106,6 +106,10 @@ struct Mxfp4Q8PackedMatrix
 // use the 4-row layout.  Passing an explicit tile_rows to pack_weights must
 // be either 4 or 8.
 [[nodiscard]] uint32_t mxfp4_q8_packed_tile_rows(size_t row_count) noexcept;
+[[nodiscard]] uint64_t mxfp4_q8_packed_storage_bytes(
+    size_t row_count,
+    uint32_t block_count,
+    uint32_t tile_rows = 0) noexcept;
 
 // True only when the current ISA has a tuned implementation for the
 // interleaved layout.  Keeping this separate from the packer lets callers

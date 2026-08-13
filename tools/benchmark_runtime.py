@@ -199,6 +199,12 @@ def parse_arguments():
         choices=("auto", "eager", "on-demand"),
         default="auto",
     )
+    parser.add_argument(
+        "--cpu-packed-weights",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="Control persistent CPU MXFP4/Qn_K packed weight sidecars.",
+    )
     parser.add_argument("--host-memory-mb", type=int, default=0)
     parser.add_argument("--expert-cache-mb", type=int, default=0)
     parser.add_argument(
@@ -547,6 +553,8 @@ def runner_command(arguments):
         command.append(f"--{arguments.backend}")
     if arguments.expert_memory != "auto":
         command.extend(["--expert-memory", arguments.expert_memory])
+    if arguments.cpu_packed_weights != "auto":
+        command.extend(["--cpu-packed-weights", arguments.cpu_packed_weights])
     if arguments.host_memory_mb:
         command.extend(["--host-memory-mb", str(arguments.host_memory_mb)])
     if arguments.expert_cache_mb:
@@ -1074,6 +1082,10 @@ def parse_runner_output(output):
         "runtime_backend": extract_text(
             output,
             r"^loaded [a-zA-Z0-9_-]+ in [0-9.]+ s, backend (.+)$",
+        ),
+        "effective_cpu_packed_weights": extract_text(
+            output,
+            r"^Effective runtime:.*CPU packed weights ([^,]+),",
         ),
         "routed_expert_format": extract_text(
             output, r"^Routed Expert format: (.+)$"
@@ -2371,6 +2383,8 @@ def main():
         "backend": arguments.backend,
         "execution_evidence": execution_evidence,
         "expert_memory": arguments.expert_memory,
+        "cpu_packed_weights": arguments.cpu_packed_weights,
+        "effective_cpu_packed_weights": samples[0]["effective_cpu_packed_weights"],
         "host_memory_mb": arguments.host_memory_mb,
         "expert_cache_mb": arguments.expert_cache_mb,
         "host": {

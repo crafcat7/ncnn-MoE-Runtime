@@ -1787,7 +1787,18 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         }
     }
     const uint64_t q8_flags = kTestOptimizationFlags | RuntimeOptimizationCpuMxfp4Q8;
+    matrix.mxfp4_q8_packed.reset();
+    const CpuBatch unpacked_q8_projected = linear_batch(
+        matrix,
+        input,
+        q8_flags & ~RuntimeOptimizationCpuPackedWeights);
+    check(static_cast<bool>(!matrix.mxfp4_q8_packed));
+    for (size_t input_row = 0; input_row < input.rows(); ++input_row)
+        for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row)
+            check_near(unpacked_q8_projected.row(input_row)[matrix_row], scalar_row(matrix_row, input_row), 0.15f);
     const CpuBatch q8_projected = linear_batch(matrix, input, q8_flags);
+    if (mxfp4_q8_packed_kernel_available())
+        check(static_cast<bool>(matrix.mxfp4_q8_packed));
     for (size_t input_row = 0; input_row < input.rows(); ++input_row)
         for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row)
             check_near(q8_projected.row(input_row)[matrix_row], scalar_row(matrix_row, input_row), 0.15f);
@@ -2569,6 +2580,11 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         packed_matrix_rows,
         packed_matrix)));
     check(static_cast<bool>(packed_matrix.valid()));
+    check(static_cast<bool>(
+        packed_matrix.storage.size()
+        == mxfp4_q8_packed_storage_bytes(
+            packed_matrix_rows,
+            test_block_count)));
 
     std::array<float, 37> q8_reference_input = {};
     for (size_t index = 0; index < q8_reference_input.size(); ++index)
@@ -2752,6 +2768,7 @@ void test_qnk_cpu_kernel_and_pack()
         check(packed.valid());
         check(packed.block_count == block_count);
         check(packed.storage.size() == ((rows + 7) / 8) * block_count * 8 * block_bytes);
+        check(packed.storage.size() == qnk_packed_storage_bytes(dtype, rows, columns));
         for (size_t row = 0; row < rows; ++row)
         {
             for (uint32_t block = 0; block < block_count; ++block)
@@ -2767,8 +2784,18 @@ void test_qnk_cpu_kernel_and_pack()
         matrix.quantized_data = raw;
         CpuBatch projected;
         linear_batch_into(matrix, input, projected, 0);
+        check(static_cast<bool>(!matrix.qnk_packed));
         check(projected.rows() == input_rows);
         check(projected.columns() == rows);
+        CpuBatch packed_projected;
+        linear_batch_into(
+            matrix,
+            input,
+            packed_projected,
+            RuntimeOptimizationCpuPackedWeights);
+        check(static_cast<bool>(matrix.qnk_packed));
+        check(packed_projected.rows() == input_rows);
+        check(packed_projected.columns() == rows);
 
         alignas(64) float decoded[qnk_block_elements];
         for (size_t token = 0; token < input_rows; ++token)
@@ -2784,6 +2811,7 @@ void test_qnk_cpu_kernel_and_pack()
                         expected += decoded[column] * input.row(token)[block * qnk_block_elements + column];
                 }
                 check_near(projected.row(token)[row], expected, 0.1f);
+                check_near(packed_projected.row(token)[row], expected, 0.1f);
             }
         }
     }
@@ -3742,6 +3770,59 @@ void test_file_backed_mxfp4_expert_cache()
     check(static_cast<bool>(statistics.resident_bytes == 34));
     check(static_cast<bool>(statistics.mapped_ranges == 8));
     check(static_cast<bool>(statistics.mapped_bytes == statistics.bytes_read));
+
+    const std::filesystem::path reserved_blocks_path = directory / "reserved-blocks.bin";
+    const std::filesystem::path reserved_scales_path = directory / "reserved-scales.bin";
+    {
+        std::vector<uint8_t> blocks(128, 7);
+        std::ofstream stream(reserved_blocks_path, std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(blocks.data()), static_cast<std::streamsize>(blocks.size()));
+    }
+    {
+        std::vector<uint8_t> scales(8, 127);
+        std::ofstream stream(reserved_scales_path, std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(scales.data()), static_cast<std::streamsize>(scales.size()));
+    }
+    const auto reserved_tensor = [&](uint64_t block_offset, uint64_t scale_offset) {
+        TensorData tensor;
+        tensor.dtype = DType::MxFp4;
+        tensor.shape = {4, 32};
+        auto storage = std::make_shared<MxFp4FileStorage>();
+        storage->blocks_path = reserved_blocks_path.string();
+        storage->blocks_offset = block_offset;
+        storage->blocks_bytes = 64;
+        storage->scales_path = reserved_scales_path.string();
+        storage->scales_offset = scale_offset;
+        storage->scales_bytes = 4;
+        tensor.mxfp4_file_storage = std::move(storage);
+        return tensor;
+    };
+    const TensorData reserved_gate = reserved_tensor(0, 0);
+    const TensorData reserved_down = reserved_tensor(64, 4);
+    Mxfp4ExpertCache packed_reservation(
+        272,
+        1,
+        {},
+        ExpertCacheBufferedReads,
+        0,
+        true);
+    auto reserved_pair = packed_reservation.acquire_pair(reserved_gate, reserved_down);
+    check(static_cast<bool>(reserved_pair));
+    check(static_cast<bool>(reserved_pair.value().bytes_read == 136));
+    check(static_cast<bool>(packed_reservation.statistics().bytes_read == 136));
+    check(static_cast<bool>(packed_reservation.statistics().resident_bytes == 272));
+    Mxfp4ExpertCache undersized_packed_reservation(
+        271,
+        1,
+        {},
+        ExpertCacheBufferedReads,
+        0,
+        true);
+    auto rejected_packed_pair = undersized_packed_reservation.acquire_pair(
+        reserved_gate,
+        reserved_down);
+    check(static_cast<bool>(!rejected_packed_pair));
+    check(static_cast<bool>(rejected_packed_pair.error().code == ErrorCode::InvalidArgument));
 
     const std::filesystem::path packed_path = directory / "packed.bin";
     {
@@ -4718,8 +4799,10 @@ void test_staged_bfloat16_dispatch_telemetry()
     TestRuntime runtime;
     RuntimeConfig runtime_options;
     runtime_options.hybrid_mode = HybridMode::CpuOnly;
+    runtime_options.cpu_packed_weight_mode = CpuPackedWeightMode::Disabled;
     runtime_options.optimization_flags &= ~(RuntimeOptimizationNcnnCpuBfloat16Linear
-                                            | RuntimeOptimizationNcnnCpuBfloat16LinearForce);
+                                            | RuntimeOptimizationNcnnCpuBfloat16LinearForce
+                                            | RuntimeOptimizationCpuPackedWeights);
     SchedulerOptions scheduler_options;
     scheduler_options.worker_count = 2;
     scheduler_options.flags = SchedulerOptionForceStagedBatching;
@@ -6817,6 +6900,33 @@ void test_automatic_expert_memory_planning()
     check(static_cast<bool>(small_plan.value().selected_mode == ExpertMemoryMode::Eager));
     check(static_cast<bool>(!has_flag(small_plan.value().flags, ModelMemoryFileBackedExperts)));
     check(static_cast<bool>(small_plan.value().estimated_expert_bytes < 11 * gibibyte));
+    check(static_cast<bool>(small_plan.value().estimated_cpu_packed_expert_bytes == 0));
+    check(static_cast<bool>(small_plan.value().estimated_expert_resident_bytes == small_plan.value().estimated_expert_bytes));
+
+    auto small_packed_plan = plan_model_memory(
+        small,
+        options,
+        physical_memory,
+        false,
+        0,
+        true);
+    check(static_cast<bool>(small_packed_plan));
+    check(static_cast<bool>(small_packed_plan.value().selected_mode == ExpertMemoryMode::OnDemand));
+    check(static_cast<bool>(small_packed_plan.value().estimated_cpu_packed_expert_bytes == small_packed_plan.value().estimated_expert_bytes));
+    check(static_cast<bool>(small_packed_plan.value().estimated_expert_resident_bytes == small_packed_plan.value().estimated_expert_bytes * 2));
+    check(static_cast<bool>(small_packed_plan.value().expert_pair_resident_bytes == small_packed_plan.value().expert_pair_bytes * 2));
+    check(static_cast<bool>(small_packed_plan.value().minimum_active_expert_bytes == small_packed_plan.value().expert_pair_resident_bytes * 4));
+    RuntimeConfig forced_eager_packed_options;
+    forced_eager_packed_options.expert_memory_mode = ExpertMemoryMode::Eager;
+    auto forced_eager_packed_plan = plan_model_memory(
+        small,
+        forced_eager_packed_options,
+        physical_memory,
+        false,
+        0,
+        true);
+    check(static_cast<bool>(!forced_eager_packed_plan));
+    check(static_cast<bool>(forced_eager_packed_plan.error().code == ErrorCode::InvalidArgument));
 
     const MoeIR large = gpt_oss_memory_ir(36, 128);
     auto large_plan = plan_model_memory(large, options, physical_memory);
@@ -6826,9 +6936,31 @@ void test_automatic_expert_memory_planning()
     check(static_cast<bool>(large_plan.value().host_memory_budget_bytes == 24 * gibibyte));
     check(static_cast<bool>(large_plan.value().estimated_dense_bytes == 4334742144ull));
     check(static_cast<bool>(large_plan.value().expert_pair_bytes == 13219200ull));
+    check(static_cast<bool>(large_plan.value().expert_pair_resident_bytes == large_plan.value().expert_pair_bytes));
     check(static_cast<bool>(large_plan.value().estimated_expert_bytes == 60914073600ull));
+    check(static_cast<bool>(large_plan.value().estimated_expert_resident_bytes == large_plan.value().estimated_expert_bytes));
     check(static_cast<bool>(large_plan.value().expert_cache_bytes == 20 * gibibyte - large_plan.value().estimated_dense_bytes));
     check(static_cast<bool>(large_plan.value().expert_cache_bytes >= large_plan.value().minimum_active_expert_bytes));
+
+    MoeIR qnk = gpt_oss_memory_ir(1, 24);
+    qnk.vocabulary_size = 128;
+    qnk.hidden_size = 4096;
+    qnk.intermediate_size = 4096;
+    qnk.layers.front().ffn.moe.intermediate_size = 4096;
+    qnk.layers.front().ffn.moe.expert_weight_dtype = DType::Q4K;
+    RuntimeConfig qnk_options;
+    qnk_options.host_memory_budget_bytes = 3 * gibibyte;
+    auto qnk_raw_plan = plan_model_memory(qnk, qnk_options, 4 * gibibyte);
+    check(static_cast<bool>(qnk_raw_plan));
+    auto qnk_packed_plan = plan_model_memory(
+        qnk,
+        qnk_options,
+        4 * gibibyte,
+        false,
+        0,
+        true);
+    check(static_cast<bool>(!qnk_packed_plan));
+    check(static_cast<bool>(qnk_packed_plan.error().code == ErrorCode::InvalidArgument));
 
     auto available_plan = plan_model_memory(
         large,
@@ -7085,6 +7217,8 @@ void test_backend_capabilities_and_hybrid_execution()
     check(static_cast<bool>(automatic_effective.selected_expert_memory_mode == automatic_model.value()->memory_plan().selected_mode));
     check(static_cast<bool>(automatic_effective.host_memory_budget_bytes == automatic_model.value()->memory_plan().host_memory_budget_bytes));
     check(static_cast<bool>(automatic_effective.expert_cache_bytes == automatic_model.value()->memory_plan().expert_cache_bytes));
+    check(static_cast<bool>(automatic_effective.requested_cpu_packed_weight_mode == CpuPackedWeightMode::Auto));
+    check(static_cast<bool>(automatic_effective.selected_cpu_packed_weight_mode == CpuPackedWeightMode::Disabled));
     check(static_cast<bool>(automatic_effective.expected_concurrency == automatic_options.expected_concurrency));
     check(static_cast<bool>(automatic_effective.vulkan_device_indices == automatic_model.value()->vulkan_device_indices()));
     auto automatic_session = runtime.create_session(automatic_model.value());
@@ -7467,8 +7601,12 @@ void test_flag_defaults()
     check(static_cast<bool>(has_flag(
         RuntimeOptimizationDefaultFlags,
         RuntimeOptimizationVulkanQnK)));
+    check(static_cast<bool>(has_flag(
+        RuntimeOptimizationDefaultFlags,
+        RuntimeOptimizationCpuPackedWeights)));
     RuntimeConfig runtime;
     check(static_cast<bool>(runtime.optimization_flags == RuntimeOptimizationDefaultFlags));
+    check(static_cast<bool>(runtime.cpu_packed_weight_mode == CpuPackedWeightMode::Auto));
     check(static_cast<bool>(!has_flag(runtime.flags, RuntimeOptionMemoryMapExperts)));
     check(static_cast<bool>(!has_flag(runtime.flags, RuntimeOptionRouterPrediction)));
     check(static_cast<bool>(!has_flag(runtime.flags, RuntimeOptionForwardAwareCache)));
@@ -8302,10 +8440,23 @@ void benchmark_qnk_gemm()
         matrix.dtype = dtype;
         matrix.shape = {static_cast<uint32_t>(rows), columns};
         matrix.quantized_data = std::move(raw);
-        CpuBatch output;
-        linear_batch_into(matrix, input, output, 0);
+        CpuBatch raw_output;
+        CpuBatch packed_output;
+        linear_batch_into(matrix, input, raw_output, 0);
+        linear_batch_into(
+            matrix,
+            input,
+            packed_output,
+            RuntimeOptimizationCpuPackedWeights);
         for (uint32_t iteration = 0; iteration < 2; ++iteration)
-            linear_batch_into(matrix, input, output, 0);
+        {
+            linear_batch_into(matrix, input, raw_output, 0);
+            linear_batch_into(
+                matrix,
+                input,
+                packed_output,
+                RuntimeOptimizationCpuPackedWeights);
+        }
 
         const std::span<const uint8_t> raw_view = matrix.qnk_values();
         float reference_checksum = 0.0f;
@@ -8336,27 +8487,44 @@ void benchmark_qnk_gemm()
         }
         const auto baseline_end = std::chrono::steady_clock::now();
 
-        float checksum = 0.0f;
-        const auto start = std::chrono::steady_clock::now();
+        float raw_checksum = 0.0f;
+        const auto raw_start = std::chrono::steady_clock::now();
         for (uint32_t iteration = 0; iteration < iterations; ++iteration)
         {
-            linear_batch_into(matrix, input, output, 0);
-            checksum += output.row(iteration % token_count)[iteration % rows];
+            linear_batch_into(matrix, input, raw_output, 0);
+            raw_checksum += raw_output.row(iteration % token_count)[iteration % rows];
         }
-        const auto end = std::chrono::steady_clock::now();
+        const auto raw_end = std::chrono::steady_clock::now();
+        float packed_checksum = 0.0f;
+        const auto packed_start = std::chrono::steady_clock::now();
+        for (uint32_t iteration = 0; iteration < iterations; ++iteration)
+        {
+            linear_batch_into(
+                matrix,
+                input,
+                packed_output,
+                RuntimeOptimizationCpuPackedWeights);
+            packed_checksum += packed_output.row(iteration % token_count)[iteration % rows];
+        }
+        const auto packed_end = std::chrono::steady_clock::now();
         const double baseline_ms = std::chrono::duration<double, std::milli>(baseline_end - baseline_start).count();
-        const double milliseconds = std::chrono::duration<double, std::milli>(end - start).count();
+        const double raw_ms = std::chrono::duration<double, std::milli>(raw_end - raw_start).count();
+        const double packed_ms = std::chrono::duration<double, std::milli>(packed_end - packed_start).count();
         std::cout << "qnk_gemm dtype=" << static_cast<int>(dtype)
                   << " rows=" << rows
                   << " columns=" << columns
                   << " tokens=" << token_count
                   << " iterations=" << iterations
                   << " baseline_ms=" << baseline_ms
-                  << " ms=" << milliseconds
-                  << " per_iter_ms=" << (milliseconds / iterations)
-                  << " speedup=" << (baseline_ms / milliseconds)
-                  << " checksum_delta=" << std::abs(reference_checksum - checksum)
-                  << " checksum=" << checksum << '\n';
+                  << " raw_ms=" << raw_ms
+                  << " packed_ms=" << packed_ms
+                  << " ms=" << packed_ms
+                  << " per_iter_ms=" << (packed_ms / iterations)
+                  << " speedup=" << (baseline_ms / packed_ms)
+                  << " packed_vs_raw=" << (raw_ms / packed_ms)
+                  << " raw_checksum_delta=" << std::abs(reference_checksum - raw_checksum)
+                  << " checksum_delta=" << std::abs(reference_checksum - packed_checksum)
+                  << " checksum=" << packed_checksum << '\n';
     }
 }
 

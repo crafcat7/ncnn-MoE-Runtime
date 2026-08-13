@@ -37,6 +37,31 @@
 namespace ncnn {
 namespace moe {
 
+static bool cpu_packed_weights_supported(
+    const MoeIR& ir,
+    const RuntimeConfig& config) noexcept
+{
+    for (const LayerDescriptor& layer : ir.layers)
+    {
+        if (!has_flag(layer.flags, LayerDescriptorMoe))
+            continue;
+        const DType dtype = layer.ffn.moe.expert_weight_dtype;
+        if (is_qnk_dtype(dtype))
+        {
+            return true;
+        }
+        if (dtype == DType::MxFp4
+            && has_flag(
+                config.optimization_flags,
+                RuntimeOptimizationCpuMxfp4Q8)
+            && mxfp4_q8_packed_kernel_available())
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 static Result<std::string> read_text_file(const std::filesystem::path& path)
 {
     std::ifstream stream(path, std::ios::binary);
@@ -365,15 +390,56 @@ Result<ModelPtr> Runtime::load_model(
     const bool release_vulkan_dense_host_storage = use_vulkan_dense && has_flag(config.flags, RuntimeOptionReleaseVulkanDenseHostStorage);
     report_progress(4, "memory", "Planning host memory and Expert cache");
     const uint64_t current_available_memory_bytes = available_memory_bytes();
-    auto memory_plan = plan_model_memory(
+    auto raw_memory_plan = plan_model_memory(
         parsed_ir.value(),
         config,
         capabilities_.physical_memory_bytes,
         release_vulkan_dense_host_storage,
-        current_available_memory_bytes);
-    if (!memory_plan)
-        return memory_plan.error();
-    ModelMemoryPlan plan = std::move(memory_plan).value();
+        current_available_memory_bytes,
+        false);
+    if (!raw_memory_plan)
+        return raw_memory_plan.error();
+    ModelMemoryPlan plan = std::move(raw_memory_plan).value();
+    CpuPackedWeightMode selected_cpu_packed_weight_mode = CpuPackedWeightMode::Disabled;
+    const bool packed_supported = cpu_packed_weights_supported(parsed_ir.value(), config);
+    const bool packed_requested = config.cpu_packed_weight_mode == CpuPackedWeightMode::Enabled
+                                  || (config.cpu_packed_weight_mode == CpuPackedWeightMode::Auto
+                                      && has_flag(
+                                          config.optimization_flags,
+                                          RuntimeOptimizationCpuPackedWeights));
+    if (packed_supported && packed_requested)
+    {
+        auto packed_memory_plan = plan_model_memory(
+            parsed_ir.value(),
+            config,
+            capabilities_.physical_memory_bytes,
+            release_vulkan_dense_host_storage,
+            current_available_memory_bytes,
+            true);
+        if (config.cpu_packed_weight_mode == CpuPackedWeightMode::Enabled)
+        {
+            if (!packed_memory_plan)
+                return packed_memory_plan.error();
+            plan = std::move(packed_memory_plan).value();
+            selected_cpu_packed_weight_mode = CpuPackedWeightMode::Enabled;
+        }
+        else if (packed_memory_plan
+                 && !(plan.selected_mode == ExpertMemoryMode::Eager
+                      && packed_memory_plan.value().selected_mode == ExpertMemoryMode::OnDemand))
+        {
+            plan = std::move(packed_memory_plan).value();
+            selected_cpu_packed_weight_mode = CpuPackedWeightMode::Enabled;
+        }
+    }
+    uint64_t effective_optimization_flags = config.optimization_flags;
+    if (selected_cpu_packed_weight_mode == CpuPackedWeightMode::Enabled)
+    {
+        effective_optimization_flags |= RuntimeOptimizationCpuPackedWeights;
+    }
+    else
+    {
+        effective_optimization_flags &= ~RuntimeOptimizationCpuPackedWeights;
+    }
     const bool file_backed_experts = has_flag(plan.flags, ModelMemoryFileBackedExperts);
     if (file_backed_experts)
         package.flags |= ModelPackageDeferMxfp4Experts;
@@ -418,7 +484,7 @@ Result<ModelPtr> Runtime::load_model(
     compiler_capabilities.cpu_parallelism = capabilities_.openmp_thread_count;
     compiler_capabilities.vulkan_device_index = selected_vulkan_device_index;
     compiler_capabilities.expected_concurrency = config.expected_concurrency;
-    compiler_capabilities.optimization_flags = config.optimization_flags;
+    compiler_capabilities.optimization_flags = effective_optimization_flags;
     compiler_capabilities.vulkan_context_instance = context_instance;
     compiler_capabilities.vulkan_device_indices = selected_vulkan_device_indices;
     compiler_capabilities.vulkan_device_scores.reserve(selected_vulkan_device_indices.size());
@@ -461,7 +527,7 @@ Result<ModelPtr> Runtime::load_model(
     CompiledModel compiled_model = std::move(compiled).value();
     compiled_model.memory_plan = plan;
     compiled_model.runtime_option_flags = config.flags;
-    compiled_model.optimization_flags = config.optimization_flags;
+    compiled_model.optimization_flags = effective_optimization_flags;
     compiled_model.expected_concurrency = config.expected_concurrency;
     uint64_t expert_gpu_cache_bytes = config.expert_gpu_cache_bytes;
     uint64_t expert_gpu_victim_cache_bytes = config.expert_gpu_victim_cache_bytes;
@@ -498,6 +564,8 @@ Result<ModelPtr> Runtime::load_model(
     compiled_model.effective_runtime_config.hybrid_mode = compiled_model.hybrid_mode;
     compiled_model.effective_runtime_config.requested_expert_memory_mode = plan.requested_mode;
     compiled_model.effective_runtime_config.selected_expert_memory_mode = plan.selected_mode;
+    compiled_model.effective_runtime_config.requested_cpu_packed_weight_mode = config.cpu_packed_weight_mode;
+    compiled_model.effective_runtime_config.selected_cpu_packed_weight_mode = selected_cpu_packed_weight_mode;
     compiled_model.effective_runtime_config.host_memory_budget_bytes = plan.host_memory_budget_bytes;
     compiled_model.effective_runtime_config.expert_cache_bytes = plan.expert_cache_bytes;
     compiled_model.effective_runtime_config.expert_gpu_cache_bytes = expert_gpu_cache_bytes;
@@ -506,7 +574,7 @@ Result<ModelPtr> Runtime::load_model(
     compiled_model.effective_runtime_config.vulkan_device_index = compiled_model.vulkan_device_index;
     compiled_model.effective_runtime_config.vulkan_device_indices = compiled_model.vulkan_device_indices;
     compiled_model.effective_runtime_config.flags = config.flags;
-    compiled_model.effective_runtime_config.optimization_flags = config.optimization_flags;
+    compiled_model.effective_runtime_config.optimization_flags = effective_optimization_flags;
     compiled_model.effective_runtime_config.expected_concurrency = config.expected_concurrency;
     compiled_model.effective_runtime_config.file_backed_experts = file_backed_experts;
     report_progress(7, "cache", "Preparing Expert storage and caches");
@@ -613,7 +681,7 @@ Result<ModelPtr> Runtime::load_model(
                     capacity,
                     device_index,
                     compiled_model.vulkan_context_instance,
-                    config.optimization_flags);
+                    effective_optimization_flags);
                 if (!shard)
                 {
                     return Error{ErrorCode::UnsupportedModel, "cannot create an Expert GPU victim-cache shard"};
@@ -644,7 +712,7 @@ Result<ModelPtr> Runtime::load_model(
                     placement_device_index,
                     !use_victim_device_source ? std::shared_ptr<IExpertVictimCache>() : expert_victim_cache_shards[index],
                     compiled_model.vulkan_context_instance,
-                    config.optimization_flags);
+                    effective_optimization_flags);
                 if (!backend)
                 {
                     return Error{ErrorCode::UnsupportedModel, "cannot create a Vulkan MXFP4 Expert execution cache/source backend"};
@@ -685,7 +753,8 @@ Result<ModelPtr> Runtime::load_model(
             expert_io_workers,
             std::move(expert_victim_cache),
             expert_cache_flags,
-            static_cast<uint32_t>(residency_group_count));
+            static_cast<uint32_t>(residency_group_count),
+            selected_cpu_packed_weight_mode == CpuPackedWeightMode::Enabled);
     }
 
     bool has_resident_qnk_experts = false;
@@ -730,7 +799,7 @@ Result<ModelPtr> Runtime::load_model(
             selected_vulkan_device_index,
             nullptr,
             compiled_model.vulkan_context_instance,
-            config.optimization_flags);
+            effective_optimization_flags);
         if (!backend)
             return Error{ErrorCode::UnsupportedModel, "cannot create the Vulkan Qn_K Expert execution backend"};
         compiled_model.expert_backend = std::move(backend);
