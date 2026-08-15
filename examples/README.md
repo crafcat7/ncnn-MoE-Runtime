@@ -53,13 +53,15 @@ resource plan; human-readable memory and I/O sizes are shown as decimal `GB`.
 The JSONL protocol still reports exact `*_bytes` fields. `Auto` selects Hybrid only when a real Vulkan device is
 available; otherwise it falls back to CPU. Use `--cpu`, `--hybrid`, or the
 advanced memory, Expert-cache, I/O, and device options when an explicit plan is
-needed. Use `--cpu-packed-weights auto|on|off` to control persistent in-memory
-MXFP4-Q8 and Qn_K CPU weight packs separately from Expert residency. Packed
-sidecar reservations are included in Eager admission and Expert-cache capacity;
-`auto` preserves Eager residency by selecting `off` when necessary, while
-explicit `on` can make automatic Expert residency choose on-demand. A plan
-change that requires a new worker is reported instead of being
+needed. Hybrid automatically issues bounded cache-prefetch hints before CPU
+Expert kernels; there is no separate prefetch backend. A plan change that
+requires a new worker is reported instead of being
 silently applied to the current session.
+
+CPU Expert weight repacking is an explicit experiment. Pass
+`--cpu-packed-weights on` to enable it for supported MXFP4-Q8 or Qn_K weights;
+when the option is absent, the worker keeps repack off and does not reserve an
+in-memory packed sidecar.
 
 The CLI is intentionally the only public text entry point. The three
 model-named native executables (`ncnn_moe_gpt_oss`,

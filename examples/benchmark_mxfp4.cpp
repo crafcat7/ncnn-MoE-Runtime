@@ -319,14 +319,23 @@ static int benchmark_cpu_mxfp4_q8_expert(
     uint32_t token_count,
     uint32_t repeats)
 {
-    if (!mxfp4_q8_packed_kernel_available())
+    if (!mxfp4_q8_kernel_available())
     {
-        std::cout << "CPU MXFP4-Q8 packed kernel unavailable; exact kernel retained\n";
+        std::cout << "CPU MXFP4-Q8 kernel unavailable; exact kernel retained\n";
+        return 0;
+    }
+    if (token_count == 1
+        && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
+    {
+        std::cout << "CPU MXFP4-Q8 expert benchmark skipped: single-token AVX512 decode intentionally uses the exact row-pair kernel; use token count 2 or greater\n";
         return 0;
     }
     constexpr uint64_t base_optimization_flags = RuntimeOptimizationDefaultFlags;
     constexpr uint64_t reference_optimization_flags = base_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8;
-    constexpr uint64_t q8_optimization_flags = base_optimization_flags | RuntimeOptimizationCpuMxfp4Q8;
+    constexpr uint64_t q8_optimization_flags =
+        base_optimization_flags
+        | RuntimeOptimizationCpuMxfp4Q8
+        | RuntimeOptimizationCpuPackedWeights;
     TensorData gate_up = make_matrix(intermediate_columns * 2, input_columns);
     TensorData down = make_matrix(input_columns, intermediate_columns);
     const CpuBatch input = make_input(token_count, input_columns);
@@ -416,9 +425,9 @@ static int benchmark_cpu_mxfp4_q8_expert(
               << ", Q8 activation: int8 per-32-element block\n";
     std::cout << "exact median: " << reference_ms << " ms, "
               << bandwidth(reference_ms) << " effective GiB/s\n";
-    std::cout << "Q8 median: " << candidate_ms << " ms, "
+    std::cout << "packed Q8 median: " << candidate_ms << " ms, "
               << bandwidth(candidate_ms) << " effective GiB/s\n";
-    std::cout << "Q8 speedup: " << reference_ms / candidate_ms << "x\n";
+    std::cout << "packed Q8 speedup: " << reference_ms / candidate_ms << "x\n";
     std::cout << "maximum absolute/normalized error: " << maximum_error
               << " / " << maximum_normalized_error << '\n';
     return 0;
@@ -544,7 +553,7 @@ static int benchmark_cpu_bfloat16_projection(
     uint32_t repeats)
 {
     constexpr uint64_t base_optimization_flags = RuntimeOptimizationDefaultFlags;
-    constexpr uint64_t policy_flags = RuntimeOptimizationCpuBfloat16Batched | RuntimeOptimizationCpuBfloat16ForceSmall;
+    constexpr uint64_t policy_flags = RuntimeOptimizationCpuBfloat16Batched;
     const uint64_t reference_optimization_flags = base_optimization_flags & ~policy_flags;
     const uint64_t candidate_optimization_flags = base_optimization_flags | policy_flags;
     TensorData matrix = make_bfloat16_matrix(output_columns, input_columns);

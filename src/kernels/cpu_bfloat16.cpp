@@ -565,8 +565,7 @@ static float scalar_bfloat16_pair_dot(
 enum class Bfloat16BatchedLinearPolicy
 {
     Automatic,
-    Disabled,
-    Forced
+    Disabled
 };
 
 // Scoped instrumentation context only. Model weights, activation scratch,
@@ -613,16 +612,7 @@ static Bfloat16BatchedLinearPolicy bfloat16_batched_linear_policy(uint64_t optim
 {
     if (!runtime_optimization_enabled(optimization_flags, RuntimeOptimizationCpuBfloat16Batched))
         return Bfloat16BatchedLinearPolicy::Disabled;
-    return runtime_optimization_enabled(optimization_flags,
-               RuntimeOptimizationCpuBfloat16ForceSmall)
-               ? Bfloat16BatchedLinearPolicy::Forced
-               : Bfloat16BatchedLinearPolicy::Automatic;
-}
-
-static bool bfloat16_single_token_linear_enabled(uint64_t optimization_flags) noexcept
-{
-    return runtime_optimization_enabled(optimization_flags,
-        RuntimeOptimizationCpuBfloat16SingleToken);
+    return Bfloat16BatchedLinearPolicy::Automatic;
 }
 
 static Bfloat16DotFunction select_bfloat16_dot() noexcept
@@ -775,14 +765,12 @@ bool bfloat16_batched_linear(const uint16_t* weights,
                              uint64_t optimization_flags)
 {
     if (!weights || !input || !output || token_count == 0
-        || (token_count > 1 && token_count < 4)
+        || token_count < 4
         || output_columns < 4 || output_columns % 4 != 0
         || input_columns == 0 || input_columns % 32 != 0 || input_stride < input_columns || output_stride < output_columns)
     {
         return false;
     }
-    if (token_count == 1 && !bfloat16_single_token_linear_enabled(optimization_flags))
-        return false;
     if (token_count > std::numeric_limits<size_t>::max() - 3)
         return false;
     const size_t padded_token_count = (token_count + 3) & ~size_t{3};
@@ -795,7 +783,7 @@ bool bfloat16_batched_linear(const uint16_t* weights,
     if (token_count > std::numeric_limits<uint64_t>::max() / output_columns / input_columns)
         return false;
     const uint64_t operation_count = static_cast<uint64_t>(token_count) * output_columns * input_columns;
-    if (policy == Bfloat16BatchedLinearPolicy::Automatic && (output_columns < 128 || operation_count < 1024 * 1024))
+    if (output_columns < 128 || operation_count < 1024 * 1024)
         return false;
     std::vector<uint16_t> packed_input;
 

@@ -1031,6 +1031,26 @@ static uint64_t run_experts(
         decode_tasks.push_back(task);
     }
 
+    const bool prefetched_batch_weights = prefetch
+                                          && std::all_of(
+                                              decode_tasks.begin(),
+                                              decode_tasks.end(),
+                                              [](const Mxfp4Task& task) {
+                                                  return task.gate_up
+                                                         && task.down
+                                                         && task.gate_up->dtype == DType::MxFp4
+                                                         && task.down->dtype == DType::MxFp4;
+                                              });
+    if (prefetched_batch_weights)
+    {
+        for (size_t task_index = 0; task_index < decode_tasks.size(); ++task_index)
+        {
+            ActiveExpertExecution& active = layer_state.active_experts[active_indices[task_index]];
+            active.metrics.hinted_bytes += prefetch_tensor(*decode_tasks[task_index].gate_up);
+            active.metrics.hinted_bytes += prefetch_tensor(*decode_tasks[task_index].down);
+        }
+    }
+
     const bool grouped_decode = mxfp4_expert_batch(decode_tasks, &scratch.kernels, model.optimization_flags);
     if (grouped_decode)
     {
@@ -1077,7 +1097,7 @@ static uint64_t run_experts(
             bfloat16_counter);
         ActiveExpertExecution& active = layer_state.active_experts[active_indices[static_cast<size_t>(task_index)]];
         const uint32_t expert_id = active.batch.expert_id;
-        active.output = run_expert(model.weights, model.operators, moe.experts[expert_id], active.lease.gate_up ? &active.lease : nullptr, active.input, prefetch, active.metrics, model.optimization_flags);
+        active.output = run_expert(model.weights, model.operators, moe.experts[expert_id], active.lease.gate_up ? &active.lease : nullptr, active.input, prefetch && !prefetched_batch_weights, active.metrics, model.optimization_flags);
     }
     const uint64_t elapsed = elapsed_microseconds(compute_start);
     if (model.expert_backend)

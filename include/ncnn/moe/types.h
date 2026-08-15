@@ -257,8 +257,6 @@ enum class ExpertLayout
 enum class HybridMode
 {
     CpuOnly,
-    VulkanOnly,
-    VulkanWithCpuPrefetch,
     HybridExperts,
     Auto
 };
@@ -359,9 +357,9 @@ struct TensorData
     std::shared_ptr<const uint8_t> mapped_data;
     uint64_t mapped_byte_count = 0;
     std::shared_ptr<const MxFp4FileStorage> mxfp4_file_storage;
-    // Immutable CPU MXFP4 weights may share an ISA-specific packed sidecar.
+    // Optional immutable CPU repack sidecars. They are created lazily only
+    // when the explicit CPU packed-weight mode is enabled.
     mutable std::shared_ptr<const Mxfp4Q8PackedMatrix> mxfp4_q8_packed;
-    // Optional ISA-specific packed sidecar.
     mutable std::shared_ptr<const QnKPack> qnk_packed;
     [[nodiscard]] uint64_t element_count() const noexcept;
     [[nodiscard]] std::span<const float> float32_values() const noexcept;

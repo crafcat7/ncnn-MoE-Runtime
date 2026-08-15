@@ -191,7 +191,7 @@ def parse_arguments():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
         "--backend",
-        choices=("auto", "cpu", "hybrid", "hybrid-prefetch"),
+        choices=("auto", "cpu", "hybrid"),
         default="auto",
     )
     parser.add_argument(
@@ -201,9 +201,9 @@ def parse_arguments():
     )
     parser.add_argument(
         "--cpu-packed-weights",
-        choices=("auto", "on", "off"),
-        default="auto",
-        help="Control persistent CPU MXFP4/Qn_K packed weight sidecars.",
+        choices=("off", "on"),
+        default="off",
+        help="Enable the optional CPU Expert weight repack (default: off).",
     )
     parser.add_argument("--host-memory-mb", type=int, default=0)
     parser.add_argument("--expert-cache-mb", type=int, default=0)
@@ -553,8 +553,8 @@ def runner_command(arguments):
         command.append(f"--{arguments.backend}")
     if arguments.expert_memory != "auto":
         command.extend(["--expert-memory", arguments.expert_memory])
-    if arguments.cpu_packed_weights != "auto":
-        command.extend(["--cpu-packed-weights", arguments.cpu_packed_weights])
+    if arguments.cpu_packed_weights == "on":
+        command.extend(["--cpu-packed-weights", "on"])
     if arguments.host_memory_mb:
         command.extend(["--host-memory-mb", str(arguments.host_memory_mb)])
     if arguments.expert_cache_mb:
@@ -1083,9 +1083,9 @@ def parse_runner_output(output):
             output,
             r"^loaded [a-zA-Z0-9_-]+ in [0-9.]+ s, backend (.+)$",
         ),
-        "effective_cpu_packed_weights": extract_text(
+        "cpu_packed_weights": extract_text(
             output,
-            r"^Effective runtime:.*CPU packed weights ([^,]+),",
+            r"^Effective runtime:.*CPU packed weights (on|off),",
         ),
         "routed_expert_format": extract_text(
             output, r"^Routed Expert format: (.+)$"
@@ -2231,6 +2231,7 @@ def run_cache_sweep(arguments):
         "parallel_speculative": arguments.parallel_speculative,
         "parallel_independent": arguments.parallel_independent,
         "backend": arguments.backend,
+        "cpu_packed_weights": arguments.cpu_packed_weights,
         "execution_evidence": execution_evidence,
         "warmup_runs": arguments.warmup,
         "cache_warmup_runs": arguments.cache_warmup_runs,
@@ -2381,10 +2382,9 @@ def main():
         "parallel_speculative": arguments.parallel_speculative,
         "parallel_independent": arguments.parallel_independent,
         "backend": arguments.backend,
+        "cpu_packed_weights": arguments.cpu_packed_weights,
         "execution_evidence": execution_evidence,
         "expert_memory": arguments.expert_memory,
-        "cpu_packed_weights": arguments.cpu_packed_weights,
-        "effective_cpu_packed_weights": samples[0]["effective_cpu_packed_weights"],
         "host_memory_mb": arguments.host_memory_mb,
         "expert_cache_mb": arguments.expert_cache_mb,
         "host": {

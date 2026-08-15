@@ -58,6 +58,7 @@ struct Mxfp4Q8Batch
 
 void mxfp4_q8_quantize(const float* source, int8_t* values, float* scales, uint32_t columns) noexcept;
 void mxfp4_q8_quantize_batch(const float* source, size_t input_stride, size_t rows, uint32_t columns, Mxfp4Q8Batch& output) noexcept;
+[[nodiscard]] bool mxfp4_q8_kernel_available() noexcept;
 [[nodiscard]] float mxfp4_q8_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count,
                                  const int8_t* input, const float* input_scales) noexcept;
 void mxfp4_q8_gemm_row(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const int8_t* input,

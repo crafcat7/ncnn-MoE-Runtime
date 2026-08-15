@@ -255,7 +255,6 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/bfloat16_rms_norm_projection.comp
         src/kernels/vulkan/bfloat16_swiglu_down.comp
         src/kernels/vulkan/float8_projection.comp
-        src/kernels/vulkan/float8_projection_tiled4.comp
         src/kernels/vulkan/float8_quantize.comp
         src/kernels/vulkan/float8_rms_norm_quantize.comp
         src/kernels/vulkan/float8_swiglu_quantize.comp

@@ -657,7 +657,7 @@ static Result<void> build_speculative_execution_graph(
         const bool can_use_vulkan_experts = vulkan_expert_layer_supported(compiled, layer, capabilities.flags);
         const ExecutionBackend expert_backend = can_use_vulkan_experts ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
         const uint32_t expert_backend_mask = can_use_vulkan_experts ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
-        const uint32_t expert_flags = compiled.hybrid_mode == HybridMode::VulkanWithCpuPrefetch
+        const uint32_t expert_flags = compiled.hybrid_mode == HybridMode::HybridExperts
                                           ? ExecutionNodeCpuPrefetch
                                           : 0u;
         const ExecutionTensorId expert_output = append_execution_tensor(
@@ -822,7 +822,7 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
         const bool can_use_vulkan_experts = vulkan_expert_layer_supported(compiled, layer, capabilities.flags);
         const ExecutionBackend expert_backend = can_use_vulkan_experts ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
         const uint32_t expert_backend_mask = can_use_vulkan_experts ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
-        const uint32_t expert_flags = compiled.hybrid_mode == HybridMode::VulkanWithCpuPrefetch
+        const uint32_t expert_flags = compiled.hybrid_mode == HybridMode::HybridExperts
                                           ? ExecutionNodeCpuPrefetch
                                           : 0u;
         const ExecutionTensorId expert_output = append_execution_tensor(graph, prefix + "experts.output", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size}, TensorLocation::Cpu, ExecutionTensorDynamic);

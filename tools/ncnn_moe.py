@@ -289,13 +289,16 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
         help="Override the default worker under build-ncnn",
     )
     parser.add_argument("--config-dir", help="Override the persistent configuration directory")
-    parser.add_argument("--backend", choices=("auto", "cpu", "vulkan", "hybrid", "hybrid-prefetch"))
+    parser.add_argument("--backend", choices=("auto", "cpu", "hybrid"))
     backend_group = parser.add_mutually_exclusive_group()
     backend_group.add_argument("--cpu", dest="backend", action="store_const", const="cpu")
     backend_group.add_argument("--hybrid", dest="backend", action="store_const", const="hybrid")
-    backend_group.add_argument("--hybrid-prefetch", dest="backend", action="store_const", const="hybrid-prefetch")
     parser.add_argument("--expert-memory", choices=("auto", "eager", "on-demand"))
-    parser.add_argument("--cpu-packed-weights", choices=("auto", "on", "off"))
+    parser.add_argument(
+        "--cpu-packed-weights",
+        choices=("off", "on"),
+        help="Enable the optional CPU Expert weight repack (default: off)",
+    )
     parser.add_argument("--host-memory-mb", type=int)
     parser.add_argument("--expert-cache-mb", type=int)
     parser.add_argument("--expert-gpu-cache-mb", type=int)
@@ -1217,10 +1220,16 @@ def inspect_command(arguments: argparse.Namespace) -> int:
             telemetry = ready.get("telemetry", {})
             print(f"model: {model_info.get('model_type', 'N/A')}")
             print(f"backend: {resources.get('backend', 'N/A')}")
+            print(
+                "CPU packed weights: "
+                f"{resources.get('selected_cpu_packed_weights', 'off')}"
+            )
             print(f"host memory: {_format_bytes_gb(resources.get('host_memory_budget_bytes'))}")
             print(f"Expert cache: {_format_bytes_gb(resources.get('expert_cache_bytes'))}")
-            print(f"CPU packed weights: {resources.get('selected_cpu_packed_weights', 'N/A')}")
-            print(f"CPU packed Expert estimate: {_format_bytes_gb(resources.get('estimated_cpu_packed_expert_bytes'))}")
+            print(
+                "packed Expert estimate: "
+                f"{_format_bytes_gb(resources.get('estimated_cpu_packed_expert_bytes'))}"
+            )
             print(f"Expert IO workers: {resources.get('expert_io_workers', 'N/A')}")
             print(f"CPU: {capabilities.get('physical_cpu_core_count', 'N/A')} physical / {capabilities.get('logical_cpu_count', 'N/A')} logical")
             print(f"Vulkan devices: {capabilities.get('vulkan_device_count', 0)}")

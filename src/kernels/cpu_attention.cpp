@@ -256,18 +256,9 @@ static bool direct_bfloat16_attention_enabled(uint64_t optimization_flags) noexc
     return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationCpuBf16DirectAttention);
 }
 
-static bool bfloat16_attention_pair_dot_enabled(uint64_t optimization_flags) noexcept
-{
-    return bfloat16_pair_dot_available()
-           && runtime_optimization_enabled(optimization_flags,
-                                           RuntimeOptimizationCpuBf16AttentionDot);
-}
-
 static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, const TensorData* sinks, uint64_t position_offset, const CpuBatch& query,
                                               const CpuLayerCache& cache, CpuBatch& output, std::vector<float>& logits,
                                               std::vector<float>& key_cache, std::vector<float>& value_cache,
-                                              std::vector<uint16_t>& query_bfloat16,
-                                              std::vector<uint16_t>& flash_query_bfloat16,
                                               std::vector<float>& flash_partial_max,
                                               std::vector<float>& flash_partial_sum,
                                               std::vector<float>& flash_partial_output,
@@ -303,10 +294,6 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                                        && cache.token_count - 1 <= position_offset - cache.start_position
                                        && (plan.sliding_window == 0
                                            || cache.token_count <= plan.sliding_window);
-    const bool pair_dot = direct_bfloat16
-                          && bfloat16_attention_pair_dot_enabled(optimization_flags);
-    if (pair_dot)
-        query_bfloat16.resize(head_dimension);
     if (direct_bfloat16)
     {
         bfloat16_key_values = cache.bfloat16_keys.data();
@@ -382,7 +369,7 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                    && (plan.sliding_window == 0
                        || key_position + plan.sliding_window > query_position);
         };
-        const auto key_dot = [&](uint32_t query_head, const float* query_vector, const uint16_t* query_bfloat16_values, uint64_t key_index) {
+        const auto key_dot = [&](uint32_t query_head, const float* query_vector, uint64_t key_index) {
             const uint32_t kv_head = query_head / heads_per_group;
             if (direct_bfloat16)
             {
@@ -391,15 +378,7 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                                           : cache_slot(cache, key_index);
                 const uint16_t* key_vector = bfloat16_key_values + static_cast<size_t>(slot) * cache.columns
                                              + static_cast<size_t>(kv_head) * head_dimension;
-                return pair_dot
-                           ? bfloat16_pair_dot(
-                                 key_vector,
-                                 query_bfloat16_values,
-                                 head_dimension)
-                           : bfloat16_dot(
-                                 key_vector,
-                                 query_vector,
-                                 head_dimension);
+                return bfloat16_dot(key_vector, query_vector, head_dimension);
             }
             const float* key_vector = key_values + static_cast<size_t>(key_index) * cache.columns
                                       + static_cast<size_t>(kv_head) * head_dimension;
@@ -430,28 +409,6 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                        ? sinks->float32_values()[query_head]
                        : bfloat16_to_float(sinks->bfloat16_values()[query_head]);
         };
-
-        if (pair_dot)
-        {
-            flash_query_bfloat16.resize(static_cast<size_t>(head_count) * head_dimension);
-            for (uint32_t query_head = 0; query_head < head_count; ++query_head)
-            {
-                float_to_bfloat16_array(
-                    flash_query_bfloat16.data() + static_cast<size_t>(query_head) * head_dimension,
-                    query.row(0) + static_cast<size_t>(query_head) * head_dimension,
-                    head_dimension);
-            }
-            if (query.rows() > 1)
-            {
-                flash_query_bfloat16.resize(static_cast<size_t>(query.rows()) * head_count * head_dimension);
-                for (size_t query_index = 0; query_index < query.rows(); ++query_index)
-                    for (uint32_t query_head = 0; query_head < head_count; ++query_head)
-                        float_to_bfloat16_array(
-                            flash_query_bfloat16.data() + (query_index * head_count + query_head) * head_dimension,
-                            query.row(query_index) + static_cast<size_t>(query_head) * head_dimension,
-                            head_dimension);
-            }
-        }
 
         if (flash_prefill_enabled)
         {
@@ -608,9 +565,6 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
             const uint64_t begin = chunk * key_chunk_size;
             const uint64_t end = std::min(cache.token_count, begin + key_chunk_size);
             const float* query_vector = query.row(0) + static_cast<size_t>(query_head) * head_dimension;
-            const uint16_t* query_bfloat16_values = pair_dot
-                                                        ? flash_query_bfloat16.data() + static_cast<size_t>(query_head) * head_dimension
-                                                        : nullptr;
             local_maximum = -std::numeric_limits<float>::infinity();
             local_normalizer = 0.0f;
             std::fill(local_output, local_output + head_dimension, 0.0f);
@@ -619,7 +573,7 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                 const size_t chunk_offset = static_cast<size_t>(key_index - begin);
                 if (valid_key(0, key_index))
                 {
-                    const float score = key_dot(query_head, query_vector, query_bfloat16_values, key_index) * scale;
+                    const float score = key_dot(query_head, query_vector, key_index) * scale;
                     local_logits[chunk_offset] = score;
                     local_maximum = std::max(local_maximum, score);
                 }
@@ -738,13 +692,6 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
         {
             const uint32_t kv_head = query_head / heads_per_group;
             const float* query_vector = query.row(query_index) + query_head * head_dimension;
-            if (pair_dot)
-            {
-                float_to_bfloat16_array(
-                    query_bfloat16.data(),
-                    query_vector,
-                    head_dimension);
-            }
             float maximum = -std::numeric_limits<float>::infinity();
             if (sinks)
             {
@@ -763,15 +710,7 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                                                   : cache_slot(cache, key_index);
                         const uint16_t* key_vector = bfloat16_key_values + static_cast<size_t>(slot) * cache.columns
                                                      + static_cast<size_t>(kv_head) * head_dimension;
-                        dot = pair_dot
-                                  ? bfloat16_pair_dot(
-                                        key_vector,
-                                        query_bfloat16.data(),
-                                        head_dimension)
-                                  : bfloat16_dot(
-                                        key_vector,
-                                        query_vector,
-                                        head_dimension);
+                        dot = bfloat16_dot(key_vector, query_vector, head_dimension);
                     }
                     else
                     {
@@ -804,15 +743,7 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                                                   : cache_slot(cache, key_index);
                         const uint16_t* key_vector = bfloat16_key_values + static_cast<size_t>(slot) * cache.columns
                                                      + static_cast<size_t>(kv_head) * head_dimension;
-                        dot = pair_dot
-                                  ? bfloat16_pair_dot(
-                                        key_vector,
-                                        query_bfloat16.data(),
-                                        head_dimension)
-                                  : bfloat16_dot(
-                                        key_vector,
-                                        query_vector,
-                                        head_dimension);
+                        dot = bfloat16_dot(key_vector, query_vector, head_dimension);
                     }
                     else
                     {
@@ -1275,8 +1206,6 @@ Result<void> execute_attention_block_into(
         scratch.logits,
         scratch.key_cache,
         scratch.value_cache,
-        scratch.query_bfloat16,
-        scratch.flash_query_bfloat16,
         scratch.flash_partial_max,
         scratch.flash_partial_sum,
         scratch.flash_partial_output,

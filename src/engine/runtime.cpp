@@ -47,9 +47,7 @@ static bool cpu_packed_weights_supported(
             continue;
         const DType dtype = layer.ffn.moe.expert_weight_dtype;
         if (is_qnk_dtype(dtype))
-        {
             return true;
-        }
         if (dtype == DType::MxFp4
             && has_flag(
                 config.optimization_flags,
@@ -212,7 +210,7 @@ Runtime::Runtime()
     capabilities_.vulkan_device_count = NcnnLinearOperator::vulkan_device_count();
     if (capabilities_.vulkan_device_count > 0)
     {
-        capabilities_.flags |= RuntimeCapabilityVulkanExecution | RuntimeCapabilityVulkanCpuMix | RuntimeCapabilityVulkanCpuPrefetch | RuntimeCapabilityVulkanAttention | RuntimeCapabilityVulkanVictimCache
+        capabilities_.flags |= RuntimeCapabilityVulkanExecution | RuntimeCapabilityVulkanCpuMix | RuntimeCapabilityVulkanAttention | RuntimeCapabilityVulkanVictimCache
                                | RuntimeCapabilityVulkanDoubleBuffering | RuntimeCapabilityMxfp4VulkanProjection;
     }
     capabilities_.vulkan_heap_budget_bytes = NcnnLinearOperator::vulkan_heap_budget_bytes();
@@ -280,15 +278,9 @@ Result<ModelPtr> Runtime::load_model(
     HybridMode resolved_mode = config.hybrid_mode;
     if (resolved_mode == HybridMode::Auto)
         resolved_mode = has_flag(capabilities_.flags, RuntimeCapabilityVulkanCpuMix) ? HybridMode::HybridExperts : HybridMode::CpuOnly;
-    if (resolved_mode == HybridMode::VulkanOnly)
-        return Error{ErrorCode::UnsupportedModel, "Vulkan-only execution is not implemented; use HybridExperts"};
     if (resolved_mode == HybridMode::HybridExperts && !has_flag(capabilities_.flags, RuntimeCapabilityVulkanCpuMix))
     {
         return Error{ErrorCode::UnsupportedModel, "HybridExperts requires a Vulkan device and Vulkan-enabled ncnn"};
-    }
-    if (resolved_mode == HybridMode::VulkanWithCpuPrefetch && !has_flag(capabilities_.flags, RuntimeCapabilityVulkanCpuPrefetch))
-    {
-        return Error{ErrorCode::UnsupportedModel, "VulkanWithCpuPrefetch requires a Vulkan device and Vulkan-enabled ncnn"};
     }
     std::vector<uint32_t> selected_vulkan_device_indices;
     if (!config.vulkan_device_indices.empty())
@@ -386,7 +378,7 @@ Result<ModelPtr> Runtime::load_model(
     if (!normalized_ir)
         return normalized_ir.error();
 
-    const bool use_vulkan_dense = resolved_mode == HybridMode::HybridExperts || resolved_mode == HybridMode::VulkanWithCpuPrefetch;
+    const bool use_vulkan_dense = resolved_mode == HybridMode::HybridExperts;
     const bool release_vulkan_dense_host_storage = use_vulkan_dense && has_flag(config.flags, RuntimeOptionReleaseVulkanDenseHostStorage);
     report_progress(4, "memory", "Planning host memory and Expert cache");
     const uint64_t current_available_memory_bytes = available_memory_bytes();
@@ -400,15 +392,16 @@ Result<ModelPtr> Runtime::load_model(
     if (!raw_memory_plan)
         return raw_memory_plan.error();
     ModelMemoryPlan plan = std::move(raw_memory_plan).value();
-    CpuPackedWeightMode selected_cpu_packed_weight_mode = CpuPackedWeightMode::Disabled;
-    const bool packed_supported = cpu_packed_weights_supported(parsed_ir.value(), config);
-    const bool packed_requested = config.cpu_packed_weight_mode == CpuPackedWeightMode::Enabled
-                                  || (config.cpu_packed_weight_mode == CpuPackedWeightMode::Auto
-                                      && has_flag(
-                                          config.optimization_flags,
-                                          RuntimeOptimizationCpuPackedWeights));
-    if (packed_supported && packed_requested)
+    CpuPackedWeightMode selected_cpu_packed_weight_mode =
+        CpuPackedWeightMode::Disabled;
+    if (config.cpu_packed_weight_mode == CpuPackedWeightMode::Enabled)
     {
+        if (!cpu_packed_weights_supported(parsed_ir.value(), config))
+        {
+            return Error{
+                ErrorCode::UnsupportedModel,
+                "CPU packed weights are unavailable for this model or CPU"};
+        }
         auto packed_memory_plan = plan_model_memory(
             parsed_ir.value(),
             config,
@@ -416,30 +409,15 @@ Result<ModelPtr> Runtime::load_model(
             release_vulkan_dense_host_storage,
             current_available_memory_bytes,
             true);
-        if (config.cpu_packed_weight_mode == CpuPackedWeightMode::Enabled)
-        {
-            if (!packed_memory_plan)
-                return packed_memory_plan.error();
-            plan = std::move(packed_memory_plan).value();
-            selected_cpu_packed_weight_mode = CpuPackedWeightMode::Enabled;
-        }
-        else if (packed_memory_plan
-                 && !(plan.selected_mode == ExpertMemoryMode::Eager
-                      && packed_memory_plan.value().selected_mode == ExpertMemoryMode::OnDemand))
-        {
-            plan = std::move(packed_memory_plan).value();
-            selected_cpu_packed_weight_mode = CpuPackedWeightMode::Enabled;
-        }
+        if (!packed_memory_plan)
+            return packed_memory_plan.error();
+        plan = std::move(packed_memory_plan).value();
+        selected_cpu_packed_weight_mode = CpuPackedWeightMode::Enabled;
     }
-    uint64_t effective_optimization_flags = config.optimization_flags;
+    uint64_t effective_optimization_flags =
+        config.optimization_flags & ~RuntimeOptimizationCpuPackedWeights;
     if (selected_cpu_packed_weight_mode == CpuPackedWeightMode::Enabled)
-    {
         effective_optimization_flags |= RuntimeOptimizationCpuPackedWeights;
-    }
-    else
-    {
-        effective_optimization_flags &= ~RuntimeOptimizationCpuPackedWeights;
-    }
     const bool file_backed_experts = has_flag(plan.flags, ModelMemoryFileBackedExperts);
     if (file_backed_experts)
         package.flags |= ModelPackageDeferMxfp4Experts;
@@ -504,13 +482,13 @@ Result<ModelPtr> Runtime::load_model(
     }
     if (use_vulkan_dense && has_flag(capabilities_.flags, RuntimeCapabilityVulkanAttention))
     {
-        if (has_flag(config.optimization_flags, RuntimeOptimizationVulkanAttention))
+        if (has_flag(effective_optimization_flags, RuntimeOptimizationVulkanAttention))
             compiler_capabilities.flags |= ModelCompiler::BackendCapabilityVulkanAttention;
     }
     if (requested_expert_gpu_bytes != 0
         || (automatic_gpu_expert_cache && file_backed_experts)
         || (use_vulkan_dense
-            && has_flag(config.optimization_flags, RuntimeOptimizationVulkanQnK)))
+            && has_flag(effective_optimization_flags, RuntimeOptimizationVulkanQnK)))
     {
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityVulkanExperts;
     }
@@ -564,8 +542,10 @@ Result<ModelPtr> Runtime::load_model(
     compiled_model.effective_runtime_config.hybrid_mode = compiled_model.hybrid_mode;
     compiled_model.effective_runtime_config.requested_expert_memory_mode = plan.requested_mode;
     compiled_model.effective_runtime_config.selected_expert_memory_mode = plan.selected_mode;
-    compiled_model.effective_runtime_config.requested_cpu_packed_weight_mode = config.cpu_packed_weight_mode;
-    compiled_model.effective_runtime_config.selected_cpu_packed_weight_mode = selected_cpu_packed_weight_mode;
+    compiled_model.effective_runtime_config.requested_cpu_packed_weight_mode =
+        config.cpu_packed_weight_mode;
+    compiled_model.effective_runtime_config.selected_cpu_packed_weight_mode =
+        selected_cpu_packed_weight_mode;
     compiled_model.effective_runtime_config.host_memory_budget_bytes = plan.host_memory_budget_bytes;
     compiled_model.effective_runtime_config.expert_cache_bytes = plan.expert_cache_bytes;
     compiled_model.effective_runtime_config.expert_gpu_cache_bytes = expert_gpu_cache_bytes;
@@ -785,7 +765,7 @@ Result<ModelPtr> Runtime::load_model(
     inspect_qnk_graph(compiled_model.speculative.graph);
     if (has_resident_qnk_experts
         && use_vulkan_dense
-        && has_flag(config.optimization_flags, RuntimeOptimizationVulkanQnK)
+        && has_flag(effective_optimization_flags, RuntimeOptimizationVulkanQnK)
         && !compiled_model.expert_backend)
     {
         if (maximum_qnk_pair_bytes == 0

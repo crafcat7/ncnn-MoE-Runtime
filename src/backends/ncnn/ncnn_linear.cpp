@@ -23,7 +23,6 @@
 #include "kernels/vulkan/bfloat16_rms_norm_projection.comp.hex.h"
 #include "kernels/vulkan/bfloat16_swiglu_down.comp.hex.h"
 #include "kernels/vulkan/float8_projection.comp.hex.h"
-#include "kernels/vulkan/float8_projection_tiled4.comp.hex.h"
 #include "kernels/vulkan/float8_quantize.comp.hex.h"
 #include "kernels/vulkan/float8_rms_norm_quantize.comp.hex.h"
 #include "kernels/vulkan/float8_swiglu_quantize.comp.hex.h"
@@ -300,13 +299,10 @@ static bool ncnn_cpu_bfloat16_linear_enabled(uint64_t optimization_flags) noexce
     // unbenchmarked ISAs. The direct BF16 path is default only where its
     // AVX512 implementation has been validated end to end.
     const bool default_enabled = (isa & CpuIsaX86Avx512) == 0;
-    return runtime_optimization_enabled(
+    return default_enabled
+           && runtime_optimization_enabled(
                optimization_flags,
-               RuntimeOptimizationNcnnCpuBfloat16Linear)
-           && (default_enabled
-               || runtime_optimization_enabled(
-                   optimization_flags,
-                   RuntimeOptimizationNcnnCpuBfloat16LinearForce));
+               RuntimeOptimizationNcnnCpuBfloat16Linear);
 }
 #endif
 
@@ -1350,13 +1346,6 @@ static size_t vulkan_activation_storage_variant(
                                      : 0;
 }
 
-static bool vulkan_fp16_activations_enabled(uint64_t optimization_flags) noexcept
-{
-    return runtime_optimization_enabled(
-        optimization_flags,
-        RuntimeOptimizationVulkanFp16Activations);
-}
-
 static size_t vulkan_activation_element_size(
     const ncnn::Option& option) noexcept
 {
@@ -1414,26 +1403,16 @@ static bool vulkan_attention_device_rope_enabled(uint64_t optimization_flags) no
 
 static bool direct_host_buffer_enabled(
     const NcnnVulkanContext& context,
-    size_t bytes,
-    bool enabled,
-    size_t maximum_discrete_default_bytes) noexcept
+    size_t bytes) noexcept
 {
-    // Host-visible buffers are useful for small activation tensors, but are
-    // not a replacement for device-local storage on discrete GPUs.  Keep
-    // this policy generic: dtype/layout and device class decide it, not a
-    // model adapter or checkpoint family.
+    // Direct host bindings are a memory-topology policy, not a user-facing
+    // optimization toggle. Keep device-local storage on discrete GPUs.
     constexpr size_t maximum_direct_host_bytes = 64 * 1024;
     if (bytes > maximum_direct_host_bytes)
         return false;
 
-    if (!enabled)
-        return false;
-
     const ncnn::VulkanDevice* device = context.device();
-    return device
-           && (device->info.type() > 0
-               || (maximum_discrete_default_bytes != 0
-                   && bytes <= maximum_discrete_default_bytes));
+    return device && device->info.type() > 0;
 }
 
 static bool direct_host_input_enabled(
@@ -1446,13 +1425,7 @@ static bool direct_host_input_enabled(
     // FP32 storage contract used by this path.
     if (input_dtype != DType::Float32)
         return false;
-    return direct_host_buffer_enabled(
-        context,
-        input_bytes,
-        runtime_optimization_enabled(
-            context.optimization_flags(),
-            RuntimeOptimizationVulkanDirectHostInput),
-        16 * 1024);
+    return direct_host_buffer_enabled(context, input_bytes);
 }
 
 static bool direct_host_output_enabled(
@@ -1460,19 +1433,10 @@ static bool direct_host_output_enabled(
     size_t output_bytes,
     DType output_dtype) noexcept
 {
-    // The command layer now records the shader-write -> host-read barrier
-    // explicitly.  Keep this conservative on discrete GPUs by default: a
-    // host-visible output can save a device-to-staging copy for small tensors,
-    // but PCIe write latency can outweigh that saving for larger outputs.
+    // The command layer records the shader-write -> host-read barrier.
     if (output_dtype != DType::Float32)
         return false;
-    return direct_host_buffer_enabled(
-        context,
-        output_bytes,
-        runtime_optimization_enabled(
-            context.optimization_flags(),
-            RuntimeOptimizationVulkanDirectHostOutput),
-        0);
+    return direct_host_buffer_enabled(context, output_bytes);
 }
 
 static ncnn::VkMat bind_direct_host_input(ncnn::VkMat& staging, NcnnVulkanRuntimeState& runtime_state)
@@ -3470,8 +3434,7 @@ NcnnVulkanBfloat16Operator::create(
     implementation.option.vulkan_device_index = device->info.device_index();
     implementation.option.use_vulkan_compute = true;
     implementation.option.use_fp16_packed = false;
-    implementation.option.use_fp16_storage = vulkan_fp16_activations_enabled(implementation.optimization_flags)
-                                             && device->info.support_fp16_storage();
+    implementation.option.use_fp16_storage = false;
     implementation.option.use_fp16_arithmetic = false;
     implementation.option.use_bf16_packed = false;
     implementation.option.use_bf16_storage = false;
@@ -5895,7 +5858,6 @@ public:
     std::shared_ptr<NcnnVulkanContext> vulkan_context;
     std::unique_ptr<ncnn::VkWeightStagingAllocator> weight_staging_allocator;
     std::shared_ptr<ncnn::Pipeline> pipeline;
-    std::shared_ptr<ncnn::Pipeline> tiled4_pipeline;
     std::shared_ptr<ncnn::Pipeline> quantize_pipeline;
     std::shared_ptr<ncnn::Pipeline> swiglu_quantize_pipeline;
     std::shared_ptr<ncnn::Pipeline> rms_norm_quantize_pipeline;
@@ -5918,12 +5880,6 @@ public:
 };
 
 #if NCNN_MOE_WITH_VULKAN
-
-// Four-output FP8 GEMV variant.  A workgroup shares each 128-value input
-// block across four adjacent output rows, reducing repeated activation loads
-// for decode-sized batches while retaining the exact FP32 accumulation and
-// FP8 dequantization of the scalar path.  It is only selected for a single
-// input group, where the four output rows address the same input row.
 
 static bool create_float8_projection_pipeline(
     const std::shared_ptr<NcnnVulkanContext>& context,
@@ -5954,46 +5910,6 @@ static bool create_float8_projection_pipeline(
         delete value;
     });
     context->cache_pipeline(float8_projection_shader, 0, destination);
-    return true;
-}
-
-static bool create_float8_projection_tiled4_pipeline(
-    const std::shared_ptr<NcnnVulkanContext>& context,
-    const ncnn::Option& option,
-    std::shared_ptr<ncnn::Pipeline>& destination)
-{
-    const std::shared_ptr<const std::vector<uint32_t>> spirv = context->shader_binary(
-        float8_projection_tiled4_shader,
-        static_cast<int>(sizeof(float8_projection_tiled4_shader) - 1),
-        option,
-        0);
-    if (!spirv || spirv->empty())
-        return false;
-
-    ncnn::VulkanDevice* device = context->device();
-    destination = context->find_pipeline(float8_projection_tiled4_shader, 0);
-    if (destination)
-    {
-        return true;
-    }
-    std::unique_ptr<ncnn::Pipeline> pipeline(new ncnn::Pipeline(device));
-    pipeline->set_optimal_local_size_xyz(32, 1, 1);
-    const std::vector<ncnn::vk_specialization_type> specializations;
-    if (pipeline->create(
-            spirv->data(),
-            spirv->size() * sizeof(uint32_t),
-            specializations)
-        != 0)
-    {
-        return false;
-    }
-    destination = std::shared_ptr<ncnn::Pipeline>(
-        pipeline.release(),
-        [context](ncnn::Pipeline* value) {
-            const std::lock_guard<std::mutex> lock(context->command_mutex());
-            delete value;
-        });
-    context->cache_pipeline(float8_projection_tiled4_shader, 0, destination);
     return true;
 }
 
@@ -6111,66 +6027,6 @@ static bool prepare_float8_upload(std::span<const uint8_t> source, ncnn::Mat& de
     return true;
 }
 
-static bool vulkan_float8_tiled4_enabled(uint64_t optimization_flags) noexcept
-{
-    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationVulkanFp8Tile4);
-}
-
-static const ncnn::Pipeline* select_float8_projection_pipeline(
-    const std::shared_ptr<ncnn::Pipeline>& scalar_pipeline,
-    const std::shared_ptr<ncnn::Pipeline>& tiled4_pipeline,
-    uint32_t input_group_count,
-    uint32_t matrix_input_columns,
-    uint32_t logical_input_columns,
-    uint32_t output_columns,
-    uint64_t optimization_flags)
-{
-    if (vulkan_float8_tiled4_enabled(optimization_flags)
-        && tiled4_pipeline
-        && input_group_count == 1
-        && matrix_input_columns == logical_input_columns
-        && output_columns >= 4)
-    {
-        return tiled4_pipeline.get();
-    }
-    return scalar_pipeline.get();
-}
-
-static bool vulkan_float8_input_quantize_enabled(uint64_t optimization_flags) noexcept
-{
-    return runtime_optimization_enabled(
-        optimization_flags,
-        RuntimeOptimizationVulkanInputQuantize);
-}
-
-static bool record_float8_input_quantize(
-    const std::shared_ptr<ncnn::Pipeline>& quantize_pipeline,
-    ncnn::VkMat& input,
-    uint32_t columns,
-    size_t token_count,
-    ncnn::VkCompute& command)
-{
-    if (!quantize_pipeline || columns == 0 || columns % 128 != 0 || token_count == 0
-        || token_count > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-    {
-        return false;
-    }
-
-    std::vector<ncnn::VkMat> bindings = {input};
-    std::vector<ncnn::vk_constant_type> constants(2);
-    constants[0].u32 = columns;
-    constants[1].u32 = static_cast<uint32_t>(token_count);
-    ncnn::VkMat dispatcher;
-    dispatcher.w = static_cast<int>((columns / 128) * 32);
-    dispatcher.h = static_cast<int>(token_count);
-    dispatcher.c = 1;
-    command.record_pipeline(
-        quantize_pipeline.get(),
-        bindings,
-        constants,
-        dispatcher);
-    return true;
-}
 #endif
 
 NcnnVulkanFloat8Operator::NcnnVulkanFloat8Operator()
@@ -6285,13 +6141,6 @@ std::shared_ptr<NcnnVulkanFloat8Operator> NcnnVulkanFloat8Operator::create(
                 implementation.option,
                 implementation.swiglu_quantize_pipeline))
             return {};
-        if (vulkan_float8_tiled4_enabled(optimization_flags))
-        {
-            (void)create_float8_projection_tiled4_pipeline(
-                implementation.vulkan_context,
-                implementation.option,
-                implementation.tiled4_pipeline);
-        }
     }
     ncnn::Option upload_option = implementation.option;
     upload_option.blob_vkallocator = implementation.vulkan_context->blob_allocator();
@@ -6454,21 +6303,15 @@ bool NcnnVulkanFloat8Operator::forward(const ActivationBuffer& input, Activation
         static_cast<size_t>(input.rows()) * implementation.output_columns
             * sizeof(float),
         output.dtype());
-    const bool gpu_input_quantize = vulkan_float8_input_quantize_enabled(implementation.optimization_flags) && implementation.quantize_pipeline;
-    ActivationBuffer quantized_input;
-    if (!gpu_input_quantize)
-    {
-        quantized_input = input;
-        for (size_t token_index = 0; token_index < quantized_input.rows(); ++token_index)
-            quantize_float8_e4m3_inplace(
-                quantized_input.row(token_index),
-                implementation.logical_input_columns,
-                128,
-                true,
-                implementation.optimization_flags);
-    }
-    const ActivationBuffer& upload_input = gpu_input_quantize ? input : quantized_input;
-    if (!fill_staging_upload(upload_input, transfer_slot.upload, transfer_slot.staging_allocator, runtime_state)
+    ActivationBuffer quantized_input = input;
+    for (size_t token_index = 0; token_index < quantized_input.rows(); ++token_index)
+        quantize_float8_e4m3_inplace(
+            quantized_input.row(token_index),
+            implementation.logical_input_columns,
+            128,
+            true,
+            implementation.optimization_flags);
+    if (!fill_staging_upload(quantized_input, transfer_slot.upload, transfer_slot.staging_allocator, runtime_state)
         || !prepare_staging_batch(transfer_slot.download, input.rows(), implementation.output_columns, transfer_slot.staging_allocator, runtime_state))
     {
         return false;
@@ -6490,16 +6333,6 @@ bool NcnnVulkanFloat8Operator::forward(const ActivationBuffer& input, Activation
         input_gpu = bind_direct_host_input(transfer_slot.upload, runtime_state);
     else if (!record_mapped_upload(transfer_slot.upload, input_gpu, command, implementation.option))
         return false;
-    if (gpu_input_quantize
-        && !record_float8_input_quantize(
-            implementation.quantize_pipeline,
-            input_gpu,
-            implementation.logical_input_columns,
-            input.rows(),
-            command))
-    {
-        return false;
-    }
     ncnn::VkMat output_gpu;
     if (direct_host_output)
         output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
@@ -6530,14 +6363,7 @@ bool NcnnVulkanFloat8Operator::forward(const ActivationBuffer& input, Activation
     dispatcher.h = static_cast<int>(input.rows());
     dispatcher.c = 1;
     command.record_pipeline_readonly(
-        select_float8_projection_pipeline(
-            implementation.pipeline,
-            implementation.tiled4_pipeline,
-            implementation.input_group_count,
-            implementation.matrix_input_columns,
-            implementation.logical_input_columns,
-            implementation.output_columns,
-            implementation.optimization_flags),
+        implementation.pipeline.get(),
         bindings,
         {1, 1, 1, 1, 0},
         constants,
@@ -6557,7 +6383,7 @@ bool NcnnVulkanFloat8Operator::forward(const ActivationBuffer& input, Activation
     {
         return false;
     }
-    runtime_state.dispatches += 1 + static_cast<uint64_t>(gpu_input_quantize);
+    ++runtime_state.dispatches;
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     ++runtime_state.batch_downloads;
@@ -6591,17 +6417,11 @@ bool NcnnVulkanFloat8Operator::forward_chain(const ActivationBuffer& input, cons
         static_cast<size_t>(input.rows()) * second.output_columns
             * sizeof(float),
         output.dtype());
-    const bool gpu_input_quantize = vulkan_float8_input_quantize_enabled(first.optimization_flags) && first.quantize_pipeline;
-    ActivationBuffer quantized_input;
-    if (!gpu_input_quantize)
-    {
-        quantized_input = input;
-        for (size_t token_index = 0; token_index < quantized_input.rows(); ++token_index)
-            quantize_float8_e4m3_inplace(quantized_input.row(token_index), first.logical_input_columns, 128, true,
-                                         first.optimization_flags);
-    }
-    const ActivationBuffer& upload_input = gpu_input_quantize ? input : quantized_input;
-    if (!fill_staging_upload(upload_input, transfer_slot.upload, transfer_slot.staging_allocator, runtime_state)
+    ActivationBuffer quantized_input = input;
+    for (size_t token_index = 0; token_index < quantized_input.rows(); ++token_index)
+        quantize_float8_e4m3_inplace(quantized_input.row(token_index), first.logical_input_columns, 128, true,
+                                     first.optimization_flags);
+    if (!fill_staging_upload(quantized_input, transfer_slot.upload, transfer_slot.staging_allocator, runtime_state)
         || !prepare_staging_batch(transfer_slot.download, input.rows(), second.output_columns, transfer_slot.staging_allocator, runtime_state))
     {
         return false;
@@ -6621,16 +6441,6 @@ bool NcnnVulkanFloat8Operator::forward_chain(const ActivationBuffer& input, cons
     ncnn::VkMat input_gpu;
     if (!record_mapped_upload(transfer_slot.upload, input_gpu, command, first.option))
         return false;
-    if (gpu_input_quantize
-        && !record_float8_input_quantize(
-            first.quantize_pipeline,
-            input_gpu,
-            first.logical_input_columns,
-            input.rows(),
-            command))
-    {
-        return false;
-    }
     ncnn::VkMat intermediate_gpu;
     intermediate_gpu.create(
         static_cast<int>(first.output_columns),
@@ -6662,14 +6472,7 @@ bool NcnnVulkanFloat8Operator::forward_chain(const ActivationBuffer& input, cons
     first_dispatcher.h = static_cast<int>(input.rows());
     first_dispatcher.c = 1;
     command.record_pipeline_readonly(
-        select_float8_projection_pipeline(
-            first.pipeline,
-            first.tiled4_pipeline,
-            first.input_group_count,
-            first.matrix_input_columns,
-            first.logical_input_columns,
-            first.output_columns,
-            first.optimization_flags),
+        first.pipeline.get(),
         first_bindings,
         {1, 1, 1, 1, 0},
         first_constants,
@@ -6698,14 +6501,7 @@ bool NcnnVulkanFloat8Operator::forward_chain(const ActivationBuffer& input, cons
     second_dispatcher.h = static_cast<int>(input.rows());
     second_dispatcher.c = 1;
     command.record_pipeline_readonly(
-        select_float8_projection_pipeline(
-            second.pipeline,
-            second.tiled4_pipeline,
-            second.input_group_count,
-            second.matrix_input_columns,
-            second.logical_input_columns,
-            second.output_columns,
-            second.optimization_flags),
+        second.pipeline.get(),
         second_bindings,
         {1, 1, 1, 1, 0},
         second_constants,
@@ -6726,7 +6522,7 @@ bool NcnnVulkanFloat8Operator::forward_chain(const ActivationBuffer& input, cons
     {
         return false;
     }
-    runtime_state.dispatches += 2 + static_cast<uint64_t>(gpu_input_quantize);
+    runtime_state.dispatches += 2;
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     ++runtime_state.batch_downloads;
@@ -6766,17 +6562,11 @@ bool NcnnVulkanFloat8Operator::forward_rms_norm_chain(
         static_cast<size_t>(input.rows()) * second.output_columns
             * sizeof(float),
         output.dtype());
-    const bool gpu_input_quantize = vulkan_float8_input_quantize_enabled(first.optimization_flags) && first.rms_norm_quantize_pipeline;
-    ActivationBuffer quantized_input;
-    if (!gpu_input_quantize)
-    {
-        quantized_input = input;
-        for (size_t token_index = 0; token_index < quantized_input.rows(); ++token_index)
-            quantize_float8_e4m3_inplace(quantized_input.row(token_index), first.logical_input_columns, 128, true,
-                                         first.optimization_flags);
-    }
-    const ActivationBuffer& upload_input = gpu_input_quantize ? input : quantized_input;
-    if (!fill_staging_upload(upload_input, transfer_slot.upload, transfer_slot.staging_allocator, runtime_state)
+    ActivationBuffer quantized_input = input;
+    for (size_t token_index = 0; token_index < quantized_input.rows(); ++token_index)
+        quantize_float8_e4m3_inplace(quantized_input.row(token_index), first.logical_input_columns, 128, true,
+                                     first.optimization_flags);
+    if (!fill_staging_upload(quantized_input, transfer_slot.upload, transfer_slot.staging_allocator, runtime_state)
         || !prepare_staging_batch(transfer_slot.download, input.rows(), second.output_columns, transfer_slot.staging_allocator, runtime_state))
     {
         return false;
@@ -6796,16 +6586,6 @@ bool NcnnVulkanFloat8Operator::forward_rms_norm_chain(
     ncnn::VkMat input_gpu;
     if (!record_mapped_upload(transfer_slot.upload, input_gpu, command, first.option))
         return false;
-    if (gpu_input_quantize
-        && !record_float8_input_quantize(
-            first.quantize_pipeline,
-            input_gpu,
-            first.logical_input_columns,
-            input.rows(),
-            command))
-    {
-        return false;
-    }
     ncnn::VkMat intermediate_gpu;
     intermediate_gpu.create(
         static_cast<int>(first.output_columns),
@@ -6837,14 +6617,7 @@ bool NcnnVulkanFloat8Operator::forward_rms_norm_chain(
     first_dispatcher.h = static_cast<int>(input.rows());
     first_dispatcher.c = 1;
     command.record_pipeline_readonly(
-        select_float8_projection_pipeline(
-            first.pipeline,
-            first.tiled4_pipeline,
-            first.input_group_count,
-            first.matrix_input_columns,
-            first.logical_input_columns,
-            first.output_columns,
-            first.optimization_flags),
+        first.pipeline.get(),
         first_bindings,
         {1, 1, 1, 1, 0},
         first_constants,
@@ -6879,14 +6652,7 @@ bool NcnnVulkanFloat8Operator::forward_rms_norm_chain(
     second_dispatcher.h = static_cast<int>(input.rows());
     second_dispatcher.c = 1;
     command.record_pipeline_readonly(
-        select_float8_projection_pipeline(
-            second.pipeline,
-            second.tiled4_pipeline,
-            second.input_group_count,
-            second.matrix_input_columns,
-            second.logical_input_columns,
-            second.output_columns,
-            second.optimization_flags),
+        second.pipeline.get(),
         second_bindings,
         {1, 1, 1, 1, 0},
         second_constants,
@@ -6907,7 +6673,7 @@ bool NcnnVulkanFloat8Operator::forward_rms_norm_chain(
     {
         return false;
     }
-    runtime_state.dispatches += 2 + static_cast<uint64_t>(gpu_input_quantize);
+    runtime_state.dispatches += 2;
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     ++runtime_state.batch_downloads;
@@ -6969,18 +6735,15 @@ bool NcnnVulkanFloat8Operator::forward_rms_norm_chain_parallel_impl(
         static_cast<size_t>(input.rows()) * parallel.output_columns
             * sizeof(float),
         parallel_output.dtype());
-    const bool gpu_input_quantize = !normalize_input
-                                    && vulkan_float8_input_quantize_enabled(first.optimization_flags)
-                                    && first.quantize_pipeline;
     ActivationBuffer quantized_input;
-    if (!normalize_input && !gpu_input_quantize)
+    if (!normalize_input)
     {
         quantized_input = input;
         for (size_t token_index = 0; token_index < quantized_input.rows(); ++token_index)
             quantize_float8_e4m3_inplace(quantized_input.row(token_index), first.logical_input_columns, 128, true,
                                          first.optimization_flags);
     }
-    const ActivationBuffer& upload_input = normalize_input || gpu_input_quantize ? input : quantized_input;
+    const ActivationBuffer& upload_input = normalize_input ? input : quantized_input;
     ncnn::VkMat parallel_download;
     if (!fill_staging_upload(upload_input, transfer_slot.upload, transfer_slot.staging_allocator, runtime_state)
         || !prepare_staging_batch(transfer_slot.download, input.rows(), second.output_columns, transfer_slot.staging_allocator, runtime_state)
@@ -7024,16 +6787,6 @@ bool NcnnVulkanFloat8Operator::forward_rms_norm_chain_parallel_impl(
             {0, 1},
             input_norm_constants,
             input_norm_dispatcher);
-    }
-    else if (gpu_input_quantize
-             && !record_float8_input_quantize(
-                 first.quantize_pipeline,
-                 input_gpu,
-                 first.logical_input_columns,
-                 input.rows(),
-                 command))
-    {
-        return false;
     }
     ncnn::VkMat intermediate_gpu;
     intermediate_gpu.create(
@@ -7082,14 +6835,7 @@ bool NcnnVulkanFloat8Operator::forward_rms_norm_chain_parallel_impl(
         dispatcher.h = static_cast<int>(input.rows());
         dispatcher.c = 1;
         command.record_pipeline_readonly(
-            select_float8_projection_pipeline(
-                projection.pipeline,
-                projection.tiled4_pipeline,
-                projection.input_group_count,
-                projection.matrix_input_columns,
-                projection.logical_input_columns,
-                projection.output_columns,
-                projection.optimization_flags),
+            projection.pipeline.get(),
             bindings,
             {1, 1, 1, 1, 0},
             constants,
@@ -7141,7 +6887,7 @@ bool NcnnVulkanFloat8Operator::forward_rms_norm_chain_parallel_impl(
     {
         return false;
     }
-    runtime_state.dispatches += 3 + static_cast<uint64_t>(gpu_input_quantize);
+    runtime_state.dispatches += 3;
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     runtime_state.batch_downloads += 2;
@@ -7424,14 +7170,7 @@ bool NcnnVulkanFloat8Operator::forward_rms_norm_chain_parallel_bfloat16(
         dispatcher.h = static_cast<int>(input.rows());
         dispatcher.c = 1;
         command.record_pipeline_readonly(
-            select_float8_projection_pipeline(
-                projection.pipeline,
-                projection.tiled4_pipeline,
-                projection.input_group_count,
-                projection.matrix_input_columns,
-                projection.logical_input_columns,
-                projection.output_columns,
-                projection.optimization_flags),
+            projection.pipeline.get(),
             bindings,
             {1, 1, 1, 1, 0},
             constants,
@@ -7594,17 +7333,11 @@ bool NcnnVulkanFloat8Operator::forward_swiglu_chain(
         static_cast<size_t>(input.rows()) * down.output_columns
             * sizeof(float),
         output.dtype());
-    const bool gpu_input_quantize = vulkan_float8_input_quantize_enabled(gate.optimization_flags) && gate.quantize_pipeline;
-    ActivationBuffer quantized_input;
-    if (!gpu_input_quantize)
-    {
-        quantized_input = input;
-        for (size_t token_index = 0; token_index < quantized_input.rows(); ++token_index)
-            quantize_float8_e4m3_inplace(quantized_input.row(token_index), gate.logical_input_columns, 128, true,
-                                         gate.optimization_flags);
-    }
-    const ActivationBuffer& upload_input = gpu_input_quantize ? input : quantized_input;
-    if (!fill_staging_upload(upload_input, transfer_slot.upload, transfer_slot.staging_allocator, runtime_state)
+    ActivationBuffer quantized_input = input;
+    for (size_t token_index = 0; token_index < quantized_input.rows(); ++token_index)
+        quantize_float8_e4m3_inplace(quantized_input.row(token_index), gate.logical_input_columns, 128, true,
+                                     gate.optimization_flags);
+    if (!fill_staging_upload(quantized_input, transfer_slot.upload, transfer_slot.staging_allocator, runtime_state)
         || !prepare_staging_batch(transfer_slot.download, input.rows(), down.output_columns, transfer_slot.staging_allocator, runtime_state))
     {
         return false;
@@ -7624,16 +7357,6 @@ bool NcnnVulkanFloat8Operator::forward_swiglu_chain(
     ncnn::VkMat input_gpu;
     if (!record_mapped_upload(transfer_slot.upload, input_gpu, command, gate.option))
         return false;
-    if (gpu_input_quantize
-        && !record_float8_input_quantize(
-            gate.quantize_pipeline,
-            input_gpu,
-            gate.logical_input_columns,
-            input.rows(),
-            command))
-    {
-        return false;
-    }
     ncnn::VkMat gate_gpu;
     gate_gpu.create(
         static_cast<int>(gate.output_columns),
@@ -7678,14 +7401,7 @@ bool NcnnVulkanFloat8Operator::forward_swiglu_chain(
         dispatcher.h = static_cast<int>(input.rows());
         dispatcher.c = 1;
         command.record_pipeline_readonly(
-            select_float8_projection_pipeline(
-                projection.pipeline,
-                projection.tiled4_pipeline,
-                projection.input_group_count,
-                projection.matrix_input_columns,
-                projection.logical_input_columns,
-                projection.output_columns,
-                projection.optimization_flags),
+            projection.pipeline.get(),
             bindings,
             {1, 1, 1, 1, 0},
             constants,
@@ -7725,7 +7441,7 @@ bool NcnnVulkanFloat8Operator::forward_swiglu_chain(
     {
         return false;
     }
-    runtime_state.dispatches += 3 + static_cast<uint64_t>(gpu_input_quantize);
+    runtime_state.dispatches += 3;
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     ++runtime_state.batch_downloads;
@@ -9293,9 +9009,6 @@ static bool route_aggregation_enabled(
     const bool enabled = runtime_optimization_enabled(
         optimization_flags,
         RuntimeOptimizationVulkanRouteAggregation);
-    const bool force_small = runtime_optimization_enabled(
-        optimization_flags,
-        RuntimeOptimizationVulkanRouteAggregationForce);
     if (!enabled)
         return false;
 
@@ -9338,8 +9051,6 @@ static bool route_aggregation_enabled(
     // hard-coding a model or hidden size: this enables the optimization for
     // large generic MoE outputs while leaving tiny test and latency paths on
     // the simple per-route return.
-    if (force_small)
-        return true;
     if (route_count <= token_count)
         return false;
     if (token_count > 1)
@@ -12637,19 +12348,14 @@ static bool record_attention_output_gate(
 enum class DecodeSdpaMode
 {
     Auto,
-    Disabled,
-    Forced
+    Disabled
 };
 
 static DecodeSdpaMode decode_sdpa_mode(uint64_t optimization_flags) noexcept
 {
     if (!runtime_optimization_enabled(optimization_flags, RuntimeOptimizationVulkanDecodeSdpa))
         return DecodeSdpaMode::Disabled;
-    return runtime_optimization_enabled(
-               optimization_flags,
-               RuntimeOptimizationVulkanDecodeSdpaForce)
-               ? DecodeSdpaMode::Forced
-               : DecodeSdpaMode::Auto;
+    return DecodeSdpaMode::Auto;
 }
 
 static bool qkv_ring_fusion_enabled(uint64_t optimization_flags) noexcept
@@ -13574,19 +13280,16 @@ bool NcnnVulkanAttentionOperator::forward(uint64_t position_offset, CpuLayerCach
     const bool adaptive_decode_sdpa = input.rows() == 1
                                       && config.head_dimension <= 128
                                       && destination_count <= 4096
-                                      && selected_decode_sdpa_mode
-                                             == DecodeSdpaMode::Auto;
+                                      && selected_decode_sdpa_mode == DecodeSdpaMode::Auto;
     const bool try_decode_sdpa = input.rows() == 1
                                  && selected_decode_sdpa_mode
                                         != DecodeSdpaMode::Disabled
-                                 && (selected_decode_sdpa_mode
-                                         == DecodeSdpaMode::Forced
-                                     || (adaptive_decode_sdpa
-                                         && implementation.choose_decode_sdpa(
-                                             config.head_dimension,
-                                             config.head_count,
-                                             config.kv_head_count,
-                                             destination_count)));
+                                 && adaptive_decode_sdpa
+                                 && implementation.choose_decode_sdpa(
+                                     config.head_dimension,
+                                     config.head_count,
+                                     config.kv_head_count,
+                                     destination_count);
 
     const bool query_key_norm_and_gate = implementation.fused_qkv_gate != nullptr;
     const NcnnLinearOperator::Implementation* fused = implementation.fused_qkv
@@ -14802,13 +14505,12 @@ NcnnVulkanAttentionOperator::forward_batch(
                                     && destination_count <= 4096
                                     && selected_decode_sdpa_mode == DecodeSdpaMode::Auto;
         work.try_decode_sdpa = selected_decode_sdpa_mode != DecodeSdpaMode::Disabled
-                               && (selected_decode_sdpa_mode == DecodeSdpaMode::Forced
-                                   || (work.adaptive_decode_sdpa
-                                       && implementation.choose_decode_sdpa(
-                                           config.head_dimension,
-                                           config.head_count,
-                                           config.kv_head_count,
-                                           destination_count)));
+                               && work.adaptive_decode_sdpa
+                               && implementation.choose_decode_sdpa(
+                                   config.head_dimension,
+                                   config.head_count,
+                                   config.kv_head_count,
+                                   destination_count);
         work.next_cache = cache.vulkan_attention_cache;
         work.retained_tokens = config.sliding_window == 0
                                    ? actual_token_count

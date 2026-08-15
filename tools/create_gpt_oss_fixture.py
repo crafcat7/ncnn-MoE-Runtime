@@ -182,14 +182,14 @@ def main() -> None:
             stderr=subprocess.STDOUT,
             check=False,
         )
-        cpu_raw = subprocess.run(
+        cpu = subprocess.run(
             common_arguments + ["--cpu", "--cpu-packed-weights", "off"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=False,
         )
-        cpu_packed = subprocess.run(
+        packed = subprocess.run(
             common_arguments + ["--cpu", "--cpu-packed-weights", "on"],
             text=True,
             stdout=subprocess.PIPE,
@@ -206,15 +206,24 @@ def main() -> None:
         print(automatic.stdout, end="")
         if automatic.returncode:
             raise SystemExit(automatic.returncode)
-        if cpu_raw.returncode:
-            print(cpu_raw.stdout, end="")
-            raise SystemExit(cpu_raw.returncode)
-        if cpu_packed.returncode:
-            print(cpu_packed.stdout, end="")
-            raise SystemExit(cpu_packed.returncode)
+        if cpu.returncode:
+            print(cpu.stdout, end="")
+            raise SystemExit(cpu.returncode)
         if paged.returncode:
             print(paged.stdout, end="")
             raise SystemExit(paged.returncode)
+        if "CPU packed weights off" not in automatic.stdout:
+            raise SystemExit("default GPT-OSS run did not keep CPU repack disabled")
+        if "CPU packed weights off" not in cpu.stdout:
+            print(cpu.stdout, end="")
+            raise SystemExit("explicit CPU packed-weight off mode was not selected")
+        packed_supported = packed.returncode == 0
+        if packed_supported and "CPU packed weights on" not in packed.stdout:
+            print(packed.stdout, end="")
+            raise SystemExit("explicit CPU packed-weight on mode was not selected")
+        if not packed_supported and "CPU packed weights are unavailable" not in packed.stdout:
+            print(packed.stdout, end="")
+            raise SystemExit(packed.returncode)
         if "loaded gpt_oss" not in automatic.stdout or "generated token ids:" not in automatic.stdout:
             raise SystemExit("GPT-OSS fixture runner output is incomplete")
         def generated_tokens(output: str) -> str:
@@ -225,20 +234,15 @@ def main() -> None:
             )
 
         automatic_tokens = generated_tokens(automatic.stdout)
-        cpu_raw_tokens = generated_tokens(cpu_raw.stdout)
-        cpu_packed_tokens = generated_tokens(cpu_packed.stdout)
+        cpu_tokens = generated_tokens(cpu.stdout)
         paged_tokens = generated_tokens(paged.stdout)
-        if automatic_tokens != cpu_raw_tokens or automatic_tokens != cpu_packed_tokens or automatic_tokens != paged_tokens:
-            print(cpu_raw.stdout, end="")
-            print(cpu_packed.stdout, end="")
+        if automatic_tokens != cpu_tokens or automatic_tokens != paged_tokens:
+            print(cpu.stdout, end="")
             print(paged.stdout, end="")
-            raise SystemExit("automatic, raw, packed, and paged GPT-OSS outputs differ")
-        if "CPU packed weights off" not in cpu_raw.stdout:
-            print(cpu_raw.stdout, end="")
-            raise SystemExit("GPT-OSS raw-layout run did not disable CPU packed weights")
-        if "CPU packed weights " not in cpu_packed.stdout:
-            print(cpu_packed.stdout, end="")
-            raise SystemExit("GPT-OSS packed-layout run did not report the effective policy")
+            raise SystemExit("automatic and CPU GPT-OSS outputs differ")
+        if packed_supported and automatic_tokens != generated_tokens(packed.stdout):
+            print(packed.stdout, end="")
+            raise SystemExit("packed and default GPT-OSS outputs differ")
         if "Expert cache: 2 hit(s), 1 miss(es)" not in paged.stdout:
             print(paged.stdout, end="")
             raise SystemExit("paged GPT-OSS fixture did not exercise the expert cache")

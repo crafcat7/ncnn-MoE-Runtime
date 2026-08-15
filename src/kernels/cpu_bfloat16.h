@@ -61,8 +61,7 @@ void float_to_bfloat16_array(
 void bfloat16_scaled_add(float* output, const uint16_t* input, float scale, uint32_t count) noexcept;
 
 // Uses a runtime-dispatched BF16 dot-product matrix kernel when a batch can
-// amortize packing the FP32 activations to BF16. The precision-changing
-// single-token path additionally requires RuntimeOptimizationCpuBfloat16SingleToken.
+// amortize packing the FP32 activations to BF16.
 // Returns false without modifying output when the kernel is unavailable or not
 // admitted.
 [[nodiscard]] bool bfloat16_batched_linear(const uint16_t* weights,

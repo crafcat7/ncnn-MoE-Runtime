@@ -530,6 +530,11 @@ bool mxfp4_q8_packed_kernel_available() noexcept
 #endif
 }
 
+bool mxfp4_q8_kernel_available() noexcept
+{
+    return mxfp4_q8_packed_kernel_available();
+}
+
 bool mxfp4_q8_pack_weights(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, size_t row_count,
                            Mxfp4Q8PackedMatrix& output, uint32_t tile_rows)
 {

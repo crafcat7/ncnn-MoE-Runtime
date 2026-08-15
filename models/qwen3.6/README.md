@@ -140,9 +140,9 @@ CTest fixture; normal text and chat usage should use `ncnn_moe.py`.
 | --- | --- |
 | `--cpu` | Portable CPU path |
 | `--hybrid` | Vulkan Dense projections with CPU stateful Attention and Experts |
-| `--hybrid-prefetch` | Same placement with explicit CPU prefetch coordination |
 | `--vulkan-device N` | Select one Vulkan device |
 | `--host-memory-mb N` | Override the automatic host-memory planning budget |
+| `--cpu-packed-weights on\|off` | Opt into MXFP4-Q8 repack when the compiled Artifact is active; default `off` |
 
 The official package contains about 60 GiB of routed BF16 Expert tensors.
 Without the optional Artifact, these tensors are mapped directly from

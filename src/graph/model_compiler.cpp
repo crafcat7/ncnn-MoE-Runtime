@@ -1591,7 +1591,7 @@ static Result<void> compile_speculative_model(
 Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping mapping, HybridMode hybrid_mode) const
 {
     BackendCapabilities capabilities;
-    if (hybrid_mode == HybridMode::HybridExperts || hybrid_mode == HybridMode::VulkanWithCpuPrefetch)
+    if (hybrid_mode == HybridMode::HybridExperts)
     {
         capabilities.flags |= BackendCapabilityVulkanDense | BackendCapabilityVulkanAttention;
     }
@@ -1643,7 +1643,7 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
     compiled.optimization_flags = capabilities.optimization_flags;
     compiled.vulkan_context_instance = capabilities.vulkan_context_instance;
     compiled.expert_store = std::make_shared<ExpertStore>();
-    const bool hybrid_requests_vulkan = hybrid_mode == HybridMode::HybridExperts || hybrid_mode == HybridMode::VulkanWithCpuPrefetch;
+    const bool hybrid_requests_vulkan = hybrid_mode == HybridMode::HybridExperts;
     const bool use_vulkan_dense = hybrid_requests_vulkan && has_flag(capabilities.flags, BackendCapabilityVulkanDense);
     const bool retain_cpu_dense_copies = has_flag(capabilities.flags, BackendCapabilityRetainCpuDenseCopies);
     std::vector<uint32_t> dense_device_indices = capabilities.vulkan_device_indices;

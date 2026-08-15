@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ncnn_moe_adapters import QwenAdapter, _normalize_token_ids, create_adapter  # noqa: E402
 from ncnn_moe import _format_bytes_gb, _format_runtime_metrics, default_worker_path, find_worker, parse_arguments  # noqa: E402
 from ncnn_moe_protocol import WorkerClient, WorkerError  # noqa: E402
+from ncnn_moe_state import runtime_args_from_settings  # noqa: E402
 
 
 def main() -> int:
@@ -63,6 +64,30 @@ def main() -> int:
     assert overrides.stream is False
     assert overrides.show_reasoning is False
     assert overrides.metrics_enabled is True
+
+    assert runtime_args_from_settings({"backend": "auto"}) == []
+    assert runtime_args_from_settings({"backend": "cpu"}) == ["--cpu"]
+    assert runtime_args_from_settings({"backend": "hybrid"}) == ["--hybrid"]
+    assert runtime_args_from_settings({"cpu_packed_weights": "off"}) == [
+        "--cpu-packed-weights",
+        "off",
+    ]
+    assert runtime_args_from_settings({"cpu_packed_weights": "on"}) == [
+        "--cpu-packed-weights",
+        "on",
+    ]
+    try:
+        runtime_args_from_settings({"cpu_packed_weights": "auto"})
+    except ValueError as error:
+        assert "must be off or on" in str(error)
+    else:
+        raise AssertionError("automatic CPU packed weights must not be accepted")
+    try:
+        runtime_args_from_settings({"backend": "vulkan"})
+    except ValueError as error:
+        assert "unknown backend" in str(error)
+    else:
+        raise AssertionError("Vulkan-only backend must not be accepted from saved settings")
 
     class FakeQwenTokenizer:
         eos_token_id = 99

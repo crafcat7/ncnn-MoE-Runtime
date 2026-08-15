@@ -29,7 +29,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--worker", required=True, type=Path)
-    parser.add_argument("--backend", choices=("cpu", "hybrid", "hybrid-prefetch"), default="cpu")
+    parser.add_argument("--backend", choices=("cpu", "hybrid"), default="cpu")
     parser.add_argument("--vulkan-device", type=int, default=0)
     parser.add_argument(
         "--expert-io-workers",
@@ -92,9 +92,6 @@ def _parse_args() -> argparse.Namespace:
 def _runtime_args(arguments: argparse.Namespace) -> list[str]:
     if arguments.backend == "cpu":
         runtime_args = ["--cpu"]
-    elif arguments.backend == "hybrid-prefetch":
-        mode = "--hybrid-prefetch"
-        runtime_args = [mode, "--vulkan-device", str(arguments.vulkan_device)]
     else:
         mode = "--hybrid"
         runtime_args = [mode, "--vulkan-device", str(arguments.vulkan_device)]

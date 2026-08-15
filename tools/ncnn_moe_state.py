@@ -159,7 +159,21 @@ def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
     args: list[str] = []
     backend = settings.get("backend")
     if backend and backend != "auto":
-        args.append(f"--{backend}")
+        backend_flags = {
+            "cpu": "--cpu",
+            "hybrid": "--hybrid",
+        }
+        backend_flag = backend_flags.get(backend) if isinstance(backend, str) else None
+        if backend_flag is None:
+            raise ValueError(f"unknown backend in runtime settings: {backend}")
+        args.append(backend_flag)
+    cpu_packed_weights = settings.get("cpu_packed_weights")
+    if cpu_packed_weights is not None:
+        if cpu_packed_weights not in ("off", "on"):
+            raise ValueError(
+                "CPU packed weights in runtime settings must be off or on"
+            )
+        args.extend(["--cpu-packed-weights", cpu_packed_weights])
     for key, option in (
         ("host_memory_mb", "--host-memory-mb"),
         ("expert_cache_mb", "--expert-cache-mb"),
@@ -167,7 +181,6 @@ def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
         ("expert_gpu_victim_cache_mb", "--expert-gpu-victim-cache-mb"),
         ("expert_io_workers", "--expert-io-workers"),
         ("expert_memory", "--expert-memory"),
-        ("cpu_packed_weights", "--cpu-packed-weights"),
         ("expected_concurrency", "--expected-concurrency"),
     ):
         value = settings.get(key)

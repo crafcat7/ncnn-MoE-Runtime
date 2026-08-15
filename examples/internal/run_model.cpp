@@ -30,8 +30,6 @@ static const char* hybrid_mode_name(HybridMode mode)
 {
     if (mode == HybridMode::HybridExperts)
         return "vulkan-dense/hybrid-experts";
-    if (mode == HybridMode::VulkanWithCpuPrefetch)
-        return "vulkan-dense/cpu-experts-prefetch";
     return "cpu";
 }
 
@@ -46,11 +44,7 @@ static const char* expert_memory_mode_name(ExpertMemoryMode mode)
 
 static const char* cpu_packed_weight_mode_name(CpuPackedWeightMode mode)
 {
-    if (mode == CpuPackedWeightMode::Enabled)
-        return "on";
-    if (mode == CpuPackedWeightMode::Disabled)
-        return "off";
-    return "auto";
+    return mode == CpuPackedWeightMode::Enabled ? "on" : "off";
 }
 
 static const char* require_value(int argc, char** argv, int& index, const char* option)
@@ -153,7 +147,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                                                                     " [--speculative-confidence P] [--speculative-max-draft N]"
                                                                     " [--top-k K] [--top-p P] [--min-p P] [--seed N]"
                                                                     " [--expert-memory auto|eager|on-demand]"
-                                                                    " [--cpu-packed-weights auto|on|off]"
+                                                                    " [--cpu-packed-weights on|off]"
                                                                     " [--host-memory-mb N] [--expert-cache-mb N]"
                                                                     " [--expert-gpu-cache-mb N]"
                                                                     " [--expert-gpu-victim-cache-mb N]"
@@ -182,10 +176,10 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                                                                     " [--parallel-speculative]"
                                                                     " [--scheduler-expert-threads N]"
                                                                     " [--scheduler-staging auto|force|off]"
-                                                                    " [--scheduler-cross-call]"
-                                                                    " [--scheduler-collection-us N]"
-                                                                    " [--scheduler-max-micro-batch N]"
-                                                                    " [--cpu|--hybrid|--hybrid-prefetch]"
+                                                                     " [--scheduler-cross-call]"
+                                                                     " [--scheduler-collection-us N]"
+                                                                     " [--scheduler-max-micro-batch N]"
+                                                                     " [--cpu|--hybrid]"
                                                                     " [--stream-token-ids] [--report-throughput]\n";
         return 2;
     }
@@ -399,22 +393,25 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             }
             else if (argument == "--cpu-packed-weights")
             {
-                const std::string mode = ncnn::moe::require_value(argc, argv, index, "--cpu-packed-weights");
-                if (mode == "auto")
+                const std::string mode = ncnn::moe::require_value(
+                    argc,
+                    argv,
+                    index,
+                    "--cpu-packed-weights");
+                if (mode == "on")
                 {
-                    runtime_options.cpu_packed_weight_mode = ncnn::moe::CpuPackedWeightMode::Auto;
-                }
-                else if (mode == "on")
-                {
-                    runtime_options.cpu_packed_weight_mode = ncnn::moe::CpuPackedWeightMode::Enabled;
+                    runtime_options.cpu_packed_weight_mode =
+                        ncnn::moe::CpuPackedWeightMode::Enabled;
                 }
                 else if (mode == "off")
                 {
-                    runtime_options.cpu_packed_weight_mode = ncnn::moe::CpuPackedWeightMode::Disabled;
+                    runtime_options.cpu_packed_weight_mode =
+                        ncnn::moe::CpuPackedWeightMode::Disabled;
                 }
                 else
                 {
-                    std::cerr << "--cpu-packed-weights must be auto, on, or off\n";
+                    std::cerr
+                        << "--cpu-packed-weights must be on or off\n";
                     return 2;
                 }
             }
@@ -528,10 +525,6 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             else if (argument == "--hybrid")
             {
                 runtime_options.hybrid_mode = ncnn::moe::HybridMode::HybridExperts;
-            }
-            else if (argument == "--hybrid-prefetch")
-            {
-                runtime_options.hybrid_mode = ncnn::moe::HybridMode::VulkanWithCpuPrefetch;
             }
             else
             {

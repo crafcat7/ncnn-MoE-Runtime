@@ -179,8 +179,6 @@ static const char* hybrid_mode_name(HybridMode mode) noexcept
     switch (mode)
     {
     case HybridMode::CpuOnly: return "cpu";
-    case HybridMode::VulkanOnly: return "vulkan";
-    case HybridMode::VulkanWithCpuPrefetch: return "hybrid-prefetch";
     case HybridMode::HybridExperts: return "hybrid";
     case HybridMode::Auto: return "auto";
     }
@@ -198,15 +196,10 @@ static const char* expert_memory_mode_name(ExpertMemoryMode mode) noexcept
     return "unknown";
 }
 
-static const char* cpu_packed_weight_mode_name(CpuPackedWeightMode mode) noexcept
+static const char* cpu_packed_weight_mode_name(
+    CpuPackedWeightMode mode) noexcept
 {
-    switch (mode)
-    {
-    case CpuPackedWeightMode::Auto: return "auto";
-    case CpuPackedWeightMode::Enabled: return "on";
-    case CpuPackedWeightMode::Disabled: return "off";
-    }
-    return "unknown";
+    return mode == CpuPackedWeightMode::Enabled ? "on" : "off";
 }
 
 static const char* vulkan_type_name(VulkanDeviceType type) noexcept
@@ -636,9 +629,7 @@ static HybridMode parse_hybrid_mode(const std::string& value)
 {
     if (value == "auto") return HybridMode::Auto;
     if (value == "cpu") return HybridMode::CpuOnly;
-    if (value == "vulkan") return HybridMode::VulkanOnly;
     if (value == "hybrid") return HybridMode::HybridExperts;
-    if (value == "hybrid-prefetch") return HybridMode::VulkanWithCpuPrefetch;
     throw std::invalid_argument("unknown backend: " + value);
 }
 
@@ -650,12 +641,13 @@ static ExpertMemoryMode parse_expert_memory_mode(const std::string& value)
     throw std::invalid_argument("unknown Expert memory mode: " + value);
 }
 
-static CpuPackedWeightMode parse_cpu_packed_weight_mode(const std::string& value)
+static CpuPackedWeightMode parse_cpu_packed_weight_mode(
+    const std::string& value)
 {
-    if (value == "auto") return CpuPackedWeightMode::Auto;
     if (value == "on") return CpuPackedWeightMode::Enabled;
     if (value == "off") return CpuPackedWeightMode::Disabled;
-    throw std::invalid_argument("unknown CPU packed-weight mode: " + value);
+    throw std::invalid_argument(
+        "CPU packed-weight mode must be on or off");
 }
 
 static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argument)
@@ -673,10 +665,6 @@ static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argum
             result.hybrid_mode = HybridMode::CpuOnly;
         else if (argument == "--hybrid")
             result.hybrid_mode = HybridMode::HybridExperts;
-        else if (argument == "--hybrid-prefetch")
-            result.hybrid_mode = HybridMode::VulkanWithCpuPrefetch;
-        else if (argument == "--vulkan")
-            result.hybrid_mode = HybridMode::VulkanOnly;
         else if (argument == "--host-memory-mb")
             result.host_memory_budget_bytes = require_mebibytes(require_value(argc, argv, index, "--host-memory-mb"), "--host-memory-mb");
         else if (argument == "--expert-cache-mb")
@@ -692,7 +680,8 @@ static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argum
         else if (argument == "--expert-memory")
             result.expert_memory_mode = parse_expert_memory_mode(require_value(argc, argv, index, "--expert-memory"));
         else if (argument == "--cpu-packed-weights")
-            result.cpu_packed_weight_mode = parse_cpu_packed_weight_mode(require_value(argc, argv, index, "--cpu-packed-weights"));
+            result.cpu_packed_weight_mode = parse_cpu_packed_weight_mode(
+                require_value(argc, argv, index, "--cpu-packed-weights"));
         else if (argument == "--vulkan-device")
             result.vulkan_device_index = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--vulkan-device")));
         else if (argument == "--vulkan-devices")
@@ -1239,9 +1228,9 @@ public:
 static void print_usage(const char* executable)
 {
     std::cerr << "usage: " << executable << " <model-directory> [runtime options]\n"
-              << "  runtime: --backend auto|cpu|vulkan|hybrid|hybrid-prefetch, --host-memory-mb N,\n"
+              << "  runtime: --backend auto|cpu|hybrid, --host-memory-mb N,\n"
               << "           --expert-cache-mb N, --expert-gpu-cache-mb N, --expert-io-workers N,\n"
-              << "           --expert-memory auto|eager|on-demand, --cpu-packed-weights auto|on|off,\n"
+              << "           --expert-memory auto|eager|on-demand, --cpu-packed-weights on|off,\n"
               << "           --vulkan-device N, --vulkan-devices N[,N...]\n"
               << "  io/cache: --mmap-experts, --direct-expert-io, --buffered-expert-io,\n"
               << "            --release-vulkan-dense-host, --disable-gpu-expert-execution,\n"

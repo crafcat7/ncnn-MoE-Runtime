@@ -101,7 +101,6 @@ The native runner also accepts repeated `--stop-token ID` options.
 | --- | --- |
 | `--cpu` | Portable CPU path |
 | `--hybrid` | Vulkan Dense/Attention and CPU MXFP4 Experts |
-| `--hybrid-prefetch` | Mixed path with explicit CPU cache hints |
 
 `HybridMode::Auto` selects mixed execution for a hardware Vulkan device and
 falls back to CPU-only for a software CPU Vulkan implementation. MXFP4 Experts
@@ -118,7 +117,7 @@ uses a byte-bounded cache backed by exact ranges in the original shards.
 | Option | Effect |
 | --- | --- |
 | `--expert-memory auto\|eager\|on-demand` | Select Expert residency |
-| `--cpu-packed-weights auto\|on\|off` | Control the persistent in-memory MXFP4-Q8 CPU weight pack |
+| `--cpu-packed-weights on\|off` | Opt into the CPU MXFP4-Q8 in-memory repack; default `off` |
 | `--host-memory-mb N` | Override the detected host-memory budget |
 | `--expert-cache-mb N` | Bound resident Expert pairs in RAM |
 | `--expert-io-workers N` | Set asynchronous read concurrency; `0` derives it from Top-K and physical cores |

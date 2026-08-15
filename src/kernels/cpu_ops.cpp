@@ -50,7 +50,7 @@ static bool cpu_mxfp4_q8_enabled(uint64_t optimization_flags) noexcept
     return runtime_optimization_enabled(
                optimization_flags,
                RuntimeOptimizationCpuMxfp4Q8)
-           && mxfp4_q8_packed_kernel_available();
+           && mxfp4_q8_kernel_available();
 }
 
 static bool cpu_packed_weights_enabled(uint64_t optimization_flags) noexcept
@@ -690,7 +690,8 @@ bool float8_linear_rms_norm_batch_into(
     return true;
 }
 
-static std::shared_ptr<const Mxfp4Q8PackedMatrix> get_mxfp4_q8_packed_weights(
+static std::shared_ptr<const Mxfp4Q8PackedMatrix>
+get_mxfp4_q8_packed_weights(
     const TensorData& matrix,
     uint32_t block_count,
     size_t row_count)
@@ -701,7 +702,8 @@ static std::shared_ptr<const Mxfp4Q8PackedMatrix> get_mxfp4_q8_packed_weights(
         matrix.mxfp4_blocks.data());
     std::lock_guard<std::mutex> build_lock(
         build_locks[(storage_key >> 6) & 63u]);
-    std::shared_ptr<const Mxfp4Q8PackedMatrix> cached = matrix.mxfp4_q8_packed;
+    std::shared_ptr<const Mxfp4Q8PackedMatrix> cached =
+        matrix.mxfp4_q8_packed;
     if (cached && cached->valid()
         && cached->rows == row_count
         && cached->block_count == block_count)
@@ -724,6 +726,24 @@ static std::shared_ptr<const Mxfp4Q8PackedMatrix> get_mxfp4_q8_packed_weights(
     return desired;
 }
 
+static bool try_vulkan_linear_batch(
+    const CompiledOperator* executable,
+    const CpuBatch& input,
+    CpuBatch& output,
+    ExecutionBackend backend)
+{
+    if (backend != ExecutionBackend::Vulkan || !executable)
+        return false;
+    return (executable->bfloat16
+            && executable->bfloat16->forward(input, output))
+           || (executable->float8
+               && executable->float8->forward(input, output))
+           || (executable->qnk
+               && executable->qnk->forward(input, output))
+           || (executable->linear
+               && executable->linear->forward(input, output));
+}
+
 void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch& output, uint64_t optimization_flags, const CompiledOperator* executable, ExecutionBackend backend)
 {
     assert(matrix.shape.size() == 2);
@@ -731,29 +751,14 @@ void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch
     const uint32_t input_columns = matrix.shape[1];
     assert(input.columns() == input_columns);
 
-    if (is_qnk_dtype(matrix.dtype))
-    {
-        if (backend == ExecutionBackend::Vulkan
-            && executable
-            && executable->qnk
-            && executable->qnk->forward(input, output))
-        {
-            return;
-        }
-        if (qnk_linear_batch_into(
-                matrix,
-                input,
-                output,
-                cpu_packed_weights_enabled(optimization_flags)))
-            return;
-    }
-
-    if (backend == ExecutionBackend::Vulkan
-        && ((executable && executable->bfloat16
-             && executable->bfloat16->forward(input, output))
-            || (executable && executable->float8 && executable->float8->forward(input, output))
-            || (executable && executable->qnk && executable->qnk->forward(input, output))
-            || (executable && executable->linear && executable->linear->forward(input, output))))
+    if (try_vulkan_linear_batch(executable, input, output, backend))
+        return;
+    if (is_qnk_dtype(matrix.dtype)
+        && qnk_linear_batch_into(
+            matrix,
+            input,
+            output,
+            cpu_packed_weights_enabled(optimization_flags)))
         return;
     require_dense_host_storage(matrix, "linear weight");
     output.reset(input.rows(), output_columns, false);
@@ -851,16 +856,15 @@ void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch
                 input.rows(),
                 input_columns,
                 q8_input);
-
-            // Repack complete matrices; small tails keep the row-pair path.
             if (cpu_packed_weights_enabled(optimization_flags)
                 && output_columns >= 4
                 && mxfp4_q8_packed_kernel_available())
             {
-                const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_weights = get_mxfp4_q8_packed_weights(
-                    matrix,
-                    blocks_per_row,
-                    output_columns);
+                const std::shared_ptr<const Mxfp4Q8PackedMatrix>
+                    packed_weights = get_mxfp4_q8_packed_weights(
+                        matrix,
+                        blocks_per_row,
+                        output_columns);
                 if (packed_weights)
                 {
                     mxfp4_q8_packed_gemm(
@@ -1414,7 +1418,7 @@ static bool mxfp4_expert_decode(
     std::vector<CpuBatch>& activated = buffers.activated;
     std::vector<CpuBatch>& packed_gate_up = buffers.packed_gate_up;
     std::vector<Mxfp4Q8Batch> q8_inputs;
-    // Keep Q8/packed for batched paths; single-token AVX512 uses row pairs.
+    // Single-token AVX512 keeps the FP32 row-pair path.
     const bool use_q8 = cpu_mxfp4_q8_enabled(optimization_flags)
                         && mxfp4_kernel_kind() != MxFp4KernelKind::X86Avx512;
     const size_t invalid_q8_owner = tasks.size();
@@ -1438,7 +1442,8 @@ static bool mxfp4_expert_decode(
     for (size_t task_index = 0; task_index < tasks.size(); ++task_index)
     {
         const Mxfp4Task& task = tasks[task_index];
-        if (!task.gate_up || !task.down || !task.input || !task.output || task.input->rows() != 1 || task.gate_up->dtype != DType::MxFp4
+        if (!task.gate_up || !task.down || !task.input || !task.output
+            || task.input->rows() != 1 || task.gate_up->dtype != DType::MxFp4
             || task.down->dtype != DType::MxFp4 || task.gate_up->shape.size() != 2 || task.down->shape.size() != 2 || task.gate_up->shape[0] % 2 != 0
             || task.gate_up->shape[1] != task.input->columns() || task.down->shape[1] != task.gate_up->shape[0] / 2)
         {
@@ -1461,10 +1466,11 @@ static bool mxfp4_expert_decode(
                 && task.down->shape[0] >= 4
                 && mxfp4_q8_packed_kernel_available())
             {
-                const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_weights = get_mxfp4_q8_packed_weights(
-                    *task.down,
-                    intermediate_size / 32,
-                    task.down->shape[0]);
+                const std::shared_ptr<const Mxfp4Q8PackedMatrix>
+                    packed_weights = get_mxfp4_q8_packed_weights(
+                        *task.down,
+                        intermediate_size / 32,
+                        task.down->shape[0]);
                 q8_down_packed[task_index] = packed_weights ? 1 : 0;
             }
         }
@@ -1489,7 +1495,6 @@ static bool mxfp4_expert_decode(
                 && task.gate_up->shape[0] >= 4
                 && mxfp4_q8_packed_kernel_available())
             {
-                // The fixed Expert team completes the sidecar GEMV below.
                 q8_gate_packed[task_index] = 1;
             }
         }
@@ -1543,11 +1548,13 @@ static bool mxfp4_expert_decode(
             if (!q8_gate_packed[static_cast<size_t>(task_index)])
                 continue;
             const Mxfp4Task& task = tasks[static_cast<size_t>(task_index)];
-            const size_t input_owner = q8_input_owner[static_cast<size_t>(task_index)];
-            const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_weights = get_mxfp4_q8_packed_weights(
-                *task.gate_up,
-                task.input->columns() / 32,
-                task.gate_up->shape[0]);
+            const size_t input_owner =
+                q8_input_owner[static_cast<size_t>(task_index)];
+            const std::shared_ptr<const Mxfp4Q8PackedMatrix>
+                packed_weights = get_mxfp4_q8_packed_weights(
+                    *task.gate_up,
+                    task.input->columns() / 32,
+                    task.gate_up->shape[0]);
             if (!packed_weights)
             {
                 q8_gate_packed[static_cast<size_t>(task_index)] = 0;
@@ -1579,20 +1586,24 @@ static bool mxfp4_expert_decode(
             const uint32_t first_column = pair_group * pair_group_size;
             const uint32_t column_count = std::min<uint32_t>(pair_group_size, intermediate_size - first_column);
             const size_t gate_row = static_cast<size_t>(first_column) * 2;
-            const size_t input_owner = q8_input_owner[task_index];
             float gates[2] = {};
             float linears[2] = {};
             if (q8_gate_packed[task_index])
             {
-                for (uint32_t local_column = 0; local_column < column_count; ++local_column)
+                for (uint32_t local_column = 0;
+                     local_column < column_count;
+                     ++local_column)
                 {
                     const uint32_t column = first_column + local_column;
-                    gates[local_column] = packed_gate_up[task_index].row(0)[column * 2];
-                    linears[local_column] = packed_gate_up[task_index].row(0)[column * 2 + 1];
+                    gates[local_column] =
+                        packed_gate_up[task_index].row(0)[column * 2];
+                    linears[local_column] =
+                        packed_gate_up[task_index].row(0)[column * 2 + 1];
                 }
             }
             else if (use_q8 && input_columns % 32 == 0)
             {
+                const size_t input_owner = q8_input_owner[task_index];
                 mxfp4_q8_matmul_row_pairs(
                     matrix.mxfp4_blocks.data() + gate_row * input_columns / 2,
                     matrix.mxfp4_scales.data() + gate_row * blocks_per_row,
@@ -1667,7 +1678,8 @@ static bool mxfp4_expert_decode(
             {
                 if (q8_down_enabled[static_cast<size_t>(task_index)])
                 {
-                    const CpuBatch& task_activated = activated[static_cast<size_t>(task_index)];
+                    const CpuBatch& task_activated =
+                        activated[static_cast<size_t>(task_index)];
                     mxfp4_q8_quantize_batch(
                         task_activated.row(0),
                         task_activated.columns(),
@@ -1686,10 +1698,11 @@ static bool mxfp4_expert_decode(
             if (!q8_down_packed[static_cast<size_t>(task_index)])
                 continue;
             const Mxfp4Task& task = tasks[static_cast<size_t>(task_index)];
-            const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_weights = get_mxfp4_q8_packed_weights(
-                *task.down,
-                task.down->shape[1] / 32,
-                task.down->shape[0]);
+            const std::shared_ptr<const Mxfp4Q8PackedMatrix>
+                packed_weights = get_mxfp4_q8_packed_weights(
+                    *task.down,
+                    task.down->shape[1] / 32,
+                    task.down->shape[0]);
             if (!packed_weights)
             {
                 q8_down_packed[static_cast<size_t>(task_index)] = 0;
@@ -1822,18 +1835,16 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
         if (!task.input || task.input->rows() != 1)
             single_token = false;
     }
-    Mxfp4Scratch local_scratch;
-    Mxfp4Scratch& buffers = scratch ? *scratch : local_scratch;
     if (single_token)
     {
         if (scratch)
         {
-            buffers.physical_input_rows.assign(
+            scratch->physical_input_rows.assign(
                 tasks.size(),
                 1);
-            buffers.unique_row_maps.resize(tasks.size());
+            scratch->unique_row_maps.resize(tasks.size());
             for (std::vector<uint32_t>& row_map :
-                 buffers.unique_row_maps)
+                 scratch->unique_row_maps)
             {
                 row_map.clear();
             }
@@ -1841,6 +1852,8 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
         return mxfp4_expert_decode(tasks, scratch, optimization_flags);
     }
 
+    Mxfp4Scratch local_scratch;
+    Mxfp4Scratch& buffers = scratch ? *scratch : local_scratch;
     buffers.unique_input.resize(tasks.size());
     buffers.unique_output.resize(tasks.size());
     buffers.unique_row_maps.resize(tasks.size());
@@ -1937,12 +1950,13 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
     const bool use_q8 = cpu_mxfp4_q8_enabled(optimization_flags);
     std::vector<Mxfp4Q8Batch> q8_inputs;
     const size_t invalid_q8_owner = execution_tasks.size();
-    std::vector<size_t> q8_input_owner(execution_tasks.size(), invalid_q8_owner);
-    std::vector<uint8_t> q8_gate_enabled(execution_tasks.size(), 0);
-    std::vector<uint8_t> q8_down_enabled(execution_tasks.size(), 0);
+    std::vector<size_t> q8_input_owner;
     if (use_q8)
+    {
         q8_inputs.resize(execution_tasks.size());
-    buffers.q8_activated.resize(tasks.size());
+        q8_input_owner.assign(execution_tasks.size(), invalid_q8_owner);
+        buffers.q8_activated.resize(tasks.size());
+    }
     std::vector<CpuBatch>& activated = buffers.activated;
     std::vector<CpuBatch>& linear = buffers.linear;
     std::vector<Mxfp4Q8Batch>& q8_activated = buffers.q8_activated;
@@ -1987,10 +2001,7 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
                     task.input->columns(),
                     q8_inputs[input_owner]);
             }
-            q8_gate_enabled[task_index] = 1;
         }
-        if (use_q8 && intermediate_size % 32 == 0)
-            q8_down_enabled[task_index] = 1;
         task.output->reset(task.input->rows(), task.down->shape[0], false);
         gate_column_count += intermediate_size;
         down_row_pair_count += (task.down->shape[0] + 1) / 2;
@@ -2045,7 +2056,7 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
             const uint32_t input_columns = matrix.shape[1];
             const uint32_t blocks_per_row = input_columns / 32;
             const size_t first_row = static_cast<size_t>(local_begin) * 2;
-            if (q8_gate_enabled[task_index])
+            if (use_q8 && input_columns % 32 == 0)
             {
                 const size_t input_owner = q8_input_owner[task_index];
                 mxfp4_q8_matmul_row_pairs(
@@ -2149,9 +2160,9 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
              task_index < static_cast<int64_t>(execution_tasks.size());
              ++task_index)
         {
-            if (q8_down_enabled[static_cast<size_t>(task_index)])
+            const CpuBatch& task_activated = activated[static_cast<size_t>(task_index)];
+            if (task_activated.columns() % 32 == 0)
             {
-                const CpuBatch& task_activated = activated[static_cast<size_t>(task_index)];
                 mxfp4_q8_quantize_batch(
                     task_activated.row(0),
                     task_activated.columns(),
@@ -2191,7 +2202,7 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
             const uint32_t input_columns = matrix.shape[1];
             const uint32_t blocks_per_row = input_columns / 32;
             const size_t first_row = static_cast<size_t>(local_begin) * 2;
-            if (q8_down_enabled[task_index])
+            if (use_q8 && input_columns % 32 == 0)
             {
                 mxfp4_q8_matmul_row_pairs(
                     matrix.mxfp4_blocks.data() + first_row * input_columns / 2,
@@ -2252,7 +2263,7 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
             continue;
         const uint32_t row = matrix.shape[0] - 1;
         const uint32_t blocks_per_row = matrix.shape[1] / 32;
-        if (q8_down_enabled[task_index])
+        if (use_q8 && matrix.shape[1] % 32 == 0)
         {
             mxfp4_q8_gemm_row(
                 matrix.mxfp4_blocks.data() + static_cast<size_t>(row) * matrix.shape[1] / 2,
@@ -2313,16 +2324,9 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
 
 void linear_batch_into(const TensorData& matrix, const TensorData& bias, const CpuBatch& input, CpuBatch& output, uint64_t optimization_flags, const CompiledOperator* executable, ExecutionBackend backend)
 {
-    if (backend == ExecutionBackend::Vulkan
-        && ((executable && executable->bfloat16
-             && executable->bfloat16->forward(input, output))
-            || (executable && executable->float8 && executable->float8->forward(input, output))
-            || (executable && executable->qnk && executable->qnk->forward(input, output))
-            || (executable && executable->linear && executable->linear->forward(input, output))))
-    {
+    if (try_vulkan_linear_batch(executable, input, output, backend))
         return;
-    }
-    linear_batch_into(matrix, input, output, optimization_flags, executable, backend);
+    linear_batch_into(matrix, input, output, optimization_flags);
     require_dense_host_storage(bias, "linear bias");
     assert(bias.shape.size() == 1 && bias.shape[0] == output.columns());
     if (bias.dtype == DType::Float32)
