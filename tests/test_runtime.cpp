@@ -3576,7 +3576,7 @@ void test_safetensors_packed_mxfp4_expert()
     std::filesystem::remove_all(directory, ignored);
 }
 
-void test_safetensors_packed_qnk_expert()
+void test_safetensors_qnk_source_binding()
 {
     const std::filesystem::path directory = create_unique_test_directory("ncnn_moe_safetensors_qnk_packed_test_");
     const auto write_archive = [](const std::filesystem::path& path, std::string header, const std::vector<uint8_t>& data) {
@@ -3592,10 +3592,10 @@ void test_safetensors_packed_qnk_expert()
     constexpr uint32_t rows = 2;
     constexpr uint32_t columns = 256;
     const size_t expert_bytes = static_cast<size_t>(qnk_storage_bytes(DType::Q4K, rows, columns));
-    std::vector<uint8_t> source(expert_count * expert_bytes, 3);
+    std::vector<uint8_t> source(expert_count * expert_bytes + expert_bytes, 3);
     write_archive(
         directory / "model.safetensors",
-        R"({"experts":{"dtype":"U8","shape":[2,2,1,144],"data_offsets":[0,576]}})",
+        R"({"experts":{"dtype":"U8","shape":[2,2,1,144],"data_offsets":[0,576]},"matrix":{"dtype":"U8","shape":[2,1,144],"data_offsets":[576,864]}})",
         source);
     std::vector<uint8_t> packed(expert_bytes * 2, 91);
     write_archive(
@@ -3616,15 +3616,41 @@ void test_safetensors_packed_qnk_expert()
     check(expert.value().dtype == DType::Q4K);
     check(expert.value().shape == std::vector<uint32_t>{rows, columns});
     check(expert.value().qnk_values().size() == expert_bytes);
-    check(expert.value().qnk_values().front() == 91);
-    check(expert.value().qnk_values().back() == 91);
+    check(expert.value().qnk_values().front() == 3);
+    check(expert.value().qnk_values().back() == 3);
     auto matrix = archive.value().load_qnk_tensor("matrix", DType::Q4K, rows, columns);
     check(static_cast<bool>(matrix));
     check(matrix.value().qnk_values().size() == expert_bytes);
-    check(matrix.value().qnk_values().front() == 91);
+    check(matrix.value().qnk_values().front() == 3);
+
+    const std::filesystem::path sidecar_only_directory = create_unique_test_directory("ncnn_moe_safetensors_qnk_sidecar_only_test_");
+    write_archive(
+        sidecar_only_directory / "ncnn-moe-packed-qnk.safetensors",
+        R"({"__ncnn_moe_packed__.0.experts":{"dtype":"U8","shape":[2,1,144],"data_offsets":[0,288]},"__ncnn_moe_packed__.1.experts":{"dtype":"U8","shape":[2,1,144],"data_offsets":[288,576]}})",
+        packed);
+    auto sidecar_only = SafetensorsArchive::open(sidecar_only_directory);
+    check(static_cast<bool>(sidecar_only));
+    check(!sidecar_only.value().find_qnk_expert_dtype("experts", expert_count, rows, columns));
+    check(!sidecar_only.value().load_qnk_expert("experts", DType::Q4K, 0, expert_count, rows, columns));
+
+    const std::filesystem::path bfloat16_directory = create_unique_test_directory("ncnn_moe_safetensors_qnk_bfloat16_sidecar_test_");
+    write_archive(
+        bfloat16_directory / "model.safetensors",
+        R"({"experts":{"dtype":"BF16","shape":[2,2,256],"data_offsets":[0,2048]}})",
+        std::vector<uint8_t>(2048, 7));
+    write_archive(
+        bfloat16_directory / "ncnn-moe-packed-qnk.safetensors",
+        R"({"__ncnn_moe_packed__.0.experts":{"dtype":"U8","shape":[2,1,144],"data_offsets":[0,288]},"__ncnn_moe_packed__.1.experts":{"dtype":"U8","shape":[2,1,144],"data_offsets":[288,576]}})",
+        packed);
+    auto bfloat16_with_sidecar = SafetensorsArchive::open(bfloat16_directory);
+    check(static_cast<bool>(bfloat16_with_sidecar));
+    check(!bfloat16_with_sidecar.value().find_qnk_expert_dtype("experts", expert_count, rows, columns));
+    check(!bfloat16_with_sidecar.value().load_qnk_expert("experts", DType::Q4K, 0, expert_count, rows, columns));
 
     std::error_code ignored;
     std::filesystem::remove_all(directory, ignored);
+    std::filesystem::remove_all(sidecar_only_directory, ignored);
+    std::filesystem::remove_all(bfloat16_directory, ignored);
 }
 
 void test_file_backed_mxfp4_expert_cache()
@@ -8690,7 +8716,7 @@ int main(int argc, char** argv)
         ncnn::moe::test_mapped_file_range_and_shared_buffer();
         ncnn::moe::test_safetensors_dense_mmap();
         ncnn::moe::test_safetensors_packed_mxfp4_expert();
-        ncnn::moe::test_safetensors_packed_qnk_expert();
+        ncnn::moe::test_safetensors_qnk_source_binding();
         ncnn::moe::test_file_backed_mxfp4_expert_cache();
         ncnn::moe::test_cpu_topology_parsing_and_partitioning();
         ncnn::moe::test_cross_session_batch_scheduler();

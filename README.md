@@ -204,7 +204,7 @@ See [examples/README.md](examples/README.md) for the protocol boundary and
 common commands. The model guides document model-specific package preparation
 and adapter options.
 
-## Qn_K CPU weights and read sidecar
+## Qn_K CPU weights
 
 The CPU path accepts the portable Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, and
 Q8_K blocks. Q2_K-Q6_K use the exact 256-element super-block layouts; Q8_K is
@@ -233,23 +233,6 @@ build-cpu\Release\ncnn_moe_tests.exe --benchmark-qnk
 
 It reports the scalar-decode/SIMD-float-dot reference time, direct SIMD time,
 speedup, and checksum delta for all six formats.
-
-For Expert banks stored as one contiguous U8 tensor, create an optional read-
-optimized sidecar without modifying the source shards:
-
-```powershell
-python tools\pack_qnk_experts.py D:\Models\my-model `
-  --tensor model.layers.0.mlp.experts.gate.weight `
-  --tensor model.layers.0.mlp.experts.up.weight `
-  --dtype q5_k --rows 4096 --columns 4096 --expert-count 32 `
-  --output D:\Models\my-model\ncnn-moe-packed-qnk.safetensors
-```
-
-The source tensors must contain `expert_count * rows * (columns / 256) *
-block_bytes` bytes, where `block_bytes` is the canonical Qn_K block size. The
-runtime prefers sidecar names of the form
-`__ncnn_moe_packed__.{expert}.{tensor}`. Packing only copies/reorders storage;
-it does not requantize weights or introduce an additional numerical error.
 
 ## Runtime API
 
@@ -407,7 +390,7 @@ src/backends/ncnn/ ncnn CPU/Vulkan operator packaging, mixed Attention, Vulkan c
 models/            Model catalog and model-family execution guides
 assets/            Published benchmark visualizations used by model reports
 examples/          Unified worker, benchmark/reference runners, protocol helpers, and MXFP4 microbenchmark
-tools/             Unified CLI/adapters, fixture, packed-Expert/Qn_K, and benchmark utilities
+tools/             Unified CLI/adapters, fixtures, packed-Expert tooling, and Qn_K/runtime benchmarks
 tests/             Deterministic, parity, cache, scheduling, concurrency, and error-path tests
 third_party/ncnn/  Pinned ncnn source submodule
 ```

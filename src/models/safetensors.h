@@ -48,7 +48,7 @@ public:
         uint32_t expert_count,
         uint32_t rows,
         uint32_t columns) const noexcept;
-    // Load a raw Qn_K matrix, preferring its packed sidecar.
+    // Load a raw Qn_K matrix from the source checkpoint.
     [[nodiscard]] Result<TensorData> load_qnk_tensor(const std::string& name, DType dtype, uint32_t rows, uint32_t columns) const;
     // Load one Expert slice from a bank tensor.
     [[nodiscard]] Result<TensorData> load_qnk_expert(const std::string& name, DType dtype, uint32_t expert_id, uint32_t expert_count,

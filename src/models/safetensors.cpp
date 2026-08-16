@@ -272,7 +272,6 @@ std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(
         return {};
 
     const SafetensorInfo* source = find(name);
-    const SafetensorInfo* packed_expert_zero = find("__ncnn_moe_packed__.0." + name);
     const std::array<DType, 6> dtypes = {
         DType::Q2K,
         DType::Q3K,
@@ -293,12 +292,6 @@ std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(
         if (source
             && source->dtype == "U8"
             && source->byte_count == bank_bytes)
-        {
-            return dtype;
-        }
-        if (packed_expert_zero
-            && packed_expert_zero->dtype == "U8"
-            && packed_expert_zero->byte_count == expert_bytes)
         {
             return dtype;
         }
@@ -384,9 +377,7 @@ Result<TensorData> SafetensorsArchive::load_qnk_tensor(
     if (!qnk_shape_supported(dtype, rows, columns))
         return Error{ErrorCode::InvalidArgument, "invalid Qn_K tensor shape: " + name};
     const uint64_t expected_bytes = qnk_storage_bytes(dtype, rows, columns);
-    const SafetensorInfo* source = find(packed_tensor_name(name));
-    if (!source)
-        source = find(name);
+    const SafetensorInfo* source = find(name);
     if (!source || source->dtype != "U8" || source->byte_count != expected_bytes)
         return Error{ErrorCode::InvalidModel, "invalid Qn_K safetensors tensor: " + name};
 
@@ -419,26 +410,14 @@ Result<TensorData> SafetensorsArchive::load_qnk_expert(
     if (expert_count == 0 || expert_id >= expert_count || !qnk_shape_supported(dtype, rows, columns))
         return Error{ErrorCode::InvalidArgument, "invalid Qn_K Expert shape: " + name};
     const uint64_t expert_bytes = qnk_storage_bytes(dtype, rows, columns);
-    const std::string packed_name = "__ncnn_moe_packed__." + std::to_string(expert_id) + "." + name;
-    const SafetensorInfo* source = find(packed_name);
-    uint64_t offset = 0;
-    if (source)
+    const SafetensorInfo* source = find(name);
+    if (!source || source->dtype != "U8"
+        || expert_bytes > std::numeric_limits<uint64_t>::max() / expert_count
+        || source->byte_count != expert_bytes * expert_count)
     {
-        if (source->dtype != "U8" || source->byte_count != expert_bytes)
-            return Error{ErrorCode::InvalidModel, "invalid packed Qn_K Expert tensor: " + name};
-        offset = source->offset;
+        return Error{ErrorCode::InvalidModel, "invalid Qn_K Expert tensor: " + name};
     }
-    else
-    {
-        source = find(name);
-        if (!source || source->dtype != "U8"
-            || expert_bytes > std::numeric_limits<uint64_t>::max() / expert_count
-            || source->byte_count != expert_bytes * expert_count)
-        {
-            return Error{ErrorCode::InvalidModel, "invalid Qn_K Expert tensor: " + name};
-        }
-        offset = source->offset + expert_id * expert_bytes;
-    }
+    const uint64_t offset = source->offset + expert_id * expert_bytes;
 
     TensorData tensor;
     tensor.dtype = dtype;
