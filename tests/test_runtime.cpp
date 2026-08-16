@@ -53,6 +53,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -75,7 +76,10 @@ static void check_near(float actual, float expected, float tolerance)
     }
 }
 
-inline constexpr uint64_t kTestOptimizationFlags = RuntimeOptimizationDefaultFlags;
+inline uint64_t g_test_optimization_flags = RuntimeOptimizationDefaultFlags;
+
+static_assert(std::is_same_v<RuntimeOptions, RuntimeConfig>);
+static_assert(std::is_same_v<EffectiveRuntimeOptions, EffectiveRuntimeConfig>);
 
 class TestRuntime final : public Runtime
 {
@@ -671,7 +675,7 @@ void test_ncnn_linear_operator()
         NcnnLinearDevice::Cpu,
         automatic_vulkan_device_index,
         context_instance,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(linear));
 
     CpuBatch input(2, 3);
@@ -760,7 +764,7 @@ void test_ncnn_linear_operator()
         bfloat_bias.bfloat16_data.push_back(float_to_bfloat16(value));
 
     {
-        const uint64_t direct_bfloat16_flags = kTestOptimizationFlags
+        const uint64_t direct_bfloat16_flags = g_test_optimization_flags
                                                & ~RuntimeOptimizationNcnnCpuBfloat16Linear;
         check(std::string(
                   NcnnLinearOperator::cpu_small_bfloat16_linear_policy(
@@ -775,7 +779,7 @@ void test_ncnn_linear_operator()
             direct_bfloat16_flags));
     }
     {
-        const uint64_t ncnn_bfloat16_flags = kTestOptimizationFlags
+        const uint64_t ncnn_bfloat16_flags = g_test_optimization_flags
                                              | RuntimeOptimizationNcnnCpuBfloat16Linear;
         const bool ncnn_bfloat16_enabled = std::string(
                                                NcnnLinearOperator::cpu_small_bfloat16_linear_policy(
@@ -821,7 +825,7 @@ void test_ncnn_linear_operator()
             NcnnLinearDevice::Vulkan,
             automatic_vulkan_device_index,
             context_instance,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
         check(static_cast<bool>(vulkan_linear));
         const NcnnVulkanRuntimeCounters initial_counters = NcnnLinearOperator::vulkan_execution_snapshot(context_instance).counters;
         for (uint32_t iteration = 0; iteration < 4; ++iteration)
@@ -905,24 +909,24 @@ void test_ncnn_linear_operator()
             NcnnLinearDevice::Vulkan,
             automatic_vulkan_device_index,
             context_instance,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
         const auto parallel_operator = NcnnLinearOperator::create(
             parallel_matrix,
             nullptr,
             NcnnLinearDevice::Vulkan,
             automatic_vulkan_device_index,
             context_instance,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
         check(static_cast<bool>(chain_operator));
         check(static_cast<bool>(parallel_operator));
         const CpuBatch expected_chain = linear_batch(
             chain_matrix,
             expected_output,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
         const CpuBatch expected_parallel = linear_batch(
             parallel_matrix,
             input,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
         const NcnnVulkanRuntimeCounters graph_before = NcnnLinearOperator::vulkan_execution_snapshot(context_instance).counters;
         auto graph = NcnnVulkanCommandGraph::create(*vulkan_linear);
         NcnnVulkanDeviceTensor graph_input;
@@ -1069,7 +1073,7 @@ void test_dense_mxn_tiles()
     const CpuBatch float_output = linear_batch(
         float_matrix,
         input,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     for (size_t token = 0; token < input.rows(); ++token)
     {
         for (uint32_t output_column = 0;
@@ -1101,7 +1105,7 @@ void test_dense_mxn_tiles()
     const CpuBatch bfloat_output = linear_batch(
         bfloat_matrix,
         input,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     for (size_t token = 0; token < input.rows(); ++token)
     {
         for (uint32_t output_column = 0;
@@ -1143,7 +1147,7 @@ void test_released_dense_host_storage_guard()
             released_matrix,
             input,
             output,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
     }
     catch (const std::runtime_error& error)
     {
@@ -1167,7 +1171,7 @@ void test_released_dense_host_storage_guard()
             released_bias,
             input,
             output,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
     }
     catch (const std::runtime_error& error)
     {
@@ -1188,7 +1192,7 @@ void test_released_dense_host_storage_guard()
             1e-5f,
             output,
             0.0f,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
     }
     catch (const std::runtime_error& error)
     {
@@ -1230,14 +1234,14 @@ void test_ncnn_vulkan_float8_operator()
     const CpuBatch cpu_output = linear_batch(
         matrix,
         input,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     const auto vulkan = NcnnVulkanFloat8Operator::create(
         matrix,
         nullptr,
         1,
         automatic_vulkan_device_index,
         context_instance,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(vulkan));
     CpuBatch vulkan_output;
     check(static_cast<bool>(vulkan->forward(input, vulkan_output)));
@@ -1265,14 +1269,14 @@ void test_ncnn_vulkan_float8_operator()
     const CpuBatch cpu_chain = linear_batch(
         second_matrix,
         cpu_output,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     const auto second_vulkan = NcnnVulkanFloat8Operator::create(
         second_matrix,
         nullptr,
         1,
         automatic_vulkan_device_index,
         context_instance,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(second_vulkan));
     CpuBatch vulkan_chain;
     check(static_cast<bool>(vulkan->forward_chain(input, *second_vulkan, vulkan_chain)));
@@ -1295,11 +1299,11 @@ void test_ncnn_vulkan_float8_operator()
         norm_weight,
         norm_epsilon,
         0.0f,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     const CpuBatch cpu_norm_chain = linear_batch(
         second_matrix,
         normalized_cpu_output,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(vulkan->prepare_rms_norm(norm_weight, norm_epsilon)));
     CpuBatch vulkan_norm_chain;
     check(static_cast<bool>(vulkan->forward_rms_norm_chain(input, *second_vulkan, vulkan_norm_chain)));
@@ -1325,7 +1329,7 @@ void test_ncnn_vulkan_float8_operator()
     const uint64_t parallel_redundant_pipeline_binds = parallel_counters_after.command_redundant_pipeline_binds
                                                        - parallel_counters_before.command_redundant_pipeline_binds;
     const bool bind_elision_enabled = runtime_optimization_enabled(
-        kTestOptimizationFlags,
+        g_test_optimization_flags,
         RuntimeOptimizationVulkanPipelineBindElision);
     check(static_cast<bool>(parallel_redundant_pipeline_binds == 1));
     check(static_cast<bool>(
@@ -1353,7 +1357,7 @@ void test_ncnn_vulkan_float8_operator()
     const CpuBatch cpu_swiglu_chain = linear_batch(
         second_matrix,
         cpu_activated,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     CpuBatch vulkan_swiglu_chain;
     check(static_cast<bool>(vulkan->forward_swiglu_chain(
         input,
@@ -1430,13 +1434,13 @@ void test_ncnn_vulkan_bfloat16_operator()
                                      * 0.0031f;
         }
     }
-    const CpuBatch first_cpu = linear_batch(first, first_bias, input, kTestOptimizationFlags);
+    const CpuBatch first_cpu = linear_batch(first, first_bias, input, g_test_optimization_flags);
     const auto first_vulkan = NcnnVulkanBfloat16Operator::create(
         first,
         &first_bias,
         automatic_vulkan_device_index,
         context_instance,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(first_vulkan));
     CpuBatch first_output;
     check(static_cast<bool>(
@@ -1468,12 +1472,12 @@ void test_ncnn_vulkan_bfloat16_operator()
         norm_weight,
         norm_epsilon,
         0.0f,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     const CpuBatch norm_chain_cpu = linear_batch(
         first,
         first_bias,
         normalized_cpu,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(
         first_vulkan->prepare_rms_norm(norm_weight, norm_epsilon)));
     CpuBatch norm_chain_vulkan;
@@ -1512,7 +1516,7 @@ void test_ncnn_vulkan_bfloat16_operator()
     }
 
     {
-        const uint64_t cooperative_flags = kTestOptimizationFlags | RuntimeOptimizationVulkanBfloat16CoopMatrix;
+        const uint64_t cooperative_flags = g_test_optimization_flags | RuntimeOptimizationVulkanBfloat16CoopMatrix;
         const auto cooperative_operator = NcnnVulkanBfloat16Operator::create(
             first,
             &first_bias,
@@ -1581,13 +1585,13 @@ void test_ncnn_vulkan_bfloat16_operator()
         const CpuBatch tail_reference = linear_batch(
             tail_matrix,
             tail_input,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
         const auto tail_operator = NcnnVulkanBfloat16Operator::create(
             tail_matrix,
             nullptr,
             automatic_vulkan_device_index,
             context_instance,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
         check(static_cast<bool>(tail_operator));
         CpuBatch tail_output;
         check(static_cast<bool>(tail_operator->forward(
@@ -1612,7 +1616,7 @@ void test_ncnn_vulkan_bfloat16_operator()
         {&first_bias, &second_bias},
         automatic_vulkan_device_index,
         context_instance,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(fused));
     CpuBatch fused_output;
     check(static_cast<bool>(
@@ -1621,7 +1625,7 @@ void test_ncnn_vulkan_bfloat16_operator()
         second,
         second_bias,
         input,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     for (size_t row = 0; row < input.rows(); ++row)
     {
         for (uint32_t column = 0; column < 192; ++column)
@@ -1678,27 +1682,27 @@ void test_ncnn_vulkan_bfloat16_operator()
         {nullptr, nullptr, nullptr},
         automatic_vulkan_device_index,
         context_instance,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     const auto down_vulkan = NcnnVulkanBfloat16Operator::create(
         down,
         nullptr,
         automatic_vulkan_device_index,
         context_instance,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(fused_swiglu));
     check(static_cast<bool>(down_vulkan));
     const CpuBatch gate_cpu = linear_batch(
         gate,
         input,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     const CpuBatch up_cpu = linear_batch(
         up,
         input,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     const CpuBatch router_cpu = linear_batch(
         router_gate,
         input,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     CpuBatch activated(input.rows(), 128);
     for (size_t row = 0; row < input.rows(); ++row)
     {
@@ -1712,7 +1716,7 @@ void test_ncnn_vulkan_bfloat16_operator()
     CpuBatch expected_swiglu = linear_batch(
         down,
         activated,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     for (size_t row = 0; row < expected_swiglu.rows(); ++row)
     {
         const float router_scale = 1.0f / (1.0f + std::exp(-router_cpu.row(row)[0]));
@@ -1779,7 +1783,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     const CpuBatch projected = linear_batch(
         matrix,
         input,
-        kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+        g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
     for (size_t input_row = 0; input_row < input.rows(); ++input_row)
     {
         for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row)
@@ -1787,7 +1791,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             check_near(projected.row(input_row)[matrix_row], scalar_row(matrix_row, input_row), 1e-5f);
         }
     }
-    const uint64_t q8_flags = kTestOptimizationFlags | RuntimeOptimizationCpuMxfp4Q8;
+    const uint64_t q8_flags = g_test_optimization_flags | RuntimeOptimizationCpuMxfp4Q8;
     matrix.mxfp4_q8_packed.reset();
     const CpuBatch unpacked_q8_projected = linear_batch(
         matrix,
@@ -1811,7 +1815,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         nullptr,
         automatic_vulkan_device_index,
         context_instance,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     if (NcnnLinearOperator::vulkan_device_count() > 0)
     {
         check(static_cast<bool>(vulkan_projection));
@@ -1837,7 +1841,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         const CpuBatch four_row_cpu = linear_batch(
             matrix,
             four_row_input,
-            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+            g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
         CpuBatch four_row_vulkan;
         check(static_cast<bool>(vulkan_projection->forward(four_row_input, four_row_vulkan)));
         for (size_t row = 0; row < four_row_input.rows(); ++row)
@@ -1858,7 +1862,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     const CpuBatch decoded = linear_batch(
         matrix,
         decode_input,
-        kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+        g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
     for (size_t matrix_row = 0; matrix_row < 4; ++matrix_row)
     {
         check_near(decoded.row(0)[matrix_row], scalar_row(matrix_row, 0), 1e-5f);
@@ -1870,7 +1874,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     const CpuBatch odd_projected = linear_batch(
         odd_matrix,
         input,
-        kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+        g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
     check(static_cast<bool>(odd_projected.columns() == 3));
     for (size_t input_row = 0; input_row < input.rows(); ++input_row)
     {
@@ -1884,7 +1888,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         nullptr,
         automatic_vulkan_device_index,
         context_instance,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     if (NcnnLinearOperator::vulkan_device_count() > 0)
     {
         check(static_cast<bool>(odd_vulkan_projection));
@@ -1913,7 +1917,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         input,
         ExpertActivation::GptOssSwiGlu,
         7.0f,
-        kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+        g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
     check(static_cast<bool>(fused.rows() == input.rows()));
     check(static_cast<bool>(fused.columns() == 2));
     for (float sigmoid_scale : {1.0f, 1.702f})
@@ -1927,7 +1931,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 scaled_silu(
                     value,
                     sigmoid_scale,
-                    kTestOptimizationFlags),
+                    g_test_optimization_flags),
                 expected,
                 1e-5f);
         }
@@ -2015,12 +2019,12 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         repeated_expert_input,
         ExpertActivation::DeepSeekSwiGlu,
         expert_activation_limit,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     const CpuBatch repeated_reference = linear_batch(
         expert_down,
         expert_down_bias,
         repeated_activated,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     CpuBatch repeated_output;
     Mxfp4Task repeated_task;
     repeated_task.gate_up = &expert_gate_up;
@@ -2038,7 +2042,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 &repeated_task,
                 1),
             &repeated_scratch,
-            kTestOptimizationFlags)));
+            g_test_optimization_flags)));
     check(static_cast<bool>(
         repeated_scratch.physical_input_rows
         == std::vector<uint32_t>({3})));
@@ -2059,7 +2063,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 1e-5f);
         }
     }
-    const uint64_t q8_expert_flags = kTestOptimizationFlags | RuntimeOptimizationCpuMxfp4Q8;
+    const uint64_t q8_expert_flags = g_test_optimization_flags | RuntimeOptimizationCpuMxfp4Q8;
     CpuBatch q8_repeated_output;
     Mxfp4Scratch q8_repeated_scratch;
     repeated_task.output = &q8_repeated_output;
@@ -2098,11 +2102,11 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             silu_input,
             ExpertActivation::Silu,
             0.0f,
-            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+            g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
         const CpuBatch silu_reference = linear_batch(
             expert_down,
             silu_activated,
-            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+            g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
         CpuBatch silu_output;
         Mxfp4Task silu_task;
         silu_task.gate_up = &expert_gate_up;
@@ -2115,7 +2119,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             mxfp4_expert_batch(
                 std::span<const Mxfp4Task>(&silu_task, 1),
                 &silu_scratch,
-                kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8)));
+                g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8)));
         check(silu_output.rows() == silu_reference.rows());
         check(silu_output.columns() == silu_reference.columns());
         for (size_t row = 0; row < silu_output.rows(); ++row)
@@ -2136,7 +2140,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 &repeated_task,
                 1),
             &repeated_scratch,
-            kTestOptimizationFlags)));
+            g_test_optimization_flags)));
     check(static_cast<bool>(
         repeated_scratch.physical_input_rows
         == std::vector<uint32_t>({4})));
@@ -2150,7 +2154,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         automatic_vulkan_device_index,
         ExpertActivation::GptOssSwiGlu,
         context_instance,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     if (NcnnLinearOperator::vulkan_device_count() > 0)
     {
         check(static_cast<bool>(vulkan_expert));
@@ -2170,12 +2174,12 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 expert_input,
                 ExpertActivation::GptOssSwiGlu,
                 expert_activation_limit,
-                kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+                g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
             const CpuBatch cpu_expert = linear_batch(
                 expert_down,
                 expert_down_bias,
                 cpu_activated,
-                kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+                g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
             CpuBatch vulkan_expert_output;
             check(static_cast<bool>(vulkan_expert->forward(expert_input, vulkan_expert_output)));
             check(static_cast<bool>(vulkan_expert_output.rows() == cpu_expert.rows()));
@@ -2197,7 +2201,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             automatic_vulkan_device_index,
             ExpertActivation::Silu,
             context_instance,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
         check(static_cast<bool>(silu_vulkan_expert));
         CpuBatch silu_input(1, 32);
         for (uint32_t column = 0; column < silu_input.columns(); ++column)
@@ -2208,12 +2212,12 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             silu_input,
             ExpertActivation::Silu,
             expert_activation_limit,
-            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+            g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
         const CpuBatch silu_expected = linear_batch(
             expert_down,
             expert_down_bias,
             silu_activated,
-            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+            g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
         CpuBatch silu_actual;
         check(static_cast<bool>(silu_vulkan_expert->forward(silu_input, silu_actual)));
         for (uint32_t column = 0; column < silu_expected.columns(); ++column)
@@ -2228,7 +2232,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             automatic_vulkan_device_index,
             ExpertActivation::DeepSeekSwiGlu,
             context_instance,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
         check(static_cast<bool>(deepseek_vulkan_expert));
         CpuBatch deepseek_input(1, 32);
         for (uint32_t column = 0; column < deepseek_input.columns(); ++column)
@@ -2239,12 +2243,12 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             deepseek_input,
             ExpertActivation::DeepSeekSwiGlu,
             expert_activation_limit,
-            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+            g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
         const CpuBatch deepseek_expected = linear_batch(
             expert_down,
             expert_down_bias,
             deepseek_activated,
-            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+            g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
         CpuBatch deepseek_actual;
         check(static_cast<bool>(deepseek_vulkan_expert->forward(deepseek_input, deepseek_actual)));
         for (uint32_t column = 0; column < deepseek_expected.columns(); ++column)
@@ -2255,7 +2259,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         check(static_cast<bool>(!vulkan_expert));
     }
 
-    const uint64_t backend_optimization_flags = kTestOptimizationFlags
+    const uint64_t backend_optimization_flags = g_test_optimization_flags
                                                 | RuntimeOptimizationVulkanRouteAggregation;
     auto expert_backend = create_vulkan_mxfp4_expert_backend(
         4096,
@@ -2292,12 +2296,12 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             backend_input,
             ExpertActivation::GptOssSwiGlu,
             expert_activation_limit,
-            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+            g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
         const CpuBatch backend_expected = linear_batch(
             expert_down,
             expert_down_bias,
             backend_activated,
-            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+            g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
         for (uint32_t sample = 0; sample < 3; ++sample)
         {
             CpuBatch backend_output;
@@ -2325,12 +2329,12 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             backend_input,
             ExpertActivation::GptOssSwiGlu,
             expert_activation_limit,
-            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+            g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
         const CpuBatch backend_second_expected = linear_batch(
             *backend_down_second,
             expert_down_bias,
             backend_second_activated,
-            kTestOptimizationFlags & ~RuntimeOptimizationCpuMxfp4Q8);
+            g_test_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8);
         CpuBatch backend_batch_output_first;
         CpuBatch backend_batch_output_second;
         const std::array<ExpertBackendRequest, 2> backend_requests = {{
@@ -2621,7 +2625,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     check(static_cast<bool>(mxfp4_kernel_kind() == MxFp4KernelKind::ArmNeon || mxfp4_kernel_kind() == MxFp4KernelKind::ArmSve2));
 #endif
     check(static_cast<bool>(std::string(mxfp4_kernel_name()).size() > 0));
-    const std::string activation_kernel = scaled_silu_kernel_name(kTestOptimizationFlags);
+    const std::string activation_kernel = scaled_silu_kernel_name(g_test_optimization_flags);
     check(!activation_kernel.empty());
 }
 
@@ -2930,7 +2934,7 @@ void test_ncnn_vulkan_qnk_operator()
             nullptr,
             automatic_vulkan_device_index,
             context_instance,
-            kTestOptimizationFlags | RuntimeOptimizationVulkanQnK);
+            g_test_optimization_flags | RuntimeOptimizationVulkanQnK);
         if (NcnnLinearOperator::vulkan_device_count() == 0)
         {
             check(static_cast<bool>(!vulkan));
@@ -3035,7 +3039,7 @@ void test_ncnn_vulkan_qnk_expert_operator()
             automatic_vulkan_device_index,
             activation,
             context_instance,
-            kTestOptimizationFlags | RuntimeOptimizationVulkanQnK);
+            g_test_optimization_flags | RuntimeOptimizationVulkanQnK);
         if (NcnnLinearOperator::vulkan_device_count() == 0)
         {
             check(static_cast<bool>(!vulkan));
@@ -3097,7 +3101,7 @@ void test_ncnn_vulkan_qnk_expert_operator()
         automatic_vulkan_device_index,
         ExpertActivation::GptOssSwiGlu,
         context_instance,
-        kTestOptimizationFlags | RuntimeOptimizationVulkanQnK);
+        g_test_optimization_flags | RuntimeOptimizationVulkanQnK);
     if (NcnnLinearOperator::vulkan_device_count() == 0)
     {
         check(static_cast<bool>(!packed_vulkan));
@@ -3134,7 +3138,7 @@ void test_ncnn_vulkan_qnk_expert_operator()
     }
     const CpuBatch expected = linear_batch(down, activated, 0);
     const uint64_t qnk_pair_bytes = gate_up.quantized_data.size() + down.quantized_data.size();
-    const uint64_t backend_flags = kTestOptimizationFlags
+    const uint64_t backend_flags = g_test_optimization_flags
                                    | RuntimeOptimizationVulkanQnK;
     const auto backend = create_vulkan_mxfp4_expert_backend(
         qnk_pair_bytes * 2 + 4096,
@@ -3191,7 +3195,7 @@ void test_ncnn_vulkan_qnk_expert_operator()
         automatic_vulkan_device_index,
         ExpertActivation::GptOssSwiGlu,
         context_instance,
-        kTestOptimizationFlags | RuntimeOptimizationVulkanQnK);
+        g_test_optimization_flags | RuntimeOptimizationVulkanQnK);
     CpuBatch direct_second_output;
     check(static_cast<bool>(direct_second));
     check(static_cast<bool>(direct_second->forward(input, direct_second_output)));
@@ -4076,7 +4080,7 @@ void test_file_backed_mxfp4_expert_cache()
             68,
             automatic_vulkan_device_index,
             context_instance,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
         check(static_cast<bool>(gpu_victim));
         gpu_victim->admit("gpu-roundtrip", gpu_source.value().gate_up, gpu_source.value().down);
         gpu_victim->wait_for_background_work();
@@ -5035,7 +5039,7 @@ void test_attention_graph_without_bias_or_sink()
         full_scratch,
         context_hidden,
         full_output,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(full_attention));
     auto appended_context = append_attention_context_into(
         compiled.weights,
@@ -5048,7 +5052,7 @@ void test_attention_graph_without_bias_or_sink()
         context_cache,
         context_scratch,
         context_hidden,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(appended_context));
     check(full_cache.start_position == context_cache.start_position);
     check(full_cache.token_count == context_cache.token_count);
@@ -5062,7 +5066,7 @@ void test_attention_graph_without_bias_or_sink()
         long_hidden.row(row)[0] = static_cast<float>(static_cast<int>(row % 13) - 6) * 0.0625f;
         long_hidden.row(row)[1] = static_cast<float>(static_cast<int>((row * 3) % 17) - 8) * 0.03125f;
     }
-    const uint64_t attention_reference_flags = kTestOptimizationFlags
+    const uint64_t attention_reference_flags = g_test_optimization_flags
                                                & ~RuntimeOptimizationCpuFlashAttention
                                                & ~RuntimeOptimizationCpuSplitKvAttention;
     CpuLayerCache reference_long_cache;
@@ -5096,7 +5100,7 @@ void test_attention_graph_without_bias_or_sink()
         flash_long_scratch,
         long_hidden,
         flash_long_output,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(reference_long));
     check(static_cast<bool>(flash_long));
     check(static_cast<bool>(reference_long_output.rows() == flash_long_output.rows()));
@@ -5138,7 +5142,7 @@ void test_attention_graph_without_bias_or_sink()
         split_kv_cache,
         split_kv_scratch,
         split_prefix,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(reference_context));
     check(static_cast<bool>(split_context));
     CpuBatch split_token(1, 2);
@@ -5171,7 +5175,7 @@ void test_attention_graph_without_bias_or_sink()
         split_kv_scratch,
         split_token,
         split_kv_output,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(reference_decode));
     check(static_cast<bool>(split_decode));
     for (uint32_t column = 0; column < reference_split_output.columns(); ++column)
@@ -5195,7 +5199,7 @@ void test_attention_graph_without_bias_or_sink()
         sliding_context_cache.front(),
         sliding_context_scratch,
         context_hidden,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(!rejected_sliding_context));
     check(static_cast<bool>(
         rejected_sliding_context.error().code
@@ -5592,7 +5596,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
         2,
         1e-6f,
         1e-6f,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(mixed));
     check_near(mixed.value().reduced.row(0)[0], 3.000006f, 1e-4f);
     CpuBatch branch(1, 1);
@@ -5709,7 +5713,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
         static_cast<uint32_t>(quantized_float8_input.size()),
         128,
         true,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     for (size_t index = 0; index < quantized_float8_input.size(); ++index)
     {
         check_near(
@@ -5723,7 +5727,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
         static_cast<uint32_t>(float8_input.size()),
         128,
         true,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     for (size_t index = 0; index < quantized_float8_copy.size(); ++index)
     {
         check_near(
@@ -5743,7 +5747,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
             quantized_float8_input.data(),
             static_cast<uint32_t>(quantized_float8_input.size()),
             128,
-            kTestOptimizationFlags),
+            g_test_optimization_flags),
         quantized_float8_reference,
         1e-3f);
     std::array<float, 4> quantized_float8_row_reference = {};
@@ -5766,7 +5770,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
         128,
         4,
         quantized_float8_row_output.data(),
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     for (size_t row = 0; row < quantized_float8_row_output.size(); ++row)
     {
         check_near(quantized_float8_row_output[row],
@@ -5786,13 +5790,13 @@ void test_deepseek_router_and_hyper_connection_kernels()
             float8_row_weights.data(), 256, float8_scales.data(),
             quantized_float8_batch_input.data() + token * 256, 256, 128, 4,
             quantized_float8_batch_expected.data() + token * 4,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
     }
     float8_e4m3_quantized_input_dot_rows_batch(
         float8_row_weights.data(), 256, float8_scales.data(),
         quantized_float8_batch_input.data(), 256, 256, 128, 4, 4, 4,
         quantized_float8_batch_output.data(),
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     for (size_t index = 0; index < quantized_float8_batch_output.size();
          ++index)
     {
@@ -5814,7 +5818,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
             unit_float8_input.data(),
             32,
             32,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
         if ((code & UINT32_C(0x7f)) == UINT32_C(0x7f))
         {
             check(std::isnan(fp32_value));
@@ -5834,7 +5838,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
                 quantized_float8_input.data(),
                 count,
                 128,
-                kTestOptimizationFlags),
+                g_test_optimization_flags),
             float8_e4m3_block_dot(
                 float8_weights.data(), float8_scales.data(),
                 quantized_float8_input.data(), count, 128),
@@ -5858,7 +5862,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
             float8_rows8_weights.data(), 256, float8_scales.data(),
             quantized_float8_input.data(), 256, 128, row_count,
             rows8_output.data(),
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
         for (uint32_t row = 0; row < row_count; ++row)
         {
             check_near(
@@ -5871,7 +5875,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
         }
     }
     check(static_cast<bool>(std::string(float8_kernel_name()).size() > 0));
-    const std::string float8_kernel = float8_linear_kernel_name(kTestOptimizationFlags);
+    const std::string float8_kernel = float8_linear_kernel_name(g_test_optimization_flags);
     check(static_cast<bool>(!float8_kernel.empty()));
 
     auto make_float8_projection = [](uint32_t seed,
@@ -5916,12 +5920,12 @@ void test_deepseek_router_and_hyper_connection_kernels()
     CpuBatch reference_up = linear_batch(
         float8_up,
         fused_input,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     const CpuBatch reference_raw_up = reference_up;
     const CpuBatch reference_gate = linear_batch(
         float8_gate,
         fused_input,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     for (size_t token_index = 0; token_index < reference_up.rows();
          ++token_index)
     {
@@ -5939,7 +5943,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
         fused_input,
         paired_gate,
         paired_up,
-        kTestOptimizationFlags));
+        g_test_optimization_flags));
     for (size_t token_index = 0; token_index < fused_input.rows();
          ++token_index)
     {
@@ -5961,16 +5965,16 @@ void test_deepseek_router_and_hyper_connection_kernels()
         rms_weight,
         1e-6f,
         0.0f,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     const CpuBatch reference_rms_projection = linear_batch(
         float8_gate,
         normalized_fused_input,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     CpuBatch fused_rms_projection;
     check(float8_linear_rms_norm_batch_into(
         float8_gate, fused_input, rms_weight, 1e-6f,
         fused_rms_projection,
-        kTestOptimizationFlags));
+        g_test_optimization_flags));
     for (size_t token_index = 0; token_index < fused_input.rows();
          ++token_index)
     {
@@ -5986,7 +5990,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
     check(fused_float8_gate_up_batch(
         float8_gate, float8_up, fused_input, ExpertActivation::Silu, 0.0f,
         fused_output,
-        kTestOptimizationFlags));
+        g_test_optimization_flags));
     check(fused_output.rows() == reference_up.rows());
     check(fused_output.columns() == reference_up.columns());
     for (size_t token_index = 0; token_index < reference_up.rows();
@@ -6003,11 +6007,11 @@ void test_deepseek_router_and_hyper_connection_kernels()
     CpuBatch deepseek_reference_up = linear_batch(
         float8_up,
         fused_input,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     const CpuBatch deepseek_reference_gate = linear_batch(
         float8_gate,
         fused_input,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     for (size_t token_index = 0;
          token_index < deepseek_reference_up.rows(); ++token_index)
     {
@@ -6029,7 +6033,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
         float8_gate, float8_up, fused_input,
         ExpertActivation::DeepSeekSwiGlu, deepseek_limit,
         deepseek_fused_output,
-        kTestOptimizationFlags));
+        g_test_optimization_flags));
     for (size_t token_index = 0;
          token_index < deepseek_reference_up.rows(); ++token_index)
     {
@@ -6045,7 +6049,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
     const CpuBatch scale_boundary_output = linear_batch(
         scale_boundary_matrix,
         fused_input,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     CpuBatch quantized_boundary_input = fused_input;
     for (size_t token_index = 0;
          token_index < quantized_boundary_input.rows(); ++token_index)
@@ -6055,7 +6059,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
             128,
             128,
             true,
-            kTestOptimizationFlags);
+            g_test_optimization_flags);
     }
     for (size_t token_index = 0; token_index < fused_input.rows();
          ++token_index)
@@ -6515,7 +6519,7 @@ void test_gated_delta_net_continuation()
         prefill_scratch,
         input,
         prefill_output,
-        kTestOptimizationFlags)));
+        g_test_optimization_flags)));
 
     CpuLayerCache decode_cache;
     CpuGatedDeltaExecutionScratch decode_scratch;
@@ -6535,7 +6539,7 @@ void test_gated_delta_net_continuation()
             decode_scratch,
             token,
             token_output,
-            kTestOptimizationFlags)));
+            g_test_optimization_flags)));
         std::copy_n(token_output.row(0), 2, decode_output.row(row));
     }
 
@@ -6581,7 +6585,7 @@ void test_gated_delta_net_continuation()
         NcnnLinearDevice::Cpu,
         automatic_vulkan_device_index,
         context_instance,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     plan.fused_delta_input_operator = fused_delta_handle;
     check(static_cast<bool>(operators.at(fused_delta_handle).linear));
     CpuLayerCache fused_cache;
@@ -6597,7 +6601,7 @@ void test_gated_delta_net_continuation()
         fused_scratch,
         input,
         fused_output,
-        kTestOptimizationFlags)));
+        g_test_optimization_flags)));
     for (size_t row = 0; row < input.rows(); ++row)
     {
         for (size_t column = 0; column < input.columns(); ++column)
@@ -6647,7 +6651,7 @@ void test_gated_delta_net_continuation()
         first_row_scratch,
         first_row_input,
         first_row_output,
-        kTestOptimizationFlags)));
+        g_test_optimization_flags)));
 
     std::array<CpuLayerCache, 1> committed_cache;
     check(static_cast<bool>(
@@ -6670,7 +6674,7 @@ void test_gated_delta_net_continuation()
         committed_scratch,
         input,
         committed_output,
-        kTestOptimizationFlags)));
+        g_test_optimization_flags)));
     auto committed = finish_state_cache_transaction(
         committed_cache,
         1);
@@ -6702,7 +6706,7 @@ void test_gated_delta_net_continuation()
         rolled_back_scratch,
         input,
         rolled_back_output,
-        kTestOptimizationFlags)));
+        g_test_optimization_flags)));
     auto rolled_back = finish_state_cache_transaction(
         rolled_back_cache,
         0);
@@ -6762,7 +6766,7 @@ void test_gated_delta_net_continuation()
         poisoned_attention_scratch,
         poisoned_attention_hidden,
         poisoned_attention_output,
-        kTestOptimizationFlags);
+        g_test_optimization_flags);
     check(static_cast<bool>(!poisoned_attention));
     check(static_cast<bool>(
         poisoned_attention.error().code == ErrorCode::InternalError));
@@ -8034,8 +8038,8 @@ void test_bfloat16_batched_linear_kernel()
     }
 
     const uint64_t batched_flags = RuntimeOptimizationCpuBfloat16Batched;
-    const uint64_t disabled_flags = kTestOptimizationFlags & ~batched_flags;
-    const uint64_t enabled_flags = kTestOptimizationFlags | batched_flags;
+    const uint64_t disabled_flags = g_test_optimization_flags & ~batched_flags;
+    const uint64_t enabled_flags = g_test_optimization_flags | batched_flags;
     check(!bfloat16_batched_linear(
         weights.data(),
         input.data(),
@@ -8441,7 +8445,7 @@ void benchmark_vulkan_qnk()
             nullptr,
             automatic_vulkan_device_index,
             context_instance,
-            kTestOptimizationFlags | RuntimeOptimizationVulkanQnK);
+            g_test_optimization_flags | RuntimeOptimizationVulkanQnK);
         if (!vulkan)
         {
             std::cout << "vulkan_qnk dtype=" << static_cast<int>(dtype) << " create=failed\n";
@@ -8566,7 +8570,7 @@ void benchmark_vulkan_qnk_expert()
         automatic_vulkan_device_index,
         ExpertActivation::GptOssSwiGlu,
         context_instance,
-        kTestOptimizationFlags | RuntimeOptimizationVulkanQnK);
+        g_test_optimization_flags | RuntimeOptimizationVulkanQnK);
     if (!vulkan)
     {
         std::cout << "vulkan_qnk_expert create=failed\n";
@@ -8662,25 +8666,41 @@ int main(int argc, char** argv)
 {
     try
     {
-        if (argc > 1 && std::string(argv[1]) == "--benchmark-bfloat16-attention")
+        if (argc > 2)
+        {
+            std::cerr << "expected at most one test argument\n";
+            return 2;
+        }
+        const std::string argument = argc > 1 ? std::string(argv[1]) : std::string{};
+        if (argument == "--benchmark-bfloat16-attention")
         {
             ncnn::moe::benchmark_bfloat16_attention_kernels();
             return 0;
         }
-        if (argc > 1 && std::string(argv[1]) == "--benchmark-qnk")
+        if (argument == "--benchmark-qnk")
         {
             ncnn::moe::benchmark_qnk_gemm();
             return 0;
         }
-        if (argc > 1 && std::string(argv[1]) == "--benchmark-vulkan-qnk")
+        if (argument == "--benchmark-vulkan-qnk")
         {
             ncnn::moe::benchmark_vulkan_qnk();
             return 0;
         }
-        if (argc > 1 && std::string(argv[1]) == "--benchmark-vulkan-qnk-expert")
+        if (argument == "--benchmark-vulkan-qnk-expert")
         {
             ncnn::moe::benchmark_vulkan_qnk_expert();
             return 0;
+        }
+        if (argument == "--disable-vulkan-pipeline-bind-elision")
+        {
+            ncnn::moe::g_test_optimization_flags &=
+                ~ncnn::moe::RuntimeOptimizationVulkanPipelineBindElision;
+        }
+        else if (!argument.empty())
+        {
+            std::cerr << "unknown test argument: " << argument << '\n';
+            return 2;
         }
         ncnn::moe::test_flag_defaults();
         ncnn::moe::test_cpu_task_worker();

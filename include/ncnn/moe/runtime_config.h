@@ -220,6 +220,9 @@ struct RuntimeConfig
     uint64_t optimization_flags = RuntimeOptimizationDefaultFlags;
 };
 
+// Source-compatible name for existing native runners and clients.
+using RuntimeOptions = RuntimeConfig;
+
 // Runtime settings after Auto values have been resolved.
 struct EffectiveRuntimeConfig
 {
@@ -241,6 +244,9 @@ struct EffectiveRuntimeConfig
     uint32_t expected_concurrency = 1;
     bool file_backed_experts = false;
 };
+
+// Source-compatible name for clients using the original terminology.
+using EffectiveRuntimeOptions = EffectiveRuntimeConfig;
 
 } // namespace moe
 } // namespace ncnn
