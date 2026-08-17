@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -126,6 +127,14 @@ def main() -> int:
     # and tensor-backed tokenizers may add a single batch dimension.
     assert _normalize_token_ids(UserDict({"input_ids": [4, 5, 6]})) == [4, 5, 6]
     assert _normalize_token_ids(UserDict({"input_ids": [[7, 8, 9]]})) == [7, 8, 9]
+
+    if importlib.util.find_spec("openai_harmony") is None:
+        print(
+            f"SKIP: openai_harmony is not installed for {sys.executable}; install with "
+            f'"{sys.executable}" -m pip install -e ".[gpt-oss]"',
+            file=sys.stderr,
+        )
+        return 77
 
     adapter = create_adapter(arguments.model)
     if adapter.model_type != "gpt_oss":

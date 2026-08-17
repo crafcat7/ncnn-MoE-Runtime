@@ -446,7 +446,9 @@ if(NCNN_MOE_BUILD_TESTS AND NCNN_MOE_BUILD_EXAMPLES)
         )
         set_tests_properties(
             ncnn_moe_python_fixture
-            PROPERTIES DEPENDS ncnn_moe_gpt_oss_fixture
+            PROPERTIES
+                DEPENDS ncnn_moe_gpt_oss_fixture
+                SKIP_RETURN_CODE 77
         )
         add_test(
             NAME ncnn_moe_python_auto_fixture
@@ -458,7 +460,9 @@ if(NCNN_MOE_BUILD_TESTS AND NCNN_MOE_BUILD_EXAMPLES)
         )
         set_tests_properties(
             ncnn_moe_python_auto_fixture
-            PROPERTIES DEPENDS ncnn_moe_gpt_oss_fixture
+            PROPERTIES
+                DEPENDS ncnn_moe_gpt_oss_fixture
+                SKIP_RETURN_CODE 77
         )
     endif()
 endif()
