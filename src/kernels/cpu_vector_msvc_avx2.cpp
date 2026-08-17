@@ -568,20 +568,15 @@ float msvc_avx2_int8_float_dot(
     __m256 sum = _mm256_add_ps(
         _mm256_add_ps(accumulator0, accumulator1),
         _mm256_add_ps(accumulator2, accumulator3));
-    __m128 low = _mm256_castps256_ps128(sum);
-    __m128 high = _mm256_extractf128_ps(sum, 1);
-    low = _mm_add_ps(low, high);
-    low = _mm_add_ps(low, _mm_movehl_ps(low, low));
-    low = _mm_add_ss(low, _mm_movehdup_ps(low));
-    float result = _mm_cvtss_f32(low);
     for (; index + 8 <= count; index += 8)
     {
-        result += _mm_cvtss_f32(_mm_dp_ps(
-            _mm256_castps256_ps128(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
-                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(left + index))))),
-            _mm_loadu_ps(right + index),
-            0xff));
+        sum = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(left + index)))),
+            _mm256_loadu_ps(right + index),
+            sum);
     }
+    float result = msvc_avx2_horizontal_sum(sum);
     for (; index < count; ++index)
         result += static_cast<float>(left[index]) * right[index];
     return result;

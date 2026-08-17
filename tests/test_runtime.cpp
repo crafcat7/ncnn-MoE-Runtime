@@ -13,6 +13,7 @@
 #include "kernels/cpu_vector.h"
 #include "kernels/cpu_hyper_connection.h"
 #include "engine/cpu_executor.h"
+#include "engine/cpu_features.h"
 #include "engine/cpu_task_worker.h"
 #include "engine/cpu_thread_budget.h"
 #include "engine/expert_backend.h"
@@ -28,6 +29,10 @@
 #include "models/deepseek_v4_model_adapter.h"
 #include "models/qwen3_5_moe_model_adapter.h"
 #include "models/safetensors.h"
+
+#if defined(_MSC_VER) && defined(_M_X64)
+#include "kernels/cpu_vector_msvc.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -7705,6 +7710,43 @@ void test_int8_float_dot()
         expected,
         1e-4f);
     check_near(int8_float_dot(left.data(), right.data(), 0), 0.0f, 1e-6f);
+
+#if defined(_MSC_VER) && defined(_M_X64)
+    if ((detect_cpu_isa_capabilities().flags & CpuIsaX86Avx2Fma) != 0)
+    {
+        // Exercise AVX2 directly so AVX512-capable hosts cannot mask its tail path.
+        check_near(
+            msvc_avx2_int8_float_dot(
+                left.data(), right.data(), static_cast<uint32_t>(left.size())),
+            expected,
+            1e-4f);
+        constexpr std::array<uint32_t, 23> counts = {
+            0, 1, 4, 7, 8, 9, 12, 15, 16, 23, 24, 31,
+            32, 33, 39, 40, 47, 48, 55, 56, 63, 64, 137,
+        };
+        std::array<int8_t, 137> avx2_left = {};
+        std::array<float, 137> avx2_right = {};
+        for (size_t index = 0; index < avx2_left.size(); ++index)
+        {
+            avx2_left[index] = static_cast<int8_t>(index % 13 + 1);
+            avx2_right[index] = static_cast<float>(index % 7 + 1) * 0.125f;
+        }
+        for (const uint32_t count : counts)
+        {
+            float avx2_expected = 0.0f;
+            for (uint32_t index = 0; index < count; ++index)
+            {
+                avx2_expected += static_cast<float>(avx2_left[index])
+                                 * avx2_right[index];
+            }
+            check_near(
+                msvc_avx2_int8_float_dot(
+                    avx2_left.data(), avx2_right.data(), count),
+                avx2_expected,
+                1e-4f);
+        }
+    }
+#endif
 }
 
 void test_weighted_scale()
