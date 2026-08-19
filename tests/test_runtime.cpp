@@ -73,12 +73,30 @@ static void check(bool condition, const std::source_location location = std::sou
     }
 }
 
-static void check_near(float actual, float expected, float tolerance)
+static void check_near(
+    float actual,
+    float expected,
+    float tolerance,
+    const std::source_location location = std::source_location::current())
 {
     if (std::abs(actual - expected) > tolerance)
     {
-        throw std::runtime_error("near check failed: actual=" + std::to_string(actual) + ", expected=" + std::to_string(expected));
+        throw std::runtime_error(
+            "near check failed at " + std::string(location.file_name()) + ":"
+            + std::to_string(location.line()) + ": actual="
+            + std::to_string(actual) + ", expected=" + std::to_string(expected));
     }
+}
+
+static float bfloat16_storage_tolerance(float value) noexcept
+{
+    // Native conversion may round, while ncnn's packed fallback truncates.
+    // One storage ULP is the strict bound shared by both paths.
+    if (value == 0.0f)
+        return std::ldexp(1.0f, -133);
+    return std::ldexp(
+        1.0f,
+        std::max(std::ilogb(std::abs(value)) - 7, -133));
 }
 
 inline uint64_t g_test_optimization_flags = RuntimeOptimizationDefaultFlags;
@@ -1051,7 +1069,7 @@ void test_ncnn_linear_operator()
                 check_near(
                     bfloat16_to_float(output_value),
                     expected,
-                    0.02f);
+                    bfloat16_storage_tolerance(expected));
             }
         }
     }
