@@ -4494,7 +4494,9 @@ void test_cross_session_batch_scheduler()
     check(static_cast<bool>(!duplicate_results[1]));
     check(static_cast<bool>(first.value()->sequence_length() == 1));
     const SchedulerStatistics statistics = scheduler.value()->statistics();
-    check(static_cast<bool>(statistics.worker_count == 2));
+    check(static_cast<bool>(
+        statistics.worker_count
+        == std::min(options.worker_count, statistics.compute_thread_budget)));
     check(static_cast<bool>(statistics.expert_threads_per_worker >= 1));
     check(static_cast<bool>(statistics.logical_cpu_count >= 1));
     check(static_cast<bool>(statistics.physical_cpu_count >= 1));
@@ -4547,13 +4549,17 @@ void test_cross_session_batch_scheduler()
     check(static_cast<bool>(bypass_statistics.staging_bypassed_batches == 1));
     for (uint32_t iteration = 0; iteration < 3; ++iteration)
     {
+        auto adaptive_first = runtime.create_session(model.value());
+        auto adaptive_second = runtime.create_session(model.value());
+        check(static_cast<bool>(adaptive_first));
+        check(static_cast<bool>(adaptive_second));
         auto adaptive_future = bypass_scheduler.value()->submit_decode({
             {
-                bypass_first.value(),
+                adaptive_first.value(),
                 0,
             },
             {
-                bypass_second.value(),
+                adaptive_second.value(),
                 1,
             },
         });
@@ -8717,6 +8723,28 @@ void test_cpu_resource_coordination()
     const CpuThreadBudgetSnapshot returned = controller.snapshot();
     check(returned.active_compute_threads == 0);
     check(returned.compute_acquisitions == returned.compute_returns);
+
+    constexpr std::array<uint32_t, 3> scheduler_resource_limits = {1, 2, 4};
+    TestRuntime runtime;
+    for (uint32_t requested_workers : scheduler_resource_limits)
+    {
+        for (uint32_t requested_compute_threads : scheduler_resource_limits)
+        {
+            SchedulerOptions options;
+            options.worker_count = requested_workers;
+            options.compute_threads = requested_compute_threads;
+            options.cross_call_window_microseconds = 0;
+            auto scheduler = runtime.create_scheduler(options);
+            check(static_cast<bool>(scheduler));
+            const SchedulerStatistics statistics = scheduler.value()->statistics();
+            check(static_cast<bool>(statistics.compute_thread_budget >= 1));
+            check(static_cast<bool>(
+                statistics.compute_thread_budget <= requested_compute_threads));
+            check(static_cast<bool>(
+                statistics.worker_count
+                == std::min(requested_workers, statistics.compute_thread_budget)));
+        }
+    }
 }
 
 } // namespace moe
