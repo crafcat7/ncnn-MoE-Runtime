@@ -44,7 +44,9 @@ public:
 
     [[nodiscard]] Result<void> initialize(const ExecutionGraph& graph);
     [[nodiscard]] Result<void> transition(ExecutionTensorId tensor_id, TensorLocation location);
-    [[nodiscard]] Result<void> record_execution(const ExecutionGraph& graph);
+    [[nodiscard]] Result<void> record_execution(
+        const ExecutionGraph& graph,
+        const ExecutionSchedule& schedule);
     [[nodiscard]] MemoryManagerStatistics statistics() const;
 };
 

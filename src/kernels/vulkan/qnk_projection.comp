@@ -1,0 +1,213 @@
+#version 450
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(binding = 0) readonly buffer input_blob
+{
+    float input_data[];
+};
+layout(binding = 1) readonly buffer quantized_blob
+{
+    uint quantized_words[];
+};
+layout(binding = 2) readonly buffer bias_blob
+{
+    float bias_data[];
+};
+layout(binding = 3) writeonly buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint input_columns;
+    uint output_columns;
+    uint block_count;
+    uint token_count;
+    uint block_bytes;
+    uint qnk_type;
+}
+p;
+
+uint qnk_byte(uint index)
+{
+    const uint word = quantized_words[index >> 2];
+    return (word >> ((index & 3u) * 8u)) & 255u;
+}
+
+uint qnk_u16(uint index)
+{
+    return qnk_byte(index) | (qnk_byte(index + 1u) << 8u);
+}
+
+uint qnk_u32(uint index)
+{
+    return qnk_byte(index)
+           | (qnk_byte(index + 1u) << 8u)
+           | (qnk_byte(index + 2u) << 16u)
+           | (qnk_byte(index + 3u) << 24u);
+}
+
+float qnk_f16(uint index)
+{
+    return unpackHalf2x16(qnk_u16(index)).x;
+}
+
+int qnk_signed_byte(uint value)
+{
+    return value < 128u ? int(value) : int(value) - 256;
+}
+
+void qnk_scale_min_k4(uint block, int index, out uint scale, out uint minimum)
+{
+    const uint scales = block + 4u;
+    if (index < 4)
+    {
+        scale = qnk_byte(scales + uint(index)) & 63u;
+        minimum = qnk_byte(scales + uint(index + 4)) & 63u;
+    }
+    else
+    {
+        scale = (qnk_byte(scales + uint(index + 4)) & 15u)
+                 | ((qnk_byte(scales + uint(index - 4)) >> 6u) << 4u);
+        minimum = (qnk_byte(scales + uint(index + 4)) >> 4u)
+                  | ((qnk_byte(scales + uint(index)) >> 6u) << 4u);
+    }
+}
+
+int qnk_q3_scale(uint block, uint index)
+{
+    const uint first = qnk_u32(block + 96u);
+    const uint second = qnk_u32(block + 100u);
+    const uint temporary = qnk_u32(block + 104u);
+    const uint mask1 = 0x03030303u;
+    const uint mask2 = 0x0f0f0f0fu;
+    const uint transformed0 = (first & mask2) | ((temporary & mask1) << 4u);
+    const uint transformed1 = (second & mask2) | (((temporary >> 2u) & mask1) << 4u);
+    const uint transformed2 = ((first >> 4u) & mask2) | (((temporary >> 4u) & mask1) << 4u);
+    const uint transformed3 = ((second >> 4u) & mask2) | (((temporary >> 6u) & mask1) << 4u);
+    const uint group = index >> 2u;
+    const uint word = group == 0u ? transformed0
+                            : group == 1u ? transformed1
+                            : group == 2u ? transformed2
+                                          : transformed3;
+    return qnk_signed_byte((word >> ((index & 3u) * 8u)) & 255u);
+}
+
+float qnk_value(uint block, uint type, uint index)
+{
+    if (type == 0u)
+    {
+        const uint super = index >> 7u;
+        const uint within = index & 127u;
+        const uint chunk = within >> 5u;
+        const uint lane = within & 15u;
+        const uint q_index = block + 16u + super * 32u + ((within & 16u) != 0u ? 16u : 0u) + lane;
+        const uint scale_min = qnk_byte(block + (super << 3u) + (within >> 4u));
+        const float d = qnk_f16(block + 80u);
+        const float minimum = qnk_f16(block + 82u);
+        const float scale = d * float(scale_min & 15u);
+        const float min_value = minimum * float(scale_min >> 4u);
+        return scale * float((qnk_byte(q_index) >> (chunk * 2u)) & 3u) - min_value;
+    }
+    if (type == 1u)
+    {
+        const uint super = index >> 7u;
+        const uint within = index & 127u;
+        const uint chunk = within >> 5u;
+        const uint lane = within & 15u;
+        const uint q_index = block + 32u + super * 32u + ((within & 16u) != 0u ? 16u : 0u) + lane;
+        const uint high_index = block + ((within & 16u) != 0u ? 16u : 0u) + lane;
+        const uint high = (qnk_byte(high_index) & (1u << (chunk + super * 4u))) != 0u ? 0u : 4u;
+        const int q = int((qnk_byte(q_index) >> (chunk * 2u)) & 3u) - int(high);
+        const int scale = qnk_q3_scale(block, (super << 3u) + (within >> 4u)) - 32;
+        return qnk_f16(block + 108u) * float(scale * q);
+    }
+    if (type == 2u || type == 3u)
+    {
+        const uint group = index >> 6u;
+        const uint within = index & 63u;
+        const uint part = within >> 5u;
+        const uint lane = within & 31u;
+        const uint scale_index = (group << 1u) + part;
+        uint scale_value = 0u;
+        uint min_value = 0u;
+        qnk_scale_min_k4(block, int(scale_index), scale_value, min_value);
+        const uint q_index = block + (type == 2u ? 16u : 48u) + group * 32u + lane;
+        const uint nibble = part == 0u ? qnk_byte(q_index) & 15u : qnk_byte(q_index) >> 4u;
+        uint value = nibble;
+        if (type == 3u)
+        {
+            const uint mask = (part == 0u ? 1u : 2u) << (group * 2u);
+            if ((qnk_byte(block + 16u + lane) & mask) != 0u)
+                value += 16u;
+        }
+        return qnk_f16(block) * float(scale_value * value)
+               - qnk_f16(block + 2u) * float(min_value);
+    }
+    if (type == 4u)
+    {
+        const uint super = index >> 7u;
+        const uint within = index & 127u;
+        const uint group = within >> 5u;
+        const uint lane = within & 31u;
+        const uint low_index = block + super * 64u + ((group & 1u) != 0u ? 32u : 0u) + lane;
+        const uint high_index = block + 128u + super * 32u + lane;
+        const uint low = (group < 2u) ? qnk_byte(low_index) & 15u : qnk_byte(low_index) >> 4u;
+        const uint value = low | (((qnk_byte(high_index) >> (group * 2u)) & 3u) << 4u);
+        const int signed_value = int(value) - 32;
+        const int scale = qnk_signed_byte(qnk_byte(block + 192u + super * 8u + group * 2u));
+        return qnk_f16(block + 208u) * float(scale * signed_value);
+    }
+
+    const float scale = uintBitsToFloat(qnk_u32(block));
+    return scale * float(qnk_signed_byte(qnk_byte(block + 4u + index)));
+}
+
+#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
+shared float partial_sum[32];
+#endif
+
+void main()
+{
+    const uint output_column = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    const bool valid = output_column < p.output_columns && token < p.token_count;
+    float sum = 0.0;
+    if (valid && lane < 32u)
+    {
+        const uint input_row = token * p.input_columns;
+        const uint matrix_row = output_column * p.block_count * p.block_bytes;
+        for (uint block = 0u; block < p.block_count; ++block)
+        {
+            const uint block_offset = matrix_row + block * p.block_bytes;
+            const uint input_offset = input_row + block * 256u + lane * 8u;
+            for (uint offset = 0u; offset < 8u; ++offset)
+            {
+                sum += qnk_value(block_offset, p.qnk_type, lane * 8u + offset)
+                       * input_data[input_offset + offset];
+            }
+        }
+    }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const float reduced_sum = subgroupAdd(sum);
+    if (valid && lane == 0u)
+        output_data[token * p.output_columns + output_column] = reduced_sum + bias_data[output_column];
+#else
+    partial_sum[lane] = sum;
+    barrier();
+    for (uint stride = 16u; stride > 0u; stride >>= 1u)
+    {
+        if (lane < stride)
+            partial_sum[lane] += partial_sum[lane + stride];
+        barrier();
+    }
+    if (valid && lane == 0u)
+        output_data[token * p.output_columns + output_column] = partial_sum[0] + bias_data[output_column];
+#endif
+}

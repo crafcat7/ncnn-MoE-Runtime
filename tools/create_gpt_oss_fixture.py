@@ -183,7 +183,14 @@ def main() -> None:
             check=False,
         )
         cpu = subprocess.run(
-            common_arguments + ["--cpu"],
+            common_arguments + ["--cpu", "--cpu-packed-weights", "off"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        packed = subprocess.run(
+            common_arguments + ["--cpu", "--cpu-packed-weights", "on"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -205,6 +212,18 @@ def main() -> None:
         if paged.returncode:
             print(paged.stdout, end="")
             raise SystemExit(paged.returncode)
+        if "CPU packed weights off" not in automatic.stdout:
+            raise SystemExit("default GPT-OSS run did not keep CPU repack disabled")
+        if "CPU packed weights off" not in cpu.stdout:
+            print(cpu.stdout, end="")
+            raise SystemExit("explicit CPU packed-weight off mode was not selected")
+        packed_supported = packed.returncode == 0
+        if packed_supported and "CPU packed weights on" not in packed.stdout:
+            print(packed.stdout, end="")
+            raise SystemExit("explicit CPU packed-weight on mode was not selected")
+        if not packed_supported and "CPU packed weights are unavailable" not in packed.stdout:
+            print(packed.stdout, end="")
+            raise SystemExit(packed.returncode)
         if "loaded gpt_oss" not in automatic.stdout or "generated token ids:" not in automatic.stdout:
             raise SystemExit("GPT-OSS fixture runner output is incomplete")
         def generated_tokens(output: str) -> str:
@@ -221,6 +240,9 @@ def main() -> None:
             print(cpu.stdout, end="")
             print(paged.stdout, end="")
             raise SystemExit("automatic and CPU GPT-OSS outputs differ")
+        if packed_supported and automatic_tokens != generated_tokens(packed.stdout):
+            print(packed.stdout, end="")
+            raise SystemExit("packed and default GPT-OSS outputs differ")
         if "Expert cache: 2 hit(s), 1 miss(es)" not in paged.stdout:
             print(paged.stdout, end="")
             raise SystemExit("paged GPT-OSS fixture did not exercise the expert cache")

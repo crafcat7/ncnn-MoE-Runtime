@@ -69,7 +69,7 @@ requiring a resident copy of every routed weight.
 | Execution graph | Tensor and node dependencies, backend candidates and placement, cross-backend events, and topological execution waves |
 | Dense path | Portable CPU with runtime-dispatched FP8 E4M3 scalar/AVX2/AVX-512 Linear, optional ncnn CPU operators, and mixed ncnn Vulkan Dense/Attention execution |
 | Attention | RMSNorm, GQA, full/sliding Attention, Gated DeltaNet, latent Attention with learned compressed history, RoPE/YaRN variants, output gates, sinks, persistent KV/recurrent state, fused QKV+RoPE, and adaptive online Decode SDPA |
-| Experts | Stable Top-K regrouping, Softmax/Sigmoid/square-root-Softplus scoring, hash routes, gated shared Experts, float32/BF16/FP8/INT8 execution, and fused-decode FP4 kernels selected at runtime for scalar, NEON, SVE2, AVX2/FMA, or AVX-512 |
+| Experts | Stable Top-K regrouping, Softmax/Sigmoid/square-root-Softplus scoring, hash routes, gated shared Experts, float32/BF16/FP8/INT8/Q2_K-Q6_K execution, and fused-decode FP4 kernels selected at runtime for scalar, NEON, SVE2, AVX2/FMA, or AVX-512 |
 | Memory and storage | Automatic eager/on-demand planning, per-Session Tensor residency accounting, Expert lifecycle/hotset statistics, byte-bounded host ARC, mmap or asynchronous direct/buffered reads, optional packed Expert storage, and optional Vulkan cache tiers |
 | Heterogeneous execution | CPU Experts by default, optional calibrated native Vulkan MXFP4 Experts, and capability-weighted multi-Vulkan layer placement |
 | Scheduling | Independent Session state, ragged staged Prefill, mHC/Attention/Expert Decode batching, same-Expert and exact-input coalescing, adaptive staged/independent execution, and bounded cross-call micro-batching |
@@ -204,6 +204,36 @@ See [examples/README.md](examples/README.md) for the protocol boundary and
 common commands. The model guides document model-specific package preparation
 and adapter options.
 
+## Qn_K CPU weights
+
+The CPU path accepts the portable Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, and
+Q8_K blocks. Q2_K-Q6_K use the exact 256-element super-block layouts; Q8_K is
+available for activation/block interchange. A `TensorData` loaded through
+`SafetensorsArchive::load_qnk_tensor()` or `load_qnk_expert()` keeps the raw
+bytes lossless. By default, CPU linear execution reads those blocks directly
+and does not create a second persistent in-memory weight layout.
+The x86 build dispatches Q2_K-Q8_K to direct SIMD bit-decode dot kernels: AVX2
+handles all formats, while AVX-512 uses 16-lane Q4_K/Q5_K/Q6_K kernels and the
+validated AVX2 kernels for the remaining formats. The scalar decoder remains
+the portability and correctness fallback.
+
+`--cpu-packed-weights on` explicitly enables lazy in-memory repacking for
+supported Qn_K and MXFP4-Q8 CPU Expert weights. The default is `off`; there is
+no automatic mode. When enabled, the memory planner and on-demand Expert cache
+reserve the additional sidecar bytes before loading. Repack can help some
+batched shapes but increases resident memory and is not assumed to improve
+single-token decode, so benchmark it on the target machine before enabling it.
+
+The deterministic Qn_K reference comparison can be run from the CPU test
+binary:
+
+```powershell
+build-cpu\Release\ncnn_moe_tests.exe --benchmark-qnk
+```
+
+It reports the scalar-decode/SIMD-float-dot reference time, direct SIMD time,
+speedup, and checksum delta for all six formats.
+
 ## Runtime API
 
 `Runtime` selects a registered adapter for the supplied model package, compiles
@@ -299,15 +329,7 @@ the public upstream ncnn submission API.
 
 Cross-layer Router prediction, forward-aware cache policy, Rank-adaptive
 prefetch, a bounded prediction worker, and exact-adjacency cross-Expert reads
-are available as experimental opt-ins. They remain disabled by default. In the
-current 24-token Direct-I/O triplets, synchronous prediction improves DeepSeek
-throughput by 5.93%, while async prediction improves GPT-OSS by 0.88% but loses
-to synchronous prediction on DeepSeek because it competes with CPU Experts.
-See the
-[Palm-Infra transfer report](memories/repo/investigation-results/palm-infra-transfer-experiment.md)
-and the historical
-[Router/cache/I/O A/B report](memories/repo/investigation-results/router-prefetch-cache-io-ab.md)
-for protocols, per-Rank metrics, and acceptance boundaries.
+are available as experimental opt-ins and remain disabled by default.
 
 Kernel, scheduling, memory-management, and fallback behavior are provided by
 the Runtime API and its public model guides.
@@ -355,12 +377,12 @@ src/graph/         Model compilation, execution-graph scheduling, Expert dispatc
 src/engine/        Runtime Core, Sessions, batch scheduling, MemoryManager, CPU execution, and Expert-backend coordination
 src/models/        Built-in model adapters, package loading, packed-sidecar selection, and canonical Tensor names
 src/storage/       Mapped files, range I/O, host ARC, Vulkan victim cache, system-memory discovery, and Expert lifecycle
-src/kernels/       Portable CPU Attention/Linear, BF16 helpers, and runtime-selected FP8/MXFP4 SIMD kernels
+src/kernels/       Portable CPU Attention/Linear, BF16 helpers, Qn_K pack/decode, and runtime-selected FP8/MXFP4 SIMD kernels
 src/backends/ncnn/ ncnn CPU/Vulkan operator packaging, mixed Attention, Vulkan contexts, and native MXFP4 Experts
 models/            Model catalog and model-family execution guides
 assets/            Published benchmark visualizations used by model reports
 examples/          Unified worker, benchmark/reference runners, protocol helpers, and MXFP4 microbenchmark
-tools/             Unified CLI/adapters, fixture, packed-Expert, and benchmark utilities
+tools/             Unified CLI/adapters, fixtures, packed-Expert tooling, and Qn_K/runtime benchmarks
 tests/             Deterministic, parity, cache, scheduling, concurrency, and error-path tests
 third_party/ncnn/  Pinned ncnn source submodule
 ```

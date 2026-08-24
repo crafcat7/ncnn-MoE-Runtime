@@ -1,0 +1,122 @@
+#version 450
+
+#ifdef NCNN_fp16_arithmetic
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(binding = 0) readonly buffer input_blob
+{
+    float input_data[];
+};
+layout(binding = 1) readonly buffer packed_blob
+{
+    uint packed_words[];
+};
+layout(binding = 2) readonly buffer scale_blob
+{
+    uint scale_words[];
+};
+layout(binding = 3) readonly buffer bias_blob
+{
+    float bias_data[];
+};
+layout(binding = 4) writeonly buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint input_columns;
+    uint output_columns;
+    uint block_count;
+    uint token_count;
+}
+p;
+
+uint packed_byte(uint index)
+{
+    const uint word = packed_words[index >> 2];
+    return (word >> ((index & 3) * 8)) & 255;
+}
+
+uint scale_byte(uint index)
+{
+    const uint word = scale_words[index >> 2];
+    return (word >> ((index & 3) * 8)) & 255;
+}
+
+float decode_mxfp4(uint value)
+{
+    const float magnitudes[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    const float magnitude = magnitudes[value & 7];
+    return (value & 8) == 0 ? magnitude : -magnitude;
+}
+
+float decode_scale(uint value)
+{
+    // E8M0 maps directly to an IEEE-754 exponent.
+    return uintBitsToFloat(value == 0 ? 0x00400000u : value << 23);
+}
+
+float mxfp4_product(float value, float input_value, float scale)
+{
+#ifdef NCNN_fp16_arithmetic
+    return float(float16_t(value) * float16_t(input_value) * float16_t(scale));
+#else
+    return value * input_value * scale;
+#endif
+}
+
+#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
+shared float partial_sum[32];
+#endif
+
+void main()
+{
+    const uint output_column = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    const bool valid = output_column < p.output_columns && token < p.token_count;
+    float sum = 0.0;
+    if (valid && lane < 32)
+    {
+        const uint packed_row = output_column * p.block_count * 16;
+        const uint scale_row = output_column * p.block_count;
+        const uint input_row = token * p.input_columns;
+        for (uint block = 0; block < p.block_count; ++block)
+        {
+            const float scale = decode_scale(scale_byte(scale_row + block));
+            const uint value = packed_byte(packed_row + block * 16 + lane / 2);
+            const uint nibble = (lane & 1) == 0 ? value & 15 : value >> 4;
+            sum += mxfp4_product(
+                decode_mxfp4(nibble),
+                input_data[input_row + block * 32 + lane],
+                scale);
+        }
+    }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const float reduced_sum = subgroupAdd(sum);
+    if (valid && lane == 0)
+    {
+        output_data[token * p.output_columns + output_column] = reduced_sum + bias_data[output_column];
+    }
+#else
+    partial_sum[lane] = sum;
+    barrier();
+    for (uint stride = 16; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+            partial_sum[lane] += partial_sum[lane + stride];
+        barrier();
+    }
+    if (valid && lane == 0)
+        output_data[token * p.output_columns + output_column] = partial_sum[0] + bias_data[output_column];
+#endif
+}

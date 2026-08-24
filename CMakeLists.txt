@@ -42,6 +42,7 @@ set(NCNN_MOE_SOURCES
     src/engine/cpu_executor.cpp
     src/engine/cpu_features.cpp
     src/engine/cpu_task_worker.cpp
+    src/engine/cpu_thread_budget.cpp
     src/engine/cpu_topology.cpp
     src/engine/expert_backend.cpp
     src/engine/memory_manager.cpp
@@ -59,6 +60,7 @@ set(NCNN_MOE_SOURCES
     src/kernels/cpu_hyper_connection.cpp
     src/kernels/cpu_latent_attention.cpp
     src/kernels/cpu_mxfp4.cpp
+    src/kernels/cpu_qnk.cpp
     src/kernels/cpu_ops.cpp
     src/kernels/cpu_state_cache.cpp
     src/kernels/cpu_vector.cpp
@@ -71,6 +73,7 @@ set(NCNN_MOE_SOURCES
     src/storage/expert_victim_cache.cpp
     src/storage/mapped_file.cpp
     src/storage/system_memory.cpp
+    src/storage/weight_store.cpp
 )
 add_library(ncnn_moe STATIC ${NCNN_MOE_SOURCES})
 source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_SOURCES})
@@ -81,6 +84,8 @@ if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
         src/kernels/cpu_float8_msvc_avx512.cpp
         src/kernels/cpu_mxfp4_msvc_avx2.cpp
         src/kernels/cpu_mxfp4_msvc_avx512.cpp
+        src/kernels/cpu_qnk_msvc_avx2.cpp
+        src/kernels/cpu_qnk_msvc_avx512.cpp
         src/kernels/cpu_vector_msvc_avx2.cpp
         src/kernels/cpu_vector_msvc_avx512.cpp
     )
@@ -89,12 +94,14 @@ if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
     set_source_files_properties(
         src/kernels/cpu_float8_msvc_avx2.cpp
         src/kernels/cpu_mxfp4_msvc_avx2.cpp
+        src/kernels/cpu_qnk_msvc_avx2.cpp
         src/kernels/cpu_vector_msvc_avx2.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX2"
     )
     set_source_files_properties(
         src/kernels/cpu_float8_msvc_avx512.cpp
         src/kernels/cpu_mxfp4_msvc_avx512.cpp
+        src/kernels/cpu_qnk_msvc_avx512.cpp
         src/kernels/cpu_vector_msvc_avx512.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX512"
     )
@@ -235,6 +242,72 @@ if(NCNN_MOE_USE_NCNN)
     endif()
 endif()
 
+if(NCNN_MOE_WITH_VULKAN)
+    set(NCNN_MOE_VULKAN_SHADER_SOURCES
+        src/kernels/vulkan/attention_decode_sdpa.comp
+        src/kernels/vulkan/attention_output_gate.comp
+        src/kernels/vulkan/attention_qkv_norm_rope.comp
+        src/kernels/vulkan/attention_qkv_rope.comp
+        src/kernels/vulkan/attention_ring_append.comp
+        src/kernels/vulkan/attention_ring_zero.comp
+        src/kernels/vulkan/bfloat16_cooperative_projection.comp
+        src/kernels/vulkan/bfloat16_projection.comp
+        src/kernels/vulkan/bfloat16_rms_norm_projection.comp
+        src/kernels/vulkan/bfloat16_swiglu_down.comp
+        src/kernels/vulkan/float8_projection.comp
+        src/kernels/vulkan/float8_quantize.comp
+        src/kernels/vulkan/float8_rms_norm_quantize.comp
+        src/kernels/vulkan/float8_swiglu_quantize.comp
+        src/kernels/vulkan/gated_delta_net.comp
+        src/kernels/vulkan/mxfp4_gate_up.comp
+        src/kernels/vulkan/mxfp4_indexed.comp
+        src/kernels/vulkan/mxfp4_projection.comp
+        src/kernels/vulkan/mxfp4_route_aggregation.comp
+        src/kernels/vulkan/qnk_projection.comp
+        src/kernels/vulkan/qnk_swiglu.comp
+    )
+    set(NCNN_MOE_VULKAN_SHADER_HEADERS)
+    foreach(NCNN_MOE_SHADER_SOURCE IN LISTS NCNN_MOE_VULKAN_SHADER_SOURCES)
+        get_filename_component(
+            NCNN_MOE_SHADER_NAME
+            "${NCNN_MOE_SHADER_SOURCE}"
+            NAME_WE)
+        set(NCNN_MOE_SHADER_HEADER
+            "${CMAKE_CURRENT_BINARY_DIR}/kernels/vulkan/${NCNN_MOE_SHADER_NAME}.comp.hex.h")
+        add_custom_command(
+            OUTPUT "${NCNN_MOE_SHADER_HEADER}"
+            COMMAND ${CMAKE_COMMAND}
+                -DSHADER_SRC=${CMAKE_CURRENT_SOURCE_DIR}/${NCNN_MOE_SHADER_SOURCE}
+                -DSHADER_COMP_HEADER=${NCNN_MOE_SHADER_HEADER}
+                -DSHADER_VARIABLE=${NCNN_MOE_SHADER_NAME}_shader
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ncnn_moe_generate_shader_comp_header.cmake"
+            DEPENDS
+                "${CMAKE_CURRENT_SOURCE_DIR}/${NCNN_MOE_SHADER_SOURCE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ncnn_moe_generate_shader_comp_header.cmake"
+            COMMENT "Preprocessing MoE Vulkan shader ${NCNN_MOE_SHADER_NAME}.comp"
+            VERBATIM
+        )
+        set_source_files_properties("${NCNN_MOE_SHADER_HEADER}" PROPERTIES GENERATED TRUE)
+        list(APPEND NCNN_MOE_VULKAN_SHADER_HEADERS "${NCNN_MOE_SHADER_HEADER}")
+    endforeach()
+    set_source_files_properties(
+        ${NCNN_MOE_VULKAN_SHADER_SOURCES}
+        PROPERTIES HEADER_FILE_ONLY TRUE)
+    target_sources(
+        ncnn_moe
+        PRIVATE
+            ${NCNN_MOE_VULKAN_SHADER_SOURCES}
+            ${NCNN_MOE_VULKAN_SHADER_HEADERS})
+    target_include_directories(ncnn_moe PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    add_custom_target(
+        ncnn-moe-generate-vulkan-shaders
+        DEPENDS ${NCNN_MOE_VULKAN_SHADER_HEADERS})
+    add_dependencies(ncnn_moe ncnn-moe-generate-vulkan-shaders)
+    source_group(
+        TREE "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        FILES ${NCNN_MOE_VULKAN_SHADER_SOURCES})
+endif()
+
 if(MSVC)
     target_compile_options(ncnn_moe PRIVATE /W4 /permissive-)
 else()
@@ -252,6 +325,12 @@ if(NCNN_MOE_BUILD_TESTS)
     target_include_directories(ncnn_moe_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(ncnn_moe_tests PRIVATE NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>)
     add_test(NAME ncnn_moe_tests COMMAND ncnn_moe_tests)
+    if(NCNN_MOE_WITH_VULKAN)
+        add_test(
+            NAME ncnn_moe_pipeline_bind_elision_disabled
+            COMMAND ncnn_moe_tests --disable-vulkan-pipeline-bind-elision
+        )
+    endif()
     add_test(
         NAME ncnn_moe_style
         COMMAND ${CMAKE_COMMAND}
@@ -367,7 +446,9 @@ if(NCNN_MOE_BUILD_TESTS AND NCNN_MOE_BUILD_EXAMPLES)
         )
         set_tests_properties(
             ncnn_moe_python_fixture
-            PROPERTIES DEPENDS ncnn_moe_gpt_oss_fixture
+            PROPERTIES
+                DEPENDS ncnn_moe_gpt_oss_fixture
+                SKIP_RETURN_CODE 77
         )
         add_test(
             NAME ncnn_moe_python_auto_fixture
@@ -379,7 +460,9 @@ if(NCNN_MOE_BUILD_TESTS AND NCNN_MOE_BUILD_EXAMPLES)
         )
         set_tests_properties(
             ncnn_moe_python_auto_fixture
-            PROPERTIES DEPENDS ncnn_moe_gpt_oss_fixture
+            PROPERTIES
+                DEPENDS ncnn_moe_gpt_oss_fixture
+                SKIP_RETURN_CODE 77
         )
     endif()
 endif()

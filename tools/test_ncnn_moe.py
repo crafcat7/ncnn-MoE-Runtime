@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -15,8 +16,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ncnn_moe_adapters import QwenAdapter, _normalize_token_ids, create_adapter  # noqa: E402
-from ncnn_moe import _format_bytes_gb, default_worker_path, find_worker, parse_arguments  # noqa: E402
+from ncnn_moe import _format_bytes_gb, _format_runtime_metrics, default_worker_path, find_worker, parse_arguments  # noqa: E402
 from ncnn_moe_protocol import WorkerClient, WorkerError  # noqa: E402
+from ncnn_moe_state import runtime_args_from_settings  # noqa: E402
 
 
 def main() -> int:
@@ -28,6 +30,21 @@ def main() -> int:
 
     assert _format_bytes_gb(1_000_000_000) == "1.00 GB"
     assert _format_bytes_gb(None) == "N/A"
+    formatted_metrics = _format_runtime_metrics(
+        {
+            "prompt_tok_per_second": 3.7,
+            "generation_tok_per_second": 13.33,
+            "tpot_microseconds": 75_030.0,
+            "gpu": {
+                "available": True,
+                "kernel_time_available": False,
+                "reason": "gpu_expert_execution_not_observed",
+            },
+            "gpu_device": {},
+        }
+    )
+    assert "Prompt: 3.70 t/s | Generation: 13.33 t/s" in formatted_metrics
+    assert "kernel N/A (no GPU Expert execution)" in formatted_metrics
 
     defaults = parse_arguments(["run", "--model", "model", "--prompt", "hello"])
     assert defaults.stream is True
@@ -48,6 +65,30 @@ def main() -> int:
     assert overrides.stream is False
     assert overrides.show_reasoning is False
     assert overrides.metrics_enabled is True
+
+    assert runtime_args_from_settings({"backend": "auto"}) == []
+    assert runtime_args_from_settings({"backend": "cpu"}) == ["--cpu"]
+    assert runtime_args_from_settings({"backend": "hybrid"}) == ["--hybrid"]
+    assert runtime_args_from_settings({"cpu_packed_weights": "off"}) == [
+        "--cpu-packed-weights",
+        "off",
+    ]
+    assert runtime_args_from_settings({"cpu_packed_weights": "on"}) == [
+        "--cpu-packed-weights",
+        "on",
+    ]
+    try:
+        runtime_args_from_settings({"cpu_packed_weights": "auto"})
+    except ValueError as error:
+        assert "must be off or on" in str(error)
+    else:
+        raise AssertionError("automatic CPU packed weights must not be accepted")
+    try:
+        runtime_args_from_settings({"backend": "vulkan"})
+    except ValueError as error:
+        assert "unknown backend" in str(error)
+    else:
+        raise AssertionError("Vulkan-only backend must not be accepted from saved settings")
 
     class FakeQwenTokenizer:
         eos_token_id = 99
@@ -86,6 +127,14 @@ def main() -> int:
     # and tensor-backed tokenizers may add a single batch dimension.
     assert _normalize_token_ids(UserDict({"input_ids": [4, 5, 6]})) == [4, 5, 6]
     assert _normalize_token_ids(UserDict({"input_ids": [[7, 8, 9]]})) == [7, 8, 9]
+
+    if importlib.util.find_spec("openai_harmony") is None:
+        print(
+            f"SKIP: openai_harmony is not installed for {sys.executable}; install with "
+            f'"{sys.executable}" -m pip install -e ".[gpt-oss]"',
+            file=sys.stderr,
+        )
+        return 77
 
     adapter = create_adapter(arguments.model)
     if adapter.model_type != "gpt_oss":
@@ -132,6 +181,8 @@ def main() -> int:
         assert len(tokens) == 3
         assert not any(event.get("event") == "metrics" for event in events)
         assert "metrics" in done
+        assert "prompt_tok_per_second" in done["metrics"]
+        assert "generation_tok_per_second" in done["metrics"]
         assert "expert" in done["metrics"]
         assert "ttft_microseconds" in done["metrics"]
         assert "tpot_microseconds" in done["metrics"]

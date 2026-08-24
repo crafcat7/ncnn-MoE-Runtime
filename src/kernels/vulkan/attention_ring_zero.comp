@@ -1,0 +1,31 @@
+#version 450
+
+layout(binding = 0) buffer destination_key_blob
+{
+    sfp destination_key_data[];
+};
+layout(binding = 1) buffer destination_value_blob
+{
+    sfp destination_value_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint width;
+    uint channels;
+    uint destination_cstep;
+    uint destination_row;
+}
+p;
+
+void main()
+{
+    const uint column = gl_GlobalInvocationID.x;
+    const uint channel = gl_GlobalInvocationID.z;
+    if (column >= p.width || channel >= p.channels)
+        return;
+
+    const uint destination_index = channel * p.destination_cstep + p.destination_row * p.width + column;
+    buffer_st1(destination_key_data, destination_index, 0.0);
+    buffer_st1(destination_value_data, destination_index, 0.0);
+}

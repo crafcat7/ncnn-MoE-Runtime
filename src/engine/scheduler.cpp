@@ -1,6 +1,7 @@
 #include "ncnn/moe/scheduler.h"
 
 #include "engine/session_batch.h"
+#include "engine/cpu_thread_budget.h"
 #include "engine/cpu_topology.h"
 
 #include <algorithm>
@@ -69,13 +70,23 @@ class BatchScheduler::Implementation
 
 public:
     explicit Implementation(const SchedulerOptions& options)
-        : option_flags_(options.flags | (!options.worker_cpu_sets.empty() ? static_cast<uint32_t>(SchedulerOptionPinWorkers) : 0u)),
+        : cpu_budget_(resolve_cpu_thread_budget(
+              options.reserved_io_threads,
+              options.reserved_service_threads,
+              options.compute_threads)),
+          option_flags_(options.flags | (!options.worker_cpu_sets.empty() ? static_cast<uint32_t>(SchedulerOptionPinWorkers) : 0u)),
           adaptive_probe_interval_(options.adaptive_probe_interval == 0 ? 32 : options.adaptive_probe_interval),
           cross_call_window_microseconds_(options.cross_call_window_microseconds),
           cross_call_max_batch_size_(options.cross_call_max_batch_size),
           worker_cpu_sets_(options.worker_cpu_sets)
     {
-        const uint32_t hardware_threads = std::max(1u, std::thread::hardware_concurrency());
+        const CpuThreadBudget& thread_budget = cpu_budget_.budget();
+        logical_cpu_count_ = thread_budget.logical_threads;
+        physical_cpu_count_ = thread_budget.physical_cores;
+        reserved_io_threads_ = thread_budget.reserved_io_threads;
+        reserved_service_threads_ = thread_budget.reserved_service_threads;
+        compute_thread_budget_ = thread_budget.compute_threads;
+        max_compute_thread_capacity_ = thread_budget.max_compute_threads;
 #if defined(__linux__)
         CpuTopology automatic_topology;
         if (has_flag(option_flags_, SchedulerOptionPinWorkers) && worker_cpu_sets_.empty())
@@ -84,7 +95,7 @@ public:
             numa_nodes_detected_ = static_cast<uint32_t>(automatic_topology.numa_nodes.size());
         }
 #endif
-        uint32_t default_worker_count = std::min(4u, hardware_threads);
+        uint32_t default_worker_count = std::min(4u, compute_thread_budget_);
 #if defined(__linux__)
         if (!automatic_topology.allowed_cpus.empty())
         {
@@ -101,9 +112,18 @@ public:
                         : options.worker_count == 0
                             ? default_worker_count
                             : options.worker_count;
-        worker_count_ = std::max(1u, worker_count_);
+        worker_count_ = std::max(1u, std::min(worker_count_, compute_thread_budget_));
         if (cross_call_max_batch_size_ == 0)
-            cross_call_max_batch_size_ = worker_count_;
+        {
+            // Bound implicit cross-call aggregation by worker concurrency.
+            constexpr uint32_t default_cross_call_batch_ceiling = 16;
+            const uint32_t requested_concurrency = options.worker_count == 0
+                                                       ? worker_count_
+                                                       : options.worker_count;
+            cross_call_max_batch_size_ = std::max(
+                worker_count_,
+                std::min(default_cross_call_batch_ceiling, requested_concurrency));
+        }
 #if defined(__linux__)
         if (has_flag(option_flags_, SchedulerOptionPinWorkers) && worker_cpu_sets_.empty())
         {
@@ -121,10 +141,10 @@ public:
         affinity_cpus.erase(std::unique(affinity_cpus.begin(), affinity_cpus.end()), affinity_cpus.end());
         affinity_cpu_count_ = static_cast<uint32_t>(affinity_cpus.size());
 #if defined(_OPENMP)
-        const uint32_t affinity_threads = affinity_cpu_count_ == 0 ? hardware_threads : affinity_cpu_count_;
+        const uint32_t affinity_threads = affinity_cpu_count_ == 0 ? compute_thread_budget_ : std::min(affinity_cpu_count_, compute_thread_budget_);
         expert_threads_per_worker_ = options.expert_threads_per_worker == 0
                                          ? std::max(1u, affinity_threads / worker_count_)
-                                         : options.expert_threads_per_worker;
+                                         : std::max(1u, std::min(options.expert_threads_per_worker, std::max(1u, compute_thread_budget_ / worker_count_)));
 #else
         (void)options.expert_threads_per_worker;
         expert_threads_per_worker_ = 1;
@@ -289,26 +309,16 @@ public:
                                              sessions,
                                              requests = std::move(requests)]() mutable {
 #if defined(_OPENMP)
-            struct OpenMpTeamRestore
-            {
-                int team_size = 1;
-                ~OpenMpTeamRestore()
-                {
-                    omp_set_num_threads(team_size);
-                }
-            };
-            const OpenMpTeamRestore restore{
-                omp_get_max_threads()};
-            const uint32_t staged_team_size = std::max(
-                1u,
-                std::min(
-                    static_cast<uint32_t>(
-                        std::thread::hardware_concurrency()),
-                    expert_threads_per_worker_
-                        * static_cast<uint32_t>(
-                            requests.size())));
-            omp_set_num_threads(
-                static_cast<int>(staged_team_size));
+            CpuOpenMpThreadLimitScope thread_limit;
+            CpuThreadBudgetController::Lease extra_compute;
+            uint64_t work_units = 0;
+            for (const PrefillBatchRequest& request : requests)
+                work_units += static_cast<uint64_t>(request.input_ids.size());
+            const uint32_t team_size = prepare_staging_team(
+                work_units,
+                static_cast<uint32_t>(requests.size()),
+                extra_compute);
+            thread_limit.set(team_size);
 #endif
             std::vector<Result<PrefillResult>> results;
             try
@@ -347,6 +357,15 @@ public:
                 }
                 coalesced_expert_routes_.fetch_add(
                     metrics.coalesced_expert_routes,
+                    std::memory_order_relaxed);
+                vulkan_attention_batch_submissions_.fetch_add(
+                    metrics.vulkan_attention_batch_submissions,
+                    std::memory_order_relaxed);
+                vulkan_attention_batch_rows_.fetch_add(
+                    metrics.vulkan_attention_batch_rows,
+                    std::memory_order_relaxed);
+                vulkan_attention_batch_avoided_submissions_.fetch_add(
+                    metrics.vulkan_attention_batch_avoided_submissions,
                     std::memory_order_relaxed);
                 update_max(
                     max_coalesced_expert_batch_size_,
@@ -537,7 +556,9 @@ public:
         }
         if (staged_candidate)
         {
-            std::function<void()> staged_work = [this, requests, complete]() mutable {
+            std::function<void()> staged_work = [this,
+                                                 requests,
+                                                 complete]() mutable {
                 std::vector<Session*> sessions;
                 std::vector<int32_t> input_ids;
                 sessions.reserve(requests.size());
@@ -548,17 +569,15 @@ public:
                     input_ids.push_back(request.input_id);
                 }
 #if defined(_OPENMP)
-                struct OpenMpTeamRestore
-                {
-                    int team_size = 1;
-                    ~OpenMpTeamRestore()
-                    {
-                        omp_set_num_threads(team_size);
-                    }
-                };
-                const OpenMpTeamRestore restore{omp_get_max_threads()};
-                const uint32_t staged_team_size = std::max(1u, std::min(static_cast<uint32_t>(std::thread::hardware_concurrency()), expert_threads_per_worker_ * static_cast<uint32_t>(requests.size())));
-                omp_set_num_threads(static_cast<int>(staged_team_size));
+                CpuOpenMpThreadLimitScope thread_limit;
+                CpuThreadBudgetController::Lease extra_compute;
+                const uint64_t work_units = static_cast<uint64_t>(requests.size())
+                                            * std::max(1u, expert_threads_per_worker_);
+                const uint32_t team_size = prepare_staging_team(
+                    work_units,
+                    static_cast<uint32_t>(requests.size()),
+                    extra_compute);
+                thread_limit.set(team_size);
 #endif
                 try
                 {
@@ -573,6 +592,9 @@ public:
                         coalesced_expert_batches_.fetch_add(metrics.logical_expert_batches - metrics.physical_expert_batches, std::memory_order_relaxed);
                     }
                     coalesced_expert_routes_.fetch_add(metrics.coalesced_expert_routes, std::memory_order_relaxed);
+                    vulkan_attention_batch_submissions_.fetch_add(metrics.vulkan_attention_batch_submissions, std::memory_order_relaxed);
+                    vulkan_attention_batch_rows_.fetch_add(metrics.vulkan_attention_batch_rows, std::memory_order_relaxed);
+                    vulkan_attention_batch_avoided_submissions_.fetch_add(metrics.vulkan_attention_batch_avoided_submissions, std::memory_order_relaxed);
                     update_max(max_coalesced_expert_batch_size_, metrics.max_expert_batch_size);
                     if (!decoded)
                     {
@@ -685,6 +707,9 @@ public:
         result.coalesced_expert_batches = coalesced_expert_batches_.load(std::memory_order_relaxed);
         result.coalesced_expert_routes = coalesced_expert_routes_.load(std::memory_order_relaxed);
         result.max_coalesced_expert_batch_size = max_coalesced_expert_batch_size_.load(std::memory_order_relaxed);
+        result.vulkan_attention_batch_submissions = vulkan_attention_batch_submissions_.load(std::memory_order_relaxed);
+        result.vulkan_attention_batch_rows = vulkan_attention_batch_rows_.load(std::memory_order_relaxed);
+        result.vulkan_attention_batch_avoided_submissions = vulkan_attention_batch_avoided_submissions_.load(std::memory_order_relaxed);
         result.adaptive_staged_decisions = adaptive_staged_decisions_.load(std::memory_order_relaxed);
         result.adaptive_independent_decisions = adaptive_independent_decisions_.load(std::memory_order_relaxed);
         result.adaptive_probe_decisions = adaptive_probe_decisions_.load(std::memory_order_relaxed);
@@ -716,6 +741,20 @@ public:
         result.automatic_topology_affinity = has_flag(option_flags_, scheduler_internal_automatic_topology_affinity);
         result.worker_count = worker_count_;
         result.expert_threads_per_worker = expert_threads_per_worker_;
+        result.logical_cpu_count = logical_cpu_count_;
+        result.physical_cpu_count = physical_cpu_count_;
+        result.reserved_io_threads = reserved_io_threads_;
+        result.reserved_service_threads = reserved_service_threads_;
+        result.compute_thread_budget = compute_thread_budget_;
+        const CpuThreadBudgetSnapshot budget_snapshot = cpu_budget_.snapshot();
+        result.max_compute_thread_capacity = max_compute_thread_capacity_;
+        result.active_compute_threads = budget_snapshot.active_compute_threads;
+        result.available_compute_threads = budget_snapshot.available_compute_threads;
+        result.active_io_threads = budget_snapshot.active_io_threads;
+        result.active_service_threads = budget_snapshot.active_service_threads;
+        result.borrowed_compute_threads = budget_snapshot.borrowed_compute_threads;
+        result.compute_thread_acquisitions = budget_snapshot.compute_acquisitions;
+        result.compute_thread_returns = budget_snapshot.compute_returns;
         return result;
     }
 
@@ -726,6 +765,45 @@ private:
         while (previous < value && !destination.compare_exchange_weak(previous, value, std::memory_order_relaxed, std::memory_order_relaxed))
         {
         }
+    }
+
+    [[nodiscard]] uint32_t prepare_staging_team(
+        uint64_t work_units,
+        uint32_t independent_work_items,
+        CpuThreadBudgetController::Lease& extra_compute)
+    {
+#if defined(_OPENMP)
+        const uint32_t current_team_size = cpu_openmp_thread_limit();
+        if (omp_in_parallel() != 0)
+            return 1;
+        const CpuThreadBudgetSnapshot snapshot = cpu_budget_.snapshot();
+        const uint32_t available_for_team = std::max(
+            1u,
+            std::min(
+                max_compute_thread_capacity_,
+                current_team_size + snapshot.available_compute_threads));
+        const uint32_t desired_team_size = choose_cpu_team_size(
+            work_units,
+            independent_work_items,
+            expert_threads_per_worker_,
+            available_for_team);
+        if (desired_team_size > current_team_size)
+        {
+            extra_compute = cpu_budget_.try_acquire_compute(
+                desired_team_size - current_team_size,
+                true);
+        }
+        return std::max(
+            1u,
+            std::min(
+                desired_team_size,
+                current_team_size + extra_compute.size()));
+#else
+        (void)work_units;
+        (void)independent_work_items;
+        (void)extra_compute;
+        return 1;
+#endif
     }
 
     enum AdaptiveStagingFlag : uint32_t
@@ -1000,16 +1078,24 @@ private:
                 };
                 const bool already_collected = has_distinct_peer();
                 const bool probe_due = consecutive_timeouts < 4 || decisions - last_probe_decision >= adaptive_probe_interval_;
-                if (!already_collected && !cross_call_stopping_ && probe_due)
+                const bool fill_window_available = !cross_call_stopping_
+                                                   && cross_call_pending_.size() < cross_call_max_batch_size_
+                                                   && cross_call_window_microseconds_ != 0;
+                if (fill_window_available && (already_collected || probe_due))
                 {
-                    probed = true;
-                    last_probe_decision = decisions;
-                    cross_call_collection_probes_.fetch_add(1, std::memory_order_relaxed);
+                    probed = !already_collected && probe_due;
+                    if (probed)
+                    {
+                        last_probe_decision = decisions;
+                        cross_call_collection_probes_.fetch_add(1, std::memory_order_relaxed);
+                    }
                     const auto wait_started = std::chrono::steady_clock::now();
                     const auto deadline = cross_call_pending_.front().submitted_at + std::chrono::microseconds(cross_call_window_microseconds_);
                     if (deadline > wait_started)
                     {
-                        cross_call_ready_.wait_until(lock, deadline, [this, &has_distinct_peer] { return cross_call_stopping_ || has_distinct_peer(); });
+                        cross_call_ready_.wait_until(lock, deadline, [this] {
+                            return cross_call_stopping_ || cross_call_pending_.size() >= cross_call_max_batch_size_;
+                        });
                     }
                     cross_call_collection_wait_microseconds_.fetch_add(static_cast<uint64_t>(std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wait_started).count())),
                                                                        std::memory_order_relaxed);
@@ -1186,6 +1272,7 @@ private:
 
     void worker_loop()
     {
+        CpuOpenMpThreadLimitScope thread_limit;
         for (;;)
         {
             std::function<void()> work;
@@ -1197,16 +1284,16 @@ private:
                 work = std::move(queue_.front());
                 queue_.pop_front();
             }
+            CpuThreadBudgetController::Lease compute_lease = cpu_budget_.acquire_compute(
+                expert_threads_per_worker_,
+                false);
+            thread_limit.set(std::max(1u, compute_lease.size()));
             work();
         }
     }
 
     void configure_worker(uint32_t worker_index)
     {
-#if defined(_OPENMP)
-        omp_set_dynamic(0);
-        omp_set_num_threads(static_cast<int>(expert_threads_per_worker_));
-#endif
 #if defined(__linux__)
         if (!has_flag(option_flags_, SchedulerOptionPinWorkers))
             return;
@@ -1250,6 +1337,7 @@ private:
 #endif
     }
 
+    CpuThreadBudgetController cpu_budget_;
     uint32_t option_flags_ = 0;
     bool stopping_ = false;
     bool cross_call_stopping_ = false;
@@ -1258,6 +1346,12 @@ private:
     uint32_t cross_call_max_batch_size_ = 0;
     uint32_t worker_count_ = 0;
     uint32_t expert_threads_per_worker_ = 1;
+    uint32_t logical_cpu_count_ = 1;
+    uint32_t physical_cpu_count_ = 1;
+    uint32_t reserved_io_threads_ = 1;
+    uint32_t reserved_service_threads_ = 1;
+    uint32_t compute_thread_budget_ = 1;
+    uint32_t max_compute_thread_capacity_ = 1;
     uint32_t affinity_cpu_count_ = 0;
     uint32_t numa_nodes_detected_ = 0;
     std::vector<std::vector<uint32_t>> worker_cpu_sets_;
@@ -1289,6 +1383,9 @@ private:
     std::atomic<uint64_t> coalesced_expert_batches_{0};
     std::atomic<uint64_t> coalesced_expert_routes_{0};
     std::atomic<uint64_t> max_coalesced_expert_batch_size_{0};
+    std::atomic<uint64_t> vulkan_attention_batch_submissions_{0};
+    std::atomic<uint64_t> vulkan_attention_batch_rows_{0};
+    std::atomic<uint64_t> vulkan_attention_batch_avoided_submissions_{0};
     std::atomic<uint64_t> adaptive_staged_decisions_{0};
     std::atomic<uint64_t> adaptive_independent_decisions_{0};
     std::atomic<uint64_t> adaptive_probe_decisions_{0};

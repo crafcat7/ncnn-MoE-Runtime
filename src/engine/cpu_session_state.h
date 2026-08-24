@@ -2,6 +2,7 @@
 #define NCNN_MOE_CPU_SESSION_STATE_H
 
 #include "kernels/cpu_ops.h"
+#include "kernels/cpu_gated_delta_net.h"
 #include "kernels/cpu_hyper_connection.h"
 #include "engine/cpu_task_worker.h"
 #include "engine/expert_backend.h"
@@ -24,6 +25,25 @@ namespace ncnn {
 namespace moe {
 
 class NcnnVulkanAttentionCache;
+class NcnnVulkanGatedDeltaState;
+struct CpuAttentionExecutionScratch;
+struct CpuLayerCache;
+
+struct CpuAttentionBatchEntry
+{
+    uint64_t position_offset = 0;
+    CpuLayerCache* cache = nullptr;
+    CpuAttentionExecutionScratch* scratch = nullptr;
+    const CpuBatch* hidden = nullptr;
+    CpuBatch* output = nullptr;
+};
+
+struct CpuDecodeRouteOrigin
+{
+    size_t session_index = 0;
+    size_t active_index = 0;
+    size_t route_index = 0;
+};
 
 struct ExpertExecutionMetrics
 {
@@ -100,13 +120,29 @@ struct CpuExpertExecutionScratch
     std::vector<ExpertCachePairRequest> cache_requests;
     std::vector<ExpertCacheLease> cache_leases;
     std::vector<uint8_t> backend_executed;
+    std::vector<uint8_t> backend_aggregated;
     std::vector<size_t> backend_indices;
     std::vector<ExpertBackendRequest> backend_requests;
     std::vector<size_t> failed_indices;
+    bool backend_aggregated_output_valid = false;
+    CpuBatch backend_aggregated_output;
     CpuBatch staged_merged;
     CpuBatch staged_output;
     CpuBatch staged_router_logits;
     std::vector<int32_t> staged_input_ids;
+    std::vector<uint32_t> staged_expert_ids;
+    std::vector<CpuGatedDeltaBatchEntry> gated_delta_entries;
+    CpuGatedDeltaBatchScratch gated_delta_batch;
+    std::vector<uint64_t> staged_attention_positions;
+    std::vector<CpuLayerCache*> staged_attention_caches;
+    std::vector<CpuAttentionBatchEntry> attention_batch_entries;
+    std::vector<CpuBatch> staged_batches;
+    std::vector<CpuHyperConnectionMix> staged_hyper_mixes;
+    std::vector<size_t> combined_by_expert;
+    std::vector<std::vector<CpuDecodeRouteOrigin>> staged_route_origins;
+    std::vector<uint8_t> combined_backend_aggregated;
+    bool combined_backend_aggregated_output_valid = false;
+    CpuBatch combined_backend_aggregated_output;
 };
 
 struct CpuAttentionExecutionScratch
@@ -120,7 +156,14 @@ struct CpuAttentionExecutionScratch
     CpuBatch gate;
     CpuBatch projected;
     CpuBatch output;
+    std::vector<float> key_cache;
+    std::vector<float> value_cache;
     std::vector<float> logits;
+    std::vector<float> flash_partial_max;
+    std::vector<float> flash_partial_sum;
+    std::vector<float> flash_partial_output;
+    std::vector<float> rope_cosine;
+    std::vector<float> rope_sine;
 };
 
 struct CpuGatedDeltaExecutionScratch
@@ -134,6 +177,8 @@ struct CpuGatedDeltaExecutionScratch
     CpuBatch recurrent_output;
     CpuBatch projected;
     CpuBatch output;
+    std::vector<float> recurrent_memory;
+    std::vector<float> recurrent_delta;
 };
 
 struct CpuLatentVectorUndo
@@ -189,7 +234,8 @@ struct CpuStateCacheSnapshot
     }
 };
 
-struct CpuStateCacheTransaction
+// Session transactions record reversible KV, DeltaNet, and latent state.
+struct CpuSessionStateTransaction
 {
     CpuStateCacheSnapshot initial;
     std::vector<CpuStateCacheSnapshot> rows;
@@ -200,6 +246,8 @@ struct CpuStateCacheTransaction
     size_t expected_rows = 0;
     size_t recorded_rows = 0;
     bool active = false;
+    std::vector<CpuLatentCacheUndo> latent_undo;
+    bool latent_active = false;
 
     [[nodiscard]] uint64_t allocated_bytes() const noexcept
     {
@@ -208,32 +256,51 @@ struct CpuStateCacheTransaction
                                * sizeof(CpuStateCacheSnapshot);
         for (const CpuStateCacheSnapshot& row : rows)
             bytes += row.allocated_bytes();
+        bytes += static_cast<uint64_t>(latent_undo.capacity())
+                 * sizeof(CpuLatentCacheUndo);
+        for (const CpuLatentCacheUndo& undo : latent_undo)
+            bytes += undo.allocated_bytes();
         return bytes;
     }
 };
 
-struct RouterPrefetchState
+// Persistent attention state is kept in an explicit component.
+struct CpuKvState
 {
-    uint32_t target_top_k = 0;
-    uint32_t prefetch_width = 0;
-    uint64_t decisions = 0;
-    uint64_t last_adjustment_decision = 0;
-};
-
-struct CpuLayerCache
-{
-    struct LatentScoredIndex
-    {
-        uint32_t index = 0;
-        float score = 0.0f;
-    };
-
     std::vector<float> keys;
     std::vector<float> values;
     std::vector<uint16_t> bfloat16_keys;
     std::vector<uint16_t> bfloat16_values;
+    std::shared_ptr<NcnnVulkanAttentionCache> vulkan_attention_cache;
+    uint64_t start_position = 0;
+    uint64_t token_count = 0;
+    uint64_t first_slot = 0;
+    uint64_t capacity_tokens = 0;
+    uint32_t columns = 0;
+    DType dtype = DType::Float32;
+    bool vulkan_attention_promotion_disabled = false;
+    bool vulkan_attention_state_unknown = false;
+};
+
+// Recurrent state and its device mirror are independent from KV/MLA storage.
+struct CpuGatedDeltaState
+{
     std::vector<float> gated_delta_convolution;
     std::vector<float> gated_delta_recurrent;
+    std::shared_ptr<NcnnVulkanGatedDeltaState> gated_delta_device_state;
+    uint64_t gated_delta_token_count = 0;
+    uint64_t device_allocated_bytes = 0;
+};
+
+struct CpuLatentScoredIndex
+{
+    uint32_t index = 0;
+    float score = 0.0f;
+};
+
+// MLA compression/index state has its own undo records.
+struct CpuLatentState
+{
     std::vector<float> latent_window;
     std::vector<float> latent_compressed;
     std::vector<float> latent_index_compressed;
@@ -254,31 +321,37 @@ struct CpuLayerCache
     CpuBatch latent_index_query;
     CpuBatch latent_index_projected_weights;
     std::vector<float> latent_index_scores;
-    std::vector<LatentScoredIndex> latent_scored_indices;
+    std::vector<CpuLatentScoredIndex> latent_scored_indices;
     std::vector<uint32_t> latent_selected_indices;
     std::vector<float> latent_attention_logits;
-    uint64_t start_position = 0;
-    uint64_t token_count = 0;
-    uint64_t first_slot = 0;
-    uint64_t capacity_tokens = 0;
+    std::vector<float> latent_rope_cosines;
+    std::vector<float> latent_rope_sines;
     uint64_t latent_token_count = 0;
-    uint64_t gated_delta_token_count = 0;
-    uint32_t columns = 0;
-    DType dtype = DType::Float32;
     bool latent_cache = false;
-    std::shared_ptr<NcnnVulkanAttentionCache> vulkan_attention_cache;
+};
+
+struct RouterPrefetchState
+{
+    uint32_t target_top_k = 0;
+    uint32_t prefetch_width = 0;
+    uint64_t decisions = 0;
+    uint64_t last_adjustment_decision = 0;
+};
+
+struct CpuLayerCache
+    : CpuKvState,
+      CpuGatedDeltaState,
+      CpuLatentState
+{
+    using LatentScoredIndex = CpuLatentScoredIndex;
+
+    CpuSessionStateTransaction transaction;
+
     std::vector<uint32_t> predicted_expert_ids;
     RouterPrefetchState next_router_prediction;
-    std::vector<CpuLatentCacheUndo> latent_transaction_undo;
-    CpuStateCacheTransaction state_transaction;
-    uint64_t device_allocated_bytes = 0;
-    bool latent_transaction_active = false;
 
     [[nodiscard]] uint64_t allocated_bytes() const noexcept
     {
-        uint64_t transaction_bytes = static_cast<uint64_t>(latent_transaction_undo.capacity()) * sizeof(CpuLatentCacheUndo);
-        for (const CpuLatentCacheUndo& undo : latent_transaction_undo)
-            transaction_bytes += undo.allocated_bytes();
         return static_cast<uint64_t>(keys.capacity() + values.capacity()
                                      + gated_delta_convolution.capacity() + gated_delta_recurrent.capacity()
                                      + latent_window.capacity() + latent_compressed.capacity() + latent_index_compressed.capacity()
@@ -287,7 +360,8 @@ struct CpuLayerCache
                                      + index_compressor_pending_values.capacity() + index_compressor_pending_scores.capacity()
                                      + index_compressor_previous_values.capacity() + index_compressor_previous_scores.capacity()
                                      + compressor_pooled.capacity() + compressor_exponentials.capacity()
-                                     + latent_index_scores.capacity() + latent_attention_logits.capacity())
+                                     + latent_index_scores.capacity() + latent_attention_logits.capacity()
+                                     + latent_rope_cosines.capacity() + latent_rope_sines.capacity())
                    * sizeof(float)
                + compressor_values.allocated_bytes() + compressor_scores.allocated_bytes()
                + latent_token_input.allocated_bytes() + latent_token_rank.allocated_bytes()
@@ -296,7 +370,7 @@ struct CpuLayerCache
                + static_cast<uint64_t>(latent_scored_indices.capacity()) * sizeof(LatentScoredIndex)
                + static_cast<uint64_t>(latent_selected_indices.capacity()) * sizeof(uint32_t)
                + static_cast<uint64_t>(predicted_expert_ids.capacity()) * sizeof(uint32_t)
-               + transaction_bytes + state_transaction.allocated_bytes()
+               + transaction.allocated_bytes()
                + device_allocated_bytes;
     }
 
@@ -310,6 +384,10 @@ struct CpuLayerCache
         if (!gated_delta_convolution.empty() || !gated_delta_recurrent.empty())
         {
             return static_cast<uint64_t>(gated_delta_convolution.size() + gated_delta_recurrent.size()) * sizeof(float);
+        }
+        if (gated_delta_device_state)
+        {
+            return device_allocated_bytes;
         }
         const uint64_t element_size = dtype == DType::BFloat16 ? sizeof(uint16_t) : sizeof(float);
         return token_count * columns * element_size * 2;

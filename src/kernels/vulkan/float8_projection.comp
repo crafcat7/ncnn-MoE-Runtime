@@ -1,0 +1,105 @@
+#version 450
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(binding = 0) readonly buffer input_blob
+{
+    float input_data[];
+};
+layout(binding = 1) readonly buffer packed_blob
+{
+    uint packed_words[];
+};
+layout(binding = 2) readonly buffer scale_blob
+{
+    float scale_data[];
+};
+layout(binding = 3) readonly buffer bias_blob
+{
+    float bias_data[];
+};
+layout(binding = 4) writeonly buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint matrix_input_columns;
+    uint logical_input_columns;
+    uint output_columns;
+    uint output_columns_per_group;
+    uint block_count;
+    uint token_count;
+}
+p;
+
+uint packed_byte(uint index)
+{
+    const uint word = packed_words[index >> 2];
+    return (word >> ((index & 3) * 8)) & 255;
+}
+
+float decode_float8_e4m3(uint value)
+{
+    const uint magnitude = value & 127;
+    const uint exponent = magnitude >> 3;
+    const uint mantissa = magnitude & 7;
+    float decoded = 0.0;
+    if (exponent == 0)
+        decoded = float(mantissa) * 0.001953125;
+    else
+        decoded = uintBitsToFloat(((exponent + 120) << 23) | (mantissa << 20));
+    return (value & 128) == 0 ? decoded : -decoded;
+}
+
+#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
+shared float partial_sum[32];
+#endif
+
+void main()
+{
+    const uint output_column = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    const bool valid = output_column < p.output_columns && token < p.token_count;
+    const uint input_group = output_column / p.output_columns_per_group;
+    const uint input_row = token * p.logical_input_columns + input_group * p.matrix_input_columns;
+    const uint weight_row = output_column * p.matrix_input_columns;
+    const uint scale_row = (output_column / 128) * p.block_count;
+    float sum = 0.0;
+    for (uint block = 0; block < p.block_count; ++block)
+    {
+        if (valid && lane < 32)
+        {
+            const uint block_begin = block * 128;
+            const float scale = scale_data[scale_row + block];
+            const uint column = block_begin + lane * 4;
+            const uint word = packed_words[(weight_row + column) >> 2];
+            for (uint offset = 0; offset < 4; ++offset)
+            {
+                const float weight = decode_float8_e4m3((word >> (offset * 8)) & 255);
+                sum += weight * input_data[input_row + column + offset] * scale;
+            }
+        }
+    }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const float reduced_sum = subgroupAdd(sum);
+    if (valid && lane == 0)
+        output_data[token * p.output_columns + output_column] = reduced_sum + bias_data[output_column];
+#else
+    partial_sum[lane] = sum;
+    barrier();
+    for (uint stride = 16; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+            partial_sum[lane] += partial_sum[lane + stride];
+        barrier();
+    }
+    if (valid && lane == 0)
+        output_data[token * p.output_columns + output_column] = partial_sum[0] + bias_data[output_column];
+#endif
+}

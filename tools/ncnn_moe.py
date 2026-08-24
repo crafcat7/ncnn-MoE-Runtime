@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shlex
 import sys
@@ -98,16 +99,66 @@ def _format_rate(value: Any) -> str:
     return f"{float(value):.2f}"
 
 
+def _numeric_metric(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    return numeric if math.isfinite(numeric) else None
+
+
+def _prompt_rate(metrics: dict[str, Any]) -> float | None:
+    for name in ("prompt_tok_per_second", "prompt_tokens_per_second"):
+        value = _numeric_metric(metrics.get(name))
+        if value is not None:
+            return value
+    prompt_elapsed_microseconds = _numeric_metric(metrics.get("prompt_elapsed_microseconds"))
+    input_tokens = _numeric_metric(metrics.get("input_tokens"))
+    if prompt_elapsed_microseconds is not None and prompt_elapsed_microseconds > 0.0 and input_tokens:
+        return input_tokens * 1_000_000.0 / prompt_elapsed_microseconds
+    ttft_microseconds = _numeric_metric(metrics.get("ttft_microseconds"))
+    if ttft_microseconds is not None and ttft_microseconds > 0.0 and input_tokens:
+        return input_tokens * 1_000_000.0 / ttft_microseconds
+    return None
+
+
+def _generation_rate(metrics: dict[str, Any]) -> float | None:
+    for name in (
+        "generation_tok_per_second",
+        "generation_tokens_per_second",
+        "decode_tok_per_second",
+        "tokens_per_second",
+        "token_per_second",
+    ):
+        value = _numeric_metric(metrics.get(name))
+        if value is not None:
+            return value
+    tpot_microseconds = _numeric_metric(metrics.get("tpot_microseconds"))
+    if tpot_microseconds is not None and tpot_microseconds > 0.0:
+        return 1_000_000.0 / tpot_microseconds
+    return None
+
+
+def _decode_rate(metrics: dict[str, Any]) -> float | None:
+    """Legacy decode-rate alias."""
+    return _generation_rate(metrics)
+
+
+def _format_gpu_kernel_time(gpu: dict[str, Any], available: bool) -> str:
+    if not available:
+        return "N/A (CPU-only)"
+    if gpu.get("kernel_time_available", False):
+        return _format_duration_microseconds(gpu.get("kernel_time_microseconds"))
+    if gpu.get("reason") == "gpu_expert_execution_not_observed":
+        return "N/A (no GPU Expert execution)"
+    return "N/A"
+
+
 def _format_runtime_metrics(metrics: Any) -> str:
     if not isinstance(metrics, dict):
         return "metrics\n  unavailable"
     expert = metrics.get("expert", {})
-    if not isinstance(expert, dict) or "cache_hit" not in expert:
-        expert = {
-            "cache_hit": metrics.get("expert_cache_hits"),
-            "cache_miss": metrics.get("expert_cache_misses"),
-            "io_bytes": metrics.get("expert_cache_bytes_read"),
-        }
+    if not isinstance(expert, dict):
+        expert = {}
     cache_hit_rate = expert.get("cache_hit_rate") if isinstance(expert, dict) else None
     if not isinstance(cache_hit_rate, (int, float)) and isinstance(expert, dict):
         cache_hit = expert.get("cache_hit")
@@ -137,8 +188,9 @@ def _format_runtime_metrics(metrics: Any) -> str:
     return "\n".join(
         (
             "metrics",
-            "  Decode tok/s "
-            f"{_format_rate(metrics.get('decode_tok_per_second', metrics.get('tokens_per_second')))}"
+            "  Prompt: "
+            f"{_format_rate(_prompt_rate(metrics))} t/s | Generation: "
+            f"{_format_rate(_generation_rate(metrics))} t/s"
             " · TTFT "
             f"{_format_duration_microseconds(metrics.get('ttft_microseconds'))}"
             " · TPOT "
@@ -149,6 +201,18 @@ def _format_runtime_metrics(metrics: Any) -> str:
             f"{_format_metric_count(expert.get('cache_miss') if isinstance(expert, dict) else None)}"
             " · IO "
             f"{_format_bytes_gb(expert.get('io_bytes') if isinstance(expert, dict) else None)}",
+            "  GPU Expert: cache hit "
+            f"{_format_metric_count(expert.get('gpu_cache_hit') if isinstance(expert, dict) else None)}"
+            " / miss "
+            f"{_format_metric_count(expert.get('gpu_cache_miss') if isinstance(expert, dict) else None)}"
+            " / exec "
+            f"{_format_metric_count(expert.get('gpu_executions') if isinstance(expert, dict) else None)}"
+            " / CPU-preferred "
+            f"{_format_metric_count(expert.get('gpu_cpu_preferred') if isinstance(expert, dict) else None)}"
+            " / resident "
+            f"{_format_bytes_gb(expert.get('gpu_cache_resident_bytes') if isinstance(expert, dict) else None)}"
+            " / dropped "
+            f"{_format_metric_count(expert.get('gpu_cache_dropped_admissions') if isinstance(expert, dict) else None)}",
             "  CPU: expert compute "
             f"{_format_duration_microseconds(cpu.get('expert_compute_time_microseconds') if isinstance(cpu, dict) else None)}"
             f" · process {process_cpu_text}",
@@ -157,9 +221,59 @@ def _format_runtime_metrics(metrics: Any) -> str:
             " · wait "
             f"{_format_duration_microseconds(gpu.get('wait_time_microseconds') if isinstance(gpu, dict) and gpu_available else None)}"
             " · kernel "
-            f"{_format_duration_microseconds(gpu.get('kernel_time_microseconds') if isinstance(gpu, dict) and gpu_available and gpu.get('kernel_time_available', False) else None)}"
+            f"{_format_gpu_kernel_time(gpu, gpu_available)}"
             " · utilization "
-            f"{_format_gpu_utilization(gpu_device)}",
+            f"{_format_gpu_utilization(gpu_device)}"
+            " / attention "
+            f"{_format_metric_count(gpu.get('attention_blocks') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / linear "
+            f"{_format_metric_count(gpu.get('linear_dispatches') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / gated-delta "
+            f"{_format_metric_count(gpu.get('gated_delta_fusions') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / upload/download "
+            f"{_format_metric_count(gpu.get('batch_uploads') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('batch_downloads') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / qkv-rope/device-rope/ring "
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_fusions') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_device_rope_fusions') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_qkv_ring_fusions') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / qkv-fail P/S/R/N/G/A "
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_pipeline_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_shape_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_source_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_norm_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_ring_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_allocation_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / fail pre/stage/norm/qkv/cache "
+            f"{_format_metric_count(gpu.get('attention_precondition_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_staging_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_norm_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_qkv_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_cache_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / fail sdpa/proj/out/submit "
+            f"{_format_metric_count(gpu.get('attention_sdpa_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_projection_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_output_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('attention_submit_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / kv-materialize "
+            f"{_format_metric_count(gpu.get('attention_cache_materializations') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            " / attention-cpu-fallback "
+            f"{_format_metric_count(gpu.get('attention_cpu_fallbacks') if isinstance(gpu, dict) else None, available=gpu_available)}",
         )
     )
 
@@ -175,12 +289,16 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
         help="Override the default worker under build-ncnn",
     )
     parser.add_argument("--config-dir", help="Override the persistent configuration directory")
-    parser.add_argument("--backend", choices=("auto", "cpu", "vulkan", "hybrid", "hybrid-prefetch"))
+    parser.add_argument("--backend", choices=("auto", "cpu", "hybrid"))
     backend_group = parser.add_mutually_exclusive_group()
     backend_group.add_argument("--cpu", dest="backend", action="store_const", const="cpu")
     backend_group.add_argument("--hybrid", dest="backend", action="store_const", const="hybrid")
-    backend_group.add_argument("--hybrid-prefetch", dest="backend", action="store_const", const="hybrid-prefetch")
     parser.add_argument("--expert-memory", choices=("auto", "eager", "on-demand"))
+    parser.add_argument(
+        "--cpu-packed-weights",
+        choices=("off", "on"),
+        help="Enable the optional CPU Expert weight repack (default: off)",
+    )
     parser.add_argument("--host-memory-mb", type=int)
     parser.add_argument("--expert-cache-mb", type=int)
     parser.add_argument("--expert-gpu-cache-mb", type=int)
@@ -189,15 +307,11 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vulkan-device", type=int)
     parser.add_argument("--vulkan-devices", help="Comma-separated Vulkan device indices")
     parser.add_argument("--expected-concurrency", type=int)
-    parser.add_argument("--mmap-experts", action="store_true", default=None)
-    parser.add_argument("--direct-expert-io", action="store_true", default=None)
-    parser.add_argument("--buffered-expert-io", action="store_true", default=None)
+    expert_io_group = parser.add_mutually_exclusive_group()
+    expert_io_group.add_argument("--mmap-experts", action="store_true", default=None)
+    expert_io_group.add_argument("--direct-expert-io", action="store_true", default=None)
+    expert_io_group.add_argument("--buffered-expert-io", action="store_true", default=None)
     parser.add_argument("--disable-gpu-victim-execution", action="store_true", default=None)
-    parser.add_argument("--router-prediction", action="store_true", default=None)
-    parser.add_argument("--async-router-prediction", action="store_true", default=None)
-    parser.add_argument("--forward-aware-cache", action="store_true", default=None)
-    parser.add_argument("--rank-adaptive-prefetch", action="store_true", default=None)
-    parser.add_argument("--cross-expert-read-coalescing", action="store_true", default=None)
     parser.add_argument("--release-vulkan-dense-host", action="store_true", default=None)
     parser.add_argument("--verbose", action="store_true")
 
@@ -237,7 +351,7 @@ def _add_generation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--speculative-max-draft", type=int, default=0)
     _add_metrics_options(parser)
     parser.add_argument("--context-tokens", type=int, default=0)
-    parser.add_argument("--prefill-chunk-size", type=int, default=256)
+    parser.add_argument("--prefill-chunk-size", type=int, default=512)
     stream_group = parser.add_mutually_exclusive_group()
     stream_group.add_argument("--stream", dest="stream", action="store_true", help="Stream generated text (default)")
     stream_group.add_argument("--no-stream", dest="stream", action="store_false", help="Print the completed response only")
@@ -293,7 +407,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     tune.add_argument("--no-thinking", action="store_true")
     tune.add_argument("--max-new-tokens", type=int, default=64)
     tune.add_argument("--context-tokens", type=int, default=0)
-    tune.add_argument("--prefill-chunk-size", type=int, default=256)
+    tune.add_argument("--prefill-chunk-size", type=int, default=512)
     tune.add_argument("--seed", type=int, default=0)
     _add_metrics_options(tune)
     _add_worker_options(tune)
@@ -383,6 +497,7 @@ def cli_runtime_settings(arguments: argparse.Namespace) -> dict[str, Any]:
     keys = (
         "backend",
         "expert_memory",
+        "cpu_packed_weights",
         "host_memory_mb",
         "expert_cache_mb",
         "expert_gpu_cache_mb",
@@ -395,11 +510,6 @@ def cli_runtime_settings(arguments: argparse.Namespace) -> dict[str, Any]:
         "direct_expert_io",
         "buffered_expert_io",
         "disable_gpu_victim_execution",
-        "router_prediction",
-        "async_router_prediction",
-        "forward_aware_cache",
-        "rank_adaptive_prefetch",
-        "cross_expert_read_coalescing",
         "release_vulkan_dense_host",
     )
     return {key: getattr(arguments, key) for key in keys if getattr(arguments, key, None) is not None}
@@ -1110,8 +1220,16 @@ def inspect_command(arguments: argparse.Namespace) -> int:
             telemetry = ready.get("telemetry", {})
             print(f"model: {model_info.get('model_type', 'N/A')}")
             print(f"backend: {resources.get('backend', 'N/A')}")
+            print(
+                "CPU packed weights: "
+                f"{resources.get('selected_cpu_packed_weights', 'off')}"
+            )
             print(f"host memory: {_format_bytes_gb(resources.get('host_memory_budget_bytes'))}")
             print(f"Expert cache: {_format_bytes_gb(resources.get('expert_cache_bytes'))}")
+            print(
+                "packed Expert estimate: "
+                f"{_format_bytes_gb(resources.get('estimated_cpu_packed_expert_bytes'))}"
+            )
             print(f"Expert IO workers: {resources.get('expert_io_workers', 'N/A')}")
             print(f"CPU: {capabilities.get('physical_cpu_core_count', 'N/A')} physical / {capabilities.get('logical_cpu_count', 'N/A')} logical")
             print(f"Vulkan devices: {capabilities.get('vulkan_device_count', 0)}")

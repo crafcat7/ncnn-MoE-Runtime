@@ -1,0 +1,50 @@
+#version 450
+
+layout(binding = 0) readonly buffer source_key_blob
+{
+    sfp source_key_data[];
+};
+layout(binding = 1) readonly buffer source_value_blob
+{
+    sfp source_value_data[];
+};
+layout(binding = 2) buffer destination_key_blob
+{
+    sfp destination_key_data[];
+};
+layout(binding = 3) buffer destination_value_blob
+{
+    sfp destination_value_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint width;
+    uint rows;
+    uint channels;
+    uint source_cstep;
+    uint destination_cstep;
+    uint capacity;
+    uint destination_start;
+}
+p;
+
+void main()
+{
+    const uint column = gl_GlobalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y;
+    const uint channel = gl_GlobalInvocationID.z;
+    if (column >= p.width || row >= p.rows || channel >= p.channels)
+        return;
+
+    const uint source_index = channel * p.source_cstep + row * p.width + column;
+    const uint slot = (p.destination_start + row) % p.capacity;
+    const uint destination_index = channel * p.destination_cstep + slot * p.width + column;
+    const uint duplicate_index = destination_index + p.capacity * p.width;
+    const float key = buffer_ld1(source_key_data, source_index);
+    const float value = buffer_ld1(source_value_data, source_index);
+    buffer_st1(destination_key_data, destination_index, key);
+    buffer_st1(destination_key_data, duplicate_index, key);
+    buffer_st1(destination_value_data, destination_index, value);
+    buffer_st1(destination_value_data, duplicate_index, value);
+}

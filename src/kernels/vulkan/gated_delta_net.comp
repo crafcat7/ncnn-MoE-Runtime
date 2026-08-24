@@ -1,0 +1,204 @@
+#version 450
+
+layout(binding = 0) buffer fused_input_blob
+{
+    float fused_input[];
+};
+layout(binding = 1) buffer convolution_state_blob
+{
+    float convolution_state[];
+};
+layout(binding = 2) buffer recurrent_state_blob
+{
+    float recurrent_state[];
+};
+layout(binding = 3) readonly buffer convolution_weight_blob
+{
+    float convolution_weight[];
+};
+layout(binding = 4) readonly buffer time_bias_blob
+{
+    float time_bias[];
+};
+layout(binding = 5) readonly buffer decay_log_blob
+{
+    float decay_log[];
+};
+layout(binding = 6) readonly buffer norm_weight_blob
+{
+    float norm_weight[];
+};
+layout(binding = 7) buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint convolution_size;
+    uint value_size;
+    uint fused_columns;
+    uint head_count;
+    uint kv_head_count;
+    uint head_dimension;
+    uint value_head_dimension;
+    uint kernel_size;
+    uint token_count;
+    float norm_epsilon;
+}
+p;
+
+float sigmoid(float value)
+{
+    if (value >= 0.0)
+        return 1.0 / (1.0 + exp(-value));
+    const float exponential = exp(value);
+    return exponential / (1.0 + exponential);
+}
+
+float softplus(float value)
+{
+    if (value > 20.0)
+        return value;
+    if (value < -20.0)
+        return exp(value);
+    return log(1.0 + exp(value));
+}
+
+shared float partial_sum[128];
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint key_size = p.kv_head_count * p.head_dimension;
+    const uint head_ratio = p.head_count / p.kv_head_count;
+    const float query_scale = 1.0 / sqrt(float(p.head_dimension));
+
+    for (uint token = 0; token < p.token_count; ++token)
+    {
+        const uint input_row = token * p.fused_columns;
+
+        for (uint channel = lane; channel < p.convolution_size; channel += 128)
+        {
+            const uint state_base = channel * p.kernel_size;
+            for (uint tap = 0; tap + 1 < p.kernel_size; ++tap)
+                convolution_state[state_base + tap] = convolution_state[state_base + tap + 1];
+            convolution_state[state_base + p.kernel_size - 1] = fused_input[input_row + channel];
+            float sum = 0.0;
+            for (uint tap = 0; tap < p.kernel_size; ++tap)
+                sum += convolution_state[state_base + tap]
+                       * convolution_weight[state_base + tap];
+            fused_input[input_row + channel] = sum * sigmoid(sum);
+        }
+        barrier();
+
+        for (uint key_head = lane; key_head < p.kv_head_count; key_head += 128)
+        {
+            const uint query_base = input_row + key_head * p.head_dimension;
+            const uint key_base = input_row + key_size + key_head * p.head_dimension;
+            float query_square_sum = 0.0;
+            float key_square_sum = 0.0;
+            for (uint column = 0; column < p.head_dimension; ++column)
+            {
+                const float query = fused_input[query_base + column];
+                const float key = fused_input[key_base + column];
+                query_square_sum += query * query;
+                key_square_sum += key * key;
+            }
+            const float query_inverse_norm = 1.0 / sqrt(query_square_sum + 1e-6);
+            const float key_inverse_norm = 1.0 / sqrt(key_square_sum + 1e-6);
+            for (uint column = 0; column < p.head_dimension; ++column)
+            {
+                fused_input[query_base + column] *= query_inverse_norm;
+                fused_input[key_base + column] *= key_inverse_norm;
+            }
+        }
+        barrier();
+
+        for (uint value_head = 0; value_head < p.head_count; ++value_head)
+        {
+            const uint key_head = value_head / head_ratio;
+            const uint query_base = input_row + key_head * p.head_dimension;
+            const uint key_base = input_row + key_size + key_head * p.head_dimension;
+            const uint value_base = input_row + key_size * 2
+                                    + value_head * p.value_head_dimension;
+            const uint recurrent_base = value_head * p.head_dimension
+                                        * p.value_head_dimension;
+            const uint output_base = token * p.value_size
+                                     + value_head * p.value_head_dimension;
+            const float beta = sigmoid(fused_input[input_row + p.convolution_size
+                                                   + p.value_size + value_head]);
+            const uint alpha_base = input_row + p.convolution_size + p.value_size
+                                    + p.head_count;
+            const float decay = exp(
+                -exp(decay_log[value_head])
+                * softplus(fused_input[alpha_base + value_head] + time_bias[value_head]));
+
+            for (uint value_column = lane;
+                 value_column < p.value_head_dimension;
+                 value_column += 128)
+            {
+                float memory_value = 0.0;
+                for (uint key_column = 0; key_column < p.head_dimension; ++key_column)
+                {
+                    memory_value += recurrent_state[recurrent_base
+                                                       + key_column * p.value_head_dimension
+                                                       + value_column]
+                                    * decay * fused_input[key_base + key_column];
+                }
+                const float value = fused_input[value_base + value_column];
+                const float delta = (value - memory_value) * beta;
+                for (uint key_column = 0; key_column < p.head_dimension; ++key_column)
+                {
+                    recurrent_state[recurrent_base
+                                    + key_column * p.value_head_dimension
+                                    + value_column] = recurrent_state[recurrent_base
+                                                                       + key_column * p.value_head_dimension
+                                                                       + value_column] * decay
+                                                       + fused_input[key_base + key_column] * delta;
+                }
+                float output_value = 0.0;
+                for (uint key_column = 0; key_column < p.head_dimension; ++key_column)
+                {
+                    output_value += recurrent_state[recurrent_base
+                                                    + key_column * p.value_head_dimension
+                                                    + value_column]
+                                   * fused_input[query_base + key_column];
+                }
+                output_data[output_base + value_column] = output_value * query_scale;
+            }
+
+            float square_sum = 0.0;
+            for (uint value_column = lane;
+                 value_column < p.value_head_dimension;
+                 value_column += 128)
+            {
+                const float value = output_data[output_base + value_column];
+                square_sum += value * value;
+            }
+            partial_sum[lane] = square_sum;
+            barrier();
+            for (uint stride = 64; stride > 0; stride >>= 1)
+            {
+                if (lane < stride)
+                    partial_sum[lane] += partial_sum[lane + stride];
+                barrier();
+            }
+            const float inverse_rms = 1.0 / sqrt(
+                partial_sum[0] / float(p.value_head_dimension)
+                + p.norm_epsilon);
+            const uint gate_base = input_row + p.convolution_size;
+            for (uint value_column = lane;
+                 value_column < p.value_head_dimension;
+                 value_column += 128)
+            {
+                const float gate = fused_input[gate_base
+                                               + value_head * p.value_head_dimension
+                                               + value_column];
+                output_data[output_base + value_column] *= inverse_rms
+                    * norm_weight[value_column] * gate * sigmoid(gate);
+            }
+            barrier();
+        }
+    }
+}

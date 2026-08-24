@@ -1,0 +1,121 @@
+#version 450
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(binding = 0) buffer data_blob
+{
+    float data[];
+};
+layout(binding = 1) readonly buffer weight_blob
+{
+    float weights[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint columns;
+    uint token_count;
+    float epsilon;
+}
+p;
+
+#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
+shared float partial[32];
+#endif
+
+float quantize_float8_e4m3(float value)
+{
+    const float sign_value = value < 0.0 ? -1.0 : 1.0;
+    const float magnitude = min(abs(value), 448.0);
+    if (magnitude < 0.015625)
+    {
+        const float mantissa = min(7.0, floor(magnitude * 512.0 + 0.5));
+        return sign_value * mantissa * 0.001953125;
+    }
+    float exponent = floor(log2(magnitude));
+    float encoded_exponent = exponent + 7.0;
+    float mantissa = floor((magnitude * exp2(-exponent) - 1.0) * 8.0 + 0.5);
+    if (mantissa >= 8.0)
+    {
+        mantissa = 0.0;
+        encoded_exponent += 1.0;
+    }
+    if (encoded_exponent >= 15.0)
+    {
+        encoded_exponent = 15.0;
+        mantissa = min(mantissa, 6.0);
+    }
+    const float decoded = encoded_exponent == 0.0
+        ? mantissa * 0.001953125
+        : (1.0 + mantissa * 0.125) * exp2(encoded_exponent - 7.0);
+    return sign_value * decoded;
+}
+
+void main()
+{
+    const uint token = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    float square_sum = 0.0;
+    for (uint column = lane; column < p.columns; column += 32)
+    {
+        const float value = data[token * p.columns + column];
+        square_sum += value * value;
+    }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const float total_square_sum = subgroupAdd(square_sum);
+    const float inverse_rms = inversesqrt(total_square_sum / float(p.columns) + p.epsilon);
+#else
+    partial[lane] = square_sum;
+    barrier();
+    for (uint stride = 16; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+            partial[lane] += partial[lane + stride];
+        barrier();
+    }
+    const float inverse_rms = inversesqrt(partial[0] / float(p.columns) + p.epsilon);
+#endif
+    for (uint block_begin = 0; block_begin < p.columns; block_begin += 128)
+    {
+        float maximum = 0.0001;
+        for (uint offset = lane; offset < 128; offset += 32)
+        {
+            const uint column = block_begin + offset;
+            if (column < p.columns)
+            {
+                const uint index = token * p.columns + column;
+                data[index] *= inverse_rms * weights[column];
+                maximum = max(maximum, abs(data[index]));
+            }
+        }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+        const float block_maximum = subgroupMax(maximum);
+        const float scale = exp2(ceil(log2(block_maximum / 448.0)));
+#else
+        partial[lane] = maximum;
+        barrier();
+        for (uint stride = 16; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+                partial[lane] = max(partial[lane], partial[lane + stride]);
+            barrier();
+        }
+        const float scale = exp2(ceil(log2(partial[0] / 448.0)));
+#endif
+        for (uint offset = lane; offset < 128; offset += 32)
+        {
+            const uint column = block_begin + offset;
+            if (column < p.columns)
+            {
+                const uint index = token * p.columns + column;
+                data[index] = quantize_float8_e4m3(clamp(data[index] / scale, -448.0, 448.0)) * scale;
+            }
+        }
+#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
+        barrier();
+#endif
+    }
+}

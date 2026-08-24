@@ -1,5 +1,6 @@
 #include "cpu_mxfp4_msvc.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -22,6 +23,79 @@ static const std::array<float, 256>& avx2_scale_table()
     return values;
 }
 
+static float avx2_horizontal_max(__m256 values) noexcept
+{
+    const __m128 halves = _mm_max_ps(
+        _mm256_castps256_ps128(values),
+        _mm256_extractf128_ps(values, 1));
+    const __m128 pairs = _mm_max_ps(halves, _mm_movehl_ps(halves, halves));
+    const __m128 result = _mm_max_ss(pairs, _mm_movehdup_ps(pairs));
+    return _mm_cvtss_f32(result);
+}
+
+void msvc_avx2_mxfp4_q8_quantize(
+    const float* source,
+    int8_t* values,
+    float* scales,
+    uint32_t columns) noexcept
+{
+    if (!source || !values || !scales || columns == 0)
+        return;
+
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    const __m256 lower_bound = _mm256_set1_ps(-127.0f);
+    const __m256 upper_bound = _mm256_set1_ps(127.0f);
+    const uint32_t block_count = (columns + 31) / 32;
+    for (uint32_t block = 0; block < block_count; ++block)
+    {
+        const uint32_t begin = block * 32;
+        const uint32_t end = (columns < begin + 32) ? columns : begin + 32;
+        const uint32_t count = end - begin;
+        __m256 maximum_values = zero;
+        uint32_t index = 0;
+        for (; index + 8 <= count; index += 8)
+        {
+            const __m256 current = _mm256_loadu_ps(source + begin + index);
+            maximum_values = _mm256_max_ps(
+                maximum_values,
+                _mm256_andnot_ps(sign_mask, current));
+        }
+        float maximum = avx2_horizontal_max(maximum_values);
+        for (; index < count; ++index)
+            maximum = std::max(maximum, std::fabs(source[begin + index]));
+
+        const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+        scales[block] = scale;
+        const __m256 inverse_scale = _mm256_set1_ps(1.0f / scale);
+        index = 0;
+        for (; index + 8 <= count; index += 8)
+        {
+            __m256 normalized = _mm256_mul_ps(
+                _mm256_loadu_ps(source + begin + index),
+                inverse_scale);
+            normalized = _mm256_max_ps(
+                lower_bound,
+                _mm256_min_ps(upper_bound, normalized));
+            const __m256i quantized = _mm256_cvtps_epi32(normalized);
+            alignas(32) int32_t quantized_values[8];
+            _mm256_storeu_si256(
+                reinterpret_cast<__m256i*>(quantized_values),
+                quantized);
+            for (uint32_t lane = 0; lane < 8; ++lane)
+                values[begin + index + lane] = static_cast<int8_t>(quantized_values[lane]);
+        }
+        for (; index < count; ++index)
+        {
+            const float normalized = std::clamp(
+                source[begin + index] / scale,
+                -127.0f,
+                127.0f);
+            values[begin + index] = static_cast<int8_t>(std::lrintf(normalized));
+        }
+    }
+}
+
 static void avx2_decode_block(const uint8_t* packed, __m128i decoded[2]) noexcept
 {
     const __m128i nibble_mask = _mm_set1_epi8(0x0f);
@@ -40,17 +114,58 @@ static float avx2_horizontal_sum(__m256 values) noexcept
     return _mm_cvtss_f32(_mm_hadd_ps(pairs, pairs));
 }
 
+static int32_t avx2_horizontal_sum_epi32(__m256i values) noexcept
+{
+    __m128i sum = _mm_add_epi32(
+        _mm256_castsi256_si128(values),
+        _mm256_extracti128_si256(values, 1));
+    sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(2, 3, 0, 1)));
+    sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(1, 0, 3, 2)));
+    return _mm_cvtsi128_si32(sum);
+}
+
 float msvc_avx2_bfloat16_dot(const uint16_t* weights, const float* input, uint32_t count) noexcept
 {
-    __m256 accumulator = _mm256_setzero_ps();
+    __m256 accumulator0 = _mm256_setzero_ps();
+    __m256 accumulator1 = _mm256_setzero_ps();
+    __m256 accumulator2 = _mm256_setzero_ps();
+    __m256 accumulator3 = _mm256_setzero_ps();
     uint32_t index = 0;
+    for (; index + 32 <= count; index += 32)
+    {
+        const __m128i packed0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + index));
+        const __m128i packed1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + index + 8));
+        const __m128i packed2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + index + 16));
+        const __m128i packed3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + index + 24));
+        accumulator0 = _mm256_fmadd_ps(
+            _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed0), 16)),
+            _mm256_loadu_ps(input + index),
+            accumulator0);
+        accumulator1 = _mm256_fmadd_ps(
+            _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed1), 16)),
+            _mm256_loadu_ps(input + index + 8),
+            accumulator1);
+        accumulator2 = _mm256_fmadd_ps(
+            _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed2), 16)),
+            _mm256_loadu_ps(input + index + 16),
+            accumulator2);
+        accumulator3 = _mm256_fmadd_ps(
+            _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed3), 16)),
+            _mm256_loadu_ps(input + index + 24),
+            accumulator3);
+    }
+    float sum = avx2_horizontal_sum(
+        _mm256_add_ps(
+            _mm256_add_ps(accumulator0, accumulator1),
+            _mm256_add_ps(accumulator2, accumulator3)));
     for (; index + 8 <= count; index += 8)
     {
         const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + index));
-        const __m256 values = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed), 16));
-        accumulator = _mm256_fmadd_ps(values, _mm256_loadu_ps(input + index), accumulator);
+        const __m256 values = _mm256_castsi256_ps(
+            _mm256_slli_epi32(_mm256_cvtepu16_epi32(packed), 16));
+        sum += avx2_horizontal_sum(
+            _mm256_mul_ps(values, _mm256_loadu_ps(input + index)));
     }
-    float sum = avx2_horizontal_sum(accumulator);
     for (; index < count; ++index)
     {
         const uint32_t bits = static_cast<uint32_t>(weights[index]) << 16;
@@ -59,6 +174,60 @@ float msvc_avx2_bfloat16_dot(const uint16_t* weights, const float* input, uint32
         sum += weight * input[index];
     }
     return sum;
+}
+
+void msvc_avx2_float_to_bfloat16_array(
+    uint16_t* output,
+    const float* input,
+    uint32_t count) noexcept
+{
+    const __m256i rounding_bias = _mm256_set1_epi32(0x7fff);
+    const __m256i low_bit_mask = _mm256_set1_epi32(1);
+    uint32_t index = 0;
+    for (; index + 8 <= count; index += 8)
+    {
+        const __m256i bits = _mm256_castps_si256(_mm256_loadu_ps(input + index));
+        const __m256i rounding = _mm256_add_epi32(
+            rounding_bias,
+            _mm256_and_si256(_mm256_srli_epi32(bits, 16), low_bit_mask));
+        const __m256i high = _mm256_srli_epi32(
+            _mm256_add_epi32(bits, rounding), 16);
+        const __m128i shuffle_mask = _mm_setr_epi8(
+            0, 1, 4, 5, 8, 9, 12, 13,
+            -128, -128, -128, -128, -128, -128, -128, -128);
+        const __m128i packed_low = _mm_shuffle_epi8(
+            _mm256_castsi256_si128(high), shuffle_mask);
+        const __m128i packed_high = _mm_shuffle_epi8(
+            _mm256_extracti128_si256(high, 1), shuffle_mask);
+        const __m128i packed = _mm_unpacklo_epi64(packed_low, packed_high);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(output + index), packed);
+    }
+    for (; index < count; ++index)
+    {
+        uint32_t bits = 0;
+        std::memcpy(&bits, input + index, sizeof(bits));
+        const uint32_t rounding = 0x7fffu + ((bits >> 16) & 1u);
+        output[index] = static_cast<uint16_t>((bits + rounding) >> 16);
+    }
+}
+
+void msvc_avx2_bfloat16_scaled_add(float* output, const uint16_t* input, float scale, uint32_t count) noexcept
+{
+    const __m256 scale_vector = _mm256_set1_ps(scale);
+    uint32_t index = 0;
+    for (; index + 8 <= count; index += 8)
+    {
+        const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(input + index));
+        const __m256 values = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed), 16));
+        _mm256_storeu_ps(output + index, _mm256_fmadd_ps(values, scale_vector, _mm256_loadu_ps(output + index)));
+    }
+    for (; index < count; ++index)
+    {
+        const uint32_t bits = static_cast<uint32_t>(input[index]) << 16;
+        float value = 0.0f;
+        std::memcpy(&value, &bits, sizeof(value));
+        output[index] += scale * value;
+    }
 }
 
 float msvc_avx2_mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input) noexcept
@@ -80,6 +249,194 @@ float msvc_avx2_mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32_t
         total = _mm256_fmadd_ps(accumulator, _mm256_set1_ps(0.5f * scales_by_exponent[scales[block_index]]), total);
     }
     return avx2_horizontal_sum(total);
+}
+
+float msvc_avx2_mxfp4_q8_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count,
+                             const int8_t* input, const float* input_scales) noexcept
+{
+    const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+    const __m128i value_table = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+    const std::array<float, 256>& scales_by_exponent = avx2_scale_table();
+    float sum = 0.0f;
+    for (uint32_t block = 0; block < block_count; ++block)
+    {
+        const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed + static_cast<size_t>(block) * 16));
+        const __m128i low = _mm_and_si128(bytes, nibble_mask);
+        const __m128i high = _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask);
+        const __m128i decoded_low = _mm_shuffle_epi8(value_table, _mm_unpacklo_epi8(low, high));
+        const __m128i decoded_high = _mm_shuffle_epi8(value_table, _mm_unpackhi_epi8(low, high));
+        const int8_t* input_block = input + static_cast<size_t>(block) * 32;
+        const __m256i input_low = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(input_block)));
+        const __m256i input_high = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(input_block + 16)));
+        const __m256i product_low = _mm256_madd_epi16(_mm256_cvtepi8_epi16(decoded_low), input_low);
+        const __m256i product_high = _mm256_madd_epi16(_mm256_cvtepi8_epi16(decoded_high), input_high);
+        sum += static_cast<float>(avx2_horizontal_sum_epi32(_mm256_add_epi32(product_low, product_high)))
+               * (0.5f * scales_by_exponent[scales[block]])
+               * input_scales[block];
+    }
+    return sum;
+}
+
+void msvc_avx2_mxfp4_q8_matmul_rows2(
+    const uint8_t* first_packed,
+    const uint8_t* first_scales,
+    const uint8_t* second_packed,
+    const uint8_t* second_scales,
+    uint32_t block_count,
+    const int8_t* input,
+    size_t input_stride,
+    const float* input_scales,
+    size_t scale_stride,
+    size_t token_count,
+    float* first_output,
+    size_t first_output_stride,
+    float* second_output,
+    size_t second_output_stride) noexcept
+{
+    const std::array<float, 256>& scales_by_exponent = avx2_scale_table();
+    for (size_t token = 0; token < token_count; ++token)
+    {
+        first_output[token * first_output_stride] = 0.0f;
+        second_output[token * second_output_stride] = 0.0f;
+    }
+
+    for (uint32_t block = 0; block < block_count; ++block)
+    {
+        __m128i first_decoded[2];
+        __m128i second_decoded[2];
+        avx2_decode_block(
+            first_packed + static_cast<size_t>(block) * 16,
+            first_decoded);
+        avx2_decode_block(
+            second_packed + static_cast<size_t>(block) * 16,
+            second_decoded);
+        const float first_weight_scale = 0.5f * scales_by_exponent[first_scales[block]];
+        const float second_weight_scale = 0.5f * scales_by_exponent[second_scales[block]];
+        const __m256i first_low_weights = _mm256_cvtepi8_epi16(first_decoded[0]);
+        const __m256i first_high_weights = _mm256_cvtepi8_epi16(first_decoded[1]);
+        const __m256i second_low_weights = _mm256_cvtepi8_epi16(second_decoded[0]);
+        const __m256i second_high_weights = _mm256_cvtepi8_epi16(second_decoded[1]);
+        for (size_t token = 0; token < token_count; ++token)
+        {
+            const int8_t* input_block = input + token * input_stride + static_cast<size_t>(block) * 32;
+            const __m256i input_low = _mm256_cvtepi8_epi16(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(input_block)));
+            const __m256i input_high = _mm256_cvtepi8_epi16(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(input_block + 16)));
+            const int32_t first_integer_sum = avx2_horizontal_sum_epi32(
+                _mm256_add_epi32(
+                    _mm256_madd_epi16(first_low_weights, input_low),
+                    _mm256_madd_epi16(first_high_weights, input_high)));
+            const int32_t second_integer_sum = avx2_horizontal_sum_epi32(
+                _mm256_add_epi32(
+                    _mm256_madd_epi16(second_low_weights, input_low),
+                    _mm256_madd_epi16(second_high_weights, input_high)));
+            const float input_scale = input_scales[token * scale_stride + block];
+            first_output[token * first_output_stride] += static_cast<float>(first_integer_sum)
+                                                         * first_weight_scale * input_scale;
+            second_output[token * second_output_stride] += static_cast<float>(second_integer_sum)
+                                                           * second_weight_scale * input_scale;
+        }
+    }
+}
+
+static int32_t msvc_avx2_mxfp4_q8_packed_chunk_dot(const uint8_t* packed, const int8_t* input) noexcept
+{
+    const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+    const __m128i value_table = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+    const __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(packed));
+    const __m128i low = _mm_and_si128(bytes, nibble_mask);
+    const __m128i high = _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask);
+    const __m128i decoded = _mm_shuffle_epi8(value_table, _mm_unpacklo_epi8(low, high));
+    const __m256i weights = _mm256_cvtepi8_epi16(decoded);
+    const __m256i input_values = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(input)));
+    return avx2_horizontal_sum_epi32(_mm256_madd_epi16(weights, input_values));
+}
+
+void msvc_avx2_mxfp4_q8_packed_gemm(
+    const uint8_t* packed,
+    uint32_t row_count,
+    uint32_t block_count,
+    uint32_t tile_rows,
+    const int8_t* input,
+    size_t input_stride,
+    const float* input_scales,
+    size_t scale_stride,
+    size_t token_count,
+    float* output,
+    size_t output_stride) noexcept
+{
+    if (!packed || !input || !input_scales || !output || row_count == 0 || block_count == 0 || tile_rows != 8 || token_count == 0)
+        return;
+
+    const size_t block_bytes = 8 * 17;
+    const size_t group_stride = static_cast<size_t>(block_count) * block_bytes;
+    const std::array<float, 256>& scales_by_exponent = avx2_scale_table();
+    const size_t group_count = (static_cast<size_t>(row_count) + 7) / 8;
+    if (token_count == 1)
+    {
+        for (size_t group = 0; group < group_count; ++group)
+        {
+            float accumulators[8] = {};
+            for (uint32_t block = 0; block < block_count; ++block)
+            {
+                const uint8_t* packed_block = packed + group * group_stride + static_cast<size_t>(block) * block_bytes;
+                const uint8_t* packed_values = packed_block + 8;
+                const float input_scale = input_scales[block];
+                for (uint32_t chunk = 0; chunk < 2; ++chunk)
+                {
+                    const int8_t* input_chunk = input + static_cast<size_t>(block) * 32 + chunk * 16;
+                    for (uint32_t row = 0; row < 8; ++row)
+                    {
+                        const size_t matrix_row = group * 8 + row;
+                        if (matrix_row >= row_count)
+                            continue;
+                        const uint8_t* row_values = packed_values + (static_cast<size_t>(chunk) * 8 + row) * 8;
+                        accumulators[row] += static_cast<float>(msvc_avx2_mxfp4_q8_packed_chunk_dot(row_values, input_chunk))
+                                             * (0.5f * scales_by_exponent[packed_block[row]]) * input_scale;
+                    }
+                }
+            }
+            for (uint32_t row = 0; row < 8; ++row)
+            {
+                const size_t matrix_row = group * 8 + row;
+                if (matrix_row < row_count)
+                    output[matrix_row] = accumulators[row];
+            }
+        }
+        return;
+    }
+
+    for (size_t token = 0; token < token_count; ++token)
+        for (uint32_t row = 0; row < row_count; ++row)
+            output[token * output_stride + row] = 0.0f;
+
+    for (size_t group = 0; group < group_count; ++group)
+    {
+        for (uint32_t block = 0; block < block_count; ++block)
+        {
+            const uint8_t* packed_block = packed + group * group_stride + static_cast<size_t>(block) * block_bytes;
+            const uint8_t* packed_values = packed_block + 8;
+            for (size_t token = 0; token < token_count; ++token)
+            {
+                const int8_t* input_block = input + token * input_stride + static_cast<size_t>(block) * 32;
+                const float input_scale = input_scales[token * scale_stride + block];
+                for (uint32_t chunk = 0; chunk < 2; ++chunk)
+                {
+                    const int8_t* input_chunk = input_block + chunk * 16;
+                    for (uint32_t row = 0; row < 8; ++row)
+                    {
+                        const size_t matrix_row = group * 8 + row;
+                        if (matrix_row >= row_count)
+                            continue;
+                        const uint8_t* row_values = packed_values + (static_cast<size_t>(chunk) * 8 + row) * 8;
+                        output[token * output_stride + matrix_row] += static_cast<float>(msvc_avx2_mxfp4_q8_packed_chunk_dot(row_values, input_chunk))
+                                                                      * (0.5f * scales_by_exponent[packed_block[row]]) * input_scale;
+                    }
+                }
+            }
+        }
+    }
 }
 
 void msvc_avx2_mxfp4_gemm_row(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input, size_t input_stride, size_t token_count,

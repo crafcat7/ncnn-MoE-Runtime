@@ -10,29 +10,6 @@
 namespace ncnn {
 namespace moe {
 
-enum class ModelNodeType
-{
-    RmsNorm,
-    FusedQkv,
-    GatedDeltaNet,
-    MultiHeadLatentAttention,
-    Rope,
-    AttentionSink,
-    Sdpa,
-    Projection,
-    Router,
-    TopK,
-    ExpertGroup,
-    SharedExpertGroup,
-    DenseFfn,
-    Combine
-};
-
-struct ModelNodeDescriptor
-{
-    ModelNodeType type = ModelNodeType::RmsNorm;
-};
-
 #define NCNN_MOE_ATTN_BIAS_BIT             0
 #define NCNN_MOE_ATTN_SINK_BIT             1
 #define NCNN_MOE_ATTN_QK_NORM_BIT          2
@@ -145,7 +122,6 @@ struct LayerDescriptor
 {
     AttentionDescriptor attention;
     FfnDescriptor ffn;
-    std::vector<ModelNodeDescriptor> nodes;
 
     NormType pre_attention_norm = NormType::None;
     NormType pre_ffn_norm = NormType::RmsNorm;

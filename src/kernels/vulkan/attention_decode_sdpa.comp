@@ -1,0 +1,113 @@
+#version 450
+
+layout(binding = 0) readonly buffer query_blob
+{
+    float query_data[];
+};
+layout(binding = 1) readonly buffer key_blob
+{
+    sfp key_data[];
+};
+layout(binding = 2) readonly buffer value_blob
+{
+    sfp value_data[];
+};
+layout(binding = 3) readonly buffer sink_blob
+{
+    float sink_data[];
+};
+layout(binding = 4) writeonly buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint head_dimension;
+    uint destination_count;
+    uint head_count;
+    uint key_value_head_count;
+    uint query_cstep;
+    uint key_cstep;
+    uint value_cstep;
+    uint use_attention_sink;
+    float scale;
+}
+p;
+
+shared float reduction[128];
+shared float online_maximum;
+shared float online_sum;
+shared float previous_scale;
+shared float current_weight;
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint head = gl_WorkGroupID.z;
+    if (head >= p.head_count)
+        return;
+
+    const uint heads_per_group = p.head_count / p.key_value_head_count;
+    const uint key_value_head = head / heads_per_group;
+    const uint query_base = head * p.query_cstep;
+    const uint key_base = key_value_head * p.key_cstep;
+    const uint value_base = key_value_head * p.value_cstep;
+    float numerator = 0.0;
+
+    if (lane == 0)
+    {
+        online_maximum = -3.402823466e+38;
+        online_sum = 0.0;
+    }
+    barrier();
+
+    for (uint token = 0; token < p.destination_count; ++token)
+    {
+        const bool sink_token = p.use_attention_sink != 0 && token + 1 == p.destination_count;
+        float partial = 0.0;
+        if (lane < p.head_dimension && !sink_token)
+        {
+            partial = query_data[query_base + lane]
+                      * buffer_ld1(key_data, key_base + token * p.head_dimension + lane);
+        }
+        reduction[lane] = partial;
+        barrier();
+        for (uint stride = gl_WorkGroupSize.x >> 1; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+                reduction[lane] += reduction[lane + stride];
+            barrier();
+        }
+
+        if (lane == 0)
+        {
+            const float score = reduction[0] * p.scale
+                                + (sink_token ? sink_data[head] : 0.0);
+            const float next_maximum = max(online_maximum, score);
+            previous_scale = online_sum == 0.0 ? 0.0 : exp(online_maximum - next_maximum);
+            current_weight = exp(score - next_maximum);
+            online_sum = online_sum * previous_scale + current_weight;
+            online_maximum = next_maximum;
+        }
+        barrier();
+
+        if (lane < p.head_dimension)
+        {
+            numerator = numerator * previous_scale
+                        + (sink_token
+                               ? 0.0
+                               : current_weight
+                                     * buffer_ld1(
+                                         value_data,
+                                         value_base
+                                             + token * p.head_dimension
+                                             + lane));
+        }
+    }
+
+    if (lane < p.head_dimension)
+    {
+        output_data[head * p.head_dimension + lane] = numerator / online_sum;
+    }
+}

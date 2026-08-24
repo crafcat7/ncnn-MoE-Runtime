@@ -47,7 +47,7 @@ public:
     }
     [[nodiscard]] const std::vector<CompiledLayerPlan>& execution_plan() const noexcept
     {
-        return compiled_->layers;
+        return compiled_->graph.layer_plans;
     }
     [[nodiscard]] const ExecutionGraph& execution_graph() const noexcept
     {
@@ -57,20 +57,23 @@ public:
     {
         return compiled_->schedule;
     }
+    [[nodiscard]] const ExecutionGraph& speculative_execution_graph() const noexcept
+    {
+        return compiled_->speculative.graph;
+    }
+    [[nodiscard]] const ExecutionSchedule& speculative_execution_schedule() const noexcept
+    {
+        return compiled_->speculative.schedule;
+    }
     [[nodiscard]] const ModelMemoryPlan& memory_plan() const noexcept
     {
         return compiled_->memory_plan;
     }
     [[nodiscard]] const EffectiveRuntimeConfig& effective_runtime_config() const noexcept
     {
-        return compiled_->effective_runtime_options;
+        return compiled_->effective_runtime_config;
     }
 
-    // Compatibility name for applications built against the pre-RuntimeConfig API.
-    [[nodiscard]] const EffectiveRuntimeOptions& effective_runtime_options() const noexcept
-    {
-        return effective_runtime_config();
-    }
     [[nodiscard]] const ExpertStore& expert_store() const noexcept
     {
         return *compiled_->expert_store;

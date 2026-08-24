@@ -30,6 +30,9 @@ struct CpuDecodeBatchMetrics
     uint64_t physical_expert_batches = 0;
     uint64_t coalesced_expert_routes = 0;
     uint64_t max_expert_batch_size = 0;
+    uint64_t vulkan_attention_batch_submissions = 0;
+    uint64_t vulkan_attention_batch_rows = 0;
+    uint64_t vulkan_attention_batch_avoided_submissions = 0;
 };
 
 struct CpuSpeculativeProposal

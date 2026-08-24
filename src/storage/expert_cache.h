@@ -67,6 +67,10 @@ struct ExpertCacheStatistics
     uint64_t coalesced_experts = 0;
     uint64_t coalesced_read_ranges_saved = 0;
     uint32_t adaptive_read_policy = 0;
+    uint32_t io_worker_count = 0;
+    uint32_t adaptive_io_workers = 0;
+    uint64_t io_read_samples = 0;
+    uint64_t io_read_time_microseconds = 0;
     ExpertVictimCacheStatistics victim;
 };
 
@@ -131,6 +135,7 @@ private:
         uint64_t& ranges_saved,
         bool& coalesced);
     [[nodiscard]] static Result<uint64_t> stored_bytes(const TensorData& tensor);
+    [[nodiscard]] static Result<uint64_t> packed_weight_bytes(const TensorData& tensor);
     [[nodiscard]] Result<std::shared_ptr<Entry>> enqueue_pair(
         const TensorData& gate_up,
         const TensorData& down,
@@ -155,7 +160,7 @@ private:
         uint32_t residency_group,
         uint32_t forward_anchor = invalid_residency_group,
         bool allow_predicted_victim = false);
-    void worker_loop();
+    void worker_loop(uint32_t worker_index);
 
     uint64_t capacity_bytes_ = 0;
     uint64_t resident_bytes_ = 0;
@@ -198,9 +203,14 @@ private:
     std::deque<std::shared_ptr<Entry>> high_priority_;
     std::deque<std::shared_ptr<Entry>> low_priority_;
     std::vector<std::thread> workers_;
+    uint32_t io_worker_count_ = 0;
+    uint32_t adaptive_io_workers_ = 0;
+    uint64_t io_read_samples_ = 0;
+    uint64_t io_read_time_nanoseconds_ = 0;
     std::unique_ptr<FileRangeReader> reader_;
     std::shared_ptr<IExpertVictimCache> victim_cache_;
     uint32_t flags_ = 0;
+    bool reserve_cpu_packed_weights_ = false;
 
 public:
     explicit Mxfp4ExpertCache(
@@ -208,7 +218,8 @@ public:
         uint32_t io_worker_count = 0,
         std::shared_ptr<IExpertVictimCache> victim_cache = {},
         uint32_t flags = 0,
-        uint32_t residency_group_count = 0);
+        uint32_t residency_group_count = 0,
+        bool reserve_cpu_packed_weights = false);
     ~Mxfp4ExpertCache();
 
     Mxfp4ExpertCache(const Mxfp4ExpertCache&) = delete;

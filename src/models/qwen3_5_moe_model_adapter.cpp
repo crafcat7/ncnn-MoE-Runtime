@@ -417,7 +417,49 @@ Result<MoeIR> Qwen3_5MoeModelAdapter::parse_model(const ModelPackage& package) c
             return artifact_status.error();
     }
     const bool compiled_mxfp4_experts = artifact_exists;
-    moe.expert_weight_dtype = compiled_mxfp4_experts ? DType::MxFp4 : DType::BFloat16;
+    std::optional<DType> detected_qnk_expert_dtype;
+    if (!compiled_mxfp4_experts && !package.root.empty())
+    {
+        std::error_code archive_error;
+        if (std::filesystem::is_directory(package.root, archive_error) && !archive_error)
+        {
+            auto opened = SafetensorsArchive::open(package.root);
+            if (opened)
+            {
+                SafetensorsArchive& archive = opened.value();
+                for (uint32_t layer_id = 0; layer_id < layer_count.value(); ++layer_id)
+                {
+                    const std::string source =
+                        "model.language_model.layers." + std::to_string(layer_id) + ".mlp.experts.";
+                    const auto gate_up_dtype = archive.find_qnk_expert_dtype(
+                        source + "gate_up_proj",
+                        expert_count.value(),
+                        intermediate_size.value() * 2,
+                        hidden_size.value());
+                    const auto down_dtype = archive.find_qnk_expert_dtype(
+                        source + "down_proj",
+                        expert_count.value(),
+                        hidden_size.value(),
+                        intermediate_size.value());
+                    if (!gate_up_dtype || !down_dtype || gate_up_dtype != down_dtype)
+                    {
+                        detected_qnk_expert_dtype.reset();
+                        break;
+                    }
+                    if (!detected_qnk_expert_dtype)
+                        detected_qnk_expert_dtype = gate_up_dtype;
+                    else if (detected_qnk_expert_dtype != gate_up_dtype)
+                    {
+                        detected_qnk_expert_dtype.reset();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    moe.expert_weight_dtype = compiled_mxfp4_experts
+                                 ? DType::MxFp4
+                                 : detected_qnk_expert_dtype.value_or(DType::BFloat16);
     moe.shared_expert_weight_dtype = DType::BFloat16;
     moe.flags = MoeDescriptorNormalizeTopKWeights | MoeDescriptorSharedExpert | MoeDescriptorSharedExpertGate;
 
@@ -454,36 +496,6 @@ Result<MoeIR> Qwen3_5MoeModelAdapter::parse_model(const ModelPackage& package) c
         layer.pre_ffn_norm = NormType::RmsNorm;
         layer.attention = layer_type == "linear_attention" ? linear_attention : full_attention;
         layer.ffn.moe = moe;
-        if (layer.attention.kind == AttentionKind::GatedDeltaNet)
-        {
-            layer.nodes = {
-                {ModelNodeType::RmsNorm},
-                {ModelNodeType::GatedDeltaNet},
-                {ModelNodeType::Projection},
-                {ModelNodeType::RmsNorm},
-                {ModelNodeType::Router},
-                {ModelNodeType::TopK},
-                {ModelNodeType::ExpertGroup},
-                {ModelNodeType::SharedExpertGroup},
-                {ModelNodeType::Combine},
-            };
-        }
-        else
-        {
-            layer.nodes = {
-                {ModelNodeType::RmsNorm},
-                {ModelNodeType::FusedQkv},
-                {ModelNodeType::Rope},
-                {ModelNodeType::Sdpa},
-                {ModelNodeType::Projection},
-                {ModelNodeType::RmsNorm},
-                {ModelNodeType::Router},
-                {ModelNodeType::TopK},
-                {ModelNodeType::ExpertGroup},
-                {ModelNodeType::SharedExpertGroup},
-                {ModelNodeType::Combine},
-            };
-        }
     }
     return descriptor;
 }
@@ -510,6 +522,30 @@ static Result<void> qwen_add_expert_slice(
     std::vector<uint32_t> shape)
 {
     auto tensor = archive.load_bfloat16_slice(source, expert_id, std::move(shape));
+    if (!tensor)
+        return tensor.error();
+    mapping.tensors.emplace(target, std::move(tensor).value());
+    return {};
+}
+
+static Result<void> qwen_add_qnk_expert(
+    WeightMapping& mapping,
+    const SafetensorsArchive& archive,
+    const std::string& target,
+    const std::string& source,
+    DType dtype,
+    uint32_t expert_id,
+    uint32_t expert_count,
+    uint32_t rows,
+    uint32_t columns)
+{
+    auto tensor = archive.load_qnk_expert(
+        source,
+        dtype,
+        expert_id,
+        expert_count,
+        rows,
+        columns);
     if (!tensor)
         return tensor.error();
     mapping.tensors.emplace(target, std::move(tensor).value());
@@ -652,46 +688,83 @@ Result<WeightMapping> Qwen3_5MoeModelAdapter::map_weights(const ModelPackage& pa
 
         const MoeDescriptor& moe = descriptor.layers[layer_id].ffn.moe;
         const bool compiled_mxfp4_experts = moe.expert_weight_dtype == DType::MxFp4;
+        const bool compiled_qnk_experts = is_qnk_dtype(moe.expert_weight_dtype);
         const std::string artifact_experts = qwen_mxfp4_expert_prefix(layer_id);
         for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
         {
             const std::string expert = expert_prefix(layer_id, expert_id);
-            status = compiled_mxfp4_experts
-                         ? qwen_add_mxfp4_expert(
-                               mapping,
-                               archive,
-                               expert + "gate_up.weight",
-                               artifact_experts + "gate_up.",
-                               expert_id,
-                               moe.intermediate_size * 2,
-                               descriptor.hidden_size,
-                               expert_load_flags)
-                         : qwen_add_expert_slice(
-                               mapping,
-                               archive,
-                               expert + "gate_up.weight",
-                               source + "mlp.experts.gate_up_proj",
-                               expert_id,
-                               {moe.intermediate_size * 2, descriptor.hidden_size});
+            if (compiled_qnk_experts)
+            {
+                status = qwen_add_qnk_expert(
+                    mapping,
+                    archive,
+                    expert + "gate_up.weight",
+                    source + "mlp.experts.gate_up_proj",
+                    moe.expert_weight_dtype,
+                    expert_id,
+                    moe.expert_count,
+                    moe.intermediate_size * 2,
+                    descriptor.hidden_size);
+            }
+            else if (compiled_mxfp4_experts)
+            {
+                status = qwen_add_mxfp4_expert(
+                    mapping,
+                    archive,
+                    expert + "gate_up.weight",
+                    artifact_experts + "gate_up.",
+                    expert_id,
+                    moe.intermediate_size * 2,
+                    descriptor.hidden_size,
+                    expert_load_flags);
+            }
+            else
+            {
+                status = qwen_add_expert_slice(
+                    mapping,
+                    archive,
+                    expert + "gate_up.weight",
+                    source + "mlp.experts.gate_up_proj",
+                    expert_id,
+                    {moe.intermediate_size * 2, descriptor.hidden_size});
+            }
             if (!status)
                 return status.error();
-            status = compiled_mxfp4_experts
-                         ? qwen_add_mxfp4_expert(
-                               mapping,
-                               archive,
-                               expert + "down.weight",
-                               artifact_experts + "down.",
-                               expert_id,
-                               descriptor.hidden_size,
-                               moe.intermediate_size,
-                               expert_load_flags)
-                         : qwen_add_expert_slice(
-                               mapping,
-                               archive,
-                               expert + "down.weight",
-                               source + "mlp.experts.down_proj",
-                               expert_id,
-                               {descriptor.hidden_size, moe.intermediate_size});
+            if (compiled_qnk_experts)
+            {
+                status = qwen_add_qnk_expert(
+                    mapping,
+                    archive,
+                    expert + "down.weight",
+                    source + "mlp.experts.down_proj",
+                    moe.expert_weight_dtype,
+                    expert_id,
+                    moe.expert_count,
+                    descriptor.hidden_size,
+                    moe.intermediate_size);
+            }
+            else if (compiled_mxfp4_experts)
+            {
+                status = qwen_add_mxfp4_expert(
+                    mapping,
+                    archive,
+                    expert + "down.weight",
+                    artifact_experts + "down.",
+                    expert_id,
+                    descriptor.hidden_size,
+                    moe.intermediate_size,
+                    expert_load_flags);
+            }
+            else
+            {
+                status = qwen_add_expert_slice(
+                    mapping,
+                    archive,
+                    expert + "down.weight",
+                    source + "mlp.experts.down_proj",
+                    expert_id,
+                    {descriptor.hidden_size, moe.intermediate_size});
+            }
             if (!status)
                 return status.error();
         }

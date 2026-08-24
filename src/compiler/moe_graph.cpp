@@ -74,36 +74,16 @@ Result<void> MoeGraph::validate() const
             producers[output] = node.id;
         }
 
-        if (node.operation == MoeIROperator::Attention)
+        const bool layer_bound = node.operation == MoeIROperator::Attention
+                                 || node.operation == MoeIROperator::Router
+                                 || node.operation == MoeIROperator::ExpertGroup
+                                 || node.operation == MoeIROperator::SharedExpertGroup
+                                 || node.operation == MoeIROperator::DenseFfn
+                                 || node.operation == MoeIROperator::Combine
+                                 || node.operation == MoeIROperator::KvCache;
+        if (layer_bound && node.layer_id == invalid_moe_ir_layer_id)
         {
-            if (node.layer_id == invalid_moe_ir_layer_id
-                || node.attention.head_count == 0
-                || node.attention.kv_head_count == 0
-                || node.attention.head_dimension == 0)
-            {
-                return Error{ErrorCode::InvalidModel, "MoeIR Attention requires layer and head metadata"};
-            }
-        }
-        if (node.operation == MoeIROperator::ExpertGroup)
-        {
-            if (node.layer_id == invalid_moe_ir_layer_id
-                || node.experts.expert_count == 0
-                || node.experts.top_k == 0
-                || node.experts.top_k > node.experts.expert_count)
-            {
-                return Error{ErrorCode::InvalidModel, "MoeIR ExpertGroup requires valid layer and routing metadata"};
-            }
-        }
-        if (node.operation == MoeIROperator::SharedExpertGroup
-            && (node.layer_id == invalid_moe_ir_layer_id
-                || node.experts.shared_expert_count == 0
-                || node.experts.intermediate_size == 0))
-        {
-            return Error{ErrorCode::InvalidModel, "MoeIR SharedExpertGroup requires shared Expert metadata"};
-        }
-        if (node.operation == MoeIROperator::DenseFfn && (node.layer_id == invalid_moe_ir_layer_id || node.intermediate_size == 0))
-        {
-            return Error{ErrorCode::InvalidModel, "MoeIR DenseFfn requires layer and intermediate-size metadata"};
+            return Error{ErrorCode::InvalidModel, "MoeIR layer-bound node requires a layer id"};
         }
         if (node.operation == MoeIROperator::KvCache && !has_flag(node.flags, MoeIRNodeStateful))
         {

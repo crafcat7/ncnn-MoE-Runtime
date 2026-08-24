@@ -2,6 +2,7 @@
 
 #include "compiler/moe_ir.hpp"
 #include "kernels/cpu_mxfp4.h"
+#include "kernels/cpu_qnk.h"
 #include "models/internal/tensor_names.h"
 #include "backends/ncnn/ncnn_attention.h"
 #include "backends/ncnn/ncnn_linear.h"
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <utility>
 
@@ -21,100 +23,80 @@ static bool shape_equals(const TensorData& tensor, std::initializer_list<uint32_
     return tensor.shape.size() == expected.size() && std::equal(tensor.shape.begin(), tensor.shape.end(), expected.begin());
 }
 
+static bool vulkan_latent_compressor_enabled(uint64_t optimization_flags) noexcept
+{
+    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationVulkanLatentCompressor);
+}
+
 #define NCNN_MOE_ADAPTER_GRAPH_ATTN_BIT   0
 #define NCNN_MOE_ADAPTER_GRAPH_SINK_BIT   1
 #define NCNN_MOE_ADAPTER_GRAPH_MOE_BIT    2
-#define NCNN_MOE_ADAPTER_GRAPH_MLA_BIT    3
-#define NCNN_MOE_ADAPTER_GRAPH_SHARED_BIT 4
+#define NCNN_MOE_ADAPTER_GRAPH_SHARED_BIT 3
 
 enum AdapterGraphFlag : uint32_t
 {
     AdapterGraphAttention = UINT32_C(1) << NCNN_MOE_ADAPTER_GRAPH_ATTN_BIT,
     AdapterGraphAttentionSink = UINT32_C(1) << NCNN_MOE_ADAPTER_GRAPH_SINK_BIT,
     AdapterGraphMoe = UINT32_C(1) << NCNN_MOE_ADAPTER_GRAPH_MOE_BIT,
-    AdapterGraphMla = UINT32_C(1) << NCNN_MOE_ADAPTER_GRAPH_MLA_BIT,
     AdapterGraphSharedExpert = UINT32_C(1) << NCNN_MOE_ADAPTER_GRAPH_SHARED_BIT
 };
 
 struct AdapterGraph
 {
     uint32_t flags = 0;
-    size_t attention_node_count = 0;
 };
 
-static Result<AdapterGraph> validate_adapter_graph(const LayerDescriptor& layer)
+static Result<AdapterGraph> validate_adapter_graph(const MoeGraph& graph, uint32_t layer_id, const LayerDescriptor& layer)
 {
-    if (layer.nodes.empty())
-        return Error{ErrorCode::InvalidModel, "adapter must provide an explicit operator graph"};
-    AdapterGraph graph;
-    size_t cursor = 0;
-    if (layer.nodes.size() >= 3
-        && layer.nodes[0].type == ModelNodeType::RmsNorm
-        && layer.nodes[1].type == ModelNodeType::FusedQkv
-        && layer.nodes[2].type == ModelNodeType::Rope)
+    AdapterGraph result;
+    uint32_t attention_count = 0;
+    uint32_t expert_count = 0;
+    uint32_t shared_count = 0;
+    uint32_t dense_count = 0;
+    for (const MoeIRNode& node : graph.nodes)
     {
-        graph.flags |= AdapterGraphAttention;
-        cursor = 3;
-        if (cursor < layer.nodes.size() && layer.nodes[cursor].type == ModelNodeType::AttentionSink)
+        if (node.layer_id != layer_id)
+            continue;
+        switch (node.operation)
         {
-            graph.flags |= AdapterGraphAttentionSink;
-            ++cursor;
+        case MoeIROperator::Attention:
+            ++attention_count;
+            break;
+        case MoeIROperator::ExpertGroup:
+            ++expert_count;
+            break;
+        case MoeIROperator::SharedExpertGroup:
+            ++shared_count;
+            break;
+        case MoeIROperator::DenseFfn:
+            ++dense_count;
+            break;
+        default:
+            break;
         }
-        if (cursor + 1 >= layer.nodes.size() || layer.nodes[cursor].type != ModelNodeType::Sdpa || layer.nodes[cursor + 1].type != ModelNodeType::Projection)
-        {
-            return Error{ErrorCode::InvalidModel, "adapter attention graph must end with SDPA and Projection"};
-        }
-        cursor += 2;
-        graph.attention_node_count = cursor;
     }
-    else if (layer.nodes.size() >= 4
-             && layer.nodes[0].type == ModelNodeType::RmsNorm
-             && layer.nodes[1].type == ModelNodeType::MultiHeadLatentAttention
-             && layer.nodes[2].type == ModelNodeType::AttentionSink
-             && layer.nodes[3].type == ModelNodeType::Projection)
+    if (attention_count != (has_flag(layer.flags, LayerDescriptorAttention) ? 1u : 0u))
+        return Error{ErrorCode::InvalidModel, "execution graph Attention does not match layer metadata"};
+    if (expert_count != (has_flag(layer.flags, LayerDescriptorMoe) ? 1u : 0u)
+        || dense_count != (has_flag(layer.flags, LayerDescriptorDenseFfn) ? 1u : 0u))
+        return Error{ErrorCode::InvalidModel, "execution graph FFN does not match layer metadata"};
+    if (has_flag(layer.flags, LayerDescriptorMoe)
+        && shared_count != (has_flag(layer.ffn.moe.flags, MoeDescriptorSharedExpert) ? 1u : 0u))
+        return Error{ErrorCode::InvalidModel, "execution graph shared Expert does not match layer metadata"};
+    if (attention_count != 0)
     {
-        graph.flags |= AdapterGraphAttention | AdapterGraphAttentionSink | AdapterGraphMla;
-        cursor = 4;
-        graph.attention_node_count = cursor;
+        result.flags |= AdapterGraphAttention;
+        if (has_flag(layer.attention.flags, AttentionDescriptorSinks))
+            result.flags |= AdapterGraphAttentionSink;
     }
-    else if (layer.nodes.size() >= 3
-             && layer.nodes[0].type == ModelNodeType::RmsNorm
-             && layer.nodes[1].type == ModelNodeType::GatedDeltaNet
-             && layer.nodes[2].type == ModelNodeType::Projection)
-    {
-        graph.flags |= AdapterGraphAttention;
-        cursor = 3;
-        graph.attention_node_count = cursor;
-    }
-    static constexpr ModelNodeType moe_prefix[] = {
-        ModelNodeType::RmsNorm,
-        ModelNodeType::Router,
-        ModelNodeType::TopK,
-        ModelNodeType::ExpertGroup,
-    };
-    constexpr size_t moe_prefix_count = sizeof(moe_prefix) / sizeof(moe_prefix[0]);
-    bool has_moe = cursor + moe_prefix_count + 1 <= layer.nodes.size();
-    for (size_t index = 0; has_moe && index < moe_prefix_count; ++index)
-        has_moe = moe_prefix[index] == layer.nodes[cursor + index].type;
-    if (has_moe)
-    {
-        graph.flags |= AdapterGraphMoe;
-        cursor += moe_prefix_count;
-        if (cursor < layer.nodes.size() && layer.nodes[cursor].type == ModelNodeType::SharedExpertGroup)
-        {
-            graph.flags |= AdapterGraphSharedExpert;
-            ++cursor;
-        }
-        if (cursor >= layer.nodes.size() || layer.nodes[cursor].type != ModelNodeType::Combine)
-            return Error{ErrorCode::InvalidModel, "adapter MoE graph must end with Combine"};
-        ++cursor;
-    }
-    if (cursor != layer.nodes.size())
-        return Error{ErrorCode::InvalidModel, "adapter operator graph has an invalid node order"};
-    return graph;
+    if (expert_count != 0)
+        result.flags |= AdapterGraphMoe;
+    if (shared_count != 0)
+        result.flags |= AdapterGraphSharedExpert;
+    return result;
 }
 
-static Result<TensorHandle> require_tensor(const WeightTable& weights, const std::string& name, std::initializer_list<uint32_t> shape, DType dtype)
+static Result<TensorHandle> require_tensor(const WeightStore& weights, const std::string& name, std::initializer_list<uint32_t> shape, DType dtype)
 {
     const TensorHandle handle = weights.find_handle(name);
     if (handle == invalid_tensor_handle)
@@ -221,6 +203,23 @@ static Result<TensorHandle> require_tensor(const WeightTable& weights, const std
             || tensor.mapped_data)
             return Error{ErrorCode::InvalidModel, "MXFP4 tensor contains unrelated storage: " + name};
     }
+    else if (is_qnk_dtype(dtype))
+    {
+        if (tensor.shape.size() != 2 || !qnk_shape_supported(dtype, tensor.shape[0], tensor.shape[1])
+            || tensor.qnk_values().size() != qnk_storage_bytes(dtype, tensor.shape[0], tensor.shape[1]))
+        {
+            return Error{ErrorCode::InvalidModel, "invalid Qn_K tensor storage: " + name};
+        }
+        if (!tensor.float32_data.empty()
+            || !tensor.bfloat16_data.empty()
+            || !tensor.int8_data.empty()
+            || !tensor.quantization_scales.empty()
+            || !tensor.mxfp4_blocks.empty()
+            || !tensor.mxfp4_scales.empty())
+        {
+            return Error{ErrorCode::InvalidModel, "Qn_K tensor contains unrelated storage: " + name};
+        }
+    }
     else
     {
         return Error{ErrorCode::UnsupportedModel, "unsupported tensor dtype: " + name};
@@ -228,56 +227,53 @@ static Result<TensorHandle> require_tensor(const WeightTable& weights, const std
     return handle;
 }
 
-Result<TensorHandle> WeightTable::add(std::string name, TensorData tensor)
-{
-    if (name.empty())
-        return Error{ErrorCode::InvalidArgument, "tensor name cannot be empty"};
-    if (handles_.contains(name))
-        return Error{ErrorCode::InvalidModel, "duplicate tensor: " + name};
-
-    const TensorHandle handle = static_cast<TensorHandle>(tensors_.size());
-    tensors_.push_back(std::move(tensor));
-    handles_.emplace(std::move(name), handle);
-    return handle;
-}
-
-const TensorData& WeightTable::at(TensorHandle handle) const
-{
-    assert(handle < tensors_.size());
-    return tensors_[handle];
-}
-
-TensorData& WeightTable::at_mutable(TensorHandle handle)
-{
-    assert(handle < tensors_.size());
-    return tensors_[handle];
-}
-
-TensorHandle WeightTable::find_handle(const std::string& name) const noexcept
-{
-    const auto it = handles_.find(name);
-    return it == handles_.end() ? invalid_tensor_handle : it->second;
-}
-
 static Result<void> prepare_linear_operator(
-    WeightTable& weights,
+    WeightStore& weights,
+    CompiledOperatorTable& operators,
     TensorHandle matrix_handle,
     TensorHandle bias_handle,
     NcnnLinearDevice device,
     bool retain_cpu_dense_copy,
     uint32_t vulkan_device_index,
+    const NcnnVulkanContextInstancePtr& context_instance,
+    uint64_t optimization_flags,
     uint32_t input_group_count = 1,
     bool prefer_bfloat16_vulkan = true)
 {
     TensorData& matrix = weights.at_mutable(matrix_handle);
+    CompiledOperator& compiled_operator = operators.at_weight_mutable(matrix_handle);
     const TensorData* bias = bias_handle == invalid_tensor_handle ? nullptr : &weights.at(bias_handle);
     if (matrix.dtype == DType::Float8E4M3)
     {
         if (device == NcnnLinearDevice::Vulkan)
         {
-            matrix.float8_linear_operator = NcnnVulkanFloat8Operator::create(matrix, bias, input_group_count, vulkan_device_index);
-            if (!matrix.float8_linear_operator)
+            compiled_operator.float8 = NcnnVulkanFloat8Operator::create(
+                matrix,
+                bias,
+                input_group_count,
+                vulkan_device_index,
+                context_instance,
+                optimization_flags);
+            if (!compiled_operator.float8)
                 return Error{ErrorCode::InternalError, "failed to create Vulkan FP8 Linear operator"};
+        }
+        return {};
+    }
+    if (is_qnk_dtype(matrix.dtype))
+    {
+        if (device == NcnnLinearDevice::Vulkan
+            && runtime_optimization_enabled(
+                optimization_flags,
+                RuntimeOptimizationVulkanQnK))
+        {
+            compiled_operator.qnk = NcnnVulkanQnkOperator::create(
+                matrix,
+                bias,
+                vulkan_device_index,
+                context_instance,
+                optimization_flags);
+            if (!compiled_operator.qnk)
+                return Error{ErrorCode::InternalError, "failed to create Vulkan Qn_K Linear operator"};
         }
         return {};
     }
@@ -289,32 +285,41 @@ static Result<void> prepare_linear_operator(
         && matrix.dtype == DType::BFloat16
         && prefer_bfloat16_vulkan)
     {
-        matrix.bfloat16_linear_operator =
-            NcnnVulkanBfloat16Operator::create(
-                matrix,
-                bias,
-                vulkan_device_index);
-        if (matrix.bfloat16_linear_operator)
+        compiled_operator.bfloat16 = NcnnVulkanBfloat16Operator::create(
+            matrix,
+            bias,
+            vulkan_device_index,
+            context_instance,
+            optimization_flags);
+        if (compiled_operator.bfloat16)
             return {};
     }
-    matrix.linear_operator = NcnnLinearOperator::create(matrix, bias, device, vulkan_device_index);
-    if (device == NcnnLinearDevice::Vulkan && !matrix.linear_operator)
+    compiled_operator.linear = NcnnLinearOperator::create(
+        matrix,
+        bias,
+        device,
+        vulkan_device_index,
+        context_instance,
+        optimization_flags);
+    if (device == NcnnLinearDevice::Vulkan && !compiled_operator.linear)
         return Error{ErrorCode::InternalError, "failed to create Vulkan InnerProduct operator"};
     return {};
 }
 
 static Result<void> prepare_shared_expert_operators(
-    WeightTable& weights,
+    WeightStore& weights,
+    CompiledOperatorTable& operators,
     MoeBlockPlan& moe,
     NcnnLinearDevice device,
     bool retain_cpu_dense_copy,
-    uint32_t vulkan_device_index)
+    uint32_t vulkan_device_index,
+    const NcnnVulkanContextInstancePtr& context_instance,
+    uint64_t optimization_flags)
 {
     ExpertPlan& shared = moe.shared_expert;
     const TensorData& gate = weights.at(shared.gate_weight);
     const TensorData& up = weights.at(shared.up_weight);
-    const bool has_router_gate =
-        moe.shared_expert_gate_weight != invalid_tensor_handle;
+    const bool has_router_gate = moe.shared_expert_gate_weight != invalid_tensor_handle;
     if (device == NcnnLinearDevice::Vulkan
         && gate.dtype == DType::BFloat16
         && up.dtype == DType::BFloat16
@@ -336,14 +341,18 @@ static Result<void> prepare_shared_expert_operators(
                 &weights.at(moe.shared_expert_gate_weight));
             biases.push_back(nullptr);
         }
-        moe.fused_shared_input_bfloat16_operator =
-            NcnnVulkanBfloat16Operator::create_fused(
-                matrices,
-                biases,
-                vulkan_device_index);
+        const CompiledOperatorHandle fused_handle = operators.allocate();
+        operators.at_mutable(fused_handle).bfloat16 = NcnnVulkanBfloat16Operator::create_fused(
+            matrices,
+            biases,
+            vulkan_device_index,
+            context_instance,
+            optimization_flags);
+        if (operators.at(fused_handle).bfloat16)
+            moe.fused_shared_input_bfloat16_operator = fused_handle;
     }
 
-    if (!moe.fused_shared_input_bfloat16_operator)
+    if (moe.fused_shared_input_bfloat16_operator == invalid_compiled_operator_handle)
     {
         const TensorHandle input_handles[] = {
             shared.gate_weight,
@@ -356,26 +365,32 @@ static Result<void> prepare_shared_expert_operators(
                 continue;
             auto prepared = prepare_linear_operator(
                 weights,
+                operators,
                 handle,
                 invalid_tensor_handle,
                 device,
                 retain_cpu_dense_copy,
-                vulkan_device_index);
+                vulkan_device_index,
+                context_instance,
+                optimization_flags);
             if (!prepared)
                 return prepared.error();
         }
     }
     return prepare_linear_operator(
         weights,
+        operators,
         shared.down_weight,
         invalid_tensor_handle,
         device,
         retain_cpu_dense_copy,
-        vulkan_device_index);
+        vulkan_device_index,
+        context_instance,
+        optimization_flags);
 }
 
 static Result<void> assign_required_tensor(
-    const WeightTable& weights,
+    const WeightStore& weights,
     const std::string& name,
     std::initializer_list<uint32_t> shape,
     DType dtype,
@@ -389,7 +404,7 @@ static Result<void> assign_required_tensor(
 }
 
 static Result<void> compile_latent_attention(
-    const WeightTable& weights,
+    const WeightStore& weights,
     const std::string& layer_name,
     const MoeIR& descriptor,
     const AttentionDescriptor& attention,
@@ -499,7 +514,7 @@ static Result<void> compile_latent_attention(
 }
 
 static Result<void> compile_gated_delta_attention(
-    const WeightTable& weights,
+    const WeightStore& weights,
     const std::string& layer_name,
     const MoeIR& descriptor,
     const AttentionDescriptor& attention,
@@ -614,6 +629,7 @@ static uint64_t tensor_storage_bytes(const TensorData& tensor)
     bytes += static_cast<uint64_t>(tensor.bfloat16_data.size()) * sizeof(uint16_t);
     bytes += static_cast<uint64_t>(tensor.int64_data.size()) * sizeof(int64_t);
     bytes += tensor.int8_data.size();
+    bytes += tensor.quantized_data.size();
     bytes += static_cast<uint64_t>(tensor.quantization_scales.size()) * sizeof(float);
     bytes += tensor.mxfp4_blocks.size();
     bytes += tensor.mxfp4_scales.size();
@@ -627,11 +643,11 @@ static uint64_t tensor_storage_bytes(const TensorData& tensor)
     return bytes;
 }
 
-static bool uses_vulkan_dense_operator(const TensorData& tensor)
+static bool uses_vulkan_dense_operator(const CompiledOperator& executable)
 {
-    return tensor.bfloat16_linear_operator
-           || tensor.float8_linear_operator
-           || (tensor.linear_operator && tensor.linear_operator->uses_vulkan());
+    return executable.bfloat16
+           || executable.float8
+           || (executable.linear && executable.linear->uses_vulkan());
 }
 
 static void release_tensor_host_storage(TensorData& tensor)
@@ -668,25 +684,26 @@ static void release_vulkan_dense_host_copies(CompiledModel& compiled)
     for (TensorHandle handle = 0; handle < compiled.weights.size(); ++handle)
     {
         TensorData& tensor = compiled.weights.at_mutable(handle);
-        if (uses_vulkan_dense_operator(tensor))
+        if (uses_vulkan_dense_operator(compiled.operators.at_weight(handle)))
             release_tensor_host_storage(tensor);
     }
 
     const auto release_fused_layer_handles = [&compiled](CompiledLayerPlan& layer) {
         AttentionBlockPlan& attention = layer.attention;
-        const bool qkv_fused = attention.fused_qkv_operator
-                               || attention.fused_qkv_bfloat16_operator
-                               || attention.fused_qkv_gate_bfloat16_operator;
+        const bool qkv_fused = attention.fused_qkv_operator != invalid_compiled_operator_handle
+                               || attention.fused_qkv_bfloat16_operator != invalid_compiled_operator_handle
+                               || attention.fused_qkv_gate_bfloat16_operator != invalid_compiled_operator_handle;
         if (qkv_fused)
         {
             release_vulkan_dense_handle(compiled, attention.query_weight);
             release_vulkan_dense_handle(compiled, attention.key_weight);
             release_vulkan_dense_handle(compiled, attention.value_weight);
         }
-        if (attention.fused_qkv_gate_bfloat16_operator)
+        if (attention.fused_qkv_gate_bfloat16_operator != invalid_compiled_operator_handle)
             release_vulkan_dense_handle(compiled, attention.output_gate_weight);
 
-        if (attention.fused_delta_input_operator || attention.fused_delta_input_bfloat16_operator)
+        if (attention.fused_delta_input_operator != invalid_compiled_operator_handle
+            || attention.fused_delta_input_bfloat16_operator != invalid_compiled_operator_handle)
         {
             release_vulkan_dense_handle(compiled, attention.delta_qkv_weight);
             release_vulkan_dense_handle(compiled, attention.delta_z_weight);
@@ -694,13 +711,18 @@ static void release_vulkan_dense_host_copies(CompiledModel& compiled)
             release_vulkan_dense_handle(compiled, attention.delta_alpha_weight);
         }
 
-        if (attention.vulkan_attention_operator)
+        if (attention.vulkan_attention_operator != invalid_compiled_operator_handle)
         {
             release_vulkan_dense_handle(compiled, attention.pre_attention_norm_weight);
             release_vulkan_dense_handle(compiled, attention.sinks);
+            if (has_flag(attention.flags, AttentionBlockQueryKeyNorm))
+            {
+                release_vulkan_dense_handle(compiled, attention.query_norm_weight);
+                release_vulkan_dense_handle(compiled, attention.key_norm_weight);
+            }
         }
 
-        if (layer.moe.fused_shared_input_bfloat16_operator)
+        if (layer.moe.fused_shared_input_bfloat16_operator != invalid_compiled_operator_handle)
         {
             release_vulkan_dense_handle(compiled, layer.moe.shared_expert.gate_weight);
             release_vulkan_dense_handle(compiled, layer.moe.shared_expert.up_weight);
@@ -708,13 +730,13 @@ static void release_vulkan_dense_host_copies(CompiledModel& compiled)
         }
     };
 
-    for (CompiledLayerPlan& layer : compiled.layers)
+    for (CompiledLayerPlan& layer : compiled.graph.layer_plans)
         release_fused_layer_handles(layer);
-    for (CompiledLayerPlan& layer : compiled.speculative.layers)
+    for (CompiledLayerPlan& layer : compiled.speculative.graph.layer_plans)
         release_fused_layer_handles(layer);
 }
 
-static uint64_t expert_weight_bytes(const WeightTable& weights, const ExpertPlan& expert)
+static uint64_t expert_weight_bytes(const WeightStore& weights, const ExpertPlan& expert)
 {
     const uint32_t handles[] = {
         expert.gate_weight,
@@ -731,6 +753,56 @@ static uint64_t expert_weight_bytes(const WeightTable& weights, const ExpertPlan
             bytes += tensor_storage_bytes(weights.at(handle));
     }
     return bytes;
+}
+
+static Result<void> combine_qnk_gate_up_weights(
+    WeightStore& weights,
+    TensorHandle gate_handle,
+    TensorHandle up_handle,
+    uint32_t rows,
+    uint32_t columns)
+{
+    if (gate_handle == invalid_tensor_handle || up_handle == invalid_tensor_handle)
+        return Error{ErrorCode::InvalidArgument, "Qn_K gate/up handles cannot be invalid"};
+
+    const TensorData& gate = weights.at(gate_handle);
+    const TensorData& up = weights.at(up_handle);
+    if (!is_qnk_dtype(gate.dtype)
+        || gate.dtype != up.dtype
+        || gate.shape != std::vector<uint32_t>{rows, columns}
+        || up.shape != std::vector<uint32_t>{rows, columns}
+        || !qnk_shape_supported(gate.dtype, rows, columns))
+    {
+        return Error{ErrorCode::InvalidModel, "Qn_K gate/up tensors cannot be packed"};
+    }
+
+    const uint64_t row_bytes = qnk_storage_bytes(gate.dtype, 1, columns);
+    if (row_bytes == 0
+        || rows > std::numeric_limits<uint32_t>::max() / 2
+        || row_bytes > std::numeric_limits<size_t>::max() / rows
+        || row_bytes * rows > std::numeric_limits<size_t>::max() / 2)
+    {
+        return Error{ErrorCode::InvalidModel, "Qn_K gate/up tensor size overflows"};
+    }
+
+    const size_t source_bytes = static_cast<size_t>(row_bytes * rows);
+    const std::span<const uint8_t> gate_data = gate.qnk_values();
+    const std::span<const uint8_t> up_data = up.qnk_values();
+    if (gate_data.size() != source_bytes || up_data.size() != source_bytes)
+    {
+        return Error{ErrorCode::InvalidModel, "Qn_K gate/up tensor byte count does not match its shape"};
+    }
+
+    TensorData combined;
+    combined.dtype = gate.dtype;
+    combined.shape = {rows * 2, columns};
+    combined.qnk_interleave_rows = false;
+    combined.quantized_data.reserve(source_bytes * 2);
+    combined.quantized_data.insert(combined.quantized_data.end(), gate_data.begin(), gate_data.end());
+    combined.quantized_data.insert(combined.quantized_data.end(), up_data.begin(), up_data.end());
+    weights.at_mutable(gate_handle) = std::move(combined);
+    weights.at_mutable(up_handle) = TensorData{};
+    return {};
 }
 
 static ExpertKernel selected_expert_kernel(DType dtype)
@@ -786,10 +858,10 @@ static Result<void> compile_mtp_speculative_model(
         || compiled.descriptor.speculative_block_size == 0
         || !compiled.descriptor.speculative_target_layer_ids.empty()
         || compiled.descriptor.hyper_connection_multiplier != 1
-        || compiled.layers.empty()
-        || has_flag(compiled.layers.back().attention.flags, AttentionBlockLatent)
-        || has_flag(compiled.layers.back().attention.flags, AttentionBlockGatedDeltaNet)
-        || compiled.layers.back().attention.sliding_window != 0)
+        || compiled.graph.layer_plans.empty()
+        || has_flag(compiled.graph.layer_plans.back().attention.flags, AttentionBlockLatent)
+        || has_flag(compiled.graph.layer_plans.back().attention.flags, AttentionBlockGatedDeltaNet)
+        || compiled.graph.layer_plans.back().attention.sliding_window != 0)
     {
         return Error{ErrorCode::InvalidModel, "invalid Qwen MTP speculative model configuration"};
     }
@@ -830,27 +902,26 @@ static Result<void> compile_mtp_speculative_model(
         speculative.final_norm_weight);
     if (!status)
         return status.error();
-    status = prepare_linear_operator(
-        compiled.weights,
-        speculative.mtp_input_projection_weight,
-        invalid_tensor_handle,
-        dense_device,
-        retain_cpu_dense_copies,
-        compiled.vulkan_device_index);
+    status = prepare_linear_operator(compiled.weights, compiled.operators, speculative.mtp_input_projection_weight,
+                                     invalid_tensor_handle,
+                                     dense_device,
+                                     retain_cpu_dense_copies,
+                                     compiled.vulkan_device_index,
+                                     compiled.vulkan_context_instance,
+                                     compiled.optimization_flags);
     if (!status)
         return status.error();
 
     const std::string layer_name = speculative_layer_prefix(0);
-    CompiledLayerPlan layer_plan = compiled.layers.back();
+    CompiledLayerPlan layer_plan = compiled.graph.layer_plans.back();
     layer_plan.layer_id = compiled.descriptor.layer_count;
     layer_plan.vulkan_device_index = compiled.vulkan_device_index;
-    layer_plan.nodes.clear();
     layer_plan.hyper_connection = {};
     AttentionBlockPlan& attention = layer_plan.attention;
-    attention.vulkan_attention_operator.reset();
-    attention.fused_qkv_operator.reset();
-    attention.fused_qkv_bfloat16_operator.reset();
-    attention.fused_qkv_gate_bfloat16_operator.reset();
+    attention.vulkan_attention_operator = invalid_compiled_operator_handle;
+    attention.fused_qkv_operator = invalid_compiled_operator_handle;
+    attention.fused_qkv_bfloat16_operator = invalid_compiled_operator_handle;
+    attention.fused_qkv_gate_bfloat16_operator = invalid_compiled_operator_handle;
     attention.query_bias = invalid_tensor_handle;
     attention.key_bias = invalid_tensor_handle;
     attention.value_bias = invalid_tensor_handle;
@@ -942,42 +1013,52 @@ static Result<void> compile_mtp_speculative_model(
             && attention.output_gate_weight
                    != invalid_tensor_handle)
         {
-            std::vector<const TensorData*> qkv_gate_matrices =
-                qkv_matrices;
+            std::vector<const TensorData*> qkv_gate_matrices = qkv_matrices;
             qkv_gate_matrices.push_back(
                 &compiled.weights.at(
                     attention.output_gate_weight));
-            std::vector<const TensorData*> qkv_gate_biases =
-                qkv_biases;
+            std::vector<const TensorData*> qkv_gate_biases = qkv_biases;
             qkv_gate_biases.push_back(nullptr);
-            attention.fused_qkv_gate_bfloat16_operator =
-                NcnnVulkanBfloat16Operator::create_fused(
-                    qkv_gate_matrices,
-                    qkv_gate_biases,
-                    layer_plan.vulkan_device_index);
+            const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
+            compiled.operators.at_mutable(fused_handle).bfloat16 = NcnnVulkanBfloat16Operator::create_fused(
+                qkv_gate_matrices,
+                qkv_gate_biases,
+                layer_plan.vulkan_device_index,
+                compiled.vulkan_context_instance,
+                compiled.optimization_flags);
+            if (compiled.operators.at(fused_handle).bfloat16)
+                attention.fused_qkv_gate_bfloat16_operator = fused_handle;
         }
-        if (!attention.fused_qkv_gate_bfloat16_operator
+        if (attention.fused_qkv_gate_bfloat16_operator == invalid_compiled_operator_handle
             && qkv_matrices.front()->dtype == DType::BFloat16)
         {
-            attention.fused_qkv_bfloat16_operator =
-                NcnnVulkanBfloat16Operator::create_fused(
-                    qkv_matrices,
-                    qkv_biases,
-                    layer_plan.vulkan_device_index);
+            const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
+            compiled.operators.at_mutable(fused_handle).bfloat16 = NcnnVulkanBfloat16Operator::create_fused(
+                qkv_matrices,
+                qkv_biases,
+                layer_plan.vulkan_device_index,
+                compiled.vulkan_context_instance,
+                compiled.optimization_flags);
+            if (compiled.operators.at(fused_handle).bfloat16)
+                attention.fused_qkv_bfloat16_operator = fused_handle;
         }
-        if (!attention.fused_qkv_gate_bfloat16_operator
-            && !attention.fused_qkv_bfloat16_operator)
+        if (attention.fused_qkv_gate_bfloat16_operator == invalid_compiled_operator_handle
+            && attention.fused_qkv_bfloat16_operator == invalid_compiled_operator_handle)
         {
-            attention.fused_qkv_operator =
-                NcnnLinearOperator::create_fused(
-                    qkv_matrices,
-                    qkv_biases,
-                    dense_device,
-                    layer_plan.vulkan_device_index);
+            const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
+            compiled.operators.at_mutable(fused_handle).linear = NcnnLinearOperator::create_fused(
+                qkv_matrices,
+                qkv_biases,
+                dense_device,
+                layer_plan.vulkan_device_index,
+                compiled.vulkan_context_instance,
+                compiled.optimization_flags);
+            if (compiled.operators.at(fused_handle).linear)
+                attention.fused_qkv_operator = fused_handle;
         }
-        if (!attention.fused_qkv_gate_bfloat16_operator
-            && !attention.fused_qkv_bfloat16_operator
-            && !attention.fused_qkv_operator)
+        if (attention.fused_qkv_gate_bfloat16_operator == invalid_compiled_operator_handle
+            && attention.fused_qkv_bfloat16_operator == invalid_compiled_operator_handle
+            && attention.fused_qkv_operator == invalid_compiled_operator_handle)
             return Error{ErrorCode::InternalError, "failed to create fused Qwen MTP Vulkan QKV operator"};
     }
     else
@@ -989,13 +1070,13 @@ static Result<void> compile_mtp_speculative_model(
         };
         for (TensorHandle handle : projection_handles)
         {
-            status = prepare_linear_operator(
-                compiled.weights,
-                handle,
-                invalid_tensor_handle,
-                dense_device,
-                retain_cpu_dense_copies,
-                layer_plan.vulkan_device_index);
+            status = prepare_linear_operator(compiled.weights, compiled.operators, handle,
+                                             invalid_tensor_handle,
+                                             dense_device,
+                                             retain_cpu_dense_copies,
+                                             layer_plan.vulkan_device_index,
+                                             compiled.vulkan_context_instance,
+                                             compiled.optimization_flags);
             if (!status)
                 return status.error();
         }
@@ -1009,17 +1090,17 @@ static Result<void> compile_mtp_speculative_model(
         if (handle == invalid_tensor_handle)
             continue;
         if (handle == attention.output_gate_weight
-            && attention.fused_qkv_gate_bfloat16_operator)
+            && attention.fused_qkv_gate_bfloat16_operator != invalid_compiled_operator_handle)
         {
             continue;
         }
-        status = prepare_linear_operator(
-            compiled.weights,
-            handle,
-            invalid_tensor_handle,
-            dense_device,
-            retain_cpu_dense_copies,
-            layer_plan.vulkan_device_index);
+        status = prepare_linear_operator(compiled.weights, compiled.operators, handle,
+                                         invalid_tensor_handle,
+                                         dense_device,
+                                         retain_cpu_dense_copies,
+                                         layer_plan.vulkan_device_index,
+                                         compiled.vulkan_context_instance,
+                                         compiled.optimization_flags);
         if (!status)
             return status.error();
     }
@@ -1047,13 +1128,13 @@ static Result<void> compile_mtp_speculative_model(
         compiled_moe.router_weight);
     if (!status)
         return status.error();
-    status = prepare_linear_operator(
-        compiled.weights,
-        compiled_moe.router_weight,
-        invalid_tensor_handle,
-        NcnnLinearDevice::Cpu,
-        retain_cpu_dense_copies,
-        layer_plan.vulkan_device_index);
+    status = prepare_linear_operator(compiled.weights, compiled.operators, compiled_moe.router_weight,
+                                     invalid_tensor_handle,
+                                     NcnnLinearDevice::Cpu,
+                                     retain_cpu_dense_copies,
+                                     layer_plan.vulkan_device_index,
+                                     compiled.vulkan_context_instance,
+                                     compiled.optimization_flags);
     if (!status)
         return status.error();
 
@@ -1098,10 +1179,13 @@ static Result<void> compile_mtp_speculative_model(
     }
     status = prepare_shared_expert_operators(
         compiled.weights,
+        compiled.operators,
         compiled_moe,
         dense_device,
         retain_cpu_dense_copies,
-        layer_plan.vulkan_device_index);
+        layer_plan.vulkan_device_index,
+        compiled.vulkan_context_instance,
+        compiled.optimization_flags);
     if (!status)
         return status.error();
 
@@ -1122,6 +1206,11 @@ static Result<void> compile_mtp_speculative_model(
             expert.gate_up_weight);
         if (!status)
             return status.error();
+        if (is_qnk_dtype(compiled.weights.at(expert.gate_up_weight).dtype))
+        {
+            compiled.weights.at_mutable(expert.gate_up_weight).qnk_interleave_rows =
+                moe.layout == ExpertLayout::InterleavedGateUpDown;
+        }
         status = assign_required_tensor(
             compiled.weights,
             prefix + "down.weight",
@@ -1135,9 +1224,11 @@ static Result<void> compile_mtp_speculative_model(
         const TensorData& down_weight = compiled.weights.at(expert.down_weight);
         if (gate_up_weight.mxfp4_file_storage && down_weight.mxfp4_file_storage)
             expert.cache_key = Mxfp4ExpertCache::make_pair_key(gate_up_weight, down_weight);
+        else if (is_qnk_dtype(gate_up_weight.dtype) && gate_up_weight.dtype == down_weight.dtype)
+            expert.cache_key = "qnk:" + prefix;
         compiled_moe.experts.push_back(std::move(expert));
     }
-    speculative.layers.push_back(std::move(layer_plan));
+    speculative.graph.layer_plans.push_back(std::move(layer_plan));
     return {};
 }
 
@@ -1248,13 +1339,13 @@ static Result<void> compile_speculative_model(
     };
     for (TensorHandle handle : dense_handles)
     {
-        status = prepare_linear_operator(
-            compiled.weights,
-            handle,
-            invalid_tensor_handle,
-            dense_device,
-            retain_cpu_dense_copies,
-            compiled.vulkan_device_index);
+        status = prepare_linear_operator(compiled.weights, compiled.operators, handle,
+                                         invalid_tensor_handle,
+                                         dense_device,
+                                         retain_cpu_dense_copies,
+                                         compiled.vulkan_device_index,
+                                         compiled.vulkan_context_instance,
+                                         compiled.optimization_flags);
         if (!status)
             return status.error();
     }
@@ -1262,7 +1353,7 @@ static Result<void> compile_speculative_model(
     LayerDescriptor draft_layer = compiled.descriptor.layers.back();
     draft_layer.attention.compression_ratio = 0;
     draft_layer.ffn.moe.flags |= MoeDescriptorRouterBias;
-    speculative.layers.reserve(compiled.descriptor.speculative_layer_count);
+    speculative.graph.layer_plans.reserve(compiled.descriptor.speculative_layer_count);
     for (uint32_t layer_id = 0; layer_id < compiled.descriptor.speculative_layer_count; ++layer_id)
     {
         const std::string layer_name = speculative_layer_prefix(layer_id);
@@ -1345,36 +1436,40 @@ static Result<void> compile_speculative_model(
         };
         for (TensorHandle handle : latent_linear_handles)
         {
-            status = prepare_linear_operator(
-                compiled.weights,
-                handle,
-                invalid_tensor_handle,
-                dense_device,
-                retain_cpu_dense_copies,
-                layer_plan.vulkan_device_index);
+            status = prepare_linear_operator(compiled.weights, compiled.operators, handle,
+                                             invalid_tensor_handle,
+                                             dense_device,
+                                             retain_cpu_dense_copies,
+                                             layer_plan.vulkan_device_index,
+                                             compiled.vulkan_context_instance,
+                                             compiled.optimization_flags);
             if (!status)
                 return status.error();
         }
-        status = prepare_linear_operator(
-            compiled.weights,
-            layer_plan.attention.output_a_weight,
-            invalid_tensor_handle,
-            dense_device,
-            retain_cpu_dense_copies,
-            layer_plan.vulkan_device_index,
-            layer_plan.attention.output_group_count);
+        status = prepare_linear_operator(compiled.weights, compiled.operators, layer_plan.attention.output_a_weight,
+                                         invalid_tensor_handle,
+                                         dense_device,
+                                         retain_cpu_dense_copies,
+                                         layer_plan.vulkan_device_index,
+                                         compiled.vulkan_context_instance,
+                                         compiled.optimization_flags,
+                                         layer_plan.attention.output_group_count);
         if (!status)
             return status.error();
         if (dense_device == NcnnLinearDevice::Vulkan)
         {
-            TensorData& query_a = compiled.weights.at_mutable(layer_plan.attention.query_a_weight);
-            const TensorData& query_b = compiled.weights.at(layer_plan.attention.query_b_weight);
-            if (query_a.float8_linear_operator && query_b.float8_linear_operator
-                && !query_a.float8_linear_operator->prepare_rms_norm(
-                    compiled.weights.at(layer_plan.attention.query_norm_weight),
-                    compiled.descriptor.norm_epsilon))
+            const CompiledOperator& query_a = compiled.operators.at_weight(layer_plan.attention.query_a_weight);
+            const CompiledOperator& query_b = compiled.operators.at_weight(layer_plan.attention.query_b_weight);
+            if (query_a.float8 && query_b.float8)
             {
-                return Error{ErrorCode::InternalError, "failed to prepare speculative Vulkan FP8 query RMSNorm chain"};
+                if (!query_a.float8->prepare_rms_norm(
+                        compiled.weights.at(layer_plan.attention.query_norm_weight),
+                        compiled.descriptor.norm_epsilon))
+                    return Error{ErrorCode::InternalError, "failed to prepare speculative Vulkan FP8 query RMSNorm chain"};
+                if (!query_a.float8->prepare_input_rms_norm(
+                        compiled.weights.at(layer_plan.attention.pre_attention_norm_weight),
+                        compiled.descriptor.norm_epsilon))
+                    return Error{ErrorCode::InternalError, "failed to prepare speculative Vulkan FP8 latent input RMSNorm chain"};
             }
         }
 
@@ -1402,13 +1497,13 @@ static Result<void> compile_speculative_model(
             layer_plan.moe.router_selection_bias);
         if (!status)
             return status.error();
-        status = prepare_linear_operator(
-            compiled.weights,
-            layer_plan.moe.router_weight,
-            invalid_tensor_handle,
-            NcnnLinearDevice::Cpu,
-            retain_cpu_dense_copies,
-            layer_plan.vulkan_device_index);
+        status = prepare_linear_operator(compiled.weights, compiled.operators, layer_plan.moe.router_weight,
+                                         invalid_tensor_handle,
+                                         NcnnLinearDevice::Cpu,
+                                         retain_cpu_dense_copies,
+                                         layer_plan.vulkan_device_index,
+                                         compiled.vulkan_context_instance,
+                                         compiled.optimization_flags);
         if (!status)
             return status.error();
 
@@ -1447,13 +1542,13 @@ static Result<void> compile_speculative_model(
         };
         for (TensorHandle handle : shared_handles)
         {
-            status = prepare_linear_operator(
-                compiled.weights,
-                handle,
-                invalid_tensor_handle,
-                dense_device,
-                retain_cpu_dense_copies,
-                layer_plan.vulkan_device_index);
+            status = prepare_linear_operator(compiled.weights, compiled.operators, handle,
+                                             invalid_tensor_handle,
+                                             dense_device,
+                                             retain_cpu_dense_copies,
+                                             layer_plan.vulkan_device_index,
+                                             compiled.vulkan_context_instance,
+                                             compiled.optimization_flags);
             if (!status)
                 return status.error();
         }
@@ -1488,7 +1583,7 @@ static Result<void> compile_speculative_model(
                 expert.cache_key = Mxfp4ExpertCache::make_pair_key(gate_up_weight, down_weight);
             layer_plan.moe.experts.push_back(std::move(expert));
         }
-        speculative.layers.push_back(std::move(layer_plan));
+        speculative.graph.layer_plans.push_back(std::move(layer_plan));
     }
     return {};
 }
@@ -1496,7 +1591,7 @@ static Result<void> compile_speculative_model(
 Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping mapping, HybridMode hybrid_mode) const
 {
     BackendCapabilities capabilities;
-    if (hybrid_mode == HybridMode::HybridExperts || hybrid_mode == HybridMode::VulkanWithCpuPrefetch)
+    if (hybrid_mode == HybridMode::HybridExperts)
     {
         capabilities.flags |= BackendCapabilityVulkanDense | BackendCapabilityVulkanAttention;
     }
@@ -1545,8 +1640,10 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
 
     CompiledModel compiled;
     compiled.descriptor = std::move(descriptor);
+    compiled.optimization_flags = capabilities.optimization_flags;
+    compiled.vulkan_context_instance = capabilities.vulkan_context_instance;
     compiled.expert_store = std::make_shared<ExpertStore>();
-    const bool hybrid_requests_vulkan = hybrid_mode == HybridMode::HybridExperts || hybrid_mode == HybridMode::VulkanWithCpuPrefetch;
+    const bool hybrid_requests_vulkan = hybrid_mode == HybridMode::HybridExperts;
     const bool use_vulkan_dense = hybrid_requests_vulkan && has_flag(capabilities.flags, BackendCapabilityVulkanDense);
     const bool retain_cpu_dense_copies = has_flag(capabilities.flags, BackendCapabilityRetainCpuDenseCopies);
     std::vector<uint32_t> dense_device_indices = capabilities.vulkan_device_indices;
@@ -1557,6 +1654,10 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
     if (use_vulkan_dense && dense_device_indices.empty())
     {
         return Error{ErrorCode::InvalidArgument, "Vulkan dense execution requires at least one device"};
+    }
+    if (use_vulkan_dense && !compiled.vulkan_context_instance)
+    {
+        return Error{ErrorCode::InvalidArgument, "Vulkan dense execution requires a context instance"};
     }
     std::vector<uint32_t> dense_device_scores = capabilities.vulkan_device_scores;
     if (dense_device_scores.size() != dense_device_indices.size())
@@ -1614,6 +1715,7 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
         if (!added)
             return added.error();
     }
+    compiled.operators.bind_weight_count(compiled.weights.size());
 
     auto embedding = require_tensor(compiled.weights, "token_embedding.weight", {compiled.descriptor.vocabulary_size, compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype);
     if (!embedding)
@@ -1629,9 +1731,19 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
     if (!lm_head)
         return lm_head.error();
     compiled.lm_head_weight = lm_head.value();
-    auto prepared = prepare_linear_operator(compiled.weights, compiled.lm_head_weight, invalid_tensor_handle, dense_device, retain_cpu_dense_copies, compiled.vulkan_device_index);
+    auto prepared = prepare_linear_operator(compiled.weights, compiled.operators, compiled.lm_head_weight, invalid_tensor_handle, dense_device, retain_cpu_dense_copies,
+                                            compiled.vulkan_device_index, compiled.vulkan_context_instance,
+                                            compiled.optimization_flags);
     if (!prepared)
         return prepared.error();
+    const CompiledOperator& lm_head_operator = compiled.operators.at_weight(compiled.lm_head_weight);
+    if (lm_head_operator.bfloat16)
+    {
+        (void)lm_head_operator.bfloat16->prepare_rms_norm(
+            compiled.weights.at(compiled.final_norm_weight),
+            compiled.descriptor.norm_epsilon,
+            compiled.descriptor.norm_weight_offset);
+    }
     if (compiled.descriptor.hyper_connection_multiplier > 1)
     {
         const uint32_t hyper_columns = compiled.descriptor.hyper_connection_multiplier * compiled.descriptor.hidden_size;
@@ -1648,11 +1760,11 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
             return Error{ErrorCode::InvalidModel, "invalid hyper-connection configuration"};
     }
 
-    compiled.layers.reserve(compiled.descriptor.layer_count);
+    compiled.graph.layer_plans.reserve(compiled.descriptor.layer_count);
     for (uint32_t layer_id = 0; layer_id < compiled.descriptor.layer_count; ++layer_id)
     {
         const LayerDescriptor& layer = compiled.descriptor.layers[layer_id];
-        auto parsed_graph = validate_adapter_graph(layer);
+        auto parsed_graph = validate_adapter_graph(compiled.descriptor.graph, layer_id, layer);
         if (!parsed_graph)
             return parsed_graph.error();
         const AdapterGraph graph = parsed_graph.value();
@@ -1681,8 +1793,9 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
         if (moe.expert_weight_dtype != DType::Float32
             && moe.expert_weight_dtype != DType::BFloat16
             && moe.expert_weight_dtype != DType::Int8
-            && moe.expert_weight_dtype != DType::MxFp4)
-            return Error{ErrorCode::UnsupportedModel, "expert weights must use float32, bfloat16, int8, or MXFP4"};
+            && moe.expert_weight_dtype != DType::MxFp4
+            && !is_qnk_dtype(moe.expert_weight_dtype))
+            return Error{ErrorCode::UnsupportedModel, "expert weights must use float32, bfloat16, int8, MXFP4, or Qn_K"};
         if (moe.expert_weight_dtype == DType::MxFp4 && !has_flag(capabilities.flags, BackendCapabilityMxfp4CpuKernel))
         {
             return Error{ErrorCode::UnsupportedModel, "backend capabilities do not provide an MXFP4 CPU expert kernel"};
@@ -1703,12 +1816,6 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
         const bool use_vulkan_delta_linear = has_flag(graph.flags, AdapterGraphAttention)
                                              && layer.attention.kind == AttentionKind::GatedDeltaNet
                                              && use_vulkan_dense;
-        layer_plan.nodes.reserve(layer.nodes.size());
-        for (size_t node_index = 0; node_index < layer.nodes.size(); ++node_index)
-        {
-            const ExecutionBackend backend = use_vulkan_attention && node_index < graph.attention_node_count ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
-            layer_plan.nodes.push_back({layer.nodes[node_index].type, backend});
-        }
         layer_plan.moe.top_k = moe.top_k;
         layer_plan.moe.hidden_size = compiled.descriptor.hidden_size;
         layer_plan.moe.score_function = moe.score_function;
@@ -1784,36 +1891,65 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 {
                     if (handle == invalid_tensor_handle)
                         continue;
-                    prepared = prepare_linear_operator(
-                        compiled.weights,
-                        handle,
-                        invalid_tensor_handle,
-                        attention_device,
-                        retain_cpu_dense_copies,
-                        layer_plan.vulkan_device_index);
+                    prepared = prepare_linear_operator(compiled.weights, compiled.operators, handle,
+                                                       invalid_tensor_handle,
+                                                       attention_device,
+                                                       retain_cpu_dense_copies,
+                                                       layer_plan.vulkan_device_index,
+                                                       compiled.vulkan_context_instance,
+                                                       compiled.optimization_flags);
                     if (!prepared)
                         return prepared.error();
                 }
-                prepared = prepare_linear_operator(
-                    compiled.weights,
-                    plan.output_a_weight,
-                    invalid_tensor_handle,
-                    attention_device,
-                    retain_cpu_dense_copies,
-                    layer_plan.vulkan_device_index,
-                    plan.output_group_count);
+                if (attention_device == NcnnLinearDevice::Vulkan
+                    && attention.compression_ratio == 4
+                    && vulkan_latent_compressor_enabled(compiled.optimization_flags))
+                {
+                    const TensorHandle compressor_linear_handles[] = {
+                        plan.compressor_key_value_weight,
+                        plan.compressor_gate_weight,
+                        plan.indexer_compressor_key_value_weight,
+                        plan.indexer_compressor_gate_weight,
+                    };
+                    for (TensorHandle handle : compressor_linear_handles)
+                    {
+                        if (handle == invalid_tensor_handle)
+                            continue;
+                        prepared = prepare_linear_operator(compiled.weights, compiled.operators, handle,
+                                                           invalid_tensor_handle,
+                                                           attention_device,
+                                                           retain_cpu_dense_copies,
+                                                           layer_plan.vulkan_device_index,
+                                                           compiled.vulkan_context_instance,
+                                                           compiled.optimization_flags);
+                        if (!prepared)
+                            return prepared.error();
+                    }
+                }
+                prepared = prepare_linear_operator(compiled.weights, compiled.operators, plan.output_a_weight,
+                                                   invalid_tensor_handle,
+                                                   attention_device,
+                                                   retain_cpu_dense_copies,
+                                                   layer_plan.vulkan_device_index,
+                                                   compiled.vulkan_context_instance,
+                                                   compiled.optimization_flags,
+                                                   plan.output_group_count);
                 if (!prepared)
                     return prepared.error();
                 if (attention_device == NcnnLinearDevice::Vulkan)
                 {
-                    TensorData& query_a = compiled.weights.at_mutable(plan.query_a_weight);
-                    const TensorData& query_b = compiled.weights.at(plan.query_b_weight);
-                    if (query_a.float8_linear_operator && query_b.float8_linear_operator
-                        && !query_a.float8_linear_operator->prepare_rms_norm(
-                            compiled.weights.at(plan.query_norm_weight),
-                            compiled.descriptor.norm_epsilon))
+                    const CompiledOperator& query_a = compiled.operators.at_weight(plan.query_a_weight);
+                    const CompiledOperator& query_b = compiled.operators.at_weight(plan.query_b_weight);
+                    if (query_a.float8 && query_b.float8)
                     {
-                        return Error{ErrorCode::InternalError, "failed to prepare Vulkan FP8 query RMSNorm chain"};
+                        if (!query_a.float8->prepare_rms_norm(
+                                compiled.weights.at(plan.query_norm_weight),
+                                compiled.descriptor.norm_epsilon))
+                            return Error{ErrorCode::InternalError, "failed to prepare Vulkan FP8 query RMSNorm chain"};
+                        if (!query_a.float8->prepare_input_rms_norm(
+                                compiled.weights.at(plan.pre_attention_norm_weight),
+                                compiled.descriptor.norm_epsilon))
+                            return Error{ErrorCode::InternalError, "failed to prepare Vulkan FP8 latent input RMSNorm chain"};
                     }
                 }
             }
@@ -1843,42 +1979,54 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                     && delta_input_matrices.front()->dtype
                            == DType::BFloat16)
                 {
-                    plan.fused_delta_input_bfloat16_operator =
-                        NcnnVulkanBfloat16Operator::create_fused(
-                            delta_input_matrices,
-                            delta_input_biases,
-                            layer_plan.vulkan_device_index);
+                    const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
+                    compiled.operators.at_mutable(fused_handle).bfloat16 = NcnnVulkanBfloat16Operator::create_fused(
+                        delta_input_matrices,
+                        delta_input_biases,
+                        layer_plan.vulkan_device_index,
+                        compiled.vulkan_context_instance,
+                        compiled.optimization_flags);
+                    if (compiled.operators.at(fused_handle).bfloat16)
+                        plan.fused_delta_input_bfloat16_operator = fused_handle;
                 }
                 else
                 {
-                    plan.fused_delta_input_operator =
-                        NcnnLinearOperator::create_fused(
-                            delta_input_matrices,
-                            delta_input_biases,
-                            attention_device,
-                            layer_plan.vulkan_device_index);
+                    const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
+                    compiled.operators.at_mutable(fused_handle).linear = NcnnLinearOperator::create_fused(
+                        delta_input_matrices,
+                        delta_input_biases,
+                        attention_device,
+                        layer_plan.vulkan_device_index,
+                        compiled.vulkan_context_instance,
+                        compiled.optimization_flags);
+                    if (compiled.operators.at(fused_handle).linear)
+                        plan.fused_delta_input_operator = fused_handle;
                 }
                 if (attention_device == NcnnLinearDevice::Vulkan
-                    && !plan.fused_delta_input_bfloat16_operator
-                    && !plan.fused_delta_input_operator)
+                    && plan.fused_delta_input_bfloat16_operator == invalid_compiled_operator_handle
+                    && plan.fused_delta_input_operator == invalid_compiled_operator_handle)
                 {
-                    plan.fused_delta_input_operator =
-                        NcnnLinearOperator::create_fused(
-                            delta_input_matrices,
-                            delta_input_biases,
-                            attention_device,
-                            layer_plan.vulkan_device_index);
+                    const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
+                    compiled.operators.at_mutable(fused_handle).linear = NcnnLinearOperator::create_fused(
+                        delta_input_matrices,
+                        delta_input_biases,
+                        attention_device,
+                        layer_plan.vulkan_device_index,
+                        compiled.vulkan_context_instance,
+                        compiled.optimization_flags);
+                    if (compiled.operators.at(fused_handle).linear)
+                        plan.fused_delta_input_operator = fused_handle;
                 }
                 if (attention_device == NcnnLinearDevice::Vulkan
-                    && !plan.fused_delta_input_bfloat16_operator
-                    && !plan.fused_delta_input_operator)
+                    && plan.fused_delta_input_bfloat16_operator == invalid_compiled_operator_handle
+                    && plan.fused_delta_input_operator == invalid_compiled_operator_handle)
                 {
                     return Error{
                         ErrorCode::InternalError,
                         "failed to create fused Vulkan Gated DeltaNet input operator"};
                 }
-                if (!plan.fused_delta_input_bfloat16_operator
-                    && !plan.fused_delta_input_operator)
+                if (plan.fused_delta_input_bfloat16_operator == invalid_compiled_operator_handle
+                    && plan.fused_delta_input_operator == invalid_compiled_operator_handle)
                 {
                     const TensorHandle delta_input_handles[] = {
                         plan.delta_qkv_weight,
@@ -1888,26 +2036,65 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                     };
                     for (TensorHandle handle : delta_input_handles)
                     {
-                        prepared = prepare_linear_operator(
-                            compiled.weights,
-                            handle,
-                            invalid_tensor_handle,
-                            attention_device,
-                            retain_cpu_dense_copies,
-                            layer_plan.vulkan_device_index);
+                        prepared = prepare_linear_operator(compiled.weights, compiled.operators, handle,
+                                                           invalid_tensor_handle,
+                                                           attention_device,
+                                                           retain_cpu_dense_copies,
+                                                           layer_plan.vulkan_device_index,
+                                                           compiled.vulkan_context_instance,
+                                                           compiled.optimization_flags);
                         if (!prepared)
                             return prepared.error();
                     }
                 }
-                prepared = prepare_linear_operator(
-                    compiled.weights,
-                    plan.output_weight,
-                    invalid_tensor_handle,
-                    attention_device,
-                    retain_cpu_dense_copies,
-                    layer_plan.vulkan_device_index);
+                prepared = prepare_linear_operator(compiled.weights, compiled.operators, plan.output_weight,
+                                                   invalid_tensor_handle,
+                                                   attention_device,
+                                                   retain_cpu_dense_copies,
+                                                   layer_plan.vulkan_device_index,
+                                                   compiled.vulkan_context_instance,
+                                                   compiled.optimization_flags);
                 if (!prepared)
                     return prepared.error();
+                if (attention_device == NcnnLinearDevice::Vulkan
+                    && runtime_optimization_enabled(
+                        compiled.optimization_flags,
+                        RuntimeOptimizationVulkanAttention)
+                    && plan.fused_delta_input_bfloat16_operator != invalid_compiled_operator_handle)
+                {
+                    const CompiledOperator& output_operator = compiled.operators.at_weight(plan.output_weight);
+                    if (output_operator.bfloat16)
+                    {
+                        const CompiledOperator& fused_operator = compiled.operators.at(plan.fused_delta_input_bfloat16_operator);
+                        // Fuse pre-attention RMSNorm with the DeltaNet input projection.
+                        if (fused_operator.bfloat16)
+                        {
+                            (void)fused_operator.bfloat16->prepare_rms_norm(
+                                compiled.weights.at(plan.pre_attention_norm_weight),
+                                compiled.descriptor.norm_epsilon,
+                                plan.norm_weight_offset);
+                        }
+                        const CompiledOperatorHandle gated_handle = compiled.operators.allocate();
+                        compiled.operators.at_mutable(gated_handle).gated_delta = NcnnVulkanGatedDeltaNetOperator::create(
+                            fused_operator.bfloat16,
+                            compiled.weights.at(plan.delta_convolution_weight),
+                            compiled.weights.at(plan.delta_time_bias),
+                            compiled.weights.at(plan.delta_decay_log),
+                            compiled.weights.at(plan.delta_norm_weight),
+                            output_operator.bfloat16,
+                            plan.head_count,
+                            plan.kv_head_count,
+                            plan.head_dimension,
+                            plan.value_head_dimension,
+                            plan.convolution_kernel_size,
+                            compiled.descriptor.norm_epsilon,
+                            layer_plan.vulkan_device_index,
+                            compiled.vulkan_context_instance,
+                            compiled.optimization_flags);
+                        if (compiled.operators.at(gated_handle).gated_delta)
+                            plan.gated_delta_vulkan_operator = gated_handle;
+                    }
+                }
             }
             else
             {
@@ -1939,18 +2126,17 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 {
                     return Error{ErrorCode::InvalidModel, "invalid partial rotary dimension"};
                 }
-                const bool fused_vulkan_attention_eligible =
-                    attention_device == NcnnLinearDevice::Vulkan
-                    && !has_flag(
-                        plan.flags,
-                        AttentionBlockQueryKeyNorm)
-                    && !has_flag(
-                        plan.flags,
-                        AttentionBlockOutputGate)
-                    && (plan.rope_head_dimension == 0
-                        || plan.rope_head_dimension
-                               == plan.head_dimension)
-                    && plan.norm_weight_offset == 0.0f;
+                const bool fused_vulkan_attention_eligible = attention_device == NcnnLinearDevice::Vulkan
+                                                             && !has_flag(
+                                                                 plan.flags,
+                                                                 AttentionBlockQueryKeyNorm)
+                                                             && !has_flag(
+                                                                 plan.flags,
+                                                                 AttentionBlockOutputGate)
+                                                             && (plan.rope_head_dimension == 0
+                                                                 || plan.rope_head_dimension
+                                                                        == plan.head_dimension)
+                                                             && plan.norm_weight_offset == 0.0f;
 
                 const uint32_t query_size = attention.head_count * attention.head_dimension;
                 const uint32_t key_value_size = attention.kv_head_count * attention.head_dimension;
@@ -2058,72 +2244,90 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                         std::vector<const TensorData*>
                             qkv_gate_biases = qkv_biases;
                         qkv_gate_biases.push_back(nullptr);
-                        plan.fused_qkv_gate_bfloat16_operator =
-                            NcnnVulkanBfloat16Operator::create_fused(
-                                qkv_gate_matrices,
-                                qkv_gate_biases,
-                                layer_plan.vulkan_device_index);
+                        const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
+                        compiled.operators.at_mutable(fused_handle).bfloat16 = NcnnVulkanBfloat16Operator::create_fused(
+                            qkv_gate_matrices,
+                            qkv_gate_biases,
+                            layer_plan.vulkan_device_index,
+                            compiled.vulkan_context_instance,
+                            compiled.optimization_flags);
+                        if (compiled.operators.at(fused_handle).bfloat16)
+                            plan.fused_qkv_gate_bfloat16_operator = fused_handle;
                     }
-                    if (!plan.fused_qkv_gate_bfloat16_operator
+                    if (plan.fused_qkv_gate_bfloat16_operator == invalid_compiled_operator_handle
                         && !fused_vulkan_attention_eligible
                         && qkv_matrices.front()->dtype
                                == DType::BFloat16)
                     {
-                        plan.fused_qkv_bfloat16_operator =
-                            NcnnVulkanBfloat16Operator::create_fused(
-                                qkv_matrices,
-                                qkv_biases,
-                                layer_plan.vulkan_device_index);
+                        const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
+                        compiled.operators.at_mutable(fused_handle).bfloat16 = NcnnVulkanBfloat16Operator::create_fused(
+                            qkv_matrices,
+                            qkv_biases,
+                            layer_plan.vulkan_device_index,
+                            compiled.vulkan_context_instance,
+                            compiled.optimization_flags);
+                        if (compiled.operators.at(fused_handle).bfloat16)
+                            plan.fused_qkv_bfloat16_operator = fused_handle;
                     }
-                    if (!plan.fused_qkv_gate_bfloat16_operator
-                        && !plan.fused_qkv_bfloat16_operator)
+                    if (plan.fused_qkv_gate_bfloat16_operator == invalid_compiled_operator_handle
+                        && plan.fused_qkv_bfloat16_operator == invalid_compiled_operator_handle)
                     {
-                        plan.fused_qkv_operator =
-                            NcnnLinearOperator::create_fused(
-                                qkv_matrices,
-                                qkv_biases,
-                                attention_device,
-                                layer_plan.vulkan_device_index);
+                        const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
+                        compiled.operators.at_mutable(fused_handle).linear = NcnnLinearOperator::create_fused(
+                            qkv_matrices,
+                            qkv_biases,
+                            attention_device,
+                            layer_plan.vulkan_device_index,
+                            compiled.vulkan_context_instance,
+                            compiled.optimization_flags);
+                        if (compiled.operators.at(fused_handle).linear)
+                            plan.fused_qkv_operator = fused_handle;
                     }
-                    if (!plan.fused_qkv_gate_bfloat16_operator
-                        && !plan.fused_qkv_bfloat16_operator
-                        && !plan.fused_qkv_operator)
+                    if (plan.fused_qkv_gate_bfloat16_operator == invalid_compiled_operator_handle
+                        && plan.fused_qkv_bfloat16_operator == invalid_compiled_operator_handle
+                        && plan.fused_qkv_operator == invalid_compiled_operator_handle)
                         return Error{ErrorCode::InternalError, "failed to create fused Vulkan QKV operator"};
                 }
                 else
                 {
-                    prepared = prepare_linear_operator(compiled.weights, plan.query_weight, plan.query_bias, attention_device, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
+                    prepared = prepare_linear_operator(compiled.weights, compiled.operators, plan.query_weight, plan.query_bias, attention_device, retain_cpu_dense_copies,
+                                                       layer_plan.vulkan_device_index, compiled.vulkan_context_instance,
+                                                       compiled.optimization_flags);
                     if (!prepared)
                         return prepared.error();
-                    prepared = prepare_linear_operator(compiled.weights, plan.key_weight, plan.key_bias, attention_device, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
+                    prepared = prepare_linear_operator(compiled.weights, compiled.operators, plan.key_weight, plan.key_bias, attention_device, retain_cpu_dense_copies,
+                                                       layer_plan.vulkan_device_index, compiled.vulkan_context_instance,
+                                                       compiled.optimization_flags);
                     if (!prepared)
                         return prepared.error();
-                    prepared = prepare_linear_operator(compiled.weights, plan.value_weight, plan.value_bias, attention_device, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
+                    prepared = prepare_linear_operator(compiled.weights, compiled.operators, plan.value_weight, plan.value_bias, attention_device, retain_cpu_dense_copies,
+                                                       layer_plan.vulkan_device_index, compiled.vulkan_context_instance,
+                                                       compiled.optimization_flags);
                     if (!prepared)
                         return prepared.error();
                 }
-                prepared = prepare_linear_operator(
-                    compiled.weights,
-                    plan.output_weight,
-                    plan.output_bias,
-                    attention_device,
-                    retain_cpu_dense_copies,
-                    layer_plan.vulkan_device_index,
-                    1,
-                    !fused_vulkan_attention_eligible);
+                prepared = prepare_linear_operator(compiled.weights, compiled.operators, plan.output_weight,
+                                                   plan.output_bias,
+                                                   attention_device,
+                                                   retain_cpu_dense_copies,
+                                                   layer_plan.vulkan_device_index,
+                                                   compiled.vulkan_context_instance,
+                                                   compiled.optimization_flags,
+                                                   1,
+                                                   !fused_vulkan_attention_eligible);
                 if (!prepared)
                     return prepared.error();
                 if (plan.output_gate_weight != invalid_tensor_handle)
                 {
-                    if (!plan.fused_qkv_gate_bfloat16_operator)
+                    if (plan.fused_qkv_gate_bfloat16_operator == invalid_compiled_operator_handle)
                     {
-                        prepared = prepare_linear_operator(
-                            compiled.weights,
-                            plan.output_gate_weight,
-                            invalid_tensor_handle,
-                            attention_device,
-                            retain_cpu_dense_copies,
-                            layer_plan.vulkan_device_index);
+                        prepared = prepare_linear_operator(compiled.weights, compiled.operators, plan.output_gate_weight,
+                                                           invalid_tensor_handle,
+                                                           attention_device,
+                                                           retain_cpu_dense_copies,
+                                                           layer_plan.vulkan_device_index,
+                                                           compiled.vulkan_context_instance,
+                                                           compiled.optimization_flags);
                         if (!prepared)
                             return prepared.error();
                     }
@@ -2135,19 +2339,71 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                     attention_config.head_count = plan.head_count;
                     attention_config.kv_head_count = plan.kv_head_count;
                     attention_config.head_dimension = plan.head_dimension;
+                    attention_config.rope_head_dimension = plan.rope_head_dimension;
                     attention_config.sliding_window = plan.sliding_window;
                     attention_config.initial_context_length = plan.initial_context_length;
                     attention_config.norm_epsilon = compiled.descriptor.norm_epsilon;
+                    attention_config.norm_weight_offset = plan.norm_weight_offset;
                     attention_config.rope_theta = plan.rope_theta;
                     attention_config.rope_scaling_factor = plan.rope_scaling_factor;
                     attention_config.rope_ntk_alpha = plan.rope_ntk_alpha;
                     attention_config.rope_ntk_beta = plan.rope_ntk_beta;
                     attention_config.activation_dtype = compiled.descriptor.activation_dtype;
                     attention_config.kv_cache_dtype = compiled.descriptor.kv_cache_dtype;
+                    attention_config.optimization_flags = compiled.optimization_flags;
                     if (has_flag(plan.flags, AttentionBlockSink))
                         attention_config.flags |= NcnnAttentionSink;
-                    plan.vulkan_attention_operator = NcnnVulkanAttentionOperator::create(compiled.weights.at(plan.pre_attention_norm_weight), plan.sinks == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.sinks),
-                                                                                         plan.fused_qkv_operator, compiled.weights.at(plan.output_weight).linear_operator, attention_config);
+                    const CompiledOperatorHandle attention_handle = compiled.operators.allocate();
+                    const CompiledOperator& fused_operator = compiled.operators.at(plan.fused_qkv_operator);
+                    compiled.operators.at_mutable(attention_handle).attention = NcnnVulkanAttentionOperator::create(
+                        compiled.weights.at(plan.pre_attention_norm_weight),
+                        plan.sinks == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.sinks),
+                        fused_operator.linear,
+                        compiled.operators.at_weight(plan.output_weight).linear,
+                        attention_config);
+                    if (compiled.operators.at(attention_handle).attention)
+                        plan.vulkan_attention_operator = attention_handle;
+                }
+                else if (attention_device == NcnnLinearDevice::Vulkan
+                         && has_flag(plan.flags, AttentionBlockQueryKeyNorm)
+                         && has_flag(plan.flags, AttentionBlockOutputGate)
+                         && plan.fused_qkv_gate_bfloat16_operator != invalid_compiled_operator_handle
+                         && plan.query_norm_weight != invalid_tensor_handle
+                         && plan.key_norm_weight != invalid_tensor_handle
+                         && compiled.operators.at_weight(plan.output_weight).bfloat16)
+                {
+                    NcnnVulkanAttentionConfig attention_config;
+                    attention_config.hidden_size = compiled.descriptor.hidden_size;
+                    attention_config.head_count = plan.head_count;
+                    attention_config.kv_head_count = plan.kv_head_count;
+                    attention_config.head_dimension = plan.head_dimension;
+                    attention_config.rope_head_dimension = plan.rope_head_dimension;
+                    attention_config.sliding_window = plan.sliding_window;
+                    attention_config.initial_context_length = plan.initial_context_length;
+                    attention_config.norm_epsilon = compiled.descriptor.norm_epsilon;
+                    attention_config.norm_weight_offset = plan.norm_weight_offset;
+                    attention_config.rope_theta = plan.rope_theta;
+                    attention_config.rope_scaling_factor = plan.rope_scaling_factor;
+                    attention_config.rope_ntk_alpha = plan.rope_ntk_alpha;
+                    attention_config.rope_ntk_beta = plan.rope_ntk_beta;
+                    attention_config.activation_dtype = compiled.descriptor.activation_dtype;
+                    attention_config.kv_cache_dtype = compiled.descriptor.kv_cache_dtype;
+                    attention_config.optimization_flags = compiled.optimization_flags;
+                    attention_config.flags |= NcnnAttentionQueryKeyNorm | NcnnAttentionOutputGate;
+                    if (has_flag(plan.flags, AttentionBlockSink))
+                        attention_config.flags |= NcnnAttentionSink;
+                    const CompiledOperatorHandle attention_handle = compiled.operators.allocate();
+                    const CompiledOperator& fused_operator = compiled.operators.at(plan.fused_qkv_gate_bfloat16_operator);
+                    compiled.operators.at_mutable(attention_handle).attention = NcnnVulkanAttentionOperator::create_with_query_key_norm_and_gate(
+                        compiled.weights.at(plan.pre_attention_norm_weight),
+                        compiled.weights.at(plan.query_norm_weight),
+                        compiled.weights.at(plan.key_norm_weight),
+                        plan.sinks == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.sinks),
+                        fused_operator.bfloat16,
+                        compiled.operators.at_weight(plan.output_weight).bfloat16,
+                        attention_config);
+                    if (compiled.operators.at(attention_handle).attention)
+                        plan.vulkan_attention_operator = attention_handle;
                 }
             }
         }
@@ -2187,7 +2443,9 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
             layer_plan.moe.token_experts = token_experts.value();
         }
         // The CPU router avoids a Vulkan round trip before Expert dispatch.
-        prepared = prepare_linear_operator(compiled.weights, layer_plan.moe.router_weight, layer_plan.moe.router_bias, NcnnLinearDevice::Cpu, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
+        prepared = prepare_linear_operator(compiled.weights, compiled.operators, layer_plan.moe.router_weight, layer_plan.moe.router_bias, NcnnLinearDevice::Cpu,
+                                           retain_cpu_dense_copies, layer_plan.vulkan_device_index,
+                                           compiled.vulkan_context_instance, compiled.optimization_flags);
         if (!prepared)
             return prepared.error();
 
@@ -2223,18 +2481,23 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
             }
             prepared = prepare_shared_expert_operators(
                 compiled.weights,
+                compiled.operators,
                 layer_plan.moe,
                 dense_device,
                 retain_cpu_dense_copies,
-                layer_plan.vulkan_device_index);
+                layer_plan.vulkan_device_index,
+                compiled.vulkan_context_instance,
+                compiled.optimization_flags);
             if (!prepared)
                 return prepared.error();
         }
 
         layer_plan.moe.experts.reserve(moe.expert_count);
-        const bool prepare_routed_dense_operators =
-            moe.expert_weight_dtype != DType::BFloat16
-            || moe.expert_count <= 64;
+        const bool prepare_routed_dense_operators = moe.expert_weight_dtype != DType::BFloat16
+                                                    || moe.expert_count <= 64;
+        const bool fuse_qnk_gate_up = runtime_optimization_enabled(
+            compiled.optimization_flags,
+            RuntimeOptimizationVulkanQnK);
         for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
         {
             ExpertPlan expert;
@@ -2252,6 +2515,11 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 if (!gate_up)
                     return gate_up.error();
                 expert.gate_up_weight = gate_up.value();
+                if (is_qnk_dtype(compiled.weights.at(expert.gate_up_weight).dtype))
+                {
+                    compiled.weights.at_mutable(expert.gate_up_weight).qnk_interleave_rows =
+                        moe.layout == ExpertLayout::InterleavedGateUpDown;
+                }
             }
             else if (has_flag(expert.flags, ExpertPlanGated))
             {
@@ -2259,8 +2527,6 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 if (!gate)
                     return gate.error();
                 expert.gate_weight = gate.value();
-                if (prepare_routed_dense_operators)
-                    (void)prepare_linear_operator(compiled.weights, expert.gate_weight, invalid_tensor_handle, NcnnLinearDevice::Cpu, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
             }
 
             if (moe.layout != ExpertLayout::InterleavedGateUpDown && moe.layout != ExpertLayout::PackedGateUpDown)
@@ -2269,8 +2535,45 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 if (!up)
                     return up.error();
                 expert.up_weight = up.value();
-                if (prepare_routed_dense_operators)
-                    (void)prepare_linear_operator(compiled.weights, expert.up_weight, invalid_tensor_handle, NcnnLinearDevice::Cpu, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
+            }
+
+            bool qnk_gate_up_fused = false;
+            if (fuse_qnk_gate_up
+                && moe.layout == ExpertLayout::GateUpDown
+                && expert.gate_weight != invalid_tensor_handle
+                && expert.up_weight != invalid_tensor_handle)
+            {
+                auto fused = combine_qnk_gate_up_weights(
+                    compiled.weights,
+                    expert.gate_weight,
+                    expert.up_weight,
+                    moe.intermediate_size,
+                    compiled.descriptor.hidden_size);
+                if (fused)
+                {
+                    expert.gate_up_weight = expert.gate_weight;
+                    expert.gate_weight = invalid_tensor_handle;
+                    expert.up_weight = invalid_tensor_handle;
+                    expert.flags |= ExpertPlanPackedGateUp;
+                    qnk_gate_up_fused = true;
+                }
+                else if (is_qnk_dtype(compiled.weights.at(expert.gate_weight).dtype)
+                         && is_qnk_dtype(compiled.weights.at(expert.up_weight).dtype))
+                {
+                    return fused.error();
+                }
+            }
+
+            if (prepare_routed_dense_operators && !qnk_gate_up_fused)
+            {
+                if (expert.gate_weight != invalid_tensor_handle)
+                    (void)prepare_linear_operator(compiled.weights, compiled.operators, expert.gate_weight, invalid_tensor_handle, NcnnLinearDevice::Cpu,
+                                                  retain_cpu_dense_copies, layer_plan.vulkan_device_index,
+                                                  compiled.vulkan_context_instance, compiled.optimization_flags);
+                if (expert.up_weight != invalid_tensor_handle)
+                    (void)prepare_linear_operator(compiled.weights, compiled.operators, expert.up_weight, invalid_tensor_handle, NcnnLinearDevice::Cpu,
+                                                  retain_cpu_dense_copies, layer_plan.vulkan_device_index,
+                                                  compiled.vulkan_context_instance, compiled.optimization_flags);
             }
 
             auto down = require_tensor(compiled.weights, prefix + "down.weight", {compiled.descriptor.hidden_size, moe.intermediate_size}, moe.expert_weight_dtype);
@@ -2290,7 +2593,9 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 expert.down_bias = down_bias.value();
             }
             if (prepare_routed_dense_operators)
-                (void)prepare_linear_operator(compiled.weights, expert.down_weight, expert.down_bias, NcnnLinearDevice::Cpu, retain_cpu_dense_copies, layer_plan.vulkan_device_index);
+                (void)prepare_linear_operator(compiled.weights, compiled.operators, expert.down_weight, expert.down_bias, NcnnLinearDevice::Cpu,
+                                              retain_cpu_dense_copies, layer_plan.vulkan_device_index,
+                                              compiled.vulkan_context_instance, compiled.optimization_flags);
 
             expert.weight_bytes = expert_weight_bytes(compiled.weights, expert);
             const TensorData& down_weight = compiled.weights.at(expert.down_weight);
@@ -2300,6 +2605,10 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 if (gate_up_weight.mxfp4_file_storage && down_weight.mxfp4_file_storage)
                 {
                     expert.cache_key = Mxfp4ExpertCache::make_pair_key(gate_up_weight, down_weight);
+                }
+                else if (is_qnk_dtype(gate_up_weight.dtype) && gate_up_weight.dtype == down_weight.dtype)
+                {
+                    expert.cache_key = "qnk:" + prefix;
                 }
             }
             const bool file_backed = down_weight.mxfp4_file_storage
@@ -2311,13 +2620,13 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
             layer_plan.moe.experts.push_back(expert);
         }
 
-        compiled.layers.push_back(std::move(layer_plan));
+        compiled.graph.layer_plans.push_back(std::move(layer_plan));
     }
 
     auto speculative = compile_speculative_model(compiled, dense_device, retain_cpu_dense_copies);
     if (!speculative)
         return speculative.error();
-    for (CompiledLayerPlan& layer_plan : compiled.speculative.layers)
+    for (CompiledLayerPlan& layer_plan : compiled.speculative.graph.layer_plans)
     {
         const MoeDescriptor& moe = compiled.descriptor.layers.back().ffn.moe;
         for (uint32_t expert_id = 0; expert_id < layer_plan.moe.experts.size(); ++expert_id)
@@ -2326,10 +2635,9 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
             if (expert.runtime)
                 continue;
             const TensorData& down_weight = compiled.weights.at(expert.down_weight);
-            const bool file_backed =
-                down_weight.mxfp4_file_storage
-                || (expert.gate_up_weight != invalid_tensor_handle
-                    && compiled.weights.at(expert.gate_up_weight).mxfp4_file_storage);
+            const bool file_backed = down_weight.mxfp4_file_storage
+                                     || (expert.gate_up_weight != invalid_tensor_handle
+                                         && compiled.weights.at(expert.gate_up_weight).mxfp4_file_storage);
             expert.runtime = std::shared_ptr<Expert>(
                 new Expert(
                     ExpertKey{layer_plan.layer_id, expert_id},

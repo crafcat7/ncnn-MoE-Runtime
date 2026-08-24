@@ -36,7 +36,7 @@ private:
     std::unique_ptr<Impl> impl_;
 
 public:
-    GpuTelemetrySampler(const RuntimeCapabilities& capabilities, const EffectiveRuntimeOptions& effective);
+    GpuTelemetrySampler(const RuntimeCapabilities& capabilities, const EffectiveRuntimeConfig& effective);
     ~GpuTelemetrySampler();
 
     GpuTelemetrySampler(const GpuTelemetrySampler&) = delete;

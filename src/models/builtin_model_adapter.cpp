@@ -140,19 +140,6 @@ static Result<MoeIR> parse_gpt_oss_model(const ModelPackage& package)
         layer.attention = attention;
         layer.attention.sliding_window = layer_id % 2 == 0 ? sliding_window.value() : 0;
         layer.ffn.moe = moe;
-        layer.nodes = {
-            {ModelNodeType::RmsNorm},
-            {ModelNodeType::FusedQkv},
-            {ModelNodeType::Rope},
-            {ModelNodeType::AttentionSink},
-            {ModelNodeType::Sdpa},
-            {ModelNodeType::Projection},
-            {ModelNodeType::RmsNorm},
-            {ModelNodeType::Router},
-            {ModelNodeType::TopK},
-            {ModelNodeType::ExpertGroup},
-            {ModelNodeType::Combine},
-        };
     }
     return descriptor;
 }

@@ -159,7 +159,21 @@ def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
     args: list[str] = []
     backend = settings.get("backend")
     if backend and backend != "auto":
-        args.append(f"--{backend}")
+        backend_flags = {
+            "cpu": "--cpu",
+            "hybrid": "--hybrid",
+        }
+        backend_flag = backend_flags.get(backend) if isinstance(backend, str) else None
+        if backend_flag is None:
+            raise ValueError(f"unknown backend in runtime settings: {backend}")
+        args.append(backend_flag)
+    cpu_packed_weights = settings.get("cpu_packed_weights")
+    if cpu_packed_weights is not None:
+        if cpu_packed_weights not in ("off", "on"):
+            raise ValueError(
+                "CPU packed weights in runtime settings must be off or on"
+            )
+        args.extend(["--cpu-packed-weights", cpu_packed_weights])
     for key, option in (
         ("host_memory_mb", "--host-memory-mb"),
         ("expert_cache_mb", "--expert-cache-mb"),
@@ -184,11 +198,6 @@ def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
         ("direct_expert_io", "--direct-expert-io"),
         ("buffered_expert_io", "--buffered-expert-io"),
         ("disable_gpu_victim_execution", "--disable-gpu-victim-execution"),
-        ("router_prediction", "--router-prediction"),
-        ("async_router_prediction", "--async-router-prediction"),
-        ("forward_aware_cache", "--forward-aware-cache"),
-        ("rank_adaptive_prefetch", "--rank-adaptive-prefetch"),
-        ("cross_expert_read_coalescing", "--cross-expert-read-coalescing"),
         ("release_vulkan_dense_host", "--release-vulkan-dense-host"),
     ):
         if settings.get(key):

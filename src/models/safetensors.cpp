@@ -1,7 +1,9 @@
 #include "safetensors.h"
+#include "kernels/cpu_qnk.h"
 #include "storage/mapped_file.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstring>
 #include <fstream>
@@ -260,6 +262,43 @@ const SafetensorInfo* SafetensorsArchive::find(const std::string& name) const no
     return iterator == tensors_.end() ? nullptr : &iterator->second;
 }
 
+std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(
+    const std::string& name,
+    uint32_t expert_count,
+    uint32_t rows,
+    uint32_t columns) const noexcept
+{
+    if (expert_count == 0 || !qnk_shape_supported(DType::Q2K, rows, columns))
+        return {};
+
+    const SafetensorInfo* source = find(name);
+    const std::array<DType, 6> dtypes = {
+        DType::Q2K,
+        DType::Q3K,
+        DType::Q4K,
+        DType::Q5K,
+        DType::Q6K,
+        DType::Q8K,
+    };
+    for (const DType dtype : dtypes)
+    {
+        const uint64_t expert_bytes = qnk_storage_bytes(dtype, rows, columns);
+        if (expert_bytes == 0
+            || expert_bytes > std::numeric_limits<uint64_t>::max() / expert_count)
+        {
+            continue;
+        }
+        const uint64_t bank_bytes = expert_bytes * expert_count;
+        if (source
+            && source->dtype == "U8"
+            && source->byte_count == bank_bytes)
+        {
+            return dtype;
+        }
+    }
+    return {};
+}
+
 Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) const
 {
     const SafetensorInfo* info = find(name);
@@ -326,6 +365,75 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) cons
     {
         return Error{ErrorCode::UnsupportedModel, "unsupported safetensors dtype for tensor: " + name};
     }
+    return tensor;
+}
+
+Result<TensorData> SafetensorsArchive::load_qnk_tensor(
+    const std::string& name,
+    DType dtype,
+    uint32_t rows,
+    uint32_t columns) const
+{
+    if (!qnk_shape_supported(dtype, rows, columns))
+        return Error{ErrorCode::InvalidArgument, "invalid Qn_K tensor shape: " + name};
+    const uint64_t expected_bytes = qnk_storage_bytes(dtype, rows, columns);
+    const SafetensorInfo* source = find(name);
+    if (!source || source->dtype != "U8" || source->byte_count != expected_bytes)
+        return Error{ErrorCode::InvalidModel, "invalid Qn_K safetensors tensor: " + name};
+
+    TensorData tensor;
+    tensor.dtype = dtype;
+    tensor.shape = {rows, columns};
+    auto mapped = MappedFileRange::open(source->path, source->offset, source->byte_count);
+    if (mapped)
+    {
+        mapped.value()->prefault();
+        tensor.mapped_data = mapped.value()->share_data();
+        tensor.mapped_byte_count = source->byte_count;
+        return tensor;
+    }
+    auto bytes = read_range(source->path, source->offset, source->byte_count);
+    if (!bytes)
+        return bytes.error();
+    tensor.quantized_data = std::move(bytes).value();
+    return tensor;
+}
+
+Result<TensorData> SafetensorsArchive::load_qnk_expert(
+    const std::string& name,
+    DType dtype,
+    uint32_t expert_id,
+    uint32_t expert_count,
+    uint32_t rows,
+    uint32_t columns) const
+{
+    if (expert_count == 0 || expert_id >= expert_count || !qnk_shape_supported(dtype, rows, columns))
+        return Error{ErrorCode::InvalidArgument, "invalid Qn_K Expert shape: " + name};
+    const uint64_t expert_bytes = qnk_storage_bytes(dtype, rows, columns);
+    const SafetensorInfo* source = find(name);
+    if (!source || source->dtype != "U8"
+        || expert_bytes > std::numeric_limits<uint64_t>::max() / expert_count
+        || source->byte_count != expert_bytes * expert_count)
+    {
+        return Error{ErrorCode::InvalidModel, "invalid Qn_K Expert tensor: " + name};
+    }
+    const uint64_t offset = source->offset + expert_id * expert_bytes;
+
+    TensorData tensor;
+    tensor.dtype = dtype;
+    tensor.shape = {rows, columns};
+    auto mapped = MappedFileRange::open(source->path, offset, expert_bytes);
+    if (mapped)
+    {
+        mapped.value()->prefault();
+        tensor.mapped_data = mapped.value()->share_data();
+        tensor.mapped_byte_count = expert_bytes;
+        return tensor;
+    }
+    auto bytes = read_range(source->path, offset, expert_bytes);
+    if (!bytes)
+        return bytes.error();
+    tensor.quantized_data = std::move(bytes).value();
     return tensor;
 }
 

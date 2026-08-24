@@ -42,6 +42,10 @@ struct SchedulerOptions
 {
     uint32_t worker_count = 0;
     uint32_t expert_threads_per_worker = 0;
+    // CPU budget reservations. Zero reserved I/O uses the automatic
+    // physical-core fraction selected for CPU scheduling.
+    uint32_t reserved_io_threads = 0;
+    uint32_t reserved_service_threads = 1;
     // Probe interval for each request-count and context bucket.
     uint32_t adaptive_probe_interval = 32;
     // Zero disables cross-call collection.
@@ -49,6 +53,9 @@ struct SchedulerOptions
     uint32_t cross_call_max_batch_size = 0;
     uint32_t flags = 0;
     std::vector<std::vector<uint32_t>> worker_cpu_sets;
+    // Optional explicit compute cap. Zero keeps the automatic physical-core
+    // budget and allows idle I/O/service reservations to be reclaimed.
+    uint32_t compute_threads = 0;
 };
 
 struct SchedulerStatistics
@@ -104,6 +111,22 @@ struct SchedulerStatistics
     bool automatic_topology_affinity = false;
     uint32_t worker_count = 0;
     uint32_t expert_threads_per_worker = 0;
+    uint32_t logical_cpu_count = 0;
+    uint32_t physical_cpu_count = 0;
+    uint32_t reserved_io_threads = 0;
+    uint32_t reserved_service_threads = 0;
+    uint32_t compute_thread_budget = 0;
+    uint64_t vulkan_attention_batch_submissions = 0;
+    uint64_t vulkan_attention_batch_rows = 0;
+    uint64_t vulkan_attention_batch_avoided_submissions = 0;
+    uint32_t max_compute_thread_capacity = 0;
+    uint32_t active_compute_threads = 0;
+    uint32_t available_compute_threads = 0;
+    uint32_t active_io_threads = 0;
+    uint32_t active_service_threads = 0;
+    uint32_t borrowed_compute_threads = 0;
+    uint64_t compute_thread_acquisitions = 0;
+    uint64_t compute_thread_returns = 0;
 };
 
 class BatchScheduler

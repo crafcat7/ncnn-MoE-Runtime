@@ -1,0 +1,24 @@
+#version 450
+
+layout(binding = 0) buffer attention_blob
+{
+    float attention_data[];
+};
+layout(binding = 1) readonly buffer gate_blob
+{
+    float gate_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint elements;
+}
+p;
+
+void main()
+{
+    const uint index = gl_GlobalInvocationID.x;
+    if (index >= p.elements)
+        return;
+    attention_data[index] *= gate_data[index];
+}

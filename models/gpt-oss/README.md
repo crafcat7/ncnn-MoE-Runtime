@@ -101,7 +101,6 @@ The native runner also accepts repeated `--stop-token ID` options.
 | --- | --- |
 | `--cpu` | Portable CPU path |
 | `--hybrid` | Vulkan Dense/Attention and CPU MXFP4 Experts |
-| `--hybrid-prefetch` | Mixed path with explicit CPU cache hints |
 
 `HybridMode::Auto` selects mixed execution for a hardware Vulkan device and
 falls back to CPU-only for a software CPU Vulkan implementation. MXFP4 Experts
@@ -118,6 +117,7 @@ uses a byte-bounded cache backed by exact ranges in the original shards.
 | Option | Effect |
 | --- | --- |
 | `--expert-memory auto\|eager\|on-demand` | Select Expert residency |
+| `--cpu-packed-weights on\|off` | Opt into the CPU MXFP4-Q8 in-memory repack; default `off` |
 | `--host-memory-mb N` | Override the detected host-memory budget |
 | `--expert-cache-mb N` | Bound resident Expert pairs in RAM |
 | `--expert-io-workers N` | Set asynchronous read concurrency; `0` derives it from Top-K and physical cores |
@@ -131,11 +131,6 @@ uses a byte-bounded cache backed by exact ranges in the original shards.
 | `--parallel-sessions N` | Run independent sequences through the batch scheduler |
 | `--scheduler-expert-threads N` | Override Expert threads per scheduler worker |
 | `--scheduler-cross-call` | Let the Runtime collector form micro-batches across submissions |
-| `--router-prediction` | Experimentally run the next layer's real Router on the current normalized Router input |
-| `--async-router-prediction` | Run Router prediction on a bounded Session worker; implies `--router-prediction` |
-| `--forward-aware-cache` | Experimentally resolve speculative predictions and prefer forward-distance ARC victims |
-| `--rank-adaptive-prefetch` | Experimentally adapt predicted Top-K width from per-Rank accuracy and demand queue time |
-| `--cross-expert-read-coalescing` | Experimentally merge physically adjacent buffered ranges across Experts |
 
 Dense tensors and eager MXFP4 ranges are mapped automatically. On-demand
 Experts are read directly into final cache storage without allocating or
@@ -147,16 +142,10 @@ adapt the resident split without retaining weight bytes. Cache accounting and
 the benchmark report expose resident bytes, ghost hits, reads, cancellations,
 and speculative admissions.
 
-The prediction and cache controls above are disabled by default. The current
-24-token Direct-I/O GPT-OSS-20B triplets measured 98.5% prediction-set
-accuracy. Synchronous prediction was neutral at 4.2307 versus 4.2291 token/s;
-the bounded worker reached 4.2664 token/s (+0.88%), reduced Cache wait by
-1.46%, and completed 529/529 predictions with 0.020 ms target-layer wait.
-Logical reads still increased by 0.49%, so this remains an opt-in result. The
-[Palm-Infra transfer report](../../memories/repo/investigation-results/palm-infra-transfer-experiment.md)
-contains the current protocol. The historical
-[DeepSeek/GPT A/B report](../../memories/repo/investigation-results/router-prefetch-cache-io-ab.md)
-retains the earlier transition-predictor and read-coalescing screening.
+The shipped kernel and Vulkan optimization profile is enabled by default. The
+experimental prediction/cache controls remain native A/B hooks and are not
+exposed by the unified worker. They remain disabled by default; benchmark them
+against the target workload before enabling them through native callers.
 
 ### Optional packed Expert sidecar
 

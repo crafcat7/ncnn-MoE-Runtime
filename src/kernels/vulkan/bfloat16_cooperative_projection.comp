@@ -1,0 +1,190 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+
+layout(binding = 0) readonly buffer input_blob
+{
+    float input_data[];
+};
+layout(binding = 1) readonly buffer packed_blob
+{
+    uint packed_words[];
+};
+layout(binding = 2) readonly buffer bias_blob
+{
+    float bias_data[];
+};
+layout(binding = 3) writeonly buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint input_columns;
+    uint output_columns;
+    uint token_count;
+    uint token_tile_count;
+}
+p;
+
+shared uvec2 input_tile[(TILE_M * TILE_K + 3) / 4];
+shared uvec2 weight_tile[(TILE_K * TILE_N + 3) / 4];
+shared float result_tile[TILE_M * TILE_N];
+
+vec4 load_input_values(uint token_base, uint column_base, uint packed_index)
+{
+    const uint scalar_index = packed_index * 4;
+    const uint row = scalar_index / TILE_K;
+    const uint column = scalar_index - row * TILE_K;
+    vec4 values = vec4(0.0);
+    if (token_base + row >= p.token_count)
+        return values;
+    const uint source = (token_base + row) * p.input_columns
+                        + column_base + column;
+    if (column_base + column < p.input_columns)
+        values.x = input_data[source];
+    if (column_base + column + 1 < p.input_columns)
+        values.y = input_data[source + 1];
+    if (column_base + column + 2 < p.input_columns)
+        values.z = input_data[source + 2];
+    if (column_base + column + 3 < p.input_columns)
+        values.w = input_data[source + 3];
+    return values;
+}
+
+uvec4 load_weight_bits(uint output_base, uint column_base, uint packed_index)
+{
+    const uint scalar_index = packed_index * 4;
+    const uint row = scalar_index / TILE_N;
+    const uint column = scalar_index - row * TILE_N;
+    uvec4 values = uvec4(0);
+    if (column_base + row >= p.input_columns)
+        return values;
+    const uint input_column = column_base + row;
+    if (output_base + column < p.output_columns)
+    {
+        const uint word = packed_words[
+            ((output_base + column) * p.input_columns + input_column) >> 1];
+        values.x =
+            (input_column & 1) == 0 ? word & 65535u : word >> 16;
+    }
+    if (output_base + column + 1 < p.output_columns)
+    {
+        const uint word = packed_words[
+            ((output_base + column + 1) * p.input_columns + input_column) >> 1];
+        values.y =
+            (input_column & 1) == 0 ? word & 65535u : word >> 16;
+    }
+    if (output_base + column + 2 < p.output_columns)
+    {
+        const uint word = packed_words[
+            ((output_base + column + 2) * p.input_columns + input_column) >> 1];
+        values.z =
+            (input_column & 1) == 0 ? word & 65535u : word >> 16;
+    }
+    if (output_base + column + 3 < p.output_columns)
+    {
+        const uint word = packed_words[
+            ((output_base + column + 3) * p.input_columns + input_column) >> 1];
+        values.w =
+            (input_column & 1) == 0 ? word & 65535u : word >> 16;
+    }
+    return values;
+}
+
+void main()
+{
+    const uint lane = gl_SubgroupInvocationID;
+    const uint tile_index = gl_WorkGroupID.x;
+    const uint output_tile_index = tile_index / p.token_tile_count;
+    const uint token_tile_index = tile_index
+                                  - output_tile_index * p.token_tile_count;
+    const uint token_base = token_tile_index * TILE_M;
+    const uint output_base = output_tile_index * TILE_N;
+
+    coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N,
+            gl_MatrixUseAccumulator> sum =
+        coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N,
+                gl_MatrixUseAccumulator>(0.0);
+
+    for (uint column_base = 0;
+         column_base < p.input_columns;
+         column_base += TILE_K)
+    {
+        for (uint index = lane;
+             index < (TILE_M * TILE_K + 3) / 4;
+             index += gl_SubgroupSize)
+        {
+            const vec4 values = load_input_values(
+                token_base,
+                column_base,
+                index);
+            input_tile[index] = uvec2(
+                packBFloat2x16(values.xy),
+                packBFloat2x16(values.zw));
+        }
+        for (uint index = lane;
+             index < (TILE_K * TILE_N + 3) / 4;
+             index += gl_SubgroupSize)
+        {
+            const uvec4 values = load_weight_bits(
+                output_base,
+                column_base,
+                index);
+            weight_tile[index] = uvec2(
+                values.x | values.y << 16,
+                values.z | values.w << 16);
+        }
+        barrier();
+
+        coopmat<bfloat16_t, gl_ScopeSubgroup, TILE_M, TILE_K,
+                gl_MatrixUseA> activation;
+        coopmat<bfloat16_t, gl_ScopeSubgroup, TILE_K, TILE_N,
+                gl_MatrixUseB> weight;
+        coopMatLoad(
+            activation,
+            input_tile,
+            0,
+            (TILE_K + 3) / 4,
+            gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(
+            weight,
+            weight_tile,
+            0,
+            (TILE_N + 3) / 4,
+            gl_CooperativeMatrixLayoutRowMajor);
+        sum = coopMatMulAdd(activation, weight, sum);
+        barrier();
+    }
+
+    coopMatStore(
+        sum,
+        result_tile,
+        0,
+        TILE_N,
+        gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for (uint index = lane;
+         index < TILE_M * TILE_N;
+         index += gl_SubgroupSize)
+    {
+        const uint row = index / TILE_N;
+        const uint column = index - row * TILE_N;
+        if (token_base + row < p.token_count
+            && output_base + column < p.output_columns)
+        {
+            output_data[(token_base + row) * p.output_columns
+                        + output_base + column] =
+                result_tile[index] + bias_data[output_base + column];
+        }
+    }
+}

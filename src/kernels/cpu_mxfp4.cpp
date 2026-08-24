@@ -1,5 +1,8 @@
 #include "cpu_mxfp4.h"
+#include "cpu_bfloat16.h"
 #include "engine/cpu_features.h"
+#include "engine/cpu_thread_budget.h"
+#include "ncnn/moe/runtime.h"
 
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
 #include "cpu_mxfp4_msvc.h"
@@ -11,10 +14,10 @@
 #endif
 
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -33,8 +36,6 @@
 
 namespace ncnn {
 namespace moe {
-
-static volatile float mxfp4_benchmark_sink = 0.0f;
 
 static std::array<float, 256> make_scale_table()
 {
@@ -137,6 +138,520 @@ static void scalar_matmul_rows2(const uint8_t* first_packed, const uint8_t* firs
             }
         }
     }
+}
+
+static constexpr int8_t mxfp4_integer_values[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12,
+    0, -1, -2, -3, -4, -6, -8, -12};
+
+void Mxfp4Q8Batch::reset(size_t row_count, uint32_t column_count)
+{
+    rows = row_count;
+    columns = column_count;
+    const size_t block_count = (static_cast<size_t>(column_count) + 31) / 32;
+    values.resize(row_count * column_count);
+    scales.resize(row_count * block_count);
+}
+
+static void scalar_mxfp4_q8_quantize(const float* source, int8_t* values, float* scales, uint32_t columns) noexcept
+{
+    const uint32_t block_count = (columns + 31) / 32;
+    for (uint32_t block = 0; block < block_count; ++block)
+    {
+        const uint32_t begin = block * 32;
+        const uint32_t end = std::min(columns, begin + 32);
+        float maximum = 0.0f;
+        for (uint32_t column = begin; column < end; ++column)
+            maximum = std::max(maximum, std::fabs(source[column]));
+        const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+        scales[block] = scale;
+        const float inverse_scale = 1.0f / scale;
+        for (uint32_t column = begin; column < end; ++column)
+        {
+            const float normalized = std::clamp(source[column] * inverse_scale, -127.0f, 127.0f);
+            values[column] = static_cast<int8_t>(std::lrintf(normalized));
+        }
+        for (uint32_t column = end; column < begin + 32 && column < columns; ++column)
+            values[column] = 0;
+    }
+}
+
+void mxfp4_q8_quantize(const float* source, int8_t* values, float* scales, uint32_t columns) noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
+    {
+        msvc_avx512_mxfp4_q8_quantize(source, values, scales, columns);
+        return;
+    }
+    if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
+    {
+        msvc_avx2_mxfp4_q8_quantize(source, values, scales, columns);
+        return;
+    }
+#endif
+    scalar_mxfp4_q8_quantize(source, values, scales, columns);
+}
+
+void mxfp4_q8_quantize_batch(const float* source, size_t input_stride, size_t rows, uint32_t columns, Mxfp4Q8Batch& output) noexcept
+{
+    output.reset(rows, columns);
+    const size_t block_count = (static_cast<size_t>(columns) + 31) / 32;
+    for (size_t row = 0; row < rows; ++row)
+    {
+        mxfp4_q8_quantize(
+            source + row * input_stride,
+            output.row(row),
+            output.scales.data() + row * block_count,
+            columns);
+    }
+}
+
+static float scalar_mxfp4_q8_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count,
+                                 const int8_t* input, const float* input_scales) noexcept
+{
+    const std::array<float, 256>& scales_by_exponent = scale_table();
+    float sum = 0.0f;
+    for (uint32_t block = 0; block < block_count; ++block)
+    {
+        const uint8_t* packed_block = packed + static_cast<size_t>(block) * 16;
+        const int8_t* input_block = input + static_cast<size_t>(block) * 32;
+        int32_t integer_sum = 0;
+        for (uint32_t byte = 0; byte < 16; ++byte)
+        {
+            const uint8_t packed_value = packed_block[byte];
+            integer_sum += static_cast<int32_t>(mxfp4_integer_values[packed_value & 0x0f]) * input_block[byte * 2];
+            integer_sum += static_cast<int32_t>(mxfp4_integer_values[packed_value >> 4]) * input_block[byte * 2 + 1];
+        }
+        sum += static_cast<float>(integer_sum)
+               * (0.5f * scales_by_exponent[scales[block]])
+               * input_scales[block];
+    }
+    return sum;
+}
+
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx2,ssse3"))) static int32_t avx2_horizontal_sum_epi32(__m256i values) noexcept
+{
+    __m128i sum = _mm_add_epi32(
+        _mm256_castsi256_si128(values),
+        _mm256_extracti128_si256(values, 1));
+    sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(2, 3, 0, 1)));
+    sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(1, 0, 3, 2)));
+    return _mm_cvtsi128_si32(sum);
+}
+
+__attribute__((target("avx2,ssse3"))) static float avx2_mxfp4_q8_dot(
+    const uint8_t* packed,
+    const uint8_t* scales,
+    uint32_t block_count,
+    const int8_t* input,
+    const float* input_scales) noexcept
+{
+    const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+    const __m128i value_table = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+    const std::array<float, 256>& scales_by_exponent = scale_table();
+    float sum = 0.0f;
+    for (uint32_t block = 0; block < block_count; ++block)
+    {
+        const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed + static_cast<size_t>(block) * 16));
+        const __m128i low = _mm_and_si128(bytes, nibble_mask);
+        const __m128i high = _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask);
+        const __m128i decoded_low = _mm_shuffle_epi8(value_table, _mm_unpacklo_epi8(low, high));
+        const __m128i decoded_high = _mm_shuffle_epi8(value_table, _mm_unpackhi_epi8(low, high));
+        const int8_t* input_block = input + static_cast<size_t>(block) * 32;
+        const __m256i input_low = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(input_block)));
+        const __m256i input_high = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(input_block + 16)));
+        const __m256i product_low = _mm256_madd_epi16(
+            _mm256_cvtepi8_epi16(decoded_low),
+            input_low);
+        const __m256i product_high = _mm256_madd_epi16(
+            _mm256_cvtepi8_epi16(decoded_high),
+            input_high);
+        const int32_t integer_sum = avx2_horizontal_sum_epi32(_mm256_add_epi32(product_low, product_high));
+        sum += static_cast<float>(integer_sum)
+               * (0.5f * scales_by_exponent[scales[block]])
+               * input_scales[block];
+    }
+    return sum;
+}
+#endif
+
+float mxfp4_q8_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count,
+                   const int8_t* input, const float* input_scales) noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512
+        || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
+        return msvc_avx2_mxfp4_q8_dot(packed, scales, block_count, input, input_scales);
+#elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+    if ((detect_cpu_isa_capabilities().flags & CpuIsaX86Avx2Fma) != 0)
+        return avx2_mxfp4_q8_dot(packed, scales, block_count, input, input_scales);
+#endif
+    return scalar_mxfp4_q8_dot(packed, scales, block_count, input, input_scales);
+}
+
+void mxfp4_q8_gemm_row(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const int8_t* input,
+                       size_t input_stride, const float* input_scales, size_t scale_stride, size_t token_count,
+                       float* output, size_t output_stride) noexcept
+{
+    for (size_t token = 0; token < token_count; ++token)
+    {
+        output[token * output_stride] = mxfp4_q8_dot(
+            packed,
+            scales,
+            block_count,
+            input + token * input_stride,
+            input_scales + token * scale_stride);
+    }
+}
+
+void mxfp4_q8_matmul_rows2(const uint8_t* first_packed, const uint8_t* first_scales, const uint8_t* second_packed,
+                           const uint8_t* second_scales, uint32_t block_count, const int8_t* input, size_t input_stride,
+                           const float* input_scales, size_t scale_stride, size_t token_count, float* first_output,
+                           size_t first_output_stride, float* second_output, size_t second_output_stride) noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512
+        || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
+    {
+        msvc_avx2_mxfp4_q8_matmul_rows2(
+            first_packed,
+            first_scales,
+            second_packed,
+            second_scales,
+            block_count,
+            input,
+            input_stride,
+            input_scales,
+            scale_stride,
+            token_count,
+            first_output,
+            first_output_stride,
+            second_output,
+            second_output_stride);
+        return;
+    }
+#endif
+    for (size_t token = 0; token < token_count; ++token)
+    {
+        const int8_t* input_row = input + token * input_stride;
+        const float* scale_row = input_scales + token * scale_stride;
+        first_output[token * first_output_stride] = mxfp4_q8_dot(
+            first_packed, first_scales, block_count, input_row, scale_row);
+        second_output[token * second_output_stride] = mxfp4_q8_dot(
+            second_packed, second_scales, block_count, input_row, scale_row);
+    }
+}
+
+void mxfp4_q8_matmul_row_pairs(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, uint32_t row_pair_count,
+                               const int8_t* input, size_t input_stride, const float* input_scales, size_t scale_stride,
+                               size_t token_count, float* first_output, size_t first_pair_stride, size_t first_token_stride,
+                               float* second_output, size_t second_pair_stride, size_t second_token_stride) noexcept
+{
+    const size_t packed_row_bytes = static_cast<size_t>(block_count) * 16;
+    for (uint32_t pair = 0; pair < row_pair_count; ++pair)
+    {
+        const size_t first_row = static_cast<size_t>(pair) * 2;
+        mxfp4_q8_matmul_rows2(
+            packed + first_row * packed_row_bytes,
+            scales + first_row * block_count,
+            packed + (first_row + 1) * packed_row_bytes,
+            scales + (first_row + 1) * block_count,
+            block_count,
+            input,
+            input_stride,
+            input_scales,
+            scale_stride,
+            token_count,
+            first_output + static_cast<size_t>(pair) * first_pair_stride,
+            first_token_stride,
+            second_output + static_cast<size_t>(pair) * second_pair_stride,
+            second_token_stride);
+    }
+}
+
+static constexpr uint32_t mxfp4_q8_packed_block_bytes(uint32_t tile_rows) noexcept
+{
+    return tile_rows * (1 + 16);
+}
+
+static constexpr uint32_t mxfp4_q8_packed_chunk_bytes(uint32_t tile_rows) noexcept
+{
+    return tile_rows;
+}
+
+static int32_t scalar_packed_chunk_dot(const uint8_t* packed, const int8_t* input, uint32_t chunk_bytes) noexcept
+{
+    int32_t sum = 0;
+    for (uint32_t byte = 0; byte < chunk_bytes; ++byte)
+    {
+        const uint8_t value = packed[byte];
+        sum += static_cast<int32_t>(mxfp4_integer_values[value & 0x0f]) * input[byte * 2];
+        sum += static_cast<int32_t>(mxfp4_integer_values[value >> 4]) * input[byte * 2 + 1];
+    }
+    return sum;
+}
+
+static void scalar_packed_gemv(const Mxfp4Q8PackedMatrix& weights, const int8_t* input, const float* input_scales,
+                               float* output) noexcept
+{
+    const uint32_t tile_rows = weights.tile_rows;
+    const uint32_t chunk_bytes = mxfp4_q8_packed_chunk_bytes(tile_rows);
+    const uint32_t chunk_count = 16 / chunk_bytes;
+    const size_t block_bytes = mxfp4_q8_packed_block_bytes(tile_rows);
+    const size_t group_stride = static_cast<size_t>(weights.block_count) * block_bytes;
+    const std::array<float, 256>& scales_by_exponent = scale_table();
+
+    for (size_t row = 0; row < weights.rows; ++row)
+        output[row] = 0.0f;
+
+    for (size_t group = 0; group < weights.group_count(); ++group)
+    {
+        float accumulators[8] = {};
+        for (uint32_t block = 0; block < weights.block_count; ++block)
+        {
+            const uint8_t* packed_block = weights.storage.data() + group * group_stride + static_cast<size_t>(block) * block_bytes;
+            const uint8_t* packed_values = packed_block + tile_rows;
+            const float input_scale = input_scales[block];
+            for (uint32_t chunk = 0; chunk < chunk_count; ++chunk)
+            {
+                const int8_t* input_chunk = input + static_cast<size_t>(block) * 32 + chunk * chunk_bytes * 2;
+                for (uint32_t row = 0; row < tile_rows; ++row)
+                {
+                    const size_t matrix_row = group * tile_rows + row;
+                    if (matrix_row >= weights.rows)
+                        continue;
+                    const uint8_t* row_values = packed_values + (static_cast<size_t>(chunk) * tile_rows + row) * chunk_bytes;
+                    accumulators[row] += static_cast<float>(scalar_packed_chunk_dot(row_values, input_chunk, chunk_bytes))
+                                         * (0.5f * scales_by_exponent[packed_block[row]]) * input_scale;
+                }
+            }
+        }
+        for (uint32_t row = 0; row < tile_rows; ++row)
+        {
+            const size_t matrix_row = group * tile_rows + row;
+            if (matrix_row < weights.rows)
+                output[matrix_row] = accumulators[row];
+        }
+    }
+}
+
+static void scalar_packed_gemm(const Mxfp4Q8PackedMatrix& weights, const int8_t* input, size_t input_stride,
+                               const float* input_scales, size_t scale_stride, size_t token_count, float* output,
+                               size_t output_stride) noexcept
+{
+    if (token_count == 0 || !weights.valid())
+        return;
+    if (token_count == 1)
+    {
+        scalar_packed_gemv(weights, input, input_scales, output);
+        return;
+    }
+
+    for (size_t token = 0; token < token_count; ++token)
+        std::fill(output + token * output_stride, output + token * output_stride + weights.rows, 0.0f);
+
+    const uint32_t tile_rows = weights.tile_rows;
+    const uint32_t chunk_bytes = mxfp4_q8_packed_chunk_bytes(tile_rows);
+    const uint32_t chunk_count = 16 / chunk_bytes;
+    const size_t block_bytes = mxfp4_q8_packed_block_bytes(tile_rows);
+    const size_t group_stride = static_cast<size_t>(weights.block_count) * block_bytes;
+    const std::array<float, 256>& scales_by_exponent = scale_table();
+    for (size_t group = 0; group < weights.group_count(); ++group)
+    {
+        for (uint32_t block = 0; block < weights.block_count; ++block)
+        {
+            const uint8_t* packed_block = weights.storage.data() + group * group_stride + static_cast<size_t>(block) * block_bytes;
+            const uint8_t* packed_values = packed_block + tile_rows;
+            for (size_t token = 0; token < token_count; ++token)
+            {
+                const int8_t* input_block = input + token * input_stride + static_cast<size_t>(block) * 32;
+                const float input_scale = input_scales[token * scale_stride + block];
+                for (uint32_t chunk = 0; chunk < chunk_count; ++chunk)
+                {
+                    const int8_t* input_chunk = input_block + chunk * chunk_bytes * 2;
+                    for (uint32_t row = 0; row < tile_rows; ++row)
+                    {
+                        const size_t matrix_row = group * tile_rows + row;
+                        if (matrix_row >= weights.rows)
+                            continue;
+                        const uint8_t* row_values = packed_values + (static_cast<size_t>(chunk) * tile_rows + row) * chunk_bytes;
+                        output[token * output_stride + matrix_row] += static_cast<float>(scalar_packed_chunk_dot(row_values, input_chunk, chunk_bytes))
+                                                                      * (0.5f * scales_by_exponent[packed_block[row]]) * input_scale;
+                    }
+                }
+            }
+        }
+    }
+}
+
+uint32_t mxfp4_q8_packed_tile_rows(size_t row_count) noexcept
+{
+    if (row_count >= 8 && (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2 || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512))
+        return 8;
+    return 4;
+}
+
+uint64_t mxfp4_q8_packed_storage_bytes(
+    size_t row_count,
+    uint32_t block_count,
+    uint32_t tile_rows) noexcept
+{
+    if (row_count == 0 || block_count == 0)
+        return 0;
+    if (tile_rows == 0)
+        tile_rows = mxfp4_q8_packed_tile_rows(row_count);
+    if ((tile_rows != 4 && tile_rows != 8)
+        || row_count > std::numeric_limits<size_t>::max() - (tile_rows - 1))
+    {
+        return 0;
+    }
+    const uint64_t group_count = (row_count + tile_rows - 1) / tile_rows;
+    const uint64_t bytes_per_block = static_cast<uint64_t>(tile_rows) * 17;
+    if (group_count > std::numeric_limits<uint64_t>::max() / block_count
+        || group_count * block_count > std::numeric_limits<uint64_t>::max() / bytes_per_block)
+    {
+        return 0;
+    }
+    return group_count * block_count * bytes_per_block;
+}
+
+bool mxfp4_q8_packed_kernel_available() noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    return mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
+           || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512;
+#elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+    // Keep the interleaved sidecar available until the compiler-specific kernel lands.
+    return false;
+#else
+    return false;
+#endif
+}
+
+bool mxfp4_q8_kernel_available() noexcept
+{
+    return mxfp4_q8_packed_kernel_available();
+}
+
+bool mxfp4_q8_pack_weights(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, size_t row_count,
+                           Mxfp4Q8PackedMatrix& output, uint32_t tile_rows)
+{
+    if (!packed || !scales || block_count == 0 || row_count == 0)
+    {
+        output.clear();
+        return false;
+    }
+    if (tile_rows == 0)
+        tile_rows = mxfp4_q8_packed_tile_rows(row_count);
+    if (tile_rows != 4 && tile_rows != 8)
+    {
+        output.clear();
+        return false;
+    }
+
+    const uint64_t storage_bytes = mxfp4_q8_packed_storage_bytes(
+        row_count,
+        block_count,
+        tile_rows);
+    if (storage_bytes == 0
+        || storage_bytes > std::numeric_limits<size_t>::max())
+    {
+        output.clear();
+        return false;
+    }
+
+    const size_t group_count = (row_count + tile_rows - 1) / tile_rows;
+    const size_t block_bytes = mxfp4_q8_packed_block_bytes(tile_rows);
+    const size_t group_stride = static_cast<size_t>(block_count) * block_bytes;
+    try
+    {
+        output.storage.assign(static_cast<size_t>(storage_bytes), 0);
+    }
+    catch (...)
+    {
+        output.clear();
+        return false;
+    }
+    output.rows = row_count;
+    output.block_count = block_count;
+    output.tile_rows = tile_rows;
+
+    const uint32_t chunk_bytes = mxfp4_q8_packed_chunk_bytes(tile_rows);
+    const uint32_t chunk_count = 16 / chunk_bytes;
+    const size_t source_row_bytes = static_cast<size_t>(block_count) * 16;
+    for (size_t group = 0; group < group_count; ++group)
+    {
+        for (uint32_t block = 0; block < block_count; ++block)
+        {
+            uint8_t* destination = output.storage.data() + group * group_stride + static_cast<size_t>(block) * block_bytes;
+            for (uint32_t row = 0; row < tile_rows; ++row)
+            {
+                const size_t source_row = group * tile_rows + row;
+                if (source_row >= row_count)
+                    continue;
+                destination[row] = scales[source_row * block_count + block];
+                const uint8_t* source = packed + source_row * source_row_bytes + static_cast<size_t>(block) * 16;
+                for (uint32_t chunk = 0; chunk < chunk_count; ++chunk)
+                {
+                    std::memcpy(destination + tile_rows + (static_cast<size_t>(chunk) * tile_rows + row) * chunk_bytes,
+                                source + chunk * chunk_bytes, chunk_bytes);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+void mxfp4_q8_packed_gemv(const Mxfp4Q8PackedMatrix& weights, const int8_t* input, const float* input_scales,
+                          float* output) noexcept
+{
+    if (!input || !input_scales || !output || !weights.valid())
+        return;
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    if (weights.tile_rows == 8 && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
+    {
+        msvc_avx512_mxfp4_q8_packed_gemm(weights.storage.data(), static_cast<uint32_t>(weights.rows), weights.block_count, weights.tile_rows,
+                                         input, 0, input_scales, 0, 1, output, weights.rows);
+        return;
+    }
+    if (weights.tile_rows == 8 && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
+    {
+        msvc_avx2_mxfp4_q8_packed_gemm(weights.storage.data(), static_cast<uint32_t>(weights.rows), weights.block_count, weights.tile_rows,
+                                       input, 0, input_scales, 0, 1, output, weights.rows);
+        return;
+    }
+#endif
+    scalar_packed_gemv(weights, input, input_scales, output);
+}
+
+void mxfp4_q8_packed_gemm(const Mxfp4Q8PackedMatrix& weights, const int8_t* input, size_t input_stride,
+                          const float* input_scales, size_t scale_stride, size_t token_count, float* output,
+                          size_t output_stride) noexcept
+{
+    if (!input || !input_scales || !output || !weights.valid())
+        return;
+    if (token_count == 1)
+    {
+        mxfp4_q8_packed_gemv(weights, input, input_scales, output);
+        return;
+    }
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    if (weights.tile_rows == 8 && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
+    {
+        msvc_avx512_mxfp4_q8_packed_gemm(weights.storage.data(), static_cast<uint32_t>(weights.rows), weights.block_count, weights.tile_rows,
+                                         input, input_stride, input_scales, scale_stride, token_count, output, output_stride);
+        return;
+    }
+    if (weights.tile_rows == 8 && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
+    {
+        msvc_avx2_mxfp4_q8_packed_gemm(weights.storage.data(), static_cast<uint32_t>(weights.rows), weights.block_count, weights.tile_rows,
+                                       input, input_stride, input_scales, scale_stride, token_count, output, output_stride);
+        return;
+    }
+#endif
+    scalar_packed_gemm(weights, input, input_stride, input_scales, scale_stride, token_count, output, output_stride);
 }
 
 #define NCNN_MOE_DEFINE_MXFP4_ROW_PAIR_KERNEL(function_name, row_pair_function)                                                                     \
@@ -619,77 +1134,23 @@ static KernelDispatch select_kernel() noexcept
     }
 #endif
 
-    const char* override_name = nullptr;
-#if defined(_MSC_VER)
-    std::array<char, 16> override_storage = {};
-    size_t override_length = 0;
-    if (getenv_s(&override_length, override_storage.data(), override_storage.size(), "NCNN_MOE_MXFP4_KERNEL") == 0 && override_length > 1
-        && override_length <= override_storage.size())
-    {
-        override_name = override_storage.data();
-    }
-#else
-    override_name = std::getenv("NCNN_MOE_MXFP4_KERNEL");
-#endif
-    if (override_name && override_name[0] != '\0')
+    // Select the highest supported ISA without an initialization benchmark.
+    constexpr std::array<MxFp4KernelKind, 5> preference = {
+        MxFp4KernelKind::X86Avx512,
+        MxFp4KernelKind::ArmSve2,
+        MxFp4KernelKind::X86Avx2,
+        MxFp4KernelKind::ArmNeon,
+        MxFp4KernelKind::Scalar,
+    };
+    for (const MxFp4KernelKind preferred : preference)
     {
         for (size_t index = 0; index < candidate_count; ++index)
         {
-            const bool selected = (std::strcmp(override_name, "scalar") == 0 && candidates[index].kind == MxFp4KernelKind::Scalar)
-                                  || (std::strcmp(override_name, "neon") == 0 && candidates[index].kind == MxFp4KernelKind::ArmNeon)
-                                  || (std::strcmp(override_name, "sve2") == 0 && candidates[index].kind == MxFp4KernelKind::ArmSve2)
-                                  || (std::strcmp(override_name, "avx2") == 0 && candidates[index].kind == MxFp4KernelKind::X86Avx2)
-                                  || (std::strcmp(override_name, "avx512") == 0 && candidates[index].kind == MxFp4KernelKind::X86Avx512);
-            if (selected)
+            if (candidates[index].kind == preferred)
                 return candidates[index];
         }
     }
-    if (candidate_count == 1)
-        return candidates[0];
-
-    static constexpr uint32_t benchmark_blocks = 64;
-    static constexpr uint32_t benchmark_repeats = 96;
-    std::array<uint8_t, benchmark_blocks * 16 * 2> packed = {};
-    std::array<uint8_t, benchmark_blocks * 2> scales = {};
-    std::array<float, benchmark_blocks * 32> input = {};
-    for (size_t index = 0; index < packed.size(); ++index)
-    {
-        packed[index] = static_cast<uint8_t>(((index * 5 + 1) & 0x0f) | (((index * 7 + 3) & 0x0f) << 4));
-    }
-    for (size_t index = 0; index < scales.size(); ++index)
-        scales[index] = static_cast<uint8_t>(124 + index % 7);
-    for (size_t index = 0; index < input.size(); ++index)
-    {
-        input[index] = static_cast<float>(static_cast<int>(index % 31) - 15) * 0.03125f;
-    }
-
-    std::array<int64_t, 3> elapsed = {};
-    volatile float sink = 0.0f;
-    for (uint32_t round = 0; round < 5; ++round)
-    {
-        for (size_t order = 0; order < candidate_count; ++order)
-        {
-            const size_t index = round % 2 == 0 ? order : candidate_count - order - 1;
-            float first = 0.0f;
-            float second = 0.0f;
-            const auto started = std::chrono::steady_clock::now();
-            for (uint32_t repeat = 0; repeat < benchmark_repeats; ++repeat)
-            {
-                candidates[index].matmul_rows2(packed.data(), scales.data(), packed.data() + benchmark_blocks * 16, scales.data() + benchmark_blocks,
-                                               benchmark_blocks, input.data(), input.size(), 1, &first, 1, &second, 1);
-                sink = first + second;
-            }
-            elapsed[index] += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
-        }
-    }
-    (void)sink;
-    size_t selected_index = 0;
-    for (size_t index = 1; index < candidate_count; ++index)
-    {
-        if (elapsed[index] < elapsed[selected_index])
-            selected_index = index;
-    }
-    return candidates[selected_index];
+    return candidates[0];
 }
 
 static const KernelDispatch& kernel_dispatch() noexcept
@@ -716,116 +1177,13 @@ const char* mxfp4_kernel_name() noexcept
     return "scalar";
 }
 
-static int64_t measure_decode_group(bool grouped, bool parallel, const KernelDispatch& dispatch, const std::vector<uint8_t>& packed,
-                                    const std::vector<uint8_t>& scales, uint32_t block_count, uint32_t pair_count, uint32_t repeats, size_t packed_row_bytes,
-                                    const float* input, size_t input_count, std::vector<float>& first, std::vector<float>& second)
-{
-    const auto started = std::chrono::steady_clock::now();
-    for (uint32_t repeat = 0; repeat < repeats; ++repeat)
-    {
-        if (grouped)
-        {
-            const int64_t group_count = pair_count / 2;
-#pragma omp parallel for schedule(static) if (parallel)
-            for (int64_t group = 0; group < group_count; ++group)
-            {
-                const uint32_t pair = static_cast<uint32_t>(group) * 2;
-                const size_t first_row = static_cast<size_t>(pair) * 2;
-                dispatch.matmul_row_pairs(packed.data() + first_row * packed_row_bytes, scales.data() + first_row * block_count, block_count, 2, input,
-                                          input_count, 1, first.data() + pair, 1, 1, second.data() + pair, 1, 1);
-            }
-        }
-        else
-        {
-            const int64_t group_count = pair_count;
-#pragma omp parallel for schedule(static) if (parallel)
-            for (int64_t group = 0; group < group_count; ++group)
-            {
-                const uint32_t pair = static_cast<uint32_t>(group);
-                const size_t first_row = static_cast<size_t>(pair) * 2;
-                dispatch.matmul_rows2(packed.data() + first_row * packed_row_bytes, scales.data() + first_row * block_count,
-                                      packed.data() + (first_row + 1) * packed_row_bytes, scales.data() + (first_row + 1) * block_count, block_count, input,
-                                      input_count, 1, first.data() + pair, 1, second.data() + pair, 1);
-            }
-        }
-    }
-    mxfp4_benchmark_sink = first.back() + second.back();
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
-}
-
-static uint32_t select_decode_group_size() noexcept
-{
-    const char* override_name = nullptr;
-#if defined(_MSC_VER)
-    std::array<char, 8> override_storage = {};
-    size_t override_length = 0;
-    if (getenv_s(&override_length, override_storage.data(), override_storage.size(), "NCNN_MOE_MXFP4_DECODE_GROUP") == 0 && override_length > 1
-        && override_length <= override_storage.size())
-    {
-        override_name = override_storage.data();
-    }
-#else
-    override_name = std::getenv("NCNN_MOE_MXFP4_DECODE_GROUP");
-#endif
-    if (override_name)
-    {
-        if (std::strcmp(override_name, "1") == 0)
-            return 1;
-        if (std::strcmp(override_name, "2") == 0)
-            return 2;
-    }
-
-    constexpr uint32_t block_count = 90;
-    constexpr uint32_t pair_count = 128;
-    constexpr uint32_t rounds = 5;
-    constexpr uint32_t repeats = 8;
-    const size_t packed_row_bytes = static_cast<size_t>(block_count) * 16;
-    std::vector<uint8_t> packed(static_cast<size_t>(pair_count) * 2 * packed_row_bytes);
-    std::vector<uint8_t> scales(static_cast<size_t>(pair_count) * 2 * block_count);
-    std::array<float, block_count * 32> input = {};
-    std::vector<float> first(pair_count);
-    std::vector<float> second(pair_count);
-    for (size_t index = 0; index < packed.size(); ++index)
-    {
-        packed[index] = static_cast<uint8_t>(((index * 5 + 1) & 0x0f) | (((index * 7 + 3) & 0x0f) << 4));
-    }
-    for (size_t index = 0; index < scales.size(); ++index)
-        scales[index] = static_cast<uint8_t>(124 + index % 7);
-    for (size_t index = 0; index < input.size(); ++index)
-        input[index] = static_cast<float>(static_cast<int>(index % 31) - 15) * 0.03125f;
-
-    const KernelDispatch& dispatch = kernel_dispatch();
-    bool parallel = false;
-#if defined(_OPENMP)
-    parallel = omp_in_parallel() == 0 && omp_get_max_threads() > 1;
-#endif
-    int64_t scalar_pair_time = 0;
-    int64_t grouped_pair_time = 0;
-    for (uint32_t round = 0; round < rounds; ++round)
-    {
-        if (round % 2 == 0)
-        {
-            scalar_pair_time += measure_decode_group(false, parallel, dispatch, packed, scales, block_count, pair_count, repeats, packed_row_bytes,
-                                                     input.data(), input.size(), first, second);
-            grouped_pair_time += measure_decode_group(true, parallel, dispatch, packed, scales, block_count, pair_count, repeats, packed_row_bytes,
-                                                      input.data(), input.size(), first, second);
-        }
-        else
-        {
-            grouped_pair_time += measure_decode_group(true, parallel, dispatch, packed, scales, block_count, pair_count, repeats, packed_row_bytes,
-                                                      input.data(), input.size(), first, second);
-            scalar_pair_time += measure_decode_group(false, parallel, dispatch, packed, scales, block_count, pair_count, repeats, packed_row_bytes,
-                                                     input.data(), input.size(), first, second);
-        }
-    }
-    // Five percent hysteresis prevents noisy decode-strategy changes.
-    return grouped_pair_time < scalar_pair_time - scalar_pair_time / 20 ? 2 : 1;
-}
-
 uint32_t mxfp4_decode_row_pair_group_size() noexcept
 {
-    static const uint32_t selected = select_decode_group_size();
-    return selected;
+    // Keep the row-pair tile static; decode must not benchmark on first use.
+    return mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
+                   || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512
+               ? 2
+               : 1;
 }
 
 float mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input) noexcept

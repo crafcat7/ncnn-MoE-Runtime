@@ -23,7 +23,6 @@ namespace moe {
 #define NCNN_MOE_RUNTIME_CAP_NCNN_LINEAR_BIT      1
 #define NCNN_MOE_RUNTIME_CAP_VULKAN_BIT           2
 #define NCNN_MOE_RUNTIME_CAP_VULKAN_CPU_BIT       3
-#define NCNN_MOE_RUNTIME_CAP_VULKAN_PREFETCH_BIT  4
 #define NCNN_MOE_RUNTIME_CAP_VULKAN_ATTENTION_BIT 5
 #define NCNN_MOE_RUNTIME_CAP_VULKAN_VICTIM_BIT    6
 #define NCNN_MOE_RUNTIME_CAP_MXFP4_CPU_BIT        7
@@ -43,7 +42,6 @@ enum RuntimeCapabilityFlag : uint32_t
     RuntimeCapabilityNcnnCpuLinear = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_NCNN_LINEAR_BIT,
     RuntimeCapabilityVulkanExecution = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_VULKAN_BIT,
     RuntimeCapabilityVulkanCpuMix = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_VULKAN_CPU_BIT,
-    RuntimeCapabilityVulkanCpuPrefetch = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_VULKAN_PREFETCH_BIT,
     RuntimeCapabilityVulkanAttention = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_VULKAN_ATTENTION_BIT,
     RuntimeCapabilityVulkanVictimCache = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_VULKAN_VICTIM_BIT,
     RuntimeCapabilityMxfp4CpuKernel = UINT32_C(1) << NCNN_MOE_RUNTIME_CAP_MXFP4_CPU_BIT,
@@ -105,6 +103,10 @@ struct RuntimeCapabilities
     std::string cpu_isa;
     std::string activation_kernel;
     std::vector<VulkanDeviceCapabilities> vulkan_devices;
+    std::string bfloat16_dot_kernel;
+    std::string cpu_small_bfloat16_linear_policy;
+    uint64_t available_memory_bytes = 0;
+    std::string bfloat16_batched_linear_kernel;
 };
 
 // Stable, model-neutral progress reported while Runtime prepares a model.

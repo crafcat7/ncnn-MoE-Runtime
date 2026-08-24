@@ -113,7 +113,6 @@ The native runner stops on DeepSeek EOS token `1` and also accepts repeated
 | --- | --- |
 | `--cpu` | Portable CPU path |
 | `--hybrid` | Vulkan FP8 Dense projections with CPU Attention cache logic, routing, and Experts |
-| `--hybrid-prefetch` | Mixed path with explicit CPU cache hints |
 
 `HybridMode::Auto` selects mixed execution for a hardware Vulkan device and
 falls back to CPU-only for a software CPU Vulkan implementation.
@@ -136,6 +135,7 @@ python tools\ncnn_moe.py run `
 | Option | Effect |
 | --- | --- |
 | `--expert-memory auto\|eager\|on-demand` | Select Expert residency |
+| `--cpu-packed-weights on\|off` | Opt into the CPU MXFP4-Q8 in-memory repack; default `off` |
 | `--host-memory-mb N` | Override the detected host-memory budget |
 | `--expert-cache-mb N` | Bound resident Expert pairs in RAM |
 | `--expert-io-workers N` | Set asynchronous read concurrency |

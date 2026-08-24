@@ -2,6 +2,9 @@
 
 #include "ncnn/moe/runtime.h"
 
+#include "kernels/cpu_mxfp4.h"
+#include "kernels/cpu_qnk.h"
+
 #include <algorithm>
 #include <limits>
 #include <string>
@@ -35,6 +38,15 @@ static Result<uint64_t> matrix_storage_bytes(uint64_t rows, uint64_t columns, DT
     {
         const uint64_t scale_count = ((rows + 127) / 128) * ((columns + 127) / 128);
         return checked_add(elements.value(), scale_count, name);
+    }
+    if (is_qnk_dtype(dtype))
+    {
+        if (rows > std::numeric_limits<uint32_t>::max() || columns > std::numeric_limits<uint32_t>::max())
+            return Error{ErrorCode::InvalidModel, std::string(name) + " Qn_K dimensions exceed uint32"};
+        const uint64_t bytes = qnk_storage_bytes(dtype, static_cast<size_t>(rows), static_cast<uint32_t>(columns));
+        if (bytes == 0)
+            return Error{ErrorCode::InvalidModel, std::string(name) + " has invalid Qn_K dimensions"};
+        return bytes;
     }
     const uint64_t element_bytes = dtype == DType::Int64 ? 8 : dtype == DType::BFloat16 ? 2
                                                                                         : 4;
@@ -588,12 +600,76 @@ static Result<uint64_t> expert_pair_bytes(const MoeIR& ir, DType dtype)
     return checked_add(gate_up.value(), down.value(), "expert pair");
 }
 
+static Result<uint64_t> packed_matrix_storage_bytes(
+    uint64_t rows,
+    uint64_t columns,
+    DType dtype,
+    const char* name)
+{
+    if (dtype == DType::MxFp4)
+    {
+        if (rows < 4)
+            return uint64_t{0};
+        if (rows > std::numeric_limits<size_t>::max()
+            || columns == 0
+            || columns > std::numeric_limits<uint32_t>::max()
+            || columns % 32 != 0)
+        {
+            return Error{ErrorCode::InvalidModel, std::string(name) + " has invalid MXFP4 dimensions"};
+        }
+        const uint64_t bytes = mxfp4_q8_packed_storage_bytes(
+            static_cast<size_t>(rows),
+            static_cast<uint32_t>(columns / 32));
+        if (bytes == 0)
+            return Error{ErrorCode::InvalidModel, std::string(name) + " packed byte estimate overflows"};
+        return bytes;
+    }
+    if (is_qnk_dtype(dtype))
+    {
+        if (rows > std::numeric_limits<size_t>::max()
+            || columns > std::numeric_limits<uint32_t>::max())
+        {
+            return Error{ErrorCode::InvalidModel, std::string(name) + " has invalid Qn_K dimensions"};
+        }
+        const uint64_t bytes = qnk_packed_storage_bytes(
+            dtype,
+            static_cast<size_t>(rows),
+            static_cast<uint32_t>(columns));
+        if (bytes == 0)
+            return Error{ErrorCode::InvalidModel, std::string(name) + " has invalid Qn_K dimensions"};
+        return bytes;
+    }
+    return uint64_t{0};
+}
+
+static Result<uint64_t> packed_expert_pair_bytes(const MoeIR& ir, DType dtype)
+{
+    auto gate_up = packed_matrix_storage_bytes(
+        static_cast<uint64_t>(ir.intermediate_size) * 2,
+        ir.hidden_size,
+        dtype,
+        "packed expert gate/up");
+    if (!gate_up)
+        return gate_up.error();
+    auto down = packed_matrix_storage_bytes(
+        ir.hidden_size,
+        ir.intermediate_size,
+        dtype,
+        "packed expert down");
+    if (!down)
+        return down.error();
+    return checked_add(gate_up.value(), down.value(), "packed expert pair");
+}
+
 Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& config, uint64_t physical_memory_bytes,
-                                          bool release_vulkan_dense_host_storage)
+                                          bool release_vulkan_dense_host_storage,
+                                          uint64_t available_memory_bytes,
+                                          bool reserve_cpu_packed_weights)
 {
     ModelMemoryPlan plan;
     plan.requested_mode = config.expert_memory_mode;
     plan.physical_memory_bytes = physical_memory_bytes;
+    plan.available_memory_bytes = available_memory_bytes;
     if (config.host_memory_budget_bytes != 0)
     {
         if (physical_memory_bytes != 0 && config.host_memory_budget_bytes > physical_memory_bytes)
@@ -605,6 +681,17 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
     else if (physical_memory_bytes != 0)
     {
         plan.host_memory_budget_bytes = physical_memory_bytes / 4 * 3;
+        if (available_memory_bytes != 0)
+        {
+            const uint64_t system_reserve = 2 * gibibyte;
+            const uint64_t available_budget =
+                available_memory_bytes > system_reserve
+                    ? available_memory_bytes - system_reserve
+                    : available_memory_bytes / 2;
+            plan.host_memory_budget_bytes = std::min(
+                plan.host_memory_budget_bytes,
+                available_budget);
+        }
     }
     else
     {
@@ -636,7 +723,21 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
     if (!pair_bytes)
         return pair_bytes.error();
     plan.expert_pair_bytes = pair_bytes.value();
-    auto active_bytes = checked_multiply(plan.expert_pair_bytes, moe.top_k, "active experts");
+    plan.expert_pair_resident_bytes = plan.expert_pair_bytes;
+    if (reserve_cpu_packed_weights)
+    {
+        auto packed_pair_bytes = packed_expert_pair_bytes(ir, moe.expert_weight_dtype);
+        if (!packed_pair_bytes)
+            return packed_pair_bytes.error();
+        auto resident_pair_bytes = checked_add(
+            plan.expert_pair_bytes,
+            packed_pair_bytes.value(),
+            "resident expert pair");
+        if (!resident_pair_bytes)
+            return resident_pair_bytes.error();
+        plan.expert_pair_resident_bytes = resident_pair_bytes.value();
+    }
+    auto active_bytes = checked_multiply(plan.expert_pair_resident_bytes, moe.top_k, "active experts");
     if (!active_bytes)
         return active_bytes.error();
     plan.minimum_active_expert_bytes = active_bytes.value();
@@ -647,6 +748,27 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
     if (!expert_bytes)
         return expert_bytes.error();
     plan.estimated_expert_bytes = expert_bytes.value();
+    auto packed_expert_bytes = checked_multiply(
+        plan.expert_pair_resident_bytes - plan.expert_pair_bytes,
+        expert_count.value(),
+        "packed expert weights");
+    if (!packed_expert_bytes)
+        return packed_expert_bytes.error();
+    plan.estimated_cpu_packed_expert_bytes = packed_expert_bytes.value();
+    auto resident_expert_bytes = checked_add(
+        plan.estimated_expert_bytes,
+        plan.estimated_cpu_packed_expert_bytes,
+        "resident expert weights");
+    if (!resident_expert_bytes)
+        return resident_expert_bytes.error();
+    plan.estimated_expert_resident_bytes = resident_expert_bytes.value();
+
+    const uint64_t safety_reserve = std::max(2 * gibibyte, physical_memory_bytes == 0 ? 2 * gibibyte : physical_memory_bytes / 8);
+    uint64_t eager_capacity = 0;
+    if (plan.host_memory_budget_bytes > plan.estimated_dense_bytes && plan.host_memory_budget_bytes - plan.estimated_dense_bytes > safety_reserve)
+    {
+        eager_capacity = plan.host_memory_budget_bytes - plan.estimated_dense_bytes - safety_reserve;
+    }
     if (moe.expert_weight_dtype != DType::MxFp4)
     {
         plan.selected_mode = ExpertMemoryMode::Eager;
@@ -654,14 +776,12 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
         {
             return Error{ErrorCode::UnsupportedModel, "on-demand expert storage currently requires MXFP4 experts"};
         }
+        if (reserve_cpu_packed_weights
+            && plan.estimated_expert_resident_bytes > eager_capacity)
+        {
+            return Error{ErrorCode::InvalidArgument, "host memory budget cannot hold the requested CPU packed Expert weights"};
+        }
         return plan;
-    }
-
-    const uint64_t safety_reserve = std::max(2 * gibibyte, physical_memory_bytes == 0 ? 2 * gibibyte : physical_memory_bytes / 8);
-    uint64_t eager_capacity = 0;
-    if (plan.host_memory_budget_bytes > plan.estimated_dense_bytes && plan.host_memory_budget_bytes - plan.estimated_dense_bytes > safety_reserve)
-    {
-        eager_capacity = plan.host_memory_budget_bytes - plan.estimated_dense_bytes - safety_reserve;
     }
 
     if (config.expert_cache_bytes != 0)
@@ -674,7 +794,7 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
     }
     else if (config.expert_memory_mode == ExpertMemoryMode::Auto)
     {
-        plan.selected_mode = plan.estimated_expert_bytes <= eager_capacity ? ExpertMemoryMode::Eager : ExpertMemoryMode::OnDemand;
+        plan.selected_mode = plan.estimated_expert_resident_bytes <= eager_capacity ? ExpertMemoryMode::Eager : ExpertMemoryMode::OnDemand;
     }
     else
     {
@@ -682,7 +802,14 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
     }
 
     if (plan.selected_mode == ExpertMemoryMode::Eager)
+    {
+        if (reserve_cpu_packed_weights
+            && plan.estimated_expert_resident_bytes > eager_capacity)
+        {
+            return Error{ErrorCode::InvalidArgument, "host memory budget cannot hold the requested CPU packed Expert weights"};
+        }
         return plan;
+    }
     bool file_backed_expert_encoding = true;
     for (const LayerDescriptor& layer : ir.layers)
     {
