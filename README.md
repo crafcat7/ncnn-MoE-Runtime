@@ -329,15 +329,7 @@ the public upstream ncnn submission API.
 
 Cross-layer Router prediction, forward-aware cache policy, Rank-adaptive
 prefetch, a bounded prediction worker, and exact-adjacency cross-Expert reads
-are available as experimental opt-ins. They remain disabled by default. In the
-current 24-token Direct-I/O triplets, synchronous prediction improves DeepSeek
-throughput by 5.93%, while async prediction improves GPT-OSS by 0.88% but loses
-to synchronous prediction on DeepSeek because it competes with CPU Experts.
-See the
-[Palm-Infra transfer report](memories/repo/investigation-results/palm-infra-transfer-experiment.md)
-and the historical
-[Router/cache/I/O A/B report](memories/repo/investigation-results/router-prefetch-cache-io-ab.md)
-for protocols, per-Rank metrics, and acceptance boundaries.
+are available as experimental opt-ins and remain disabled by default.
 
 Kernel, scheduling, memory-management, and fallback behavior are provided by
 the Runtime API and its public model guides.

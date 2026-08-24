@@ -144,15 +144,8 @@ and speculative admissions.
 
 The shipped kernel and Vulkan optimization profile is enabled by default. The
 experimental prediction/cache controls remain native A/B hooks and are not
-exposed by the unified worker. The current 24-token Direct-I/O GPT-OSS-20B triplets measured 98.5% prediction-set
-accuracy. Synchronous prediction was neutral at 4.2307 versus 4.2291 token/s;
-the bounded worker reached 4.2664 token/s (+0.88%), reduced Cache wait by
-1.46%, and completed 529/529 predictions with 0.020 ms target-layer wait.
-Logical reads still increased by 0.49%, so this remains an opt-in result. The
-[Palm-Infra transfer report](../../memories/repo/investigation-results/palm-infra-transfer-experiment.md)
-contains the current protocol. The historical
-[DeepSeek/GPT A/B report](../../memories/repo/investigation-results/router-prefetch-cache-io-ab.md)
-retains the earlier transition-predictor and read-coalescing screening.
+exposed by the unified worker. They remain disabled by default; benchmark them
+against the target workload before enabling them through native callers.
 
 ### Optional packed Expert sidecar
 
