@@ -1,3 +1,5 @@
+
+
 # ncnn MoE Runtime
 
 >❗This software is in the early development stage
@@ -123,7 +125,8 @@ DeepSeek/Qwen model-download and artifact-build tools, the optional
 Rich/prompt-toolkit UI, and CPU/GPU telemetry providers. The file delegates to
 the extras in `pyproject.toml`, so the dependency groups have a single source
 of truth. For a smaller installation, use only the required extra, for example
-`python -m pip install -e ".[gpt-oss]"`.
+`python -m pip install -e ".[gpt-oss]"`. When the Python package is installed,
+the CLI is also available as the `ncnn-moe` console script.
 
 ```powershell
 git clone --recurse-submodules https://github.com/crafcat7/ncnn-MoE-Runtime.git
