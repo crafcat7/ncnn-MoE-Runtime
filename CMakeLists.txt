@@ -27,6 +27,10 @@ option(NCNN_MOE_USE_VULKAN "Build ncnn with Vulkan support" ${NCNN_MOE_USE_VULKA
 option(NCNN_MOE_ENABLE_EXPERIMENTAL_MACOS_VULKAN "Enable the experimental MoltenVK hybrid backend on macOS" ON)
 include(GNUInstallDirs)
 
+if(MSVC)
+    include(third_party/Mile.Windows.UniCrt/Mile.Windows.UniCrt.cmake)
+endif()
+
 if(MSVC AND NCNN_MOE_ENABLE_MSVC_MP)
     add_compile_options(/MP)
 endif()
