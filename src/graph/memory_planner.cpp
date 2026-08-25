@@ -197,9 +197,6 @@ static Result<uint64_t> latent_fp8_dense_bytes(const MoeIR& ir)
         status = add_matrix_bytes(moe.intermediate_size, ir.hidden_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert input", total);
         if (!status)
             return status.error();
-        status = add_matrix_bytes(moe.intermediate_size, ir.hidden_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert input", total);
-        if (!status)
-            return status.error();
         status = add_matrix_bytes(ir.hidden_size, moe.intermediate_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert output", total);
         if (!status)
             return status.error();
