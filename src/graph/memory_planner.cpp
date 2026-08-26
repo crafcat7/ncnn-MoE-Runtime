@@ -763,7 +763,25 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
         return resident_expert_bytes.error();
     plan.estimated_expert_resident_bytes = resident_expert_bytes.value();
 
-    const uint64_t safety_reserve = std::max(2 * gibibyte, physical_memory_bytes == 0 ? 2 * gibibyte : physical_memory_bytes / 8);
+#if defined(_WIN32)
+    // For Windows, reserve 2 GiB for the OS and other processes. This is based
+    // on the minimum RAM requirements for Windows 11 IoT Enterprise LTSC 2024
+    // and Windows Server 2025, which both require at least 2 GiB of RAM.
+    // References:
+    // - https://learn.microsoft.com/en-us/windows/iot/iot-enterprise/hardware/system_requirements?tabs=Windows11LTSC
+    // - https://learn.microsoft.com/en-us/windows-server/get-started/hardware-requirements?tabs=ram&pivots=windows-server-2025
+    const uint64_t safety_reserve = 2 * gibibyte;
+#else
+    // For non-Windows platforms, reserve 1 GiB for the OS and other processes.
+    // This is based on the minimum RAM requirements for current typical Linux
+    // distributions without desktop environments, which often require at least
+    // 1 GiB of RAM.
+    // References:
+    // - https://www.debian.org/releases/trixie/amd64/ch03s04.en.html
+    // - https://ubuntu.com/server/docs/reference/installation/system-requirements
+    // - https://en.opensuse.org/Hardware_requirements
+    const uint64_t safety_reserve = 1 * gibibyte;
+#endif
     uint64_t eager_capacity = 0;
     if (plan.host_memory_budget_bytes > plan.estimated_dense_bytes && plan.host_memory_budget_bytes - plan.estimated_dense_bytes > safety_reserve)
     {
