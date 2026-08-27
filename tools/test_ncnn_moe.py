@@ -12,6 +12,7 @@ import sys
 import tempfile
 from collections import UserDict
 from pathlib import Path
+from types import ModuleType
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -101,6 +102,51 @@ def main() -> int:
     qwen.tokenizer = FakeQwenTokenizer()
     assert qwen.decode_text([1, 99]) == "answer"
     assert qwen.decode_text([1]) == "partial\ufffd"
+
+    class FakeQwen4Tokenizer(FakeQwenTokenizer):
+        def apply_chat_template(self, messages: object, **options: object) -> list[int]:
+            del messages, options
+            return [1, 2, 3]
+
+    class FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(model: str, *, local_files_only: bool) -> FakeQwen4Tokenizer:
+            assert Path(model).is_dir()
+            assert local_files_only
+            return FakeQwen4Tokenizer()
+
+    transformers = ModuleType("transformers")
+    transformers.AutoTokenizer = FakeAutoTokenizer  # type: ignore[attr-defined]
+    previous_transformers = sys.modules.get("transformers")
+    sys.modules["transformers"] = transformers
+    try:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-qwen4-adapter-") as directory:
+            qwen4_root = Path(directory)
+            (qwen4_root / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "qwen4_exp",
+                        "text_config": {"max_position_embeddings": 262144},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (qwen4_root / "tokenizer.json").write_text("{}", encoding="utf-8")
+            (qwen4_root / "generation_config.json").write_text(
+                json.dumps({"eos_token_id": [248046, 248044]}),
+                encoding="utf-8",
+            )
+            qwen4 = create_adapter(qwen4_root)
+            assert isinstance(qwen4, QwenAdapter)
+            assert qwen4.name == "qwen3.8"
+            assert qwen4.model_type == "qwen4_exp"
+            assert qwen4.context_limit == 262144
+            assert qwen4.stop_tokens == [99, 248046, 248044]
+    finally:
+        if previous_transformers is None:
+            del sys.modules["transformers"]
+        else:
+            sys.modules["transformers"] = previous_transformers
 
     with tempfile.TemporaryDirectory(prefix="ncnn-moe-worker-path-") as directory:
         root = Path(directory)

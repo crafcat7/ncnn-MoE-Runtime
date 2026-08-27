@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -642,10 +643,41 @@ void Mxfp4ExpertCache::wait_for_background_work()
         victim_cache_->wait_for_background_work();
 }
 
+static bool is_file_backed_bfloat16_tensor(const TensorData& tensor) noexcept
+{
+    if (tensor.dtype != DType::BFloat16
+        || tensor.shape.size() != 2
+        || !tensor.mapped_data)
+    {
+        return false;
+    }
+    const uint64_t elements = static_cast<uint64_t>(tensor.shape[0])
+                              * tensor.shape[1];
+    if (elements == 0
+        || elements > std::numeric_limits<uint64_t>::max() / sizeof(uint16_t)
+        || elements > std::numeric_limits<size_t>::max())
+    {
+        return false;
+    }
+    return tensor.mapped_byte_count == elements * sizeof(uint16_t)
+           && tensor.bfloat16_values().size() == static_cast<size_t>(elements);
+}
+
+static bool is_supported_file_backed_pair(
+    const TensorData& gate_up,
+    const TensorData& down) noexcept
+{
+    return (gate_up.mxfp4_file_storage && down.mxfp4_file_storage)
+           || (is_file_backed_bfloat16_tensor(gate_up)
+               && is_file_backed_bfloat16_tensor(down));
+}
+
 Result<uint64_t> Mxfp4ExpertCache::stored_bytes(const TensorData& tensor)
 {
+    if (is_file_backed_bfloat16_tensor(tensor))
+        return tensor.mapped_byte_count;
     if (tensor.dtype != DType::MxFp4 || !tensor.mxfp4_file_storage)
-        return Error{ErrorCode::InvalidArgument, "expert cache requires file-backed MXFP4 tensors"};
+        return Error{ErrorCode::InvalidArgument, "expert cache requires file-backed MXFP4 or BF16 tensors"};
     const MxFp4FileStorage& source = *tensor.mxfp4_file_storage;
     if (source.scales_bytes > std::numeric_limits<uint64_t>::max() - source.blocks_bytes)
         return Error{ErrorCode::InvalidModel, "file-backed MXFP4 tensor byte count overflows"};
@@ -701,6 +733,16 @@ Result<uint64_t> Mxfp4ExpertCache::packed_weight_bytes(const TensorData& tensor)
 
 std::string Mxfp4ExpertCache::make_pair_key(const TensorData& gate_up, const TensorData& down)
 {
+    if (is_file_backed_bfloat16_tensor(gate_up)
+        && is_file_backed_bfloat16_tensor(down))
+    {
+        return "bf16:"
+               + std::to_string(reinterpret_cast<uintptr_t>(gate_up.mapped_data.get()))
+               + ":" + std::to_string(gate_up.mapped_byte_count)
+               + "|"
+               + std::to_string(reinterpret_cast<uintptr_t>(down.mapped_data.get()))
+               + ":" + std::to_string(down.mapped_byte_count);
+    }
     const MxFp4FileStorage& gate = *gate_up.mxfp4_file_storage;
     const MxFp4FileStorage& projection = *down.mxfp4_file_storage;
     return gate.blocks_path + ":" + std::to_string(gate.blocks_offset)
@@ -764,8 +806,33 @@ static Result<void> copy_interleaved_mxfp4_rows(
 
 Result<std::shared_ptr<TensorData>> Mxfp4ExpertCache::load_tensor(const TensorData& source, uint64_t& mapped_ranges, uint64_t& mapped_bytes)
 {
+    if (is_file_backed_bfloat16_tensor(source))
+    {
+        auto loaded = std::make_shared<TensorData>();
+        loaded->dtype = DType::BFloat16;
+        loaded->shape = source.shape;
+        if (has_flag(flags_, ExpertCacheMemoryMapRanges))
+        {
+            loaded->mapped_data = source.mapped_data;
+            loaded->mapped_byte_count = source.mapped_byte_count;
+            // The source is a slice of a mapped Expert bank.  Give the OS the
+            // exact slice range while this cache worker is waiting for it so
+            // CPU execution can overlap page staging with other admissions.
+            prefetch_mapped_memory(
+                loaded->mapped_data.get(),
+                loaded->mapped_byte_count);
+            ++mapped_ranges;
+            mapped_bytes += source.mapped_byte_count;
+        }
+        else
+        {
+            const std::span<const uint16_t> values = source.bfloat16_values();
+            loaded->bfloat16_data.assign(values.begin(), values.end());
+        }
+        return loaded;
+    }
     if (!source.mxfp4_file_storage)
-        return Error{ErrorCode::InvalidArgument, "MXFP4 tensor is not file-backed"};
+        return Error{ErrorCode::InvalidArgument, "Expert tensor is not file-backed"};
     const MxFp4FileStorage& file = *source.mxfp4_file_storage;
     if (file.blocks_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
         || file.scales_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
@@ -977,11 +1044,24 @@ Result<ExpertVictimPair> Mxfp4ExpertCache::load_interleaved_pair(const TensorDat
 
 Result<ExpertVictimPair> Mxfp4ExpertCache::load_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_ranges, uint64_t& mapped_bytes)
 {
+    if (is_file_backed_bfloat16_tensor(gate_up)
+        && is_file_backed_bfloat16_tensor(down))
+    {
+        auto loaded_gate = load_tensor(gate_up, mapped_ranges, mapped_bytes);
+        if (!loaded_gate)
+            return loaded_gate.error();
+        auto loaded_down = load_tensor(down, mapped_ranges, mapped_bytes);
+        if (!loaded_down)
+            return loaded_down.error();
+        return ExpertVictimPair{
+            std::move(loaded_gate).value(),
+            std::move(loaded_down).value()};
+    }
     if (!gate_up.mxfp4_file_storage || !down.mxfp4_file_storage)
     {
         return Error{
             ErrorCode::InvalidArgument,
-            "MXFP4 Expert pair is not file-backed"};
+            "Expert pair does not use a supported file-backed encoding"};
     }
     const MxFp4FileStorage& gate = *gate_up.mxfp4_file_storage;
     const MxFp4FileStorage& projection = *down.mxfp4_file_storage;
@@ -1112,6 +1192,14 @@ Result<std::vector<ExpertVictimPair>> Mxfp4ExpertCache::load_coalesced_pairs(
     mapped_bytes = 0;
     if (entries.size() < 2 || has_flag(flags_, ExpertCacheMemoryMapRanges))
         return std::vector<ExpertVictimPair>();
+    for (const std::shared_ptr<Entry>& entry : entries)
+    {
+        if (is_file_backed_bfloat16_tensor(entry->gate_up_source)
+            || is_file_backed_bfloat16_tensor(entry->down_source))
+        {
+            return std::vector<ExpertVictimPair>();
+        }
+    }
 
     std::vector<Range> ranges;
     ranges.reserve(entries.size() * 6);
@@ -1615,10 +1703,13 @@ Result<std::shared_ptr<Mxfp4ExpertCache::Entry>> Mxfp4ExpertCache::enqueue_pair(
     uint32_t residency_group,
     std::string_view prepared_key,
     ExpertVictimExecutionMetadata victim_execution,
-    bool* already_ready)
+    bool* already_ready,
+    bool* temporarily_exhausted)
 {
     if (already_ready)
         *already_ready = false;
+    if (temporarily_exhausted)
+        *temporarily_exhausted = false;
     auto gate_bytes = stored_bytes(gate_up);
     if (!gate_bytes)
         return gate_bytes.error();
@@ -1654,7 +1745,7 @@ Result<std::shared_ptr<Mxfp4ExpertCache::Entry>> Mxfp4ExpertCache::enqueue_pair(
         }
         return Error{
             ErrorCode::InvalidArgument,
-            "expert cache is smaller than one resident MXFP4 expert pair"};
+            "expert cache is smaller than one resident expert pair"};
     }
 
     std::string generated_key;
@@ -1714,6 +1805,8 @@ Result<std::shared_ptr<Mxfp4ExpertCache::Entry>> Mxfp4ExpertCache::enqueue_pair(
                 ++dropped_speculative_admissions_;
                 return std::shared_ptr<Entry>();
             }
+            if (temporarily_exhausted)
+                *temporarily_exhausted = true;
             return Error{
                 ErrorCode::InvalidArgument,
                 "expert cache capacity is exhausted by active expert leases or reads"};
@@ -2141,8 +2234,8 @@ Result<bool> Mxfp4ExpertCache::try_acquire_ready_pairs(
     {
         if (!request.gate_up
             || !request.down
-            || !request.gate_up->mxfp4_file_storage
-            || !request.down->mxfp4_file_storage
+            || !is_supported_file_backed_pair(
+                *request.gate_up, *request.down)
             || request.prepared_key.empty())
         {
             return Error{
@@ -2225,29 +2318,44 @@ Result<size_t> Mxfp4ExpertCache::wait_acquire_ready_pairs(
         overflow_entries.resize(requests.size());
         ready_entries = overflow_entries.data();
     }
+    size_t enqueued_count = 0;
     for (size_t index = 0; index < requests.size(); ++index)
     {
         leases[index] = {};
         const ExpertCachePairRequest& request = requests[index];
         if (!request.gate_up
             || !request.down
-            || !request.gate_up->mxfp4_file_storage
-            || !request.down->mxfp4_file_storage
+            || !is_supported_file_backed_pair(
+                *request.gate_up, *request.down)
             || request.prepared_key.empty())
         {
             return Error{
                 ErrorCode::InvalidArgument,
                 "Expert cache ready wait requires prepared file-backed pairs"};
         }
-        auto queued = enqueue_pair(*request.gate_up, *request.down, false, request.residency_group, request.prepared_key, request.victim_execution);
+        bool temporarily_exhausted = false;
+        auto queued = enqueue_pair(
+            *request.gate_up,
+            *request.down,
+            false,
+            request.residency_group,
+            request.prepared_key,
+            request.victim_execution,
+            nullptr,
+            &temporarily_exhausted);
         if (!queued)
+        {
+            if (temporarily_exhausted && enqueued_count != 0)
+                break;
             return queued.error();
+        }
         ready_entries[index] = std::move(queued).value();
+        ++enqueued_count;
     }
 
     std::unique_lock<std::mutex> lock(mutex_);
     ready_.wait(lock, [ready_entries,
-                       request_count = requests.size(),
+                       request_count = enqueued_count,
                        wait_for_any] {
         if (!wait_for_any)
         {
@@ -2263,7 +2371,7 @@ Result<size_t> Mxfp4ExpertCache::wait_acquire_ready_pairs(
         return false;
     });
 
-    for (size_t index = 0; index < requests.size(); ++index)
+    for (size_t index = 0; index < enqueued_count; ++index)
     {
         const std::shared_ptr<Entry>& entry = ready_entries[index];
         if (entry->state == Entry::State::Failed)
@@ -2271,7 +2379,7 @@ Result<size_t> Mxfp4ExpertCache::wait_acquire_ready_pairs(
     }
 
     size_t acquired = 0;
-    for (size_t index = 0; index < requests.size(); ++index)
+    for (size_t index = 0; index < enqueued_count; ++index)
     {
         const std::shared_ptr<Entry>& entry = ready_entries[index];
         if (entry->state != Entry::State::Ready)
@@ -2297,7 +2405,7 @@ Result<size_t> Mxfp4ExpertCache::wait_acquire_ready_pairs(
 
 bool Mxfp4ExpertCache::is_ready(const TensorData& gate_up, const TensorData& down, std::string_view prepared_key) const
 {
-    if (!gate_up.mxfp4_file_storage || !down.mxfp4_file_storage)
+    if (!is_supported_file_backed_pair(gate_up, down))
         return false;
     std::string generated_key;
     if (prepared_key.empty())

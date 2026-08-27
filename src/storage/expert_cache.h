@@ -143,7 +143,8 @@ private:
         uint32_t residency_group,
         std::string_view prepared_key,
         ExpertVictimExecutionMetadata victim_execution = {},
-        bool* already_ready = nullptr);
+        bool* already_ready = nullptr,
+        bool* temporarily_exhausted = nullptr);
     [[nodiscard]] bool evict_one_locked(bool incoming_from_frequent_ghost, bool speculative_admission, uint32_t incoming_group, uint64_t required);
     void insert_resident_locked(Entry& entry, bool frequent);
     void touch_resident_locked(Entry& entry, bool repeated);
@@ -246,7 +247,8 @@ public:
         ExpertVictimExecutionMetadata victim_execution = {});
     // Acquires a ready group under one cache lock.
     [[nodiscard]] Result<bool> try_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests, std::span<ExpertCacheLease> leases);
-    // Waits for one completion and acquires all pairs ready at that point.
+    // Enqueues as many pairs as the current cache capacity permits, waits for
+    // one completion, and acquires all enqueued pairs ready at that point.
     [[nodiscard]] Result<size_t> wait_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests, std::span<ExpertCacheLease> leases, bool wait_for_any = true);
     [[nodiscard]] bool is_ready(const TensorData& gate_up, const TensorData& down, std::string_view prepared_key = {}) const;
     [[nodiscard]] static std::string make_pair_key(const TensorData& gate_up, const TensorData& down);

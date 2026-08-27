@@ -48,6 +48,11 @@ public:
     void prefault() const noexcept;
 };
 
+// Ask the platform to stage a mapped slice without synchronously touching
+// every page on the caller thread.  This is intentionally a best-effort hint:
+// the mapping remains valid and demand paging is still the fallback.
+void prefetch_mapped_memory(const void* data, size_t byte_count) noexcept;
+
 } // namespace moe
 } // namespace ncnn
 

@@ -851,6 +851,7 @@ private:
             resources.add_uint("vulkan_device_index", effective.vulkan_device_index);
         resources.add_raw("vulkan_device_indices", uint_array(effective.vulkan_device_indices));
         resources.add_uint("estimated_dense_bytes", memory_plan.estimated_dense_bytes);
+        resources.add_uint("estimated_file_backed_dense_bytes", memory_plan.estimated_file_backed_dense_bytes);
         resources.add_uint("estimated_expert_bytes", memory_plan.estimated_expert_bytes);
         resources.add_uint("expert_pair_bytes", memory_plan.expert_pair_bytes);
         resources.add_uint("expert_pair_resident_bytes", memory_plan.expert_pair_resident_bytes);

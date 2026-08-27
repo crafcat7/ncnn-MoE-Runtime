@@ -9,6 +9,7 @@
 #include "models/builtin_model_adapter.h"
 #include "models/deepseek_v4_model_adapter.h"
 #include "models/qwen3_5_moe_model_adapter.h"
+#include "models/qwen4_exp_model_adapter.h"
 #include "kernels/cpu_bfloat16.h"
 #include "kernels/cpu_mxfp4.h"
 #include "kernels/cpu_float8.h"
@@ -231,6 +232,7 @@ Runtime::Runtime()
     register_adapter(std::make_shared<BuiltinModelAdapter>());
     register_adapter(std::make_shared<DeepSeekV4ModelAdapter>());
     register_adapter(std::make_shared<Qwen3_5MoeModelAdapter>());
+    register_adapter(std::make_shared<Qwen4ExpModelAdapter>());
 }
 
 void Runtime::register_adapter(std::shared_ptr<IMoeModelAdapter> adapter)
@@ -419,7 +421,27 @@ Result<ModelPtr> Runtime::load_model(
     if (selected_cpu_packed_weight_mode == CpuPackedWeightMode::Enabled)
         effective_optimization_flags |= RuntimeOptimizationCpuPackedWeights;
     const bool file_backed_experts = has_flag(plan.flags, ModelMemoryFileBackedExperts);
-    if (file_backed_experts)
+    const bool mxfp4_file_backed_experts = file_backed_experts
+                                           && std::all_of(
+                                               parsed_ir.value().layers.begin(),
+                                               parsed_ir.value().layers.end(),
+                                               [](const LayerDescriptor& layer) {
+                                                   return !has_flag(layer.flags, LayerDescriptorMoe)
+                                                          || layer.ffn.moe.expert_weight_dtype == DType::MxFp4;
+                                               });
+    const bool vulkan_file_backed_experts = file_backed_experts
+                                            && std::all_of(
+                                                parsed_ir.value().layers.begin(),
+                                                parsed_ir.value().layers.end(),
+                                                [](const LayerDescriptor& layer) {
+                                                    if (!has_flag(layer.flags, LayerDescriptorMoe))
+                                                        return true;
+                                                    const MoeDescriptor& moe = layer.ffn.moe;
+                                                    return moe.expert_weight_dtype == DType::MxFp4
+                                                           || (moe.expert_weight_dtype == DType::BFloat16
+                                                               && has_flag(moe.flags, MoeDescriptorFileBackedExperts));
+                                                });
+    if (mxfp4_file_backed_experts)
         package.flags |= ModelPackageDeferMxfp4Experts;
 
     if (config.expert_gpu_cache_bytes > std::numeric_limits<uint64_t>::max() - config.expert_gpu_victim_cache_bytes)
@@ -433,12 +455,24 @@ Result<ModelPtr> Runtime::load_model(
     }
     const bool automatic_gpu_expert_cache = resolved_mode == HybridMode::HybridExperts
                                             && !has_flag(config.flags, RuntimeOptionDisableGpuExpertExecution)
+                                            // BF16 Expert uploads are large and
+                                            // routed prefill waves touch most
+                                            // of the 512 experts once.  Keep
+                                            // the new BF16 backend available
+                                            // for an explicit GPU-cache size,
+                                            // but do not make a cold, thrashing
+                                            // BF16 cache the hybrid default.
+                                            && mxfp4_file_backed_experts
                                             && requested_expert_gpu_bytes == 0;
     if (requested_expert_gpu_bytes != 0)
     {
         if (!file_backed_experts)
         {
             return Error{ErrorCode::InvalidArgument, "the Expert GPU cache requires on-demand Expert memory"};
+        }
+        if (!vulkan_file_backed_experts)
+        {
+            return Error{ErrorCode::UnsupportedModel, "the Expert GPU cache requires file-backed MXFP4 or BF16 Expert weights"};
         }
         if (!use_vulkan_dense || !has_flag(capabilities_.flags, RuntimeCapabilityVulkanVictimCache))
         {
@@ -494,6 +528,8 @@ Result<ModelPtr> Runtime::load_model(
     }
     if (has_flag(capabilities_.flags, RuntimeCapabilityMxfp4CpuKernel))
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityMxfp4CpuKernel;
+    if (file_backed_experts)
+        compiler_capabilities.flags |= ModelCompiler::BackendCapabilityFileBackedExperts;
     if (!file_backed_experts)
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityRetainCpuDenseCopies;
     if (release_vulkan_dense_host_storage && file_backed_experts)
@@ -695,7 +731,7 @@ Result<ModelPtr> Runtime::load_model(
                     effective_optimization_flags);
                 if (!backend)
                 {
-                    return Error{ErrorCode::UnsupportedModel, "cannot create a Vulkan MXFP4 Expert execution cache/source backend"};
+                    return Error{ErrorCode::UnsupportedModel, "cannot create a Vulkan Expert execution cache/source backend"};
                 }
                 device_backends.push_back(std::move(backend));
                 expert_device_indices.push_back(placement_device_index);
@@ -720,7 +756,7 @@ Result<ModelPtr> Runtime::load_model(
             }
             if (!compiled_model.expert_backend)
             {
-                return Error{ErrorCode::UnsupportedModel, "cannot create the Vulkan MXFP4 Expert execution cache/source backend"};
+                return Error{ErrorCode::UnsupportedModel, "cannot create the Vulkan Expert execution cache/source backend"};
             }
         }
         const size_t residency_group_count = compiled_model.graph.layer_plans.size() + compiled_model.speculative.graph.layer_plans.size();

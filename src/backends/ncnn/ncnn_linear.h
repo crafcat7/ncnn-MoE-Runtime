@@ -210,6 +210,16 @@ private:
     friend class NcnnVulkanFloat8Operator;
     friend class NcnnVulkanGatedDeltaNetOperator;
     friend class NcnnVulkanAttentionOperator;
+    friend class NcnnVulkanBfloat16ExpertOperator;
+    friend class VulkanMxfp4ExpertBackend;
+
+    [[nodiscard]] static std::shared_ptr<NcnnVulkanBfloat16Operator> create_with_allocator(
+        const TensorData& matrix,
+        const TensorData* bias,
+        uint32_t vulkan_device_index,
+        ncnn::VkAllocator* weight_allocator,
+        const NcnnVulkanContextInstancePtr& context_instance,
+        uint64_t optimization_flags);
 
     class Implementation;
 
@@ -261,6 +271,53 @@ public:
         ExpertActivation activation,
         float activation_limit,
         bool apply_router_gate,
+        ActivationBuffer& output) const;
+};
+
+// Fused Vulkan BF16 Expert chain.  The backend owns one pair of BF16
+// projections per resident Expert and can record a whole routed batch in a
+// single command submission.
+class NcnnVulkanBfloat16ExpertOperator
+{
+private:
+    friend class VulkanMxfp4ExpertBackend;
+
+    [[nodiscard]] static std::shared_ptr<NcnnVulkanBfloat16ExpertOperator> create_with_allocator(
+        const TensorData& gate_up,
+        const TensorData* gate_up_bias,
+        const TensorData& down,
+        const TensorData* down_bias,
+        float activation_limit,
+        uint32_t vulkan_device_index,
+        ncnn::VkAllocator* weight_allocator,
+        ExpertActivation activation,
+        const NcnnVulkanContextInstancePtr& context_instance,
+        uint64_t optimization_flags);
+    [[nodiscard]] static bool forward_batch(
+        std::span<const NcnnVulkanBfloat16ExpertOperator*> experts,
+        std::span<const ActivationBuffer*> inputs,
+        std::span<ActivationBuffer*> outputs);
+
+    class Implementation;
+
+    NcnnVulkanBfloat16ExpertOperator();
+    std::unique_ptr<Implementation> implementation_;
+
+public:
+    ~NcnnVulkanBfloat16ExpertOperator();
+
+    [[nodiscard]] static std::shared_ptr<NcnnVulkanBfloat16ExpertOperator> create(
+        const TensorData& gate_up,
+        const TensorData* gate_up_bias,
+        const TensorData& down,
+        const TensorData* down_bias,
+        float activation_limit,
+        uint32_t vulkan_device_index,
+        ExpertActivation activation,
+        const NcnnVulkanContextInstancePtr& context_instance,
+        uint64_t optimization_flags);
+    [[nodiscard]] bool forward(
+        const ActivationBuffer& input,
         ActivationBuffer& output) const;
 };
 

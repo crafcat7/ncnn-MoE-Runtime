@@ -73,6 +73,7 @@ struct CompiledModel
     TensorHandle hyper_head_function = invalid_tensor_handle;
     TensorHandle hyper_head_base = invalid_tensor_handle;
     TensorHandle hyper_head_scale = invalid_tensor_handle;
+    GatedResidualPlan gated_residual_head;
     SpeculativeModelPlan speculative;
     std::shared_ptr<Mxfp4ExpertCache> expert_cache;
     std::shared_ptr<IExpertExecutionBackend> expert_backend;
@@ -94,6 +95,7 @@ struct CompiledModel
 #define NCNN_MOE_BACKEND_CAP_RETAIN_CPU_DENSE_BIT 4
 #define NCNN_MOE_BACKEND_CAP_RELEASE_DENSE_BIT     5
 #define NCNN_MOE_BACKEND_CAP_VULKAN_EXPERT_BIT     6
+#define NCNN_MOE_BACKEND_CAP_FILE_EXPERT_BIT       7
 
 class ModelCompiler
 {
@@ -106,7 +108,8 @@ public:
         BackendCapabilityMxfp4CpuKernel = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_MXFP4_CPU_BIT,
         BackendCapabilityRetainCpuDenseCopies = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_RETAIN_CPU_DENSE_BIT,
         BackendCapabilityReleaseVulkanDenseHostStorage = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_RELEASE_DENSE_BIT,
-        BackendCapabilityVulkanExperts = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_VULKAN_EXPERT_BIT
+        BackendCapabilityVulkanExperts = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_VULKAN_EXPERT_BIT,
+        BackendCapabilityFileBackedExperts = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_FILE_EXPERT_BIT
     };
 
     struct BackendCapabilities

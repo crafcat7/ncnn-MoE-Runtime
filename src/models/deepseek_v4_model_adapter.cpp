@@ -232,6 +232,7 @@ Result<MoeIR> DeepSeekV4ModelAdapter::parse_model(const ModelPackage& package) c
     descriptor.activation_dtype = DType::BFloat16;
     descriptor.kv_cache_dtype = DType::BFloat16;
     descriptor.norm_epsilon = deepseek_optional_float(json, "rms_norm_eps", 1e-6f);
+    descriptor.hyper_connection_kind = HyperConnectionKind::Sinkhorn;
     descriptor.hyper_connection_multiplier = hyper_multiplier.value();
     descriptor.hyper_connection_iterations = hyper_iterations.value();
     descriptor.hyper_connection_epsilon = deepseek_optional_float(json, "hc_eps", 1e-6f);

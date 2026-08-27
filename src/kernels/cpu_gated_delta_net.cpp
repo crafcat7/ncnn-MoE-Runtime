@@ -365,13 +365,22 @@ static void execute_gated_delta_recurrence_row(
         if (vectorized_norm)
         {
             const float* head_gate = z + static_cast<size_t>(value_head) * plan.value_head_dimension;
-            float_silu_mul(
-                head_output,
-                head_gate,
-                head_output,
-                1.0f,
-                0.0f,
-                plan.value_head_dimension);
+            if (has_flag(plan.flags, AttentionBlockSigmoidGate))
+            {
+                float_sigmoid_mul(
+                    head_output, head_gate, head_output,
+                    plan.value_head_dimension);
+            }
+            else
+            {
+                float_silu_mul(
+                    head_output,
+                    head_gate,
+                    head_output,
+                    1.0f,
+                    0.0f,
+                    plan.value_head_dimension);
+            }
         }
         else
         {
@@ -400,8 +409,10 @@ static void execute_gated_delta_recurrence_row(
             {
                 head_output[value_column] *= inverse_rms
                                              * gated_delta_tensor_value(norm_weight, value_column)
-                                             * (head_gate[value_column]
-                                                * gated_delta_sigmoid(head_gate[value_column]));
+                                             * (has_flag(plan.flags, AttentionBlockSigmoidGate)
+                                                    ? gated_delta_sigmoid(head_gate[value_column])
+                                                    : head_gate[value_column]
+                                                          * gated_delta_sigmoid(head_gate[value_column]));
             }
         }
     }
@@ -495,13 +506,16 @@ Result<void> execute_gated_delta_net_into(
 
     if (!normalized_ready)
     {
-        rms_norm_batch_into(
-            hidden,
-            weights.at(plan.pre_attention_norm_weight),
-            norm_epsilon,
-            scratch.normalized,
-            plan.norm_weight_offset,
-            optimization_flags);
+        if (plan.pre_attention_norm_weight == invalid_tensor_handle)
+            scratch.normalized = hidden;
+        else
+            rms_norm_batch_into(
+                hidden,
+                weights.at(plan.pre_attention_norm_weight),
+                norm_epsilon,
+                scratch.normalized,
+                plan.norm_weight_offset,
+                optimization_flags);
         normalized_ready = true;
     }
 
@@ -595,8 +609,13 @@ Result<void> execute_gated_delta_net_into(
         record_gated_delta_cache_transaction_row(cache);
     }
     linear_batch_into(weights.at(plan.output_weight), scratch.recurrent_output, scratch.projected, optimization_flags, &operators.at_weight(plan.output_weight));
-    output = hidden;
-    add_batch_inplace(output, scratch.projected);
+    if (has_flag(plan.flags, AttentionBlockExternalResidual))
+        output = scratch.projected;
+    else
+    {
+        output = hidden;
+        add_batch_inplace(output, scratch.projected);
+    }
     cache.gated_delta_token_count += hidden.rows();
     return {};
 }

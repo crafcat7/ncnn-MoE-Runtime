@@ -418,6 +418,129 @@ static Result<uint64_t> dense_bytes(const MoeIR& ir)
                     return with_output_gate.error();
                 layer_elements = with_output_gate.value();
             }
+            if (has_flag(layer.attention.flags, AttentionDescriptorQsa))
+            {
+                const uint64_t index_columns =
+                    (static_cast<uint64_t>(attention.index_head_count) + 1)
+                    * attention.index_head_dimension;
+                auto index_projection = checked_multiply(
+                    index_columns, ir.hidden_size, "QSA index projection");
+                if (!index_projection)
+                    return index_projection.error();
+                auto index_weights = checked_add(
+                    index_projection.value(),
+                    static_cast<uint64_t>(attention.index_head_dimension) * 2,
+                    "QSA index weights");
+                if (!index_weights)
+                    return index_weights.error();
+                auto with_index = checked_add(
+                    layer_elements, index_weights.value(),
+                    "layer dense weights");
+                if (!with_index)
+                    return with_index.error();
+                layer_elements = with_index.value();
+            }
+        }
+
+        uint64_t layer_auxiliary_bytes = 0;
+        if (layer.ple.enabled())
+        {
+            if (layer.ple.ngram_size < 2 || layer.ple.heads_per_ngram == 0)
+                return Error{ErrorCode::InvalidModel, "invalid PLE dense-memory configuration"};
+            const uint64_t head_count =
+                static_cast<uint64_t>(layer.ple.ngram_size - 1)
+                * layer.ple.heads_per_ngram;
+            if (head_count == 0
+                || layer.ple.embedding_dimension != ir.hidden_size
+                || layer.ple.embedding_dimension % head_count != 0)
+            {
+                return Error{ErrorCode::InvalidModel, "invalid PLE dense-memory configuration"};
+            }
+            const uint64_t expanded_size =
+                static_cast<uint64_t>(ir.hyper_connection_multiplier)
+                * ir.hidden_size;
+            auto key_projection = checked_multiply(
+                expanded_size, ir.hidden_size, "PLE key projection");
+            if (!key_projection)
+                return key_projection.error();
+            auto value_projection = checked_multiply(
+                ir.hidden_size, ir.hidden_size, "PLE value projection");
+            if (!value_projection)
+                return value_projection.error();
+            auto ple_elements = checked_add(
+                key_projection.value(), value_projection.value(),
+                "PLE projections");
+            if (!ple_elements)
+                return ple_elements.error();
+            auto norm_and_convolution = checked_multiply(
+                expanded_size,
+                3ull + layer.ple.convolution_kernel_size,
+                "PLE norms and convolution");
+            if (!norm_and_convolution)
+                return norm_and_convolution.error();
+            ple_elements = checked_add(
+                ple_elements.value(), norm_and_convolution.value(),
+                "PLE dense weights");
+            if (!ple_elements)
+                return ple_elements.error();
+            auto with_ple = checked_add(
+                layer_elements, ple_elements.value(),
+                "layer dense weights");
+            if (!with_ple)
+                return with_ple.error();
+            layer_elements = with_ple.value();
+            auto head_metadata_count = checked_multiply(
+                head_count, 2, "PLE metadata");
+            if (!head_metadata_count)
+                return head_metadata_count.error();
+            auto metadata_count = checked_add(
+                layer.ple.ngram_size, head_metadata_count.value(),
+                "PLE metadata");
+            if (!metadata_count)
+                return metadata_count.error();
+            auto metadata_bytes = checked_multiply(
+                metadata_count.value(), sizeof(int64_t),
+                "PLE metadata");
+            if (!metadata_bytes)
+                return metadata_bytes.error();
+            layer_auxiliary_bytes = metadata_bytes.value();
+        }
+
+        if (ir.hyper_connection_kind == HyperConnectionKind::GatedResidual)
+        {
+            const uint64_t expanded_size =
+                static_cast<uint64_t>(ir.hyper_connection_multiplier)
+                * ir.hidden_size;
+            auto projections = checked_multiply(
+                expanded_size, ir.hyper_connection_low_rank * 2ull,
+                "gated-residual projections");
+            if (!projections)
+                return projections.error();
+            auto block_elements = checked_add(
+                expanded_size, projections.value(),
+                "gated-residual block");
+            if (!block_elements)
+                return block_elements.error();
+            auto injection = checked_multiply(
+                ir.hyper_connection_multiplier, expanded_size,
+                "gated-residual injection");
+            if (!injection)
+                return injection.error();
+            block_elements = checked_add(
+                block_elements.value(), injection.value(),
+                "gated-residual block");
+            if (!block_elements)
+                return block_elements.error();
+            auto layer_gated_residual = checked_multiply(
+                block_elements.value(), 2, "gated-residual layer");
+            if (!layer_gated_residual)
+                return layer_gated_residual.error();
+            auto with_gated_residual = checked_add(
+                layer_elements, layer_gated_residual.value(),
+                "layer dense weights");
+            if (!with_gated_residual)
+                return with_gated_residual.error();
+            layer_elements = with_gated_residual.value();
         }
 
         if (has_flag(layer.flags, LayerDescriptorMoe))
@@ -480,6 +603,11 @@ static Result<uint64_t> dense_bytes(const MoeIR& ir)
         if (!layer_bytes)
             return layer_bytes.error();
         auto with_layer = checked_add(total, layer_bytes.value(), "dense weights");
+        if (!with_layer)
+            return with_layer.error();
+        with_layer = checked_add(
+            with_layer.value(), layer_auxiliary_bytes,
+            "dense weights");
         if (!with_layer)
             return with_layer.error();
         total = with_layer.value();
@@ -559,10 +687,73 @@ static Result<uint64_t> dense_bytes(const MoeIR& ir)
         total = with_mtp.value();
     }
 
-    auto final_norm = checked_multiply(ir.hidden_size, element_bytes, "final norm");
+    if (ir.hyper_connection_kind == HyperConnectionKind::GatedResidual)
+    {
+        const uint64_t expanded_size =
+            static_cast<uint64_t>(ir.hyper_connection_multiplier)
+            * ir.hidden_size;
+        auto head_projections = checked_multiply(
+            expanded_size, ir.hyper_connection_low_rank * 2ull,
+            "gated-residual head projections");
+        if (!head_projections)
+            return head_projections.error();
+        auto head_elements = checked_add(
+            expanded_size, head_projections.value(),
+            "gated-residual head");
+        if (!head_elements)
+            return head_elements.error();
+        auto head_bytes = checked_multiply(
+            head_elements.value(), element_bytes,
+            "gated-residual head");
+        if (!head_bytes)
+            return head_bytes.error();
+        auto with_head = checked_add(total, head_bytes.value(), "dense weights");
+        if (!with_head)
+            return with_head.error();
+        total = with_head.value();
+    }
+
+    const uint64_t final_norm_elements = ir.final_norm == NormType::None
+                                             ? 0
+                                             : ir.hidden_size;
+    auto final_norm = checked_multiply(
+        final_norm_elements, element_bytes, "final norm");
     if (!final_norm)
         return final_norm.error();
     return checked_add(total, final_norm.value(), "dense weights");
+}
+
+static Result<uint64_t> file_backed_ple_bytes(const MoeIR& ir)
+{
+    uint64_t total = 0;
+    for (const LayerDescriptor& layer : ir.layers)
+    {
+        if (!layer.ple.enabled())
+            continue;
+        if (layer.ple.ngram_size < 2 || layer.ple.heads_per_ngram == 0)
+            return Error{ErrorCode::InvalidModel, "invalid file-backed PLE configuration"};
+        const uint64_t head_count =
+            static_cast<uint64_t>(layer.ple.ngram_size - 1)
+            * layer.ple.heads_per_ngram;
+        if (head_count == 0
+            || layer.ple.embedding_dimension % head_count != 0
+            || layer.ple.embedding_row_count == 0)
+        {
+            return Error{ErrorCode::InvalidModel, "invalid file-backed PLE configuration"};
+        }
+        auto bytes = matrix_storage_bytes(
+            layer.ple.embedding_row_count,
+            layer.ple.embedding_dimension / head_count,
+            ir.activation_dtype,
+            "file-backed PLE embedding");
+        if (!bytes)
+            return bytes.error();
+        auto added = checked_add(total, bytes.value(), "file-backed PLE embedding");
+        if (!added)
+            return added.error();
+        total = added.value();
+    }
+    return total;
 }
 
 static Result<uint64_t> mxfp4_pair_bytes(const MoeIR& ir)
@@ -702,6 +893,12 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
     if (!estimated_dense)
         return estimated_dense.error();
     plan.estimated_dense_bytes = estimated_dense.value();
+    auto estimated_file_backed_dense = file_backed_ple_bytes(ir);
+    if (!estimated_file_backed_dense)
+        return estimated_file_backed_dense.error();
+    plan.estimated_file_backed_dense_bytes = estimated_file_backed_dense.value();
+    if (plan.estimated_file_backed_dense_bytes != 0)
+        plan.flags |= ModelMemoryFileBackedPle;
 
     if (ir.layers.empty())
         return Error{ErrorCode::InvalidModel, "memory planner requires at least one layer"};
@@ -769,12 +966,17 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
     {
         eager_capacity = plan.host_memory_budget_bytes - plan.estimated_dense_bytes - safety_reserve;
     }
-    if (moe.expert_weight_dtype != DType::MxFp4)
+    const auto supports_file_backed_experts = [](const MoeDescriptor& descriptor) {
+        return descriptor.expert_weight_dtype == DType::MxFp4
+               || (descriptor.expert_weight_dtype == DType::BFloat16
+                   && has_flag(descriptor.flags, MoeDescriptorFileBackedExperts));
+    };
+    if (!supports_file_backed_experts(moe))
     {
         plan.selected_mode = ExpertMemoryMode::Eager;
         if (config.expert_memory_mode == ExpertMemoryMode::OnDemand || config.expert_cache_bytes != 0)
         {
-            return Error{ErrorCode::UnsupportedModel, "on-demand expert storage currently requires MXFP4 experts"};
+            return Error{ErrorCode::UnsupportedModel, "on-demand expert storage requires an explicitly file-backed Expert encoding"};
         }
         if (reserve_cpu_packed_weights
             && plan.estimated_expert_resident_bytes > eager_capacity)
@@ -813,7 +1015,8 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
     bool file_backed_expert_encoding = true;
     for (const LayerDescriptor& layer : ir.layers)
     {
-        if (has_flag(layer.flags, LayerDescriptorMoe) && layer.ffn.moe.expert_weight_dtype != DType::MxFp4)
+        if (has_flag(layer.flags, LayerDescriptorMoe)
+            && !supports_file_backed_experts(layer.ffn.moe))
         {
             file_backed_expert_encoding = false;
             break;
