@@ -645,6 +645,59 @@ private:
         pipelines_;
 };
 
+// Weight admissions are produced by one background worker, but each Expert
+// used to create and wait for a separate transfer command.  Keep one transfer
+// command and its staging allocators alive for a bounded group of MXFP4
+// Experts so the device sees one submission for the whole group.  The caller
+// owns the context command lock while the batch is recording; this keeps
+// ncnn's allocators and command domain serialized with foreground execution.
+class NcnnVulkanWeightUploadBatch
+{
+public:
+    explicit NcnnVulkanWeightUploadBatch(const std::shared_ptr<NcnnVulkanContext>& context)
+        : context_(context),
+          command_(context ? context->device() : nullptr),
+          command_lock_(context ? std::unique_lock<std::mutex>(context->command_mutex()) : std::unique_lock<std::mutex>())
+    {
+    }
+
+    NcnnVulkanWeightUploadBatch(const NcnnVulkanWeightUploadBatch&) = delete;
+    NcnnVulkanWeightUploadBatch& operator=(const NcnnVulkanWeightUploadBatch&) = delete;
+
+    [[nodiscard]] bool record(
+        const ncnn::Mat& source,
+        ncnn::VkMat& destination,
+        const ncnn::Option& option,
+        ncnn::VkAllocator* weight_allocator)
+    {
+        if (!context_ || !weight_allocator || source.empty())
+            return false;
+        auto staging_allocator = std::make_unique<ncnn::VkWeightStagingAllocator>(context_->device());
+        if (!staging_allocator)
+            return false;
+        ncnn::Option upload_option = option;
+        upload_option.blob_vkallocator = weight_allocator;
+        upload_option.workspace_vkallocator = weight_allocator;
+        upload_option.staging_vkallocator = staging_allocator.get();
+        command_.record_upload(source, destination, upload_option);
+        if (destination.empty())
+            return false;
+        staging_allocators_.push_back(std::move(staging_allocator));
+        return true;
+    }
+
+    [[nodiscard]] bool submit()
+    {
+        return context_ && command_.submit_and_wait() == 0;
+    }
+
+private:
+    std::shared_ptr<NcnnVulkanContext> context_;
+    std::vector<std::unique_ptr<ncnn::VkWeightStagingAllocator>> staging_allocators_;
+    ncnn::VkTransfer command_;
+    std::unique_lock<std::mutex> command_lock_;
+};
+
 class VulkanExpertVictimCache final : public IExpertVictimCache
 {
 public:
@@ -4801,6 +4854,7 @@ public:
     uint32_t value_head_dimension = 0;
     uint32_t convolution_kernel_size = 0;
     float norm_epsilon = 0.0f;
+    bool sigmoid_gate = false;
     uint64_t optimization_flags = RuntimeOptimizationDefaultFlags;
 #endif
 };
@@ -5482,6 +5536,7 @@ NcnnVulkanGatedDeltaNetOperator::create(
     uint32_t value_head_dimension,
     uint32_t convolution_kernel_size,
     float norm_epsilon,
+    bool sigmoid_gate,
     uint32_t vulkan_device_index,
     const NcnnVulkanContextInstancePtr& context_instance,
     uint64_t optimization_flags)
@@ -5543,6 +5598,7 @@ NcnnVulkanGatedDeltaNetOperator::create(
     implementation.value_head_dimension = value_head_dimension;
     implementation.convolution_kernel_size = convolution_kernel_size;
     implementation.norm_epsilon = norm_epsilon;
+    implementation.sigmoid_gate = sigmoid_gate;
     {
         const std::lock_guard<std::mutex> lock(
             implementation.vulkan_context->command_mutex());
@@ -5612,6 +5668,7 @@ NcnnVulkanGatedDeltaNetOperator::create(
     (void)value_head_dimension;
     (void)convolution_kernel_size;
     (void)norm_epsilon;
+    (void)sigmoid_gate;
     (void)vulkan_device_index;
     (void)context_instance;
     (void)optimization_flags;
@@ -5838,7 +5895,7 @@ bool NcnnVulkanGatedDeltaNetOperator::forward_impl(
         implementation.decay_log,
         implementation.norm_weight,
         recurrent_output_gpu};
-    std::vector<ncnn::vk_constant_type> delta_constants(10);
+    std::vector<ncnn::vk_constant_type> delta_constants(11);
     delta_constants[0].u32 = implementation.convolution_size;
     delta_constants[1].u32 = implementation.value_size;
     delta_constants[2].u32 = implementation.fused_columns;
@@ -5849,6 +5906,7 @@ bool NcnnVulkanGatedDeltaNetOperator::forward_impl(
     delta_constants[7].u32 = implementation.convolution_kernel_size;
     delta_constants[8].u32 = static_cast<uint32_t>(input.rows());
     delta_constants[9].f = implementation.norm_epsilon;
+    delta_constants[10].u32 = implementation.sigmoid_gate ? 1u : 0u;
     ncnn::VkMat delta_dispatcher;
     delta_dispatcher.w = 128;
     delta_dispatcher.h = 1;
@@ -8057,7 +8115,8 @@ std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create(const T
 std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create_with_allocator(const TensorData& matrix, const TensorData* bias,
                                                                                         uint32_t vulkan_device_index, ncnn::VkAllocator* weight_allocator,
                                                                                         const NcnnVulkanContextInstancePtr& context_instance,
-                                                                                        uint64_t optimization_flags)
+                                                                                        uint64_t optimization_flags,
+                                                                                        NcnnVulkanWeightUploadBatch* upload_batch)
 {
 #if NCNN_MOE_WITH_VULKAN
     if (matrix.dtype != DType::MxFp4 || matrix.shape.size() != 2 || matrix.shape[0] == 0 || matrix.shape[1] == 0 || matrix.shape[1] % 32 != 0
@@ -8114,7 +8173,8 @@ std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create_with_al
         implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(device, static_cast<size_t>(preferred_weight_bytes)));
         weight_allocator = implementation.weight_allocator.get();
     }
-    implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(device));
+    if (!upload_batch)
+        implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(device));
 
     ncnn::Mat packed;
     ncnn::Mat scales;
@@ -8188,6 +8248,12 @@ std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create_with_al
     std::memcpy(static_cast<std::byte*>(combined.data) + scales_offset, scales.data, scales_bytes);
     std::memcpy(static_cast<std::byte*>(combined.data) + bias_offset, biases.data, bias_bytes);
 
+    if (upload_batch)
+    {
+        if (!create_mxfp4_projection_pipeline(implementation.vulkan_context, implementation.option, implementation.pipeline))
+            return {};
+    }
+    else
     {
         const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
         if (!create_mxfp4_projection_pipeline(implementation.vulkan_context, implementation.option, implementation.pipeline))
@@ -8198,9 +8264,14 @@ std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create_with_al
     ncnn::Option upload_option = implementation.option;
     upload_option.blob_vkallocator = weight_allocator;
     upload_option.workspace_vkallocator = weight_allocator;
-    upload_option.staging_vkallocator = implementation.weight_staging_allocator.get();
     bool uploaded = false;
+    if (upload_batch)
     {
+        uploaded = upload_batch->record(combined, implementation.storage, implementation.option, weight_allocator);
+    }
+    else
+    {
+        upload_option.staging_vkallocator = implementation.weight_staging_allocator.get();
         // Executable-cache admission runs on a background thread. Serialize
         // weight uploads with foreground compute and other context users;
         // ncnn's transfer command and Vulkan allocators are not an independent
@@ -8211,7 +8282,10 @@ std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create_with_al
         command.record_upload(combined, implementation.storage, upload_option);
         uploaded = !implementation.storage.empty() && command.submit_and_wait() == 0;
     }
-    implementation.weight_staging_allocator.reset();
+    if (!upload_batch)
+    {
+        implementation.weight_staging_allocator.reset();
+    }
     if (!uploaded)
     {
         return {};
@@ -8248,6 +8322,7 @@ std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create_with_al
     (void)weight_allocator;
     (void)context_instance;
     (void)optimization_flags;
+    (void)upload_batch;
     return {};
 #endif
 }
@@ -9696,7 +9771,8 @@ std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> NcnnVulkanMxfp4ExpertOperator::cr
                                                                                                     ncnn::VkAllocator* weight_allocator,
                                                                                                     ExpertActivation activation,
                                                                                                     const NcnnVulkanContextInstancePtr& context_instance,
-                                                                                                    uint64_t optimization_flags)
+                                                                                                     uint64_t optimization_flags,
+                                                                                                     NcnnVulkanWeightUploadBatch* upload_batch)
 {
 #if NCNN_MOE_WITH_VULKAN
     if (gate_up.shape.size() != 2 || gate_up.shape[0] % 2 != 0 || down.shape.size() != 2 || down.shape[1] != gate_up.shape[0] / 2 || activation_limit < 0.0f)
@@ -9710,14 +9786,16 @@ std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> NcnnVulkanMxfp4ExpertOperator::cr
         vulkan_device_index,
         weight_allocator,
         context_instance,
-        optimization_flags);
+        optimization_flags,
+        upload_batch);
     std::shared_ptr<NcnnVulkanMxfp4Operator> down_projection = NcnnVulkanMxfp4Operator::create_with_allocator(
         down,
         down_bias,
         vulkan_device_index,
         weight_allocator,
         context_instance,
-        optimization_flags);
+        optimization_flags,
+        upload_batch);
     if (!gate_up_projection || !down_projection)
         return {};
     if (gate_up_projection->implementation_->vulkan_context != down_projection->implementation_->vulkan_context)
@@ -9733,10 +9811,18 @@ std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> NcnnVulkanMxfp4ExpertOperator::cr
     implementation.activation = activation;
     implementation.optimization_flags = optimization_flags;
     NcnnVulkanMxfp4Operator::Implementation& gate_implementation = *implementation.gate_up->implementation_;
-    const std::lock_guard<std::mutex> lock(gate_implementation.vulkan_context->command_mutex());
-    if (!create_mxfp4_gate_up_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.gate_up_pipeline))
+    if (upload_batch)
     {
-        return {};
+        if (!create_mxfp4_gate_up_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.gate_up_pipeline))
+            return {};
+    }
+    else
+    {
+        const std::lock_guard<std::mutex> lock(gate_implementation.vulkan_context->command_mutex());
+        if (!create_mxfp4_gate_up_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.gate_up_pipeline))
+        {
+            return {};
+        }
     }
     return result;
 #else
@@ -9750,6 +9836,7 @@ std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> NcnnVulkanMxfp4ExpertOperator::cr
     (void)activation;
     (void)context_instance;
     (void)optimization_flags;
+    (void)upload_batch;
     return {};
 #endif
 }
@@ -10296,8 +10383,9 @@ public:
                 auto existing = entries_.find(request.key);
                 if (existing == entries_.end())
                 {
+                    constexpr size_t admission_min_rows = 1;
                     const bool source_allowed = request.weight_bytes == 0
-                                                || request.input->rows() >= vulkan_expert_gpu_admission_min_rows;
+                                                || request.input->rows() >= admission_min_rows;
                     std::optional<VulkanExpertVictimCache::DeviceOperationLease> device_lease;
                     const std::shared_ptr<VulkanExpertVictimCache> device_weight_source = device_weight_source_;
                     if (device_weight_source && source_allowed)
@@ -10348,43 +10436,11 @@ public:
                 });
             }
 
-            size_t selected_count = 0;
-            bool direct_resident_execution = foreground_depth_ == 0 && !candidates.empty();
-            if (direct_resident_execution)
-            {
-                for (const ExpertBackendRequest& request : requests)
-                {
-                    if (request.weight_bytes != 0)
-                    {
-                        direct_resident_execution = false;
-                        break;
-                    }
-                }
-            }
-            if (direct_resident_execution)
-            {
-                // The weight-less backend API is an explicit resident
-                // operation used by backend clients and validation. It must
-                // execute every explicitly requested resident Expert.
-                selected_count = candidates.size();
-            }
-            else if (runtime_optimization_enabled(
-                         optimization_flags_,
-                         RuntimeOptimizationVulkanExpertGpuPriority))
-            {
-                // Use Vulkan only for resident Experts that amortize transfer.
-                const auto gpu_end = std::stable_partition(
-                    candidates.begin(),
-                    candidates.end(),
-                    [&requests](const Selection& selection) {
-                        const ExpertBackendRequest& request = requests[selection.request_index];
-                        return request.input
-                               && request.input->rows()
-                                      >= vulkan_expert_gpu_min_rows;
-                    });
-                selected_count = static_cast<size_t>(
-                    std::distance(candidates.begin(), gpu_end));
-            }
+            // This backend is created only for mixed Vulkan execution. Once
+            // a resident Expert is available, execute it on the device even
+            // for a single-token wave; the caller keeps CPU fallback for
+            // non-resident or failed requests.
+            const size_t selected_count = candidates.size();
 
             for (size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index)
             {
@@ -11087,13 +11143,14 @@ private:
                 transfer_slot.expert_slots,
                 transfer_slot.staging_allocator,
                 runtime_state)
-            || !fill_staging_values(
-                expert_row_offsets.data(),
-                expert_row_offsets.size(),
-                sizeof(uint32_t),
-                transfer_slot.expert_row_offsets,
-                transfer_slot.staging_allocator,
-                runtime_state))
+            || (use_tiled_indexed
+                && !fill_staging_values(
+                    expert_row_offsets.data(),
+                    expert_row_offsets.size(),
+                    sizeof(uint32_t),
+                    transfer_slot.expert_row_offsets,
+                    transfer_slot.staging_allocator,
+                    runtime_state)))
         {
             return IndexedBatchResult::Failed;
         }
@@ -11159,7 +11216,8 @@ private:
             return IndexedBatchResult::Failed;
         }
         ncnn::VkMat expert_row_offsets_gpu;
-        if (!record_mapped_upload(
+        if (use_tiled_indexed
+            && !record_mapped_upload(
                 transfer_slot.expert_row_offsets,
                 expert_row_offsets_gpu,
                 command,
@@ -12076,6 +12134,7 @@ private:
 
     void worker_loop()
     {
+        static constexpr size_t maximum_upload_batch = 8;
         while (true)
         {
             std::vector<std::shared_ptr<Entry>> retired;
@@ -12084,7 +12143,7 @@ private:
                 retired.swap(retired_entries_);
             }
             retired.clear();
-            PendingAdmission admission;
+            std::vector<PendingAdmission> admissions;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 work_available_.wait(lock, [this] {
@@ -12093,125 +12152,161 @@ private:
                 });
                 if (stopping_)
                     return;
-                admission = std::move(pending_.front());
+                admissions.push_back(std::move(pending_.front()));
                 pending_.pop_front();
                 ++active_admissions_;
+                if (runtime_optimization_enabled(
+                        optimization_flags_,
+                        RuntimeOptimizationVulkanExpertBatchAdmission)
+                    && admissions.front().gate_up
+                    && admissions.front().gate_up->dtype == DType::MxFp4)
+                {
+                    // Keep the batch homogeneous.  MXFP4 admissions can
+                    // share one VkTransfer command; BF16 and QnK creation
+                    // paths still use their existing upload implementation.
+                    while (admissions.size() < maximum_upload_batch
+                           && !pending_.empty()
+                           && pending_.front().gate_up
+                           && pending_.front().gate_up->dtype == DType::MxFp4)
+                    {
+                        admissions.push_back(std::move(pending_.front()));
+                        pending_.pop_front();
+                        ++active_admissions_;
+                    }
+                }
             }
 
-            std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> operation;
-            std::shared_ptr<NcnnVulkanQnkExpertOperator> qnk_operation;
-            std::shared_ptr<NcnnVulkanBfloat16ExpertOperator> bfloat16_operation;
-            if (admission.gate_up->dtype == DType::MxFp4)
+            std::vector<std::shared_ptr<Entry>> entries(admissions.size());
             {
-                operation = NcnnVulkanMxfp4ExpertOperator::create_with_allocator(
-                    *admission.gate_up,
-                    admission.gate_up_bias.get(),
-                    *admission.down,
-                    admission.down_bias.get(),
-                    admission.activation_limit,
-                    vulkan_device_index_,
-                    expert_weight_allocator_.get(),
-                    admission.activation,
-                    context_instance_,
-                    optimization_flags_);
-            }
-            else if (admission.gate_up->dtype == DType::BFloat16)
-            {
-                bfloat16_operation = NcnnVulkanBfloat16ExpertOperator::create_with_allocator(
-                    *admission.gate_up,
-                    admission.gate_up_bias.get(),
-                    *admission.down,
-                    admission.down_bias.get(),
-                    admission.activation_limit,
-                    vulkan_device_index_,
-                    expert_weight_allocator_.get(),
-                    admission.activation,
-                    context_instance_,
-                    optimization_flags_);
-            }
-            else
-            {
-                qnk_operation = NcnnVulkanQnkExpertOperator::create_with_allocator(
-                    *admission.gate_up,
-                    admission.gate_up_bias.get(),
-                    *admission.down,
-                    admission.down_bias.get(),
-                    admission.activation_limit,
-                    vulkan_device_index_,
-                    expert_weight_allocator_.get(),
-                    admission.activation,
-                    context_instance_,
-                    optimization_flags_);
-            }
-            std::shared_ptr<Entry> entry;
-            if (operation || qnk_operation || bfloat16_operation)
-            {
-                entry = std::make_shared<Entry>();
-                entry->key = admission.key;
-                entry->operation = std::move(operation);
-                entry->qnk_operation = std::move(qnk_operation);
-                entry->bfloat16_operation = std::move(bfloat16_operation);
-                entry->bytes = admission.bytes;
-                entry->residency_group = admission.residency_group;
+                std::optional<NcnnVulkanWeightUploadBatch> upload_batch;
+                if (admissions.size() > 1)
+                    upload_batch.emplace(vulkan_context_);
+                for (size_t admission_index = 0; admission_index < admissions.size(); ++admission_index)
+                {
+                    const PendingAdmission& admission = admissions[admission_index];
+                    std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> operation;
+                    std::shared_ptr<NcnnVulkanQnkExpertOperator> qnk_operation;
+                    std::shared_ptr<NcnnVulkanBfloat16ExpertOperator> bfloat16_operation;
+                    if (admission.gate_up->dtype == DType::MxFp4)
+                    {
+                        operation = NcnnVulkanMxfp4ExpertOperator::create_with_allocator(
+                            *admission.gate_up,
+                            admission.gate_up_bias.get(),
+                            *admission.down,
+                            admission.down_bias.get(),
+                            admission.activation_limit,
+                            vulkan_device_index_,
+                            expert_weight_allocator_.get(),
+                            admission.activation,
+                            context_instance_,
+                            optimization_flags_,
+                            upload_batch ? &*upload_batch : nullptr);
+                    }
+                    else if (admission.gate_up->dtype == DType::BFloat16)
+                    {
+                        bfloat16_operation = NcnnVulkanBfloat16ExpertOperator::create_with_allocator(
+                            *admission.gate_up,
+                            admission.gate_up_bias.get(),
+                            *admission.down,
+                            admission.down_bias.get(),
+                            admission.activation_limit,
+                            vulkan_device_index_,
+                            expert_weight_allocator_.get(),
+                            admission.activation,
+                            context_instance_,
+                            optimization_flags_);
+                    }
+                    else
+                    {
+                        qnk_operation = NcnnVulkanQnkExpertOperator::create_with_allocator(
+                            *admission.gate_up,
+                            admission.gate_up_bias.get(),
+                            *admission.down,
+                            admission.down_bias.get(),
+                            admission.activation_limit,
+                            vulkan_device_index_,
+                            expert_weight_allocator_.get(),
+                            admission.activation,
+                            context_instance_,
+                            optimization_flags_);
+                    }
+                    if (operation || qnk_operation || bfloat16_operation)
+                    {
+                        entries[admission_index] = std::make_shared<Entry>();
+                        entries[admission_index]->key = admission.key;
+                        entries[admission_index]->operation = std::move(operation);
+                        entries[admission_index]->qnk_operation = std::move(qnk_operation);
+                        entries[admission_index]->bfloat16_operation = std::move(bfloat16_operation);
+                        entries[admission_index]->bytes = admission.bytes;
+                        entries[admission_index]->residency_group = admission.residency_group;
+                    }
+                }
+                if (upload_batch && !upload_batch->submit())
+                    std::fill(entries.begin(), entries.end(), std::shared_ptr<Entry>());
             }
 
             const std::lock_guard<std::mutex> lock(mutex_);
-            pending_bytes_ -= admission.bytes;
-            pending_keys_.erase(admission.key);
-            if (stopping_)
+            for (size_t admission_index = 0; admission_index < admissions.size(); ++admission_index)
             {
-                finish_admission_locked();
-                return;
-            }
-            if (!entry || entries_.find(entry->key) != entries_.end())
-            {
-                if (!entry)
-                    ++dropped_admissions_;
-                finish_admission_locked();
-                continue;
-            }
-            bool frequent = false;
-            bool from_frequent = false;
-            (void)consume_ghost_locked(entry->key, entry->bytes, frequent, from_frequent);
-            while (resident_bytes_ > capacity_bytes_ - entry->bytes)
-            {
-                if (!evict_one_locked(from_frequent, entry->residency_group, entry->bytes))
+                const PendingAdmission& admission = admissions[admission_index];
+                pending_bytes_ -= admission.bytes;
+                pending_keys_.erase(admission.key);
+                std::shared_ptr<Entry>& entry = entries[admission_index];
+                if (stopping_)
                 {
-                    ++dropped_admissions_;
-                    entry.reset();
-                    break;
+                    finish_admission_locked();
+                    continue;
                 }
-            }
-            if (!entry)
-            {
+                if (!entry || entries_.find(entry->key) != entries_.end())
+                {
+                    if (!entry)
+                        ++dropped_admissions_;
+                    finish_admission_locked();
+                    continue;
+                }
+                bool frequent = false;
+                bool from_frequent = false;
+                (void)consume_ghost_locked(entry->key, entry->bytes, frequent, from_frequent);
+                while (resident_bytes_ > capacity_bytes_ - entry->bytes)
+                {
+                    if (!evict_one_locked(from_frequent, entry->residency_group, entry->bytes))
+                    {
+                        ++dropped_admissions_;
+                        entry.reset();
+                        break;
+                    }
+                }
+                if (!entry)
+                {
+                    finish_admission_locked();
+                    continue;
+                }
+                if (frequent)
+                {
+                    frequent_.push_back(entry->key);
+                    entry->position = std::prev(frequent_.end());
+                    entry->list = ArcList::Frequent;
+                    frequent_bytes_ += entry->bytes;
+                }
+                else
+                {
+                    recent_.push_back(entry->key);
+                    entry->position = std::prev(recent_.end());
+                    entry->list = ArcList::Recent;
+                    recent_bytes_ += entry->bytes;
+                }
+                resident_bytes_ += entry->bytes;
+                if (entry->residency_group >= residency_group_bytes_.size())
+                {
+                    residency_group_bytes_.resize(static_cast<size_t>(entry->residency_group) + 1, 0);
+                }
+                residency_group_bytes_[entry->residency_group] += entry->bytes;
+                bytes_uploaded_ += entry->bytes;
+                const std::string entry_key = entry->key;
+                entries_.emplace(entry_key, std::move(entry));
+                ++stores_;
                 finish_admission_locked();
-                continue;
             }
-            if (frequent)
-            {
-                frequent_.push_back(entry->key);
-                entry->position = std::prev(frequent_.end());
-                entry->list = ArcList::Frequent;
-                frequent_bytes_ += entry->bytes;
-            }
-            else
-            {
-                recent_.push_back(entry->key);
-                entry->position = std::prev(recent_.end());
-                entry->list = ArcList::Recent;
-                recent_bytes_ += entry->bytes;
-            }
-            resident_bytes_ += entry->bytes;
-            if (entry->residency_group >= residency_group_bytes_.size())
-            {
-                residency_group_bytes_.resize(static_cast<size_t>(entry->residency_group) + 1, 0);
-            }
-            residency_group_bytes_[entry->residency_group] += entry->bytes;
-            bytes_uploaded_ += entry->bytes;
-            const std::string entry_key = entry->key;
-            entries_.emplace(entry_key, std::move(entry));
-            ++stores_;
-            finish_admission_locked();
         }
     }
 

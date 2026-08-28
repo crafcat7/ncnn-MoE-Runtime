@@ -200,14 +200,31 @@ static void execute_gated_delta_recurrence_row(
         }
     }
 
+    const uint32_t head_team_size = vectorized
+                                        ? std::min(
+                                              plan.head_count,
+                                              cpu_linear_thread_limit())
+                                        : 1;
+    const bool parallelize_value_heads = head_team_size > 1;
     if (vectorized)
     {
-        memory.resize(plan.value_head_dimension);
-        delta.resize(plan.value_head_dimension);
+        const size_t scratch_head_count = head_team_size > 1
+                                              ? plan.head_count
+                                              : 1;
+        memory.resize(
+            static_cast<size_t>(scratch_head_count)
+            * plan.value_head_dimension);
+        delta.resize(
+            static_cast<size_t>(scratch_head_count)
+            * plan.value_head_dimension);
     }
 
-    for (uint32_t value_head = 0; value_head < plan.head_count; ++value_head)
+#pragma omp parallel for schedule(static) num_threads(head_team_size) if (parallelize_value_heads)
+    for (int64_t value_head_index = 0;
+         value_head_index < static_cast<int64_t>(plan.head_count);
+         ++value_head_index)
     {
+        const uint32_t value_head = static_cast<uint32_t>(value_head_index);
         const uint32_t key_head = value_head / head_ratio;
         const float* query = qkv + static_cast<size_t>(key_head) * plan.head_dimension;
         const float* key = qkv + key_size
@@ -228,13 +245,32 @@ static void execute_gated_delta_recurrence_row(
         float* head_output = recurrent_output
                              + static_cast<size_t>(value_head)
                                    * plan.value_head_dimension;
+        float* memory_values = vectorized
+                                   ? memory.data()
+                                         + static_cast<size_t>(
+                                               parallelize_value_heads
+                                                   ? value_head
+                                                   : 0)
+                                               * plan.value_head_dimension
+                                   : nullptr;
+        float* delta_values = vectorized
+                                  ? delta.data()
+                                        + static_cast<size_t>(
+                                              parallelize_value_heads
+                                                  ? value_head
+                                                  : 0)
+                                              * plan.value_head_dimension
+                                  : nullptr;
         if (vectorized)
         {
             // Keep the state in its public [key][value] layout, but traverse it
             // row-wise.  Decay and the first matrix-vector product share one
             // load/store pass: the state is updated in place and the decayed
             // row is accumulated into memory before moving to the next key.
-            std::fill(memory.begin(), memory.end(), 0.0f);
+            std::fill(
+                memory_values,
+                memory_values + plan.value_head_dimension,
+                0.0f);
             for (uint32_t key_column = 0;
                  key_column < plan.head_dimension;
                  ++key_column)
@@ -244,7 +280,7 @@ static void execute_gated_delta_recurrence_row(
                         + static_cast<size_t>(key_column)
                               * plan.value_head_dimension,
                     decay,
-                    memory.data(),
+                    memory_values,
                     key[key_column],
                     plan.value_head_dimension);
             }
@@ -252,19 +288,7 @@ static void execute_gated_delta_recurrence_row(
                  value_column < plan.value_head_dimension;
                  ++value_column)
             {
-                delta[value_column] = (value[value_column] - memory[value_column]) * beta;
-            }
-            for (uint32_t key_column = 0;
-                 key_column < plan.head_dimension;
-                 ++key_column)
-            {
-                float_scaled_add(
-                    recurrent
-                        + static_cast<size_t>(key_column)
-                              * plan.value_head_dimension,
-                    delta.data(),
-                    key[key_column],
-                    plan.value_head_dimension);
+                delta_values[value_column] = (value[value_column] - memory_values[value_column]) * beta;
             }
             std::fill(head_output,
                       head_output + plan.value_head_dimension,
@@ -273,11 +297,14 @@ static void execute_gated_delta_recurrence_row(
                  key_column < plan.head_dimension;
                  ++key_column)
             {
-                float_scaled_add(
-                    head_output,
+                float_scale_inplace_and_scaled_add_and_accumulate(
                     recurrent
                         + static_cast<size_t>(key_column)
                               * plan.value_head_dimension,
+                    1.0f,
+                    delta_values,
+                    key[key_column],
+                    head_output,
                     query[key_column],
                     plan.value_head_dimension);
             }
@@ -441,13 +468,16 @@ Result<void> execute_gated_delta_net_into(
         const bool device_input_rms_norm = gated_delta_operator.gated_delta->has_input_rms_norm();
         if (!device_input_rms_norm)
         {
-            rms_norm_batch_into(
-                hidden,
-                weights.at(plan.pre_attention_norm_weight),
-                norm_epsilon,
-                scratch.normalized,
-                plan.norm_weight_offset,
-                optimization_flags);
+            if (plan.pre_attention_norm_weight == invalid_tensor_handle)
+                scratch.normalized = hidden;
+            else
+                rms_norm_batch_into(
+                    hidden,
+                    weights.at(plan.pre_attention_norm_weight),
+                    norm_epsilon,
+                    scratch.normalized,
+                    plan.norm_weight_offset,
+                    optimization_flags);
             normalized_ready = true;
         }
         const bool device_executed = device_input_rms_norm
@@ -461,8 +491,13 @@ Result<void> execute_gated_delta_net_into(
                                                scratch.projected);
         if (device_executed)
         {
-            output = hidden;
-            add_batch_inplace(output, scratch.projected);
+            if (has_flag(plan.flags, AttentionBlockExternalResidual))
+                output = scratch.projected;
+            else
+            {
+                output = hidden;
+                add_batch_inplace(output, scratch.projected);
+            }
             cache.gated_delta_convolution.clear();
             cache.gated_delta_recurrent.clear();
             for (size_t row = 0; row < hidden.rows(); ++row)
@@ -669,13 +704,16 @@ bool execute_gated_delta_net_batch_into(
             device_entries.clear();
             break;
         }
-        rms_norm_batch_into(
-            *entry.hidden,
-            weights.at(plan.pre_attention_norm_weight),
-            norm_epsilon,
-            entry.scratch->normalized,
-            plan.norm_weight_offset,
-            optimization_flags);
+        if (plan.pre_attention_norm_weight == invalid_tensor_handle)
+            entry.scratch->normalized = *entry.hidden;
+        else
+            rms_norm_batch_into(
+                *entry.hidden,
+                weights.at(plan.pre_attention_norm_weight),
+                norm_epsilon,
+                entry.scratch->normalized,
+                plan.norm_weight_offset,
+                optimization_flags);
         device_entries.push_back({&entry.scratch->normalized,
                                   entry.cache,
                                   &entry.scratch->projected});
@@ -691,15 +729,29 @@ bool execute_gated_delta_net_batch_into(
     {
         for (CpuGatedDeltaBatchEntry& entry : entries)
         {
-            entry.output->reset(
-                entry.hidden->rows(),
-                entry.hidden->columns(),
-                false);
-            std::copy_n(
-                entry.hidden->row(0),
-                entry.hidden->columns(),
-                entry.output->row(0));
-            add_batch_inplace(*entry.output, entry.scratch->projected);
+            if (has_flag(plan.flags, AttentionBlockExternalResidual))
+            {
+                entry.output->reset(
+                    entry.scratch->projected.rows(),
+                    entry.scratch->projected.columns(),
+                    false);
+                std::copy_n(
+                    entry.scratch->projected.row(0),
+                    entry.scratch->projected.columns(),
+                    entry.output->row(0));
+            }
+            else
+            {
+                entry.output->reset(
+                    entry.hidden->rows(),
+                    entry.hidden->columns(),
+                    false);
+                std::copy_n(
+                    entry.hidden->row(0),
+                    entry.hidden->columns(),
+                    entry.output->row(0));
+                add_batch_inplace(*entry.output, entry.scratch->projected);
+            }
             entry.cache->gated_delta_convolution.clear();
             entry.cache->gated_delta_recurrent.clear();
             record_gated_delta_cache_transaction_row(*entry.cache);

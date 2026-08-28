@@ -6572,6 +6572,122 @@ void test_qwen3_5_moe_descriptors()
     check(stale_artifact.error().code == ErrorCode::InvalidModel);
 }
 
+static void write_qwen4_mxfp4_test_artifact(
+    ModelPackage& package,
+    const std::filesystem::path& root)
+{
+    constexpr uint32_t layer_count = 4;
+    constexpr uint32_t mtp_layer_count = 1;
+    constexpr uint32_t expert_count = 4;
+    constexpr uint32_t hidden_size = 32;
+    constexpr uint32_t intermediate_size = 32;
+    package.root = root;
+    for (const auto& replacement : std::vector<std::pair<const char*, const char*>>{
+             {R"("hidden_size"\s*:\s*16)", R"("hidden_size": 32)"},
+             {R"("moe_intermediate_size"\s*:\s*4)", R"("moe_intermediate_size": 32)"},
+             {R"("shared_expert_intermediate_size"\s*:\s*4)", R"("shared_expert_intermediate_size": 32)"},
+             {R"("ple_embed_dim"\s*:\s*16)", R"("ple_embed_dim": 32)"},
+         })
+    {
+        package.manifest.raw_json = std::regex_replace(
+            package.manifest.raw_json,
+            std::regex(replacement.first),
+            replacement.second);
+    }
+    const std::string index_json = "{}\n";
+    {
+        std::ofstream config(root / "config.json", std::ios::binary);
+        config << package.manifest.raw_json;
+    }
+    {
+        std::ofstream index(
+            root / "model.safetensors.index.json",
+            std::ios::binary);
+        index << index_json;
+    }
+
+    std::ostringstream identity;
+    identity << "__ncnn_moe_qwen3_8_mxfp4__.identity.v1."
+             << layer_count << '.' << mtp_layer_count << '.'
+             << expert_count << '.'
+             << hidden_size << '.'
+             << intermediate_size << '.'
+             << std::hex << std::setfill('0')
+             << std::setw(16)
+             << qwen_test_fnv1a64(package.manifest.raw_json)
+             << '.'
+             << std::setw(16)
+             << qwen_test_fnv1a64(index_json);
+
+    std::ostringstream header;
+    header << R"({"__metadata__":{"format":"ncnn-moe-qwen3.8-mxfp4-v1"})";
+    uint64_t data_offset = 0;
+    const auto add_tensor = [&](const std::string& name, const std::vector<uint32_t>& shape) {
+        uint64_t byte_count = 1;
+        header << ",\"" << name << "\":{\"dtype\":\"U8\",\"shape\":[";
+        for (size_t index = 0; index < shape.size(); ++index)
+        {
+            if (index != 0)
+                header << ',';
+            header << shape[index];
+            byte_count *= shape[index];
+        }
+        header << "],\"data_offsets\":["
+               << data_offset << ','
+               << data_offset + byte_count << "]}";
+        data_offset += byte_count;
+    };
+    add_tensor(identity.str(), {0});
+    const auto add_bank = [&](const std::string& prefix) {
+        add_tensor(
+            prefix + "gate_up.blocks",
+            {expert_count, intermediate_size * 2, hidden_size / 32, 16});
+        add_tensor(
+            prefix + "gate_up.scales",
+            {expert_count, intermediate_size * 2, hidden_size / 32});
+        add_tensor(
+            prefix + "down.blocks",
+            {expert_count, hidden_size, intermediate_size / 32, 16});
+        add_tensor(
+            prefix + "down.scales",
+            {expert_count, hidden_size, intermediate_size / 32});
+    };
+    for (uint32_t layer_id = 0; layer_id < layer_count; ++layer_id)
+    {
+        add_bank(
+            "__ncnn_moe_qwen3_8_mxfp4__.layers."
+            + std::to_string(layer_id)
+            + ".experts.");
+    }
+    add_bank("__ncnn_moe_qwen3_8_mxfp4__.mtp.layers.0.experts.");
+    header << '}';
+    std::string encoded_header = header.str();
+    encoded_header.append(
+        (8 - encoded_header.size() % 8) % 8,
+        ' ');
+    std::ofstream artifact(
+        root / "ncnn-moe-qwen3.8-mxfp4.safetensors",
+        std::ios::binary);
+    const uint64_t header_bytes = encoded_header.size();
+    artifact.write(
+        reinterpret_cast<const char*>(&header_bytes),
+        sizeof(header_bytes));
+    artifact.write(
+        encoded_header.data(),
+        static_cast<std::streamsize>(encoded_header.size()));
+    std::array<char, 4096> zeros = {};
+    for (uint64_t written = 0; written < data_offset;)
+    {
+        const uint64_t count = std::min<uint64_t>(
+            zeros.size(),
+            data_offset - written);
+        artifact.write(
+            zeros.data(),
+            static_cast<std::streamsize>(count));
+        written += count;
+    }
+}
+
 static ModelPackage qwen4_exp_package()
 {
     ModelPackage package;
@@ -6608,6 +6724,7 @@ static ModelPackage qwen4_exp_package()
             "max_position_embeddings": 128,
             "make_ngram_vocab_size_divisible_by": 4,
             "moe_intermediate_size": 4,
+            "mtp_num_hidden_layers": 1,
             "mtp": {
                 "num_hidden_layers": 1,
                 "rope_theta": 10000.0
@@ -6729,6 +6846,31 @@ void test_qwen4_exp_descriptors()
         std::regex(R"("ple_layer_ids"\s*:\s*\[2\])"),
         R"("ple_layer_ids": [0])");
     check(!adapter.parse_model(invalid));
+
+    ScopedTestDirectory artifact_directory("ncnn_moe_qwen4_artifact_test_");
+    ModelPackage artifact_package = qwen4_exp_package();
+    write_qwen4_mxfp4_test_artifact(
+        artifact_package,
+        artifact_directory.path());
+    auto artifact_descriptor = adapter.parse_model(artifact_package);
+    check(static_cast<bool>(artifact_descriptor));
+    check(artifact_descriptor.value().layers[0].ffn.moe.expert_weight_dtype
+          == DType::MxFp4);
+    check(artifact_descriptor.value().layers[3].ffn.moe.expert_weight_dtype
+          == DType::MxFp4);
+    check(has_flag(
+        artifact_descriptor.value().layers[0].ffn.moe.flags,
+        MoeDescriptorFileBackedExperts));
+
+    {
+        std::ofstream changed_index(
+            artifact_directory.path() / "model.safetensors.index.json",
+            std::ios::binary | std::ios::app);
+        changed_index << ' ';
+    }
+    auto stale_artifact = adapter.parse_model(artifact_package);
+    check(!stale_artifact);
+    check(stale_artifact.error().code == ErrorCode::InvalidModel);
 }
 
 static void add_qwen4_mapping_bfloat16(
@@ -9051,7 +9193,7 @@ void test_bfloat16_batched_linear_kernel()
 {
     constexpr size_t token_count = 5;
     constexpr uint32_t input_columns = 512;
-    constexpr uint32_t output_columns = 512;
+    constexpr uint32_t output_columns = 2048;
     std::vector<uint16_t> weights(
         static_cast<size_t>(output_columns) * input_columns);
     std::vector<float> input(token_count * input_columns);
@@ -9120,7 +9262,7 @@ void test_bfloat16_batched_linear_kernel()
             check_near(output[index], expected[index], 5e-5f);
 
         std::vector<float> single_output(output_columns, -9.0f);
-        check(!bfloat16_batched_linear(
+        check(static_cast<bool>(bfloat16_batched_linear(
             weights.data(),
             input.data(),
             input_columns,
@@ -9130,7 +9272,14 @@ void test_bfloat16_batched_linear_kernel()
             single_output.data(),
             output_columns,
             4,
-            enabled_flags));
+            enabled_flags)));
+        for (uint32_t output_column = 0;
+             output_column < output_columns;
+             ++output_column)
+        {
+            check(static_cast<bool>(
+                single_output[output_column] == expected[output_column]));
+        }
 
         Bfloat16BatchedLinearExecutionCounter first_counter;
         Bfloat16BatchedLinearExecutionCounter second_counter;

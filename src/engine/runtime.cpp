@@ -496,6 +496,32 @@ Result<ModelPtr> Runtime::load_model(
     compiler_capabilities.cpu_parallelism = capabilities_.openmp_thread_count;
     compiler_capabilities.vulkan_device_index = selected_vulkan_device_index;
     compiler_capabilities.expected_concurrency = config.expected_concurrency;
+    compiler_capabilities.vulkan_heap_budget_bytes = selected_vulkan_device
+                                                        ? selected_vulkan_device->heap_budget_bytes
+                                                        : capabilities_.vulkan_heap_budget_bytes;
+    // A compiled graph can be placed on more than one Vulkan device.  Use the
+    // smallest reported heap as the conservative common budget so an optional
+    // persistent attention operator cannot over-admit on a weaker shard.
+    for (uint32_t device_index : selected_vulkan_device_indices)
+    {
+        if (device_index >= capabilities_.vulkan_devices.size())
+        {
+            compiler_capabilities.vulkan_heap_budget_bytes = 0;
+            break;
+        }
+        const uint64_t device_budget = capabilities_.vulkan_devices[device_index].heap_budget_bytes;
+        if (device_budget == 0)
+        {
+            compiler_capabilities.vulkan_heap_budget_bytes = 0;
+            break;
+        }
+        if (compiler_capabilities.vulkan_heap_budget_bytes == 0)
+            compiler_capabilities.vulkan_heap_budget_bytes = device_budget;
+        else
+            compiler_capabilities.vulkan_heap_budget_bytes = std::min(
+                compiler_capabilities.vulkan_heap_budget_bytes,
+                device_budget);
+    }
     compiler_capabilities.optimization_flags = effective_optimization_flags;
     compiler_capabilities.vulkan_context_instance = context_instance;
     compiler_capabilities.vulkan_device_indices = selected_vulkan_device_indices;

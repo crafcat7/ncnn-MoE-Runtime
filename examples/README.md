@@ -58,6 +58,13 @@ Expert kernels; there is no separate prefetch backend. A plan change that
 requires a new worker is reported instead of being
 silently applied to the current session.
 
+Hybrid execution automatically sends resident, backend-compatible routed
+Experts to Vulkan, including single-token decode waves; non-resident or
+unsupported requests retain the CPU fallback. The policy is shared by all
+adapters and does not require a model-specific GPU-decode option. The Qwen3.8-
+Flash-Next `qwen4_exp` adapter additionally requires its checkpoint-bound MXFP4
+Artifact. Use `--cpu` for a CPU-only comparison.
+
 CPU Expert weight repacking is an explicit experiment. Pass
 `--cpu-packed-weights on` to enable it for supported MXFP4-Q8 or Qn_K weights;
 when the option is absent, the worker keeps repack off and does not reserve an

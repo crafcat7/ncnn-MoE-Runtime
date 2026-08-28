@@ -22,6 +22,7 @@ namespace moe {
 
 struct CpuLayerCache;
 class NcnnVulkanContext;
+class NcnnVulkanWeightUploadBatch;
 
 struct NcnnVulkanGatedDeltaBatchEntry
 {
@@ -393,6 +394,7 @@ public:
         uint32_t value_head_dimension,
         uint32_t convolution_kernel_size,
         float norm_epsilon,
+        bool sigmoid_gate,
         uint32_t vulkan_device_index,
         const NcnnVulkanContextInstancePtr& context_instance,
         uint64_t optimization_flags);
@@ -488,7 +490,8 @@ private:
     [[nodiscard]] static std::shared_ptr<NcnnVulkanMxfp4Operator> create_with_allocator(const TensorData& matrix, const TensorData* bias,
                                                                                         uint32_t vulkan_device_index, ncnn::VkAllocator* weight_allocator,
                                                                                         const NcnnVulkanContextInstancePtr& context_instance,
-                                                                                        uint64_t optimization_flags);
+                                                                                        uint64_t optimization_flags,
+                                                                                        NcnnVulkanWeightUploadBatch* upload_batch = nullptr);
     class Implementation;
 
     NcnnVulkanMxfp4Operator();
@@ -602,7 +605,8 @@ private:
                                                                                               ncnn::VkAllocator* weight_allocator,
                                                                                               ExpertActivation activation,
                                                                                               const NcnnVulkanContextInstancePtr& context_instance,
-                                                                                              uint64_t optimization_flags);
+                                                                                              uint64_t optimization_flags,
+                                                                                              NcnnVulkanWeightUploadBatch* upload_batch = nullptr);
 
     class Implementation;
 

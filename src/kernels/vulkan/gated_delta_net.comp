@@ -45,6 +45,7 @@ layout(push_constant) uniform parameter
     uint kernel_size;
     uint token_count;
     float norm_epsilon;
+    uint sigmoid_gate;
 }
 p;
 
@@ -196,7 +197,8 @@ void main()
                                                + value_head * p.value_head_dimension
                                                + value_column];
                 output_data[output_base + value_column] *= inverse_rms
-                    * norm_weight[value_column] * gate * sigmoid(gate);
+                    * norm_weight[value_column]
+                    * (p.sigmoid_gate != 0 ? sigmoid(gate) : gate * sigmoid(gate));
             }
             barrier();
         }

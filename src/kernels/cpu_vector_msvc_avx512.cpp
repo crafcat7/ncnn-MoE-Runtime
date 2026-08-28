@@ -626,6 +626,42 @@ void msvc_avx512_float_scale_inplace_and_scaled_add(
     }
 }
 
+void msvc_avx512_float_scale_inplace_and_scaled_add_and_accumulate(
+    float* values,
+    float value_scale,
+    const float* input,
+    float input_scale,
+    float* output,
+    float output_scale,
+    uint32_t count) noexcept
+{
+    const __m512 value_scale_values = _mm512_set1_ps(value_scale);
+    const __m512 input_scale_values = _mm512_set1_ps(input_scale);
+    const __m512 output_scale_values = _mm512_set1_ps(output_scale);
+    uint32_t index = 0;
+    for (; index + 16 <= count; index += 16)
+    {
+        const __m512 scaled_values = _mm512_mul_ps(
+            _mm512_loadu_ps(values + index), value_scale_values);
+        const __m512 input_values = _mm512_mul_ps(
+            _mm512_loadu_ps(input + index), input_scale_values);
+        const __m512 updated_values = _mm512_add_ps(
+            scaled_values, input_values);
+        _mm512_storeu_ps(values + index, updated_values);
+        _mm512_storeu_ps(
+            output + index,
+            _mm512_add_ps(
+                _mm512_loadu_ps(output + index),
+                _mm512_mul_ps(updated_values, output_scale_values)));
+    }
+    for (; index < count; ++index)
+    {
+        values[index] = values[index] * value_scale
+                        + input[index] * input_scale;
+        output[index] += output_scale * values[index];
+    }
+}
+
 void msvc_avx512_float_weighted_scale(float* output, const float* input, const float* weight, float scale, float weight_offset, uint32_t count) noexcept
 {
     const __m512 scale_values = _mm512_set1_ps(scale);

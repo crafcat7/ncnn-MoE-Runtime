@@ -547,7 +547,10 @@ def open_worker(
     worker = find_worker(getattr(arguments, "worker", None), root)
     user = user_runtime_settings(store)
     cli = cli_runtime_settings(arguments)
-    initial = merge_runtime_settings(cli=cli, session=session.get("settings", {}) if session else None, profile=None, user=user)
+    session_settings = session.get("settings", {}) if session else None
+    if not isinstance(session_settings, dict):
+        session_settings = {}
+    initial = merge_runtime_settings(cli=cli, session=session_settings, profile=None, user=user)
     client = start_worker_client(
         worker,
         model,
@@ -569,7 +572,7 @@ def open_worker(
         profile_settings = {}
     merged = merge_runtime_settings(
         cli=cli,
-        session=session.get("settings", {}) if session else None,
+        session=session_settings,
         profile=profile_settings,
         user=user,
     )

@@ -4,18 +4,193 @@
 #include "safetensors.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <optional>
 #include <regex>
 #include <span>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace ncnn {
 namespace moe {
+
+static constexpr const char* q4_mxfp4_artifact_name = "ncnn-moe-qwen3.8-mxfp4.safetensors";
+
+static std::string q4_mxfp4_expert_prefix(uint32_t layer_id)
+{
+    return "__ncnn_moe_qwen3_8_mxfp4__.layers." + std::to_string(layer_id) + ".experts.";
+}
+
+static Result<uint64_t> q4_fnv1a64_file(const std::filesystem::path& path)
+{
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream)
+        return Error{ErrorCode::IoError, "cannot open Qwen4 Exp artifact identity source: " + path.string()};
+    uint64_t hash = UINT64_C(14695981039346656037);
+    std::array<char, 64 * 1024> buffer;
+    while (stream)
+    {
+        stream.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize count = stream.gcount();
+        for (std::streamsize index = 0; index < count; ++index)
+        {
+            hash ^= static_cast<unsigned char>(buffer[static_cast<size_t>(index)]);
+            hash *= UINT64_C(1099511628211);
+        }
+    }
+    if (!stream.eof())
+        return Error{ErrorCode::IoError, "cannot read Qwen4 Exp artifact identity source: " + path.string()};
+    return hash;
+}
+
+static std::string q4_mxfp4_identity_name(
+    uint32_t layer_count,
+    uint32_t mtp_layer_count,
+    uint32_t expert_count,
+    uint32_t hidden_size,
+    uint32_t intermediate_size,
+    uint64_t config_hash,
+    uint64_t index_hash)
+{
+    std::ostringstream name;
+    name << "__ncnn_moe_qwen3_8_mxfp4__.identity.v1."
+         << layer_count << '.' << mtp_layer_count << '.'
+         << expert_count << '.'
+         << hidden_size << '.'
+         << intermediate_size << '.'
+         << std::hex << std::setfill('0')
+         << std::setw(16) << config_hash << '.'
+         << std::setw(16) << index_hash;
+    return name.str();
+}
+
+static Result<void> q4_validate_artifact_tensor(
+    const SafetensorsArchive& archive,
+    const std::string& name,
+    std::vector<uint32_t> shape)
+{
+    const SafetensorInfo* info = archive.find(name);
+    if (!info)
+        return Error{ErrorCode::InvalidModel, "Qwen4 Exp MXFP4 artifact is missing tensor: " + name};
+    uint64_t expected_bytes = 1;
+    for (uint32_t dimension : shape)
+    {
+        if (dimension != 0
+            && expected_bytes > std::numeric_limits<uint64_t>::max() / dimension)
+        {
+            return Error{ErrorCode::InvalidModel, "Qwen4 Exp MXFP4 artifact tensor is too large: " + name};
+        }
+        expected_bytes *= dimension;
+    }
+    if (info->dtype != "U8"
+        || info->shape != shape
+        || info->byte_count != expected_bytes)
+    {
+        return Error{ErrorCode::InvalidModel, "invalid Qwen4 Exp MXFP4 artifact tensor: " + name};
+    }
+    return {};
+}
+
+static Result<void> q4_validate_artifact_expert_bank(
+    const SafetensorsArchive& archive,
+    const std::string& prefix,
+    uint32_t expert_count,
+    uint32_t hidden_size,
+    uint32_t intermediate_size)
+{
+    auto status = q4_validate_artifact_tensor(
+        archive,
+        prefix + "gate_up.blocks",
+        {expert_count, intermediate_size * 2, hidden_size / 32, 16});
+    if (!status)
+        return status.error();
+    status = q4_validate_artifact_tensor(
+        archive,
+        prefix + "gate_up.scales",
+        {expert_count, intermediate_size * 2, hidden_size / 32});
+    if (!status)
+        return status.error();
+    status = q4_validate_artifact_tensor(
+        archive,
+        prefix + "down.blocks",
+        {expert_count, hidden_size, intermediate_size / 32, 16});
+    if (!status)
+        return status.error();
+    return q4_validate_artifact_tensor(
+        archive,
+        prefix + "down.scales",
+        {expert_count, hidden_size, intermediate_size / 32});
+}
+
+static Result<void> q4_validate_mxfp4_artifact(
+    const std::filesystem::path& model_root,
+    uint32_t layer_count,
+    uint32_t mtp_layer_count,
+    uint32_t expert_count,
+    uint32_t hidden_size,
+    uint32_t intermediate_size)
+{
+    if (hidden_size % 32 != 0 || intermediate_size % 32 != 0)
+        return Error{ErrorCode::InvalidModel, "Qwen4 Exp MXFP4 artifact dimensions must be divisible by 32"};
+    auto opened = SafetensorsArchive::open_file(model_root / q4_mxfp4_artifact_name);
+    if (!opened)
+        return opened.error();
+    SafetensorsArchive archive = std::move(opened).value();
+    auto config_hash = q4_fnv1a64_file(model_root / "config.json");
+    if (!config_hash)
+        return config_hash.error();
+    auto index_hash = q4_fnv1a64_file(model_root / "model.safetensors.index.json");
+    if (!index_hash)
+        return index_hash.error();
+    const std::string identity = q4_mxfp4_identity_name(
+        layer_count,
+        mtp_layer_count,
+        expert_count,
+        hidden_size,
+        intermediate_size,
+        config_hash.value(),
+        index_hash.value());
+    auto status = q4_validate_artifact_tensor(archive, identity, {0});
+    if (!status)
+    {
+        return Error{
+            ErrorCode::InvalidModel,
+            status.error().message
+                + "; rebuild the artifact for this exact checkpoint or remove it to use BF16 Experts"};
+    }
+
+    for (uint32_t layer_id = 0; layer_id < layer_count; ++layer_id)
+    {
+        status = q4_validate_artifact_expert_bank(
+            archive,
+            q4_mxfp4_expert_prefix(layer_id),
+            expert_count,
+            hidden_size,
+            intermediate_size);
+        if (!status)
+            return status.error();
+    }
+    for (uint32_t layer_id = 0; layer_id < mtp_layer_count; ++layer_id)
+    {
+        status = q4_validate_artifact_expert_bank(
+            archive,
+            "__ncnn_moe_qwen3_8_mxfp4__.mtp.layers." + std::to_string(layer_id) + ".experts.",
+            expert_count,
+            hidden_size,
+            intermediate_size);
+        if (!status)
+            return status.error();
+    }
+    return {};
+}
 
 static void q4_skip_whitespace(const std::string& json, size_t& position) noexcept
 {
@@ -311,6 +486,29 @@ static Result<void> q4_add_expert_bank(
     return {};
 }
 
+static Result<void> q4_add_mxfp4_expert(
+    WeightMapping& mapping,
+    const SafetensorsArchive& archive,
+    const std::string& target,
+    const std::string& source,
+    uint32_t expert_id,
+    uint32_t rows,
+    uint32_t columns,
+    uint32_t flags)
+{
+    auto tensor = archive.load_mxfp4_expert(
+        source + "blocks",
+        source + "scales",
+        expert_id,
+        rows,
+        columns,
+        flags);
+    if (!tensor)
+        return tensor.error();
+    mapping.tensors.emplace(target, std::move(tensor).value());
+    return {};
+}
+
 static bool q4_is_prime(uint64_t value) noexcept
 {
     if (value < 2)
@@ -582,7 +780,37 @@ Result<MoeIR> Qwen4ExpModelAdapter::parse_model(const ModelPackage& package) con
     moe.normalization = RouterNormalization::SelectedExperts;
     moe.activation = ExpertActivation::Silu;
     moe.layout = ExpertLayout::PackedGateUpDown;
-    moe.expert_weight_dtype = DType::BFloat16;
+    uint32_t mtp_layer_count = 0;
+    const std::optional<std::string> mtp_layer_count_text = q4_object_member(json, "mtp_num_hidden_layers");
+    if (mtp_layer_count_text)
+    {
+        auto parsed_mtp_layer_count = q4_uint(json, "mtp_num_hidden_layers");
+        if (!parsed_mtp_layer_count)
+            return parsed_mtp_layer_count.error();
+        mtp_layer_count = parsed_mtp_layer_count.value();
+    }
+    const std::filesystem::path artifact_path = package.root / q4_mxfp4_artifact_name;
+    std::error_code artifact_error;
+    const bool artifact_exists = std::filesystem::exists(artifact_path, artifact_error);
+    if (artifact_error)
+        return Error{ErrorCode::IoError, "cannot inspect the optional Qwen4 Exp MXFP4 artifact"};
+    if (artifact_exists && !std::filesystem::is_regular_file(artifact_path, artifact_error))
+        return Error{ErrorCode::InvalidModel, "the optional Qwen4 Exp MXFP4 artifact path is not a regular file"};
+    if (artifact_error)
+        return Error{ErrorCode::IoError, "cannot inspect the optional Qwen4 Exp MXFP4 artifact"};
+    if (artifact_exists)
+    {
+        auto artifact_status = q4_validate_mxfp4_artifact(
+            package.root,
+            layer_count.value(),
+            mtp_layer_count,
+            expert_count.value(),
+            hidden_size.value(),
+            intermediate_size.value());
+        if (!artifact_status)
+            return artifact_status.error();
+    }
+    moe.expert_weight_dtype = artifact_exists ? DType::MxFp4 : DType::BFloat16;
     moe.shared_expert_weight_dtype = DType::BFloat16;
     moe.flags = MoeDescriptorNormalizeTopKWeights
                 | MoeDescriptorSharedExpert
@@ -643,6 +871,9 @@ Result<WeightMapping> Qwen4ExpModelAdapter::map_weights(const ModelPackage& pack
         return opened.error();
     SafetensorsArchive archive = std::move(opened).value();
     WeightMapping mapping;
+    uint32_t expert_load_flags = 0;
+    if (has_flag(package.flags, ModelPackageDeferMxfp4Experts))
+        expert_load_flags |= SafetensorLoadDeferMxfp4Data;
     auto status = q4_add_tensor(mapping, archive, "token_embedding.weight", "model.language_model.embed_tokens.weight");
     if (!status)
         return status.error();
@@ -679,20 +910,53 @@ Result<WeightMapping> Qwen4ExpModelAdapter::map_weights(const ModelPackage& pack
                 return status.error();
         }
         const MoeDescriptor& moe = descriptor.layers[layer_id].ffn.moe;
-        status = q4_add_expert_bank(
-            mapping, archive, "gate_up.weight",
-            source + "mlp.experts.gate_up_proj", layer_id,
-            moe.expert_count, moe.intermediate_size * 2,
-            descriptor.hidden_size);
-        if (!status)
-            return status.error();
-        status = q4_add_expert_bank(
-            mapping, archive, "down.weight",
-            source + "mlp.experts.down_proj", layer_id,
-            moe.expert_count, descriptor.hidden_size,
-            moe.intermediate_size);
-        if (!status)
-            return status.error();
+        const std::string artifact_experts = q4_mxfp4_expert_prefix(layer_id);
+        if (moe.expert_weight_dtype == DType::MxFp4)
+        {
+            for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
+            {
+                const std::string expert = expert_prefix(layer_id, expert_id);
+                status = q4_add_mxfp4_expert(
+                    mapping,
+                    archive,
+                    expert + "gate_up.weight",
+                    artifact_experts + "gate_up.",
+                    expert_id,
+                    moe.intermediate_size * 2,
+                    descriptor.hidden_size,
+                    expert_load_flags);
+                if (!status)
+                    return status.error();
+                status = q4_add_mxfp4_expert(
+                    mapping,
+                    archive,
+                    expert + "down.weight",
+                    artifact_experts + "down.",
+                    expert_id,
+                    descriptor.hidden_size,
+                    moe.intermediate_size,
+                    expert_load_flags);
+                if (!status)
+                    return status.error();
+            }
+        }
+        else
+        {
+            status = q4_add_expert_bank(
+                mapping, archive, "gate_up.weight",
+                source + "mlp.experts.gate_up_proj", layer_id,
+                moe.expert_count, moe.intermediate_size * 2,
+                descriptor.hidden_size);
+            if (!status)
+                return status.error();
+            status = q4_add_expert_bank(
+                mapping, archive, "down.weight",
+                source + "mlp.experts.down_proj", layer_id,
+                moe.expert_count, descriptor.hidden_size,
+                moe.intermediate_size);
+            if (!status)
+                return status.error();
+        }
 
         const AttentionDescriptor& attention = descriptor.layers[layer_id].attention;
         if (attention.kind == AttentionKind::GatedDeltaNet)

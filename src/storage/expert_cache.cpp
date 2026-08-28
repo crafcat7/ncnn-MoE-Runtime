@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <shared_mutex>
@@ -44,6 +45,15 @@ struct ThreadReadEvent
 
     HANDLE handle = nullptr;
 };
+
+// Every Expert I/O worker issues reads serially.  Keep one overlapped event
+// per worker instead of creating and closing a kernel object for every range;
+// a cold routed wave can otherwise create tens of thousands of events.
+static ThreadReadEvent& thread_read_event() noexcept
+{
+    static thread_local ThreadReadEvent event;
+    return event;
+}
 
 #endif
 
@@ -247,8 +257,8 @@ struct Mxfp4ExpertCache::FileRangeReader
 #if defined(_WIN32)
     Result<MxFp4ByteBuffer> read_direct(const std::string& path, uint64_t offset, uint64_t byte_count)
     {
-        ThreadReadEvent read_event;
-        if (read_event.handle == nullptr)
+        const HANDLE read_event = thread_read_event().handle;
+        if (read_event == nullptr)
         {
             return Error{
                 ErrorCode::IoError,
@@ -299,7 +309,7 @@ struct Mxfp4ExpertCache::FileRangeReader
         OVERLAPPED operation{};
         operation.Offset = static_cast<DWORD>(aligned_offset);
         operation.OffsetHigh = static_cast<DWORD>(aligned_offset >> 32);
-        operation.hEvent = read_event.handle;
+        operation.hEvent = read_event;
         if (operation.hEvent == nullptr || !ResetEvent(operation.hEvent))
         {
             return Error{
@@ -330,8 +340,8 @@ struct Mxfp4ExpertCache::FileRangeReader
     Result<void> read(const std::string& path, uint64_t offset, MxFp4ByteBuffer& destination)
     {
 #if defined(_WIN32)
-        ThreadReadEvent read_event;
-        if (read_event.handle == nullptr)
+        const HANDLE read_event = thread_read_event().handle;
+        if (read_event == nullptr)
         {
             return Error{
                 ErrorCode::IoError,
@@ -353,7 +363,7 @@ struct Mxfp4ExpertCache::FileRangeReader
             OVERLAPPED operation{};
             operation.Offset = static_cast<DWORD>(current_offset);
             operation.OffsetHigh = static_cast<DWORD>(current_offset >> 32);
-            operation.hEvent = read_event.handle;
+            operation.hEvent = read_event;
             if (!ResetEvent(operation.hEvent))
             {
                 return Error{
@@ -845,10 +855,20 @@ Result<std::shared_ptr<TensorData>> Mxfp4ExpertCache::load_tensor(const TensorDa
     auto loaded = std::make_shared<TensorData>();
     loaded->dtype = DType::MxFp4;
     loaded->shape = source.shape;
-    auto blocks = reader_->load(file.blocks_path, file.blocks_offset, file.blocks_bytes, flags_);
+    // Blocks and scales are independent ranges.  Keep both requests in
+    // flight for file-backed Experts instead of serializing two overlapped
+    // reads on every cache worker.  This is deliberately scoped to the
+    // cache worker's pair load; the public cache worker count remains the
+    // runtime's single I/O concurrency contract.
+    auto blocks_future = std::async(
+        std::launch::async,
+        [this, &file] {
+            return reader_->load(file.blocks_path, file.blocks_offset, file.blocks_bytes, flags_);
+        });
+    auto scales = reader_->load(file.scales_path, file.scales_offset, file.scales_bytes, flags_);
+    auto blocks = blocks_future.get();
     if (!blocks)
         return blocks.error();
-    auto scales = reader_->load(file.scales_path, file.scales_offset, file.scales_bytes, flags_);
     if (!scales)
         return scales.error();
     if (blocks.value().mapped)
@@ -906,12 +926,21 @@ Result<ExpertVictimPair> Mxfp4ExpertCache::load_interleaved_pair(const TensorDat
                           && gate.blocks_path == projection.scales_path;
     if (!one_file)
     {
-        auto loaded_gate = load_tensor(gate_up, mapped_ranges, mapped_bytes);
+        uint64_t down_mapped_ranges = 0;
+        uint64_t down_mapped_bytes = 0;
+        auto gate_future = std::async(
+            std::launch::async,
+            [this, &gate_up, &mapped_ranges, &mapped_bytes] {
+                return load_tensor(gate_up, mapped_ranges, mapped_bytes);
+            });
+        auto loaded_down = load_tensor(down, down_mapped_ranges, down_mapped_bytes);
+        auto loaded_gate = gate_future.get();
         if (!loaded_gate)
             return loaded_gate.error();
-        auto loaded_down = load_tensor(down, mapped_ranges, mapped_bytes);
         if (!loaded_down)
             return loaded_down.error();
+        mapped_ranges += down_mapped_ranges;
+        mapped_bytes += down_mapped_bytes;
         return ExpertVictimPair{std::move(loaded_gate).value(), std::move(loaded_down).value()};
     }
 
@@ -1110,12 +1139,21 @@ Result<ExpertVictimPair> Mxfp4ExpertCache::load_pair(const TensorData& gate_up, 
 
     if (!contiguous)
     {
-        auto loaded_gate = load_tensor(gate_up, mapped_ranges, mapped_bytes);
+        uint64_t down_mapped_ranges = 0;
+        uint64_t down_mapped_bytes = 0;
+        auto gate_future = std::async(
+            std::launch::async,
+            [this, &gate_up, &mapped_ranges, &mapped_bytes] {
+                return load_tensor(gate_up, mapped_ranges, mapped_bytes);
+            });
+        auto loaded_down = load_tensor(down, down_mapped_ranges, down_mapped_bytes);
+        auto loaded_gate = gate_future.get();
         if (!loaded_gate)
             return loaded_gate.error();
-        auto loaded_down = load_tensor(down, mapped_ranges, mapped_bytes);
         if (!loaded_down)
             return loaded_down.error();
+        mapped_ranges += down_mapped_ranges;
+        mapped_bytes += down_mapped_bytes;
         return ExpertVictimPair{std::move(loaded_gate).value(), std::move(loaded_down).value()};
     }
 
@@ -2191,10 +2229,16 @@ Result<ExpertCacheLease> Mxfp4ExpertCache::acquire_pair(
     std::string_view prepared_key,
     ExpertVictimExecutionMetadata victim_execution)
 {
-    auto queued = enqueue_pair(gate_up, down, false, residency_group, prepared_key, victim_execution);
+    auto queued = enqueue_pair(
+        gate_up,
+        down,
+        false,
+        residency_group,
+        prepared_key,
+        victim_execution);
     if (!queued)
         return queued.error();
-    const std::shared_ptr<Entry> entry = queued.value();
+    std::shared_ptr<Entry> entry = std::move(queued).value();
 
     std::unique_lock<std::mutex> lock(mutex_);
     ready_.wait(lock, [&entry] {
@@ -2333,24 +2377,39 @@ Result<size_t> Mxfp4ExpertCache::wait_acquire_ready_pairs(
                 ErrorCode::InvalidArgument,
                 "Expert cache ready wait requires prepared file-backed pairs"};
         }
-        bool temporarily_exhausted = false;
-        auto queued = enqueue_pair(
-            *request.gate_up,
-            *request.down,
-            false,
-            request.residency_group,
-            request.prepared_key,
-            request.victim_execution,
-            nullptr,
-            &temporarily_exhausted);
-        if (!queued)
+        for (;;)
         {
-            if (temporarily_exhausted && enqueued_count != 0)
+            bool temporarily_exhausted = false;
+            auto queued = enqueue_pair(
+                *request.gate_up,
+                *request.down,
+                false,
+                request.residency_group,
+                request.prepared_key,
+                request.victim_execution,
+                nullptr,
+                &temporarily_exhausted);
+            if (queued)
+            {
+                ready_entries[index] = std::move(queued).value();
+                ++enqueued_count;
                 break;
-            return queued.error();
+            }
+            if (!temporarily_exhausted)
+                return queued.error();
+            if (enqueued_count != 0)
+                break;
+
+            // A small host cache can have every resident entry pinned by an
+            // in-flight speculative read or another foreground request.  Do
+            // not turn that transient state into a hard failure when the
+            // first exact request arrives; wait briefly for a read or lease
+            // to become reclaimable, then retry the admission.
+            std::unique_lock<std::mutex> wait_lock(mutex_);
+            if (stopping_)
+                return Error{ErrorCode::InternalError, "expert cache is stopping"};
+            ready_.wait_for(wait_lock, std::chrono::milliseconds(1));
         }
-        ready_entries[index] = std::move(queued).value();
-        ++enqueued_count;
     }
 
     std::unique_lock<std::mutex> lock(mutex_);

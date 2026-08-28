@@ -119,6 +119,11 @@ public:
         uint32_t vulkan_queue_count = 0;
         uint32_t vulkan_device_index = automatic_vulkan_device_index;
         uint32_t expected_concurrency = 1;
+        // Total heap budget available to the selected Vulkan placement.  The
+        // compiler uses this as a conservative admission limit for optional
+        // persistent GPU attention state; zero means that no budget-based
+        // promotion should be attempted.
+        uint64_t vulkan_heap_budget_bytes = 0;
         uint64_t optimization_flags = RuntimeOptimizationDefaultFlags;
         NcnnVulkanContextInstancePtr vulkan_context_instance;
         std::vector<uint32_t> vulkan_device_indices;

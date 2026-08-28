@@ -103,9 +103,25 @@ void msvc_avx2_float_scale_inplace_and_scaled_add(
     float* output,
     float output_scale,
     uint32_t count) noexcept;
+void msvc_avx2_float_scale_inplace_and_scaled_add_and_accumulate(
+    float* values,
+    float value_scale,
+    const float* input,
+    float input_scale,
+    float* output,
+    float output_scale,
+    uint32_t count) noexcept;
 void msvc_avx512_float_scale_inplace_and_scaled_add(
     float* values,
     float value_scale,
+    float* output,
+    float output_scale,
+    uint32_t count) noexcept;
+void msvc_avx512_float_scale_inplace_and_scaled_add_and_accumulate(
+    float* values,
+    float value_scale,
+    const float* input,
+    float input_scale,
     float* output,
     float output_scale,
     uint32_t count) noexcept;

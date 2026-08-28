@@ -94,6 +94,13 @@ void msvc_avx512_bfloat16_batched_linear(const uint16_t* weights, const float* i
                                          uint32_t input_columns, float* output, size_t output_stride, int thread_count,
                                          std::vector<uint16_t>& packed_input);
 
+void msvc_avx512_bfloat16_single_token_linear(const uint16_t* weights,
+                                              const float* input,
+                                              uint32_t output_columns,
+                                              uint32_t input_columns,
+                                              float* output,
+                                              int thread_count);
+
 [[nodiscard]] float msvc_avx512_mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input) noexcept;
 void msvc_avx512_mxfp4_q8_quantize(const float* source, int8_t* values, float* scales, uint32_t columns) noexcept;
 

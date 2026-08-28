@@ -28,6 +28,100 @@ static bool vulkan_latent_compressor_enabled(uint64_t optimization_flags) noexce
     return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationVulkanLatentCompressor);
 }
 
+static uint64_t saturating_add_u64(uint64_t left, uint64_t right) noexcept
+{
+    return right > std::numeric_limits<uint64_t>::max() - left
+               ? std::numeric_limits<uint64_t>::max()
+               : left + right;
+}
+
+static uint64_t saturating_multiply_u64(uint64_t left, uint64_t right) noexcept
+{
+    return left != 0 && right > std::numeric_limits<uint64_t>::max() / left
+               ? std::numeric_limits<uint64_t>::max()
+               : left * right;
+}
+
+static uint64_t gated_delta_vulkan_working_set_bytes(
+    const AttentionDescriptor& attention,
+    const MoeModelDescriptor& descriptor) noexcept
+{
+    // The fused Vulkan implementation currently consumes BF16 projection
+    // matrices and expands the small recurrent constants to FP32.  Returning
+    // zero for other dtypes keeps the admission policy capability-driven
+    // instead of selecting a path that cannot create the fused operator.
+    if (attention.kind != AttentionKind::GatedDeltaNet
+        || descriptor.activation_dtype != DType::BFloat16
+        || attention.head_count == 0
+        || attention.kv_head_count == 0
+        || attention.head_dimension == 0
+        || attention.value_head_dimension == 0
+        || attention.convolution_kernel_size == 0
+        || attention.head_count % attention.kv_head_count != 0)
+    {
+        return 0;
+    }
+
+    const uint64_t key_size = saturating_multiply_u64(
+        attention.kv_head_count, attention.head_dimension);
+    const uint64_t value_size = saturating_multiply_u64(
+        attention.head_count, attention.value_head_dimension);
+    const uint64_t convolution_size = saturating_add_u64(
+        saturating_multiply_u64(key_size, 2), value_size);
+    const uint64_t fused_columns = saturating_add_u64(
+        saturating_add_u64(convolution_size, value_size),
+        saturating_multiply_u64(attention.head_count, 2));
+
+    // NcnnVulkanBfloat16Operator stores BF16 matrix weights and allocates
+    // FP32 bias/input-output metadata for each projection.  The GDN operator
+    // additionally uploads convolution and per-head constants as FP32.
+    const uint64_t projection_elements = saturating_multiply_u64(
+        saturating_add_u64(fused_columns, value_size), descriptor.hidden_size);
+    const uint64_t projection_bytes = saturating_multiply_u64(
+        projection_elements, sizeof(uint16_t));
+    const uint64_t projection_metadata_bytes = saturating_multiply_u64(
+        saturating_add_u64(
+            saturating_add_u64(
+                saturating_multiply_u64(descriptor.hidden_size, 2),
+                fused_columns),
+            value_size),
+        sizeof(float));
+    const uint64_t recurrent_constant_elements = saturating_add_u64(
+        saturating_multiply_u64(convolution_size, attention.convolution_kernel_size),
+        saturating_add_u64(
+            saturating_multiply_u64(attention.head_count, 2),
+            attention.value_head_dimension));
+    const uint64_t recurrent_constant_bytes = saturating_multiply_u64(
+        recurrent_constant_elements, sizeof(float));
+    const uint64_t allocated_bytes = saturating_add_u64(
+        saturating_add_u64(projection_bytes, projection_metadata_bytes),
+        recurrent_constant_bytes);
+
+    // Weight allocators and the first dispatch need transient workspace in
+    // addition to the raw payload.  A two-times safety margin is deliberately
+    // conservative and keeps this policy independent of a model's layer id or
+    // tensor naming convention.
+    return saturating_multiply_u64(allocated_bytes, 2);
+}
+
+static uint64_t gated_delta_vulkan_budget_bytes(
+    const ModelCompiler::BackendCapabilities& capabilities,
+    bool use_vulkan_dense,
+    bool protects_file_backed_experts) noexcept
+{
+    if (!use_vulkan_dense || capabilities.vulkan_heap_budget_bytes == 0)
+        return 0;
+
+    // File-backed Expert execution normally consumes nearly all free heap for
+    // its executable/victim caches.  Reserve a small, concurrency-scaled
+    // fraction for persistent GDN projection/state; without an Expert cache,
+    // more of the heap can safely be used by dense attention operators.
+    const uint64_t heap_divisor = protects_file_backed_experts ? 64 : 8;
+    const uint64_t concurrency = std::max(1u, capabilities.expected_concurrency);
+    const uint64_t divisor = saturating_multiply_u64(heap_divisor, concurrency);
+    return divisor == 0 ? 0 : capabilities.vulkan_heap_budget_bytes / divisor;
+}
+
 #define NCNN_MOE_ADAPTER_GRAPH_ATTN_BIT   0
 #define NCNN_MOE_ADAPTER_GRAPH_SINK_BIT   1
 #define NCNN_MOE_ADAPTER_GRAPH_MOE_BIT    2
@@ -1934,6 +2028,19 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
         }
     }
     const NcnnLinearDevice dense_device = use_vulkan_dense ? NcnnLinearDevice::Vulkan : NcnnLinearDevice::Cpu;
+    const bool vulkan_delta_fusion_available = use_vulkan_dense
+                                               && has_flag(capabilities.flags, BackendCapabilityVulkanAttention)
+                                               && runtime_optimization_enabled(
+                                                   capabilities.optimization_flags,
+                                                   RuntimeOptimizationVulkanAttention);
+    const bool protect_file_backed_experts = has_flag(
+        capabilities.flags, BackendCapabilityVulkanExperts)
+                                             && file_backed_experts;
+    const uint64_t gated_delta_gpu_budget = gated_delta_vulkan_budget_bytes(
+        capabilities,
+        vulkan_delta_fusion_available,
+        protect_file_backed_experts);
+    uint64_t planned_gated_delta_gpu_bytes = 0;
 
     for (auto& [name, tensor] : mapping.tensors)
     {
@@ -2064,11 +2171,20 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
         const bool use_vulkan_latent_linear = has_flag(graph.flags, AdapterGraphAttention)
                                               && layer.attention.kind == AttentionKind::MultiHeadLatent
                                               && use_vulkan_dense;
-        const bool use_vulkan_delta_linear = has_flag(graph.flags, AdapterGraphAttention)
-                                             && layer.attention.kind == AttentionKind::GatedDeltaNet
-                                             && !has_flag(layer.attention.flags, AttentionDescriptorSigmoidGate)
-                                             && compiled.descriptor.hyper_connection_kind != HyperConnectionKind::GatedResidual
-                                             && use_vulkan_dense;
+        const uint64_t gated_delta_layer_bytes =
+            gated_delta_vulkan_working_set_bytes(
+                layer.attention,
+                compiled.descriptor);
+        const bool use_vulkan_delta_linear =
+            vulkan_delta_fusion_available
+            && gated_delta_layer_bytes != 0
+            && gated_delta_layer_bytes <= gated_delta_gpu_budget
+            && planned_gated_delta_gpu_bytes
+                   <= gated_delta_gpu_budget - gated_delta_layer_bytes;
+        if (use_vulkan_delta_linear)
+            planned_gated_delta_gpu_bytes = saturating_add_u64(
+                planned_gated_delta_gpu_bytes,
+                gated_delta_layer_bytes);
         layer_plan.moe.top_k = moe.top_k;
         layer_plan.moe.hidden_size = compiled.descriptor.hidden_size;
         layer_plan.moe.score_function = moe.score_function;
@@ -2337,7 +2453,8 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                     {
                         const CompiledOperator& fused_operator = compiled.operators.at(plan.fused_delta_input_bfloat16_operator);
                         // Fuse pre-attention RMSNorm with the DeltaNet input projection.
-                        if (fused_operator.bfloat16)
+                        if (fused_operator.bfloat16
+                            && plan.pre_attention_norm_weight != invalid_tensor_handle)
                         {
                             (void)fused_operator.bfloat16->prepare_rms_norm(
                                 compiled.weights.at(plan.pre_attention_norm_weight),
@@ -2358,6 +2475,7 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                             plan.value_head_dimension,
                             plan.convolution_kernel_size,
                             compiled.descriptor.norm_epsilon,
+                            has_flag(plan.flags, AttentionBlockSigmoidGate),
                             layer_plan.vulkan_device_index,
                             compiled.vulkan_context_instance,
                             compiled.optimization_flags);
