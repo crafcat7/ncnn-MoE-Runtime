@@ -6294,7 +6294,7 @@ NcnnVulkanGatedDeltaNetOperator::forward_batch(
             implementation.decay_log,
             implementation.norm_weight,
             recurrent_view};
-        std::vector<ncnn::vk_constant_type> delta_constants(10);
+        std::vector<ncnn::vk_constant_type> delta_constants(11);
         delta_constants[0].u32 = implementation.convolution_size;
         delta_constants[1].u32 = implementation.value_size;
         delta_constants[2].u32 = implementation.fused_columns;
@@ -6305,6 +6305,7 @@ NcnnVulkanGatedDeltaNetOperator::forward_batch(
         delta_constants[7].u32 = implementation.convolution_kernel_size;
         delta_constants[8].u32 = 1;
         delta_constants[9].f = implementation.norm_epsilon;
+        delta_constants[10].u32 = implementation.sigmoid_gate ? 1u : 0u;
         ncnn::VkMat delta_dispatcher;
         delta_dispatcher.w = 128;
         delta_dispatcher.h = 1;
@@ -9696,7 +9697,8 @@ static bool build_route_aggregation_metadata(
     return true;
 }
 
-// Indexed Expert dispatch uses one storage-buffer binding per selected Expert.
+// Indexed Expert dispatch uses one storage-buffer binding per selected Expert
+// slot. Larger top-k batches are chunked and reuse this fixed descriptor table.
 static constexpr uint32_t mxfp4_indexed_max_experts = 8;
 
 static bool create_mxfp4_indexed_pipeline(
@@ -10955,9 +10957,13 @@ private:
     {
         // Use the indexed shader only when its selector cost is amortized.
         if (selected.size() < 4
-            || selected.size() > mxfp4_indexed_max_experts
             || !selected.front().entry
             || !selected.front().entry->operation)
+            return IndexedBatchResult::NotSupported;
+        // The shader deliberately keeps a fixed descriptor layout.  Dynamic
+        // top-k is represented by several <=8 Expert chunks recorded into the
+        // same command buffer, rather than by growing descriptor arrays.
+        if (selected.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
             return IndexedBatchResult::NotSupported;
 
         const NcnnVulkanMxfp4ExpertOperator::Implementation& first_expert = *selected.front().entry->operation->implementation_;
@@ -11041,6 +11047,24 @@ private:
 
         // Tile only when the largest selected Expert has row reuse.
         const bool use_tiled_indexed = maximum_request_rows >= 2;
+        const size_t indexed_chunk_count =
+            (selected.size() + mxfp4_indexed_max_experts - 1)
+            / mxfp4_indexed_max_experts;
+        // The indexed shader has a generic slot switch, while the regular
+        // path uses a specialized projection pipeline. Keep the dynamic
+        // capability model-neutral, but only select it when the dispatch
+        // reduction is large enough to amortize that selector overhead.
+        // This is intentionally an internal policy (not a model option):
+        // top-k=10 decode uses the regular path, whereas top-k=16/24 can
+        // benefit from 8+8/8+8+8 chunking.
+        const uint64_t regular_dispatches = static_cast<uint64_t>(selected.size()) * 2;
+        const uint64_t indexed_dispatches = static_cast<uint64_t>(indexed_chunk_count) * 2;
+        const uint64_t selector_overhead_factor = use_tiled_indexed ? 4 : 6;
+        if (indexed_dispatches == 0
+            || regular_dispatches <= indexed_dispatches * selector_overhead_factor)
+        {
+            return IndexedBatchResult::NotSupported;
+        }
 
         if (!indexed_pipeline_
             && !create_mxfp4_indexed_pipeline(
@@ -11251,8 +11275,12 @@ private:
         if (output_gpu.empty())
             return IndexedBatchResult::Failed;
 
-        const auto make_constants = [&](uint32_t mode) {
-            std::vector<ncnn::vk_constant_type> constants(18);
+        const auto make_constants = [&](uint32_t mode,
+                                        uint32_t row_base,
+                                        uint32_t expert_slot_base,
+                                        uint32_t expert_count,
+                                        uint32_t tile_mode) {
+            std::vector<ncnn::vk_constant_type> constants(20);
             constants[0].u32 = first_gate.input_columns;
             constants[1].u32 = first_gate.output_columns;
             constants[2].u32 = first_down.input_columns;
@@ -11260,7 +11288,7 @@ private:
             constants[4].u32 = first_gate.block_count;
             constants[5].u32 = first_down.block_count;
             constants[6].u32 = static_cast<uint32_t>(total_rows);
-            constants[7].u32 = static_cast<uint32_t>(selected.size());
+            constants[7].u32 = expert_count;
             constants[8].u32 = 0;
             constants[9].u32 = first_gate.indexed_scales_word_offset;
             constants[10].u32 = first_gate.indexed_bias_word_offset;
@@ -11270,69 +11298,93 @@ private:
             constants[14].u32 = mode;
             constants[15].u32 = first_expert.activation == ExpertActivation::GptOssSwiGlu ? 0u : 1u;
             constants[16].f = first_expert.activation_limit;
-            constants[17].u32 = use_tiled_indexed ? 1u : 0u;
+            constants[17].u32 = tile_mode;
+            constants[18].u32 = row_base;
+            constants[19].u32 = expert_slot_base;
             return constants;
         };
 
-        std::vector<ncnn::VkMat> gate_bindings;
-        gate_bindings.reserve(mxfp4_indexed_max_experts + 3);
-        gate_bindings.push_back(input_gpu);
-        for (uint32_t slot = 0; slot < mxfp4_indexed_max_experts; ++slot)
+        for (size_t chunk_begin = 0;
+             chunk_begin < selected.size();
+             chunk_begin += mxfp4_indexed_max_experts)
         {
-            if (slot < selected.size())
+            const size_t chunk_end = std::min(
+                selected.size(),
+                chunk_begin + static_cast<size_t>(mxfp4_indexed_max_experts));
+            const uint32_t chunk_count = static_cast<uint32_t>(chunk_end - chunk_begin);
+            const uint32_t row_base = expert_row_offsets[chunk_begin];
+            const uint32_t row_end = expert_row_offsets[chunk_end];
+            const uint32_t chunk_rows = row_end - row_base;
+            uint32_t chunk_maximum_request_rows = 0;
+            for (size_t slot = chunk_begin; slot < chunk_end; ++slot)
             {
-                gate_bindings.push_back(
-                    selected[slot].entry->operation->implementation_->gate_up->implementation_->storage);
+                const size_t request_index = selected[slot].request_index;
+                chunk_maximum_request_rows = std::max(
+                    chunk_maximum_request_rows,
+                    static_cast<uint32_t>(requests[request_index].input->rows()));
             }
-            else
-            {
-                gate_bindings.emplace_back();
-            }
-        }
-        gate_bindings.push_back(use_tiled_indexed ? expert_row_offsets_gpu : expert_ids_gpu);
-        gate_bindings.push_back(intermediate_gpu);
-        std::vector<unsigned char> readonly_bindings(gate_bindings.size(), 1);
-        readonly_bindings.back() = 0;
-        ncnn::VkMat gate_dispatcher;
-        gate_dispatcher.w = static_cast<int>(intermediate_columns * 32);
-        gate_dispatcher.h = static_cast<int>(use_tiled_indexed ? (maximum_request_rows + 1) / 2 : total_rows);
-        gate_dispatcher.c = static_cast<int>(use_tiled_indexed ? selected.size() : 1);
-        command.record_pipeline_readonly(
-            indexed_pipeline_.get(),
-            gate_bindings,
-            readonly_bindings,
-            make_constants(0),
-            gate_dispatcher);
+            const uint32_t chunk_tile_mode = use_tiled_indexed && chunk_maximum_request_rows >= 2 ? 1u : 0u;
 
-        std::vector<ncnn::VkMat> down_bindings;
-        down_bindings.reserve(mxfp4_indexed_max_experts + 3);
-        down_bindings.push_back(intermediate_gpu);
-        for (uint32_t slot = 0; slot < mxfp4_indexed_max_experts; ++slot)
-        {
-            if (slot < selected.size())
+            std::vector<ncnn::VkMat> gate_bindings;
+            gate_bindings.reserve(mxfp4_indexed_max_experts + 3);
+            gate_bindings.push_back(input_gpu);
+            for (uint32_t slot = 0; slot < mxfp4_indexed_max_experts; ++slot)
             {
-                down_bindings.push_back(
-                    selected[slot].entry->operation->implementation_->down->implementation_->storage);
+                if (slot < chunk_count)
+                {
+                    gate_bindings.push_back(
+                        selected[chunk_begin + slot].entry->operation->implementation_->gate_up->implementation_->storage);
+                }
+                else
+                {
+                    gate_bindings.emplace_back();
+                }
             }
-            else
+            gate_bindings.push_back(chunk_tile_mode != 0 ? expert_row_offsets_gpu : expert_ids_gpu);
+            gate_bindings.push_back(intermediate_gpu);
+            std::vector<unsigned char> readonly_bindings(gate_bindings.size(), 1);
+            readonly_bindings.back() = 0;
+            ncnn::VkMat gate_dispatcher;
+            gate_dispatcher.w = static_cast<int>(intermediate_columns * 32);
+            gate_dispatcher.h = static_cast<int>(chunk_tile_mode != 0 ? (chunk_maximum_request_rows + 1) / 2 : chunk_rows);
+            gate_dispatcher.c = static_cast<int>(chunk_tile_mode != 0 ? chunk_count : 1);
+            command.record_pipeline_readonly(
+                indexed_pipeline_.get(),
+                gate_bindings,
+                readonly_bindings,
+                make_constants(0, row_base, static_cast<uint32_t>(chunk_begin), chunk_count, chunk_tile_mode),
+                gate_dispatcher);
+
+            std::vector<ncnn::VkMat> down_bindings;
+            down_bindings.reserve(mxfp4_indexed_max_experts + 3);
+            down_bindings.push_back(intermediate_gpu);
+            for (uint32_t slot = 0; slot < mxfp4_indexed_max_experts; ++slot)
             {
-                down_bindings.emplace_back();
+                if (slot < chunk_count)
+                {
+                    down_bindings.push_back(
+                        selected[chunk_begin + slot].entry->operation->implementation_->down->implementation_->storage);
+                }
+                else
+                {
+                    down_bindings.emplace_back();
+                }
             }
+            down_bindings.push_back(chunk_tile_mode != 0 ? expert_row_offsets_gpu : expert_ids_gpu);
+            down_bindings.push_back(output_gpu);
+            readonly_bindings.assign(down_bindings.size(), 1);
+            readonly_bindings.back() = 0;
+            ncnn::VkMat down_dispatcher;
+            down_dispatcher.w = static_cast<int>(output_columns * 32);
+            down_dispatcher.h = static_cast<int>(chunk_tile_mode != 0 ? (chunk_maximum_request_rows + 1) / 2 : chunk_rows);
+            down_dispatcher.c = static_cast<int>(chunk_tile_mode != 0 ? chunk_count : 1);
+            command.record_pipeline_readonly(
+                indexed_pipeline_.get(),
+                down_bindings,
+                readonly_bindings,
+                make_constants(1, row_base, static_cast<uint32_t>(chunk_begin), chunk_count, chunk_tile_mode),
+                down_dispatcher);
         }
-        down_bindings.push_back(use_tiled_indexed ? expert_row_offsets_gpu : expert_ids_gpu);
-        down_bindings.push_back(output_gpu);
-        readonly_bindings.assign(down_bindings.size(), 1);
-        readonly_bindings.back() = 0;
-        ncnn::VkMat down_dispatcher;
-        down_dispatcher.w = static_cast<int>(output_columns * 32);
-        down_dispatcher.h = static_cast<int>(use_tiled_indexed ? (maximum_request_rows + 1) / 2 : total_rows);
-        down_dispatcher.c = static_cast<int>(use_tiled_indexed ? selected.size() : 1);
-        command.record_pipeline_readonly(
-            indexed_pipeline_.get(),
-            down_bindings,
-            readonly_bindings,
-            make_constants(1),
-            down_dispatcher);
 
         if (use_route_aggregation)
         {
@@ -11450,7 +11502,7 @@ private:
                 row_offset += request.input->rows();
             }
         }
-        runtime_state.dispatches += 2 + static_cast<uint64_t>(use_route_aggregation);
+        runtime_state.dispatches += indexed_chunk_count * 2 + static_cast<uint64_t>(use_route_aggregation);
         ++runtime_state.compute_submissions;
         ++runtime_state.batch_uploads;
         ++runtime_state.batch_downloads;

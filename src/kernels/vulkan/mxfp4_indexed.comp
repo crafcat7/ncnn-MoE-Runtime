@@ -75,6 +75,12 @@ layout(push_constant) uniform parameter
     uint activation;
     float activation_limit;
     uint tile_mode;
+    // The descriptor table is intentionally bounded to eight entries.  A
+    // larger/dynamic top-k is dispatched in chunks and reuses this table;
+    // these bases translate the local chunk indices to the shared row and
+    // expert tables.
+    uint row_base;
+    uint expert_slot_base;
 }
 p;
 
@@ -225,8 +231,9 @@ void main()
     {
         const uint slot = gl_WorkGroupID.z;
         const uint row_tile = gl_WorkGroupID.y;
-        const uint row_begin = expert_ids[slot] + row_tile * 2u;
-        const uint row_end = expert_ids[slot + 1u];
+        const uint table_slot = slot + p.expert_slot_base;
+        const uint row_begin = expert_ids[table_slot] + row_tile * 2u;
+        const uint row_end = expert_ids[table_slot + 1u];
         const bool output_valid = output_column < (gate_mode ? p.gate_output_columns / 2u : p.down_output_columns);
         const bool row_0_valid = slot < p.expert_count && row_begin < row_end && row_begin < p.token_count;
         const bool row_1_valid = slot < p.expert_count && row_begin + 1u < row_end && row_begin + 1u < p.token_count;
@@ -285,15 +292,16 @@ void main()
 
     const uint matrix_input_columns = gate_mode ? p.gate_input_columns : p.down_input_columns;
     const uint block_count = gate_mode ? p.gate_block_count : p.down_block_count;
-    const uint slot = token < p.token_count ? expert_ids[token] : 0u;
+    const uint row = token + p.row_base;
+    const uint slot = row < p.token_count ? expert_ids[row] - p.expert_slot_base : 0u;
     const bool valid = output_column < (gate_mode ? p.gate_output_columns / 2u : p.down_output_columns)
-                       && token < p.token_count
+                       && row < p.token_count
                        && slot < p.expert_count;
     float sum_0 = 0.0;
     float sum_1 = 0.0;
     if (valid && lane < 32u)
     {
-        const uint input_row = token * matrix_input_columns;
+        const uint input_row = row * matrix_input_columns;
         const uint row_0 = gate_mode ? output_column * 2u : output_column;
         const uint row_1 = row_0 + 1u;
         const uint row_0_packed = row_0 * block_count * 16u;
@@ -325,7 +333,7 @@ void main()
     {
         if (!gate_mode)
         {
-            output_data[token * p.down_output_columns + output_column] =
+            output_data[row * p.down_output_columns + output_column] =
                 reduced_0 + bias_value(slot, output_column);
         }
         else
@@ -340,7 +348,7 @@ void main()
             const float silu = p.activation == 0u
                                    ? gate / (1.0 + exp(-1.702 * gate))
                                    : gate / (1.0 + exp(-gate));
-            output_data[token * (p.gate_output_columns / 2u) + output_column] =
+            output_data[row * (p.gate_output_columns / 2u) + output_column] =
                 p.activation == 0u ? silu * (up + 1.0) : silu * up;
         }
     }
@@ -361,7 +369,7 @@ void main()
     {
         if (!gate_mode)
         {
-            output_data[token * p.down_output_columns + output_column] =
+            output_data[row * p.down_output_columns + output_column] =
                 partial_sum_0[0] + bias_value(slot, output_column);
         }
         else
@@ -376,7 +384,7 @@ void main()
             const float silu = p.activation == 0u
                                    ? gate / (1.0 + exp(-1.702 * gate))
                                    : gate / (1.0 + exp(-gate));
-            output_data[token * (p.gate_output_columns / 2u) + output_column] =
+            output_data[row * (p.gate_output_columns / 2u) + output_column] =
                 p.activation == 0u ? silu * (up + 1.0) : silu * up;
         }
     }
