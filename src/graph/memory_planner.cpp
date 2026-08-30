@@ -723,7 +723,7 @@ static Result<uint64_t> dense_bytes(const MoeIR& ir)
     return checked_add(total, final_norm.value(), "dense weights");
 }
 
-static Result<uint64_t> file_backed_ple_bytes(const MoeIR& ir)
+static Result<uint64_t> ple_embedding_bytes(const MoeIR& ir)
 {
     uint64_t total = 0;
     for (const LayerDescriptor& layer : ir.layers)
@@ -731,7 +731,7 @@ static Result<uint64_t> file_backed_ple_bytes(const MoeIR& ir)
         if (!layer.ple.enabled())
             continue;
         if (layer.ple.ngram_size < 2 || layer.ple.heads_per_ngram == 0)
-            return Error{ErrorCode::InvalidModel, "invalid file-backed PLE configuration"};
+            return Error{ErrorCode::InvalidModel, "invalid PLE memory configuration"};
         const uint64_t head_count =
             static_cast<uint64_t>(layer.ple.ngram_size - 1)
             * layer.ple.heads_per_ngram;
@@ -739,16 +739,16 @@ static Result<uint64_t> file_backed_ple_bytes(const MoeIR& ir)
             || layer.ple.embedding_dimension % head_count != 0
             || layer.ple.embedding_row_count == 0)
         {
-            return Error{ErrorCode::InvalidModel, "invalid file-backed PLE configuration"};
+            return Error{ErrorCode::InvalidModel, "invalid PLE memory configuration"};
         }
         auto bytes = matrix_storage_bytes(
             layer.ple.embedding_row_count,
             layer.ple.embedding_dimension / head_count,
             ir.activation_dtype,
-            "file-backed PLE embedding");
+            "PLE embedding");
         if (!bytes)
             return bytes.error();
-        auto added = checked_add(total, bytes.value(), "file-backed PLE embedding");
+        auto added = checked_add(total, bytes.value(), "PLE embedding");
         if (!added)
             return added.error();
         total = added.value();
@@ -892,13 +892,14 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
     auto estimated_dense = dense_bytes(ir);
     if (!estimated_dense)
         return estimated_dense.error();
-    plan.estimated_dense_bytes = estimated_dense.value();
-    auto estimated_file_backed_dense = file_backed_ple_bytes(ir);
-    if (!estimated_file_backed_dense)
-        return estimated_file_backed_dense.error();
-    plan.estimated_file_backed_dense_bytes = estimated_file_backed_dense.value();
-    if (plan.estimated_file_backed_dense_bytes != 0)
-        plan.flags |= ModelMemoryFileBackedPle;
+    auto ple_embedding = ple_embedding_bytes(ir);
+    if (!ple_embedding)
+        return ple_embedding.error();
+    auto dense_with_ple = checked_add(
+        estimated_dense.value(), ple_embedding.value(), "dense weights");
+    if (!dense_with_ple)
+        return dense_with_ple.error();
+    plan.estimated_dense_bytes = dense_with_ple.value();
 
     if (ir.layers.empty())
         return Error{ErrorCode::InvalidModel, "memory planner requires at least one layer"};

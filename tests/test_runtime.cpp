@@ -6817,11 +6817,16 @@ void test_qwen4_exp_descriptors()
     auto memory = plan_model_memory(
         descriptor, memory_options, UINT64_C(8) * 1024 * 1024 * 1024);
     check(static_cast<bool>(memory));
-    check(has_flag(memory.value().flags, ModelMemoryFileBackedPle));
     check(has_flag(memory.value().flags, ModelMemoryFileBackedExperts));
     check(memory.value().selected_mode == ExpertMemoryMode::OnDemand);
     check(memory.value().expert_cache_bytes == 4096);
-    check(memory.value().estimated_file_backed_dense_bytes == 128);
+    MoeIR without_ple = descriptor;
+    without_ple.layers[1].ple = {};
+    auto memory_without_ple = plan_model_memory(
+        without_ple, memory_options, UINT64_C(8) * 1024 * 1024 * 1024);
+    check(static_cast<bool>(memory_without_ple));
+    check(memory.value().estimated_dense_bytes
+          == memory_without_ple.value().estimated_dense_bytes + 3384);
 
     const MoeDescriptor& moe = descriptor.layers[0].ffn.moe;
     check(moe.expert_count == 4);
