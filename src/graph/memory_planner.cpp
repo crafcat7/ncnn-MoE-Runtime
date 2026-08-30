@@ -723,39 +723,6 @@ static Result<uint64_t> dense_bytes(const MoeIR& ir)
     return checked_add(total, final_norm.value(), "dense weights");
 }
 
-static Result<uint64_t> ple_embedding_bytes(const MoeIR& ir)
-{
-    uint64_t total = 0;
-    for (const LayerDescriptor& layer : ir.layers)
-    {
-        if (!layer.ple.enabled())
-            continue;
-        if (layer.ple.ngram_size < 2 || layer.ple.heads_per_ngram == 0)
-            return Error{ErrorCode::InvalidModel, "invalid PLE memory configuration"};
-        const uint64_t head_count =
-            static_cast<uint64_t>(layer.ple.ngram_size - 1)
-            * layer.ple.heads_per_ngram;
-        if (head_count == 0
-            || layer.ple.embedding_dimension % head_count != 0
-            || layer.ple.embedding_row_count == 0)
-        {
-            return Error{ErrorCode::InvalidModel, "invalid PLE memory configuration"};
-        }
-        auto bytes = matrix_storage_bytes(
-            layer.ple.embedding_row_count,
-            layer.ple.embedding_dimension / head_count,
-            ir.activation_dtype,
-            "PLE embedding");
-        if (!bytes)
-            return bytes.error();
-        auto added = checked_add(total, bytes.value(), "PLE embedding");
-        if (!added)
-            return added.error();
-        total = added.value();
-    }
-    return total;
-}
-
 static Result<uint64_t> mxfp4_pair_bytes(const MoeIR& ir)
 {
     auto elements = checked_multiply(ir.hidden_size, ir.intermediate_size, "expert pair");
@@ -858,6 +825,7 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
                                           bool reserve_cpu_packed_weights)
 {
     ModelMemoryPlan plan;
+    bool budget_limited_by_available_memory = false;
     plan.requested_mode = config.expert_memory_mode;
     plan.physical_memory_bytes = physical_memory_bytes;
     plan.available_memory_bytes = available_memory_bytes;
@@ -879,9 +847,11 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
                 available_memory_bytes > system_reserve
                     ? available_memory_bytes - system_reserve
                     : available_memory_bytes / 2;
-            plan.host_memory_budget_bytes = std::min(
-                plan.host_memory_budget_bytes,
-                available_budget);
+            if (available_budget < plan.host_memory_budget_bytes)
+            {
+                plan.host_memory_budget_bytes = available_budget;
+                budget_limited_by_available_memory = true;
+            }
         }
     }
     else
@@ -892,14 +862,9 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
     auto estimated_dense = dense_bytes(ir);
     if (!estimated_dense)
         return estimated_dense.error();
-    auto ple_embedding = ple_embedding_bytes(ir);
-    if (!ple_embedding)
-        return ple_embedding.error();
-    auto dense_with_ple = checked_add(
-        estimated_dense.value(), ple_embedding.value(), "dense weights");
-    if (!dense_with_ple)
-        return dense_with_ple.error();
-    plan.estimated_dense_bytes = dense_with_ple.value();
+    // PLE embedding shards remain file-backed and are paged on demand.  The
+    // dense estimate covers only their resident projections and state.
+    plan.estimated_dense_bytes = estimated_dense.value();
 
     if (ir.layers.empty())
         return Error{ErrorCode::InvalidModel, "memory planner requires at least one layer"};
@@ -961,7 +926,9 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeIR& ir, const RuntimeConfig& 
         return resident_expert_bytes.error();
     plan.estimated_expert_resident_bytes = resident_expert_bytes.value();
 
-    const uint64_t safety_reserve = std::max(2 * gibibyte, physical_memory_bytes == 0 ? 2 * gibibyte : physical_memory_bytes / 8);
+    const uint64_t safety_reserve = budget_limited_by_available_memory
+                                        ? 0
+                                        : std::max(2 * gibibyte, physical_memory_bytes == 0 ? 2 * gibibyte : physical_memory_bytes / 8);
     uint64_t eager_capacity = 0;
     if (plan.host_memory_budget_bytes > plan.estimated_dense_bytes && plan.host_memory_budget_bytes - plan.estimated_dense_bytes > safety_reserve)
     {

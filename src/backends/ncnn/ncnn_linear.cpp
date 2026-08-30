@@ -9585,13 +9585,17 @@ static bool route_aggregation_enabled(
         return false;
 
     bool require_all_requests = false;
+    for (const ExpertBackendRequest& request : requests)
+    {
+        require_all_requests = require_all_requests
+                               || request.route_aggregation.require_all_requests;
+    }
     for (size_t request_index : selected_indices)
     {
         if (request_index >= requests.size())
             return false;
         const ExpertBackendRequest& request = requests[request_index];
         const ExpertBackendRequest::RouteAggregation& aggregation = request.route_aggregation;
-        require_all_requests = require_all_requests || aggregation.require_all_requests;
         if (!request.input || !aggregation.output || !aggregation.completed || aggregation.token_count == 0
             || aggregation.routes.size() != request.input->rows()
             || aggregation.output->rows() != aggregation.token_count
@@ -9616,29 +9620,13 @@ static bool route_aggregation_enabled(
     if (require_all_requests && selected_indices.size() != requests.size())
         return false;
 
-    // Aggregating only pays when the selected GPU routes contain more rows
-    // than the final token output.  For decode, the metadata upload and one
-    // extra aggregation dispatch should be amortized by the output transfer
-    // and CPU combine work that it removes.  Keep a byte threshold instead of
-    // hard-coding a model or hidden size: this enables the optimization for
-    // large generic MoE outputs while leaving tiny test and latency paths on
-    // the simple per-route return.
-    if (route_count <= token_count)
+    // Keep single-token decode in canonical route order.  Device-side
+    // reduction remains useful for multi-token waves, where it amortizes the
+    // metadata upload and output transfer without changing the next-token
+    // decision at every layer.
+    if (token_count == 1 || route_count <= token_count)
         return false;
-    if (token_count > 1)
-        return true;
-    if (output_columns == 0)
-        return false;
-    constexpr uint64_t minimum_saved_output_bytes = 32 * 1024;
-    const uint64_t saved_rows = route_count - token_count;
-    if (saved_rows > std::numeric_limits<uint64_t>::max()
-                         / static_cast<uint64_t>(output_columns)
-                         / sizeof(float))
-    {
-        return true;
-    }
-    const uint64_t saved_output_bytes = saved_rows * static_cast<uint64_t>(output_columns) * sizeof(float);
-    return saved_output_bytes >= minimum_saved_output_bytes;
+    return true;
 }
 
 static bool build_route_aggregation_metadata(
@@ -10622,29 +10610,58 @@ private:
             // caller-owned buffer. A failed reservation must be a safe CPU
             // fallback, never a partially published batch.
             ActivationBuffer* route_output = nullptr;
+            size_t route_requests = 0;
+            size_t executed_route_requests = 0;
+            size_t completed_route_requests = 0;
+            bool require_all_route_requests = false;
             for (size_t index = 0; index < work_->final.size(); ++index)
             {
-                if (work_->final[index] != ExpertBackendExecutionResult::Executed)
-                    continue;
                 ExpertBackendRequest& client = work_->client_requests[index];
-                if (!client.output)
+                const bool executed =
+                    work_->final[index] == ExpertBackendExecutionResult::Executed;
+                if (executed && !client.output)
                 {
                     aborted_ = true;
                     return false;
                 }
-                if (client.route_aggregation.output)
+                if (!client.route_aggregation.output)
                 {
-                    if (work_->private_route_completed[index] == 0)
+                    if (work_->private_route_completed[index] != 0)
                     {
                         aborted_ = true;
                         return false;
                     }
-                    if (route_output && route_output != client.route_aggregation.output)
+                    continue;
+                }
+                ++route_requests;
+                require_all_route_requests =
+                    require_all_route_requests
+                    || client.route_aggregation.require_all_requests;
+                if (executed)
+                    ++executed_route_requests;
+                if (work_->private_route_completed[index] != 0)
+                {
+                    if (!executed
+                        || (route_output
+                            && route_output != client.route_aggregation.output))
                     {
                         aborted_ = true;
                         return false;
                     }
                     route_output = client.route_aggregation.output;
+                    ++completed_route_requests;
+                }
+            }
+            if (completed_route_requests != 0)
+            {
+                const size_t expected_route_requests =
+                    require_all_route_requests
+                        ? route_requests
+                        : executed_route_requests;
+                if (completed_route_requests != expected_route_requests)
+                {
+                    aborted_ = true;
+                    return false;
                 }
             }
             bool route_published = false;
@@ -10654,7 +10671,7 @@ private:
                     continue;
                 ExpertBackendRequest& client = work_->client_requests[index];
                 client.output->swap(work_->private_outputs[index]);
-                if (client.route_aggregation.output)
+                if (work_->private_route_completed[index] != 0)
                 {
                     if (!route_published)
                     {

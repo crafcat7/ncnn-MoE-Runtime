@@ -1616,8 +1616,6 @@ static Result<void> run_hybrid_expert_blocks(
             static_cast<uint32_t>(layer_state.normalized.rows()),
             ExecutionBackend::Vulkan);
     }
-    model.expert_backend->wait_for_background_work();
-
     for (size_t block_index = 0; block_index < blocks.size(); ++block_index)
     {
         HybridBlockState& block = blocks[block_index];
@@ -1632,7 +1630,7 @@ static Result<void> run_hybrid_expert_blocks(
         request.route_aggregation.routes = std::span<const ExpertRoute>(active.batch.routes).subspan(block.input_begin, block.input.rows());
         request.route_aggregation.token_count = static_cast<uint32_t>(layer_state.normalized.rows());
         request.route_aggregation.completed = &block_aggregated[block_index];
-        request.route_aggregation.require_all_requests = false;
+        request.route_aggregation.require_all_requests = true;
         requests.push_back(request);
     }
 
@@ -1847,6 +1845,11 @@ static Result<void> run_hybrid_expert_blocks(
         layer_state,
         blocks,
         std::span<const uint8_t>(scratch.backend_aggregated));
+
+    // Let cold GPU admissions overlap the CPU fallback for this layer, then
+    // finish them before advancing so the warmed entries are available to
+    // later decode passes.
+    model.expert_backend->wait_for_background_work();
 
     for (size_t active_index : cpu_active_indices)
         layer_state.active_experts[active_index].lease = {};
@@ -2617,6 +2620,15 @@ static Result<void> run_moe(
             request.route_aggregation.token_count = static_cast<uint32_t>(layer_state.normalized.rows());
             request.route_aggregation.completed = &backend_aggregated[active_index];
             backend_requests.push_back(request);
+        }
+        const bool complete_backend_coverage =
+            backend_requests.size() == active_expert_count;
+        for (ExpertBackendRequest& request : backend_requests)
+        {
+            if (complete_backend_coverage)
+                request.route_aggregation.require_all_requests = true;
+            else
+                request.route_aggregation = {};
         }
         backend_execution_start = std::chrono::steady_clock::now();
         backend_submission = model.expert_backend->submit_batch(backend_requests);

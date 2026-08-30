@@ -81,7 +81,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expert-memory",
         choices=("auto", "eager", "on-demand"),
-        default="eager",
+        default="auto",
         help="Expert residency mode passed to the ncnn-MoE worker",
     )
     parser.add_argument("--enable-speculative", action="store_true")

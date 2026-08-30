@@ -3267,16 +3267,16 @@ void test_ncnn_vulkan_qnk_expert_operator()
         }
     }
 
-    ActivationBuffer aggregated_output(1, expected.columns());
+    ActivationBuffer aggregated_output(2, expected.columns());
     std::vector<ExpertRoute> first_routes = {
         {0, 0, 0.15f},
         {0, 1, 0.25f},
-        {0, 2, 0.10f},
+        {1, 2, 0.10f},
     };
     std::vector<ExpertRoute> second_routes = {
         {0, 0, 0.20f},
-        {0, 1, 0.15f},
-        {0, 2, 0.15f},
+        {1, 1, 0.15f},
+        {1, 2, 0.15f},
     };
     CpuBatch aggregation_output_first;
     CpuBatch aggregation_output_second;
@@ -3289,14 +3289,14 @@ void test_ncnn_vulkan_qnk_expert_operator()
     aggregation_requests[0].route_aggregation = {
         &aggregated_output,
         first_routes,
-        1,
+        2,
         &first_completed,
         true,
     };
     aggregation_requests[1].route_aggregation = {
         &aggregated_output,
         second_routes,
-        1,
+        2,
         &second_completed,
         true,
     };
@@ -3309,17 +3309,88 @@ void test_ncnn_vulkan_qnk_expert_operator()
     check(aggregation_results[1] == ExpertBackendExecutionResult::Executed);
     check(first_completed == 1);
     check(second_completed == 1);
-    for (uint32_t column = 0; column < expected.columns(); ++column)
+    for (size_t token = 0; token < aggregated_output.rows(); ++token)
     {
-        float expected_aggregation = 0.0f;
-        for (size_t row = 0; row < input.rows(); ++row)
+        for (uint32_t column = 0; column < expected.columns(); ++column)
         {
-            expected_aggregation += first_routes[row].weight * expected.row(row)[column];
-            expected_aggregation += second_routes[row].weight * second_expected.row(row)[column];
+            float expected_aggregation = 0.0f;
+            for (size_t row = 0; row < input.rows(); ++row)
+            {
+                if (first_routes[row].token_index == token)
+                    expected_aggregation += first_routes[row].weight * expected.row(row)[column];
+                if (second_routes[row].token_index == token)
+                    expected_aggregation += second_routes[row].weight * second_expected.row(row)[column];
+            }
+            check_near(aggregated_output.row(token)[column], expected_aggregation, 0.2f);
         }
-        check_near(aggregated_output.row(0)[column], expected_aggregation, 0.2f);
     }
     check(backend->statistics().route_aggregation_batches >= 1);
+
+    const uint64_t aggregation_batches =
+        backend->statistics().route_aggregation_batches;
+    std::fill_n(
+        aggregated_output.row(0),
+        aggregated_output.rows() * aggregated_output.columns(),
+        123.0f);
+    CpuBatch partial_output_first;
+    CpuBatch partial_output_second;
+    CpuBatch missing_output(input.rows(), expected.columns());
+    std::fill_n(
+        missing_output.row(0),
+        missing_output.rows() * missing_output.columns(),
+        321.0f);
+    uint8_t partial_first_completed = 0;
+    uint8_t partial_second_completed = 0;
+    uint8_t missing_completed = 0;
+    std::array<ExpertBackendRequest, 3> partial_requests = {{
+        {"qnk-expert", &input, &partial_output_first},
+        {"qnk-expert-second", &input, &partial_output_second},
+        {"qnk-expert-missing", &input, &missing_output},
+    }};
+    partial_requests[0].route_aggregation = {
+        &aggregated_output,
+        first_routes,
+        2,
+        &partial_first_completed,
+        false,
+    };
+    partial_requests[1].route_aggregation = {
+        &aggregated_output,
+        second_routes,
+        2,
+        &partial_second_completed,
+        false,
+    };
+    partial_requests[2].route_aggregation = {
+        &aggregated_output,
+        first_routes,
+        2,
+        &missing_completed,
+        true,
+    };
+    auto partial_submission = backend->submit_batch(partial_requests);
+    check(static_cast<bool>(partial_submission));
+    const auto partial_results = partial_submission->wait();
+    check(partial_submission->commit());
+    check(partial_results.size() == partial_requests.size());
+    check(partial_results[0] == ExpertBackendExecutionResult::Executed);
+    check(partial_results[1] == ExpertBackendExecutionResult::Executed);
+    check(partial_results[2] == ExpertBackendExecutionResult::NotResident);
+    check(partial_first_completed == 0);
+    check(partial_second_completed == 0);
+    check(missing_completed == 0);
+    check(aggregated_output.row(0)[0] == 123.0f);
+    check(missing_output.row(0)[0] == 321.0f);
+    for (size_t row = 0; row < input.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < expected.columns(); ++column)
+        {
+            check_near(partial_output_first.row(row)[column], expected.row(row)[column], 0.2f);
+            check_near(partial_output_second.row(row)[column], second_expected.row(row)[column], 0.2f);
+        }
+    }
+    check(backend->statistics().route_aggregation_batches
+          == aggregation_batches);
 }
 
 class TestExpertVictimCache final : public IExpertVictimCache
@@ -6826,7 +6897,14 @@ void test_qwen4_exp_descriptors()
         without_ple, memory_options, UINT64_C(8) * 1024 * 1024 * 1024);
     check(static_cast<bool>(memory_without_ple));
     check(memory.value().estimated_dense_bytes
-          == memory_without_ple.value().estimated_dense_bytes + 3384);
+          == memory_without_ple.value().estimated_dense_bytes + 3256);
+    MoeIR large_file_backed_ple = descriptor;
+    large_file_backed_ple.layers[1].ple.embedding_row_count = UINT64_C(320001536);
+    auto large_ple_memory = plan_model_memory(
+        large_file_backed_ple, memory_options, UINT64_C(8) * 1024 * 1024 * 1024);
+    check(static_cast<bool>(large_ple_memory));
+    check(large_ple_memory.value().estimated_dense_bytes
+          == memory.value().estimated_dense_bytes);
 
     const MoeDescriptor& moe = descriptor.layers[0].ffn.moe;
     check(moe.expert_count == 4);
@@ -7989,6 +8067,17 @@ void test_automatic_expert_memory_planning()
     check(static_cast<bool>(large_plan.value().estimated_expert_resident_bytes == large_plan.value().estimated_expert_bytes));
     check(static_cast<bool>(large_plan.value().expert_cache_bytes == 20 * gibibyte - large_plan.value().estimated_dense_bytes));
     check(static_cast<bool>(large_plan.value().expert_cache_bytes >= large_plan.value().minimum_active_expert_bytes));
+
+    auto available_limited_plan = plan_model_memory(
+        large,
+        options,
+        physical_memory,
+        false,
+        12 * gibibyte);
+    check(static_cast<bool>(available_limited_plan));
+    check(static_cast<bool>(available_limited_plan.value().host_memory_budget_bytes == 10 * gibibyte));
+    check(static_cast<bool>(available_limited_plan.value().expert_cache_bytes
+                            == 10 * gibibyte - available_limited_plan.value().estimated_dense_bytes));
 
     MoeIR qnk = gpt_oss_memory_ir(1, 24);
     qnk.vocabulary_size = 128;
