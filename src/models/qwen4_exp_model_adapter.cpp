@@ -178,17 +178,6 @@ static Result<void> q4_validate_mxfp4_artifact(
         if (!status)
             return status.error();
     }
-    for (uint32_t layer_id = 0; layer_id < mtp_layer_count; ++layer_id)
-    {
-        status = q4_validate_artifact_expert_bank(
-            archive,
-            "__ncnn_moe_qwen3_8_mxfp4__.mtp.layers." + std::to_string(layer_id) + ".experts.",
-            expert_count,
-            hidden_size,
-            intermediate_size);
-        if (!status)
-            return status.error();
-    }
     return {};
 }
 
@@ -719,12 +708,25 @@ Result<MoeIR> Qwen4ExpModelAdapter::parse_model(const ModelPackage& package) con
 
     const float rotary_value = static_cast<float>(head_dimension.value()) * partial_rotary_factor.value();
     const uint32_t rotary_dimension = static_cast<uint32_t>(std::round(rotary_value));
-    if (layer_types.value().size() != layer_count.value()
+    if (hidden_size.value() == 0 || intermediate_size.value() == 0
+        || layer_count.value() == 0 || expert_count.value() == 0
+        || top_k.value() == 0 || top_k.value() > expert_count.value()
+        || attention_head_count.value() == 0 || kv_head_count.value() == 0
+        || head_dimension.value() == 0
+        || linear_key_head_count.value() == 0
+        || linear_value_head_count.value() == 0
+        || linear_key_head_dimension.value() == 0
+        || linear_value_head_dimension.value() == 0
+        || layer_types.value().size() != layer_count.value()
         || shared_intermediate_size.value() != intermediate_size.value()
         || attention_head_count.value() % kv_head_count.value() != 0
         || linear_value_head_count.value() % linear_key_head_count.value() != 0
+        || linear_convolution.value() == 0
+        || index_head_count.value() == 0
+        || index_head_dimension.value() == 0
         || index_kv_head_count.value() != 1 || index_compression.value() == 0
         || index_budget.value() % index_compression.value() != 0
+        || hyper_low_rank.value() == 0
         || rotary_dimension == 0 || rotary_dimension > head_dimension.value()
         || rotary_dimension > index_head_dimension.value()
         || rotary_dimension % 2 != 0
@@ -733,6 +735,7 @@ Result<MoeIR> Qwen4ExpModelAdapter::parse_model(const ModelPackage& package) con
         || state_dtype.value() != "float32" || output_gate_type.value() != "sigmoid"
         || attention_bias.value() || hyper_count.value() != 4
         || ple_embedding_dimension.value() != hidden_size.value()
+        || ple_convolution.value() == 0 || embedding_shards.value() == 0
         || ple_layer_ids.value().size() != 1 || ple_layer_ids.value()[0] == 0
         || ple_layer_ids.value()[0] > layer_count.value())
     {

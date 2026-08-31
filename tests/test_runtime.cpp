@@ -6730,7 +6730,6 @@ static void write_qwen4_mxfp4_test_artifact(
             + std::to_string(layer_id)
             + ".experts.");
     }
-    add_bank("__ncnn_moe_qwen3_8_mxfp4__.mtp.layers.0.experts.");
     header << '}';
     std::string encoded_header = header.str();
     encoded_header.append(
@@ -6928,6 +6927,20 @@ void test_qwen4_exp_descriptors()
         invalid.manifest.raw_json,
         std::regex(R"("ple_layer_ids"\s*:\s*\[2\])"),
         R"("ple_layer_ids": [0])");
+    check(!adapter.parse_model(invalid));
+
+    invalid = qwen4_exp_package();
+    invalid.manifest.raw_json = std::regex_replace(
+        invalid.manifest.raw_json,
+        std::regex(R"("split_ngram_parts"\s*:\s*2)"),
+        R"("split_ngram_parts": 0)");
+    check(!adapter.parse_model(invalid));
+
+    invalid = qwen4_exp_package();
+    invalid.manifest.raw_json = std::regex_replace(
+        invalid.manifest.raw_json,
+        std::regex(R"("num_key_value_heads"\s*:\s*1)"),
+        R"("num_key_value_heads": 0)");
     check(!adapter.parse_model(invalid));
 
     ScopedTestDirectory artifact_directory("ncnn_moe_qwen4_artifact_test_");

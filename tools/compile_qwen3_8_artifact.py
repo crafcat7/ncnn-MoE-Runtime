@@ -197,10 +197,6 @@ def artifact_tensor_plan(
             )
     for layer_id in range(layer_count):
         append_bank(f"{ARTIFACT_PREFIX}.layers.{layer_id}.experts.")
-    for layer_id in range(mtp_layer_count):
-        append_bank(
-            f"{ARTIFACT_PREFIX}.mtp.layers.{layer_id}.experts."
-        )
     return plan
 
 
@@ -215,7 +211,7 @@ def encode_header(
         "__metadata__": {
             "format": ARTIFACT_FORMAT,
             "model_type": "qwen4_exp",
-            "scope": "main-and-mtp-routed-experts",
+            "scope": "main-routed-experts",
             "quantization": "ocp-e2m1-e8m0-block32-maxabs",
             "source_config_sha256": config_sha256,
             "source_index_sha256": index_sha256,
@@ -348,7 +344,6 @@ def compile_artifact(
     tensors: dict[str, TensorRange],
     header: bytes,
     layer_count: int,
-    mtp_layer_count: int,
     expert_count: int,
     hidden_size: int,
     intermediate_size: int,
@@ -362,7 +357,7 @@ def compile_artifact(
     temporary = output.with_name(output.name + ".tmp")
     if temporary.exists():
         temporary.unlink()
-    expected_data_bytes = (layer_count + mtp_layer_count) * expert_count * (
+    expected_data_bytes = layer_count * expert_count * (
         intermediate_size * 2 * hidden_size * 17 // 32
         + hidden_size * intermediate_size * 17 // 32
     )
@@ -424,54 +419,6 @@ def compile_artifact(
                     f"compiled layer {layer_id + 1}/{layer_count} down",
                     flush=True,
                 )
-            for layer_id in range(mtp_layer_count):
-                source_prefix = f"mtp.layers.{layer_id}.mlp.experts."
-                gate_up = required_source(
-                    tensors,
-                    source_prefix + "gate_up_proj",
-                    (
-                        expert_count,
-                        intermediate_size * 2,
-                        hidden_size,
-                    ),
-                )
-                compile_bank(
-                    destination,
-                    gate_up,
-                    expert_count,
-                    intermediate_size * 2,
-                    hidden_size,
-                    workers,
-                    True,
-                )
-                print(
-                    f"compiled MTP layer {layer_id + 1}/"
-                    f"{mtp_layer_count} gate/up",
-                    flush=True,
-                )
-                down = required_source(
-                    tensors,
-                    source_prefix + "down_proj",
-                    (
-                        expert_count,
-                        hidden_size,
-                        intermediate_size,
-                    ),
-                )
-                compile_bank(
-                    destination,
-                    down,
-                    expert_count,
-                    hidden_size,
-                    intermediate_size,
-                    workers,
-                    False,
-                )
-                print(
-                    f"compiled MTP layer {layer_id + 1}/"
-                    f"{mtp_layer_count} down",
-                    flush=True,
-                )
             destination.flush()
             os.fsync(destination.fileno())
         actual_bytes = temporary.stat().st_size
@@ -505,19 +452,18 @@ def main() -> int:
         if not isinstance(text_config, dict):
             raise ValueError("config.json is missing text_config")
         layer_count = int(text_config["num_hidden_layers"])
-        mtp_layer_count = int(text_config["mtp_num_hidden_layers"])
+        mtp_layer_count = int(text_config.get("mtp_num_hidden_layers", 0))
         expert_count = int(text_config["num_experts"])
         hidden_size = int(text_config["hidden_size"])
         intermediate_size = int(text_config["moe_intermediate_size"])
         if (
             layer_count <= 0
-            or mtp_layer_count != 1
+            or mtp_layer_count < 0
             or expert_count <= 0
             or hidden_size <= 0
             or intermediate_size <= 0
             or hidden_size % 32
             or intermediate_size % 32
-            or bool(text_config.get("mtp_use_dedicated_embeddings", True))
         ):
             raise ValueError("unsupported Qwen routed Expert dimensions")
 
@@ -545,8 +491,7 @@ def main() -> int:
             tensor.byte_count for tensor in plan
         )
         print(
-            f"compiling {(layer_count + mtp_layer_count) * expert_count} "
-            f"main/MTP routed Experts "
+            f"compiling {layer_count * expert_count} main routed Experts "
             f"into {artifact_bytes / (1024 ** 3):.2f} GiB at {output}",
             flush=True,
         )
@@ -556,7 +501,6 @@ def main() -> int:
             tensors,
             header,
             layer_count,
-            mtp_layer_count,
             expert_count,
             hidden_size,
             intermediate_size,

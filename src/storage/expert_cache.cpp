@@ -855,11 +855,10 @@ Result<std::shared_ptr<TensorData>> Mxfp4ExpertCache::load_tensor(const TensorDa
     auto loaded = std::make_shared<TensorData>();
     loaded->dtype = DType::MxFp4;
     loaded->shape = source.shape;
-    // Blocks and scales are independent ranges.  Keep both requests in
-    // flight for file-backed Experts instead of serializing two overlapped
-    // reads on every cache worker.  This is deliberately scoped to the
-    // cache worker's pair load; the public cache worker count remains the
-    // runtime's single I/O concurrency contract.
+    // A pair loader may overlap Gate/Up with Down, while each tensor overlaps
+    // its independent blocks and scales.  That keeps the physical read fanout
+    // fixed at four per cache worker instead of tying storage latency to four
+    // serial ranges.
     auto blocks_future = std::async(
         std::launch::async,
         [this, &file] {
@@ -2363,6 +2362,7 @@ Result<size_t> Mxfp4ExpertCache::wait_acquire_ready_pairs(
         ready_entries = overflow_entries.data();
     }
     size_t enqueued_count = 0;
+    bool capacity_exhausted = false;
     for (size_t index = 0; index < requests.size(); ++index)
     {
         leases[index] = {};
@@ -2398,7 +2398,10 @@ Result<size_t> Mxfp4ExpertCache::wait_acquire_ready_pairs(
             if (!temporarily_exhausted)
                 return queued.error();
             if (enqueued_count != 0)
+            {
+                capacity_exhausted = true;
                 break;
+            }
 
             // A small host cache can have every resident entry pinned by an
             // in-flight speculative read or another foreground request.  Do
@@ -2409,6 +2412,13 @@ Result<size_t> Mxfp4ExpertCache::wait_acquire_ready_pairs(
             if (stopping_)
                 return Error{ErrorCode::InternalError, "expert cache is stopping"};
             ready_.wait_for(wait_lock, std::chrono::milliseconds(1));
+        }
+        if (capacity_exhausted)
+        {
+            // ready_entries is consumed as a prefix below.  Stop the batch at
+            // the first capacity miss instead of leaving a null slot between
+            // requests admitted by concurrent releases.
+            break;
         }
     }
 

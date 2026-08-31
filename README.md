@@ -15,7 +15,8 @@ The runtime targets local inference on Desktop and edge-class systems where the
 complete model may be larger than available RAM. The public API is independent
 of a model family, device vendor, and fixed cache size. The distributed release
 includes validated GPT-OSS, DeepSeek-V4-Flash, DeepSeek-V4-Flash-DSpark, and
-Qwen3.6-35B-A3B text-backbone support for their official Safetensors packages.
+Qwen3.6-35B-A3B and Qwen3.8-Flash-Next text-backbone support for their official
+Safetensors packages.
 
 [Runtime capabilities](#runtime-capabilities) | [Architecture](#architecture) |
 [Supported models and data](#supported-models-and-reference-data) |
@@ -36,6 +37,7 @@ matrix.
 | DeepSeek-V4-Flash | Hybrid, 16 GiB host ARC | **1.254 token/s** | **3.809 aggregate token/s** (4 staged Sessions) | [Flash performance](models/deepseek-v4/README.md#deepseek-v4-flash-matrix) |
 | DeepSeek-V4-Flash-DSpark | Hybrid, DSpark enabled, 16 GiB host ARC | **1.254 token/s** | **3.594 aggregate token/s** (4 independent Sessions) | [DSpark performance](models/deepseek-v4/README.md#deepseek-v4-flash-dspark-matrix) |
 | Qwen3.6-35B-A3B | Hybrid, compiled MXFP4 Artifact, target only | **8.383 token/s** | **22.435 aggregate token/s** (4 independent Sessions) | [Qwen3.6 performance](models/qwen3.6/README.md#reference-performance) |
+| Qwen3.8-Flash-Next | Hybrid, on-demand Experts | Not yet published | Not yet published | [Qwen3.8 admission](models/qwen3.8/README.md) |
 
 Model-specific prompts, kernels, quantization formats, and service policies
 differ, so these rows are reference points rather than a cross-model ranking.
@@ -66,7 +68,7 @@ requiring a resident copy of every routed weight.
 | Area | Release capability |
 | --- | --- |
 | Runtime API | `Runtime`, immutable shared `Model`, per-request `Session`, and cross-Session `BatchScheduler` |
-| Model integration | Public `IMoeModelAdapter` contract and model-neutral `MoeIR`; built-in GPT-OSS, DeepSeek V4, and Qwen3.6 text adapters |
+| Model integration | Public `IMoeModelAdapter` contract and model-neutral `MoeIR`; built-in GPT-OSS, DeepSeek V4, Qwen3.6, and Qwen3.8 text adapters |
 | IR and compiler | Model-neutral `MoeIR` for Attention, Router, ExpertGroup, Combine, KV Cache, and quantization metadata; validation, normalization, weight resolution, and immutable compilation |
 | Execution graph | Tensor and node dependencies, backend candidates and placement, cross-backend events, and topological execution waves |
 | Dense path | Portable CPU with runtime-dispatched FP8 E4M3 scalar/AVX2/AVX-512 Linear, optional ncnn CPU operators, and mixed ncnn Vulkan Dense/Attention execution |
@@ -84,9 +86,9 @@ requiring a resident copy of every routed weight.
   Experts are admitted only when phase-level calibration measures a benefit.
 - **Fused MXFP4 compute.** Expert kernels decode MXFP4 blocks inside the
   compute loop instead of materializing complete FP32 weights. Runtime dispatch
-  selects scalar, NEON, SVE2, AVX2/FMA, or AVX-512 implementations. Qwen3.6 can
-  optionally compile its routed BF16 banks into the same fused storage profile
-  without modifying the official shards.
+  selects scalar, NEON, SVE2, AVX2/FMA, or AVX-512 implementations. Qwen3.6 and
+  Qwen3.8 can optionally compile their routed BF16 banks into the same fused
+  storage profile without modifying the official shards.
 - **Vectorized FP8 Linear.** E4M3 block-scale projections select scalar,
   AVX2/FMA, or AVX-512 kernels at runtime, share input loads across adjacent
   output rows, and use a data-type-aware CPU thread limit.

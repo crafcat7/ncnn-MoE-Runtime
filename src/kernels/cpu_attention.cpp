@@ -1107,6 +1107,8 @@ static Result<void> prepare_qsa_selection(
         scratch.qsa_query.rows()
         * static_cast<size_t>(maximum_selected_per_query));
     const float scale = 1.0f / std::sqrt(static_cast<float>(plan.index_head_dimension));
+    std::vector<std::pair<float, uint32_t>> scores;
+    std::vector<float> pooled(plan.index_head_dimension);
     for (size_t query_index = 0; query_index < scratch.qsa_query.rows(); ++query_index)
     {
         const uint64_t query_position = position_offset + query_index;
@@ -1116,9 +1118,8 @@ static Result<void> prepare_qsa_selection(
                                                  cache.token_count,
                                                  query_position - cache.start_position + 1);
         const uint64_t complete_blocks = visible_count / plan.compression_ratio;
-        std::vector<std::pair<float, uint32_t>> scores;
+        scores.clear();
         scores.reserve(static_cast<size_t>(complete_blocks));
-        std::vector<float> pooled(plan.index_head_dimension);
         for (uint32_t block = 0; block < complete_blocks; ++block)
         {
             std::fill(pooled.begin(), pooled.end(), 0.0f);
