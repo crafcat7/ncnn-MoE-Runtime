@@ -344,7 +344,7 @@ the Runtime API and its public model guides.
 | Capability | Public behavior |
 | --- | --- |
 | Adapter interface | Public `IMoeModelAdapter` to `MoeIR` lowering contract |
-| Built-in reference adapters | GPT-OSS-20B/120B, DeepSeek-V4-Flash/DSpark, and the Qwen3.6-35B-A3B text backbone |
+| Built-in reference adapters | GPT-OSS-20B/120B, DeepSeek-V4-Flash/DSpark, and the Qwen3.6-35B-A3B and Qwen3.8-Flash-Next text backbones |
 | CPU execution | Complete portable path |
 | Heterogeneous execution | Vulkan Dense/Attention with CPU routing and Experts |
 | Native Vulkan Experts | Optional MXFP4 cache and execution with runtime calibration and CPU fallback |
@@ -353,10 +353,11 @@ the Runtime API and its public model guides.
 | KV cache | CPU FP32/BF16 or mixed-backend FP32 ring |
 | Output | Full logits with native sampling and streaming |
 
-The distributed release includes validated GPT-OSS, DeepSeek V4, and Qwen3.6
-text production adapters. The Qwen admission excludes its vision encoder;
-its one-layer MTP payload is admitted with the checkpoint-bound compiled
-Artifact. Additional adapters use the same public IR and
+The distributed release includes validated GPT-OSS, DeepSeek V4, Qwen3.6, and
+Qwen3.8 text production adapters. Both Qwen admissions exclude their vision
+encoders. Qwen3.6 admits its one-layer MTP payload with the checkpoint-bound
+compiled Artifact, while Qwen3.8 does not execute its MTP tensors. Additional
+adapters use the same public IR and
 compiler boundary without adding model-family checks to Prefill, Decode,
 scheduling, or Expert execution.
 Multi-device placement is layer placement rather than Tensor Parallelism, and
@@ -372,6 +373,7 @@ definitions:
 - [GPT-OSS-20B/120B execution and performance](models/gpt-oss/README.md)
 - [DeepSeek V4 Flash and DSpark execution and performance](models/deepseek-v4/README.md)
 - [Qwen3.6-35B-A3B text admission and execution](models/qwen3.6/README.md)
+- [Qwen3.8-Flash-Next text admission and execution](models/qwen3.8/README.md)
 
 ## Project layout
 
