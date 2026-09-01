@@ -194,8 +194,6 @@ backend, memory, Expert-cache, and I/O plan. `chat` adds resumable sessions,
 context budgeting, compaction, and live token/CPU/GPU/I/O metrics. Install
 `openai-harmony` for GPT-OSS or `transformers` and the Hugging Face packages
 for DeepSeek/Qwen; `rich` and `prompt-toolkit` are optional TUI upgrades.
-While the worker is loading, the CLI renders native `init` lifecycle progress
-on stderr so JSONL stdout remains machine-readable.
 Human-readable resource sizes in `inspect` and metrics use decimal `GB`; the
 machine-readable JSONL fields retain their exact byte values.
 Persistent session history, user configuration, and tuning profiles are stored

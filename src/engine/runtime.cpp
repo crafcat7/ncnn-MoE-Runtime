@@ -241,24 +241,9 @@ void Runtime::register_adapter(std::shared_ptr<IMoeModelAdapter> adapter)
         adapters_.push_back(std::move(adapter));
 }
 
-Result<ModelPtr> Runtime::load_model(
-    const std::filesystem::path& model_path,
-    const RuntimeConfig& config,
-    RuntimeLoadProgressCallback on_progress)
+Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path,
+                                     const RuntimeConfig& config)
 {
-    constexpr uint32_t total_load_steps = 9;
-    const auto report_progress = [&](uint32_t completed_steps, std::string_view phase, std::string_view message) {
-        if (!on_progress)
-            return;
-        RuntimeLoadProgress progress;
-        progress.completed_steps = completed_steps;
-        progress.total_steps = total_load_steps;
-        progress.phase = phase;
-        progress.message = message;
-        on_progress(progress);
-    };
-
-    report_progress(0, "validate", "Validating runtime configuration");
     if (has_flag(config.flags, RuntimeOptionMemoryMapExperts)
         && (has_flag(config.flags, RuntimeOptionDirectExpertIo)
             || has_flag(config.flags, RuntimeOptionBufferedExpertIo)))
@@ -337,7 +322,6 @@ Result<ModelPtr> Runtime::load_model(
         }
     }
 
-    report_progress(1, "hardware", "Selecting CPU and Vulkan execution devices");
     std::filesystem::path root = model_path;
     std::filesystem::path manifest_path;
     std::error_code filesystem_error;
@@ -349,7 +333,6 @@ Result<ModelPtr> Runtime::load_model(
         root = model_path.parent_path();
     }
 
-    report_progress(2, "manifest", "Reading model manifest");
     auto manifest_text = read_text_file(manifest_path);
     if (!manifest_text)
         return manifest_text.error();
@@ -372,7 +355,6 @@ Result<ModelPtr> Runtime::load_model(
     if (!selected_adapter)
         return Error{ErrorCode::UnsupportedModel, "no adapter registered for model_type: " + package.manifest.model_type};
 
-    report_progress(3, "architecture", "Parsing model architecture");
     auto parsed_ir = selected_adapter->parse_model(package);
     if (!parsed_ir)
         return parsed_ir.error();
@@ -382,7 +364,6 @@ Result<ModelPtr> Runtime::load_model(
 
     const bool use_vulkan_dense = resolved_mode == HybridMode::HybridExperts;
     const bool release_vulkan_dense_host_storage = use_vulkan_dense && has_flag(config.flags, RuntimeOptionReleaseVulkanDenseHostStorage);
-    report_progress(4, "memory", "Planning host memory and Expert cache");
     const uint64_t current_available_memory_bytes = available_memory_bytes();
     auto raw_memory_plan = plan_model_memory(
         parsed_ir.value(),
@@ -484,7 +465,6 @@ Result<ModelPtr> Runtime::load_model(
         }
     }
 
-    report_progress(5, "weights", "Mapping model weights");
     auto weights = selected_adapter->map_weights(package, parsed_ir.value());
     if (!weights)
         return weights.error();
@@ -560,7 +540,6 @@ Result<ModelPtr> Runtime::load_model(
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityRetainCpuDenseCopies;
     if (release_vulkan_dense_host_storage && file_backed_experts)
         compiler_capabilities.flags |= ModelCompiler::BackendCapabilityReleaseVulkanDenseHostStorage;
-    report_progress(6, "compile", "Compiling execution graph");
     auto compiled = compiler.compile(std::move(parsed_ir).value(), std::move(weights).value(), resolved_mode, compiler_capabilities);
     if (!compiled)
         return compiled.error();
@@ -619,7 +598,6 @@ Result<ModelPtr> Runtime::load_model(
     compiled_model.effective_runtime_config.optimization_flags = effective_optimization_flags;
     compiled_model.effective_runtime_config.expected_concurrency = config.expected_concurrency;
     compiled_model.effective_runtime_config.file_backed_experts = file_backed_experts;
-    report_progress(7, "cache", "Preparing Expert storage and caches");
     if (file_backed_experts)
     {
         uint32_t expert_io_workers = config.expert_io_workers;
@@ -848,9 +826,7 @@ Result<ModelPtr> Runtime::load_model(
         compiled_model.effective_runtime_config.expert_gpu_cache_bytes = qnk_capacity;
     }
 
-    report_progress(8, "finalize", "Finalizing runtime model");
     auto immutable = std::make_shared<const CompiledModel>(std::move(compiled_model));
-    report_progress(9, "ready", "Model initialization complete");
     return ModelPtr(new Model(std::move(immutable)));
 }
 

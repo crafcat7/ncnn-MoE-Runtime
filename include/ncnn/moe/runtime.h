@@ -11,7 +11,6 @@
 #include "ncnn/moe/types.h"
 
 #include <filesystem>
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -109,20 +108,6 @@ struct RuntimeCapabilities
     std::string bfloat16_batched_linear_kernel;
 };
 
-// Stable, model-neutral progress reported while Runtime prepares a model.
-// The phase/message are intentionally descriptive rather than implementation
-// details so CLI, TUI, and future frontends can render the same initialization
-// lifecycle.
-struct RuntimeLoadProgress
-{
-    uint32_t completed_steps = 0;
-    uint32_t total_steps = 0;
-    std::string phase;
-    std::string message;
-};
-
-using RuntimeLoadProgressCallback = std::function<void(const RuntimeLoadProgress&)>;
-
 class Runtime
 {
 private:
@@ -141,8 +126,7 @@ public:
 
     [[nodiscard]] Result<ModelPtr> load_model(
         const std::filesystem::path& model_path,
-        const RuntimeConfig& config = {},
-        RuntimeLoadProgressCallback on_progress = {});
+        const RuntimeConfig& config = {});
 
     // Synchronization point for warm-up and traffic transitions.
     [[nodiscard]] Result<void> synchronize_model_caches(const ModelPtr& model);

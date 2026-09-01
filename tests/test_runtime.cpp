@@ -608,18 +608,8 @@ void test_prefill_decode_and_reset()
     check(static_cast<bool>(runtime.capabilities().float8_linear_row_group_size == 1 || runtime.capabilities().float8_linear_row_group_size == 2
                             || runtime.capabilities().float8_linear_row_group_size == 4
                             || runtime.capabilities().float8_linear_row_group_size == 8));
-    std::vector<RuntimeLoadProgress> load_progress;
-    auto model = runtime.load_model(
-        package.path(),
-        RuntimeConfig{},
-        [&load_progress](const RuntimeLoadProgress& progress) {
-            load_progress.push_back(progress);
-        });
+    auto model = runtime.load_model(package.path());
     check(static_cast<bool>(model));
-    check(static_cast<bool>(load_progress.size() >= 2));
-    check(static_cast<bool>(load_progress.front().completed_steps == 0));
-    check(static_cast<bool>(load_progress.back().completed_steps == load_progress.back().total_steps));
-    check(static_cast<bool>(load_progress.back().phase == "ready"));
     check(static_cast<bool>(model.value()->descriptor().model_type == "test_moe"));
     check(static_cast<bool>(model.value()->descriptor().layer_count == 1));
 

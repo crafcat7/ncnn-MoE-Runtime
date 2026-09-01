@@ -145,22 +145,6 @@ static std::string uint_array(const std::vector<uint32_t>& values)
     return result;
 }
 
-static void emit_initialization_progress(
-    uint32_t completed_steps,
-    uint32_t total_steps,
-    std::string_view phase,
-    std::string_view message)
-{
-    JsonObject result;
-    result.add_string("event", "init");
-    result.add_uint("completed_steps", completed_steps);
-    result.add_uint("total_steps", total_steps);
-    result.add_string("phase", phase);
-    result.add_string("message", message);
-    std::cout << result.finish() << '\n'
-              << std::flush;
-}
-
 static const char* error_code_name(ErrorCode code) noexcept
 {
     switch (code)
@@ -1250,19 +1234,8 @@ int main(int argc, char** argv)
     try
     {
         const ncnn::moe::RuntimeConfig config = ncnn::moe::parse_runtime_config(argc, argv, 2);
-        ncnn::moe::emit_initialization_progress(0, 10, "hardware", "Detecting CPU and Vulkan devices");
         ncnn::moe::Runtime runtime;
-        ncnn::moe::emit_initialization_progress(1, 10, "hardware", "CPU and Vulkan capabilities detected");
-        auto model = runtime.load_model(
-            std::filesystem::path(argv[1]),
-            config,
-            [](const ncnn::moe::RuntimeLoadProgress& progress) {
-                ncnn::moe::emit_initialization_progress(
-                    progress.completed_steps + 1,
-                    progress.total_steps + 1,
-                    progress.phase,
-                    progress.message);
-            });
+        auto model = runtime.load_model(std::filesystem::path(argv[1]), config);
         if (!model)
         {
             ncnn::moe::JsonObject error;
@@ -1273,7 +1246,6 @@ int main(int argc, char** argv)
                       << std::flush;
             return 1;
         }
-        ncnn::moe::emit_initialization_progress(10, 10, "worker", "Starting JSONL worker");
         ncnn::moe::Worker worker(runtime, std::move(model).value());
         return worker.run();
     }

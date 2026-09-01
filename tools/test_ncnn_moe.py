@@ -187,17 +187,8 @@ def main() -> int:
         raise AssertionError(f"unexpected adapter: {adapter.model_type}")
 
     runtime_args = [] if arguments.auto else ["--cpu"]
-    startup_events: list[dict[str, object]] = []
-    with WorkerClient(
-        arguments.worker,
-        arguments.model,
-        runtime_args,
-        startup_callback=startup_events.append,
-    ) as client:
+    with WorkerClient(arguments.worker, arguments.model, runtime_args) as client:
         assert client.ready["event"] == "ready"
-        assert startup_events
-        assert startup_events[-1]["completed_steps"] == startup_events[-1]["total_steps"]
-        assert startup_events[-1]["phase"] == "worker"
         assert client.ready["resources"]["backend"] in {"cpu", "hybrid"}
         assert "provider" in client.ready.get("telemetry", {})
         assert "reason" in client.ready.get("telemetry", {})
@@ -254,14 +245,8 @@ def main() -> int:
         bufsize=1,
     )
     assert process.stdin is not None and process.stdout is not None
-    startup_lines: list[dict[str, object]] = []
-    while True:
-        ready = json.loads(process.stdout.readline())
-        if ready.get("event") != "init":
-            break
-        startup_lines.append(ready)
+    ready = json.loads(process.stdout.readline())
     assert ready["event"] == "ready"
-    assert startup_lines and startup_lines[-1]["phase"] == "worker"
     process.stdin.write('{"op":"create_session","session_id":"cancel"}\n')
     process.stdin.flush()
     assert json.loads(process.stdout.readline())["event"] == "session_created"

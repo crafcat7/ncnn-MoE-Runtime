@@ -25,8 +25,7 @@ directories or executables on `PATH`. On Windows its default worker path is
 `NCNN_MOE_WORKER=PATH` when a different build is intentionally selected.
 
 `ncnn_moe_worker` loads Runtime/Model once and accepts one JSON object per line
-on stdin. During startup it emits `init` progress events before `ready`, then
-emits `token`, `metrics`, `done`, and `error` events. Its
+on stdin. It emits `ready`, `token`, `metrics`, `done`, and `error` events. Its
 native sessions contain token IDs and KV state only:
 
 - Python adapters provide the official tokenizer and chat template for each
@@ -35,18 +34,6 @@ native sessions contain token IDs and KV state only:
   compaction, persistence, and continuous chat.
 - The worker provides model loading, native Session state, generation, reset,
   cancellation, and runtime statistics.
-
-The Python CLI consumes the `init` events and renders a progress bar such as:
-
-```text
-Init [====================----]  83.3% · Preparing Expert storage and caches · 2.4s
-```
-
-The progress stages are public lifecycle descriptions (`hardware`, `manifest`,
-`architecture`, `memory`, `weights`, `compile`, `cache`, and `finalize`); they
-are not a promise about the exact number of internal operations. If loading
-fails, the last stage remains visible and the following `error` event contains
-the actionable failure.
 
 Use `inspect` before a run to see the detected CPU/Vulkan devices and effective
 resource plan; human-readable memory and I/O sizes are shown as decimal `GB`.

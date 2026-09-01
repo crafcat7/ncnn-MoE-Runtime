@@ -551,7 +551,7 @@ def open_worker(
     if not isinstance(session_settings, dict):
         session_settings = {}
     initial = merge_runtime_settings(cli=cli, session=session_settings, profile=None, user=user)
-    client = start_worker_client(
+    client = WorkerClient(
         worker,
         model,
         runtime_args_from_settings(initial),
@@ -578,7 +578,7 @@ def open_worker(
     )
     if merged != initial:
         client.close()
-        client = start_worker_client(
+        client = WorkerClient(
             worker,
             model,
             runtime_args_from_settings(merged),
@@ -632,61 +632,6 @@ def validate_generation_arguments(arguments: argparse.Namespace) -> None:
 
 def metrics_trace_enabled(arguments: argparse.Namespace) -> bool:
     return bool(getattr(arguments, "metrics_enabled", True)) and getattr(arguments, "metrics_interval_ms", 1000) > 0
-
-
-class StartupProgress:
-    """Render native worker initialization without polluting JSON stdout."""
-
-    def __init__(self) -> None:
-        self.started = time.monotonic()
-        self.last_width = 0
-        self.last_phase = ""
-        self.is_tty = bool(getattr(sys.stderr, "isatty", lambda: False)())
-
-    def __call__(self, event: dict[str, Any]) -> None:
-        completed = int(event.get("completed_steps", 0) or 0)
-        total = max(1, int(event.get("total_steps", 0) or 0))
-        percent = max(0.0, min(100.0, completed * 100.0 / total))
-        width = 24
-        filled = min(width, int(width * percent / 100.0))
-        bar = "=" * filled + "-" * (width - filled)
-        elapsed = time.monotonic() - self.started
-        message = str(event.get("message", event.get("phase", "initializing")))
-        text = f"Init [{bar}] {percent:5.1f}% · {message} · {elapsed:.1f}s"
-        if self.is_tty:
-            padding = max(0, self.last_width - len(text))
-            sys.stderr.write("\r" + text + (" " * padding))
-            sys.stderr.flush()
-            self.last_width = len(text)
-        elif event.get("phase") != self.last_phase or completed == total:
-            print(text, file=sys.stderr)
-        self.last_phase = str(event.get("phase", ""))
-
-    def finish(self) -> None:
-        if self.is_tty and self.last_width:
-            sys.stderr.write("\r" + (" " * self.last_width) + "\r")
-            sys.stderr.flush()
-        self.last_width = 0
-
-
-def start_worker_client(
-    worker: Path,
-    model: Path,
-    runtime_args: list[str],
-    *,
-    verbose: bool,
-) -> WorkerClient:
-    progress = StartupProgress()
-    try:
-        return WorkerClient(
-            worker,
-            model,
-            runtime_args,
-            startup_callback=progress,
-            verbose=verbose,
-        )
-    finally:
-        progress.finish()
 
 
 class ConversationApp:
