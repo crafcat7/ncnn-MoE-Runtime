@@ -217,5 +217,8 @@ def merge_runtime_settings(
         for key, value in source.items():
             if value is not None:
                 result[key] = value
+    # Hybrid mode owns GPU Expert decode selection. Ignore the pre-release
+    # experimental setting so stale profiles do not preserve a dead option.
+    result.pop("gpu_decode_experts", None)
     result.setdefault("backend", "auto")
     return result

@@ -156,9 +156,13 @@ struct CpuAttentionExecutionScratch
     CpuBatch gate;
     CpuBatch projected;
     CpuBatch output;
+    CpuBatch qsa_query_key;
+    CpuBatch qsa_query;
     std::vector<float> key_cache;
     std::vector<float> value_cache;
     std::vector<float> logits;
+    std::vector<size_t> qsa_selected_offsets;
+    std::vector<uint32_t> qsa_selected_indices;
     std::vector<float> flash_partial_max;
     std::vector<float> flash_partial_sum;
     std::vector<float> flash_partial_output;
@@ -349,6 +353,9 @@ struct CpuLayerCache
 
     std::vector<uint32_t> predicted_expert_ids;
     RouterPrefetchState next_router_prediction;
+    std::vector<uint16_t> qsa_index_keys;
+    std::vector<int32_t> ple_token_history;
+    std::vector<float> ple_convolution_state;
 
     [[nodiscard]] uint64_t allocated_bytes() const noexcept
     {
@@ -370,27 +377,36 @@ struct CpuLayerCache
                + static_cast<uint64_t>(latent_scored_indices.capacity()) * sizeof(LatentScoredIndex)
                + static_cast<uint64_t>(latent_selected_indices.capacity()) * sizeof(uint32_t)
                + static_cast<uint64_t>(predicted_expert_ids.capacity()) * sizeof(uint32_t)
+               + static_cast<uint64_t>(qsa_index_keys.capacity()) * sizeof(uint16_t)
+               + static_cast<uint64_t>(ple_token_history.capacity()) * sizeof(int32_t)
+               + static_cast<uint64_t>(ple_convolution_state.capacity()) * sizeof(float)
                + transaction.allocated_bytes()
                + device_allocated_bytes;
     }
 
     [[nodiscard]] uint64_t logical_bytes() const noexcept
     {
+        const uint64_t auxiliary_bytes =
+            static_cast<uint64_t>(qsa_index_keys.size()) * sizeof(uint16_t)
+            + static_cast<uint64_t>(ple_token_history.size()) * sizeof(int32_t)
+            + static_cast<uint64_t>(ple_convolution_state.size()) * sizeof(float);
         if (latent_cache)
         {
             const uint64_t window_tokens = std::min(latent_token_count, capacity_tokens);
-            return (window_tokens * columns + latent_compressed.size() + latent_index_compressed.size()) * sizeof(float);
+            return (window_tokens * columns + latent_compressed.size() + latent_index_compressed.size()) * sizeof(float)
+                   + auxiliary_bytes;
         }
         if (!gated_delta_convolution.empty() || !gated_delta_recurrent.empty())
         {
-            return static_cast<uint64_t>(gated_delta_convolution.size() + gated_delta_recurrent.size()) * sizeof(float);
+            return static_cast<uint64_t>(gated_delta_convolution.size() + gated_delta_recurrent.size()) * sizeof(float)
+                   + auxiliary_bytes;
         }
         if (gated_delta_device_state)
         {
-            return device_allocated_bytes;
+            return device_allocated_bytes + auxiliary_bytes;
         }
         const uint64_t element_size = dtype == DType::BFloat16 ? sizeof(uint16_t) : sizeof(float);
-        return token_count * columns * element_size * 2;
+        return token_count * columns * element_size * 2 + auxiliary_bytes;
     }
 };
 

@@ -44,6 +44,9 @@ struct ExpertPlan
 #define NCNN_MOE_ATTN_PLAN_COMPRESSED_BIT 3
 #define NCNN_MOE_ATTN_PLAN_DELTA_BIT      4
 #define NCNN_MOE_ATTN_PLAN_GATE_BIT       5
+#define NCNN_MOE_ATTN_PLAN_QSA_BIT        6
+#define NCNN_MOE_ATTN_PLAN_EXTERNAL_BIT   7
+#define NCNN_MOE_ATTN_PLAN_SIGMOID_BIT    8
 
 enum AttentionBlockFlag : uint32_t
 {
@@ -52,7 +55,10 @@ enum AttentionBlockFlag : uint32_t
     AttentionBlockLatent = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_LATENT_BIT,
     AttentionBlockCompressed = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_COMPRESSED_BIT,
     AttentionBlockGatedDeltaNet = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_DELTA_BIT,
-    AttentionBlockOutputGate = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_GATE_BIT
+    AttentionBlockOutputGate = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_GATE_BIT,
+    AttentionBlockQsa = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_QSA_BIT,
+    AttentionBlockExternalResidual = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_EXTERNAL_BIT,
+    AttentionBlockSigmoidGate = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_SIGMOID_BIT
 };
 
 struct AttentionBlockPlan
@@ -101,6 +107,9 @@ struct AttentionBlockPlan
     TensorHandle indexer_compressor_gate_weight = invalid_tensor_handle;
     TensorHandle indexer_query_weight = invalid_tensor_handle;
     TensorHandle indexer_weights_weight = invalid_tensor_handle;
+    TensorHandle qsa_query_key_weight = invalid_tensor_handle;
+    TensorHandle qsa_query_norm_weight = invalid_tensor_handle;
+    TensorHandle qsa_key_norm_weight = invalid_tensor_handle;
 
     uint32_t head_count = 0;
     uint32_t kv_head_count = 0;
@@ -117,6 +126,7 @@ struct AttentionBlockPlan
     uint32_t index_head_count = 0;
     uint32_t index_head_dimension = 0;
     uint32_t index_top_k = 0;
+    uint32_t index_token_budget = 0;
     uint32_t convolution_kernel_size = 0;
     float rope_theta = 10000.0f;
     float compressed_rope_theta = 10000.0f;
@@ -135,6 +145,38 @@ struct HyperConnectionPlan
     TensorHandle ffn_function = invalid_tensor_handle;
     TensorHandle ffn_base = invalid_tensor_handle;
     TensorHandle ffn_scale = invalid_tensor_handle;
+};
+
+struct GatedResidualPlan
+{
+    TensorHandle norm_weight = invalid_tensor_handle;
+    TensorHandle mix_down_weight = invalid_tensor_handle;
+    TensorHandle mix_up_weight = invalid_tensor_handle;
+    TensorHandle inject_weight = invalid_tensor_handle;
+};
+
+struct PleBlockPlan
+{
+    TensorHandle key_weight = invalid_tensor_handle;
+    TensorHandle value_weight = invalid_tensor_handle;
+    TensorHandle key_norm_weight = invalid_tensor_handle;
+    TensorHandle query_norm_weight = invalid_tensor_handle;
+    TensorHandle convolution_norm_weight = invalid_tensor_handle;
+    TensorHandle convolution_weight = invalid_tensor_handle;
+    TensorHandle hash_multipliers = invalid_tensor_handle;
+    TensorHandle head_vocabulary_sizes = invalid_tensor_handle;
+    TensorHandle head_offsets = invalid_tensor_handle;
+    std::vector<TensorHandle> embedding_shards;
+    uint32_t embedding_dimension = 0;
+    uint32_t convolution_kernel_size = 0;
+    uint32_t ngram_size = 0;
+    uint32_t heads_per_ngram = 0;
+    uint32_t eos_token_id = 0;
+
+    [[nodiscard]] bool enabled() const noexcept
+    {
+        return embedding_dimension != 0;
+    }
 };
 
 #define NCNN_MOE_BLOCK_NORMALIZE_TOPK_BIT 0
@@ -178,6 +220,9 @@ struct CompiledLayerPlan
     uint32_t vulkan_device_index = automatic_vulkan_device_index;
     AttentionBlockPlan attention;
     HyperConnectionPlan hyper_connection;
+    GatedResidualPlan attention_gated_residual;
+    GatedResidualPlan ffn_gated_residual;
+    PleBlockPlan ple;
     MoeBlockPlan moe;
     uint32_t flags = 0;
 };

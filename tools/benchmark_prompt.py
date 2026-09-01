@@ -81,7 +81,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expert-memory",
         choices=("auto", "eager", "on-demand"),
-        default="eager",
+        default="auto",
         help="Expert residency mode passed to the ncnn-MoE worker",
     )
     parser.add_argument("--enable-speculative", action="store_true")
@@ -173,6 +173,8 @@ def _summary(done_events: list[dict[str, Any]], generated: list[list[int]]) -> d
         "gpu_available": bool(gpu.get("available", False)),
         "gpu_linear_dispatches": int(gpu.get("linear_dispatches", 0)),
         "gpu_attention_blocks": int(gpu.get("attention_blocks", 0)),
+        "gpu_gated_delta_fusions": int(gpu.get("gated_delta_fusions", 0)),
+        "gpu_gated_delta_submissions": int(gpu.get("gated_delta_submissions", 0)),
         "gpu_batch_uploads": int(gpu.get("batch_uploads", 0)),
         "gpu_batch_downloads": int(gpu.get("batch_downloads", 0)),
         "gpu_execution_evidence": "expert_execution_counter"
@@ -215,7 +217,11 @@ def main() -> int:
     generated: list[list[int]] = []
 
     with WorkerClient(worker, model, _runtime_args(arguments)) as client:
-        client.create_session("prompt-benchmark", prefill_chunk_size=arguments.prefill_chunk_size, enable_speculative_context=False)
+        client.create_session(
+            "prompt-benchmark",
+            prefill_chunk_size=arguments.prefill_chunk_size,
+            enable_speculative_context=arguments.enable_speculative,
+        )
         for run_index in range(arguments.warmup + arguments.runs):
             if run_index:
                 client.reset("prompt-benchmark")
@@ -266,7 +272,8 @@ def main() -> int:
         print(
             "GPU evidence: executions={expert_gpu_executions}, failures={expert_gpu_execution_failures}, "
             "CPU-preferred={expert_gpu_cpu_preferred}, dense dispatches={gpu_linear_dispatches}, "
-            "attention blocks={gpu_attention_blocks}, uploads/downloads={gpu_batch_uploads}/{gpu_batch_downloads}; {gpu_execution_evidence}".format(**result)
+            "attention blocks={gpu_attention_blocks}, GDN fusions/submissions={gpu_gated_delta_fusions}/{gpu_gated_delta_submissions}, "
+            "uploads/downloads={gpu_batch_uploads}/{gpu_batch_downloads}; {gpu_execution_evidence}".format(**result)
         )
         print(
             "GPU Expert route aggregation: batches={expert_gpu_route_aggregation_batches}, "

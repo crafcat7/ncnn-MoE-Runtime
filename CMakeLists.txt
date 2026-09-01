@@ -61,16 +61,19 @@ set(NCNN_MOE_SOURCES
     src/kernels/cpu_bfloat16.cpp
     src/kernels/cpu_float8.cpp
     src/kernels/cpu_gated_delta_net.cpp
+    src/kernels/cpu_gated_residual.cpp
     src/kernels/cpu_hyper_connection.cpp
     src/kernels/cpu_latent_attention.cpp
     src/kernels/cpu_mxfp4.cpp
     src/kernels/cpu_qnk.cpp
     src/kernels/cpu_ops.cpp
+    src/kernels/cpu_ple.cpp
     src/kernels/cpu_state_cache.cpp
     src/kernels/cpu_vector.cpp
     src/models/builtin_model_adapter.cpp
     src/models/deepseek_v4_model_adapter.cpp
     src/models/qwen3_5_moe_model_adapter.cpp
+    src/models/qwen4_exp_model_adapter.cpp
     src/models/safetensors.cpp
     src/storage/expert_cache.cpp
     src/storage/expert_store.cpp
@@ -384,6 +387,16 @@ if(NCNN_MOE_BUILD_EXAMPLES)
             PRIVATE ncnn_moe_reference_runner)
         target_compile_features(
             ncnn_moe_qwen3_6
+            PRIVATE cxx_std_20)
+
+        add_executable(
+            ncnn_moe_qwen3_8
+            examples/run_qwen3_8.cpp)
+        target_link_libraries(
+            ncnn_moe_qwen3_8
+            PRIVATE ncnn_moe_reference_runner)
+        target_compile_features(
+            ncnn_moe_qwen3_8
             PRIVATE cxx_std_20)
     endif()
 

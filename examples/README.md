@@ -58,14 +58,24 @@ Expert kernels; there is no separate prefetch backend. A plan change that
 requires a new worker is reported instead of being
 silently applied to the current session.
 
+Hybrid execution automatically sends resident, backend-compatible routed
+Experts to Vulkan, including single-token decode waves; non-resident or
+unsupported requests retain the CPU fallback. The policy is shared by all
+adapters and does not require a model-specific GPU-decode option. The Qwen3.8-
+Flash-Next `qwen4_exp` adapter can use its checkpoint-bound MXFP4 artifact to
+reduce routed-Expert storage and improve GPU residency; without it, the
+official file-backed BF16 Experts remain supported. Use `--cpu` for a CPU-only
+comparison.
+
 CPU Expert weight repacking is an explicit experiment. Pass
 `--cpu-packed-weights on` to enable it for supported MXFP4-Q8 or Qn_K weights;
 when the option is absent, the worker keeps repack off and does not reserve an
 in-memory packed sidecar.
 
-The CLI is intentionally the only public text entry point. The three
+The CLI is intentionally the only public text entry point. The four
 model-named native executables (`ncnn_moe_gpt_oss`,
-`ncnn_moe_deepseek_v4`, and `ncnn_moe_qwen3_6`) remain reference/benchmark
+`ncnn_moe_deepseek_v4`, `ncnn_moe_qwen3_6`, and `ncnn_moe_qwen3_8`) remain
+reference/benchmark
 targets because the benchmark harness and CTest fixture use their positional
 token-ID, prompt-file, and multi-session controls. They are not built by the
 fast default configuration and are not required for normal text or chat usage.
@@ -74,7 +84,7 @@ Enable them at configure time when needed:
 ```powershell
 cmake -S . -B build-reference -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON
 cmake --build build-reference --config Release `
-  --target ncnn_moe_gpt_oss ncnn_moe_deepseek_v4 ncnn_moe_qwen3_6 --parallel
+  --target ncnn_moe_gpt_oss ncnn_moe_deepseek_v4 ncnn_moe_qwen3_6 ncnn_moe_qwen3_8 --parallel
 ```
 
 ## Metrics trace

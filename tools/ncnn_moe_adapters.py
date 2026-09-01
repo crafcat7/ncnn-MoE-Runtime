@@ -138,7 +138,14 @@ class ModelAdapter:
             return GptOssAdapter(model, **options)
         if model_type in {"deepseek_v4", "deepseek-v4", "deepseek_v4_flash"}:
             return DeepSeekAdapter(model, **options)
-        if model_type in {"qwen3_5_moe", "qwen3_6", "qwen3.6", "qwen3_5"}:
+        if model_type in {
+            "qwen3_5_moe",
+            "qwen3_6",
+            "qwen3.6",
+            "qwen3_5",
+            "qwen4_exp",
+            "qwen4_exp_text",
+        }:
             return QwenAdapter(model, **options)
         raise AdapterError(f"unsupported model_type: {model_type or '<missing>'}")
 
@@ -164,15 +171,20 @@ class ModelAdapter:
 
     @property
     def context_limit(self) -> int | None:
-        for key in (
-            "max_position_embeddings",
-            "max_sequence_length",
-            "max_seq_len",
-            "max_context_length",
-        ):
-            value = self.config.get(key)
-            if isinstance(value, int) and value > 0:
-                return value
+        configs = [self.config]
+        text_config = self.config.get("text_config")
+        if isinstance(text_config, dict):
+            configs.append(text_config)
+        for config in configs:
+            for key in (
+                "max_position_embeddings",
+                "max_sequence_length",
+                "max_seq_len",
+                "max_context_length",
+            ):
+                value = config.get(key)
+                if isinstance(value, int) and value > 0:
+                    return value
         return None
 
     @property
@@ -320,11 +332,33 @@ class QwenAdapter(ModelAdapter):
 
     def __init__(self, model: Path, **options: Any) -> None:
         super().__init__(model, **options)
-        _required(self.model, "config.json", "tokenizer.json", "chat_template.jinja")
+        _required(self.model, "config.json", "tokenizer.json")
+        if self.model_type in {"qwen4_exp", "qwen4_exp_text"}:
+            self.name = "qwen3.8"
         self.tokenizer = _load_transformers_tokenizer(self.model)
+        if not callable(getattr(self.tokenizer, "apply_chat_template", None)):
+            raise AdapterError("the official Qwen tokenizer does not provide a chat template")
+        stop_tokens: list[int] = []
+        tokenizer_eos = getattr(self.tokenizer, "eos_token_id", None)
+        if isinstance(tokenizer_eos, Integral):
+            stop_tokens.append(int(tokenizer_eos))
+        generation_path = self.model / "generation_config.json"
+        if generation_path.is_file():
+            generation = _load_json(generation_path)
+            configured_eos = generation.get("eos_token_id")
+            if isinstance(configured_eos, Integral):
+                configured_eos = [configured_eos]
+            if isinstance(configured_eos, list):
+                for token in configured_eos:
+                    if isinstance(token, Integral) and int(token) not in stop_tokens:
+                        stop_tokens.append(int(token))
+        self._stop_tokens = stop_tokens
 
     @property
     def stop_tokens(self) -> list[int]:
+        configured = getattr(self, "_stop_tokens", None)
+        if configured is not None:
+            return list(configured)
         value = getattr(self.tokenizer, "eos_token_id", None)
         return [] if value is None else [int(value)]
 

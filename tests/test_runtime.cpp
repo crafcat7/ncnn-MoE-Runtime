@@ -5,7 +5,9 @@
 #include "kernels/cpu_bfloat16.h"
 #include "kernels/cpu_fast_math.h"
 #include "kernels/cpu_gated_delta_net.h"
+#include "kernels/cpu_gated_residual.h"
 #include "kernels/cpu_mxfp4.h"
+#include "kernels/cpu_ple.h"
 #include "kernels/cpu_qnk.h"
 #include "kernels/cpu_ops.h"
 #include "kernels/cpu_state_cache.h"
@@ -28,6 +30,7 @@
 #include "models/builtin_model_adapter.h"
 #include "models/deepseek_v4_model_adapter.h"
 #include "models/qwen3_5_moe_model_adapter.h"
+#include "models/qwen4_exp_model_adapter.h"
 #include "models/safetensors.h"
 
 #if defined(_MSC_VER) && defined(_M_X64)
@@ -3264,16 +3267,16 @@ void test_ncnn_vulkan_qnk_expert_operator()
         }
     }
 
-    ActivationBuffer aggregated_output(1, expected.columns());
+    ActivationBuffer aggregated_output(2, expected.columns());
     std::vector<ExpertRoute> first_routes = {
         {0, 0, 0.15f},
         {0, 1, 0.25f},
-        {0, 2, 0.10f},
+        {1, 2, 0.10f},
     };
     std::vector<ExpertRoute> second_routes = {
         {0, 0, 0.20f},
-        {0, 1, 0.15f},
-        {0, 2, 0.15f},
+        {1, 1, 0.15f},
+        {1, 2, 0.15f},
     };
     CpuBatch aggregation_output_first;
     CpuBatch aggregation_output_second;
@@ -3286,14 +3289,14 @@ void test_ncnn_vulkan_qnk_expert_operator()
     aggregation_requests[0].route_aggregation = {
         &aggregated_output,
         first_routes,
-        1,
+        2,
         &first_completed,
         true,
     };
     aggregation_requests[1].route_aggregation = {
         &aggregated_output,
         second_routes,
-        1,
+        2,
         &second_completed,
         true,
     };
@@ -3306,17 +3309,88 @@ void test_ncnn_vulkan_qnk_expert_operator()
     check(aggregation_results[1] == ExpertBackendExecutionResult::Executed);
     check(first_completed == 1);
     check(second_completed == 1);
-    for (uint32_t column = 0; column < expected.columns(); ++column)
+    for (size_t token = 0; token < aggregated_output.rows(); ++token)
     {
-        float expected_aggregation = 0.0f;
-        for (size_t row = 0; row < input.rows(); ++row)
+        for (uint32_t column = 0; column < expected.columns(); ++column)
         {
-            expected_aggregation += first_routes[row].weight * expected.row(row)[column];
-            expected_aggregation += second_routes[row].weight * second_expected.row(row)[column];
+            float expected_aggregation = 0.0f;
+            for (size_t row = 0; row < input.rows(); ++row)
+            {
+                if (first_routes[row].token_index == token)
+                    expected_aggregation += first_routes[row].weight * expected.row(row)[column];
+                if (second_routes[row].token_index == token)
+                    expected_aggregation += second_routes[row].weight * second_expected.row(row)[column];
+            }
+            check_near(aggregated_output.row(token)[column], expected_aggregation, 0.2f);
         }
-        check_near(aggregated_output.row(0)[column], expected_aggregation, 0.2f);
     }
     check(backend->statistics().route_aggregation_batches >= 1);
+
+    const uint64_t aggregation_batches =
+        backend->statistics().route_aggregation_batches;
+    std::fill_n(
+        aggregated_output.row(0),
+        aggregated_output.rows() * aggregated_output.columns(),
+        123.0f);
+    CpuBatch partial_output_first;
+    CpuBatch partial_output_second;
+    CpuBatch missing_output(input.rows(), expected.columns());
+    std::fill_n(
+        missing_output.row(0),
+        missing_output.rows() * missing_output.columns(),
+        321.0f);
+    uint8_t partial_first_completed = 0;
+    uint8_t partial_second_completed = 0;
+    uint8_t missing_completed = 0;
+    std::array<ExpertBackendRequest, 3> partial_requests = {{
+        {"qnk-expert", &input, &partial_output_first},
+        {"qnk-expert-second", &input, &partial_output_second},
+        {"qnk-expert-missing", &input, &missing_output},
+    }};
+    partial_requests[0].route_aggregation = {
+        &aggregated_output,
+        first_routes,
+        2,
+        &partial_first_completed,
+        false,
+    };
+    partial_requests[1].route_aggregation = {
+        &aggregated_output,
+        second_routes,
+        2,
+        &partial_second_completed,
+        false,
+    };
+    partial_requests[2].route_aggregation = {
+        &aggregated_output,
+        first_routes,
+        2,
+        &missing_completed,
+        true,
+    };
+    auto partial_submission = backend->submit_batch(partial_requests);
+    check(static_cast<bool>(partial_submission));
+    const auto partial_results = partial_submission->wait();
+    check(partial_submission->commit());
+    check(partial_results.size() == partial_requests.size());
+    check(partial_results[0] == ExpertBackendExecutionResult::Executed);
+    check(partial_results[1] == ExpertBackendExecutionResult::Executed);
+    check(partial_results[2] == ExpertBackendExecutionResult::NotResident);
+    check(partial_first_completed == 0);
+    check(partial_second_completed == 0);
+    check(missing_completed == 0);
+    check(aggregated_output.row(0)[0] == 123.0f);
+    check(missing_output.row(0)[0] == 321.0f);
+    for (size_t row = 0; row < input.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < expected.columns(); ++column)
+        {
+            check_near(partial_output_first.row(row)[column], expected.row(row)[column], 0.2f);
+            check_near(partial_output_second.row(row)[column], second_expected.row(row)[column], 0.2f);
+        }
+    }
+    check(backend->statistics().route_aggregation_batches
+          == aggregation_batches);
 }
 
 class TestExpertVictimCache final : public IExpertVictimCache
@@ -3678,6 +3752,113 @@ void test_safetensors_qnk_source_binding()
     std::filesystem::remove_all(directory, ignored);
     std::filesystem::remove_all(sidecar_only_directory, ignored);
     std::filesystem::remove_all(bfloat16_directory, ignored);
+}
+
+void test_file_backed_bfloat16_expert_cache()
+{
+    const auto mapped_bfloat16 = [](
+                                     std::vector<uint32_t> shape,
+                                     std::initializer_list<float> source_values) {
+        auto storage = std::make_shared<std::vector<uint16_t>>();
+        storage->reserve(source_values.size());
+        for (float value : source_values)
+            storage->push_back(float_to_bfloat16(value));
+
+        TensorData tensor;
+        tensor.dtype = DType::BFloat16;
+        tensor.shape = std::move(shape);
+        tensor.mapped_data = std::shared_ptr<const uint8_t>(
+            storage,
+            reinterpret_cast<const uint8_t*>(storage->data()));
+        tensor.mapped_byte_count = storage->size() * sizeof(uint16_t);
+        return tensor;
+    };
+
+    const TensorData gate_up = mapped_bfloat16(
+        {2, 2}, {1.0f, 2.0f, 3.0f, 4.0f});
+    const TensorData down = mapped_bfloat16(
+        {2, 2}, {5.0f, 6.0f, 7.0f, 8.0f});
+    constexpr uint64_t pair_bytes = 16;
+
+    Mxfp4ExpertCache mapped_cache(
+        pair_bytes, 0, {}, ExpertCacheMemoryMapRanges);
+    auto mapped = mapped_cache.acquire_pair(gate_up, down);
+    check(static_cast<bool>(mapped));
+    check(!mapped.value().cache_hit);
+    check(mapped.value().bytes_read == pair_bytes);
+    check(static_cast<bool>(mapped.value().gate_up->mapped_data));
+    check(mapped.value().gate_up->bfloat16_data.empty());
+    check_near(
+        bfloat16_to_float(mapped.value().gate_up->bfloat16_values()[2]),
+        3.0f, 0.0f);
+    const std::string key = Mxfp4ExpertCache::make_pair_key(gate_up, down);
+    check(mapped_cache.is_ready(gate_up, down, key));
+    auto hit = mapped_cache.acquire_pair(
+        gate_up, down, std::numeric_limits<uint32_t>::max(), key);
+    check(static_cast<bool>(hit));
+    check(hit.value().cache_hit);
+    check(hit.value().bytes_read == 0);
+    const ExpertCacheStatistics mapped_statistics = mapped_cache.statistics();
+    check(mapped_statistics.misses == 1);
+    check(mapped_statistics.hits == 1);
+    check(mapped_statistics.resident_bytes == pair_bytes);
+    check(mapped_statistics.mapped_ranges == 2);
+    check(mapped_statistics.mapped_bytes == pair_bytes);
+
+    Mxfp4ExpertCache copied_cache(pair_bytes);
+    auto copied = copied_cache.acquire_pair(gate_up, down);
+    check(static_cast<bool>(copied));
+    check(!copied.value().gate_up->mapped_data);
+    check(copied.value().gate_up->bfloat16_data.size() == 4);
+    check_near(
+        bfloat16_to_float(copied.value().down->bfloat16_values()[3]),
+        8.0f, 0.0f);
+
+    const TensorData gate_up_two = mapped_bfloat16(
+        {2, 2}, {9.0f, 10.0f, 11.0f, 12.0f});
+    const TensorData down_two = mapped_bfloat16(
+        {2, 2}, {13.0f, 14.0f, 15.0f, 16.0f});
+    const TensorData gate_up_three = mapped_bfloat16(
+        {2, 2}, {17.0f, 18.0f, 19.0f, 20.0f});
+    const TensorData down_three = mapped_bfloat16(
+        {2, 2}, {21.0f, 22.0f, 23.0f, 24.0f});
+    const std::array<ExpertCachePairRequest, 3> requests = {{
+        {&gate_up, &down, 0, Mxfp4ExpertCache::make_pair_key(gate_up, down)},
+        {&gate_up_two, &down_two, 0, Mxfp4ExpertCache::make_pair_key(gate_up_two, down_two)},
+        {&gate_up_three, &down_three, 0, Mxfp4ExpertCache::make_pair_key(gate_up_three, down_three)},
+    }};
+    Mxfp4ExpertCache bounded_cache(pair_bytes * 2);
+    std::array<uint8_t, 3> acquired_pairs{};
+    size_t acquired_count = 0;
+    while (acquired_count != requests.size())
+    {
+        std::array<ExpertCachePairRequest, 3> pending_requests{};
+        std::array<size_t, 3> pending_indices{};
+        size_t pending_count = 0;
+        for (size_t index = 0; index < requests.size(); ++index)
+        {
+            if (acquired_pairs[index] != 0)
+                continue;
+            pending_requests[pending_count] = requests[index];
+            pending_indices[pending_count] = index;
+            ++pending_count;
+        }
+        std::array<ExpertCacheLease, 3> leases;
+        auto ready = bounded_cache.wait_acquire_ready_pairs(
+            std::span<const ExpertCachePairRequest>(
+                pending_requests.data(), pending_count),
+            std::span<ExpertCacheLease>(leases.data(), pending_count));
+        check(static_cast<bool>(ready));
+        check(ready.value() != 0);
+        for (size_t index = 0; index < pending_count; ++index)
+        {
+            if (!leases[index].gate_up)
+                continue;
+            acquired_pairs[pending_indices[index]] = 1;
+            ++acquired_count;
+        }
+    }
+    check(bounded_cache.statistics().resident_bytes <= pair_bytes * 2);
 }
 
 void test_file_backed_mxfp4_expert_cache()
@@ -6402,6 +6583,13 @@ void test_qwen3_5_moe_descriptors()
     check(memory.value().selected_mode == ExpertMemoryMode::Eager);
     check(memory.value().expert_pair_bytes == 384);
     check(memory.value().estimated_expert_bytes == 6144);
+    check(!has_flag(moe.flags, MoeDescriptorFileBackedExperts));
+    RuntimeConfig unsupported_on_demand;
+    unsupported_on_demand.expert_memory_mode = ExpertMemoryMode::OnDemand;
+    check(!plan_model_memory(
+        descriptor,
+        unsupported_on_demand,
+        UINT64_C(8) * 1024 * 1024 * 1024));
     MoeGraphBuilder graph_builder;
     auto graph = graph_builder.build(descriptor);
     check(static_cast<bool>(graph));
@@ -6455,6 +6643,665 @@ void test_qwen3_5_moe_descriptors()
     check(stale_artifact.error().code == ErrorCode::InvalidModel);
 }
 
+static void write_qwen4_mxfp4_test_artifact(
+    ModelPackage& package,
+    const std::filesystem::path& root)
+{
+    constexpr uint32_t layer_count = 4;
+    constexpr uint32_t mtp_layer_count = 1;
+    constexpr uint32_t expert_count = 4;
+    constexpr uint32_t hidden_size = 32;
+    constexpr uint32_t intermediate_size = 32;
+    package.root = root;
+    for (const auto& replacement : std::vector<std::pair<const char*, const char*>>{
+             {R"("hidden_size"\s*:\s*16)", R"("hidden_size": 32)"},
+             {R"("moe_intermediate_size"\s*:\s*4)", R"("moe_intermediate_size": 32)"},
+             {R"("shared_expert_intermediate_size"\s*:\s*4)", R"("shared_expert_intermediate_size": 32)"},
+             {R"("ple_embed_dim"\s*:\s*16)", R"("ple_embed_dim": 32)"},
+         })
+    {
+        package.manifest.raw_json = std::regex_replace(
+            package.manifest.raw_json,
+            std::regex(replacement.first),
+            replacement.second);
+    }
+    const std::string index_json = "{}\n";
+    {
+        std::ofstream config(root / "config.json", std::ios::binary);
+        config << package.manifest.raw_json;
+    }
+    {
+        std::ofstream index(
+            root / "model.safetensors.index.json",
+            std::ios::binary);
+        index << index_json;
+    }
+
+    std::ostringstream identity;
+    identity << "__ncnn_moe_qwen3_8_mxfp4__.identity.v1."
+             << layer_count << '.' << mtp_layer_count << '.'
+             << expert_count << '.'
+             << hidden_size << '.'
+             << intermediate_size << '.'
+             << std::hex << std::setfill('0')
+             << std::setw(16)
+             << qwen_test_fnv1a64(package.manifest.raw_json)
+             << '.'
+             << std::setw(16)
+             << qwen_test_fnv1a64(index_json);
+
+    std::ostringstream header;
+    header << R"({"__metadata__":{"format":"ncnn-moe-qwen3.8-mxfp4-v1"})";
+    uint64_t data_offset = 0;
+    const auto add_tensor = [&](const std::string& name, const std::vector<uint32_t>& shape) {
+        uint64_t byte_count = 1;
+        header << ",\"" << name << "\":{\"dtype\":\"U8\",\"shape\":[";
+        for (size_t index = 0; index < shape.size(); ++index)
+        {
+            if (index != 0)
+                header << ',';
+            header << shape[index];
+            byte_count *= shape[index];
+        }
+        header << "],\"data_offsets\":["
+               << data_offset << ','
+               << data_offset + byte_count << "]}";
+        data_offset += byte_count;
+    };
+    add_tensor(identity.str(), {0});
+    const auto add_bank = [&](const std::string& prefix) {
+        add_tensor(
+            prefix + "gate_up.blocks",
+            {expert_count, intermediate_size * 2, hidden_size / 32, 16});
+        add_tensor(
+            prefix + "gate_up.scales",
+            {expert_count, intermediate_size * 2, hidden_size / 32});
+        add_tensor(
+            prefix + "down.blocks",
+            {expert_count, hidden_size, intermediate_size / 32, 16});
+        add_tensor(
+            prefix + "down.scales",
+            {expert_count, hidden_size, intermediate_size / 32});
+    };
+    for (uint32_t layer_id = 0; layer_id < layer_count; ++layer_id)
+    {
+        add_bank(
+            "__ncnn_moe_qwen3_8_mxfp4__.layers."
+            + std::to_string(layer_id)
+            + ".experts.");
+    }
+    header << '}';
+    std::string encoded_header = header.str();
+    encoded_header.append(
+        (8 - encoded_header.size() % 8) % 8,
+        ' ');
+    std::ofstream artifact(
+        root / "ncnn-moe-qwen3.8-mxfp4.safetensors",
+        std::ios::binary);
+    const uint64_t header_bytes = encoded_header.size();
+    artifact.write(
+        reinterpret_cast<const char*>(&header_bytes),
+        sizeof(header_bytes));
+    artifact.write(
+        encoded_header.data(),
+        static_cast<std::streamsize>(encoded_header.size()));
+    std::array<char, 4096> zeros = {};
+    for (uint64_t written = 0; written < data_offset;)
+    {
+        const uint64_t count = std::min<uint64_t>(
+            zeros.size(),
+            data_offset - written);
+        artifact.write(
+            zeros.data(),
+            static_cast<std::streamsize>(count));
+        written += count;
+    }
+}
+
+static ModelPackage qwen4_exp_package()
+{
+    ModelPackage package;
+    package.manifest.model_type = "qwen4_exp";
+    package.manifest.raw_json = R"({
+        "model_type": "qwen4_exp",
+        "text_config": {
+            "attention_bias": false,
+            "dtype": "bfloat16",
+            "eos_token_id": 127,
+            "hc_count": 4,
+            "hc_lowrank": 2,
+            "head_dim": 8,
+            "heads_per_ngram": 1,
+            "hidden_act": "silu",
+            "hidden_size": 16,
+            "indexer_budget": 16,
+            "indexer_compress_ratio": 4,
+            "indexer_head_dim": 4,
+            "indexer_kv_heads": 1,
+            "indexer_n_heads": 2,
+            "layer_types": [
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention"
+            ],
+            "linear_conv_kernel_dim": 2,
+            "linear_key_head_dim": 4,
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 2,
+            "linear_value_head_dim": 4,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 128,
+            "make_ngram_vocab_size_divisible_by": 4,
+            "moe_intermediate_size": 4,
+            "mtp_num_hidden_layers": 1,
+            "mtp": {
+                "num_hidden_layers": 1,
+                "rope_theta": 10000.0
+            },
+            "ngram_size": 3,
+            "ngram_vocab_size_base": 2,
+            "num_attention_heads": 2,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "num_hidden_layers": 4,
+            "num_key_value_heads": 1,
+            "output_gate_type": "sigmoid",
+            "ple_conv_kernel_size": 2,
+            "ple_embed_dim": 16,
+            "ple_layer_ids": [2],
+            "rms_norm_eps": 0.000001,
+            "rope_parameters": {
+                "partial_rotary_factor": 0.5,
+                "rope_theta": 10000.0
+            },
+            "shared_expert_intermediate_size": 4,
+            "split_ngram_parts": 2,
+            "vocab_size": 128
+        }
+    })";
+    return package;
+}
+
+void test_qwen4_exp_descriptors()
+{
+    Qwen4ExpModelAdapter adapter;
+    auto parsed = adapter.parse_model(qwen4_exp_package());
+    check(static_cast<bool>(parsed));
+    const MoeIR& descriptor = parsed.value();
+    check(descriptor.model_type == "qwen4_exp");
+    check(descriptor.vocabulary_size == 128);
+    check(descriptor.hidden_size == 16);
+    check(descriptor.layer_count == 4);
+    check(descriptor.activation_dtype == DType::BFloat16);
+    check(descriptor.kv_cache_dtype == DType::BFloat16);
+    check(descriptor.final_norm == NormType::None);
+    check(descriptor.norm_weight_offset == 1.0f);
+    check(descriptor.hyper_connection_kind
+          == HyperConnectionKind::GatedResidual);
+    check(descriptor.hyper_connection_multiplier == 4);
+    check(descriptor.hyper_connection_low_rank == 2);
+    check(descriptor.speculative_kind == SpeculativeModelKind::None);
+
+    const AttentionDescriptor& linear = descriptor.layers[0].attention;
+    check(linear.kind == AttentionKind::GatedDeltaNet);
+    check(linear.head_count == 2);
+    check(linear.kv_head_count == 1);
+    check(linear.head_dimension == 4);
+    check(linear.value_head_dimension == 4);
+    check(linear.convolution_kernel_size == 2);
+    check(has_flag(linear.flags, AttentionDescriptorSigmoidGate));
+    check(descriptor.layers[0].pre_attention_norm == NormType::None);
+    check(descriptor.layers[0].pre_ffn_norm == NormType::None);
+
+    const AttentionDescriptor& full = descriptor.layers[3].attention;
+    check(full.kind == AttentionKind::Standard);
+    check(full.head_count == 2);
+    check(full.kv_head_count == 1);
+    check(full.head_dimension == 8);
+    check(full.qk_rope_head_dimension == 4);
+    check(full.index_head_count == 2);
+    check(full.index_head_dimension == 4);
+    check(full.index_token_budget == 16);
+    check(full.index_top_k == 4);
+    check(full.compression_ratio == 4);
+    check(has_flag(full.flags, AttentionDescriptorQueryKeyNorm));
+    check(has_flag(full.flags, AttentionDescriptorOutputGate));
+    check(has_flag(full.flags, AttentionDescriptorQsa));
+
+    const PleDescriptor& ple = descriptor.layers[1].ple;
+    check(ple.enabled());
+    check(ple.embedding_dimension == 16);
+    check(ple.convolution_kernel_size == 2);
+    check(ple.ngram_size == 3);
+    check(ple.heads_per_ngram == 1);
+    check(ple.embedding_shard_count == 2);
+    check(ple.embedding_row_count == 8);
+    check(ple.eos_token_id == 127);
+    check(!descriptor.layers[0].ple.enabled());
+    check(!descriptor.layers[2].ple.enabled());
+
+    RuntimeConfig memory_options;
+    memory_options.expert_memory_mode = ExpertMemoryMode::OnDemand;
+    memory_options.expert_cache_bytes = 4096;
+    auto memory = plan_model_memory(
+        descriptor, memory_options, UINT64_C(8) * 1024 * 1024 * 1024);
+    check(static_cast<bool>(memory));
+    check(has_flag(memory.value().flags, ModelMemoryFileBackedExperts));
+    check(memory.value().selected_mode == ExpertMemoryMode::OnDemand);
+    check(memory.value().expert_cache_bytes == 4096);
+    MoeIR without_ple = descriptor;
+    without_ple.layers[1].ple = {};
+    auto memory_without_ple = plan_model_memory(
+        without_ple, memory_options, UINT64_C(8) * 1024 * 1024 * 1024);
+    check(static_cast<bool>(memory_without_ple));
+    check(memory.value().estimated_dense_bytes
+          == memory_without_ple.value().estimated_dense_bytes + 3256);
+    MoeIR large_file_backed_ple = descriptor;
+    large_file_backed_ple.layers[1].ple.embedding_row_count = UINT64_C(320001536);
+    auto large_ple_memory = plan_model_memory(
+        large_file_backed_ple, memory_options, UINT64_C(8) * 1024 * 1024 * 1024);
+    check(static_cast<bool>(large_ple_memory));
+    check(large_ple_memory.value().estimated_dense_bytes
+          == memory.value().estimated_dense_bytes);
+
+    const MoeDescriptor& moe = descriptor.layers[0].ffn.moe;
+    check(moe.expert_count == 4);
+    check(moe.top_k == 2);
+    check(moe.shared_expert_count == 1);
+    check(moe.expert_weight_dtype == DType::BFloat16);
+    check(moe.layout == ExpertLayout::PackedGateUpDown);
+    check(has_flag(moe.flags, MoeDescriptorSharedExpert));
+    check(has_flag(moe.flags, MoeDescriptorSharedExpertGate));
+    check(has_flag(moe.flags, MoeDescriptorFileBackedExperts));
+
+    ModelPackage invalid = qwen4_exp_package();
+    invalid.manifest.raw_json = std::regex_replace(
+        invalid.manifest.raw_json,
+        std::regex(R"("output_gate_type"\s*:\s*"sigmoid")"),
+        R"("output_gate_type": "silu")");
+    check(!adapter.parse_model(invalid));
+
+    invalid = qwen4_exp_package();
+    invalid.manifest.raw_json = std::regex_replace(
+        invalid.manifest.raw_json,
+        std::regex(R"("ple_layer_ids"\s*:\s*\[2\])"),
+        R"("ple_layer_ids": [0])");
+    check(!adapter.parse_model(invalid));
+
+    invalid = qwen4_exp_package();
+    invalid.manifest.raw_json = std::regex_replace(
+        invalid.manifest.raw_json,
+        std::regex(R"("split_ngram_parts"\s*:\s*2)"),
+        R"("split_ngram_parts": 0)");
+    check(!adapter.parse_model(invalid));
+
+    invalid = qwen4_exp_package();
+    invalid.manifest.raw_json = std::regex_replace(
+        invalid.manifest.raw_json,
+        std::regex(R"("num_key_value_heads"\s*:\s*1)"),
+        R"("num_key_value_heads": 0)");
+    check(!adapter.parse_model(invalid));
+
+    ScopedTestDirectory artifact_directory("ncnn_moe_qwen4_artifact_test_");
+    ModelPackage artifact_package = qwen4_exp_package();
+    write_qwen4_mxfp4_test_artifact(
+        artifact_package,
+        artifact_directory.path());
+    auto artifact_descriptor = adapter.parse_model(artifact_package);
+    check(static_cast<bool>(artifact_descriptor));
+    check(artifact_descriptor.value().layers[0].ffn.moe.expert_weight_dtype
+          == DType::MxFp4);
+    check(artifact_descriptor.value().layers[3].ffn.moe.expert_weight_dtype
+          == DType::MxFp4);
+    check(has_flag(
+        artifact_descriptor.value().layers[0].ffn.moe.flags,
+        MoeDescriptorFileBackedExperts));
+
+    {
+        std::ofstream changed_index(
+            artifact_directory.path() / "model.safetensors.index.json",
+            std::ios::binary | std::ios::app);
+        changed_index << ' ';
+    }
+    auto stale_artifact = adapter.parse_model(artifact_package);
+    check(!stale_artifact);
+    check(stale_artifact.error().code == ErrorCode::InvalidModel);
+}
+
+static void add_qwen4_mapping_bfloat16(
+    WeightMapping& mapping,
+    const std::string& name,
+    std::vector<uint32_t> shape,
+    float value = 0.0f)
+{
+    TensorData tensor;
+    tensor.dtype = DType::BFloat16;
+    tensor.shape = std::move(shape);
+    tensor.bfloat16_data.assign(
+        tensor.element_count(), float_to_bfloat16(value));
+    check(mapping.tensors.emplace(name, std::move(tensor)).second);
+}
+
+static void add_qwen4_mapping_int64(
+    WeightMapping& mapping,
+    const std::string& name,
+    std::vector<int64_t> values)
+{
+    TensorData tensor;
+    tensor.dtype = DType::Int64;
+    tensor.shape = {static_cast<uint32_t>(values.size())};
+    tensor.int64_data = std::move(values);
+    check(mapping.tensors.emplace(name, std::move(tensor)).second);
+}
+
+static WeightMapping qwen4_exp_test_mapping(const MoeIR& descriptor)
+{
+    WeightMapping mapping;
+    add_qwen4_mapping_bfloat16(
+        mapping, "token_embedding.weight",
+        {descriptor.vocabulary_size, descriptor.hidden_size});
+    add_qwen4_mapping_bfloat16(
+        mapping, "lm_head.weight",
+        {descriptor.vocabulary_size, descriptor.hidden_size});
+    const uint32_t expanded_size = descriptor.hyper_connection_multiplier
+                                   * descriptor.hidden_size;
+    add_qwen4_mapping_bfloat16(
+        mapping, "gated_residual.head.norm.weight", {expanded_size});
+    add_qwen4_mapping_bfloat16(
+        mapping, "gated_residual.head.mix_down.weight",
+        {descriptor.hyper_connection_low_rank, expanded_size});
+    add_qwen4_mapping_bfloat16(
+        mapping, "gated_residual.head.mix_up.weight",
+        {expanded_size, descriptor.hyper_connection_low_rank});
+
+    for (uint32_t layer_id = 0;
+         layer_id < descriptor.layer_count;
+         ++layer_id)
+    {
+        const std::string layer = "layers." + std::to_string(layer_id) + ".";
+        for (const char* block : {"attention", "ffn"})
+        {
+            const std::string prefix = layer + "gated_residual." + block + ".";
+            add_qwen4_mapping_bfloat16(
+                mapping, prefix + "norm.weight", {expanded_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, prefix + "mix_down.weight",
+                {descriptor.hyper_connection_low_rank, expanded_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, prefix + "mix_up.weight",
+                {expanded_size, descriptor.hyper_connection_low_rank});
+            add_qwen4_mapping_bfloat16(
+                mapping, prefix + "inject.weight",
+                {descriptor.hyper_connection_multiplier, expanded_size});
+        }
+        const MoeDescriptor& moe = descriptor.layers[layer_id].ffn.moe;
+        add_qwen4_mapping_bfloat16(
+            mapping, layer + "router.weight",
+            {moe.expert_count, descriptor.hidden_size});
+        add_qwen4_mapping_bfloat16(
+            mapping, layer + "shared_expert.gate.weight",
+            {moe.intermediate_size, descriptor.hidden_size});
+        add_qwen4_mapping_bfloat16(
+            mapping, layer + "shared_expert.up.weight",
+            {moe.intermediate_size, descriptor.hidden_size});
+        add_qwen4_mapping_bfloat16(
+            mapping, layer + "shared_expert.down.weight",
+            {descriptor.hidden_size, moe.intermediate_size});
+        add_qwen4_mapping_bfloat16(
+            mapping, layer + "shared_expert.router_gate.weight",
+            {1, descriptor.hidden_size});
+        for (uint32_t expert_id = 0;
+             expert_id < moe.expert_count;
+             ++expert_id)
+        {
+            const std::string expert = layer + "experts."
+                                       + std::to_string(expert_id) + ".";
+            add_qwen4_mapping_bfloat16(
+                mapping, expert + "gate_up.weight",
+                {moe.intermediate_size * 2, descriptor.hidden_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, expert + "down.weight",
+                {descriptor.hidden_size, moe.intermediate_size});
+        }
+
+        const AttentionDescriptor& attention =
+            descriptor.layers[layer_id].attention;
+        if (attention.kind == AttentionKind::GatedDeltaNet)
+        {
+            const uint32_t key_size = attention.kv_head_count
+                                      * attention.head_dimension;
+            const uint32_t value_size = attention.head_count
+                                        * attention.value_head_dimension;
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.delta.qkv.weight",
+                {key_size * 2 + value_size, descriptor.hidden_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.delta.z.weight",
+                {value_size, descriptor.hidden_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.delta.beta.weight",
+                {attention.head_count, descriptor.hidden_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.delta.alpha.weight",
+                {attention.head_count, descriptor.hidden_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.delta.convolution.weight",
+                {key_size * 2 + value_size, 1,
+                 attention.convolution_kernel_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.delta.time_bias",
+                {attention.head_count});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.delta.decay_log",
+                {attention.head_count});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.delta.norm.weight",
+                {attention.value_head_dimension});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.output.weight",
+                {descriptor.hidden_size, value_size});
+        }
+        else
+        {
+            const uint32_t query_size = attention.head_count
+                                        * attention.head_dimension;
+            const uint32_t key_value_size = attention.kv_head_count
+                                            * attention.head_dimension;
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.query.weight",
+                {query_size, descriptor.hidden_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.key.weight",
+                {key_value_size, descriptor.hidden_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.value.weight",
+                {key_value_size, descriptor.hidden_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.output.weight",
+                {descriptor.hidden_size, query_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.output_gate.weight",
+                {query_size, descriptor.hidden_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.query_norm.weight",
+                {attention.head_dimension});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.key_norm.weight",
+                {attention.head_dimension});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.qsa.query_key.weight",
+                {(attention.index_head_count + 1)
+                     * attention.index_head_dimension,
+                 descriptor.hidden_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.qsa.query_norm.weight",
+                {attention.index_head_dimension});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "attention.qsa.key_norm.weight",
+                {attention.index_head_dimension});
+        }
+
+        const PleDescriptor& ple = descriptor.layers[layer_id].ple;
+        if (ple.enabled())
+        {
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "ple.key.weight",
+                {expanded_size, descriptor.hidden_size});
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "ple.value.weight",
+                {descriptor.hidden_size, descriptor.hidden_size});
+            for (const char* norm : {"key", "query", "convolution"})
+            {
+                add_qwen4_mapping_bfloat16(
+                    mapping, layer + "ple." + norm + "_norm.weight",
+                    {expanded_size});
+            }
+            add_qwen4_mapping_bfloat16(
+                mapping, layer + "ple.convolution.weight",
+                {expanded_size, 1, ple.convolution_kernel_size});
+            add_qwen4_mapping_int64(
+                mapping, layer + "ple.hash_multipliers", {1, 3, 5});
+            add_qwen4_mapping_int64(
+                mapping, layer + "ple.head_vocabulary_sizes", {2, 3});
+            add_qwen4_mapping_int64(
+                mapping, layer + "ple.head_offsets", {0, 2});
+            const uint32_t head_count = (ple.ngram_size - 1)
+                                        * ple.heads_per_ngram;
+            const uint32_t head_dimension = ple.embedding_dimension
+                                            / head_count;
+            for (uint32_t shard = 0;
+                 shard < ple.embedding_shard_count;
+                 ++shard)
+            {
+                add_qwen4_mapping_bfloat16(
+                    mapping,
+                    layer + "ple.embedding_shard."
+                        + std::to_string(shard),
+                    {4, head_dimension});
+            }
+        }
+    }
+    return mapping;
+}
+
+static void make_qwen4_routed_experts_file_backed(
+    WeightMapping& mapping)
+{
+    for (auto& item : mapping.tensors)
+    {
+        if (item.first.find(".experts.") == std::string::npos)
+            continue;
+        TensorData& tensor = item.second;
+        check(tensor.dtype == DType::BFloat16);
+        auto storage = std::make_shared<std::vector<uint16_t>>(
+            std::move(tensor.bfloat16_data));
+        tensor.bfloat16_data = {};
+        tensor.mapped_data = std::shared_ptr<const uint8_t>(
+            storage,
+            reinterpret_cast<const uint8_t*>(storage->data()));
+        tensor.mapped_byte_count = storage->size() * sizeof(uint16_t);
+    }
+}
+
+void test_qwen4_exp_compile_and_execute()
+{
+    Qwen4ExpModelAdapter adapter;
+    auto parsed = adapter.parse_model(qwen4_exp_package());
+    check(static_cast<bool>(parsed));
+    ModelCompiler compiler;
+    WeightMapping mapping = qwen4_exp_test_mapping(parsed.value());
+    make_qwen4_routed_experts_file_backed(mapping);
+    ModelCompiler::BackendCapabilities capabilities;
+    capabilities.flags |= ModelCompiler::BackendCapabilityFileBackedExperts;
+    auto compiled = compiler.compile(
+        parsed.value(),
+        std::move(mapping),
+        HybridMode::CpuOnly,
+        capabilities);
+    if (!compiled)
+    {
+        throw std::runtime_error(
+            "Qwen4 Exp test compilation failed: "
+            + compiled.error().message);
+    }
+    check(compiled.value().final_norm_weight == invalid_tensor_handle);
+    check(compiled.value().gated_residual_head.norm_weight
+          != invalid_tensor_handle);
+    check(compiled.value().graph.layer_plans[1].ple.enabled());
+    check(has_flag(
+        compiled.value().graph.layer_plans[3].attention.flags,
+        AttentionBlockQsa));
+    check(has_flag(
+        compiled.value().graph.layer_plans[0].attention.flags,
+        AttentionBlockSigmoidGate));
+    check(has_flag(
+        compiled.value().graph.layer_plans[0].attention.flags,
+        AttentionBlockExternalResidual));
+    const uint64_t expert_pair_bytes =
+        UINT64_C(3) * parsed.value().intermediate_size
+        * parsed.value().hidden_size * sizeof(uint16_t);
+    compiled.value().expert_cache = std::make_shared<Mxfp4ExpertCache>(
+        expert_pair_bytes);
+
+    CpuExecutor executor;
+    CpuSessionState state(compiled.value().graph);
+    SessionStatistics statistics;
+    const std::array<int32_t, 4> prompt = {1, 2, 9, 3};
+    auto prefilled = executor.execute(
+        compiled.value(), prompt, statistics, state, 0);
+    if (!prefilled)
+    {
+        throw std::runtime_error(
+            "Qwen4 Exp test execution failed: "
+            + prefilled.error().message);
+    }
+    check(prefilled.value().size() == prompt.size());
+    for (const std::vector<float>& logits : prefilled.value())
+    {
+        check(logits.size() == parsed.value().vocabulary_size);
+        for (float value : logits)
+            check_near(value, 0.0f, 1e-6f);
+    }
+    check(state.layers[1].ple_token_history
+          == std::vector<int32_t>({9, 3}));
+    check(state.layers[3].qsa_index_keys.size()
+          == prompt.size()
+                 * parsed.value().layers[3].attention.index_head_dimension);
+    check(statistics.expert_cache_misses > 0);
+    check(statistics.expert_cache_bytes_read > 0);
+    check(compiled.value().expert_cache->statistics().resident_bytes
+          <= expert_pair_bytes);
+
+    const uint64_t prefill_cache_misses = statistics.expert_cache_misses;
+    CpuDecodeBatchMetrics batch_metrics;
+    const std::array<CpuDecodeBatchEntry, 1> entries = {{
+        4,
+        &statistics,
+        &state,
+        prompt.size(),
+    }};
+    auto decoded = executor.execute_decode_batch(
+        compiled.value(), entries, batch_metrics);
+    check(static_cast<bool>(decoded));
+    check(decoded.value().size() == 1);
+    check(state.layers[1].ple_token_history
+          == std::vector<int32_t>({3, 4}));
+    check(state.layers[3].qsa_index_keys.size()
+          == (prompt.size() + 1)
+                 * parsed.value().layers[3].attention.index_head_dimension);
+    check(statistics.expert_cache_misses > prefill_cache_misses);
+
+    MoeIR sliding_qsa = parsed.value();
+    sliding_qsa.layers[3].attention.sliding_window = 4;
+    auto rejected = compiler.compile(
+        sliding_qsa,
+        qwen4_exp_test_mapping(sliding_qsa),
+        HybridMode::CpuOnly);
+    check(!rejected);
+    check(rejected.error().code == ErrorCode::UnsupportedModel);
+}
+
 static TensorHandle add_float_tensor(
     WeightStore& weights,
     const std::string& name,
@@ -6468,6 +7315,377 @@ static TensorHandle add_float_tensor(
     auto added = weights.add(name, std::move(tensor));
     check(static_cast<bool>(added));
     return added.value();
+}
+
+static TensorHandle add_bfloat16_tensor(
+    WeightStore& weights,
+    const std::string& name,
+    std::vector<uint32_t> shape,
+    const std::vector<float>& values)
+{
+    TensorData tensor;
+    tensor.dtype = DType::BFloat16;
+    tensor.shape = std::move(shape);
+    tensor.bfloat16_data.reserve(values.size());
+    for (float value : values)
+        tensor.bfloat16_data.push_back(float_to_bfloat16(value));
+    auto added = weights.add(name, std::move(tensor));
+    check(static_cast<bool>(added));
+    return added.value();
+}
+
+static TensorHandle add_int64_tensor(
+    WeightStore& weights,
+    const std::string& name,
+    std::vector<uint32_t> shape,
+    std::vector<int64_t> values)
+{
+    TensorData tensor;
+    tensor.dtype = DType::Int64;
+    tensor.shape = std::move(shape);
+    tensor.int64_data = std::move(values);
+    auto added = weights.add(name, std::move(tensor));
+    check(static_cast<bool>(added));
+    return added.value();
+}
+
+void test_gated_residual_kernels()
+{
+    WeightStore weights;
+    const TensorHandle norm = add_bfloat16_tensor(
+        weights, "gr_norm", {4}, {0.0f, 0.0f, 0.0f, 0.0f});
+    const TensorHandle mix_down = add_bfloat16_tensor(
+        weights, "gr_down", {1, 4}, {0.0f, 0.0f, 0.0f, 0.0f});
+    const TensorHandle mix_up = add_bfloat16_tensor(
+        weights, "gr_up", {4, 1}, {0.0f, 0.0f, 0.0f, 0.0f});
+    const TensorHandle inject = add_bfloat16_tensor(
+        weights, "gr_inject", {2, 4},
+        {0.0f, 0.0f, 0.0f, 0.0f,
+         0.0f, 0.0f, 0.0f, 0.0f});
+
+    CpuBatch input(1, 4);
+    input.row(0)[0] = 1.0f;
+    input.row(0)[1] = 2.0f;
+    input.row(0)[2] = 3.0f;
+    input.row(0)[3] = 4.0f;
+    constexpr float epsilon = 1e-6f;
+    auto mixed = gated_residual_pre(
+        input,
+        weights.at(norm),
+        weights.at(mix_down),
+        weights.at(mix_up),
+        weights.at(inject),
+        2,
+        2,
+        epsilon,
+        1.0f,
+        0);
+    check(static_cast<bool>(mixed));
+    const float first_scale = 1.0f / std::sqrt(2.5f + epsilon);
+    const float second_scale = 1.0f / std::sqrt(12.5f + epsilon);
+    check_near(
+        mixed.value().reduced.row(0)[0],
+        (first_scale + 3.0f * second_scale) * 0.25f,
+        1e-6f);
+    check_near(
+        mixed.value().reduced.row(0)[1],
+        (2.0f * first_scale + 4.0f * second_scale) * 0.25f,
+        1e-6f);
+    check(mixed.value().post.size() == 2);
+    check_near(mixed.value().post[0], 1.0f, 1e-6f);
+    check_near(mixed.value().post[1], 1.0f, 1e-6f);
+
+    CpuBatch branch(1, 2);
+    branch.row(0)[0] = 10.0f;
+    branch.row(0)[1] = 20.0f;
+    auto posted = gated_residual_post(branch, input, mixed.value(), 2);
+    check(static_cast<bool>(posted));
+    check_near(posted.value().row(0)[0], 11.0f, 1e-6f);
+    check_near(posted.value().row(0)[1], 22.0f, 1e-6f);
+    check_near(posted.value().row(0)[2], 13.0f, 1e-6f);
+    check_near(posted.value().row(0)[3], 24.0f, 1e-6f);
+
+    auto head = gated_residual_head(
+        input,
+        weights.at(norm),
+        weights.at(mix_down),
+        weights.at(mix_up),
+        2,
+        2,
+        epsilon,
+        1.0f,
+        0);
+    check(static_cast<bool>(head));
+    check_near(
+        head.value().row(0)[0], mixed.value().reduced.row(0)[0], 1e-6f);
+    check_near(
+        head.value().row(0)[1], mixed.value().reduced.row(0)[1], 1e-6f);
+}
+
+void test_ple_prefill_decode_continuation()
+{
+    WeightStore weights;
+    PleBlockPlan plan;
+    plan.embedding_dimension = 4;
+    plan.convolution_kernel_size = 2;
+    plan.ngram_size = 3;
+    plan.heads_per_ngram = 1;
+    plan.eos_token_id = 9;
+    plan.hash_multipliers = add_int64_tensor(
+        weights, "ple_multipliers", {3}, {1, 3, 5});
+    plan.head_vocabulary_sizes = add_int64_tensor(
+        weights, "ple_vocab", {2}, {2, 2});
+    plan.head_offsets = add_int64_tensor(
+        weights, "ple_offsets", {2}, {0, 2});
+    plan.embedding_shards.push_back(add_bfloat16_tensor(
+        weights,
+        "ple_embedding",
+        {4, 2},
+        {1.0f, 2.0f,
+         3.0f, 4.0f,
+         5.0f, 6.0f,
+         7.0f, 8.0f}));
+    plan.key_weight = add_bfloat16_tensor(
+        weights, "ple_key", {4, 4}, std::vector<float>(16, 0.0f));
+    plan.value_weight = add_bfloat16_tensor(
+        weights,
+        "ple_value",
+        {2, 4},
+        {1.0f, 0.0f, 0.0f, 0.0f,
+         0.0f, 1.0f, 0.0f, 0.0f});
+    plan.key_norm_weight = add_bfloat16_tensor(
+        weights, "ple_key_norm", {4}, {0.0f, 0.0f, 0.0f, 0.0f});
+    plan.query_norm_weight = add_bfloat16_tensor(
+        weights, "ple_query_norm", {4}, {0.0f, 0.0f, 0.0f, 0.0f});
+    plan.convolution_norm_weight = add_bfloat16_tensor(
+        weights, "ple_conv_norm", {4}, {0.0f, 0.0f, 0.0f, 0.0f});
+    plan.convolution_weight = add_bfloat16_tensor(
+        weights,
+        "ple_conv",
+        {4, 1, 2},
+        {1.0f, 0.0f,
+         1.0f, 0.0f,
+         1.0f, 0.0f,
+         1.0f, 0.0f});
+
+    const std::array<int32_t, 4> input_ids = {1, 2, 9, 3};
+    CpuBatch prefill_hidden(input_ids.size(), 4);
+    CpuLayerCache prefill_cache;
+    check(static_cast<bool>(execute_ple_into(
+        weights,
+        plan,
+        2,
+        2,
+        1e-6f,
+        1.0f,
+        input_ids,
+        prefill_cache,
+        prefill_hidden,
+        0)));
+
+    CpuBatch decode_hidden(input_ids.size(), 4);
+    CpuLayerCache decode_cache;
+    for (size_t row = 0; row < input_ids.size(); ++row)
+    {
+        CpuBatch token_hidden(1, 4);
+        const std::array<int32_t, 1> token = {input_ids[row]};
+        check(static_cast<bool>(execute_ple_into(
+            weights,
+            plan,
+            2,
+            2,
+            1e-6f,
+            1.0f,
+            token,
+            decode_cache,
+            token_hidden,
+            0)));
+        std::copy_n(token_hidden.row(0), 4, decode_hidden.row(row));
+    }
+    for (size_t row = 0; row < input_ids.size(); ++row)
+        for (size_t column = 0; column < 4; ++column)
+            check_near(prefill_hidden.row(row)[column], decode_hidden.row(row)[column], 1e-6f);
+    constexpr float first_gate = 0.5f;
+    check_near(prefill_hidden.row(0)[0], first_gate, 1e-6f);
+    check_near(prefill_hidden.row(0)[1], first_gate * 2.0f, 1e-6f);
+    check_near(prefill_hidden.row(0)[2], first_gate, 1e-6f);
+    check_near(prefill_hidden.row(0)[3], first_gate * 2.0f, 1e-6f);
+    check(prefill_hidden.row(3)[0] > first_gate);
+    check(prefill_cache.ple_token_history
+          == std::vector<int32_t>({9, 3}));
+    check(prefill_cache.ple_token_history
+          == decode_cache.ple_token_history);
+    check(prefill_cache.ple_convolution_state.size() == 12);
+    check(prefill_cache.ple_convolution_state.size()
+          == decode_cache.ple_convolution_state.size());
+    for (size_t index = 0;
+         index < prefill_cache.ple_convolution_state.size();
+         ++index)
+    {
+        check_near(
+            prefill_cache.ple_convolution_state[index],
+            decode_cache.ple_convolution_state[index],
+            1e-6f);
+    }
+}
+
+void test_qsa_prefill_decode_continuation()
+{
+    WeightStore weights;
+    CompiledOperatorTable operators;
+    AttentionBlockPlan plan;
+    plan.head_count = 1;
+    plan.kv_head_count = 1;
+    plan.head_dimension = 2;
+    plan.value_head_dimension = 2;
+    plan.rope_head_dimension = 2;
+    plan.max_context_length = 128;
+    plan.rope_theta = 10000.0f;
+    plan.norm_weight_offset = 1.0f;
+    plan.index_head_count = 1;
+    plan.index_head_dimension = 2;
+    plan.index_top_k = 1;
+    plan.index_token_budget = 2;
+    plan.compression_ratio = 2;
+    plan.flags = AttentionBlockQsa | AttentionBlockExternalResidual;
+    const std::vector<float> identity = {
+        1.0f, 0.0f,
+        0.0f, 1.0f,
+    };
+    plan.query_weight = add_bfloat16_tensor(
+        weights, "qsa_query", {2, 2}, identity);
+    plan.key_weight = add_bfloat16_tensor(
+        weights, "qsa_key", {2, 2}, identity);
+    plan.value_weight = add_bfloat16_tensor(
+        weights, "qsa_value", {2, 2}, identity);
+    plan.output_weight = add_bfloat16_tensor(
+        weights, "qsa_output", {2, 2}, identity);
+    plan.qsa_query_key_weight = add_bfloat16_tensor(
+        weights,
+        "qsa_query_key",
+        {4, 2},
+        {1.0f, 0.0f,
+         0.0f, 1.0f,
+         1.0f, 0.0f,
+         0.0f, 1.0f});
+    plan.qsa_query_norm_weight = add_bfloat16_tensor(
+        weights, "qsa_query_norm", {2}, {0.0f, 0.0f});
+    plan.qsa_key_norm_weight = add_bfloat16_tensor(
+        weights, "qsa_key_norm", {2}, {0.0f, 0.0f});
+
+    CpuBatch input(6, 2);
+    const float values[6][2] = {
+        {1.0f, 0.0f},
+        {0.0f, 1.0f},
+        {1.0f, 1.0f},
+        {-1.0f, 0.5f},
+        {0.25f, -0.75f},
+        {0.6f, 0.2f},
+    };
+    for (size_t row = 0; row < input.rows(); ++row)
+        std::copy_n(values[row], 2, input.row(row));
+
+    CpuLayerCache prefill_cache;
+    CpuAttentionExecutionScratch prefill_scratch;
+    CpuBatch prefill_output;
+    check(static_cast<bool>(execute_attention_block_into(
+        weights,
+        operators,
+        plan,
+        ExecutionBackend::Cpu,
+        1e-6f,
+        DType::BFloat16,
+        0,
+        prefill_cache,
+        prefill_scratch,
+        input,
+        prefill_output,
+        0)));
+
+    CpuLayerCache decode_cache;
+    CpuAttentionExecutionScratch decode_scratch;
+    CpuBatch decode_output(input.rows(), 2);
+    for (size_t row = 0; row < input.rows(); ++row)
+    {
+        CpuBatch token(1, 2);
+        std::copy_n(input.row(row), 2, token.row(0));
+        CpuBatch token_output;
+        check(static_cast<bool>(execute_attention_block_into(
+            weights,
+            operators,
+            plan,
+            ExecutionBackend::Cpu,
+            1e-6f,
+            DType::BFloat16,
+            row,
+            decode_cache,
+            decode_scratch,
+            token,
+            token_output,
+            0)));
+        std::copy_n(token_output.row(0), 2, decode_output.row(row));
+    }
+    check(prefill_cache.token_count == input.rows());
+    check(prefill_cache.qsa_index_keys.size() == input.rows() * 2);
+    check(prefill_cache.qsa_index_keys == decode_cache.qsa_index_keys);
+    for (size_t row = 0; row < input.rows(); ++row)
+        for (size_t column = 0; column < 2; ++column)
+            check_near(prefill_output.row(row)[column], decode_output.row(row)[column], 1e-6f);
+    check(prefill_scratch.qsa_selected_offsets.size()
+          == input.rows() + 1);
+    check(prefill_scratch.qsa_selected_offsets.back()
+              - prefill_scratch.qsa_selected_offsets[input.rows() - 1]
+          == 2);
+    check(!prefill_scratch.qsa_selected_indices.empty());
+    check(decode_scratch.qsa_selected_offsets.size() == 2);
+    check(decode_scratch.qsa_selected_offsets.back() == 2);
+    check(decode_scratch.qsa_selected_indices.size() == 2);
+
+    AttentionBlockPlan long_plan = plan;
+    long_plan.max_context_length = 262144;
+    long_plan.index_top_k = 512;
+    long_plan.index_token_budget = 2048;
+    long_plan.compression_ratio = 4;
+    constexpr uint64_t existing_tokens = 262142;
+    CpuLayerCache long_cache;
+    long_cache.columns = 2;
+    long_cache.dtype = DType::BFloat16;
+    long_cache.capacity_tokens = existing_tokens;
+    long_cache.token_count = existing_tokens;
+    long_cache.bfloat16_keys.assign(existing_tokens * 2, 0);
+    long_cache.bfloat16_values.assign(existing_tokens * 2, 0);
+    long_cache.qsa_index_keys.assign(existing_tokens * 2, 0);
+    CpuAttentionExecutionScratch long_scratch;
+    CpuBatch long_input(2, 2);
+    long_input.row(0)[0] = 1.0f;
+    long_input.row(1)[1] = 1.0f;
+    CpuBatch long_output;
+    check(static_cast<bool>(execute_attention_block_into(
+        weights,
+        operators,
+        long_plan,
+        ExecutionBackend::Cpu,
+        1e-6f,
+        DType::BFloat16,
+        existing_tokens,
+        long_cache,
+        long_scratch,
+        long_input,
+        long_output,
+        RuntimeOptimizationCpuBf16DirectAttention)));
+    check(long_cache.token_count == long_plan.max_context_length);
+    check(long_scratch.qsa_selected_offsets.size() == 3);
+    check(long_scratch.qsa_selected_indices.size()
+          <= 2 * (long_plan.index_token_budget
+                  + long_plan.compression_ratio - 1));
+    check(long_scratch.qsa_selected_offsets[1] > 0);
+    check(long_scratch.qsa_selected_offsets[2]
+              > long_scratch.qsa_selected_offsets[1]);
+    check(long_scratch.key_cache.empty());
+    check(long_scratch.value_cache.empty());
+    for (size_t row = 0; row < long_output.rows(); ++row)
+        for (size_t column = 0; column < long_output.columns(); ++column)
+            check(std::isfinite(long_output.row(row)[column]));
 }
 
 void test_gated_delta_net_continuation()
@@ -6862,6 +8080,17 @@ void test_automatic_expert_memory_planning()
     check(static_cast<bool>(large_plan.value().estimated_expert_resident_bytes == large_plan.value().estimated_expert_bytes));
     check(static_cast<bool>(large_plan.value().expert_cache_bytes == 20 * gibibyte - large_plan.value().estimated_dense_bytes));
     check(static_cast<bool>(large_plan.value().expert_cache_bytes >= large_plan.value().minimum_active_expert_bytes));
+
+    auto available_limited_plan = plan_model_memory(
+        large,
+        options,
+        physical_memory,
+        false,
+        12 * gibibyte);
+    check(static_cast<bool>(available_limited_plan));
+    check(static_cast<bool>(available_limited_plan.value().host_memory_budget_bytes == 10 * gibibyte));
+    check(static_cast<bool>(available_limited_plan.value().expert_cache_bytes
+                            == 10 * gibibyte - available_limited_plan.value().estimated_dense_bytes));
 
     MoeIR qnk = gpt_oss_memory_ir(1, 24);
     qnk.vocabulary_size = 128;
@@ -8071,7 +9300,7 @@ void test_bfloat16_batched_linear_kernel()
 {
     constexpr size_t token_count = 5;
     constexpr uint32_t input_columns = 512;
-    constexpr uint32_t output_columns = 512;
+    constexpr uint32_t output_columns = 2048;
     std::vector<uint16_t> weights(
         static_cast<size_t>(output_columns) * input_columns);
     std::vector<float> input(token_count * input_columns);
@@ -8140,7 +9369,7 @@ void test_bfloat16_batched_linear_kernel()
             check_near(output[index], expected[index], 5e-5f);
 
         std::vector<float> single_output(output_columns, -9.0f);
-        check(!bfloat16_batched_linear(
+        check(static_cast<bool>(bfloat16_batched_linear(
             weights.data(),
             input.data(),
             input_columns,
@@ -8150,7 +9379,14 @@ void test_bfloat16_batched_linear_kernel()
             single_output.data(),
             output_columns,
             4,
-            enabled_flags));
+            enabled_flags)));
+        for (uint32_t output_column = 0;
+             output_column < output_columns;
+             ++output_column)
+        {
+            check(static_cast<bool>(
+                single_output[output_column] == expected[output_column]));
+        }
 
         Bfloat16BatchedLinearExecutionCounter first_counter;
         Bfloat16BatchedLinearExecutionCounter second_counter;
@@ -8825,6 +10061,7 @@ int main(int argc, char** argv)
         ncnn::moe::test_safetensors_dense_mmap();
         ncnn::moe::test_safetensors_packed_mxfp4_expert();
         ncnn::moe::test_safetensors_qnk_source_binding();
+        ncnn::moe::test_file_backed_bfloat16_expert_cache();
         ncnn::moe::test_file_backed_mxfp4_expert_cache();
         ncnn::moe::test_cpu_topology_parsing_and_partitioning();
         ncnn::moe::test_cross_session_batch_scheduler();
@@ -8843,6 +10080,11 @@ int main(int argc, char** argv)
         ncnn::moe::test_deepseek_router_and_hyper_connection_kernels();
         ncnn::moe::test_deepseek_v4_descriptors();
         ncnn::moe::test_qwen3_5_moe_descriptors();
+        ncnn::moe::test_qwen4_exp_descriptors();
+        ncnn::moe::test_qwen4_exp_compile_and_execute();
+        ncnn::moe::test_gated_residual_kernels();
+        ncnn::moe::test_ple_prefill_decode_continuation();
+        ncnn::moe::test_qsa_prefill_decode_continuation();
         ncnn::moe::test_gated_delta_net_continuation();
         ncnn::moe::test_automatic_expert_memory_planning();
         ncnn::moe::test_sampling_and_streaming_generation();

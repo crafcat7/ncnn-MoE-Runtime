@@ -62,6 +62,14 @@ void float_scale_inplace_and_scaled_add(
     float* output,
     float output_scale,
     uint32_t count) noexcept;
+void float_scale_inplace_and_scaled_add_and_accumulate(
+    float* values,
+    float value_scale,
+    const float* input,
+    float input_scale,
+    float* output,
+    float output_scale,
+    uint32_t count) noexcept;
 void float_weighted_scale(float* output, const float* input, const float* weight,
                           float scale, float weight_offset, uint32_t count) noexcept;
 void bfloat16_weighted_scale(float* output, const float* input, const uint16_t* weight,

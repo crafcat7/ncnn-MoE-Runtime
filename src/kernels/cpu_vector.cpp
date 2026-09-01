@@ -21,6 +21,7 @@ using FloatScaleFunction = void (*)(float*, float, uint32_t) noexcept;
 using FloatScaledAddFunction = void (*)(float*, const float*, float, uint32_t) noexcept;
 using FloatScaleAddFunction = void (*)(float*, float, const float*, float, uint32_t) noexcept;
 using FloatScaleInplaceAndScaledAddFunction = void (*)(float*, float, float*, float, uint32_t) noexcept;
+using FloatScaleInplaceAndScaledAddAndAccumulateFunction = void (*)(float*, float, const float*, float, float*, float, uint32_t) noexcept;
 using FloatWeightedScaleFunction = void (*)(float*, const float*, const float*, float, float, uint32_t) noexcept;
 using Bfloat16WeightedScaleFunction = void (*)(float*, const float*, const uint16_t*, float, float, uint32_t) noexcept;
 using FloatRmsScaleFunction = void (*)(float*, float, uint32_t) noexcept;
@@ -196,6 +197,23 @@ static void scalar_float_scale_inplace_and_scaled_add(
     for (uint32_t index = 0; index < count; ++index)
     {
         values[index] *= value_scale;
+        output[index] += output_scale * values[index];
+    }
+}
+
+static void scalar_float_scale_inplace_and_scaled_add_and_accumulate(
+    float* values,
+    float value_scale,
+    const float* input,
+    float input_scale,
+    float* output,
+    float output_scale,
+    uint32_t count) noexcept
+{
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        values[index] = values[index] * value_scale
+                        + input[index] * input_scale;
         output[index] += output_scale * values[index];
     }
 }
@@ -424,6 +442,19 @@ static FloatScaleInplaceAndScaledAddFunction select_float_scale_inplace_and_scal
         return msvc_avx2_float_scale_inplace_and_scaled_add;
 #endif
     return scalar_float_scale_inplace_and_scaled_add;
+}
+
+static FloatScaleInplaceAndScaledAddAndAccumulateFunction
+select_float_scale_inplace_and_scaled_add_and_accumulate() noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    if ((isa & CpuIsaX86Avx512) != 0)
+        return msvc_avx512_float_scale_inplace_and_scaled_add_and_accumulate;
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+        return msvc_avx2_float_scale_inplace_and_scaled_add_and_accumulate;
+#endif
+    return scalar_float_scale_inplace_and_scaled_add_and_accumulate;
 }
 
 static FloatWeightedScaleFunction select_float_weighted_scale() noexcept
@@ -789,6 +820,20 @@ void float_scale_inplace_and_scaled_add(
 {
     static const FloatScaleInplaceAndScaledAddFunction function = select_float_scale_inplace_and_scaled_add();
     function(values, value_scale, output, output_scale, count);
+}
+
+void float_scale_inplace_and_scaled_add_and_accumulate(
+    float* values,
+    float value_scale,
+    const float* input,
+    float input_scale,
+    float* output,
+    float output_scale,
+    uint32_t count) noexcept
+{
+    static const FloatScaleInplaceAndScaledAddAndAccumulateFunction function =
+        select_float_scale_inplace_and_scaled_add_and_accumulate();
+    function(values, value_scale, input, input_scale, output, output_scale, count);
 }
 
 void float_weighted_scale(float* output, const float* input, const float* weight, float scale, float weight_offset, uint32_t count) noexcept

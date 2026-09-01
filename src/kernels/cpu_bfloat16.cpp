@@ -19,6 +19,154 @@
 #include <immintrin.h>
 #endif
 
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx512f,avx512bw"))) static void avx512_bfloat16_single_token_linear(
+    const uint16_t* weights,
+    const float* input,
+    uint32_t output_columns,
+    uint32_t input_columns,
+    float* output,
+    int thread_count)
+{
+    const int64_t output_groups = output_columns / 4;
+#pragma omp parallel for num_threads(thread_count) if (thread_count > 1)
+    for (int64_t output_group = 0; output_group < output_groups;
+         ++output_group)
+    {
+        const uint32_t first_output = static_cast<uint32_t>(output_group) * 4;
+        const uint16_t* group_weights =
+            weights + static_cast<size_t>(first_output) * input_columns;
+        __m512 accumulator00 = _mm512_setzero_ps();
+        __m512 accumulator01 = _mm512_setzero_ps();
+        __m512 accumulator02 = _mm512_setzero_ps();
+        __m512 accumulator03 = _mm512_setzero_ps();
+        __m512 accumulator10 = _mm512_setzero_ps();
+        __m512 accumulator11 = _mm512_setzero_ps();
+        __m512 accumulator12 = _mm512_setzero_ps();
+        __m512 accumulator13 = _mm512_setzero_ps();
+        __m512 accumulator20 = _mm512_setzero_ps();
+        __m512 accumulator21 = _mm512_setzero_ps();
+        __m512 accumulator22 = _mm512_setzero_ps();
+        __m512 accumulator23 = _mm512_setzero_ps();
+        __m512 accumulator30 = _mm512_setzero_ps();
+        __m512 accumulator31 = _mm512_setzero_ps();
+        __m512 accumulator32 = _mm512_setzero_ps();
+        __m512 accumulator33 = _mm512_setzero_ps();
+        uint32_t column = 0;
+        for (; column + 64 <= input_columns; column += 64)
+        {
+            const __m512 input0 = _mm512_loadu_ps(input + column);
+            const __m512 input1 = _mm512_loadu_ps(input + column + 16);
+            const __m512 input2 = _mm512_loadu_ps(input + column + 32);
+            const __m512 input3 = _mm512_loadu_ps(input + column + 48);
+            const __m256i packed00 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + column));
+            const __m256i packed01 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + column + 16));
+            const __m256i packed02 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + column + 32));
+            const __m256i packed03 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + column + 48));
+            const __m256i packed10 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + input_columns + column));
+            const __m256i packed11 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + input_columns + column + 16));
+            const __m256i packed12 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + input_columns + column + 32));
+            const __m256i packed13 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + input_columns + column + 48));
+            const __m256i packed20 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column));
+            const __m256i packed21 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column + 16));
+            const __m256i packed22 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column + 32));
+            const __m256i packed23 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column + 48));
+            const __m256i packed30 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column));
+            const __m256i packed31 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column + 16));
+            const __m256i packed32 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column + 32));
+            const __m256i packed33 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column + 48));
+#define NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator, packed, input_values) \
+            accumulator = _mm512_fmadd_ps(                             \
+                _mm512_castsi512_ps(_mm512_slli_epi32(                 \
+                    _mm512_cvtepu16_epi32(packed), 16)),              \
+                input_values,                                          \
+                accumulator)
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator00, packed00, input0);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator01, packed01, input1);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator02, packed02, input2);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator03, packed03, input3);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator10, packed10, input0);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator11, packed11, input1);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator12, packed12, input2);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator13, packed13, input3);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator20, packed20, input0);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator21, packed21, input1);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator22, packed22, input2);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator23, packed23, input3);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator30, packed30, input0);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator31, packed31, input1);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator32, packed32, input2);
+            NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator33, packed33, input3);
+#undef NCNN_MOE_BF16_SINGLE_TOKEN_FMA
+        }
+        __m512 sum0 = _mm512_add_ps(
+            _mm512_add_ps(accumulator00, accumulator01),
+            _mm512_add_ps(accumulator02, accumulator03));
+        __m512 sum1 = _mm512_add_ps(
+            _mm512_add_ps(accumulator10, accumulator11),
+            _mm512_add_ps(accumulator12, accumulator13));
+        __m512 sum2 = _mm512_add_ps(
+            _mm512_add_ps(accumulator20, accumulator21),
+            _mm512_add_ps(accumulator22, accumulator23));
+        __m512 sum3 = _mm512_add_ps(
+            _mm512_add_ps(accumulator30, accumulator31),
+            _mm512_add_ps(accumulator32, accumulator33));
+        for (; column + 16 <= input_columns; column += 16)
+        {
+            const __m512 input_values = _mm512_loadu_ps(input + column);
+            const __m256i packed0 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + column));
+            const __m256i packed1 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + input_columns + column));
+            const __m256i packed2 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column));
+            const __m256i packed3 = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column));
+            sum0 = _mm512_fmadd_ps(
+                _mm512_castsi512_ps(_mm512_slli_epi32(
+                    _mm512_cvtepu16_epi32(packed0), 16)),
+                input_values,
+                sum0);
+            sum1 = _mm512_fmadd_ps(
+                _mm512_castsi512_ps(_mm512_slli_epi32(
+                    _mm512_cvtepu16_epi32(packed1), 16)),
+                input_values,
+                sum1);
+            sum2 = _mm512_fmadd_ps(
+                _mm512_castsi512_ps(_mm512_slli_epi32(
+                    _mm512_cvtepu16_epi32(packed2), 16)),
+                input_values,
+                sum2);
+            sum3 = _mm512_fmadd_ps(
+                _mm512_castsi512_ps(_mm512_slli_epi32(
+                    _mm512_cvtepu16_epi32(packed3), 16)),
+                input_values,
+                sum3);
+        }
+        output[first_output] = _mm512_reduce_add_ps(sum0);
+        output[first_output + 1] = _mm512_reduce_add_ps(sum1);
+        output[first_output + 2] = _mm512_reduce_add_ps(sum2);
+        output[first_output + 3] = _mm512_reduce_add_ps(sum3);
+    }
+}
+#endif
+
 namespace ncnn {
 namespace moe {
 
@@ -765,7 +913,6 @@ bool bfloat16_batched_linear(const uint16_t* weights,
                              uint64_t optimization_flags)
 {
     if (!weights || !input || !output || token_count == 0
-        || token_count < 4
         || output_columns < 4 || output_columns % 4 != 0
         || input_columns == 0 || input_columns % 32 != 0 || input_stride < input_columns || output_stride < output_columns)
     {
@@ -791,6 +938,18 @@ bool bfloat16_batched_linear(const uint16_t* weights,
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
     if ((isa & CpuIsaX86Avx512Bf16) != 0)
     {
+        if (token_count == 1)
+        {
+            msvc_avx512_bfloat16_single_token_linear(
+                weights,
+                input,
+                output_columns,
+                input_columns,
+                output,
+                std::max(1, thread_count));
+            record_bfloat16_batched_linear_dispatch();
+            return true;
+        }
         msvc_avx512_bfloat16_batched_linear(weights,
                                             input,
                                             input_stride,
@@ -807,6 +966,18 @@ bool bfloat16_batched_linear(const uint16_t* weights,
 #elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
     if ((isa & CpuIsaX86Avx512Bf16) != 0)
     {
+        if (token_count == 1)
+        {
+            avx512_bfloat16_single_token_linear(
+                weights,
+                input,
+                output_columns,
+                input_columns,
+                output,
+                std::max(1, thread_count));
+            record_bfloat16_batched_linear_dispatch();
+            return true;
+        }
         avx512bf16_batched_linear(weights,
                                   input,
                                   input_stride,

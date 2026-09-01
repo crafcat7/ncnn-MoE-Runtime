@@ -88,6 +88,20 @@ static bool vulkan_expert_layer_supported(
             continue;
         }
 
+        if (gate_up.dtype == DType::BFloat16 && down.dtype == DType::BFloat16)
+        {
+            if (expert.activation != ExpertActivation::Silu
+                || gate_up.shape[1] == 0
+                || down.shape[1] == 0
+                || gate_up.shape[0] / 2 % 128 != 0
+                || gate_up.bfloat16_values().size() != gate_up.element_count()
+                || down.bfloat16_values().size() != down.element_count())
+            {
+                return false;
+            }
+            continue;
+        }
+
         if (!runtime_optimization_enabled(compiled.optimization_flags, RuntimeOptimizationVulkanQnK)
             || !is_qnk_dtype(gate_up.dtype)
             || gate_up.dtype != down.dtype
@@ -860,9 +874,11 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
         graph, ExecutionNodeType::FinalNorm, ExecutionBackend::Cpu, ExecutionBackendCpu, "final_norm",
         {previous}, {hidden}, {normalized},
         invalid_execution_layer_id, invalid_execution_expert_id, 0);
-    graph.nodes[previous].weight_inputs = {
-        compiled.final_norm_weight,
-        compiled.lm_head_weight};
+    graph.nodes[previous].weight_inputs =
+        compiled.final_norm_weight == invalid_tensor_handle
+            ? std::vector<TensorHandle>{compiled.lm_head_weight}
+            : std::vector<TensorHandle>{compiled.final_norm_weight,
+                                        compiled.lm_head_weight};
 
     const ExecutionBackend lm_head_backend = compiled.hybrid_mode == HybridMode::CpuOnly ? ExecutionBackend::Cpu : ExecutionBackend::Vulkan;
     uint32_t logits_tensor_flags = ExecutionTensorDynamic;
@@ -873,9 +889,11 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
         graph, ExecutionNodeType::LmHead, lm_head_backend, lm_head_backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, "lm_head",
         {previous}, {normalized}, {logits},
         invalid_execution_layer_id, invalid_execution_expert_id, 0);
-    graph.nodes[lm_head_node].weight_inputs = {
-        compiled.lm_head_weight,
-        compiled.final_norm_weight};
+    graph.nodes[lm_head_node].weight_inputs =
+        compiled.final_norm_weight == invalid_tensor_handle
+            ? std::vector<TensorHandle>{compiled.lm_head_weight}
+            : std::vector<TensorHandle>{compiled.lm_head_weight,
+                                        compiled.final_norm_weight};
 
     RuntimeSchedulingOptions options;
     options.available_backends = ExecutionBackendCpu;

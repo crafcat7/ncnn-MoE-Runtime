@@ -21,6 +21,46 @@
 namespace ncnn {
 namespace moe {
 
+void prefetch_mapped_memory(const void* data, size_t byte_count) noexcept
+{
+    if (!data || byte_count == 0)
+        return;
+#if defined(_WIN32)
+    // Resolve the API dynamically so the runtime still works on Windows
+    // versions whose SDK does not expose PrefetchVirtualMemory.
+    struct MemoryRange
+    {
+        void* virtual_address;
+        SIZE_T number_of_bytes;
+    };
+    using PrefetchVirtualMemoryFunction = BOOL(WINAPI*)(HANDLE, ULONG_PTR, MemoryRange*, ULONG);
+    static const PrefetchVirtualMemoryFunction prefetch = [] {
+        HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (!kernel32)
+            return static_cast<PrefetchVirtualMemoryFunction>(nullptr);
+        return reinterpret_cast<PrefetchVirtualMemoryFunction>(
+            GetProcAddress(kernel32, "PrefetchVirtualMemory"));
+    }();
+    if (!prefetch)
+        return;
+    MemoryRange range{const_cast<void*>(data), byte_count};
+    (void)prefetch(GetCurrentProcess(), 1, &range, 0);
+#elif defined(MADV_WILLNEED)
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0)
+        return;
+    const uintptr_t address = reinterpret_cast<uintptr_t>(data);
+    const uintptr_t aligned = address & ~static_cast<uintptr_t>(page_size - 1);
+    const size_t prefix = static_cast<size_t>(address - aligned);
+    if (byte_count > std::numeric_limits<size_t>::max() - prefix)
+        return;
+    (void)madvise(reinterpret_cast<void*>(aligned), prefix + byte_count, MADV_WILLNEED);
+#else
+    (void)data;
+    (void)byte_count;
+#endif
+}
+
 class MappedFile
 {
 public:
@@ -50,6 +90,9 @@ public:
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr,
             OPEN_EXISTING,
+            // Expert routing touches slices in a demand-driven order across
+            // layers; retain the random-access hint for the bounded working
+            // set used by on-demand mappings.
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
             nullptr);
         if (file->file_ == INVALID_HANDLE_VALUE)
@@ -66,7 +109,11 @@ public:
                 "cannot query memory-mapped model shard: " + path.string()};
         }
         file->size_ = static_cast<uint64_t>(file_size.QuadPart);
-        file->mapping_ = CreateFileMappingW(file->file_, nullptr, PAGE_WRITECOPY, 0, 0, nullptr);
+        // Model weights are immutable.  PAGE_WRITECOPY charges commit for the
+        // full private view on Windows, which makes checkpoints larger than
+        // physical memory impossible to map even when only a small working set
+        // will be resident.
+        file->mapping_ = CreateFileMappingW(file->file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
         if (file->mapping_ == nullptr && file->size_ != 0)
         {
             return Error{
@@ -174,7 +221,7 @@ Result<std::shared_ptr<MappedFileRange>> MappedFileRange::open(const std::filesy
 #if defined(_WIN32)
     range->view_ = MapViewOfFile(
         range->file_->mapping(),
-        FILE_MAP_COPY,
+        FILE_MAP_READ,
         static_cast<DWORD>(aligned_offset >> 32),
         static_cast<DWORD>(aligned_offset),
         range->view_size_);
@@ -192,7 +239,7 @@ Result<std::shared_ptr<MappedFileRange>> MappedFileRange::open(const std::filesy
     range->view_ = mmap(
         nullptr,
         range->view_size_,
-        PROT_READ | PROT_WRITE,
+        PROT_READ,
         MAP_PRIVATE,
         range->file_->descriptor(),
         static_cast<off_t>(aligned_offset));

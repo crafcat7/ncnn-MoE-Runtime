@@ -262,6 +262,8 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                                               std::vector<float>& flash_partial_max,
                                               std::vector<float>& flash_partial_sum,
                                               std::vector<float>& flash_partial_output,
+                                              std::span<const size_t> selected_offsets,
+                                              std::span<const uint32_t> selected_indices,
                                               uint64_t optimization_flags)
 {
     const uint32_t head_count = plan.head_count;
@@ -269,8 +271,22 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
     const uint32_t head_dimension = plan.head_dimension;
     const uint32_t heads_per_group = head_count / kv_head_count;
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dimension));
+    const bool has_selected_keys = selected_offsets.size() == query.rows() + 1;
     output.reset(query.rows(), head_count * head_dimension, true);
-    logits.resize(cache.token_count);
+    size_t maximum_selected_keys = 0;
+    if (has_selected_keys)
+    {
+        for (size_t query_index = 0; query_index < query.rows(); ++query_index)
+        {
+            maximum_selected_keys = std::max(
+                maximum_selected_keys,
+                selected_offsets[query_index + 1]
+                    - selected_offsets[query_index]);
+        }
+    }
+    logits.resize(has_selected_keys
+                      ? maximum_selected_keys
+                      : static_cast<size_t>(cache.token_count));
 
     const size_t cache_elements = static_cast<size_t>(cache.token_count) * cache.columns;
     const size_t cache_capacity_elements = static_cast<size_t>(cache.capacity_tokens) * cache.columns;
@@ -278,7 +294,7 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
     const float* value_values = nullptr;
     const uint16_t* bfloat16_key_values = nullptr;
     const uint16_t* bfloat16_value_values = nullptr;
-    const bool direct_bfloat16 = query.rows() == 1
+    const bool direct_bfloat16 = (query.rows() == 1 || has_selected_keys)
                                  && direct_bfloat16_attention_enabled(optimization_flags)
                                  && cache.dtype == DType::BFloat16
                                  && cache.capacity_tokens > 0
@@ -293,7 +309,8 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                                        && cache.start_position <= position_offset
                                        && cache.token_count - 1 <= position_offset - cache.start_position
                                        && (plan.sliding_window == 0
-                                           || cache.token_count <= plan.sliding_window);
+                                           || cache.token_count <= plan.sliding_window)
+                                       && !has_selected_keys;
     if (direct_bfloat16)
     {
         bfloat16_key_values = cache.bfloat16_keys.data();
@@ -345,7 +362,8 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                                            optimization_flags,
                                            RuntimeOptimizationCpuFlashAttention)
                                        && query.rows() > 1
-                                       && cache.token_count >= 64;
+                                       && cache.token_count >= 64
+                                       && !has_selected_keys;
     int attention_team_size = 1;
 #if defined(_OPENMP)
     if (omp_in_parallel() == 0)
@@ -356,7 +374,8 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                                       RuntimeOptimizationCpuSplitKvAttention)
                                   && query.rows() == 1
                                   && cache.token_count >= 512
-                                  && attention_team_size > 1;
+                                  && attention_team_size > 1
+                                  && !has_selected_keys;
 
     if (flash_prefill_enabled || split_kv_enabled)
     {
@@ -698,6 +717,112 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                 maximum = sinks->dtype == DType::Float32 ? sinks->float32_values()[query_head] : bfloat16_to_float(sinks->bfloat16_values()[query_head]);
             }
 
+            if (has_selected_keys)
+            {
+                const size_t selected_begin = selected_offsets[query_index];
+                const size_t selected_end = selected_offsets[query_index + 1];
+                for (size_t selected_index = selected_begin;
+                     selected_index < selected_end; ++selected_index)
+                {
+                    const uint64_t key_index = selected_indices[selected_index];
+                    const uint64_t key_position = cache.start_position + key_index;
+                    const bool future = key_position > query_position;
+                    const bool too_old = plan.sliding_window > 0
+                                         && key_position + plan.sliding_window <= query_position;
+                    const size_t logit_index = selected_index - selected_begin;
+                    if (key_index >= cache.token_count || future || too_old)
+                    {
+                        logits[logit_index] = -std::numeric_limits<float>::infinity();
+                        continue;
+                    }
+
+                    float dot = 0.0f;
+                    if (direct_bfloat16)
+                    {
+                        const uint64_t slot = direct_bfloat16_contiguous
+                                                  ? cache.first_slot + key_index
+                                                  : cache_slot(cache, key_index);
+                        const uint16_t* key_vector = bfloat16_key_values
+                                                     + static_cast<size_t>(slot) * cache.columns
+                                                     + static_cast<size_t>(kv_head) * head_dimension;
+                        dot = bfloat16_dot(
+                            key_vector, query_vector, head_dimension);
+                    }
+                    else
+                    {
+                        const float* key_vector = key_values
+                                                  + static_cast<size_t>(key_index) * cache.columns
+                                                  + static_cast<size_t>(kv_head) * head_dimension;
+                        dot = float_dot(
+                            query_vector, key_vector, head_dimension);
+                    }
+                    logits[logit_index] = dot * scale;
+                    maximum = std::max(maximum, logits[logit_index]);
+                }
+
+                float normalizer = 0.0f;
+                if (sinks)
+                {
+                    const float sink_value = sinks->dtype == DType::Float32
+                                                 ? sinks->float32_values()[query_head]
+                                                 : bfloat16_to_float(
+                                                     sinks->bfloat16_values()[query_head]);
+                    normalizer = float_approximate_exp(
+                        sink_value - maximum);
+                }
+                for (size_t selected_index = selected_begin;
+                     selected_index < selected_end; ++selected_index)
+                {
+                    const size_t logit_index = selected_index - selected_begin;
+                    if (std::isfinite(logits[logit_index]))
+                    {
+                        logits[logit_index] = float_approximate_exp(
+                            logits[logit_index] - maximum);
+                        normalizer += logits[logit_index];
+                    }
+                    else
+                    {
+                        logits[logit_index] = 0.0f;
+                    }
+                }
+
+                if (normalizer > 0.0f)
+                {
+                    float* output_vector = output.row(query_index)
+                                           + query_head * head_dimension;
+                    for (size_t selected_index = selected_begin;
+                         selected_index < selected_end; ++selected_index)
+                    {
+                        const uint64_t key_index = selected_indices[selected_index];
+                        const float probability =
+                            logits[selected_index - selected_begin]
+                            / normalizer;
+                        if (direct_bfloat16)
+                        {
+                            const uint64_t slot = direct_bfloat16_contiguous
+                                                      ? cache.first_slot + key_index
+                                                      : cache_slot(cache, key_index);
+                            const uint16_t* value_vector = bfloat16_value_values
+                                                           + static_cast<size_t>(slot) * cache.columns
+                                                           + static_cast<size_t>(kv_head) * head_dimension;
+                            bfloat16_scaled_add(
+                                output_vector, value_vector, probability,
+                                head_dimension);
+                        }
+                        else
+                        {
+                            const float* value_vector = value_values
+                                                        + static_cast<size_t>(key_index) * cache.columns
+                                                        + static_cast<size_t>(kv_head) * head_dimension;
+                            float_scaled_add(
+                                output_vector, value_vector, probability,
+                                head_dimension);
+                        }
+                    }
+                }
+                continue;
+            }
+
             if (decode_all_keys_valid)
             {
                 for (uint64_t key_index = 0; key_index < cache.token_count; ++key_index)
@@ -880,6 +1005,200 @@ static void apply_head_rms_norm(CpuBatch& batch, uint32_t head_count, uint32_t h
     }
 }
 
+static Result<void> project_and_append_qsa_keys(
+    const WeightStore& weights,
+    const CompiledOperatorTable& operators,
+    const AttentionBlockPlan& plan,
+    const CpuBatch& normalized,
+    CpuLayerCache& cache,
+    CpuAttentionExecutionScratch& scratch,
+    uint64_t optimization_flags)
+{
+    if (!has_flag(plan.flags, AttentionBlockQsa))
+        return {};
+    if (cache.transaction.active)
+        return Error{ErrorCode::UnsupportedModel, "QSA cache transactions are not supported"};
+    attention_linear_into(
+        weights, operators, plan.qsa_query_key_weight,
+        invalid_tensor_handle, normalized, scratch.qsa_query_key,
+        optimization_flags);
+    const uint32_t query_columns = plan.index_head_count * plan.index_head_dimension;
+    const uint32_t expected_columns = query_columns + plan.index_head_dimension;
+    if (scratch.qsa_query_key.columns() != expected_columns)
+        return Error{ErrorCode::InvalidModel, "invalid QSA projection output"};
+    if (cache.qsa_index_keys.size()
+        != static_cast<size_t>(cache.token_count) * plan.index_head_dimension)
+    {
+        return Error{ErrorCode::InternalError, "QSA key cache is out of sync"};
+    }
+    scratch.qsa_query.reset(normalized.rows(), query_columns, false);
+    const size_t previous_size = cache.qsa_index_keys.size();
+    cache.qsa_index_keys.resize(
+        previous_size + normalized.rows() * plan.index_head_dimension);
+    for (size_t row_index = 0; row_index < normalized.rows(); ++row_index)
+    {
+        const float* source = scratch.qsa_query_key.row(row_index);
+        std::copy_n(source, query_columns, scratch.qsa_query.row(row_index));
+        float_to_bfloat16_array(
+            cache.qsa_index_keys.data() + previous_size
+                + row_index * plan.index_head_dimension,
+            source + query_columns,
+            plan.index_head_dimension);
+    }
+    return {};
+}
+
+static Result<void> prepare_qsa_selection(
+    const WeightStore& weights,
+    const AttentionBlockPlan& plan,
+    uint64_t position_offset,
+    float norm_epsilon,
+    CpuLayerCache& cache,
+    CpuAttentionExecutionScratch& scratch,
+    uint64_t optimization_flags)
+{
+    if (!has_flag(plan.flags, AttentionBlockQsa))
+    {
+        scratch.qsa_selected_offsets.clear();
+        scratch.qsa_selected_indices.clear();
+        return {};
+    }
+    if (cache.qsa_index_keys.size()
+        != static_cast<size_t>(cache.token_count) * plan.index_head_dimension)
+    {
+        return Error{ErrorCode::InternalError, "QSA key cache is out of sync after append"};
+    }
+    apply_head_rms_norm(
+        scratch.qsa_query, plan.index_head_count,
+        plan.index_head_dimension,
+        weights.at(plan.qsa_query_norm_weight), norm_epsilon,
+        plan.norm_weight_offset, optimization_flags);
+    const uint32_t rope_dimension = plan.rope_head_dimension == 0
+                                        ? plan.index_head_dimension
+                                        : plan.rope_head_dimension;
+    for (size_t row_index = 0; row_index < scratch.qsa_query.rows(); ++row_index)
+    {
+        for (uint32_t head = 0; head < plan.index_head_count; ++head)
+        {
+            apply_rope(
+                scratch.qsa_query.row(row_index)
+                    + static_cast<size_t>(head) * plan.index_head_dimension,
+                rope_dimension, position_offset + row_index, plan);
+        }
+    }
+
+    if (cache.token_count > std::numeric_limits<uint32_t>::max())
+        return Error{ErrorCode::InvalidModel, "QSA key index exceeds uint32 storage"};
+    const uint64_t maximum_selected_per_query =
+        static_cast<uint64_t>(plan.index_top_k) * plan.compression_ratio
+        + plan.compression_ratio - 1;
+    if (maximum_selected_per_query > std::numeric_limits<size_t>::max()
+        || (scratch.qsa_query.rows() != 0
+            && maximum_selected_per_query
+                   > std::numeric_limits<size_t>::max()
+                         / scratch.qsa_query.rows()))
+    {
+        return Error{ErrorCode::InvalidModel, "QSA selection storage size overflows"};
+    }
+    scratch.qsa_selected_offsets.assign(
+        scratch.qsa_query.rows() + 1, 0);
+    scratch.qsa_selected_indices.clear();
+    scratch.qsa_selected_indices.reserve(
+        scratch.qsa_query.rows()
+        * static_cast<size_t>(maximum_selected_per_query));
+    const float scale = 1.0f / std::sqrt(static_cast<float>(plan.index_head_dimension));
+    std::vector<std::pair<float, uint32_t>> scores;
+    std::vector<float> pooled(plan.index_head_dimension);
+    for (size_t query_index = 0; query_index < scratch.qsa_query.rows(); ++query_index)
+    {
+        const uint64_t query_position = position_offset + query_index;
+        const uint64_t visible_count = query_position < cache.start_position
+                                           ? 0
+                                           : std::min<uint64_t>(
+                                                 cache.token_count,
+                                                 query_position - cache.start_position + 1);
+        const uint64_t complete_blocks = visible_count / plan.compression_ratio;
+        scores.clear();
+        scores.reserve(static_cast<size_t>(complete_blocks));
+        for (uint32_t block = 0; block < complete_blocks; ++block)
+        {
+            std::fill(pooled.begin(), pooled.end(), 0.0f);
+            const uint64_t first_token = static_cast<uint64_t>(block) * plan.compression_ratio;
+            for (uint32_t token = 0; token < plan.compression_ratio; ++token)
+            {
+                const uint16_t* raw = cache.qsa_index_keys.data()
+                                      + (first_token + token) * plan.index_head_dimension;
+                for (uint32_t column = 0; column < plan.index_head_dimension; ++column)
+                    pooled[column] += bfloat16_to_float(raw[column]);
+            }
+            const float inverse_ratio = 1.0f / static_cast<float>(plan.compression_ratio);
+            for (float& value : pooled)
+            {
+                value *= inverse_ratio;
+                value = bfloat16_to_float(float_to_bfloat16(value));
+            }
+            float square_sum = 0.0f;
+            for (float value : pooled)
+                square_sum += value * value;
+            const float inverse_rms = 1.0f / std::sqrt(
+                square_sum / static_cast<float>(plan.index_head_dimension)
+                + norm_epsilon);
+            const TensorData& key_norm = weights.at(plan.qsa_key_norm_weight);
+            for (uint32_t column = 0; column < plan.index_head_dimension; ++column)
+            {
+                pooled[column] *= inverse_rms
+                                  * (attention_weight_value(key_norm, column)
+                                     + plan.norm_weight_offset);
+            }
+            apply_rope(pooled.data(), rope_dimension,
+                       cache.start_position + first_token, plan);
+            float score = 0.0f;
+            for (uint32_t head = 0; head < plan.index_head_count; ++head)
+            {
+                const float* query = scratch.qsa_query.row(query_index)
+                                     + static_cast<size_t>(head) * plan.index_head_dimension;
+                score += std::max(0.0f,
+                                  float_dot(query, pooled.data(),
+                                            plan.index_head_dimension));
+            }
+            scores.emplace_back(score * scale, block);
+        }
+        const size_t selected_count = std::min<size_t>(plan.index_top_k, scores.size());
+        std::partial_sort(
+            scores.begin(), scores.begin() + selected_count, scores.end(),
+            [](const auto& left, const auto& right) {
+                if (left.first != right.first)
+                    return left.first > right.first;
+                return left.second < right.second;
+            });
+        const size_t selection_begin =
+            scratch.qsa_selected_indices.size();
+        for (size_t index = 0; index < selected_count; ++index)
+        {
+            const uint64_t first_token = static_cast<uint64_t>(scores[index].second)
+                                         * plan.compression_ratio;
+            for (uint32_t token = 0;
+                 token < plan.compression_ratio; ++token)
+            {
+                scratch.qsa_selected_indices.push_back(
+                    static_cast<uint32_t>(first_token + token));
+            }
+        }
+        for (uint64_t token = complete_blocks * plan.compression_ratio;
+             token < visible_count; ++token)
+        {
+            scratch.qsa_selected_indices.push_back(
+                static_cast<uint32_t>(token));
+        }
+        std::sort(
+            scratch.qsa_selected_indices.begin() + selection_begin,
+            scratch.qsa_selected_indices.end());
+        scratch.qsa_selected_offsets[query_index + 1] =
+            scratch.qsa_selected_indices.size();
+    }
+    return {};
+}
+
 Result<void> append_attention_context_into(
     const WeightStore& weights,
     const CompiledOperatorTable& operators,
@@ -912,7 +1231,18 @@ Result<void> append_attention_context_into(
             "state cache transaction does not support sliding Attention"};
     }
 
-    rms_norm_batch_into(hidden, weights.at(plan.pre_attention_norm_weight), norm_epsilon, scratch.normalized, plan.norm_weight_offset, optimization_flags);
+    configure_cache(
+        cache, plan.kv_head_count * plan.head_dimension,
+        kv_cache_dtype);
+    if (plan.pre_attention_norm_weight == invalid_tensor_handle)
+        scratch.normalized = hidden;
+    else
+        rms_norm_batch_into(hidden, weights.at(plan.pre_attention_norm_weight), norm_epsilon, scratch.normalized, plan.norm_weight_offset, optimization_flags);
+    auto qsa_status = project_and_append_qsa_keys(
+        weights, operators, plan, scratch.normalized, cache, scratch,
+        optimization_flags);
+    if (!qsa_status)
+        return qsa_status.error();
     CpuBatch& key = scratch.key;
     CpuBatch& value = scratch.value;
     CpuBatch& fused_qkv = scratch.fused_qkv;
@@ -1091,7 +1421,18 @@ Result<void> execute_attention_block_into(
         }
     }
 
-    rms_norm_batch_into(hidden, weights.at(plan.pre_attention_norm_weight), norm_epsilon, scratch.normalized, plan.norm_weight_offset, optimization_flags);
+    configure_cache(
+        cache, plan.kv_head_count * plan.head_dimension,
+        kv_cache_dtype);
+    if (plan.pre_attention_norm_weight == invalid_tensor_handle)
+        scratch.normalized = hidden;
+    else
+        rms_norm_batch_into(hidden, weights.at(plan.pre_attention_norm_weight), norm_epsilon, scratch.normalized, plan.norm_weight_offset, optimization_flags);
+    auto qsa_status = project_and_append_qsa_keys(
+        weights, operators, plan, scratch.normalized, cache, scratch,
+        optimization_flags);
+    if (!qsa_status)
+        return qsa_status.error();
     CpuBatch& query = scratch.query;
     CpuBatch& key = scratch.key;
     CpuBatch& value = scratch.value;
@@ -1196,6 +1537,11 @@ Result<void> execute_attention_block_into(
     if (cache.token_count == 0)
         cache.start_position = position_offset;
     append_cache(cache, kv_cache_dtype, key, value);
+    qsa_status = prepare_qsa_selection(
+        weights, plan, position_offset, norm_epsilon, cache, scratch,
+        optimization_flags);
+    if (!qsa_status)
+        return qsa_status.error();
     scaled_dot_product_attention_into(
         plan,
         plan.sinks == invalid_tensor_handle ? nullptr : &weights.at(plan.sinks),
@@ -1209,6 +1555,8 @@ Result<void> execute_attention_block_into(
         scratch.flash_partial_max,
         scratch.flash_partial_sum,
         scratch.flash_partial_output,
+        scratch.qsa_selected_offsets,
+        scratch.qsa_selected_indices,
         optimization_flags);
     if (has_flag(plan.flags, AttentionBlockOutputGate))
     {
@@ -1243,8 +1591,13 @@ Result<void> execute_attention_block_into(
         }
     }
     attention_linear_into(weights, operators, plan.output_weight, plan.output_bias, scratch.attention, scratch.projected, optimization_flags);
-    output = hidden;
-    add_batch_inplace(output, scratch.projected);
+    if (has_flag(plan.flags, AttentionBlockExternalResidual))
+        output = scratch.projected;
+    else
+    {
+        output = hidden;
+        add_batch_inplace(output, scratch.projected);
+    }
     trim_sliding_cache(cache, plan);
     return {};
 }

@@ -645,6 +645,59 @@ private:
         pipelines_;
 };
 
+// Weight admissions are produced by one background worker, but each Expert
+// used to create and wait for a separate transfer command.  Keep one transfer
+// command and its staging allocators alive for a bounded group of MXFP4
+// Experts so the device sees one submission for the whole group.  The caller
+// owns the context command lock while the batch is recording; this keeps
+// ncnn's allocators and command domain serialized with foreground execution.
+class NcnnVulkanWeightUploadBatch
+{
+public:
+    explicit NcnnVulkanWeightUploadBatch(const std::shared_ptr<NcnnVulkanContext>& context)
+        : context_(context),
+          command_(context ? context->device() : nullptr),
+          command_lock_(context ? std::unique_lock<std::mutex>(context->command_mutex()) : std::unique_lock<std::mutex>())
+    {
+    }
+
+    NcnnVulkanWeightUploadBatch(const NcnnVulkanWeightUploadBatch&) = delete;
+    NcnnVulkanWeightUploadBatch& operator=(const NcnnVulkanWeightUploadBatch&) = delete;
+
+    [[nodiscard]] bool record(
+        const ncnn::Mat& source,
+        ncnn::VkMat& destination,
+        const ncnn::Option& option,
+        ncnn::VkAllocator* weight_allocator)
+    {
+        if (!context_ || !weight_allocator || source.empty())
+            return false;
+        auto staging_allocator = std::make_unique<ncnn::VkWeightStagingAllocator>(context_->device());
+        if (!staging_allocator)
+            return false;
+        ncnn::Option upload_option = option;
+        upload_option.blob_vkallocator = weight_allocator;
+        upload_option.workspace_vkallocator = weight_allocator;
+        upload_option.staging_vkallocator = staging_allocator.get();
+        command_.record_upload(source, destination, upload_option);
+        if (destination.empty())
+            return false;
+        staging_allocators_.push_back(std::move(staging_allocator));
+        return true;
+    }
+
+    [[nodiscard]] bool submit()
+    {
+        return context_ && command_.submit_and_wait() == 0;
+    }
+
+private:
+    std::shared_ptr<NcnnVulkanContext> context_;
+    std::vector<std::unique_ptr<ncnn::VkWeightStagingAllocator>> staging_allocators_;
+    ncnn::VkTransfer command_;
+    std::unique_lock<std::mutex> command_lock_;
+};
+
 class VulkanExpertVictimCache final : public IExpertVictimCache
 {
 public:
@@ -3387,6 +3440,24 @@ NcnnVulkanBfloat16Operator::create(
     const NcnnVulkanContextInstancePtr& context_instance,
     uint64_t optimization_flags)
 {
+    return create_with_allocator(
+        matrix,
+        bias,
+        vulkan_device_index,
+        nullptr,
+        context_instance,
+        optimization_flags);
+}
+
+std::shared_ptr<NcnnVulkanBfloat16Operator>
+NcnnVulkanBfloat16Operator::create_with_allocator(
+    const TensorData& matrix,
+    const TensorData* bias,
+    uint32_t vulkan_device_index,
+    ncnn::VkAllocator* weight_allocator,
+    const NcnnVulkanContextInstancePtr& context_instance,
+    uint64_t optimization_flags)
+{
 #if NCNN_MOE_WITH_VULKAN
     if (matrix.dtype != DType::BFloat16
         || matrix.shape.size() != 2
@@ -3453,10 +3524,14 @@ NcnnVulkanBfloat16Operator::create(
     {
         return {};
     }
-    implementation.weight_allocator.reset(
-        new ncnn::VkWeightAllocator(
-            device,
-            static_cast<size_t>(preferred_weight_bytes)));
+    if (!weight_allocator)
+    {
+        implementation.weight_allocator.reset(
+            new ncnn::VkWeightAllocator(
+                device,
+                static_cast<size_t>(preferred_weight_bytes)));
+        weight_allocator = implementation.weight_allocator.get();
+    }
     implementation.weight_staging_allocator.reset(
         new ncnn::VkWeightStagingAllocator(device));
 
@@ -3517,8 +3592,8 @@ NcnnVulkanBfloat16Operator::create(
         }
     }
     ncnn::Option upload_option = implementation.option;
-    upload_option.blob_vkallocator = implementation.weight_allocator.get();
-    upload_option.workspace_vkallocator = implementation.weight_allocator.get();
+    upload_option.blob_vkallocator = weight_allocator;
+    upload_option.workspace_vkallocator = weight_allocator;
     upload_option.staging_vkallocator = implementation.weight_staging_allocator.get();
     ncnn::Option packed_upload_option = upload_option;
     packed_upload_option.use_fp16_storage = false;
@@ -3546,6 +3621,7 @@ NcnnVulkanBfloat16Operator::create(
     (void)matrix;
     (void)bias;
     (void)vulkan_device_index;
+    (void)weight_allocator;
     (void)context_instance;
     (void)optimization_flags;
     return {};
@@ -4245,6 +4321,479 @@ bool NcnnVulkanBfloat16Operator::forward_swiglu_chain(
 #endif
 }
 
+class NcnnVulkanBfloat16ExpertOperator::Implementation
+{
+public:
+    std::shared_ptr<NcnnVulkanBfloat16Operator> gate_up;
+    std::shared_ptr<NcnnVulkanBfloat16Operator> down;
+#if NCNN_MOE_WITH_VULKAN
+    std::shared_ptr<NcnnVulkanContext> vulkan_context;
+#endif
+    uint32_t intermediate_columns = 0;
+    uint32_t output_columns = 0;
+    float activation_limit = 0.0f;
+    ExpertActivation activation = ExpertActivation::Silu;
+    uint64_t optimization_flags = RuntimeOptimizationDefaultFlags;
+};
+
+NcnnVulkanBfloat16ExpertOperator::NcnnVulkanBfloat16ExpertOperator()
+    : implementation_(new Implementation)
+{
+}
+
+NcnnVulkanBfloat16ExpertOperator::~NcnnVulkanBfloat16ExpertOperator() = default;
+
+std::shared_ptr<NcnnVulkanBfloat16ExpertOperator>
+NcnnVulkanBfloat16ExpertOperator::create(
+    const TensorData& gate_up,
+    const TensorData* gate_up_bias,
+    const TensorData& down,
+    const TensorData* down_bias,
+    float activation_limit,
+    uint32_t vulkan_device_index,
+    ExpertActivation activation,
+    const NcnnVulkanContextInstancePtr& context_instance,
+    uint64_t optimization_flags)
+{
+    return create_with_allocator(
+        gate_up,
+        gate_up_bias,
+        down,
+        down_bias,
+        activation_limit,
+        vulkan_device_index,
+        nullptr,
+        activation,
+        context_instance,
+        optimization_flags);
+}
+
+std::shared_ptr<NcnnVulkanBfloat16ExpertOperator>
+NcnnVulkanBfloat16ExpertOperator::create_with_allocator(
+    const TensorData& gate_up,
+    const TensorData* gate_up_bias,
+    const TensorData& down,
+    const TensorData* down_bias,
+    float activation_limit,
+    uint32_t vulkan_device_index,
+    ncnn::VkAllocator* weight_allocator,
+    ExpertActivation activation,
+    const NcnnVulkanContextInstancePtr& context_instance,
+    uint64_t optimization_flags)
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (activation != ExpertActivation::Silu
+        || gate_up.dtype != DType::BFloat16
+        || down.dtype != DType::BFloat16
+        || gate_up.shape.size() != 2
+        || down.shape.size() != 2
+        || gate_up.shape[0] == 0
+        || gate_up.shape[0] % 2 != 0
+        || down.shape[0] == 0
+        || down.shape[1] != gate_up.shape[0] / 2
+        || (gate_up.shape[0] / 2) % 128 != 0
+        || activation_limit < 0.0f)
+    {
+        return {};
+    }
+
+    std::shared_ptr<NcnnVulkanBfloat16ExpertOperator> result(
+        new NcnnVulkanBfloat16ExpertOperator);
+    Implementation& implementation = *result->implementation_;
+    implementation.gate_up = NcnnVulkanBfloat16Operator::create_with_allocator(
+        gate_up,
+        gate_up_bias,
+        vulkan_device_index,
+        weight_allocator,
+        context_instance,
+        optimization_flags);
+    implementation.down = NcnnVulkanBfloat16Operator::create_with_allocator(
+        down,
+        down_bias,
+        vulkan_device_index,
+        weight_allocator,
+        context_instance,
+        optimization_flags);
+    if (!implementation.gate_up || !implementation.down)
+        return {};
+
+    const NcnnVulkanBfloat16Operator::Implementation& gate =
+        *implementation.gate_up->implementation_;
+    const NcnnVulkanBfloat16Operator::Implementation& down_projection =
+        *implementation.down->implementation_;
+    if (!gate.vulkan_context
+        || gate.vulkan_context != down_projection.vulkan_context
+        || gate.output_columns != gate_up.shape[0]
+        || down_projection.input_columns != gate_up.shape[0] / 2
+        || down_projection.output_columns != down.shape[0])
+    {
+        return {};
+    }
+
+    implementation.vulkan_context = gate.vulkan_context;
+    implementation.intermediate_columns = gate.output_columns / 2;
+    implementation.output_columns = down_projection.output_columns;
+    implementation.activation_limit = activation_limit;
+    implementation.activation = activation;
+    implementation.optimization_flags = optimization_flags;
+    {
+        const std::lock_guard<std::mutex> lock(
+            implementation.vulkan_context->command_mutex());
+        if (!create_bfloat16_swiglu_down_pipeline(
+                implementation.vulkan_context,
+                gate.option,
+                gate.swiglu_down_pipeline))
+        {
+            return {};
+        }
+    }
+    return result;
+#else
+    (void)gate_up;
+    (void)gate_up_bias;
+    (void)down;
+    (void)down_bias;
+    (void)activation_limit;
+    (void)vulkan_device_index;
+    (void)weight_allocator;
+    (void)activation;
+    (void)context_instance;
+    (void)optimization_flags;
+    return {};
+#endif
+}
+
+bool NcnnVulkanBfloat16ExpertOperator::forward(
+    const ActivationBuffer& input,
+    ActivationBuffer& output) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    const Implementation& implementation = *implementation_;
+    return implementation.gate_up
+           && implementation.down
+           && implementation.gate_up->forward_swiglu_chain(
+               input,
+               *implementation.down,
+               implementation.intermediate_columns,
+               implementation.activation,
+               implementation.activation_limit,
+               false,
+               output);
+#else
+    (void)input;
+    (void)output;
+    return false;
+#endif
+}
+
+bool NcnnVulkanBfloat16ExpertOperator::forward_batch(
+    std::span<const NcnnVulkanBfloat16ExpertOperator*> experts,
+    std::span<const ActivationBuffer*> inputs,
+    std::span<ActivationBuffer*> outputs)
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (experts.empty()
+        || experts.size() != inputs.size()
+        || experts.size() != outputs.size())
+    {
+        return false;
+    }
+
+    const NcnnVulkanBfloat16ExpertOperator* first_operator = experts.front();
+    if (!first_operator || !first_operator->implementation_)
+        return false;
+    const Implementation& first_expert = *first_operator->implementation_;
+    if (!first_expert.gate_up
+        || !first_expert.down
+        || !first_expert.vulkan_context)
+    {
+        return false;
+    }
+    const NcnnVulkanBfloat16Operator::Implementation& first_gate =
+        *first_expert.gate_up->implementation_;
+    const NcnnVulkanBfloat16Operator::Implementation& first_down =
+        *first_expert.down->implementation_;
+    if (!first_gate.pipeline
+        || !first_gate.swiglu_down_pipeline
+        || first_down.packed.empty()
+        || first_down.bias.empty()
+        || first_gate.output_columns % 2 != 0
+        || first_down.input_columns != first_expert.intermediate_columns
+        || first_down.output_columns != first_expert.output_columns)
+    {
+        return false;
+    }
+
+    const uint32_t input_columns = first_gate.input_columns;
+    const uint32_t output_columns = first_down.output_columns;
+    if (input_columns == 0
+        || output_columns == 0
+        || first_expert.intermediate_columns == 0
+        || first_expert.intermediate_columns % 128 != 0)
+    {
+        return false;
+    }
+
+    size_t total_rows = 0;
+    for (size_t index = 0; index < experts.size(); ++index)
+    {
+        const NcnnVulkanBfloat16ExpertOperator* operator_instance = experts[index];
+        const ActivationBuffer* input = inputs[index];
+        const ActivationBuffer* output = outputs[index];
+        if (!operator_instance
+            || !operator_instance->implementation_
+            || !input
+            || !output
+            || input->rows() == 0
+            || input->rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max())
+            || input->rows() > static_cast<size_t>(std::numeric_limits<int>::max())
+            || input->dtype() != DType::Float32
+            || input->columns() != input_columns
+            || output->dtype() != DType::Float32)
+        {
+            return false;
+        }
+        const Implementation& expert = *operator_instance->implementation_;
+        if (!expert.gate_up
+            || !expert.down
+            || !expert.vulkan_context
+            || expert.vulkan_context != first_expert.vulkan_context
+            || expert.intermediate_columns != first_expert.intermediate_columns
+            || expert.output_columns != output_columns
+            || expert.activation != first_expert.activation
+            || expert.activation_limit != first_expert.activation_limit)
+        {
+            return false;
+        }
+        const NcnnVulkanBfloat16Operator::Implementation& gate =
+            *expert.gate_up->implementation_;
+        const NcnnVulkanBfloat16Operator::Implementation& down =
+            *expert.down->implementation_;
+        if (!gate.pipeline
+            || !gate.swiglu_down_pipeline
+            || down.packed.empty()
+            || down.bias.empty()
+            || gate.vulkan_context != first_expert.vulkan_context
+            || down.vulkan_context != first_expert.vulkan_context
+            || gate.input_columns != input_columns
+            || gate.output_columns != first_gate.output_columns
+            || down.input_columns != first_down.input_columns
+            || down.output_columns != output_columns
+            || vulkan_activation_storage_variant(gate.option)
+                   != vulkan_activation_storage_variant(first_gate.option))
+        {
+            return false;
+        }
+        if (total_rows > static_cast<size_t>(std::numeric_limits<uint32_t>::max())
+                         - input->rows()
+            || total_rows > static_cast<size_t>(std::numeric_limits<int>::max())
+                              - input->rows())
+        {
+            return false;
+        }
+        total_rows += input->rows();
+    }
+    if (total_rows == 0
+        || total_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
+    {
+        return false;
+    }
+
+    NcnnVulkanRuntimeState& runtime_state =
+        first_expert.vulkan_context->runtime_state();
+    NcnnVulkanTransferLease transfer_lease =
+        first_expert.vulkan_context->acquire_transfer_slot();
+    NcnnVulkanTransferSlot& transfer_slot = transfer_lease.slot();
+    if (!prepare_staging_batch(
+            transfer_slot.upload,
+            total_rows,
+            input_columns,
+            transfer_slot.staging_allocator,
+            runtime_state,
+            sizeof(float))
+        || !prepare_staging_batch(
+            transfer_slot.download,
+            total_rows,
+            output_columns,
+            transfer_slot.staging_allocator,
+            runtime_state,
+            sizeof(float)))
+    {
+        return false;
+    }
+
+    ncnn::Mat mapped_input = transfer_slot.upload.mapped();
+    if (mapped_input.empty()
+        || mapped_input.dims != 2
+        || mapped_input.w != static_cast<int>(input_columns)
+        || mapped_input.h != static_cast<int>(total_rows)
+        || mapped_input.elemsize != sizeof(float)
+        || mapped_input.elempack != 1)
+    {
+        return false;
+    }
+    auto* mapped_input_bytes = static_cast<std::byte*>(mapped_input.data);
+    size_t row_offset = 0;
+    for (const ActivationBuffer* input : inputs)
+    {
+        const size_t input_bytes =
+            input->rows() * static_cast<size_t>(input_columns) * sizeof(float);
+        if (input->bytes().size() != input_bytes)
+            return false;
+        std::memcpy(
+            mapped_input_bytes
+                + row_offset * static_cast<size_t>(input_columns) * sizeof(float),
+            input->bytes().data(),
+            input_bytes);
+        row_offset += input->rows();
+    }
+    transfer_slot.upload.allocator->flush(transfer_slot.upload.data);
+    transfer_slot.upload.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
+    transfer_slot.upload.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
+
+    std::unique_lock<std::mutex> lock(
+        first_expert.vulkan_context->command_mutex());
+    ncnn::VkCompute& command = *transfer_slot.command;
+    if (transfer_slot.command_used)
+    {
+        if (command.reset() != 0)
+            return false;
+        ++runtime_state.command_buffer_reuses;
+    }
+    transfer_slot.command_used = true;
+
+    ncnn::VkMat input_gpu;
+    if (!record_mapped_activation_upload(
+            transfer_slot.upload,
+            input_gpu,
+            command,
+            first_expert.vulkan_context->device(),
+            first_gate.option,
+            DType::Float32))
+    {
+        return false;
+    }
+    ncnn::VkMat output_gpu;
+    output_gpu.create(
+        static_cast<int>(output_columns),
+        static_cast<int>(total_rows),
+        vulkan_activation_element_size(first_gate.option),
+        first_expert.vulkan_context->blob_allocator());
+    if (input_gpu.empty() || output_gpu.empty())
+        return false;
+
+    std::vector<ncnn::VkMat> intermediates;
+    intermediates.reserve(experts.size());
+    row_offset = 0;
+    for (size_t index = 0; index < experts.size(); ++index)
+    {
+        const Implementation& expert = *experts[index]->implementation_;
+        const NcnnVulkanBfloat16Operator::Implementation& gate =
+            *expert.gate_up->implementation_;
+        const NcnnVulkanBfloat16Operator::Implementation& down =
+            *expert.down->implementation_;
+        const size_t rows = inputs[index]->rows();
+        ncnn::VkMat input_view = row_view(input_gpu, row_offset, rows);
+        ncnn::VkMat output_view = row_view(output_gpu, row_offset, rows);
+        if (input_view.empty() || output_view.empty())
+            return false;
+
+        ncnn::VkMat fused_gpu;
+        fused_gpu.create(
+            static_cast<int>(gate.output_columns),
+            static_cast<int>(rows),
+            vulkan_activation_element_size(first_gate.option),
+            first_expert.vulkan_context->blob_allocator());
+        if (fused_gpu.empty())
+            return false;
+        intermediates.push_back(fused_gpu);
+
+        const bool used_cooperative_matrix = record_bfloat16_projection(
+                gate.pipeline,
+                gate.cooperative_pipeline,
+                input_view,
+                gate.packed,
+                gate.bias,
+                fused_gpu,
+                gate.input_columns,
+                gate.output_columns,
+                gate.block_count,
+                static_cast<uint32_t>(rows),
+                gate.cooperative_tile_m,
+                gate.cooperative_tile_n,
+                gate.cooperative_tile_k,
+                gate.cooperative_subgroup_size,
+                gate.cooperative_forced,
+                command);
+        if (used_cooperative_matrix)
+            ++runtime_state.bfloat16_cooperative_matrix_dispatches;
+
+        std::vector<ncnn::VkMat> swiglu_bindings = {
+            fused_gpu,
+            down.packed,
+            down.bias,
+            output_view};
+        std::vector<ncnn::vk_constant_type> swiglu_constants(5);
+        swiglu_constants[0].u32 = expert.intermediate_columns;
+        swiglu_constants[1].u32 = gate.output_columns;
+        swiglu_constants[2].u32 = down.output_columns;
+        swiglu_constants[3].u32 = static_cast<uint32_t>(rows);
+        swiglu_constants[4].u32 = 0;
+        ncnn::VkMat swiglu_dispatcher;
+        swiglu_dispatcher.w = static_cast<int>(down.output_columns * 32);
+        swiglu_dispatcher.h = static_cast<int>(rows);
+        swiglu_dispatcher.c = 1;
+        command.record_pipeline(
+            gate.swiglu_down_pipeline.get(),
+            swiglu_bindings,
+            swiglu_constants,
+            swiglu_dispatcher);
+        row_offset += rows;
+    }
+
+    ActivationBuffer combined_output(total_rows, output_columns, DType::Float32);
+    if (!record_prepared_activation_staging_download(
+            output_gpu,
+            total_rows,
+            output_columns,
+            transfer_slot.download,
+            command,
+            first_expert.vulkan_context->device(),
+            first_down.option,
+            DType::Float32)
+        || submit_compute_and_wait(command, runtime_state) != 0
+        || !copy_staging_to_cpu_batch(transfer_slot.download, combined_output))
+    {
+        return false;
+    }
+    lock.unlock();
+
+    row_offset = 0;
+    for (size_t index = 0; index < outputs.size(); ++index)
+    {
+        outputs[index]->reset(inputs[index]->rows(), output_columns, false);
+        for (size_t row = 0; row < inputs[index]->rows(); ++row)
+        {
+            std::copy_n(
+                combined_output.row(row_offset + row),
+                output_columns,
+                outputs[index]->row(row));
+        }
+        row_offset += inputs[index]->rows();
+    }
+    runtime_state.dispatches += static_cast<uint64_t>(experts.size()) * 2;
+    ++runtime_state.compute_submissions;
+    ++runtime_state.batch_uploads;
+    ++runtime_state.batch_downloads;
+    return true;
+#else
+    (void)experts;
+    (void)inputs;
+    (void)outputs;
+    return false;
+#endif
+}
+
 class NcnnVulkanGatedDeltaState::Implementation
 {
 public:
@@ -4305,6 +4854,7 @@ public:
     uint32_t value_head_dimension = 0;
     uint32_t convolution_kernel_size = 0;
     float norm_epsilon = 0.0f;
+    bool sigmoid_gate = false;
     uint64_t optimization_flags = RuntimeOptimizationDefaultFlags;
 #endif
 };
@@ -4986,6 +5536,7 @@ NcnnVulkanGatedDeltaNetOperator::create(
     uint32_t value_head_dimension,
     uint32_t convolution_kernel_size,
     float norm_epsilon,
+    bool sigmoid_gate,
     uint32_t vulkan_device_index,
     const NcnnVulkanContextInstancePtr& context_instance,
     uint64_t optimization_flags)
@@ -5047,6 +5598,7 @@ NcnnVulkanGatedDeltaNetOperator::create(
     implementation.value_head_dimension = value_head_dimension;
     implementation.convolution_kernel_size = convolution_kernel_size;
     implementation.norm_epsilon = norm_epsilon;
+    implementation.sigmoid_gate = sigmoid_gate;
     {
         const std::lock_guard<std::mutex> lock(
             implementation.vulkan_context->command_mutex());
@@ -5116,6 +5668,7 @@ NcnnVulkanGatedDeltaNetOperator::create(
     (void)value_head_dimension;
     (void)convolution_kernel_size;
     (void)norm_epsilon;
+    (void)sigmoid_gate;
     (void)vulkan_device_index;
     (void)context_instance;
     (void)optimization_flags;
@@ -5342,7 +5895,7 @@ bool NcnnVulkanGatedDeltaNetOperator::forward_impl(
         implementation.decay_log,
         implementation.norm_weight,
         recurrent_output_gpu};
-    std::vector<ncnn::vk_constant_type> delta_constants(10);
+    std::vector<ncnn::vk_constant_type> delta_constants(11);
     delta_constants[0].u32 = implementation.convolution_size;
     delta_constants[1].u32 = implementation.value_size;
     delta_constants[2].u32 = implementation.fused_columns;
@@ -5353,6 +5906,7 @@ bool NcnnVulkanGatedDeltaNetOperator::forward_impl(
     delta_constants[7].u32 = implementation.convolution_kernel_size;
     delta_constants[8].u32 = static_cast<uint32_t>(input.rows());
     delta_constants[9].f = implementation.norm_epsilon;
+    delta_constants[10].u32 = implementation.sigmoid_gate ? 1u : 0u;
     ncnn::VkMat delta_dispatcher;
     delta_dispatcher.w = 128;
     delta_dispatcher.h = 1;
@@ -5740,7 +6294,7 @@ NcnnVulkanGatedDeltaNetOperator::forward_batch(
             implementation.decay_log,
             implementation.norm_weight,
             recurrent_view};
-        std::vector<ncnn::vk_constant_type> delta_constants(10);
+        std::vector<ncnn::vk_constant_type> delta_constants(11);
         delta_constants[0].u32 = implementation.convolution_size;
         delta_constants[1].u32 = implementation.value_size;
         delta_constants[2].u32 = implementation.fused_columns;
@@ -5751,6 +6305,7 @@ NcnnVulkanGatedDeltaNetOperator::forward_batch(
         delta_constants[7].u32 = implementation.convolution_kernel_size;
         delta_constants[8].u32 = 1;
         delta_constants[9].f = implementation.norm_epsilon;
+        delta_constants[10].u32 = implementation.sigmoid_gate ? 1u : 0u;
         ncnn::VkMat delta_dispatcher;
         delta_dispatcher.w = 128;
         delta_dispatcher.h = 1;
@@ -7561,7 +8116,8 @@ std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create(const T
 std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create_with_allocator(const TensorData& matrix, const TensorData* bias,
                                                                                         uint32_t vulkan_device_index, ncnn::VkAllocator* weight_allocator,
                                                                                         const NcnnVulkanContextInstancePtr& context_instance,
-                                                                                        uint64_t optimization_flags)
+                                                                                        uint64_t optimization_flags,
+                                                                                        NcnnVulkanWeightUploadBatch* upload_batch)
 {
 #if NCNN_MOE_WITH_VULKAN
     if (matrix.dtype != DType::MxFp4 || matrix.shape.size() != 2 || matrix.shape[0] == 0 || matrix.shape[1] == 0 || matrix.shape[1] % 32 != 0
@@ -7618,7 +8174,8 @@ std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create_with_al
         implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(device, static_cast<size_t>(preferred_weight_bytes)));
         weight_allocator = implementation.weight_allocator.get();
     }
-    implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(device));
+    if (!upload_batch)
+        implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(device));
 
     ncnn::Mat packed;
     ncnn::Mat scales;
@@ -7692,6 +8249,12 @@ std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create_with_al
     std::memcpy(static_cast<std::byte*>(combined.data) + scales_offset, scales.data, scales_bytes);
     std::memcpy(static_cast<std::byte*>(combined.data) + bias_offset, biases.data, bias_bytes);
 
+    if (upload_batch)
+    {
+        if (!create_mxfp4_projection_pipeline(implementation.vulkan_context, implementation.option, implementation.pipeline))
+            return {};
+    }
+    else
     {
         const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
         if (!create_mxfp4_projection_pipeline(implementation.vulkan_context, implementation.option, implementation.pipeline))
@@ -7702,9 +8265,14 @@ std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create_with_al
     ncnn::Option upload_option = implementation.option;
     upload_option.blob_vkallocator = weight_allocator;
     upload_option.workspace_vkallocator = weight_allocator;
-    upload_option.staging_vkallocator = implementation.weight_staging_allocator.get();
     bool uploaded = false;
+    if (upload_batch)
     {
+        uploaded = upload_batch->record(combined, implementation.storage, implementation.option, weight_allocator);
+    }
+    else
+    {
+        upload_option.staging_vkallocator = implementation.weight_staging_allocator.get();
         // Executable-cache admission runs on a background thread. Serialize
         // weight uploads with foreground compute and other context users;
         // ncnn's transfer command and Vulkan allocators are not an independent
@@ -7715,7 +8283,10 @@ std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create_with_al
         command.record_upload(combined, implementation.storage, upload_option);
         uploaded = !implementation.storage.empty() && command.submit_and_wait() == 0;
     }
-    implementation.weight_staging_allocator.reset();
+    if (!upload_batch)
+    {
+        implementation.weight_staging_allocator.reset();
+    }
     if (!uploaded)
     {
         return {};
@@ -7752,6 +8323,7 @@ std::shared_ptr<NcnnVulkanMxfp4Operator> NcnnVulkanMxfp4Operator::create_with_al
     (void)weight_allocator;
     (void)context_instance;
     (void)optimization_flags;
+    (void)upload_batch;
     return {};
 #endif
 }
@@ -9013,13 +9585,17 @@ static bool route_aggregation_enabled(
         return false;
 
     bool require_all_requests = false;
+    for (const ExpertBackendRequest& request : requests)
+    {
+        require_all_requests = require_all_requests
+                               || request.route_aggregation.require_all_requests;
+    }
     for (size_t request_index : selected_indices)
     {
         if (request_index >= requests.size())
             return false;
         const ExpertBackendRequest& request = requests[request_index];
         const ExpertBackendRequest::RouteAggregation& aggregation = request.route_aggregation;
-        require_all_requests = require_all_requests || aggregation.require_all_requests;
         if (!request.input || !aggregation.output || !aggregation.completed || aggregation.token_count == 0
             || aggregation.routes.size() != request.input->rows()
             || aggregation.output->rows() != aggregation.token_count
@@ -9044,29 +9620,13 @@ static bool route_aggregation_enabled(
     if (require_all_requests && selected_indices.size() != requests.size())
         return false;
 
-    // Aggregating only pays when the selected GPU routes contain more rows
-    // than the final token output.  For decode, the metadata upload and one
-    // extra aggregation dispatch should be amortized by the output transfer
-    // and CPU combine work that it removes.  Keep a byte threshold instead of
-    // hard-coding a model or hidden size: this enables the optimization for
-    // large generic MoE outputs while leaving tiny test and latency paths on
-    // the simple per-route return.
-    if (route_count <= token_count)
+    // Keep single-token decode in canonical route order.  Device-side
+    // reduction remains useful for multi-token waves, where it amortizes the
+    // metadata upload and output transfer without changing the next-token
+    // decision at every layer.
+    if (token_count == 1 || route_count <= token_count)
         return false;
-    if (token_count > 1)
-        return true;
-    if (output_columns == 0)
-        return false;
-    constexpr uint64_t minimum_saved_output_bytes = 32 * 1024;
-    const uint64_t saved_rows = route_count - token_count;
-    if (saved_rows > std::numeric_limits<uint64_t>::max()
-                         / static_cast<uint64_t>(output_columns)
-                         / sizeof(float))
-    {
-        return true;
-    }
-    const uint64_t saved_output_bytes = saved_rows * static_cast<uint64_t>(output_columns) * sizeof(float);
-    return saved_output_bytes >= minimum_saved_output_bytes;
+    return true;
 }
 
 static bool build_route_aggregation_metadata(
@@ -9125,7 +9685,8 @@ static bool build_route_aggregation_metadata(
     return true;
 }
 
-// Indexed Expert dispatch uses one storage-buffer binding per selected Expert.
+// Indexed Expert dispatch uses one storage-buffer binding per selected Expert
+// slot. Larger top-k batches are chunked and reuse this fixed descriptor table.
 static constexpr uint32_t mxfp4_indexed_max_experts = 8;
 
 static bool create_mxfp4_indexed_pipeline(
@@ -9200,7 +9761,8 @@ std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> NcnnVulkanMxfp4ExpertOperator::cr
                                                                                                     ncnn::VkAllocator* weight_allocator,
                                                                                                     ExpertActivation activation,
                                                                                                     const NcnnVulkanContextInstancePtr& context_instance,
-                                                                                                    uint64_t optimization_flags)
+                                                                                                     uint64_t optimization_flags,
+                                                                                                     NcnnVulkanWeightUploadBatch* upload_batch)
 {
 #if NCNN_MOE_WITH_VULKAN
     if (gate_up.shape.size() != 2 || gate_up.shape[0] % 2 != 0 || down.shape.size() != 2 || down.shape[1] != gate_up.shape[0] / 2 || activation_limit < 0.0f)
@@ -9214,14 +9776,16 @@ std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> NcnnVulkanMxfp4ExpertOperator::cr
         vulkan_device_index,
         weight_allocator,
         context_instance,
-        optimization_flags);
+        optimization_flags,
+        upload_batch);
     std::shared_ptr<NcnnVulkanMxfp4Operator> down_projection = NcnnVulkanMxfp4Operator::create_with_allocator(
         down,
         down_bias,
         vulkan_device_index,
         weight_allocator,
         context_instance,
-        optimization_flags);
+        optimization_flags,
+        upload_batch);
     if (!gate_up_projection || !down_projection)
         return {};
     if (gate_up_projection->implementation_->vulkan_context != down_projection->implementation_->vulkan_context)
@@ -9237,10 +9801,18 @@ std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> NcnnVulkanMxfp4ExpertOperator::cr
     implementation.activation = activation;
     implementation.optimization_flags = optimization_flags;
     NcnnVulkanMxfp4Operator::Implementation& gate_implementation = *implementation.gate_up->implementation_;
-    const std::lock_guard<std::mutex> lock(gate_implementation.vulkan_context->command_mutex());
-    if (!create_mxfp4_gate_up_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.gate_up_pipeline))
+    if (upload_batch)
     {
-        return {};
+        if (!create_mxfp4_gate_up_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.gate_up_pipeline))
+            return {};
+    }
+    else
+    {
+        const std::lock_guard<std::mutex> lock(gate_implementation.vulkan_context->command_mutex());
+        if (!create_mxfp4_gate_up_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.gate_up_pipeline))
+        {
+            return {};
+        }
     }
     return result;
 #else
@@ -9254,6 +9826,7 @@ std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> NcnnVulkanMxfp4ExpertOperator::cr
     (void)activation;
     (void)context_instance;
     (void)optimization_flags;
+    (void)upload_batch;
     return {};
 #endif
 }
@@ -9621,6 +10194,18 @@ public:
                const TensorData* down_bias, uint32_t residency_group, uint32_t token_count, float activation_limit,
                ExpertActivation activation) override
     {
+        const bool bfloat16_expert = gate_up
+                                     && down
+                                     && gate_up->dtype == DType::BFloat16
+                                     && down->dtype == DType::BFloat16
+                                     && activation == ExpertActivation::Silu
+                                     && gate_up->shape.size() == 2
+                                     && down->shape.size() == 2
+                                     && gate_up->shape[0] % 2 == 0
+                                     && gate_up->shape[0] / 2 % 128 == 0
+                                     && down->shape[1] == gate_up->shape[0] / 2
+                                     && gate_up->bfloat16_values().size() == gate_up->element_count()
+                                     && down->bfloat16_values().size() == down->element_count();
         const bool mxfp4_expert = gate_up
                                   && down
                                   && gate_up->dtype == DType::MxFp4
@@ -9640,7 +10225,7 @@ public:
                                 && qnk_shape_supported(gate_up->dtype, gate_up->shape[0], gate_up->shape[1])
                                 && qnk_shape_supported(down->dtype, down->shape[0], down->shape[1]);
         if (key.empty()
-            || (!mxfp4_expert && !qnk_expert)
+            || (!mxfp4_expert && !qnk_expert && !bfloat16_expert)
             || (activation != ExpertActivation::Silu
                 && activation != ExpertActivation::GptOssSwiGlu
                 && activation != ExpertActivation::DeepSeekSwiGlu)
@@ -9788,8 +10373,9 @@ public:
                 auto existing = entries_.find(request.key);
                 if (existing == entries_.end())
                 {
+                    constexpr size_t admission_min_rows = 1;
                     const bool source_allowed = request.weight_bytes == 0
-                                                || request.input->rows() >= vulkan_expert_gpu_admission_min_rows;
+                                                || request.input->rows() >= admission_min_rows;
                     std::optional<VulkanExpertVictimCache::DeviceOperationLease> device_lease;
                     const std::shared_ptr<VulkanExpertVictimCache> device_weight_source = device_weight_source_;
                     if (device_weight_source && source_allowed)
@@ -9840,43 +10426,11 @@ public:
                 });
             }
 
-            size_t selected_count = 0;
-            bool direct_resident_execution = foreground_depth_ == 0 && !candidates.empty();
-            if (direct_resident_execution)
-            {
-                for (const ExpertBackendRequest& request : requests)
-                {
-                    if (request.weight_bytes != 0)
-                    {
-                        direct_resident_execution = false;
-                        break;
-                    }
-                }
-            }
-            if (direct_resident_execution)
-            {
-                // The weight-less backend API is an explicit resident
-                // operation used by backend clients and validation. It must
-                // execute every explicitly requested resident Expert.
-                selected_count = candidates.size();
-            }
-            else if (runtime_optimization_enabled(
-                         optimization_flags_,
-                         RuntimeOptimizationVulkanExpertGpuPriority))
-            {
-                // Use Vulkan only for resident Experts that amortize transfer.
-                const auto gpu_end = std::stable_partition(
-                    candidates.begin(),
-                    candidates.end(),
-                    [&requests](const Selection& selection) {
-                        const ExpertBackendRequest& request = requests[selection.request_index];
-                        return request.input
-                               && request.input->rows()
-                                      >= vulkan_expert_gpu_min_rows;
-                    });
-                selected_count = static_cast<size_t>(
-                    std::distance(candidates.begin(), gpu_end));
-            }
+            // This backend is created only for mixed Vulkan execution. Once
+            // a resident Expert is available, execute it on the device even
+            // for a single-token wave; the caller keeps CPU fallback for
+            // non-resident or failed requests.
+            const size_t selected_count = candidates.size();
 
             for (size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index)
             {
@@ -9987,6 +10541,7 @@ private:
         std::string key;
         std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> operation;
         std::shared_ptr<NcnnVulkanQnkExpertOperator> qnk_operation;
+        std::shared_ptr<NcnnVulkanBfloat16ExpertOperator> bfloat16_operation;
         std::shared_ptr<const void> device_source_pin;
         uint64_t bytes = 0;
         uint32_t residency_group = 0;
@@ -10055,29 +10610,58 @@ private:
             // caller-owned buffer. A failed reservation must be a safe CPU
             // fallback, never a partially published batch.
             ActivationBuffer* route_output = nullptr;
+            size_t route_requests = 0;
+            size_t executed_route_requests = 0;
+            size_t completed_route_requests = 0;
+            bool require_all_route_requests = false;
             for (size_t index = 0; index < work_->final.size(); ++index)
             {
-                if (work_->final[index] != ExpertBackendExecutionResult::Executed)
-                    continue;
                 ExpertBackendRequest& client = work_->client_requests[index];
-                if (!client.output)
+                const bool executed =
+                    work_->final[index] == ExpertBackendExecutionResult::Executed;
+                if (executed && !client.output)
                 {
                     aborted_ = true;
                     return false;
                 }
-                if (client.route_aggregation.output)
+                if (!client.route_aggregation.output)
                 {
-                    if (work_->private_route_completed[index] == 0)
+                    if (work_->private_route_completed[index] != 0)
                     {
                         aborted_ = true;
                         return false;
                     }
-                    if (route_output && route_output != client.route_aggregation.output)
+                    continue;
+                }
+                ++route_requests;
+                require_all_route_requests =
+                    require_all_route_requests
+                    || client.route_aggregation.require_all_requests;
+                if (executed)
+                    ++executed_route_requests;
+                if (work_->private_route_completed[index] != 0)
+                {
+                    if (!executed
+                        || (route_output
+                            && route_output != client.route_aggregation.output))
                     {
                         aborted_ = true;
                         return false;
                     }
                     route_output = client.route_aggregation.output;
+                    ++completed_route_requests;
+                }
+            }
+            if (completed_route_requests != 0)
+            {
+                const size_t expected_route_requests =
+                    require_all_route_requests
+                        ? route_requests
+                        : executed_route_requests;
+                if (completed_route_requests != expected_route_requests)
+                {
+                    aborted_ = true;
+                    return false;
                 }
             }
             bool route_published = false;
@@ -10087,7 +10671,7 @@ private:
                     continue;
                 ExpertBackendRequest& client = work_->client_requests[index];
                 client.output->swap(work_->private_outputs[index]);
-                if (client.route_aggregation.output)
+                if (work_->private_route_completed[index] != 0)
                 {
                     if (!route_published)
                     {
@@ -10149,7 +10733,11 @@ private:
 
     static uint64_t expert_matrix_bytes(const TensorData& tensor)
     {
-        return tensor.dtype == DType::MxFp4 ? mxfp4_bytes(tensor) : qnk_bytes(tensor);
+        if (tensor.dtype == DType::MxFp4)
+            return mxfp4_bytes(tensor);
+        if (tensor.dtype == DType::BFloat16)
+            return tensor.bfloat16_values().size() * sizeof(uint16_t);
+        return qnk_bytes(tensor);
     }
 
     static uint64_t tensor_bytes(const TensorData* tensor)
@@ -10386,9 +10974,13 @@ private:
     {
         // Use the indexed shader only when its selector cost is amortized.
         if (selected.size() < 4
-            || selected.size() > mxfp4_indexed_max_experts
             || !selected.front().entry
             || !selected.front().entry->operation)
+            return IndexedBatchResult::NotSupported;
+        // The shader deliberately keeps a fixed descriptor layout.  Dynamic
+        // top-k is represented by several <=8 Expert chunks recorded into the
+        // same command buffer, rather than by growing descriptor arrays.
+        if (selected.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
             return IndexedBatchResult::NotSupported;
 
         const NcnnVulkanMxfp4ExpertOperator::Implementation& first_expert = *selected.front().entry->operation->implementation_;
@@ -10472,6 +11064,24 @@ private:
 
         // Tile only when the largest selected Expert has row reuse.
         const bool use_tiled_indexed = maximum_request_rows >= 2;
+        const size_t indexed_chunk_count =
+            (selected.size() + mxfp4_indexed_max_experts - 1)
+            / mxfp4_indexed_max_experts;
+        // The indexed shader has a generic slot switch, while the regular
+        // path uses a specialized projection pipeline. Keep the dynamic
+        // capability model-neutral, but only select it when the dispatch
+        // reduction is large enough to amortize that selector overhead.
+        // This is intentionally an internal policy (not a model option):
+        // top-k=10 decode uses the regular path, whereas top-k=16/24 can
+        // benefit from 8+8/8+8+8 chunking.
+        const uint64_t regular_dispatches = static_cast<uint64_t>(selected.size()) * 2;
+        const uint64_t indexed_dispatches = static_cast<uint64_t>(indexed_chunk_count) * 2;
+        const uint64_t selector_overhead_factor = use_tiled_indexed ? 4 : 6;
+        if (indexed_dispatches == 0
+            || regular_dispatches <= indexed_dispatches * selector_overhead_factor)
+        {
+            return IndexedBatchResult::NotSupported;
+        }
 
         if (!indexed_pipeline_
             && !create_mxfp4_indexed_pipeline(
@@ -10574,13 +11184,14 @@ private:
                 transfer_slot.expert_slots,
                 transfer_slot.staging_allocator,
                 runtime_state)
-            || !fill_staging_values(
-                expert_row_offsets.data(),
-                expert_row_offsets.size(),
-                sizeof(uint32_t),
-                transfer_slot.expert_row_offsets,
-                transfer_slot.staging_allocator,
-                runtime_state))
+            || (use_tiled_indexed
+                && !fill_staging_values(
+                    expert_row_offsets.data(),
+                    expert_row_offsets.size(),
+                    sizeof(uint32_t),
+                    transfer_slot.expert_row_offsets,
+                    transfer_slot.staging_allocator,
+                    runtime_state)))
         {
             return IndexedBatchResult::Failed;
         }
@@ -10646,7 +11257,8 @@ private:
             return IndexedBatchResult::Failed;
         }
         ncnn::VkMat expert_row_offsets_gpu;
-        if (!record_mapped_upload(
+        if (use_tiled_indexed
+            && !record_mapped_upload(
                 transfer_slot.expert_row_offsets,
                 expert_row_offsets_gpu,
                 command,
@@ -10680,8 +11292,12 @@ private:
         if (output_gpu.empty())
             return IndexedBatchResult::Failed;
 
-        const auto make_constants = [&](uint32_t mode) {
-            std::vector<ncnn::vk_constant_type> constants(18);
+        const auto make_constants = [&](uint32_t mode,
+                                        uint32_t row_base,
+                                        uint32_t expert_slot_base,
+                                        uint32_t expert_count,
+                                        uint32_t tile_mode) {
+            std::vector<ncnn::vk_constant_type> constants(20);
             constants[0].u32 = first_gate.input_columns;
             constants[1].u32 = first_gate.output_columns;
             constants[2].u32 = first_down.input_columns;
@@ -10689,7 +11305,7 @@ private:
             constants[4].u32 = first_gate.block_count;
             constants[5].u32 = first_down.block_count;
             constants[6].u32 = static_cast<uint32_t>(total_rows);
-            constants[7].u32 = static_cast<uint32_t>(selected.size());
+            constants[7].u32 = expert_count;
             constants[8].u32 = 0;
             constants[9].u32 = first_gate.indexed_scales_word_offset;
             constants[10].u32 = first_gate.indexed_bias_word_offset;
@@ -10699,69 +11315,93 @@ private:
             constants[14].u32 = mode;
             constants[15].u32 = first_expert.activation == ExpertActivation::GptOssSwiGlu ? 0u : 1u;
             constants[16].f = first_expert.activation_limit;
-            constants[17].u32 = use_tiled_indexed ? 1u : 0u;
+            constants[17].u32 = tile_mode;
+            constants[18].u32 = row_base;
+            constants[19].u32 = expert_slot_base;
             return constants;
         };
 
-        std::vector<ncnn::VkMat> gate_bindings;
-        gate_bindings.reserve(mxfp4_indexed_max_experts + 3);
-        gate_bindings.push_back(input_gpu);
-        for (uint32_t slot = 0; slot < mxfp4_indexed_max_experts; ++slot)
+        for (size_t chunk_begin = 0;
+             chunk_begin < selected.size();
+             chunk_begin += mxfp4_indexed_max_experts)
         {
-            if (slot < selected.size())
+            const size_t chunk_end = std::min(
+                selected.size(),
+                chunk_begin + static_cast<size_t>(mxfp4_indexed_max_experts));
+            const uint32_t chunk_count = static_cast<uint32_t>(chunk_end - chunk_begin);
+            const uint32_t row_base = expert_row_offsets[chunk_begin];
+            const uint32_t row_end = expert_row_offsets[chunk_end];
+            const uint32_t chunk_rows = row_end - row_base;
+            uint32_t chunk_maximum_request_rows = 0;
+            for (size_t slot = chunk_begin; slot < chunk_end; ++slot)
             {
-                gate_bindings.push_back(
-                    selected[slot].entry->operation->implementation_->gate_up->implementation_->storage);
+                const size_t request_index = selected[slot].request_index;
+                chunk_maximum_request_rows = std::max(
+                    chunk_maximum_request_rows,
+                    static_cast<uint32_t>(requests[request_index].input->rows()));
             }
-            else
-            {
-                gate_bindings.emplace_back();
-            }
-        }
-        gate_bindings.push_back(use_tiled_indexed ? expert_row_offsets_gpu : expert_ids_gpu);
-        gate_bindings.push_back(intermediate_gpu);
-        std::vector<unsigned char> readonly_bindings(gate_bindings.size(), 1);
-        readonly_bindings.back() = 0;
-        ncnn::VkMat gate_dispatcher;
-        gate_dispatcher.w = static_cast<int>(intermediate_columns * 32);
-        gate_dispatcher.h = static_cast<int>(use_tiled_indexed ? (maximum_request_rows + 1) / 2 : total_rows);
-        gate_dispatcher.c = static_cast<int>(use_tiled_indexed ? selected.size() : 1);
-        command.record_pipeline_readonly(
-            indexed_pipeline_.get(),
-            gate_bindings,
-            readonly_bindings,
-            make_constants(0),
-            gate_dispatcher);
+            const uint32_t chunk_tile_mode = use_tiled_indexed && chunk_maximum_request_rows >= 2 ? 1u : 0u;
 
-        std::vector<ncnn::VkMat> down_bindings;
-        down_bindings.reserve(mxfp4_indexed_max_experts + 3);
-        down_bindings.push_back(intermediate_gpu);
-        for (uint32_t slot = 0; slot < mxfp4_indexed_max_experts; ++slot)
-        {
-            if (slot < selected.size())
+            std::vector<ncnn::VkMat> gate_bindings;
+            gate_bindings.reserve(mxfp4_indexed_max_experts + 3);
+            gate_bindings.push_back(input_gpu);
+            for (uint32_t slot = 0; slot < mxfp4_indexed_max_experts; ++slot)
             {
-                down_bindings.push_back(
-                    selected[slot].entry->operation->implementation_->down->implementation_->storage);
+                if (slot < chunk_count)
+                {
+                    gate_bindings.push_back(
+                        selected[chunk_begin + slot].entry->operation->implementation_->gate_up->implementation_->storage);
+                }
+                else
+                {
+                    gate_bindings.emplace_back();
+                }
             }
-            else
+            gate_bindings.push_back(chunk_tile_mode != 0 ? expert_row_offsets_gpu : expert_ids_gpu);
+            gate_bindings.push_back(intermediate_gpu);
+            std::vector<unsigned char> readonly_bindings(gate_bindings.size(), 1);
+            readonly_bindings.back() = 0;
+            ncnn::VkMat gate_dispatcher;
+            gate_dispatcher.w = static_cast<int>(intermediate_columns * 32);
+            gate_dispatcher.h = static_cast<int>(chunk_tile_mode != 0 ? (chunk_maximum_request_rows + 1) / 2 : chunk_rows);
+            gate_dispatcher.c = static_cast<int>(chunk_tile_mode != 0 ? chunk_count : 1);
+            command.record_pipeline_readonly(
+                indexed_pipeline_.get(),
+                gate_bindings,
+                readonly_bindings,
+                make_constants(0, row_base, static_cast<uint32_t>(chunk_begin), chunk_count, chunk_tile_mode),
+                gate_dispatcher);
+
+            std::vector<ncnn::VkMat> down_bindings;
+            down_bindings.reserve(mxfp4_indexed_max_experts + 3);
+            down_bindings.push_back(intermediate_gpu);
+            for (uint32_t slot = 0; slot < mxfp4_indexed_max_experts; ++slot)
             {
-                down_bindings.emplace_back();
+                if (slot < chunk_count)
+                {
+                    down_bindings.push_back(
+                        selected[chunk_begin + slot].entry->operation->implementation_->down->implementation_->storage);
+                }
+                else
+                {
+                    down_bindings.emplace_back();
+                }
             }
+            down_bindings.push_back(chunk_tile_mode != 0 ? expert_row_offsets_gpu : expert_ids_gpu);
+            down_bindings.push_back(output_gpu);
+            readonly_bindings.assign(down_bindings.size(), 1);
+            readonly_bindings.back() = 0;
+            ncnn::VkMat down_dispatcher;
+            down_dispatcher.w = static_cast<int>(output_columns * 32);
+            down_dispatcher.h = static_cast<int>(chunk_tile_mode != 0 ? (chunk_maximum_request_rows + 1) / 2 : chunk_rows);
+            down_dispatcher.c = static_cast<int>(chunk_tile_mode != 0 ? chunk_count : 1);
+            command.record_pipeline_readonly(
+                indexed_pipeline_.get(),
+                down_bindings,
+                readonly_bindings,
+                make_constants(1, row_base, static_cast<uint32_t>(chunk_begin), chunk_count, chunk_tile_mode),
+                down_dispatcher);
         }
-        down_bindings.push_back(use_tiled_indexed ? expert_row_offsets_gpu : expert_ids_gpu);
-        down_bindings.push_back(output_gpu);
-        readonly_bindings.assign(down_bindings.size(), 1);
-        readonly_bindings.back() = 0;
-        ncnn::VkMat down_dispatcher;
-        down_dispatcher.w = static_cast<int>(output_columns * 32);
-        down_dispatcher.h = static_cast<int>(use_tiled_indexed ? (maximum_request_rows + 1) / 2 : total_rows);
-        down_dispatcher.c = static_cast<int>(use_tiled_indexed ? selected.size() : 1);
-        command.record_pipeline_readonly(
-            indexed_pipeline_.get(),
-            down_bindings,
-            readonly_bindings,
-            make_constants(1),
-            down_dispatcher);
 
         if (use_route_aggregation)
         {
@@ -10879,7 +11519,7 @@ private:
                 row_offset += request.input->rows();
             }
         }
-        runtime_state.dispatches += 2 + static_cast<uint64_t>(use_route_aggregation);
+        runtime_state.dispatches += indexed_chunk_count * 2 + static_cast<uint64_t>(use_route_aggregation);
         ++runtime_state.compute_submissions;
         ++runtime_state.batch_uploads;
         ++runtime_state.batch_downloads;
@@ -11226,6 +11866,101 @@ private:
         return true;
     }
 
+    bool forward_bfloat16_batch(
+        std::span<const ExpertBackendRequest> requests,
+        std::span<const Selection> selected)
+    {
+        if (selected.empty())
+            return true;
+        if (!selected.front().entry
+            || !selected.front().entry->bfloat16_operation)
+        {
+            return false;
+        }
+
+        std::vector<size_t> selected_request_indices;
+        selected_request_indices.reserve(selected.size());
+        std::vector<const NcnnVulkanBfloat16ExpertOperator*> experts;
+        std::vector<const ActivationBuffer*> inputs;
+        std::vector<ActivationBuffer*> outputs;
+        experts.reserve(selected.size());
+        inputs.reserve(selected.size());
+        outputs.reserve(selected.size());
+        for (const Selection& selection : selected)
+        {
+            if (selection.request_index >= requests.size()
+                || !selection.entry
+                || !selection.entry->bfloat16_operation)
+            {
+                return false;
+            }
+            const ExpertBackendRequest& request =
+                requests[selection.request_index];
+            if (!request.input || !request.output)
+                return false;
+            selected_request_indices.push_back(selection.request_index);
+            experts.push_back(selection.entry->bfloat16_operation.get());
+            inputs.push_back(request.input);
+            outputs.push_back(request.output);
+        }
+
+        const NcnnVulkanBfloat16ExpertOperator::Implementation& first_expert =
+            *selected.front().entry->bfloat16_operation->implementation_;
+        const NcnnVulkanBfloat16Operator::Implementation& first_gate =
+            *first_expert.gate_up->implementation_;
+        const uint32_t output_columns =
+            selected.front().entry->bfloat16_operation->implementation_->output_columns;
+        ActivationBuffer* aggregated_output = nullptr;
+        uint32_t aggregated_token_count = 0;
+        const bool use_route_aggregation = route_aggregation_enabled(
+            requests,
+            selected_request_indices,
+            output_columns,
+            aggregated_output,
+            aggregated_token_count,
+            first_gate.optimization_flags);
+
+        if (!NcnnVulkanBfloat16ExpertOperator::forward_batch(
+                experts,
+                inputs,
+                outputs))
+        {
+            return false;
+        }
+
+        if (use_route_aggregation)
+        {
+            if (!aggregated_output)
+                return false;
+            aggregated_output->reset(aggregated_token_count, output_columns, true);
+            for (const Selection& selection : selected)
+            {
+                const ExpertBackendRequest& request =
+                    requests[selection.request_index];
+                if (request.route_aggregation.routes.size()
+                    != request.input->rows())
+                {
+                    return false;
+                }
+                for (size_t row = 0; row < request.input->rows(); ++row)
+                {
+                    const ExpertRoute& route =
+                        request.route_aggregation.routes[row];
+                    if (route.token_index >= aggregated_output->rows())
+                        return false;
+                    float* destination =
+                        aggregated_output->row(route.token_index);
+                    const float* source = request.output->row(row);
+                    for (uint32_t column = 0; column < output_columns; ++column)
+                        destination[column] += route.weight * source[column];
+                }
+                if (request.route_aggregation.completed)
+                    *request.route_aggregation.completed = 1;
+            }
+        }
+        return true;
+    }
+
     bool forward_qnk_batch(std::span<const ExpertBackendRequest> requests, std::span<const Selection> selected)
     {
         if (selected.empty())
@@ -11341,6 +12076,7 @@ private:
                                                       : IndexedBatchResult::NotSupported;
         const bool executed = indexed_result == IndexedBatchResult::Executed
                               || forward_batch(work->requests, work->selected)
+                              || forward_bfloat16_batch(work->requests, work->selected)
                               || forward_qnk_batch(work->requests, work->selected);
         const uint64_t elapsed = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
         uint64_t route_aggregation_routes = 0;
@@ -11467,6 +12203,7 @@ private:
 
     void worker_loop()
     {
+        static constexpr size_t maximum_upload_batch = 8;
         while (true)
         {
             std::vector<std::shared_ptr<Entry>> retired;
@@ -11475,7 +12212,7 @@ private:
                 retired.swap(retired_entries_);
             }
             retired.clear();
-            PendingAdmission admission;
+            std::vector<PendingAdmission> admissions;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 work_available_.wait(lock, [this] {
@@ -11484,109 +12221,161 @@ private:
                 });
                 if (stopping_)
                     return;
-                admission = std::move(pending_.front());
+                admissions.push_back(std::move(pending_.front()));
                 pending_.pop_front();
                 ++active_admissions_;
+                if (runtime_optimization_enabled(
+                        optimization_flags_,
+                        RuntimeOptimizationVulkanExpertBatchAdmission)
+                    && admissions.front().gate_up
+                    && admissions.front().gate_up->dtype == DType::MxFp4)
+                {
+                    // Keep the batch homogeneous.  MXFP4 admissions can
+                    // share one VkTransfer command; BF16 and QnK creation
+                    // paths still use their existing upload implementation.
+                    while (admissions.size() < maximum_upload_batch
+                           && !pending_.empty()
+                           && pending_.front().gate_up
+                           && pending_.front().gate_up->dtype == DType::MxFp4)
+                    {
+                        admissions.push_back(std::move(pending_.front()));
+                        pending_.pop_front();
+                        ++active_admissions_;
+                    }
+                }
             }
 
-            std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> operation;
-            std::shared_ptr<NcnnVulkanQnkExpertOperator> qnk_operation;
-            if (admission.gate_up->dtype == DType::MxFp4)
+            std::vector<std::shared_ptr<Entry>> entries(admissions.size());
             {
-                operation = NcnnVulkanMxfp4ExpertOperator::create_with_allocator(
-                    *admission.gate_up,
-                    admission.gate_up_bias.get(),
-                    *admission.down,
-                    admission.down_bias.get(),
-                    admission.activation_limit,
-                    vulkan_device_index_,
-                    expert_weight_allocator_.get(),
-                    admission.activation,
-                    context_instance_,
-                    optimization_flags_);
-            }
-            else
-            {
-                qnk_operation = NcnnVulkanQnkExpertOperator::create_with_allocator(
-                    *admission.gate_up,
-                    admission.gate_up_bias.get(),
-                    *admission.down,
-                    admission.down_bias.get(),
-                    admission.activation_limit,
-                    vulkan_device_index_,
-                    expert_weight_allocator_.get(),
-                    admission.activation,
-                    context_instance_,
-                    optimization_flags_);
-            }
-            std::shared_ptr<Entry> entry;
-            if (operation || qnk_operation)
-            {
-                entry = std::make_shared<Entry>();
-                entry->key = admission.key;
-                entry->operation = std::move(operation);
-                entry->qnk_operation = std::move(qnk_operation);
-                entry->bytes = admission.bytes;
-                entry->residency_group = admission.residency_group;
+                std::optional<NcnnVulkanWeightUploadBatch> upload_batch;
+                if (admissions.size() > 1)
+                    upload_batch.emplace(vulkan_context_);
+                for (size_t admission_index = 0; admission_index < admissions.size(); ++admission_index)
+                {
+                    const PendingAdmission& admission = admissions[admission_index];
+                    std::shared_ptr<NcnnVulkanMxfp4ExpertOperator> operation;
+                    std::shared_ptr<NcnnVulkanQnkExpertOperator> qnk_operation;
+                    std::shared_ptr<NcnnVulkanBfloat16ExpertOperator> bfloat16_operation;
+                    if (admission.gate_up->dtype == DType::MxFp4)
+                    {
+                        operation = NcnnVulkanMxfp4ExpertOperator::create_with_allocator(
+                            *admission.gate_up,
+                            admission.gate_up_bias.get(),
+                            *admission.down,
+                            admission.down_bias.get(),
+                            admission.activation_limit,
+                            vulkan_device_index_,
+                            expert_weight_allocator_.get(),
+                            admission.activation,
+                            context_instance_,
+                            optimization_flags_,
+                            upload_batch ? &*upload_batch : nullptr);
+                    }
+                    else if (admission.gate_up->dtype == DType::BFloat16)
+                    {
+                        bfloat16_operation = NcnnVulkanBfloat16ExpertOperator::create_with_allocator(
+                            *admission.gate_up,
+                            admission.gate_up_bias.get(),
+                            *admission.down,
+                            admission.down_bias.get(),
+                            admission.activation_limit,
+                            vulkan_device_index_,
+                            expert_weight_allocator_.get(),
+                            admission.activation,
+                            context_instance_,
+                            optimization_flags_);
+                    }
+                    else
+                    {
+                        qnk_operation = NcnnVulkanQnkExpertOperator::create_with_allocator(
+                            *admission.gate_up,
+                            admission.gate_up_bias.get(),
+                            *admission.down,
+                            admission.down_bias.get(),
+                            admission.activation_limit,
+                            vulkan_device_index_,
+                            expert_weight_allocator_.get(),
+                            admission.activation,
+                            context_instance_,
+                            optimization_flags_);
+                    }
+                    if (operation || qnk_operation || bfloat16_operation)
+                    {
+                        entries[admission_index] = std::make_shared<Entry>();
+                        entries[admission_index]->key = admission.key;
+                        entries[admission_index]->operation = std::move(operation);
+                        entries[admission_index]->qnk_operation = std::move(qnk_operation);
+                        entries[admission_index]->bfloat16_operation = std::move(bfloat16_operation);
+                        entries[admission_index]->bytes = admission.bytes;
+                        entries[admission_index]->residency_group = admission.residency_group;
+                    }
+                }
+                if (upload_batch && !upload_batch->submit())
+                    std::fill(entries.begin(), entries.end(), std::shared_ptr<Entry>());
             }
 
             const std::lock_guard<std::mutex> lock(mutex_);
-            pending_bytes_ -= admission.bytes;
-            pending_keys_.erase(admission.key);
-            if (stopping_)
+            for (size_t admission_index = 0; admission_index < admissions.size(); ++admission_index)
             {
-                finish_admission_locked();
-                return;
-            }
-            if (!entry || entries_.find(entry->key) != entries_.end())
-            {
-                if (!entry)
-                    ++dropped_admissions_;
-                finish_admission_locked();
-                continue;
-            }
-            bool frequent = false;
-            bool from_frequent = false;
-            (void)consume_ghost_locked(entry->key, entry->bytes, frequent, from_frequent);
-            while (resident_bytes_ > capacity_bytes_ - entry->bytes)
-            {
-                if (!evict_one_locked(from_frequent, entry->residency_group, entry->bytes))
+                const PendingAdmission& admission = admissions[admission_index];
+                pending_bytes_ -= admission.bytes;
+                pending_keys_.erase(admission.key);
+                std::shared_ptr<Entry>& entry = entries[admission_index];
+                if (stopping_)
                 {
-                    ++dropped_admissions_;
-                    entry.reset();
-                    break;
+                    finish_admission_locked();
+                    continue;
                 }
-            }
-            if (!entry)
-            {
+                if (!entry || entries_.find(entry->key) != entries_.end())
+                {
+                    if (!entry)
+                        ++dropped_admissions_;
+                    finish_admission_locked();
+                    continue;
+                }
+                bool frequent = false;
+                bool from_frequent = false;
+                (void)consume_ghost_locked(entry->key, entry->bytes, frequent, from_frequent);
+                while (resident_bytes_ > capacity_bytes_ - entry->bytes)
+                {
+                    if (!evict_one_locked(from_frequent, entry->residency_group, entry->bytes))
+                    {
+                        ++dropped_admissions_;
+                        entry.reset();
+                        break;
+                    }
+                }
+                if (!entry)
+                {
+                    finish_admission_locked();
+                    continue;
+                }
+                if (frequent)
+                {
+                    frequent_.push_back(entry->key);
+                    entry->position = std::prev(frequent_.end());
+                    entry->list = ArcList::Frequent;
+                    frequent_bytes_ += entry->bytes;
+                }
+                else
+                {
+                    recent_.push_back(entry->key);
+                    entry->position = std::prev(recent_.end());
+                    entry->list = ArcList::Recent;
+                    recent_bytes_ += entry->bytes;
+                }
+                resident_bytes_ += entry->bytes;
+                if (entry->residency_group >= residency_group_bytes_.size())
+                {
+                    residency_group_bytes_.resize(static_cast<size_t>(entry->residency_group) + 1, 0);
+                }
+                residency_group_bytes_[entry->residency_group] += entry->bytes;
+                bytes_uploaded_ += entry->bytes;
+                const std::string entry_key = entry->key;
+                entries_.emplace(entry_key, std::move(entry));
+                ++stores_;
                 finish_admission_locked();
-                continue;
             }
-            if (frequent)
-            {
-                frequent_.push_back(entry->key);
-                entry->position = std::prev(frequent_.end());
-                entry->list = ArcList::Frequent;
-                frequent_bytes_ += entry->bytes;
-            }
-            else
-            {
-                recent_.push_back(entry->key);
-                entry->position = std::prev(recent_.end());
-                entry->list = ArcList::Recent;
-                recent_bytes_ += entry->bytes;
-            }
-            resident_bytes_ += entry->bytes;
-            if (entry->residency_group >= residency_group_bytes_.size())
-            {
-                residency_group_bytes_.resize(static_cast<size_t>(entry->residency_group) + 1, 0);
-            }
-            residency_group_bytes_[entry->residency_group] += entry->bytes;
-            bytes_uploaded_ += entry->bytes;
-            const std::string entry_key = entry->key;
-            entries_.emplace(entry_key, std::move(entry));
-            ++stores_;
-            finish_admission_locked();
         }
     }
 

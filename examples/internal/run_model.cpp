@@ -629,7 +629,10 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         {
             std::cout << ", " << memory_plan.available_memory_bytes / (1024 * 1024) << " MiB available";
         }
-        std::cout << ", dense estimate " << memory_plan.estimated_dense_bytes / (1024 * 1024) << " MiB\n";
+        std::cout << ", dense estimate "
+                  << memory_plan.estimated_dense_bytes / (1024 * 1024)
+                  << " MiB";
+        std::cout << '\n';
         std::cout << "Vulkan runtime devices: " << runtime.capabilities().vulkan_device_count << '\n';
         if (runtime.capabilities().vulkan_heap_budget_bytes != 0)
         {
