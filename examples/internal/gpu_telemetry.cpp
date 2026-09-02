@@ -116,33 +116,33 @@ struct GpuTelemetrySampler::Impl
     NvmlDevice device = nullptr;
     bool initialized = false;
 
-    Impl(const RuntimeCapabilities& capabilities, const EffectiveRuntimeConfig& effective)
+    Impl(const RuntimeInfo& info, const EffectiveOption& opt)
     {
-        base.active = effective.hybrid_mode != HybridMode::CpuOnly;
+        base.active = opt.hybrid_mode != HybridMode::CpuOnly;
         if (!base.active)
         {
             base.reason = "backend_cpu";
             return;
         }
 
-        std::optional<uint32_t> selected_index;
-        if (!effective.vulkan_device_indices.empty())
-            selected_index = effective.vulkan_device_indices.front();
-        else if (effective.vulkan_device_index != automatic_vulkan_device_index)
-            selected_index = effective.vulkan_device_index;
-        else if (capabilities.vulkan_device_count != 0)
-            selected_index = capabilities.selected_vulkan_device_index;
+        std::optional<uint32_t> device_index;
+        if (!opt.vulkan_device_indices.empty())
+            device_index = opt.vulkan_device_indices.front();
+        else if (opt.vulkan_device_index != automatic_vulkan_device_index)
+            device_index = opt.vulkan_device_index;
+        else if (!info.gpu_infos.empty())
+            device_index = info.default_gpu_index;
 
-        if (!selected_index || *selected_index >= capabilities.vulkan_devices.size())
+        if (!device_index || *device_index >= info.gpu_infos.size())
         {
             base.reason = "no_vulkan_device";
             return;
         }
 
-        const VulkanDeviceCapabilities& vulkan_device = capabilities.vulkan_devices[*selected_index];
-        base.device_index = vulkan_device.index;
-        base.vendor_id = vulkan_device.vendor_id;
-        base.device_name = vulkan_device.name;
+        const VulkanDeviceCapabilities& gpu_info = info.gpu_infos[*device_index];
+        base.device_index = gpu_info.device_index;
+        base.vendor_id = gpu_info.vendor_id;
+        base.device_name = gpu_info.device_name;
         if (base.vendor_id != nvidia_vendor_id)
         {
             base.reason = "selected_device_not_nvidia";
@@ -209,8 +209,7 @@ struct GpuTelemetrySampler::Impl
             if (get_name(candidate, name, sizeof(name)) != nvml_success)
                 continue;
             const std::string candidate_name = lower_copy(name);
-            if (!target_name.empty() && (candidate_name == target_name || candidate_name.find(target_name) != std::string::npos
-                                          || target_name.find(candidate_name) != std::string::npos))
+            if (!target_name.empty() && (candidate_name == target_name || candidate_name.find(target_name) != std::string::npos || target_name.find(candidate_name) != std::string::npos))
             {
                 device = candidate;
                 break;
@@ -220,10 +219,10 @@ struct GpuTelemetrySampler::Impl
         // Vulkan and NVML usually enumerate NVIDIA devices in the same order.
         // Use the index as a conservative fallback when the driver changes the
         // reported device name format.
-        if (device == nullptr && *selected_index < device_count)
+        if (device == nullptr && *device_index < device_count)
         {
             NvmlDevice candidate = nullptr;
-            if (get_handle_by_index(*selected_index, &candidate) == nvml_success)
+            if (get_handle_by_index(*device_index, &candidate) == nvml_success)
                 device = candidate;
         }
 
@@ -293,8 +292,8 @@ struct GpuTelemetrySampler::Impl
     }
 };
 
-GpuTelemetrySampler::GpuTelemetrySampler(const RuntimeCapabilities& capabilities, const EffectiveRuntimeConfig& effective)
-    : impl_(std::make_unique<Impl>(capabilities, effective))
+GpuTelemetrySampler::GpuTelemetrySampler(const RuntimeInfo& info, const EffectiveOption& opt)
+    : d(std::make_unique<Impl>(info, opt))
 {
 }
 
@@ -302,7 +301,7 @@ GpuTelemetrySampler::~GpuTelemetrySampler() = default;
 
 GpuTelemetrySample GpuTelemetrySampler::sample() const
 {
-    return impl_->sample();
+    return d->sample();
 }
 
 } // namespace moe

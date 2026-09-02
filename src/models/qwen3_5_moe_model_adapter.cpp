@@ -81,19 +81,19 @@ static Result<void> qwen_validate_artifact_tensor(
     const SafetensorInfo* info = archive.find(name);
     if (!info)
         return Error{ErrorCode::InvalidModel, "Qwen MXFP4 artifact is missing tensor: " + name};
-    uint64_t expected_bytes = 1;
+    uint64_t expected_size = 1;
     for (uint32_t dimension : shape)
     {
         if (dimension != 0
-            && expected_bytes > std::numeric_limits<uint64_t>::max() / dimension)
+            && expected_size > std::numeric_limits<uint64_t>::max() / dimension)
         {
             return Error{ErrorCode::InvalidModel, "Qwen MXFP4 artifact tensor is too large: " + name};
         }
-        expected_bytes *= dimension;
+        expected_size *= dimension;
     }
     if (info->dtype != "U8"
         || info->shape != shape
-        || info->byte_count != expected_bytes)
+        || info->size != expected_size)
     {
         return Error{ErrorCode::InvalidModel, "invalid Qwen MXFP4 artifact tensor: " + name};
     }
@@ -300,8 +300,7 @@ Result<MoeIR> Qwen3_5MoeModelAdapter::parse_model(const ModelPackage& package) c
     auto state_dtype = qwen_required_string(json, "mamba_ssm_dtype");
     auto attention_bias = qwen_required_bool(json, "attention_bias");
     auto attention_output_gate = qwen_required_bool(json, "attn_output_gate");
-    auto mtp_dedicated_embeddings =
-        qwen_required_bool(json, "mtp_use_dedicated_embeddings");
+    auto mtp_dedicated_embeddings = qwen_required_bool(json, "mtp_use_dedicated_embeddings");
 
     if (!vocabulary_size || !hidden_size || !intermediate_size || !shared_intermediate_size
         || !layer_count || !mtp_layer_count || !expert_count || !top_k
@@ -314,33 +313,33 @@ Result<MoeIR> Qwen3_5MoeModelAdapter::parse_model(const ModelPackage& package) c
         || !attention_bias || !attention_output_gate
         || !mtp_dedicated_embeddings)
     {
-        const Error* error = !vocabulary_size            ? &vocabulary_size.error()
-                             : !hidden_size              ? &hidden_size.error()
-                             : !intermediate_size        ? &intermediate_size.error()
-                             : !shared_intermediate_size ? &shared_intermediate_size.error()
-                             : !layer_count              ? &layer_count.error()
-                             : !mtp_layer_count          ? &mtp_layer_count.error()
-                             : !expert_count             ? &expert_count.error()
-                             : !top_k                    ? &top_k.error()
-                             : !attention_head_count     ? &attention_head_count.error()
-                             : !kv_head_count            ? &kv_head_count.error()
-                             : !head_dimension           ? &head_dimension.error()
-                             : !linear_key_head_count    ? &linear_key_head_count.error()
-                             : !linear_value_head_count  ? &linear_value_head_count.error()
-                             : !linear_key_head_dimension ? &linear_key_head_dimension.error()
+        const Error* error = !vocabulary_size               ? &vocabulary_size.error()
+                             : !hidden_size                 ? &hidden_size.error()
+                             : !intermediate_size           ? &intermediate_size.error()
+                             : !shared_intermediate_size    ? &shared_intermediate_size.error()
+                             : !layer_count                 ? &layer_count.error()
+                             : !mtp_layer_count             ? &mtp_layer_count.error()
+                             : !expert_count                ? &expert_count.error()
+                             : !top_k                       ? &top_k.error()
+                             : !attention_head_count        ? &attention_head_count.error()
+                             : !kv_head_count               ? &kv_head_count.error()
+                             : !head_dimension              ? &head_dimension.error()
+                             : !linear_key_head_count       ? &linear_key_head_count.error()
+                             : !linear_value_head_count     ? &linear_value_head_count.error()
+                             : !linear_key_head_dimension   ? &linear_key_head_dimension.error()
                              : !linear_value_head_dimension ? &linear_value_head_dimension.error()
-                             : !convolution_kernel_size  ? &convolution_kernel_size.error()
-                             : !maximum_context          ? &maximum_context.error()
-                             : !norm_epsilon             ? &norm_epsilon.error()
-                             : !rope_theta               ? &rope_theta.error()
-                             : !partial_rotary_factor    ? &partial_rotary_factor.error()
-                             : !layer_types              ? &layer_types.error()
-                             : !activation               ? &activation.error()
-                             : !activation_dtype         ? &activation_dtype.error()
-                             : !state_dtype              ? &state_dtype.error()
-                             : !attention_bias           ? &attention_bias.error()
-                             : !attention_output_gate    ? &attention_output_gate.error()
-                                                        : &mtp_dedicated_embeddings.error();
+                             : !convolution_kernel_size     ? &convolution_kernel_size.error()
+                             : !maximum_context             ? &maximum_context.error()
+                             : !norm_epsilon                ? &norm_epsilon.error()
+                             : !rope_theta                  ? &rope_theta.error()
+                             : !partial_rotary_factor       ? &partial_rotary_factor.error()
+                             : !layer_types                 ? &layer_types.error()
+                             : !activation                  ? &activation.error()
+                             : !activation_dtype            ? &activation_dtype.error()
+                             : !state_dtype                 ? &state_dtype.error()
+                             : !attention_bias              ? &attention_bias.error()
+                             : !attention_output_gate       ? &attention_output_gate.error()
+                                                            : &mtp_dedicated_embeddings.error();
         return *error;
     }
 
@@ -429,8 +428,7 @@ Result<MoeIR> Qwen3_5MoeModelAdapter::parse_model(const ModelPackage& package) c
                 SafetensorsArchive& archive = opened.value();
                 for (uint32_t layer_id = 0; layer_id < layer_count.value(); ++layer_id)
                 {
-                    const std::string source =
-                        "model.language_model.layers." + std::to_string(layer_id) + ".mlp.experts.";
+                    const std::string source = "model.language_model.layers." + std::to_string(layer_id) + ".mlp.experts.";
                     const auto gate_up_dtype = archive.find_qnk_expert_dtype(
                         source + "gate_up_proj",
                         expert_count.value(),
@@ -458,8 +456,8 @@ Result<MoeIR> Qwen3_5MoeModelAdapter::parse_model(const ModelPackage& package) c
         }
     }
     moe.expert_weight_dtype = compiled_mxfp4_experts
-                                 ? DType::MxFp4
-                                 : detected_qnk_expert_dtype.value_or(DType::BFloat16);
+                                  ? DType::MxFp4
+                                  : detected_qnk_expert_dtype.value_or(DType::BFloat16);
     moe.shared_expert_weight_dtype = DType::BFloat16;
     moe.flags = MoeDescriptorNormalizeTopKWeights | MoeDescriptorSharedExpert | MoeDescriptorSharedExpertGate;
 
@@ -841,10 +839,8 @@ Result<WeightMapping> Qwen3_5MoeModelAdapter::map_weights(const ModelPackage& pa
          layer_id < descriptor.speculative_layer_count;
          ++layer_id)
     {
-        const std::string source =
-            "mtp.layers." + std::to_string(layer_id) + ".";
-        const std::string target =
-            speculative_layer_prefix(layer_id);
+        const std::string source = "mtp.layers." + std::to_string(layer_id) + ".";
+        const std::string target = speculative_layer_prefix(layer_id);
         status = qwen_add_tensor(
             mapping,
             archive,
@@ -884,18 +880,14 @@ Result<WeightMapping> Qwen3_5MoeModelAdapter::map_weights(const ModelPackage& pa
                 return status.error();
         }
 
-        const MoeDescriptor& moe =
-            descriptor.layers.back().ffn.moe;
-        const bool compiled_mxfp4_experts =
-            moe.expert_weight_dtype == DType::MxFp4;
-        const std::string artifact_experts =
-            qwen_mxfp4_mtp_expert_prefix(layer_id);
+        const MoeDescriptor& moe = descriptor.layers.back().ffn.moe;
+        const bool compiled_mxfp4_experts = moe.expert_weight_dtype == DType::MxFp4;
+        const std::string artifact_experts = qwen_mxfp4_mtp_expert_prefix(layer_id);
         for (uint32_t expert_id = 0;
              expert_id < moe.expert_count;
              ++expert_id)
         {
-            const std::string expert =
-                speculative_expert_prefix(layer_id, expert_id);
+            const std::string expert = speculative_expert_prefix(layer_id, expert_id);
             status = compiled_mxfp4_experts
                          ? qwen_add_mxfp4_expert(
                                mapping,
@@ -938,8 +930,7 @@ Result<WeightMapping> Qwen3_5MoeModelAdapter::map_weights(const ModelPackage& pa
                 return status.error();
         }
 
-        const AttentionDescriptor& attention =
-            descriptor.layers.back().attention;
+        const AttentionDescriptor& attention = descriptor.layers.back().attention;
         status = qwen_add_query_gate(
             mapping,
             archive,

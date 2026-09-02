@@ -79,7 +79,10 @@ CMakeUserPresets.json
 
 # Local caches, logs, and environment files
 /.ncnn-moe/
-/memories/
+/memories/*
+!/memories/repo/
+/memories/repo/*
+!/memories/repo/code-conventions.md
 /.cache/
 *.log
 *.tmp

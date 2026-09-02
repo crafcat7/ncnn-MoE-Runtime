@@ -70,13 +70,13 @@ private:
 
 static bool use_fused_float8_gate_up(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(
+    return optimization_enabled(
         optimization_flags,
-        RuntimeOptimizationCpuFloat8FusedGateUp);
+        OptimizationCpuFloat8FusedGateUp);
 }
 
-static constexpr size_t expert_prefetch_limit_bytes = 4 * 1024;
-static constexpr size_t assumed_cache_line_bytes = 64;
+static constexpr size_t expert_prefetch_limit_size = 4 * 1024;
+static constexpr size_t cache_line_size = 64;
 
 static void expand_hyper_connections(CpuBatch& hidden, uint32_t multiplier, CpuBatch& scratch)
 {
@@ -119,8 +119,8 @@ static void add_saturating(uint64_t value, uint64_t& destination) noexcept
 
 static void record_expert_weight_demand(const ExpertPlan& expert, size_t route_count, SessionStatistics& statistics) noexcept
 {
-    add_saturating(expert.weight_bytes, statistics.expert_batch_weight_bytes);
-    add_saturating(saturating_weight_product(expert.weight_bytes, route_count), statistics.expert_route_weight_bytes);
+    add_saturating(expert.weight_size, statistics.expert_batch_weight_bytes);
+    add_saturating(saturating_weight_product(expert.weight_size, route_count), statistics.expert_route_weight_bytes);
 }
 
 struct VulkanExecutionSnapshot
@@ -299,17 +299,17 @@ static void record_expert_backend_delta(SessionStatistics& statistics, const Exp
     statistics.expert_gpu_cache_evictions += after.evictions - before.evictions;
     statistics.expert_gpu_cache_dropped_admissions += after.dropped_admissions - before.dropped_admissions;
     statistics.expert_gpu_cache_bytes_uploaded += after.bytes_uploaded - before.bytes_uploaded;
-    statistics.expert_gpu_cache_resident_bytes = after.resident_bytes;
-    statistics.expert_gpu_cache_pending_bytes = after.pending_bytes;
+    statistics.expert_gpu_cache_resident_size = after.resident_size;
+    statistics.expert_gpu_cache_pending_size = after.pending_size;
     statistics.expert_gpu_executions += after.executions - before.executions;
     statistics.expert_gpu_execution_failures += after.execution_failures - before.execution_failures;
     statistics.expert_gpu_cpu_preferred += after.cpu_preferred - before.cpu_preferred;
     statistics.expert_gpu_execution_time_microseconds += after.execution_time_microseconds - before.execution_time_microseconds;
-    statistics.expert_gpu_arc_recent_bytes = after.arc_recent_bytes;
-    statistics.expert_gpu_arc_frequent_bytes = after.arc_frequent_bytes;
-    statistics.expert_gpu_arc_recent_target_bytes = after.arc_recent_target_bytes;
-    statistics.expert_gpu_arc_recent_ghost_bytes = after.arc_recent_ghost_bytes;
-    statistics.expert_gpu_arc_frequent_ghost_bytes = after.arc_frequent_ghost_bytes;
+    statistics.expert_gpu_arc_recent_size = after.arc_recent_size;
+    statistics.expert_gpu_arc_frequent_size = after.arc_frequent_size;
+    statistics.expert_gpu_arc_recent_target_size = after.arc_recent_target_size;
+    statistics.expert_gpu_arc_recent_ghost_size = after.arc_recent_ghost_size;
+    statistics.expert_gpu_arc_frequent_ghost_size = after.arc_frequent_ghost_size;
     statistics.expert_gpu_device_source_hits += after.device_source_hits - before.device_source_hits;
     statistics.expert_gpu_device_source_misses += after.device_source_misses - before.device_source_misses;
     statistics.expert_gpu_device_source_executions += after.device_source_executions - before.device_source_executions;
@@ -336,8 +336,8 @@ static void record_expert_victim_cache_delta(SessionStatistics& statistics, cons
     statistics.expert_gpu_victim_cache_restore_time_microseconds += after.restore_time_microseconds - before.restore_time_microseconds;
     statistics.expert_gpu_victim_cache_mapped_stores += after.mapped_stores - before.mapped_stores;
     statistics.expert_gpu_victim_cache_mapped_restores += after.mapped_restores - before.mapped_restores;
-    statistics.expert_gpu_victim_cache_resident_bytes = after.resident_bytes;
-    statistics.expert_gpu_victim_cache_pending_bytes = after.pending_bytes;
+    statistics.expert_gpu_victim_cache_resident_size = after.resident_size;
+    statistics.expert_gpu_victim_cache_pending_size = after.pending_size;
 }
 
 static void prefetch_address(const void* address)
@@ -355,11 +355,11 @@ static uint64_t prefetch_buffer(const void* data, size_t size)
 {
     if (!data || size == 0)
         return 0;
-    const size_t hinted_bytes = std::min(size, expert_prefetch_limit_bytes);
-    const uint8_t* bytes = static_cast<const uint8_t*>(data);
-    for (size_t offset = 0; offset < hinted_bytes; offset += assumed_cache_line_bytes)
-        prefetch_address(bytes + offset);
-    return hinted_bytes;
+    const size_t hinted_size = std::min(size, expert_prefetch_limit_size);
+    const uint8_t* ptr = static_cast<const uint8_t*>(data);
+    for (size_t offset = 0; offset < hinted_size; offset += cache_line_size)
+        prefetch_address(ptr + offset);
+    return hinted_size;
 }
 
 static uint64_t prefetch_tensor(const TensorData& tensor)
@@ -867,7 +867,7 @@ static uint64_t run_hybrid_cpu_blocks(
     int team_size = 1;
     bool parallelize = false;
 #if defined(_OPENMP)
-    team_size = std::min(static_cast<int>(groups.size()), static_cast<int>(cpu_linear_thread_limit()));
+    team_size = std::min(static_cast<int>(groups.size()), static_cast<int>(cpu_linear_num_threads()));
     parallelize = team_size > 1;
 #endif
     Bfloat16BatchedLinearExecutionCounter* const bfloat16_counter = current_bfloat16_batched_linear_execution_counter();
@@ -944,7 +944,7 @@ static uint64_t run_hybrid_cpu_blocks(
                 group_rows += blocks[block_index].input.rows();
             model.expert_backend->observe_cpu(
                 static_cast<uint32_t>(group_rows),
-                moe.experts[active.batch.expert_id].weight_bytes,
+                moe.experts[active.batch.expert_id].weight_size,
                 share);
         }
     }
@@ -1078,7 +1078,7 @@ static uint64_t run_experts(
             {
                 const ActiveExpertExecution& active = layer_state.active_experts[active_index];
                 const ExpertPlan& expert = moe.experts[active.batch.expert_id];
-                model.expert_backend->observe_cpu(static_cast<uint32_t>(active.input.rows()), expert.weight_bytes, share);
+                model.expert_backend->observe_cpu(static_cast<uint32_t>(active.input.rows()), expert.weight_size, share);
             }
         }
         return elapsed;
@@ -1087,7 +1087,7 @@ static uint64_t run_experts(
     bool parallelize_experts = false;
     int expert_team_size = 1;
 #if defined(_OPENMP)
-    expert_team_size = std::min(static_cast<int>(active_indices.size()), static_cast<int>(cpu_linear_thread_limit()));
+    expert_team_size = std::min(static_cast<int>(active_indices.size()), static_cast<int>(cpu_linear_num_threads()));
     parallelize_experts = expert_team_size > 1;
 #endif
     const int64_t parallel_expert_count = static_cast<int64_t>(active_indices.size());
@@ -1109,7 +1109,7 @@ static uint64_t run_experts(
         {
             const ActiveExpertExecution& active = layer_state.active_experts[active_index];
             const ExpertPlan& expert = moe.experts[active.batch.expert_id];
-            model.expert_backend->observe_cpu(static_cast<uint32_t>(active.input.rows()), expert.weight_bytes, share);
+            model.expert_backend->observe_cpu(static_cast<uint32_t>(active.input.rows()), expert.weight_size, share);
         }
     }
     return elapsed;
@@ -1140,7 +1140,7 @@ static bool can_run_vulkan_expert(
                && gate_up.bfloat16_values().size() == gate_up.element_count()
                && down.bfloat16_values().size() == down.element_count();
     }
-    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationVulkanQnK)
+    return optimization_enabled(optimization_flags, OptimizationVulkanQnK)
            && is_qnk_dtype(gate_up.dtype)
            && gate_up.dtype == down.dtype
            && qnk_shape_supported(gate_up.dtype, gate_up.shape[0], gate_up.shape[1])
@@ -1282,10 +1282,10 @@ static ExpertVictimExecutionMetadata victim_metadata(
         || model.weights.at(expert.gate_up_weight).dtype != DType::MxFp4
         || model.weights.at(expert.down_weight).dtype != DType::MxFp4
         || !can_run_vulkan_expert(
-               expert,
-               model.weights.at(expert.gate_up_weight),
-               model.weights.at(expert.down_weight),
-               model.optimization_flags))
+            expert,
+            model.weights.at(expert.gate_up_weight),
+            model.weights.at(expert.down_weight),
+            model.optimization_flags))
     {
         return metadata;
     }
@@ -1323,10 +1323,10 @@ static bool should_use_hybrid_expert_blocks(
         if (expert.gate_up_weight == invalid_tensor_handle
             || expert.down_weight == invalid_tensor_handle
             || !can_run_vulkan_expert(
-                   expert,
-                   model.weights.at(expert.gate_up_weight),
-                   model.weights.at(expert.down_weight),
-                   model.optimization_flags))
+                expert,
+                model.weights.at(expert.gate_up_weight),
+                model.weights.at(expert.down_weight),
+                model.optimization_flags))
         {
             return false;
         }
@@ -1516,8 +1516,7 @@ static Result<void> run_hybrid_expert_blocks(
         bool release_after_admit = true;
         for (size_t active_index : pending_cpu)
         {
-            const ExpertPlan& expert =
-                moe.experts[layer_state.active_experts[active_index].batch.expert_id];
+            const ExpertPlan& expert = moe.experts[layer_state.active_experts[active_index].batch.expert_id];
             if (expert.gate_up_weight == invalid_tensor_handle
                 || expert.down_weight == invalid_tensor_handle)
             {
@@ -1556,8 +1555,7 @@ static Result<void> run_hybrid_expert_blocks(
             // a prefill touches hundreds of the 512 Experts.
             for (size_t active_index : pending_cpu)
             {
-                const ExpertPlan& expert =
-                    moe.experts[layer_state.active_experts[active_index].batch.expert_id];
+                const ExpertPlan& expert = moe.experts[layer_state.active_experts[active_index].batch.expert_id];
                 const auto wait_start = std::chrono::steady_clock::now();
                 auto lease = model.expert_cache->acquire_pair(
                     model.weights.at(expert.gate_up_weight),
@@ -1568,13 +1566,11 @@ static Result<void> run_hybrid_expert_blocks(
                         model,
                         expert,
                         layer_state.normalized.rows()));
-                layer_state.active_experts[active_index].metrics.cache_wait_time_microseconds +=
-                    elapsed_microseconds(wait_start);
+                layer_state.active_experts[active_index].metrics.cache_wait_time_microseconds += elapsed_microseconds(wait_start);
                 if (!lease)
                     return lease.error();
 
-                ActiveExpertExecution& active =
-                    layer_state.active_experts[active_index];
+                ActiveExpertExecution& active = layer_state.active_experts[active_index];
                 active.lease = std::move(lease).value();
                 const TensorData& gate_up = model.weights.at(expert.gate_up_weight);
                 const TensorData& down = model.weights.at(expert.down_weight);
@@ -1625,7 +1621,7 @@ static Result<void> run_hybrid_expert_blocks(
             expert.cache_key,
             &block.input,
             &block.output,
-            expert.weight_bytes};
+            expert.weight_size};
         request.route_aggregation.output = &scratch.backend_aggregated_output;
         request.route_aggregation.routes = std::span<const ExpertRoute>(active.batch.routes).subspan(block.input_begin, block.input.rows());
         request.route_aggregation.token_count = static_cast<uint32_t>(layer_state.normalized.rows());
@@ -1659,7 +1655,7 @@ static Result<void> run_hybrid_expert_blocks(
             static_cast<uint32_t>(block.input.rows()));
         if (active_accelerated[block.active_index] == 0)
         {
-            backend_total_weight_bytes += expert.weight_bytes;
+            backend_total_weight_bytes += expert.weight_size;
             active_accelerated[block.active_index] = 2;
         }
         if (planned[request_index] == ExpertBackendExecutionResult::Executed)
@@ -1793,7 +1789,7 @@ static Result<void> run_hybrid_expert_blocks(
             if (active_accelerated[block.active_index] == 2)
             {
                 active_accelerated[block.active_index] = 1;
-                backend_accelerated_weight_bytes += moe.experts[layer_state.active_experts[block.active_index].batch.expert_id].weight_bytes;
+                backend_accelerated_weight_bytes += moe.experts[layer_state.active_experts[block.active_index].batch.expert_id].weight_size;
             }
         }
         else
@@ -1982,7 +1978,7 @@ static void resolve_router_predictions(
 {
     if (!model.expert_cache
         || layer.layer_id >= state.layers.size()
-        || !has_flag(model.runtime_option_flags, RuntimeOptionRouterPrediction))
+        || !has_flag(model.option_flags, OptionRouterPrediction))
     {
         return;
     }
@@ -2030,7 +2026,7 @@ static void resolve_router_predictions(
         }
         demanded_keys[demanded_key_count++] = layer.moe.experts[expert_id].cache_key;
     }
-    if (resolve_unused_predictions && model.expected_concurrency == 1)
+    if (resolve_unused_predictions && model.num_concurrent_sessions == 1)
     {
         model.expert_cache->resolve_predictions(
             layer.layer_id,
@@ -2082,12 +2078,12 @@ static RouterPredictionTarget prepare_next_router_prediction(
     SessionStatistics& statistics)
 {
     if (!model.expert_cache
-        || model.expected_concurrency != 1
+        || model.num_concurrent_sessions != 1
         || router_input.rows() != 1
         || layer.layer_id >= state.layers.size()
         || layer.moe.router_weight == invalid_tensor_handle
         || layer.moe.token_experts != invalid_tensor_handle
-        || !has_flag(model.runtime_option_flags, RuntimeOptionRouterPrediction))
+        || !has_flag(model.option_flags, OptionRouterPrediction))
     {
         return {};
     }
@@ -2117,7 +2113,7 @@ static RouterPredictionTarget prepare_next_router_prediction(
     adapt_router_prefetch_width(
         source_cache.next_router_prediction,
         statistics,
-        has_flag(model.runtime_option_flags, RuntimeOptionRankAdaptivePrefetch));
+        has_flag(model.option_flags, OptionRankAdaptivePrefetch));
     return RouterPredictionTarget{
         next_layer,
         std::min(
@@ -2412,8 +2408,8 @@ static Result<void> predict_next_router_routes(
         return {};
 
     if (has_flag(
-            model.runtime_option_flags,
-            RuntimeOptionAsyncRouterPrediction))
+            model.option_flags,
+            OptionAsyncRouterPrediction))
     {
         bool submitted = false;
         try
@@ -2523,7 +2519,7 @@ static Result<void> run_moe(
     bool parallelize_regroup = false;
     int expert_team_size = 1;
 #if defined(_OPENMP)
-    expert_team_size = std::min(static_cast<int>(active_expert_count), static_cast<int>(cpu_linear_thread_limit()));
+    expert_team_size = std::min(static_cast<int>(active_expert_count), static_cast<int>(cpu_linear_num_threads()));
     parallelize_regroup = expert_team_size > 1 && regroup_element_count >= minimum_parallel_regroup_elements;
 #endif
     const int64_t parallel_expert_count = static_cast<int64_t>(active_expert_count);
@@ -2580,10 +2576,10 @@ static Result<void> run_moe(
             if (expert.gate_up_weight == invalid_tensor_handle
                 || expert.down_weight == invalid_tensor_handle
                 || !can_run_vulkan_expert(
-                   expert,
-                   model.weights.at(expert.gate_up_weight),
-                   model.weights.at(expert.down_weight),
-                   model.optimization_flags))
+                    expert,
+                    model.weights.at(expert.gate_up_weight),
+                    model.weights.at(expert.down_weight),
+                    model.optimization_flags))
             {
                 continue;
             }
@@ -2613,16 +2609,15 @@ static Result<void> run_moe(
             }
             backend_indices.push_back(active_index);
             backend_max_token_count = std::max<uint32_t>(backend_max_token_count, static_cast<uint32_t>(active.input.rows()));
-            backend_total_weight_bytes += expert.weight_bytes;
-            ExpertBackendRequest request{expert.cache_key, &active.input, &active.output, expert.weight_bytes};
+            backend_total_weight_bytes += expert.weight_size;
+            ExpertBackendRequest request{expert.cache_key, &active.input, &active.output, expert.weight_size};
             request.route_aggregation.output = &scratch.backend_aggregated_output;
             request.route_aggregation.routes = active.batch.routes;
             request.route_aggregation.token_count = static_cast<uint32_t>(layer_state.normalized.rows());
             request.route_aggregation.completed = &backend_aggregated[active_index];
             backend_requests.push_back(request);
         }
-        const bool complete_backend_coverage =
-            backend_requests.size() == active_expert_count;
+        const bool complete_backend_coverage = backend_requests.size() == active_expert_count;
         for (ExpertBackendRequest& request : backend_requests)
         {
             if (complete_backend_coverage)
@@ -2649,7 +2644,7 @@ static Result<void> run_moe(
                         continue;
                     backend_executed[backend_indices[result_index]] = 1;
                     const ActiveExpertExecution& active = layer_state.active_experts[backend_indices[result_index]];
-                    backend_accelerated_weight_bytes += moe.experts[active.batch.expert_id].weight_bytes;
+                    backend_accelerated_weight_bytes += moe.experts[active.batch.expert_id].weight_size;
                     backend_reserved_work = true;
                 }
             }
@@ -2687,8 +2682,8 @@ static Result<void> run_moe(
                 &model.weights.at(expert.gate_up_weight),
                 &model.weights.at(expert.down_weight),
                 residency_group,
-                    expert.cache_key,
-                    victim_metadata(model, expert, layer_state.normalized.rows()),
+                expert.cache_key,
+                victim_metadata(model, expert, layer_state.normalized.rows()),
             });
         }
         auto ready = model.expert_cache->try_acquire_ready_pairs(requests, leases);
@@ -2873,7 +2868,7 @@ static Result<void> run_moe(
             {
                 backend_executed[active_index] = 0;
                 const ActiveExpertExecution& active = layer_state.active_experts[active_index];
-                backend_accelerated_weight_bytes -= std::min<uint64_t>(backend_accelerated_weight_bytes, moe.experts[active.batch.expert_id].weight_bytes);
+                backend_accelerated_weight_bytes -= std::min<uint64_t>(backend_accelerated_weight_bytes, moe.experts[active.batch.expert_id].weight_size);
                 failed_indices.push_back(active_index);
                 continue;
             }
@@ -2938,8 +2933,8 @@ static Result<void> run_moe(
             {
                 layer_state.active_experts[active_index].lease = {};
             }
-            }
-            model.expert_backend->observe_phase(backend_max_token_count, backend_total_weight_bytes, backend_accelerated_weight_bytes, elapsed_microseconds(backend_execution_start));
+        }
+        model.expert_backend->observe_phase(backend_max_token_count, backend_total_weight_bytes, backend_accelerated_weight_bytes, elapsed_microseconds(backend_execution_start));
     }
 
     statistics.expert_compute_time_microseconds += compute_wall_time_microseconds;
@@ -3598,12 +3593,12 @@ static Result<CpuSpeculativeProposal> propose_mtp(
         statistics.expert_cache_misses += cache_after.misses - cache_before.misses;
         statistics.expert_cache_evictions += cache_after.evictions - cache_before.evictions;
         statistics.expert_cache_bytes_read += cache_after.bytes_read - cache_before.bytes_read;
-        statistics.expert_cache_io_worker_count = cache_after.io_worker_count;
-        statistics.expert_cache_adaptive_io_workers = cache_after.adaptive_io_workers;
+        statistics.expert_cache_num_io_threads = cache_after.num_io_threads;
+        statistics.expert_cache_num_active_io_threads = cache_after.num_active_io_threads;
         statistics.expert_cache_io_read_samples += cache_after.io_read_samples - cache_before.io_read_samples;
         statistics.expert_cache_io_read_time_microseconds += cache_after.io_read_time_microseconds
                                                              - cache_before.io_read_time_microseconds;
-        statistics.expert_cache_resident_bytes = cache_after.resident_bytes;
+        statistics.expert_cache_resident_size = cache_after.resident_size;
     }
     if (model.expert_backend)
     {
@@ -3769,11 +3764,11 @@ Result<CpuSpeculativeProposal> CpuExecutor::propose_speculative(const CompiledMo
         statistics.expert_cache_misses += cache_after.misses - cache_before.misses;
         statistics.expert_cache_evictions += cache_after.evictions - cache_before.evictions;
         statistics.expert_cache_bytes_read += cache_after.bytes_read - cache_before.bytes_read;
-        statistics.expert_cache_io_worker_count = cache_after.io_worker_count;
-        statistics.expert_cache_adaptive_io_workers = cache_after.adaptive_io_workers;
+        statistics.expert_cache_num_io_threads = cache_after.num_io_threads;
+        statistics.expert_cache_num_active_io_threads = cache_after.num_active_io_threads;
         statistics.expert_cache_io_read_samples += cache_after.io_read_samples - cache_before.io_read_samples;
         statistics.expert_cache_io_read_time_microseconds += cache_after.io_read_time_microseconds - cache_before.io_read_time_microseconds;
-        statistics.expert_cache_resident_bytes = cache_after.resident_bytes;
+        statistics.expert_cache_resident_size = cache_after.resident_size;
     }
     if (model.expert_backend)
     {
@@ -4449,11 +4444,11 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute(
         statistics.expert_cache_dropped_speculative_admissions += after.dropped_speculative_admissions - execution_cache_before.dropped_speculative_admissions;
         statistics.expert_cache_unused_speculative_reads += after.unused_speculative_reads - execution_cache_before.unused_speculative_reads;
         statistics.expert_cache_short_term_reloads += after.short_term_reloads - execution_cache_before.short_term_reloads;
-        statistics.expert_cache_arc_recent_bytes = after.arc_recent_bytes;
-        statistics.expert_cache_arc_frequent_bytes = after.arc_frequent_bytes;
-        statistics.expert_cache_arc_recent_target_bytes = after.arc_recent_target_bytes;
-        statistics.expert_cache_arc_recent_ghost_bytes = after.arc_recent_ghost_bytes;
-        statistics.expert_cache_arc_frequent_ghost_bytes = after.arc_frequent_ghost_bytes;
+        statistics.expert_cache_arc_recent_size = after.arc_recent_size;
+        statistics.expert_cache_arc_frequent_size = after.arc_frequent_size;
+        statistics.expert_cache_arc_recent_target_size = after.arc_recent_target_size;
+        statistics.expert_cache_arc_recent_ghost_size = after.arc_recent_ghost_size;
+        statistics.expert_cache_arc_frequent_ghost_size = after.arc_frequent_ghost_size;
         statistics.expert_cache_arc_recent_ghost_hits += after.arc_recent_ghost_hits - execution_cache_before.arc_recent_ghost_hits;
         statistics.expert_cache_arc_frequent_ghost_hits += after.arc_frequent_ghost_hits - execution_cache_before.arc_frequent_ghost_hits;
         statistics.expert_cache_mapped_ranges += after.mapped_ranges - execution_cache_before.mapped_ranges;
@@ -4467,11 +4462,11 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute(
         statistics.expert_cache_coalesced_experts += after.coalesced_experts - execution_cache_before.coalesced_experts;
         statistics.expert_cache_coalesced_read_ranges_saved += after.coalesced_read_ranges_saved - execution_cache_before.coalesced_read_ranges_saved;
         statistics.expert_cache_read_policy = after.adaptive_read_policy;
-        statistics.expert_cache_io_worker_count = after.io_worker_count;
-        statistics.expert_cache_adaptive_io_workers = after.adaptive_io_workers;
+        statistics.expert_cache_num_io_threads = after.num_io_threads;
+        statistics.expert_cache_num_active_io_threads = after.num_active_io_threads;
         statistics.expert_cache_io_read_samples += after.io_read_samples - execution_cache_before.io_read_samples;
         statistics.expert_cache_io_read_time_microseconds += after.io_read_time_microseconds - execution_cache_before.io_read_time_microseconds;
-        statistics.expert_cache_resident_bytes = after.resident_bytes;
+        statistics.expert_cache_resident_size = after.resident_size;
         record_expert_victim_cache_delta(statistics, execution_cache_before.victim, after.victim);
     }
     if (model.expert_backend)
@@ -5493,14 +5488,14 @@ Result<std::vector<std::vector<float>>> CpuExecutor::execute_decode_batch(const 
             statistics.expert_cache_coalesced_read_batches += cache_after.coalesced_read_batches - cache_before.coalesced_read_batches;
             statistics.expert_cache_coalesced_experts += cache_after.coalesced_experts - cache_before.coalesced_experts;
             statistics.expert_cache_coalesced_read_ranges_saved += cache_after.coalesced_read_ranges_saved - cache_before.coalesced_read_ranges_saved;
-            statistics.expert_cache_io_worker_count = cache_after.io_worker_count;
-            statistics.expert_cache_adaptive_io_workers = cache_after.adaptive_io_workers;
+            statistics.expert_cache_num_io_threads = cache_after.num_io_threads;
+            statistics.expert_cache_num_active_io_threads = cache_after.num_active_io_threads;
             statistics.expert_cache_io_read_samples += cache_after.io_read_samples - cache_before.io_read_samples;
             statistics.expert_cache_io_read_time_microseconds += cache_after.io_read_time_microseconds - cache_before.io_read_time_microseconds;
-            statistics.expert_cache_resident_bytes = cache_after.resident_bytes;
-            statistics.expert_cache_arc_recent_bytes = cache_after.arc_recent_bytes;
-            statistics.expert_cache_arc_frequent_bytes = cache_after.arc_frequent_bytes;
-            statistics.expert_cache_arc_recent_target_bytes = cache_after.arc_recent_target_bytes;
+            statistics.expert_cache_resident_size = cache_after.resident_size;
+            statistics.expert_cache_arc_recent_size = cache_after.arc_recent_size;
+            statistics.expert_cache_arc_frequent_size = cache_after.arc_frequent_size;
+            statistics.expert_cache_arc_recent_target_size = cache_after.arc_recent_target_size;
             record_expert_victim_cache_delta(statistics, cache_before.victim, cache_after.victim);
         }
     }

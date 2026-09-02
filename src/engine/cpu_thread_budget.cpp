@@ -23,29 +23,29 @@ CpuThreadBudget resolve_cpu_thread_budget(
     uint32_t requested_service_threads,
     uint32_t requested_compute_threads) noexcept
 {
-    const uint32_t logical_threads = std::max(1u, std::thread::hardware_concurrency());
-    const uint32_t physical_cores = std::max(1u, discover_cpu_topology().physical_core_count);
+    const uint32_t cpu_count = std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t physical_cpu_count = std::max(1u, discover_cpu_topology().physical_cpu_count);
     // Keep I/O parallelism bounded so it does not consume the compute pool.
     const uint32_t automatic_io = std::min(
-        physical_cores,
-        std::min(6u, std::max(2u, physical_cores / 2u)));
+        physical_cpu_count,
+        std::min(6u, std::max(2u, physical_cpu_count / 2u)));
     const uint32_t reserved_io = requested_io_threads == 0
                                      ? automatic_io
-                                     : std::min(requested_io_threads, physical_cores);
-    const uint32_t reserved_service = std::min(std::max(1u, requested_service_threads), physical_cores);
+                                     : std::min(requested_io_threads, physical_cpu_count);
+    const uint32_t reserved_service = std::min(std::max(1u, requested_service_threads), physical_cpu_count);
     const uint64_t unavailable = std::min<uint64_t>(
-        physical_cores,
+        physical_cpu_count,
         static_cast<uint64_t>(reserved_io) + reserved_service);
     const uint32_t available_compute = std::max(
         1u,
-        physical_cores - static_cast<uint32_t>(unavailable));
+        physical_cpu_count - static_cast<uint32_t>(unavailable));
     const uint32_t compute = requested_compute_threads == 0
                                  ? available_compute
                                  : std::max(1u, std::min(requested_compute_threads, available_compute));
     const uint32_t max_compute = requested_compute_threads == 0
-                                     ? physical_cores
-                                     : std::max(1u, std::min(requested_compute_threads, physical_cores));
-    return {logical_threads, physical_cores, reserved_io, reserved_service, compute, max_compute};
+                                     ? physical_cpu_count
+                                     : std::max(1u, std::min(requested_compute_threads, physical_cpu_count));
+    return {cpu_count, physical_cpu_count, reserved_io, reserved_service, compute, max_compute};
 }
 
 CpuOpenMpThreadLimitScope::CpuOpenMpThreadLimitScope() noexcept

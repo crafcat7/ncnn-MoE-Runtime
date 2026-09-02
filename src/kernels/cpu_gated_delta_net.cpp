@@ -7,7 +7,7 @@
 #include "cpu_state_cache.h"
 #include "backends/ncnn/ncnn_linear.h"
 #include "engine/cpu_session_state.h"
-#include "ncnn/moe/runtime_config.h"
+#include "ncnn/moe/option.h"
 
 #include <algorithm>
 #include <cassert>
@@ -43,7 +43,7 @@ static float gated_delta_softplus(float value)
 
 static bool gated_delta_simd_enabled(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationCpuGatedDeltaSimd);
+    return optimization_enabled(optimization_flags, OptimizationCpuGatedDeltaSimd);
 }
 
 static void configure_gated_delta_cache(CpuLayerCache& cache, const AttentionBlockPlan& plan)
@@ -203,7 +203,7 @@ static void execute_gated_delta_recurrence_row(
     const uint32_t head_team_size = vectorized
                                         ? std::min(
                                               plan.head_count,
-                                              cpu_linear_thread_limit())
+                                              cpu_linear_num_threads())
                                         : 1;
     const bool parallelize_value_heads = head_team_size > 1;
     if (vectorized)
@@ -504,7 +504,7 @@ Result<void> execute_gated_delta_net_into(
                 record_gated_delta_cache_transaction_row(cache);
             cache.gated_delta_token_count += hidden.rows();
             if (cache.gated_delta_device_state)
-                cache.device_allocated_bytes = cache.gated_delta_device_state->allocated_bytes();
+                cache.device_allocated_size = cache.gated_delta_device_state->allocated_bytes();
             return {};
         }
 
@@ -535,7 +535,7 @@ Result<void> execute_gated_delta_net_into(
             cache.gated_delta_convolution = std::move(convolution);
             cache.gated_delta_recurrent = std::move(recurrent);
             cache.gated_delta_device_state.reset();
-            cache.device_allocated_bytes = 0;
+            cache.device_allocated_size = 0;
         }
     }
 

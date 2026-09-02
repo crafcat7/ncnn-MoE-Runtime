@@ -25,7 +25,7 @@ static bool shape_equals(const TensorData& tensor, std::initializer_list<uint32_
 
 static bool vulkan_latent_compressor_enabled(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationVulkanLatentCompressor);
+    return optimization_enabled(optimization_flags, OptimizationVulkanLatentCompressor);
 }
 
 static uint64_t saturating_add_u64(uint64_t left, uint64_t right) noexcept
@@ -42,7 +42,7 @@ static uint64_t saturating_multiply_u64(uint64_t left, uint64_t right) noexcept
                : left * right;
 }
 
-static uint64_t gated_delta_vulkan_working_set_bytes(
+static uint64_t gated_delta_vulkan_working_set_size(
     const AttentionDescriptor& attention,
     const MoeModelDescriptor& descriptor) noexcept
 {
@@ -77,9 +77,9 @@ static uint64_t gated_delta_vulkan_working_set_bytes(
     // additionally uploads convolution and per-head constants as FP32.
     const uint64_t projection_elements = saturating_multiply_u64(
         saturating_add_u64(fused_columns, value_size), descriptor.hidden_size);
-    const uint64_t projection_bytes = saturating_multiply_u64(
+    const uint64_t projection_size = saturating_multiply_u64(
         projection_elements, sizeof(uint16_t));
-    const uint64_t projection_metadata_bytes = saturating_multiply_u64(
+    const uint64_t projection_metadata_size = saturating_multiply_u64(
         saturating_add_u64(
             saturating_add_u64(
                 saturating_multiply_u64(descriptor.hidden_size, 2),
@@ -91,25 +91,25 @@ static uint64_t gated_delta_vulkan_working_set_bytes(
         saturating_add_u64(
             saturating_multiply_u64(attention.head_count, 2),
             attention.value_head_dimension));
-    const uint64_t recurrent_constant_bytes = saturating_multiply_u64(
+    const uint64_t recurrent_constant_size = saturating_multiply_u64(
         recurrent_constant_elements, sizeof(float));
-    const uint64_t allocated_bytes = saturating_add_u64(
-        saturating_add_u64(projection_bytes, projection_metadata_bytes),
-        recurrent_constant_bytes);
+    const uint64_t allocated_size = saturating_add_u64(
+        saturating_add_u64(projection_size, projection_metadata_size),
+        recurrent_constant_size);
 
     // Weight allocators and the first dispatch need transient workspace in
     // addition to the raw payload.  A two-times safety margin is deliberately
     // conservative and keeps this policy independent of a model's layer id or
     // tensor naming convention.
-    return saturating_multiply_u64(allocated_bytes, 2);
+    return saturating_multiply_u64(allocated_size, 2);
 }
 
-static uint64_t gated_delta_vulkan_budget_bytes(
-    const ModelCompiler::BackendCapabilities& capabilities,
+static uint64_t gated_delta_vulkan_budget_size(
+    const ModelCompiler::BackendCapabilities& caps,
     bool use_vulkan_dense,
     bool protects_file_backed_experts) noexcept
 {
-    if (!use_vulkan_dense || capabilities.vulkan_heap_budget_bytes == 0)
+    if (!use_vulkan_dense || caps.gpu_heap_budget == 0)
         return 0;
 
     // File-backed Expert execution normally consumes nearly all free heap for
@@ -117,9 +117,9 @@ static uint64_t gated_delta_vulkan_budget_bytes(
     // fraction for persistent GDN projection/state; without an Expert cache,
     // more of the heap can safely be used by dense attention operators.
     const uint64_t heap_divisor = protects_file_backed_experts ? 64 : 8;
-    const uint64_t concurrency = std::max(1u, capabilities.expected_concurrency);
+    const uint64_t concurrency = std::max(1u, caps.num_concurrent_sessions);
     const uint64_t divisor = saturating_multiply_u64(heap_divisor, concurrency);
-    return divisor == 0 ? 0 : capabilities.vulkan_heap_budget_bytes / divisor;
+    return divisor == 0 ? 0 : caps.gpu_heap_budget / divisor;
 }
 
 #define NCNN_MOE_ADAPTER_GRAPH_ATTN_BIT   0
@@ -271,8 +271,8 @@ static Result<TensorHandle> require_tensor(const WeightStore& weights, const std
             return Error{ErrorCode::InvalidModel, "MXFP4 tensor must be a matrix with 32-aligned columns: " + name};
         if (tensor.mxfp4_file_storage)
         {
-            const uint64_t stored_blocks = tensor.mxfp4_file_storage->blocks_bytes + tensor.mxfp4_file_storage->secondary_blocks_bytes;
-            const uint64_t stored_scales = tensor.mxfp4_file_storage->scales_bytes + tensor.mxfp4_file_storage->secondary_scales_bytes;
+            const uint64_t stored_blocks = tensor.mxfp4_file_storage->blocks_size + tensor.mxfp4_file_storage->secondary_blocks_size;
+            const uint64_t stored_scales = tensor.mxfp4_file_storage->scales_size + tensor.mxfp4_file_storage->secondary_scales_size;
             if (!tensor.mxfp4_blocks.empty()
                 || !tensor.mxfp4_scales.empty()
                 || tensor.mxfp4_file_storage->blocks_path.empty()
@@ -356,9 +356,9 @@ static Result<void> prepare_linear_operator(
     if (is_qnk_dtype(matrix.dtype))
     {
         if (device == NcnnLinearDevice::Vulkan
-            && runtime_optimization_enabled(
+            && optimization_enabled(
                 optimization_flags,
-                RuntimeOptimizationVulkanQnK))
+                OptimizationVulkanQnK))
         {
             compiled_operator.qnk = NcnnVulkanQnkOperator::create(
                 matrix,
@@ -629,10 +629,8 @@ static Result<void> compile_ple_plan(
     if (embedding_rows != descriptor.embedding_row_count)
         return Error{ErrorCode::InvalidModel, "PLE embedding shard rows do not match the model configuration"};
 
-    const std::span<const int64_t> vocabulary_sizes =
-        compiled.weights.at(plan.head_vocabulary_sizes).int64_values();
-    const std::span<const int64_t> offsets =
-        compiled.weights.at(plan.head_offsets).int64_values();
+    const std::span<const int64_t> vocabulary_sizes = compiled.weights.at(plan.head_vocabulary_sizes).int64_values();
+    const std::span<const int64_t> offsets = compiled.weights.at(plan.head_offsets).int64_values();
     uint64_t required_rows = 0;
     for (uint32_t head = 0; head < head_count; ++head)
     {
@@ -895,25 +893,25 @@ static Result<void> compile_gated_delta_attention(
         plan.output_weight);
 }
 
-static uint64_t tensor_storage_bytes(const TensorData& tensor)
+static uint64_t tensor_storage_size(const TensorData& tensor)
 {
-    uint64_t bytes = tensor.mapped_byte_count;
-    bytes += static_cast<uint64_t>(tensor.float32_data.size()) * sizeof(float);
-    bytes += static_cast<uint64_t>(tensor.bfloat16_data.size()) * sizeof(uint16_t);
-    bytes += static_cast<uint64_t>(tensor.int64_data.size()) * sizeof(int64_t);
-    bytes += tensor.int8_data.size();
-    bytes += tensor.quantized_data.size();
-    bytes += static_cast<uint64_t>(tensor.quantization_scales.size()) * sizeof(float);
-    bytes += tensor.mxfp4_blocks.size();
-    bytes += tensor.mxfp4_scales.size();
+    uint64_t size = tensor.mapped_size;
+    size += static_cast<uint64_t>(tensor.float32_data.size()) * sizeof(float);
+    size += static_cast<uint64_t>(tensor.bfloat16_data.size()) * sizeof(uint16_t);
+    size += static_cast<uint64_t>(tensor.int64_data.size()) * sizeof(int64_t);
+    size += tensor.int8_data.size();
+    size += tensor.quantized_data.size();
+    size += static_cast<uint64_t>(tensor.quantization_scales.size()) * sizeof(float);
+    size += tensor.mxfp4_blocks.size();
+    size += tensor.mxfp4_scales.size();
     if (tensor.mxfp4_file_storage)
     {
-        bytes += tensor.mxfp4_file_storage->blocks_bytes;
-        bytes += tensor.mxfp4_file_storage->scales_bytes;
-        bytes += tensor.mxfp4_file_storage->secondary_blocks_bytes;
-        bytes += tensor.mxfp4_file_storage->secondary_scales_bytes;
+        size += tensor.mxfp4_file_storage->blocks_size;
+        size += tensor.mxfp4_file_storage->scales_size;
+        size += tensor.mxfp4_file_storage->secondary_blocks_size;
+        size += tensor.mxfp4_file_storage->secondary_scales_size;
     }
-    return bytes;
+    return size;
 }
 
 static bool uses_vulkan_dense_operator(const CompiledOperator& executable)
@@ -942,7 +940,7 @@ static void release_tensor_host_storage(TensorData& tensor)
         return;
     }
     tensor.mapped_data.reset();
-    tensor.mapped_byte_count = 0;
+    tensor.mapped_size = 0;
 }
 
 static void release_vulkan_dense_handle(CompiledModel& compiled, TensorHandle handle)
@@ -1009,7 +1007,7 @@ static void release_vulkan_dense_host_copies(CompiledModel& compiled)
         release_fused_layer_handles(layer);
 }
 
-static uint64_t expert_weight_bytes(const WeightStore& weights, const ExpertPlan& expert)
+static uint64_t expert_weight_size(const WeightStore& weights, const ExpertPlan& expert)
 {
     const uint32_t handles[] = {
         expert.gate_weight,
@@ -1019,13 +1017,13 @@ static uint64_t expert_weight_bytes(const WeightStore& weights, const ExpertPlan
         expert.gate_up_bias,
         expert.down_bias,
     };
-    uint64_t bytes = 0;
+    uint64_t size = 0;
     for (uint32_t handle : handles)
     {
         if (handle != invalid_tensor_handle)
-            bytes += tensor_storage_bytes(weights.at(handle));
+            size += tensor_storage_size(weights.at(handle));
     }
-    return bytes;
+    return size;
 }
 
 static bool is_mapped_bfloat16_expert_tensor(const TensorData& tensor) noexcept
@@ -1039,7 +1037,7 @@ static bool is_mapped_bfloat16_expert_tensor(const TensorData& tensor) noexcept
     const uint64_t elements = tensor.element_count();
     return elements != 0
            && elements <= std::numeric_limits<uint64_t>::max() / sizeof(uint16_t)
-           && tensor.mapped_byte_count == elements * sizeof(uint16_t)
+           && tensor.mapped_size == elements * sizeof(uint16_t)
            && tensor.bfloat16_values().size() == elements;
 }
 
@@ -1082,19 +1080,19 @@ static Result<void> combine_qnk_gate_up_weights(
         return Error{ErrorCode::InvalidModel, "Qn_K gate/up tensors cannot be packed"};
     }
 
-    const uint64_t row_bytes = qnk_storage_bytes(gate.dtype, 1, columns);
-    if (row_bytes == 0
+    const uint64_t row_size = qnk_storage_bytes(gate.dtype, 1, columns);
+    if (row_size == 0
         || rows > std::numeric_limits<uint32_t>::max() / 2
-        || row_bytes > std::numeric_limits<size_t>::max() / rows
-        || row_bytes * rows > std::numeric_limits<size_t>::max() / 2)
+        || row_size > std::numeric_limits<size_t>::max() / rows
+        || row_size * rows > std::numeric_limits<size_t>::max() / 2)
     {
         return Error{ErrorCode::InvalidModel, "Qn_K gate/up tensor size overflows"};
     }
 
-    const size_t source_bytes = static_cast<size_t>(row_bytes * rows);
+    const size_t source_size = static_cast<size_t>(row_size * rows);
     const std::span<const uint8_t> gate_data = gate.qnk_values();
     const std::span<const uint8_t> up_data = up.qnk_values();
-    if (gate_data.size() != source_bytes || up_data.size() != source_bytes)
+    if (gate_data.size() != source_size || up_data.size() != source_size)
     {
         return Error{ErrorCode::InvalidModel, "Qn_K gate/up tensor byte count does not match its shape"};
     }
@@ -1103,7 +1101,7 @@ static Result<void> combine_qnk_gate_up_weights(
     combined.dtype = gate.dtype;
     combined.shape = {rows * 2, columns};
     combined.qnk_interleave_rows = false;
-    combined.quantized_data.reserve(source_bytes * 2);
+    combined.quantized_data.reserve(source_size * 2);
     combined.quantized_data.insert(combined.quantized_data.end(), gate_data.begin(), gate_data.end());
     combined.quantized_data.insert(combined.quantized_data.end(), up_data.begin(), up_data.end());
     weights.at_mutable(gate_handle) = std::move(combined);
@@ -1159,7 +1157,7 @@ static Result<void> compile_mtp_speculative_model(
     CompiledModel& compiled,
     NcnnLinearDevice dense_device,
     bool retain_cpu_dense_copies,
-    bool file_backed_experts)
+    bool use_file_backed_experts)
 {
     if (compiled.descriptor.speculative_layer_count != 1
         || compiled.descriptor.speculative_block_size == 0
@@ -1472,7 +1470,7 @@ static Result<void> compile_mtp_speculative_model(
         shared.down_weight);
     if (!status)
         return status.error();
-    shared.weight_bytes = expert_weight_bytes(compiled.weights, shared);
+    shared.weight_size = expert_weight_size(compiled.weights, shared);
     if (has_flag(moe.flags, MoeDescriptorSharedExpertGate))
     {
         status = assign_required_tensor(
@@ -1515,8 +1513,7 @@ static Result<void> compile_mtp_speculative_model(
             return status.error();
         if (is_qnk_dtype(compiled.weights.at(expert.gate_up_weight).dtype))
         {
-            compiled.weights.at_mutable(expert.gate_up_weight).qnk_interleave_rows =
-                moe.layout == ExpertLayout::InterleavedGateUpDown;
+            compiled.weights.at_mutable(expert.gate_up_weight).qnk_interleave_rows = moe.layout == ExpertLayout::InterleavedGateUpDown;
         }
         status = assign_required_tensor(
             compiled.weights,
@@ -1526,14 +1523,14 @@ static Result<void> compile_mtp_speculative_model(
             expert.down_weight);
         if (!status)
             return status.error();
-        expert.weight_bytes = expert_weight_bytes(compiled.weights, expert);
+        expert.weight_size = expert_weight_size(compiled.weights, expert);
         const TensorData& gate_up_weight = compiled.weights.at(expert.gate_up_weight);
         const TensorData& down_weight = compiled.weights.at(expert.down_weight);
-        const bool file_backed_bfloat16 = file_backed_experts
-                                          && moe.expert_weight_dtype == DType::BFloat16
-                                          && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
+        const bool use_file_backed_bfloat16 = use_file_backed_experts
+                                              && moe.expert_weight_dtype == DType::BFloat16
+                                              && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
         if (is_cache_file_backed_expert_pair(
-                gate_up_weight, down_weight, file_backed_bfloat16))
+                gate_up_weight, down_weight, use_file_backed_bfloat16))
             expert.cache_key = Mxfp4ExpertCache::make_pair_key(gate_up_weight, down_weight);
         else if (is_qnk_dtype(gate_up_weight.dtype) && gate_up_weight.dtype == down_weight.dtype)
             expert.cache_key = "qnk:" + prefix;
@@ -1547,14 +1544,14 @@ static Result<void> compile_speculative_model(
     CompiledModel& compiled,
     NcnnLinearDevice dense_device,
     bool retain_cpu_dense_copies,
-    bool file_backed_experts)
+    bool use_file_backed_experts)
 {
     if (compiled.descriptor.speculative_layer_count == 0)
         return {};
     if (compiled.descriptor.speculative_kind == SpeculativeModelKind::Mtp)
         return compile_mtp_speculative_model(
             compiled, dense_device, retain_cpu_dense_copies,
-            file_backed_experts);
+            use_file_backed_experts);
     if (compiled.descriptor.speculative_kind != SpeculativeModelKind::DSpark)
         return Error{ErrorCode::InvalidModel, "speculative layer kind is not configured"};
     if (compiled.descriptor.speculative_target_layer_ids.size() != compiled.descriptor.speculative_layer_count
@@ -1848,7 +1845,7 @@ static Result<void> compile_speculative_model(
             shared.down_weight);
         if (!status)
             return status.error();
-        shared.weight_bytes = expert_weight_bytes(compiled.weights, shared);
+        shared.weight_size = expert_weight_size(compiled.weights, shared);
         const TensorHandle shared_handles[] = {
             shared.gate_weight,
             shared.up_weight,
@@ -1890,14 +1887,14 @@ static Result<void> compile_speculative_model(
                 expert.down_weight);
             if (!status)
                 return status.error();
-            expert.weight_bytes = expert_weight_bytes(compiled.weights, expert);
+            expert.weight_size = expert_weight_size(compiled.weights, expert);
             const TensorData& gate_up_weight = compiled.weights.at(expert.gate_up_weight);
             const TensorData& down_weight = compiled.weights.at(expert.down_weight);
-            const bool file_backed_bfloat16 = file_backed_experts
-                                              && moe.expert_weight_dtype == DType::BFloat16
-                                              && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
+            const bool use_file_backed_bfloat16 = use_file_backed_experts
+                                                  && moe.expert_weight_dtype == DType::BFloat16
+                                                  && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
             if (is_cache_file_backed_expert_pair(
-                    gate_up_weight, down_weight, file_backed_bfloat16))
+                    gate_up_weight, down_weight, use_file_backed_bfloat16))
                 expert.cache_key = Mxfp4ExpertCache::make_pair_key(gate_up_weight, down_weight);
             layer_plan.moe.experts.push_back(std::move(expert));
         }
@@ -1908,17 +1905,17 @@ static Result<void> compile_speculative_model(
 
 Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping mapping, HybridMode hybrid_mode) const
 {
-    BackendCapabilities capabilities;
+    BackendCapabilities caps;
     if (hybrid_mode == HybridMode::HybridExperts)
     {
-        capabilities.flags |= BackendCapabilityVulkanDense | BackendCapabilityVulkanAttention;
+        caps.flags |= BackendVulkanDense | BackendVulkanAttention;
     }
-    return compile(std::move(descriptor), std::move(mapping), hybrid_mode, capabilities);
+    return compile(std::move(descriptor), std::move(mapping), hybrid_mode, caps);
 }
 
-Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping mapping, HybridMode hybrid_mode, const BackendCapabilities& capabilities) const
+Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping mapping, HybridMode hybrid_mode, const BackendCapabilities& caps) const
 {
-    if (!has_flag(capabilities.flags, BackendCapabilityCpuExecution))
+    if (!has_flag(caps.flags, BackendCpuExecution))
         return Error{ErrorCode::UnsupportedModel, "compiler requires a CPU execution backend"};
     auto normalized_ir = normalize_moe_ir(descriptor);
     if (!normalized_ir)
@@ -1958,18 +1955,18 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
 
     CompiledModel compiled;
     compiled.descriptor = std::move(descriptor);
-    compiled.optimization_flags = capabilities.optimization_flags;
-    compiled.vulkan_context_instance = capabilities.vulkan_context_instance;
+    compiled.optimization_flags = caps.optimization_flags;
+    compiled.vulkan_context_instance = caps.vkctx;
     compiled.expert_store = std::make_shared<ExpertStore>();
     const bool hybrid_requests_vulkan = hybrid_mode == HybridMode::HybridExperts;
-    const bool use_vulkan_dense = hybrid_requests_vulkan && has_flag(capabilities.flags, BackendCapabilityVulkanDense);
-    const bool retain_cpu_dense_copies = has_flag(capabilities.flags, BackendCapabilityRetainCpuDenseCopies);
-    const bool file_backed_experts = has_flag(
-        capabilities.flags, BackendCapabilityFileBackedExperts);
-    std::vector<uint32_t> dense_device_indices = capabilities.vulkan_device_indices;
-    if (dense_device_indices.empty() && capabilities.vulkan_device_index != automatic_vulkan_device_index)
+    const bool use_vulkan_dense = hybrid_requests_vulkan && has_flag(caps.flags, BackendVulkanDense);
+    const bool retain_cpu_dense_copies = has_flag(caps.flags, BackendRetainCpuDenseCopies);
+    const bool use_file_backed_experts = has_flag(
+        caps.flags, BackendFileBackedExperts);
+    std::vector<uint32_t> dense_device_indices = caps.device_indices;
+    if (dense_device_indices.empty() && caps.device_index != automatic_vulkan_device_index)
     {
-        dense_device_indices.push_back(capabilities.vulkan_device_index);
+        dense_device_indices.push_back(caps.device_index);
     }
     if (use_vulkan_dense && dense_device_indices.empty())
     {
@@ -1979,7 +1976,7 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
     {
         return Error{ErrorCode::InvalidArgument, "Vulkan dense execution requires a context instance"};
     }
-    std::vector<uint32_t> dense_device_scores = capabilities.vulkan_device_scores;
+    std::vector<uint32_t> dense_device_scores = caps.device_scores;
     if (dense_device_scores.size() != dense_device_indices.size())
     {
         dense_device_scores.assign(dense_device_indices.size(), 1);
@@ -1989,7 +1986,7 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
     std::vector<uint32_t> device_layer_counts(dense_device_indices.size(), 0);
     if (use_vulkan_dense)
     {
-        if (capabilities.expected_concurrency <= 1 || dense_device_indices.size() == 1)
+        if (caps.num_concurrent_sessions <= 1 || dense_device_indices.size() == 1)
         {
             const size_t fastest = static_cast<size_t>(std::distance(dense_device_scores.begin(), std::max_element(dense_device_scores.begin(), dense_device_scores.end())));
             device_layer_counts[fastest] = compiled.descriptor.layer_count;
@@ -1999,10 +1996,10 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
             for (uint32_t layer = 0; layer < compiled.descriptor.layer_count; ++layer)
             {
                 size_t selected = 0;
-                double selected_cost = placement_cost(device_layer_counts, dense_device_scores, capabilities.expected_concurrency, 0);
+                double selected_cost = placement_cost(device_layer_counts, dense_device_scores, caps.num_concurrent_sessions, 0);
                 for (size_t index = 1; index < dense_device_indices.size(); ++index)
                 {
-                    const double cost = placement_cost(device_layer_counts, dense_device_scores, capabilities.expected_concurrency, index);
+                    const double cost = placement_cost(device_layer_counts, dense_device_scores, caps.num_concurrent_sessions, index);
                     if (cost < selected_cost)
                     {
                         selected = index;
@@ -2029,18 +2026,18 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
     }
     const NcnnLinearDevice dense_device = use_vulkan_dense ? NcnnLinearDevice::Vulkan : NcnnLinearDevice::Cpu;
     const bool vulkan_delta_fusion_available = use_vulkan_dense
-                                               && has_flag(capabilities.flags, BackendCapabilityVulkanAttention)
-                                               && runtime_optimization_enabled(
-                                                   capabilities.optimization_flags,
-                                                   RuntimeOptimizationVulkanAttention);
+                                               && has_flag(caps.flags, BackendVulkanAttention)
+                                               && optimization_enabled(
+                                                   caps.optimization_flags,
+                                                   OptimizationVulkanAttention);
     const bool protect_file_backed_experts = has_flag(
-        capabilities.flags, BackendCapabilityVulkanExperts)
-                                             && file_backed_experts;
-    const uint64_t gated_delta_gpu_budget = gated_delta_vulkan_budget_bytes(
-        capabilities,
+                                                 caps.flags, BackendVulkanExperts)
+                                             && use_file_backed_experts;
+    const uint64_t gated_delta_gpu_budget = gated_delta_vulkan_budget_size(
+        caps,
         vulkan_delta_fusion_available,
         protect_file_backed_experts);
-    uint64_t planned_gated_delta_gpu_bytes = 0;
+    uint64_t planned_gated_delta_gpu_size = 0;
 
     for (auto& [name, tensor] : mapping.tensors)
     {
@@ -2152,7 +2149,7 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
             && moe.expert_weight_dtype != DType::MxFp4
             && !is_qnk_dtype(moe.expert_weight_dtype))
             return Error{ErrorCode::UnsupportedModel, "expert weights must use float32, bfloat16, int8, MXFP4, or Qn_K"};
-        if (moe.expert_weight_dtype == DType::MxFp4 && !has_flag(capabilities.flags, BackendCapabilityMxfp4CpuKernel))
+        if (moe.expert_weight_dtype == DType::MxFp4 && !has_flag(caps.flags, BackendMxfp4CpuKernel))
         {
             return Error{ErrorCode::UnsupportedModel, "backend capabilities do not provide an MXFP4 CPU expert kernel"};
         }
@@ -2167,24 +2164,22 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                                           && !has_flag(layer.attention.flags, AttentionDescriptorQsa)
                                           && compiled.descriptor.hyper_connection_kind != HyperConnectionKind::GatedResidual
                                           && use_vulkan_dense
-                                          && has_flag(capabilities.flags, BackendCapabilityVulkanAttention);
+                                          && has_flag(caps.flags, BackendVulkanAttention);
         const bool use_vulkan_latent_linear = has_flag(graph.flags, AdapterGraphAttention)
                                               && layer.attention.kind == AttentionKind::MultiHeadLatent
                                               && use_vulkan_dense;
-        const uint64_t gated_delta_layer_bytes =
-            gated_delta_vulkan_working_set_bytes(
-                layer.attention,
-                compiled.descriptor);
-        const bool use_vulkan_delta_linear =
-            vulkan_delta_fusion_available
-            && gated_delta_layer_bytes != 0
-            && gated_delta_layer_bytes <= gated_delta_gpu_budget
-            && planned_gated_delta_gpu_bytes
-                   <= gated_delta_gpu_budget - gated_delta_layer_bytes;
+        const uint64_t gated_delta_layer_size = gated_delta_vulkan_working_set_size(
+            layer.attention,
+            compiled.descriptor);
+        const bool use_vulkan_delta_linear = vulkan_delta_fusion_available
+                                             && gated_delta_layer_size != 0
+                                             && gated_delta_layer_size <= gated_delta_gpu_budget
+                                             && planned_gated_delta_gpu_size
+                                                    <= gated_delta_gpu_budget - gated_delta_layer_size;
         if (use_vulkan_delta_linear)
-            planned_gated_delta_gpu_bytes = saturating_add_u64(
-                planned_gated_delta_gpu_bytes,
-                gated_delta_layer_bytes);
+            planned_gated_delta_gpu_size = saturating_add_u64(
+                planned_gated_delta_gpu_size,
+                gated_delta_layer_size);
         layer_plan.moe.top_k = moe.top_k;
         layer_plan.moe.hidden_size = compiled.descriptor.hidden_size;
         layer_plan.moe.score_function = moe.score_function;
@@ -2443,9 +2438,9 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 if (!prepared)
                     return prepared.error();
                 if (attention_device == NcnnLinearDevice::Vulkan
-                    && runtime_optimization_enabled(
+                    && optimization_enabled(
                         compiled.optimization_flags,
-                        RuntimeOptimizationVulkanAttention)
+                        OptimizationVulkanAttention)
                     && plan.fused_delta_input_bfloat16_operator != invalid_compiled_operator_handle)
                 {
                     const CompiledOperator& output_operator = compiled.operators.at_weight(plan.output_weight);
@@ -2627,22 +2622,22 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                     || !qsa_key_norm_weight
                     || !sinks)
                 {
-                    const Error* error = !attention_norm       ? &attention_norm.error()
-                                         : !query_weight       ? &query_weight.error()
-                                         : !query_bias         ? &query_bias.error()
-                                         : !query_norm_weight  ? &query_norm_weight.error()
-                                         : !key_weight         ? &key_weight.error()
-                                         : !key_bias           ? &key_bias.error()
-                                         : !key_norm_weight    ? &key_norm_weight.error()
-                                         : !value_weight       ? &value_weight.error()
-                                         : !value_bias         ? &value_bias.error()
-                                         : !output_weight      ? &output_weight.error()
-                                         : !output_bias        ? &output_bias.error()
-                                         : !output_gate_weight ? &output_gate_weight.error()
-                                         : !qsa_query_key_weight ? &qsa_query_key_weight.error()
+                    const Error* error = !attention_norm          ? &attention_norm.error()
+                                         : !query_weight          ? &query_weight.error()
+                                         : !query_bias            ? &query_bias.error()
+                                         : !query_norm_weight     ? &query_norm_weight.error()
+                                         : !key_weight            ? &key_weight.error()
+                                         : !key_bias              ? &key_bias.error()
+                                         : !key_norm_weight       ? &key_norm_weight.error()
+                                         : !value_weight          ? &value_weight.error()
+                                         : !value_bias            ? &value_bias.error()
+                                         : !output_weight         ? &output_weight.error()
+                                         : !output_bias           ? &output_bias.error()
+                                         : !output_gate_weight    ? &output_gate_weight.error()
+                                         : !qsa_query_key_weight  ? &qsa_query_key_weight.error()
                                          : !qsa_query_norm_weight ? &qsa_query_norm_weight.error()
-                                         : !qsa_key_norm_weight ? &qsa_key_norm_weight.error()
-                                                               : &sinks.error();
+                                         : !qsa_key_norm_weight   ? &qsa_key_norm_weight.error()
+                                                                  : &sinks.error();
                     return *error;
                 }
                 plan.pre_attention_norm_weight = attention_norm.value();
@@ -2937,7 +2932,7 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
             shared.gate_weight = gate.value();
             shared.up_weight = up.value();
             shared.down_weight = down.value();
-            shared.weight_bytes = expert_weight_bytes(compiled.weights, shared);
+            shared.weight_size = expert_weight_size(compiled.weights, shared);
             if (has_flag(moe.flags, MoeDescriptorSharedExpertGate))
             {
                 auto shared_gate = require_tensor(
@@ -2965,9 +2960,9 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
         layer_plan.moe.experts.reserve(moe.expert_count);
         const bool prepare_routed_dense_operators = moe.expert_weight_dtype != DType::BFloat16
                                                     || moe.expert_count <= 64;
-        const bool fuse_qnk_gate_up = runtime_optimization_enabled(
+        const bool fuse_qnk_gate_up = optimization_enabled(
             compiled.optimization_flags,
-            RuntimeOptimizationVulkanQnK);
+            OptimizationVulkanQnK);
         for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
         {
             ExpertPlan expert;
@@ -2987,8 +2982,7 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 expert.gate_up_weight = gate_up.value();
                 if (is_qnk_dtype(compiled.weights.at(expert.gate_up_weight).dtype))
                 {
-                    compiled.weights.at_mutable(expert.gate_up_weight).qnk_interleave_rows =
-                        moe.layout == ExpertLayout::InterleavedGateUpDown;
+                    compiled.weights.at_mutable(expert.gate_up_weight).qnk_interleave_rows = moe.layout == ExpertLayout::InterleavedGateUpDown;
                 }
             }
             else if (has_flag(expert.flags, ExpertPlanGated))
@@ -3067,15 +3061,15 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                                               retain_cpu_dense_copies, layer_plan.vulkan_device_index,
                                               compiled.vulkan_context_instance, compiled.optimization_flags);
 
-            expert.weight_bytes = expert_weight_bytes(compiled.weights, expert);
+            expert.weight_size = expert_weight_size(compiled.weights, expert);
             const TensorData& down_weight = compiled.weights.at(expert.down_weight);
-            const bool file_backed_bfloat16 = file_backed_experts
-                                              && moe.expert_weight_dtype == DType::BFloat16
-                                              && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
+            const bool use_file_backed_bfloat16 = use_file_backed_experts
+                                                  && moe.expert_weight_dtype == DType::BFloat16
+                                                  && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
             if (expert.gate_up_weight != invalid_tensor_handle)
             {
                 const TensorData& gate_up_weight = compiled.weights.at(expert.gate_up_weight);
-                if (file_backed_bfloat16
+                if (use_file_backed_bfloat16
                     && !is_cache_file_backed_expert_pair(
                         gate_up_weight, down_weight, true))
                 {
@@ -3084,7 +3078,7 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                         "file-backed BF16 Expert weights must remain memory-mapped"};
                 }
                 if (is_cache_file_backed_expert_pair(
-                        gate_up_weight, down_weight, file_backed_bfloat16))
+                        gate_up_weight, down_weight, use_file_backed_bfloat16))
                 {
                     expert.cache_key = Mxfp4ExpertCache::make_pair_key(gate_up_weight, down_weight);
                 }
@@ -3094,12 +3088,12 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 }
             }
             const bool file_backed = is_cache_file_backed_expert_tensor(
-                                         down_weight, file_backed_bfloat16)
+                                         down_weight, use_file_backed_bfloat16)
                                      || (expert.gate_up_weight != invalid_tensor_handle
                                          && is_cache_file_backed_expert_tensor(
                                              compiled.weights.at(expert.gate_up_weight),
-                                             file_backed_bfloat16));
-            expert.runtime = std::shared_ptr<Expert>(new Expert(ExpertKey{layer_id, expert_id}, expert.weight_bytes, file_backed ? ExpertCacheState::Unloaded : ExpertCacheState::Resident,
+                                             use_file_backed_bfloat16));
+            expert.runtime = std::shared_ptr<Expert>(new Expert(ExpertKey{layer_id, expert_id}, expert.weight_size, file_backed ? ExpertCacheState::Unloaded : ExpertCacheState::Resident,
                                                                 file_backed ? TensorLocation::Automatic : TensorLocation::Cpu, selected_expert_kernel(moe.expert_weight_dtype)));
             compiled.expert_store->add(expert.runtime);
             layer_plan.moe.experts.push_back(expert);
@@ -3110,15 +3104,15 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
 
     auto speculative = compile_speculative_model(
         compiled, dense_device, retain_cpu_dense_copies,
-        file_backed_experts);
+        use_file_backed_experts);
     if (!speculative)
         return speculative.error();
     for (CompiledLayerPlan& layer_plan : compiled.speculative.graph.layer_plans)
     {
         const MoeDescriptor& moe = compiled.descriptor.layers.back().ffn.moe;
-        const bool file_backed_bfloat16 = file_backed_experts
-                                          && moe.expert_weight_dtype == DType::BFloat16
-                                          && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
+        const bool use_file_backed_bfloat16 = use_file_backed_experts
+                                              && moe.expert_weight_dtype == DType::BFloat16
+                                              && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
         for (uint32_t expert_id = 0; expert_id < layer_plan.moe.experts.size(); ++expert_id)
         {
             ExpertPlan& expert = layer_plan.moe.experts[expert_id];
@@ -3126,15 +3120,15 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
                 continue;
             const TensorData& down_weight = compiled.weights.at(expert.down_weight);
             const bool file_backed = is_cache_file_backed_expert_tensor(
-                                         down_weight, file_backed_bfloat16)
+                                         down_weight, use_file_backed_bfloat16)
                                      || (expert.gate_up_weight != invalid_tensor_handle
                                          && is_cache_file_backed_expert_tensor(
                                              compiled.weights.at(expert.gate_up_weight),
-                                             file_backed_bfloat16));
+                                             use_file_backed_bfloat16));
             expert.runtime = std::shared_ptr<Expert>(
                 new Expert(
                     ExpertKey{layer_plan.layer_id, expert_id},
-                    expert.weight_bytes,
+                    expert.weight_size,
                     file_backed ? ExpertCacheState::Unloaded : ExpertCacheState::Resident,
                     file_backed ? TensorLocation::Automatic : TensorLocation::Cpu,
                     selected_expert_kernel(moe.expert_weight_dtype)));
@@ -3142,10 +3136,10 @@ Result<CompiledModel> ModelCompiler::compile(MoeIR descriptor, WeightMapping map
         }
     }
 
-    auto graph = build_compiled_execution_graph(compiled, capabilities);
+    auto graph = build_compiled_execution_graph(compiled, caps);
     if (!graph)
         return graph.error();
-    if (has_flag(capabilities.flags, BackendCapabilityReleaseVulkanDenseHostStorage))
+    if (has_flag(caps.flags, BackendReleaseVulkanDenseHostStorage))
         release_vulkan_dense_host_copies(compiled);
     return compiled;
 }

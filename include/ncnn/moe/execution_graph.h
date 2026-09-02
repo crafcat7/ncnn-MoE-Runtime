@@ -52,8 +52,8 @@ enum ExecutionBackendMask : uint32_t
     ExecutionBackendVulkan = UINT32_C(1) << NCNN_MOE_BACKEND_VULKAN_BIT
 };
 
-#define NCNN_MOE_NODE_CONDITIONAL_BIT 0
-#define NCNN_MOE_NODE_ASYNC_BIT       1
+#define NCNN_MOE_NODE_CONDITIONAL_BIT  0
+#define NCNN_MOE_NODE_ASYNC_BIT        1
 #define NCNN_MOE_NODE_CPU_PREFETCH_BIT 2
 
 enum ExecutionNodeFlag : uint32_t
@@ -83,7 +83,7 @@ struct ExecutionTensor
     TensorLocation location = TensorLocation::Cpu;
     ExecutionNodeId producer = invalid_execution_node_id;
     std::vector<ExecutionNodeId> consumers;
-    uint64_t estimated_bytes = 0;
+    uint64_t estimated_size = 0;
     uint32_t flags = 0;
 };
 

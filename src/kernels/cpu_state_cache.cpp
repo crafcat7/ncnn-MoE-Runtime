@@ -71,8 +71,7 @@ Result<void> begin_state_cache_transaction(
             if (!cache.gated_delta_device_state->begin_transaction(
                     expected_rows))
             {
-                for (NcnnVulkanGatedDeltaState* state
-                     : device_transactions)
+                for (NcnnVulkanGatedDeltaState* state : device_transactions)
                 {
                     state->complete_transaction();
                 }
@@ -80,8 +79,7 @@ Result<void> begin_state_cache_transaction(
                 {
                     if (cleanup_cache.gated_delta_device_state)
                     {
-                        cleanup_cache.device_allocated_bytes =
-                            cleanup_cache.gated_delta_device_state->allocated_bytes();
+                        cleanup_cache.device_allocated_size = cleanup_cache.gated_delta_device_state->allocated_bytes();
                     }
                 }
                 return Error{
@@ -90,8 +88,7 @@ Result<void> begin_state_cache_transaction(
             }
             device_transactions.push_back(
                 cache.gated_delta_device_state.get());
-            cache.device_allocated_bytes =
-                cache.gated_delta_device_state->allocated_bytes();
+            cache.device_allocated_size = cache.gated_delta_device_state->allocated_bytes();
         }
     }
 
@@ -99,13 +96,11 @@ Result<void> begin_state_cache_transaction(
     {
         for (CpuLayerCache& cache : caches)
         {
-            CpuSessionStateTransaction& transaction =
-                cache.transaction;
+            CpuSessionStateTransaction& transaction = cache.transaction;
             transaction.initial_start_position = cache.start_position;
             transaction.initial_token_count = cache.token_count;
             transaction.initial_first_slot = cache.first_slot;
-            transaction.initial_gated_delta_token_count =
-                cache.gated_delta_token_count;
+            transaction.initial_gated_delta_token_count = cache.gated_delta_token_count;
             transaction.expected_rows = expected_rows;
             transaction.recorded_rows = 0;
             transaction.initial.gated_delta_convolution.clear();
@@ -127,8 +122,7 @@ Result<void> begin_state_cache_transaction(
     {
         for (CpuLayerCache& cache : caches)
         {
-            CpuSessionStateTransaction& transaction =
-                cache.transaction;
+            CpuSessionStateTransaction& transaction = cache.transaction;
             transaction.active = false;
             transaction.expected_rows = 0;
             transaction.recorded_rows = 0;
@@ -142,8 +136,7 @@ Result<void> begin_state_cache_transaction(
         {
             if (cleanup_cache.gated_delta_device_state)
             {
-                cleanup_cache.device_allocated_bytes =
-                    cleanup_cache.gated_delta_device_state->allocated_bytes();
+                cleanup_cache.device_allocated_size = cleanup_cache.gated_delta_device_state->allocated_bytes();
             }
         }
         return Error{
@@ -186,8 +179,7 @@ Result<void> finish_state_cache_transaction(
 {
     for (const CpuLayerCache& cache : caches)
     {
-        const CpuSessionStateTransaction& transaction =
-            cache.transaction;
+        const CpuSessionStateTransaction& transaction = cache.transaction;
         if (!transaction.active)
             continue;
         if (committed_rows > transaction.recorded_rows
@@ -223,8 +215,7 @@ Result<void> finish_state_cache_transaction(
 
     for (CpuLayerCache& cache : caches)
     {
-        CpuSessionStateTransaction& transaction =
-            cache.transaction;
+        CpuSessionStateTransaction& transaction = cache.transaction;
         if (!transaction.active || !cache.gated_delta_device_state)
             continue;
         if (!cache.gated_delta_device_state->prepare_transaction_finish(
@@ -252,13 +243,11 @@ Result<void> finish_state_cache_transaction(
         if (!transaction.active)
             continue;
 
-        const bool gated_delta =
-            cache.gated_delta_device_state
-            ||
-            !transaction.initial.gated_delta_convolution.empty()
-            || !transaction.initial.gated_delta_recurrent.empty()
-            || !cache.gated_delta_convolution.empty()
-            || !cache.gated_delta_recurrent.empty();
+        const bool gated_delta = cache.gated_delta_device_state
+                                 || !transaction.initial.gated_delta_convolution.empty()
+                                 || !transaction.initial.gated_delta_recurrent.empty()
+                                 || !cache.gated_delta_convolution.empty()
+                                 || !cache.gated_delta_recurrent.empty();
         if (gated_delta)
         {
             if (committed_rows == 0)
@@ -275,28 +264,25 @@ Result<void> finish_state_cache_transaction(
                         transaction.rows[committed_rows - 1]);
                 }
             }
-            cache.gated_delta_token_count =
-                transaction.initial_gated_delta_token_count
-                + committed_rows;
+            cache.gated_delta_token_count = transaction.initial_gated_delta_token_count
+                                            + committed_rows;
             if (cache.gated_delta_device_state)
             {
-                cache.device_allocated_bytes =
-                    cache.gated_delta_device_state->allocated_bytes();
+                cache.device_allocated_size = cache.gated_delta_device_state->allocated_bytes();
             }
         }
         else
         {
             cache.start_position = transaction.initial_start_position;
             cache.first_slot = transaction.initial_first_slot;
-            cache.token_count =
-                transaction.initial_token_count + committed_rows;
+            cache.token_count = transaction.initial_token_count + committed_rows;
             if (transaction.initial_token_count == 0
                 && committed_rows == 0
                 && cache.vulkan_attention_cache)
             {
                 cache.vulkan_attention_cache.reset();
                 cache.capacity_tokens = 0;
-                cache.device_allocated_bytes = 0;
+                cache.device_allocated_size = 0;
                 cache.vulkan_attention_state_unknown = false;
             }
         }

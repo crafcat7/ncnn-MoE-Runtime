@@ -50,6 +50,7 @@ set(NCNN_MOE_SOURCES
     src/engine/cpu_topology.cpp
     src/engine/expert_backend.cpp
     src/engine/memory_manager.cpp
+    src/engine/modelloader.cpp
     src/engine/runtime.cpp
     src/engine/scheduler.cpp
     src/engine/session.cpp
@@ -358,6 +359,9 @@ if(NCNN_MOE_BUILD_EXAMPLES)
         target_compile_features(
             ncnn_moe_reference_runner
             PRIVATE cxx_std_20)
+        target_include_directories(
+            ncnn_moe_reference_runner
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
         add_executable(
             ncnn_moe_gpt_oss
@@ -410,6 +414,9 @@ if(NCNN_MOE_BUILD_EXAMPLES)
     target_compile_features(
         ncnn_moe_worker
         PRIVATE cxx_std_20)
+    target_include_directories(
+        ncnn_moe_worker
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     if(WIN32)
         target_link_libraries(ncnn_moe_worker PRIVATE psapi)
     endif()

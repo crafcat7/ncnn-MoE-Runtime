@@ -34,8 +34,7 @@ __attribute__((target("avx512f,avx512bw"))) static void avx512_bfloat16_single_t
          ++output_group)
     {
         const uint32_t first_output = static_cast<uint32_t>(output_group) * 4;
-        const uint16_t* group_weights =
-            weights + static_cast<size_t>(first_output) * input_columns;
+        const uint16_t* group_weights = weights + static_cast<size_t>(first_output) * input_columns;
         __m512 accumulator00 = _mm512_setzero_ps();
         __m512 accumulator01 = _mm512_setzero_ps();
         __m512 accumulator02 = _mm512_setzero_ps();
@@ -92,11 +91,11 @@ __attribute__((target("avx512f,avx512bw"))) static void avx512_bfloat16_single_t
             const __m256i packed33 = _mm256_loadu_si256(
                 reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column + 48));
 #define NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator, packed, input_values) \
-            accumulator = _mm512_fmadd_ps(                             \
-                _mm512_castsi512_ps(_mm512_slli_epi32(                 \
-                    _mm512_cvtepu16_epi32(packed), 16)),              \
-                input_values,                                          \
-                accumulator)
+    accumulator = _mm512_fmadd_ps(                                        \
+        _mm512_castsi512_ps(_mm512_slli_epi32(                            \
+            _mm512_cvtepu16_epi32(packed), 16)),                          \
+        input_values,                                                     \
+        accumulator)
             NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator00, packed00, input0);
             NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator01, packed01, input1);
             NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator02, packed02, input2);
@@ -509,12 +508,12 @@ __attribute__((target("avx512bf16,avx512f,avx512bw"))) static float avx512bf16_p
 }
 
 __attribute__((target("avx512bf16,avx512f,avx512bw"), always_inline)) static inline void avx512bf16_linear_tile4x4(const uint16_t* weights,
-                                                                                                               const uint16_t* input,
-                                                                                                               size_t input_stride,
-                                                                                                               uint32_t input_columns,
-                                                                                                               float* output,
-                                                                                                               size_t output_stride,
-                                                                                                               size_t valid_rows) noexcept
+                                                                                                                   const uint16_t* input,
+                                                                                                                   size_t input_stride,
+                                                                                                                   uint32_t input_columns,
+                                                                                                                   float* output,
+                                                                                                                   size_t output_stride,
+                                                                                                                   size_t valid_rows) noexcept
 {
     __m512 sum00 = _mm512_setzero_ps();
     __m512 sum01 = _mm512_setzero_ps();
@@ -598,10 +597,8 @@ __attribute__((target("avx512bf16,avx512f,avx512bw"), always_inline)) static inl
     __m512 sum3 = _mm512_setzero_ps();
     for (uint32_t column = 0; column < input_columns; column += 32)
     {
-        const __m512bh input_values =
-            (__m512bh)_mm512_loadu_si512(input + column);
-        const __m512bh weight0 =
-            (__m512bh)_mm512_loadu_si512(weights + column);
+        const __m512bh input_values = (__m512bh)_mm512_loadu_si512(input + column);
+        const __m512bh weight0 = (__m512bh)_mm512_loadu_si512(weights + column);
         const __m512bh weight1 = (__m512bh)_mm512_loadu_si512(
             weights + input_columns + column);
         const __m512bh weight2 = (__m512bh)_mm512_loadu_si512(
@@ -620,19 +617,19 @@ __attribute__((target("avx512bf16,avx512f,avx512bw"), always_inline)) static inl
 }
 
 __attribute__((target("avx512bf16,avx512f,avx512bw"))) static void avx512bf16_batched_linear(const uint16_t* weights,
-                                                                                                      const float* input,
-                                                                                                      size_t input_stride,
-                                                                                                      size_t token_count,
-                                                                                                      uint32_t output_columns,
-                                                                                                      uint32_t input_columns,
-                                                                                                      float* output,
-                                                                                                      size_t output_stride,
-                                                                                                      int thread_count,
-                                                                                                      std::vector<uint16_t>& packed_input)
+                                                                                             const float* input,
+                                                                                             size_t input_stride,
+                                                                                             size_t token_count,
+                                                                                             uint32_t output_columns,
+                                                                                             uint32_t input_columns,
+                                                                                             float* output,
+                                                                                             size_t output_stride,
+                                                                                             int thread_count,
+                                                                                             std::vector<uint16_t>& packed_input)
 {
     const size_t padded_token_count = token_count == 1
-        ? size_t{1}
-        : (token_count + 3) & ~size_t{3};
+                                          ? size_t{1}
+                                          : (token_count + 3) & ~size_t{3};
     packed_input.resize(padded_token_count * input_columns);
     for (size_t token = 0; token < token_count; ++token)
     {
@@ -656,8 +653,7 @@ __attribute__((target("avx512bf16,avx512f,avx512bw"))) static void avx512bf16_ba
         for (int64_t output_group = 0; output_group < output_groups;
              ++output_group)
         {
-            const uint32_t first_output =
-                static_cast<uint32_t>(output_group) * 4;
+            const uint32_t first_output = static_cast<uint32_t>(output_group) * 4;
             avx512bf16_linear_tile1x4(
                 weights + static_cast<size_t>(first_output) * input_columns,
                 packed_input_data,
@@ -758,14 +754,14 @@ void record_bfloat16_batched_linear_dispatch() noexcept
 
 static Bfloat16BatchedLinearPolicy bfloat16_batched_linear_policy(uint64_t optimization_flags) noexcept
 {
-    if (!runtime_optimization_enabled(optimization_flags, RuntimeOptimizationCpuBfloat16Batched))
+    if (!optimization_enabled(optimization_flags, OptimizationCpuBfloat16Batched))
         return Bfloat16BatchedLinearPolicy::Disabled;
     return Bfloat16BatchedLinearPolicy::Automatic;
 }
 
 static Bfloat16DotFunction select_bfloat16_dot() noexcept
 {
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
 #if defined(__aarch64__) || defined(_M_ARM64)
     if ((isa & CpuIsaArmNeon) != 0)
         return neon_bfloat16_dot;
@@ -785,7 +781,7 @@ static Bfloat16DotFunction select_bfloat16_dot() noexcept
 
 static FloatToBfloat16Function select_float_to_bfloat16_array() noexcept
 {
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
 #if defined(__aarch64__) || defined(_M_ARM64)
     if ((isa & CpuIsaArmNeon) != 0)
         return neon_float_to_bfloat16_array;
@@ -805,7 +801,7 @@ static FloatToBfloat16Function select_float_to_bfloat16_array() noexcept
 
 static Bfloat16ScaledAddFunction select_bfloat16_scaled_add() noexcept
 {
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
 #if defined(__aarch64__) || defined(_M_ARM64)
     if ((isa & CpuIsaArmNeon) != 0)
         return neon_bfloat16_scaled_add;
@@ -854,14 +850,13 @@ void float_to_bfloat16_array(
     const float* input,
     uint32_t count) noexcept
 {
-    static const FloatToBfloat16Function function =
-        select_float_to_bfloat16_array();
+    static const FloatToBfloat16Function function = select_float_to_bfloat16_array();
     function(output, input, count);
 }
 
 bool bfloat16_pair_dot_available() noexcept
 {
-    return (detect_cpu_isa_capabilities().flags & CpuIsaX86Avx512Bf16) != 0;
+    return (cpu_isa_flags() & CpuIsaX86Avx512Bf16) != 0;
 }
 
 float bfloat16_pair_dot(
@@ -887,9 +882,9 @@ void bfloat16_scaled_add(float* output, const uint16_t* input, float scale, uint
 
 const char* bfloat16_batched_linear_kernel_name(uint64_t optimization_flags) noexcept
 {
-    if (!runtime_optimization_enabled(optimization_flags, RuntimeOptimizationCpuBfloat16Batched))
+    if (!optimization_enabled(optimization_flags, OptimizationCpuBfloat16Batched))
         return "unavailable";
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
     if ((isa & CpuIsaX86Avx512Bf16) != 0)
         return "x86-avx512-bf16-dpbf16-1x4+4x4";
@@ -934,7 +929,7 @@ bool bfloat16_batched_linear(const uint16_t* weights,
         return false;
     std::vector<uint16_t> packed_input;
 
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
     if ((isa & CpuIsaX86Avx512Bf16) != 0)
     {

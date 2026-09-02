@@ -8,7 +8,7 @@
 #include "ncnn/moe/memory_plan.h"
 #include "ncnn/moe/moe_ir.h"
 #include "ncnn/moe/result.h"
-#include "ncnn/moe/runtime_config.h"
+#include "ncnn/moe/option.h"
 #include "ncnn/moe/types.h"
 #include "ncnn/moe/vulkan_context.h"
 #include "ncnn/moe/weight_store.h"
@@ -82,57 +82,57 @@ struct CompiledModel
     HybridMode hybrid_mode = HybridMode::CpuOnly;
     uint32_t vulkan_device_index = automatic_vulkan_device_index;
     std::vector<uint32_t> vulkan_device_indices;
-    uint32_t runtime_option_flags = 0;
-    uint64_t optimization_flags = RuntimeOptimizationDefaultFlags;
-    uint32_t expected_concurrency = 1;
-    EffectiveRuntimeConfig effective_runtime_config;
+    uint32_t option_flags = 0;
+    uint64_t optimization_flags = OptimizationDefaultFlags;
+    uint32_t num_concurrent_sessions = 1;
+    EffectiveOption effective_option;
 };
 
-#define NCNN_MOE_BACKEND_CAP_CPU_BIT              0
-#define NCNN_MOE_BACKEND_CAP_VULKAN_DENSE_BIT     1
-#define NCNN_MOE_BACKEND_CAP_VULKAN_ATTN_BIT      2
-#define NCNN_MOE_BACKEND_CAP_MXFP4_CPU_BIT        3
-#define NCNN_MOE_BACKEND_CAP_RETAIN_CPU_DENSE_BIT 4
-#define NCNN_MOE_BACKEND_CAP_RELEASE_DENSE_BIT     5
-#define NCNN_MOE_BACKEND_CAP_VULKAN_EXPERT_BIT     6
-#define NCNN_MOE_BACKEND_CAP_FILE_EXPERT_BIT       7
+#define NCNN_MOE_COMPILER_BACKEND_CPU_BIT              0
+#define NCNN_MOE_COMPILER_BACKEND_VULKAN_DENSE_BIT     1
+#define NCNN_MOE_COMPILER_BACKEND_VULKAN_ATTN_BIT      2
+#define NCNN_MOE_COMPILER_BACKEND_MXFP4_CPU_BIT        3
+#define NCNN_MOE_COMPILER_BACKEND_RETAIN_CPU_DENSE_BIT 4
+#define NCNN_MOE_COMPILER_BACKEND_RELEASE_DENSE_BIT    5
+#define NCNN_MOE_COMPILER_BACKEND_VULKAN_EXPERT_BIT    6
+#define NCNN_MOE_COMPILER_BACKEND_FILE_EXPERT_BIT      7
 
 class ModelCompiler
 {
 public:
-    enum BackendCapabilityFlag : uint32_t
+    enum BackendFlag : uint32_t
     {
-        BackendCapabilityCpuExecution = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_CPU_BIT,
-        BackendCapabilityVulkanDense = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_VULKAN_DENSE_BIT,
-        BackendCapabilityVulkanAttention = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_VULKAN_ATTN_BIT,
-        BackendCapabilityMxfp4CpuKernel = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_MXFP4_CPU_BIT,
-        BackendCapabilityRetainCpuDenseCopies = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_RETAIN_CPU_DENSE_BIT,
-        BackendCapabilityReleaseVulkanDenseHostStorage = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_RELEASE_DENSE_BIT,
-        BackendCapabilityVulkanExperts = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_VULKAN_EXPERT_BIT,
-        BackendCapabilityFileBackedExperts = UINT32_C(1) << NCNN_MOE_BACKEND_CAP_FILE_EXPERT_BIT
+        BackendCpuExecution = UINT32_C(1) << NCNN_MOE_COMPILER_BACKEND_CPU_BIT,
+        BackendVulkanDense = UINT32_C(1) << NCNN_MOE_COMPILER_BACKEND_VULKAN_DENSE_BIT,
+        BackendVulkanAttention = UINT32_C(1) << NCNN_MOE_COMPILER_BACKEND_VULKAN_ATTN_BIT,
+        BackendMxfp4CpuKernel = UINT32_C(1) << NCNN_MOE_COMPILER_BACKEND_MXFP4_CPU_BIT,
+        BackendRetainCpuDenseCopies = UINT32_C(1) << NCNN_MOE_COMPILER_BACKEND_RETAIN_CPU_DENSE_BIT,
+        BackendReleaseVulkanDenseHostStorage = UINT32_C(1) << NCNN_MOE_COMPILER_BACKEND_RELEASE_DENSE_BIT,
+        BackendVulkanExperts = UINT32_C(1) << NCNN_MOE_COMPILER_BACKEND_VULKAN_EXPERT_BIT,
+        BackendFileBackedExperts = UINT32_C(1) << NCNN_MOE_COMPILER_BACKEND_FILE_EXPERT_BIT
     };
 
     struct BackendCapabilities
     {
-        uint32_t flags = BackendCapabilityCpuExecution | BackendCapabilityMxfp4CpuKernel | BackendCapabilityRetainCpuDenseCopies;
-        uint32_t cpu_parallelism = 1;
-        uint32_t vulkan_queue_count = 0;
-        uint32_t vulkan_device_index = automatic_vulkan_device_index;
-        uint32_t expected_concurrency = 1;
+        uint32_t flags = BackendCpuExecution | BackendMxfp4CpuKernel | BackendRetainCpuDenseCopies;
+        uint32_t num_threads = 1;
+        uint32_t compute_queue_count = 0;
+        uint32_t device_index = automatic_vulkan_device_index;
+        uint32_t num_concurrent_sessions = 1;
         // Total heap budget available to the selected Vulkan placement.  The
         // compiler uses this as a conservative admission limit for optional
         // persistent GPU attention state; zero means that no budget-based
         // promotion should be attempted.
-        uint64_t vulkan_heap_budget_bytes = 0;
-        uint64_t optimization_flags = RuntimeOptimizationDefaultFlags;
-        NcnnVulkanContextInstancePtr vulkan_context_instance;
-        std::vector<uint32_t> vulkan_device_indices;
-        std::vector<uint32_t> vulkan_device_scores;
+        uint64_t gpu_heap_budget = 0;
+        uint64_t optimization_flags = OptimizationDefaultFlags;
+        NcnnVulkanContextInstancePtr vkctx;
+        std::vector<uint32_t> device_indices;
+        std::vector<uint32_t> device_scores;
     };
 
     [[nodiscard]] Result<CompiledModel> compile(MoeIR ir, WeightMapping mapping, HybridMode hybrid_mode = HybridMode::CpuOnly) const;
 
-    [[nodiscard]] Result<CompiledModel> compile(MoeIR ir, WeightMapping mapping, HybridMode hybrid_mode, const BackendCapabilities& capabilities) const;
+    [[nodiscard]] Result<CompiledModel> compile(MoeIR ir, WeightMapping mapping, HybridMode hybrid_mode, const BackendCapabilities& caps) const;
 };
 
 using MoeCompiler = ModelCompiler;

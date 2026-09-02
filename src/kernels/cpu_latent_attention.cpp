@@ -6,7 +6,7 @@
 #include "cpu_ops.h"
 #include "cpu_vector.h"
 #include "engine/cpu_session_state.h"
-#include "ncnn/moe/runtime_config.h"
+#include "ncnn/moe/option.h"
 
 #include <algorithm>
 #include <array>
@@ -209,27 +209,27 @@ static void apply_rope(float* values, uint32_t dimension, uint64_t position, con
 
 static bool prepared_latent_rope_enabled(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(optimization_flags,
-                                        RuntimeOptimizationCpuLatentPreparedRope);
+    return optimization_enabled(optimization_flags,
+                                OptimizationCpuLatentPreparedRope);
 }
 
 static bool simd_latent_norm_enabled(uint64_t optimization_flags) noexcept
 {
     return simd_rms_norm_enabled(optimization_flags)
-           && runtime_optimization_enabled(optimization_flags,
-                                           RuntimeOptimizationCpuLatentSimdNorm);
+           && optimization_enabled(optimization_flags,
+                                   OptimizationCpuLatentSimdNorm);
 }
 
 static bool online_latent_softmax_enabled(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(optimization_flags,
-                                        RuntimeOptimizationCpuLatentOnlineSoftmax);
+    return optimization_enabled(optimization_flags,
+                                OptimizationCpuLatentOnlineSoftmax);
 }
 
 static bool vector_latent_softmax_enabled(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(optimization_flags,
-                                        RuntimeOptimizationCpuLatentVectorSoftmax)
+    return optimization_enabled(optimization_flags,
+                                OptimizationCpuLatentVectorSoftmax)
            && float_exp_simd_available();
 }
 
@@ -237,8 +237,8 @@ static constexpr uint32_t vector_latent_softmax_min_candidates = 64;
 
 static bool parallel_latent_output_groups_enabled(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(optimization_flags,
-                                        RuntimeOptimizationCpuLatentOutputGroups);
+    return optimization_enabled(optimization_flags,
+                                OptimizationCpuLatentOutputGroups);
 }
 
 static void prepare_rope_coefficients(
@@ -461,8 +461,8 @@ static bool vulkan_latent_compressor_enabled(
     uint64_t optimization_flags) noexcept
 {
     return backend == ExecutionBackend::Vulkan
-           && runtime_optimization_enabled(optimization_flags,
-                                           RuntimeOptimizationVulkanLatentCompressor);
+           && optimization_enabled(optimization_flags,
+                                   OptimizationVulkanLatentCompressor);
 }
 
 static void append_compressed_value(
@@ -716,12 +716,12 @@ static int latent_output_group_team_size(
     if (!parallel_latent_output_groups_enabled(optimization_flags)
         || operations < 1024 * 1024)
         return 1;
-    const uint32_t maximum = float8_linear_thread_limit();
+    const uint32_t maximum = float8_linear_num_threads();
     return std::max(
         1,
         std::min({static_cast<int>(maximum),
                   static_cast<int>(row_count * group_count),
-                  static_cast<int>(cpu_linear_thread_limit())}));
+                  static_cast<int>(cpu_linear_num_threads())}));
 #else
     (void)row_count;
     (void)group_count;
@@ -867,8 +867,8 @@ static Result<CpuBatch> execute_latent_attention_rows(
             else
             {
                 if (plan.compression_ratio == 0
-                    && runtime_optimization_enabled(optimization_flags,
-                                                    RuntimeOptimizationVulkanLatentInputRmsNorm))
+                    && optimization_enabled(optimization_flags,
+                                            OptimizationVulkanLatentInputRmsNorm))
                 {
                     chained_query = query_a_operator.float8->forward_input_rms_norm_chain_parallel(
                         input,
@@ -905,8 +905,8 @@ static Result<CpuBatch> execute_latent_attention_rows(
     }
     if (!chained_query
         && backend == ExecutionBackend::Vulkan
-        && runtime_optimization_enabled(optimization_flags,
-                                        RuntimeOptimizationVulkanCommandGraph)
+        && optimization_enabled(optimization_flags,
+                                OptimizationVulkanCommandGraph)
         && query_rank_not_required
         && query_a_operator.linear
         && query_b_operator.linear
@@ -1193,7 +1193,7 @@ static Result<CpuBatch> execute_latent_attention_rows(
                     denominator *= rescale;
                     maximum = score;
                 }
-                    const float weight = float_approximate_exp(score - maximum);
+                const float weight = float_approximate_exp(score - maximum);
                 denominator += weight;
                 float_scaled_add(
                     output_head, candidate_key, weight,
@@ -1320,7 +1320,7 @@ static Result<CpuBatch> execute_latent_attention_rows(
             prepare_attention_row(row_index);
         const int64_t task_count = static_cast<int64_t>(input.rows()) * plan.head_count;
 #if defined(_OPENMP)
-        const int attention_team_size = std::max(1, std::min(static_cast<int>(task_count), static_cast<int>(cpu_linear_thread_limit())));
+        const int attention_team_size = std::max(1, std::min(static_cast<int>(task_count), static_cast<int>(cpu_linear_num_threads())));
 #pragma omp parallel for schedule(static) num_threads(attention_team_size) if (attention_team_size > 1)
 #endif
         for (int64_t task = 0; task < task_count; ++task)
@@ -1506,8 +1506,8 @@ Result<CpuBatch> execute_dspark_attention(
     {
         if (key_value_operator.float8)
         {
-            if (runtime_optimization_enabled(optimization_flags,
-                                             RuntimeOptimizationVulkanLatentInputRmsNorm))
+            if (optimization_enabled(optimization_flags,
+                                     OptimizationVulkanLatentInputRmsNorm))
             {
                 chained_query = query_a_operator.float8->forward_input_rms_norm_chain_parallel(
                     input,

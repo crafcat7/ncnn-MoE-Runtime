@@ -111,7 +111,7 @@ struct SchedulerStatistics
     bool automatic_topology_affinity = false;
     uint32_t worker_count = 0;
     uint32_t expert_threads_per_worker = 0;
-    uint32_t logical_cpu_count = 0;
+    uint32_t cpu_count = 0;
     uint32_t physical_cpu_count = 0;
     uint32_t reserved_io_threads = 0;
     uint32_t reserved_service_threads = 0;

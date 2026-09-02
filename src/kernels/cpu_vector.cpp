@@ -363,7 +363,7 @@ static void scalar_float_silu_inplace(float* values, uint32_t count) noexcept
 static FloatDotFunction select_float_dot() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_dot;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -375,7 +375,7 @@ static FloatDotFunction select_float_dot() noexcept
 static FloatExpInplaceFunction select_float_exp_inplace() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_exp_inplace;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -387,7 +387,7 @@ static FloatExpInplaceFunction select_float_exp_inplace() noexcept
 static Int8FloatDotFunction select_int8_float_dot() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_int8_float_dot;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -399,7 +399,7 @@ static Int8FloatDotFunction select_int8_float_dot() noexcept
 static FloatScaledAddFunction select_float_scaled_add() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_scaled_add;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -411,7 +411,7 @@ static FloatScaledAddFunction select_float_scaled_add() noexcept
 static FloatScaleFunction select_float_scale() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_scale_inplace;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -423,7 +423,7 @@ static FloatScaleFunction select_float_scale() noexcept
 static FloatScaleAddFunction select_float_scale_add() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_scale_add;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -435,7 +435,7 @@ static FloatScaleAddFunction select_float_scale_add() noexcept
 static FloatScaleInplaceAndScaledAddFunction select_float_scale_inplace_and_scaled_add() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_scale_inplace_and_scaled_add;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -448,7 +448,7 @@ static FloatScaleInplaceAndScaledAddAndAccumulateFunction
 select_float_scale_inplace_and_scaled_add_and_accumulate() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_scale_inplace_and_scaled_add_and_accumulate;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -460,7 +460,7 @@ select_float_scale_inplace_and_scaled_add_and_accumulate() noexcept
 static FloatWeightedScaleFunction select_float_weighted_scale() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_weighted_scale;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -472,7 +472,7 @@ static FloatWeightedScaleFunction select_float_weighted_scale() noexcept
 static Bfloat16WeightedScaleFunction select_bfloat16_weighted_scale() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_bfloat16_weighted_scale;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -484,7 +484,7 @@ static Bfloat16WeightedScaleFunction select_bfloat16_weighted_scale() noexcept
 static FloatRmsScaleFunction select_float_rms_scale() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_rms_scale_inplace;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -496,7 +496,7 @@ static FloatRmsScaleFunction select_float_rms_scale() noexcept
 static FloatL2ScaleFunction select_float_l2_scale() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_l2_scale_inplace;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -508,7 +508,7 @@ static FloatL2ScaleFunction select_float_l2_scale() noexcept
 static FloatRmsNormFunction select_float_rms_norm() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_rms_norm;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -520,7 +520,7 @@ static FloatRmsNormFunction select_float_rms_norm() noexcept
 static Bfloat16RmsNormFunction select_bfloat16_rms_norm() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_bfloat16_rms_norm;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -532,7 +532,7 @@ static Bfloat16RmsNormFunction select_bfloat16_rms_norm() noexcept
 static FloatRopeFunction select_float_rope() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_rope_inplace;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -544,7 +544,7 @@ static FloatRopeFunction select_float_rope() noexcept
 static FloatHcPre4Function select_float_hc_pre_4() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_hc_pre_4;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -556,7 +556,7 @@ static FloatHcPre4Function select_float_hc_pre_4() noexcept
 static FloatHcPost4Function select_float_hc_post_4() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_hc_post_4;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -572,7 +572,7 @@ using FloatSiluInplaceFunction = void (*)(float*, uint32_t) noexcept;
 static FloatSigmoidMulFunction select_float_sigmoid_mul() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_sigmoid_mul;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -584,7 +584,7 @@ static FloatSigmoidMulFunction select_float_sigmoid_mul() noexcept
 static FloatSiluMulFunction select_float_silu_mul() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_silu_mul;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -596,7 +596,7 @@ static FloatSiluMulFunction select_float_silu_mul() noexcept
 static FloatSiluInplaceFunction select_float_silu_inplace() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_silu_inplace;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
@@ -623,7 +623,7 @@ void float_gemm_4x4(
     size_t output_stride) noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
     {
         msvc_avx512_float_gemm_4x4(
@@ -677,7 +677,7 @@ void float_gemm_4x8(
     size_t output_stride) noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
     {
         msvc_avx512_float_gemm_4x8(
@@ -710,7 +710,7 @@ void bfloat16_gemm_4x8(
     size_t output_stride) noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
     {
         msvc_avx512_bfloat16_gemm_4x8(

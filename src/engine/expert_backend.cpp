@@ -34,14 +34,14 @@ static void add_statistics(ExpertBackendStatistics& destination, const ExpertBac
     NCNN_MOE_ADD_EXPERT_STATISTIC(execution_failures);
     NCNN_MOE_ADD_EXPERT_STATISTIC(cpu_preferred);
     NCNN_MOE_ADD_EXPERT_STATISTIC(bytes_uploaded);
-    NCNN_MOE_ADD_EXPERT_STATISTIC(resident_bytes);
-    NCNN_MOE_ADD_EXPERT_STATISTIC(pending_bytes);
+    NCNN_MOE_ADD_EXPERT_STATISTIC(resident_size);
+    NCNN_MOE_ADD_EXPERT_STATISTIC(pending_size);
     NCNN_MOE_ADD_EXPERT_STATISTIC(execution_time_microseconds);
-    NCNN_MOE_ADD_EXPERT_STATISTIC(arc_recent_bytes);
-    NCNN_MOE_ADD_EXPERT_STATISTIC(arc_frequent_bytes);
-    NCNN_MOE_ADD_EXPERT_STATISTIC(arc_recent_target_bytes);
-    NCNN_MOE_ADD_EXPERT_STATISTIC(arc_recent_ghost_bytes);
-    NCNN_MOE_ADD_EXPERT_STATISTIC(arc_frequent_ghost_bytes);
+    NCNN_MOE_ADD_EXPERT_STATISTIC(arc_recent_size);
+    NCNN_MOE_ADD_EXPERT_STATISTIC(arc_frequent_size);
+    NCNN_MOE_ADD_EXPERT_STATISTIC(arc_recent_target_size);
+    NCNN_MOE_ADD_EXPERT_STATISTIC(arc_recent_ghost_size);
+    NCNN_MOE_ADD_EXPERT_STATISTIC(arc_frequent_ghost_size);
     NCNN_MOE_ADD_EXPERT_STATISTIC(device_source_hits);
     NCNN_MOE_ADD_EXPERT_STATISTIC(device_source_misses);
     NCNN_MOE_ADD_EXPERT_STATISTIC(device_source_executions);
@@ -55,29 +55,29 @@ static void add_statistics(ExpertBackendStatistics& destination, const ExpertBac
 class MultiDeviceExpertBackend final : public IExpertExecutionBackend
 {
 public:
-    MultiDeviceExpertBackend(std::vector<std::shared_ptr<IExpertExecutionBackend>> backends, std::vector<uint32_t> device_indices, std::vector<uint32_t> residency_group_devices, bool key_sharded)
-        : backends_(std::move(backends)),
-          device_indices_(std::move(device_indices)),
-          residency_group_devices_(std::move(residency_group_devices)),
-          key_sharded_(key_sharded)
+    MultiDeviceExpertBackend(std::vector<std::shared_ptr<IExpertExecutionBackend>> _backends, std::vector<uint32_t> _device_indices, std::vector<uint32_t> _residency_group_devices, bool _key_sharded)
+        : backends(std::move(_backends)),
+          device_indices(std::move(_device_indices)),
+          residency_group_devices(std::move(_residency_group_devices)),
+          key_sharded(_key_sharded)
     {
-        for (size_t index = 0; index < device_indices_.size(); ++index)
+        for (size_t index = 0; index < device_indices.size(); ++index)
         {
-            device_to_backend_.emplace(device_indices_[index], index);
+            device_to_backend.emplace(device_indices[index], index);
         }
     }
 
     void admit(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group, uint32_t token_count,
                float activation_limit, ExpertActivation activation) override
     {
-        if (backends_.empty() || key.empty())
+        if (backends.empty() || key.empty())
             return;
-        const size_t backend_index = key_sharded_ ? fallback_backend(key) : backend_for_group(residency_group);
+        const size_t backend_index = key_sharded ? fallback_backend(key) : backend_for_group(residency_group);
         {
-            const std::lock_guard<std::mutex> lock(placement_mutex_);
-            key_placements_.insert_or_assign(key, backend_index);
+            const std::lock_guard<std::mutex> lock(placement_mutex);
+            key_placements.insert_or_assign(key, backend_index);
         }
-        backends_[backend_index]->admit(
+        backends[backend_index]->admit(
             std::move(key),
             std::move(gate_up),
             gate_up_bias,
@@ -91,15 +91,15 @@ public:
 
     ExpertBackendExecutionResult try_execute(const std::string& key, const ActivationBuffer& input, ActivationBuffer& output) override
     {
-        if (backends_.empty())
+        if (backends.empty())
             return ExpertBackendExecutionResult::Failed;
-        return backends_[backend_for_key(key)]->try_execute(key, input, output);
+        return backends[backend_for_key(key)]->try_execute(key, input, output);
     }
 
     std::vector<ExpertBackendExecutionResult> try_execute_batch(std::span<const ExpertBackendRequest> requests) override
     {
-        if (backends_.size() == 1)
-            return backends_.front()->try_execute_batch(requests);
+        if (backends.size() == 1)
+            return backends.front()->try_execute_batch(requests);
         auto submission = submit_batch(requests);
         if (!submission)
             return std::vector<ExpertBackendExecutionResult>(requests.size(), ExpertBackendExecutionResult::Failed);
@@ -141,24 +141,24 @@ public:
 
     std::unique_ptr<IExpertBackendBatchSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) override
     {
-        std::vector<std::vector<size_t>> request_indices(backends_.size());
+        std::vector<std::vector<size_t>> request_indices(backends.size());
         {
-            const std::lock_guard<std::mutex> lock(placement_mutex_);
+            const std::lock_guard<std::mutex> lock(placement_mutex);
             for (size_t request_index = 0; request_index < requests.size(); ++request_index)
             {
-                const auto placed = key_placements_.find(requests[request_index].key);
-                const size_t backend_index = placed == key_placements_.end() ? fallback_backend(requests[request_index].key) : placed->second;
+                const auto placed = key_placements.find(requests[request_index].key);
+                const size_t backend_index = placed == key_placements.end() ? fallback_backend(requests[request_index].key) : placed->second;
                 request_indices[backend_index].push_back(request_index);
             }
         }
         return std::make_unique<Submission>(this, requests, std::move(request_indices));
     }
 
-    void observe_cpu(uint32_t token_count, uint64_t weight_bytes, uint64_t elapsed_microseconds) override
+    void observe_cpu(uint32_t token_count, uint64_t weight_size, uint64_t elapsed_microseconds) override
     {
-        for (const auto& backend : backends_)
+        for (const auto& backend : backends)
         {
-            backend->observe_cpu(token_count, weight_bytes, elapsed_microseconds);
+            backend->observe_cpu(token_count, weight_size, elapsed_microseconds);
         }
     }
 
@@ -166,7 +166,7 @@ public:
     {
         if (accelerated_weight_bytes == 0)
         {
-            for (const auto& backend : backends_)
+            for (const auto& backend : backends)
             {
                 backend->observe_phase(token_count, total_weight_bytes, 0, elapsed_microseconds);
             }
@@ -174,37 +174,37 @@ public:
         }
         std::vector<uint64_t> observation;
         {
-            const std::lock_guard<std::mutex> lock(phase_mutex_);
-            if (pending_accelerated_bytes_.empty())
+            const std::lock_guard<std::mutex> lock(phase_mutex);
+            if (pending_accelerated_bytes.empty())
                 return;
-            observation = std::move(pending_accelerated_bytes_.front());
-            pending_accelerated_bytes_.pop_front();
+            observation = std::move(pending_accelerated_bytes.front());
+            pending_accelerated_bytes.pop_front();
         }
-        for (size_t backend_index = 0; backend_index < backends_.size(); ++backend_index)
+        for (size_t backend_index = 0; backend_index < backends.size(); ++backend_index)
         {
             const uint64_t bytes = backend_index < observation.size() ? observation[backend_index] : 0;
             if (bytes == 0)
                 continue;
-            backends_[backend_index]->observe_phase(token_count, total_weight_bytes, bytes, elapsed_microseconds);
+            backends[backend_index]->observe_phase(token_count, total_weight_bytes, bytes, elapsed_microseconds);
         }
     }
 
     void set_foreground_active(bool active) noexcept override
     {
-        for (const auto& backend : backends_)
+        for (const auto& backend : backends)
             backend->set_foreground_active(active);
     }
 
     void wait_for_background_work() override
     {
-        for (const auto& backend : backends_)
+        for (const auto& backend : backends)
             backend->wait_for_background_work();
     }
 
     ExpertBackendStatistics statistics() const override
     {
         ExpertBackendStatistics aggregate;
-        for (const auto& backend : backends_)
+        for (const auto& backend : backends)
             add_statistics(aggregate, backend->statistics());
         return aggregate;
     }
@@ -212,13 +212,13 @@ public:
     std::vector<ExpertBackendDeviceStatistics> device_statistics() const override
     {
         std::vector<ExpertBackendDeviceStatistics> result;
-        result.reserve(backends_.size());
-        for (size_t backend_index = 0; backend_index < backends_.size(); ++backend_index)
+        result.reserve(backends.size());
+        for (size_t backend_index = 0; backend_index < backends.size(); ++backend_index)
         {
-            std::vector<ExpertBackendDeviceStatistics> child = backends_[backend_index]->device_statistics();
+            std::vector<ExpertBackendDeviceStatistics> child = backends[backend_index]->device_statistics();
             if (child.empty())
             {
-                result.push_back({device_indices_[backend_index], backends_[backend_index]->capacity_bytes(), backends_[backend_index]->statistics()});
+                result.push_back({device_indices[backend_index], backends[backend_index]->capacity(), backends[backend_index]->statistics()});
             }
             else
             {
@@ -228,26 +228,26 @@ public:
         return result;
     }
 
-    uint64_t capacity_bytes() const noexcept override
+    uint64_t capacity() const noexcept override
     {
-        uint64_t capacity = 0;
-        for (const auto& backend : backends_)
-            capacity += backend->capacity_bytes();
-        return capacity;
+        uint64_t total_size = 0;
+        for (const auto& backend : backends)
+            total_size += backend->capacity();
+        return total_size;
     }
 
 private:
     size_t backend_for_key(std::string_view key) const
     {
-        const std::lock_guard<std::mutex> lock(placement_mutex_);
-        const auto placed = key_placements_.find(key);
-        return placed == key_placements_.end() ? fallback_backend(key) : placed->second;
+        const std::lock_guard<std::mutex> lock(placement_mutex);
+        const auto placed = key_placements.find(key);
+        return placed == key_placements.end() ? fallback_backend(key) : placed->second;
     }
 
-    void publish_accelerated_bytes(std::vector<uint64_t> bytes)
+    void publish_accelerated_bytes(std::vector<uint64_t> values)
     {
-        const std::lock_guard<std::mutex> lock(phase_mutex_);
-        pending_accelerated_bytes_.push_back(std::move(bytes));
+        const std::lock_guard<std::mutex> lock(phase_mutex);
+        pending_accelerated_bytes.push_back(std::move(values));
     }
 
     struct ChildSubmission
@@ -261,16 +261,16 @@ private:
     class Submission final : public IExpertBackendBatchSubmission
     {
     public:
-        Submission(MultiDeviceExpertBackend* owner, std::span<const ExpertBackendRequest> requests, std::vector<std::vector<size_t>> request_indices)
-            : owner_(owner),
-              client_requests_(requests.begin(), requests.end()),
-              private_outputs_(requests.size()),
-              planned_(requests.size(), ExpertBackendExecutionResult ::NotResident),
-              final_(planned_),
-              accelerated_bytes_(owner->backends_.size(), 0)
+        Submission(MultiDeviceExpertBackend* _owner, std::span<const ExpertBackendRequest> requests, std::vector<std::vector<size_t>> request_indices)
+            : owner(_owner),
+              client_requests(requests.begin(), requests.end()),
+              private_outputs(requests.size()),
+              planned(requests.size(), ExpertBackendExecutionResult ::NotResident),
+              final(planned),
+              accelerated_bytes(owner->backends.size(), 0)
         {
-            children_.reserve(owner->backends_.size());
-            for (size_t backend_index = 0; backend_index < owner->backends_.size(); ++backend_index)
+            children.reserve(owner->backends.size());
+            for (size_t backend_index = 0; backend_index < owner->backends.size(); ++backend_index)
             {
                 if (request_indices[backend_index].empty())
                 {
@@ -282,12 +282,12 @@ private:
                 for (size_t request_index : child.request_indices)
                 {
                     ExpertBackendRequest child_request = requests[request_index];
-                    child_request.output = &private_outputs_[request_index];
+                    child_request.output = &private_outputs[request_index];
                     // Let the framework combine multi-device outputs on CPU.
                     child_request.route_aggregation = {};
                     child.requests.push_back(child_request);
                 }
-                child.submission = owner->backends_[backend_index]->submit_batch(child.requests);
+                child.submission = owner->backends[backend_index]->submit_batch(child.requests);
                 if (child.submission)
                 {
                     const auto child_planned = child.submission->reservations();
@@ -296,46 +296,46 @@ private:
                     {
                         child.submission->abort();
                         for (const size_t request_index : child.request_indices)
-                            planned_[request_index] = ExpertBackendExecutionResult ::Failed;
+                            planned[request_index] = ExpertBackendExecutionResult ::Failed;
                     }
                     else
                     {
                         for (size_t index = 0; index < child_planned.size(); ++index)
                         {
-                            planned_[child.request_indices[index]] = child_planned[index];
+                            planned[child.request_indices[index]] = child_planned[index];
                         }
                     }
                 }
-                children_.push_back(std::move(child));
-                child_backend_indices_.push_back(backend_index);
+                children.push_back(std::move(child));
+                child_backend_indices.push_back(backend_index);
             }
-            final_ = planned_;
+            final = planned;
         }
 
         ~Submission() override
         {
-            if (!waited_)
+            if (!waited)
                 (void)wait();
-            if (!committed_ && !aborted_)
+            if (!committed && !aborted)
                 abort();
         }
 
         std::span<const ExpertBackendExecutionResult> reservations() const noexcept override
         {
-            return planned_;
+            return planned;
         }
 
         std::vector<ExpertBackendExecutionResult> wait() override
         {
-            if (waited_)
-                return final_;
-            for (size_t child_index = 0; child_index < children_.size(); ++child_index)
+            if (waited)
+                return final;
+            for (size_t child_index = 0; child_index < children.size(); ++child_index)
             {
-                ChildSubmission& child = children_[child_index];
+                ChildSubmission& child = children[child_index];
                 if (!child.submission)
                     continue;
                 const auto child_final = child.submission->wait();
-                const size_t backend_index = child_backend_indices_[child_index];
+                const size_t backend_index = child_backend_indices[child_index];
                 bool result_shape_valid = child.reservation_shape_valid && child_final.size() == child.request_indices.size();
                 if (result_shape_valid)
                 {
@@ -343,7 +343,7 @@ private:
                     {
                         const size_t request_index = child.request_indices[index];
                         if (child_final[index] == ExpertBackendExecutionResult ::Executed
-                            && planned_[request_index] != ExpertBackendExecutionResult::Executed)
+                            && planned[request_index] != ExpertBackendExecutionResult::Executed)
                         {
                             result_shape_valid = false;
                             break;
@@ -354,47 +354,47 @@ private:
                 {
                     child.submission->abort();
                     for (const size_t request_index : child.request_indices)
-                        final_[request_index] = ExpertBackendExecutionResult ::Failed;
+                        final[request_index] = ExpertBackendExecutionResult ::Failed;
                     continue;
                 }
                 for (size_t index = 0; index < child_final.size(); ++index)
                 {
                     const size_t request_index = child.request_indices[index];
-                    final_[request_index] = child_final[index];
+                    final[request_index] = child_final[index];
                     if (child_final[index] == ExpertBackendExecutionResult ::Executed)
                     {
-                        accelerated_bytes_[backend_index] += child.requests[index].weight_bytes;
+                        accelerated_bytes[backend_index] += child.requests[index].weight_size;
                     }
                 }
             }
-            waited_ = true;
-            return final_;
+            waited = true;
+            return final;
         }
 
         bool commit() override
         {
-            if (!waited_)
+            if (!waited)
                 (void)wait();
-            if (committed_ || aborted_)
-                return committed_;
-            for (size_t index = 0; index < final_.size(); ++index)
+            if (committed || aborted)
+                return committed;
+            for (size_t index = 0; index < final.size(); ++index)
             {
-                if (final_[index] != ExpertBackendExecutionResult::Executed)
+                if (final[index] != ExpertBackendExecutionResult::Executed)
                     continue;
-                if (!client_requests_[index].output)
+                if (!client_requests[index].output)
                 {
                     abort();
                     return false;
                 }
             }
-            for (ChildSubmission& child : children_)
+            for (ChildSubmission& child : children)
             {
                 if (child.submission)
                 {
                     bool child_has_executed = false;
                     for (const size_t request_index : child.request_indices)
                     {
-                        child_has_executed = child_has_executed || final_[request_index] == ExpertBackendExecutionResult::Executed;
+                        child_has_executed = child_has_executed || final[request_index] == ExpertBackendExecutionResult::Executed;
                     }
                     if (child_has_executed && !child.submission->commit())
                     {
@@ -405,22 +405,22 @@ private:
                         child.submission->abort();
                 }
             }
-            for (size_t index = 0; index < final_.size(); ++index)
+            for (size_t index = 0; index < final.size(); ++index)
             {
-                if (final_[index] == ExpertBackendExecutionResult::Executed)
-                    client_requests_[index].output->swap(private_outputs_[index]);
+                if (final[index] == ExpertBackendExecutionResult::Executed)
+                    client_requests[index].output->swap(private_outputs[index]);
             }
-            committed_ = true;
-            owner_->publish_accelerated_bytes(std::move(accelerated_bytes_));
+            committed = true;
+            owner->publish_accelerated_bytes(std::move(accelerated_bytes));
             return true;
         }
 
         void abort() noexcept override
         {
-            if (committed_ || aborted_)
+            if (committed || aborted)
                 return;
-            aborted_ = true;
-            for (ChildSubmission& child : children_)
+            aborted = true;
+            for (ChildSubmission& child : children)
             {
                 if (child.submission)
                     child.submission->abort();
@@ -428,46 +428,46 @@ private:
         }
 
     private:
-        MultiDeviceExpertBackend* owner_;
-        std::vector<ExpertBackendRequest> client_requests_;
-        std::vector<ActivationBuffer> private_outputs_;
-        std::vector<ChildSubmission> children_;
-        std::vector<size_t> child_backend_indices_;
-        std::vector<ExpertBackendExecutionResult> planned_;
-        std::vector<ExpertBackendExecutionResult> final_;
-        std::vector<uint64_t> accelerated_bytes_;
-        bool waited_ = false;
-        bool committed_ = false;
-        bool aborted_ = false;
+        MultiDeviceExpertBackend* owner;
+        std::vector<ExpertBackendRequest> client_requests;
+        std::vector<ActivationBuffer> private_outputs;
+        std::vector<ChildSubmission> children;
+        std::vector<size_t> child_backend_indices;
+        std::vector<ExpertBackendExecutionResult> planned;
+        std::vector<ExpertBackendExecutionResult> final;
+        std::vector<uint64_t> accelerated_bytes;
+        bool waited = false;
+        bool committed = false;
+        bool aborted = false;
     };
 
     size_t backend_for_group(uint32_t residency_group) const
     {
-        if (residency_group < residency_group_devices_.size())
+        if (residency_group < residency_group_devices.size())
         {
-            const auto backend = device_to_backend_.find(residency_group_devices_[residency_group]);
-            if (backend != device_to_backend_.end())
+            const auto backend = device_to_backend.find(residency_group_devices[residency_group]);
+            if (backend != device_to_backend.end())
             {
                 return backend->second;
             }
         }
-        return static_cast<size_t>(residency_group) % backends_.size();
+        return static_cast<size_t>(residency_group) % backends.size();
     }
 
     size_t fallback_backend(std::string_view key) const
     {
-        return std::hash<std::string_view>{}(key) % backends_.size();
+        return std::hash<std::string_view>{}(key) % backends.size();
     }
 
-    std::vector<std::shared_ptr<IExpertExecutionBackend>> backends_;
-    std::vector<uint32_t> device_indices_;
-    std::vector<uint32_t> residency_group_devices_;
-    std::unordered_map<uint32_t, size_t> device_to_backend_;
-    mutable std::mutex placement_mutex_;
-    std::unordered_map<std::string, size_t, ExpertBackendTransparentStringHash, std::equal_to<>> key_placements_;
-    bool key_sharded_ = false;
-    mutable std::mutex phase_mutex_;
-    std::deque<std::vector<uint64_t>> pending_accelerated_bytes_;
+    std::vector<std::shared_ptr<IExpertExecutionBackend>> backends;
+    std::vector<uint32_t> device_indices;
+    std::vector<uint32_t> residency_group_devices;
+    std::unordered_map<uint32_t, size_t> device_to_backend;
+    mutable std::mutex placement_mutex;
+    std::unordered_map<std::string, size_t, ExpertBackendTransparentStringHash, std::equal_to<>> key_placements;
+    bool key_sharded = false;
+    mutable std::mutex phase_mutex;
+    std::deque<std::vector<uint64_t>> pending_accelerated_bytes;
 };
 
 std::shared_ptr<IExpertExecutionBackend> create_multi_device_expert_backend(std::vector<std::shared_ptr<IExpertExecutionBackend>> backends, std::vector<uint32_t> device_indices, std::vector<uint32_t> residency_group_devices)

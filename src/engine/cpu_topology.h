@@ -12,7 +12,7 @@ struct CpuTopology
 {
     std::vector<uint32_t> allowed_cpus;
     std::vector<std::vector<uint32_t>> numa_nodes;
-    uint32_t physical_core_count = 0;
+    uint32_t physical_cpu_count = 0;
 };
 
 [[nodiscard]] std::vector<uint32_t> parse_linux_cpu_list(std::string_view value);

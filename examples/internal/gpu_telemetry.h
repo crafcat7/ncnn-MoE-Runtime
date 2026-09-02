@@ -2,7 +2,7 @@
 #define NCNN_MOE_GPU_TELEMETRY_H
 
 #include "ncnn/moe/runtime.h"
-#include "ncnn/moe/runtime_config.h"
+#include "ncnn/moe/option.h"
 
 #include <cstdint>
 #include <memory>
@@ -33,10 +33,10 @@ class GpuTelemetrySampler
 {
 private:
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    std::unique_ptr<Impl> d;
 
 public:
-    GpuTelemetrySampler(const RuntimeCapabilities& capabilities, const EffectiveRuntimeConfig& effective);
+    GpuTelemetrySampler(const RuntimeInfo& info, const EffectiveOption& opt);
     ~GpuTelemetrySampler();
 
     GpuTelemetrySampler(const GpuTelemetrySampler&) = delete;

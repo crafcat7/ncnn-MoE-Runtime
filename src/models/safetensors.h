@@ -20,7 +20,7 @@ struct SafetensorInfo
     std::string dtype;
     std::vector<uint32_t> shape;
     uint64_t offset = 0;
-    uint64_t byte_count = 0;
+    uint64_t size = 0;
 };
 
 #define NCNN_MOE_SAFETENSOR_DEFER_MXFP4_BIT 0
@@ -33,7 +33,7 @@ enum SafetensorLoadFlag : uint32_t
 class SafetensorsArchive
 {
 private:
-    std::unordered_map<std::string, SafetensorInfo> tensors_;
+    std::unordered_map<std::string, SafetensorInfo> tensors;
 
 public:
     [[nodiscard]] static Result<SafetensorsArchive> open(const std::filesystem::path& root);

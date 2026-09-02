@@ -9,7 +9,7 @@ namespace ncnn {
 namespace moe {
 
 [[nodiscard]] Result<void> normalize_moe_ir(MoeIR& ir);
-[[nodiscard]] Result<void> build_compiled_execution_graph(CompiledModel& compiled, const ModelCompiler::BackendCapabilities& capabilities);
+[[nodiscard]] Result<void> build_compiled_execution_graph(CompiledModel& compiled, const ModelCompiler::BackendCapabilities& caps);
 
 } // namespace moe
 } // namespace ncnn

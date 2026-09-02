@@ -285,7 +285,7 @@ float mxfp4_q8_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_
         || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
         return msvc_avx2_mxfp4_q8_dot(packed, scales, block_count, input, input_scales);
 #elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
-    if ((detect_cpu_isa_capabilities().flags & CpuIsaX86Avx2Fma) != 0)
+    if ((cpu_isa_flags() & CpuIsaX86Avx2Fma) != 0)
         return avx2_mxfp4_q8_dot(packed, scales, block_count, input, input_scales);
 #endif
     return scalar_mxfp4_q8_dot(packed, scales, block_count, input, input_scales);
@@ -1100,7 +1100,7 @@ static KernelDispatch select_kernel() noexcept
 #if defined(__aarch64__) || defined(_M_ARM64)
     candidates[candidate_count++] = {MxFp4KernelKind::ArmNeon, neon_dot, neon_gemm_row, neon_matmul_rows2, neon_matmul_row_pairs};
 #if defined(NCNN_MOE_ARM_SVE2_KERNEL)
-    if ((detect_cpu_isa_capabilities().flags & CpuIsaArmSve2) != 0)
+    if ((cpu_isa_flags() & CpuIsaArmSve2) != 0)
     {
         candidates[candidate_count++] = {MxFp4KernelKind::ArmSve2, sve2_mxfp4_dot, neon_gemm_row, sve2_mxfp4_matmul_rows2, sve2_mxfp4_matmul_row_pairs};
     }

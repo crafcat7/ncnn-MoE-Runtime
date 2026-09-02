@@ -69,34 +69,29 @@ static uint64_t enabled_xstate() noexcept
 }
 #endif
 
-CpuIsaCapabilities detect_cpu_isa_capabilities() noexcept
+static uint64_t detect_cpu_isa_flags() noexcept
 {
-    CpuIsaCapabilities result;
+    uint64_t flags = 0;
 
 #if defined(__aarch64__) || defined(_M_ARM64)
-    result.flags |= CpuIsaArmNeon;
-    append_name(result.names, "neon");
+    flags |= CpuIsaArmNeon;
 #if defined(__linux__) && defined(__aarch64__) && defined(HWCAP_SVE)
     const unsigned long hardware = getauxval(AT_HWCAP);
     if ((hardware & HWCAP_SVE) != 0)
     {
-        result.flags |= CpuIsaArmSve;
-        append_name(result.names, "sve");
+        flags |= CpuIsaArmSve;
     }
 #elif defined(__ARM_FEATURE_SVE)
-    result.flags |= CpuIsaArmSve;
-    append_name(result.names, "sve");
+    flags |= CpuIsaArmSve;
 #endif
 #if defined(__linux__) && defined(__aarch64__) && defined(HWCAP2_SVE2)
     const unsigned long hardware2 = getauxval(AT_HWCAP2);
     if ((hardware2 & HWCAP2_SVE2) != 0)
     {
-        result.flags |= CpuIsaArmSve2;
-        append_name(result.names, "sve2");
+        flags |= CpuIsaArmSve2;
     }
 #elif defined(__ARM_FEATURE_SVE2)
-    result.flags |= CpuIsaArmSve2;
-    append_name(result.names, "sve2");
+    flags |= CpuIsaArmSve2;
 #endif
 #elif defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
     const uint32_t maximum_leaf = maximum_cpuid_leaf();
@@ -119,8 +114,7 @@ CpuIsaCapabilities detect_cpu_isa_capabilities() noexcept
             const bool avx2 = (ebx & (UINT32_C(1) << NCNN_MOE_CPUID_7_EBX_AVX2_BIT)) != 0;
             if (avx2 && fma)
             {
-                result.flags |= CpuIsaX86Avx2Fma;
-                append_name(result.names, "avx2-fma");
+                flags |= CpuIsaX86Avx2Fma;
             }
 
             const uint64_t avx512_state_mask = avx_state_mask | (UINT64_C(1) << NCNN_MOE_XSTATE_OPMASK_BIT) | (UINT64_C(1) << NCNN_MOE_XSTATE_ZMM_HI256_BIT) | (UINT64_C(1) << NCNN_MOE_XSTATE_HI16_ZMM_BIT);
@@ -131,13 +125,11 @@ CpuIsaCapabilities detect_cpu_isa_capabilities() noexcept
                                 && (ebx & (UINT32_C(1) << NCNN_MOE_CPUID_7_EBX_AVX512VL_BIT)) != 0;
             if (avx512)
             {
-                result.flags |= CpuIsaX86Avx512;
-                append_name(result.names, "avx512");
+                flags |= CpuIsaX86Avx512;
             }
             if (avx512 && (ecx7 & (UINT32_C(1) << NCNN_MOE_CPUID_7_ECX_AVX512VNNI_BIT)) != 0)
             {
-                result.flags |= CpuIsaX86Avx512Vnni;
-                append_name(result.names, "avx512-vnni");
+                flags |= CpuIsaX86Avx512Vnni;
             }
 
             if (maximum_leaf >= 7)
@@ -145,13 +137,11 @@ CpuIsaCapabilities detect_cpu_isa_capabilities() noexcept
                 const std::array<uint32_t, 4> leaf71 = cpuid(7, 1);
                 if (avx2 && (leaf71[0] & (UINT32_C(1) << NCNN_MOE_CPUID_7_1_EAX_AVXVNNI_BIT)) != 0)
                 {
-                    result.flags |= CpuIsaX86AvxVnni;
-                    append_name(result.names, "avx-vnni");
+                    flags |= CpuIsaX86AvxVnni;
                 }
                 if (avx512 && (leaf71[0] & (UINT32_C(1) << NCNN_MOE_CPUID_7_1_EAX_AVX512BF16_BIT)) != 0)
                 {
-                    result.flags |= CpuIsaX86Avx512Bf16;
-                    append_name(result.names, "avx512-bf16");
+                    flags |= CpuIsaX86Avx512Bf16;
                 }
             }
 
@@ -160,26 +150,55 @@ CpuIsaCapabilities detect_cpu_isa_capabilities() noexcept
             const bool amx_tile = tile_state && (edx & (UINT32_C(1) << NCNN_MOE_CPUID_7_EDX_AMX_TILE_BIT)) != 0;
             if (amx_tile)
             {
-                result.flags |= CpuIsaX86AmxTile;
-                append_name(result.names, "amx-tile");
+                flags |= CpuIsaX86AmxTile;
             }
             if (amx_tile && (edx & (UINT32_C(1) << NCNN_MOE_CPUID_7_EDX_AMX_INT8_BIT)) != 0)
             {
-                result.flags |= CpuIsaX86AmxInt8;
-                append_name(result.names, "amx-int8");
+                flags |= CpuIsaX86AmxInt8;
             }
             if (amx_tile && (edx & (UINT32_C(1) << NCNN_MOE_CPUID_7_EDX_AMX_BF16_BIT)) != 0)
             {
-                result.flags |= CpuIsaX86AmxBf16;
-                append_name(result.names, "amx-bf16");
+                flags |= CpuIsaX86AmxBf16;
             }
         }
     }
 #endif
 
-    if (result.names.empty())
-        result.names = "scalar";
-    return result;
+    return flags;
+}
+
+uint64_t cpu_isa_flags() noexcept
+{
+    static const uint64_t flags = detect_cpu_isa_flags();
+    return flags;
+}
+
+std::string cpu_isa_names(uint64_t flags)
+{
+    std::string names;
+    if (has_flag(flags, CpuIsaArmNeon))
+        append_name(names, "neon");
+    if (has_flag(flags, CpuIsaArmSve))
+        append_name(names, "sve");
+    if (has_flag(flags, CpuIsaArmSve2))
+        append_name(names, "sve2");
+    if (has_flag(flags, CpuIsaX86Avx2Fma))
+        append_name(names, "avx2-fma");
+    if (has_flag(flags, CpuIsaX86Avx512))
+        append_name(names, "avx512");
+    if (has_flag(flags, CpuIsaX86Avx512Vnni))
+        append_name(names, "avx512-vnni");
+    if (has_flag(flags, CpuIsaX86AvxVnni))
+        append_name(names, "avx-vnni");
+    if (has_flag(flags, CpuIsaX86Avx512Bf16))
+        append_name(names, "avx512-bf16");
+    if (has_flag(flags, CpuIsaX86AmxTile))
+        append_name(names, "amx-tile");
+    if (has_flag(flags, CpuIsaX86AmxInt8))
+        append_name(names, "amx-int8");
+    if (has_flag(flags, CpuIsaX86AmxBf16))
+        append_name(names, "amx-bf16");
+    return names.empty() ? "scalar" : names;
 }
 
 } // namespace moe

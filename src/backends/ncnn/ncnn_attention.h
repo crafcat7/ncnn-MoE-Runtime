@@ -4,7 +4,7 @@
 #include "kernels/cpu_batch.h"
 
 #include "ncnn/moe/types.h"
-#include "ncnn/moe/runtime_config.h"
+#include "ncnn/moe/option.h"
 
 #include <cstdint>
 #include <memory>
@@ -17,8 +17,8 @@ struct CpuLayerCache;
 class NcnnLinearOperator;
 class NcnnVulkanBfloat16Operator;
 
-#define NCNN_MOE_NCNN_ATTN_SINK_BIT 0
-#define NCNN_MOE_NCNN_ATTN_QK_NORM_BIT 1
+#define NCNN_MOE_NCNN_ATTN_SINK_BIT        0
+#define NCNN_MOE_NCNN_ATTN_QK_NORM_BIT     1
 #define NCNN_MOE_NCNN_ATTN_OUTPUT_GATE_BIT 2
 
 enum NcnnAttentionFlag : uint32_t
@@ -46,7 +46,7 @@ struct NcnnVulkanAttentionConfig
     DType activation_dtype = DType::Float32;
     DType kv_cache_dtype = DType::Float32;
     uint32_t flags = 0;
-    uint64_t optimization_flags = RuntimeOptimizationDefaultFlags;
+    uint64_t optimization_flags = OptimizationDefaultFlags;
 };
 
 enum class NcnnVulkanAttentionBatchResult

@@ -42,18 +42,18 @@ struct ExpertCacheStatistics
     uint64_t misses = 0;
     uint64_t evictions = 0;
     uint64_t bytes_read = 0;
-    uint64_t resident_bytes = 0;
+    uint64_t resident_size = 0;
     uint64_t queued_reads = 0;
     uint64_t speculative_reads = 0;
     uint64_t cancelled_speculative_reads = 0;
     uint64_t dropped_speculative_admissions = 0;
     uint64_t unused_speculative_reads = 0;
     uint64_t short_term_reloads = 0;
-    uint64_t arc_recent_bytes = 0;
-    uint64_t arc_frequent_bytes = 0;
-    uint64_t arc_recent_target_bytes = 0;
-    uint64_t arc_recent_ghost_bytes = 0;
-    uint64_t arc_frequent_ghost_bytes = 0;
+    uint64_t arc_recent_size = 0;
+    uint64_t arc_frequent_size = 0;
+    uint64_t arc_recent_target_size = 0;
+    uint64_t arc_recent_ghost_size = 0;
+    uint64_t arc_frequent_ghost_size = 0;
     uint64_t arc_recent_ghost_hits = 0;
     uint64_t arc_frequent_ghost_hits = 0;
     uint64_t mapped_ranges = 0;
@@ -67,8 +67,8 @@ struct ExpertCacheStatistics
     uint64_t coalesced_experts = 0;
     uint64_t coalesced_read_ranges_saved = 0;
     uint32_t adaptive_read_policy = 0;
-    uint32_t io_worker_count = 0;
-    uint32_t adaptive_io_workers = 0;
+    uint32_t num_io_threads = 0;
+    uint32_t num_active_io_threads = 0;
     uint64_t io_read_samples = 0;
     uint64_t io_read_time_microseconds = 0;
     ExpertVictimCacheStatistics victim;
@@ -83,11 +83,11 @@ struct ExpertCachePairRequest
     ExpertVictimExecutionMetadata victim_execution;
 };
 
-#define NCNN_MOE_EXPERT_CACHE_MMAP_BIT        0
-#define NCNN_MOE_EXPERT_CACHE_DIRECT_IO_BIT   1
-#define NCNN_MOE_EXPERT_CACHE_BUFFERED_IO_BIT 2
-#define NCNN_MOE_EXPERT_CACHE_FORWARD_ARC_BIT 3
-#define NCNN_MOE_EXPERT_CACHE_READ_MERGE_BIT  4
+#define NCNN_MOE_EXPERT_CACHE_MMAP_BIT              0
+#define NCNN_MOE_EXPERT_CACHE_DIRECT_IO_BIT         1
+#define NCNN_MOE_EXPERT_CACHE_BUFFERED_IO_BIT       2
+#define NCNN_MOE_EXPERT_CACHE_FORWARD_ARC_BIT       3
+#define NCNN_MOE_EXPERT_CACHE_READ_MERGE_BIT        4
 #define NCNN_MOE_EXPERT_CACHE_SPECULATIVE_EVICT_BIT 5
 
 enum ExpertCacheOptionFlag : uint32_t
@@ -110,7 +110,7 @@ private:
     struct GhostRecord
     {
         std::string key;
-        uint64_t bytes = 0;
+        uint64_t size = 0;
     };
     using GhostList = std::list<GhostRecord>;
     struct TransparentStringHash
@@ -125,17 +125,17 @@ private:
     using EntryMap = std::unordered_map<std::string, std::shared_ptr<Entry>, TransparentStringHash, std::equal_to<>>;
     using GhostIndex = std::unordered_map<std::string, GhostList::iterator, TransparentStringHash, std::equal_to<>>;
 
-    [[nodiscard]] Result<std::shared_ptr<TensorData>> load_tensor(const TensorData& source, uint64_t& mapped_ranges, uint64_t& mapped_bytes);
-    [[nodiscard]] Result<ExpertVictimPair> load_interleaved_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_ranges, uint64_t& mapped_bytes);
-    [[nodiscard]] Result<ExpertVictimPair> load_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_ranges, uint64_t& mapped_bytes);
+    [[nodiscard]] Result<std::shared_ptr<TensorData>> load_tensor(const TensorData& source, uint64_t& mapped_range_count, uint64_t& mapped_size);
+    [[nodiscard]] Result<ExpertVictimPair> load_interleaved_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_range_count, uint64_t& mapped_size);
+    [[nodiscard]] Result<ExpertVictimPair> load_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_range_count, uint64_t& mapped_size);
     [[nodiscard]] Result<std::vector<ExpertVictimPair>> load_coalesced_pairs(
-        std::span<const std::shared_ptr<Entry>> entries,
-        uint64_t& mapped_ranges,
-        uint64_t& mapped_bytes,
-        uint64_t& ranges_saved,
+        std::span<const std::shared_ptr<Entry>> batch,
+        uint64_t& mapped_range_count,
+        uint64_t& mapped_size,
+        uint64_t& saved_range_count,
         bool& coalesced);
-    [[nodiscard]] static Result<uint64_t> stored_bytes(const TensorData& tensor);
-    [[nodiscard]] static Result<uint64_t> packed_weight_bytes(const TensorData& tensor);
+    [[nodiscard]] static Result<uint64_t> stored_size(const TensorData& tensor);
+    [[nodiscard]] static Result<uint64_t> packed_weight_size(const TensorData& tensor);
     [[nodiscard]] Result<std::shared_ptr<Entry>> enqueue_pair(
         const TensorData& gate_up,
         const TensorData& down,
@@ -145,16 +145,16 @@ private:
         ExpertVictimExecutionMetadata victim_execution = {},
         bool* already_ready = nullptr,
         bool* temporarily_exhausted = nullptr);
-    [[nodiscard]] bool evict_one_locked(bool incoming_from_frequent_ghost, bool speculative_admission, uint32_t incoming_group, uint64_t required);
+    [[nodiscard]] bool evict_one_locked(bool incoming_from_frequent_ghost, bool speculative_admission, uint32_t incoming_group, uint64_t required_size);
     void insert_resident_locked(Entry& entry, bool frequent);
     void touch_resident_locked(Entry& entry, bool repeated);
     void remove_resident_locked(Entry& entry, bool add_ghost);
     void add_ghost_locked(const Entry& entry);
-    void erase_ghost_locked(GhostIndex& index, GhostList& list, uint64_t& bytes, std::string_view key);
-    void trim_ghost_front_locked(GhostIndex& index, GhostList& list, uint64_t& bytes);
+    void erase_ghost_locked(GhostIndex& index, GhostList& list, uint64_t& size, std::string_view key);
+    void trim_ghost_front_locked(GhostIndex& index, GhostList& list, uint64_t& size);
     void trim_ghosts_locked();
-    [[nodiscard]] uint64_t arc_delta(uint64_t required, uint64_t numerator, uint64_t denominator) const;
-    [[nodiscard]] bool consume_ghost_locked(std::string_view key, uint64_t required, bool& frequent, bool& from_frequent_ghost);
+    [[nodiscard]] uint64_t arc_delta(uint64_t required_size, uint64_t numerator, uint64_t denominator) const;
+    [[nodiscard]] bool consume_ghost_locked(std::string_view key, uint64_t required_size, bool& frequent, bool& from_frequent_ghost);
     [[nodiscard]] Entry* find_victim_locked(
         const std::list<Entry*>& list,
         bool speculative,
@@ -163,64 +163,64 @@ private:
         bool allow_predicted_victim = false);
     void worker_loop(uint32_t worker_index);
 
-    uint64_t capacity_bytes_ = 0;
-    uint64_t resident_bytes_ = 0;
-    uint64_t arc_recent_bytes_ = 0;
-    uint64_t arc_frequent_bytes_ = 0;
-    uint64_t arc_recent_target_bytes_ = 0;
-    uint64_t arc_recent_ghost_bytes_ = 0;
-    uint64_t arc_frequent_ghost_bytes_ = 0;
-    uint64_t arc_recent_ghost_hits_ = 0;
-    uint64_t arc_frequent_ghost_hits_ = 0;
-    uint64_t hits_ = 0;
-    uint64_t misses_ = 0;
-    uint64_t evictions_ = 0;
-    uint64_t bytes_read_ = 0;
-    uint64_t queued_reads_ = 0;
-    uint64_t speculative_reads_ = 0;
-    uint64_t cancelled_speculative_reads_ = 0;
-    uint64_t dropped_speculative_admissions_ = 0;
-    uint64_t unused_speculative_reads_ = 0;
-    uint64_t short_term_reloads_ = 0;
-    uint64_t coalesced_read_batches_ = 0;
-    uint64_t coalesced_experts_ = 0;
-    uint64_t coalesced_read_ranges_saved_ = 0;
-    uint64_t mapped_ranges_ = 0;
-    uint64_t mapped_bytes_ = 0;
-    bool stopping_ = false;
-    mutable std::mutex mutex_;
-    std::condition_variable ready_;
-    std::condition_variable work_available_;
-    std::condition_variable idle_;
-    uint32_t active_jobs_ = 0;
-    EntryMap entries_;
-    std::list<Entry*> arc_recent_;
-    std::list<Entry*> arc_frequent_;
-    std::vector<uint64_t> residency_group_bytes_;
-    GhostList arc_recent_ghost_;
-    GhostList arc_frequent_ghost_;
-    GhostIndex arc_recent_ghost_index_;
-    GhostIndex arc_frequent_ghost_index_;
-    std::deque<std::shared_ptr<Entry>> high_priority_;
-    std::deque<std::shared_ptr<Entry>> low_priority_;
-    std::vector<std::thread> workers_;
-    uint32_t io_worker_count_ = 0;
-    uint32_t adaptive_io_workers_ = 0;
-    uint64_t io_read_samples_ = 0;
-    uint64_t io_read_time_nanoseconds_ = 0;
-    std::unique_ptr<FileRangeReader> reader_;
-    std::shared_ptr<IExpertVictimCache> victim_cache_;
-    uint32_t flags_ = 0;
-    bool reserve_cpu_packed_weights_ = false;
+    uint64_t cache_size = 0;
+    uint64_t resident_size = 0;
+    uint64_t arc_recent_size = 0;
+    uint64_t arc_frequent_size = 0;
+    uint64_t arc_recent_target_size = 0;
+    uint64_t arc_recent_ghost_size = 0;
+    uint64_t arc_frequent_ghost_size = 0;
+    uint64_t arc_recent_ghost_hits = 0;
+    uint64_t arc_frequent_ghost_hits = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t evictions = 0;
+    uint64_t bytes_read = 0;
+    uint64_t queued_reads = 0;
+    uint64_t speculative_reads = 0;
+    uint64_t cancelled_speculative_reads = 0;
+    uint64_t dropped_speculative_admissions = 0;
+    uint64_t unused_speculative_reads = 0;
+    uint64_t short_term_reloads = 0;
+    uint64_t coalesced_read_batches = 0;
+    uint64_t coalesced_experts = 0;
+    uint64_t coalesced_read_ranges_saved = 0;
+    uint64_t mapped_ranges = 0;
+    uint64_t mapped_bytes = 0;
+    bool stopping = false;
+    mutable std::mutex mutex;
+    std::condition_variable ready;
+    std::condition_variable work_available;
+    std::condition_variable idle;
+    uint32_t active_jobs = 0;
+    EntryMap entries;
+    std::list<Entry*> arc_recent;
+    std::list<Entry*> arc_frequent;
+    std::vector<uint64_t> residency_group_sizes;
+    GhostList arc_recent_ghost;
+    GhostList arc_frequent_ghost;
+    GhostIndex arc_recent_ghost_index;
+    GhostIndex arc_frequent_ghost_index;
+    std::deque<std::shared_ptr<Entry>> high_priority;
+    std::deque<std::shared_ptr<Entry>> low_priority;
+    std::vector<std::thread> workers;
+    uint32_t num_io_threads = 0;
+    uint32_t num_active_io_threads = 0;
+    uint64_t io_read_samples = 0;
+    uint64_t io_read_time_nanoseconds = 0;
+    std::unique_ptr<FileRangeReader> reader;
+    std::shared_ptr<IExpertVictimCache> victim_cache;
+    uint32_t flags = 0;
+    bool reserve_cpu_packed_weights = false;
 
 public:
     explicit Mxfp4ExpertCache(
-        uint64_t capacity_bytes,
-        uint32_t io_worker_count = 0,
-        std::shared_ptr<IExpertVictimCache> victim_cache = {},
-        uint32_t flags = 0,
-        uint32_t residency_group_count = 0,
-        bool reserve_cpu_packed_weights = false);
+        uint64_t _cache_size,
+        uint32_t _num_io_threads = 0,
+        std::shared_ptr<IExpertVictimCache> _victim_cache = {},
+        uint32_t _flags = 0,
+        uint32_t num_residency_groups = 0,
+        bool _reserve_cpu_packed_weights = false);
     ~Mxfp4ExpertCache();
 
     Mxfp4ExpertCache(const Mxfp4ExpertCache&) = delete;
@@ -256,9 +256,9 @@ public:
     void resolve_predictions(uint32_t residency_group, std::span<const std::string_view> demanded_keys);
     void wait_for_background_work();
     [[nodiscard]] ExpertCacheStatistics statistics() const;
-    [[nodiscard]] uint64_t capacity_bytes() const noexcept
+    [[nodiscard]] uint64_t capacity() const noexcept
     {
-        return capacity_bytes_;
+        return cache_size;
     }
 };
 

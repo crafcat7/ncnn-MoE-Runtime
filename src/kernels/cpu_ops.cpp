@@ -9,7 +9,7 @@
 #include "backends/ncnn/ncnn_linear.h"
 #include "engine/cpu_thread_budget.h"
 #include "engine/cpu_topology.h"
-#include "ncnn/moe/runtime_config.h"
+#include "ncnn/moe/option.h"
 
 #include <algorithm>
 #include <cassert>
@@ -32,32 +32,32 @@ namespace moe {
 
 bool simd_rms_norm_enabled(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationCpuSimdRmsNorm);
+    return optimization_enabled(optimization_flags, OptimizationCpuSimdRmsNorm);
 }
 
 bool cpu_fast_silu_enabled(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationCpuFastSilu);
+    return optimization_enabled(optimization_flags, OptimizationCpuFastSilu);
 }
 
 static bool cpu_mxfp4_bulk_row_pairs_enabled(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationCpuMxfp4RowPairs);
+    return optimization_enabled(optimization_flags, OptimizationCpuMxfp4RowPairs);
 }
 
 static bool cpu_mxfp4_q8_enabled(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(
+    return optimization_enabled(
                optimization_flags,
-               RuntimeOptimizationCpuMxfp4Q8)
+               OptimizationCpuMxfp4Q8)
            && mxfp4_q8_kernel_available();
 }
 
 static bool cpu_packed_weights_enabled(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(
+    return optimization_enabled(
         optimization_flags,
-        RuntimeOptimizationCpuPackedWeights);
+        OptimizationCpuPackedWeights);
 }
 
 static bool dense_host_storage_available(const TensorData& tensor) noexcept
@@ -159,32 +159,32 @@ static bool allow_openmp_parallel_region() noexcept
 #endif
 }
 
-static uint32_t physical_core_count()
+static uint32_t physical_cpu_count()
 {
-    static const uint32_t count = discover_cpu_topology().physical_core_count;
+    static const uint32_t count = discover_cpu_topology().physical_cpu_count;
     return count;
 }
 
-static uint32_t select_cpu_linear_thread_limit() noexcept
+static uint32_t get_cpu_linear_num_threads() noexcept
 {
 #if defined(_OPENMP)
     const uint32_t maximum_threads = cpu_openmp_thread_limit();
-    const uint32_t core_count = physical_core_count();
+    const uint32_t core_count = physical_cpu_count();
     return core_count == 0 ? maximum_threads : std::min(maximum_threads, core_count);
 #else
     return 1;
 #endif
 }
 
-uint32_t cpu_linear_thread_limit() noexcept
+uint32_t cpu_linear_num_threads() noexcept
 {
     // Honor the scheduler's thread-local OpenMP cap.
-    return select_cpu_linear_thread_limit();
+    return get_cpu_linear_num_threads();
 }
 
-uint32_t float8_linear_thread_limit() noexcept
+uint32_t float8_linear_num_threads() noexcept
 {
-    return cpu_linear_thread_limit();
+    return cpu_linear_num_threads();
 }
 
 static int openmp_linear_team_size(uint64_t operation_count, DType dtype) noexcept
@@ -199,7 +199,7 @@ static int openmp_linear_team_size(uint64_t operation_count, DType dtype) noexce
     {
         return 1;
     }
-    const int maximum_threads = static_cast<int>(dtype == DType::Float8E4M3 ? float8_linear_thread_limit() : cpu_linear_thread_limit());
+    const int maximum_threads = static_cast<int>(dtype == DType::Float8E4M3 ? float8_linear_num_threads() : cpu_linear_num_threads());
     if (operation_count < full_team_operations)
         return std::min(4, maximum_threads);
     return maximum_threads;
@@ -214,8 +214,8 @@ static int openmp_mxfp4_group_team_size(uint64_t operation_count) noexcept
 {
 #if defined(_OPENMP)
     static constexpr uint64_t minimum_operations_per_thread = 128 * 1024;
-    const uint32_t core_count = physical_core_count();
-    const int maximum_threads = static_cast<int>(cpu_linear_thread_limit());
+    const uint32_t core_count = physical_cpu_count();
+    const int maximum_threads = static_cast<int>(cpu_linear_num_threads());
     const uint64_t useful_threads = std::max<uint64_t>(1, (operation_count + minimum_operations_per_thread - 1) / minimum_operations_per_thread);
     const int topology_limit = core_count == 0 ? maximum_threads : std::min(maximum_threads, static_cast<int>(core_count));
     return std::max(1, std::min(topology_limit, static_cast<int>(std::min<uint64_t>(useful_threads, static_cast<uint64_t>(std::numeric_limits<int>::max())))));
@@ -321,8 +321,8 @@ static void prepare_quantized_float8_input(CpuBatch& scratch, const CpuBatch& in
 
 static bool cpu_float8_fused_projections_enabled(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(optimization_flags,
-                                        RuntimeOptimizationCpuFloat8FusedProjections);
+    return optimization_enabled(optimization_flags,
+                                OptimizationCpuFloat8FusedProjections);
 }
 
 static void float8_linear_group_into(
@@ -677,8 +677,8 @@ bool float8_linear_rms_norm_batch_into(
             for (uint32_t column = 0; column < input.columns(); ++column)
             {
                 const float weight_value = norm_weight.dtype == DType::Float32
-                                                ? norm_weight.float32_values()[column]
-                                                : bfloat16_to_float(norm_weight.bfloat16_values()[column]);
+                                               ? norm_weight.float32_values()[column]
+                                               : bfloat16_to_float(norm_weight.bfloat16_values()[column]);
                 destination[column] = source[column] * inverse_rms * weight_value;
             }
         }
@@ -702,8 +702,7 @@ get_mxfp4_q8_packed_weights(
         matrix.mxfp4_blocks.data());
     std::lock_guard<std::mutex> build_lock(
         build_locks[(storage_key >> 6) & 63u]);
-    std::shared_ptr<const Mxfp4Q8PackedMatrix> cached =
-        matrix.mxfp4_q8_packed;
+    std::shared_ptr<const Mxfp4Q8PackedMatrix> cached = matrix.mxfp4_q8_packed;
     if (cached && cached->valid()
         && cached->rows == row_count
         && cached->block_count == block_count)
@@ -1268,7 +1267,7 @@ CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* b
 
     const bool parallel_enabled = allow_openmp_parallel_region();
     const int linear_team_size = parallel_enabled
-                                     ? static_cast<int>(cpu_linear_thread_limit())
+                                     ? static_cast<int>(cpu_linear_num_threads())
                                      : 1;
     size_t scratch_worker_count = 1;
 #if defined(_OPENMP)
@@ -1548,8 +1547,7 @@ static bool mxfp4_expert_decode(
             if (!q8_gate_packed[static_cast<size_t>(task_index)])
                 continue;
             const Mxfp4Task& task = tasks[static_cast<size_t>(task_index)];
-            const size_t input_owner =
-                q8_input_owner[static_cast<size_t>(task_index)];
+            const size_t input_owner = q8_input_owner[static_cast<size_t>(task_index)];
             const std::shared_ptr<const Mxfp4Q8PackedMatrix>
                 packed_weights = get_mxfp4_q8_packed_weights(
                     *task.gate_up,
@@ -1595,10 +1593,8 @@ static bool mxfp4_expert_decode(
                      ++local_column)
                 {
                     const uint32_t column = first_column + local_column;
-                    gates[local_column] =
-                        packed_gate_up[task_index].row(0)[column * 2];
-                    linears[local_column] =
-                        packed_gate_up[task_index].row(0)[column * 2 + 1];
+                    gates[local_column] = packed_gate_up[task_index].row(0)[column * 2];
+                    linears[local_column] = packed_gate_up[task_index].row(0)[column * 2 + 1];
                 }
             }
             else if (use_q8 && input_columns % 32 == 0)
@@ -1678,8 +1674,7 @@ static bool mxfp4_expert_decode(
             {
                 if (q8_down_enabled[static_cast<size_t>(task_index)])
                 {
-                    const CpuBatch& task_activated =
-                        activated[static_cast<size_t>(task_index)];
+                    const CpuBatch& task_activated = activated[static_cast<size_t>(task_index)];
                     mxfp4_q8_quantize_batch(
                         task_activated.row(0),
                         task_activated.columns(),

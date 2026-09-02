@@ -7,7 +7,7 @@
 #include "cpu_vector.h"
 #include "backends/ncnn/ncnn_attention.h"
 #include "backends/ncnn/ncnn_linear.h"
-#include "ncnn/moe/runtime_config.h"
+#include "ncnn/moe/option.h"
 
 #include <algorithm>
 #include <array>
@@ -66,7 +66,7 @@ static void apply_rope(float* vector, uint32_t dimension, uint64_t position, con
 
 static bool cached_rope_coefficients_enabled(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationCpuRopeCache);
+    return optimization_enabled(optimization_flags, OptimizationCpuRopeCache);
 }
 
 static void prepare_rope_coefficients(
@@ -253,7 +253,7 @@ static void append_cache(CpuLayerCache& cache, DType dtype, const CpuBatch& key,
 
 static bool direct_bfloat16_attention_enabled(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationCpuBf16DirectAttention);
+    return optimization_enabled(optimization_flags, OptimizationCpuBf16DirectAttention);
 }
 
 static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, const TensorData* sinks, uint64_t position_offset, const CpuBatch& query,
@@ -358,20 +358,20 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
         value_values = value_cache.data();
     }
 
-    const bool flash_prefill_enabled = runtime_optimization_enabled(
+    const bool flash_prefill_enabled = optimization_enabled(
                                            optimization_flags,
-                                           RuntimeOptimizationCpuFlashAttention)
+                                           OptimizationCpuFlashAttention)
                                        && query.rows() > 1
                                        && cache.token_count >= 64
                                        && !has_selected_keys;
     int attention_team_size = 1;
 #if defined(_OPENMP)
     if (omp_in_parallel() == 0)
-        attention_team_size = static_cast<int>(cpu_linear_thread_limit());
+        attention_team_size = static_cast<int>(cpu_linear_num_threads());
 #endif
-    const bool split_kv_enabled = runtime_optimization_enabled(
+    const bool split_kv_enabled = optimization_enabled(
                                       optimization_flags,
-                                      RuntimeOptimizationCpuSplitKvAttention)
+                                      OptimizationCpuSplitKvAttention)
                                   && query.rows() == 1
                                   && cache.token_count >= 512
                                   && attention_team_size > 1
@@ -485,7 +485,7 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                             {
                                 const uint64_t key_index = key_begin + key_offset;
                                 float& score = tile_logits[static_cast<size_t>(query_offset) * key_tile_size
-                                                            + static_cast<size_t>(key_index - tile_begin)];
+                                                           + static_cast<size_t>(key_index - tile_begin)];
                                 if (valid_key(query_group + query_offset, key_index))
                                 {
                                     score *= scale;
@@ -553,7 +553,7 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                     std::vector<float> tile_output(query_tile_size * head_dimension);
                     std::vector<float> tile_logits(query_tile_size * key_tile_size);
 #pragma omp for schedule(static)
-                for (int64_t job = 0; job < static_cast<int64_t>(job_count); ++job)
+                    for (int64_t job = 0; job < static_cast<int64_t>(job_count); ++job)
                         process_flash_group(static_cast<uint64_t>(job), running, tile_output, tile_logits);
                 }
             }
@@ -766,7 +766,7 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                     const float sink_value = sinks->dtype == DType::Float32
                                                  ? sinks->float32_values()[query_head]
                                                  : bfloat16_to_float(
-                                                     sinks->bfloat16_values()[query_head]);
+                                                       sinks->bfloat16_values()[query_head]);
                     normalizer = float_approximate_exp(
                         sink_value - maximum);
                 }
@@ -794,9 +794,8 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                          selected_index < selected_end; ++selected_index)
                     {
                         const uint64_t key_index = selected_indices[selected_index];
-                        const float probability =
-                            logits[selected_index - selected_begin]
-                            / normalizer;
+                        const float probability = logits[selected_index - selected_begin]
+                                                  / normalizer;
                         if (direct_bfloat16)
                         {
                             const uint64_t slot = direct_bfloat16_contiguous
@@ -1089,9 +1088,8 @@ static Result<void> prepare_qsa_selection(
 
     if (cache.token_count > std::numeric_limits<uint32_t>::max())
         return Error{ErrorCode::InvalidModel, "QSA key index exceeds uint32 storage"};
-    const uint64_t maximum_selected_per_query =
-        static_cast<uint64_t>(plan.index_top_k) * plan.compression_ratio
-        + plan.compression_ratio - 1;
+    const uint64_t maximum_selected_per_query = static_cast<uint64_t>(plan.index_top_k) * plan.compression_ratio
+                                                + plan.compression_ratio - 1;
     if (maximum_selected_per_query > std::numeric_limits<size_t>::max()
         || (scratch.qsa_query.rows() != 0
             && maximum_selected_per_query
@@ -1140,9 +1138,7 @@ static Result<void> prepare_qsa_selection(
             float square_sum = 0.0f;
             for (float value : pooled)
                 square_sum += value * value;
-            const float inverse_rms = 1.0f / std::sqrt(
-                square_sum / static_cast<float>(plan.index_head_dimension)
-                + norm_epsilon);
+            const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(plan.index_head_dimension) + norm_epsilon);
             const TensorData& key_norm = weights.at(plan.qsa_key_norm_weight);
             for (uint32_t column = 0; column < plan.index_head_dimension; ++column)
             {
@@ -1171,8 +1167,7 @@ static Result<void> prepare_qsa_selection(
                     return left.first > right.first;
                 return left.second < right.second;
             });
-        const size_t selection_begin =
-            scratch.qsa_selected_indices.size();
+        const size_t selection_begin = scratch.qsa_selected_indices.size();
         for (size_t index = 0; index < selected_count; ++index)
         {
             const uint64_t first_token = static_cast<uint64_t>(scores[index].second)
@@ -1193,8 +1188,7 @@ static Result<void> prepare_qsa_selection(
         std::sort(
             scratch.qsa_selected_indices.begin() + selection_begin,
             scratch.qsa_selected_indices.end());
-        scratch.qsa_selected_offsets[query_index + 1] =
-            scratch.qsa_selected_indices.size();
+        scratch.qsa_selected_offsets[query_index + 1] = scratch.qsa_selected_indices.size();
     }
     return {};
 }

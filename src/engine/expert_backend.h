@@ -6,7 +6,7 @@
 #include "ncnn/moe/expert_dispatcher.h"
 #include "ncnn/moe/result.h"
 #include "ncnn/moe/types.h"
-#include "ncnn/moe/runtime_config.h"
+#include "ncnn/moe/option.h"
 #include "ncnn/moe/vulkan_context.h"
 
 #include <cstdint>
@@ -49,14 +49,14 @@ struct ExpertBackendStatistics
     uint64_t execution_failures = 0;
     uint64_t cpu_preferred = 0;
     uint64_t bytes_uploaded = 0;
-    uint64_t resident_bytes = 0;
-    uint64_t pending_bytes = 0;
+    uint64_t resident_size = 0;
+    uint64_t pending_size = 0;
     uint64_t execution_time_microseconds = 0;
-    uint64_t arc_recent_bytes = 0;
-    uint64_t arc_frequent_bytes = 0;
-    uint64_t arc_recent_target_bytes = 0;
-    uint64_t arc_recent_ghost_bytes = 0;
-    uint64_t arc_frequent_ghost_bytes = 0;
+    uint64_t arc_recent_size = 0;
+    uint64_t arc_frequent_size = 0;
+    uint64_t arc_recent_target_size = 0;
+    uint64_t arc_recent_ghost_size = 0;
+    uint64_t arc_frequent_ghost_size = 0;
     uint64_t device_source_hits = 0;
     uint64_t device_source_misses = 0;
     uint64_t device_source_executions = 0;
@@ -69,7 +69,7 @@ struct ExpertBackendStatistics
 struct ExpertBackendDeviceStatistics
 {
     uint32_t device_index = automatic_vulkan_device_index;
-    uint64_t capacity_bytes = 0;
+    uint64_t cache_size = 0;
     ExpertBackendStatistics statistics;
 };
 
@@ -92,7 +92,7 @@ struct ExpertBackendRequest
     std::string_view key;
     const ActivationBuffer* input = nullptr;
     ActivationBuffer* output = nullptr;
-    uint64_t weight_bytes = 0;
+    uint64_t weight_size = 0;
     RouteAggregation route_aggregation;
 };
 
@@ -156,7 +156,7 @@ public:
 
     [[nodiscard]] virtual std::unique_ptr<IExpertBackendBatchSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) = 0;
 
-    virtual void observe_cpu(uint32_t token_count, uint64_t weight_bytes, uint64_t elapsed_microseconds) = 0;
+    virtual void observe_cpu(uint32_t token_count, uint64_t weight_size, uint64_t elapsed_microseconds) = 0;
 
     // A zero accelerated byte count records the CPU counterfactual.
     virtual void observe_phase(uint32_t token_count, uint64_t total_weight_bytes, uint64_t accelerated_weight_bytes, uint64_t elapsed_microseconds) = 0;
@@ -176,12 +176,12 @@ public:
     {
         return {};
     }
-    [[nodiscard]] virtual uint64_t capacity_bytes() const noexcept = 0;
+    [[nodiscard]] virtual uint64_t capacity() const noexcept = 0;
 };
 
 [[nodiscard]] std::shared_ptr<IExpertExecutionBackend> create_vulkan_mxfp4_expert_backend(
-    uint64_t capacity_bytes,
-    uint32_t vulkan_device_index,
+    uint64_t cache_size,
+    uint32_t device_index,
     std::shared_ptr<IExpertVictimCache> device_weight_source,
     const NcnnVulkanContextInstancePtr& context_instance,
     uint64_t optimization_flags);

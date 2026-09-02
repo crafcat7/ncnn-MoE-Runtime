@@ -293,7 +293,7 @@ struct CpuGatedDeltaState
     std::vector<float> gated_delta_recurrent;
     std::shared_ptr<NcnnVulkanGatedDeltaState> gated_delta_device_state;
     uint64_t gated_delta_token_count = 0;
-    uint64_t device_allocated_bytes = 0;
+    uint64_t device_allocated_size = 0;
 };
 
 struct CpuLatentScoredIndex
@@ -381,32 +381,31 @@ struct CpuLayerCache
                + static_cast<uint64_t>(ple_token_history.capacity()) * sizeof(int32_t)
                + static_cast<uint64_t>(ple_convolution_state.capacity()) * sizeof(float)
                + transaction.allocated_bytes()
-               + device_allocated_bytes;
+               + device_allocated_size;
     }
 
     [[nodiscard]] uint64_t logical_bytes() const noexcept
     {
-        const uint64_t auxiliary_bytes =
-            static_cast<uint64_t>(qsa_index_keys.size()) * sizeof(uint16_t)
-            + static_cast<uint64_t>(ple_token_history.size()) * sizeof(int32_t)
-            + static_cast<uint64_t>(ple_convolution_state.size()) * sizeof(float);
+        const uint64_t auxiliary_size = static_cast<uint64_t>(qsa_index_keys.size()) * sizeof(uint16_t)
+                                        + static_cast<uint64_t>(ple_token_history.size()) * sizeof(int32_t)
+                                        + static_cast<uint64_t>(ple_convolution_state.size()) * sizeof(float);
         if (latent_cache)
         {
             const uint64_t window_tokens = std::min(latent_token_count, capacity_tokens);
             return (window_tokens * columns + latent_compressed.size() + latent_index_compressed.size()) * sizeof(float)
-                   + auxiliary_bytes;
+                   + auxiliary_size;
         }
         if (!gated_delta_convolution.empty() || !gated_delta_recurrent.empty())
         {
             return static_cast<uint64_t>(gated_delta_convolution.size() + gated_delta_recurrent.size()) * sizeof(float)
-                   + auxiliary_bytes;
+                   + auxiliary_size;
         }
         if (gated_delta_device_state)
         {
-            return device_allocated_bytes + auxiliary_bytes;
+            return device_allocated_size + auxiliary_size;
         }
         const uint64_t element_size = dtype == DType::BFloat16 ? sizeof(uint16_t) : sizeof(float);
-        return token_count * columns * element_size * 2 + auxiliary_bytes;
+        return token_count * columns * element_size * 2 + auxiliary_size;
     }
 };
 
@@ -435,7 +434,7 @@ public:
     uint64_t mtp_pending_target_position = 0;
     bool speculative_context_enabled = true;
 
-    [[nodiscard]] uint64_t kv_cache_allocated_bytes() const noexcept
+    [[nodiscard]] uint64_t kv_cache_allocated_size() const noexcept
     {
         uint64_t bytes = 0;
         for (const CpuLayerCache& layer : layers)
@@ -443,7 +442,7 @@ public:
         return bytes;
     }
 
-    [[nodiscard]] uint64_t kv_cache_logical_bytes() const noexcept
+    [[nodiscard]] uint64_t kv_cache_logical_size() const noexcept
     {
         uint64_t bytes = 0;
         for (const CpuLayerCache& layer : layers)

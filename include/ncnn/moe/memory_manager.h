@@ -15,7 +15,7 @@ struct TensorResidency
 {
     ExecutionTensorId tensor_id = invalid_execution_tensor_id;
     TensorLocation location = TensorLocation::Automatic;
-    uint64_t bytes = 0;
+    uint64_t size = 0;
     uint64_t use_count = 0;
     uint64_t transition_count = 0;
 };
@@ -23,9 +23,9 @@ struct TensorResidency
 struct MemoryManagerStatistics
 {
     uint64_t registered_tensors = 0;
-    uint64_t cpu_bytes = 0;
-    uint64_t vulkan_bytes = 0;
-    uint64_t shared_bytes = 0;
+    uint64_t cpu_size = 0;
+    uint64_t vulkan_size = 0;
+    uint64_t shared_size = 0;
     uint64_t transitions = 0;
     uint64_t tensor_uses = 0;
 };
@@ -35,8 +35,8 @@ class MemoryManager
 private:
     [[nodiscard]] Result<void> transition_unlocked(ExecutionTensorId tensor_id, TensorLocation location);
 
-    mutable std::mutex mutex_;
-    std::vector<TensorResidency> tensors_;
+    mutable std::mutex mutex;
+    std::vector<TensorResidency> tensors;
 
 public:
     MemoryManager() = default;

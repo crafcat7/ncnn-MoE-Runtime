@@ -2,7 +2,7 @@
 
 #include "engine/cpu_features.h"
 #include "ncnn/moe/runtime.h"
-#include "ncnn/moe/runtime_config.h"
+#include "ncnn/moe/option.h"
 
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
 #include "cpu_float8_msvc.h"
@@ -302,7 +302,7 @@ static Float8KernelDispatch select_float8_kernel() noexcept
     std::array<Float8KernelDispatch, 3> candidates = {};
     size_t candidate_count = 0;
     candidates[candidate_count++] = {};
-    const uint64_t isa = detect_cpu_isa_capabilities().flags;
+    const uint64_t isa = cpu_isa_flags();
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
     if ((isa & CpuIsaX86Avx2Fma) != 0)
         candidates[candidate_count++] = {Float8KernelKind::X86Avx2, msvc_avx2_float8_e4m3_block_dot, msvc_avx2_float8_e4m3_block_dot_rows4};
@@ -340,9 +340,9 @@ void float8_e4m3_block_dot_rows4(const uint8_t* weights, uint32_t weight_row_str
 static bool select_bfloat16_float8_linear_dot(uint64_t optimization_flags) noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    if ((detect_cpu_isa_capabilities().flags & CpuIsaX86Avx512Bf16) == 0)
+    if ((cpu_isa_flags() & CpuIsaX86Avx512Bf16) == 0)
         return false;
-    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationCpuFloat8Bf16Dot);
+    return optimization_enabled(optimization_flags, OptimizationCpuFloat8Bf16Dot);
 #else
     return false;
 #endif
@@ -355,7 +355,7 @@ static bool use_bfloat16_float8_linear_dot(uint64_t optimization_flags) noexcept
 
 static bool use_float8_batch_tile(uint64_t optimization_flags) noexcept
 {
-    return runtime_optimization_enabled(optimization_flags, RuntimeOptimizationCpuFloat8BatchTile);
+    return optimization_enabled(optimization_flags, OptimizationCpuFloat8BatchTile);
 }
 
 float float8_e4m3_quantized_input_dot(const uint8_t* weights,
@@ -584,9 +584,9 @@ uint32_t float8_linear_row_group_size(uint64_t optimization_flags) noexcept
 static bool simd_float8_quantization_enabled(uint64_t optimization_flags) noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    return (detect_cpu_isa_capabilities().flags & CpuIsaX86Avx512) != 0
-           && runtime_optimization_enabled(optimization_flags,
-                                           RuntimeOptimizationCpuFloat8SimdQuantize);
+    return (cpu_isa_flags() & CpuIsaX86Avx512) != 0
+           && optimization_enabled(optimization_flags,
+                                   OptimizationCpuFloat8SimdQuantize);
 #else
     return false;
 #endif

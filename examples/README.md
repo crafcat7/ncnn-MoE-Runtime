@@ -117,7 +117,7 @@ token; it is also exposed under the compatibility field
 `decode_tokens_per_second`. `TTFT` uses the same prompt boundary and `TPOT`
 is the average interval for the remaining output tokens.
 
-The native public boundary is `RuntimeConfig`, token IDs, token-ID generation
+The native public boundary is `Option`, token IDs, token-ID generation
 config, Session state, and the stable `SessionMetrics` view. The generic
 `SamplingOptions` controls distribution selection over token IDs; it does not
 own a tokenizer or chat policy. Tokenizers, chat templates, stop-policy

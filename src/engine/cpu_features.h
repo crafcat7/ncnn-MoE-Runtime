@@ -29,13 +29,8 @@
 namespace ncnn {
 namespace moe {
 
-struct CpuIsaCapabilities
-{
-    uint64_t flags = 0;
-    std::string names;
-};
-
-[[nodiscard]] CpuIsaCapabilities detect_cpu_isa_capabilities() noexcept;
+[[nodiscard]] uint64_t cpu_isa_flags() noexcept;
+[[nodiscard]] std::string cpu_isa_names(uint64_t flags);
 
 } // namespace moe
 } // namespace ncnn

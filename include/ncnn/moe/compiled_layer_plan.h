@@ -34,7 +34,7 @@ struct ExpertPlan
     TensorHandle down_bias = invalid_tensor_handle;
     ExpertActivation activation = ExpertActivation::Silu;
     float activation_limit = 0.0f;
-    uint64_t weight_bytes = 0;
+    uint64_t weight_size = 0;
     uint32_t flags = ExpertPlanGated;
 };
 

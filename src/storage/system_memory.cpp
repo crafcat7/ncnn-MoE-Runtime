@@ -14,16 +14,16 @@
 namespace ncnn {
 namespace moe {
 
-uint64_t physical_memory_bytes() noexcept
+uint64_t physical_memory_size() noexcept
 {
 #if defined(_WIN32)
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof(status);
     return GlobalMemoryStatusEx(&status) ? static_cast<uint64_t>(status.ullTotalPhys) : 0;
 #elif defined(__APPLE__)
-    uint64_t bytes = 0;
-    size_t size = sizeof(bytes);
-    return sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) == 0 ? bytes : 0;
+    uint64_t memory_size = 0;
+    size_t size = sizeof(memory_size);
+    return sysctlbyname("hw.memsize", &memory_size, &size, nullptr, 0) == 0 ? memory_size : 0;
 #else
     const long pages = sysconf(_SC_PHYS_PAGES);
     const long page_size = sysconf(_SC_PAGESIZE);
@@ -33,7 +33,7 @@ uint64_t physical_memory_bytes() noexcept
 #endif
 }
 
-uint64_t available_memory_bytes() noexcept
+uint64_t available_memory_size() noexcept
 {
 #if defined(_WIN32)
     MEMORYSTATUSEX status{};

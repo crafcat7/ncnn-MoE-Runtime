@@ -80,19 +80,19 @@ static Result<void> q4_validate_artifact_tensor(
     const SafetensorInfo* info = archive.find(name);
     if (!info)
         return Error{ErrorCode::InvalidModel, "Qwen4 Exp MXFP4 artifact is missing tensor: " + name};
-    uint64_t expected_bytes = 1;
+    uint64_t expected_size = 1;
     for (uint32_t dimension : shape)
     {
         if (dimension != 0
-            && expected_bytes > std::numeric_limits<uint64_t>::max() / dimension)
+            && expected_size > std::numeric_limits<uint64_t>::max() / dimension)
         {
             return Error{ErrorCode::InvalidModel, "Qwen4 Exp MXFP4 artifact tensor is too large: " + name};
         }
-        expected_bytes *= dimension;
+        expected_size *= dimension;
     }
     if (info->dtype != "U8"
         || info->shape != shape
-        || info->byte_count != expected_bytes)
+        || info->size != expected_size)
     {
         return Error{ErrorCode::InvalidModel, "invalid Qwen4 Exp MXFP4 artifact tensor: " + name};
     }
@@ -413,7 +413,7 @@ static Result<std::vector<uint32_t>> q4_uints(const std::string& json, const std
 }
 
 static Result<void> q4_add_tensor(WeightMapping& mapping, const SafetensorsArchive& archive,
-                           const std::string& target, const std::string& source)
+                                  const std::string& target, const std::string& source)
 {
     auto tensor = archive.load_tensor(source);
     if (!tensor)
@@ -437,11 +437,11 @@ static Result<void> q4_add_expert_bank(
         return loaded.error();
     TensorData bank = std::move(loaded).value();
     const uint64_t slice_elements = static_cast<uint64_t>(rows) * columns;
-    const uint64_t slice_bytes = slice_elements * sizeof(uint16_t);
+    const uint64_t slice_size = slice_elements * sizeof(uint16_t);
     if (bank.dtype != DType::BFloat16
         || bank.shape != std::vector<uint32_t>{expert_count, rows, columns}
         || bank.bfloat16_values().size() != bank.element_count()
-        || slice_bytes > std::numeric_limits<size_t>::max())
+        || slice_size > std::numeric_limits<size_t>::max())
     {
         return Error{
             ErrorCode::InvalidModel,
@@ -460,7 +460,7 @@ static Result<void> q4_add_expert_bank(
             const size_t byte_offset = element_offset * sizeof(uint16_t);
             slice.mapped_data = std::shared_ptr<const uint8_t>(
                 bank.mapped_data, bank.mapped_data.get() + byte_offset);
-            slice.mapped_byte_count = slice_bytes;
+            slice.mapped_size = slice_size;
         }
         else
         {
@@ -549,9 +549,9 @@ static Result<uint64_t> q4_ple_embedding_rows(
 }
 
 static Result<void> q4_add_query_gate(WeightMapping& mapping, const SafetensorsArchive& archive,
-                               const std::string& source, const std::string& target_prefix,
-                               uint32_t head_count, uint32_t head_dimension,
-                               uint32_t hidden_size)
+                                      const std::string& source, const std::string& target_prefix,
+                                      uint32_t head_count, uint32_t head_dimension,
+                                      uint32_t hidden_size)
 {
     auto loaded = archive.load_tensor(source);
     if (!loaded)
@@ -582,8 +582,8 @@ static Result<void> q4_add_query_gate(WeightMapping& mapping, const SafetensorsA
 }
 
 static Result<void> q4_add_gated_residual(WeightMapping& mapping, const SafetensorsArchive& archive,
-                                   const std::string& source, const std::string& target,
-                                   bool has_injection)
+                                          const std::string& source, const std::string& target,
+                                          bool has_injection)
 {
     const std::pair<const char*, const char*> common[] = {
         {"norm.weight", "hc_norm.weight"},
@@ -662,7 +662,8 @@ Result<MoeIR> Qwen4ExpModelAdapter::parse_model(const ModelPackage& package) con
     auto state_dtype = q4_string(json, "mamba_ssm_dtype");
     auto output_gate_type = q4_string(json, "output_gate_type");
     auto attention_bias = q4_bool(json, "attention_bias");
-#define Q4_REQUIRE(value) if (!(value)) return (value).error()
+#define Q4_REQUIRE(value) \
+    if (!(value)) return (value).error()
     Q4_REQUIRE(vocabulary_size);
     Q4_REQUIRE(hidden_size);
     Q4_REQUIRE(intermediate_size);

@@ -1,5 +1,5 @@
 #include "compiler/moe_ir.hpp"
-#include "ncnn/moe/runtime_config.h"
+#include "ncnn/moe/option.h"
 
 #include "kernels/cpu_qnk.h"
 
@@ -47,7 +47,7 @@ static bool vulkan_expert_layer_supported(
     uint32_t capability_flags) noexcept
 {
     if (compiled.hybrid_mode == HybridMode::CpuOnly
-        || !has_flag(capability_flags, ModelCompiler::BackendCapabilityVulkanExperts)
+        || !has_flag(capability_flags, ModelCompiler::BackendVulkanExperts)
         || layer.moe.experts.empty())
     {
         return false;
@@ -102,7 +102,7 @@ static bool vulkan_expert_layer_supported(
             continue;
         }
 
-        if (!runtime_optimization_enabled(compiled.optimization_flags, RuntimeOptimizationVulkanQnK)
+        if (!optimization_enabled(compiled.optimization_flags, OptimizationVulkanQnK)
             || !is_qnk_dtype(gate_up.dtype)
             || gate_up.dtype != down.dtype
             || !qnk_shape_supported(gate_up.dtype, gate_up.shape[0], gate_up.shape[1])
@@ -385,7 +385,7 @@ static uint64_t dtype_size(DType dtype)
     return 0;
 }
 
-static uint64_t estimate_tensor_bytes(DType dtype, const std::vector<uint32_t>& shape)
+static uint64_t estimate_tensor_size(DType dtype, const std::vector<uint32_t>& shape)
 {
     const uint64_t element_size = dtype_size(dtype);
     if (element_size == 0)
@@ -409,7 +409,7 @@ static ExecutionTensorId append_execution_tensor(ExecutionGraph& graph, std::str
     tensor.dtype = dtype;
     tensor.shape = std::move(shape);
     tensor.location = location;
-    tensor.estimated_bytes = estimate_tensor_bytes(tensor.dtype, tensor.shape);
+    tensor.estimated_size = estimate_tensor_size(tensor.dtype, tensor.shape);
     tensor.flags = flags;
     graph.tensors.push_back(std::move(tensor));
     return id;
@@ -449,9 +449,9 @@ static bool attention_supports_vulkan(
     const CompiledLayerPlan& layer) noexcept
 {
     if (compiled.hybrid_mode == HybridMode::CpuOnly
-        || !runtime_optimization_enabled(
+        || !optimization_enabled(
             compiled.optimization_flags,
-            RuntimeOptimizationVulkanAttention)
+            OptimizationVulkanAttention)
         || layer.layer_id >= compiled.descriptor.layers.size())
     {
         return false;
@@ -505,9 +505,9 @@ static bool speculative_attention_supports_vulkan(
     const AttentionBlockPlan& attention) noexcept
 {
     if (compiled.hybrid_mode == HybridMode::CpuOnly
-        || !runtime_optimization_enabled(
+        || !optimization_enabled(
             compiled.optimization_flags,
-            RuntimeOptimizationVulkanAttention))
+            OptimizationVulkanAttention))
         return false;
     if (attention.gated_delta_vulkan_operator != invalid_compiled_operator_handle
         && compiled.operators.at(attention.gated_delta_vulkan_operator).gated_delta)
@@ -544,7 +544,7 @@ static bool speculative_attention_supports_vulkan(
 
 static Result<void> build_speculative_execution_graph(
     CompiledModel& compiled,
-    const ModelCompiler::BackendCapabilities& capabilities)
+    const ModelCompiler::BackendCapabilities& caps)
 {
     if (!compiled.speculative.enabled())
         return {};
@@ -668,7 +668,7 @@ static Result<void> build_speculative_execution_graph(
             invalid_execution_expert_id,
             0);
 
-        const bool can_use_vulkan_experts = vulkan_expert_layer_supported(compiled, layer, capabilities.flags);
+        const bool can_use_vulkan_experts = vulkan_expert_layer_supported(compiled, layer, caps.flags);
         const ExecutionBackend expert_backend = can_use_vulkan_experts ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
         const uint32_t expert_backend_mask = can_use_vulkan_experts ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
         const uint32_t expert_flags = compiled.hybrid_mode == HybridMode::HybridExperts
@@ -749,11 +749,11 @@ static Result<void> build_speculative_execution_graph(
 
     RuntimeSchedulingOptions options;
     options.available_backends = ExecutionBackendCpu;
-    options.cpu_parallelism = capabilities.cpu_parallelism;
+    options.cpu_parallelism = caps.num_threads;
     if (compiled.hybrid_mode != HybridMode::CpuOnly)
     {
         options.available_backends |= ExecutionBackendVulkan;
-        options.vulkan_queue_count = std::max(1u, capabilities.vulkan_queue_count);
+        options.vulkan_queue_count = std::max(1u, caps.compute_queue_count);
     }
     RuntimeScheduler scheduler;
     auto scheduled = scheduler.compile(std::move(graph), options);
@@ -765,7 +765,7 @@ static Result<void> build_speculative_execution_graph(
     return {};
 }
 
-Result<void> build_compiled_execution_graph(CompiledModel& compiled, const ModelCompiler::BackendCapabilities& capabilities)
+Result<void> build_compiled_execution_graph(CompiledModel& compiled, const ModelCompiler::BackendCapabilities& caps)
 {
     ExecutionGraph graph;
     graph.layer_plans = std::move(compiled.graph.layer_plans);
@@ -833,7 +833,7 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
             {router}, {router_scores}, {assignments},
             static_cast<uint32_t>(plan_index), invalid_execution_expert_id, 0);
 
-        const bool can_use_vulkan_experts = vulkan_expert_layer_supported(compiled, layer, capabilities.flags);
+        const bool can_use_vulkan_experts = vulkan_expert_layer_supported(compiled, layer, caps.flags);
         const ExecutionBackend expert_backend = can_use_vulkan_experts ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
         const uint32_t expert_backend_mask = can_use_vulkan_experts ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
         const uint32_t expert_flags = compiled.hybrid_mode == HybridMode::HybridExperts
@@ -874,11 +874,10 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
         graph, ExecutionNodeType::FinalNorm, ExecutionBackend::Cpu, ExecutionBackendCpu, "final_norm",
         {previous}, {hidden}, {normalized},
         invalid_execution_layer_id, invalid_execution_expert_id, 0);
-    graph.nodes[previous].weight_inputs =
-        compiled.final_norm_weight == invalid_tensor_handle
-            ? std::vector<TensorHandle>{compiled.lm_head_weight}
-            : std::vector<TensorHandle>{compiled.final_norm_weight,
-                                        compiled.lm_head_weight};
+    graph.nodes[previous].weight_inputs = compiled.final_norm_weight == invalid_tensor_handle
+                                              ? std::vector<TensorHandle>{compiled.lm_head_weight}
+                                              : std::vector<TensorHandle>{compiled.final_norm_weight,
+                                                                          compiled.lm_head_weight};
 
     const ExecutionBackend lm_head_backend = compiled.hybrid_mode == HybridMode::CpuOnly ? ExecutionBackend::Cpu : ExecutionBackend::Vulkan;
     uint32_t logits_tensor_flags = ExecutionTensorDynamic;
@@ -889,19 +888,18 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
         graph, ExecutionNodeType::LmHead, lm_head_backend, lm_head_backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, "lm_head",
         {previous}, {normalized}, {logits},
         invalid_execution_layer_id, invalid_execution_expert_id, 0);
-    graph.nodes[lm_head_node].weight_inputs =
-        compiled.final_norm_weight == invalid_tensor_handle
-            ? std::vector<TensorHandle>{compiled.lm_head_weight}
-            : std::vector<TensorHandle>{compiled.lm_head_weight,
-                                        compiled.final_norm_weight};
+    graph.nodes[lm_head_node].weight_inputs = compiled.final_norm_weight == invalid_tensor_handle
+                                                  ? std::vector<TensorHandle>{compiled.lm_head_weight}
+                                                  : std::vector<TensorHandle>{compiled.lm_head_weight,
+                                                                              compiled.final_norm_weight};
 
     RuntimeSchedulingOptions options;
     options.available_backends = ExecutionBackendCpu;
-    options.cpu_parallelism = capabilities.cpu_parallelism;
+    options.cpu_parallelism = caps.num_threads;
     if (compiled.hybrid_mode != HybridMode::CpuOnly)
     {
         options.available_backends |= ExecutionBackendVulkan;
-        options.vulkan_queue_count = std::max(1u, capabilities.vulkan_queue_count);
+        options.vulkan_queue_count = std::max(1u, caps.compute_queue_count);
     }
     RuntimeScheduler scheduler;
     auto scheduled = scheduler.compile(std::move(graph), options);
@@ -910,7 +908,7 @@ Result<void> build_compiled_execution_graph(CompiledModel& compiled, const Model
     ScheduledExecutionGraph result = std::move(scheduled).value();
     compiled.graph = std::move(result.graph);
     compiled.schedule = std::move(result.schedule);
-    return build_speculative_execution_graph(compiled, capabilities);
+    return build_speculative_execution_graph(compiled, caps);
 }
 
 } // namespace moe

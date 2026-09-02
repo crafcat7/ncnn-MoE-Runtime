@@ -5,7 +5,7 @@
 
 #include "ncnn/moe/compiled_operator.h"
 #include "ncnn/moe/types.h"
-#include "ncnn/moe/runtime_config.h"
+#include "ncnn/moe/option.h"
 #include "ncnn/moe/vulkan_context.h"
 
 #include <cstddef>
@@ -135,9 +135,9 @@ public:
                                                                           uint64_t optimization_flags);
     [[nodiscard]] static const char* cpu_small_bfloat16_linear_policy(
         uint64_t optimization_flags) noexcept;
-    [[nodiscard]] static uint32_t vulkan_device_count() noexcept;
-    [[nodiscard]] static uint64_t vulkan_heap_budget_bytes() noexcept;
-    [[nodiscard]] static std::vector<VulkanDeviceCapabilities> vulkan_device_capabilities();
+    [[nodiscard]] static uint32_t gpu_count() noexcept;
+    [[nodiscard]] static uint32_t default_gpu_index() noexcept;
+    [[nodiscard]] static std::vector<VulkanDeviceCapabilities> gpu_infos();
     [[nodiscard]] static NcnnVulkanExecutionSnapshot vulkan_execution_snapshot(
         const NcnnVulkanContextInstancePtr& context_instance) noexcept;
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
@@ -588,8 +588,8 @@ struct NcnnVulkanMxfp4DeviceMatrixView
 {
     uint32_t output_columns = 0;
     uint32_t input_columns = 0;
-    uint64_t packed_bytes = 0;
-    uint64_t scales_bytes = 0;
+    uint64_t packed_size = 0;
+    uint64_t scales_size = 0;
     size_t packed_offset = 0;
     size_t scales_offset = 0;
 };

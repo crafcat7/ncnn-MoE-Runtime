@@ -1,6 +1,8 @@
 #include "internal/json_line.h"
 #include "internal/gpu_telemetry.h"
 #include "ncnn/moe/runtime.h"
+#include "engine/cpu_features.h"
+#include "kernels/cpu_bfloat16.h"
 
 #include <algorithm>
 #include <atomic>
@@ -199,27 +201,27 @@ static const char* vulkan_type_name(VulkanDeviceType type) noexcept
     return "unknown";
 }
 
-static std::string devices_json(const std::vector<VulkanDeviceCapabilities>& devices)
+static std::string gpu_infos_json(const std::vector<VulkanDeviceCapabilities>& gpu_infos)
 {
     std::string result = "[";
-    for (std::size_t index = 0; index < devices.size(); ++index)
+    for (std::size_t i = 0; i < gpu_infos.size(); ++i)
     {
-        if (index != 0)
+        if (i != 0)
             result.push_back(',');
-        const VulkanDeviceCapabilities& device = devices[index];
+        const VulkanDeviceCapabilities& gpu_info = gpu_infos[i];
         JsonObject item;
-        item.add_uint("index", device.index);
-        item.add_string("name", device.name);
-        item.add_string("type", vulkan_type_name(device.type));
-        item.add_uint("vendor_id", device.vendor_id);
-        item.add_uint("device_id", device.device_id);
-        item.add_uint("rough_score", device.rough_score);
-        item.add_uint("compute_queue_count", device.compute_queue_count);
-        item.add_uint("transfer_queue_count", device.transfer_queue_count);
-        item.add_uint("heap_budget_bytes", device.heap_budget_bytes);
-        item.add_uint("heap_usage_bytes", device.heap_usage_bytes);
-        item.add_uint("heap_available_bytes", device.heap_available_bytes);
-        item.add_uint("flags", device.flags);
+        item.add_uint("index", gpu_info.device_index);
+        item.add_string("name", gpu_info.device_name);
+        item.add_string("type", vulkan_type_name(gpu_info.type));
+        item.add_uint("vendor_id", gpu_info.vendor_id);
+        item.add_uint("device_id", gpu_info.device_id);
+        item.add_uint("rough_score", gpu_info.rough_score);
+        item.add_uint("compute_queue_count", gpu_info.compute_queue_count);
+        item.add_uint("transfer_queue_count", gpu_info.transfer_queue_count);
+        item.add_uint("heap_budget_bytes", gpu_info.heap_budget);
+        item.add_uint("heap_usage_bytes", gpu_info.heap_usage);
+        item.add_uint("heap_available_bytes", gpu_info.heap_available);
+        item.add_uint("flags", gpu_info.flags);
         result += item.finish();
     }
     result.push_back(']');
@@ -232,14 +234,14 @@ static std::string expert_metrics_json(const RuntimeMetricCounters& counters)
     result.add_uint("cache_hit", counters.expert_cache_hits);
     result.add_uint("cache_miss", counters.expert_cache_misses);
     result.add_uint("io_bytes", counters.expert_io_bytes);
-    result.add_uint("cache_resident_bytes", counters.expert_cache_resident_bytes);
+    result.add_uint("cache_resident_bytes", counters.expert_cache_resident_size);
     result.add_uint("gpu_cache_hit", counters.expert_gpu_cache_hits);
     result.add_uint("gpu_cache_miss", counters.expert_gpu_cache_misses);
     result.add_uint("gpu_cache_admissions", counters.expert_gpu_cache_admissions);
     result.add_uint("gpu_cache_stores", counters.expert_gpu_cache_stores);
     result.add_uint("gpu_cache_dropped_admissions", counters.expert_gpu_cache_dropped_admissions);
-    result.add_uint("gpu_cache_resident_bytes", counters.expert_gpu_cache_resident_bytes);
-    result.add_uint("gpu_cache_pending_bytes", counters.expert_gpu_cache_pending_bytes);
+    result.add_uint("gpu_cache_resident_bytes", counters.expert_gpu_cache_resident_size);
+    result.add_uint("gpu_cache_pending_bytes", counters.expert_gpu_cache_pending_size);
     result.add_uint("gpu_executions", counters.expert_gpu_executions);
     result.add_uint("gpu_execution_failures", counters.expert_gpu_execution_failures);
     result.add_uint("gpu_cpu_preferred", counters.expert_gpu_cpu_preferred);
@@ -341,8 +343,8 @@ static std::string stats_json(const SessionMetrics& metrics)
     result.add_raw("cumulative_gpu", gpu_metrics_json(metrics.cumulative, metrics.gpu_available));
     result.add_raw("timing", generation_timing_json(metrics.timing));
     result.add_bool("gpu_available", metrics.gpu_available);
-    result.add_uint("kv_cache_logical_bytes", metrics.cumulative.kv_cache_logical_bytes);
-    result.add_uint("kv_cache_allocated_bytes", metrics.cumulative.kv_cache_allocated_bytes);
+    result.add_uint("kv_cache_logical_bytes", metrics.cumulative.kv_cache_logical_size);
+    result.add_uint("kv_cache_allocated_bytes", metrics.cumulative.kv_cache_allocated_size);
 
     return result.finish();
 }
@@ -351,9 +353,9 @@ static std::string memory_statistics_json(const MemoryManagerStatistics& statist
 {
     JsonObject result;
     result.add_uint("registered_tensors", statistics.registered_tensors);
-    result.add_uint("cpu_bytes", statistics.cpu_bytes);
-    result.add_uint("vulkan_bytes", statistics.vulkan_bytes);
-    result.add_uint("shared_bytes", statistics.shared_bytes);
+    result.add_uint("cpu_bytes", statistics.cpu_size);
+    result.add_uint("vulkan_bytes", statistics.vulkan_size);
+    result.add_uint("shared_bytes", statistics.shared_size);
     result.add_uint("transitions", statistics.transitions);
     result.add_uint("tensor_uses", statistics.tensor_uses);
     return result.finish();
@@ -634,11 +636,11 @@ static CpuPackedWeightMode parse_cpu_packed_weight_mode(
         "CPU packed-weight mode must be on or off");
 }
 
-static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argument)
+static Option parse_options(int argc, char** argv, int first_argument)
 {
-    RuntimeConfig result;
+    Option result;
     const auto set_expert_io_mode = [&result](uint32_t mode) {
-        result.flags = (result.flags & ~RuntimeOptionExpertIoMask) | mode;
+        result.flags = (result.flags & ~OptionExpertIoMask) | mode;
     };
     for (int index = first_argument; index < argc; ++index)
     {
@@ -650,17 +652,17 @@ static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argum
         else if (argument == "--hybrid")
             result.hybrid_mode = HybridMode::HybridExperts;
         else if (argument == "--host-memory-mb")
-            result.host_memory_budget_bytes = require_mebibytes(require_value(argc, argv, index, "--host-memory-mb"), "--host-memory-mb");
+            result.host_memory_budget = require_mebibytes(require_value(argc, argv, index, "--host-memory-mb"), "--host-memory-mb");
         else if (argument == "--expert-cache-mb")
-            result.expert_cache_bytes = require_mebibytes(require_value(argc, argv, index, "--expert-cache-mb"), "--expert-cache-mb");
+            result.expert_cache_size = require_mebibytes(require_value(argc, argv, index, "--expert-cache-mb"), "--expert-cache-mb");
         else if (argument == "--expert-gpu-cache-mb")
-            result.expert_gpu_cache_bytes = require_mebibytes(require_value(argc, argv, index, "--expert-gpu-cache-mb"), "--expert-gpu-cache-mb");
+            result.expert_gpu_cache_size = require_mebibytes(require_value(argc, argv, index, "--expert-gpu-cache-mb"), "--expert-gpu-cache-mb");
         else if (argument == "--expert-gpu-victim-cache-mb")
-            result.expert_gpu_victim_cache_bytes = require_mebibytes(require_value(argc, argv, index, "--expert-gpu-victim-cache-mb"), "--expert-gpu-victim-cache-mb");
+            result.expert_gpu_victim_cache_size = require_mebibytes(require_value(argc, argv, index, "--expert-gpu-victim-cache-mb"), "--expert-gpu-victim-cache-mb");
         else if (argument == "--expert-gpu-victim-reuse-probe")
             result.expert_gpu_victim_reuse_probe_interval = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expert-gpu-victim-reuse-probe")));
         else if (argument == "--expert-io-workers")
-            result.expert_io_workers = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expert-io-workers")));
+            result.num_expert_io_threads = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expert-io-workers")));
         else if (argument == "--expert-memory")
             result.expert_memory_mode = parse_expert_memory_mode(require_value(argc, argv, index, "--expert-memory"));
         else if (argument == "--cpu-packed-weights")
@@ -671,19 +673,19 @@ static RuntimeConfig parse_runtime_config(int argc, char** argv, int first_argum
         else if (argument == "--vulkan-devices")
             result.vulkan_device_indices = parse_device_indices(require_value(argc, argv, index, "--vulkan-devices"));
         else if (argument == "--expected-concurrency")
-            result.expected_concurrency = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expected-concurrency")));
+            result.num_concurrent_sessions = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expected-concurrency")));
         else if (argument == "--mmap-experts")
-            set_expert_io_mode(RuntimeOptionMemoryMapExperts);
+            set_expert_io_mode(OptionMemoryMapExperts);
         else if (argument == "--direct-expert-io")
-            set_expert_io_mode(RuntimeOptionDirectExpertIo);
+            set_expert_io_mode(OptionDirectExpertIo);
         else if (argument == "--buffered-expert-io")
-            set_expert_io_mode(RuntimeOptionBufferedExpertIo);
+            set_expert_io_mode(OptionBufferedExpertIo);
         else if (argument == "--disable-gpu-victim-execution")
-            result.flags |= ncnn::moe::RuntimeOptionDisableGpuVictimExecution;
+            result.flags |= ncnn::moe::OptionDisableGpuVictimExecution;
         else if (argument == "--disable-gpu-expert-execution")
-            result.flags |= ncnn::moe::RuntimeOptionDisableGpuExpertExecution;
+            result.flags |= ncnn::moe::OptionDisableGpuExpertExecution;
         else if (argument == "--release-vulkan-dense-host")
-            result.flags |= ncnn::moe::RuntimeOptionReleaseVulkanDenseHostStorage;
+            result.flags |= ncnn::moe::OptionReleaseVulkanDenseHostStorage;
         else
             throw std::invalid_argument("unknown worker option: " + argument);
     }
@@ -802,8 +804,8 @@ private:
 
     void emit_ready()
     {
-        const RuntimeCapabilities& capabilities = runtime_.capabilities();
-        const ncnn::moe::EffectiveRuntimeConfig& effective = model_->effective_runtime_config();
+        const RuntimeInfo& info = runtime_.info();
+        const ncnn::moe::EffectiveOption& effective = model_->effective_option();
         const ncnn::moe::ModelMemoryPlan& memory_plan = model_->memory_plan();
         JsonObject model;
         model.add_string("model_type", model_->descriptor().model_type);
@@ -820,47 +822,47 @@ private:
         resources.add_string("selected_expert_memory", expert_memory_mode_name(effective.selected_expert_memory_mode));
         resources.add_string("requested_cpu_packed_weights", cpu_packed_weight_mode_name(effective.requested_cpu_packed_weight_mode));
         resources.add_string("selected_cpu_packed_weights", cpu_packed_weight_mode_name(effective.selected_cpu_packed_weight_mode));
-        resources.add_uint("host_memory_budget_bytes", effective.host_memory_budget_bytes);
-        resources.add_uint("expert_cache_bytes", effective.expert_cache_bytes);
-        resources.add_uint("expert_gpu_cache_bytes", effective.expert_gpu_cache_bytes);
-        resources.add_uint("expert_gpu_victim_cache_bytes", effective.expert_gpu_victim_cache_bytes);
-        resources.add_uint("expert_io_workers", effective.expert_io_workers);
-        resources.add_uint("expected_concurrency", effective.expected_concurrency);
+        resources.add_uint("host_memory_budget_bytes", effective.host_memory_budget);
+        resources.add_uint("expert_cache_bytes", effective.expert_cache_size);
+        resources.add_uint("expert_gpu_cache_bytes", effective.expert_gpu_cache_size);
+        resources.add_uint("expert_gpu_victim_cache_bytes", effective.expert_gpu_victim_cache_size);
+        resources.add_uint("expert_io_workers", effective.num_expert_io_threads);
+        resources.add_uint("expected_concurrency", effective.num_concurrent_sessions);
         resources.add_uint("flags", effective.flags);
         resources.add_uint("optimization_flags", effective.optimization_flags);
-        resources.add_bool("file_backed_experts", effective.file_backed_experts);
+        resources.add_bool("file_backed_experts", effective.use_file_backed_experts);
         if (effective.vulkan_device_index == ncnn::moe::automatic_vulkan_device_index)
             resources.add_null("vulkan_device_index");
         else
             resources.add_uint("vulkan_device_index", effective.vulkan_device_index);
         resources.add_raw("vulkan_device_indices", uint_array(effective.vulkan_device_indices));
-        resources.add_uint("estimated_dense_bytes", memory_plan.estimated_dense_bytes);
-        resources.add_uint("estimated_expert_bytes", memory_plan.estimated_expert_bytes);
-        resources.add_uint("expert_pair_bytes", memory_plan.expert_pair_bytes);
-        resources.add_uint("expert_pair_resident_bytes", memory_plan.expert_pair_resident_bytes);
-        resources.add_uint("estimated_cpu_packed_expert_bytes", memory_plan.estimated_cpu_packed_expert_bytes);
-        resources.add_uint("estimated_expert_resident_bytes", memory_plan.estimated_expert_resident_bytes);
-        resources.add_uint("minimum_active_expert_bytes", memory_plan.minimum_active_expert_bytes);
+        resources.add_uint("estimated_dense_bytes", memory_plan.estimated_dense_size);
+        resources.add_uint("estimated_expert_bytes", memory_plan.estimated_expert_size);
+        resources.add_uint("expert_pair_bytes", memory_plan.expert_pair_size);
+        resources.add_uint("expert_pair_resident_bytes", memory_plan.expert_pair_resident_size);
+        resources.add_uint("estimated_cpu_packed_expert_bytes", memory_plan.estimated_cpu_packed_expert_size);
+        resources.add_uint("estimated_expert_resident_bytes", memory_plan.estimated_expert_resident_size);
+        resources.add_uint("minimum_active_expert_bytes", memory_plan.minimum_active_expert_size);
 
-        JsonObject capabilities_json;
-        capabilities_json.add_uint("physical_memory_bytes", capabilities.physical_memory_bytes);
-        capabilities_json.add_uint("logical_cpu_count", capabilities.logical_cpu_count);
-        capabilities_json.add_uint("physical_cpu_core_count", capabilities.physical_cpu_core_count);
-        capabilities_json.add_uint("openmp_thread_count", capabilities.openmp_thread_count);
-        capabilities_json.add_uint("flags", capabilities.flags);
-        capabilities_json.add_string("cpu_isa", capabilities.cpu_isa);
-        capabilities_json.add_string(
+        JsonObject info_json;
+        info_json.add_uint("physical_memory_bytes", info.physical_memory_size);
+        info_json.add_uint("logical_cpu_count", info.cpu_count);
+        info_json.add_uint("physical_cpu_core_count", info.physical_cpu_count);
+        info_json.add_uint("openmp_thread_count", info.num_threads);
+        info_json.add_uint("flags", info.flags);
+        info_json.add_string("cpu_isa", cpu_isa_names(info.cpu_isa_flags));
+        info_json.add_string(
             "bfloat16_batched_linear_kernel",
-            capabilities.bfloat16_batched_linear_kernel);
-        capabilities_json.add_uint("vulkan_device_count", capabilities.vulkan_device_count);
-        capabilities_json.add_uint("selected_vulkan_device_index", capabilities.selected_vulkan_device_index);
-        capabilities_json.add_raw("vulkan_devices", devices_json(capabilities.vulkan_devices));
+            bfloat16_batched_linear_kernel_name(effective.optimization_flags));
+        info_json.add_uint("vulkan_device_count", info.gpu_infos.size());
+        info_json.add_uint("selected_vulkan_device_index", info.default_gpu_index);
+        info_json.add_raw("vulkan_devices", gpu_infos_json(info.gpu_infos));
 
         JsonObject result;
         result.add_string("event", "ready");
         result.add_raw("model", model.finish());
         result.add_raw("resources", resources.finish());
-        result.add_raw("capabilities", capabilities_json.finish());
+        result.add_raw("capabilities", info_json.finish());
         result.add_raw("telemetry", gpu_telemetry_json(gpu_telemetry_sampler_));
         emit(result.finish());
     }
@@ -1145,7 +1147,7 @@ private:
 
 public:
     Worker(Runtime& runtime, ModelPtr model)
-        : runtime_(runtime), model_(std::move(model)), gpu_telemetry_sampler_(runtime.capabilities(), model_->effective_runtime_config())
+        : runtime_(runtime), model_(std::move(model)), gpu_telemetry_sampler_(runtime.info(), model_->effective_option())
     {
         (void)telemetry_sampler_.sample();
         emit_ready();
@@ -1233,9 +1235,9 @@ int main(int argc, char** argv)
     }
     try
     {
-        const ncnn::moe::RuntimeConfig config = ncnn::moe::parse_runtime_config(argc, argv, 2);
+        const ncnn::moe::Option opt = ncnn::moe::parse_options(argc, argv, 2);
         ncnn::moe::Runtime runtime;
-        auto model = runtime.load_model(std::filesystem::path(argv[1]), config);
+        auto model = runtime.load_model(std::filesystem::path(argv[1]), opt);
         if (!model)
         {
             ncnn::moe::JsonObject error;

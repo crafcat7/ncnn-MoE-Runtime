@@ -46,8 +46,8 @@ struct ExpertVictimCacheStatistics
     uint64_t restore_time_microseconds = 0;
     uint64_t mapped_stores = 0;
     uint64_t mapped_restores = 0;
-    uint64_t resident_bytes = 0;
-    uint64_t pending_bytes = 0;
+    uint64_t resident_size = 0;
+    uint64_t pending_size = 0;
 };
 
 class IExpertVictimCache
@@ -60,12 +60,12 @@ public:
     [[nodiscard]] virtual std::optional<ExpertVictimPair> restore(const std::string& key, const TensorData& gate_up_source, const TensorData& down_source) = 0;
     virtual void wait_for_background_work() = 0;
     [[nodiscard]] virtual ExpertVictimCacheStatistics statistics() const = 0;
-    [[nodiscard]] virtual uint64_t capacity_bytes() const noexcept = 0;
+    [[nodiscard]] virtual uint64_t capacity() const noexcept = 0;
 };
 
-[[nodiscard]] std::shared_ptr<IExpertVictimCache> create_vulkan_victim_cache(uint64_t capacity_bytes, uint32_t vulkan_device_index,
-                                                                               const NcnnVulkanContextInstancePtr& context_instance,
-                                                                               uint64_t optimization_flags);
+[[nodiscard]] std::shared_ptr<IExpertVictimCache> create_vulkan_victim_cache(uint64_t cache_size, uint32_t device_index,
+                                                                             const NcnnVulkanContextInstancePtr& context_instance,
+                                                                             uint64_t optimization_flags);
 
 // Payload-bounded reuse filter for upper-cache evictions.
 [[nodiscard]] std::shared_ptr<IExpertVictimCache> create_reuse_victim_cache(std::shared_ptr<IExpertVictimCache> inner, uint32_t reuse_probe_interval);

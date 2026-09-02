@@ -13,18 +13,18 @@ Result<void> MemoryManager::initialize(const ExecutionGraph& graph)
     auto valid = graph.validate();
     if (!valid)
         return valid.error();
-    std::vector<TensorResidency> tensors;
-    tensors.reserve(graph.tensors.size());
+    std::vector<TensorResidency> residencies;
+    residencies.reserve(graph.tensors.size());
     for (const ExecutionTensor& tensor : graph.tensors)
     {
         TensorResidency residency;
         residency.tensor_id = tensor.id;
         residency.location = tensor.location;
-        residency.bytes = tensor.estimated_bytes;
-        tensors.push_back(residency);
+        residency.size = tensor.estimated_size;
+        residencies.push_back(residency);
     }
-    const std::lock_guard<std::mutex> lock(mutex_);
-    tensors_ = std::move(tensors);
+    const std::lock_guard<std::mutex> lock(mutex);
+    tensors = std::move(residencies);
     return {};
 }
 
@@ -34,11 +34,11 @@ Result<void> MemoryManager::transition_unlocked(ExecutionTensorId tensor_id, Ten
     {
         return Error{ErrorCode::InvalidArgument, "tensor residency transition requires a concrete location"};
     }
-    if (tensor_id >= tensors_.size())
+    if (tensor_id >= tensors.size())
     {
         return Error{ErrorCode::InvalidArgument, "tensor residency id is out of range"};
     }
-    TensorResidency& tensor = tensors_[tensor_id];
+    TensorResidency& tensor = tensors[tensor_id];
     if (tensor.location != location)
     {
         tensor.location = location;
@@ -50,7 +50,7 @@ Result<void> MemoryManager::transition_unlocked(ExecutionTensorId tensor_id, Ten
 
 Result<void> MemoryManager::transition(ExecutionTensorId tensor_id, TensorLocation location)
 {
-    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::lock_guard<std::mutex> lock(mutex);
     return transition_unlocked(tensor_id, location);
 }
 
@@ -63,7 +63,7 @@ Result<void> MemoryManager::record_execution(
     // every decode token would put the scheduler back on the hot path.
     if (schedule.node_order.size() != graph.nodes.size())
         return Error{ErrorCode::InternalError, "execution reservation does not cover the graph"};
-    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::lock_guard<std::mutex> lock(mutex);
     for (ExecutionNodeId node_id : schedule.node_order)
     {
         if (node_id >= graph.nodes.size())
@@ -93,17 +93,17 @@ Result<void> MemoryManager::record_execution(
 
 MemoryManagerStatistics MemoryManager::statistics() const
 {
-    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::lock_guard<std::mutex> lock(mutex);
     MemoryManagerStatistics result;
-    result.registered_tensors = tensors_.size();
-    for (const TensorResidency& tensor : tensors_)
+    result.registered_tensors = tensors.size();
+    for (const TensorResidency& tensor : tensors)
     {
         switch (tensor.location)
         {
         case TensorLocation::Automatic: break;
-        case TensorLocation::Cpu: result.cpu_bytes += tensor.bytes; break;
-        case TensorLocation::Vulkan: result.vulkan_bytes += tensor.bytes; break;
-        case TensorLocation::Shared: result.shared_bytes += tensor.bytes; break;
+        case TensorLocation::Cpu: result.cpu_size += tensor.size; break;
+        case TensorLocation::Vulkan: result.vulkan_size += tensor.size; break;
+        case TensorLocation::Shared: result.shared_size += tensor.size; break;
         }
         result.transitions += tensor.transition_count;
         result.tensor_uses += tensor.use_count;

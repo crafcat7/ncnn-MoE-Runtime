@@ -251,10 +251,10 @@ ncnn::moe::Result<ncnn::moe::GenerationResult> run(
     std::span<const int32_t> input_ids)
 {
     ncnn::moe::Runtime runtime;
-    ncnn::moe::RuntimeOptions runtime_options;
-    runtime_options.hybrid_mode = ncnn::moe::HybridMode::Auto;
+    ncnn::moe::Option opt;
+    opt.hybrid_mode = ncnn::moe::HybridMode::Auto;
 
-    auto model = runtime.load_model(model_path, runtime_options);
+    auto model = runtime.load_model(model_path, opt);
     if (!model)
         return model.error();
 

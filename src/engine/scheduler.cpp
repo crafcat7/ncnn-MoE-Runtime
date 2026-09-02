@@ -81,8 +81,8 @@ public:
           worker_cpu_sets_(options.worker_cpu_sets)
     {
         const CpuThreadBudget& thread_budget = cpu_budget_.budget();
-        logical_cpu_count_ = thread_budget.logical_threads;
-        physical_cpu_count_ = thread_budget.physical_cores;
+        cpu_count = thread_budget.logical_threads;
+        physical_cpu_count = thread_budget.physical_cores;
         reserved_io_threads_ = thread_budget.reserved_io_threads;
         reserved_service_threads_ = thread_budget.reserved_service_threads;
         compute_thread_budget_ = thread_budget.compute_threads;
@@ -741,8 +741,8 @@ public:
         result.automatic_topology_affinity = has_flag(option_flags_, scheduler_internal_automatic_topology_affinity);
         result.worker_count = worker_count_;
         result.expert_threads_per_worker = expert_threads_per_worker_;
-        result.logical_cpu_count = logical_cpu_count_;
-        result.physical_cpu_count = physical_cpu_count_;
+        result.cpu_count = cpu_count;
+        result.physical_cpu_count = physical_cpu_count;
         result.reserved_io_threads = reserved_io_threads_;
         result.reserved_service_threads = reserved_service_threads_;
         result.compute_thread_budget = compute_thread_budget_;
@@ -1346,8 +1346,8 @@ private:
     uint32_t cross_call_max_batch_size_ = 0;
     uint32_t worker_count_ = 0;
     uint32_t expert_threads_per_worker_ = 1;
-    uint32_t logical_cpu_count_ = 1;
-    uint32_t physical_cpu_count_ = 1;
+    uint32_t cpu_count = 1;
+    uint32_t physical_cpu_count = 1;
     uint32_t reserved_io_threads_ = 1;
     uint32_t reserved_service_threads_ = 1;
     uint32_t compute_thread_budget_ = 1;

@@ -54,8 +54,8 @@ struct Mxfp4Scratch
     uint64_t optimization_flags) noexcept;
 [[nodiscard]] bool cpu_fast_silu_enabled(uint64_t optimization_flags) noexcept;
 [[nodiscard]] bool simd_rms_norm_enabled(uint64_t optimization_flags) noexcept;
-[[nodiscard]] uint32_t cpu_linear_thread_limit() noexcept;
-[[nodiscard]] uint32_t float8_linear_thread_limit() noexcept;
+[[nodiscard]] uint32_t cpu_linear_num_threads() noexcept;
+[[nodiscard]] uint32_t float8_linear_num_threads() noexcept;
 void embedding_batch_into(const TensorData& embedding, std::span<const int32_t> input_ids, CpuBatch& output);
 [[nodiscard]] CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
 void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch& output, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);

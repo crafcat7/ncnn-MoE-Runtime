@@ -98,7 +98,7 @@ CpuTopology discover_cpu_topology()
         if (!package_id.empty() && !core_id.empty())
             physical_cores.emplace(package_id, core_id);
     }
-    topology.physical_core_count = static_cast<uint32_t>(physical_cores.size());
+    topology.physical_cpu_count = static_cast<uint32_t>(physical_cores.size());
 
     const std::vector<uint32_t> node_ids = parse_linux_cpu_list(read_first_line("/sys/devices/system/node/online"));
     for (uint32_t node_id : node_ids)
@@ -123,7 +123,7 @@ CpuTopology discover_cpu_topology()
             {
                 auto* entry = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(storage.data() + offset);
                 if (entry->Relationship == RelationProcessorCore)
-                    ++topology.physical_core_count;
+                    ++topology.physical_cpu_count;
                 if (entry->Size == 0)
                     break;
                 offset += entry->Size;

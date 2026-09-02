@@ -5,7 +5,7 @@
 #include "kernels/cpu_ops.h"
 
 #include "ncnn/moe/types.h"
-#include "ncnn/moe/runtime_config.h"
+#include "ncnn/moe/option.h"
 
 #include <algorithm>
 #include <array>
@@ -153,7 +153,7 @@ static TensorData make_float8_matrix(uint32_t output_columns,
         storage[index] = float_to_float8_e4m3(value);
     }
     matrix.mapped_data = std::shared_ptr<const uint8_t>(storage, storage.get());
-    matrix.mapped_byte_count = element_count;
+    matrix.mapped_size = element_count;
     const uint32_t output_blocks = (output_columns + 127) / 128;
     const uint32_t input_blocks = (input_columns + 127) / 128;
     matrix.quantization_scales.resize(
@@ -211,7 +211,7 @@ static void print_command_statistics(
 
 static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_columns, uint32_t token_count, uint32_t repeats, uint32_t device_index)
 {
-    constexpr uint64_t optimization_flags = RuntimeOptimizationDefaultFlags;
+    constexpr uint64_t optimization_flags = OptimizationDefaultFlags;
     const NcnnVulkanContextInstancePtr context_instance = create_ncnn_vulkan_context_instance();
     if (intermediate_columns > std::numeric_limits<uint32_t>::max() / 2)
     {
@@ -246,14 +246,14 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
         }
     }
 
-    const uint64_t weight_bytes = gate_up.mxfp4_blocks.size() + gate_up.mxfp4_scales.size() + down.mxfp4_blocks.size() + down.mxfp4_scales.size();
+    const uint64_t weight_size = gate_up.mxfp4_blocks.size() + gate_up.mxfp4_scales.size() + down.mxfp4_blocks.size() + down.mxfp4_scales.size();
     const double cpu_ms = median_milliseconds(cpu_times);
-    auto bandwidth = [weight_bytes, token_count](double milliseconds) {
-        return static_cast<double>(weight_bytes) * token_count / (1024.0 * 1024.0 * 1024.0) / (milliseconds / 1000.0);
+    auto bandwidth = [weight_size, token_count](double milliseconds) {
+        return static_cast<double>(weight_size) * token_count / (1024.0 * 1024.0 * 1024.0) / (milliseconds / 1000.0);
     };
     std::cout << "expert shape: " << token_count << " x " << input_columns << " -> " << intermediate_columns << " -> " << input_columns << '\n';
     std::cout << "MXFP4 CPU kernel: " << mxfp4_kernel_name() << ", row group: " << mxfp4_decode_row_pair_group_size() << '\n';
-    std::cout << "weight bytes: " << weight_bytes << '\n';
+    std::cout << "weight bytes: " << weight_size << '\n';
     std::cout << "CPU median: " << cpu_ms << " ms, " << bandwidth(cpu_ms) << " effective GiB/s\n";
 
     auto vulkan = NcnnVulkanMxfp4ExpertOperator::create(
@@ -330,12 +330,11 @@ static int benchmark_cpu_mxfp4_q8_expert(
         std::cout << "CPU MXFP4-Q8 expert benchmark skipped: single-token AVX512 decode intentionally uses the exact row-pair kernel; use token count 2 or greater\n";
         return 0;
     }
-    constexpr uint64_t base_optimization_flags = RuntimeOptimizationDefaultFlags;
-    constexpr uint64_t reference_optimization_flags = base_optimization_flags & ~RuntimeOptimizationCpuMxfp4Q8;
-    constexpr uint64_t q8_optimization_flags =
-        base_optimization_flags
-        | RuntimeOptimizationCpuMxfp4Q8
-        | RuntimeOptimizationCpuPackedWeights;
+    constexpr uint64_t base_optimization_flags = OptimizationDefaultFlags;
+    constexpr uint64_t reference_optimization_flags = base_optimization_flags & ~OptimizationCpuMxfp4Q8;
+    constexpr uint64_t q8_optimization_flags = base_optimization_flags
+                                               | OptimizationCpuMxfp4Q8
+                                               | OptimizationCpuPackedWeights;
     TensorData gate_up = make_matrix(intermediate_columns * 2, input_columns);
     TensorData down = make_matrix(input_columns, intermediate_columns);
     const CpuBatch input = make_input(token_count, input_columns);
@@ -411,10 +410,10 @@ static int benchmark_cpu_mxfp4_q8_expert(
     }
     const double reference_ms = median_milliseconds(reference_times);
     const double candidate_ms = median_milliseconds(candidate_times);
-    const uint64_t weight_bytes = gate_up.mxfp4_blocks.size() + gate_up.mxfp4_scales.size()
-                                  + down.mxfp4_blocks.size() + down.mxfp4_scales.size();
-    auto bandwidth = [weight_bytes, token_count](double milliseconds) {
-        return static_cast<double>(weight_bytes) * token_count
+    const uint64_t weight_size = gate_up.mxfp4_blocks.size() + gate_up.mxfp4_scales.size()
+                                 + down.mxfp4_blocks.size() + down.mxfp4_scales.size();
+    auto bandwidth = [weight_size, token_count](double milliseconds) {
+        return static_cast<double>(weight_size) * token_count
                / (1024.0 * 1024.0 * 1024.0)
                / (milliseconds / 1000.0);
     };
@@ -440,7 +439,7 @@ static int benchmark_bfloat16_projection(
     uint32_t repeats,
     uint32_t device_index)
 {
-    constexpr uint64_t optimization_flags = RuntimeOptimizationDefaultFlags;
+    constexpr uint64_t optimization_flags = OptimizationDefaultFlags;
     const NcnnVulkanContextInstancePtr context_instance = create_ncnn_vulkan_context_instance();
     TensorData matrix = make_bfloat16_matrix(
         output_columns,
@@ -511,9 +510,9 @@ static int benchmark_bfloat16_projection(
     const double rms_error = std::sqrt(
         squared_error
         / static_cast<double>(reference.rows() * reference.columns()));
-    const uint64_t weight_bytes = matrix.bfloat16_data.size() * sizeof(uint16_t);
+    const uint64_t weight_size = matrix.bfloat16_data.size() * sizeof(uint16_t);
     const double milliseconds = median_milliseconds(times);
-    const double effective_bandwidth = static_cast<double>(weight_bytes) * token_count
+    const double effective_bandwidth = static_cast<double>(weight_size) * token_count
                                        / (1024.0 * 1024.0 * 1024.0)
                                        / (milliseconds / 1000.0);
     const uint64_t submit_wait_microseconds = counters_after.submit_wait_time_microseconds
@@ -552,8 +551,8 @@ static int benchmark_cpu_bfloat16_projection(
     uint32_t token_count,
     uint32_t repeats)
 {
-    constexpr uint64_t base_optimization_flags = RuntimeOptimizationDefaultFlags;
-    constexpr uint64_t policy_flags = RuntimeOptimizationCpuBfloat16Batched;
+    constexpr uint64_t base_optimization_flags = OptimizationDefaultFlags;
+    constexpr uint64_t policy_flags = OptimizationCpuBfloat16Batched;
     const uint64_t reference_optimization_flags = base_optimization_flags & ~policy_flags;
     const uint64_t candidate_optimization_flags = base_optimization_flags | policy_flags;
     TensorData matrix = make_bfloat16_matrix(output_columns, input_columns);
@@ -650,7 +649,7 @@ static int benchmark_cpu_float8_expert(uint32_t input_columns,
                                        uint32_t token_count,
                                        uint32_t repeats)
 {
-    constexpr uint64_t optimization_flags = RuntimeOptimizationDefaultFlags;
+    constexpr uint64_t optimization_flags = OptimizationDefaultFlags;
     TensorData gate = make_float8_matrix(intermediate_columns,
                                          input_columns, 1);
     TensorData up = make_float8_matrix(intermediate_columns,
@@ -808,7 +807,7 @@ int main(int argc, char** argv)
 {
     try
     {
-        constexpr uint64_t optimization_flags = ncnn::moe::RuntimeOptimizationDefaultFlags;
+        constexpr uint64_t optimization_flags = ncnn::moe::OptimizationDefaultFlags;
         const uint32_t input_columns = argc > 1 ? ncnn::moe::parse_dimension(argv[1], "input columns") : 2880;
         const uint32_t output_columns = argc > 2 ? ncnn::moe::parse_dimension(argv[2], "output columns") : 5760;
         const uint32_t token_count = argc > 3 ? ncnn::moe::parse_dimension(argv[3], "token count") : 1;
@@ -981,7 +980,7 @@ int main(int argc, char** argv)
                 row_errors[row] = std::max(row_errors[row], std::abs(cpu_output.row(row)[column] - vulkan_output.row(row)[column]));
             }
         }
-        const uint64_t weight_bytes = matrix.mxfp4_blocks.size() + matrix.mxfp4_scales.size();
+        const uint64_t weight_size = matrix.mxfp4_blocks.size() + matrix.mxfp4_scales.size();
         const uint64_t bfloat16_source_bytes = bfloat16_matrix.bfloat16_data.size() * sizeof(uint16_t);
         const uint64_t bfloat16_device_bytes = bfloat16_matrix.bfloat16_data.size() * sizeof(float);
         const double cpu_ms = ncnn::moe::median_milliseconds(cpu_times);
@@ -989,13 +988,13 @@ int main(int argc, char** argv)
         const double bfloat16_vulkan_ms = ncnn::moe::median_milliseconds(bfloat16_vulkan_times);
         const double packed_bfloat16_vulkan_ms = ncnn::moe::median_milliseconds(
             packed_bfloat16_vulkan_times);
-        const auto bandwidth = [weight_bytes, token_count](double milliseconds) { return static_cast<double>(weight_bytes) * token_count / (1024.0 * 1024.0 * 1024.0) / (milliseconds / 1000.0); };
+        const auto bandwidth = [weight_size, token_count](double milliseconds) { return static_cast<double>(weight_size) * token_count / (1024.0 * 1024.0 * 1024.0) / (milliseconds / 1000.0); };
         const auto bfloat16_bandwidth = [bfloat16_device_bytes, token_count](double milliseconds) {
             return static_cast<double>(bfloat16_device_bytes) * token_count / (1024.0 * 1024.0 * 1024.0) / (milliseconds / 1000.0);
         };
         std::cout << "shape: " << token_count << " x " << input_columns << " -> " << output_columns << '\n';
         std::cout << "Vulkan device: " << (device_index == ncnn::moe::automatic_vulkan_device_index ? -1 : static_cast<int64_t>(device_index)) << '\n';
-        std::cout << "MXFP4 weight bytes: " << weight_bytes << '\n';
+        std::cout << "MXFP4 weight bytes: " << weight_size << '\n';
         std::cout << "BF16 source/device weight bytes: " << bfloat16_source_bytes << " / " << bfloat16_device_bytes << '\n';
         std::cout << "CPU median: " << cpu_ms << " ms, " << bandwidth(cpu_ms) << " effective GiB/s\n";
         std::cout << "Vulkan MXFP4 median: " << vulkan_ms << " ms, " << bandwidth(vulkan_ms) << " effective GiB/s\n";
