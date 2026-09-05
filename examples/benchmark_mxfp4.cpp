@@ -1,8 +1,8 @@
-#include "backends/ncnn/ncnn_linear.h"
-#include "kernels/cpu_bfloat16.h"
-#include "kernels/cpu_float8.h"
-#include "kernels/cpu_mxfp4.h"
-#include "kernels/cpu_ops.h"
+#include "backends/ncnn/linear.h"
+#include "kernels/bfloat16.h"
+#include "kernels/float8.h"
+#include "kernels/mxfp4.h"
+#include "kernels/ops.h"
 
 #include "ncnn/moe/types.h"
 #include "ncnn/moe/option.h"
@@ -279,7 +279,7 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
     }
     std::vector<double> vulkan_times;
     vulkan_times.reserve(repeats);
-    const NcnnVulkanRuntimeCounters counters_before = NcnnLinearOperator::vulkan_execution_snapshot(context_instance).counters;
+    const NcnnVulkanRuntimeCounters counters_before = get_vulkan_execution_snapshot(context_instance).counters;
     for (uint32_t repeat = 0; repeat < repeats; ++repeat)
     {
         const auto started = std::chrono::steady_clock::now();
@@ -290,7 +290,7 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
         }
         vulkan_times.push_back(elapsed_milliseconds(started));
     }
-    const NcnnVulkanRuntimeCounters counters_after = NcnnLinearOperator::vulkan_execution_snapshot(context_instance).counters;
+    const NcnnVulkanRuntimeCounters counters_after = get_vulkan_execution_snapshot(context_instance).counters;
 
     float maximum_error = 0.0f;
     float maximum_normalized_error = 0.0f;
@@ -476,7 +476,7 @@ static int benchmark_bfloat16_projection(
             return 1;
         }
     }
-    const NcnnVulkanRuntimeCounters counters_before = NcnnLinearOperator::vulkan_execution_snapshot(context_instance).counters;
+    const NcnnVulkanRuntimeCounters counters_before = get_vulkan_execution_snapshot(context_instance).counters;
     std::vector<double> times;
     times.reserve(repeats);
     for (uint32_t repeat = 0; repeat < repeats; ++repeat)
@@ -489,7 +489,7 @@ static int benchmark_bfloat16_projection(
         }
         times.push_back(elapsed_milliseconds(started));
     }
-    const NcnnVulkanRuntimeCounters counters_after = NcnnLinearOperator::vulkan_execution_snapshot(context_instance).counters;
+    const NcnnVulkanRuntimeCounters counters_after = get_vulkan_execution_snapshot(context_instance).counters;
 
     float maximum_error = 0.0f;
     float maximum_normalized_error = 0.0f;

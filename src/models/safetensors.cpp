@@ -1,6 +1,6 @@
 #include "safetensors.h"
-#include "kernels/cpu_qnk.h"
-#include "storage/mapped_file.h"
+#include "kernels/qnk.h"
+#include "storage/mappedfile.h"
 
 #include <algorithm>
 #include <array>

@@ -35,6 +35,6 @@ directories in `models/` and are not version-controlled.
 | Model-provided speculative execution | No | No | DSpark | One-layer MTP with the compiled Artifact | Not admitted |
 | Vision input | No | No | No | Not admitted | Not admitted |
 
-`MoeIR` is model-neutral. Family-specific recognition and tensor names remain
-inside the production adapters; Prefill, Decode, routing, Expert storage, and
-scheduling consume compiled plans.
+`MoeModelDescriptor` is the public model-neutral descriptor. Family-specific
+recognition and tensor names remain inside the production adapters; Prefill,
+Decode, routing, Expert storage, and scheduling consume compiled plans.

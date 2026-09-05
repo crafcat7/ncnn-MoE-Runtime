@@ -6,8 +6,9 @@
 
 ncnn MoE Runtime is a lightweight, high-performance C++20 inference engine for
 sparse Mixture-of-Experts models, built on
-[Tencent/ncnn](https://github.com/Tencent/ncnn). Model adapters lower external
-packages into a model-neutral `MoeIR`; the Runtime compiles that IR into an
+[Tencent/ncnn](https://github.com/Tencent/ncnn). Model adapters parse external
+packages into a model-neutral `MoeModelDescriptor`; the Loader validates that
+descriptor, while the Runtime compiles its model plans into an
 execution graph and schedules Dense Transformer work, routing, and sparse
 Experts across CPU, Vulkan, memory, and storage backends.
 
@@ -52,13 +53,13 @@ bounded host and device cache tiers backed by asynchronous range I/O.
 
 | Runtime concern | Mechanism |
 | --- | --- |
-| Model integration | `IMoeModelAdapter` lowers package metadata and weights into `MoeIR` |
-| Compilation | Validation, normalization, weight resolution, graph construction, and backend placement |
+| Model integration | `ModelAdapter` parses package metadata into `MoeModelDescriptor` and maps weights |
+| Compilation | Descriptor validation, weight resolution, execution-graph construction, and backend placement |
 | Dense Transformer | Portable CPU, ncnn CPU operators, or ncnn Vulkan |
 | Sparse Experts | Stable Top-K grouping, batched execution, and runtime-selected kernels |
 | Weight residency | Automatic eager or byte-bounded on-demand Expert storage |
 | Cache policy | Host ARC with independent optional Vulkan execution and victim tiers |
-| Scheduling | Dependency waves, backend events, and cross-Session micro-batching |
+| Scheduling | Dependency-ordered backend runs and cross-Session micro-batching |
 
 The Runtime therefore scales with the active Expert working set rather than
 requiring a resident copy of every routed weight.
@@ -68,15 +69,15 @@ requiring a resident copy of every routed weight.
 | Area | Release capability |
 | --- | --- |
 | Runtime API | `Runtime`, immutable shared `Model`, per-request `Session`, and cross-Session `BatchScheduler` |
-| Model integration | Public `IMoeModelAdapter` contract and model-neutral `MoeIR`; built-in GPT-OSS, DeepSeek V4, Qwen3.6, and Qwen3.8 text adapters |
-| IR and compiler | Model-neutral `MoeIR` for Attention, Router, ExpertGroup, Combine, KV Cache, and quantization metadata; validation, normalization, weight resolution, and immutable compilation |
-| Execution graph | Tensor and node dependencies, backend candidates and placement, cross-backend events, and topological execution waves |
+| Model integration | Public `ModelAdapter` contract and model-neutral `MoeModelDescriptor`; built-in GPT-OSS, DeepSeek V4, Qwen3.6, and Qwen3.8 text adapters |
+| Compiler | Descriptor validation, weight resolution, execution-graph construction, and immutable compilation |
+| Execution graph | Tensor and node dependencies, backend candidates and placement, and dependency-ordered backend runs |
 | Dense path | Portable CPU with runtime-dispatched FP8 E4M3 scalar/AVX2/AVX-512 Linear, optional ncnn CPU operators, and mixed ncnn Vulkan Dense/Attention execution |
 | Attention | RMSNorm, GQA, full/sliding Attention, Gated DeltaNet, latent Attention with learned compressed history, RoPE/YaRN variants, output gates, sinks, persistent KV/recurrent state, fused QKV+RoPE, and adaptive online Decode SDPA |
 | Experts | Stable Top-K regrouping, Softmax/Sigmoid/square-root-Softplus scoring, hash routes, gated shared Experts, float32/BF16/FP8/INT8/Q2_K-Q6_K execution, and fused-decode FP4 kernels selected at runtime for scalar, NEON, SVE2, AVX2/FMA, or AVX-512 |
-| Memory and storage | Automatic eager/on-demand planning, per-Session Tensor residency accounting, Expert lifecycle/hotset statistics, byte-bounded host ARC, mmap or asynchronous direct/buffered reads, optional packed Expert storage, and optional Vulkan cache tiers |
+| Memory and storage | Automatic eager/on-demand planning, per-Session KV/recurrent state, byte-bounded host ARC, mmap or asynchronous direct/buffered reads, optional packed Expert storage, and optional Vulkan cache tiers |
 | Heterogeneous execution | CPU Experts by default, optional calibrated native Vulkan MXFP4 Experts, and capability-weighted multi-Vulkan layer placement |
-| Scheduling | Independent Session state, ragged staged Prefill, mHC/Attention/Expert Decode batching, same-Expert and exact-input coalescing, adaptive staged/independent execution, and bounded cross-call micro-batching |
+| Scheduling | Independent Session state, ragged staged Prefill, mHC/Attention/Expert Decode batching, and same-Expert and exact-input coalescing |
 | Generation | Greedy, temperature, Top-K, Top-P, Min-P, stop tokens, streaming, and model-provided speculative plans |
 
 ## Why it is fast
@@ -106,9 +107,9 @@ requiring a resident copy of every routed weight.
   transactional Attention/recurrent state and exact fallback commits. DSpark
   supports batched verification; Qwen currently uses exact sequential target
   verification and remains opt-in.
-- **Workload-aware scheduling.** Ragged Prefill, cross-Session collection,
-  mHC/Attention/Expert batching, and adaptive staged/independent execution
-  improve service throughput without fixing policy choices to one device.
+- **Workload-aware scheduling.** Ragged Prefill, cross-Session collection, and
+  mHC/Attention/Expert batching improve service throughput without fixing
+  policy choices to one device.
 
 ## Quick start
 
@@ -239,9 +240,10 @@ speedup, and checksum delta for all six formats.
 
 ## Runtime API
 
-`Runtime` selects a registered adapter for the supplied model package, compiles
-its `MoeIR`, creates independent Session state, and exposes Prefill, Decode, or
-complete generation:
+`Runtime` selects a registered adapter for the supplied model package, validates
+the model descriptor, compiles its execution plan, creates independent Session
+state, and
+exposes Prefill, Decode, or complete generation:
 
 ```cpp
 #include "ncnn/moe/runtime.h"
@@ -268,10 +270,10 @@ ncnn::moe::Result<ncnn::moe::GenerationResult> run(
 }
 ```
 
-Applications add model families that map to the supported `MoeIR` node set
-through `IMoeModelAdapter::can_load`, `parse_model`, and `map_weights`;
-execution code consumes only the compiled model-neutral representation. The
-unified Python CLI is the text and conversation entry point, while
+Applications add model families that describe supported model semantics through
+`ModelAdapter::can_load`, `parse_model`, and `map_weights`; execution code
+consumes only compiled plans. The unified Python CLI is the text and
+conversation entry point, while
 `ncnn_moe_worker` is the tokenizer-neutral token-ID protocol boundary.
 Model-specific tokenization, chat templates, reasoning/final-channel decoding,
 and stop-token policy stay in Python adapters.
@@ -286,9 +288,9 @@ consume that state through explicit contracts.
 | Boundary | Responsibility |
 | --- | --- |
 | MoE Runtime API | Hardware capabilities, model loading, immutable `Model` lifetime, mutable `Session` state, generation, sampling, cache synchronization, and `BatchScheduler` creation |
-| Adapter and compiler | Model-package parsing through `IMoeModelAdapter`, model-neutral `MoeIR`, validation and normalization, weight resolution, memory planning, backend placement, and `CompiledModel` construction |
-| Execution | `ExecutionGraph` dependencies and Tensor locations, `RuntimeScheduler` backend lanes/events, `MoeScheduler` topological waves, routing, and Expert dispatch |
-| Memory | `ModelMemoryPlan`, per-Session `MemoryManager`, runtime `Expert`/`ExpertStore` state, host ARC residency, and optional Vulkan cache tiers |
+| Adapter and compiler | Model-package parsing through `ModelAdapter` into `MoeModelDescriptor`, descriptor validation, weight resolution, memory planning, backend placement, and `CompiledModel` construction |
+| Execution | `ExecutionGraph` dependencies and Tensor locations, dependency-ordered backend runs, routing, and Expert dispatch |
+| Memory | `ModelMemoryPlan`, per-Session KV/recurrent state, host ARC residency, and optional Vulkan cache tiers |
 | Backends | Portable CPU kernels, ncnn CPU/Vulkan Dense and Attention blocks, CPU Expert execution, and the optional native Vulkan MXFP4 Expert backend |
 | Model storage | Package metadata and mappings, asynchronous range I/O, packed Expert storage, and cache lifetime ownership |
 
@@ -300,12 +302,14 @@ Runtime / Model / Session / BatchScheduler
     |
 Runtime Core
     |
-Model Adapter -> MoeIR -> ModelCompiler -> CompiledModel
+Model Adapter -> MoeModelDescriptor -> ModelLoader -> compile_model
+                                                |
+                                          CompiledModel
                                                 |
                          +----------------------+----------------------+
                          |                                             |
-             ExecutionGraph + RuntimeScheduler          Memory plan + MemoryManager
-                         |                               Expert + ExpertStore + ARC
+             ExecutionGraph + ExecutionSchedule           Memory plan + runtime caches
+                         |                                Host ARC + Vulkan caches
                          +----------------------+----------------------+
                                                 |
                             +-------------------+-------------------+
@@ -317,18 +321,27 @@ Model Adapter -> MoeIR -> ModelCompiler -> CompiledModel
 ```
 
 Model adapters translate family-specific metadata and tensor names into
-`MoeIR`. `ModelCompiler` resolves weights, validates the graph, and creates an
-immutable compiled plan. `ExecutionGraph` records data dependencies, placement
-and event metadata; `RuntimeScheduler` turns it into CPU/Vulkan lanes and
-waves. `Session` owns mutable KV cache, sampling state, reusable execution
-scratch, Tensor-residency accounting, and statistics. `ExpertStore` exposes
-Expert lifecycle and hotset information, while the byte-bounded Expert cache
+`MoeModelDescriptor`. `ModelLoader` validates the descriptor, resolves options,
+maps package storage, and plans memory before calling the free `compile_model`
+function. The compiler binds model semantics and tensor handles, delegates
+concrete ncnn operator construction to backend preparers, and calls
+`build_graph` to materialize the immutable execution graph
+and compile-time schedule. `ExecutionGraph` records data dependencies and
+placement; `ExecutionSchedule` records the dependency-ordered CPU/Vulkan
+backend runs consumed by execution. `BatchScheduler` coordinates Session
+requests.
+`Session` owns mutable KV cache, recurrent state, sampling state,
+reusable execution scratch, and statistics. The byte-bounded Expert cache
 implements ARC recent/frequent resident lists and ghost histories.
 
 Autoregressive dependencies are preserved within each Session. Independent
-Sessions can overlap through the batch scheduler. Expert cache admission and
-range I/O retain explicit asynchronous lifetimes, while Vulkan commands use
-the public upstream ncnn submission API.
+Sessions can overlap through explicit batch submissions. Multi-Session prefill
+requires one shared model and no pending scheduler work. Compatible decode
+batches use staged execution when enabled and all Sessions are available;
+otherwise, requests run independently in per-Session order. The scheduler does
+not aggregate separate calls. Expert cache admission and range I/O retain
+explicit asynchronous lifetimes, while Vulkan commands use the public upstream
+ncnn submission API.
 
 Cross-layer Router prediction, forward-aware cache policy, Rank-adaptive
 prefetch, a bounded prediction worker, and exact-adjacency cross-Expert reads
@@ -341,7 +354,7 @@ the Runtime API and its public model guides.
 
 | Capability | Public behavior |
 | --- | --- |
-| Adapter interface | Public `IMoeModelAdapter` to `MoeIR` lowering contract |
+| Adapter interface | Public `ModelAdapter` descriptor and weight-mapping contract |
 | Built-in reference adapters | GPT-OSS-20B/120B, DeepSeek-V4-Flash/DSpark, and the Qwen3.6-35B-A3B and Qwen3.8-Flash-Next text backbones |
 | CPU execution | Complete portable path |
 | Heterogeneous execution | Vulkan Dense/Attention with CPU routing and Experts |
@@ -355,8 +368,8 @@ The distributed release includes validated GPT-OSS, DeepSeek V4, Qwen3.6, and
 Qwen3.8 text production adapters. Both Qwen admissions exclude their vision
 encoders. Qwen3.6 admits its one-layer MTP payload with the checkpoint-bound
 compiled Artifact, while Qwen3.8 does not execute its MTP tensors. Additional
-adapters use the same public IR and
-compiler boundary without adding model-family checks to Prefill, Decode,
+adapters use the same public descriptor and
+internal compiler boundary without adding model-family checks to Prefill, Decode,
 scheduling, or Expert execution.
 Multi-device placement is layer placement rather than Tensor Parallelism, and
 Vulkan-only execution is not a supported public mode.
@@ -376,12 +389,11 @@ definitions:
 ## Project layout
 
 ```text
-include/ncnn/moe/  Installed Runtime API, MoeIR, graph, plan, Expert, memory, and scheduler contracts
-src/compiler/      MoeIR validation, normalization, descriptor conversion, and graph construction
-src/graph/         Model compilation, execution-graph scheduling, Expert dispatch, and memory planning
-src/engine/        Runtime Core, Sessions, batch scheduling, MemoryManager, CPU execution, and Expert-backend coordination
+include/ncnn/moe/  Installed Runtime, Session, Scheduler, model-adapter, and model-descriptor contracts
+src/graph/         Model compilation, graph construction/scheduling, Expert routing, and memory planning
+src/engine/        Runtime, Sessions, execution, CPU/thread resources, and Expert coordination
 src/models/        Built-in model adapters, package loading, packed-sidecar selection, and canonical Tensor names
-src/storage/       Mapped files, range I/O, host ARC, Vulkan victim cache, system-memory discovery, and Expert lifecycle
+src/storage/       Weight storage, mapped-file I/O, host ARC, and Vulkan victim cache
 src/kernels/       Portable CPU Attention/Linear, BF16 helpers, Qn_K pack/decode, and runtime-selected FP8/MXFP4 SIMD kernels
 src/backends/ncnn/ ncnn CPU/Vulkan operator packaging, mixed Attention, Vulkan contexts, and native MXFP4 Experts
 models/            Model catalog and model-family execution guides
@@ -394,6 +406,17 @@ third_party/ncnn/  Pinned ncnn source submodule
 
 Private source files are grouped by owning responsibility and retain direct,
 ncnn-style names within each directory.
+
+Start with `engine/runtime.cpp` and `engine/modelloader.cpp` for loading,
+`graph/compiler.cpp` for model semantics, `graph/graph.cpp` for graph construction
+and scheduling, and `engine/executor.cpp` for execution. Backend operator
+preparation stays in `backends/ncnn/modelpipeline.cpp`; CPU and Vulkan kernels
+remain separate from that loading policy.
+
+Compound module names use joined words (`modeladapter.h`, `weightstore.h`).
+Implementation variants keep a suffix (`executor_speculative.cpp`,
+`expertbackend_vulkan.cpp`, `mxfp4_msvc_avx2.cpp`). The installed model contracts
+are `ncnn/moe/modeladapter.h` and `ncnn/moe/modeldescriptor.h`.
 
 ## License
 

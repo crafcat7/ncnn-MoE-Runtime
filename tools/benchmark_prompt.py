@@ -160,7 +160,6 @@ def _summary(done_events: list[dict[str, Any]], generated: list[list[int]]) -> d
         "generated_token_ids_by_run": generated,
         "expert_gpu_executions": int(expert.get("gpu_executions", 0)),
         "expert_gpu_execution_failures": int(expert.get("gpu_execution_failures", 0)),
-        "expert_gpu_cpu_preferred": int(expert.get("gpu_cpu_preferred", 0)),
         "expert_gpu_route_aggregation_batches": int(expert.get("gpu_route_aggregation_batches", 0)),
         "expert_gpu_route_aggregation_routes": int(expert.get("gpu_route_aggregation_routes", 0)),
         "expert_gpu_route_aggregation_bytes_saved": int(expert.get("gpu_route_aggregation_bytes_saved", 0)),
@@ -271,7 +270,7 @@ def main() -> int:
         )
         print(
             "GPU evidence: executions={expert_gpu_executions}, failures={expert_gpu_execution_failures}, "
-            "CPU-preferred={expert_gpu_cpu_preferred}, dense dispatches={gpu_linear_dispatches}, "
+            "dense dispatches={gpu_linear_dispatches}, "
             "attention blocks={gpu_attention_blocks}, GDN fusions/submissions={gpu_gated_delta_fusions}/{gpu_gated_delta_submissions}, "
             "uploads/downloads={gpu_batch_uploads}/{gpu_batch_downloads}; {gpu_execution_evidence}".format(**result)
         )

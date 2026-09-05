@@ -1,7 +1,6 @@
 #ifndef NCNN_MOE_OPTION_H
 #define NCNN_MOE_OPTION_H
 
-#include "ncnn/moe/memory_plan.h"
 #include "ncnn/moe/types.h"
 
 #include <cstdint>
@@ -184,16 +183,16 @@ static_assert(
 static_assert(
     (OptimizationDefaultFlags & OptimizationOptionalFlags) == 0);
 
-[[nodiscard]] inline bool optimization_enabled(
-    uint64_t optimization_flags,
-    uint64_t flag) noexcept
-{
-    return has_flag(optimization_flags, flag);
-}
-
 // User-supplied model loading options. Zero-valued memory settings and Auto
 // enum values leave hardware- and model-specific decisions to Runtime.
 // Tokenizer, prompt, chat, and sampling state deliberately do not belong here.
+enum class ExpertMemoryMode
+{
+    Auto,
+    Eager,
+    OnDemand
+};
+
 enum class CpuPackedWeightMode
 {
     Disabled,
@@ -216,28 +215,6 @@ struct Option
     std::vector<uint32_t> vulkan_device_indices;
     uint32_t flags = 0;
     uint64_t optimization_flags = OptimizationDefaultFlags;
-};
-
-// Runtime settings after Auto values have been resolved.
-struct EffectiveOption
-{
-    HybridMode hybrid_mode = HybridMode::CpuOnly;
-    ExpertMemoryMode requested_expert_memory_mode = ExpertMemoryMode::Auto;
-    ExpertMemoryMode selected_expert_memory_mode = ExpertMemoryMode::Eager;
-    CpuPackedWeightMode requested_cpu_packed_weight_mode = CpuPackedWeightMode::Disabled;
-    CpuPackedWeightMode selected_cpu_packed_weight_mode = CpuPackedWeightMode::Disabled;
-    uint64_t host_memory_budget = 0;
-    uint64_t expert_cache_size = 0;
-    uint64_t expert_gpu_cache_size = 0;
-    uint64_t expert_gpu_victim_cache_size = 0;
-    uint32_t expert_gpu_victim_reuse_probe_interval = 1;
-    uint32_t num_expert_io_threads = 0;
-    uint32_t vulkan_device_index = automatic_vulkan_device_index;
-    std::vector<uint32_t> vulkan_device_indices;
-    uint32_t flags = 0;
-    uint64_t optimization_flags = OptimizationDefaultFlags;
-    uint32_t num_concurrent_sessions = 1;
-    bool use_file_backed_experts = false;
 };
 
 } // namespace moe

@@ -2,6 +2,8 @@ if(NOT DEFINED NCNN_MOE_SOURCE_DIR)
     message(FATAL_ERROR "NCNN_MOE_SOURCE_DIR is required")
 endif()
 
+get_filename_component(NCNN_MOE_SOURCE_DIR "${NCNN_MOE_SOURCE_DIR}" ABSOLUTE)
+
 file(GLOB_RECURSE NCNN_MOE_STYLE_FILES
     LIST_DIRECTORIES false
     "${NCNN_MOE_SOURCE_DIR}/include/*.h"
@@ -16,6 +18,10 @@ file(GLOB_RECURSE NCNN_MOE_STYLE_FILES
     "${NCNN_MOE_SOURCE_DIR}/examples/*.hpp"
     "${NCNN_MOE_SOURCE_DIR}/examples/*.cpp"
 )
+
+if(NOT NCNN_MOE_STYLE_FILES)
+    message(FATAL_ERROR "No C++ source files found in ${NCNN_MOE_SOURCE_DIR}")
+endif()
 
 set(NCNN_MOE_STYLE_ERRORS "")
 

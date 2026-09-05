@@ -1,4 +1,4 @@
-#include "internal/run_model.h"
+#include "internal/modelrunner.h"
 
 int main(int argc, char** argv)
 {

@@ -154,39 +154,10 @@ def parse_arguments():
         ),
     )
     parser.add_argument(
-        "--scheduler-expert-threads",
-        type=int,
-        default=0,
-        help=(
-            "Override Expert OpenMP threads per scheduler worker "
-            "(zero keeps the runner's topology default)."
-        ),
-    )
-    parser.add_argument(
         "--scheduler-staging",
-        choices=("auto", "force", "off"),
+        choices=("auto", "off"),
         default="auto",
         help="Control cross-session staged decode batching.",
-    )
-    parser.add_argument(
-        "--scheduler-cross-call",
-        action="store_true",
-        help=(
-            "Submit each Session as an independent scheduler call so the "
-            "Runtime cross-call collector is exercised."
-        ),
-    )
-    parser.add_argument(
-        "--scheduler-collection-us",
-        type=int,
-        default=200,
-        help="Maximum cross-call collection window in microseconds.",
-    )
-    parser.add_argument(
-        "--scheduler-max-micro-batch",
-        type=int,
-        default=0,
-        help="Maximum collected requests; zero follows scheduler workers.",
     )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
@@ -362,27 +333,6 @@ def validate_arguments(arguments):
         or arguments.parallel_sessions > 64
     ):
         raise ValueError("--parallel-sessions must be between 1 and 64")
-    if (
-        arguments.scheduler_expert_threads < 0
-        or arguments.scheduler_expert_threads > 1024
-    ):
-        raise ValueError(
-            "--scheduler-expert-threads must be between 0 and 1024"
-        )
-    if (
-        arguments.scheduler_collection_us < 0
-        or arguments.scheduler_collection_us > 1000000
-    ):
-        raise ValueError(
-            "--scheduler-collection-us must be between 0 and 1000000"
-        )
-    if (
-        arguments.scheduler_max_micro_batch < 0
-        or arguments.scheduler_max_micro_batch > 1024
-    ):
-        raise ValueError(
-            "--scheduler-max-micro-batch must be between 0 and 1024"
-        )
     if arguments.repeats <= 0:
         raise ValueError("--repeats must be positive")
     if (
@@ -524,31 +474,8 @@ def runner_command(arguments):
         command.extend(
             ["--parallel-sessions", str(arguments.parallel_sessions)]
         )
-    if arguments.scheduler_expert_threads:
-        command.extend(
-            [
-                "--scheduler-expert-threads",
-                str(arguments.scheduler_expert_threads),
-            ]
-        )
     if arguments.scheduler_staging != "auto":
         command.extend(["--scheduler-staging", arguments.scheduler_staging])
-    if arguments.scheduler_cross_call:
-        command.append("--scheduler-cross-call")
-    if arguments.scheduler_collection_us != 200:
-        command.extend(
-            [
-                "--scheduler-collection-us",
-                str(arguments.scheduler_collection_us),
-            ]
-        )
-    if arguments.scheduler_max_micro_batch:
-        command.extend(
-            [
-                "--scheduler-max-micro-batch",
-                str(arguments.scheduler_max_micro_batch),
-            ]
-        )
     if arguments.backend != "auto":
         command.append(f"--{arguments.backend}")
     if arguments.expert_memory != "auto":
@@ -1043,24 +970,6 @@ def parse_runner_output(output):
         if token_match
         else []
     )
-    hotsets = [
-        {
-            "capacity_mib": int(match.group(1)),
-            "resident_experts": int(match.group(2)),
-            "active_experts": int(match.group(3)),
-            "resident_bytes": int(match.group(4)),
-            "batch_weight_coverage": float(match.group(5)) / 100.0,
-            "route_weight_coverage": float(match.group(6)) / 100.0,
-        }
-        for match in re.finditer(
-            r"^Expert static hotset at (\d+) MiB: "
-            r"(\d+)/(\d+) Expert\(s\), (\d+) bytes resident, "
-            r"([0-9.]+)% batch-byte coverage, "
-            r"([0-9.]+)% route-byte coverage$",
-            output,
-            re.MULTILINE,
-        )
-    ]
     route_ranks = [
         {
             "rank": int(match.group(1)),
@@ -1268,19 +1177,6 @@ def parse_runner_output(output):
         "vulkan_attention_blocks": extract_number(
             output, r"^Vulkan attention blocks: (\d+)", int
         ),
-        "vulkan_attention_batch_submissions": extract_number(
-            output, r"^Vulkan attention batching: (\d+) submission", int
-        ),
-        "vulkan_attention_batch_rows": extract_number(
-            output,
-            r"^Vulkan attention batching: \d+ submission\(s\), (\d+) row",
-            int,
-        ),
-        "vulkan_attention_batch_avoided_submissions": extract_number(
-            output,
-            r"^Vulkan attention batching: \d+ submission\(s\), \d+ row\(s\), (\d+) submission",
-            int,
-        ),
         "vulkan_kernel_features": extract_text(
             output, r"^Vulkan kernel features: (.+)$"
         ),
@@ -1377,145 +1273,25 @@ def parse_runner_output(output):
             r"^Vulkan KV cache promotion: \d+ promotion\(s\), (\d+) bytes",
             int,
         ),
-        "scheduler_staged_batches": extract_number(
-            output, r"^Scheduler staging: (\d+) batch", int
+        "scheduler_num_threads": extract_number(
+            output, r"^Scheduler threads: (\d+)", int
         ),
-        "scheduler_staged_requests": extract_number(
+        "scheduler_prefill_batches": extract_number(
+            output, r"^Scheduler batches: (\d+) prefill", int
+        ),
+        "scheduler_staged_prefill_batches": extract_number(
             output,
-            r"^Scheduler staging: \d+ batch\(es\), (\d+) request",
+            r"^Scheduler batches: \d+ prefill \((\d+) staged\)",
             int,
         ),
-        "scheduler_staging_bypassed_batches": extract_number(
+        "scheduler_decode_batches": extract_number(
             output,
-            r"^Scheduler staging: \d+ batch\(es\), \d+ request\(s\), (\d+) bypassed",
+            r"^Scheduler batches: \d+ prefill \(\d+ staged\), (\d+) decode",
             int,
         ),
-        "scheduler_logical_expert_batches": extract_number(
+        "scheduler_staged_decode_batches": extract_number(
             output,
-            r"^Scheduler staging:.*?(\d+) logical Expert batch",
-            int,
-        ),
-        "scheduler_physical_expert_batches": extract_number(
-            output,
-            r"^Scheduler staging:.*?-> (\d+) physical",
-            int,
-        ),
-        "scheduler_coalesced_expert_routes": extract_number(
-            output,
-            r"^Scheduler staging:.*?(\d+) coalesced route",
-            int,
-        ),
-        "scheduler_max_coalesced_expert_batch_size": extract_number(
-            output,
-            r"^Scheduler staging:.*?max (\d+) row",
-            int,
-        ),
-        "scheduler_adaptive_staged_decisions": extract_number(
-            output,
-            r"^Scheduler adaptive policy: (\d+) staged decision",
-            int,
-        ),
-        "scheduler_adaptive_independent_decisions": extract_number(
-            output,
-            r"^Scheduler adaptive policy: \d+ staged decision\(s\), (\d+) independent",
-            int,
-        ),
-        "scheduler_adaptive_probe_decisions": extract_number(
-            output,
-            r"^Scheduler adaptive policy:.*?(\d+) probe",
-            int,
-        ),
-        "scheduler_adaptive_policy_switches": extract_number(
-            output,
-            r"^Scheduler adaptive policy:.*?(\d+) switch",
-            int,
-        ),
-        "scheduler_adaptive_staged_ms_per_request": extract_number(
-            output,
-            r"^Scheduler adaptive policy:.*?([0-9.]+)/[0-9.]+ mean ms/request",
-        ),
-        "scheduler_adaptive_independent_ms_per_request": extract_number(
-            output,
-            r"^Scheduler adaptive policy:.*?[0-9.]+/([0-9.]+) mean ms/request",
-        ),
-        "scheduler_adaptive_resident_decisions": extract_number(
-            output,
-            r"^Scheduler adaptive phases: (\d+)/",
-            int,
-        ),
-        "scheduler_adaptive_mixed_decisions": extract_number(
-            output,
-            r"^Scheduler adaptive phases: \d+/(\d+)/",
-            int,
-        ),
-        "scheduler_adaptive_storage_decisions": extract_number(
-            output,
-            r"^Scheduler adaptive phases: \d+/\d+/(\d+) resident",
-            int,
-        ),
-        "scheduler_adaptive_resident_observations": extract_number(
-            output,
-            r"^Scheduler adaptive phases:.*?, (\d+)/\d+/\d+ observation",
-            int,
-        ),
-        "scheduler_adaptive_mixed_observations": extract_number(
-            output,
-            r"^Scheduler adaptive phases:.*?, \d+/(\d+)/\d+ observation",
-            int,
-        ),
-        "scheduler_adaptive_storage_observations": extract_number(
-            output,
-            r"^Scheduler adaptive phases:.*?, \d+/\d+/(\d+) observation",
-            int,
-        ),
-        "scheduler_adaptive_phase_changes": extract_number(
-            output,
-            r"^Scheduler adaptive phases:.*?(\d+) phase change",
-            int,
-        ),
-        "scheduler_adaptive_noisy_switch_rejections": extract_number(
-            output,
-            r"^Scheduler adaptive phases:.*?(\d+) noisy switch rejection",
-            int,
-        ),
-        "scheduler_cross_call_collected_batches": extract_number(
-            output,
-            r"^Scheduler cross-call: (\d+) collected batch",
-            int,
-        ),
-        "scheduler_cross_call_collected_requests": extract_number(
-            output,
-            r"^Scheduler cross-call: \d+ collected batch\(es\), (\d+) collected request",
-            int,
-        ),
-        "scheduler_cross_call_collection_probes": extract_number(
-            output,
-            r"^Scheduler cross-call:.*?(\d+) probe",
-            int,
-        ),
-        "scheduler_cross_call_collection_timeouts": extract_number(
-            output,
-            r"^Scheduler cross-call:.*?(\d+) timeout",
-            int,
-        ),
-        "scheduler_cross_call_collection_bypasses": extract_number(
-            output,
-            r"^Scheduler cross-call:.*?(\d+) bypass",
-            int,
-        ),
-        "scheduler_cross_call_collection_wait_us": extract_number(
-            output,
-            r"^Scheduler cross-call:.*?(\d+) us waiting",
-            int,
-        ),
-        "scheduler_cross_call_max_batch_size": extract_number(
-            output,
-            r"^Scheduler cross-call:.*?max batch (\d+)",
-            int,
-        ),
-        "scheduler_cross_call_max_pending": extract_number(
-            output,
-            r"^Scheduler cross-call:.*?max pending (\d+)",
+            r"^Scheduler batches: \d+ prefill \(\d+ staged\), \d+ decode \((\d+) staged\)",
             int,
         ),
         "expert_route_predictions": extract_number(
@@ -1779,9 +1555,6 @@ def parse_runner_output(output):
         "expert_gpu_execution_failures": extract_number(
             output, r"^Expert GPU execution:.*?(\d+) failure", int
         ),
-        "expert_gpu_cpu_preferred": extract_number(
-            output, r"^Expert GPU execution:.*?(\d+) CPU-preferred", int
-        ),
         "expert_gpu_execution_ms": extract_number(
             output, r"^Expert GPU execution:.*?([0-9.]+) ms executing"
         ),
@@ -1827,7 +1600,6 @@ def parse_runner_output(output):
         "expert_gpu_arc_frequent_ghost_bytes": extract_number(
             output, r"^Expert GPU ARC:.*?(\d+) frequent ghost byte", int
         ),
-        "expert_static_hotsets": hotsets,
         "generated_token_ids": tokens,
     }
     def has_positive(field):
@@ -2440,15 +2212,7 @@ def main():
         "warmup_runs": arguments.warmup,
         "cache_warmup_runs": arguments.cache_warmup_runs,
         "parallel_sessions": arguments.parallel_sessions,
-        "scheduler_expert_threads": arguments.scheduler_expert_threads,
         "scheduler_staging": arguments.scheduler_staging,
-        "scheduler_cross_call": arguments.scheduler_cross_call,
-        "scheduler_collection_us": (
-            arguments.scheduler_collection_us
-        ),
-        "scheduler_max_micro_batch": (
-            arguments.scheduler_max_micro_batch
-        ),
         "expert_gpu_cache_mb": arguments.expert_gpu_cache_mb,
         "expert_gpu_victim_cache_mb": (
             arguments.expert_gpu_victim_cache_mb
@@ -2483,9 +2247,6 @@ def main():
                 samples,
                 "required_pcie_gib_per_second_at_20_tps",
             ),
-            "expert_static_hotsets": samples[-1][
-                "expert_static_hotsets"
-            ],
             "expert_cache_wait_ms": median_field(
                 samples, "expert_cache_wait_ms"
             ),
@@ -2600,15 +2361,6 @@ def main():
             "vulkan_attention_blocks": median_field(
                 samples, "vulkan_attention_blocks"
             ),
-            "vulkan_attention_batch_submissions": median_field(
-                samples, "vulkan_attention_batch_submissions"
-            ),
-            "vulkan_attention_batch_rows": median_field(
-                samples, "vulkan_attention_batch_rows"
-            ),
-            "vulkan_attention_batch_avoided_submissions": median_field(
-                samples, "vulkan_attention_batch_avoided_submissions"
-            ),
             "vulkan_gated_delta_fusions": median_field(
                 samples, "vulkan_gated_delta_fusions"
             ),
@@ -2633,92 +2385,20 @@ def main():
             "vulkan_kv_cache_promotion_bytes": median_field(
                 samples, "vulkan_kv_cache_promotion_bytes"
             ),
-            "scheduler_staged_batches": median_field(
-                samples, "scheduler_staged_batches"
+            "scheduler_num_threads": median_field(
+                samples, "scheduler_num_threads"
             ),
-            "scheduler_staged_requests": median_field(
-                samples, "scheduler_staged_requests"
+            "scheduler_prefill_batches": median_field(
+                samples, "scheduler_prefill_batches"
             ),
-            "scheduler_staging_bypassed_batches": median_field(
-                samples, "scheduler_staging_bypassed_batches"
+            "scheduler_staged_prefill_batches": median_field(
+                samples, "scheduler_staged_prefill_batches"
             ),
-            "scheduler_logical_expert_batches": median_field(
-                samples, "scheduler_logical_expert_batches"
+            "scheduler_decode_batches": median_field(
+                samples, "scheduler_decode_batches"
             ),
-            "scheduler_physical_expert_batches": median_field(
-                samples, "scheduler_physical_expert_batches"
-            ),
-            "scheduler_coalesced_expert_routes": median_field(
-                samples, "scheduler_coalesced_expert_routes"
-            ),
-            "scheduler_max_coalesced_expert_batch_size": median_field(
-                samples, "scheduler_max_coalesced_expert_batch_size"
-            ),
-            "scheduler_adaptive_staged_decisions": median_field(
-                samples, "scheduler_adaptive_staged_decisions"
-            ),
-            "scheduler_adaptive_independent_decisions": median_field(
-                samples, "scheduler_adaptive_independent_decisions"
-            ),
-            "scheduler_adaptive_probe_decisions": median_field(
-                samples, "scheduler_adaptive_probe_decisions"
-            ),
-            "scheduler_adaptive_policy_switches": median_field(
-                samples, "scheduler_adaptive_policy_switches"
-            ),
-            "scheduler_adaptive_staged_ms_per_request": median_field(
-                samples, "scheduler_adaptive_staged_ms_per_request"
-            ),
-            "scheduler_adaptive_independent_ms_per_request": median_field(
-                samples, "scheduler_adaptive_independent_ms_per_request"
-            ),
-            "scheduler_adaptive_resident_decisions": median_field(
-                samples, "scheduler_adaptive_resident_decisions"
-            ),
-            "scheduler_adaptive_mixed_decisions": median_field(
-                samples, "scheduler_adaptive_mixed_decisions"
-            ),
-            "scheduler_adaptive_storage_decisions": median_field(
-                samples, "scheduler_adaptive_storage_decisions"
-            ),
-            "scheduler_adaptive_resident_observations": median_field(
-                samples, "scheduler_adaptive_resident_observations"
-            ),
-            "scheduler_adaptive_mixed_observations": median_field(
-                samples, "scheduler_adaptive_mixed_observations"
-            ),
-            "scheduler_adaptive_storage_observations": median_field(
-                samples, "scheduler_adaptive_storage_observations"
-            ),
-            "scheduler_adaptive_phase_changes": median_field(
-                samples, "scheduler_adaptive_phase_changes"
-            ),
-            "scheduler_adaptive_noisy_switch_rejections": median_field(
-                samples, "scheduler_adaptive_noisy_switch_rejections"
-            ),
-            "scheduler_cross_call_collected_batches": median_field(
-                samples, "scheduler_cross_call_collected_batches"
-            ),
-            "scheduler_cross_call_collected_requests": median_field(
-                samples, "scheduler_cross_call_collected_requests"
-            ),
-            "scheduler_cross_call_collection_probes": median_field(
-                samples, "scheduler_cross_call_collection_probes"
-            ),
-            "scheduler_cross_call_collection_timeouts": median_field(
-                samples, "scheduler_cross_call_collection_timeouts"
-            ),
-            "scheduler_cross_call_collection_bypasses": median_field(
-                samples, "scheduler_cross_call_collection_bypasses"
-            ),
-            "scheduler_cross_call_collection_wait_us": median_field(
-                samples, "scheduler_cross_call_collection_wait_us"
-            ),
-            "scheduler_cross_call_max_batch_size": median_field(
-                samples, "scheduler_cross_call_max_batch_size"
-            ),
-            "scheduler_cross_call_max_pending": median_field(
-                samples, "scheduler_cross_call_max_pending"
+            "scheduler_staged_decode_batches": median_field(
+                samples, "scheduler_staged_decode_batches"
             ),
             "expert_route_predictions": median_field(
                 samples, "expert_route_predictions"
@@ -2937,9 +2617,6 @@ def main():
             "expert_gpu_execution_failures": median_field(
                 samples, "expert_gpu_execution_failures"
             ),
-            "expert_gpu_cpu_preferred": median_field(
-                samples, "expert_gpu_cpu_preferred"
-            ),
             "expert_gpu_execution_ms": median_field(
                 samples, "expert_gpu_execution_ms"
             ),
@@ -3012,8 +2689,7 @@ def main():
         print(
             "median GPU Expert execution cache: "
             f"{median['expert_gpu_cache_hits']:.0f} hit(s), "
-            f"{median['expert_gpu_executions']:.0f} execution(s), "
-            f"{median['expert_gpu_cpu_preferred']:.0f} CPU-preferred"
+            f"{median['expert_gpu_executions']:.0f} execution(s)"
         )
     if median["expert_gpu_route_aggregation_batches"] is not None:
         print(

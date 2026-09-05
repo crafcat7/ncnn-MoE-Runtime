@@ -138,11 +138,6 @@ def _generation_rate(metrics: dict[str, Any]) -> float | None:
     return None
 
 
-def _decode_rate(metrics: dict[str, Any]) -> float | None:
-    """Legacy decode-rate alias."""
-    return _generation_rate(metrics)
-
-
 def _format_gpu_kernel_time(gpu: dict[str, Any], available: bool) -> str:
     if not available:
         return "N/A (CPU-only)"
@@ -159,8 +154,8 @@ def _format_runtime_metrics(metrics: Any) -> str:
     expert = metrics.get("expert", {})
     if not isinstance(expert, dict):
         expert = {}
-    cache_hit_rate = expert.get("cache_hit_rate") if isinstance(expert, dict) else None
-    if not isinstance(cache_hit_rate, (int, float)) and isinstance(expert, dict):
+    cache_hit_rate = expert.get("cache_hit_rate")
+    if not isinstance(cache_hit_rate, (int, float)):
         cache_hit = expert.get("cache_hit")
         cache_miss = expert.get("cache_miss")
         if isinstance(cache_hit, (int, float)) and isinstance(cache_miss, (int, float)) and cache_hit + cache_miss:
@@ -182,7 +177,7 @@ def _format_runtime_metrics(metrics: Any) -> str:
         if isinstance(process_cpu, (int, float))
         else "N/A"
     )
-    cache_hit_text = _format_metric_count(expert.get("cache_hit") if isinstance(expert, dict) else None)
+    cache_hit_text = _format_metric_count(expert.get("cache_hit"))
     if isinstance(cache_hit_rate, (int, float)):
         cache_hit_text += f" ({float(cache_hit_rate) * 100:.1f}%)"
     return "\n".join(
@@ -198,82 +193,80 @@ def _format_runtime_metrics(metrics: Any) -> str:
             "  Expert: cache hit "
             f"{cache_hit_text}"
             " · cache miss "
-            f"{_format_metric_count(expert.get('cache_miss') if isinstance(expert, dict) else None)}"
+            f"{_format_metric_count(expert.get('cache_miss'))}"
             " · IO "
-            f"{_format_bytes_gb(expert.get('io_bytes') if isinstance(expert, dict) else None)}",
+            f"{_format_bytes_gb(expert.get('io_bytes'))}",
             "  GPU Expert: cache hit "
-            f"{_format_metric_count(expert.get('gpu_cache_hit') if isinstance(expert, dict) else None)}"
+            f"{_format_metric_count(expert.get('gpu_cache_hit'))}"
             " / miss "
-            f"{_format_metric_count(expert.get('gpu_cache_miss') if isinstance(expert, dict) else None)}"
+            f"{_format_metric_count(expert.get('gpu_cache_miss'))}"
             " / exec "
-            f"{_format_metric_count(expert.get('gpu_executions') if isinstance(expert, dict) else None)}"
-            " / CPU-preferred "
-            f"{_format_metric_count(expert.get('gpu_cpu_preferred') if isinstance(expert, dict) else None)}"
+            f"{_format_metric_count(expert.get('gpu_executions'))}"
             " / resident "
-            f"{_format_bytes_gb(expert.get('gpu_cache_resident_bytes') if isinstance(expert, dict) else None)}"
+            f"{_format_bytes_gb(expert.get('gpu_cache_resident_bytes'))}"
             " / dropped "
-            f"{_format_metric_count(expert.get('gpu_cache_dropped_admissions') if isinstance(expert, dict) else None)}",
+            f"{_format_metric_count(expert.get('gpu_cache_dropped_admissions'))}",
             "  CPU: expert compute "
-            f"{_format_duration_microseconds(cpu.get('expert_compute_time_microseconds') if isinstance(cpu, dict) else None)}"
+            f"{_format_duration_microseconds(cpu.get('expert_compute_time_microseconds'))}"
             f" · process {process_cpu_text}",
             "  GPU: submit "
-            f"{_format_metric_count(gpu.get('submit_count') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('submit_count'), available=gpu_available)}"
             " · wait "
-            f"{_format_duration_microseconds(gpu.get('wait_time_microseconds') if isinstance(gpu, dict) and gpu_available else None)}"
+            f"{_format_duration_microseconds(gpu.get('wait_time_microseconds') if gpu_available else None)}"
             " · kernel "
             f"{_format_gpu_kernel_time(gpu, gpu_available)}"
             " · utilization "
             f"{_format_gpu_utilization(gpu_device)}"
             " / attention "
-            f"{_format_metric_count(gpu.get('attention_blocks') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_blocks'), available=gpu_available)}"
             " / linear "
-            f"{_format_metric_count(gpu.get('linear_dispatches') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('linear_dispatches'), available=gpu_available)}"
             " / gated-delta "
-            f"{_format_metric_count(gpu.get('gated_delta_fusions') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('gated_delta_fusions'), available=gpu_available)}"
             " / upload/download "
-            f"{_format_metric_count(gpu.get('batch_uploads') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('batch_uploads'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('batch_downloads') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('batch_downloads'), available=gpu_available)}"
             " / qkv-rope/device-rope/ring "
-            f"{_format_metric_count(gpu.get('attention_qkv_rope_fusions') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_fusions'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('attention_device_rope_fusions') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_device_rope_fusions'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('attention_qkv_ring_fusions') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_qkv_ring_fusions'), available=gpu_available)}"
             " / qkv-fail P/S/R/N/G/A "
-            f"{_format_metric_count(gpu.get('attention_qkv_rope_pipeline_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_pipeline_failures'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('attention_qkv_rope_shape_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_shape_failures'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('attention_qkv_rope_source_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_source_failures'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('attention_qkv_rope_norm_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_norm_failures'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('attention_qkv_rope_ring_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_ring_failures'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('attention_qkv_rope_allocation_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_qkv_rope_allocation_failures'), available=gpu_available)}"
             " / fail pre/stage/norm/qkv/cache "
-            f"{_format_metric_count(gpu.get('attention_precondition_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_precondition_failures'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('attention_staging_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_staging_failures'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('attention_norm_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_norm_failures'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('attention_qkv_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_qkv_failures'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('attention_cache_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_cache_failures'), available=gpu_available)}"
             " / fail sdpa/proj/out/submit "
-            f"{_format_metric_count(gpu.get('attention_sdpa_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_sdpa_failures'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('attention_projection_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_projection_failures'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('attention_output_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_output_failures'), available=gpu_available)}"
             "/"
-            f"{_format_metric_count(gpu.get('attention_submit_failures') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_submit_failures'), available=gpu_available)}"
             " / kv-materialize "
-            f"{_format_metric_count(gpu.get('attention_cache_materializations') if isinstance(gpu, dict) else None, available=gpu_available)}"
+            f"{_format_metric_count(gpu.get('attention_cache_materializations'), available=gpu_available)}"
             " / attention-cpu-fallback "
-            f"{_format_metric_count(gpu.get('attention_cpu_fallbacks') if isinstance(gpu, dict) else None, available=gpu_available)}",
+            f"{_format_metric_count(gpu.get('attention_cpu_fallbacks'), available=gpu_available)}",
         )
     )
 

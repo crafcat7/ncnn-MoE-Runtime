@@ -1,0 +1,1100 @@
+#include "modelrunner.h"
+
+#include "ncnn/moe/runtime.h"
+#include "backends/ncnn/linear.h"
+#include "engine/cpu.h"
+#include "graph/compiledmodel.h"
+#include "kernels/bfloat16.h"
+#include "kernels/float8.h"
+#include "kernels/mxfp4.h"
+#include "kernels/ops.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace ncnn {
+namespace moe {
+
+static double elapsed_seconds(std::chrono::steady_clock::time_point start)
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
+static const char* hybrid_mode_name(HybridMode mode)
+{
+    if (mode == HybridMode::HybridExperts)
+        return "vulkan-dense/hybrid-experts";
+    return "cpu";
+}
+
+static const char* expert_memory_mode_name(ExpertMemoryMode mode)
+{
+    if (mode == ExpertMemoryMode::OnDemand)
+        return "on-demand";
+    if (mode == ExpertMemoryMode::Eager)
+        return "eager";
+    return "auto";
+}
+
+static const char* require_value(int argc, char** argv, int& index, const char* option)
+{
+    if (++index >= argc)
+        throw std::invalid_argument(std::string(option) + " requires a value");
+    return argv[index];
+}
+
+static uint64_t mebibytes(const char* value, const char* option)
+{
+    const uint64_t count = std::stoull(value);
+    if (count > std::numeric_limits<uint64_t>::max() / (1024 * 1024))
+        throw std::out_of_range(std::string(option) + " is too large");
+    return count * 1024 * 1024;
+}
+
+static std::vector<int32_t> read_prompt_tokens(const std::filesystem::path& path)
+{
+    std::ifstream stream(path);
+    if (!stream)
+        throw std::runtime_error("cannot open prompt token file: " + path.string());
+
+    std::vector<int32_t> result;
+    int64_t token = 0;
+    while (stream >> token)
+    {
+        if (token < std::numeric_limits<int32_t>::min() || token > std::numeric_limits<int32_t>::max())
+            throw std::out_of_range("prompt token ID is outside the int32 range");
+        result.push_back(static_cast<int32_t>(token));
+    }
+    if (!stream.eof())
+        throw std::invalid_argument("prompt token file must contain whitespace-separated integers");
+    if (result.empty())
+        throw std::invalid_argument("prompt token file is empty");
+    return result;
+}
+
+static std::vector<uint32_t> parse_device_indices(const char* value, const char* option)
+{
+    std::vector<uint32_t> result;
+    std::stringstream input(value);
+    std::string item;
+    while (std::getline(input, item, ','))
+    {
+        if (item.empty())
+        {
+            throw std::invalid_argument(std::string(option) + " contains an empty device index");
+        }
+        result.push_back(static_cast<uint32_t>(std::stoul(item)));
+    }
+    if (result.empty())
+    {
+        throw std::invalid_argument(std::string(option) + " requires at least one device index");
+    }
+    return result;
+}
+
+static void append_feature(std::string& features, const char* name)
+{
+    if (!features.empty())
+        features += ',';
+    features += name;
+}
+
+static std::string vulkan_kernel_features(const GpuInfo& gpu_info)
+{
+    std::string result;
+    if (has_flag(gpu_info.flags, VulkanDeviceInt8Storage))
+        append_feature(result, "int8-storage");
+    if (has_flag(gpu_info.flags, VulkanDeviceInt8Arithmetic))
+        append_feature(result, "int8-arithmetic");
+    if (has_flag(gpu_info.flags, VulkanDeviceIntegerDotProduct))
+        append_feature(result, "integer-dot");
+    if (has_flag(gpu_info.flags, VulkanDeviceSubgroupOperations))
+        append_feature(result, "subgroup");
+    if (has_flag(gpu_info.flags, VulkanDeviceCooperativeMatrix))
+        append_feature(result, "cooperative-matrix");
+    if (has_flag(gpu_info.flags, VulkanDeviceInt8CooperativeMatrix))
+        append_feature(result, "int8-cooperative-matrix");
+    return result.empty() ? "baseline-fp32" : result;
+}
+
+// The native runner does not own a tokenizer.  This label records the exact
+// benchmark prompt while token IDs remain externally supplied.
+static constexpr const char* p0_benchmark_prompt = "\xE4\xBD\xA0\xE5\xA5\xBD\xEF\xBC\x8C\xE4\xBD\xA0\xE8\x83\xBD\xE5\x81\x9A\xE4\xBB\x80\xE4\xB9\x88\xEF\xBC\x81\xE4\xBD\xA0\xE7\x9A\x84\xE7\x9F\xA5\xE8\xAF\x86\xE5\xBA\x93\xE6\x98\xAF\xE4\xBB\x80\xE4\xB9\x88\xE6\x97\xB6\xE5\x80\x99\xE7\x9A\x84\xE7\x89\x88\xE6\x9C\xAC";
+
+} // namespace moe
+} // namespace ncnn
+
+int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::ExampleRunnerOptions& runner_options)
+{
+    if (argc < 2)
+    {
+        std::cerr << "usage: " << runner_options.executable_name << " <model-directory> [token-id ...]"
+                                                                    " [--prompt-token-file PATH]"
+                                                                    " [--prompt-text TEXT|--benchmark-prompt]"
+                                                                    " [--baseline-token-per-second N]"
+                                                                    " [--max-new-tokens N] [--stop-token ID ...] [--temperature T] [--speculative|--no-speculative]"
+                                                                    " [--speculative-confidence P] [--speculative-max-draft N]"
+                                                                    " [--top-k K] [--top-p P] [--min-p P] [--seed N]"
+                                                                    " [--expert-memory auto|eager|on-demand]"
+                                                                    " [--cpu-packed-weights on|off]"
+                                                                    " [--host-memory-mb N] [--expert-cache-mb N]"
+                                                                    " [--expert-gpu-cache-mb N]"
+                                                                    " [--expert-gpu-victim-cache-mb N]"
+                                                                    " [--expert-gpu-victim-reuse-probe N]"
+                                                                    " [--disable-vulkan-indexed-experts]"
+                                                                    " [--disable-gpu-expert-execution]"
+                                                                    " [--disable-gpu-victim-execution]"
+                                                                    " [--disable-router-prediction]"
+                                                                    " [--disable-async-router-prediction]"
+                                                                    " [--disable-forward-aware-cache]"
+                                                                    " [--disable-rank-adaptive-prefetch]"
+                                                                    " [--disable-cross-expert-read-coalescing]"
+                                                                    " [--release-vulkan-dense-host]"
+                                                                    " [--router-prediction] [--async-router-prediction]"
+                                                                    " [--forward-aware-cache]"
+                                                                    " [--rank-adaptive-prefetch] [--cross-expert-read-coalescing]"
+                                                                    " [--expert-io-workers N]"
+                                                                    " [--vulkan-device N]"
+                                                                    " [--vulkan-devices N[,N...]]"
+                                                                    " [--mmap-experts]"
+                                                                    " [--direct-expert-io]"
+                                                                    " [--buffered-expert-io]"
+                                                                    " [--cache-warmup-runs N]"
+                                                                    " [--parallel-sessions N]"
+                                                                    " [--parallel-independent]"
+                                                                    " [--parallel-speculative]"
+                                                                    " [--scheduler-staging auto|off]"
+                                                                    " [--cpu|--hybrid]"
+                                                                    " [--stream-token-ids] [--report-throughput]\n";
+        return 2;
+    }
+
+    try
+    {
+        ncnn::moe::Option opt;
+        ncnn::moe::SessionOptions session_options;
+        ncnn::moe::GenerationOptions generation_options;
+        const auto set_expert_io_mode = [&opt](uint32_t mode) {
+            opt.flags = (opt.flags & ~ncnn::moe::OptionExpertIoMask) | mode;
+        };
+        generation_options.sampling.temperature = 0.0f;
+        generation_options.use_speculative = runner_options.use_speculative;
+        if (runner_options.default_stop_token >= 0)
+            generation_options.stop_tokens.push_back(runner_options.default_stop_token);
+        if (runner_options.secondary_default_stop_token >= 0)
+            generation_options.stop_tokens.push_back(runner_options.secondary_default_stop_token);
+        std::vector<int32_t> prompt;
+        std::string prompt_text;
+        double baseline_token_per_second = 0.0;
+        bool has_baseline_token_per_second = false;
+        bool stream_token_ids = false;
+        bool report_throughput = false;
+        bool parallel_independent = false;
+        bool parallel_speculative = false;
+        uint32_t cache_warmup_runs = 0;
+        uint32_t parallel_sessions = 1;
+        bool scheduler_staging = true;
+        std::filesystem::path prompt_token_file;
+        for (int index = 2; index < argc; ++index)
+        {
+            const std::string argument = argv[index];
+            if (argument == "--prompt-token-file")
+            {
+                prompt_token_file = ncnn::moe::require_value(argc, argv, index, "--prompt-token-file");
+            }
+            else if (argument == "--prompt-text")
+            {
+                prompt_text = ncnn::moe::require_value(argc, argv, index, "--prompt-text");
+                if (prompt_text.empty())
+                    throw std::invalid_argument("--prompt-text must not be empty");
+            }
+            else if (argument == "--benchmark-prompt")
+            {
+                if (!prompt_text.empty())
+                    throw std::invalid_argument("--benchmark-prompt cannot be combined with --prompt-text");
+                prompt_text = ncnn::moe::p0_benchmark_prompt;
+            }
+            else if (argument == "--baseline-token-per-second")
+            {
+                baseline_token_per_second = std::stod(ncnn::moe::require_value(argc, argv, index, "--baseline-token-per-second"));
+                if (!std::isfinite(baseline_token_per_second) || baseline_token_per_second <= 0.0)
+                    throw std::invalid_argument("--baseline-token-per-second must be finite and greater than zero");
+                has_baseline_token_per_second = true;
+            }
+            else if (argument == "--max-new-tokens")
+            {
+                generation_options.max_new_tokens = static_cast<uint32_t>(std::stoul(ncnn::moe::require_value(argc, argv, index, "--max-new-tokens")));
+            }
+            else if (argument == "--stop-token")
+            {
+                generation_options.stop_tokens.push_back(std::stoi(ncnn::moe::require_value(argc, argv, index, "--stop-token")));
+            }
+            else if (argument == "--temperature")
+            {
+                generation_options.sampling.temperature = std::stof(ncnn::moe::require_value(argc, argv, index, "--temperature"));
+            }
+            else if (argument == "--top-k")
+            {
+                generation_options.sampling.top_k = static_cast<uint32_t>(std::stoul(ncnn::moe::require_value(argc, argv, index, "--top-k")));
+            }
+            else if (argument == "--top-p")
+            {
+                generation_options.sampling.top_p = std::stof(ncnn::moe::require_value(argc, argv, index, "--top-p"));
+            }
+            else if (argument == "--min-p")
+            {
+                generation_options.sampling.min_p = std::stof(ncnn::moe::require_value(argc, argv, index, "--min-p"));
+            }
+            else if (argument == "--seed")
+            {
+                session_options.sampling_seed = std::stoull(ncnn::moe::require_value(argc, argv, index, "--seed"));
+            }
+            else if (argument == "--no-speculative")
+            {
+                generation_options.use_speculative = false;
+            }
+            else if (argument == "--speculative")
+            {
+                generation_options.use_speculative = true;
+            }
+            else if (argument == "--speculative-confidence")
+            {
+                generation_options.speculative_confidence_threshold = std::stof(ncnn::moe::require_value(
+                    argc,
+                    argv,
+                    index,
+                    "--speculative-confidence"));
+            }
+            else if (argument == "--speculative-max-draft")
+            {
+                generation_options.speculative_max_draft_tokens = static_cast<uint32_t>(std::stoul(
+                    ncnn::moe::require_value(
+                        argc,
+                        argv,
+                        index,
+                        "--speculative-max-draft")));
+            }
+            else if (argument == "--expert-cache-mb")
+            {
+                opt.expert_cache_size = ncnn::moe::mebibytes(ncnn::moe::require_value(argc, argv, index, "--expert-cache-mb"), "--expert-cache-mb");
+            }
+            else if (argument == "--host-memory-mb")
+            {
+                opt.host_memory_budget = ncnn::moe::mebibytes(ncnn::moe::require_value(argc, argv, index, "--host-memory-mb"), "--host-memory-mb");
+            }
+            else if (argument == "--expert-gpu-cache-mb")
+            {
+                opt.expert_gpu_cache_size = ncnn::moe::mebibytes(ncnn::moe::require_value(argc, argv, index, "--expert-gpu-cache-mb"), "--expert-gpu-cache-mb");
+            }
+            else if (argument == "--expert-gpu-victim-cache-mb")
+            {
+                opt.expert_gpu_victim_cache_size = ncnn::moe::mebibytes(ncnn::moe::require_value(argc, argv, index, "--expert-gpu-victim-cache-mb"), "--expert-gpu-victim-cache-mb");
+            }
+            else if (argument == "--disable-gpu-expert-execution")
+            {
+                opt.flags |= ncnn::moe::OptionDisableGpuExpertExecution;
+            }
+            else if (argument == "--expert-gpu-victim-reuse-probe")
+            {
+                opt.expert_gpu_victim_reuse_probe_interval = static_cast<uint32_t>(std::stoul(ncnn::moe::require_value(argc, argv, index, "--expert-gpu-victim-reuse-probe")));
+            }
+            else if (argument == "--disable-vulkan-indexed-experts")
+            {
+                opt.optimization_flags &= ~ncnn::moe::OptimizationVulkanIndexedExperts;
+            }
+            else if (argument == "--disable-gpu-victim-execution")
+            {
+                opt.flags |= ncnn::moe::OptionDisableGpuVictimExecution;
+            }
+            else if (argument == "--disable-router-prediction")
+            {
+                opt.flags &= ~ncnn::moe::OptionRouterPrediction;
+            }
+            else if (argument == "--disable-async-router-prediction")
+            {
+                opt.flags &= ~ncnn::moe::OptionAsyncRouterPrediction;
+            }
+            else if (argument == "--disable-forward-aware-cache")
+            {
+                opt.flags &= ~ncnn::moe::OptionForwardAwareCache;
+            }
+            else if (argument == "--disable-rank-adaptive-prefetch")
+            {
+                opt.flags &= ~ncnn::moe::OptionRankAdaptivePrefetch;
+            }
+            else if (argument == "--disable-cross-expert-read-coalescing")
+            {
+                opt.flags &= ~ncnn::moe::OptionCrossExpertReadCoalescing;
+            }
+            else if (argument == "--release-vulkan-dense-host")
+            {
+                opt.flags |= ncnn::moe::OptionReleaseVulkanDenseHostStorage;
+            }
+            else if (argument == "--router-prediction")
+            {
+                opt.flags |= ncnn::moe::OptionRouterPrediction;
+            }
+            else if (argument == "--async-router-prediction")
+            {
+                opt.flags |= ncnn::moe::OptionRouterPrediction
+                             | ncnn::moe::OptionAsyncRouterPrediction;
+            }
+            else if (argument == "--forward-aware-cache")
+            {
+                opt.flags |= ncnn::moe::OptionForwardAwareCache;
+            }
+            else if (argument == "--rank-adaptive-prefetch")
+            {
+                opt.flags |= ncnn::moe::OptionRankAdaptivePrefetch;
+            }
+            else if (argument == "--cross-expert-read-coalescing")
+            {
+                opt.flags |= ncnn::moe::OptionCrossExpertReadCoalescing;
+            }
+            else if (argument == "--expert-memory")
+            {
+                const std::string mode = ncnn::moe::require_value(argc, argv, index, "--expert-memory");
+                if (mode == "auto")
+                {
+                    opt.expert_memory_mode = ncnn::moe::ExpertMemoryMode::Auto;
+                }
+                else if (mode == "eager")
+                {
+                    opt.expert_memory_mode = ncnn::moe::ExpertMemoryMode::Eager;
+                }
+                else if (mode == "on-demand")
+                {
+                    opt.expert_memory_mode = ncnn::moe::ExpertMemoryMode::OnDemand;
+                }
+                else
+                {
+                    std::cerr << "--expert-memory must be auto, eager, or on-demand\n";
+                    return 2;
+                }
+            }
+            else if (argument == "--cpu-packed-weights")
+            {
+                const std::string mode = ncnn::moe::require_value(
+                    argc,
+                    argv,
+                    index,
+                    "--cpu-packed-weights");
+                if (mode == "on")
+                {
+                    opt.cpu_packed_weight_mode = ncnn::moe::CpuPackedWeightMode::Enabled;
+                }
+                else if (mode == "off")
+                {
+                    opt.cpu_packed_weight_mode = ncnn::moe::CpuPackedWeightMode::Disabled;
+                }
+                else
+                {
+                    std::cerr
+                        << "--cpu-packed-weights must be on or off\n";
+                    return 2;
+                }
+            }
+            else if (argument == "--expert-io-workers")
+            {
+                const uint64_t workers = std::stoull(ncnn::moe::require_value(argc, argv, index, "--expert-io-workers"));
+                if (workers > 64)
+                {
+                    std::cerr << "--expert-io-workers must be between 0 and 64\n";
+                    return 2;
+                }
+                opt.num_expert_io_threads = static_cast<uint32_t>(workers);
+            }
+            else if (argument == "--vulkan-device")
+            {
+                opt.vulkan_device_index = static_cast<uint32_t>(std::stoul(ncnn::moe::require_value(argc, argv, index, "--vulkan-device")));
+            }
+            else if (argument == "--vulkan-devices")
+            {
+                opt.vulkan_device_indices = ncnn::moe::parse_device_indices(ncnn::moe::require_value(argc, argv, index, "--vulkan-devices"), "--vulkan-devices");
+            }
+            else if (argument == "--stream-token-ids")
+            {
+                stream_token_ids = true;
+            }
+            else if (argument == "--report-throughput")
+            {
+                report_throughput = true;
+            }
+            else if (argument == "--mmap-experts")
+            {
+                set_expert_io_mode(ncnn::moe::OptionMemoryMapExperts);
+            }
+            else if (argument == "--direct-expert-io")
+            {
+                set_expert_io_mode(ncnn::moe::OptionDirectExpertIo);
+            }
+            else if (argument == "--buffered-expert-io")
+            {
+                set_expert_io_mode(ncnn::moe::OptionBufferedExpertIo);
+            }
+            else if (argument == "--cache-warmup-runs")
+            {
+                cache_warmup_runs = static_cast<uint32_t>(std::stoul(ncnn::moe::require_value(argc, argv, index, "--cache-warmup-runs")));
+            }
+            else if (argument == "--parallel-sessions")
+            {
+                const uint64_t count = std::stoull(ncnn::moe::require_value(argc, argv, index, "--parallel-sessions"));
+                if (count == 0 || count > 64)
+                {
+                    std::cerr << "--parallel-sessions must be between 1 and 64\n";
+                    return 2;
+                }
+                parallel_sessions = static_cast<uint32_t>(count);
+            }
+            else if (argument == "--parallel-speculative")
+            {
+                parallel_speculative = true;
+            }
+            else if (argument == "--parallel-independent")
+            {
+                parallel_independent = true;
+            }
+            else if (argument == "--scheduler-staging")
+            {
+                const std::string mode = ncnn::moe::require_value(argc, argv, index, "--scheduler-staging");
+                if (mode == "auto")
+                {
+                    scheduler_staging = true;
+                }
+                else if (mode == "off")
+                {
+                    scheduler_staging = false;
+                }
+                else
+                {
+                    std::cerr << "--scheduler-staging must be auto or off\n";
+                    return 2;
+                }
+            }
+            else if (argument == "--cpu")
+            {
+                opt.hybrid_mode = ncnn::moe::HybridMode::CpuOnly;
+            }
+            else if (argument == "--hybrid")
+            {
+                opt.hybrid_mode = ncnn::moe::HybridMode::HybridExperts;
+            }
+            else
+            {
+                prompt.push_back(std::stoi(argument));
+            }
+        }
+        if (!prompt.empty() && !prompt_token_file.empty())
+            throw std::invalid_argument("use positional token IDs or --prompt-token-file, not both");
+        if (!prompt_token_file.empty())
+            prompt = ncnn::moe::read_prompt_tokens(prompt_token_file);
+        if (prompt.empty())
+            throw std::invalid_argument("at least one prompt token is required");
+        if (generation_options.max_new_tokens == 0)
+            throw std::invalid_argument("--max-new-tokens must be greater than zero");
+        session_options.use_speculative_context = generation_options.use_speculative
+                                                  && (parallel_sessions == 1
+                                                      || parallel_independent
+                                                      || parallel_speculative);
+        opt.num_concurrent_sessions = parallel_sessions;
+
+        ncnn::moe::Runtime runtime;
+        const auto load_start = std::chrono::steady_clock::now();
+        auto model = runtime.load_model(std::filesystem::path(argv[1]), opt);
+        if (!model)
+        {
+            std::cerr << "load failed: " << model.error().message << '\n';
+            return 1;
+        }
+        ncnn::moe::ModelPtr loaded_model = std::move(model).value();
+        if (runner_options.expected_model_type != nullptr
+            && loaded_model->descriptor().model_type != runner_options.expected_model_type)
+        {
+            std::cerr << "model type is " << loaded_model->descriptor().model_type
+                      << ", expected " << runner_options.expected_model_type << '\n';
+            return 1;
+        }
+        if (parallel_speculative
+            && (parallel_sessions < 2
+                || !generation_options.use_speculative
+                || loaded_model->descriptor().speculative_layer_count == 0))
+        {
+            std::cerr
+                << "--parallel-speculative requires multiple Sessions and "
+                   "an enabled model-provided speculative plan\n";
+            return 2;
+        }
+        if (parallel_independent && parallel_sessions < 2)
+        {
+            std::cerr
+                << "--parallel-independent requires multiple Sessions\n";
+            return 2;
+        }
+        std::cout << "loaded " << loaded_model->descriptor().model_type << " in " << ncnn::moe::elapsed_seconds(load_start) << " s, backend " << ncnn::moe::hybrid_mode_name(loaded_model->hybrid_mode()) << '\n';
+        const ncnn::moe::EffectiveOption& effective_opt = ncnn::moe::model_compiled(*loaded_model).opt;
+        const ncnn::moe::ModelMemoryPlan& memory_plan = ncnn::moe::model_compiled(*loaded_model).memory_plan;
+        std::cout << "Effective runtime: backend " << ncnn::moe::hybrid_mode_name(effective_opt.hybrid_mode)
+                  << ", host budget " << memory_plan.host_memory_budget / (1024 * 1024) << " MiB"
+                  << ", Expert cache " << memory_plan.expert_cache_size / (1024 * 1024) << " MiB"
+                  << ", CPU packed weights " << (ncnn::moe::has_flag(effective_opt.optimization_flags, ncnn::moe::OptimizationCpuPackedWeights) ? "on" : "off")
+                  << ", Expert IO workers " << effective_opt.num_expert_io_threads
+                  << ", optimization flags 0x" << std::hex
+                  << effective_opt.optimization_flags << std::dec << '\n';
+        const auto moe_layer = std::find_if(
+            loaded_model->descriptor().layers.begin(),
+            loaded_model->descriptor().layers.end(),
+            [](const ncnn::moe::LayerDescriptor& layer) {
+                return layer.ffn.kind == ncnn::moe::FfnKind::Moe;
+            });
+        if (moe_layer != loaded_model->descriptor().layers.end())
+        {
+            const ncnn::moe::DType dtype = moe_layer->ffn.moe.expert_weight_dtype;
+            const char* format = "unknown";
+            if (dtype == ncnn::moe::DType::Float32)
+                format = "float32-source";
+            else if (dtype == ncnn::moe::DType::BFloat16)
+                format = "bfloat16-source";
+            else if (dtype == ncnn::moe::DType::Int8)
+                format = "int8-source";
+            else if (dtype == ncnn::moe::DType::Float8E4M3)
+                format = "float8-e4m3-source";
+            else if (dtype == ncnn::moe::DType::MxFp4)
+                format = loaded_model->descriptor().model_type == "qwen3_5_moe"
+                             ? "mxfp4-compiled-artifact-v3"
+                             : "mxfp4-source";
+            std::cout << "Routed Expert format: " << format << '\n';
+        }
+        std::cout << "Expert memory: " << ncnn::moe::expert_memory_mode_name(memory_plan.selected_mode)
+                  << ", " << memory_plan.estimated_expert_size / (1024 * 1024) << " MiB raw"
+                  << ", " << memory_plan.estimated_cpu_packed_expert_size / (1024 * 1024) << " MiB packed estimate"
+                  << ", " << memory_plan.estimated_expert_resident_size / (1024 * 1024) << " MiB resident estimate";
+        if (memory_plan.selected_mode == ncnn::moe::ExpertMemoryMode::OnDemand)
+        {
+            std::cout << ", " << memory_plan.expert_cache_size / (1024 * 1024) << " MiB cache";
+        }
+        std::cout << '\n';
+        std::cout << "Host memory budget: " << memory_plan.host_memory_budget / (1024 * 1024) << " MiB";
+        if (memory_plan.physical_memory_size != 0)
+        {
+            std::cout << " of " << memory_plan.physical_memory_size / (1024 * 1024) << " MiB detected";
+        }
+        if (memory_plan.available_memory_size != 0)
+        {
+            std::cout << ", " << memory_plan.available_memory_size / (1024 * 1024) << " MiB available";
+        }
+        std::cout << ", dense estimate "
+                  << memory_plan.estimated_dense_size / (1024 * 1024)
+                  << " MiB";
+        std::cout << '\n';
+        const ncnn::moe::RuntimeInfo& runtime_info = runtime.info();
+        const ncnn::moe::GpuInfo* default_gpu = runtime_info.default_gpu_index < runtime_info.gpu_infos.size()
+                                                    ? &runtime_info.gpu_infos[runtime_info.default_gpu_index]
+                                                    : nullptr;
+        std::cout << "Vulkan runtime devices: " << runtime_info.gpu_infos.size() << '\n';
+        if (default_gpu && default_gpu->heap_budget != 0)
+        {
+            std::cout << "Vulkan heap budget: " << default_gpu->heap_budget / (1024 * 1024) << " MiB\n";
+        }
+        if (loaded_model->vulkan_device_index() != ncnn::moe::automatic_vulkan_device_index)
+        {
+            std::cout << "Vulkan model device: " << loaded_model->vulkan_device_index() << '\n';
+            const uint32_t index = loaded_model->vulkan_device_index();
+            if (index < runtime.info().gpu_infos.size())
+            {
+                std::cout << "Vulkan kernel features: " << ncnn::moe::vulkan_kernel_features(runtime.info().gpu_infos[index]) << '\n';
+            }
+        }
+        if (!loaded_model->vulkan_device_indices().empty())
+        {
+            std::cout << "Vulkan model devices: ";
+            for (size_t index = 0; index < loaded_model->vulkan_device_indices().size(); ++index)
+            {
+                if (index != 0)
+                    std::cout << ',';
+                std::cout << loaded_model->vulkan_device_indices()[index];
+            }
+            std::cout << '\n';
+        }
+        if (effective_opt.expert_gpu_cache_size != 0)
+        {
+            std::cout << "Executable Expert GPU cache: " << effective_opt.expert_gpu_cache_size / (1024 * 1024) << " MiB effective\n";
+        }
+        if (effective_opt.expert_gpu_victim_cache_size != 0)
+        {
+            std::cout << "Expert GPU victim cache: " << effective_opt.expert_gpu_victim_cache_size / (1024 * 1024) << " MiB effective\n";
+            std::cout << "Expert GPU victim reuse-probe interval: " << effective_opt.expert_gpu_victim_reuse_probe_interval << '\n';
+        }
+
+        for (uint32_t warmup = 0; warmup < cache_warmup_runs; ++warmup)
+        {
+            auto warmup_session = runtime.create_session(loaded_model, session_options);
+            if (!warmup_session)
+            {
+                std::cerr << "cache warm-up session creation failed: " << warmup_session.error().message << '\n';
+                return 1;
+            }
+            auto warmed = warmup_session.value()->generate(prompt, generation_options);
+            if (!warmed)
+            {
+                std::cerr << "cache warm-up generation failed: " << warmed.error().message << '\n';
+                return 1;
+            }
+        }
+        if (cache_warmup_runs != 0)
+        {
+            auto synchronized = runtime.synchronize_model_caches(loaded_model);
+            if (!synchronized)
+            {
+                std::cerr << "cache warm-up synchronization failed: " << synchronized.error().message << '\n';
+                return 1;
+            }
+        }
+
+        std::vector<ncnn::moe::SessionPtr> active_sessions;
+        active_sessions.reserve(parallel_sessions);
+        for (uint32_t session_index = 0; session_index < parallel_sessions; ++session_index)
+        {
+            auto session = runtime.create_session(loaded_model, session_options);
+            if (!session)
+            {
+                std::cerr << "session creation failed: " << session.error().message << '\n';
+                return 1;
+            }
+            active_sessions.push_back(std::move(session).value());
+        }
+
+        const auto generation_start = std::chrono::steady_clock::now();
+        double parallel_prefill_seconds = 0.0;
+        double parallel_decode_seconds = 0.0;
+        uint64_t parallel_decode_tokens = 0;
+        std::vector<ncnn::moe::GenerationResult> session_generations(parallel_sessions);
+        ncnn::moe::SchedulerStatistics scheduler_statistics;
+        if (parallel_sessions == 1)
+        {
+            auto generated = active_sessions.front()->generate(prompt, generation_options, [stream_token_ids](const ncnn::moe::StreamToken& token) {
+                if (stream_token_ids)
+                {
+                    std::cout << "generated token id: " << token.token_id << '\n'
+                              << std::flush;
+                }
+                return true;
+            });
+            if (!generated)
+            {
+                std::cerr << "generation failed: " << generated.error().message << '\n';
+                return 1;
+            }
+            session_generations.front() = std::move(generated).value();
+        }
+        else if (parallel_independent || parallel_speculative)
+        {
+            std::mutex stream_mutex;
+            std::vector<std::future<ncnn::moe::Result<ncnn::moe::GenerationResult>>> futures;
+            futures.reserve(parallel_sessions);
+            for (uint32_t session_index = 0; session_index < parallel_sessions; ++session_index)
+            {
+                futures.push_back(std::async(
+                    std::launch::async,
+                    [&, session_index]() {
+                        return active_sessions[session_index]->generate(
+                            prompt,
+                            generation_options,
+                            [&, session_index](const ncnn::moe::StreamToken& token) {
+                                if (stream_token_ids)
+                                {
+                                    std::lock_guard<std::mutex> lock(stream_mutex);
+                                    std::cout << "generated session " << session_index << " token id: " << token.token_id << '\n'
+                                              << std::flush;
+                                }
+                                return true;
+                            });
+                    }));
+            }
+            for (uint32_t session_index = 0; session_index < parallel_sessions; ++session_index)
+            {
+                auto generated = futures[session_index].get();
+                if (!generated)
+                {
+                    std::cerr << "parallel speculative generation failed: " << generated.error().message << '\n';
+                    return 1;
+                }
+                session_generations[session_index] = std::move(generated).value();
+            }
+        }
+        else
+        {
+            ncnn::moe::SchedulerOptions scheduler_options;
+            scheduler_options.num_threads = parallel_sessions;
+            scheduler_options.use_staged_decode = scheduler_staging;
+            auto scheduler = runtime.create_scheduler(scheduler_options);
+            if (!scheduler)
+            {
+                std::cerr << "scheduler creation failed: " << scheduler.error().message << '\n';
+                return 1;
+            }
+
+            const auto prefill_start = std::chrono::steady_clock::now();
+            std::vector<ncnn::moe::PrefillBatchRequest>
+                prefill_requests;
+            prefill_requests.reserve(parallel_sessions);
+            for (uint32_t session_index = 0;
+                 session_index < parallel_sessions;
+                 ++session_index)
+            {
+                prefill_requests.push_back({
+                    active_sessions[session_index],
+                    prompt,
+                });
+            }
+            auto prefill_future = scheduler.value()->submit_prefill(
+                std::move(prefill_requests));
+            std::vector<ncnn::moe::Result<ncnn::moe::PrefillResult>>
+                prefilled = prefill_future.get();
+            if (prefilled.size() != parallel_sessions)
+            {
+                std::cerr
+                    << "parallel prefill returned an invalid result count\n";
+                return 1;
+            }
+            std::vector<std::vector<float>>
+                logits(parallel_sessions);
+            for (uint32_t session_index = 0;
+                 session_index < parallel_sessions;
+                 ++session_index)
+            {
+                if (!prefilled[session_index])
+                {
+                    std::cerr
+                        << "parallel prefill failed: "
+                        << prefilled[session_index].error().message
+                        << '\n';
+                    return 1;
+                }
+                ncnn::moe::PrefillResult prefill_result = std::move(prefilled[session_index]).value();
+                logits[session_index] = std::move(prefill_result.logits);
+            }
+            parallel_prefill_seconds = ncnn::moe::elapsed_seconds(prefill_start);
+
+            const auto decode_start = std::chrono::steady_clock::now();
+            std::vector<bool> active(parallel_sessions, true);
+            for (uint32_t token_index = 0; token_index < generation_options.max_new_tokens; ++token_index)
+            {
+                std::vector<ncnn::moe::DecodeBatchRequest> requests;
+                std::vector<uint32_t> request_sessions;
+                requests.reserve(parallel_sessions);
+                request_sessions.reserve(parallel_sessions);
+                for (uint32_t session_index = 0; session_index < parallel_sessions; ++session_index)
+                {
+                    if (!active[session_index])
+                        continue;
+                    auto sampled = active_sessions[session_index]->sample(logits[session_index], generation_options.sampling);
+                    if (!sampled)
+                    {
+                        std::cerr << "parallel sampling failed: " << sampled.error().message << '\n';
+                        return 1;
+                    }
+                    ncnn::moe::StreamToken token;
+                    token.index = token_index;
+                    token.token_id = sampled.value().token_id;
+                    token.probability = sampled.value().probability;
+                    token.is_stop_token = std::find(generation_options.stop_tokens.begin(), generation_options.stop_tokens.end(), token.token_id) != generation_options.stop_tokens.end();
+                    session_generations[session_index].tokens.push_back(token);
+                    if (stream_token_ids)
+                    {
+                        std::cout << "generated session " << session_index << " token id: " << token.token_id << '\n'
+                                  << std::flush;
+                    }
+                    if (token.is_stop_token)
+                    {
+                        session_generations[session_index].stopped_by_stop_token = true;
+                        active[session_index] = false;
+                        continue;
+                    }
+                    if (token_index + 1 == generation_options.max_new_tokens)
+                    {
+                        continue;
+                    }
+                    requests.push_back({active_sessions[session_index], token.token_id});
+                    request_sessions.push_back(session_index);
+                }
+                if (requests.empty())
+                    break;
+                std::vector<ncnn::moe::Result<ncnn::moe::DecodeResult>> decoded = scheduler.value()->submit_decode(std::move(requests)).get();
+                for (size_t request_index = 0; request_index < decoded.size(); ++request_index)
+                {
+                    if (!decoded[request_index])
+                    {
+                        std::cerr << "parallel decode failed: " << decoded[request_index].error().message << '\n';
+                        return 1;
+                    }
+                    logits[request_sessions[request_index]] = std::move(decoded[request_index]).value().logits;
+                }
+                parallel_decode_tokens += decoded.size();
+            }
+            parallel_decode_seconds = ncnn::moe::elapsed_seconds(decode_start);
+            scheduler_statistics = scheduler.value()->statistics();
+        }
+
+        ncnn::moe::GenerationResult generation;
+        for (ncnn::moe::GenerationResult& session_generation : session_generations)
+        {
+            generation.tokens.insert(generation.tokens.end(), session_generation.tokens.begin(), session_generation.tokens.end());
+        }
+        const double generation_seconds = ncnn::moe::elapsed_seconds(generation_start);
+        const double aggregate_token_per_second = generation_seconds > 0.0
+                                                      ? static_cast<double>(generation.tokens.size()) / generation_seconds
+                                                      : 0.0;
+        const ncnn::moe::SessionStatistics statistics = active_sessions.front()->statistics();
+        uint64_t speculative_proposals = 0;
+        uint64_t speculative_draft_tokens = 0;
+        uint64_t speculative_accepted_tokens = 0;
+        uint64_t speculative_context_time_microseconds = 0;
+        uint64_t speculative_draft_time_microseconds = 0;
+        uint64_t speculative_verify_time_microseconds = 0;
+        for (const ncnn::moe::SessionPtr& session : active_sessions)
+        {
+            const ncnn::moe::SessionStatistics session_statistics = session->statistics();
+            speculative_proposals += session_statistics.speculative_proposals;
+            speculative_draft_tokens += session_statistics.speculative_draft_tokens;
+            speculative_accepted_tokens += session_statistics.speculative_accepted_tokens;
+            speculative_context_time_microseconds += session_statistics.speculative_context_time_microseconds;
+            speculative_draft_time_microseconds += session_statistics.speculative_draft_time_microseconds;
+            speculative_verify_time_microseconds += session_statistics.speculative_verify_time_microseconds;
+        }
+        std::cout << "generated " << generation.tokens.size() << " token(s) in " << generation_seconds << " s\n";
+        if (!prompt_text.empty())
+        {
+            std::cout << "Benchmark prompt: " << prompt_text << '\n';
+            std::cout << "Benchmark prompt token IDs: externally supplied ("
+                      << prompt.size() << "); native runner does not tokenize text\n";
+        }
+        std::cout << "Parallel sessions: " << parallel_sessions << '\n';
+        if (report_throughput)
+        {
+            std::cout << "Aggregate throughput: " << aggregate_token_per_second << " token/s\n";
+            if (has_baseline_token_per_second)
+            {
+                const double ratio = aggregate_token_per_second / baseline_token_per_second;
+                std::cout << "Token/s improvement ratio: " << ratio << "x ("
+                          << (ratio - 1.0) * 100.0 << "%) vs baseline "
+                          << baseline_token_per_second << " token/s\n";
+            }
+            else if (!prompt_text.empty())
+            {
+                std::cout << "Token/s improvement ratio: unavailable (pass --baseline-token-per-second)\n";
+            }
+        }
+        if (parallel_sessions > 1
+            && (parallel_independent || parallel_speculative))
+        {
+            std::cout
+                << "Parallel generation: independent "
+                << (generation_options.use_speculative
+                        ? "speculative "
+                        : "")
+                << "Sessions\n";
+        }
+        else if (parallel_sessions > 1)
+        {
+            if (report_throughput)
+            {
+                std::cout
+                    << "Parallel prefill: "
+                    << parallel_sessions * prompt.size()
+                    << " token(s) in "
+                    << parallel_prefill_seconds
+                    << " s, "
+                    << parallel_sessions * prompt.size()
+                           / parallel_prefill_seconds
+                    << " token/s\n";
+                std::cout
+                    << "Parallel staged decode: "
+                    << parallel_decode_tokens
+                    << " token(s) in "
+                    << parallel_decode_seconds
+                    << " s, "
+                    << (parallel_decode_seconds == 0.0
+                            ? 0.0
+                            : parallel_decode_tokens
+                                  / parallel_decode_seconds)
+                    << " token/s\n";
+            }
+            std::cout << "Scheduler threads: " << scheduler_statistics.num_threads << '\n';
+            std::cout << "Scheduler batches: "
+                      << scheduler_statistics.prefill_batches << " prefill ("
+                      << scheduler_statistics.staged_prefill_batches << " staged), "
+                      << scheduler_statistics.decode_batches << " decode ("
+                      << scheduler_statistics.staged_decode_batches << " staged)\n";
+        }
+        std::cout << "Vulkan linear dispatches: " << statistics.vulkan_linear_dispatches << '\n';
+        std::cout << "Vulkan attention blocks: " << statistics.vulkan_attention_blocks << '\n';
+        std::cout << "Vulkan compute submissions: " << statistics.vulkan_compute_submissions << '\n';
+        std::cout << "Vulkan submit/wait time: " << statistics.vulkan_submit_wait_time_microseconds / 1000.0 << " ms\n";
+        std::cout << "Vulkan batch boundary requests: " << statistics.vulkan_batch_uploads << " host->device, " << statistics.vulkan_batch_downloads << " device->host\n";
+        std::cout << "Vulkan direct host binding attempts: " << statistics.vulkan_direct_host_input_bindings << " input(s), " << statistics.vulkan_direct_host_output_bindings << " output(s)\n";
+        std::cout << "Vulkan auxiliary uploads: " << statistics.vulkan_auxiliary_uploads << " upload(s), " << statistics.vulkan_auxiliary_upload_bytes << " bytes\n";
+        std::cout << "Vulkan staging slots: " << statistics.vulkan_staging_slot_resizes << " resize(s), " << statistics.vulkan_staging_slot_reuses << " reuse(s), " << statistics.vulkan_staging_slot_acquisitions << " acquisition(s), "
+                  << statistics.vulkan_staging_slot_contentions << " contention(s)\n";
+        std::cout << "Vulkan command buffer reuses: " << statistics.vulkan_command_buffer_reuses << '\n';
+        std::cout << "Vulkan command graphs: "
+                  << statistics.vulkan_command_graph_submissions
+                  << " submission(s), "
+                  << statistics.vulkan_command_graph_operations
+                  << " recorded operation(s)\n";
+        std::cout << "Vulkan command recording: "
+                  << statistics.vulkan_command_dispatches << " dispatch(es), "
+                  << statistics.vulkan_command_pipeline_binds << " pipeline bind(s), "
+                  << statistics.vulkan_command_descriptor_bindings << " descriptor binding(s), "
+                  << statistics.vulkan_command_push_constant_updates << " push constant update(s), "
+                  << statistics.vulkan_command_resource_barrier_calls << " resource barrier call(s), "
+                  << statistics.vulkan_command_buffer_resource_barriers << " buffer barrier(s), "
+                  << statistics.vulkan_command_image_resource_barriers << " image barrier(s), "
+                  << statistics.vulkan_command_redundant_pipeline_binds << " redundant pipeline bind candidate(s)\n";
+        std::cout << "Vulkan attention fusion: " << statistics.vulkan_attention_qkv_rope_fusions << " QKV+RoPE block(s), " << statistics.vulkan_attention_device_rope_fusions << " device-RoPE block(s), " << statistics.vulkan_attention_qkv_ring_fusions << " QKV->ring block(s), "
+                  << statistics.vulkan_attention_decode_sdpa_fusions << " Decode-SDPA block(s)\n";
+        std::cout << "Vulkan shared Expert SwiGLU fusions: " << statistics.vulkan_shared_expert_swiglu_fusions << '\n';
+        std::cout << "Vulkan BF16 cooperative matrix dispatches: "
+                  << statistics.vulkan_bfloat16_cooperative_matrix_dispatches
+                  << '\n';
+        std::cout << "CPU BF16 batched Linear dispatches: "
+                  << statistics.cpu_bfloat16_batched_linear_dispatches
+                  << '\n';
+        std::cout << "Vulkan Gated DeltaNet fusions: " << statistics.vulkan_gated_delta_fusions << ", submissions: " << statistics.vulkan_gated_delta_submissions << '\n';
+        std::cout << "Vulkan RMSNorm+Linear fusions: " << statistics.vulkan_rms_norm_linear_fusions << '\n';
+        std::cout << "Vulkan KV ring: " << statistics.vulkan_kv_ring_appends << " append(s), " << statistics.vulkan_kv_ring_resizes << " resize(s), " << statistics.vulkan_kv_ring_wrapped_views << " wrapped view(s)\n";
+        std::cout << "Vulkan KV cache promotion: " << statistics.vulkan_kv_cache_promotions << " promotion(s), " << statistics.vulkan_kv_cache_promotion_bytes << " bytes uploaded\n";
+        std::cout << "Attention time: " << statistics.attention_time_microseconds / 1000.0 << " ms\n";
+        std::cout << "Router time: " << statistics.router_time_microseconds / 1000.0 << " ms\n";
+        std::cout << "Expert time: " << statistics.expert_time_microseconds / 1000.0 << " ms\n";
+        std::cout << "Expert weight demand: " << statistics.expert_batch_weight_bytes << " batched bytes, " << statistics.expert_route_weight_bytes << " route bytes\n";
+        std::cout << "Expert cache wait time: " << statistics.expert_cache_wait_time_microseconds / 1000.0 << " ms\n";
+        std::cout << "Expert cache management time: " << statistics.expert_cache_management_time_microseconds / 1000.0 << " ms\n";
+        std::cout << "Expert engine wall time: " << statistics.expert_engine_time_microseconds / 1000.0 << " ms\n";
+        std::cout << "Expert compute wall time: " << statistics.expert_compute_time_microseconds / 1000.0 << " ms\n";
+        const uint64_t expert_accounted_time = statistics.expert_compute_time_microseconds + statistics.expert_regroup_time_microseconds + statistics.expert_combine_time_microseconds + statistics.expert_cache_wait_time_microseconds
+                                               + statistics.expert_cache_management_time_microseconds;
+        const uint64_t expert_orchestration_time = statistics.expert_time_microseconds > expert_accounted_time ? statistics.expert_time_microseconds - expert_accounted_time : 0;
+        std::cout << "Expert orchestration wall time: " << expert_orchestration_time / 1000.0 << " ms\n";
+        std::cout << "Expert regroup time: " << statistics.expert_regroup_time_microseconds / 1000.0 << " ms\n";
+        std::cout << "Expert combine time: " << statistics.expert_combine_time_microseconds / 1000.0 << " ms\n";
+        std::cout << "Embedding time: " << statistics.embedding_time_microseconds / 1000.0 << " ms\n";
+        std::cout << "Final norm time: " << statistics.final_norm_time_microseconds / 1000.0 << " ms\n";
+        std::cout << "LM head time: " << statistics.lm_head_time_microseconds / 1000.0 << " ms\n";
+        std::cout << "Speculative decoding: " << speculative_proposals << " proposal(s), "
+                  << speculative_draft_tokens << " draft token(s), "
+                  << speculative_accepted_tokens << " accepted token(s)\n";
+        std::cout << "Speculative time: " << speculative_context_time_microseconds / 1000.0 << " ms context, "
+                  << speculative_draft_time_microseconds / 1000.0 << " ms draft, "
+                  << speculative_verify_time_microseconds / 1000.0 << " ms verify\n";
+        std::cout << "Expert prefetches: " << statistics.expert_prefetches << " (" << statistics.expert_prefetch_bytes << " bytes hinted)\n";
+        std::cout << "Expert route prediction: " << statistics.expert_route_predictions << " prediction(s), " << statistics.expert_route_prediction_matches << " match(es), " << statistics.expert_route_prediction_cache_hits
+                  << " cache-ready, " << statistics.expert_route_prediction_cache_misses << " not-ready, "
+                  << statistics.expert_route_prediction_time_microseconds / 1000.0 << " ms predictor, "
+                  << statistics.expert_route_prediction_wait_time_microseconds / 1000.0 << " ms waiting, "
+                  << statistics.expert_route_prediction_async_submissions << " async submission(s), "
+                  << statistics.expert_route_prediction_async_completions << " completion(s), "
+                  << statistics.expert_route_prediction_async_fallbacks << " fallback(s)\n";
+        std::cout << "Expert route ranks:";
+        for (uint32_t rank = 0; rank < ncnn::moe::maximum_expert_route_ranks; ++rank)
+        {
+            if (statistics.expert_route_rank_predictions[rank] == 0
+                && statistics.expert_route_rank_demands[rank] == 0)
+            {
+                continue;
+            }
+            std::cout << " r" << rank << ' '
+                      << statistics.expert_route_rank_predictions[rank] << " predicted/"
+                      << statistics.expert_route_rank_matches[rank] << " matched/"
+                      << statistics.expert_route_rank_demands[rank] << " demanded/"
+                      << statistics.expert_route_rank_demand_queue_time_microseconds[rank] << "us queued;";
+        }
+        std::cout << '\n';
+        std::cout << "Expert cache: " << statistics.expert_cache_hits << " hit(s), " << statistics.expert_cache_misses << " miss(es), " << statistics.expert_cache_evictions << " eviction(s), " << statistics.expert_cache_bytes_read
+                  << " bytes read, " << statistics.expert_cache_resident_size << " bytes resident, " << statistics.expert_cache_queued_reads << " queued read(s), " << statistics.expert_cache_speculative_reads << " speculative read(s), "
+                  << statistics.expert_cache_cancelled_speculative_reads << " cancelled speculative read(s), " << statistics.expert_cache_dropped_speculative_admissions << " dropped speculative admission(s), "
+                  << statistics.expert_cache_unused_speculative_reads << " unused speculative read(s), " << statistics.expert_cache_short_term_reloads << " short-term reload(s)\n";
+        std::cout << "Expert ARC: T1 " << statistics.expert_cache_arc_recent_size << " bytes, T2 " << statistics.expert_cache_arc_frequent_size << " bytes, target T1 " << statistics.expert_cache_arc_recent_target_size << " bytes, B1 "
+                  << statistics.expert_cache_arc_recent_ghost_size << " bytes, B2 " << statistics.expert_cache_arc_frequent_ghost_size << " bytes, B1 " << statistics.expert_cache_arc_recent_ghost_hits << " hit(s), B2 "
+                  << statistics.expert_cache_arc_frequent_ghost_hits << " hit(s)\n";
+        std::cout << "Expert mmap: " << statistics.expert_cache_mapped_ranges << " range(s), " << statistics.expert_cache_mapped_bytes << " bytes\n";
+        const char* expert_read_policy = "sampling";
+        if (statistics.expert_cache_read_policy == 1)
+            expert_read_policy = "buffered";
+        else if (statistics.expert_cache_read_policy == 2)
+            expert_read_policy = "direct";
+        else if (statistics.expert_cache_read_policy == 3)
+            expert_read_policy = "mmap";
+        std::cout << "Expert I/O policy: " << expert_read_policy << ", " << statistics.expert_cache_direct_read_ranges << " direct range(s), " << statistics.expert_cache_direct_read_bytes << " direct byte(s), "
+                  << statistics.expert_cache_direct_read_fallbacks << " fallback(s), " << statistics.expert_cache_buffered_read_ranges << " buffered range(s), " << statistics.expert_cache_buffered_read_bytes << " buffered byte(s), "
+                  << statistics.expert_cache_coalesced_read_batches << " coalesced batch(es), " << statistics.expert_cache_coalesced_experts << " coalesced Expert(s), "
+                  << statistics.expert_cache_coalesced_read_ranges_saved << " physical range(s) saved, io workers: "
+                  << statistics.expert_cache_num_io_threads << " target " << statistics.expert_cache_num_active_io_threads << ", "
+                  << statistics.expert_cache_io_read_samples << " sample(s), "
+                  << statistics.expert_cache_io_read_time_microseconds / 1000.0 << " ms observed\n";
+        std::cout << "Expert GPU execution cache: " << statistics.expert_gpu_cache_hits << " hit(s), " << statistics.expert_gpu_cache_misses << " miss(es), " << statistics.expert_gpu_cache_admissions << " admission(s), "
+                  << statistics.expert_gpu_cache_stores << " store(s), " << statistics.expert_gpu_cache_evictions << " eviction(s), " << statistics.expert_gpu_cache_dropped_admissions << " dropped admission(s), "
+                  << statistics.expert_gpu_cache_bytes_uploaded << " bytes uploaded, " << statistics.expert_gpu_cache_resident_size << " bytes resident, " << statistics.expert_gpu_cache_pending_size << " bytes pending\n";
+        std::cout << "Expert GPU victim cache: " << statistics.expert_gpu_victim_cache_hits << " hit(s), " << statistics.expert_gpu_victim_cache_misses << " miss(es), " << statistics.expert_gpu_victim_cache_admissions << " admission(s), "
+                  << statistics.expert_gpu_victim_cache_filtered_admissions << " filtered admission(s), " << statistics.expert_gpu_victim_cache_reused_admissions << " reused admission(s), "
+                  << statistics.expert_gpu_victim_cache_probe_admissions << " probe admission(s), " << statistics.expert_gpu_victim_cache_stores << " store(s), " << statistics.expert_gpu_victim_cache_evictions << " eviction(s), "
+                  << statistics.expert_gpu_victim_cache_dropped_admissions << " dropped admission(s), " << statistics.expert_gpu_victim_cache_restore_failures << " restore failure(s), " << statistics.expert_gpu_victim_cache_bytes_uploaded
+                  << " bytes uploaded, " << statistics.expert_gpu_victim_cache_bytes_downloaded << " bytes downloaded, " << statistics.expert_gpu_victim_cache_restore_time_microseconds / 1000.0 << " ms restoring, "
+                  << statistics.expert_gpu_victim_cache_mapped_stores << " mapped store(s), " << statistics.expert_gpu_victim_cache_mapped_restores << " mapped restore(s), " << statistics.expert_gpu_victim_cache_resident_size
+                  << " bytes resident, " << statistics.expert_gpu_victim_cache_pending_size << " bytes pending\n";
+        std::cout << "Expert GPU execution: " << statistics.expert_gpu_executions << " execution(s), " << statistics.expert_gpu_execution_failures << " failure(s), "
+                  << statistics.expert_gpu_execution_time_microseconds / 1000.0 << " ms executing\n";
+        std::cout << "Expert GPU route aggregation: " << statistics.expert_gpu_route_aggregation_batches << " batch(es), " << statistics.expert_gpu_route_aggregation_routes << " route(s), "
+                  << statistics.expert_gpu_route_aggregation_bytes_saved << " CPU aggregation byte(s) saved\n";
+        std::cout << "Expert GPU device source: " << statistics.expert_gpu_device_source_hits << " hit(s), " << statistics.expert_gpu_device_source_misses << " miss(es), " << statistics.expert_gpu_device_source_executions
+                  << " execution(s), " << statistics.expert_gpu_device_source_execution_failures << " failure(s)\n";
+        std::cout << "Expert GPU ARC: " << statistics.expert_gpu_arc_recent_size << " recent byte(s), " << statistics.expert_gpu_arc_frequent_size << " frequent byte(s), " << statistics.expert_gpu_arc_recent_target_size
+                  << " recent target byte(s), " << statistics.expert_gpu_arc_recent_ghost_size << " recent ghost byte(s), " << statistics.expert_gpu_arc_frequent_ghost_size << " frequent ghost byte(s)\n";
+        std::cout << "Parallel CPU experts: " << (ncnn::moe::has_flag(runtime.info().flags, ncnn::moe::RuntimeOpenmp) ? "OpenMP enabled" : "single-thread fallback") << '\n';
+        std::cout << "CPU topology: " << runtime.info().physical_cpu_count << " physical core(s), " << runtime.info().cpu_count << " logical processor(s), " << runtime.info().num_threads
+                  << " OpenMP thread(s)\n";
+        std::cout << "CPU Linear thread limit: " << runtime.info().cpu_linear_num_threads << '\n';
+        std::cout << "CPU ISA capabilities: " << ncnn::moe::cpu_isa_names(runtime.info().cpu_isa_flags) << '\n';
+        std::cout << "MXFP4 CPU kernel: " << ncnn::moe::mxfp4_kernel_name() << '\n';
+        std::cout << "FP8 CPU kernel: " << ncnn::moe::float8_linear_kernel_name(effective_opt.optimization_flags) << '\n';
+        std::cout << "BF16 CPU dot kernel: " << ncnn::moe::bfloat16_dot_kernel_name() << '\n';
+        std::cout << "BF16 batched CPU Linear kernel: "
+                  << ncnn::moe::bfloat16_batched_linear_kernel_name(effective_opt.optimization_flags)
+                  << '\n';
+        std::cout << "BF16 small CPU Linear policy: " << ncnn::moe::NcnnLinearOperator::cpu_small_bfloat16_linear_policy(effective_opt.optimization_flags) << '\n';
+        std::cout << "FP8 Linear row group: " << runtime.info().float8_linear_row_group_size << '\n';
+        std::cout << "MXFP4 decode row-pair group: " << runtime.info().mxfp4_decode_row_pair_group_size << '\n';
+        std::cout << "Activation CPU kernel: " << ncnn::moe::scaled_silu_kernel_name(effective_opt.optimization_flags) << '\n';
+        std::cout << "MXFP4 decode GEMV rows: " << statistics.mxfp4_decode_gemv_rows << '\n';
+        std::cout << "MXFP4 prefill GEMM rows: " << statistics.mxfp4_prefill_gemm_rows << '\n';
+        std::cout << "MXFP4 paired rows: " << statistics.mxfp4_paired_rows << '\n';
+        std::cout << "MXFP4 fused Gate/Up rows: " << statistics.mxfp4_fused_gate_up_rows << '\n';
+        std::cout
+            << "MXFP4 exact input rows reused: "
+            << statistics.mxfp4_reused_input_rows
+            << '\n';
+        std::cout << "Parallel expert tasks: " << statistics.expert_parallel_tasks << '\n';
+        std::cout << "generated token ids:";
+        for (const ncnn::moe::StreamToken& token : generation.tokens)
+            std::cout << ' ' << token.token_id;
+        std::cout << '\n';
+        return 0;
+    }
+    catch (const std::exception& error)
+    {
+        std::cerr << "invalid argument: " << error.what() << '\n';
+        return 2;
+    }
+}

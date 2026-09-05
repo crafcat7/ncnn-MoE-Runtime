@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
@@ -33,9 +34,7 @@ namespace moe {
 inline constexpr uint32_t automatic_vulkan_device_index = std::numeric_limits<uint32_t>::max();
 
 class MappedFileRange;
-class Mxfp4ExpertCache;
-struct Mxfp4Q8PackedMatrix;
-struct QnKPack;
+class ExpertCache;
 
 [[nodiscard]] inline bool has_flag(uint32_t flags, uint32_t flag) noexcept
 {
@@ -51,7 +50,7 @@ class MxFp4ByteBuffer
 {
 private:
     friend class MappedFileRange;
-    friend class Mxfp4ExpertCache;
+    friend class ExpertCache;
 
     MxFp4ByteBuffer(std::shared_ptr<uint8_t> _storage, size_t _length) noexcept
         : storage(std::move(_storage)),
@@ -261,14 +260,6 @@ enum class HybridMode
     Auto
 };
 
-enum class TensorLocation
-{
-    Automatic,
-    Cpu,
-    Vulkan,
-    Shared
-};
-
 enum class VulkanDeviceType
 {
     Discrete,
@@ -294,7 +285,7 @@ enum VulkanDeviceFlag : uint32_t
     VulkanDeviceInt8CooperativeMatrix = UINT32_C(1) << NCNN_MOE_VK_INT8_COOPERATIVE_MATRIX_BIT
 };
 
-struct VulkanDeviceCapabilities
+struct GpuInfo
 {
     uint32_t device_index = 0;
     uint32_t vendor_id = 0;
@@ -308,13 +299,6 @@ struct VulkanDeviceCapabilities
     uint64_t heap_available = 0;
     uint32_t flags = 0;
     std::string device_name;
-};
-
-enum class LogitsOutputMode
-{
-    FullLogits,
-    TopKCandidates,
-    SampledToken
 };
 
 struct MxFp4FileStorage
@@ -356,10 +340,7 @@ struct TensorData
     std::shared_ptr<const uint8_t> mapped_data;
     uint64_t mapped_size = 0;
     std::shared_ptr<const MxFp4FileStorage> mxfp4_file_storage;
-    // Optional immutable CPU repack sidecars. They are created lazily only
-    // when the explicit CPU packed-weight mode is enabled.
-    mutable std::shared_ptr<const Mxfp4Q8PackedMatrix> mxfp4_q8_packed;
-    mutable std::shared_ptr<const QnKPack> qnk_packed;
+
     [[nodiscard]] uint64_t element_count() const noexcept;
     [[nodiscard]] std::span<const float> float32_values() const noexcept;
     [[nodiscard]] std::span<const uint16_t> bfloat16_values() const noexcept;
@@ -369,10 +350,7 @@ struct TensorData
     [[nodiscard]] std::span<const uint8_t> qnk_values() const noexcept;
 };
 
-struct WeightMapping
-{
-    std::unordered_map<std::string, TensorData> tensors;
-};
+using WeightMapping = std::unordered_map<std::string, TensorData>;
 
 inline uint64_t TensorData::element_count() const noexcept
 {

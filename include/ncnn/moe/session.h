@@ -1,7 +1,6 @@
 #ifndef NCNN_MOE_SESSION_H
 #define NCNN_MOE_SESSION_H
 
-#include "ncnn/moe/memory_manager.h"
 #include "ncnn/moe/model.h"
 #include "ncnn/moe/result.h"
 
@@ -22,26 +21,19 @@ namespace moe {
 
 static constexpr uint32_t maximum_expert_route_ranks = 16;
 
-class SessionBatchAccess;
+class BatchSchedulerPrivate;
 
 class CpuSessionState;
-class IExecutor;
-struct SamplingScratch;
-
-struct LogitsOutput
-{
-    std::vector<float> values;
-};
 
 struct PrefillResult
 {
-    LogitsOutput logits;
+    std::vector<float> logits;
     uint32_t processed_tokens = 0;
 };
 
 struct DecodeResult
 {
-    LogitsOutput logits;
+    std::vector<float> logits;
     uint64_t sequence_length = 0;
 };
 
@@ -78,7 +70,7 @@ struct GenerationOptions
     uint32_t max_new_tokens = 1;
     SamplingOptions sampling;
     std::vector<int32_t> stop_tokens;
-    bool enable_speculative = true;
+    bool use_speculative = true;
     float speculative_confidence_threshold = 0.5f;
     uint32_t speculative_max_draft_tokens = 0;
 };
@@ -175,7 +167,6 @@ struct SessionStatistics
     uint64_t expert_gpu_victim_cache_pending_size = 0;
     uint64_t expert_gpu_executions = 0;
     uint64_t expert_gpu_execution_failures = 0;
-    uint64_t expert_gpu_cpu_preferred = 0;
     uint64_t expert_gpu_execution_time_microseconds = 0;
     uint64_t expert_gpu_arc_recent_size = 0;
     uint64_t expert_gpu_arc_frequent_size = 0;
@@ -279,10 +270,7 @@ struct SessionStatistics
     uint64_t vulkan_command_image_resource_barriers = 0;
 };
 
-// Stable, model-neutral counters intended for applications and examples.
-// SessionStatistics remains available for detailed runtime diagnostics, while
-// this view avoids exposing cache/backend implementation names at the native
-// application boundary.
+// Runtime counter snapshot used for generation and cumulative reporting.
 struct RuntimeMetricCounters
 {
     uint64_t prefill_tokens = 0;
@@ -333,7 +321,6 @@ struct RuntimeMetricCounters
     uint64_t expert_gpu_cache_pending_size = 0;
     uint64_t expert_gpu_executions = 0;
     uint64_t expert_gpu_execution_failures = 0;
-    uint64_t expert_gpu_cpu_preferred = 0;
     uint64_t expert_gpu_route_aggregation_batches = 0;
     uint64_t expert_gpu_route_aggregation_routes = 0;
     uint64_t expert_gpu_route_aggregation_bytes_saved = 0;
@@ -368,67 +355,73 @@ struct SessionMetrics
 
 struct SessionOptions
 {
-    LogitsOutputMode logits_output_mode = LogitsOutputMode::FullLogits;
     uint64_t sampling_seed = 0;
     uint32_t prefill_chunk_size = 512;
-    bool enable_speculative_context = true;
+    bool use_speculative_context = true;
 };
 
 class Session
 {
-private:
-    explicit Session(ModelPtr model, const SessionOptions& options);
-    [[nodiscard]] Result<PrefillResult> prefill_unlocked(std::span<const int32_t> input_ids);
-    [[nodiscard]] Result<DecodeResult> decode_unlocked(int32_t input_id);
-    [[nodiscard]] Result<SampledToken> sample_unlocked(std::span<const float> logits, const SamplingOptions& options);
-    [[nodiscard]] Result<SampledToken> sample_unlocked(const LogitsOutput& logits, const SamplingOptions& options);
-
-    ModelPtr model_;
-    uint64_t sequence_length_ = 0;
-    SessionStatistics statistics_;
-    SessionStatistics statistics_scratch_;
-    std::unique_ptr<CpuSessionState> state_;
-    std::unique_ptr<IExecutor> executor_;
-    std::mt19937_64 random_generator_;
-    uint32_t prefill_chunk_size_ = 512;
-    bool speculative_context_enabled_ = true;
-    SessionStatistics generation_start_statistics_;
-    bool generation_active_ = false;
-    uint64_t generation_input_tokens_ = 0;
-    uint64_t generation_output_tokens_ = 0;
-    uint64_t generation_elapsed_microseconds_ = 0;
-    bool generation_has_first_token_ = false;
-    std::chrono::steady_clock::time_point generation_started_;
-    std::chrono::steady_clock::time_point generation_first_token_ready_;
-    mutable std::mutex mutex_;
-    std::unique_ptr<SamplingScratch> sampling_scratch_;
-
-    [[nodiscard]] SessionMetrics metrics_unlocked() const;
-
-    friend class Runtime;
-    friend class SessionBatchAccess;
-
 public:
     ~Session();
 
     [[nodiscard]] Result<PrefillResult> prefill(std::span<const int32_t> input_ids);
     [[nodiscard]] Result<DecodeResult> decode(int32_t input_id);
-    [[nodiscard]] Result<SampledToken> sample(const LogitsOutput& logits, const SamplingOptions& options = {});
-    [[nodiscard]] Result<GenerationResult> generate(std::span<const int32_t> input_ids, const GenerationOptions& options = {}, TokenStreamCallback on_token = {}, TokenTextDecoder decode_text = {});
+    [[nodiscard]] Result<SampledToken> sample(std::span<const float> logits, const SamplingOptions& opt = {});
+    [[nodiscard]] Result<GenerationResult> generate(std::span<const int32_t> input_ids, const GenerationOptions& opt = {}, TokenStreamCallback on_token = {}, TokenTextDecoder decode_text = {});
     [[nodiscard]] Result<void> reset();
 
     [[nodiscard]] uint64_t sequence_length() const noexcept
     {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        return sequence_length_;
+        const std::lock_guard<std::mutex> lock(mutex);
+        return token_count;
     }
     [[nodiscard]] SessionStatistics statistics() const
     {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        return statistics_;
+        const std::lock_guard<std::mutex> lock(mutex);
+        return stats;
     }
     [[nodiscard]] SessionMetrics metrics() const;
-    [[nodiscard]] MemoryManagerStatistics memory_statistics() const;
+
+private:
+    explicit Session(ModelPtr _model, const SessionOptions& opt);
+    [[nodiscard]] static uint32_t get_max_context_length(const MoeModelDescriptor& descriptor) noexcept;
+    [[nodiscard]] Result<PrefillResult> prefill_unlocked(std::span<const int32_t> input_ids);
+    [[nodiscard]] Result<DecodeResult> decode_unlocked(int32_t input_id);
+    [[nodiscard]] Result<SampledToken> sample_unlocked(std::span<const float> logits, const SamplingOptions& opt);
+    [[nodiscard]] Result<GenerationResult> generate_unlocked(std::span<const int32_t> input_ids, const GenerationOptions& opt, const TokenStreamCallback& on_token, const TokenTextDecoder& decode_text, std::unique_lock<std::mutex>& lock);
+    [[nodiscard]] Result<GenerationResult> generate_speculative(std::vector<float> logits, const GenerationOptions& opt, const TokenStreamCallback& on_token, const TokenTextDecoder& decode_text, std::unique_lock<std::mutex>& lock);
+    [[nodiscard]] Result<bool> emit_token(StreamToken& token, const TokenStreamCallback& on_token, const TokenTextDecoder& decode_text, std::unique_lock<std::mutex>& lock);
+    void begin_generation(uint64_t input_tokens);
+    void finish_generation() noexcept;
+    // Publish counters and position; callers still own cache transactions.
+    void commit_execution(uint64_t prefill_tokens, uint64_t decode_tokens);
+
+    ModelPtr model;
+    uint64_t token_count = 0;
+    SessionStatistics stats;
+    // Tentative execution counters are published when the step commits.
+    SessionStatistics stats_scratch;
+    std::unique_ptr<CpuSessionState> state;
+    std::mt19937_64 random_generator;
+    uint32_t prefill_chunk_size = 512;
+    bool use_speculative_context = true;
+    SessionStatistics generation_start_stats;
+    bool generation_active = false;
+    uint64_t generation_input_tokens = 0;
+    uint64_t generation_output_tokens = 0;
+    uint64_t generation_elapsed_microseconds = 0;
+    std::chrono::steady_clock::time_point generation_start_time;
+    std::chrono::steady_clock::time_point generation_first_token_time;
+    mutable std::mutex mutex;
+    std::vector<int32_t> sampling_token_ids;
+    std::array<std::vector<SampledToken>, 2> sampling_candidates;
+    std::vector<float> sampling_residual;
+
+    [[nodiscard]] SessionMetrics metrics_unlocked() const;
+
+    friend class Runtime;
+    friend class BatchSchedulerPrivate;
 };
 
 using SessionPtr = std::shared_ptr<Session>;

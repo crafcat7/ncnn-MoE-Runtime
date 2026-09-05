@@ -339,9 +339,6 @@ def gpt_oss_cases(arguments):
                             "4",
                             "--parallel-sessions",
                             "2",
-                            "--scheduler-expert-threads",
-                            "8",
-                            "--scheduler-cross-call",
                             "--direct-expert-io",
                             *(
                                 [
@@ -455,7 +452,7 @@ def deepseek_cases(arguments):
                         "scheduler_staging": (
                             "independent-speculative"
                             if speculative
-                            else "force"
+                            else "auto"
                         ),
                         "token_window": window_name,
                         "generated_tokens": tokens,
@@ -471,7 +468,7 @@ def deepseek_cases(arguments):
                             *(
                                 ["--parallel-speculative"]
                                 if speculative
-                                else ["--scheduler-staging", "force"]
+                                else []
                             ),
                         ],
                     }
@@ -583,7 +580,7 @@ def qwen_cases(arguments):
                             f"{arguments.parallel_sessions}-session-service"
                         ),
                         "backend": backend,
-                        "scheduler_staging": "force",
+                        "scheduler_staging": "auto",
                         "token_window": window_name,
                         "generated_tokens": tokens,
                         "warmup": warmup_name,
@@ -593,8 +590,6 @@ def qwen_cases(arguments):
                             *eager_experts,
                             "--parallel-sessions",
                             str(arguments.parallel_sessions),
-                            "--scheduler-staging",
-                            "force",
                         ],
                     }
                 )

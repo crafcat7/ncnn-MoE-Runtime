@@ -2,10 +2,8 @@
 #define NCNN_MOE_RUNTIME_H
 
 #include "ncnn/moe/model.h"
-#include "ncnn/moe/model_adapter.h"
-#include "ncnn/moe/memory_plan.h"
-#include "ncnn/moe/result.h"
 #include "ncnn/moe/option.h"
+#include "ncnn/moe/result.h"
 #include "ncnn/moe/scheduler.h"
 #include "ncnn/moe/session.h"
 #include "ncnn/moe/types.h"
@@ -17,6 +15,8 @@
 namespace ncnn {
 namespace moe {
 
+class ModelAdapter;
+
 // Runtime capability bit positions.
 #define NCNN_MOE_RUNTIME_CPU_BIT              0
 #define NCNN_MOE_RUNTIME_NCNN_LINEAR_BIT      1
@@ -24,7 +24,7 @@ namespace moe {
 #define NCNN_MOE_RUNTIME_VULKAN_CPU_BIT       3
 #define NCNN_MOE_RUNTIME_VULKAN_ATTENTION_BIT 4
 #define NCNN_MOE_RUNTIME_VULKAN_VICTIM_BIT    5
-#define NCNN_MOE_RUNTIME_MXFP4_CPU_BIT       6
+#define NCNN_MOE_RUNTIME_MXFP4_CPU_BIT        6
 #define NCNN_MOE_RUNTIME_NEON_BIT             7
 #define NCNN_MOE_RUNTIME_AVX2_BIT             8
 #define NCNN_MOE_RUNTIME_AVX512_BIT           9
@@ -94,13 +94,12 @@ struct RuntimeInfo
     uint32_t physical_cpu_count = 1;
     uint32_t num_threads = 1;
     uint32_t cpu_linear_num_threads = 1;
-    uint32_t float8_linear_num_threads = 1;
     uint32_t float8_linear_row_group_size = 1;
     uint32_t mxfp4_decode_row_pair_group_size = 1;
     uint64_t cpu_isa_flags = 0;
 
     uint32_t default_gpu_index = 0;
-    std::vector<VulkanDeviceCapabilities> gpu_infos;
+    std::vector<GpuInfo> gpu_infos;
 
     uint32_t flags = RuntimeCpu | RuntimeMxfp4Cpu | RuntimeCrossSession;
 };
@@ -108,7 +107,7 @@ struct RuntimeInfo
 class Runtime
 {
 private:
-    std::vector<std::shared_ptr<IMoeModelAdapter>> adapters;
+    std::vector<std::shared_ptr<ModelAdapter>> adapters;
     RuntimeInfo runtime_info;
 
 public:
@@ -119,7 +118,7 @@ public:
         return runtime_info;
     }
 
-    void register_adapter(std::shared_ptr<IMoeModelAdapter> adapter);
+    void register_adapter(std::shared_ptr<ModelAdapter> adapter);
 
     [[nodiscard]] Result<ModelPtr> load_model(const std::filesystem::path& model_path, const Option& opt = {});
 

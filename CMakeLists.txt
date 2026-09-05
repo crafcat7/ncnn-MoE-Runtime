@@ -40,77 +40,76 @@ if(NOT NCNN_BUILD_MOE_RUNTIME)
 endif()
 
 set(NCNN_MOE_SOURCES
-    src/backends/ncnn/ncnn_linear.cpp
-    src/compiler/graph_builder.cpp
-    src/compiler/moe_graph.cpp
-    src/engine/cpu_executor.cpp
-    src/engine/cpu_features.cpp
-    src/engine/cpu_task_worker.cpp
-    src/engine/cpu_thread_budget.cpp
-    src/engine/cpu_topology.cpp
-    src/engine/expert_backend.cpp
-    src/engine/memory_manager.cpp
+    src/backends/ncnn/expertbackend_vulkan.cpp
+    src/backends/ncnn/linear.cpp
+    src/backends/ncnn/modelpipeline.cpp
+    src/backends/ncnn/vulkandevice.cpp
+    src/engine/cpu.cpp
+    src/engine/executor.cpp
+    src/engine/executor_speculative.cpp
+    src/engine/expert.cpp
+    src/engine/expertbackend.cpp
+    src/engine/metrics.cpp
     src/engine/modelloader.cpp
     src/engine/runtime.cpp
     src/engine/scheduler.cpp
     src/engine/session.cpp
-    src/graph/execution_graph.cpp
-    src/graph/expert_dispatcher.cpp
-    src/graph/memory_planner.cpp
-    src/graph/model_compiler.cpp
-    src/kernels/cpu_attention.cpp
-    src/kernels/cpu_bfloat16.cpp
-    src/kernels/cpu_float8.cpp
-    src/kernels/cpu_gated_delta_net.cpp
-    src/kernels/cpu_gated_residual.cpp
-    src/kernels/cpu_hyper_connection.cpp
-    src/kernels/cpu_latent_attention.cpp
-    src/kernels/cpu_mxfp4.cpp
-    src/kernels/cpu_qnk.cpp
-    src/kernels/cpu_ops.cpp
-    src/kernels/cpu_ple.cpp
-    src/kernels/cpu_state_cache.cpp
-    src/kernels/cpu_vector.cpp
-    src/models/builtin_model_adapter.cpp
-    src/models/deepseek_v4_model_adapter.cpp
-    src/models/qwen3_5_moe_model_adapter.cpp
-    src/models/qwen4_exp_model_adapter.cpp
+    src/graph/compiler.cpp
+    src/graph/graph.cpp
+    src/graph/memoryplan.cpp
+    src/graph/router.cpp
+    src/kernels/attention.cpp
+    src/kernels/bfloat16.cpp
+    src/kernels/float8.cpp
+    src/kernels/gateddeltanet.cpp
+    src/kernels/gatedresidual.cpp
+    src/kernels/hyperconnection.cpp
+    src/kernels/latentattention.cpp
+    src/kernels/mxfp4.cpp
+    src/kernels/ops.cpp
+    src/kernels/ple.cpp
+    src/kernels/qnk.cpp
+    src/kernels/statecache.cpp
+    src/kernels/vector.cpp
+    src/models/modeladapter.cpp
+    src/models/modeladapter_builtin.cpp
+    src/models/modeladapter_deepseekv4.cpp
+    src/models/modeladapter_qwen3_5.cpp
+    src/models/modeladapter_qwen4exp.cpp
     src/models/safetensors.cpp
-    src/storage/expert_cache.cpp
-    src/storage/expert_store.cpp
-    src/storage/expert_victim_cache.cpp
-    src/storage/mapped_file.cpp
-    src/storage/system_memory.cpp
-    src/storage/weight_store.cpp
+    src/storage/expertcache.cpp
+    src/storage/expertcache_victim.cpp
+    src/storage/mappedfile.cpp
+    src/storage/weightstore.cpp
 )
 add_library(ncnn_moe STATIC ${NCNN_MOE_SOURCES})
 source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_SOURCES})
 
 if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
     set(NCNN_MOE_MSVC_SIMD_SOURCES
-        src/kernels/cpu_float8_msvc_avx2.cpp
-        src/kernels/cpu_float8_msvc_avx512.cpp
-        src/kernels/cpu_mxfp4_msvc_avx2.cpp
-        src/kernels/cpu_mxfp4_msvc_avx512.cpp
-        src/kernels/cpu_qnk_msvc_avx2.cpp
-        src/kernels/cpu_qnk_msvc_avx512.cpp
-        src/kernels/cpu_vector_msvc_avx2.cpp
-        src/kernels/cpu_vector_msvc_avx512.cpp
+        src/kernels/float8_msvc_avx2.cpp
+        src/kernels/float8_msvc_avx512.cpp
+        src/kernels/mxfp4_msvc_avx2.cpp
+        src/kernels/mxfp4_msvc_avx512.cpp
+        src/kernels/qnk_msvc_avx2.cpp
+        src/kernels/qnk_msvc_avx512.cpp
+        src/kernels/vector_msvc_avx2.cpp
+        src/kernels/vector_msvc_avx512.cpp
     )
     target_sources(ncnn_moe PRIVATE ${NCNN_MOE_MSVC_SIMD_SOURCES})
     source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_MSVC_SIMD_SOURCES})
     set_source_files_properties(
-        src/kernels/cpu_float8_msvc_avx2.cpp
-        src/kernels/cpu_mxfp4_msvc_avx2.cpp
-        src/kernels/cpu_qnk_msvc_avx2.cpp
-        src/kernels/cpu_vector_msvc_avx2.cpp
+        src/kernels/float8_msvc_avx2.cpp
+        src/kernels/mxfp4_msvc_avx2.cpp
+        src/kernels/qnk_msvc_avx2.cpp
+        src/kernels/vector_msvc_avx2.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX2"
     )
     set_source_files_properties(
-        src/kernels/cpu_float8_msvc_avx512.cpp
-        src/kernels/cpu_mxfp4_msvc_avx512.cpp
-        src/kernels/cpu_qnk_msvc_avx512.cpp
-        src/kernels/cpu_vector_msvc_avx512.cpp
+        src/kernels/float8_msvc_avx512.cpp
+        src/kernels/mxfp4_msvc_avx512.cpp
+        src/kernels/qnk_msvc_avx512.cpp
+        src/kernels/vector_msvc_avx512.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX512"
     )
     target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_MSVC_X86_SIMD=1)
@@ -128,10 +127,10 @@ if(
     if(NCNN_MOE_COMPILER_SUPPORTS_SVE2)
         target_sources(
             ncnn_moe
-            PRIVATE src/kernels/cpu_mxfp4_sve2.cpp
+            PRIVATE src/kernels/mxfp4_sve2.cpp
         )
         set_source_files_properties(
-            src/kernels/cpu_mxfp4_sve2.cpp
+            src/kernels/mxfp4_sve2.cpp
             PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+sve2"
         )
         target_compile_definitions(
@@ -325,7 +324,7 @@ endif()
 if(NCNN_MOE_BUILD_TESTS)
     enable_testing()
     add_executable(ncnn_moe_tests
-        tests/fixture_model_adapter.cpp
+        tests/modeladapter_fixture.cpp
         tests/test_runtime.cpp
     )
     target_link_libraries(ncnn_moe_tests PRIVATE ncnn::moe)
@@ -333,6 +332,13 @@ if(NCNN_MOE_BUILD_TESTS)
     target_include_directories(ncnn_moe_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(ncnn_moe_tests PRIVATE NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>)
     add_test(NAME ncnn_moe_tests COMMAND ncnn_moe_tests)
+
+    # This consumer must not inherit the runtime's private src include path.
+    add_executable(ncnn_moe_public_api_test tests/public_api/main.cpp)
+    target_link_libraries(ncnn_moe_public_api_test PRIVATE ncnn::moe)
+    add_test(NAME ncnn_moe_public_api_test COMMAND ncnn_moe_public_api_test)
+    set_tests_properties(ncnn_moe_public_api_test PROPERTIES TIMEOUT 60)
+
     if(NCNN_MOE_WITH_VULKAN)
         add_test(
             NAME ncnn_moe_pipeline_bind_elision_disabled
@@ -352,7 +358,7 @@ if(NCNN_MOE_BUILD_EXAMPLES)
         add_library(
             ncnn_moe_reference_runner
             STATIC
-            examples/internal/run_model.cpp)
+            examples/internal/modelrunner.cpp)
         target_link_libraries(
             ncnn_moe_reference_runner
             PUBLIC ncnn::moe)
@@ -407,7 +413,7 @@ if(NCNN_MOE_BUILD_EXAMPLES)
     add_executable(
         ncnn_moe_worker
         examples/ncnn_moe_worker.cpp
-        examples/internal/gpu_telemetry.cpp)
+        examples/internal/gputelemetry.cpp)
     target_link_libraries(
         ncnn_moe_worker
         PRIVATE ncnn::moe)
@@ -511,7 +517,18 @@ install(TARGETS ncnn_moe
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES
+    include/ncnn/moe/modeladapter.h
+    include/ncnn/moe/modeldescriptor.h
+    include/ncnn/moe/model.h
+    include/ncnn/moe/option.h
+    include/ncnn/moe/result.h
+    include/ncnn/moe/runtime.h
+    include/ncnn/moe/scheduler.h
+    include/ncnn/moe/session.h
+    include/ncnn/moe/types.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ncnn/moe
+)
 install(EXPORT ncnn_moeTargets
     NAMESPACE ncnn::
     DESTINATION "${NCNN_MOE_INSTALL_CMAKEDIR}"

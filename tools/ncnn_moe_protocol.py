@@ -71,18 +71,17 @@ class WorkerClient:
     def _read_event(self) -> dict[str, Any]:
         if self._process.stdout is None:
             raise WorkerError("worker stdout is unavailable")
-        while True:
-            line = self._process.stdout.readline()
-            if not line:
-                return_code = self._process.poll()
-                raise WorkerError(f"worker exited before sending an event (return code {return_code})")
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise WorkerError(f"worker emitted invalid JSONL: {line.rstrip()!r}") from error
-            if not isinstance(event, dict):
-                raise WorkerError(f"worker event must be a JSON object: {event!r}")
-            return event
+        line = self._process.stdout.readline()
+        if not line:
+            return_code = self._process.poll()
+            raise WorkerError(f"worker exited before sending an event (return code {return_code})")
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise WorkerError(f"worker emitted invalid JSONL: {line.rstrip()!r}") from error
+        if not isinstance(event, dict):
+            raise WorkerError(f"worker event must be a JSON object: {event!r}")
+        return event
 
     @staticmethod
     def _raise_for_error(event: dict[str, Any]) -> None:

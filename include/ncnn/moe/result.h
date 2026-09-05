@@ -27,73 +27,73 @@ struct Error
 template<typename T>
 class Result
 {
-private:
-    std::variant<T, Error> storage_;
-
 public:
     Result(T value)
-        : storage_(std::move(value))
+        : storage(std::move(value))
     {
     }
     Result(Error error)
-        : storage_(std::move(error))
+        : storage(std::move(error))
     {
     }
 
     explicit operator bool() const noexcept
     {
-        return std::holds_alternative<T>(storage_);
+        return std::holds_alternative<T>(storage);
     }
 
     T& value() &
     {
-        assert(std::holds_alternative<T>(storage_));
-        return std::get<T>(storage_);
+        assert(std::holds_alternative<T>(storage));
+        return std::get<T>(storage);
     }
 
     const T& value() const&
     {
-        assert(std::holds_alternative<T>(storage_));
-        return std::get<T>(storage_);
+        assert(std::holds_alternative<T>(storage));
+        return std::get<T>(storage);
     }
 
     T&& value() &&
     {
-        assert(std::holds_alternative<T>(storage_));
-        return std::move(std::get<T>(storage_));
+        assert(std::holds_alternative<T>(storage));
+        return std::move(std::get<T>(storage));
     }
 
     const Error& error() const
     {
-        assert(std::holds_alternative<Error>(storage_));
-        return std::get<Error>(storage_);
+        assert(std::holds_alternative<Error>(storage));
+        return std::get<Error>(storage);
     }
+
+private:
+    std::variant<T, Error> storage;
 };
 
 template<>
 class Result<void>
 {
-private:
-    bool has_error_ = false;
-    Error error_;
-
 public:
     Result() = default;
     Result(Error error)
-        : has_error_(true), error_(std::move(error))
+        : has_error(true), failure(std::move(error))
     {
     }
 
     explicit operator bool() const noexcept
     {
-        return !has_error_;
+        return !has_error;
     }
 
     const Error& error() const
     {
-        assert(has_error_);
-        return error_;
+        assert(has_error);
+        return failure;
     }
+
+private:
+    bool has_error = false;
+    Error failure;
 };
 
 } // namespace moe

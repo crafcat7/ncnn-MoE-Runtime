@@ -18,7 +18,7 @@ is required.
 | Mixed execution | Vulkan Dense/Attention with CPU routing and Experts |
 | Expert residency | Automatic, eager, or byte-bounded on-demand |
 | Expert I/O | Asynchronous range reads, Windows aligned direct I/O, packed sidecar support, and byte-aware ARC |
-| Scheduling | Independent Sessions, Expert coalescing, and bounded cross-call micro-batching |
+| Scheduling | Independent Sessions, explicit batch submission, and Expert coalescing |
 | Generation | Greedy, temperature, Top-K, Top-P, Min-P, stop tokens, and streaming |
 
 GPT-OSS-20B can use eager Expert residency when memory permits. GPT-OSS-120B
@@ -129,8 +129,6 @@ uses a byte-bounded cache backed by exact ranges in the original shards.
 | `--vulkan-device N` | Select one Vulkan device |
 | `--vulkan-devices N[,N...]` | Supply candidates for capability-weighted layer placement |
 | `--parallel-sessions N` | Run independent sequences through the batch scheduler |
-| `--scheduler-expert-threads N` | Override Expert threads per scheduler worker |
-| `--scheduler-cross-call` | Let the Runtime collector form micro-batches across submissions |
 
 Dense tensors and eager MXFP4 ranges are mapped automatically. On-demand
 Experts are read directly into final cache storage without allocating or

@@ -1,25 +1,25 @@
-#include "internal/json_line.h"
-#include "internal/gpu_telemetry.h"
+#include "internal/jsonline.h"
+#include "internal/gputelemetry.h"
 #include "ncnn/moe/runtime.h"
-#include "engine/cpu_features.h"
-#include "kernels/cpu_bfloat16.h"
+#include "engine/cpu.h"
+#include "graph/compiledmodel.h"
+#include "kernels/bfloat16.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -40,99 +40,6 @@
 
 namespace ncnn {
 namespace moe {
-
-class JsonObject
-{
-private:
-    std::string value_ = "{";
-    bool first_ = true;
-
-    void separator()
-    {
-        if (!first_)
-            value_.push_back(',');
-        first_ = false;
-    }
-
-    void key(std::string_view name)
-    {
-        separator();
-        value_ += json_escape(name);
-        value_.push_back(':');
-    }
-
-public:
-    void add_string(std::string_view name, std::string_view value)
-    {
-        key(name);
-        value_ += json_escape(value);
-    }
-
-    void add_uint(std::string_view name, uint64_t value)
-    {
-        key(name);
-        value_ += std::to_string(value);
-    }
-
-    void add_optional_uint(std::string_view name, const std::optional<uint64_t>& value)
-    {
-        if (value)
-            add_uint(name, *value);
-        else
-            add_null(name);
-    }
-
-    void add_int(std::string_view name, int64_t value)
-    {
-        key(name);
-        value_ += std::to_string(value);
-    }
-
-    void add_bool(std::string_view name, bool value)
-    {
-        key(name);
-        value_ += value ? "true" : "false";
-    }
-
-    void add_double(std::string_view name, double value)
-    {
-        key(name);
-        if (!std::isfinite(value))
-        {
-            value_ += "null";
-            return;
-        }
-        std::ostringstream stream;
-        stream << std::setprecision(10) << value;
-        value_ += stream.str();
-    }
-
-    void add_optional_double(std::string_view name, const std::optional<double>& value)
-    {
-        if (value)
-            add_double(name, *value);
-        else
-            add_null(name);
-    }
-
-    void add_null(std::string_view name)
-    {
-        key(name);
-        value_ += "null";
-    }
-
-    void add_raw(std::string_view name, std::string_view value)
-    {
-        key(name);
-        value_.append(value);
-    }
-
-    [[nodiscard]] std::string finish()
-    {
-        value_.push_back('}');
-        return std::move(value_);
-    }
-};
 
 static std::string uint_array(const std::vector<uint32_t>& values)
 {
@@ -182,12 +89,6 @@ static const char* expert_memory_mode_name(ExpertMemoryMode mode) noexcept
     return "unknown";
 }
 
-static const char* cpu_packed_weight_mode_name(
-    CpuPackedWeightMode mode) noexcept
-{
-    return mode == CpuPackedWeightMode::Enabled ? "on" : "off";
-}
-
 static const char* vulkan_type_name(VulkanDeviceType type) noexcept
 {
     switch (type)
@@ -201,14 +102,14 @@ static const char* vulkan_type_name(VulkanDeviceType type) noexcept
     return "unknown";
 }
 
-static std::string gpu_infos_json(const std::vector<VulkanDeviceCapabilities>& gpu_infos)
+static std::string gpu_infos_json(const std::vector<GpuInfo>& gpu_infos)
 {
     std::string result = "[";
     for (std::size_t i = 0; i < gpu_infos.size(); ++i)
     {
         if (i != 0)
             result.push_back(',');
-        const VulkanDeviceCapabilities& gpu_info = gpu_infos[i];
+        const GpuInfo& gpu_info = gpu_infos[i];
         JsonObject item;
         item.add_uint("index", gpu_info.device_index);
         item.add_string("name", gpu_info.device_name);
@@ -244,7 +145,6 @@ static std::string expert_metrics_json(const RuntimeMetricCounters& counters)
     result.add_uint("gpu_cache_pending_bytes", counters.expert_gpu_cache_pending_size);
     result.add_uint("gpu_executions", counters.expert_gpu_executions);
     result.add_uint("gpu_execution_failures", counters.expert_gpu_execution_failures);
-    result.add_uint("gpu_cpu_preferred", counters.expert_gpu_cpu_preferred);
     result.add_uint("gpu_route_aggregation_batches", counters.expert_gpu_route_aggregation_batches);
     result.add_uint("gpu_route_aggregation_routes", counters.expert_gpu_route_aggregation_routes);
     result.add_uint("gpu_route_aggregation_bytes_saved", counters.expert_gpu_route_aggregation_bytes_saved);
@@ -349,18 +249,6 @@ static std::string stats_json(const SessionMetrics& metrics)
     return result.finish();
 }
 
-static std::string memory_statistics_json(const MemoryManagerStatistics& statistics)
-{
-    JsonObject result;
-    result.add_uint("registered_tensors", statistics.registered_tensors);
-    result.add_uint("cpu_bytes", statistics.cpu_size);
-    result.add_uint("vulkan_bytes", statistics.vulkan_size);
-    result.add_uint("shared_bytes", statistics.shared_size);
-    result.add_uint("transitions", statistics.transitions);
-    result.add_uint("tensor_uses", statistics.tensor_uses);
-    return result.finish();
-}
-
 struct ProcessTelemetry
 {
     std::optional<double> cpu_percent;
@@ -376,9 +264,9 @@ class ProcessTelemetrySampler
 {
 private:
     using Clock = std::chrono::steady_clock;
-    Clock::time_point previous_wall_ = Clock::now();
-    uint64_t previous_cpu_microseconds_ = 0;
-    bool has_previous_cpu_ = false;
+    Clock::time_point previous_wall = Clock::now();
+    uint64_t previous_cpu_microseconds = 0;
+    bool has_previous_cpu = false;
 
 #if defined(_WIN32)
     static uint64_t filetime_microseconds(const FILETIME& value)
@@ -403,14 +291,14 @@ public:
         {
             const uint64_t cpu_microseconds = filetime_microseconds(kernel_time) + filetime_microseconds(user_time);
             const auto now = Clock::now();
-            const uint64_t wall_microseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - previous_wall_).count());
-            if (has_previous_cpu_ && wall_microseconds != 0)
-                result.cpu_percent = 100.0 * static_cast<double>(cpu_microseconds - previous_cpu_microseconds_) / static_cast<double>(wall_microseconds);
+            const uint64_t wall_microseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - previous_wall).count());
+            if (has_previous_cpu && wall_microseconds != 0)
+                result.cpu_percent = 100.0 * static_cast<double>(cpu_microseconds - previous_cpu_microseconds) / static_cast<double>(wall_microseconds);
             else
                 result.cpu_reason = "warming_up";
-            previous_cpu_microseconds_ = cpu_microseconds;
-            previous_wall_ = now;
-            has_previous_cpu_ = true;
+            previous_cpu_microseconds = cpu_microseconds;
+            previous_wall = now;
+            has_previous_cpu = true;
         }
         else
         {
@@ -441,14 +329,14 @@ public:
                                               + static_cast<uint64_t>(usage.ru_stime.tv_sec) * 1000000
                                               + static_cast<uint64_t>(usage.ru_stime.tv_usec);
             const auto now = Clock::now();
-            const uint64_t wall_microseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - previous_wall_).count());
-            if (has_previous_cpu_ && wall_microseconds != 0)
-                result.cpu_percent = 100.0 * static_cast<double>(cpu_microseconds - previous_cpu_microseconds_) / static_cast<double>(wall_microseconds);
+            const uint64_t wall_microseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - previous_wall).count());
+            if (has_previous_cpu && wall_microseconds != 0)
+                result.cpu_percent = 100.0 * static_cast<double>(cpu_microseconds - previous_cpu_microseconds) / static_cast<double>(wall_microseconds);
             else
                 result.cpu_reason = "warming_up";
-            previous_cpu_microseconds_ = cpu_microseconds;
-            previous_wall_ = now;
-            has_previous_cpu_ = true;
+            previous_cpu_microseconds = cpu_microseconds;
+            previous_wall = now;
+            has_previous_cpu = true;
             result.rss_bytes = static_cast<uint64_t>(usage.ru_maxrss) * 1024;
             result.rss_reason = "peak_rss";
         }
@@ -493,22 +381,10 @@ static std::string process_telemetry_json(ProcessTelemetrySampler& sampler)
 {
     const ProcessTelemetry process = sampler.sample();
     JsonObject result;
-    if (process.cpu_percent)
-        result.add_double("cpu_percent", *process.cpu_percent);
-    else
-        result.add_null("cpu_percent");
-    if (process.rss_bytes)
-        result.add_uint("rss_bytes", *process.rss_bytes);
-    else
-        result.add_null("rss_bytes");
-    if (process.read_bytes)
-        result.add_uint("read_bytes", *process.read_bytes);
-    else
-        result.add_null("read_bytes");
-    if (process.write_bytes)
-        result.add_uint("write_bytes", *process.write_bytes);
-    else
-        result.add_null("write_bytes");
+    result.add_optional_double("cpu_percent", process.cpu_percent);
+    result.add_optional_uint("rss_bytes", process.rss_bytes);
+    result.add_optional_uint("read_bytes", process.read_bytes);
+    result.add_optional_uint("write_bytes", process.write_bytes);
     result.add_null("io_utilization_percent");
     result.add_string("io_utilization_reason", "process_provider_exposes_counters_only");
     result.add_string("cpu_reason", process.cpu_percent ? "" : process.cpu_reason);
@@ -522,29 +398,14 @@ static std::string gpu_telemetry_json(const GpuTelemetrySampler& sampler)
     const GpuTelemetrySample telemetry = sampler.sample();
     JsonObject result;
     result.add_bool("active", telemetry.active);
-    if (telemetry.device_index)
-        result.add_uint("device_index", *telemetry.device_index);
-    else
-        result.add_null("device_index");
+    result.add_optional_uint("device_index", telemetry.device_index);
     result.add_uint("vendor_id", telemetry.vendor_id);
     result.add_string("device_name", telemetry.device_name);
     result.add_string("provider", telemetry.provider);
-    if (telemetry.utilization_percent)
-        result.add_double("utilization_percent", *telemetry.utilization_percent);
-    else
-        result.add_null("utilization_percent");
-    if (telemetry.memory_utilization_percent)
-        result.add_double("memory_utilization_percent", *telemetry.memory_utilization_percent);
-    else
-        result.add_null("memory_utilization_percent");
-    if (telemetry.used_bytes)
-        result.add_uint("used_bytes", *telemetry.used_bytes);
-    else
-        result.add_null("used_bytes");
-    if (telemetry.total_bytes)
-        result.add_uint("total_bytes", *telemetry.total_bytes);
-    else
-        result.add_null("total_bytes");
+    result.add_optional_double("utilization_percent", telemetry.utilization_percent);
+    result.add_optional_double("memory_utilization_percent", telemetry.memory_utilization_percent);
+    result.add_optional_uint("used_bytes", telemetry.used_bytes);
+    result.add_optional_uint("total_bytes", telemetry.total_bytes);
     result.add_string("reason", telemetry.reason);
     return result.finish();
 }
@@ -681,11 +542,11 @@ static Option parse_options(int argc, char** argv, int first_argument)
         else if (argument == "--buffered-expert-io")
             set_expert_io_mode(OptionBufferedExpertIo);
         else if (argument == "--disable-gpu-victim-execution")
-            result.flags |= ncnn::moe::OptionDisableGpuVictimExecution;
+            result.flags |= OptionDisableGpuVictimExecution;
         else if (argument == "--disable-gpu-expert-execution")
-            result.flags |= ncnn::moe::OptionDisableGpuExpertExecution;
+            result.flags |= OptionDisableGpuExpertExecution;
         else if (argument == "--release-vulkan-dense-host")
-            result.flags |= ncnn::moe::OptionReleaseVulkanDenseHostStorage;
+            result.flags |= OptionReleaseVulkanDenseHostStorage;
         else
             throw std::invalid_argument("unknown worker option: " + argument);
     }
@@ -694,7 +555,7 @@ static Option parse_options(int argc, char** argv, int first_argument)
 
 static uint32_t request_uint(std::string_view request, std::string_view key, uint32_t default_value)
 {
-    const auto value = integer(request, key);
+    const auto value = json_integer(request, key);
     if (!value)
         return default_value;
     if (*value < 0 || static_cast<uint64_t>(*value) > std::numeric_limits<uint32_t>::max())
@@ -704,13 +565,13 @@ static uint32_t request_uint(std::string_view request, std::string_view key, uin
 
 static bool request_bool(std::string_view request, std::string_view key, bool default_value)
 {
-    const auto value = boolean(request, key);
+    const auto value = json_boolean(request, key);
     return value ? *value : default_value;
 }
 
 static std::vector<int32_t> request_tokens(std::string_view request, std::string_view key, bool required)
 {
-    const auto values = integer_array(request, key);
+    const auto values = json_integer_array(request, key);
     if (!values)
     {
         if (required)
@@ -736,102 +597,79 @@ struct GenerateRequest
     std::string session_id;
     std::vector<int32_t> prompt_tokens;
     GenerationOptions options;
-    bool metrics_enabled = true;
     uint32_t metrics_interval_ms = 1000;
 };
 
 class Worker
 {
 private:
-    Runtime& runtime_;
-    ModelPtr model_;
-    std::unordered_map<std::string, SessionPtr> sessions_;
-    std::mutex output_mutex_;
-    std::mutex generation_state_mutex_;
-    std::thread generation_thread_;
-    std::atomic<bool> generation_running_{false};
-    std::atomic<bool> cancel_requested_{false};
-    std::string active_request_id_;
-    ProcessTelemetrySampler telemetry_sampler_;
-    GpuTelemetrySampler gpu_telemetry_sampler_;
+    Runtime& runtime;
+    ModelPtr model;
+    std::unordered_map<std::string, SessionPtr> sessions;
+    std::mutex output_mutex;
+    std::thread generation_thread;
+    std::atomic<bool> generation_running{false};
+    std::atomic<bool> cancel_requested{false};
+    std::string active_request_id;
+    ProcessTelemetrySampler telemetry_sampler;
+    GpuTelemetrySampler gpu_telemetry_sampler;
 
     void emit(std::string value)
     {
-        const std::lock_guard<std::mutex> lock(output_mutex_);
+        const std::lock_guard<std::mutex> lock(output_mutex);
         std::cout << value << '\n'
                   << std::flush;
     }
 
-    void emit_error(std::string_view request_id, std::string_view message, std::string_view code = "invalid_request")
+    void emit_error(std::string_view request_id, std::string_view message, std::string_view code = "invalid_request") noexcept
     {
-        JsonObject result;
-        result.add_string("event", "error");
-        if (!request_id.empty())
-            result.add_string("request_id", request_id);
-        result.add_string("code", code);
-        result.add_string("message", message);
-        emit(result.finish());
-    }
-
-    void join_finished_generation()
-    {
-        if (generation_thread_.joinable() && !generation_running_.load())
-            generation_thread_.join();
-    }
-
-    [[nodiscard]] bool generation_active(std::string_view request_id = {})
-    {
-        if (!generation_running_.load())
-            return false;
-        if (request_id.empty())
-            return true;
-        const std::lock_guard<std::mutex> lock(generation_state_mutex_);
-        return active_request_id_ == request_id;
-    }
-
-    void emit_stats(std::string_view event, std::string_view request_id, std::string_view session_id, const SessionPtr& session)
-    {
-        JsonObject result;
-        result.add_string("event", event);
-        if (!request_id.empty())
-            result.add_string("request_id", request_id);
-        result.add_string("session_id", session_id);
-        result.add_uint("sequence_length", session->sequence_length());
-        result.add_raw("stats", stats_json(session->metrics()));
-        result.add_raw("memory", memory_statistics_json(session->memory_statistics()));
-        emit(result.finish());
+        try
+        {
+            JsonObject result;
+            result.add_string("event", "error");
+            if (!request_id.empty())
+                result.add_string("request_id", request_id);
+            result.add_string("code", code);
+            result.add_string("message", message);
+            emit(result.finish());
+        }
+        catch (...)
+        {
+            // Reporting failure must not prevent generation cleanup.
+        }
     }
 
     void emit_ready()
     {
-        const RuntimeInfo& info = runtime_.info();
-        const ncnn::moe::EffectiveOption& effective = model_->effective_option();
-        const ncnn::moe::ModelMemoryPlan& memory_plan = model_->memory_plan();
-        JsonObject model;
-        model.add_string("model_type", model_->descriptor().model_type);
-        model.add_uint("vocabulary_size", model_->descriptor().vocabulary_size);
-        model.add_uint("hidden_size", model_->descriptor().hidden_size);
-        model.add_uint("layer_count", model_->descriptor().layer_count);
-        model.add_uint("expert_count", model_->descriptor().expert_count);
-        model.add_uint("experts_per_token", model_->descriptor().experts_per_token);
-        model.add_uint("max_context_tokens", maximum_context_tokens());
+        const RuntimeInfo& info = runtime.info();
+        const EffectiveOption& effective = model_compiled(*model).opt;
+        const ModelMemoryPlan& memory_plan = model_compiled(*model).memory_plan;
+        const char* cpu_packed_weights = has_flag(effective.optimization_flags, OptimizationCpuPackedWeights) ? "on" : "off";
+        JsonObject model_json;
+        model_json.add_string("model_type", model->descriptor().model_type);
+        model_json.add_uint("vocabulary_size", model->descriptor().vocabulary_size);
+        model_json.add_uint("hidden_size", model->descriptor().hidden_size);
+        model_json.add_uint("layer_count", model->descriptor().layers.size());
+        model_json.add_uint("expert_count", model->descriptor().expert_count);
+        model_json.add_uint("experts_per_token", model->descriptor().experts_per_token);
+        model_json.add_uint("max_context_tokens", maximum_context_tokens());
 
         JsonObject resources;
         resources.add_string("backend", hybrid_mode_name(effective.hybrid_mode));
-        resources.add_string("requested_expert_memory", expert_memory_mode_name(effective.requested_expert_memory_mode));
-        resources.add_string("selected_expert_memory", expert_memory_mode_name(effective.selected_expert_memory_mode));
-        resources.add_string("requested_cpu_packed_weights", cpu_packed_weight_mode_name(effective.requested_cpu_packed_weight_mode));
-        resources.add_string("selected_cpu_packed_weights", cpu_packed_weight_mode_name(effective.selected_cpu_packed_weight_mode));
-        resources.add_uint("host_memory_budget_bytes", effective.host_memory_budget);
-        resources.add_uint("expert_cache_bytes", effective.expert_cache_size);
+        resources.add_string("requested_expert_memory", expert_memory_mode_name(memory_plan.requested_mode));
+        resources.add_string("selected_expert_memory", expert_memory_mode_name(memory_plan.selected_mode));
+        resources.add_string("requested_cpu_packed_weights", cpu_packed_weights);
+        resources.add_string("selected_cpu_packed_weights", cpu_packed_weights);
+        resources.add_uint("host_memory_budget_bytes", memory_plan.host_memory_budget);
+        resources.add_uint("expert_cache_bytes", memory_plan.expert_cache_size);
         resources.add_uint("expert_gpu_cache_bytes", effective.expert_gpu_cache_size);
         resources.add_uint("expert_gpu_victim_cache_bytes", effective.expert_gpu_victim_cache_size);
         resources.add_uint("expert_io_workers", effective.num_expert_io_threads);
         resources.add_uint("expected_concurrency", effective.num_concurrent_sessions);
         resources.add_uint("flags", effective.flags);
         resources.add_uint("optimization_flags", effective.optimization_flags);
-        resources.add_bool("file_backed_experts", effective.use_file_backed_experts);
-        if (effective.vulkan_device_index == ncnn::moe::automatic_vulkan_device_index)
+        resources.add_bool("file_backed_experts", memory_plan.selected_mode == ExpertMemoryMode::OnDemand);
+        if (effective.vulkan_device_index == automatic_vulkan_device_index)
             resources.add_null("vulkan_device_index");
         else
             resources.add_uint("vulkan_device_index", effective.vulkan_device_index);
@@ -860,62 +698,60 @@ private:
 
         JsonObject result;
         result.add_string("event", "ready");
-        result.add_raw("model", model.finish());
+        result.add_raw("model", model_json.finish());
         result.add_raw("resources", resources.finish());
         result.add_raw("capabilities", info_json.finish());
-        result.add_raw("telemetry", gpu_telemetry_json(gpu_telemetry_sampler_));
+        result.add_raw("telemetry", gpu_telemetry_json(gpu_telemetry_sampler));
         emit(result.finish());
     }
 
     [[nodiscard]] uint32_t maximum_context_tokens() const
     {
         uint32_t maximum = 0;
-        for (const ncnn::moe::LayerDescriptor& layer : model_->descriptor().layers)
-            maximum = std::max(maximum, layer.attention.max_context_length);
+        for (const LayerDescriptor& layer : model->descriptor().layers)
+        {
+            if (layer.attention.kind != AttentionKind::None)
+                maximum = std::max(maximum, layer.attention.max_context_length);
+        }
         return maximum;
     }
 
     void execute_generate(GenerateRequest request, SessionPtr session)
     {
-        const auto started = std::chrono::steady_clock::now();
-        std::atomic<bool> metrics_stop{false};
-        std::mutex metrics_mutex;
-        std::condition_variable metrics_condition;
-        const bool metrics_enabled = request.metrics_enabled && request.metrics_interval_ms != 0;
-        std::thread metrics_thread;
-        if (metrics_enabled)
-        {
-            metrics_thread = std::thread([&]() {
-                std::unique_lock<std::mutex> lock(metrics_mutex);
-                while (!metrics_stop.load())
-                {
-                    if (metrics_condition.wait_for(
-                            lock,
-                            std::chrono::milliseconds(request.metrics_interval_ms),
-                            [&]() { return metrics_stop.load(); }))
-                    {
-                        break;
-                    }
-                    lock.unlock();
-                    emit_runtime_metrics(request, session, started);
-                    lock.lock();
-                }
-            });
-        }
-        const auto stop_metrics = [&]() {
-            if (!metrics_enabled)
-                return;
-            metrics_stop.store(true);
-            metrics_condition.notify_one();
-            if (metrics_thread.joinable())
-                metrics_thread.join();
-        };
         try
         {
+            const auto started = std::chrono::steady_clock::now();
+            std::mutex metrics_mutex;
+            std::condition_variable_any metrics_condition;
+            std::exception_ptr metrics_error;
+            // Declared last so unwinding joins before destroying captured state.
+            std::jthread metrics_thread;
+            if (request.metrics_interval_ms != 0)
+            {
+                metrics_thread = std::jthread([&](std::stop_token stop) {
+                    try
+                    {
+                        std::unique_lock<std::mutex> lock(metrics_mutex);
+                        while (!stop.stop_requested())
+                        {
+                            metrics_condition.wait_for(lock, stop, std::chrono::milliseconds(request.metrics_interval_ms), [] { return false; });
+                            if (stop.stop_requested())
+                                break;
+                            lock.unlock();
+                            emit_runtime_metrics(request, session, started);
+                            lock.lock();
+                        }
+                    }
+                    catch (...)
+                    {
+                        metrics_error = std::current_exception();
+                    }
+                });
+            }
             auto generated = session->generate(
                 request.prompt_tokens,
                 request.options,
-                [this, &request, started](const ncnn::moe::StreamToken& token) {
+                [this, &request, started](const StreamToken& token) {
                     JsonObject event;
                     event.add_string("event", "token");
                     event.add_string("request_id", request.request_id);
@@ -928,28 +764,33 @@ private:
                     event.add_double("elapsed_seconds", elapsed);
                     emit(event.finish());
 
-                    if (cancel_requested_.load())
-                        return false;
-                    return true;
+                    return !cancel_requested.load();
                 });
-            stop_metrics();
+            if (metrics_thread.joinable())
+            {
+                metrics_thread.request_stop();
+                metrics_thread.join();
+            }
+            if (metrics_error)
+                std::rethrow_exception(metrics_error);
             if (!generated)
             {
+                generation_running.store(false);
                 emit_error(request.request_id, generated.error().message, error_code_name(generated.error().code));
             }
             else
             {
-                const ncnn::moe::GenerationResult& generation = generated.value();
+                const GenerationResult& generation = generated.value();
                 JsonObject done;
                 done.add_string("event", "done");
                 done.add_string("request_id", request.request_id);
                 done.add_string("session_id", request.session_id);
                 done.add_bool("ok", true);
-                done.add_bool("metrics_enabled", metrics_enabled);
+                done.add_bool("metrics_enabled", request.metrics_interval_ms != 0);
                 done.add_uint("generated_tokens", generation.tokens.size());
                 done.add_bool("stopped_by_stop_token", generation.stopped_by_stop_token);
                 done.add_bool("stopped_by_callback", generation.stopped_by_callback);
-                done.add_bool("cancelled", generation.stopped_by_callback && cancel_requested_.load());
+                done.add_bool("cancelled", generation.stopped_by_callback && cancel_requested.load());
                 const SessionMetrics metrics = session->metrics();
                 done.add_double("elapsed_seconds", static_cast<double>(metrics.timing.elapsed_microseconds) / 1000000.0);
                 done.add_optional_double("prompt_tok_per_second", metrics.timing.prompt_tokens_per_second);
@@ -963,29 +804,26 @@ private:
                 done.add_optional_uint("ttft_microseconds", metrics.timing.ttft_microseconds);
                 done.add_optional_double("tpot_microseconds", metrics.timing.tpot_microseconds);
                 done.add_uint("sequence_length", session->sequence_length());
-                done.add_raw("metrics", runtime_metrics_json(telemetry_sampler_, gpu_telemetry_sampler_, metrics));
+                done.add_raw("metrics", runtime_metrics_json(telemetry_sampler, gpu_telemetry_sampler, metrics));
                 done.add_raw("stats", stats_json(metrics));
-                done.add_raw("memory", memory_statistics_json(session->memory_statistics()));
-                done.add_raw("telemetry", process_telemetry_json(telemetry_sampler_));
-                done.add_raw("gpu", gpu_telemetry_json(gpu_telemetry_sampler_));
-                emit(done.finish());
+                done.add_raw("telemetry", process_telemetry_json(telemetry_sampler));
+                done.add_raw("gpu", gpu_telemetry_json(gpu_telemetry_sampler));
+                std::string response = done.finish();
+                // A terminal event may immediately trigger the next request.
+                generation_running.store(false);
+                emit(std::move(response));
             }
         }
         catch (const std::exception& exception)
         {
-            stop_metrics();
+            generation_running.store(false);
             emit_error(request.request_id, exception.what(), "worker_exception");
         }
         catch (...)
         {
-            stop_metrics();
+            generation_running.store(false);
             emit_error(request.request_id, "unknown exception in generation", "worker_exception");
         }
-        {
-            const std::lock_guard<std::mutex> lock(generation_state_mutex_);
-            active_request_id_.clear();
-        }
-        generation_running_.store(false);
     }
 
     void emit_runtime_metrics(const GenerateRequest& request, const SessionPtr& session, std::chrono::steady_clock::time_point started)
@@ -997,25 +835,25 @@ private:
         event.add_string("request_id", request.request_id);
         event.add_string("session_id", request.session_id);
         event.add_double("elapsed_seconds", elapsed);
-        event.add_raw("metrics", runtime_metrics_json(telemetry_sampler_, gpu_telemetry_sampler_, metrics));
+        event.add_raw("metrics", runtime_metrics_json(telemetry_sampler, gpu_telemetry_sampler, metrics));
         emit(event.finish());
     }
 
     void handle_create_session(std::string_view request)
     {
-        const auto session_id = string(request, "session_id");
+        const auto session_id = json_string(request, "session_id");
         if (!session_id || session_id->empty())
             throw std::invalid_argument("create_session requires a non-empty session_id");
-        if (sessions_.contains(*session_id))
+        if (sessions.contains(*session_id))
             throw std::invalid_argument("session already exists: " + *session_id);
         SessionOptions options;
-        options.sampling_seed = integer(request, "seed").value_or(0);
+        options.sampling_seed = json_integer(request, "seed").value_or(0);
         options.prefill_chunk_size = request_uint(request, "prefill_chunk_size", options.prefill_chunk_size);
-        options.enable_speculative_context = request_bool(request, "enable_speculative_context", true);
-        auto session = runtime_.create_session(model_, options);
+        options.use_speculative_context = request_bool(request, "enable_speculative_context", true);
+        auto session = runtime.create_session(model, options);
         if (!session)
             throw std::runtime_error(session.error().message);
-        sessions_.emplace(*session_id, std::move(session).value());
+        sessions.emplace(*session_id, std::move(session).value());
         JsonObject result;
         result.add_string("event", "session_created");
         result.add_string("session_id", *session_id);
@@ -1025,13 +863,13 @@ private:
 
     void handle_reset(std::string_view request)
     {
-        const auto session_id = string(request, "session_id");
+        const auto session_id = json_string(request, "session_id");
         if (!session_id)
             throw std::invalid_argument("reset requires session_id");
-        if (generation_active())
+        if (generation_running.load())
             throw std::invalid_argument("cannot reset while a generation is active; cancel it first");
-        const auto iterator = sessions_.find(*session_id);
-        if (iterator == sessions_.end())
+        const auto iterator = sessions.find(*session_id);
+        if (iterator == sessions.end())
             throw std::invalid_argument("unknown session: " + *session_id);
         auto reset = iterator->second->reset();
         if (!reset)
@@ -1044,13 +882,13 @@ private:
 
     void handle_compact(std::string_view request)
     {
-        const auto session_id = string(request, "session_id");
+        const auto session_id = json_string(request, "session_id");
         if (!session_id)
             throw std::invalid_argument("compact requires session_id");
-        if (generation_active())
+        if (generation_running.load())
             throw std::invalid_argument("cannot compact while a generation is active; cancel it first");
-        const auto iterator = sessions_.find(*session_id);
-        if (iterator == sessions_.end())
+        const auto iterator = sessions.find(*session_id);
+        if (iterator == sessions.end())
             throw std::invalid_argument("unknown session: " + *session_id);
         std::vector<int32_t> replay_tokens = request_tokens(request, "replay_tokens", false);
         auto reset = iterator->second->reset();
@@ -1072,46 +910,51 @@ private:
 
     void handle_stats(std::string_view request)
     {
-        const auto session_id = string(request, "session_id");
+        const auto session_id = json_string(request, "session_id");
         if (!session_id)
             throw std::invalid_argument("stats requires session_id");
-        const auto iterator = sessions_.find(*session_id);
-        if (iterator == sessions_.end())
+        const auto iterator = sessions.find(*session_id);
+        if (iterator == sessions.end())
             throw std::invalid_argument("unknown session: " + *session_id);
-        emit_stats("stats", {}, *session_id, iterator->second);
+        JsonObject result;
+        result.add_string("event", "stats");
+        result.add_string("session_id", *session_id);
+        result.add_uint("sequence_length", iterator->second->sequence_length());
+        result.add_raw("stats", stats_json(iterator->second->metrics()));
+        emit(result.finish());
     }
 
     void handle_generate(std::string_view request)
     {
-        join_finished_generation();
-        if (generation_running_.load())
+        if (generation_running.load())
             throw std::invalid_argument("only one generation can run at a time; cancel it first");
+        if (generation_thread.joinable())
+            generation_thread.join();
         GenerateRequest parsed;
-        parsed.request_id = string(request, "request_id").value_or("generate");
-        parsed.session_id = string(request, "session_id").value_or("main");
+        parsed.request_id = json_string(request, "request_id").value_or("generate");
+        parsed.session_id = json_string(request, "session_id").value_or("main");
         parsed.prompt_tokens = request_tokens(request, "prompt_tokens", true);
         parsed.options.max_new_tokens = request_uint(request, "max_new_tokens", parsed.options.max_new_tokens);
-        parsed.options.enable_speculative = request_bool(request, "enable_speculative", true);
-        parsed.metrics_enabled = request_bool(request, "metrics_enabled", true);
+        parsed.options.use_speculative = request_bool(request, "enable_speculative", true);
         parsed.options.stop_tokens = request_tokens(request, "stop_tokens", false);
-        if (const auto value = number(request, "temperature"))
+        if (const auto value = json_number(request, "temperature"))
             parsed.options.sampling.temperature = static_cast<float>(*value);
         else
             parsed.options.sampling.temperature = 0.0f;
-        if (const auto value = integer(request, "top_k"))
+        if (const auto value = json_integer(request, "top_k"))
             parsed.options.sampling.top_k = request_uint(request, "top_k", 0);
-        if (const auto value = number(request, "top_p"))
+        if (const auto value = json_number(request, "top_p"))
             parsed.options.sampling.top_p = static_cast<float>(*value);
-        if (const auto value = number(request, "min_p"))
+        if (const auto value = json_number(request, "min_p"))
             parsed.options.sampling.min_p = static_cast<float>(*value);
-        if (const auto value = number(request, "speculative_confidence"))
+        if (const auto value = json_number(request, "speculative_confidence"))
             parsed.options.speculative_confidence_threshold = static_cast<float>(*value);
         parsed.options.speculative_max_draft_tokens = request_uint(request, "speculative_max_draft", 0);
         parsed.metrics_interval_ms = request_uint(request, "metrics_interval_ms", 1000);
-        if (parsed.metrics_interval_ms == 0)
-            parsed.metrics_enabled = false;
-        const auto iterator = sessions_.find(parsed.session_id);
-        if (iterator == sessions_.end())
+        if (!request_bool(request, "metrics_enabled", true))
+            parsed.metrics_interval_ms = 0;
+        const auto iterator = sessions.find(parsed.session_id);
+        if (iterator == sessions.end())
             throw std::invalid_argument("unknown session: " + parsed.session_id);
         if (parsed.options.max_new_tokens == 0)
         {
@@ -1121,23 +964,30 @@ private:
                 throw std::invalid_argument("unlimited generation requires remaining model context");
             parsed.options.max_new_tokens = static_cast<uint32_t>(max_context - sequence_length);
         }
+        // Only the request loop owns the active ID; the worker publishes completion.
+        active_request_id = parsed.request_id;
+        cancel_requested.store(false);
+        generation_running.store(true);
+        try
         {
-            const std::lock_guard<std::mutex> lock(generation_state_mutex_);
-            active_request_id_ = parsed.request_id;
+            generation_thread = std::thread(&Worker::execute_generate, this, std::move(parsed), iterator->second);
         }
-        cancel_requested_.store(false);
-        generation_running_.store(true);
-        generation_thread_ = std::thread(&Worker::execute_generate, this, std::move(parsed), iterator->second);
+        catch (...)
+        {
+            generation_running.store(false);
+            active_request_id.clear();
+            throw;
+        }
     }
 
     void handle_cancel(std::string_view request)
     {
-        const std::string request_id = string(request, "request_id").value_or("");
-        if (!generation_running_.load())
+        const std::string request_id = json_string(request, "request_id").value_or("");
+        if (!generation_running.load())
             throw std::invalid_argument("no generation is active");
-        if (!request_id.empty() && !generation_active(request_id))
+        if (!request_id.empty() && request_id != active_request_id)
             throw std::invalid_argument("request_id does not match the active generation");
-        cancel_requested_.store(true);
+        cancel_requested.store(true);
         JsonObject result;
         result.add_string("event", "cancel_requested");
         if (!request_id.empty())
@@ -1146,18 +996,18 @@ private:
     }
 
 public:
-    Worker(Runtime& runtime, ModelPtr model)
-        : runtime_(runtime), model_(std::move(model)), gpu_telemetry_sampler_(runtime.info(), model_->effective_option())
+    Worker(Runtime& _runtime, ModelPtr _model)
+        : runtime(_runtime), model(std::move(_model)), gpu_telemetry_sampler(runtime.info(), model_compiled(*model).opt)
     {
-        (void)telemetry_sampler_.sample();
+        (void)telemetry_sampler.sample();
         emit_ready();
     }
 
     ~Worker()
     {
-        cancel_requested_.store(true);
-        if (generation_thread_.joinable())
-            generation_thread_.join();
+        cancel_requested.store(true);
+        if (generation_thread.joinable())
+            generation_thread.join();
     }
 
     int run()
@@ -1165,12 +1015,13 @@ public:
         std::string line;
         while (std::getline(std::cin, line))
         {
-            join_finished_generation();
+            if (generation_thread.joinable() && !generation_running.load())
+                generation_thread.join();
             if (line.empty())
                 continue;
             try
             {
-                const auto operation = string(line, "op");
+                const auto operation = json_string(line, "op");
                 if (!operation)
                     throw std::invalid_argument("request requires an op string");
                 if (*operation == "create_session")
@@ -1187,9 +1038,9 @@ public:
                     handle_cancel(line);
                 else if (*operation == "shutdown")
                 {
-                    cancel_requested_.store(true);
-                    if (generation_thread_.joinable())
-                        generation_thread_.join();
+                    cancel_requested.store(true);
+                    if (generation_thread.joinable())
+                        generation_thread.join();
                     JsonObject result;
                     result.add_string("event", "shutdown");
                     emit(result.finish());
@@ -1200,13 +1051,13 @@ public:
             }
             catch (const std::exception& exception)
             {
-                const auto request_id = string(line, "request_id").value_or("");
+                const auto request_id = json_string(line, "request_id").value_or("");
                 emit_error(request_id, exception.what());
             }
         }
-        cancel_requested_.store(true);
-        if (generation_thread_.joinable())
-            generation_thread_.join();
+        cancel_requested.store(true);
+        if (generation_thread.joinable())
+            generation_thread.join();
         return 0;
     }
 };
