@@ -4,47 +4,12 @@
 #include "modeladapter.h"
 #include "safetensors.h"
 
-#include <limits>
-#include <regex>
 #include <utility>
 
 namespace ncnn {
 namespace moe {
 
-static Result<std::vector<uint32_t>> deepseek_required_uint32_array(const std::string& json, const std::string& key)
-{
-    const std::regex expression("\\\"" + key + "\\\"\\s*:\\s*\\[([^\\]]*)\\]");
-    std::smatch match;
-    if (!std::regex_search(json, match, expression))
-        return Error{ErrorCode::InvalidModel, "DeepSeek-V4 manifest is missing integer array: " + key};
-    const std::regex number_expression("[0-9]+");
-    std::vector<uint32_t> values;
-    for (std::sregex_iterator iterator(match[1].first, match[1].second, number_expression), end; iterator != end; ++iterator)
-    {
-        try
-        {
-            const unsigned long long value = std::stoull(iterator->str());
-            if (value > std::numeric_limits<uint32_t>::max())
-                return Error{ErrorCode::InvalidModel, "DeepSeek-V4 array value is out of range: " + key};
-            values.push_back(static_cast<uint32_t>(value));
-        }
-        catch (const std::exception&)
-        {
-            return Error{ErrorCode::InvalidModel, "invalid DeepSeek-V4 integer array: " + key};
-        }
-    }
-    if (values.empty())
-        return Error{ErrorCode::InvalidModel, "DeepSeek-V4 integer array is empty: " + key};
-    return values;
-}
-
-static bool deepseek_has_key(const std::string& json, const std::string& key)
-{
-    const std::regex expression("\\\"" + key + "\\\"\\s*:");
-    return std::regex_search(json, expression);
-}
-
-static Result<void> deepseek_add_experts(
+static Result<void> add_experts(
     WeightMapping& mapping, const SafetensorsArchive& archive,
     const std::string& source, const std::string& target,
     uint32_t expert_count, uint32_t hidden_size, uint32_t intermediate_size, uint32_t flags)
@@ -129,7 +94,22 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
     auto maximum_context = read_manifest_uint32(json, "max_position_embeddings", "DeepSeek-V4 ");
     if (!maximum_context)
         return maximum_context.error();
-    auto initial_context = read_manifest_uint32(json, "original_max_position_embeddings", "DeepSeek-V4 ");
+    std::string rope_scaling_json;
+    const std::string* rope_json = &json;
+    if (find_manifest_member(json, "rope_scaling"))
+    {
+        auto parsed_rope_scaling = read_manifest_object(
+            json, "rope_scaling", "DeepSeek-V4 ");
+        if (!parsed_rope_scaling)
+            return parsed_rope_scaling.error();
+        rope_scaling_json = std::move(parsed_rope_scaling).value();
+        rope_json = &rope_scaling_json;
+    }
+    const std::string& initial_context_json = find_manifest_member(*rope_json, "original_max_position_embeddings")
+                                                  ? *rope_json
+                                                  : json;
+    auto initial_context = read_manifest_uint32(
+        initial_context_json, "original_max_position_embeddings", "DeepSeek-V4 ");
     if (!initial_context)
         return initial_context.error();
     auto hash_layer_count = read_manifest_uint32(json, "num_hash_layers", "DeepSeek-V4 ");
@@ -150,41 +130,64 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
     auto hyper_iterations = read_manifest_uint32(json, "hc_sinkhorn_iters", "DeepSeek-V4 ");
     if (!hyper_iterations)
         return hyper_iterations.error();
-    auto compress_ratios = deepseek_required_uint32_array(json, "compress_ratios");
+    auto compress_ratios = read_manifest_uint32_array(
+        json, "compress_ratios", "DeepSeek-V4 ");
     if (!compress_ratios)
         return compress_ratios.error();
+    if (compress_ratios.value().empty())
+        return Error{ErrorCode::InvalidModel, "DeepSeek-V4 integer array is empty: compress_ratios"};
     auto expert_dtype = read_manifest_string(json, "expert_dtype", "DeepSeek-V4 ");
     if (!expert_dtype)
         return expert_dtype.error();
     auto scoring_function = read_manifest_string(json, "scoring_func", "DeepSeek-V4 ");
     if (!scoring_function)
         return scoring_function.error();
-    auto quantization_method = read_manifest_string(json, "quant_method", "DeepSeek-V4 ");
+    std::string quantization_config_json;
+    const std::string* quantization_json = &json;
+    if (find_manifest_member(json, "quantization_config"))
+    {
+        auto parsed_quantization_config = read_manifest_object(
+            json, "quantization_config", "DeepSeek-V4 ");
+        if (!parsed_quantization_config)
+            return parsed_quantization_config.error();
+        quantization_config_json = std::move(parsed_quantization_config).value();
+        quantization_json = &quantization_config_json;
+    }
+    auto quantization_method = read_manifest_string(
+        *quantization_json, "quant_method", "DeepSeek-V4 ");
     if (!quantization_method)
         return quantization_method.error();
-    auto quantization_format = read_manifest_string(json, "fmt", "DeepSeek-V4 ");
+    auto quantization_format = read_manifest_string(
+        *quantization_json, "fmt", "DeepSeek-V4 ");
     if (!quantization_format)
         return quantization_format.error();
-    auto scale_format = read_manifest_string(json, "scale_fmt", "DeepSeek-V4 ");
+    auto scale_format = read_manifest_string(
+        *quantization_json, "scale_fmt", "DeepSeek-V4 ");
     if (!scale_format)
         return scale_format.error();
-    auto weight_block_size = deepseek_required_uint32_array(json, "weight_block_size");
+    auto weight_block_size = read_manifest_uint32_array(
+        *quantization_json, "weight_block_size", "DeepSeek-V4 ");
     if (!weight_block_size)
         return weight_block_size.error();
+    if (weight_block_size.value().empty())
+        return Error{ErrorCode::InvalidModel, "DeepSeek-V4 integer array is empty: weight_block_size"};
 
     std::vector<uint32_t> speculative_targets;
     uint32_t speculative_block_size = 0;
     uint32_t speculative_noise_token_id = 0;
     uint32_t speculative_markov_rank = 0;
-    const bool has_dspark = deepseek_has_key(json, "dspark_target_layer_ids")
-                            || deepseek_has_key(json, "dspark_block_size")
-                            || deepseek_has_key(json, "dspark_noise_token_id")
-                            || deepseek_has_key(json, "dspark_markov_rank");
+    const bool has_dspark = find_manifest_member(json, "dspark_target_layer_ids").has_value()
+                            || find_manifest_member(json, "dspark_block_size").has_value()
+                            || find_manifest_member(json, "dspark_noise_token_id").has_value()
+                            || find_manifest_member(json, "dspark_markov_rank").has_value();
     if (has_dspark)
     {
-        auto targets = deepseek_required_uint32_array(json, "dspark_target_layer_ids");
+        auto targets = read_manifest_uint32_array(
+            json, "dspark_target_layer_ids", "DeepSeek-V4 ");
         if (!targets)
             return targets.error();
+        if (targets.value().empty())
+            return Error{ErrorCode::InvalidModel, "DeepSeek-V4 integer array is empty: dspark_target_layer_ids"};
         auto block_size = read_manifest_uint32(json, "dspark_block_size", "DeepSeek-V4 ");
         if (!block_size)
             return block_size.error();
@@ -270,9 +273,9 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
     attention.index_top_k = index_top_k.value();
     attention.rope_theta = optional_manifest_float(json, "rope_theta", 10000.0f);
     attention.compressed_rope_theta = optional_manifest_float(json, "compress_rope_theta", 160000.0f);
-    attention.rope_scaling_factor = optional_manifest_float(json, "factor", 16.0f);
-    attention.rope_ntk_alpha = optional_manifest_float(json, "beta_slow", 1.0f);
-    attention.rope_ntk_beta = optional_manifest_float(json, "beta_fast", 32.0f);
+    attention.rope_scaling_factor = optional_manifest_float(*rope_json, "factor", 16.0f);
+    attention.rope_ntk_alpha = optional_manifest_float(*rope_json, "beta_slow", 1.0f);
+    attention.rope_ntk_beta = optional_manifest_float(*rope_json, "beta_fast", 32.0f);
     attention.projection_weight_dtype = DType::Float8E4M3;
     attention.flags = AttentionDescriptorSinks | AttentionDescriptorQueryKeyNorm;
 
@@ -298,14 +301,14 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
         layer.pre_ffn_norm = NormType::RmsNorm;
         layer.attention = attention;
         layer.attention.compression_ratio = compress_ratios.value()[layer_id];
-        layer.ffn.moe = moe;
+        layer.moe = moe;
         if (layer_id >= descriptor.hash_routing_layer_count)
-            layer.ffn.moe.flags |= MoeDescriptorRouterBias;
+            layer.moe.flags |= MoeDescriptorRouterBias;
     }
     return descriptor;
 }
 
-static Result<void> deepseek_add_common_layer_tensors(
+static Result<void> add_common_layer_tensors(
     WeightMapping& mapping, const SafetensorsArchive& archive,
     const std::string& source, const std::string& target)
 {
@@ -332,7 +335,7 @@ static Result<void> deepseek_add_common_layer_tensors(
     return {};
 }
 
-static Result<void> deepseek_add_float8(WeightMapping& mapping, const SafetensorsArchive& archive, const std::string& target, const std::string& source)
+static Result<void> add_float8(WeightMapping& mapping, const SafetensorsArchive& archive, const std::string& target, const std::string& source)
 {
     auto tensor = archive.load_float8_tensor(source + ".weight", source + ".scale");
     if (!tensor)
@@ -341,7 +344,7 @@ static Result<void> deepseek_add_float8(WeightMapping& mapping, const Safetensor
     return {};
 }
 
-static Result<void> deepseek_add_float8_layer_tensors(
+static Result<void> add_float8_layer_tensors(
     WeightMapping& mapping, const SafetensorsArchive& archive,
     const std::string& source, const std::string& target)
 {
@@ -357,14 +360,14 @@ static Result<void> deepseek_add_float8_layer_tensors(
     };
     for (const auto& item : tensors)
     {
-        auto ret = deepseek_add_float8(mapping, archive, target + item.first, source + item.second);
+        auto ret = add_float8(mapping, archive, target + item.first, source + item.second);
         if (!ret)
             return ret.error();
     }
     return {};
 }
 
-static Result<void> deepseek_validate_dspark(const SafetensorsArchive& archive, const MoeModelDescriptor& descriptor)
+static Result<void> validate_dspark(const SafetensorsArchive& archive, const MoeModelDescriptor& descriptor)
 {
     if (descriptor.speculative_layer_count == 0)
         return {};
@@ -397,7 +400,7 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
     if (!opened)
         return opened.error();
     SafetensorsArchive archive = std::move(opened).value();
-    auto dspark_status = deepseek_validate_dspark(archive, descriptor);
+    auto dspark_status = validate_dspark(archive, descriptor);
     if (!dspark_status)
         return dspark_status.error();
 
@@ -429,10 +432,10 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
     {
         const std::string source = "layers." + std::to_string(layer_id) + ".";
         const std::string target = layer_prefix(layer_id);
-        status = deepseek_add_common_layer_tensors(mapping, archive, source, target);
+        status = add_common_layer_tensors(mapping, archive, source, target);
         if (!status)
             return status.error();
-        status = deepseek_add_float8_layer_tensors(mapping, archive, source, target);
+        status = add_float8_layer_tensors(mapping, archive, source, target);
         if (!status)
             return status.error();
 
@@ -477,14 +480,14 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
                     if (!status)
                         return status.error();
                 }
-                status = deepseek_add_float8(mapping, archive, target + "attention.indexer.query.weight", source + "attn.indexer.wq_b");
+                status = add_float8(mapping, archive, target + "attention.indexer.query.weight", source + "attn.indexer.wq_b");
                 if (!status)
                     return status.error();
             }
         }
 
-        const MoeDescriptor& moe = descriptor.layers[layer_id].ffn.moe;
-        status = deepseek_add_experts(
+        const MoeDescriptor& moe = descriptor.layers[layer_id].moe;
+        status = add_experts(
             mapping, archive, source, target,
             descriptor.expert_count, descriptor.hidden_size,
             moe.intermediate_size, expert_flags);
@@ -499,16 +502,16 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
     {
         const std::string source = "mtp." + std::to_string(layer_id) + ".";
         const std::string target = speculative_layer_prefix(layer_id);
-        status = deepseek_add_common_layer_tensors(mapping, archive, source, target);
+        status = add_common_layer_tensors(mapping, archive, source, target);
         if (!status)
             return status.error();
         status = add_tensor(mapping, archive, target + "router.selection_bias", source + "ffn.gate.bias");
         if (!status)
             return status.error();
-        status = deepseek_add_float8_layer_tensors(mapping, archive, source, target);
+        status = add_float8_layer_tensors(mapping, archive, source, target);
         if (!status)
             return status.error();
-        status = deepseek_add_experts(
+        status = add_experts(
             mapping, archive, source, target,
             descriptor.expert_count, descriptor.hidden_size,
             descriptor.intermediate_size, expert_flags);
@@ -516,7 +519,7 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
             return status.error();
     }
 
-    status = deepseek_add_float8(mapping, archive, "speculative.main_projection.weight", "mtp.0.main_proj");
+    status = add_float8(mapping, archive, "speculative.main_projection.weight", "mtp.0.main_proj");
     if (!status)
         return status.error();
     status = add_tensor(mapping, archive, "speculative.main_norm.weight", "mtp.0.main_norm.weight");

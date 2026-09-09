@@ -6,6 +6,7 @@
 #include "kernels/hyperconnection.h"
 #include "kernels/ops.h"
 #include "kernels/statecache.h"
+#include "cpu.h"
 #include "expertbackend.h"
 #include "storage/expertcache.h"
 
@@ -14,14 +15,10 @@
 
 #include <algorithm>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
-#include <functional>
 #include <memory>
-#include <mutex>
-#include <thread>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -30,30 +27,7 @@ namespace moe {
 
 struct SessionStatistics;
 
-class CpuTaskWorker
-{
-public:
-    explicit CpuTaskWorker(size_t maximum_outstanding_tasks);
-    ~CpuTaskWorker();
-
-    CpuTaskWorker(const CpuTaskWorker&) = delete;
-    CpuTaskWorker& operator=(const CpuTaskWorker&) = delete;
-
-    [[nodiscard]] bool try_submit(std::function<void()> task);
-
-private:
-    void worker_loop();
-
-    const size_t task_limit;
-    std::mutex mutex;
-    std::condition_variable task_ready;
-    std::deque<std::function<void()>> tasks;
-    std::thread worker;
-    size_t outstanding_tasks = 0;
-    bool stop = false;
-};
-
-struct CpuDecodeRouteOrigin
+struct DecodeRouteOrigin
 {
     size_t session_index = 0;
     size_t active_index = 0;
@@ -75,22 +49,17 @@ struct ExpertExecutionMetrics
 struct ActiveExpertExecution
 {
     ExpertBatch batch;
-    CpuBatch input;
-    CpuBatch output;
+    ActivationBuffer input;
+    ActivationBuffer output;
     ExpertCacheLease lease;
     ExpertExecutionMetrics metrics;
 
-    void prepare(const ExpertBatch& next_batch)
+    void prepare(ExpertBatch& next_batch)
     {
+        // Consume next_batch.routes and return the old buffer for dispatch reuse.
         batch.expert_id = next_batch.expert_id;
-        batch.routes.assign(next_batch.routes.begin(), next_batch.routes.end());
-        lease = {};
-        metrics = {};
-    }
-
-    void prepare(ExpertBatch&& next_batch)
-    {
-        batch = std::move(next_batch);
+        batch.routes.swap(next_batch.routes);
+        next_batch.routes.clear();
         lease = {};
         metrics = {};
     }
@@ -98,29 +67,50 @@ struct ActiveExpertExecution
 
 struct LayerGraphState
 {
-    CpuBatch normalized;
-    CpuBatch router_logits;
-    CpuHyperConnectionMix ffn_hyper_mix;
-    CpuBatch shared_expert_output;
+    ActivationBuffer normalized;
+    ActivationBuffer router_logits;
+    HyperConnectionMix ffn_hyper_mix;
+    ActivationBuffer shared_expert_output;
     ExpertDispatchPlan dispatch_plan;
-    std::vector<ActiveExpertExecution> active_experts;
+    // Keep inactive slots too, so changing route counts does not free buffers.
+    std::vector<ActiveExpertExecution> expert_slots;
+    size_t active_expert_count = 0;
     std::chrono::steady_clock::time_point router_start;
     std::chrono::steady_clock::time_point expert_start;
     bool experts_executed = false;
 
+    void resize_experts(size_t count)
+    {
+        if (expert_slots.size() < count)
+            expert_slots.resize(count);
+        active_expert_count = count;
+    }
+
+    std::span<ActiveExpertExecution> active_experts() noexcept
+    {
+        return {expert_slots.data(), active_expert_count};
+    }
+
+    std::span<const ActiveExpertExecution> active_experts() const noexcept
+    {
+        return {expert_slots.data(), active_expert_count};
+    }
+
     void reset()
     {
-        normalized.clear();
-        router_logits.clear();
+        // Router overwrites normalized/router_logits scratch before reuse.
+        // Empty shared output means Shared Expert has not run for this pass.
         shared_expert_output.clear();
-        for (ActiveExpertExecution& active : active_experts)
+        for (ActiveExpertExecution& active : expert_slots)
             active.lease = {};
         experts_executed = false;
     }
 };
 
-struct CpuExpertExecutionScratch
+struct ExpertScratch
 {
+    // Staged execution gathers several sessions while their FFN state stays live.
+    LayerGraphState staged_state;
     Mxfp4Scratch kernels;
     std::vector<Mxfp4Task> decode_tasks;
     std::vector<size_t> uncached_indices;
@@ -134,60 +124,45 @@ struct CpuExpertExecutionScratch
     std::vector<ExpertBackendRequest> backend_requests;
     std::vector<size_t> failed_indices;
     bool backend_aggregated_output_valid = false;
-    CpuBatch backend_aggregated_output;
-    CpuBatch staged_merged;
-    CpuBatch staged_output;
-    CpuBatch staged_router_logits;
+    ActivationBuffer backend_aggregated_output;
+    ActivationBuffer staged_merged;
+    ActivationBuffer staged_output;
+    ActivationBuffer staged_router_logits;
     std::vector<int32_t> staged_input_ids;
-    std::vector<uint32_t> staged_expert_ids;
-    std::vector<CpuGatedDeltaBatchEntry> gated_delta_entries;
-    std::vector<NcnnVulkanGatedDeltaBatchEntry> gated_delta_device_entries;
+    std::vector<uint32_t> explicit_expert_ids;
+    std::vector<GatedDeltaBatchEntry> gated_delta_entries;
+    std::vector<GatedDeltaBatchEntry_vulkan> gated_delta_device_entries;
     std::vector<uint64_t> staged_attention_positions;
-    std::vector<CpuLayerCache*> staged_attention_caches;
-    std::vector<CpuAttentionBatchEntry> attention_batch_entries;
-    std::vector<CpuBatch> staged_batches;
-    std::vector<CpuHyperConnectionMix> staged_hyper_mixes;
+    std::vector<LayerCache*> staged_attention_caches;
+    std::vector<AttentionBatchEntry> attention_batch_entries;
+    std::vector<ActivationBuffer> staged_batches;
     std::vector<size_t> combined_by_expert;
-    std::vector<std::vector<CpuDecodeRouteOrigin>> staged_route_origins;
+    std::vector<std::vector<DecodeRouteOrigin>> staged_route_origins;
     std::vector<uint8_t> combined_backend_aggregated;
-    bool combined_backend_aggregated_output_valid = false;
-    CpuBatch combined_backend_aggregated_output;
+    ActivationBuffer combined_backend_aggregated_output;
 };
 
-class CpuSessionState
+class SessionState
 {
 public:
-    std::vector<CpuLayerCache> layers;
-    std::vector<CpuLayerCache> speculative_layers;
-    std::vector<LayerGraphState> execution_layers;
-    CpuExpertExecutionScratch expert_scratch;
-    CpuAttentionExecutionScratch attention_scratch;
-    CpuGatedDeltaExecutionScratch gated_delta_scratch;
+    std::vector<LayerCache> layers;
+    std::vector<LayerCache> speculative_layers;
+    // The schedule finishes each layer's Combine before starting the next layer.
+    LayerGraphState execution_state;
+    ExpertScratch expert_scratch;
+    HyperConnectionScratch hyper_connection_scratch;
+    AttentionScratch attention_scratch;
+    GatedDeltaScratch gated_delta_scratch;
     std::unique_ptr<CpuTaskWorker> router_prediction_worker;
-    CpuBatch hidden;
-    CpuBatch speculative_main_hidden;
-    CpuBatch mtp_pending_target_hidden;
+    ActivationBuffer hidden;
+    ActivationBuffer final_norm;
+    ActivationBuffer speculative_main_hidden;
+    ActivationBuffer mtp_pending_target_hidden;
     std::vector<int32_t> speculative_input_ids;
     std::vector<int32_t> speculative_direct_alignment_ids;
     uint64_t speculative_main_hidden_position = 0;
     uint64_t mtp_pending_target_position = 0;
     bool use_speculative_context = true;
-
-    [[nodiscard]] uint64_t kv_cache_allocated_size() const noexcept
-    {
-        uint64_t bytes = 0;
-        for (const CpuLayerCache& layer : layers)
-            bytes += layer.allocated_bytes();
-        return bytes;
-    }
-
-    [[nodiscard]] uint64_t kv_cache_logical_size() const noexcept
-    {
-        uint64_t bytes = 0;
-        for (const CpuLayerCache& layer : layers)
-            bytes += layer.logical_bytes();
-        return bytes;
-    }
 };
 
 } // namespace moe

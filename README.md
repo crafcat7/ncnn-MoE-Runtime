@@ -55,7 +55,7 @@ bounded host and device cache tiers backed by asynchronous range I/O.
 | --- | --- |
 | Model integration | `ModelAdapter` parses package metadata into `MoeModelDescriptor` and maps weights |
 | Compilation | Descriptor validation, weight resolution, execution-graph construction, and backend placement |
-| Dense Transformer | Portable CPU, ncnn CPU operators, or ncnn Vulkan |
+| Dense Transformer | Runtime-dispatched CPU kernels or ncnn Vulkan |
 | Sparse Experts | Stable Top-K grouping, batched execution, and runtime-selected kernels |
 | Weight residency | Automatic eager or byte-bounded on-demand Expert storage |
 | Cache policy | Host ARC with independent optional Vulkan execution and victim tiers |
@@ -72,11 +72,11 @@ requiring a resident copy of every routed weight.
 | Model integration | Public `ModelAdapter` contract and model-neutral `MoeModelDescriptor`; built-in GPT-OSS, DeepSeek V4, Qwen3.6, and Qwen3.8 text adapters |
 | Compiler | Descriptor validation, weight resolution, execution-graph construction, and immutable compilation |
 | Execution graph | Tensor and node dependencies, backend candidates and placement, and dependency-ordered backend runs |
-| Dense path | Portable CPU with runtime-dispatched FP8 E4M3 scalar/AVX2/AVX-512 Linear, optional ncnn CPU operators, and mixed ncnn Vulkan Dense/Attention execution |
-| Attention | RMSNorm, GQA, full/sliding Attention, Gated DeltaNet, latent Attention with learned compressed history, RoPE/YaRN variants, output gates, sinks, persistent KV/recurrent state, fused QKV+RoPE, and adaptive online Decode SDPA |
+| Dense path | Portable CPU with runtime-dispatched FP8 E4M3 scalar/AVX2/AVX-512 Linear, and mixed ncnn Vulkan Dense/Attention execution |
+| Attention | RMSNorm, GQA, full/sliding Attention, Gated DeltaNet, latent Attention with learned compressed history, RoPE/YaRN variants, output gates, sinks, persistent KV/recurrent state, fused QKV+RoPE, and option-controlled fused Decode SDPA |
 | Experts | Stable Top-K regrouping, Softmax/Sigmoid/square-root-Softplus scoring, hash routes, gated shared Experts, float32/BF16/FP8/INT8/Q2_K-Q6_K execution, and fused-decode FP4 kernels selected at runtime for scalar, NEON, SVE2, AVX2/FMA, or AVX-512 |
 | Memory and storage | Automatic eager/on-demand planning, per-Session KV/recurrent state, byte-bounded host ARC, mmap or asynchronous direct/buffered reads, optional packed Expert storage, and optional Vulkan cache tiers |
-| Heterogeneous execution | CPU Experts by default, optional calibrated native Vulkan MXFP4 Experts, and capability-weighted multi-Vulkan layer placement |
+| Heterogeneous execution | CPU Experts by default, optional resident native Vulkan MXFP4 Experts, and capability-weighted multi-Vulkan layer placement |
 | Scheduling | Independent Session state, ragged staged Prefill, mHC/Attention/Expert Decode batching, and same-Expert and exact-input coalescing |
 | Generation | Greedy, temperature, Top-K, Top-P, Min-P, stop tokens, streaming, and model-provided speculative plans |
 
@@ -84,7 +84,8 @@ requiring a resident copy of every routed weight.
 
 - **Heterogeneous placement.** Dense projections and Attention run through
   ncnn Vulkan while routing and sparse Expert work use the CPU; native Vulkan
-  Experts are admitted only when phase-level calibration measures a benefit.
+  Experts execute when their weights are resident in the device cache.
+  Missing or failed device work returns to the existing CPU execution path.
 - **Fused MXFP4 compute.** Expert kernels decode MXFP4 blocks inside the
   compute loop instead of materializing complete FP32 weights. Runtime dispatch
   selects scalar, NEON, SVE2, AVX2/FMA, or AVX-512 implementations. Qwen3.6 and
@@ -101,7 +102,7 @@ requiring a resident copy of every routed weight.
   reads, optional aligned direct I/O, and the packed Expert sidecar keep the
   active route working set close to compute.
 - **Reusable execution state.** Persistent KV rings, reusable scratch buffers,
-  direct QKV-to-ring writes, command reuse, and online Decode SDPA reduce
+  direct QKV-to-ring writes, command reuse, and fused Decode SDPA reduce
   per-token allocation and transfer overhead.
 - **Model-provided speculation.** DSpark and experimental Qwen MTP use
   transactional Attention/recurrent state and exact fallback commits. DSpark
@@ -270,6 +271,22 @@ ncnn::moe::Result<ncnn::moe::GenerationResult> run(
 }
 ```
 
+Expert I/O is selected with `opt.expert_io_mode`: `ExpertIoMode::Auto` (the
+default), `Mmap`, `Direct`, or `Buffered`. This replaces the three mutually
+exclusive I/O flags. The remaining `OptionFlag` bit positions are compacted;
+C++ callers must use the current named constants rather than old numeric masks.
+The CLI options `--mmap-experts`, `--direct-expert-io`, and
+`--buffered-expert-io` are unchanged.
+
+Statistics retain execution, fusion, transfer, cache, and CPU-fallback results.
+The per-stage Vulkan Attention failure fields (`vulkan_attention_*_failures`)
+and corresponding worker JSON keys have been removed; input checks, failure
+returns, and state rollback are unchanged. C++ consumers must rebuild against
+the current headers. Use `expert_cache_num_io_threads` instead of the removed
+`expert_cache_num_active_io_threads`: the old field duplicated the worker count,
+not the number of busy threads. Benchmark reports no longer emit the duplicate
+`expert_cache_adaptive_io_workers` field.
+
 Applications add model families that describe supported model semantics through
 `ModelAdapter::can_load`, `parse_model`, and `map_weights`; execution code
 consumes only compiled plans. The unified Python CLI is the text and
@@ -291,7 +308,7 @@ consume that state through explicit contracts.
 | Adapter and compiler | Model-package parsing through `ModelAdapter` into `MoeModelDescriptor`, descriptor validation, weight resolution, memory planning, backend placement, and `CompiledModel` construction |
 | Execution | `ExecutionGraph` dependencies and Tensor locations, dependency-ordered backend runs, routing, and Expert dispatch |
 | Memory | `ModelMemoryPlan`, per-Session KV/recurrent state, host ARC residency, and optional Vulkan cache tiers |
-| Backends | Portable CPU kernels, ncnn CPU/Vulkan Dense and Attention blocks, CPU Expert execution, and the optional native Vulkan MXFP4 Expert backend |
+| Backends | Runtime-dispatched CPU kernels, ncnn Vulkan Dense and Attention blocks, CPU Expert execution, and the optional native Vulkan MXFP4 Expert backend |
 | Model storage | Package metadata and mappings, asynchronous range I/O, packed Expert storage, and cache lifetime ownership |
 
 ```text
@@ -314,7 +331,7 @@ Model Adapter -> MoeModelDescriptor -> ModelLoader -> compile_model
                                                 |
                             +-------------------+-------------------+
                             |                                       |
-                    ncnn CPU/Vulkan                        CPU Expert Backend
+                   CPU / ncnn Vulkan                       CPU Expert Backend
                  Dense + Attention + KV              Router + Dispatch + MXFP4
                             |                                       |
                             +--- optional native Vulkan Experts ----+
@@ -333,6 +350,14 @@ requests.
 `Session` owns mutable KV cache, recurrent state, sampling state,
 reusable execution scratch, and statistics. The byte-bounded Expert cache
 implements ARC recent/frequent resident lists and ghost histories.
+
+Model CPU Linear execution uses the runtime's CPU kernels. Model preparation
+does not create duplicate ncnn CPU layers or FP32-expanded weight copies;
+weight-owned lazy packed caches remain available. The low-level
+`OptimizationNcnnCpuBfloat16Linear` flag still controls direct ncnn operator
+construction, not model CPU kernel selection. Reference runners report
+`CPU Linear backend: moe-kernels`; benchmark metadata uses `cpu_linear_backend`
+instead of the former `cpu_small_bfloat16_linear_policy` field.
 
 Autoregressive dependencies are preserved within each Session. Independent
 Sessions can overlap through explicit batch submissions. Multi-Session prefill
@@ -358,7 +383,7 @@ the Runtime API and its public model guides.
 | Built-in reference adapters | GPT-OSS-20B/120B, DeepSeek-V4-Flash/DSpark, and the Qwen3.6-35B-A3B and Qwen3.8-Flash-Next text backbones |
 | CPU execution | Complete portable path |
 | Heterogeneous execution | Vulkan Dense/Attention with CPU routing and Experts |
-| Native Vulkan Experts | Optional MXFP4 cache and execution with runtime calibration and CPU fallback |
+| Native Vulkan Experts | Optional MXFP4 cache and resident execution, with CPU recovery for missing or failed work |
 | Multiple Vulkan devices | Capability-weighted whole-layer placement |
 | Expert memory | Automatic eager or byte-bounded on-demand residency |
 | KV cache | CPU FP32/BF16 or mixed-backend FP32 ring |
@@ -377,8 +402,20 @@ Vulkan-only execution is not a supported public mode.
 ## Model adapters
 
 The Runtime core is model-neutral; production package support is supplied by
-registered adapters. Model execution guides live with their adapter
-definitions:
+registered adapters. Qwen artifact identity checks use the same manifest bytes
+that the adapter parses; they do not reread `config.json` during that load.
+The checkpoint index is still read and hashed from disk.
+
+Manifest field readers are shared, but each adapter explicitly selects its
+configuration objects. Reads stay within the selected object; they do not search
+unrelated nested objects for matching names. Numeric values and array elements
+must be consumed in full. These field readers are not a general JSON validator.
+Family-specific QSA, PLE, and MTP rules remain in their adapters.
+Qwen routed BF16 Expert banks share one file mapping per bank, with each Expert
+holding an owning slice. If the bank cannot be mapped or is not aligned, loading
+falls back to individual slices without making a temporary copy of the whole bank.
+
+Model execution guides live with their adapter definitions:
 
 - [Model catalog and capability matrix](models/README.md)
 - [GPT-OSS-20B/120B execution and performance](models/gpt-oss/README.md)
@@ -395,7 +432,7 @@ src/engine/        Runtime, Sessions, execution, CPU/thread resources, and Exper
 src/models/        Built-in model adapters, package loading, packed-sidecar selection, and canonical Tensor names
 src/storage/       Weight storage, mapped-file I/O, host ARC, and Vulkan victim cache
 src/kernels/       Portable CPU Attention/Linear, BF16 helpers, Qn_K pack/decode, and runtime-selected FP8/MXFP4 SIMD kernels
-src/backends/ncnn/ ncnn CPU/Vulkan operator packaging, mixed Attention, Vulkan contexts, and native MXFP4 Experts
+src/backends/ncnn/ ncnn operator packaging, mixed Attention, Vulkan contexts, and native MXFP4 Experts
 models/            Model catalog and model-family execution guides
 assets/            Published benchmark visualizations used by model reports
 examples/          Unified worker, benchmark/reference runners, protocol helpers, and MXFP4 microbenchmark
@@ -413,10 +450,30 @@ and scheduling, and `engine/executor.cpp` for execution. Backend operator
 preparation stays in `backends/ncnn/modelpipeline.cpp`; CPU and Vulkan kernels
 remain separate from that loading policy.
 
-Compound module names use joined words (`modeladapter.h`, `weightstore.h`).
+Compound module names use joined words (`modeladapter.h`, `weightstore.h`,
+`activationbuffer.h`). CPU worker and thread-budget ownership stays together in
+`engine/cpu.h` and `engine/cpu.cpp`, outside the model execution flow.
 Implementation variants keep a suffix (`executor_speculative.cpp`,
-`expertbackend_vulkan.cpp`, `mxfp4_msvc_avx2.cpp`). The installed model contracts
+`expertbackend_vulkan.cpp`, `attention_vulkan.h`, `mxfp4_msvc_avx2.cpp`). The installed model contracts
 are `ncnn/moe/modeladapter.h` and `ncnn/moe/modeldescriptor.h`.
+
+Internal compute types follow ncnn's backend-suffix convention:
+`Linear`, `Bfloat16Linear_vulkan`, `Attention_vulkan`, and
+`GatedDeltaNet_vulkan`. The `ncnn::moe` namespace provides the project context;
+types do not repeat an `Ncnn` prefix or an `Operator` suffix.
+
+Within the ncnn backend, `vulkan.h` exposes GPU queries, statistics, and an opaque
+`VulkanRuntime` resource owner without including native Vulkan headers.
+`vulkancontext.h` and `vulkancontext.cpp` own its implementation and the
+per-device `VulkanContext` resources; the actual device remains ncnn's
+`VulkanDevice`.
+
+Attention selects fused or generic execution before recording. QKV dispatch
+limits select the generic ncnn path where supported; an allocation or recording
+failure does not trigger another GPU implementation attempt. The existing CPU
+and per-session recovery boundaries remain in place. Recorders consume their
+operator's pipelines and weights directly, and batch entries retain only
+per-entry state and resources that must survive submission.
 
 ## License
 

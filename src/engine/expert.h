@@ -1,7 +1,7 @@
 #ifndef NCNN_MOE_EXPERT_H
 #define NCNN_MOE_EXPERT_H
 
-#include "kernels/activation.h"
+#include "kernels/activationbuffer.h"
 #include "ncnn/moe/result.h"
 #include "ncnn/moe/types.h"
 
@@ -13,7 +13,7 @@ namespace moe {
 
 struct CompiledModel;
 struct ExpertExecutionMetrics;
-struct CpuExpertExecutionScratch;
+struct ExpertScratch;
 struct ExpertPlan;
 struct ExpertVictimExecutionMetadata;
 struct LayerGraphState;
@@ -24,10 +24,12 @@ enum class ExecutionBackend;
 
 void record_mxfp4(const TensorData& matrix, size_t input_rows, ExpertExecutionMetrics& metrics);
 
-CpuBatch forward_shared_expert(
+// Input and output must be distinct; existing output capacity is reused.
+void forward_shared_expert(
     const CompiledModel& model,
     const MoeBlockPlan& moe,
-    const CpuBatch& input,
+    const ActivationBuffer& input,
+    ActivationBuffer& output,
     ExpertExecutionMetrics& metrics,
     uint64_t optimization_flags);
 
@@ -47,16 +49,17 @@ ExpertVictimExecutionMetadata victim_metadata(
     const MoeBlockPlan& moe,
     LayerGraphState& layer_state,
     SessionStatistics& statistics,
-    CpuExpertExecutionScratch& scratch,
+    ExpertScratch& scratch,
     uint32_t residency_group,
     ExecutionBackend backend,
     bool prefetch);
 
+// Consume a committed aggregate, or initialize a zeroed CPU accumulator.
 bool initialize_backend_aggregated_output(
-    const CpuExpertExecutionScratch& scratch,
+    ExpertScratch& scratch,
     size_t rows,
     uint32_t columns,
-    CpuBatch& output);
+    ActivationBuffer& output);
 
 } // namespace moe
 } // namespace ncnn

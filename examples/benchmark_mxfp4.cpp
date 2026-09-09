@@ -99,9 +99,9 @@ static TensorData decode_bfloat16_matrix(const TensorData& matrix)
     return decoded;
 }
 
-static CpuBatch make_input(uint32_t token_count, uint32_t columns)
+static ActivationBuffer make_input(uint32_t token_count, uint32_t columns)
 {
-    CpuBatch input(token_count, columns);
+    ActivationBuffer input(token_count, columns);
     for (size_t token = 0; token < input.rows(); ++token)
     {
         for (uint32_t column = 0; column < columns; ++column)
@@ -180,8 +180,8 @@ static double elapsed_milliseconds(std::chrono::steady_clock::time_point start)
 }
 
 static void print_command_statistics(
-    const NcnnVulkanRuntimeCounters& before,
-    const NcnnVulkanRuntimeCounters& after)
+    const VulkanStatistics& before,
+    const VulkanStatistics& after)
 {
     std::cout << "command recording: "
               << after.command_dispatches - before.command_dispatches
@@ -212,15 +212,15 @@ static void print_command_statistics(
 static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_columns, uint32_t token_count, uint32_t repeats, uint32_t device_index)
 {
     constexpr uint64_t optimization_flags = OptimizationDefaultFlags;
-    const NcnnVulkanContextInstancePtr context_instance = create_ncnn_vulkan_context_instance();
+    const VulkanRuntimePtr vulkan_runtime = create_vulkan_runtime();
     if (intermediate_columns > std::numeric_limits<uint32_t>::max() / 2)
     {
         throw std::invalid_argument("intermediate columns are out of range");
     }
     TensorData gate_up = make_matrix(intermediate_columns * 2, input_columns);
     TensorData down = make_matrix(input_columns, intermediate_columns);
-    const CpuBatch input = make_input(token_count, input_columns);
-    CpuBatch cpu_output;
+    const ActivationBuffer input = make_input(token_count, input_columns);
+    ActivationBuffer cpu_output;
     Mxfp4Scratch cpu_scratch;
     Mxfp4Task cpu_task;
     cpu_task.gate_up = &gate_up;
@@ -256,7 +256,7 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
     std::cout << "weight bytes: " << weight_size << '\n';
     std::cout << "CPU median: " << cpu_ms << " ms, " << bandwidth(cpu_ms) << " effective GiB/s\n";
 
-    auto vulkan = NcnnVulkanMxfp4ExpertOperator::create(
+    auto vulkan = Mxfp4Expert_vulkan::create(
         gate_up,
         nullptr,
         down,
@@ -264,14 +264,14 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
         7.0f,
         device_index,
         ExpertActivation::GptOssSwiGlu,
-        context_instance,
+        vulkan_runtime,
         optimization_flags);
     if (!vulkan)
     {
         std::cout << "Vulkan MXFP4 expert unavailable\n";
         return 0;
     }
-    CpuBatch vulkan_output;
+    ActivationBuffer vulkan_output;
     if (!vulkan->forward(input, vulkan_output))
     {
         std::cerr << "Vulkan MXFP4 expert warm-up failed\n";
@@ -279,7 +279,7 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
     }
     std::vector<double> vulkan_times;
     vulkan_times.reserve(repeats);
-    const NcnnVulkanRuntimeCounters counters_before = get_vulkan_execution_snapshot(context_instance).counters;
+    const VulkanStatistics counters_before = get_vulkan_statistics(vulkan_runtime);
     for (uint32_t repeat = 0; repeat < repeats; ++repeat)
     {
         const auto started = std::chrono::steady_clock::now();
@@ -290,7 +290,7 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
         }
         vulkan_times.push_back(elapsed_milliseconds(started));
     }
-    const NcnnVulkanRuntimeCounters counters_after = get_vulkan_execution_snapshot(context_instance).counters;
+    const VulkanStatistics counters_after = get_vulkan_statistics(vulkan_runtime);
 
     float maximum_error = 0.0f;
     float maximum_normalized_error = 0.0f;
@@ -337,7 +337,7 @@ static int benchmark_cpu_mxfp4_q8_expert(
                                                | OptimizationCpuPackedWeights;
     TensorData gate_up = make_matrix(intermediate_columns * 2, input_columns);
     TensorData down = make_matrix(input_columns, intermediate_columns);
-    const CpuBatch input = make_input(token_count, input_columns);
+    const ActivationBuffer input = make_input(token_count, input_columns);
     const std::array<Mxfp4Task, 1> task_template = {{Mxfp4Task{
         &gate_up,
         nullptr,
@@ -348,12 +348,12 @@ static int benchmark_cpu_mxfp4_q8_expert(
         ExpertActivation::GptOssSwiGlu,
         7.0f}}};
 
-    CpuBatch reference;
-    CpuBatch candidate;
+    ActivationBuffer reference;
+    ActivationBuffer candidate;
     Mxfp4Scratch reference_scratch;
     Mxfp4Scratch candidate_scratch;
     auto run = [&](uint64_t flags,
-                   CpuBatch& output,
+                   ActivationBuffer& output,
                    Mxfp4Scratch& scratch) {
         Mxfp4Task task = task_template[0];
         task.output = &output;
@@ -440,11 +440,11 @@ static int benchmark_bfloat16_projection(
     uint32_t device_index)
 {
     constexpr uint64_t optimization_flags = OptimizationDefaultFlags;
-    const NcnnVulkanContextInstancePtr context_instance = create_ncnn_vulkan_context_instance();
+    const VulkanRuntimePtr vulkan_runtime = create_vulkan_runtime();
     TensorData matrix = make_bfloat16_matrix(
         output_columns,
         input_columns);
-    CpuBatch input = make_input(token_count, input_columns);
+    ActivationBuffer input = make_input(token_count, input_columns);
     for (size_t row = 0; row < input.rows(); ++row)
     {
         for (uint32_t column = 0; column < input.columns(); ++column)
@@ -454,12 +454,12 @@ static int benchmark_bfloat16_projection(
                                       * 1e-5f;
         }
     }
-    const CpuBatch reference = linear_batch(matrix, input, optimization_flags);
-    auto vulkan = NcnnVulkanBfloat16Operator::create(
+    const ActivationBuffer reference = linear_batch(matrix, input, optimization_flags);
+    auto vulkan = Bfloat16Linear_vulkan::create(
         matrix,
         nullptr,
         device_index,
-        context_instance,
+        vulkan_runtime,
         optimization_flags);
     if (!vulkan)
     {
@@ -467,7 +467,7 @@ static int benchmark_bfloat16_projection(
         return 0;
     }
 
-    CpuBatch output;
+    ActivationBuffer output;
     for (uint32_t warmup = 0; warmup < 3; ++warmup)
     {
         if (!vulkan->forward(input, output))
@@ -476,7 +476,7 @@ static int benchmark_bfloat16_projection(
             return 1;
         }
     }
-    const NcnnVulkanRuntimeCounters counters_before = get_vulkan_execution_snapshot(context_instance).counters;
+    const VulkanStatistics counters_before = get_vulkan_statistics(vulkan_runtime);
     std::vector<double> times;
     times.reserve(repeats);
     for (uint32_t repeat = 0; repeat < repeats; ++repeat)
@@ -489,7 +489,7 @@ static int benchmark_bfloat16_projection(
         }
         times.push_back(elapsed_milliseconds(started));
     }
-    const NcnnVulkanRuntimeCounters counters_after = get_vulkan_execution_snapshot(context_instance).counters;
+    const VulkanStatistics counters_after = get_vulkan_statistics(vulkan_runtime);
 
     float maximum_error = 0.0f;
     float maximum_normalized_error = 0.0f;
@@ -556,7 +556,7 @@ static int benchmark_cpu_bfloat16_projection(
     const uint64_t reference_optimization_flags = base_optimization_flags & ~policy_flags;
     const uint64_t candidate_optimization_flags = base_optimization_flags | policy_flags;
     TensorData matrix = make_bfloat16_matrix(output_columns, input_columns);
-    CpuBatch input = make_input(token_count, input_columns);
+    ActivationBuffer input = make_input(token_count, input_columns);
     for (size_t row = 0; row < input.rows(); ++row)
     {
         for (uint32_t column = 0; column < input.columns(); ++column)
@@ -567,10 +567,10 @@ static int benchmark_cpu_bfloat16_projection(
         }
     }
 
-    CpuBatch reference;
+    ActivationBuffer reference;
     for (uint32_t warmup = 0; warmup < 3; ++warmup)
         reference = linear_batch(matrix, input, reference_optimization_flags);
-    CpuBatch candidate;
+    ActivationBuffer candidate;
     for (uint32_t warmup = 0; warmup < 3; ++warmup)
         candidate = linear_batch(matrix, input, candidate_optimization_flags);
 
@@ -656,12 +656,12 @@ static int benchmark_cpu_float8_expert(uint32_t input_columns,
                                        input_columns, 2);
     TensorData down = make_float8_matrix(input_columns,
                                          intermediate_columns, 3);
-    const CpuBatch input = make_input(token_count, input_columns);
+    const ActivationBuffer input = make_input(token_count, input_columns);
 
     auto fp32_linear = [optimization_flags](const TensorData& matrix,
-                                            const CpuBatch& source) {
+                                            const ActivationBuffer& source) {
         constexpr uint32_t block_size = 128;
-        CpuBatch quantized = source;
+        ActivationBuffer quantized = source;
         for (size_t token_index = 0; token_index < quantized.rows();
              ++token_index)
         {
@@ -669,7 +669,7 @@ static int benchmark_cpu_float8_expert(uint32_t input_columns,
                 quantized.row(token_index), quantized.columns(), block_size,
                 true, optimization_flags);
         }
-        CpuBatch result(source.rows(), matrix.shape[0]);
+        ActivationBuffer result(source.rows(), matrix.shape[0]);
         const uint32_t input_blocks = (matrix.shape[1] + block_size - 1) / block_size;
         for (uint32_t first_row = 0; first_row < matrix.shape[0];
              first_row += 4)
@@ -691,8 +691,8 @@ static int benchmark_cpu_float8_expert(uint32_t input_columns,
         return result;
     };
     auto fp32_reference_expert = [&]() {
-        CpuBatch up_output = fp32_linear(up, input);
-        const CpuBatch gate_output = fp32_linear(gate, input);
+        ActivationBuffer up_output = fp32_linear(up, input);
+        const ActivationBuffer gate_output = fp32_linear(gate, input);
         for (size_t token_index = 0; token_index < up_output.rows();
              ++token_index)
         {
@@ -708,8 +708,8 @@ static int benchmark_cpu_float8_expert(uint32_t input_columns,
     };
 
     auto baseline = [&]() {
-        CpuBatch up_output = linear_batch(up, input, optimization_flags);
-        const CpuBatch gate_output = linear_batch(gate, input, optimization_flags);
+        ActivationBuffer up_output = linear_batch(up, input, optimization_flags);
+        const ActivationBuffer gate_output = linear_batch(gate, input, optimization_flags);
         for (size_t token_index = 0; token_index < up_output.rows();
              ++token_index)
         {
@@ -724,7 +724,7 @@ static int benchmark_cpu_float8_expert(uint32_t input_columns,
         return linear_batch(down, up_output, optimization_flags);
     };
     auto candidate = [&]() {
-        CpuBatch activated;
+        ActivationBuffer activated;
         if (!fused_float8_gate_up_batch(
                 gate, up, input, ExpertActivation::Silu, 0.0f,
                 activated, optimization_flags))
@@ -734,8 +734,8 @@ static int benchmark_cpu_float8_expert(uint32_t input_columns,
         return linear_batch(down, activated, optimization_flags);
     };
 
-    CpuBatch reference;
-    CpuBatch fused;
+    ActivationBuffer reference;
+    ActivationBuffer fused;
     for (uint32_t warmup = 0; warmup < 5; ++warmup)
     {
         reference = baseline();
@@ -769,7 +769,7 @@ static int benchmark_cpu_float8_expert(uint32_t input_columns,
         }
     }
 
-    const CpuBatch fp32_reference = fp32_reference_expert();
+    const ActivationBuffer fp32_reference = fp32_reference_expert();
     float maximum_error = 0.0f;
     float maximum_normalized_error = 0.0f;
     for (size_t token_index = 0; token_index < fp32_reference.rows();
@@ -859,8 +859,8 @@ int main(int argc, char** argv)
 
         ncnn::moe::TensorData matrix = ncnn::moe::make_matrix(output_columns, input_columns);
         ncnn::moe::TensorData bfloat16_matrix = ncnn::moe::decode_bfloat16_matrix(matrix);
-        const ncnn::moe::CpuBatch input = ncnn::moe::make_input(token_count, input_columns);
-        ncnn::moe::CpuBatch cpu_output = ncnn::moe::linear_batch(matrix, input, optimization_flags);
+        const ncnn::moe::ActivationBuffer input = ncnn::moe::make_input(token_count, input_columns);
+        ncnn::moe::ActivationBuffer cpu_output = ncnn::moe::linear_batch(matrix, input, optimization_flags);
         std::vector<double> cpu_times;
         cpu_times.reserve(repeats);
         for (uint32_t repeat = 0; repeat < repeats; ++repeat)
@@ -870,54 +870,54 @@ int main(int argc, char** argv)
             cpu_times.push_back(ncnn::moe::elapsed_milliseconds(started));
         }
 
-        const ncnn::moe::NcnnVulkanContextInstancePtr context_instance = ncnn::moe::create_ncnn_vulkan_context_instance();
-        auto vulkan = ncnn::moe::NcnnVulkanMxfp4Operator::create(
+        const ncnn::moe::VulkanRuntimePtr vulkan_runtime = ncnn::moe::create_vulkan_runtime();
+        auto vulkan = ncnn::moe::Mxfp4Linear_vulkan::create(
             matrix,
             nullptr,
             device_index,
-            context_instance,
+            vulkan_runtime,
             optimization_flags);
         if (!vulkan)
         {
             std::cout << "Vulkan MXFP4 projection unavailable\n";
             return 0;
         }
-        auto bfloat16_vulkan = ncnn::moe::NcnnLinearOperator::create(
+        auto bfloat16_vulkan = ncnn::moe::Linear::create(
             bfloat16_matrix,
             nullptr,
-            ncnn::moe::NcnnLinearDevice::Vulkan,
+            ncnn::moe::LinearDevice::Vulkan,
             device_index,
-            context_instance,
+            vulkan_runtime,
             optimization_flags);
         if (!bfloat16_vulkan)
         {
             std::cout << "Vulkan BF16-source projection unavailable\n";
             return 0;
         }
-        auto packed_bfloat16_vulkan = ncnn::moe::NcnnVulkanBfloat16Operator::create(
+        auto packed_bfloat16_vulkan = ncnn::moe::Bfloat16Linear_vulkan::create(
             bfloat16_matrix,
             nullptr,
             device_index,
-            context_instance,
+            vulkan_runtime,
             optimization_flags);
         if (!packed_bfloat16_vulkan)
         {
             std::cout << "Vulkan packed-BF16 projection unavailable\n";
             return 0;
         }
-        ncnn::moe::CpuBatch vulkan_output;
+        ncnn::moe::ActivationBuffer vulkan_output;
         if (!vulkan->forward(input, vulkan_output))
         {
             std::cerr << "Vulkan MXFP4 warm-up failed\n";
             return 1;
         }
-        ncnn::moe::CpuBatch bfloat16_vulkan_output;
+        ncnn::moe::ActivationBuffer bfloat16_vulkan_output;
         if (!bfloat16_vulkan->forward(input, bfloat16_vulkan_output))
         {
             std::cerr << "Vulkan BF16-source warm-up failed\n";
             return 1;
         }
-        ncnn::moe::CpuBatch packed_bfloat16_vulkan_output;
+        ncnn::moe::ActivationBuffer packed_bfloat16_vulkan_output;
         if (!packed_bfloat16_vulkan->forward(
                 input,
                 packed_bfloat16_vulkan_output))

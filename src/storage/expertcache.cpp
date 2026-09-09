@@ -142,7 +142,7 @@ struct ExpertCache::FileRangeReader
 #endif
     }
 
-    Result<LoadedRange> load(const std::string& path, uint64_t offset, uint64_t size, uint32_t flags)
+    Result<LoadedRange> load(const std::string& path, uint64_t offset, uint64_t size, ExpertIoMode io_mode)
     {
         if (size > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
         {
@@ -150,7 +150,7 @@ struct ExpertCache::FileRangeReader
                 ErrorCode::InvalidModel,
                 "expert shard range is too large: " + path};
         }
-        if (has_flag(flags, ExpertCacheMemoryMapRanges))
+        if (io_mode == ExpertIoMode::Mmap)
         {
             auto mapping = MappedFileRange::open(path, offset, size);
             if (mapping)
@@ -163,12 +163,10 @@ struct ExpertCache::FileRangeReader
             }
         }
 #if defined(_WIN32)
-        const bool force_direct = has_flag(flags, ExpertCacheDirectReads);
-        const bool force_buffered = has_flag(flags, ExpertCacheBufferedReads);
-        const bool adaptive = !force_direct && !force_buffered;
+        const bool adaptive = io_mode == ExpertIoMode::Auto || io_mode == ExpertIoMode::Mmap;
         const uint32_t policy = adaptive_read_policy.load(std::memory_order_relaxed);
         const bool sample = adaptive && policy == ReadPolicySampling && size >= 1024 * 1024;
-        const bool try_direct = force_direct
+        const bool try_direct = io_mode == ExpertIoMode::Direct
                                 || (adaptive
                                     && (policy == ReadPolicyDirect
                                         || (sample && adaptive_sample_ticket.fetch_add(1, std::memory_order_relaxed) % 2 == 1)));
@@ -535,6 +533,7 @@ ExpertCache::ExpertCache(
     uint64_t _cache_size,
     uint32_t num_io_threads,
     std::shared_ptr<ExpertVictimCache> _victim_cache,
+    ExpertIoMode _io_mode,
     uint32_t _flags,
     uint32_t num_residency_groups,
     bool _reserve_cpu_packed_weights)
@@ -542,6 +541,7 @@ ExpertCache::ExpertCache(
       residency_group_sizes(num_residency_groups, 0),
       reader(std::make_unique<FileRangeReader>()),
       victim_cache(std::move(_victim_cache)),
+      io_mode(_io_mode),
       flags(_flags),
       reserve_cpu_packed_weights(_reserve_cpu_packed_weights)
 {
@@ -581,32 +581,6 @@ void ExpertCache::stop_workers()
     {
         if (worker.joinable())
             worker.join();
-    }
-}
-
-void ExpertCache::cancel_prediction()
-{
-    std::lock_guard<std::mutex> lock(mutex);
-    for (const std::shared_ptr<Entry>& entry : low_priority)
-    {
-        if (!entry
-            || entry->state != Entry::State::Queued
-            || !has_flag(entry->flags, Entry::Speculative))
-        {
-            continue;
-        }
-        const auto existing = entries.find(entry->key);
-        if (existing != entries.end() && existing->second == entry)
-        {
-            remove_resident_locked(*entry, false);
-            entries.erase(existing);
-            ++cancelled_speculative_reads;
-        }
-    }
-    low_priority.clear();
-    if (high_priority.empty() && active_jobs == 0)
-    {
-        idle.notify_all();
     }
 }
 
@@ -834,7 +808,7 @@ Result<std::shared_ptr<TensorData>> ExpertCache::load_tensor(const TensorData& s
         auto loaded = std::make_shared<TensorData>();
         loaded->dtype = DType::BFloat16;
         loaded->shape = source.shape;
-        if (has_flag(flags, ExpertCacheMemoryMapRanges))
+        if (io_mode == ExpertIoMode::Mmap)
         {
             loaded->mapped_data = source.mapped_data;
             loaded->mapped_size = source.mapped_size;
@@ -875,9 +849,9 @@ Result<std::shared_ptr<TensorData>> ExpertCache::load_tensor(const TensorData& s
     auto blocks_future = std::async(
         std::launch::async,
         [this, &file] {
-            return reader->load(file.blocks_path, file.blocks_offset, file.blocks_size, flags);
+            return reader->load(file.blocks_path, file.blocks_offset, file.blocks_size, io_mode);
         });
-    auto scales = reader->load(file.scales_path, file.scales_offset, file.scales_size, flags);
+    auto scales = reader->load(file.scales_path, file.scales_offset, file.scales_size, io_mode);
     auto blocks = blocks_future.get();
     if (!blocks)
         return blocks.error();
@@ -900,10 +874,10 @@ Result<std::shared_ptr<TensorData>> ExpertCache::load_tensor(const TensorData& s
         return loaded;
     }
 
-    auto secondary_blocks = reader->load(file.secondary_blocks_path, file.secondary_blocks_offset, file.secondary_blocks_size, flags);
+    auto secondary_blocks = reader->load(file.secondary_blocks_path, file.secondary_blocks_offset, file.secondary_blocks_size, io_mode);
     if (!secondary_blocks)
         return secondary_blocks.error();
-    auto secondary_scales = reader->load(file.secondary_scales_path, file.secondary_scales_offset, file.secondary_scales_size, flags);
+    auto secondary_scales = reader->load(file.secondary_scales_path, file.secondary_scales_offset, file.secondary_scales_size, io_mode);
     if (!secondary_scales)
         return secondary_scales.error();
     if (secondary_blocks.value().mapped)
@@ -1026,7 +1000,7 @@ Result<ExpertVictimPair> ExpertCache::load_interleaved_pair(const TensorData& ga
     for (size_t cluster_index = 0; cluster_index < cluster_count; ++cluster_index)
     {
         Cluster& cluster = clusters[cluster_index];
-        auto loaded = reader->load(gate.blocks_path, cluster.offset, cluster.size, flags);
+        auto loaded = reader->load(gate.blocks_path, cluster.offset, cluster.size, io_mode);
         if (!loaded)
             return loaded.error();
         cluster.loaded = std::move(loaded).value();
@@ -1157,7 +1131,7 @@ Result<ExpertVictimPair> ExpertCache::load_pair(const TensorData& gate_up, const
     const uint64_t first_offset = ranges.front().offset;
     const Range& last = ranges.back();
     const uint64_t span_size = last.offset + last.size - first_offset;
-    auto combined = reader->load(gate.blocks_path, first_offset, span_size, flags);
+    auto combined = reader->load(gate.blocks_path, first_offset, span_size, io_mode);
     if (!combined)
         return combined.error();
     if (combined.value().mapped)
@@ -1225,7 +1199,7 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(
     saved_range_count = 0;
     mapped_range_count = 0;
     mapped_size = 0;
-    if (batch.size() < 2 || has_flag(flags, ExpertCacheMemoryMapRanges))
+    if (batch.size() < 2 || io_mode == ExpertIoMode::Mmap)
         return std::vector<ExpertVictimPair>();
     for (const std::shared_ptr<Entry>& entry : batch)
     {
@@ -1272,23 +1246,26 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(
         }
     }
     uint64_t independent_range_count = 0;
+    // Ranges are emitted per entry: at most four Gate/Up segments plus two Down segments.
+    size_t range_cursor = 0;
     for (uint32_t entry_index = 0; entry_index < batch.size(); ++entry_index)
     {
-        std::vector<const Range*> entry_ranges;
-        for (const Range& range : ranges)
+        std::array<const Range*, 6> entry_ranges{};
+        size_t entry_range_count = 0;
+        while (range_cursor < ranges.size() && ranges[range_cursor].entry == entry_index)
         {
-            if (range.entry == entry_index)
-                entry_ranges.push_back(&range);
+            entry_ranges[entry_range_count++] = &ranges[range_cursor++];
         }
-        std::sort(entry_ranges.begin(), entry_ranges.end(), [](const Range* first, const Range* second) {
+        std::sort(entry_ranges.begin(), entry_ranges.begin() + entry_range_count, [](const Range* first, const Range* second) {
             if (*first->path != *second->path)
                 return *first->path < *second->path;
             return first->offset < second->offset;
         });
         const Range* previous = nullptr;
         uint64_t cluster_size = 0;
-        for (const Range* range : entry_ranges)
+        for (size_t range_index = 0; range_index < entry_range_count; ++range_index)
         {
+            const Range* range = entry_ranges[range_index];
             const bool adjacent = previous
                                   && *previous->path == *range->path
                                   && previous->offset + previous->size == range->offset
@@ -1344,7 +1321,7 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(
     saved_range_count = independent_range_count - clusters.size();
     for (Cluster& cluster : clusters)
     {
-        auto loaded = reader->load(*cluster.path, cluster.offset, cluster.size, flags);
+        auto loaded = reader->load(*cluster.path, cluster.offset, cluster.size, io_mode);
         if (!loaded)
             return loaded.error();
         cluster.loaded = std::move(loaded).value();
@@ -1370,11 +1347,36 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(
         const TensorData& gate_source = batch[entry_index]->gate_up_source;
         const TensorData& down_source = batch[entry_index]->down_source;
         const MxFp4FileStorage& gate = *gate_source.mxfp4_file_storage;
+        auto gate_size = stored_size(gate_source);
+        if (!gate_size)
+            return gate_size.error();
+        auto down_size = stored_size(down_source);
+        if (!down_size)
+            return down_size.error();
+        if (gate_size.value() > std::numeric_limits<uint64_t>::max() - down_size.value())
+            return Error{ErrorCode::InvalidModel, "coalesced Expert pair byte count overflows"};
+        const uint64_t total_size = gate_size.value() + down_size.value();
+        if (total_size > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+            return Error{ErrorCode::InvalidModel, "coalesced Expert pair is too large"};
+        const size_t gate_blocks_size = static_cast<size_t>(gate.blocks_size + gate.secondary_blocks_size);
+        const size_t gate_scales_size = static_cast<size_t>(gate.scales_size + gate.secondary_scales_size);
+        const MxFp4FileStorage& down = *down_source.mxfp4_file_storage;
+        MxFp4ByteBuffer resident;
+        resident.resize(static_cast<size_t>(total_size));
+        const std::shared_ptr<uint8_t> resident_owner = resident.storage;
+        size_t resident_offset = 0;
+        const auto make_resident_view = [&](size_t size) {
+            std::shared_ptr<uint8_t> view(resident_owner, resident_owner.get() + resident_offset);
+            resident_offset += size;
+            return MxFp4ByteBuffer(std::move(view), size);
+        };
         const std::array<MxFp4ByteBuffer, 6>& entry_sources = sources[entry_index];
 
         auto loaded_gate = std::make_shared<TensorData>();
         loaded_gate->dtype = DType::MxFp4;
         loaded_gate->shape = gate_source.shape;
+        loaded_gate->mxfp4_blocks = make_resident_view(gate_blocks_size);
+        loaded_gate->mxfp4_scales = make_resident_view(gate_scales_size);
         if (gate.interleave_rows)
         {
             auto copied = copy_interleaved_mxfp4_rows(
@@ -1390,15 +1392,17 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(
         }
         else
         {
-            loaded_gate->mxfp4_blocks.assign(entry_sources[0].data(), entry_sources[0].size());
-            loaded_gate->mxfp4_scales.assign(entry_sources[1].data(), entry_sources[1].size());
+            std::memcpy(loaded_gate->mxfp4_blocks.data(), entry_sources[0].data(), entry_sources[0].size());
+            std::memcpy(loaded_gate->mxfp4_scales.data(), entry_sources[1].data(), entry_sources[1].size());
         }
 
         auto loaded_down = std::make_shared<TensorData>();
         loaded_down->dtype = DType::MxFp4;
         loaded_down->shape = down_source.shape;
-        loaded_down->mxfp4_blocks.assign(entry_sources[4].data(), entry_sources[4].size());
-        loaded_down->mxfp4_scales.assign(entry_sources[5].data(), entry_sources[5].size());
+        loaded_down->mxfp4_blocks = make_resident_view(static_cast<size_t>(down.blocks_size));
+        loaded_down->mxfp4_scales = make_resident_view(static_cast<size_t>(down.scales_size));
+        std::memcpy(loaded_down->mxfp4_blocks.data(), entry_sources[4].data(), entry_sources[4].size());
+        std::memcpy(loaded_down->mxfp4_scales.data(), entry_sources[5].data(), entry_sources[5].size());
         loaded_pairs[entry_index] = {std::move(loaded_gate), std::move(loaded_down)};
     }
     return loaded_pairs;
@@ -2000,7 +2004,7 @@ void ExpertCache::worker_loop()
             }
             if (batch.size() == 1
                 && has_flag(flags, ExpertCacheCrossExpertReadCoalescing)
-                && !has_flag(flags, ExpertCacheMemoryMapRanges))
+                && io_mode != ExpertIoMode::Mmap)
             {
                 if (queue.empty())
                 {
@@ -2514,17 +2518,15 @@ ExpertCacheStatistics ExpertCache::statistics() const
         result.arc_frequent_ghost_hits = arc_frequent_ghost_hits;
         result.mapped_ranges = mapped_ranges;
         result.mapped_bytes = mapped_bytes;
-        const uint32_t worker_count = static_cast<uint32_t>(workers.size());
-        result.num_io_threads = worker_count;
-        result.num_active_io_threads = worker_count;
+        result.num_io_threads = static_cast<uint32_t>(workers.size());
         result.io_read_samples = io_read_samples;
         result.io_read_time_microseconds = (io_read_time_nanoseconds + 999) / 1000;
         victim = victim_cache;
     }
     reader->populate_statistics(result);
-    if (has_flag(flags, ExpertCacheMemoryMapRanges))
+    if (io_mode == ExpertIoMode::Mmap)
         result.adaptive_read_policy = 3;
-    else if (has_flag(flags, ExpertCacheDirectReads))
+    else if (io_mode == ExpertIoMode::Direct)
     {
 #if defined(_WIN32)
         result.adaptive_read_policy = FileRangeReader::ReadPolicyDirect;
@@ -2532,7 +2534,7 @@ ExpertCacheStatistics ExpertCache::statistics() const
         result.adaptive_read_policy = FileRangeReader::ReadPolicyBuffered;
 #endif
     }
-    else if (has_flag(flags, ExpertCacheBufferedReads))
+    else if (io_mode == ExpertIoMode::Buffered)
         result.adaptive_read_policy = FileRangeReader::ReadPolicyBuffered;
     if (victim)
         result.victim = victim->statistics();

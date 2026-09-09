@@ -48,33 +48,12 @@ class ExpertCache;
 
 class MxFp4ByteBuffer
 {
-private:
-    friend class MappedFileRange;
-    friend class ExpertCache;
-
-    MxFp4ByteBuffer(std::shared_ptr<uint8_t> _storage, size_t _length) noexcept
-        : storage(std::move(_storage)),
-          length(_length)
-    {
-    }
-
-    [[nodiscard]] static std::shared_ptr<uint8_t> allocate(size_t count)
-    {
-        return std::shared_ptr<uint8_t>(new uint8_t[count], std::default_delete<uint8_t[]>());
-    }
-
-    std::shared_ptr<uint8_t> storage;
-    size_t length = 0;
-
 public:
     MxFp4ByteBuffer() = default;
 
     MxFp4ByteBuffer(std::initializer_list<uint8_t> values)
     {
-        resize(values.size());
-        size_t index = 0;
-        for (uint8_t value : values)
-            storage.get()[index++] = value;
+        assign(values.begin(), values.size());
     }
 
     MxFp4ByteBuffer(const MxFp4ByteBuffer& other)
@@ -109,8 +88,7 @@ public:
 
     MxFp4ByteBuffer& operator=(std::initializer_list<uint8_t> values)
     {
-        MxFp4ByteBuffer replacement(values);
-        *this = std::move(replacement);
+        assign(values.begin(), values.size());
         return *this;
     }
 
@@ -190,6 +168,24 @@ public:
     {
         return storage.get()[length - 1];
     }
+
+private:
+    friend class MappedFileRange;
+    friend class ExpertCache;
+
+    MxFp4ByteBuffer(std::shared_ptr<uint8_t> _storage, size_t _length) noexcept
+        : storage(std::move(_storage)),
+          length(_length)
+    {
+    }
+
+    [[nodiscard]] static std::shared_ptr<uint8_t> allocate(size_t count)
+    {
+        return std::shared_ptr<uint8_t>(new uint8_t[count], std::default_delete<uint8_t[]>());
+    }
+
+    std::shared_ptr<uint8_t> storage;
+    size_t length = 0;
 };
 
 enum class DType

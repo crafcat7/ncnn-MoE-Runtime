@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <cmath>
 #include <span>
-#include <vector>
 
 namespace ncnn {
 namespace moe {
@@ -19,19 +18,22 @@ static float gated_sigmoid(float value) noexcept
 static bool valid_bfloat16_matrix(const TensorData& tensor, uint32_t rows, uint32_t columns) noexcept
 {
     return tensor.dtype == DType::BFloat16
-           && tensor.shape == std::vector<uint32_t>{rows, columns}
+           && tensor.shape.size() == 2
+           && tensor.shape[0] == rows
+           && tensor.shape[1] == columns
            && tensor.bfloat16_values().size() == tensor.element_count();
 }
 
 static bool valid_bfloat16_vector(const TensorData& tensor, uint32_t size) noexcept
 {
     return tensor.dtype == DType::BFloat16
-           && tensor.shape == std::vector<uint32_t>{size}
+           && tensor.shape.size() == 1
+           && tensor.shape[0] == size
            && tensor.bfloat16_values().size() == tensor.element_count();
 }
 
-static Result<CpuHyperConnectionMix> gated_residual_pre_impl(
-    const CpuBatch& input,
+static Result<void> gated_residual_pre_impl(
+    const ActivationBuffer& input,
     const TensorData& norm_weight,
     const TensorData& mix_down_weight,
     const TensorData& mix_up_weight,
@@ -40,6 +42,9 @@ static Result<CpuHyperConnectionMix> gated_residual_pre_impl(
     uint32_t hidden_size,
     float norm_epsilon,
     float norm_weight_offset,
+    ActivationBuffer& reduced_output,
+    std::vector<float>* post_output,
+    HyperConnectionScratch& scratch,
     uint64_t optimization_flags)
 {
     if (multiplier == 0 || hidden_size == 0
@@ -65,7 +70,8 @@ static Result<CpuHyperConnectionMix> gated_residual_pre_impl(
     if (inject_weight && !valid_bfloat16_matrix(*inject_weight, multiplier, expanded_size))
         return Error{ErrorCode::InvalidModel, "invalid gated-residual block injection projection"};
 
-    CpuBatch normalized(input.rows(), expanded_size);
+    ActivationBuffer& normalized = scratch.normalized;
+    normalized.reset(input.rows(), expanded_size, false);
     const std::span<const uint16_t> norm = norm_weight.bfloat16_values();
     for (size_t row_index = 0; row_index < input.rows(); ++row_index)
     {
@@ -86,39 +92,44 @@ static Result<CpuHyperConnectionMix> gated_residual_pre_impl(
         }
     }
 
-    CpuBatch low_rank_mix = linear_batch(mix_down_weight, normalized, optimization_flags);
+    linear_batch_into(mix_down_weight, normalized, scratch.projection, optimization_flags);
     const float inverse_multiplier = 1.0f / static_cast<float>(multiplier);
-    for (size_t row_index = 0; row_index < low_rank_mix.rows(); ++row_index)
+    for (size_t row_index = 0; row_index < scratch.projection.rows(); ++row_index)
     {
-        float* row = low_rank_mix.row(row_index);
-        for (uint32_t column = 0; column < low_rank_mix.columns(); ++column)
+        float* row = scratch.projection.row(row_index);
+        for (uint32_t column = 0; column < scratch.projection.columns(); ++column)
         {
             row[column] *= inverse_multiplier;
             row[column] = row[column] * gated_sigmoid(row[column]);
         }
     }
-    CpuBatch input_mix = linear_batch(mix_up_weight, low_rank_mix, optimization_flags);
+    linear_batch_into(mix_up_weight, scratch.projection, scratch.auxiliary, optimization_flags);
 
-    CpuHyperConnectionMix result;
-    result.reduced.reset(input.rows(), hidden_size, true);
+    reduced_output.reset(input.rows(), hidden_size, true);
     if (inject_weight)
     {
-        CpuBatch injection = linear_batch(*inject_weight, normalized, optimization_flags);
-        result.post.resize(input.rows() * multiplier);
+        if (!post_output)
+            return Error{ErrorCode::InternalError, "gated-residual post output is unavailable"};
+        linear_batch_into(*inject_weight, normalized, scratch.projection, optimization_flags);
+        post_output->resize(input.rows() * multiplier);
         for (size_t row_index = 0; row_index < input.rows(); ++row_index)
         {
-            const float* row = injection.row(row_index);
-            float* output = result.post.data() + row_index * multiplier;
+            const float* row = scratch.projection.row(row_index);
+            float* output = post_output->data() + row_index * multiplier;
             for (uint32_t copy = 0; copy < multiplier; ++copy)
                 output[copy] = 2.0f * gated_sigmoid(row[copy] * inverse_multiplier);
         }
+    }
+    else if (post_output)
+    {
+        post_output->resize(0);
     }
 
     for (size_t row_index = 0; row_index < input.rows(); ++row_index)
     {
         const float* normalized_row = normalized.row(row_index);
-        const float* mix_row = input_mix.row(row_index);
-        float* reduced = result.reduced.row(row_index);
+        const float* mix_row = scratch.auxiliary.row(row_index);
+        float* reduced = reduced_output.row(row_index);
         for (uint32_t copy = 0; copy < multiplier; ++copy)
         {
             const size_t offset = static_cast<size_t>(copy) * hidden_size;
@@ -130,11 +141,11 @@ static Result<CpuHyperConnectionMix> gated_residual_pre_impl(
             }
         }
     }
-    return result;
+    return {};
 }
 
-Result<CpuHyperConnectionMix> gated_residual_pre(
-    const CpuBatch& input,
+Result<void> gated_residual_pre(
+    const ActivationBuffer& input,
     const TensorData& norm_weight,
     const TensorData& mix_down_weight,
     const TensorData& mix_up_weight,
@@ -143,19 +154,33 @@ Result<CpuHyperConnectionMix> gated_residual_pre(
     uint32_t hidden_size,
     float norm_epsilon,
     float norm_weight_offset,
+    HyperConnectionMix& result,
+    HyperConnectionScratch& scratch,
     uint64_t optimization_flags)
 {
-    return gated_residual_pre_impl(input, norm_weight, mix_down_weight,
-                                   mix_up_weight, &inject_weight, multiplier,
-                                   hidden_size, norm_epsilon,
-                                   norm_weight_offset, optimization_flags);
+    result.combine.resize(0);
+    return gated_residual_pre_impl(
+        input,
+        norm_weight,
+        mix_down_weight,
+        mix_up_weight,
+        &inject_weight,
+        multiplier,
+        hidden_size,
+        norm_epsilon,
+        norm_weight_offset,
+        result.reduced,
+        &result.post,
+        scratch,
+        optimization_flags);
 }
 
-Result<CpuBatch> gated_residual_post(
-    const CpuBatch& branch,
-    const CpuBatch& residual,
-    const CpuHyperConnectionMix& mix,
-    uint32_t multiplier)
+Result<void> gated_residual_post(
+    const ActivationBuffer& branch,
+    const ActivationBuffer& residual,
+    const HyperConnectionMix& mix,
+    uint32_t multiplier,
+    ActivationBuffer& output)
 {
     if (multiplier == 0 || branch.rows() != residual.rows()
         || residual.columns() != branch.columns() * multiplier
@@ -163,7 +188,9 @@ Result<CpuBatch> gated_residual_post(
     {
         return Error{ErrorCode::InvalidArgument, "gated-residual post tensors have incompatible shapes"};
     }
-    CpuBatch output(residual.rows(), residual.columns());
+    if (&output == &branch)
+        return Error{ErrorCode::InvalidArgument, "gated-residual post output must not alias branch"};
+    output.reset(residual.rows(), residual.columns(), false);
     for (size_t row_index = 0; row_index < branch.rows(); ++row_index)
     {
         const float* branch_row = branch.row(row_index);
@@ -177,11 +204,11 @@ Result<CpuBatch> gated_residual_post(
                 destination[offset + column] = residual_row[offset + column] + branch_row[column] * injection[copy];
         }
     }
-    return output;
+    return {};
 }
 
-Result<CpuBatch> gated_residual_head(
-    const CpuBatch& input,
+Result<void> gated_residual_head(
+    const ActivationBuffer& input,
     const TensorData& norm_weight,
     const TensorData& mix_down_weight,
     const TensorData& mix_up_weight,
@@ -189,16 +216,29 @@ Result<CpuBatch> gated_residual_head(
     uint32_t hidden_size,
     float norm_epsilon,
     float norm_weight_offset,
+    ActivationBuffer& output,
+    HyperConnectionScratch& scratch,
     uint64_t optimization_flags)
 {
-    auto mixed = gated_residual_pre_impl(input, norm_weight, mix_down_weight,
-                                         mix_up_weight, nullptr, multiplier,
-                                         hidden_size, norm_epsilon,
-                                         norm_weight_offset,
-                                         optimization_flags);
+    if (&output == &input)
+        return Error{ErrorCode::InvalidArgument, "gated-residual head output must not alias input"};
+    auto mixed = gated_residual_pre_impl(
+        input,
+        norm_weight,
+        mix_down_weight,
+        mix_up_weight,
+        nullptr,
+        multiplier,
+        hidden_size,
+        norm_epsilon,
+        norm_weight_offset,
+        output,
+        nullptr,
+        scratch,
+        optimization_flags);
     if (!mixed)
         return mixed.error();
-    return std::move(mixed).value().reduced;
+    return {};
 }
 
 } // namespace moe

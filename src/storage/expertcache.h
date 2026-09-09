@@ -3,6 +3,7 @@
 
 #include "expertcache_victim.h"
 
+#include "ncnn/moe/option.h"
 #include "ncnn/moe/result.h"
 #include "ncnn/moe/types.h"
 
@@ -74,7 +75,6 @@ struct ExpertCacheStatistics
     uint64_t coalesced_read_ranges_saved = 0;
     uint32_t adaptive_read_policy = 0;
     uint32_t num_io_threads = 0;
-    uint32_t num_active_io_threads = 0;
     uint64_t io_read_samples = 0;
     uint64_t io_read_time_microseconds = 0;
     ExpertVictimCacheStatistics victim;
@@ -89,18 +89,12 @@ struct ExpertCachePairRequest
     ExpertVictimExecutionMetadata victim_execution;
 };
 
-#define NCNN_MOE_EXPERT_CACHE_MMAP_BIT              0
-#define NCNN_MOE_EXPERT_CACHE_DIRECT_IO_BIT         1
-#define NCNN_MOE_EXPERT_CACHE_BUFFERED_IO_BIT       2
-#define NCNN_MOE_EXPERT_CACHE_FORWARD_ARC_BIT       3
-#define NCNN_MOE_EXPERT_CACHE_READ_MERGE_BIT        4
-#define NCNN_MOE_EXPERT_CACHE_SPECULATIVE_EVICT_BIT 5
+#define NCNN_MOE_EXPERT_CACHE_FORWARD_ARC_BIT       0
+#define NCNN_MOE_EXPERT_CACHE_READ_MERGE_BIT        1
+#define NCNN_MOE_EXPERT_CACHE_SPECULATIVE_EVICT_BIT 2
 
 enum ExpertCacheOptionFlag : uint32_t
 {
-    ExpertCacheMemoryMapRanges = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_MMAP_BIT,
-    ExpertCacheDirectReads = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_DIRECT_IO_BIT,
-    ExpertCacheBufferedReads = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_BUFFERED_IO_BIT,
     ExpertCacheForwardAwareEviction = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_FORWARD_ARC_BIT,
     ExpertCacheCrossExpertReadCoalescing = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_READ_MERGE_BIT,
     ExpertCacheAllowSpeculativeEviction = UINT32_C(1) << NCNN_MOE_EXPERT_CACHE_SPECULATIVE_EVICT_BIT
@@ -108,6 +102,54 @@ enum ExpertCacheOptionFlag : uint32_t
 
 class ExpertCache
 {
+public:
+    explicit ExpertCache(
+        uint64_t _cache_size,
+        uint32_t num_io_threads = 0,
+        std::shared_ptr<ExpertVictimCache> _victim_cache = {},
+        ExpertIoMode _io_mode = ExpertIoMode::Auto,
+        uint32_t _flags = 0,
+        uint32_t num_residency_groups = 0,
+        bool _reserve_cpu_packed_weights = false);
+    ~ExpertCache();
+
+    ExpertCache(const ExpertCache&) = delete;
+    ExpertCache& operator=(const ExpertCache&) = delete;
+
+    // Queues an exact read and reports readiness at the same lock point.
+    [[nodiscard]] Result<bool> request_pair(
+        const TensorData& gate_up,
+        const TensorData& down,
+        uint32_t residency_group = std::numeric_limits<uint32_t>::max(),
+        std::string_view prepared_key = {},
+        ExpertVictimExecutionMetadata victim_execution = {});
+    // Best-effort admission; exact reads retain priority.
+    [[nodiscard]] Result<bool> prefetch_pair(
+        const TensorData& gate_up,
+        const TensorData& down,
+        uint32_t residency_group = std::numeric_limits<uint32_t>::max(),
+        std::string_view prepared_key = {});
+    [[nodiscard]] Result<ExpertCacheLease> acquire_pair(
+        const TensorData& gate_up,
+        const TensorData& down,
+        uint32_t residency_group = std::numeric_limits<uint32_t>::max(),
+        std::string_view prepared_key = {},
+        ExpertVictimExecutionMetadata victim_execution = {});
+    // Acquires a ready group under one cache lock.
+    [[nodiscard]] Result<bool> try_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests, std::span<ExpertCacheLease> leases);
+    // Enqueues as many pairs as the current cache capacity permits, waits for
+    // one completion, and acquires all enqueued pairs ready at that point.
+    [[nodiscard]] Result<size_t> wait_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests, std::span<ExpertCacheLease> leases, bool wait_for_any = true);
+    [[nodiscard]] bool is_ready(const TensorData& gate_up, const TensorData& down, std::string_view prepared_key = {}) const;
+    [[nodiscard]] static std::string make_pair_key(const TensorData& gate_up, const TensorData& down);
+    void resolve_predictions(uint32_t residency_group, std::span<const std::string_view> demanded_keys);
+    void wait_for_background_work();
+    [[nodiscard]] ExpertCacheStatistics statistics() const;
+    [[nodiscard]] uint64_t capacity() const noexcept
+    {
+        return cache_size;
+    }
+
 private:
     static constexpr uint32_t invalid_residency_group = std::numeric_limits<uint32_t>::max();
 
@@ -211,56 +253,9 @@ private:
     uint64_t io_read_time_nanoseconds = 0;
     std::unique_ptr<FileRangeReader> reader;
     std::shared_ptr<ExpertVictimCache> victim_cache;
+    ExpertIoMode io_mode = ExpertIoMode::Auto;
     uint32_t flags = 0;
     bool reserve_cpu_packed_weights = false;
-
-public:
-    explicit ExpertCache(
-        uint64_t _cache_size,
-        uint32_t num_io_threads = 0,
-        std::shared_ptr<ExpertVictimCache> _victim_cache = {},
-        uint32_t _flags = 0,
-        uint32_t num_residency_groups = 0,
-        bool _reserve_cpu_packed_weights = false);
-    ~ExpertCache();
-
-    ExpertCache(const ExpertCache&) = delete;
-    ExpertCache& operator=(const ExpertCache&) = delete;
-
-    // Queues an exact read and reports readiness at the same lock point.
-    [[nodiscard]] Result<bool> request_pair(
-        const TensorData& gate_up,
-        const TensorData& down,
-        uint32_t residency_group = std::numeric_limits<uint32_t>::max(),
-        std::string_view prepared_key = {},
-        ExpertVictimExecutionMetadata victim_execution = {});
-    // Best-effort admission; exact reads retain priority.
-    [[nodiscard]] Result<bool> prefetch_pair(
-        const TensorData& gate_up,
-        const TensorData& down,
-        uint32_t residency_group = std::numeric_limits<uint32_t>::max(),
-        std::string_view prepared_key = {});
-    [[nodiscard]] Result<ExpertCacheLease> acquire_pair(
-        const TensorData& gate_up,
-        const TensorData& down,
-        uint32_t residency_group = std::numeric_limits<uint32_t>::max(),
-        std::string_view prepared_key = {},
-        ExpertVictimExecutionMetadata victim_execution = {});
-    // Acquires a ready group under one cache lock.
-    [[nodiscard]] Result<bool> try_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests, std::span<ExpertCacheLease> leases);
-    // Enqueues as many pairs as the current cache capacity permits, waits for
-    // one completion, and acquires all enqueued pairs ready at that point.
-    [[nodiscard]] Result<size_t> wait_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests, std::span<ExpertCacheLease> leases, bool wait_for_any = true);
-    [[nodiscard]] bool is_ready(const TensorData& gate_up, const TensorData& down, std::string_view prepared_key = {}) const;
-    [[nodiscard]] static std::string make_pair_key(const TensorData& gate_up, const TensorData& down);
-    void cancel_prediction();
-    void resolve_predictions(uint32_t residency_group, std::span<const std::string_view> demanded_keys);
-    void wait_for_background_work();
-    [[nodiscard]] ExpertCacheStatistics statistics() const;
-    [[nodiscard]] uint64_t capacity() const noexcept
-    {
-        return cache_size;
-    }
 };
 
 } // namespace moe

@@ -187,9 +187,6 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         ncnn::moe::Option opt;
         ncnn::moe::SessionOptions session_options;
         ncnn::moe::GenerationOptions generation_options;
-        const auto set_expert_io_mode = [&opt](uint32_t mode) {
-            opt.flags = (opt.flags & ~ncnn::moe::OptionExpertIoMask) | mode;
-        };
         generation_options.sampling.temperature = 0.0f;
         generation_options.use_speculative = runner_options.use_speculative;
         if (runner_options.default_stop_token >= 0)
@@ -435,15 +432,15 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             }
             else if (argument == "--mmap-experts")
             {
-                set_expert_io_mode(ncnn::moe::OptionMemoryMapExperts);
+                opt.expert_io_mode = ncnn::moe::ExpertIoMode::Mmap;
             }
             else if (argument == "--direct-expert-io")
             {
-                set_expert_io_mode(ncnn::moe::OptionDirectExpertIo);
+                opt.expert_io_mode = ncnn::moe::ExpertIoMode::Direct;
             }
             else if (argument == "--buffered-expert-io")
             {
-                set_expert_io_mode(ncnn::moe::OptionBufferedExpertIo);
+                opt.expert_io_mode = ncnn::moe::ExpertIoMode::Buffered;
             }
             else if (argument == "--cache-warmup-runs")
             {
@@ -553,15 +550,10 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                   << ", Expert IO workers " << effective_opt.num_expert_io_threads
                   << ", optimization flags 0x" << std::hex
                   << effective_opt.optimization_flags << std::dec << '\n';
-        const auto moe_layer = std::find_if(
-            loaded_model->descriptor().layers.begin(),
-            loaded_model->descriptor().layers.end(),
-            [](const ncnn::moe::LayerDescriptor& layer) {
-                return layer.ffn.kind == ncnn::moe::FfnKind::Moe;
-            });
-        if (moe_layer != loaded_model->descriptor().layers.end())
+        const auto& layers = loaded_model->descriptor().layers;
+        if (!layers.empty())
         {
-            const ncnn::moe::DType dtype = moe_layer->ffn.moe.expert_weight_dtype;
+            const ncnn::moe::DType dtype = layers.front().moe.expert_weight_dtype;
             const char* format = "unknown";
             if (dtype == ncnn::moe::DType::Float32)
                 format = "float32-source";
@@ -1041,7 +1033,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                   << statistics.expert_cache_direct_read_fallbacks << " fallback(s), " << statistics.expert_cache_buffered_read_ranges << " buffered range(s), " << statistics.expert_cache_buffered_read_bytes << " buffered byte(s), "
                   << statistics.expert_cache_coalesced_read_batches << " coalesced batch(es), " << statistics.expert_cache_coalesced_experts << " coalesced Expert(s), "
                   << statistics.expert_cache_coalesced_read_ranges_saved << " physical range(s) saved, io workers: "
-                  << statistics.expert_cache_num_io_threads << " target " << statistics.expert_cache_num_active_io_threads << ", "
+                  << statistics.expert_cache_num_io_threads << ", "
                   << statistics.expert_cache_io_read_samples << " sample(s), "
                   << statistics.expert_cache_io_read_time_microseconds / 1000.0 << " ms observed\n";
         std::cout << "Expert GPU execution cache: " << statistics.expert_gpu_cache_hits << " hit(s), " << statistics.expert_gpu_cache_misses << " miss(es), " << statistics.expert_gpu_cache_admissions << " admission(s), "
@@ -1073,7 +1065,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         std::cout << "BF16 batched CPU Linear kernel: "
                   << ncnn::moe::bfloat16_batched_linear_kernel_name(effective_opt.optimization_flags)
                   << '\n';
-        std::cout << "BF16 small CPU Linear policy: " << ncnn::moe::NcnnLinearOperator::cpu_small_bfloat16_linear_policy(effective_opt.optimization_flags) << '\n';
+        std::cout << "CPU Linear backend: moe-kernels\n";
         std::cout << "FP8 Linear row group: " << runtime.info().float8_linear_row_group_size << '\n';
         std::cout << "MXFP4 decode row-pair group: " << runtime.info().mxfp4_decode_row_pair_group_size << '\n';
         std::cout << "Activation CPU kernel: " << ncnn::moe::scaled_silu_kernel_name(effective_opt.optimization_flags) << '\n';

@@ -101,19 +101,6 @@ struct MoeDescriptor
     uint32_t flags = 0;
 };
 
-enum class FfnKind
-{
-    Moe,
-    Dense
-};
-
-struct FfnDescriptor
-{
-    FfnKind kind = FfnKind::Moe;
-    MoeDescriptor moe;
-    uint32_t dense_intermediate_size = 0;
-};
-
 struct PleDescriptor
 {
     uint32_t embedding_dimension = 0;
@@ -133,7 +120,7 @@ struct PleDescriptor
 struct LayerDescriptor
 {
     AttentionDescriptor attention;
-    FfnDescriptor ffn;
+    MoeDescriptor moe;
     PleDescriptor ple;
 
     NormType pre_attention_norm = NormType::None;

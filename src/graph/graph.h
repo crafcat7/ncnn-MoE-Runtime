@@ -124,9 +124,12 @@ struct GraphOption
     bool prefer_vulkan_dense = true;
 };
 
-// Selects backends in place; discard the local graph on failure.
-[[nodiscard]] Result<ExecutionSchedule> schedule_graph(
+// Selects backends in place and fills caller-owned storage.  Callers provide
+// fresh, discardable graph and schedule objects when constructing a model;
+// discard the owning model on failure.
+[[nodiscard]] Result<void> schedule_graph(
     ExecutionGraph& graph,
+    ExecutionSchedule& schedule,
     const GraphOption& options);
 
 // Build and schedule the target and speculative graph regions.

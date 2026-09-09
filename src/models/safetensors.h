@@ -32,9 +32,6 @@ enum SafetensorLoadFlag : uint32_t
 
 class SafetensorsArchive
 {
-private:
-    std::unordered_map<std::string, SafetensorInfo> tensors;
-
 public:
     [[nodiscard]] static Result<SafetensorsArchive> open(const std::filesystem::path& root);
     [[nodiscard]] static Result<SafetensorsArchive> open_file(const std::filesystem::path& path);
@@ -58,6 +55,9 @@ public:
                                                                    const std::string& up_blocks_name, const std::string& up_scales_name,
                                                                    uint32_t rows, uint32_t columns, uint32_t flags = 0) const;
     [[nodiscard]] Result<TensorData> load_mxfp4_expert(const std::string& blocks_name, const std::string& scales_name, uint32_t expert_id, uint32_t rows, uint32_t columns, uint32_t flags = 0) const;
+
+private:
+    std::unordered_map<std::string, SafetensorInfo> tensors;
 };
 
 } // namespace moe

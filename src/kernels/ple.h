@@ -1,7 +1,7 @@
 #ifndef NCNN_MOE_PLE_H
 #define NCNN_MOE_PLE_H
 
-#include "activation.h"
+#include "activationbuffer.h"
 
 #include "graph/layerplan.h"
 #include "ncnn/moe/result.h"
@@ -13,7 +13,7 @@
 namespace ncnn {
 namespace moe {
 
-struct CpuLayerCache;
+struct LayerCache;
 
 [[nodiscard]] Result<void> execute_ple_into(
     const WeightStore& weights,
@@ -23,8 +23,8 @@ struct CpuLayerCache;
     float norm_epsilon,
     float norm_weight_offset,
     std::span<const int32_t> input_ids,
-    CpuLayerCache& cache,
-    CpuBatch& hidden,
+    LayerCache& cache,
+    ActivationBuffer& hidden,
     uint64_t optimization_flags);
 
 } // namespace moe

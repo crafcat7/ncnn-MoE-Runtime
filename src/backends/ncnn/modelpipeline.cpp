@@ -2,62 +2,58 @@
 
 #include "kernels/qnk.h"
 #include "linear.h"
-#include "attention.h"
+#include "attention_vulkan.h"
+#include "gateddeltanet_vulkan.h"
+#include "graph/compiler.h"
 #include "graph/compiledmodel.h"
 #include "storage/weightstore.h"
 
+#include <algorithm>
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ncnn {
 namespace moe {
 
-Result<void> prepare_linear_operator(
+static Result<void> prepare_vulkan_linear_operator(
     WeightStore& weights,
     CompiledOperatorTable& operators,
     TensorHandle matrix_handle,
     TensorHandle bias_handle,
-    NcnnLinearDevice device,
-    bool retain_cpu_dense_copy,
     uint32_t vulkan_device_index,
-    const NcnnVulkanContextInstancePtr& context_instance,
+    const VulkanRuntimePtr& vulkan_runtime,
     uint64_t optimization_flags,
-    uint32_t input_group_count,
-    bool prefer_bfloat16_vulkan)
+    uint32_t input_group_count = 1,
+    bool prefer_bfloat16_vulkan = true)
 {
     TensorData& matrix = weights.at_mutable(matrix_handle);
     CompiledOperator& compiled_operator = operators.at_weight_mutable(matrix_handle);
     const TensorData* bias = bias_handle == invalid_tensor_handle ? nullptr : &weights.at(bias_handle);
     if (matrix.dtype == DType::Float8E4M3)
     {
-        if (device == NcnnLinearDevice::Vulkan)
-        {
-            compiled_operator.float8 = NcnnVulkanFloat8Operator::create(
-                matrix,
-                bias,
-                input_group_count,
-                vulkan_device_index,
-                context_instance,
-                optimization_flags);
-            if (!compiled_operator.float8)
-                return Error{ErrorCode::InternalError, "failed to create Vulkan FP8 Linear operator"};
-        }
+        compiled_operator.float8 = Float8Linear_vulkan::create(
+            matrix,
+            bias,
+            input_group_count,
+            vulkan_device_index,
+            vulkan_runtime,
+            optimization_flags);
+        if (!compiled_operator.float8)
+            return Error{ErrorCode::InternalError, "failed to create Vulkan FP8 Linear operator"};
         return {};
     }
     if (is_qnk_dtype(matrix.dtype))
     {
-        if (device == NcnnLinearDevice::Vulkan
-            && has_flag(
-                optimization_flags,
-                OptimizationVulkanQnK))
+        if (has_flag(optimization_flags, OptimizationVulkanQnK))
         {
-            compiled_operator.qnk = NcnnVulkanQnkOperator::create(
+            compiled_operator.qnk = QnkLinear_vulkan::create(
                 matrix,
                 bias,
                 vulkan_device_index,
-                context_instance,
+                vulkan_runtime,
                 optimization_flags);
             if (!compiled_operator.qnk)
                 return Error{ErrorCode::InternalError, "failed to create Vulkan Qn_K Linear operator"};
@@ -66,41 +62,36 @@ Result<void> prepare_linear_operator(
     }
     if (matrix.dtype != DType::Float32 && matrix.dtype != DType::BFloat16)
         return {};
-    if (device == NcnnLinearDevice::Cpu && !retain_cpu_dense_copy)
-        return {};
-    if (device == NcnnLinearDevice::Vulkan
-        && matrix.dtype == DType::BFloat16
+    if (matrix.dtype == DType::BFloat16
         && prefer_bfloat16_vulkan)
     {
-        compiled_operator.bfloat16 = NcnnVulkanBfloat16Operator::create(
+        compiled_operator.bfloat16 = Bfloat16Linear_vulkan::create(
             matrix,
             bias,
             vulkan_device_index,
-            context_instance,
+            vulkan_runtime,
             optimization_flags);
         if (compiled_operator.bfloat16)
             return {};
     }
-    compiled_operator.linear = NcnnLinearOperator::create(
+    compiled_operator.linear = Linear::create(
         matrix,
         bias,
-        device,
+        LinearDevice::Vulkan,
         vulkan_device_index,
-        context_instance,
+        vulkan_runtime,
         optimization_flags);
-    if (device == NcnnLinearDevice::Vulkan && !compiled_operator.linear)
+    if (!compiled_operator.linear)
         return Error{ErrorCode::InternalError, "failed to create Vulkan InnerProduct operator"};
     return {};
 }
 
-Result<void> prepare_lm_head_operator(
-    CompiledModel& compiled,
-    NcnnLinearDevice dense_device,
-    bool retain_cpu_dense_copies)
+static Result<void> prepare_lm_head_operator(
+    CompiledModel& compiled)
 {
-    auto prepared = prepare_linear_operator(compiled.weights, compiled.operators, compiled.lm_head_weight, invalid_tensor_handle, dense_device, retain_cpu_dense_copies,
-                                            compiled.opt.vulkan_device_index, compiled.vulkan_context_instance,
-                                            compiled.opt.optimization_flags);
+    auto prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, compiled.lm_head_weight, invalid_tensor_handle,
+                                                   compiled.opt.vulkan_device_index, compiled.vulkan_runtime,
+                                                   compiled.opt.optimization_flags);
     if (!prepared)
         return prepared.error();
     const CompiledOperator& lm_head_operator = compiled.operators.at_weight(compiled.lm_head_weight);
@@ -224,7 +215,7 @@ static uint64_t saturating_multiply_u64(uint64_t left, uint64_t right) noexcept
                : left * right;
 }
 
-uint64_t gated_delta_vulkan_working_set_size(
+static uint64_t gated_delta_vulkan_working_set_size(
     const AttentionDescriptor& attention,
     const MoeModelDescriptor& descriptor) noexcept
 {
@@ -254,7 +245,7 @@ uint64_t gated_delta_vulkan_working_set_size(
         saturating_add_u64(convolution_size, value_size),
         saturating_multiply_u64(attention.head_count, 2));
 
-    // NcnnVulkanBfloat16Operator stores BF16 matrix weights and allocates
+    // Bfloat16Linear_vulkan stores BF16 matrix weights and allocates
     // FP32 bias/input-output metadata for each projection.  The GDN operator
     // additionally uploads convolution and per-head constants as FP32.
     const uint64_t projection_elements = saturating_multiply_u64(
@@ -286,7 +277,7 @@ uint64_t gated_delta_vulkan_working_set_size(
     return saturating_multiply_u64(allocated_size, 2);
 }
 
-bool uses_vulkan_dense_operator(const CompiledOperator& executable) noexcept
+static bool uses_vulkan_dense_operator(const CompiledOperator& executable) noexcept
 {
     return executable.bfloat16
            || executable.float8
@@ -379,7 +370,6 @@ void release_vulkan_dense_host_copies(CompiledModel& compiled)
     const auto release_fused_layer_handles = [&compiled](CompiledLayerPlan& layer) {
         AttentionBlockPlan& attention = layer.attention;
         const bool qkv_fused = attention.fused_qkv_operator != invalid_compiled_operator_handle
-                               || attention.fused_qkv_bfloat16_operator != invalid_compiled_operator_handle
                                || attention.fused_qkv_gate_bfloat16_operator != invalid_compiled_operator_handle;
         if (qkv_fused)
         {
@@ -391,7 +381,10 @@ void release_vulkan_dense_host_copies(CompiledModel& compiled)
             release_vulkan_dense_handle(compiled, attention.output_gate_weight);
 
         if (attention.fused_delta_input_operator != invalid_compiled_operator_handle
-            || attention.fused_delta_input_bfloat16_operator != invalid_compiled_operator_handle)
+            && attention.gated_delta_vulkan_operator != invalid_compiled_operator_handle
+            && compiled.operators.at(attention.gated_delta_vulkan_operator).gated_delta
+            && uses_vulkan_dense_operator(
+                compiled.operators.at(attention.fused_delta_input_operator)))
         {
             release_vulkan_dense_handle(compiled, attention.delta_qkv_weight);
             release_vulkan_dense_handle(compiled, attention.delta_z_weight);
@@ -424,90 +417,61 @@ void release_vulkan_dense_host_copies(CompiledModel& compiled)
         release_fused_layer_handles(layer);
 }
 
-Result<void> prepare_shared_expert_operators(
+static Result<void> prepare_shared_expert_operators(
     WeightStore& weights,
     CompiledOperatorTable& operators,
     MoeBlockPlan& moe,
-    NcnnLinearDevice device,
-    bool retain_cpu_dense_copy,
     uint32_t vulkan_device_index,
-    const NcnnVulkanContextInstancePtr& context_instance,
+    const VulkanRuntimePtr& vulkan_runtime,
     uint64_t optimization_flags)
 {
     ExpertPlan& shared = moe.shared_expert;
     const TensorData& gate = weights.at(shared.gate_weight);
     const TensorData& up = weights.at(shared.up_weight);
     const bool has_router_gate = moe.shared_expert_gate_weight != invalid_tensor_handle;
-    if (device == NcnnLinearDevice::Vulkan
-        && gate.dtype == DType::BFloat16
-        && up.dtype == DType::BFloat16
-        && (!has_router_gate
-            || weights.at(moe.shared_expert_gate_weight).dtype
-                   == DType::BFloat16))
-    {
-        std::vector<const TensorData*> matrices = {
-            &gate,
-            &up,
-        };
-        std::vector<const TensorData*> biases = {
-            nullptr,
-            nullptr,
-        };
-        if (has_router_gate)
-        {
-            matrices.push_back(
-                &weights.at(moe.shared_expert_gate_weight));
-            biases.push_back(nullptr);
-        }
-        const CompiledOperatorHandle fused_handle = operators.allocate();
-        operators.at_mutable(fused_handle).bfloat16 = NcnnVulkanBfloat16Operator::create_fused(
-            matrices,
-            biases,
-            vulkan_device_index,
-            context_instance,
-            optimization_flags);
-        if (operators.at(fused_handle).bfloat16)
-            moe.fused_shared_input_bfloat16_operator = fused_handle;
-    }
+    if (gate.dtype != DType::BFloat16
+        || up.dtype != DType::BFloat16
+        || (has_router_gate
+            && weights.at(moe.shared_expert_gate_weight).dtype != DType::BFloat16))
+        return {};
 
-    if (moe.fused_shared_input_bfloat16_operator == invalid_compiled_operator_handle)
+    std::vector<const TensorData*> matrices = {
+        &gate,
+        &up,
+    };
+    std::vector<const TensorData*> biases = {
+        nullptr,
+        nullptr,
+    };
+    if (has_router_gate)
     {
-        const TensorHandle input_handles[] = {
-            shared.gate_weight,
-            shared.up_weight,
-            moe.shared_expert_gate_weight,
-        };
-        for (TensorHandle handle : input_handles)
-        {
-            if (handle == invalid_tensor_handle)
-                continue;
-            auto prepared = prepare_linear_operator(
-                weights,
-                operators,
-                handle,
-                invalid_tensor_handle,
-                device,
-                retain_cpu_dense_copy,
-                vulkan_device_index,
-                context_instance,
-                optimization_flags);
-            if (!prepared)
-                return prepared.error();
-        }
+        matrices.push_back(
+            &weights.at(moe.shared_expert_gate_weight));
+        biases.push_back(nullptr);
     }
-    return prepare_linear_operator(
+    std::shared_ptr<Bfloat16Linear_vulkan> fused_operator = Bfloat16Linear_vulkan::create_fused(
+        matrices,
+        biases,
+        vulkan_device_index,
+        vulkan_runtime,
+        optimization_flags);
+    if (!fused_operator)
+        return {};
+
+    const CompiledOperatorHandle fused_handle = operators.allocate();
+    operators.at_mutable(fused_handle).bfloat16 = std::move(fused_operator);
+    moe.fused_shared_input_bfloat16_operator = fused_handle;
+    return prepare_vulkan_linear_operator(
         weights,
         operators,
         shared.down_weight,
         invalid_tensor_handle,
-        device,
-        retain_cpu_dense_copy,
         vulkan_device_index,
-        context_instance,
+        vulkan_runtime,
         optimization_flags);
 }
 
-Result<void> prepare_vulkan_qkv_operator(
+static Result<void> prepare_vulkan_qkv_operator(
     CompiledModel& compiled,
     CompiledLayerPlan& layer_plan,
     bool use_bfloat16_fusion,
@@ -537,59 +501,59 @@ Result<void> prepare_vulkan_qkv_operator(
         && !value_bias_data)
     {
         const TensorData* output_gate = &compiled.weights.at(plan.output_gate_weight);
-        const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
-        compiled.operators.at_mutable(fused_handle).bfloat16 = NcnnVulkanBfloat16Operator::create_fused(
+        auto fused_operator = Bfloat16Linear_vulkan::create_fused(
             {qkv_matrices[0], qkv_matrices[1], qkv_matrices[2], output_gate},
             {nullptr, nullptr, nullptr, nullptr},
             layer_plan.vulkan_device_index,
-            compiled.vulkan_context_instance,
+            compiled.vulkan_runtime,
             compiled.opt.optimization_flags);
-        if (compiled.operators.at(fused_handle).bfloat16)
+        if (fused_operator)
+        {
+            const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
+            compiled.operators.at_mutable(fused_handle).bfloat16 = std::move(fused_operator);
             plan.fused_qkv_gate_bfloat16_operator = fused_handle;
+            return {};
+        }
     }
-    if (plan.fused_qkv_gate_bfloat16_operator == invalid_compiled_operator_handle
-        && use_bfloat16_fusion
+    if (use_bfloat16_fusion
         && qkv_matrices.front()->dtype
                == DType::BFloat16)
     {
-        const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
-        compiled.operators.at_mutable(fused_handle).bfloat16 = NcnnVulkanBfloat16Operator::create_fused(
+        auto fused_operator = Bfloat16Linear_vulkan::create_fused(
             qkv_matrices,
             qkv_biases,
             layer_plan.vulkan_device_index,
-            compiled.vulkan_context_instance,
+            compiled.vulkan_runtime,
             compiled.opt.optimization_flags);
-        if (compiled.operators.at(fused_handle).bfloat16)
-            plan.fused_qkv_bfloat16_operator = fused_handle;
+        if (fused_operator)
+        {
+            const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
+            compiled.operators.at_mutable(fused_handle).bfloat16 = std::move(fused_operator);
+            plan.fused_qkv_operator = fused_handle;
+            return {};
+        }
     }
-    if (plan.fused_qkv_gate_bfloat16_operator == invalid_compiled_operator_handle
-        && plan.fused_qkv_bfloat16_operator == invalid_compiled_operator_handle)
+    auto fused_operator = Linear::create_fused(
+        qkv_matrices,
+        qkv_biases,
+        LinearDevice::Vulkan,
+        layer_plan.vulkan_device_index,
+        compiled.vulkan_runtime,
+        compiled.opt.optimization_flags);
+    if (fused_operator)
     {
         const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
-        compiled.operators.at_mutable(fused_handle).linear = NcnnLinearOperator::create_fused(
-            qkv_matrices,
-            qkv_biases,
-            NcnnLinearDevice::Vulkan,
-            layer_plan.vulkan_device_index,
-            compiled.vulkan_context_instance,
-            compiled.opt.optimization_flags);
-        if (compiled.operators.at(fused_handle).linear)
-            plan.fused_qkv_operator = fused_handle;
+        compiled.operators.at_mutable(fused_handle).linear = std::move(fused_operator);
+        plan.fused_qkv_operator = fused_handle;
+        return {};
     }
-    if (plan.fused_qkv_gate_bfloat16_operator == invalid_compiled_operator_handle
-        && plan.fused_qkv_bfloat16_operator == invalid_compiled_operator_handle
-        && plan.fused_qkv_operator == invalid_compiled_operator_handle)
-        return Error{ErrorCode::InternalError, failure_message};
-    return {};
+    return Error{ErrorCode::InternalError, failure_message};
 }
 
-Result<void> prepare_latent_attention_operators(
+static Result<void> prepare_latent_attention_operators(
     CompiledModel& compiled,
     CompiledLayerPlan& layer_plan,
-    const AttentionDescriptor& attention,
-    NcnnLinearDevice attention_device,
-    bool retain_cpu_dense_copies,
-    const char* diagnostic_prefix)
+    const char* diagnostic_prefix = "")
 {
     AttentionBlockPlan& plan = layer_plan.attention;
     Result<void> prepared;
@@ -604,18 +568,15 @@ Result<void> prepare_latent_attention_operators(
     {
         if (handle == invalid_tensor_handle)
             continue;
-        prepared = prepare_linear_operator(compiled.weights, compiled.operators, handle,
-                                           invalid_tensor_handle,
-                                           attention_device,
-                                           retain_cpu_dense_copies,
-                                           layer_plan.vulkan_device_index,
-                                           compiled.vulkan_context_instance,
-                                           compiled.opt.optimization_flags);
+        prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, handle,
+                                                  invalid_tensor_handle,
+                                                  layer_plan.vulkan_device_index,
+                                                  compiled.vulkan_runtime,
+                                                  compiled.opt.optimization_flags);
         if (!prepared)
             return prepared.error();
     }
-    if (attention_device == NcnnLinearDevice::Vulkan
-        && attention.compression_ratio == 4
+    if (plan.compression_ratio == 4
         && has_flag(compiled.opt.optimization_flags, OptimizationVulkanLatentCompressor))
     {
         const TensorHandle compressor_linear_handles[] = {
@@ -628,54 +589,44 @@ Result<void> prepare_latent_attention_operators(
         {
             if (handle == invalid_tensor_handle)
                 continue;
-            prepared = prepare_linear_operator(compiled.weights, compiled.operators, handle,
-                                               invalid_tensor_handle,
-                                               attention_device,
-                                               retain_cpu_dense_copies,
-                                               layer_plan.vulkan_device_index,
-                                               compiled.vulkan_context_instance,
-                                               compiled.opt.optimization_flags);
+            prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, handle,
+                                                      invalid_tensor_handle,
+                                                      layer_plan.vulkan_device_index,
+                                                      compiled.vulkan_runtime,
+                                                      compiled.opt.optimization_flags);
             if (!prepared)
                 return prepared.error();
         }
     }
-    prepared = prepare_linear_operator(compiled.weights, compiled.operators, plan.output_a_weight,
-                                       invalid_tensor_handle,
-                                       attention_device,
-                                       retain_cpu_dense_copies,
-                                       layer_plan.vulkan_device_index,
-                                       compiled.vulkan_context_instance,
-                                       compiled.opt.optimization_flags,
-                                       plan.output_group_count);
+    prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, plan.output_a_weight,
+                                              invalid_tensor_handle,
+                                              layer_plan.vulkan_device_index,
+                                              compiled.vulkan_runtime,
+                                              compiled.opt.optimization_flags,
+                                              plan.output_group_count);
     if (!prepared)
         return prepared.error();
-    if (attention_device == NcnnLinearDevice::Vulkan)
+    const CompiledOperator& query_a = compiled.operators.at_weight(plan.query_a_weight);
+    const CompiledOperator& query_b = compiled.operators.at_weight(plan.query_b_weight);
+    if (query_a.float8 && query_b.float8)
     {
-        const CompiledOperator& query_a = compiled.operators.at_weight(plan.query_a_weight);
-        const CompiledOperator& query_b = compiled.operators.at_weight(plan.query_b_weight);
-        if (query_a.float8 && query_b.float8)
-        {
-            if (!query_a.float8->prepare_rms_norm(
-                    compiled.weights.at(plan.query_norm_weight),
-                    compiled.descriptor.norm_epsilon))
-                return Error{ErrorCode::InternalError, "failed to prepare " + std::string(diagnostic_prefix) + "Vulkan FP8 query RMSNorm chain"};
-            if (!query_a.float8->prepare_input_rms_norm(
-                    compiled.weights.at(plan.pre_attention_norm_weight),
-                    compiled.descriptor.norm_epsilon))
-                return Error{ErrorCode::InternalError, "failed to prepare " + std::string(diagnostic_prefix) + "Vulkan FP8 latent input RMSNorm chain"};
-        }
+        if (!query_a.float8->prepare_rms_norm(
+                compiled.weights.at(plan.query_norm_weight),
+                compiled.descriptor.norm_epsilon))
+            return Error{ErrorCode::InternalError, "failed to prepare " + std::string(diagnostic_prefix) + "Vulkan FP8 query RMSNorm chain"};
+        if (!query_a.float8->prepare_input_rms_norm(
+                compiled.weights.at(plan.pre_attention_norm_weight),
+                compiled.descriptor.norm_epsilon))
+            return Error{ErrorCode::InternalError, "failed to prepare " + std::string(diagnostic_prefix) + "Vulkan FP8 latent input RMSNorm chain"};
     }
     return {};
 }
 
-Result<void> prepare_gated_delta_attention_operators(
+static void prepare_gated_delta_attention_operators(
     CompiledModel& compiled,
-    CompiledLayerPlan& layer_plan,
-    NcnnLinearDevice attention_device,
-    bool retain_cpu_dense_copies)
+    CompiledLayerPlan& layer_plan)
 {
     AttentionBlockPlan& plan = layer_plan.attention;
-    Result<void> prepared;
     const std::vector<const TensorData*> delta_input_matrices = {
         &compiled.weights.at(plan.delta_qkv_weight),
         &compiled.weights.at(plan.delta_z_weight),
@@ -688,220 +639,121 @@ Result<void> prepare_gated_delta_attention_operators(
         nullptr,
         nullptr,
     };
-    if (attention_device == NcnnLinearDevice::Vulkan
-        && delta_input_matrices.front()->dtype
-               == DType::BFloat16)
+    const TensorData& output_matrix = compiled.weights.at(plan.output_weight);
+    if (delta_input_matrices.front()->dtype != DType::BFloat16
+        || output_matrix.dtype != DType::BFloat16)
+        return;
+
+    std::shared_ptr<Bfloat16Linear_vulkan> fused_input_operator = Bfloat16Linear_vulkan::create_fused(
+        delta_input_matrices,
+        delta_input_biases,
+        layer_plan.vulkan_device_index,
+        compiled.vulkan_runtime,
+        compiled.opt.optimization_flags);
+    if (!fused_input_operator)
+        return;
+
+    // Fuse pre-attention RMSNorm with the DeltaNet input projection when the
+    // optional chain is available; the dedicated operator remains valid when
+    // the chain itself cannot be prepared.
+    if (plan.pre_attention_norm_weight != invalid_tensor_handle)
     {
-        const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
-        compiled.operators.at_mutable(fused_handle).bfloat16 = NcnnVulkanBfloat16Operator::create_fused(
-            delta_input_matrices,
-            delta_input_biases,
-            layer_plan.vulkan_device_index,
-            compiled.vulkan_context_instance,
-            compiled.opt.optimization_flags);
-        if (compiled.operators.at(fused_handle).bfloat16)
-            plan.fused_delta_input_bfloat16_operator = fused_handle;
+        (void)fused_input_operator->prepare_rms_norm(
+            compiled.weights.at(plan.pre_attention_norm_weight),
+            compiled.descriptor.norm_epsilon,
+            plan.norm_weight_offset);
     }
-    else
-    {
-        const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
-        compiled.operators.at_mutable(fused_handle).linear = NcnnLinearOperator::create_fused(
-            delta_input_matrices,
-            delta_input_biases,
-            attention_device,
-            layer_plan.vulkan_device_index,
-            compiled.vulkan_context_instance,
-            compiled.opt.optimization_flags);
-        if (compiled.operators.at(fused_handle).linear)
-            plan.fused_delta_input_operator = fused_handle;
-    }
-    if (attention_device == NcnnLinearDevice::Vulkan
-        && plan.fused_delta_input_bfloat16_operator == invalid_compiled_operator_handle
-        && plan.fused_delta_input_operator == invalid_compiled_operator_handle)
-    {
-        const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
-        compiled.operators.at_mutable(fused_handle).linear = NcnnLinearOperator::create_fused(
-            delta_input_matrices,
-            delta_input_biases,
-            attention_device,
-            layer_plan.vulkan_device_index,
-            compiled.vulkan_context_instance,
-            compiled.opt.optimization_flags);
-        if (compiled.operators.at(fused_handle).linear)
-            plan.fused_delta_input_operator = fused_handle;
-    }
-    if (attention_device == NcnnLinearDevice::Vulkan
-        && plan.fused_delta_input_bfloat16_operator == invalid_compiled_operator_handle
-        && plan.fused_delta_input_operator == invalid_compiled_operator_handle)
-    {
-        return Error{
-            ErrorCode::InternalError,
-            "failed to create fused Vulkan Gated DeltaNet input operator"};
-    }
-    if (plan.fused_delta_input_bfloat16_operator == invalid_compiled_operator_handle
-        && plan.fused_delta_input_operator == invalid_compiled_operator_handle)
-    {
-        const TensorHandle delta_input_handles[] = {
-            plan.delta_qkv_weight,
-            plan.delta_z_weight,
-            plan.delta_beta_weight,
-            plan.delta_alpha_weight,
-        };
-        for (TensorHandle handle : delta_input_handles)
-        {
-            prepared = prepare_linear_operator(compiled.weights, compiled.operators, handle,
-                                               invalid_tensor_handle,
-                                               attention_device,
-                                               retain_cpu_dense_copies,
-                                               layer_plan.vulkan_device_index,
-                                               compiled.vulkan_context_instance,
-                                               compiled.opt.optimization_flags);
-            if (!prepared)
-                return prepared.error();
-        }
-    }
-    prepared = prepare_linear_operator(compiled.weights, compiled.operators, plan.output_weight,
-                                       invalid_tensor_handle,
-                                       attention_device,
-                                       retain_cpu_dense_copies,
-                                       layer_plan.vulkan_device_index,
-                                       compiled.vulkan_context_instance,
-                                       compiled.opt.optimization_flags);
-    if (!prepared)
-        return prepared.error();
-    if (attention_device == NcnnLinearDevice::Vulkan
-        && has_flag(
-            compiled.opt.optimization_flags,
-            OptimizationVulkanAttention)
-        && plan.fused_delta_input_bfloat16_operator != invalid_compiled_operator_handle)
-    {
-        // Operator-table allocation can relocate entries; keep the operators themselves alive.
-        const std::shared_ptr<NcnnVulkanBfloat16Operator> output_operator = compiled.operators.at_weight(plan.output_weight).bfloat16;
-        if (output_operator)
-        {
-            const std::shared_ptr<NcnnVulkanBfloat16Operator> fused_operator = compiled.operators.at(plan.fused_delta_input_bfloat16_operator).bfloat16;
-            // Fuse pre-attention RMSNorm with the DeltaNet input projection.
-            if (fused_operator
-                && plan.pre_attention_norm_weight != invalid_tensor_handle)
-            {
-                (void)fused_operator->prepare_rms_norm(
-                    compiled.weights.at(plan.pre_attention_norm_weight),
-                    compiled.descriptor.norm_epsilon,
-                    plan.norm_weight_offset);
-            }
-            const CompiledOperatorHandle gated_handle = compiled.operators.allocate();
-            compiled.operators.at_mutable(gated_handle).gated_delta = NcnnVulkanGatedDeltaNetOperator::create(
-                fused_operator,
-                compiled.weights.at(plan.delta_convolution_weight),
-                compiled.weights.at(plan.delta_time_bias),
-                compiled.weights.at(plan.delta_decay_log),
-                compiled.weights.at(plan.delta_norm_weight),
-                output_operator,
-                plan.head_count,
-                plan.kv_head_count,
-                plan.head_dimension,
-                plan.value_head_dimension,
-                plan.convolution_kernel_size,
-                compiled.descriptor.norm_epsilon,
-                has_flag(plan.flags, AttentionBlockSigmoidGate),
-                layer_plan.vulkan_device_index,
-                compiled.vulkan_context_instance,
-                compiled.opt.optimization_flags);
-            if (compiled.operators.at(gated_handle).gated_delta)
-                plan.gated_delta_vulkan_operator = gated_handle;
-        }
-    }
-    return {};
+
+    std::shared_ptr<Bfloat16Linear_vulkan> output_operator = Bfloat16Linear_vulkan::create(
+        output_matrix,
+        nullptr,
+        layer_plan.vulkan_device_index,
+        compiled.vulkan_runtime,
+        compiled.opt.optimization_flags);
+    if (!output_operator)
+        return;
+
+    std::shared_ptr<GatedDeltaNet_vulkan> gated_operator = GatedDeltaNet_vulkan::create(
+        fused_input_operator,
+        compiled.weights.at(plan.delta_convolution_weight),
+        compiled.weights.at(plan.delta_time_bias),
+        compiled.weights.at(plan.delta_decay_log),
+        compiled.weights.at(plan.delta_norm_weight),
+        output_operator,
+        plan.head_count,
+        plan.kv_head_count,
+        plan.head_dimension,
+        plan.value_head_dimension,
+        plan.convolution_kernel_size,
+        compiled.descriptor.norm_epsilon,
+        has_flag(plan.flags, AttentionBlockSigmoidGate),
+        layer_plan.vulkan_device_index,
+        compiled.vulkan_runtime,
+        compiled.opt.optimization_flags);
+    if (!gated_operator)
+        return;
+
+    // Publish handles only after every optional Vulkan product is complete.
+    // The output weight entry is assigned last because the handle allocations
+    // above may relocate the operator table.
+    const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
+    compiled.operators.at_mutable(fused_handle).bfloat16 = std::move(fused_input_operator);
+    plan.fused_delta_input_operator = fused_handle;
+
+    const CompiledOperatorHandle gated_handle = compiled.operators.allocate();
+    compiled.operators.at_mutable(gated_handle).gated_delta = std::move(gated_operator);
+    plan.gated_delta_vulkan_operator = gated_handle;
+
+    compiled.operators.at_weight_mutable(plan.output_weight).bfloat16 = std::move(output_operator);
 }
 
-Result<void> prepare_standard_attention_operators(
+static Result<void> prepare_standard_attention_operators(
     CompiledModel& compiled,
-    CompiledLayerPlan& layer_plan,
-    NcnnLinearDevice attention_device,
-    bool retain_cpu_dense_copies)
+    CompiledLayerPlan& layer_plan)
 {
     AttentionBlockPlan& plan = layer_plan.attention;
-    const bool fused_vulkan_attention_eligible = attention_device == NcnnLinearDevice::Vulkan
-                                                 && !has_flag(plan.flags, AttentionBlockQueryKeyNorm)
+    const bool fused_vulkan_attention_eligible = !has_flag(plan.flags, AttentionBlockQueryKeyNorm)
                                                  && !has_flag(plan.flags, AttentionBlockOutputGate)
                                                  && (plan.rope_head_dimension == 0
                                                      || plan.rope_head_dimension == plan.head_dimension)
                                                  && plan.norm_weight_offset == 0.0f;
     Result<void> prepared;
-    if (attention_device == NcnnLinearDevice::Vulkan)
-    {
-        prepared = prepare_vulkan_qkv_operator(
-            compiled, layer_plan, !fused_vulkan_attention_eligible,
-            "failed to create fused Vulkan QKV operator");
-        if (!prepared)
-            return prepared.error();
-    }
-    else
-    {
-        prepared = prepare_linear_operator(compiled.weights, compiled.operators, plan.query_weight, plan.query_bias, attention_device, retain_cpu_dense_copies,
-                                           layer_plan.vulkan_device_index, compiled.vulkan_context_instance,
-                                           compiled.opt.optimization_flags);
-        if (!prepared)
-            return prepared.error();
-        prepared = prepare_linear_operator(compiled.weights, compiled.operators, plan.key_weight, plan.key_bias, attention_device, retain_cpu_dense_copies,
-                                           layer_plan.vulkan_device_index, compiled.vulkan_context_instance,
-                                           compiled.opt.optimization_flags);
-        if (!prepared)
-            return prepared.error();
-        prepared = prepare_linear_operator(compiled.weights, compiled.operators, plan.value_weight, plan.value_bias, attention_device, retain_cpu_dense_copies,
-                                           layer_plan.vulkan_device_index, compiled.vulkan_context_instance,
-                                           compiled.opt.optimization_flags);
-        if (!prepared)
-            return prepared.error();
-    }
-    prepared = prepare_linear_operator(compiled.weights, compiled.operators, plan.output_weight,
-                                       plan.output_bias,
-                                       attention_device,
-                                       retain_cpu_dense_copies,
-                                       layer_plan.vulkan_device_index,
-                                       compiled.vulkan_context_instance,
-                                       compiled.opt.optimization_flags,
-                                       1,
-                                       !fused_vulkan_attention_eligible);
+    prepared = prepare_vulkan_qkv_operator(
+        compiled, layer_plan, !fused_vulkan_attention_eligible,
+        "failed to create fused Vulkan QKV operator");
+    if (!prepared)
+        return prepared.error();
+    prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, plan.output_weight,
+                                              plan.output_bias,
+                                              layer_plan.vulkan_device_index,
+                                              compiled.vulkan_runtime,
+                                              compiled.opt.optimization_flags,
+                                              1,
+                                              !fused_vulkan_attention_eligible);
     if (!prepared)
         return prepared.error();
     if (plan.output_gate_weight != invalid_tensor_handle)
     {
         if (plan.fused_qkv_gate_bfloat16_operator == invalid_compiled_operator_handle)
         {
-            prepared = prepare_linear_operator(compiled.weights, compiled.operators, plan.output_gate_weight,
-                                               invalid_tensor_handle,
-                                               attention_device,
-                                               retain_cpu_dense_copies,
-                                               layer_plan.vulkan_device_index,
-                                               compiled.vulkan_context_instance,
-                                               compiled.opt.optimization_flags);
+            prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, plan.output_gate_weight,
+                                                      invalid_tensor_handle,
+                                                      layer_plan.vulkan_device_index,
+                                                      compiled.vulkan_runtime,
+                                                      compiled.opt.optimization_flags);
             if (!prepared)
                 return prepared.error();
         }
     }
-    if (plan.qsa_query_key_weight != invalid_tensor_handle)
-    {
-        prepared = prepare_linear_operator(
-            compiled.weights, compiled.operators,
-            plan.qsa_query_key_weight, invalid_tensor_handle,
-            NcnnLinearDevice::Cpu, retain_cpu_dense_copies,
-            layer_plan.vulkan_device_index,
-            compiled.vulkan_context_instance,
-            compiled.opt.optimization_flags);
-        if (!prepared)
-            return prepared.error();
-    }
     if (fused_vulkan_attention_eligible
-        || (attention_device == NcnnLinearDevice::Vulkan
-            && has_flag(plan.flags, AttentionBlockQueryKeyNorm)
+        || (has_flag(plan.flags, AttentionBlockQueryKeyNorm)
             && has_flag(plan.flags, AttentionBlockOutputGate)
             && plan.fused_qkv_gate_bfloat16_operator != invalid_compiled_operator_handle
             && plan.query_norm_weight != invalid_tensor_handle
             && plan.key_norm_weight != invalid_tensor_handle
             && compiled.operators.at_weight(plan.output_weight).bfloat16))
     {
-        NcnnVulkanAttentionConfig attention_config;
+        AttentionConfig_vulkan attention_config;
         attention_config.hidden_size = compiled.descriptor.hidden_size;
         attention_config.head_count = plan.head_count;
         attention_config.kv_head_count = plan.kv_head_count;
@@ -919,14 +771,14 @@ Result<void> prepare_standard_attention_operators(
         attention_config.kv_cache_dtype = compiled.descriptor.kv_cache_dtype;
         attention_config.optimization_flags = compiled.opt.optimization_flags;
         if (!fused_vulkan_attention_eligible)
-            attention_config.flags |= NcnnAttentionQueryKeyNorm | NcnnAttentionOutputGate;
+            attention_config.flags |= AttentionQueryKeyNorm | AttentionOutputGate;
         if (has_flag(plan.flags, AttentionBlockSink))
-            attention_config.flags |= NcnnAttentionSink;
-        const CompiledOperatorHandle attention_handle = compiled.operators.allocate();
+            attention_config.flags |= AttentionSink;
+        std::shared_ptr<Attention_vulkan> attention_operator;
         if (fused_vulkan_attention_eligible)
         {
             const CompiledOperator& fused_operator = compiled.operators.at(plan.fused_qkv_operator);
-            compiled.operators.at_mutable(attention_handle).attention = NcnnVulkanAttentionOperator::create(
+            attention_operator = Attention_vulkan::create(
                 compiled.weights.at(plan.pre_attention_norm_weight),
                 plan.sinks == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.sinks),
                 fused_operator.linear,
@@ -936,7 +788,7 @@ Result<void> prepare_standard_attention_operators(
         else
         {
             const CompiledOperator& fused_operator = compiled.operators.at(plan.fused_qkv_gate_bfloat16_operator);
-            compiled.operators.at_mutable(attention_handle).attention = NcnnVulkanAttentionOperator::create_with_query_key_norm_and_gate(
+            attention_operator = Attention_vulkan::create(
                 compiled.weights.at(plan.pre_attention_norm_weight),
                 compiled.weights.at(plan.query_norm_weight),
                 compiled.weights.at(plan.key_norm_weight),
@@ -945,9 +797,195 @@ Result<void> prepare_standard_attention_operators(
                 compiled.operators.at_weight(plan.output_weight).bfloat16,
                 attention_config);
         }
-        if (compiled.operators.at(attention_handle).attention)
+        if (attention_operator)
+        {
+            const CompiledOperatorHandle attention_handle = compiled.operators.allocate();
+            compiled.operators.at_mutable(attention_handle).attention = std::move(attention_operator);
             plan.vulkan_attention_operator = attention_handle;
+        }
     }
+    return {};
+}
+
+static uint64_t gated_delta_vulkan_budget_size(
+    const CompilerOption& opt,
+    bool use_vulkan_dense,
+    bool protects_file_backed_experts) noexcept
+{
+    if (!use_vulkan_dense || opt.gpu_heap_budget == 0)
+        return 0;
+
+    // File-backed Expert caches consume most of the free heap, so reserve a
+    // smaller concurrency-scaled fraction for persistent GDN state (1/64 vs 1/8).
+    const uint64_t heap_divisor = protects_file_backed_experts ? 64 : 8;
+    const uint64_t concurrency = std::max(1u, opt.num_concurrent_sessions);
+    return opt.gpu_heap_budget / (heap_divisor * concurrency);
+}
+
+static Result<void> prepare_mtp_operators(
+    CompiledModel& compiled)
+{
+    if (compiled.speculative.graph.layer_plans.empty())
+        return {};
+
+    CompiledLayerPlan& layer_plan = compiled.speculative.graph.layer_plans.back();
+    AttentionBlockPlan& attention = layer_plan.attention;
+    Result<void> prepared = prepare_vulkan_qkv_operator(
+        compiled,
+        layer_plan,
+        true,
+        "failed to create fused Qwen MTP Vulkan QKV operator");
+    if (!prepared)
+        return prepared.error();
+
+    const TensorHandle output_handles[] = {
+        attention.output_weight,
+        attention.output_gate_weight,
+    };
+    for (TensorHandle handle : output_handles)
+    {
+        if (handle == invalid_tensor_handle)
+            continue;
+        if (handle == attention.output_gate_weight
+            && attention.fused_qkv_gate_bfloat16_operator != invalid_compiled_operator_handle)
+        {
+            continue;
+        }
+        prepared = prepare_vulkan_linear_operator(
+            compiled.weights,
+            compiled.operators,
+            handle,
+            invalid_tensor_handle,
+            layer_plan.vulkan_device_index,
+            compiled.vulkan_runtime,
+            compiled.opt.optimization_flags);
+        if (!prepared)
+            return prepared.error();
+    }
+
+    return prepare_shared_expert_operators(
+        compiled.weights,
+        compiled.operators,
+        layer_plan.moe,
+        layer_plan.vulkan_device_index,
+        compiled.vulkan_runtime,
+        compiled.opt.optimization_flags);
+}
+
+static Result<void> prepare_dspark_operators(
+    CompiledModel& compiled)
+{
+    for (CompiledLayerPlan& layer_plan : compiled.speculative.graph.layer_plans)
+    {
+        auto prepared = prepare_latent_attention_operators(
+            compiled,
+            layer_plan,
+            "speculative ");
+        if (!prepared)
+            return prepared.error();
+    }
+    return {};
+}
+
+Result<void> prepare_model_pipeline(
+    CompiledModel& compiled,
+    const CompilerOption& opt)
+{
+    // Descriptor validation and tensor-plan binding are complete before this
+    // backend pass, so malformed-model errors precede GPU object creation errors.
+    compiled.operators.bind_weight_count(compiled.weights.size());
+    if (compiled.opt.hybrid_mode == HybridMode::CpuOnly)
+        return {};
+
+    Result<void> ret = prepare_lm_head_operator(compiled);
+    if (!ret)
+        return ret.error();
+
+    uint64_t planned_gated_delta_gpu_size = 0;
+
+    for (size_t layer_id = 0; layer_id < compiled.graph.layer_plans.size(); ++layer_id)
+    {
+        CompiledLayerPlan& layer_plan = compiled.graph.layer_plans[layer_id];
+        const LayerDescriptor& layer = compiled.descriptor.layers[layer_id];
+        const AttentionDescriptor& attention = layer.attention;
+        if (attention.kind != AttentionKind::None)
+        {
+            if (attention.kind == AttentionKind::Standard
+                && !has_flag(attention.flags, AttentionDescriptorQsa)
+                && compiled.descriptor.hyper_connection_kind != HyperConnectionKind::GatedResidual
+                && has_flag(opt.flags, BackendVulkanAttention))
+            {
+                ret = prepare_standard_attention_operators(
+                    compiled,
+                    layer_plan);
+            }
+            else if (attention.kind == AttentionKind::MultiHeadLatent)
+            {
+                ret = prepare_latent_attention_operators(
+                    compiled,
+                    layer_plan);
+            }
+            else if (attention.kind == AttentionKind::GatedDeltaNet)
+            {
+                const bool vulkan_delta_fusion_available = has_flag(opt.flags, BackendVulkanAttention)
+                                                           && has_flag(
+                                                               compiled.opt.optimization_flags,
+                                                               OptimizationVulkanAttention);
+                const bool protect_file_backed_experts = has_flag(opt.flags, BackendVulkanExperts)
+                                                         && has_flag(opt.flags, BackendFileBackedExperts);
+                const uint64_t gated_delta_gpu_budget = gated_delta_vulkan_budget_size(
+                    opt,
+                    vulkan_delta_fusion_available,
+                    protect_file_backed_experts);
+                const uint64_t gated_delta_layer_size = gated_delta_vulkan_working_set_size(
+                    attention,
+                    compiled.descriptor);
+                if (vulkan_delta_fusion_available
+                    && gated_delta_layer_size != 0
+                    && gated_delta_layer_size <= gated_delta_gpu_budget
+                    && planned_gated_delta_gpu_size
+                           <= gated_delta_gpu_budget - gated_delta_layer_size)
+                {
+                    prepare_gated_delta_attention_operators(
+                        compiled,
+                        layer_plan);
+                    const CompiledOperatorHandle gated_handle = layer_plan.attention.gated_delta_vulkan_operator;
+                    if (gated_handle != invalid_compiled_operator_handle
+                        && compiled.operators.at(gated_handle).gated_delta)
+                    {
+                        planned_gated_delta_gpu_size += gated_delta_layer_size;
+                    }
+                }
+            }
+            if (!ret)
+                return ret.error();
+        }
+        if (layer_plan.moe.has_shared_expert)
+        {
+            ret = prepare_shared_expert_operators(
+                compiled.weights,
+                compiled.operators,
+                layer_plan.moe,
+                layer_plan.vulkan_device_index,
+                compiled.vulkan_runtime,
+                compiled.opt.optimization_flags);
+            if (!ret)
+                return ret.error();
+        }
+    }
+
+    if (compiled.speculative.kind == SpeculativeModelKind::Mtp)
+    {
+        ret = prepare_mtp_operators(
+            compiled);
+    }
+    else if (compiled.speculative.kind == SpeculativeModelKind::DSpark)
+    {
+        ret = prepare_dspark_operators(
+            compiled);
+    }
+    if (!ret)
+        return ret.error();
     return {};
 }
 

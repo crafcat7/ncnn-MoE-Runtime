@@ -10,23 +10,17 @@ namespace ncnn {
 namespace moe {
 
 // Model loading option flags are kept in this public header.
-#define NCNN_MOE_OPTION_MMAP_EXPERT_BIT         0
-#define NCNN_MOE_OPTION_DIRECT_IO_BIT           1
-#define NCNN_MOE_OPTION_BUFFERED_IO_BIT         2
-#define NCNN_MOE_OPTION_DISABLE_VICTIM_EXEC_BIT 3
-#define NCNN_MOE_OPTION_ROUTER_PRED_BIT         4
-#define NCNN_MOE_OPTION_FORWARD_ARC_BIT         5
-#define NCNN_MOE_OPTION_RANK_ADAPT_BIT          6
-#define NCNN_MOE_OPTION_READ_MERGE_BIT          7
-#define NCNN_MOE_OPTION_ASYNC_ROUTER_PRED_BIT   8
-#define NCNN_MOE_OPTION_RELEASE_DENSE_BIT       9
-#define NCNN_MOE_OPTION_DISABLE_GPU_EXPERT_BIT  10
+#define NCNN_MOE_OPTION_DISABLE_VICTIM_EXEC_BIT 0
+#define NCNN_MOE_OPTION_ROUTER_PRED_BIT         1
+#define NCNN_MOE_OPTION_FORWARD_ARC_BIT         2
+#define NCNN_MOE_OPTION_RANK_ADAPT_BIT          3
+#define NCNN_MOE_OPTION_READ_MERGE_BIT          4
+#define NCNN_MOE_OPTION_ASYNC_ROUTER_PRED_BIT   5
+#define NCNN_MOE_OPTION_RELEASE_DENSE_BIT       6
+#define NCNN_MOE_OPTION_DISABLE_GPU_EXPERT_BIT  7
 
 enum OptionFlag : uint32_t
 {
-    OptionMemoryMapExperts = UINT32_C(1) << NCNN_MOE_OPTION_MMAP_EXPERT_BIT,
-    OptionDirectExpertIo = UINT32_C(1) << NCNN_MOE_OPTION_DIRECT_IO_BIT,
-    OptionBufferedExpertIo = UINT32_C(1) << NCNN_MOE_OPTION_BUFFERED_IO_BIT,
     OptionDisableGpuVictimExecution = UINT32_C(1) << NCNN_MOE_OPTION_DISABLE_VICTIM_EXEC_BIT,
     OptionRouterPrediction = UINT32_C(1) << NCNN_MOE_OPTION_ROUTER_PRED_BIT,
     OptionForwardAwareCache = UINT32_C(1) << NCNN_MOE_OPTION_FORWARD_ARC_BIT,
@@ -36,10 +30,6 @@ enum OptionFlag : uint32_t
     OptionReleaseVulkanDenseHostStorage = UINT32_C(1) << NCNN_MOE_OPTION_RELEASE_DENSE_BIT,
     OptionDisableGpuExpertExecution = UINT32_C(1) << NCNN_MOE_OPTION_DISABLE_GPU_EXPERT_BIT
 };
-
-inline constexpr uint32_t OptionExpertIoMask = OptionMemoryMapExperts
-                                               | OptionDirectExpertIo
-                                               | OptionBufferedExpertIo;
 
 // Kernel choices use a separate bitmap from storage and admission policy.
 #define NCNN_MOE_OPT_CPU_SIMD_RMS_NORM_BIT               0
@@ -199,11 +189,22 @@ enum class CpuPackedWeightMode
     Enabled
 };
 
+enum class ExpertIoMode
+{
+    // Auto keeps the existing adaptive read policy; other values select one
+    // explicit storage/read strategy.
+    Auto,
+    Mmap,
+    Direct,
+    Buffered
+};
+
 struct Option
 {
     HybridMode hybrid_mode = HybridMode::Auto;
     ExpertMemoryMode expert_memory_mode = ExpertMemoryMode::Auto;
     CpuPackedWeightMode cpu_packed_weight_mode = CpuPackedWeightMode::Disabled;
+    ExpertIoMode expert_io_mode = ExpertIoMode::Auto;
     uint64_t host_memory_budget = 0;
     uint64_t expert_cache_size = 0;
     uint64_t expert_gpu_cache_size = 0;

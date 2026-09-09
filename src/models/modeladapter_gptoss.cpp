@@ -1,4 +1,4 @@
-#include "modeladapter_builtin.h"
+#include "modeladapter_gptoss.h"
 
 #include "tensornames.h"
 #include "modeladapter.h"
@@ -9,8 +9,15 @@
 namespace ncnn {
 namespace moe {
 
-static Result<MoeModelDescriptor> parse_gpt_oss_model(const ModelPackage& package)
+bool GptOssModelAdapter::can_load(const ModelManifest& manifest) const
 {
+    return manifest.model_type == "gpt_oss";
+}
+
+Result<MoeModelDescriptor> GptOssModelAdapter::parse_model(const ModelPackage& package) const
+{
+    if (package.manifest.model_type != "gpt_oss")
+        return Error{ErrorCode::UnsupportedModel, "unsupported built-in model_type: " + package.manifest.model_type};
     const std::string& json = package.manifest.raw_json;
     auto vocabulary_size = read_manifest_uint32(json, "vocab_size");
     if (!vocabulary_size)
@@ -75,6 +82,18 @@ static Result<MoeModelDescriptor> parse_gpt_oss_model(const ModelPackage& packag
     moe.flags = MoeDescriptorRouterBias | MoeDescriptorProjectionBias;
     moe.activation_limit = optional_manifest_float(json, "swiglu_limit", 7.0f);
 
+    std::string rope_scaling_json;
+    const std::string* rope_json = &json;
+    if (find_manifest_member(json, "rope_scaling"))
+    {
+        auto parsed_rope_scaling = read_manifest_object(
+            json, "rope_scaling", "GPT-OSS ");
+        if (!parsed_rope_scaling)
+            return parsed_rope_scaling.error();
+        rope_scaling_json = std::move(parsed_rope_scaling).value();
+        rope_json = &rope_scaling_json;
+    }
+
     AttentionDescriptor attention;
     attention.kind = AttentionKind::Standard;
     attention.head_count = descriptor.attention_head_count;
@@ -83,9 +102,9 @@ static Result<MoeModelDescriptor> parse_gpt_oss_model(const ModelPackage& packag
     attention.initial_context_length = initial_context_length.value();
     attention.max_context_length = max_context_length.value();
     attention.rope_theta = optional_manifest_float(json, "rope_theta", 150000.0f);
-    attention.rope_scaling_factor = optional_manifest_float(json, "factor", 32.0f);
-    attention.rope_ntk_alpha = optional_manifest_float(json, "beta_slow", 1.0f);
-    attention.rope_ntk_beta = optional_manifest_float(json, "beta_fast", 32.0f);
+    attention.rope_scaling_factor = optional_manifest_float(*rope_json, "factor", 32.0f);
+    attention.rope_ntk_alpha = optional_manifest_float(*rope_json, "beta_slow", 1.0f);
+    attention.rope_ntk_beta = optional_manifest_float(*rope_json, "beta_fast", 32.0f);
     attention.flags = AttentionDescriptorSinks;
     auto attention_bias = read_manifest_bool(json, "attention_bias");
     const bool use_attention_bias = !attention_bias || attention_bias.value();
@@ -100,13 +119,15 @@ static Result<MoeModelDescriptor> parse_gpt_oss_model(const ModelPackage& packag
         layer.pre_ffn_norm = NormType::RmsNorm;
         layer.attention = attention;
         layer.attention.sliding_window = layer_id % 2 == 0 ? sliding_window.value() : 0;
-        layer.ffn.moe = moe;
+        layer.moe = moe;
     }
     return descriptor;
 }
 
-static Result<WeightMapping> map_gpt_oss_weights(const ModelPackage& package, const MoeModelDescriptor& descriptor)
+Result<WeightMapping> GptOssModelAdapter::map_weights(const ModelPackage& package, const MoeModelDescriptor& descriptor) const
 {
+    if (descriptor.model_type != "gpt_oss")
+        return Error{ErrorCode::UnsupportedModel, "unsupported built-in model_type: " + descriptor.model_type};
     auto opened = SafetensorsArchive::open(package.root);
     if (!opened)
         return opened.error();
@@ -170,6 +191,16 @@ static Result<WeightMapping> map_gpt_oss_weights(const ModelPackage& package, co
         const std::string gate_up_scales = source + "mlp.experts.gate_up_proj_scales";
         const std::string down_blocks = source + "mlp.experts.down_proj_blocks";
         const std::string down_scales = source + "mlp.experts.down_proj_scales";
+        status = add_bfloat16_expert_bank(
+            mapping, archive, target, "gate_up.bias", gate_up_bias,
+            descriptor.expert_count, {descriptor.intermediate_size * 2});
+        if (!status)
+            return status.error();
+        status = add_bfloat16_expert_bank(
+            mapping, archive, target, "down.bias", down_bias,
+            descriptor.expert_count, {descriptor.hidden_size});
+        if (!status)
+            return status.error();
         for (uint32_t expert_id = 0; expert_id < descriptor.expert_count; ++expert_id)
         {
             const std::string expert = expert_prefix(layer_id, expert_id);
@@ -179,18 +210,10 @@ static Result<WeightMapping> map_gpt_oss_weights(const ModelPackage& package, co
                 expert_load_flags);
             if (!status)
                 return status.error();
-            status = add_bfloat16_slice(
-                mapping, archive, expert + "gate_up.bias", gate_up_bias,
-                expert_id, {descriptor.intermediate_size * 2});
-            if (!status)
-                return status.error();
             status = add_mxfp4_expert(
                 mapping, archive, expert + "down.weight", down_blocks, down_scales,
                 expert_id, descriptor.hidden_size, descriptor.intermediate_size,
                 expert_load_flags);
-            if (!status)
-                return status.error();
-            status = add_bfloat16_slice(mapping, archive, expert + "down.bias", down_bias, expert_id, {descriptor.hidden_size});
             if (!status)
                 return status.error();
         }
@@ -203,25 +226,6 @@ static Result<WeightMapping> map_gpt_oss_weights(const ModelPackage& package, co
     if (!status)
         return status.error();
     return mapping;
-}
-
-bool BuiltinModelAdapter::can_load(const ModelManifest& manifest) const
-{
-    return manifest.model_type == "gpt_oss";
-}
-
-Result<MoeModelDescriptor> BuiltinModelAdapter::parse_model(const ModelPackage& package) const
-{
-    if (package.manifest.model_type != "gpt_oss")
-        return Error{ErrorCode::UnsupportedModel, "unsupported built-in model_type: " + package.manifest.model_type};
-    return parse_gpt_oss_model(package);
-}
-
-Result<WeightMapping> BuiltinModelAdapter::map_weights(const ModelPackage& package, const MoeModelDescriptor& descriptor) const
-{
-    if (descriptor.model_type != "gpt_oss")
-        return Error{ErrorCode::UnsupportedModel, "unsupported built-in model_type: " + descriptor.model_type};
-    return map_gpt_oss_weights(package, descriptor);
 }
 
 } // namespace moe

@@ -1,40 +1,36 @@
 #ifndef NCNN_MOE_COMPILEDOPERATOR_H
 #define NCNN_MOE_COMPILEDOPERATOR_H
 
-#include "storage/weightstore.h"
+#include "layerplan.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <cassert>
-#include <limits>
 #include <memory>
 #include <vector>
 
 namespace ncnn {
 namespace moe {
 
-class NcnnLinearOperator;
-class NcnnVulkanBfloat16Operator;
-class NcnnVulkanFloat8Operator;
-class NcnnVulkanQnkOperator;
-class NcnnVulkanAttentionOperator;
-class NcnnVulkanGatedDeltaNetOperator;
+class Linear;
+class Bfloat16Linear_vulkan;
+class Float8Linear_vulkan;
+class QnkLinear_vulkan;
+class Attention_vulkan;
+class GatedDeltaNet_vulkan;
 struct Mxfp4Q8PackedMatrix;
 struct QnKPack;
-
-using CompiledOperatorHandle = uint32_t;
-inline constexpr CompiledOperatorHandle invalid_compiled_operator_handle = std::numeric_limits<CompiledOperatorHandle>::max();
 
 // Execution products are owned by the resident model or an Expert-cache
 // Entry; TensorData contains only weight storage.
 struct CompiledOperator
 {
-    std::shared_ptr<NcnnLinearOperator> linear;
-    std::shared_ptr<NcnnVulkanBfloat16Operator> bfloat16;
-    std::shared_ptr<NcnnVulkanFloat8Operator> float8;
-    std::shared_ptr<NcnnVulkanQnkOperator> qnk;
-    std::shared_ptr<NcnnVulkanAttentionOperator> attention;
-    std::shared_ptr<NcnnVulkanGatedDeltaNetOperator> gated_delta;
+    std::shared_ptr<Linear> linear;
+    std::shared_ptr<Bfloat16Linear_vulkan> bfloat16;
+    std::shared_ptr<Float8Linear_vulkan> float8;
+    std::shared_ptr<QnkLinear_vulkan> qnk;
+    std::shared_ptr<Attention_vulkan> attention;
+    std::shared_ptr<GatedDeltaNet_vulkan> gated_delta;
 
     // Created lazily when the explicit CPU packed-weight option is enabled.
     mutable std::shared_ptr<const Mxfp4Q8PackedMatrix> mxfp4_q8_packed;
@@ -48,8 +44,8 @@ public:
     {
         entries.clear();
         weight_count = 0;
-        for (; weight_count < count; ++weight_count)
-            (void)allocate();
+        entries.resize(count);
+        weight_count = count;
     }
 
     [[nodiscard]] CompiledOperatorHandle allocate()

@@ -1,21 +1,21 @@
 #include "statecache.h"
 
-#include "backends/ncnn/linear.h"
+#include "backends/ncnn/gateddeltanet_vulkan.h"
 
 namespace ncnn {
 namespace moe {
 
 static void capture_gated_delta_snapshot(
-    const CpuLayerCache& cache,
-    CpuStateCacheSnapshot& snapshot)
+    const LayerCache& cache,
+    GatedDeltaSnapshot& snapshot)
 {
     snapshot.gated_delta_convolution = cache.gated_delta_convolution;
     snapshot.gated_delta_recurrent = cache.gated_delta_recurrent;
 }
 
 static void restore_gated_delta_snapshot(
-    CpuLayerCache& cache,
-    CpuStateCacheSnapshot& snapshot) noexcept
+    LayerCache& cache,
+    GatedDeltaSnapshot& snapshot) noexcept
 {
     cache.gated_delta_convolution.swap(
         snapshot.gated_delta_convolution);
@@ -24,10 +24,10 @@ static void restore_gated_delta_snapshot(
 }
 
 Result<void> begin_state_cache_transaction(
-    std::span<CpuLayerCache> caches,
+    std::span<LayerCache> caches,
     size_t expected_rows)
 {
-    for (const CpuLayerCache& cache : caches)
+    for (const LayerCache& cache : caches)
     {
         if (cache.transaction.active)
         {
@@ -52,7 +52,7 @@ Result<void> begin_state_cache_transaction(
         }
     }
 
-    std::vector<NcnnVulkanGatedDeltaState*> device_transactions;
+    std::vector<GatedDeltaState_vulkan*> device_transactions;
     try
     {
         device_transactions.reserve(caches.size());
@@ -63,18 +63,18 @@ Result<void> begin_state_cache_transaction(
             ErrorCode::InternalError,
             "failed to reserve state cache transaction metadata"};
     }
-    for (CpuLayerCache& cache : caches)
+    for (LayerCache& cache : caches)
     {
         if (cache.gated_delta_device_state)
         {
             if (!cache.gated_delta_device_state->begin_transaction(
                     expected_rows))
             {
-                for (NcnnVulkanGatedDeltaState* state : device_transactions)
+                for (GatedDeltaState_vulkan* state : device_transactions)
                 {
                     state->complete_transaction();
                 }
-                for (CpuLayerCache& cleanup_cache : caches)
+                for (LayerCache& cleanup_cache : caches)
                 {
                     if (cleanup_cache.gated_delta_device_state)
                     {
@@ -93,9 +93,9 @@ Result<void> begin_state_cache_transaction(
 
     try
     {
-        for (CpuLayerCache& cache : caches)
+        for (LayerCache& cache : caches)
         {
-            CpuSessionStateTransaction& transaction = cache.transaction;
+            LayerCacheTransaction& transaction = cache.transaction;
             transaction.initial_start_position = cache.start_position;
             transaction.initial_token_count = cache.token_count;
             transaction.initial_first_slot = cache.first_slot;
@@ -119,9 +119,9 @@ Result<void> begin_state_cache_transaction(
     }
     catch (...)
     {
-        for (CpuLayerCache& cache : caches)
+        for (LayerCache& cache : caches)
         {
-            CpuSessionStateTransaction& transaction = cache.transaction;
+            LayerCacheTransaction& transaction = cache.transaction;
             transaction.active = false;
             transaction.expected_rows = 0;
             transaction.recorded_rows = 0;
@@ -129,9 +129,9 @@ Result<void> begin_state_cache_transaction(
             transaction.initial.gated_delta_recurrent.clear();
             transaction.rows.clear();
         }
-        for (NcnnVulkanGatedDeltaState* state : device_transactions)
+        for (GatedDeltaState_vulkan* state : device_transactions)
             state->complete_transaction();
-        for (CpuLayerCache& cleanup_cache : caches)
+        for (LayerCache& cleanup_cache : caches)
         {
             if (cleanup_cache.gated_delta_device_state)
             {
@@ -146,19 +146,19 @@ Result<void> begin_state_cache_transaction(
 }
 
 void record_standard_cache_transaction_rows(
-    CpuLayerCache& cache,
+    LayerCache& cache,
     size_t rows)
 {
-    CpuSessionStateTransaction& transaction = cache.transaction;
+    LayerCacheTransaction& transaction = cache.transaction;
     if (!transaction.active)
         return;
     transaction.recorded_rows += rows;
 }
 
 void record_gated_delta_cache_transaction_row(
-    CpuLayerCache& cache)
+    LayerCache& cache)
 {
-    CpuSessionStateTransaction& transaction = cache.transaction;
+    LayerCacheTransaction& transaction = cache.transaction;
     if (!transaction.active)
         return;
     ++transaction.recorded_rows;
@@ -173,12 +173,12 @@ void record_gated_delta_cache_transaction_row(
 }
 
 Result<void> finish_state_cache_transaction(
-    std::span<CpuLayerCache> caches,
+    std::span<LayerCache> caches,
     size_t committed_rows)
 {
-    for (const CpuLayerCache& cache : caches)
+    for (const LayerCache& cache : caches)
     {
-        const CpuSessionStateTransaction& transaction = cache.transaction;
+        const LayerCacheTransaction& transaction = cache.transaction;
         if (!transaction.active)
             continue;
         if (committed_rows > transaction.recorded_rows
@@ -212,9 +212,9 @@ Result<void> finish_state_cache_transaction(
         }
     }
 
-    for (CpuLayerCache& cache : caches)
+    for (LayerCache& cache : caches)
     {
-        CpuSessionStateTransaction& transaction = cache.transaction;
+        LayerCacheTransaction& transaction = cache.transaction;
         if (!transaction.active || !cache.gated_delta_device_state)
             continue;
         if (!cache.gated_delta_device_state->prepare_transaction_finish(
@@ -227,7 +227,7 @@ Result<void> finish_state_cache_transaction(
         }
     }
 
-    for (CpuLayerCache& cache : caches)
+    for (LayerCache& cache : caches)
     {
         if (cache.transaction.active
             && cache.gated_delta_device_state)
@@ -236,9 +236,9 @@ Result<void> finish_state_cache_transaction(
         }
     }
 
-    for (CpuLayerCache& cache : caches)
+    for (LayerCache& cache : caches)
     {
-        CpuSessionStateTransaction& transaction = cache.transaction;
+        LayerCacheTransaction& transaction = cache.transaction;
         if (!transaction.active)
             continue;
 

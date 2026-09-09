@@ -11,7 +11,7 @@
 namespace ncnn {
 namespace moe {
 
-void hyper_connection_expand(CpuBatch& hidden, uint32_t multiplier, CpuBatch& scratch)
+void hyper_connection_expand(ActivationBuffer& hidden, uint32_t multiplier, ActivationBuffer& scratch)
 {
     if (multiplier <= 1)
         return;
@@ -29,15 +29,20 @@ static float hyper_sigmoid(float value)
     return 1.0f / (1.0f + float_approximate_exp(-value));
 }
 
-static Result<void> validate_hyper_tensors(const CpuBatch& input, const TensorData& function, const TensorData& scale, const TensorData& base,
+static Result<void> validate_hyper_tensors(const ActivationBuffer& input, const TensorData& function, const TensorData& scale, const TensorData& base,
                                            uint32_t multiplier, uint32_t output_count)
 {
     if (multiplier == 0 || input.columns() == 0 || input.columns() % multiplier != 0)
         return Error{ErrorCode::InvalidArgument, "hyper-connection input must contain multiplier hidden-state copies"};
-    if (function.dtype != DType::Float32 || function.shape != std::vector<uint32_t>{output_count, input.columns()}
+    if (function.dtype != DType::Float32
+        || function.shape.size() != 2
+        || function.shape[0] != output_count
+        || function.shape[1] != input.columns()
         || function.float32_values().size() != function.element_count())
         return Error{ErrorCode::InvalidModel, "invalid hyper-connection function tensor"};
-    if (base.dtype != DType::Float32 || base.shape != std::vector<uint32_t>{output_count}
+    if (base.dtype != DType::Float32
+        || base.shape.size() != 1
+        || base.shape[0] != output_count
         || base.float32_values().size() != output_count)
         return Error{ErrorCode::InvalidModel, "invalid hyper-connection base tensor"};
     if (scale.dtype != DType::Float32 || scale.float32_values().empty())
@@ -45,9 +50,9 @@ static Result<void> validate_hyper_tensors(const CpuBatch& input, const TensorDa
     return {};
 }
 
-Result<CpuHyperConnectionMix> hyper_connection_pre(const CpuBatch& input, const TensorData& function, const TensorData& scale, const TensorData& base,
-                                                   uint32_t multiplier, uint32_t sinkhorn_iterations, float norm_epsilon, float hyper_epsilon,
-                                                   uint64_t optimization_flags)
+Result<void> hyper_connection_pre(const ActivationBuffer& input, const TensorData& function, const TensorData& scale, const TensorData& base,
+                                  uint32_t multiplier, uint32_t sinkhorn_iterations, float norm_epsilon, float hyper_epsilon,
+                                  HyperConnectionMix& result, HyperConnectionScratch& scratch, uint64_t optimization_flags)
 {
     const uint32_t mix_count = (2 + multiplier) * multiplier;
     auto valid = validate_hyper_tensors(input, function, scale, base, multiplier, mix_count);
@@ -57,7 +62,8 @@ Result<CpuHyperConnectionMix> hyper_connection_pre(const CpuBatch& input, const 
         return Error{ErrorCode::InvalidArgument, "invalid hyper-connection mixing parameters"};
 
     const uint32_t hidden_size = input.columns() / multiplier;
-    CpuBatch normalized(input.rows(), input.columns());
+    ActivationBuffer& normalized = scratch.normalized;
+    normalized.reset(input.rows(), input.columns(), false);
     for (size_t row_index = 0; row_index < input.rows(); ++row_index)
     {
         const float* source = input.row(row_index);
@@ -65,19 +71,18 @@ Result<CpuHyperConnectionMix> hyper_connection_pre(const CpuBatch& input, const 
         std::copy_n(source, input.columns(), target);
         float_rms_scale_inplace(target, norm_epsilon, input.columns());
     }
-    CpuBatch mixes = linear_batch(function, normalized, optimization_flags);
+    linear_batch_into(function, normalized, scratch.projection, optimization_flags);
     const std::span<const float> scales = scale.float32_values();
     const std::span<const float> bases = base.float32_values();
 
-    CpuHyperConnectionMix result;
     result.reduced.reset(input.rows(), hidden_size, true);
     result.post.resize(input.rows() * multiplier);
     result.combine.resize(input.rows() * multiplier * multiplier);
-    std::vector<float> sums(multiplier);
+    scratch.sums.resize(multiplier);
     for (size_t row_index = 0; row_index < input.rows(); ++row_index)
     {
         const float* source = input.row(row_index);
-        const float* mixed = mixes.row(row_index);
+        const float* mixed = scratch.projection.row(row_index);
         float* reduced = result.reduced.row(row_index);
         float* post = result.post.data() + row_index * multiplier;
         float* combine = result.combine.data() + row_index * multiplier * multiplier;
@@ -133,12 +138,12 @@ Result<CpuHyperConnectionMix> hyper_connection_pre(const CpuBatch& input, const 
             float sum = 0.0f;
             for (uint32_t output = 0; output < multiplier; ++output)
                 sum += combine[output * multiplier + residual];
-            sums[residual] = sum;
+            scratch.sums[residual] = sum;
         }
         for (uint32_t output = 0; output < multiplier; ++output)
         {
             for (uint32_t residual = 0; residual < multiplier; ++residual)
-                combine[output * multiplier + residual] /= sums[residual] + hyper_epsilon;
+                combine[output * multiplier + residual] /= scratch.sums[residual] + hyper_epsilon;
         }
         for (uint32_t iteration = 1; iteration < sinkhorn_iterations; ++iteration)
         {
@@ -147,31 +152,31 @@ Result<CpuHyperConnectionMix> hyper_connection_pre(const CpuBatch& input, const 
                 float sum = 0.0f;
                 for (uint32_t residual = 0; residual < multiplier; ++residual)
                     sum += combine[output * multiplier + residual];
-                sums[output] = sum;
+                scratch.sums[output] = sum;
             }
             for (uint32_t output = 0; output < multiplier; ++output)
             {
                 for (uint32_t residual = 0; residual < multiplier; ++residual)
-                    combine[output * multiplier + residual] /= sums[output] + hyper_epsilon;
+                    combine[output * multiplier + residual] /= scratch.sums[output] + hyper_epsilon;
             }
             for (uint32_t residual = 0; residual < multiplier; ++residual)
             {
                 float sum = 0.0f;
                 for (uint32_t output = 0; output < multiplier; ++output)
                     sum += combine[output * multiplier + residual];
-                sums[residual] = sum;
+                scratch.sums[residual] = sum;
             }
             for (uint32_t output = 0; output < multiplier; ++output)
             {
                 for (uint32_t residual = 0; residual < multiplier; ++residual)
-                    combine[output * multiplier + residual] /= sums[residual] + hyper_epsilon;
+                    combine[output * multiplier + residual] /= scratch.sums[residual] + hyper_epsilon;
             }
         }
     }
-    return result;
+    return {};
 }
 
-Result<CpuBatch> hyper_connection_post(const CpuBatch& branch, const CpuBatch& residual, const CpuHyperConnectionMix& mix, uint32_t multiplier)
+Result<void> hyper_connection_post(const ActivationBuffer& branch, const ActivationBuffer& residual, const HyperConnectionMix& mix, uint32_t multiplier, ActivationBuffer& output)
 {
     if (multiplier == 0
         || branch.rows() != residual.rows()
@@ -179,8 +184,10 @@ Result<CpuBatch> hyper_connection_post(const CpuBatch& branch, const CpuBatch& r
         || mix.post.size() != branch.rows() * multiplier
         || mix.combine.size() != branch.rows() * multiplier * multiplier)
         return Error{ErrorCode::InvalidArgument, "hyper-connection post tensors have incompatible shapes"};
+    if (&output == &branch || &output == &residual)
+        return Error{ErrorCode::InvalidArgument, "hyper-connection post output must not alias an input"};
 
-    CpuBatch output(branch.rows(), residual.columns());
+    output.reset(branch.rows(), residual.columns(), false);
     for (size_t row_index = 0; row_index < branch.rows(); ++row_index)
     {
         const float* branch_row = branch.row(row_index);
@@ -208,20 +215,24 @@ Result<CpuBatch> hyper_connection_post(const CpuBatch& branch, const CpuBatch& r
             }
         }
     }
-    return output;
+    return {};
 }
 
-Result<CpuBatch> hyper_connection_head(const CpuBatch& input, const TensorData& function, const TensorData& scale, const TensorData& base, uint32_t multiplier,
-                                       float norm_epsilon, float hyper_epsilon, uint64_t optimization_flags)
+Result<void> hyper_connection_head(const ActivationBuffer& input, const TensorData& function, const TensorData& scale, const TensorData& base, uint32_t multiplier,
+                                   float norm_epsilon, float hyper_epsilon, ActivationBuffer& output, HyperConnectionScratch& scratch,
+                                   uint64_t optimization_flags)
 {
     auto valid = validate_hyper_tensors(input, function, scale, base, multiplier, multiplier);
     if (!valid)
         return valid.error();
     if (scale.float32_values().size() != 1 || norm_epsilon <= 0.0f || hyper_epsilon <= 0.0f)
         return Error{ErrorCode::InvalidArgument, "invalid hyper-connection head parameters"};
+    if (&output == &input)
+        return Error{ErrorCode::InvalidArgument, "hyper-connection head output must not alias input"};
 
     const uint32_t hidden_size = input.columns() / multiplier;
-    CpuBatch normalized(input.rows(), input.columns());
+    ActivationBuffer& normalized = scratch.normalized;
+    normalized.reset(input.rows(), input.columns(), false);
     for (size_t row_index = 0; row_index < input.rows(); ++row_index)
     {
         const float* source = input.row(row_index);
@@ -229,14 +240,15 @@ Result<CpuBatch> hyper_connection_head(const CpuBatch& input, const TensorData& 
         std::copy_n(source, input.columns(), target);
         float_rms_scale_inplace(target, norm_epsilon, input.columns());
     }
-    CpuBatch mixes = linear_batch(function, normalized, optimization_flags);
-    CpuBatch output(input.rows(), hidden_size);
+    linear_batch_into(function, normalized, scratch.projection, optimization_flags);
+    // Generic multiplier paths accumulate into each destination row.
+    output.reset(input.rows(), hidden_size, true);
     const float scale_value = scale.float32_values()[0];
     const std::span<const float> bases = base.float32_values();
     for (size_t row_index = 0; row_index < input.rows(); ++row_index)
     {
         const float* source = input.row(row_index);
-        const float* mixed = mixes.row(row_index);
+        const float* mixed = scratch.projection.row(row_index);
         float* destination = output.row(row_index);
         if (multiplier == 4)
         {
@@ -259,7 +271,7 @@ Result<CpuBatch> hyper_connection_head(const CpuBatch& input, const TensorData& 
             }
         }
     }
-    return output;
+    return {};
 }
 
 } // namespace moe

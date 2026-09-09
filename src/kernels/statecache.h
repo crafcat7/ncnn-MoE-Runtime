@@ -1,7 +1,7 @@
 #ifndef NCNN_MOE_STATECACHE_H
 #define NCNN_MOE_STATECACHE_H
 
-#include "activation.h"
+#include "activationbuffer.h"
 #include "ncnn/moe/result.h"
 #include "ncnn/moe/types.h"
 
@@ -15,10 +15,10 @@
 namespace ncnn {
 namespace moe {
 
-class NcnnVulkanAttentionCache;
-class NcnnVulkanGatedDeltaState;
+class AttentionCache_vulkan;
+class GatedDeltaState_vulkan;
 
-struct CpuLatentVectorUndo
+struct LatentVectorUndo
 {
     size_t original_size = 0;
     size_t offset = 0;
@@ -26,20 +26,20 @@ struct CpuLatentVectorUndo
     bool captured = false;
 };
 
-struct CpuLatentCacheUndo
+struct LatentCacheUndo
 {
     uint64_t latent_token_count = 0;
     size_t latent_compressed_size = 0;
     size_t latent_index_compressed_size = 0;
-    CpuLatentVectorUndo latent_window;
-    CpuLatentVectorUndo compressor_pending_values;
-    CpuLatentVectorUndo compressor_pending_scores;
-    CpuLatentVectorUndo compressor_previous_values;
-    CpuLatentVectorUndo compressor_previous_scores;
-    CpuLatentVectorUndo index_compressor_pending_values;
-    CpuLatentVectorUndo index_compressor_pending_scores;
-    CpuLatentVectorUndo index_compressor_previous_values;
-    CpuLatentVectorUndo index_compressor_previous_scores;
+    LatentVectorUndo latent_window;
+    LatentVectorUndo compressor_pending_values;
+    LatentVectorUndo compressor_pending_scores;
+    LatentVectorUndo compressor_previous_values;
+    LatentVectorUndo compressor_previous_scores;
+    LatentVectorUndo index_compressor_pending_values;
+    LatentVectorUndo index_compressor_pending_scores;
+    LatentVectorUndo index_compressor_previous_values;
+    LatentVectorUndo index_compressor_previous_scores;
 
     [[nodiscard]] uint64_t allocated_bytes() const noexcept
     {
@@ -57,7 +57,7 @@ struct CpuLatentCacheUndo
     }
 };
 
-struct CpuStateCacheSnapshot
+struct GatedDeltaSnapshot
 {
     std::vector<float> gated_delta_convolution;
     std::vector<float> gated_delta_recurrent;
@@ -72,10 +72,10 @@ struct CpuStateCacheSnapshot
 };
 
 // Session transactions record reversible KV, DeltaNet, and latent state.
-struct CpuSessionStateTransaction
+struct LayerCacheTransaction
 {
-    CpuStateCacheSnapshot initial;
-    std::vector<CpuStateCacheSnapshot> rows;
+    GatedDeltaSnapshot initial;
+    std::vector<GatedDeltaSnapshot> rows;
     uint64_t initial_start_position = 0;
     uint64_t initial_token_count = 0;
     uint64_t initial_first_slot = 0;
@@ -83,40 +83,38 @@ struct CpuSessionStateTransaction
     size_t expected_rows = 0;
     size_t recorded_rows = 0;
     bool active = false;
-    std::vector<CpuLatentCacheUndo> latent_undo;
+    std::vector<LatentCacheUndo> latent_undo;
     bool latent_active = false;
 
     [[nodiscard]] uint64_t allocated_bytes() const noexcept
     {
         uint64_t bytes = initial.allocated_bytes()
                          + static_cast<uint64_t>(rows.capacity())
-                               * sizeof(CpuStateCacheSnapshot);
-        for (const CpuStateCacheSnapshot& row : rows)
+                               * sizeof(GatedDeltaSnapshot);
+        for (const GatedDeltaSnapshot& row : rows)
             bytes += row.allocated_bytes();
         bytes += static_cast<uint64_t>(latent_undo.capacity())
-                 * sizeof(CpuLatentCacheUndo);
-        for (const CpuLatentCacheUndo& undo : latent_undo)
+                 * sizeof(LatentCacheUndo);
+        for (const LatentCacheUndo& undo : latent_undo)
             bytes += undo.allocated_bytes();
         return bytes;
     }
 };
 
-struct CpuLatentScoredIndex
+struct LayerCache
 {
-    uint32_t index = 0;
-    float score = 0.0f;
-};
-
-struct CpuLayerCache
-{
-    using LatentScoredIndex = CpuLatentScoredIndex;
+    struct LatentScoredIndex
+    {
+        uint32_t index = 0;
+        float score = 0.0f;
+    };
 
     // KV cache.
     std::vector<float> keys;
     std::vector<float> values;
     std::vector<uint16_t> bfloat16_keys;
     std::vector<uint16_t> bfloat16_values;
-    std::shared_ptr<NcnnVulkanAttentionCache> vulkan_attention_cache;
+    std::shared_ptr<AttentionCache_vulkan> vulkan_attention_cache;
     uint64_t start_position = 0;
     uint64_t token_count = 0;
     uint64_t first_slot = 0;
@@ -129,7 +127,7 @@ struct CpuLayerCache
     // Gated DeltaNet state.
     std::vector<float> gated_delta_convolution;
     std::vector<float> gated_delta_recurrent;
-    std::shared_ptr<NcnnVulkanGatedDeltaState> gated_delta_device_state;
+    std::shared_ptr<GatedDeltaState_vulkan> gated_delta_device_state;
     uint64_t gated_delta_token_count = 0;
     uint64_t device_allocated_size = 0;
 
@@ -147,14 +145,14 @@ struct CpuLayerCache
     std::vector<float> index_compressor_previous_scores;
     std::vector<float> compressor_pooled;
     std::vector<float> compressor_exponentials;
-    CpuBatch compressor_values;
-    CpuBatch compressor_scores;
-    CpuBatch latent_token_input;
-    CpuBatch latent_token_rank;
-    CpuBatch latent_index_query;
-    CpuBatch latent_index_projected_weights;
+    ActivationBuffer compressor_values;
+    ActivationBuffer compressor_scores;
+    ActivationBuffer latent_token_input;
+    ActivationBuffer latent_token_rank;
+    ActivationBuffer latent_index_query;
+    ActivationBuffer latent_index_projected_weights;
     std::vector<float> latent_index_scores;
-    std::vector<CpuLatentScoredIndex> latent_scored_indices;
+    std::vector<LatentScoredIndex> latent_scored_indices;
     std::vector<uint32_t> latent_selected_indices;
     std::vector<float> latent_attention_logits;
     std::vector<float> latent_rope_cosines;
@@ -162,7 +160,7 @@ struct CpuLayerCache
     uint64_t latent_token_count = 0;
     bool latent_cache = false;
 
-    CpuSessionStateTransaction transaction;
+    LayerCacheTransaction transaction;
 
     std::vector<uint32_t> predicted_expert_ids;
     uint32_t router_target_top_k = 0;
@@ -226,18 +224,18 @@ struct CpuLayerCache
 };
 
 [[nodiscard]] Result<void> begin_state_cache_transaction(
-    std::span<CpuLayerCache> caches,
+    std::span<LayerCache> caches,
     size_t expected_rows);
 
 void record_standard_cache_transaction_rows(
-    CpuLayerCache& cache,
+    LayerCache& cache,
     size_t rows);
 
 void record_gated_delta_cache_transaction_row(
-    CpuLayerCache& cache);
+    LayerCache& cache);
 
 [[nodiscard]] Result<void> finish_state_cache_transaction(
-    std::span<CpuLayerCache> caches,
+    std::span<LayerCache> caches,
     size_t committed_rows);
 
 } // namespace moe

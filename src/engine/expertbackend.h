@@ -1,7 +1,7 @@
 #ifndef NCNN_MOE_EXPERTBACKEND_H
 #define NCNN_MOE_EXPERTBACKEND_H
 
-#include "kernels/activation.h"
+#include "kernels/activationbuffer.h"
 
 #include "graph/router.h"
 #include "ncnn/moe/result.h"
@@ -10,7 +10,6 @@
 
 #include <cstdint>
 #include <cstddef>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -75,13 +74,6 @@ struct ExpertBackendStatistics
     uint64_t route_aggregation_batches = 0;
     uint64_t route_aggregation_routes = 0;
     uint64_t route_aggregation_bytes_saved = 0;
-};
-
-struct ExpertBackendDeviceStatistics
-{
-    uint32_t device_index = automatic_vulkan_device_index;
-    uint64_t cache_size = 0;
-    ExpertBackendStatistics statistics;
 };
 
 struct ExpertBackendRequest
@@ -166,11 +158,6 @@ public:
 
     [[nodiscard]] virtual std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) = 0;
 
-    virtual void observe_cpu(uint32_t token_count, uint64_t weight_size, uint64_t elapsed_microseconds) = 0;
-
-    // A zero accelerated byte count records the CPU counterfactual.
-    virtual void observe_phase(uint32_t token_count, uint64_t total_weight_bytes, uint64_t accelerated_weight_bytes, uint64_t elapsed_microseconds) = 0;
-
     // Suspend background device-weight admission while the foreground
     // executor owns the Vulkan submission path. The cache may continue to
     // reserve requests; concrete backends decide when those uploads resume.
@@ -182,17 +169,13 @@ public:
     virtual void wait_for_background_work() = 0;
 
     [[nodiscard]] virtual ExpertBackendStatistics statistics() const = 0;
-    [[nodiscard]] virtual std::vector<ExpertBackendDeviceStatistics> device_statistics() const
-    {
-        return {};
-    }
     [[nodiscard]] virtual uint64_t capacity() const noexcept = 0;
 };
 
 class MultiDeviceExpertBackend final : public ExpertBackend
 {
 public:
-    MultiDeviceExpertBackend(std::vector<std::shared_ptr<ExpertBackend>> _backends, std::vector<uint32_t> _device_indices, std::vector<uint32_t> _residency_group_devices, bool _key_sharded);
+    MultiDeviceExpertBackend(std::vector<std::shared_ptr<ExpertBackend>> _backends, std::vector<uint32_t> device_indices, std::vector<uint32_t> _residency_group_devices, bool _key_sharded);
 
     void admit(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
                float activation_limit, ExpertActivation activation) override;
@@ -203,28 +186,19 @@ public:
 
     std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) override;
 
-    void observe_cpu(uint32_t token_count, uint64_t weight_size, uint64_t elapsed_microseconds) override;
-
-    void observe_phase(uint32_t token_count, uint64_t total_weight_bytes, uint64_t accelerated_weight_bytes, uint64_t elapsed_microseconds) override;
-
     void set_foreground_active(bool active) noexcept override;
 
     void wait_for_background_work() override;
 
     ExpertBackendStatistics statistics() const override;
 
-    std::vector<ExpertBackendDeviceStatistics> device_statistics() const override;
-
     uint64_t capacity() const noexcept override;
 
 private:
     size_t backend_for_key(std::string_view key) const;
 
-    void publish_accelerated_bytes(std::vector<uint64_t> values);
-
     struct ChildSubmission
     {
-        size_t backend_index = 0;
         std::vector<size_t> request_indices;
         std::vector<ExpertBackendRequest> requests;
         std::unique_ptr<ExpertSubmission> submission;
@@ -234,7 +208,7 @@ private:
     class Submission final : public ExpertSubmission
     {
     public:
-        Submission(MultiDeviceExpertBackend* _owner, std::span<const ExpertBackendRequest> requests, std::vector<std::vector<size_t>> request_indices);
+        Submission(MultiDeviceExpertBackend* owner, std::span<const ExpertBackendRequest> requests, std::vector<std::vector<size_t>> request_indices);
 
         ~Submission() override;
 
@@ -247,13 +221,11 @@ private:
         void abort() noexcept override;
 
     private:
-        MultiDeviceExpertBackend* owner;
         std::vector<ExpertBackendRequest> client_requests;
         std::vector<ActivationBuffer> private_outputs;
         std::vector<ChildSubmission> children;
         std::vector<ExpertBackendExecutionResult> planned;
         std::vector<ExpertBackendExecutionResult> final;
-        std::vector<uint64_t> accelerated_bytes;
         bool waited = false;
         bool committed = false;
         bool aborted = false;
@@ -264,14 +236,11 @@ private:
     size_t fallback_backend(std::string_view key) const;
 
     std::vector<std::shared_ptr<ExpertBackend>> backends;
-    std::vector<uint32_t> device_indices;
     std::vector<uint32_t> residency_group_devices;
     std::unordered_map<uint32_t, size_t> device_to_backend;
     mutable std::mutex placement_mutex;
     std::unordered_map<std::string, size_t, ExpertKeyHash, std::equal_to<>> key_placements;
     bool key_sharded = false;
-    mutable std::mutex phase_mutex;
-    std::deque<std::vector<uint64_t>> pending_accelerated_bytes;
 };
 
 class ScopedExpertBackendForeground

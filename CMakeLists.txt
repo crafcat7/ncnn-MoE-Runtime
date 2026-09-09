@@ -40,10 +40,12 @@ if(NOT NCNN_BUILD_MOE_RUNTIME)
 endif()
 
 set(NCNN_MOE_SOURCES
+    src/backends/ncnn/attention_vulkan.cpp
     src/backends/ncnn/expertbackend_vulkan.cpp
+    src/backends/ncnn/gateddeltanet_vulkan.cpp
     src/backends/ncnn/linear.cpp
     src/backends/ncnn/modelpipeline.cpp
-    src/backends/ncnn/vulkandevice.cpp
+    src/backends/ncnn/vulkancontext.cpp
     src/engine/cpu.cpp
     src/engine/executor.cpp
     src/engine/executor_speculative.cpp
@@ -72,7 +74,7 @@ set(NCNN_MOE_SOURCES
     src/kernels/statecache.cpp
     src/kernels/vector.cpp
     src/models/modeladapter.cpp
-    src/models/modeladapter_builtin.cpp
+    src/models/modeladapter_gptoss.cpp
     src/models/modeladapter_deepseekv4.cpp
     src/models/modeladapter_qwen3_5.cpp
     src/models/modeladapter_qwen4exp.cpp

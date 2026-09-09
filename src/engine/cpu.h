@@ -2,9 +2,13 @@
 #define NCNN_MOE_CPU_H
 
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #define NCNN_MOE_CPUID_1_ECX_SSSE3_BIT        9
 #define NCNN_MOE_CPUID_1_ECX_FMA_BIT          12
@@ -37,6 +41,29 @@ namespace moe {
 
 [[nodiscard]] uint64_t physical_memory_size() noexcept;
 [[nodiscard]] uint64_t available_memory_size() noexcept;
+
+class CpuTaskWorker
+{
+public:
+    explicit CpuTaskWorker(size_t maximum_outstanding_tasks);
+    ~CpuTaskWorker();
+
+    CpuTaskWorker(const CpuTaskWorker&) = delete;
+    CpuTaskWorker& operator=(const CpuTaskWorker&) = delete;
+
+    [[nodiscard]] bool try_submit(std::function<void()> task);
+
+private:
+    void worker_loop();
+
+    const size_t task_limit;
+    std::mutex mutex;
+    std::condition_variable task_ready;
+    std::deque<std::function<void()>> tasks;
+    std::thread worker;
+    size_t outstanding_tasks = 0;
+    bool stop = false;
+};
 
 struct CpuThreadBudget
 {

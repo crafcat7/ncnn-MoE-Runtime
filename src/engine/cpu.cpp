@@ -47,6 +47,70 @@
 namespace ncnn {
 namespace moe {
 
+CpuTaskWorker::CpuTaskWorker(size_t maximum_outstanding_tasks)
+    : task_limit(std::max<size_t>(1, maximum_outstanding_tasks))
+{
+    worker = std::thread(&CpuTaskWorker::worker_loop, this);
+}
+
+CpuTaskWorker::~CpuTaskWorker()
+{
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        stop = true;
+    }
+    task_ready.notify_all();
+    if (worker.joinable())
+        worker.join();
+}
+
+bool CpuTaskWorker::try_submit(std::function<void()> task)
+{
+    if (!task)
+        return false;
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (stop
+            || outstanding_tasks >= task_limit)
+        {
+            return false;
+        }
+        tasks.push_back(std::move(task));
+        ++outstanding_tasks;
+    }
+    task_ready.notify_one();
+    return true;
+}
+
+void CpuTaskWorker::worker_loop()
+{
+    for (;;)
+    {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            task_ready.wait(lock, [this] {
+                return stop || !tasks.empty();
+            });
+            if (stop && tasks.empty())
+                return;
+            task = std::move(tasks.front());
+            tasks.pop_front();
+        }
+        try
+        {
+            task();
+        }
+        catch (...)
+        {
+        }
+        {
+            const std::lock_guard<std::mutex> lock(mutex);
+            --outstanding_tasks;
+        }
+    }
+}
+
 static void append_name(std::string& names, const char* name)
 {
     if (!names.empty())

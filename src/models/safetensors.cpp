@@ -491,7 +491,9 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_tensor(const std::string& bloc
         scales = packed_scales;
     }
     if (!blocks || !scales || blocks->dtype != "I8" || scales->dtype != "F8_E8M0"
-        || columns % 32 != 0
+        || rows == 0 || columns == 0 || columns % 32 != 0
+        || blocks->size != static_cast<uint64_t>(rows) * columns / 2
+        || scales->size != static_cast<uint64_t>(rows) * columns / 32
         || blocks->shape != std::vector<uint32_t>{rows, columns / 2}
         || scales->shape != std::vector<uint32_t>{rows, columns / 32})
     {
@@ -539,6 +541,13 @@ Result<TensorData> SafetensorsArchive::load_interleaved_mxfp4_tensor(const std::
                                                                      const std::string& up_blocks_name, const std::string& up_scales_name,
                                                                      uint32_t rows, uint32_t columns, uint32_t flags) const
 {
+    if (rows == 0 || columns == 0 || rows > std::numeric_limits<uint32_t>::max() / 2
+        || columns % 32 != 0)
+    {
+        return Error{ErrorCode::InvalidModel, "invalid interleaved MXFP4 tensor: " + gate_blocks_name};
+    }
+    const uint64_t block_size = static_cast<uint64_t>(rows) * columns / 2;
+    const uint64_t scale_size = static_cast<uint64_t>(rows) * columns / 32;
     if (has_flag(flags, SafetensorLoadDeferMxfp4Data))
     {
         const SafetensorInfo* gate_blocks = find(gate_blocks_name);
@@ -567,6 +576,8 @@ Result<TensorData> SafetensorsArchive::load_interleaved_mxfp4_tensor(const std::
         if (!gate_blocks || !gate_scales || !up_blocks || !up_scales
             || gate_blocks->dtype != "I8" || up_blocks->dtype != "I8"
             || gate_scales->dtype != "F8_E8M0" || up_scales->dtype != "F8_E8M0"
+            || gate_blocks->size != block_size || up_blocks->size != block_size
+            || gate_scales->size != scale_size || up_scales->size != scale_size
             || gate_blocks->shape != std::vector<uint32_t>{rows, columns / 2}
             || up_blocks->shape != gate_blocks->shape
             || gate_scales->shape != std::vector<uint32_t>{rows, columns / 32}
@@ -595,6 +606,9 @@ Result<TensorData> SafetensorsArchive::load_interleaved_mxfp4_tensor(const std::
         return tensor;
     }
 
+    if (block_size > std::numeric_limits<size_t>::max() / 2)
+        return Error{ErrorCode::InvalidModel, "invalid interleaved MXFP4 tensor: " + gate_blocks_name};
+
     auto gate = load_mxfp4_tensor(gate_blocks_name, gate_scales_name, rows, columns);
     auto up = load_mxfp4_tensor(up_blocks_name, up_scales_name, rows, columns);
     if (!gate)
@@ -606,8 +620,8 @@ Result<TensorData> SafetensorsArchive::load_interleaved_mxfp4_tensor(const std::
     tensor.shape = {rows * 2, columns};
     const size_t block_row_size = columns / 2;
     const size_t scale_row_size = columns / 32;
-    tensor.mxfp4_blocks.resize(static_cast<size_t>(rows) * block_row_size * 2);
-    tensor.mxfp4_scales.resize(static_cast<size_t>(rows) * scale_row_size * 2);
+    tensor.mxfp4_blocks.resize(static_cast<size_t>(block_size * 2));
+    tensor.mxfp4_scales.resize(static_cast<size_t>(scale_size * 2));
     for (uint32_t row = 0; row < rows; ++row)
     {
         std::memcpy(tensor.mxfp4_blocks.data() + static_cast<size_t>(row * 2) * block_row_size, gate.value().mxfp4_blocks.data() + static_cast<size_t>(row) * block_row_size, block_row_size);
@@ -659,7 +673,8 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
     const SafetensorInfo* blocks = find(blocks_name);
     const SafetensorInfo* scales = find(scales_name);
     if (!blocks || !scales || blocks->dtype != "U8" || scales->dtype != "U8"
-        || columns % 32 != 0 || blocks->shape.size() != 4 || scales->shape.size() != 3)
+        || rows == 0 || columns == 0 || columns % 32 != 0
+        || blocks->shape.size() != 4 || scales->shape.size() != 3)
         return Error{ErrorCode::InvalidModel, "invalid MXFP4 expert tensors: " + blocks_name};
     const std::vector<uint32_t> expected_blocks = {blocks->shape[0], rows, columns / 32, 16};
     const std::vector<uint32_t> expected_scales = {scales->shape[0], rows, columns / 32};
@@ -669,6 +684,7 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
 
     const uint64_t block_size = static_cast<uint64_t>(rows) * columns / 2;
     const uint64_t scale_size = static_cast<uint64_t>(rows) * columns / 32;
+    const uint64_t expert_count = blocks->shape[0];
     const std::string packed_prefix = "__ncnn_moe_packed__." + std::to_string(expert_id) + ".";
     const SafetensorInfo* packed_blocks = find(packed_prefix + blocks_name);
     const SafetensorInfo* packed_scales = find(packed_prefix + scales_name);
@@ -685,6 +701,13 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
             || packed_scales->shape != std::vector<uint32_t>{rows, columns / 32}))
     {
         return Error{ErrorCode::InvalidModel, "invalid packed MXFP4 Expert tensors: " + blocks_name};
+    }
+    if (!packed_blocks
+        && (block_size > std::numeric_limits<uint64_t>::max() / expert_count
+            || blocks->size != block_size * expert_count
+            || scales->size != scale_size * expert_count))
+    {
+        return Error{ErrorCode::InvalidModel, "invalid MXFP4 Expert tensors: " + blocks_name};
     }
     const SafetensorInfo* selected_blocks = packed_blocks ? packed_blocks : blocks;
     const SafetensorInfo* selected_scales = packed_scales ? packed_scales : scales;

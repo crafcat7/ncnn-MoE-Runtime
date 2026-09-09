@@ -13,15 +13,17 @@ class ExpertVictimCache;
 class ModelLoader
 {
 public:
+    // The caller supplies a fresh unpublished model and discards it on failure.
     ModelLoader(
         const RuntimeInfo& _info,
         const std::vector<std::shared_ptr<ModelAdapter>>& _adapters,
-        const Option& _opt);
+        const Option& _opt,
+        CompiledModel& _model);
 
-    [[nodiscard]] Result<CompiledModel> load(const std::filesystem::path& model_path);
+    [[nodiscard]] Result<void> load(const std::filesystem::path& model_path);
 
 private:
-    [[nodiscard]] Result<void> sanitize_option();
+    [[nodiscard]] Result<void> validate_option();
     [[nodiscard]] Result<void> resolve_gpu_devices();
     [[nodiscard]] Result<void> load_package(const std::filesystem::path& model_path);
     [[nodiscard]] Result<void> plan_memory();
@@ -38,9 +40,7 @@ private:
         const std::vector<std::shared_ptr<ExpertVictimCache>>& victim_caches);
     [[nodiscard]] Result<void> configure_resident_qnk_backend();
 
-    void set_effective_option();
     [[nodiscard]] uint32_t resolve_expert_io_threads() const;
-    [[nodiscard]] uint32_t expert_cache_flags() const noexcept;
 
     const RuntimeInfo& info;
     const std::vector<std::shared_ptr<ModelAdapter>>& adapters;
@@ -49,7 +49,7 @@ private:
     const ModelAdapter* adapter = nullptr;
     MoeModelDescriptor descriptor;
     ModelMemoryPlan plan;
-    CompiledModel model;
+    CompiledModel& model;
 
     uint64_t requested_gpu_cache_size = 0;
     bool use_auto_gpu_cache = false;

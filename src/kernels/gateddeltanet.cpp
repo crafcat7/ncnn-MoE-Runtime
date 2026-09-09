@@ -45,7 +45,7 @@ static bool gated_delta_simd_enabled(uint64_t optimization_flags) noexcept
     return has_flag(optimization_flags, OptimizationCpuGatedDeltaSimd);
 }
 
-static void configure_gated_delta_cache(CpuLayerCache& cache, const AttentionBlockPlan& plan)
+static void configure_gated_delta_cache(LayerCache& cache, const AttentionBlockPlan& plan)
 {
     const uint32_t key_size = plan.kv_head_count * plan.head_dimension;
     const uint32_t value_size = plan.head_count * plan.value_head_dimension;
@@ -149,7 +149,7 @@ static void execute_gated_delta_recurrence_row(
     const WeightStore& weights,
     const AttentionBlockPlan& plan,
     float norm_epsilon,
-    CpuLayerCache& cache,
+    LayerCache& cache,
     float* qkv,
     const float* z,
     const float* beta_values,
@@ -444,16 +444,16 @@ static void execute_gated_delta_recurrence_row(
     }
 }
 
-Result<void> execute_gated_delta_net_into(
+Result<void> forward_gated_delta(
     const WeightStore& weights,
     const CompiledOperatorTable& operators,
     const AttentionBlockPlan& plan,
     ExecutionBackend backend,
     float norm_epsilon,
-    CpuLayerCache& cache,
-    CpuGatedDeltaExecutionScratch& scratch,
-    const CpuBatch& hidden,
-    CpuBatch& output,
+    LayerCache& cache,
+    GatedDeltaScratch& scratch,
+    const ActivationBuffer& hidden,
+    ActivationBuffer& output,
     uint64_t optimization_flags)
 {
     const CompiledOperator& gated_delta_operator = operators.at(plan.gated_delta_vulkan_operator);
@@ -558,16 +558,15 @@ Result<void> execute_gated_delta_net_into(
     const uint32_t value_size = plan.head_count * plan.value_head_dimension;
     const uint32_t convolution_size = key_size * 2 + value_size;
     const uint32_t fused_columns = convolution_size + value_size + plan.head_count * 2;
-    const CompiledOperator& fused_delta_bfloat16_operator = operators.at(plan.fused_delta_input_bfloat16_operator);
-    const CompiledOperator& fused_delta_linear_operator = operators.at(plan.fused_delta_input_operator);
+    const CompiledOperator& fused_delta_operator = operators.at(plan.fused_delta_input_operator);
     bool fused_input = (backend == ExecutionBackend::Vulkan
-                        && fused_delta_bfloat16_operator.bfloat16
-                        && fused_delta_bfloat16_operator.bfloat16->forward(
+                        && fused_delta_operator.bfloat16
+                        && fused_delta_operator.bfloat16->forward(
                             scratch.normalized,
                             scratch.fused_input))
                        || (backend == ExecutionBackend::Vulkan
-                           && fused_delta_linear_operator.linear
-                           && fused_delta_linear_operator.linear->forward(
+                           && fused_delta_operator.linear
+                           && fused_delta_operator.linear->forward(
                                scratch.normalized,
                                scratch.fused_input));
     if (fused_input)
@@ -654,14 +653,14 @@ Result<void> execute_gated_delta_net_into(
     return {};
 }
 
-bool execute_gated_delta_net_batch_into(
+bool forward_gated_delta_batch(
     const WeightStore& weights,
     const CompiledOperatorTable& operators,
     const AttentionBlockPlan& plan,
     ExecutionBackend backend,
     float norm_epsilon,
-    std::span<CpuGatedDeltaBatchEntry> entries,
-    std::vector<NcnnVulkanGatedDeltaBatchEntry>& device_entries,
+    std::span<GatedDeltaBatchEntry> entries,
+    std::vector<GatedDeltaBatchEntry_vulkan>& device_entries,
     uint64_t optimization_flags)
 {
     if (entries.empty())
@@ -671,11 +670,11 @@ bool execute_gated_delta_net_batch_into(
         || !gated_delta_operator.gated_delta
         || entries.size() == 1)
     {
-        for (CpuGatedDeltaBatchEntry& entry : entries)
+        for (GatedDeltaBatchEntry& entry : entries)
         {
             if (!entry.hidden || !entry.scratch || !entry.cache || !entry.output)
                 return false;
-            auto executed = execute_gated_delta_net_into(
+            auto executed = forward_gated_delta(
                 weights,
                 operators,
                 plan,
@@ -694,7 +693,7 @@ bool execute_gated_delta_net_batch_into(
 
     device_entries.clear();
     device_entries.reserve(entries.size());
-    for (CpuGatedDeltaBatchEntry& entry : entries)
+    for (GatedDeltaBatchEntry& entry : entries)
     {
         if (!entry.hidden || !entry.scratch || !entry.cache || !entry.output
             || entry.hidden->rows() != 1)
@@ -717,15 +716,15 @@ bool execute_gated_delta_net_batch_into(
                                   &entry.scratch->projected});
     }
 
-    NcnnVulkanGatedDeltaBatchResult batch_result = NcnnVulkanGatedDeltaBatchResult::NotExecuted;
+    GatedDeltaBatchResult_vulkan batch_result = GatedDeltaBatchResult_vulkan::NotExecuted;
     if (!device_entries.empty()
         && device_entries.size() == entries.size())
     {
         batch_result = gated_delta_operator.gated_delta->forward_batch(device_entries);
     }
-    if (batch_result == NcnnVulkanGatedDeltaBatchResult::Executed)
+    if (batch_result == GatedDeltaBatchResult_vulkan::Executed)
     {
-        for (CpuGatedDeltaBatchEntry& entry : entries)
+        for (GatedDeltaBatchEntry& entry : entries)
         {
             if (has_flag(plan.flags, AttentionBlockExternalResidual))
             {
@@ -756,17 +755,17 @@ bool execute_gated_delta_net_batch_into(
         }
         return true;
     }
-    if (batch_result == NcnnVulkanGatedDeltaBatchResult::Failed)
+    if (batch_result == GatedDeltaBatchResult_vulkan::Failed)
         return false;
 
     // The batch path is an optimization for independent decode rows.  If a
     // device allocation or dispatch is unavailable, preserve the established
     // per-Session implementation and its failure-path state handoff.
-    for (CpuGatedDeltaBatchEntry& entry : entries)
+    for (GatedDeltaBatchEntry& entry : entries)
     {
         if (!entry.hidden || !entry.scratch || !entry.cache || !entry.output)
             return false;
-        auto executed = execute_gated_delta_net_into(
+        auto executed = forward_gated_delta(
             weights,
             operators,
             plan,

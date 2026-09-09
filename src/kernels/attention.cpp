@@ -5,7 +5,7 @@
 #include "bfloat16.h"
 #include "statecache.h"
 #include "vector.h"
-#include "backends/ncnn/attention.h"
+#include "backends/ncnn/attention_vulkan.h"
 #include "backends/ncnn/linear.h"
 #include "ncnn/moe/option.h"
 
@@ -118,13 +118,13 @@ static void apply_prepared_rope(
     float_rope_inplace(vector, cosine.data(), sine.data(), dimension);
 }
 
-static uint64_t cache_slot(const CpuLayerCache& cache, uint64_t token_index)
+static uint64_t cache_slot(const LayerCache& cache, uint64_t token_index)
 {
     assert(cache.capacity_tokens > 0);
     return (cache.first_slot + token_index) % cache.capacity_tokens;
 }
 
-static void configure_cache(CpuLayerCache& cache, uint32_t columns, DType dtype)
+static void configure_cache(LayerCache& cache, uint32_t columns, DType dtype)
 {
     if (cache.columns == columns && cache.dtype == dtype)
         return;
@@ -146,7 +146,7 @@ static uint64_t next_capacity(uint64_t current, uint64_t required)
     return capacity;
 }
 
-static void resize_cache(CpuLayerCache& cache, uint64_t required_tokens)
+static void resize_cache(LayerCache& cache, uint64_t required_tokens)
 {
     if (required_tokens <= cache.capacity_tokens)
         return;
@@ -183,7 +183,7 @@ static void resize_cache(CpuLayerCache& cache, uint64_t required_tokens)
     cache.capacity_tokens = new_capacity;
 }
 
-static void compact_cache(CpuLayerCache& cache, uint64_t target_capacity)
+static void compact_cache(LayerCache& cache, uint64_t target_capacity)
 {
     if (target_capacity >= cache.capacity_tokens)
         return;
@@ -220,7 +220,7 @@ static void compact_cache(CpuLayerCache& cache, uint64_t target_capacity)
     cache.capacity_tokens = target_capacity;
 }
 
-static void append_cache(CpuLayerCache& cache, DType dtype, const CpuBatch& key, const CpuBatch& value)
+static void append_cache(LayerCache& cache, DType dtype, const ActivationBuffer& key, const ActivationBuffer& value)
 {
     assert(key.columns() == value.columns());
     configure_cache(cache, key.columns(), dtype);
@@ -256,8 +256,8 @@ static bool direct_bfloat16_attention_enabled(uint64_t optimization_flags) noexc
     return has_flag(optimization_flags, OptimizationCpuBf16DirectAttention);
 }
 
-static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, const TensorData* sinks, uint64_t position_offset, const CpuBatch& query,
-                                              const CpuLayerCache& cache, CpuBatch& output, std::vector<float>& logits,
+static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, const TensorData* sinks, uint64_t position_offset, const ActivationBuffer& query,
+                                              const LayerCache& cache, ActivationBuffer& output, std::vector<float>& logits,
                                               std::vector<float>& key_cache, std::vector<float>& value_cache,
                                               std::vector<float>& flash_partial_max,
                                               std::vector<float>& flash_partial_sum,
@@ -923,7 +923,7 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
     }
 }
 
-static void trim_sliding_cache(CpuLayerCache& cache, const AttentionBlockPlan& plan)
+static void trim_sliding_cache(LayerCache& cache, const AttentionBlockPlan& plan)
 {
     if (plan.sliding_window == 0)
         return;
@@ -940,7 +940,7 @@ static void trim_sliding_cache(CpuLayerCache& cache, const AttentionBlockPlan& p
         compact_cache(cache, target_capacity);
 }
 
-static void attention_linear_into(const WeightStore& weights, const CompiledOperatorTable& operators, TensorHandle matrix, TensorHandle bias, const CpuBatch& input, CpuBatch& output, uint64_t optimization_flags)
+static void attention_linear_into(const WeightStore& weights, const CompiledOperatorTable& operators, TensorHandle matrix, TensorHandle bias, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags)
 {
     if (bias == invalid_tensor_handle)
     {
@@ -959,7 +959,7 @@ static float attention_weight_value(const TensorData& tensor, size_t index)
     return bfloat16_to_float(tensor.bfloat16_values()[index]);
 }
 
-static void apply_head_rms_norm(CpuBatch& batch, uint32_t head_count, uint32_t head_dimension, const TensorData& weight, float epsilon, float weight_offset, uint64_t optimization_flags)
+static void apply_head_rms_norm(ActivationBuffer& batch, uint32_t head_count, uint32_t head_dimension, const TensorData& weight, float epsilon, float weight_offset, uint64_t optimization_flags)
 {
     assert(weight.element_count() == head_dimension);
     for (size_t token_index = 0; token_index < batch.rows(); ++token_index)
@@ -968,7 +968,7 @@ static void apply_head_rms_norm(CpuBatch& batch, uint32_t head_count, uint32_t h
         for (uint32_t head = 0; head < head_count; ++head)
         {
             float* values = token + head * head_dimension;
-            if (simd_rms_norm_enabled(optimization_flags)
+            if (has_flag(optimization_flags, OptimizationCpuSimdRmsNorm)
                 && weight.dtype == DType::Float32)
             {
                 float_rms_norm(
@@ -980,7 +980,7 @@ static void apply_head_rms_norm(CpuBatch& batch, uint32_t head_count, uint32_t h
                     head_dimension);
                 continue;
             }
-            if (simd_rms_norm_enabled(optimization_flags)
+            if (has_flag(optimization_flags, OptimizationCpuSimdRmsNorm)
                 && weight.dtype == DType::BFloat16)
             {
                 bfloat16_rms_norm(
@@ -1008,9 +1008,9 @@ static Result<void> project_and_append_qsa_keys(
     const WeightStore& weights,
     const CompiledOperatorTable& operators,
     const AttentionBlockPlan& plan,
-    const CpuBatch& normalized,
-    CpuLayerCache& cache,
-    CpuAttentionExecutionScratch& scratch,
+    const ActivationBuffer& normalized,
+    LayerCache& cache,
+    AttentionScratch& scratch,
     uint64_t optimization_flags)
 {
     if (!has_flag(plan.flags, AttentionBlockQsa))
@@ -1052,8 +1052,8 @@ static Result<void> prepare_qsa_selection(
     const AttentionBlockPlan& plan,
     uint64_t position_offset,
     float norm_epsilon,
-    CpuLayerCache& cache,
-    CpuAttentionExecutionScratch& scratch,
+    LayerCache& cache,
+    AttentionScratch& scratch,
     uint64_t optimization_flags)
 {
     if (!has_flag(plan.flags, AttentionBlockQsa))
@@ -1193,7 +1193,7 @@ static Result<void> prepare_qsa_selection(
     return {};
 }
 
-Result<void> append_attention_context_into(
+Result<void> append_attention_context(
     const WeightStore& weights,
     const CompiledOperatorTable& operators,
     const AttentionBlockPlan& plan,
@@ -1201,9 +1201,9 @@ Result<void> append_attention_context_into(
     float norm_epsilon,
     DType kv_cache_dtype,
     uint64_t position_offset,
-    CpuLayerCache& cache,
-    CpuAttentionExecutionScratch& scratch,
-    const CpuBatch& hidden,
+    LayerCache& cache,
+    AttentionScratch& scratch,
+    const ActivationBuffer& hidden,
     uint64_t optimization_flags)
 {
     if (cache.vulkan_attention_cache)
@@ -1237,23 +1237,22 @@ Result<void> append_attention_context_into(
         optimization_flags);
     if (!qsa_status)
         return qsa_status.error();
-    CpuBatch& key = scratch.key;
-    CpuBatch& value = scratch.value;
-    CpuBatch& fused_qkv = scratch.fused_qkv;
+    ActivationBuffer& key = scratch.key;
+    ActivationBuffer& value = scratch.value;
+    ActivationBuffer& fused_qkv = scratch.fused_qkv;
     const CompiledOperator& fused_qkv_gate_operator = operators.at(plan.fused_qkv_gate_bfloat16_operator);
-    const CompiledOperator& fused_qkv_bfloat16_operator = operators.at(plan.fused_qkv_bfloat16_operator);
-    const CompiledOperator& fused_qkv_linear_operator = operators.at(plan.fused_qkv_operator);
+    const CompiledOperator& fused_qkv_operator = operators.at(plan.fused_qkv_operator);
     if (backend == ExecutionBackend::Vulkan
         && ((fused_qkv_gate_operator.bfloat16
              && fused_qkv_gate_operator.bfloat16->forward(
                  scratch.normalized,
                  fused_qkv))
-            || (fused_qkv_bfloat16_operator.bfloat16
-                && fused_qkv_bfloat16_operator.bfloat16->forward(
+            || (fused_qkv_operator.bfloat16
+                && fused_qkv_operator.bfloat16->forward(
                     scratch.normalized,
                     fused_qkv))
-            || (fused_qkv_linear_operator.linear
-                && fused_qkv_linear_operator.linear->forward(
+            || (fused_qkv_operator.linear
+                && fused_qkv_operator.linear->forward(
                     scratch.normalized,
                     fused_qkv))))
     {
@@ -1315,11 +1314,11 @@ Result<void> append_attention_context_into(
     return {};
 }
 
-Result<bool> execute_attention_block_batch_into(
+Result<bool> forward_attention_batch(
     const CompiledOperatorTable& operators,
     const AttentionBlockPlan& plan,
     ExecutionBackend backend,
-    std::span<CpuAttentionBatchEntry> entries,
+    std::span<AttentionBatchEntry> entries,
     uint64_t optimization_flags)
 {
     (void)optimization_flags;
@@ -1329,9 +1328,9 @@ Result<bool> execute_attention_block_batch_into(
         || !attention_operator.attention)
         return false;
 
-    std::vector<NcnnVulkanAttentionBatchEntry> device_entries;
+    std::vector<AttentionBatchEntry_vulkan> device_entries;
     device_entries.reserve(entries.size());
-    for (CpuAttentionBatchEntry& entry : entries)
+    for (AttentionBatchEntry& entry : entries)
     {
         if (!entry.cache || !entry.scratch || !entry.hidden || !entry.output)
         {
@@ -1339,7 +1338,7 @@ Result<bool> execute_attention_block_batch_into(
                 ErrorCode::InvalidArgument,
                 "Attention batch entry is incomplete"};
         }
-        if (entry.cache->transaction.active)
+        if (entry.cache->transaction.active || entry.cache->token_count == 0)
             return false;
         device_entries.push_back({entry.position_offset,
                                   entry.cache,
@@ -1347,10 +1346,10 @@ Result<bool> execute_attention_block_batch_into(
                                   entry.output});
     }
 
-    const NcnnVulkanAttentionBatchResult result = attention_operator.attention->forward_batch(device_entries);
-    if (result == NcnnVulkanAttentionBatchResult::Executed)
+    const AttentionBatchResult_vulkan result = attention_operator.attention->forward_batch(device_entries);
+    if (result == AttentionBatchResult_vulkan::Executed)
         return true;
-    if (result == NcnnVulkanAttentionBatchResult::Failed)
+    if (result == AttentionBatchResult_vulkan::Failed)
     {
         return Error{
             ErrorCode::InternalError,
@@ -1359,7 +1358,7 @@ Result<bool> execute_attention_block_batch_into(
     return false;
 }
 
-Result<void> execute_attention_block_into(
+Result<void> forward_attention(
     const WeightStore& weights,
     const CompiledOperatorTable& operators,
     const AttentionBlockPlan& plan,
@@ -1367,10 +1366,10 @@ Result<void> execute_attention_block_into(
     float norm_epsilon,
     DType kv_cache_dtype,
     uint64_t position_offset,
-    CpuLayerCache& cache,
-    CpuAttentionExecutionScratch& scratch,
-    const CpuBatch& hidden,
-    CpuBatch& output,
+    LayerCache& cache,
+    AttentionScratch& scratch,
+    const ActivationBuffer& hidden,
+    ActivationBuffer& output,
     uint64_t optimization_flags)
 {
     if (cache.vulkan_attention_state_unknown)
@@ -1427,13 +1426,12 @@ Result<void> execute_attention_block_into(
         optimization_flags);
     if (!qsa_status)
         return qsa_status.error();
-    CpuBatch& query = scratch.query;
-    CpuBatch& key = scratch.key;
-    CpuBatch& value = scratch.value;
-    CpuBatch& fused_qkv = scratch.fused_qkv;
+    ActivationBuffer& query = scratch.query;
+    ActivationBuffer& key = scratch.key;
+    ActivationBuffer& value = scratch.value;
+    ActivationBuffer& fused_qkv = scratch.fused_qkv;
     const CompiledOperator& fused_qkv_gate_operator = operators.at(plan.fused_qkv_gate_bfloat16_operator);
-    const CompiledOperator& fused_qkv_bfloat16_operator = operators.at(plan.fused_qkv_bfloat16_operator);
-    const CompiledOperator& fused_qkv_linear_operator = operators.at(plan.fused_qkv_operator);
+    const CompiledOperator& fused_qkv_operator = operators.at(plan.fused_qkv_operator);
     const bool fused_output_gate = backend == ExecutionBackend::Vulkan
                                    && fused_qkv_gate_operator.bfloat16
                                    && fused_qkv_gate_operator.bfloat16->forward(
@@ -1441,13 +1439,13 @@ Result<void> execute_attention_block_into(
                                        fused_qkv);
     const bool fused_projection = fused_output_gate
                                   || (backend == ExecutionBackend::Vulkan
-                                      && fused_qkv_bfloat16_operator.bfloat16
-                                      && fused_qkv_bfloat16_operator.bfloat16->forward(
+                                      && fused_qkv_operator.bfloat16
+                                      && fused_qkv_operator.bfloat16->forward(
                                           scratch.normalized,
                                           fused_qkv))
                                   || (backend == ExecutionBackend::Vulkan
-                                      && fused_qkv_linear_operator.linear
-                                      && fused_qkv_linear_operator.linear->forward(
+                                      && fused_qkv_operator.linear
+                                      && fused_qkv_operator.linear->forward(
                                           scratch.normalized,
                                           fused_qkv));
     if (fused_projection)
@@ -1569,7 +1567,7 @@ Result<void> execute_attention_block_into(
         {
             float* attention_row = scratch.attention.row(token_index);
             const float* gate_row = scratch.gate.row(token_index);
-            if (cpu_fast_silu_enabled(optimization_flags))
+            if (has_flag(optimization_flags, OptimizationCpuFastSilu))
             {
                 float_sigmoid_mul(
                     attention_row,

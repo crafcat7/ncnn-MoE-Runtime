@@ -23,7 +23,7 @@ static constexpr uint32_t maximum_expert_route_ranks = 16;
 
 class BatchSchedulerPrivate;
 
-class CpuSessionState;
+class SessionState;
 
 struct PrefillResult
 {
@@ -203,21 +203,6 @@ struct SessionStatistics
     uint64_t vulkan_attention_qkv_rope_fusions = 0;
     uint64_t vulkan_attention_device_rope_fusions = 0;
     uint64_t vulkan_attention_qkv_ring_fusions = 0;
-    uint64_t vulkan_attention_qkv_rope_pipeline_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_shape_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_source_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_norm_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_ring_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_allocation_failures = 0;
-    uint64_t vulkan_attention_precondition_failures = 0;
-    uint64_t vulkan_attention_staging_failures = 0;
-    uint64_t vulkan_attention_norm_failures = 0;
-    uint64_t vulkan_attention_qkv_failures = 0;
-    uint64_t vulkan_attention_cache_failures = 0;
-    uint64_t vulkan_attention_sdpa_failures = 0;
-    uint64_t vulkan_attention_projection_failures = 0;
-    uint64_t vulkan_attention_output_failures = 0;
-    uint64_t vulkan_attention_submit_failures = 0;
     uint64_t vulkan_attention_decode_sdpa_fusions = 0;
     uint64_t vulkan_attention_cache_materializations = 0;
     uint64_t vulkan_attention_cpu_fallbacks = 0;
@@ -246,7 +231,6 @@ struct SessionStatistics
     uint64_t kv_cache_allocated_size = 0;
     std::vector<uint64_t> expert_token_counts;
     uint32_t expert_cache_num_io_threads = 0;
-    uint32_t expert_cache_num_active_io_threads = 0;
     uint64_t expert_cache_io_read_samples = 0;
     uint64_t expert_cache_io_read_time_microseconds = 0;
     uint64_t expert_gpu_route_aggregation_batches = 0;
@@ -293,21 +277,6 @@ struct RuntimeMetricCounters
     uint64_t vulkan_attention_qkv_rope_fusions = 0;
     uint64_t vulkan_attention_device_rope_fusions = 0;
     uint64_t vulkan_attention_qkv_ring_fusions = 0;
-    uint64_t vulkan_attention_qkv_rope_pipeline_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_shape_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_source_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_norm_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_ring_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_allocation_failures = 0;
-    uint64_t vulkan_attention_precondition_failures = 0;
-    uint64_t vulkan_attention_staging_failures = 0;
-    uint64_t vulkan_attention_norm_failures = 0;
-    uint64_t vulkan_attention_qkv_failures = 0;
-    uint64_t vulkan_attention_cache_failures = 0;
-    uint64_t vulkan_attention_sdpa_failures = 0;
-    uint64_t vulkan_attention_projection_failures = 0;
-    uint64_t vulkan_attention_output_failures = 0;
-    uint64_t vulkan_attention_submit_failures = 0;
     uint64_t vulkan_attention_cache_materializations = 0;
     uint64_t vulkan_attention_cpu_fallbacks = 0;
     uint64_t vulkan_gated_delta_fusions = 0;
@@ -402,11 +371,11 @@ private:
     SessionStatistics stats;
     // Tentative execution counters are published when the step commits.
     SessionStatistics stats_scratch;
-    std::unique_ptr<CpuSessionState> state;
+    std::unique_ptr<SessionState> state;
     std::mt19937_64 random_generator;
     uint32_t prefill_chunk_size = 512;
     bool use_speculative_context = true;
-    SessionStatistics generation_start_stats;
+    RuntimeMetricCounters generation_start_counters;
     bool generation_active = false;
     uint64_t generation_input_tokens = 0;
     uint64_t generation_output_tokens = 0;

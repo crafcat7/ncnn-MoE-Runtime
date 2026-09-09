@@ -12,7 +12,7 @@ is required.
 | --- | --- |
 | Package | Official multi-shard Hugging Face Safetensors and `config.json` |
 | Dense weights | BF16/F32 with automatic mmap and buffered fallback |
-| Attention | RMSNorm, fused QKV+RoPE, adaptive online Decode SDPA, GQA, learned sinks, full/sliding Attention, and YaRN RoPE |
+| Attention | RMSNorm, fused QKV+RoPE, option-controlled fused Decode SDPA, GQA, learned sinks, full/sliding Attention, and YaRN RoPE |
 | KV cache | Persistent per-Session BF16 or FP32 CPU cache; FP32 mixed-backend ring |
 | Experts | Native MXFP4 blocks and scales with runtime-selected CPU SIMD kernels |
 | Mixed execution | Vulkan Dense/Attention with CPU routing and Experts |

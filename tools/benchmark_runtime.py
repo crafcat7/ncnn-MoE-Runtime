@@ -1105,8 +1105,8 @@ def parse_runner_output(output):
         "bfloat16_batched_linear_kernel": extract_text(
             output, r"^BF16 batched CPU Linear kernel: (.+)$"
         ),
-        "cpu_small_bfloat16_linear_policy": extract_text(
-            output, r"^BF16 small CPU Linear policy: (.+)$"
+        "cpu_linear_backend": extract_text(
+            output, r"^CPU Linear backend: (.+)$"
         ),
         "mxfp4_decode_row_pair_group_size": extract_number(
             output, r"^MXFP4 decode row-pair group: (\d+)", int
@@ -1440,13 +1440,10 @@ def parse_runner_output(output):
             output, r"^Expert I/O policy:.*?(\d+) physical range\(s\) saved", int
         ),
         "expert_cache_io_worker_count": extract_number(
-            output, r"^Expert I/O policy:.*?io workers: (\d+) target", int
-        ),
-        "expert_cache_adaptive_io_workers": extract_number(
-            output, r"^Expert I/O policy:.*?io workers: \d+ target (\d+)", int
+            output, r"^Expert I/O policy:.*?io workers: (\d+),", int
         ),
         "expert_cache_io_read_samples": extract_number(
-            output, r"^Expert I/O policy:.*?target \d+, (\d+) sample", int
+            output, r"^Expert I/O policy:.*?io workers: \d+, (\d+) sample", int
         ),
         "expert_cache_io_read_time_ms": extract_number(
             output, r"^Expert I/O policy:.*?sample\(s\), ([0-9.]+) ms observed", float
@@ -2177,9 +2174,7 @@ def main():
             "bfloat16_batched_linear_kernel": samples[0][
                 "bfloat16_batched_linear_kernel"
             ],
-            "cpu_small_bfloat16_linear_policy": samples[0][
-                "cpu_small_bfloat16_linear_policy"
-            ],
+            "cpu_linear_backend": samples[0]["cpu_linear_backend"],
             "cpu_isa": samples[0]["cpu_isa"],
             "mxfp4_decode_row_pair_group_size": samples[0][
                 "mxfp4_decode_row_pair_group_size"
@@ -2523,9 +2518,6 @@ def main():
             ),
             "expert_cache_io_worker_count": median_field(
                 samples, "expert_cache_io_worker_count"
-            ),
-            "expert_cache_adaptive_io_workers": median_field(
-                samples, "expert_cache_adaptive_io_workers"
             ),
             "expert_cache_io_read_samples": median_field(
                 samples, "expert_cache_io_read_samples"

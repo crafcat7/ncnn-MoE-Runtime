@@ -78,7 +78,11 @@ static void select_topk_routes(const float* scores, std::span<const float> selec
     }
 }
 
-Result<ExpertDispatchPlan> dispatch_experts(std::span<const float> router_logits, uint32_t token_count, const ExpertDispatchOptions& options)
+static Result<void> dispatch_experts_general_into(
+    std::span<const float> router_logits,
+    uint32_t token_count,
+    const ExpertDispatchOptions& options,
+    ExpertDispatchPlan& result)
 {
     if (token_count == 0)
         return Error{ErrorCode::InvalidArgument, "expert dispatch requires at least one token"};
@@ -104,17 +108,18 @@ Result<ExpertDispatchPlan> dispatch_experts(std::span<const float> router_logits
             return Error{ErrorCode::InvalidArgument, "router logits must be finite"};
     }
 
-    ExpertDispatchPlan result;
-    result.assignment_count = static_cast<size_t>(token_count) * options.top_k;
-    result.batches.resize(options.expert_count);
-    for (uint32_t expert_id = 0; expert_id < options.expert_count; ++expert_id)
-        result.batches[expert_id].expert_id = expert_id;
-
     const bool renormalize = options.normalization == RouterNormalization::SelectedExperts;
     std::vector<float> scores;
     scores.reserve(options.expert_count);
     std::vector<RouteCandidate> selected;
     selected.reserve(options.top_k);
+
+    // Stage by Expert id so a late routing error leaves the published plan intact.
+    if (result.route_scratch.size() < options.expert_count)
+        result.route_scratch.resize(options.expert_count);
+    for (uint32_t expert_id = 0; expert_id < options.expert_count; ++expert_id)
+        result.route_scratch[expert_id].clear();
+
     for (uint32_t token_index = 0; token_index < token_count; ++token_index)
     {
         const float* logits = router_logits.data() + static_cast<size_t>(token_index) * options.expert_count;
@@ -144,20 +149,44 @@ Result<ExpertDispatchPlan> dispatch_experts(std::span<const float> router_logits
             const RouteCandidate& candidate = selected[rank];
             const float score = scores[candidate.expert_id];
             const float weight = (renormalize ? score / selected_sum : score) * options.routed_scaling_factor;
-            result.batches[candidate.expert_id].routes.push_back({token_index, rank, weight});
+            result.route_scratch[candidate.expert_id].push_back({token_index, rank, weight});
         }
     }
 
     size_t batch_count = 0;
-    for (size_t index = 0; index < result.batches.size(); ++index)
+    for (uint32_t expert_id = 0; expert_id < options.expert_count; ++expert_id)
+        batch_count += !result.route_scratch[expert_id].empty();
+    if (result.batches.size() < batch_count)
+        result.batches.resize(batch_count);
+    size_t batch_index = 0;
+    for (uint32_t expert_id = 0; expert_id < options.expert_count; ++expert_id)
     {
-        if (result.batches[index].routes.empty())
+        std::vector<ExpertRoute>& routes = result.route_scratch[expert_id];
+        if (routes.empty())
             continue;
-        if (batch_count != index)
-            result.batches[batch_count] = std::move(result.batches[index]);
-        ++batch_count;
+        ExpertBatch& batch = result.batches[batch_index++];
+        batch.expert_id = expert_id;
+        batch.routes.swap(routes);
+    }
+    // Keep useful buffers from output slots that disappear after compaction.
+    for (size_t index = batch_count; index < result.batches.size(); ++index)
+    {
+        ExpertBatch& batch = result.batches[index];
+        if (batch.expert_id < result.route_scratch.size()
+            && batch.routes.capacity() > result.route_scratch[batch.expert_id].capacity())
+            batch.routes.swap(result.route_scratch[batch.expert_id]);
     }
     result.batches.resize(batch_count);
+    result.assignment_count = static_cast<size_t>(token_count) * options.top_k;
+    return {};
+}
+
+Result<ExpertDispatchPlan> dispatch_experts(std::span<const float> router_logits, uint32_t token_count, const ExpertDispatchOptions& options)
+{
+    ExpertDispatchPlan result;
+    auto dispatched = dispatch_experts_general_into(router_logits, token_count, options, result);
+    if (!dispatched)
+        return dispatched.error();
     return result;
 }
 
@@ -167,11 +196,7 @@ Result<void> dispatch_experts_into(std::span<const float> router_logits, uint32_
     if (token_count != 1
         || options.top_k > stack_top_k)
     {
-        auto dispatched = dispatch_experts(router_logits, token_count, options);
-        if (!dispatched)
-            return dispatched.error();
-        result = std::move(dispatched).value();
-        return {};
+        return dispatch_experts_general_into(router_logits, token_count, options, result);
     }
     if (options.expert_count == 0 || options.top_k == 0 || options.top_k > options.expert_count)
     {
@@ -227,11 +252,7 @@ Result<void> dispatch_experts_into(std::span<const float> router_logits, uint32_
             {
                 if (options.explicit_expert_ids[previous] == expert_id)
                 {
-                    auto dispatched = dispatch_experts(router_logits, token_count, options);
-                    if (!dispatched)
-                        return dispatched.error();
-                    result = std::move(dispatched).value();
-                    return {};
+                    return dispatch_experts_general_into(router_logits, token_count, options, result);
                 }
             }
             selected[selected_count++] = {
@@ -290,11 +311,20 @@ Result<void> dispatch_experts_into(std::span<const float> router_logits, uint32_
     }
 
     result.assignment_count = selected_count;
+    for (size_t index = selected_count; index < result.batches.size(); ++index)
+    {
+        ExpertBatch& batch = result.batches[index];
+        if (batch.expert_id < result.route_scratch.size()
+            && batch.routes.capacity() > result.route_scratch[batch.expert_id].capacity())
+            batch.routes.swap(result.route_scratch[batch.expert_id]);
+    }
     result.batches.resize(selected_count);
     for (uint32_t index = 0; index < selected_count; ++index)
     {
         ExpertBatch& batch = result.batches[index];
         batch.expert_id = selected[index].expert_id;
+        if (batch.routes.capacity() == 0 && batch.expert_id < result.route_scratch.size())
+            batch.routes.swap(result.route_scratch[batch.expert_id]);
         batch.routes.resize(1);
         batch.routes.front() = {
             0,

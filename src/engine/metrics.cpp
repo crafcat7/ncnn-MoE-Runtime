@@ -1,6 +1,6 @@
 #include "metrics.h"
 
-#include "backends/ncnn/vulkancontext.h"
+#include "backends/ncnn/vulkan.h"
 #include "executor.h"
 #include "expertbackend.h"
 #include "ncnn/moe/session.h"
@@ -25,31 +25,6 @@ void record_model_resource_delta(
     {
         const ExpertCacheStatistics after = model.expert_cache->statistics();
         record_expert_cache_delta(statistics, execution_cache_before, after);
-        statistics.expert_cache_queued_reads += after.queued_reads - execution_cache_before.queued_reads;
-        statistics.expert_cache_speculative_reads += after.speculative_reads - execution_cache_before.speculative_reads;
-        statistics.expert_cache_cancelled_speculative_reads += after.cancelled_speculative_reads - execution_cache_before.cancelled_speculative_reads;
-        statistics.expert_cache_dropped_speculative_admissions += after.dropped_speculative_admissions - execution_cache_before.dropped_speculative_admissions;
-        statistics.expert_cache_unused_speculative_reads += after.unused_speculative_reads - execution_cache_before.unused_speculative_reads;
-        statistics.expert_cache_short_term_reloads += after.short_term_reloads - execution_cache_before.short_term_reloads;
-        statistics.expert_cache_arc_recent_size = after.arc_recent_size;
-        statistics.expert_cache_arc_frequent_size = after.arc_frequent_size;
-        statistics.expert_cache_arc_recent_target_size = after.arc_recent_target_size;
-        statistics.expert_cache_arc_recent_ghost_size = after.arc_recent_ghost_size;
-        statistics.expert_cache_arc_frequent_ghost_size = after.arc_frequent_ghost_size;
-        statistics.expert_cache_arc_recent_ghost_hits += after.arc_recent_ghost_hits - execution_cache_before.arc_recent_ghost_hits;
-        statistics.expert_cache_arc_frequent_ghost_hits += after.arc_frequent_ghost_hits - execution_cache_before.arc_frequent_ghost_hits;
-        statistics.expert_cache_mapped_ranges += after.mapped_ranges - execution_cache_before.mapped_ranges;
-        statistics.expert_cache_mapped_bytes += after.mapped_bytes - execution_cache_before.mapped_bytes;
-        statistics.expert_cache_direct_read_ranges += after.direct_read_ranges - execution_cache_before.direct_read_ranges;
-        statistics.expert_cache_direct_read_bytes += after.direct_read_bytes - execution_cache_before.direct_read_bytes;
-        statistics.expert_cache_direct_read_fallbacks += after.direct_read_fallbacks - execution_cache_before.direct_read_fallbacks;
-        statistics.expert_cache_buffered_read_ranges += after.buffered_read_ranges - execution_cache_before.buffered_read_ranges;
-        statistics.expert_cache_buffered_read_bytes += after.buffered_read_bytes - execution_cache_before.buffered_read_bytes;
-        statistics.expert_cache_coalesced_read_batches += after.coalesced_read_batches - execution_cache_before.coalesced_read_batches;
-        statistics.expert_cache_coalesced_experts += after.coalesced_experts - execution_cache_before.coalesced_experts;
-        statistics.expert_cache_coalesced_read_ranges_saved += after.coalesced_read_ranges_saved - execution_cache_before.coalesced_read_ranges_saved;
-        statistics.expert_cache_read_policy = after.adaptive_read_policy;
-        record_expert_victim_cache_delta(statistics, execution_cache_before.victim, after.victim);
     }
     if (model.expert_backend)
     {
@@ -59,7 +34,7 @@ void record_model_resource_delta(
 
 void record_batch_resource_delta(
     const CompiledModel& model,
-    std::span<const CpuDecodeBatchEntry> entries,
+    std::span<const DecodeBatchEntry> entries,
     const ExpertCacheStatistics& cache_before,
     const ExpertBackendStatistics& backend_before)
 {
@@ -67,28 +42,16 @@ void record_batch_resource_delta(
     if (model.expert_cache)
     {
         const ExpertCacheStatistics cache_after = model.expert_cache->statistics();
-        for (const CpuDecodeBatchEntry& entry : entries)
+        for (const DecodeBatchEntry& entry : entries)
         {
             SessionStatistics& statistics = *entry.statistics;
             record_expert_cache_delta(statistics, cache_before, cache_after);
-            statistics.expert_cache_speculative_reads += cache_after.speculative_reads - cache_before.speculative_reads;
-            statistics.expert_cache_cancelled_speculative_reads += cache_after.cancelled_speculative_reads - cache_before.cancelled_speculative_reads;
-            statistics.expert_cache_dropped_speculative_admissions += cache_after.dropped_speculative_admissions - cache_before.dropped_speculative_admissions;
-            statistics.expert_cache_unused_speculative_reads += cache_after.unused_speculative_reads - cache_before.unused_speculative_reads;
-            statistics.expert_cache_short_term_reloads += cache_after.short_term_reloads - cache_before.short_term_reloads;
-            statistics.expert_cache_coalesced_read_batches += cache_after.coalesced_read_batches - cache_before.coalesced_read_batches;
-            statistics.expert_cache_coalesced_experts += cache_after.coalesced_experts - cache_before.coalesced_experts;
-            statistics.expert_cache_coalesced_read_ranges_saved += cache_after.coalesced_read_ranges_saved - cache_before.coalesced_read_ranges_saved;
-            statistics.expert_cache_arc_recent_size = cache_after.arc_recent_size;
-            statistics.expert_cache_arc_frequent_size = cache_after.arc_frequent_size;
-            statistics.expert_cache_arc_recent_target_size = cache_after.arc_recent_target_size;
-            record_expert_victim_cache_delta(statistics, cache_before.victim, cache_after.victim);
         }
     }
     if (model.expert_backend)
     {
         const ExpertBackendStatistics backend_after = model.expert_backend->statistics();
-        for (const CpuDecodeBatchEntry& entry : entries)
+        for (const DecodeBatchEntry& entry : entries)
         {
             record_expert_backend_delta(*entry.statistics, backend_before, backend_after);
         }
@@ -131,90 +94,97 @@ void record_expert_cache_delta(
     statistics.expert_cache_misses += after.misses - before.misses;
     statistics.expert_cache_evictions += after.evictions - before.evictions;
     statistics.expert_cache_bytes_read += after.bytes_read - before.bytes_read;
+    statistics.expert_cache_queued_reads += after.queued_reads - before.queued_reads;
+    statistics.expert_cache_speculative_reads += after.speculative_reads - before.speculative_reads;
+    statistics.expert_cache_cancelled_speculative_reads += after.cancelled_speculative_reads - before.cancelled_speculative_reads;
+    statistics.expert_cache_dropped_speculative_admissions += after.dropped_speculative_admissions - before.dropped_speculative_admissions;
+    statistics.expert_cache_unused_speculative_reads += after.unused_speculative_reads - before.unused_speculative_reads;
+    statistics.expert_cache_short_term_reloads += after.short_term_reloads - before.short_term_reloads;
+    statistics.expert_cache_arc_recent_size = after.arc_recent_size;
+    statistics.expert_cache_arc_frequent_size = after.arc_frequent_size;
+    statistics.expert_cache_arc_recent_target_size = after.arc_recent_target_size;
+    statistics.expert_cache_arc_recent_ghost_size = after.arc_recent_ghost_size;
+    statistics.expert_cache_arc_frequent_ghost_size = after.arc_frequent_ghost_size;
+    statistics.expert_cache_arc_recent_ghost_hits += after.arc_recent_ghost_hits - before.arc_recent_ghost_hits;
+    statistics.expert_cache_arc_frequent_ghost_hits += after.arc_frequent_ghost_hits - before.arc_frequent_ghost_hits;
+    statistics.expert_cache_mapped_ranges += after.mapped_ranges - before.mapped_ranges;
+    statistics.expert_cache_mapped_bytes += after.mapped_bytes - before.mapped_bytes;
+    statistics.expert_cache_direct_read_ranges += after.direct_read_ranges - before.direct_read_ranges;
+    statistics.expert_cache_direct_read_bytes += after.direct_read_bytes - before.direct_read_bytes;
+    statistics.expert_cache_direct_read_fallbacks += after.direct_read_fallbacks - before.direct_read_fallbacks;
+    statistics.expert_cache_buffered_read_ranges += after.buffered_read_ranges - before.buffered_read_ranges;
+    statistics.expert_cache_buffered_read_bytes += after.buffered_read_bytes - before.buffered_read_bytes;
+    statistics.expert_cache_coalesced_read_batches += after.coalesced_read_batches - before.coalesced_read_batches;
+    statistics.expert_cache_coalesced_experts += after.coalesced_experts - before.coalesced_experts;
+    statistics.expert_cache_coalesced_read_ranges_saved += after.coalesced_read_ranges_saved - before.coalesced_read_ranges_saved;
+    statistics.expert_cache_read_policy = after.adaptive_read_policy;
     statistics.expert_cache_num_io_threads = after.num_io_threads;
-    statistics.expert_cache_num_active_io_threads = after.num_active_io_threads;
     statistics.expert_cache_io_read_samples += after.io_read_samples - before.io_read_samples;
     statistics.expert_cache_io_read_time_microseconds += after.io_read_time_microseconds
                                                          - before.io_read_time_microseconds;
     statistics.expert_cache_resident_size = after.resident_size;
+    record_expert_victim_cache_delta(statistics, before.victim, after.victim);
 }
 
 void record_vulkan_execution_delta(
     SessionStatistics& statistics,
-    const NcnnVulkanExecutionSnapshot& before,
-    const NcnnVulkanContextInstancePtr& context_instance)
+    const VulkanStatistics& before,
+    const VulkanStatistics& after)
 {
-    const NcnnVulkanExecutionSnapshot after_snapshot = get_vulkan_execution_snapshot(context_instance);
-    const NcnnVulkanRuntimeCounters& after = after_snapshot.counters;
-    statistics.vulkan_linear_dispatches += after_snapshot.dispatches - before.dispatches;
-    statistics.vulkan_attention_blocks += after_snapshot.attention_blocks - before.attention_blocks;
-    statistics.vulkan_compute_submissions += after.compute_submissions - before.counters.compute_submissions;
+    statistics.vulkan_linear_dispatches += after.dispatches - before.dispatches;
+    statistics.vulkan_attention_blocks += after.attention_blocks - before.attention_blocks;
+    statistics.vulkan_compute_submissions += after.compute_submissions - before.compute_submissions;
     statistics.vulkan_submit_wait_time_microseconds += after.submit_wait_time_microseconds
-                                                       - before.counters.submit_wait_time_microseconds;
-    statistics.vulkan_batch_uploads += after.batch_uploads - before.counters.batch_uploads;
-    statistics.vulkan_batch_downloads += after.batch_downloads - before.counters.batch_downloads;
-    statistics.vulkan_auxiliary_uploads += after.auxiliary_uploads - before.counters.auxiliary_uploads;
-    statistics.vulkan_auxiliary_upload_bytes += after.auxiliary_upload_bytes - before.counters.auxiliary_upload_bytes;
-    statistics.vulkan_staging_slot_resizes += after.staging_slot_resizes - before.counters.staging_slot_resizes;
-    statistics.vulkan_staging_slot_reuses += after.staging_slot_reuses - before.counters.staging_slot_reuses;
-    statistics.vulkan_staging_slot_acquisitions += after.staging_slot_acquisitions - before.counters.staging_slot_acquisitions;
-    statistics.vulkan_staging_slot_contentions += after.staging_slot_contentions - before.counters.staging_slot_contentions;
-    statistics.vulkan_command_buffer_reuses += after.command_buffer_reuses - before.counters.command_buffer_reuses;
+                                                       - before.submit_wait_time_microseconds;
+    statistics.vulkan_batch_uploads += after.batch_uploads - before.batch_uploads;
+    statistics.vulkan_batch_downloads += after.batch_downloads - before.batch_downloads;
+    statistics.vulkan_auxiliary_uploads += after.auxiliary_uploads - before.auxiliary_uploads;
+    statistics.vulkan_auxiliary_upload_bytes += after.auxiliary_upload_bytes - before.auxiliary_upload_bytes;
+    statistics.vulkan_staging_slot_resizes += after.staging_slot_resizes - before.staging_slot_resizes;
+    statistics.vulkan_staging_slot_reuses += after.staging_slot_reuses - before.staging_slot_reuses;
+    statistics.vulkan_staging_slot_acquisitions += after.staging_slot_acquisitions - before.staging_slot_acquisitions;
+    statistics.vulkan_staging_slot_contentions += after.staging_slot_contentions - before.staging_slot_contentions;
+    statistics.vulkan_command_buffer_reuses += after.command_buffer_reuses - before.command_buffer_reuses;
     statistics.vulkan_command_graph_submissions += after.command_graph_submissions
-                                                   - before.counters.command_graph_submissions;
+                                                   - before.command_graph_submissions;
     statistics.vulkan_command_graph_operations += after.command_graph_operations
-                                                  - before.counters.command_graph_operations;
-    statistics.vulkan_direct_host_input_bindings += after.direct_host_input_bindings - before.counters.direct_host_input_bindings;
-    statistics.vulkan_direct_host_output_bindings += after.direct_host_output_bindings - before.counters.direct_host_output_bindings;
-    statistics.vulkan_attention_qkv_rope_fusions += after.attention_qkv_rope_fusions - before.counters.attention_qkv_rope_fusions;
-    statistics.vulkan_attention_device_rope_fusions += after.attention_device_rope_fusions - before.counters.attention_device_rope_fusions;
-    statistics.vulkan_attention_qkv_ring_fusions += after.attention_qkv_ring_fusions - before.counters.attention_qkv_ring_fusions;
-    statistics.vulkan_attention_qkv_rope_pipeline_failures += after.attention_qkv_rope_pipeline_failures - before.counters.attention_qkv_rope_pipeline_failures;
-    statistics.vulkan_attention_qkv_rope_shape_failures += after.attention_qkv_rope_shape_failures - before.counters.attention_qkv_rope_shape_failures;
-    statistics.vulkan_attention_qkv_rope_source_failures += after.attention_qkv_rope_source_failures - before.counters.attention_qkv_rope_source_failures;
-    statistics.vulkan_attention_qkv_rope_norm_failures += after.attention_qkv_rope_norm_failures - before.counters.attention_qkv_rope_norm_failures;
-    statistics.vulkan_attention_qkv_rope_ring_failures += after.attention_qkv_rope_ring_failures - before.counters.attention_qkv_rope_ring_failures;
-    statistics.vulkan_attention_qkv_rope_allocation_failures += after.attention_qkv_rope_allocation_failures - before.counters.attention_qkv_rope_allocation_failures;
-    statistics.vulkan_attention_precondition_failures += after.attention_precondition_failures - before.counters.attention_precondition_failures;
-    statistics.vulkan_attention_staging_failures += after.attention_staging_failures - before.counters.attention_staging_failures;
-    statistics.vulkan_attention_norm_failures += after.attention_norm_failures - before.counters.attention_norm_failures;
-    statistics.vulkan_attention_qkv_failures += after.attention_qkv_failures - before.counters.attention_qkv_failures;
-    statistics.vulkan_attention_cache_failures += after.attention_cache_failures - before.counters.attention_cache_failures;
-    statistics.vulkan_attention_sdpa_failures += after.attention_sdpa_failures - before.counters.attention_sdpa_failures;
-    statistics.vulkan_attention_projection_failures += after.attention_projection_failures - before.counters.attention_projection_failures;
-    statistics.vulkan_attention_output_failures += after.attention_output_failures - before.counters.attention_output_failures;
-    statistics.vulkan_attention_submit_failures += after.attention_submit_failures - before.counters.attention_submit_failures;
-    statistics.vulkan_attention_decode_sdpa_fusions += after.attention_decode_sdpa_fusions - before.counters.attention_decode_sdpa_fusions;
+                                                  - before.command_graph_operations;
+    statistics.vulkan_direct_host_input_bindings += after.direct_host_input_bindings - before.direct_host_input_bindings;
+    statistics.vulkan_direct_host_output_bindings += after.direct_host_output_bindings - before.direct_host_output_bindings;
+    statistics.vulkan_attention_qkv_rope_fusions += after.attention_qkv_rope_fusions - before.attention_qkv_rope_fusions;
+    statistics.vulkan_attention_device_rope_fusions += after.attention_device_rope_fusions - before.attention_device_rope_fusions;
+    statistics.vulkan_attention_qkv_ring_fusions += after.attention_qkv_ring_fusions - before.attention_qkv_ring_fusions;
+    statistics.vulkan_attention_decode_sdpa_fusions += after.attention_decode_sdpa_fusions - before.attention_decode_sdpa_fusions;
     statistics.vulkan_attention_cache_materializations += after.attention_cache_materializations
-                                                          - before.counters.attention_cache_materializations;
+                                                          - before.attention_cache_materializations;
     statistics.vulkan_attention_cpu_fallbacks += after.attention_cpu_fallbacks
-                                                 - before.counters.attention_cpu_fallbacks;
-    statistics.vulkan_shared_expert_swiglu_fusions += after.shared_expert_swiglu_fusions - before.counters.shared_expert_swiglu_fusions;
-    statistics.vulkan_gated_delta_fusions += after.gated_delta_fusions - before.counters.gated_delta_fusions;
-    statistics.vulkan_gated_delta_submissions += after.gated_delta_submissions - before.counters.gated_delta_submissions;
-    statistics.vulkan_rms_norm_linear_fusions += after.rms_norm_linear_fusions - before.counters.rms_norm_linear_fusions;
-    statistics.vulkan_kv_ring_appends += after.kv_ring_appends - before.counters.kv_ring_appends;
-    statistics.vulkan_kv_ring_resizes += after.kv_ring_resizes - before.counters.kv_ring_resizes;
-    statistics.vulkan_kv_ring_wrapped_views += after.kv_ring_wrapped_views - before.counters.kv_ring_wrapped_views;
-    statistics.vulkan_kv_cache_promotions += after.kv_cache_promotions - before.counters.kv_cache_promotions;
-    statistics.vulkan_kv_cache_promotion_bytes += after.kv_cache_promotion_bytes - before.counters.kv_cache_promotion_bytes;
+                                                 - before.attention_cpu_fallbacks;
+    statistics.vulkan_shared_expert_swiglu_fusions += after.shared_expert_swiglu_fusions - before.shared_expert_swiglu_fusions;
+    statistics.vulkan_gated_delta_fusions += after.gated_delta_fusions - before.gated_delta_fusions;
+    statistics.vulkan_gated_delta_submissions += after.gated_delta_submissions - before.gated_delta_submissions;
+    statistics.vulkan_rms_norm_linear_fusions += after.rms_norm_linear_fusions - before.rms_norm_linear_fusions;
+    statistics.vulkan_kv_ring_appends += after.kv_ring_appends - before.kv_ring_appends;
+    statistics.vulkan_kv_ring_resizes += after.kv_ring_resizes - before.kv_ring_resizes;
+    statistics.vulkan_kv_ring_wrapped_views += after.kv_ring_wrapped_views - before.kv_ring_wrapped_views;
+    statistics.vulkan_kv_cache_promotions += after.kv_cache_promotions - before.kv_cache_promotions;
+    statistics.vulkan_kv_cache_promotion_bytes += after.kv_cache_promotion_bytes - before.kv_cache_promotion_bytes;
     statistics.vulkan_bfloat16_cooperative_matrix_dispatches += after.bfloat16_cooperative_matrix_dispatches
-                                                                - before.counters.bfloat16_cooperative_matrix_dispatches;
-    statistics.vulkan_command_dispatches += after.command_dispatches - before.counters.command_dispatches;
+                                                                - before.bfloat16_cooperative_matrix_dispatches;
+    statistics.vulkan_command_dispatches += after.command_dispatches - before.command_dispatches;
     statistics.vulkan_command_pipeline_binds += after.command_pipeline_binds
-                                                - before.counters.command_pipeline_binds;
+                                                - before.command_pipeline_binds;
     statistics.vulkan_command_redundant_pipeline_binds += after.command_redundant_pipeline_binds
-                                                          - before.counters.command_redundant_pipeline_binds;
+                                                          - before.command_redundant_pipeline_binds;
     statistics.vulkan_command_descriptor_bindings += after.command_descriptor_bindings
-                                                     - before.counters.command_descriptor_bindings;
+                                                     - before.command_descriptor_bindings;
     statistics.vulkan_command_push_constant_updates += after.command_push_constant_updates
-                                                       - before.counters.command_push_constant_updates;
+                                                       - before.command_push_constant_updates;
     statistics.vulkan_command_resource_barrier_calls += after.command_resource_barrier_calls
-                                                        - before.counters.command_resource_barrier_calls;
+                                                        - before.command_resource_barrier_calls;
     statistics.vulkan_command_buffer_resource_barriers += after.command_buffer_resource_barriers
-                                                          - before.counters.command_buffer_resource_barriers;
+                                                          - before.command_buffer_resource_barriers;
     statistics.vulkan_command_image_resource_barriers += after.command_image_resource_barriers
-                                                         - before.counters.command_image_resource_barriers;
+                                                         - before.command_image_resource_barriers;
 }
 
 void record_expert_backend_delta(SessionStatistics& statistics, const ExpertBackendStatistics& before, const ExpertBackendStatistics& after)
@@ -271,30 +241,30 @@ static uint64_t counter_delta(uint64_t current, uint64_t baseline) noexcept
     return current >= baseline ? current - baseline : 0;
 }
 
-static RuntimeMetricCounters runtime_metric_counters(
+RuntimeMetricCounters runtime_metric_counters(
     const SessionStatistics& statistics,
-    const SessionStatistics* baseline)
+    const RuntimeMetricCounters* baseline)
 {
-    const SessionStatistics empty;
-    const SessionStatistics& start = baseline == nullptr ? empty : *baseline;
+    const RuntimeMetricCounters empty;
+    const RuntimeMetricCounters& start = baseline == nullptr ? empty : *baseline;
     RuntimeMetricCounters result;
     result.prefill_tokens = counter_delta(statistics.prefill_tokens, start.prefill_tokens);
     result.decode_tokens = counter_delta(statistics.decode_tokens, start.decode_tokens);
     result.expert_cache_hits = counter_delta(statistics.expert_cache_hits, start.expert_cache_hits);
     result.expert_cache_misses = counter_delta(statistics.expert_cache_misses, start.expert_cache_misses);
-    result.expert_io_bytes = counter_delta(statistics.expert_cache_bytes_read, start.expert_cache_bytes_read);
+    result.expert_io_bytes = counter_delta(statistics.expert_cache_bytes_read, start.expert_io_bytes);
     result.expert_compute_time_microseconds = counter_delta(
         statistics.expert_compute_time_microseconds,
         start.expert_compute_time_microseconds);
     result.gpu_submit_count = counter_delta(
         statistics.vulkan_compute_submissions,
-        start.vulkan_compute_submissions);
+        start.gpu_submit_count);
     result.gpu_wait_time_microseconds = counter_delta(
         statistics.vulkan_submit_wait_time_microseconds,
-        start.vulkan_submit_wait_time_microseconds);
+        start.gpu_wait_time_microseconds);
     result.gpu_kernel_time_microseconds = counter_delta(
         statistics.expert_gpu_execution_time_microseconds,
-        start.expert_gpu_execution_time_microseconds);
+        start.gpu_kernel_time_microseconds);
     result.gpu_kernel_time_available = counter_delta(
                                            statistics.expert_gpu_executions,
                                            start.expert_gpu_executions)
@@ -320,51 +290,6 @@ static RuntimeMetricCounters runtime_metric_counters(
     result.vulkan_attention_qkv_ring_fusions = counter_delta(
         statistics.vulkan_attention_qkv_ring_fusions,
         start.vulkan_attention_qkv_ring_fusions);
-    result.vulkan_attention_qkv_rope_pipeline_failures = counter_delta(
-        statistics.vulkan_attention_qkv_rope_pipeline_failures,
-        start.vulkan_attention_qkv_rope_pipeline_failures);
-    result.vulkan_attention_qkv_rope_shape_failures = counter_delta(
-        statistics.vulkan_attention_qkv_rope_shape_failures,
-        start.vulkan_attention_qkv_rope_shape_failures);
-    result.vulkan_attention_qkv_rope_source_failures = counter_delta(
-        statistics.vulkan_attention_qkv_rope_source_failures,
-        start.vulkan_attention_qkv_rope_source_failures);
-    result.vulkan_attention_qkv_rope_norm_failures = counter_delta(
-        statistics.vulkan_attention_qkv_rope_norm_failures,
-        start.vulkan_attention_qkv_rope_norm_failures);
-    result.vulkan_attention_qkv_rope_ring_failures = counter_delta(
-        statistics.vulkan_attention_qkv_rope_ring_failures,
-        start.vulkan_attention_qkv_rope_ring_failures);
-    result.vulkan_attention_qkv_rope_allocation_failures = counter_delta(
-        statistics.vulkan_attention_qkv_rope_allocation_failures,
-        start.vulkan_attention_qkv_rope_allocation_failures);
-    result.vulkan_attention_precondition_failures = counter_delta(
-        statistics.vulkan_attention_precondition_failures,
-        start.vulkan_attention_precondition_failures);
-    result.vulkan_attention_staging_failures = counter_delta(
-        statistics.vulkan_attention_staging_failures,
-        start.vulkan_attention_staging_failures);
-    result.vulkan_attention_norm_failures = counter_delta(
-        statistics.vulkan_attention_norm_failures,
-        start.vulkan_attention_norm_failures);
-    result.vulkan_attention_qkv_failures = counter_delta(
-        statistics.vulkan_attention_qkv_failures,
-        start.vulkan_attention_qkv_failures);
-    result.vulkan_attention_cache_failures = counter_delta(
-        statistics.vulkan_attention_cache_failures,
-        start.vulkan_attention_cache_failures);
-    result.vulkan_attention_sdpa_failures = counter_delta(
-        statistics.vulkan_attention_sdpa_failures,
-        start.vulkan_attention_sdpa_failures);
-    result.vulkan_attention_projection_failures = counter_delta(
-        statistics.vulkan_attention_projection_failures,
-        start.vulkan_attention_projection_failures);
-    result.vulkan_attention_output_failures = counter_delta(
-        statistics.vulkan_attention_output_failures,
-        start.vulkan_attention_output_failures);
-    result.vulkan_attention_submit_failures = counter_delta(
-        statistics.vulkan_attention_submit_failures,
-        start.vulkan_attention_submit_failures);
     result.vulkan_attention_cache_materializations = counter_delta(
         statistics.vulkan_attention_cache_materializations,
         start.vulkan_attention_cache_materializations);
@@ -423,7 +348,7 @@ void Session::begin_generation(uint64_t input_tokens)
     generation_elapsed_microseconds = 0;
     generation_start_time = std::chrono::steady_clock::now();
     generation_first_token_time = {};
-    generation_start_stats = stats;
+    generation_start_counters = runtime_metric_counters(stats, nullptr);
 }
 
 void Session::finish_generation() noexcept
@@ -439,7 +364,7 @@ void Session::finish_generation() noexcept
 SessionMetrics Session::metrics_unlocked() const
 {
     SessionMetrics result;
-    result.generation = runtime_metric_counters(stats, &generation_start_stats);
+    result.generation = runtime_metric_counters(stats, &generation_start_counters);
     result.cumulative = runtime_metric_counters(stats, nullptr);
     result.gpu_available = model->hybrid_mode() != HybridMode::CpuOnly;
     result.timing.active = generation_active;

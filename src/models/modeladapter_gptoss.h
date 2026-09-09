@@ -1,12 +1,12 @@
-#ifndef NCNN_MOE_MODELS_MODELADAPTER_BUILTIN_H
-#define NCNN_MOE_MODELS_MODELADAPTER_BUILTIN_H
+#ifndef NCNN_MOE_MODELS_MODELADAPTER_GPTOSS_H
+#define NCNN_MOE_MODELS_MODELADAPTER_GPTOSS_H
 
 #include "ncnn/moe/modeladapter.h"
 
 namespace ncnn {
 namespace moe {
 
-class BuiltinModelAdapter final : public ModelAdapter
+class GptOssModelAdapter final : public ModelAdapter
 {
 public:
     [[nodiscard]] bool can_load(const ModelManifest& manifest) const override;
@@ -17,4 +17,4 @@ public:
 } // namespace moe
 } // namespace ncnn
 
-#endif // NCNN_MOE_MODELS_MODELADAPTER_BUILTIN_H
+#endif // NCNN_MOE_MODELS_MODELADAPTER_GPTOSS_H

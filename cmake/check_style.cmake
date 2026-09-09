@@ -30,6 +30,26 @@ foreach(SOURCE_FILE IN LISTS NCNN_MOE_STYLE_FILES)
     string(REPLACE "\r\n" "\n" SOURCE_TEXT "${SOURCE_TEXT}")
     file(RELATIVE_PATH RELATIVE_FILE "${NCNN_MOE_SOURCE_DIR}" "${SOURCE_FILE}")
 
+    # Check direct includes at the public API and layer boundaries.
+    string(REGEX MATCHALL "(^|\n)[ \t]*#[ \t]*include[ \t]*[<\"][^>\"]+[>\"]" INCLUDE_DIRECTIVES "${SOURCE_TEXT}")
+    foreach(INCLUDE_DIRECTIVE IN LISTS INCLUDE_DIRECTIVES)
+        if(RELATIVE_FILE MATCHES "^include/" AND INCLUDE_DIRECTIVE MATCHES "[<\"]((src/)?(engine|graph|kernels|models|storage|backends)/|\\.\\./)")
+            string(APPEND NCNN_MOE_STYLE_ERRORS
+                "${RELATIVE_FILE}: public headers must not include runtime internals\n")
+        elseif(RELATIVE_FILE MATCHES "^src/models/" AND INCLUDE_DIRECTIVE MATCHES "[<\"](src/|\\.\\./)?(engine|graph|backends)/")
+            string(APPEND NCNN_MOE_STYLE_ERRORS
+                "${RELATIVE_FILE}: model adapters must not include execution or backend internals\n")
+        elseif(RELATIVE_FILE MATCHES "^src/backends/"
+               AND INCLUDE_DIRECTIVE MATCHES "[<\"]((\\.\\./)*(src/)?models/|ncnn/moe/modeladapter\\.h)")
+            string(APPEND NCNN_MOE_STYLE_ERRORS
+                "${RELATIVE_FILE}: backend code must not include model adapters\n")
+        elseif(RELATIVE_FILE MATCHES "^src/graph/(graph|layerplan)\\.h$"
+               AND INCLUDE_DIRECTIVE MATCHES "[<\"]((\\.\\./)*(src/)?(backends|engine|kernels|models)/[^>\"]+|((\\.\\./)*(src/)?graph/)?compiledoperator\\.h)[>\"]")
+            string(APPEND NCNN_MOE_STYLE_ERRORS
+                "${RELATIVE_FILE}: graph foundation headers must not include backend or execution implementations\n")
+        endif()
+    endforeach()
+
     if(SOURCE_TEXT MATCHES "namespace[ \t]*\\{")
         string(APPEND NCNN_MOE_STYLE_ERRORS "${RELATIVE_FILE}: anonymous namespace is not allowed\n")
     endif()

@@ -9,7 +9,7 @@
 #include "ncnn/moe/result.h"
 #include "ncnn/moe/option.h"
 #include "ncnn/moe/types.h"
-#include "backends/ncnn/vulkancontext.h"
+#include "backends/ncnn/vulkan.h"
 #include "storage/weightstore.h"
 
 #include <cstdint>
@@ -26,7 +26,8 @@ class Model;
 class ExpertCache;
 class ExpertBackend;
 
-// Runtime settings after Auto values have been resolved.
+// Runtime settings after hardware/resource Auto values have been resolved;
+// policy modes such as ExpertIoMode::Auto retain their adaptive meaning.
 struct EffectiveOption
 {
     HybridMode hybrid_mode = HybridMode::CpuOnly;
@@ -34,6 +35,7 @@ struct EffectiveOption
     uint64_t expert_gpu_victim_cache_size = 0;
     uint32_t expert_gpu_victim_reuse_probe_interval = 1;
     uint32_t num_expert_io_threads = 0;
+    ExpertIoMode expert_io_mode = ExpertIoMode::Auto;
     uint32_t vulkan_device_index = automatic_vulkan_device_index;
     std::vector<uint32_t> vulkan_device_indices;
     uint32_t flags = 0;
@@ -43,12 +45,25 @@ struct EffectiveOption
 
 struct SpeculativeModelPlan
 {
+    struct LayerNodes
+    {
+        // Populated with IDs when the speculative graph is built; backend
+        // placement and prefetch flags remain owned by the graph nodes.
+        ExecutionNodeId attention = invalid_execution_node_id;
+        ExecutionNodeId router = invalid_execution_node_id;
+        ExecutionNodeId expert_dispatch = invalid_execution_node_id;
+        ExecutionNodeId expert_group = invalid_execution_node_id;
+        ExecutionNodeId shared_expert_group = invalid_execution_node_id;
+        ExecutionNodeId combine = invalid_execution_node_id;
+    };
+
     // Speculative execution is a separate graph region because its layer
     // payloads are not part of the target model's main layer vector.  The
     // graph is still the sole owner of order, backend placement, and
     // prefetch policy for this region.
     ExecutionGraph graph;
     ExecutionSchedule schedule;
+    std::vector<LayerNodes> layer_nodes;
     std::vector<uint32_t> target_layer_ids;
     TensorHandle mtp_embedding_norm_weight = invalid_tensor_handle;
     TensorHandle mtp_hidden_norm_weight = invalid_tensor_handle;
@@ -93,7 +108,7 @@ struct CompiledModel
     SpeculativeModelPlan speculative;
     std::shared_ptr<ExpertCache> expert_cache;
     std::shared_ptr<ExpertBackend> expert_backend;
-    NcnnVulkanContextInstancePtr vulkan_context_instance;
+    VulkanRuntimePtr vulkan_runtime;
     EffectiveOption opt;
 };
 

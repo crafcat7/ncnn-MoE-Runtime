@@ -1,7 +1,7 @@
 #ifndef NCNN_MOE_METRICS_H
 #define NCNN_MOE_METRICS_H
 
-#include "backends/ncnn/vulkancontext.h"
+#include "backends/ncnn/vulkan.h"
 
 #include <cstddef>
 #include <span>
@@ -10,12 +10,13 @@ namespace ncnn {
 namespace moe {
 
 struct CompiledModel;
-struct CpuDecodeBatchEntry;
+struct DecodeBatchEntry;
 struct ExpertBackendStatistics;
 struct ExpertCacheStatistics;
 struct ExpertVictimCacheStatistics;
 struct ExpertPlan;
 struct SessionStatistics;
+struct RuntimeMetricCounters;
 
 // Shared resource snapshots describe the interval, not exclusive Session work.
 void record_model_resource_delta(
@@ -25,7 +26,7 @@ void record_model_resource_delta(
     const ExpertBackendStatistics& expert_backend_before);
 void record_batch_resource_delta(
     const CompiledModel& model,
-    std::span<const CpuDecodeBatchEntry> entries,
+    std::span<const DecodeBatchEntry> entries,
     const ExpertCacheStatistics& cache_before,
     const ExpertBackendStatistics& backend_before);
 
@@ -38,8 +39,9 @@ void record_expert_cache_delta(
 
 void record_vulkan_execution_delta(
     SessionStatistics& statistics,
-    const NcnnVulkanExecutionSnapshot& before,
-    const NcnnVulkanContextInstancePtr& context_instance);
+    const VulkanStatistics& before,
+    const VulkanStatistics& after);
+
 void record_expert_backend_delta(
     SessionStatistics& statistics,
     const ExpertBackendStatistics& before,
@@ -48,6 +50,10 @@ void record_expert_victim_cache_delta(
     SessionStatistics& statistics,
     const ExpertVictimCacheStatistics& before,
     const ExpertVictimCacheStatistics& after);
+
+RuntimeMetricCounters runtime_metric_counters(
+    const SessionStatistics& statistics,
+    const RuntimeMetricCounters* baseline);
 
 } // namespace moe
 } // namespace ncnn

@@ -106,10 +106,6 @@ struct RuntimeInfo
 
 class Runtime
 {
-private:
-    std::vector<std::shared_ptr<ModelAdapter>> adapters;
-    RuntimeInfo runtime_info;
-
 public:
     Runtime();
 
@@ -128,6 +124,10 @@ public:
     [[nodiscard]] Result<SessionPtr> create_session(const ModelPtr& model, const SessionOptions& opt = {});
 
     [[nodiscard]] Result<BatchSchedulerPtr> create_scheduler(const SchedulerOptions& opt = {});
+
+private:
+    std::vector<std::shared_ptr<ModelAdapter>> adapters;
+    RuntimeInfo runtime_info;
 };
 
 } // namespace moe

@@ -89,6 +89,18 @@ static const char* expert_memory_mode_name(ExpertMemoryMode mode) noexcept
     return "unknown";
 }
 
+static const char* expert_io_mode_name(ExpertIoMode mode) noexcept
+{
+    switch (mode)
+    {
+    case ExpertIoMode::Auto: return "auto";
+    case ExpertIoMode::Mmap: return "mmap";
+    case ExpertIoMode::Direct: return "direct";
+    case ExpertIoMode::Buffered: return "buffered";
+    }
+    return "unknown";
+}
+
 static const char* vulkan_type_name(VulkanDeviceType type) noexcept
 {
     switch (type)
@@ -191,21 +203,6 @@ static std::string gpu_metrics_json(const RuntimeMetricCounters& counters, bool 
     result.add_uint("attention_qkv_rope_fusions", counters.vulkan_attention_qkv_rope_fusions);
     result.add_uint("attention_device_rope_fusions", counters.vulkan_attention_device_rope_fusions);
     result.add_uint("attention_qkv_ring_fusions", counters.vulkan_attention_qkv_ring_fusions);
-    result.add_uint("attention_qkv_rope_pipeline_failures", counters.vulkan_attention_qkv_rope_pipeline_failures);
-    result.add_uint("attention_qkv_rope_shape_failures", counters.vulkan_attention_qkv_rope_shape_failures);
-    result.add_uint("attention_qkv_rope_source_failures", counters.vulkan_attention_qkv_rope_source_failures);
-    result.add_uint("attention_qkv_rope_norm_failures", counters.vulkan_attention_qkv_rope_norm_failures);
-    result.add_uint("attention_qkv_rope_ring_failures", counters.vulkan_attention_qkv_rope_ring_failures);
-    result.add_uint("attention_qkv_rope_allocation_failures", counters.vulkan_attention_qkv_rope_allocation_failures);
-    result.add_uint("attention_precondition_failures", counters.vulkan_attention_precondition_failures);
-    result.add_uint("attention_staging_failures", counters.vulkan_attention_staging_failures);
-    result.add_uint("attention_norm_failures", counters.vulkan_attention_norm_failures);
-    result.add_uint("attention_qkv_failures", counters.vulkan_attention_qkv_failures);
-    result.add_uint("attention_cache_failures", counters.vulkan_attention_cache_failures);
-    result.add_uint("attention_sdpa_failures", counters.vulkan_attention_sdpa_failures);
-    result.add_uint("attention_projection_failures", counters.vulkan_attention_projection_failures);
-    result.add_uint("attention_output_failures", counters.vulkan_attention_output_failures);
-    result.add_uint("attention_submit_failures", counters.vulkan_attention_submit_failures);
     result.add_uint("attention_cache_materializations", counters.vulkan_attention_cache_materializations);
     result.add_uint("attention_cpu_fallbacks", counters.vulkan_attention_cpu_fallbacks);
     if (available)
@@ -500,9 +497,6 @@ static CpuPackedWeightMode parse_cpu_packed_weight_mode(
 static Option parse_options(int argc, char** argv, int first_argument)
 {
     Option result;
-    const auto set_expert_io_mode = [&result](uint32_t mode) {
-        result.flags = (result.flags & ~OptionExpertIoMask) | mode;
-    };
     for (int index = first_argument; index < argc; ++index)
     {
         const std::string argument = argv[index];
@@ -536,11 +530,11 @@ static Option parse_options(int argc, char** argv, int first_argument)
         else if (argument == "--expected-concurrency")
             result.num_concurrent_sessions = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expected-concurrency")));
         else if (argument == "--mmap-experts")
-            set_expert_io_mode(OptionMemoryMapExperts);
+            result.expert_io_mode = ExpertIoMode::Mmap;
         else if (argument == "--direct-expert-io")
-            set_expert_io_mode(OptionDirectExpertIo);
+            result.expert_io_mode = ExpertIoMode::Direct;
         else if (argument == "--buffered-expert-io")
-            set_expert_io_mode(OptionBufferedExpertIo);
+            result.expert_io_mode = ExpertIoMode::Buffered;
         else if (argument == "--disable-gpu-victim-execution")
             result.flags |= OptionDisableGpuVictimExecution;
         else if (argument == "--disable-gpu-expert-execution")
@@ -658,6 +652,7 @@ private:
         resources.add_string("backend", hybrid_mode_name(effective.hybrid_mode));
         resources.add_string("requested_expert_memory", expert_memory_mode_name(memory_plan.requested_mode));
         resources.add_string("selected_expert_memory", expert_memory_mode_name(memory_plan.selected_mode));
+        resources.add_string("expert_io_mode", expert_io_mode_name(effective.expert_io_mode));
         resources.add_string("requested_cpu_packed_weights", cpu_packed_weights);
         resources.add_string("selected_cpu_packed_weights", cpu_packed_weights);
         resources.add_uint("host_memory_budget_bytes", memory_plan.host_memory_budget);

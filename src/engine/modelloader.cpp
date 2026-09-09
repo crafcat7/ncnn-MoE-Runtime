@@ -8,7 +8,7 @@
 #include "storage/expertcache.h"
 #include "storage/expertcache_victim.h"
 #include "graph/memoryplan.h"
-#include "backends/ncnn/vulkancontext.h"
+#include "backends/ncnn/vulkan.h"
 #include "backends/ncnn/expertbackend_vulkan.h"
 
 #include <algorithm>
@@ -22,15 +22,13 @@
 namespace ncnn {
 namespace moe {
 
-static bool cpu_packed_weights_supported(
+static bool support_cpu_packed_weights(
     const MoeModelDescriptor& descriptor,
     const Option& opt) noexcept
 {
     for (const LayerDescriptor& layer : descriptor.layers)
     {
-        if (layer.ffn.kind != FfnKind::Moe)
-            continue;
-        const DType dtype = layer.ffn.moe.expert_weight_dtype;
+        const DType dtype = layer.moe.expert_weight_dtype;
         if (is_qnk_dtype(dtype))
             return true;
         if (dtype == DType::MxFp4
@@ -152,22 +150,29 @@ static uint64_t sum_sizes(const std::vector<uint64_t>& sizes) noexcept
 ModelLoader::ModelLoader(
     const RuntimeInfo& _info,
     const std::vector<std::shared_ptr<ModelAdapter>>& _adapters,
-    const Option& _opt)
+    const Option& _opt,
+    CompiledModel& _model)
     : info(_info),
       adapters(_adapters),
-      opt(_opt)
+      opt(_opt),
+      model(_model)
 {
 }
 
-Result<void> ModelLoader::sanitize_option()
+Result<void> ModelLoader::validate_option()
 {
-    const bool use_mmap = has_flag(opt.flags, OptionMemoryMapExperts);
-    const bool use_direct_io = has_flag(opt.flags, OptionDirectExpertIo);
-    const bool use_buffered_io = has_flag(opt.flags, OptionBufferedExpertIo);
-    if (use_mmap && (use_direct_io || use_buffered_io))
-        return Error{ErrorCode::InvalidArgument, "memory-mapped and explicit Expert I/O modes are mutually exclusive"};
-    if (use_direct_io && use_buffered_io)
-        return Error{ErrorCode::InvalidArgument, "direct and buffered Expert I/O are mutually exclusive"};
+    if (opt.hybrid_mode != HybridMode::CpuOnly
+        && opt.hybrid_mode != HybridMode::HybridExperts
+        && opt.hybrid_mode != HybridMode::Auto)
+        return Error{ErrorCode::InvalidArgument, "invalid HybridMode"};
+    if (opt.cpu_packed_weight_mode != CpuPackedWeightMode::Disabled
+        && opt.cpu_packed_weight_mode != CpuPackedWeightMode::Enabled)
+        return Error{ErrorCode::InvalidArgument, "invalid CpuPackedWeightMode"};
+    if (opt.expert_io_mode != ExpertIoMode::Auto
+        && opt.expert_io_mode != ExpertIoMode::Mmap
+        && opt.expert_io_mode != ExpertIoMode::Direct
+        && opt.expert_io_mode != ExpertIoMode::Buffered)
+        return Error{ErrorCode::InvalidArgument, "invalid ExpertIoMode"};
     if (opt.expert_gpu_victim_reuse_probe_interval == 0 || opt.expert_gpu_victim_reuse_probe_interval > 1024)
         return Error{ErrorCode::InvalidArgument, "Expert GPU victim reuse-probe interval must be between 1 and 1024"};
     if (opt.num_concurrent_sessions == 0 || opt.num_concurrent_sessions > 1024)
@@ -228,15 +233,23 @@ Result<void> ModelLoader::resolve_gpu_devices()
 
 Result<void> ModelLoader::load_package(const std::filesystem::path& model_path)
 {
-    std::filesystem::path root = model_path;
+    if (model_path.empty())
+        return Error{ErrorCode::InvalidArgument, "model path cannot be empty"};
+
+    std::error_code absolute_error;
+    const std::filesystem::path resolved_model_path = std::filesystem::absolute(model_path, absolute_error);
+    if (absolute_error || resolved_model_path.empty())
+        return Error{ErrorCode::IoError, "cannot resolve model path: " + model_path.string()};
+
+    std::filesystem::path root = resolved_model_path;
     std::filesystem::path manifest_path;
     std::error_code ec;
-    if (std::filesystem::is_directory(model_path, ec))
-        manifest_path = model_path / "config.json";
+    if (std::filesystem::is_directory(resolved_model_path, ec))
+        manifest_path = resolved_model_path / "config.json";
     else
     {
-        manifest_path = model_path;
-        root = model_path.parent_path();
+        manifest_path = resolved_model_path;
+        root = resolved_model_path.parent_path();
     }
 
     auto manifest_json = read_text_file(manifest_path);
@@ -278,7 +291,7 @@ Result<void> ModelLoader::plan_memory()
     const bool use_vulkan_dense_host_release = use_vulkan_compute && has_flag(opt.flags, OptionReleaseVulkanDenseHostStorage);
     const bool reserve_cpu_packed_weights = opt.cpu_packed_weight_mode == CpuPackedWeightMode::Enabled;
 
-    if (reserve_cpu_packed_weights && !cpu_packed_weights_supported(descriptor, opt))
+    if (reserve_cpu_packed_weights && !support_cpu_packed_weights(descriptor, opt))
     {
         return Error{
             ErrorCode::UnsupportedModel,
@@ -307,17 +320,14 @@ Result<void> ModelLoader::plan_memory()
                                            descriptor.layers.begin(),
                                            descriptor.layers.end(),
                                            [](const LayerDescriptor& layer) {
-                                               return layer.ffn.kind != FfnKind::Moe
-                                                      || layer.ffn.moe.expert_weight_dtype == DType::MxFp4;
+                                               return layer.moe.expert_weight_dtype == DType::MxFp4;
                                            });
     const bool support_gpu_cache = use_file_backed_experts
                                    && std::all_of(
                                        descriptor.layers.begin(),
                                        descriptor.layers.end(),
                                        [](const LayerDescriptor& layer) {
-                                           if (layer.ffn.kind != FfnKind::Moe)
-                                               return true;
-                                           const MoeDescriptor& moe = layer.ffn.moe;
+                                           const MoeDescriptor& moe = layer.moe;
                                            return moe.expert_weight_dtype == DType::MxFp4
                                                   || (moe.expert_weight_dtype == DType::BFloat16
                                                       && has_flag(moe.flags, MoeDescriptorFileBackedExperts));
@@ -366,9 +376,10 @@ Result<void> ModelLoader::compile_model()
     if (opt.vulkan_device_index != automatic_vulkan_device_index)
         gpu_info = &info.gpu_infos[opt.vulkan_device_index];
 
-    const NcnnVulkanContextInstancePtr vkctx = create_ncnn_vulkan_context_instance();
     CompilerOption compiler_opt;
     compiler_opt.flags = 0;
+    if (use_vulkan_compute)
+        compiler_opt.vulkan_runtime = create_vulkan_runtime();
     compiler_opt.device_index = opt.vulkan_device_index;
     compiler_opt.num_concurrent_sessions = opt.num_concurrent_sessions;
     compiler_opt.gpu_heap_budget = gpu_info ? gpu_info->heap_budget : 0;
@@ -392,7 +403,6 @@ Result<void> ModelLoader::compile_model()
     }
 
     compiler_opt.optimization_flags = opt.optimization_flags;
-    compiler_opt.vkctx = vkctx;
     compiler_opt.device_indices = opt.vulkan_device_indices;
     compiler_opt.device_scores.reserve(opt.vulkan_device_indices.size());
     for (uint32_t device_index : opt.vulkan_device_indices)
@@ -419,31 +429,20 @@ Result<void> ModelLoader::compile_model()
         compiler_opt.flags |= BackendMxfp4CpuKernel;
     if (use_file_backed_experts)
         compiler_opt.flags |= BackendFileBackedExperts;
-    else
-        compiler_opt.flags |= BackendRetainCpuDenseCopies;
     if (use_vulkan_dense_host_release && use_file_backed_experts)
         compiler_opt.flags |= BackendReleaseVulkanDenseHostStorage;
 
-    auto compiled = ncnn::moe::compile_model(
+    auto ret = ncnn::moe::compile_model(
         std::move(descriptor),
         std::move(weights).value(),
+        model,
         opt.hybrid_mode,
         compiler_opt);
-    if (!compiled)
-        return compiled.error();
+    if (!ret)
+        return ret.error();
 
-    model = std::move(compiled).value();
     model.memory_plan = plan;
     return {};
-}
-
-void ModelLoader::set_effective_option()
-{
-    EffectiveOption& effective_opt = model.opt;
-    effective_opt.expert_gpu_cache_size = opt.expert_gpu_cache_size;
-    effective_opt.expert_gpu_victim_cache_size = opt.expert_gpu_victim_cache_size;
-    effective_opt.expert_gpu_victim_reuse_probe_interval = opt.expert_gpu_victim_reuse_probe_interval;
-    effective_opt.flags = opt.flags;
 }
 
 uint32_t ModelLoader::resolve_expert_io_threads() const
@@ -467,39 +466,27 @@ uint32_t ModelLoader::resolve_expert_io_threads() const
     return std::min(max_io_threads, resolve_cpu_thread_budget().num_io_threads);
 }
 
-uint32_t ModelLoader::expert_cache_flags() const noexcept
-{
-    uint32_t flags = 0;
-    if (has_flag(opt.flags, OptionMemoryMapExperts))
-        flags |= ExpertCacheMemoryMapRanges;
-    if (has_flag(opt.flags, OptionDirectExpertIo))
-        flags |= ExpertCacheDirectReads;
-    if (has_flag(opt.flags, OptionBufferedExpertIo))
-        flags |= ExpertCacheBufferedReads;
-    if (has_flag(opt.flags, OptionForwardAwareCache))
-        flags |= ExpertCacheForwardAwareEviction;
-    if (has_flag(opt.flags, OptionRouterPrediction))
-        flags |= ExpertCacheAllowSpeculativeEviction;
-    if (has_flag(opt.flags, OptionCrossExpertReadCoalescing))
-        flags |= ExpertCacheCrossExpertReadCoalescing;
-    return flags;
-}
-
 Result<void> ModelLoader::resolve_gpu_cache_sizes(
     std::vector<uint64_t>& gpu_cache_sizes,
     std::vector<uint64_t>& gpu_victim_cache_sizes)
 {
     const std::vector<uint32_t>& device_indices = model.opt.vulkan_device_indices;
-    std::vector<GpuInfo> gpu_infos = info.gpu_infos;
+    std::vector<GpuInfo> live_gpu_infos;
+
+#if defined(NCNN_MOE_WITH_VULKAN) && NCNN_MOE_WITH_VULKAN
+    if (use_auto_gpu_cache)
+    {
+        // Dense weights have already been allocated, so use the live budget.
+        live_gpu_infos = get_gpu_infos();
+    }
+#endif
+    const std::vector<GpuInfo>& gpu_infos = use_auto_gpu_cache
+                                                    && live_gpu_infos.size() == info.gpu_infos.size()
+                                                ? live_gpu_infos
+                                                : info.gpu_infos;
 
     if (use_auto_gpu_cache)
     {
-#if defined(NCNN_MOE_WITH_VULKAN) && NCNN_MOE_WITH_VULKAN
-        // Dense weights have already been allocated, so use the live budget.
-        std::vector<GpuInfo> live_gpu_infos = get_gpu_infos();
-        if (live_gpu_infos.size() == gpu_infos.size())
-            gpu_infos = std::move(live_gpu_infos);
-#endif
         std::vector<uint64_t> sizes = get_auto_gpu_cache_sizes(
             plan.expert_pair_size,
             device_indices,
@@ -571,7 +558,7 @@ Result<std::shared_ptr<ExpertVictimCache>> ModelLoader::create_expert_victim_cac
         auto shard = create_vulkan_victim_cache(
             gpu_victim_cache_sizes[i],
             device_indices[i],
-            model.vulkan_context_instance,
+            model.vulkan_runtime,
             model.opt.optimization_flags);
         if (!shard)
             return Error{ErrorCode::UnsupportedModel, "cannot create an Expert GPU victim-cache shard"};
@@ -609,7 +596,7 @@ Result<void> ModelLoader::create_expert_backend(
             gpu_cache_sizes[i],
             device_indices[i],
             !use_victim_source ? std::shared_ptr<ExpertVictimCache>() : victim_caches[i],
-            model.vulkan_context_instance,
+            model.vulkan_runtime,
             model.opt.optimization_flags);
         if (!backend)
             return Error{ErrorCode::UnsupportedModel, "cannot create a Vulkan Expert execution cache/source backend"};
@@ -644,12 +631,15 @@ Result<void> ModelLoader::create_expert_backend(
 
 Result<void> ModelLoader::configure_expert_cache()
 {
-    set_effective_option();
+    model.opt.expert_io_mode = opt.expert_io_mode;
+    model.opt.expert_gpu_cache_size = opt.expert_gpu_cache_size;
+    model.opt.expert_gpu_victim_cache_size = opt.expert_gpu_victim_cache_size;
+    model.opt.expert_gpu_victim_reuse_probe_interval = opt.expert_gpu_victim_reuse_probe_interval;
+    model.opt.flags = opt.flags;
     if (model.memory_plan.selected_mode != ExpertMemoryMode::OnDemand)
         return {};
 
     const uint32_t num_io_threads = resolve_expert_io_threads();
-    const uint32_t cache_flags = expert_cache_flags();
     model.opt.num_expert_io_threads = num_io_threads;
 
     std::vector<uint64_t> gpu_cache_sizes;
@@ -669,10 +659,19 @@ Result<void> ModelLoader::configure_expert_cache()
     if (group_count > std::numeric_limits<uint32_t>::max())
         return Error{ErrorCode::InvalidModel, "the total Expert residency-group count overflows"};
 
+    uint32_t cache_flags = 0;
+    if (has_flag(opt.flags, OptionForwardAwareCache))
+        cache_flags |= ExpertCacheForwardAwareEviction;
+    if (has_flag(opt.flags, OptionRouterPrediction))
+        cache_flags |= ExpertCacheAllowSpeculativeEviction;
+    if (has_flag(opt.flags, OptionCrossExpertReadCoalescing))
+        cache_flags |= ExpertCacheCrossExpertReadCoalescing;
+
     model.expert_cache = std::make_shared<ExpertCache>(
         plan.expert_cache_size,
         num_io_threads,
         std::move(victim_cache).value(),
+        opt.expert_io_mode,
         cache_flags,
         static_cast<uint32_t>(group_count),
         has_flag(model.opt.optimization_flags, OptimizationCpuPackedWeights));
@@ -729,7 +728,7 @@ Result<void> ModelLoader::configure_resident_qnk_backend()
         cache_size,
         opt.vulkan_device_index,
         nullptr,
-        model.vulkan_context_instance,
+        model.vulkan_runtime,
         model.opt.optimization_flags);
     if (!backend)
         return Error{ErrorCode::UnsupportedModel, "cannot create the Vulkan Qn_K Expert execution backend"};
@@ -739,9 +738,9 @@ Result<void> ModelLoader::configure_resident_qnk_backend()
     return {};
 }
 
-Result<CompiledModel> ModelLoader::load(const std::filesystem::path& model_path)
+Result<void> ModelLoader::load(const std::filesystem::path& model_path)
 {
-    auto ret = sanitize_option();
+    auto ret = validate_option();
     if (!ret)
         return ret.error();
     ret = resolve_gpu_devices();
@@ -767,7 +766,7 @@ Result<CompiledModel> ModelLoader::load(const std::filesystem::path& model_path)
     if (!ret)
         return ret.error();
 
-    return std::move(model);
+    return {};
 }
 
 } // namespace moe

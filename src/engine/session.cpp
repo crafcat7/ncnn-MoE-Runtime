@@ -1,6 +1,7 @@
 #include "ncnn/moe/session.h"
 
 #include "executor.h"
+#include "metrics.h"
 #include "sessionstate.h"
 #include "expertbackend.h"
 #include "graph/compiledmodel.h"
@@ -54,7 +55,7 @@ uint32_t Session::get_max_context_length(const MoeModelDescriptor& descriptor) n
 
 Session::Session(ModelPtr _model, const SessionOptions& opt)
     : model(std::move(_model)),
-      state(new CpuSessionState),
+      state(new SessionState),
       random_generator(opt.sampling_seed),
       prefill_chunk_size(opt.prefill_chunk_size),
       use_speculative_context(
@@ -72,8 +73,15 @@ void Session::commit_execution(uint64_t prefill_tokens, uint64_t decode_tokens)
     stats.prefill_tokens += prefill_tokens;
     stats.decode_tokens += decode_tokens;
     token_count += prefill_tokens + decode_tokens;
-    stats.kv_cache_logical_size = state->kv_cache_logical_size();
-    stats.kv_cache_allocated_size = state->kv_cache_allocated_size();
+    uint64_t kv_cache_logical_size = 0;
+    uint64_t kv_cache_allocated_size = 0;
+    for (const LayerCache& layer : state->layers)
+    {
+        kv_cache_logical_size += layer.logical_bytes();
+        kv_cache_allocated_size += layer.allocated_bytes();
+    }
+    stats.kv_cache_logical_size = kv_cache_logical_size;
+    stats.kv_cache_allocated_size = kv_cache_allocated_size;
 }
 
 Result<PrefillResult> Session::prefill_unlocked(std::span<const int32_t> input_ids)
@@ -96,7 +104,16 @@ Result<PrefillResult> Session::prefill_unlocked(std::span<const int32_t> input_i
         const size_t remaining_tokens = input_ids.size() - processed_tokens;
         const size_t chunk_size = prefill_chunk_size == 0 ? remaining_tokens : std::min<size_t>(remaining_tokens, prefill_chunk_size);
         const std::span<const int32_t> chunk = input_ids.subspan(processed_tokens, chunk_size);
-        auto chunk_logits = forward_model(compiled, chunk, updated_statistics, *state, token_count + processed_tokens);
+        const LogitsOutput logits_output = processed_tokens + chunk_size == input_ids.size()
+                                               ? LogitsOutput::Last
+                                               : LogitsOutput::None;
+        auto chunk_logits = forward_model(
+            compiled,
+            chunk,
+            updated_statistics,
+            *state,
+            token_count + processed_tokens,
+            logits_output);
         if (!chunk_logits)
             return chunk_logits.error();
         auto speculative_context = update_speculative_context(
@@ -105,7 +122,17 @@ Result<PrefillResult> Session::prefill_unlocked(std::span<const int32_t> input_i
             *state);
         if (!speculative_context)
             return speculative_context.error();
-        final_logits = std::move(chunk_logits.value().back());
+        std::vector<std::vector<float>>& rows = chunk_logits.value();
+        if (logits_output == LogitsOutput::Last)
+        {
+            if (rows.size() != 1)
+                return Error{ErrorCode::InternalError, "final prefill chunk produced an invalid logits row count"};
+            final_logits = std::move(rows.front());
+        }
+        else if (!rows.empty())
+        {
+            return Error{ErrorCode::InternalError, "intermediate prefill chunk produced unexpected logits"};
+        }
         processed_tokens += chunk_size;
     }
 
@@ -122,7 +149,7 @@ Result<PrefillResult> Session::prefill(std::span<const int32_t> input_ids)
     const std::lock_guard<std::mutex> lock(mutex);
     auto result = prefill_unlocked(input_ids);
     if (result)
-        generation_start_stats = stats;
+        generation_start_counters = runtime_metric_counters(stats, nullptr);
     return result;
 }
 
@@ -158,7 +185,7 @@ Result<DecodeResult> Session::decode(int32_t input_id)
     const std::lock_guard<std::mutex> lock(mutex);
     auto result = decode_unlocked(input_id);
     if (result)
-        generation_start_stats = stats;
+        generation_start_counters = runtime_metric_counters(stats, nullptr);
     return result;
 }
 
@@ -170,9 +197,9 @@ Result<void> Session::reset()
     stats.expert_token_counts.resize(model->descriptor().expert_count, 0);
     stats_scratch = {};
     stats_scratch.expert_token_counts.resize(model->descriptor().expert_count, 0);
-    state.reset(new CpuSessionState);
+    state.reset(new SessionState);
     state->use_speculative_context = use_speculative_context;
-    generation_start_stats = {};
+    generation_start_counters = {};
     generation_active = false;
     generation_input_tokens = 0;
     generation_output_tokens = 0;
@@ -322,7 +349,7 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                                           == SpeculativeModelKind::Mtp;
     const auto begin_cache_transaction =
         [state_cache_transactions](
-            std::span<CpuLayerCache> caches,
+            std::span<LayerCache> caches,
             size_t expected_rows) -> Result<void> {
         if (state_cache_transactions)
         {
@@ -335,7 +362,7 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
     };
     const auto finish_cache_transaction =
         [state_cache_transactions](
-            std::span<CpuLayerCache> caches,
+            std::span<LayerCache> caches,
             size_t committed_rows) -> Result<void> {
         return state_cache_transactions
                    ? finish_state_cache_transaction(
@@ -500,7 +527,7 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
 
                 std::vector<std::vector<float>> logits;
                 logits.reserve(verify_input_ids.size());
-                CpuBatch verified_hidden(
+                ActivationBuffer verified_hidden(
                     verify_input_ids.size(),
                     compiled.descriptor.hidden_size);
                 for (size_t index = 0;

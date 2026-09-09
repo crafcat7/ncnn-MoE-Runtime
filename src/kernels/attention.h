@@ -1,7 +1,7 @@
 #ifndef NCNN_MOE_ATTENTION_H
 #define NCNN_MOE_ATTENTION_H
 
-#include "activation.h"
+#include "activationbuffer.h"
 
 #include "graph/layerplan.h"
 #include "graph/graph.h"
@@ -11,26 +11,44 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace ncnn {
 namespace moe {
 
-struct CpuLayerCache;
+class CompiledOperatorTable;
+struct LayerCache;
 
-struct CpuAttentionExecutionScratch
+struct LatentAttentionRowContext
 {
-    CpuBatch normalized;
-    CpuBatch query;
-    CpuBatch key;
-    CpuBatch value;
-    CpuBatch fused_qkv;
-    CpuBatch attention;
-    CpuBatch gate;
-    CpuBatch projected;
-    CpuBatch output;
-    CpuBatch qsa_query_key;
-    CpuBatch qsa_query;
+    uint64_t window_begin = 0;
+    uint32_t window_count = 0;
+    uint32_t compressed_count = 0;
+    bool selected_compressed_indices = false;
+    std::span<const uint32_t> compressed_indices;
+    std::span<float> logits;
+};
+
+// Scratch storage is exclusive to one in-flight attention call.
+struct AttentionScratch
+{
+    ActivationBuffer normalized;
+    ActivationBuffer query;
+    ActivationBuffer key;
+    ActivationBuffer value;
+    ActivationBuffer fused_qkv;
+    ActivationBuffer attention;
+    ActivationBuffer gate;
+    ActivationBuffer projected;
+    ActivationBuffer output;
+    ActivationBuffer qsa_query_key;
+    ActivationBuffer qsa_query;
+    ActivationBuffer quantized_input;
+    ActivationBuffer latent_compressor_values;
+    ActivationBuffer latent_compressor_scores;
+    ActivationBuffer latent_index_compressor_values;
+    ActivationBuffer latent_index_compressor_scores;
     std::vector<float> key_cache;
     std::vector<float> value_cache;
     std::vector<float> logits;
@@ -41,25 +59,29 @@ struct CpuAttentionExecutionScratch
     std::vector<float> flash_partial_output;
     std::vector<float> rope_cosine;
     std::vector<float> rope_sine;
+    std::vector<LatentAttentionRowContext> latent_row_contexts;
+    std::vector<std::pair<const LayerCache*, uint32_t>> latent_projected_compressed_counts;
+    std::vector<uint64_t> latent_positions;
+    std::vector<LayerCache*> latent_caches;
 };
 
-struct CpuAttentionBatchEntry
+struct AttentionBatchEntry
 {
     uint64_t position_offset = 0;
-    CpuLayerCache* cache = nullptr;
-    CpuAttentionExecutionScratch* scratch = nullptr;
-    const CpuBatch* hidden = nullptr;
-    CpuBatch* output = nullptr;
+    LayerCache* cache = nullptr;
+    AttentionScratch* scratch = nullptr;
+    const ActivationBuffer* hidden = nullptr;
+    ActivationBuffer* output = nullptr;
 };
 
-[[nodiscard]] Result<bool> execute_attention_block_batch_into(
+[[nodiscard]] Result<bool> forward_attention_batch(
     const CompiledOperatorTable& operators,
     const AttentionBlockPlan& plan,
     ExecutionBackend backend,
-    std::span<CpuAttentionBatchEntry> entries,
+    std::span<AttentionBatchEntry> entries,
     uint64_t optimization_flags);
 
-[[nodiscard]] Result<void> execute_attention_block_into(
+[[nodiscard]] Result<void> forward_attention(
     const WeightStore& weights,
     const CompiledOperatorTable& operators,
     const AttentionBlockPlan& plan,
@@ -67,13 +89,13 @@ struct CpuAttentionBatchEntry
     float norm_epsilon,
     DType kv_cache_dtype,
     uint64_t position_offset,
-    CpuLayerCache& cache,
-    CpuAttentionExecutionScratch& scratch,
-    const CpuBatch& hidden,
-    CpuBatch& output,
+    LayerCache& cache,
+    AttentionScratch& scratch,
+    const ActivationBuffer& hidden,
+    ActivationBuffer& output,
     uint64_t optimization_flags);
 
-[[nodiscard]] Result<void> append_attention_context_into(
+[[nodiscard]] Result<void> append_attention_context(
     const WeightStore& weights,
     const CompiledOperatorTable& operators,
     const AttentionBlockPlan& plan,
@@ -81,9 +103,9 @@ struct CpuAttentionBatchEntry
     float norm_epsilon,
     DType kv_cache_dtype,
     uint64_t position_offset,
-    CpuLayerCache& cache,
-    CpuAttentionExecutionScratch& scratch,
-    const CpuBatch& hidden,
+    LayerCache& cache,
+    AttentionScratch& scratch,
+    const ActivationBuffer& hidden,
     uint64_t optimization_flags);
 
 } // namespace moe

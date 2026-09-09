@@ -47,6 +47,12 @@ static float optional_float(const std::string& json, const std::string& key, flo
     }
 }
 
+static uint32_t optional_uint32(const std::string& json, const std::string& key, uint32_t fallback)
+{
+    auto value = required_uint32(json, key);
+    return value ? value.value() : fallback;
+}
+
 static bool optional_bool(const std::string& json, const std::string& key, bool fallback)
 {
     const std::regex expression("\\\"" + key + "\\\"\\s*:\\s*(true|false)");
@@ -181,6 +187,14 @@ public:
             std::memcpy(tensor.quantization_scales.data(), bytes_.data() + offset_, scale_count * sizeof(float));
             offset_ += scale_count * sizeof(float);
         }
+        else if (dtype == DType::Int64)
+        {
+            if (count > remaining() / sizeof(int64_t))
+                return Error{ErrorCode::InvalidModel, "weight file ends before int64 tensor: " + name};
+            tensor.int64_data.resize(count);
+            std::memcpy(tensor.int64_data.data(), bytes_.data() + offset_, count * sizeof(int64_t));
+            offset_ += count * sizeof(int64_t);
+        }
         else
         {
             return Error{ErrorCode::UnsupportedModel, "unsupported tensor dtype: " + name};
@@ -260,6 +274,7 @@ Result<MoeModelDescriptor> FixtureModelAdapter::parse_model(const ModelPackage& 
     descriptor.intermediate_size = intermediate_size.value();
     descriptor.expert_count = expert_count.value();
     descriptor.experts_per_token = top_k.value();
+    descriptor.hash_routing_layer_count = optional_uint32(json, "hash_routing_layer_count", 0);
     descriptor.kv_cache_dtype = kv_cache_dtype.value();
     descriptor.norm_epsilon = optional_float(json, "norm_epsilon", 1e-5f);
 
@@ -312,7 +327,7 @@ Result<MoeModelDescriptor> FixtureModelAdapter::parse_model(const ModelPackage& 
     for (uint32_t layer_id = 0; layer_id < layer_count.value(); ++layer_id)
     {
         LayerDescriptor& layer = descriptor.layers[layer_id];
-        layer.ffn.moe = moe;
+        layer.moe = moe;
         if (use_attention)
         {
             layer.pre_attention_norm = NormType::RmsNorm;
@@ -357,7 +372,7 @@ Result<WeightMapping> FixtureModelAdapter::map_weights(const ModelPackage& packa
 
     for (uint32_t layer_id = 0; layer_id < descriptor.layers.size(); ++layer_id)
     {
-        const MoeDescriptor& moe = descriptor.layers[layer_id].ffn.moe;
+        const MoeDescriptor& moe = descriptor.layers[layer_id].moe;
         const std::string layer = layer_prefix(layer_id);
         if (descriptor.layers[layer_id].attention.kind != AttentionKind::None)
         {
@@ -447,6 +462,18 @@ Result<WeightMapping> FixtureModelAdapter::map_weights(const ModelPackage& packa
     status = add("lm_head.weight", {descriptor.vocabulary_size, descriptor.hidden_size}, DType::Float32);
     if (!status)
         return status.error();
+
+    for (uint32_t layer_id = 0;
+         layer_id < descriptor.layers.size() && layer_id < descriptor.hash_routing_layer_count;
+         ++layer_id)
+    {
+        status = add(
+            layer_prefix(layer_id) + "router.token_experts",
+            {descriptor.vocabulary_size, descriptor.layers[layer_id].moe.top_k},
+            DType::Int64);
+        if (!status)
+            return status.error();
+    }
 
     if (!reader.exhausted())
     {

@@ -1,7 +1,7 @@
 #ifndef NCNN_MOE_OPS_H
 #define NCNN_MOE_OPS_H
 
-#include "activation.h"
+#include "activationbuffer.h"
 #include "mxfp4.h"
 
 #include "ncnn/moe/types.h"
@@ -23,24 +23,26 @@ struct Mxfp4Task
     const TensorData* down = nullptr;
     const TensorData* down_bias = nullptr;
     const CompiledOperator* down_operator = nullptr;
-    const CpuBatch* input = nullptr;
-    CpuBatch* output = nullptr;
+    const ActivationBuffer* input = nullptr;
+    ActivationBuffer* output = nullptr;
     ExpertActivation activation = ExpertActivation::GptOssSwiGlu;
     float activation_limit = 0.0f;
 };
 
 struct Mxfp4Scratch
 {
-    std::vector<CpuBatch> activated;
-    std::vector<CpuBatch> linear;
+    std::vector<ActivationBuffer> activated;
+    std::vector<ActivationBuffer> linear;
     // Temporary full gate/up output used when the immutable MXFP4 weights
     // have a persistent 4/8-row Q8 packed sidecar.  The sidecar itself lives
     // on the compiled operator owner; these buffers are reused by the
     // caller's scratch.
-    std::vector<CpuBatch> packed_gate_up;
+    std::vector<ActivationBuffer> packed_gate_up;
+    std::vector<Mxfp4Q8Batch> q8_inputs;
+    std::vector<size_t> q8_input_owner;
     std::vector<Mxfp4Q8Batch> q8_activated;
-    std::vector<CpuBatch> unique_input;
-    std::vector<CpuBatch> unique_output;
+    std::vector<ActivationBuffer> unique_input;
+    std::vector<ActivationBuffer> unique_output;
     std::vector<std::vector<uint32_t>> unique_row_maps;
     std::vector<Mxfp4Task> effective_tasks;
     std::vector<uint32_t> physical_input_rows;
@@ -60,43 +62,45 @@ struct Mxfp4Scratch
 [[nodiscard]] float approximate_scaled_silu(float value, float sigmoid_scale = 1.0f) noexcept;
 [[nodiscard]] const char* scaled_silu_kernel_name(
     uint64_t optimization_flags) noexcept;
-[[nodiscard]] bool cpu_fast_silu_enabled(uint64_t optimization_flags) noexcept;
-[[nodiscard]] bool simd_rms_norm_enabled(uint64_t optimization_flags) noexcept;
 [[nodiscard]] uint32_t cpu_linear_num_threads() noexcept;
-void embedding_batch_into(const TensorData& embedding, std::span<const int32_t> input_ids, CpuBatch& output);
-[[nodiscard]] CpuBatch linear_batch(const TensorData& matrix, const CpuBatch& input, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
-void linear_batch_into(const TensorData& matrix, const CpuBatch& input, CpuBatch& output, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
+void embedding_batch_into(const TensorData& embedding, std::span<const int32_t> input_ids, ActivationBuffer& output);
+[[nodiscard]] ActivationBuffer linear_batch(const TensorData& matrix, const ActivationBuffer& input, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
+// A quantized input scratch, when supplied, must not alias input or output.
+void linear_batch_into(const TensorData& matrix, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu, ActivationBuffer* quantized_input_scratch = nullptr);
 [[nodiscard]] bool float8_linear_pair_batch_into(
     const TensorData& first,
     const TensorData& second,
-    const CpuBatch& input,
-    CpuBatch& first_output,
-    CpuBatch& second_output,
+    const ActivationBuffer& input,
+    ActivationBuffer& first_output,
+    ActivationBuffer& second_output,
     uint64_t optimization_flags,
     const CompiledOperator* first_executable = nullptr,
-    const CompiledOperator* second_executable = nullptr);
+    const CompiledOperator* second_executable = nullptr,
+    ActivationBuffer* quantized_input_scratch = nullptr);
 [[nodiscard]] bool float8_linear_rms_norm_batch_into(
     const TensorData& matrix,
-    const CpuBatch& input,
+    const ActivationBuffer& input,
     const TensorData& norm_weight,
     float epsilon,
-    CpuBatch& output,
+    ActivationBuffer& output,
     uint64_t optimization_flags,
-    const CompiledOperator* executable = nullptr);
-[[nodiscard]] CpuBatch linear_batch(const TensorData& matrix, const TensorData& bias, const CpuBatch& input, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
-void linear_batch_into(const TensorData& matrix, const TensorData& bias, const CpuBatch& input, CpuBatch& output, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
-[[nodiscard]] bool fused_float8_gate_up_batch(const TensorData& gate, const TensorData& up, const CpuBatch& input,
-                                              ExpertActivation activation, float activation_limit, CpuBatch& output, uint64_t optimization_flags,
+    const CompiledOperator* executable = nullptr,
+    ActivationBuffer* quantized_input_scratch = nullptr);
+[[nodiscard]] ActivationBuffer linear_batch(const TensorData& matrix, const TensorData& bias, const ActivationBuffer& input, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
+void linear_batch_into(const TensorData& matrix, const TensorData& bias, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu, ActivationBuffer* quantized_input_scratch = nullptr);
+[[nodiscard]] bool fused_float8_gate_up_batch(const TensorData& gate, const TensorData& up, const ActivationBuffer& input,
+                                              ExpertActivation activation, float activation_limit, ActivationBuffer& output, uint64_t optimization_flags,
                                               const CompiledOperator* gate_executable = nullptr,
                                               const CompiledOperator* up_executable = nullptr);
-[[nodiscard]] CpuBatch fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* bias, const CpuBatch& input, ExpertActivation activation, float activation_limit,
-                                                 uint64_t optimization_flags);
+[[nodiscard]] ActivationBuffer fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* bias, const ActivationBuffer& input, ExpertActivation activation, float activation_limit,
+                                                         uint64_t optimization_flags);
 [[nodiscard]] bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch, uint64_t optimization_flags);
-[[nodiscard]] CpuBatch rms_norm_batch(const CpuBatch& input, const TensorData& weight, float epsilon, float weight_offset, uint64_t optimization_flags);
-void rms_norm_batch_into(const CpuBatch& input, const TensorData& weight, float epsilon, CpuBatch& output, float weight_offset, uint64_t optimization_flags);
-void add_bias_inplace(CpuBatch& destination, const TensorData& bias);
-void add_batch_inplace(CpuBatch& destination, const CpuBatch& source);
-[[nodiscard]] std::vector<std::vector<float>> batch_to_vectors(const CpuBatch& batch);
+[[nodiscard]] ActivationBuffer rms_norm_batch(const ActivationBuffer& input, const TensorData& weight, float epsilon, float weight_offset, uint64_t optimization_flags);
+// Input and output may be the same buffer; each row's RMS is computed before writing it.
+void rms_norm_batch_into(const ActivationBuffer& input, const TensorData& weight, float epsilon, ActivationBuffer& output, float weight_offset, uint64_t optimization_flags);
+void add_bias_inplace(ActivationBuffer& destination, const TensorData& bias);
+void add_batch_inplace(ActivationBuffer& destination, const ActivationBuffer& source);
+[[nodiscard]] std::vector<std::vector<float>> batch_to_vectors(const ActivationBuffer& batch);
 
 } // namespace moe
 } // namespace ncnn

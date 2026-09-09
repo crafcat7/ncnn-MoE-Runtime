@@ -2,7 +2,7 @@
 
 #include "mxfp4.h"
 #include "qnk_msvc.h"
-#include "activation.h"
+#include "activationbuffer.h"
 
 #include <algorithm>
 #include <array>
@@ -555,8 +555,8 @@ bool qnk_pack_weights(
 
 bool qnk_linear_batch_into(
     const TensorData& matrix,
-    const CpuBatch& input,
-    CpuBatch& output,
+    const ActivationBuffer& input,
+    ActivationBuffer& output,
     bool use_packed_weights,
     std::shared_ptr<const QnKPack>* sidecar) noexcept
 {

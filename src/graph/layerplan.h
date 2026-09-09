@@ -1,16 +1,20 @@
 #ifndef NCNN_MOE_LAYERPLAN_H
 #define NCNN_MOE_LAYERPLAN_H
 
-#include "compiledoperator.h"
 #include "ncnn/moe/modeldescriptor.h"
 #include "ncnn/moe/types.h"
+#include "storage/weightstore.h"
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
 namespace ncnn {
 namespace moe {
+
+using CompiledOperatorHandle = uint32_t;
+inline constexpr CompiledOperatorHandle invalid_compiled_operator_handle = std::numeric_limits<CompiledOperatorHandle>::max();
 
 struct ExpertPlan
 {
@@ -46,13 +50,14 @@ enum AttentionBlockFlag : uint32_t
 
 struct AttentionBlockPlan
 {
+    // Compiled operators.
     CompiledOperatorHandle vulkan_attention_operator = invalid_compiled_operator_handle;
     CompiledOperatorHandle fused_qkv_operator = invalid_compiled_operator_handle;
-    CompiledOperatorHandle fused_qkv_bfloat16_operator = invalid_compiled_operator_handle;
     CompiledOperatorHandle fused_qkv_gate_bfloat16_operator = invalid_compiled_operator_handle;
     CompiledOperatorHandle fused_delta_input_operator = invalid_compiled_operator_handle;
-    CompiledOperatorHandle fused_delta_input_bfloat16_operator = invalid_compiled_operator_handle;
     CompiledOperatorHandle gated_delta_vulkan_operator = invalid_compiled_operator_handle;
+
+    // Projection and normalization weights.
     TensorHandle pre_attention_norm_weight = invalid_tensor_handle;
     TensorHandle query_weight = invalid_tensor_handle;
     TensorHandle query_bias = invalid_tensor_handle;
@@ -66,6 +71,8 @@ struct AttentionBlockPlan
     TensorHandle output_bias = invalid_tensor_handle;
     TensorHandle output_gate_weight = invalid_tensor_handle;
     TensorHandle sinks = invalid_tensor_handle;
+
+    // Gated DeltaNet weights.
     TensorHandle delta_qkv_weight = invalid_tensor_handle;
     TensorHandle delta_z_weight = invalid_tensor_handle;
     TensorHandle delta_beta_weight = invalid_tensor_handle;
@@ -74,6 +81,8 @@ struct AttentionBlockPlan
     TensorHandle delta_time_bias = invalid_tensor_handle;
     TensorHandle delta_decay_log = invalid_tensor_handle;
     TensorHandle delta_norm_weight = invalid_tensor_handle;
+
+    // Latent attention and compressed index weights.
     TensorHandle query_a_weight = invalid_tensor_handle;
     TensorHandle query_b_weight = invalid_tensor_handle;
     TensorHandle key_value_weight = invalid_tensor_handle;
@@ -90,17 +99,19 @@ struct AttentionBlockPlan
     TensorHandle indexer_compressor_gate_weight = invalid_tensor_handle;
     TensorHandle indexer_query_weight = invalid_tensor_handle;
     TensorHandle indexer_weights_weight = invalid_tensor_handle;
+
+    // QSA weights.
     TensorHandle qsa_query_key_weight = invalid_tensor_handle;
     TensorHandle qsa_query_norm_weight = invalid_tensor_handle;
     TensorHandle qsa_key_norm_weight = invalid_tensor_handle;
 
+    // Model parameters.
     uint32_t head_count = 0;
     uint32_t kv_head_count = 0;
     uint32_t head_dimension = 0;
     uint32_t value_head_dimension = 0;
     uint32_t sliding_window = 0;
     uint32_t initial_context_length = 0;
-    uint32_t max_context_length = 0;
     uint32_t query_lora_rank = 0;
     uint32_t rope_head_dimension = 0;
     uint32_t output_lora_rank = 0;
@@ -109,7 +120,6 @@ struct AttentionBlockPlan
     uint32_t index_head_count = 0;
     uint32_t index_head_dimension = 0;
     uint32_t index_top_k = 0;
-    uint32_t index_token_budget = 0;
     uint32_t convolution_kernel_size = 0;
     float rope_theta = 10000.0f;
     float compressed_rope_theta = 10000.0f;

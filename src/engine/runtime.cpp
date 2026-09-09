@@ -4,7 +4,7 @@
 #include "cpu.h"
 #include "expertbackend.h"
 #include "modelloader.h"
-#include "models/modeladapter_builtin.h"
+#include "models/modeladapter_gptoss.h"
 #include "models/modeladapter_deepseekv4.h"
 #include "models/modeladapter_qwen3_5.h"
 #include "models/modeladapter_qwen4exp.h"
@@ -12,7 +12,7 @@
 #include "kernels/float8.h"
 #include "kernels/ops.h"
 #include "storage/expertcache.h"
-#include "backends/ncnn/vulkancontext.h"
+#include "backends/ncnn/vulkan.h"
 
 #include <algorithm>
 #include <thread>
@@ -97,7 +97,7 @@ Runtime::Runtime()
         runtime_info.flags |= RuntimeVulkanMultiDevice;
     }
 #endif
-    register_adapter(std::make_shared<BuiltinModelAdapter>());
+    register_adapter(std::make_shared<GptOssModelAdapter>());
     register_adapter(std::make_shared<DeepSeekV4ModelAdapter>());
     register_adapter(std::make_shared<Qwen3_5MoeModelAdapter>());
     register_adapter(std::make_shared<Qwen4ExpModelAdapter>());
@@ -111,12 +111,12 @@ void Runtime::register_adapter(std::shared_ptr<ModelAdapter> adapter)
 
 Result<ModelPtr> Runtime::load_model(const std::filesystem::path& model_path, const Option& opt)
 {
-    ModelLoader loader(runtime_info, adapters, opt);
-    auto compiled = loader.load(model_path);
-    if (!compiled)
-        return compiled.error();
+    auto compiled_model = std::make_shared<CompiledModel>();
+    ModelLoader loader(runtime_info, adapters, opt, *compiled_model);
+    auto ret = loader.load(model_path);
+    if (!ret)
+        return ret.error();
 
-    auto compiled_model = std::make_shared<const CompiledModel>(std::move(compiled).value());
     return ModelPtr(new Model(std::move(compiled_model)));
 }
 

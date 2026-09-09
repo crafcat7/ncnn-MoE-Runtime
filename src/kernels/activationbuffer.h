@@ -1,5 +1,5 @@
-#ifndef NCNN_MOE_ACTIVATION_H
-#define NCNN_MOE_ACTIVATION_H
+#ifndef NCNN_MOE_ACTIVATIONBUFFER_H
+#define NCNN_MOE_ACTIVATIONBUFFER_H
 
 #include "ncnn/moe/types.h"
 
@@ -38,11 +38,13 @@ public:
             throw std::invalid_argument("unsupported activation storage type");
         if (columns != 0 && rows > data.max_size() / columns / element_size)
             throw std::length_error("activation buffer is too large");
+        const size_t old_size = data.size();
         data.resize(rows * static_cast<size_t>(columns) * element_size);
         row_count = rows;
         column_count = columns;
+        // resize initializes new bytes; only reused bytes need clearing.
         if (clear)
-            std::fill(data.begin(), data.end(), std::byte{0});
+            std::fill_n(data.begin(), std::min(old_size, data.size()), std::byte{0});
     }
 
     void clear() noexcept
@@ -165,9 +167,7 @@ private:
     DType type = DType::Float32;
 };
 
-using CpuBatch = ActivationBuffer;
-
 } // namespace moe
 } // namespace ncnn
 
-#endif // NCNN_MOE_ACTIVATION_H
+#endif // NCNN_MOE_ACTIVATIONBUFFER_H

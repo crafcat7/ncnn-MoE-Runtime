@@ -102,7 +102,7 @@ static Result<uint64_t> latent_fp8_dense_size(const MoeModelDescriptor& descript
     {
         const LayerDescriptor& layer = descriptor.layers[layer_id];
         const AttentionDescriptor& attention = layer.attention;
-        const MoeDescriptor& moe = layer.ffn.moe;
+        const MoeDescriptor& moe = layer.moe;
         if (attention.kind != AttentionKind::MultiHeadLatent
             || attention.projection_weight_dtype != DType::Float8E4M3
             || attention.output_group_count == 0
@@ -268,28 +268,28 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
                 return status.error();
         }
 
-        if (layer.ffn.moe.shared_expert_count != 0)
+        if (layer.moe.shared_expert_count != 0)
         {
             status = add_matrix_size(
-                layer.ffn.moe.intermediate_size,
+                layer.moe.intermediate_size,
                 descriptor.hidden_size,
-                layer.ffn.moe.shared_expert_weight_dtype,
+                layer.moe.shared_expert_weight_dtype,
                 "Vulkan shared Expert input",
                 total);
             if (!status)
                 return status.error();
             status = add_matrix_size(
-                layer.ffn.moe.intermediate_size,
+                layer.moe.intermediate_size,
                 descriptor.hidden_size,
-                layer.ffn.moe.shared_expert_weight_dtype,
+                layer.moe.shared_expert_weight_dtype,
                 "Vulkan shared Expert input",
                 total);
             if (!status)
                 return status.error();
             status = add_matrix_size(
                 descriptor.hidden_size,
-                layer.ffn.moe.intermediate_size,
-                layer.ffn.moe.shared_expert_weight_dtype,
+                layer.moe.intermediate_size,
+                layer.moe.shared_expert_weight_dtype,
                 "Vulkan shared Expert output",
                 total);
             if (!status)
@@ -539,60 +539,48 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
             layer_elements = with_gated_residual.value();
         }
 
-        if (layer.ffn.kind == FfnKind::Moe)
+        const MoeDescriptor& moe = layer.moe;
+        auto router = checked_multiply(moe.expert_count, descriptor.hidden_size, "router");
+        if (!router)
+            return router.error();
+        auto with_router = checked_add(layer_elements, router.value(), "layer dense weights");
+        if (!with_router)
+            return with_router.error();
+        layer_elements = with_router.value();
+        if (has_flag(moe.flags, MoeDescriptorRouterBias))
         {
-            auto router = checked_multiply(layer.ffn.moe.expert_count, descriptor.hidden_size, "router");
-            if (!router)
-                return router.error();
-            auto with_router = checked_add(layer_elements, router.value(), "layer dense weights");
-            if (!with_router)
-                return with_router.error();
-            layer_elements = with_router.value();
-            if (has_flag(layer.ffn.moe.flags, MoeDescriptorRouterBias))
-            {
-                auto with_router_bias = checked_add(layer_elements, layer.ffn.moe.expert_count, "router bias");
-                if (!with_router_bias)
-                    return with_router_bias.error();
-                layer_elements = with_router_bias.value();
-            }
-            if (has_flag(layer.ffn.moe.flags, MoeDescriptorProjectionBias))
-            {
-                const uint64_t per_expert_bias = static_cast<uint64_t>(layer.ffn.moe.intermediate_size) * 2 + descriptor.hidden_size;
-                auto expert_biases = checked_multiply(layer.ffn.moe.expert_count, per_expert_bias, "expert biases");
-                if (!expert_biases)
-                    return expert_biases.error();
-                auto with_expert_biases = checked_add(layer_elements, expert_biases.value(), "layer dense weights");
-                if (!with_expert_biases)
-                    return with_expert_biases.error();
-                layer_elements = with_expert_biases.value();
-            }
-            if (layer.ffn.moe.shared_expert_count != 0)
-            {
-                auto shared_elements = checked_multiply(static_cast<uint64_t>(descriptor.hidden_size) * layer.ffn.moe.intermediate_size * 3, layer.ffn.moe.shared_expert_count, "shared Expert weights");
-                if (!shared_elements)
-                    return shared_elements.error();
-                auto with_shared = checked_add(layer_elements, shared_elements.value(), "layer dense weights");
-                if (!with_shared)
-                    return with_shared.error();
-                layer_elements = with_shared.value();
-                if (has_flag(layer.ffn.moe.flags, MoeDescriptorSharedExpertGate))
-                {
-                    auto with_shared_gate = checked_add(layer_elements, descriptor.hidden_size, "shared Expert gate");
-                    if (!with_shared_gate)
-                        return with_shared_gate.error();
-                    layer_elements = with_shared_gate.value();
-                }
-            }
+            auto with_router_bias = checked_add(layer_elements, moe.expert_count, "router bias");
+            if (!with_router_bias)
+                return with_router_bias.error();
+            layer_elements = with_router_bias.value();
         }
-        else if (layer.ffn.kind == FfnKind::Dense)
+        if (has_flag(moe.flags, MoeDescriptorProjectionBias))
         {
-            auto dense_ffn_elements = checked_multiply(static_cast<uint64_t>(descriptor.hidden_size) * layer.ffn.dense_intermediate_size, 3, "dense FFN weights");
-            if (!dense_ffn_elements)
-                return dense_ffn_elements.error();
-            auto with_dense_ffn = checked_add(layer_elements, dense_ffn_elements.value(), "layer dense weights");
-            if (!with_dense_ffn)
-                return with_dense_ffn.error();
-            layer_elements = with_dense_ffn.value();
+            const uint64_t per_expert_bias = static_cast<uint64_t>(moe.intermediate_size) * 2 + descriptor.hidden_size;
+            auto expert_biases = checked_multiply(moe.expert_count, per_expert_bias, "expert biases");
+            if (!expert_biases)
+                return expert_biases.error();
+            auto with_expert_biases = checked_add(layer_elements, expert_biases.value(), "layer dense weights");
+            if (!with_expert_biases)
+                return with_expert_biases.error();
+            layer_elements = with_expert_biases.value();
+        }
+        if (moe.shared_expert_count != 0)
+        {
+            auto shared_elements = checked_multiply(static_cast<uint64_t>(descriptor.hidden_size) * moe.intermediate_size * 3, moe.shared_expert_count, "shared Expert weights");
+            if (!shared_elements)
+                return shared_elements.error();
+            auto with_shared = checked_add(layer_elements, shared_elements.value(), "layer dense weights");
+            if (!with_shared)
+                return with_shared.error();
+            layer_elements = with_shared.value();
+            if (has_flag(moe.flags, MoeDescriptorSharedExpertGate))
+            {
+                auto with_shared_gate = checked_add(layer_elements, descriptor.hidden_size, "shared Expert gate");
+                if (!with_shared_gate)
+                    return with_shared_gate.error();
+                layer_elements = with_shared_gate.value();
+            }
         }
 
         auto layer_size = checked_multiply(layer_elements, element_size, "layer dense weights");
@@ -619,7 +607,7 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
         }
         const LayerDescriptor& layer = descriptor.layers.back();
         const AttentionDescriptor& attention = layer.attention;
-        const MoeDescriptor& moe = layer.ffn.moe;
+        const MoeDescriptor& moe = layer.moe;
         const uint64_t query_size = static_cast<uint64_t>(attention.head_count) * attention.head_dimension;
         const uint64_t key_value_size = static_cast<uint64_t>(attention.kv_head_count) * attention.head_dimension;
         uint64_t mtp_elements = 0;
@@ -869,20 +857,9 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
 
     if (descriptor.layers.empty())
         return Error{ErrorCode::InvalidModel, "memory planner requires at least one layer"};
-    const LayerDescriptor* first_moe_layer = nullptr;
-    uint64_t moe_layer_count = 0;
-    for (const LayerDescriptor& layer : descriptor.layers)
-    {
-        if (layer.ffn.kind != FfnKind::Moe)
-            continue;
-        if (!first_moe_layer)
-            first_moe_layer = &layer;
-        ++moe_layer_count;
-    }
+    uint64_t moe_layer_count = static_cast<uint64_t>(descriptor.layers.size());
     moe_layer_count += descriptor.speculative_layer_count;
-    if (!first_moe_layer)
-        return Error{ErrorCode::InvalidModel, "memory planner requires at least one MoE layer"};
-    const MoeDescriptor& moe = first_moe_layer->ffn.moe;
+    const MoeDescriptor& moe = descriptor.layers.front().moe;
     auto pair_size = expert_pair_size(descriptor, moe.expert_weight_dtype);
     if (!pair_size)
         return pair_size.error();
@@ -983,8 +960,7 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
     }
     for (const LayerDescriptor& layer : descriptor.layers)
     {
-        if (layer.ffn.kind == FfnKind::Moe
-            && !supports_file_backed_experts(layer.ffn.moe))
+        if (!supports_file_backed_experts(layer.moe))
         {
             return Error{ErrorCode::UnsupportedModel, "on-demand mode requires a file-backed Expert encoding"};
         }

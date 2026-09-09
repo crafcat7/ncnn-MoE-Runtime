@@ -1,7 +1,7 @@
 #ifndef NCNN_MOE_QNK_H
 #define NCNN_MOE_QNK_H
 
-#include "activation.h"
+#include "activationbuffer.h"
 #include "ncnn/moe/types.h"
 
 #include <cstddef>
@@ -88,8 +88,8 @@ void qnk_q8k_quantize_batch(
 
 [[nodiscard]] bool qnk_linear_batch_into(
     const TensorData& matrix,
-    const CpuBatch& input,
-    CpuBatch& output,
+    const ActivationBuffer& input,
+    ActivationBuffer& output,
     bool use_packed_weights,
     std::shared_ptr<const QnKPack>* sidecar = nullptr) noexcept;
 

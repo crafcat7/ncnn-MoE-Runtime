@@ -19,9 +19,9 @@ static float ple_sigmoid(float value) noexcept
     return 1.0f / (1.0f + std::exp(-value));
 }
 
-static void grouped_rms_norm_into(const CpuBatch& input, const TensorData& weight,
+static void grouped_rms_norm_into(const ActivationBuffer& input, const TensorData& weight,
                                   uint32_t group_size, float epsilon,
-                                  float weight_offset, CpuBatch& output)
+                                  float weight_offset, ActivationBuffer& output)
 {
     output.reset(input.rows(), input.columns(), false);
     const std::span<const uint16_t> norm = weight.bfloat16_values();
@@ -82,8 +82,8 @@ Result<void> execute_ple_into(
     float norm_epsilon,
     float norm_weight_offset,
     std::span<const int32_t> input_ids,
-    CpuLayerCache& cache,
-    CpuBatch& hidden,
+    LayerCache& cache,
+    ActivationBuffer& hidden,
     uint64_t optimization_flags)
 {
     if (!plan.enabled())
@@ -116,31 +116,23 @@ Result<void> execute_ple_into(
               token_history.begin() + static_cast<ptrdiff_t>(existing_offset));
     token_history.insert(token_history.end(), input_ids.begin(), input_ids.end());
 
-    CpuBatch embeddings(input_ids.size(), plan.embedding_dimension);
+    ActivationBuffer embeddings(input_ids.size(), plan.embedding_dimension);
     for (size_t row_index = 0; row_index < input_ids.size(); ++row_index)
     {
         const size_t current = context_length + row_index;
-        std::vector<int64_t> shifted(plan.ngram_size, plan.eos_token_id);
-        shifted[0] = token_history[current];
+        int64_t mixed = wrapped_product(token_history[current], multipliers.int64_values()[0]);
         bool crossed_eos = false;
-        for (uint32_t shift = 1; shift < plan.ngram_size; ++shift)
-        {
-            const size_t source = current - shift;
-            crossed_eos = crossed_eos || token_history[source] == static_cast<int32_t>(plan.eos_token_id);
-            shifted[shift] = crossed_eos ? static_cast<int64_t>(plan.eos_token_id)
-                                         : static_cast<int64_t>(token_history[source]);
-        }
         uint32_t head = 0;
         for (uint32_t ngram = 2; ngram <= plan.ngram_size; ++ngram)
         {
-            int64_t mixed = wrapped_product(shifted[0], multipliers.int64_values()[0]);
-            for (uint32_t position = 1; position < ngram; ++position)
-            {
-                const int64_t product = wrapped_product(
-                    shifted[position], multipliers.int64_values()[position]);
-                mixed = std::bit_cast<int64_t>(std::bit_cast<uint64_t>(mixed)
-                                               ^ std::bit_cast<uint64_t>(product));
-            }
+            const uint32_t shift = ngram - 1;
+            const int32_t previous_token = token_history[current - shift];
+            crossed_eos = crossed_eos || previous_token == static_cast<int32_t>(plan.eos_token_id);
+            const int64_t token = crossed_eos ? static_cast<int64_t>(plan.eos_token_id)
+                                              : static_cast<int64_t>(previous_token);
+            const int64_t product = wrapped_product(token, multipliers.int64_values()[shift]);
+            mixed = std::bit_cast<int64_t>(std::bit_cast<uint64_t>(mixed)
+                                           ^ std::bit_cast<uint64_t>(product));
             for (uint32_t local_head = 0; local_head < plan.heads_per_ngram; ++local_head, ++head)
             {
                 const int64_t vocabulary_size = vocabulary_sizes.int64_values()[head];
@@ -160,16 +152,16 @@ Result<void> execute_ple_into(
     cache.ple_token_history.assign(token_history.end() - context_length,
                                    token_history.end());
 
-    CpuBatch key = linear_batch(weights.at(plan.key_weight), embeddings, optimization_flags);
-    CpuBatch value = linear_batch(weights.at(plan.value_weight), embeddings, optimization_flags);
-    CpuBatch key_normed;
-    CpuBatch query_normed;
+    ActivationBuffer key = linear_batch(weights.at(plan.key_weight), embeddings, optimization_flags);
+    ActivationBuffer value = linear_batch(weights.at(plan.value_weight), embeddings, optimization_flags);
+    ActivationBuffer key_normed;
+    ActivationBuffer query_normed;
     grouped_rms_norm_into(key, weights.at(plan.key_norm_weight), hidden_size,
                           norm_epsilon, norm_weight_offset, key_normed);
     grouped_rms_norm_into(hidden, weights.at(plan.query_norm_weight), hidden_size,
                           norm_epsilon, norm_weight_offset, query_normed);
 
-    CpuBatch gated(input_ids.size(), expanded_size);
+    ActivationBuffer gated(input_ids.size(), expanded_size);
     const float inverse_sqrt_hidden = 1.0f / std::sqrt(static_cast<float>(hidden_size));
     for (size_t row_index = 0; row_index < input_ids.size(); ++row_index)
     {
@@ -191,7 +183,7 @@ Result<void> execute_ple_into(
         }
     }
 
-    CpuBatch convolution_input;
+    ActivationBuffer convolution_input;
     grouped_rms_norm_into(gated, weights.at(plan.convolution_norm_weight),
                           hidden_size, norm_epsilon, norm_weight_offset,
                           convolution_input);

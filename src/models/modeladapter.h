@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -13,40 +14,34 @@ namespace ncnn {
 namespace moe {
 
 class SafetensorsArchive;
+struct ModelPackage;
 
-// These legacy manifest readers search the supplied JSON, including nested objects.
-// Diagnostic prefixes do not change lookup scope.
+// Manifest readers inspect only direct members of the supplied JSON object.
+[[nodiscard]] std::optional<std::string> find_manifest_member(
+    const std::string& json, const std::string& key);
+[[nodiscard]] Result<std::string> read_manifest_object(
+    const std::string& json, const std::string& key, const char* prefix = "");
 [[nodiscard]] Result<uint32_t> read_manifest_uint32(const std::string& json, const std::string& key, const char* prefix = "");
 [[nodiscard]] Result<std::string> read_manifest_string(const std::string& json, const std::string& key, const char* prefix = "");
 [[nodiscard]] Result<float> read_manifest_float(const std::string& json, const std::string& key, const char* prefix = "");
 [[nodiscard]] Result<bool> read_manifest_bool(const std::string& json, const std::string& key, const char* prefix = "");
+[[nodiscard]] Result<std::vector<uint32_t>> read_manifest_uint32_array(
+    const std::string& json, const std::string& key, const char* prefix = "");
+[[nodiscard]] Result<std::vector<std::string>> read_manifest_string_array(
+    const std::string& json, const std::string& key, const char* prefix = "");
 float optional_manifest_float(const std::string& json, const std::string& key, float fallback);
 [[nodiscard]] Result<uint32_t> get_rotary_dimension(
     uint32_t head_dimension,
     float partial_rotary_factor,
     const char* description);
 
-[[nodiscard]] Result<uint64_t> fnv1a64_file(
-    const std::filesystem::path& path,
-    const char* description);
-
 [[nodiscard]] Result<bool> optional_artifact_exists(
     const std::filesystem::path& path,
     const char* description);
 
-[[nodiscard]] std::string mxfp4_artifact_identity_name(
-    const char* prefix,
-    uint32_t layer_count,
-    uint32_t mtp_layer_count,
-    uint32_t expert_count,
-    uint32_t hidden_size,
-    uint32_t intermediate_size,
-    uint64_t config_hash,
-    uint64_t index_hash);
-
 [[nodiscard]] Result<void> validate_mxfp4_artifact_identity(
     const SafetensorsArchive& archive,
-    const std::filesystem::path& model_root,
+    const ModelPackage& package,
     const char* identity_prefix,
     uint32_t layer_count,
     uint32_t mtp_layer_count,
@@ -55,12 +50,6 @@ float optional_manifest_float(const std::string& json, const std::string& key, f
     uint32_t intermediate_size,
     const char* identity_description,
     const char* artifact_description);
-
-[[nodiscard]] Result<void> validate_u8_artifact_tensor(
-    const SafetensorsArchive& archive,
-    const std::string& name,
-    const std::vector<uint32_t>& shape,
-    const char* description);
 
 [[nodiscard]] Result<void> validate_mxfp4_artifact_expert_bank(
     const SafetensorsArchive& archive,
@@ -83,6 +72,15 @@ float optional_manifest_float(const std::string& json, const std::string& key, f
     const std::string& source_name,
     uint32_t index,
     std::vector<uint32_t> shape);
+
+[[nodiscard]] Result<void> add_bfloat16_expert_bank(
+    WeightMapping& mapping,
+    const SafetensorsArchive& archive,
+    const std::string& target_prefix,
+    const std::string& target_suffix,
+    const std::string& source_name,
+    uint32_t expert_count,
+    const std::vector<uint32_t>& shape);
 
 [[nodiscard]] Result<void> add_qwen_attention(
     WeightMapping& mapping, const SafetensorsArchive& archive,

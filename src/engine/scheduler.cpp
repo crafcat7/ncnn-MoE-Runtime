@@ -40,10 +40,10 @@ private:
     [[nodiscard]] static bool compatible(std::span<Session* const> sessions) noexcept;
     [[nodiscard]] static Result<std::vector<PrefillResult>> prefill(
         std::span<Session* const> sessions,
-        std::span<const std::vector<int32_t>> input_ids);
+        std::span<const PrefillBatchRequest> requests);
     [[nodiscard]] static Result<std::vector<DecodeResult>> decode(
         std::span<Session* const> sessions,
-        std::span<const int32_t> input_ids);
+        std::span<const DecodeBatchRequest> requests);
 
     void stop_workers();
     void worker_loop();
@@ -106,9 +106,9 @@ bool BatchSchedulerPrivate::compatible(std::span<Session* const> sessions) noexc
 
 Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(
     std::span<Session* const> sessions,
-    std::span<const std::vector<int32_t>> input_ids)
+    std::span<const PrefillBatchRequest> requests)
 {
-    if (sessions.empty() || sessions.size() != input_ids.size())
+    if (sessions.empty() || sessions.size() != requests.size())
     {
         return Error{
             ErrorCode::InvalidArgument,
@@ -139,13 +139,13 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(
                 ErrorCode::InvalidArgument,
                 "staged prefill sessions must share one loaded model"};
         }
-        if (input_ids[index].empty())
+        if (requests[index].input_ids.empty())
         {
             return Error{
                 ErrorCode::InvalidArgument,
                 "staged prefill requires non-empty input sequences"};
         }
-        if (input_ids[index].size()
+        if (requests[index].input_ids.size()
             > std::numeric_limits<uint32_t>::max())
         {
             return Error{
@@ -153,7 +153,7 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(
                 "prefill token count exceeds uint32 range"};
         }
         if (max_context_length > 0
-            && input_ids[index].size()
+            && requests[index].input_ids.size()
                    > max_context_length
                          - std::min<uint64_t>(
                              session.token_count,
@@ -164,11 +164,11 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(
                 "prefill exceeds the model context length"};
         }
         session.stats_scratch = session.stats;
-        maximum_tokens = std::max(maximum_tokens, input_ids[index].size());
+        maximum_tokens = std::max(maximum_tokens, requests[index].input_ids.size());
     }
 
     std::vector<PrefillResult> results(sessions.size());
-    std::vector<CpuDecodeBatchEntry> entries;
+    std::vector<DecodeBatchEntry> entries;
     entries.reserve(sessions.size());
 
     for (size_t token_index = 0;
@@ -180,14 +180,15 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(
              session_index < sessions.size();
              ++session_index)
         {
-            if (token_index >= input_ids[session_index].size())
+            if (token_index >= requests[session_index].input_ids.size())
                 continue;
             Session& session = *sessions[session_index];
             entries.push_back({
-                input_ids[session_index][token_index],
+                requests[session_index].input_ids[token_index],
                 &session.stats_scratch,
                 session.state.get(),
                 session.token_count + token_index,
+                token_index + 1 == requests[session_index].input_ids.size(),
             });
         }
 
@@ -208,7 +209,7 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(
              session_index < sessions.size();
              ++session_index)
         {
-            if (token_index >= input_ids[session_index].size())
+            if (token_index >= requests[session_index].input_ids.size())
                 continue;
             Session& session = *sessions[session_index];
             auto speculative_context = update_speculative_context(
@@ -224,17 +225,17 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(
     for (size_t index = 0; index < sessions.size(); ++index)
     {
         Session& session = *sessions[index];
-        session.commit_execution(input_ids[index].size(), 0);
-        results[index].processed_tokens = static_cast<uint32_t>(input_ids[index].size());
+        session.commit_execution(requests[index].input_ids.size(), 0);
+        results[index].processed_tokens = static_cast<uint32_t>(requests[index].input_ids.size());
     }
     return results;
 }
 
 Result<std::vector<DecodeResult>> BatchSchedulerPrivate::decode(
     std::span<Session* const> sessions,
-    std::span<const int32_t> input_ids)
+    std::span<const DecodeBatchRequest> requests)
 {
-    if (sessions.empty() || sessions.size() != input_ids.size())
+    if (sessions.empty() || sessions.size() != requests.size())
     {
         return Error{ErrorCode::InvalidArgument, "staged decode requires one input id per session"};
     }
@@ -266,13 +267,13 @@ Result<std::vector<DecodeResult>> BatchSchedulerPrivate::decode(
         }
     }
 
-    std::vector<CpuDecodeBatchEntry> entries(sessions.size());
+    std::vector<DecodeBatchEntry> entries(sessions.size());
     for (size_t index = 0; index < sessions.size(); ++index)
     {
         Session& session = *sessions[index];
         session.stats_scratch = session.stats;
         entries[index] = {
-            input_ids[index],
+            requests[index].input_id,
             &session.stats_scratch,
             session.state.get(),
             session.token_count,
@@ -428,12 +429,7 @@ std::future<std::vector<Result<PrefillResult>>> BatchSchedulerPrivate::submit_pr
                 work_units += static_cast<uint64_t>(request.input_ids.size());
             thread_limit.set(prepare_staging_team(work_units, static_cast<uint32_t>(requests.size()), extra_compute));
 #endif
-            std::vector<std::vector<int32_t>> input_ids;
-            input_ids.reserve(requests.size());
-            for (PrefillBatchRequest& request : requests)
-                input_ids.push_back(std::move(request.input_ids));
-
-            auto ret = prefill(sessions, input_ids);
+            auto ret = prefill(sessions, requests);
             staged_prefill_batches.fetch_add(1, std::memory_order_relaxed);
             if (ret)
             {
@@ -504,17 +500,13 @@ std::future<std::vector<Result<DecodeResult>>> BatchSchedulerPrivate::submit_dec
             std::vector<Result<DecodeResult>>& results = state->results;
             try
             {
-                std::vector<int32_t> input_ids;
-                input_ids.reserve(requests.size());
-                for (const DecodeBatchRequest& request : requests)
-                    input_ids.push_back(request.input_id);
 #if defined(_OPENMP)
                 CpuOpenMpThreadLimitScope thread_limit;
                 CpuThreadBudgetController::Lease extra_compute;
                 const uint64_t work_units = static_cast<uint64_t>(requests.size()) * team_size;
                 thread_limit.set(prepare_staging_team(work_units, static_cast<uint32_t>(requests.size()), extra_compute));
 #endif
-                auto ret = decode(sessions, input_ids);
+                auto ret = decode(sessions, requests);
                 staged_decode_batches.fetch_add(1, std::memory_order_relaxed);
                 if (ret)
                 {
