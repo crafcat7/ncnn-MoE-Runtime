@@ -44,8 +44,8 @@ float quantize_float8_e4m3(float value)
         mantissa = min(mantissa, 6.0);
     }
     const float decoded = encoded_exponent == 0.0
-        ? mantissa * 0.001953125
-        : (1.0 + mantissa * 0.125) * exp2(encoded_exponent - 7.0);
+                              ? mantissa * 0.001953125
+                              : (1.0 + mantissa * 0.125) * exp2(encoded_exponent - 7.0);
     return sign_value * decoded;
 }
 

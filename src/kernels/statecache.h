@@ -43,16 +43,15 @@ struct LatentCacheUndo
 
     [[nodiscard]] uint64_t allocated_bytes() const noexcept
     {
-        return static_cast<uint64_t>(
-                   latent_window.values.capacity()
-                   + compressor_pending_values.values.capacity()
-                   + compressor_pending_scores.values.capacity()
-                   + compressor_previous_values.values.capacity()
-                   + compressor_previous_scores.values.capacity()
-                   + index_compressor_pending_values.values.capacity()
-                   + index_compressor_pending_scores.values.capacity()
-                   + index_compressor_previous_values.values.capacity()
-                   + index_compressor_previous_scores.values.capacity())
+        return static_cast<uint64_t>(latent_window.values.capacity()
+                                     + compressor_pending_values.values.capacity()
+                                     + compressor_pending_scores.values.capacity()
+                                     + compressor_previous_values.values.capacity()
+                                     + compressor_previous_scores.values.capacity()
+                                     + index_compressor_pending_values.values.capacity()
+                                     + index_compressor_pending_scores.values.capacity()
+                                     + index_compressor_previous_values.values.capacity()
+                                     + index_compressor_previous_scores.values.capacity())
                * sizeof(float);
     }
 };
@@ -64,9 +63,8 @@ struct GatedDeltaSnapshot
 
     [[nodiscard]] uint64_t allocated_bytes() const noexcept
     {
-        return static_cast<uint64_t>(
-                   gated_delta_convolution.capacity()
-                   + gated_delta_recurrent.capacity())
+        return static_cast<uint64_t>(gated_delta_convolution.capacity()
+                                     + gated_delta_recurrent.capacity())
                * sizeof(float);
     }
 };
@@ -223,20 +221,16 @@ struct LayerCache
     }
 };
 
-[[nodiscard]] Result<void> begin_state_cache_transaction(
-    std::span<LayerCache> caches,
-    size_t expected_rows);
+[[nodiscard]] Result<void> begin_state_cache_transaction(std::span<LayerCache> caches,
+                                                         size_t expected_rows);
 
-void record_standard_cache_transaction_rows(
-    LayerCache& cache,
-    size_t rows);
+void record_standard_cache_transaction_rows(LayerCache& cache,
+                                            size_t rows);
 
-void record_gated_delta_cache_transaction_row(
-    LayerCache& cache);
+void record_gated_delta_cache_transaction_row(LayerCache& cache);
 
-[[nodiscard]] Result<void> finish_state_cache_transaction(
-    std::span<LayerCache> caches,
-    size_t committed_rows);
+[[nodiscard]] Result<void> finish_state_cache_transaction(std::span<LayerCache> caches,
+                                                          size_t committed_rows);
 
 } // namespace moe
 } // namespace ncnn

@@ -299,12 +299,11 @@ struct ExpertCache::FileRangeReader
                 ErrorCode::IoError,
                 "cannot allocate aligned direct Expert buffer"};
         }
-        std::shared_ptr<uint8_t> owner(
-            allocation,
-            [](uint8_t* pointer) {
-                if (pointer)
-                    VirtualFree(pointer, 0, MEM_RELEASE);
-            });
+        std::shared_ptr<uint8_t> owner(allocation,
+                                       [](uint8_t* pointer) {
+                                           if (pointer)
+                                               VirtualFree(pointer, 0, MEM_RELEASE);
+                                       });
 
         OVERLAPPED operation{};
         operation.Offset = static_cast<DWORD>(aligned_offset);
@@ -365,11 +364,7 @@ struct ExpertCache::FileRangeReader
             operation.OffsetHigh = static_cast<DWORD>(current_offset >> 32);
             operation.hEvent = read_event;
             if (!ResetEvent(operation.hEvent))
-            {
-                return Error{
-                    ErrorCode::IoError,
-                    "cannot reset expert shard read event: " + path};
-            }
+                return Error{ErrorCode::IoError, "cannot reset expert shard read event: " + path};
 
             DWORD read_bytes = 0;
             const BOOL started = ReadFile(handle, destination.data() + completed, request, nullptr, &operation);
@@ -442,14 +437,13 @@ private:
         }
 
         const std::wstring native_path = std::filesystem::path(path).wstring();
-        const Handle handle = CreateFileW(
-            native_path.c_str(),
-            GENERIC_READ,
-            FILE_SHARE_READ,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING,
-            nullptr);
+        const Handle handle = CreateFileW(native_path.c_str(),
+                                          GENERIC_READ,
+                                          FILE_SHARE_READ,
+                                          nullptr,
+                                          OPEN_EXISTING,
+                                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING,
+                                          nullptr);
         if (handle == invalid_handle())
         {
             return Error{
@@ -478,14 +472,13 @@ private:
 
 #if defined(_WIN32)
         const std::wstring native_path = std::filesystem::path(path).wstring();
-        const Handle handle = CreateFileW(
-            native_path.c_str(),
-            GENERIC_READ,
-            FILE_SHARE_READ,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED,
-            nullptr);
+        const Handle handle = CreateFileW(native_path.c_str(),
+                                          GENERIC_READ,
+                                          FILE_SHARE_READ,
+                                          nullptr,
+                                          OPEN_EXISTING,
+                                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED,
+                                          nullptr);
 #else
         const Handle handle = open(path.c_str(), O_RDONLY);
 #endif
@@ -529,14 +522,13 @@ private:
     std::atomic<uint64_t> buffered_read_bytes{0};
 };
 
-ExpertCache::ExpertCache(
-    uint64_t _cache_size,
-    uint32_t num_io_threads,
-    std::shared_ptr<ExpertVictimCache> _victim_cache,
-    ExpertIoMode _io_mode,
-    uint32_t _flags,
-    uint32_t num_residency_groups,
-    bool _reserve_cpu_packed_weights)
+ExpertCache::ExpertCache(uint64_t _cache_size,
+                         uint32_t num_io_threads,
+                         std::shared_ptr<ExpertVictimCache> _victim_cache,
+                         ExpertIoMode _io_mode,
+                         uint32_t _flags,
+                         uint32_t num_residency_groups,
+                         bool _reserve_cpu_packed_weights)
     : cache_size(_cache_size),
       residency_group_sizes(num_residency_groups, 0),
       reader(std::make_unique<FileRangeReader>()),
@@ -590,9 +582,7 @@ void ExpertCache::resolve_predictions(uint32_t residency_group, std::span<const 
     for (auto iterator = entries.begin(); iterator != entries.end();)
     {
         const std::shared_ptr<Entry>& entry = iterator->second;
-        if (!entry
-            || entry->residency_group != residency_group
-            || !has_flag(entry->flags, Entry::Speculative))
+        if (!entry || entry->residency_group != residency_group || !has_flag(entry->flags, Entry::Speculative))
         {
             ++iterator;
             continue;
@@ -628,14 +618,11 @@ void ExpertCache::resolve_predictions(uint32_t residency_group, std::span<const 
 
 void ExpertCache::wait_for_background_work()
 {
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        idle.wait(lock, [this] {
-            return high_priority.empty()
-                   && low_priority.empty()
-                   && active_jobs == 0;
-        });
-    }
+    std::unique_lock<std::mutex> lock(mutex);
+    idle.wait(lock, [this] {
+        return high_priority.empty() && low_priority.empty() && active_jobs == 0;
+    });
+
     if (victim_cache)
         victim_cache->wait_for_background_work();
 }
@@ -660,9 +647,8 @@ static bool is_file_backed_bfloat16_tensor(const TensorData& tensor) noexcept
            && tensor.bfloat16_values().size() == static_cast<size_t>(elements);
 }
 
-static bool is_supported_file_backed_pair(
-    const TensorData& gate_up,
-    const TensorData& down) noexcept
+static bool is_supported_file_backed_pair(const TensorData& gate_up,
+                                          const TensorData& down) noexcept
 {
     return (gate_up.mxfp4_file_storage && down.mxfp4_file_storage)
            || (is_file_backed_bfloat16_tensor(gate_up)
@@ -720,9 +706,8 @@ Result<uint64_t> ExpertCache::packed_weight_size(const TensorData& tensor)
     {
         return Error{ErrorCode::InvalidModel, "packed Expert reservation requires MXFP4 columns divisible by 32"};
     }
-    const uint64_t size = mxfp4_q8_packed_storage_bytes(
-        static_cast<size_t>(rows),
-        static_cast<uint32_t>(columns / 32));
+    const uint64_t size = mxfp4_q8_packed_storage_bytes(static_cast<size_t>(rows),
+                                                        static_cast<uint32_t>(columns / 32));
     if (size == 0)
         return Error{ErrorCode::InvalidModel, "packed Expert byte count overflows"};
     return size;
@@ -756,14 +741,13 @@ std::string ExpertCache::make_pair_key(const TensorData& gate_up, const TensorDa
            + ":" + std::to_string(projection.scales_size);
 }
 
-static Result<void> copy_interleaved_mxfp4_rows(
-    const TensorData& source,
-    const MxFp4ByteBuffer& first_blocks,
-    const MxFp4ByteBuffer& first_scales,
-    const MxFp4ByteBuffer& second_blocks,
-    const MxFp4ByteBuffer& second_scales,
-    MxFp4ByteBuffer& destination_blocks,
-    MxFp4ByteBuffer& destination_scales)
+static Result<void> copy_interleaved_mxfp4_rows(const TensorData& source,
+                                                const MxFp4ByteBuffer& first_blocks,
+                                                const MxFp4ByteBuffer& first_scales,
+                                                const MxFp4ByteBuffer& second_blocks,
+                                                const MxFp4ByteBuffer& second_scales,
+                                                MxFp4ByteBuffer& destination_blocks,
+                                                MxFp4ByteBuffer& destination_scales)
 {
     if (first_blocks.size() != second_blocks.size()
         || first_scales.size() != second_scales.size()
@@ -815,9 +799,8 @@ Result<std::shared_ptr<TensorData>> ExpertCache::load_tensor(const TensorData& s
             // The source is a slice of a mapped Expert bank.  Give the OS the
             // exact slice range while this cache worker is waiting for it so
             // CPU execution can overlap page staging with other admissions.
-            prefetch_mapped_memory(
-                loaded->mapped_data.get(),
-                loaded->mapped_size);
+            prefetch_mapped_memory(loaded->mapped_data.get(),
+                                   loaded->mapped_size);
             ++mapped_range_count;
             mapped_size += source.mapped_size;
         }
@@ -846,11 +829,10 @@ Result<std::shared_ptr<TensorData>> ExpertCache::load_tensor(const TensorData& s
     // its independent blocks and scales.  That keeps the physical read fanout
     // fixed at four per cache worker instead of tying storage latency to four
     // serial ranges.
-    auto blocks_future = std::async(
-        std::launch::async,
-        [this, &file] {
-            return reader->load(file.blocks_path, file.blocks_offset, file.blocks_size, io_mode);
-        });
+    auto blocks_future = std::async(std::launch::async,
+                                    [this, &file] {
+                                        return reader->load(file.blocks_path, file.blocks_offset, file.blocks_size, io_mode);
+                                    });
     auto scales = reader->load(file.scales_path, file.scales_offset, file.scales_size, io_mode);
     auto blocks = blocks_future.get();
     if (!blocks)
@@ -904,11 +886,10 @@ Result<ExpertVictimPair> ExpertCache::load_independent_pair(const TensorData& ga
 {
     uint64_t down_mapped_range_count = 0;
     uint64_t down_mapped_size = 0;
-    auto gate_future = std::async(
-        std::launch::async,
-        [this, &gate_up, &mapped_range_count, &mapped_size] {
-            return load_tensor(gate_up, mapped_range_count, mapped_size);
-        });
+    auto gate_future = std::async(std::launch::async,
+                                  [this, &gate_up, &mapped_range_count, &mapped_size] {
+                                      return load_tensor(gate_up, mapped_range_count, mapped_size);
+                                  });
     auto loaded_down = load_tensor(down, down_mapped_range_count, down_mapped_size);
     auto loaded_gate = gate_future.get();
     if (!loaded_gate)
@@ -1170,12 +1151,11 @@ Result<ExpertVictimPair> ExpertCache::load_pair(const TensorData& gate_up, const
     return ExpertVictimPair{std::move(loaded_gate), std::move(loaded_down)};
 }
 
-Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(
-    std::span<const std::shared_ptr<Entry>> batch,
-    uint64_t& mapped_range_count,
-    uint64_t& mapped_size,
-    uint64_t& saved_range_count,
-    bool& coalesced)
+Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(std::span<const std::shared_ptr<Entry>> batch,
+                                                                        uint64_t& mapped_range_count,
+                                                                        uint64_t& mapped_size,
+                                                                        uint64_t& saved_range_count,
+                                                                        bool& coalesced)
 {
     static constexpr uint64_t maximum_cluster_size = UINT64_C(64) * 1024 * 1024;
     struct Range
@@ -1379,14 +1359,13 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(
         loaded_gate->mxfp4_scales = make_resident_view(gate_scales_size);
         if (gate.interleave_rows)
         {
-            auto copied = copy_interleaved_mxfp4_rows(
-                gate_source,
-                entry_sources[0],
-                entry_sources[1],
-                entry_sources[2],
-                entry_sources[3],
-                loaded_gate->mxfp4_blocks,
-                loaded_gate->mxfp4_scales);
+            auto copied = copy_interleaved_mxfp4_rows(gate_source,
+                                                      entry_sources[0],
+                                                      entry_sources[1],
+                                                      entry_sources[2],
+                                                      entry_sources[3],
+                                                      loaded_gate->mxfp4_blocks,
+                                                      loaded_gate->mxfp4_scales);
             if (!copied)
                 return copied.error();
         }
@@ -1577,12 +1556,11 @@ bool ExpertCache::consume_ghost_locked(std::string_view key, uint64_t required_s
     return true;
 }
 
-ExpertCache::Entry* ExpertCache::find_victim_locked(
-    const std::list<Entry*>& list,
-    bool speculative,
-    uint32_t residency_group,
-    uint32_t forward_anchor,
-    bool allow_predicted_victim)
+ExpertCache::Entry* ExpertCache::find_victim_locked(const std::list<Entry*>& list,
+                                                    bool speculative,
+                                                    uint32_t residency_group,
+                                                    uint32_t forward_anchor,
+                                                    bool allow_predicted_victim)
 {
     Entry* selected = nullptr;
     uint32_t selected_distance = 0;
@@ -1686,33 +1664,29 @@ bool ExpertCache::evict_one_locked(bool incoming_from_frequent_ghost, bool specu
         && forward_anchor != invalid_residency_group)
     {
         victim = prefer_recent
-                     ? find_victim_locked(
-                           arc_recent,
-                           false,
-                           invalid_residency_group,
-                           forward_anchor,
-                           true)
-                     : find_victim_locked(
-                           arc_frequent,
-                           false,
-                           invalid_residency_group,
-                           forward_anchor,
-                           true);
+                     ? find_victim_locked(arc_recent,
+                                          false,
+                                          invalid_residency_group,
+                                          forward_anchor,
+                                          true)
+                     : find_victim_locked(arc_frequent,
+                                          false,
+                                          invalid_residency_group,
+                                          forward_anchor,
+                                          true);
         if (!victim)
         {
             victim = prefer_recent
-                         ? find_victim_locked(
-                               arc_frequent,
-                               false,
-                               invalid_residency_group,
-                               forward_anchor,
-                               true)
-                         : find_victim_locked(
-                               arc_recent,
-                               false,
-                               invalid_residency_group,
-                               forward_anchor,
-                               true);
+                         ? find_victim_locked(arc_frequent,
+                                              false,
+                                              invalid_residency_group,
+                                              forward_anchor,
+                                              true)
+                         : find_victim_locked(arc_recent,
+                                              false,
+                                              invalid_residency_group,
+                                              forward_anchor,
+                                              true);
         }
     }
     if (!victim)
@@ -1733,15 +1707,14 @@ bool ExpertCache::evict_one_locked(bool incoming_from_frequent_ghost, bool specu
     return true;
 }
 
-Result<std::shared_ptr<ExpertCache::Entry>> ExpertCache::enqueue_pair(
-    const TensorData& gate_up,
-    const TensorData& down,
-    bool speculative,
-    uint32_t residency_group,
-    std::string_view prepared_key,
-    ExpertVictimExecutionMetadata victim_execution,
-    bool* already_ready,
-    bool* temporarily_exhausted)
+Result<std::shared_ptr<ExpertCache::Entry>> ExpertCache::enqueue_pair(const TensorData& gate_up,
+                                                                      const TensorData& down,
+                                                                      bool speculative,
+                                                                      uint32_t residency_group,
+                                                                      std::string_view prepared_key,
+                                                                      ExpertVictimExecutionMetadata victim_execution,
+                                                                      bool* already_ready,
+                                                                      bool* temporarily_exhausted)
 {
     if (already_ready)
         *already_ready = false;
@@ -1881,12 +1854,11 @@ Result<std::shared_ptr<ExpertCache::Entry>> ExpertCache::enqueue_pair(
     return entry;
 }
 
-Result<bool> ExpertCache::request_pair(
-    const TensorData& gate_up,
-    const TensorData& down,
-    uint32_t residency_group,
-    std::string_view prepared_key,
-    ExpertVictimExecutionMetadata victim_execution)
+Result<bool> ExpertCache::request_pair(const TensorData& gate_up,
+                                       const TensorData& down,
+                                       uint32_t residency_group,
+                                       std::string_view prepared_key,
+                                       ExpertVictimExecutionMetadata victim_execution)
 {
     bool already_ready = false;
     auto entry = enqueue_pair(gate_up, down, false, residency_group, prepared_key, victim_execution, &already_ready);
@@ -1895,11 +1867,10 @@ Result<bool> ExpertCache::request_pair(
     return already_ready;
 }
 
-Result<bool> ExpertCache::prefetch_pair(
-    const TensorData& gate_up,
-    const TensorData& down,
-    uint32_t residency_group,
-    std::string_view prepared_key)
+Result<bool> ExpertCache::prefetch_pair(const TensorData& gate_up,
+                                        const TensorData& down,
+                                        uint32_t residency_group,
+                                        std::string_view prepared_key)
 {
     bool already_ready = false;
     auto entry = enqueue_pair(gate_up, down, true, residency_group, prepared_key, {}, &already_ready);
@@ -2059,10 +2030,9 @@ void ExpertCache::worker_loop()
         {
             if (victim_cache)
             {
-                std::optional<ExpertVictimPair> victim = victim_cache->restore(
-                    batch[index]->key,
-                    batch[index]->gate_up_source,
-                    batch[index]->down_source);
+                std::optional<ExpertVictimPair> victim = victim_cache->restore(batch[index]->key,
+                                                                               batch[index]->gate_up_source,
+                                                                               batch[index]->down_source);
                 if (victim)
                 {
                     loaded_pairs[index] = std::move(*victim);
@@ -2081,12 +2051,11 @@ void ExpertCache::worker_loop()
         if (disk_entries.size() > 1
             && has_flag(flags, ExpertCacheCrossExpertReadCoalescing))
         {
-            auto loaded = load_coalesced_pairs(
-                disk_entries,
-                coalesced_mapped_range_count,
-                coalesced_mapped_size,
-                coalesced_saved_range_count,
-                coalesced);
+            auto loaded = load_coalesced_pairs(disk_entries,
+                                               coalesced_mapped_range_count,
+                                               coalesced_mapped_size,
+                                               coalesced_saved_range_count,
+                                               coalesced);
             if (!loaded)
             {
                 for (size_t slot : disk_slots)
@@ -2108,11 +2077,10 @@ void ExpertCache::worker_loop()
                 const size_t slot = disk_slots[index];
                 if (errors[slot])
                     continue;
-                auto loaded = load_pair(
-                    disk_entries[index]->gate_up_source,
-                    disk_entries[index]->down_source,
-                    entry_mapped_range_counts[slot],
-                    entry_mapped_sizes[slot]);
+                auto loaded = load_pair(disk_entries[index]->gate_up_source,
+                                        disk_entries[index]->down_source,
+                                        entry_mapped_range_counts[slot],
+                                        entry_mapped_sizes[slot]);
                 if (!loaded)
                 {
                     errors[slot] = loaded.error();
@@ -2126,8 +2094,7 @@ void ExpertCache::worker_loop()
             std::lock_guard<std::mutex> lock(mutex);
             if (!disk_entries.empty())
             {
-                const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - io_started);
+                const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - io_started);
                 const uint64_t elapsed_nanoseconds = std::max<int64_t>(1, elapsed.count());
                 ++io_read_samples;
                 io_read_time_nanoseconds += elapsed_nanoseconds;
@@ -2217,20 +2184,18 @@ void ExpertCache::worker_loop()
     }
 }
 
-Result<ExpertCacheLease> ExpertCache::acquire_pair(
-    const TensorData& gate_up,
-    const TensorData& down,
-    uint32_t residency_group,
-    std::string_view prepared_key,
-    ExpertVictimExecutionMetadata victim_execution)
+Result<ExpertCacheLease> ExpertCache::acquire_pair(const TensorData& gate_up,
+                                                   const TensorData& down,
+                                                   uint32_t residency_group,
+                                                   std::string_view prepared_key,
+                                                   ExpertVictimExecutionMetadata victim_execution)
 {
-    auto queued = enqueue_pair(
-        gate_up,
-        down,
-        false,
-        residency_group,
-        prepared_key,
-        victim_execution);
+    auto queued = enqueue_pair(gate_up,
+                               down,
+                               false,
+                               residency_group,
+                               prepared_key,
+                               victim_execution);
     if (!queued)
         return queued.error();
     std::shared_ptr<Entry> entry = std::move(queued).value();
@@ -2261,9 +2226,8 @@ Result<ExpertCacheLease> ExpertCache::acquire_pair(
     return lease;
 }
 
-Result<bool> ExpertCache::try_acquire_ready_pairs(
-    std::span<const ExpertCachePairRequest> requests,
-    std::span<ExpertCacheLease> leases)
+Result<bool> ExpertCache::try_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests,
+                                                  std::span<ExpertCacheLease> leases)
 {
     if (requests.size() != leases.size())
     {
@@ -2275,8 +2239,7 @@ Result<bool> ExpertCache::try_acquire_ready_pairs(
     {
         if (!request.gate_up
             || !request.down
-            || !is_supported_file_backed_pair(
-                *request.gate_up, *request.down)
+            || !is_supported_file_backed_pair(*request.gate_up, *request.down)
             || request.prepared_key.empty())
         {
             return Error{
@@ -2334,10 +2297,9 @@ Result<bool> ExpertCache::try_acquire_ready_pairs(
     return true;
 }
 
-Result<size_t> ExpertCache::wait_acquire_ready_pairs(
-    std::span<const ExpertCachePairRequest> requests,
-    std::span<ExpertCacheLease> leases,
-    bool wait_for_any)
+Result<size_t> ExpertCache::wait_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests,
+                                                     std::span<ExpertCacheLease> leases,
+                                                     bool wait_for_any)
 {
     if (requests.size() != leases.size())
     {
@@ -2369,8 +2331,7 @@ Result<size_t> ExpertCache::wait_acquire_ready_pairs(
         const ExpertCachePairRequest& request = requests[index];
         if (!request.gate_up
             || !request.down
-            || !is_supported_file_backed_pair(
-                *request.gate_up, *request.down)
+            || !is_supported_file_backed_pair(*request.gate_up, *request.down)
             || request.prepared_key.empty())
         {
             return Error{
@@ -2380,15 +2341,14 @@ Result<size_t> ExpertCache::wait_acquire_ready_pairs(
         for (;;)
         {
             bool temporarily_exhausted = false;
-            auto queued = enqueue_pair(
-                *request.gate_up,
-                *request.down,
-                false,
-                request.residency_group,
-                request.prepared_key,
-                request.victim_execution,
-                nullptr,
-                &temporarily_exhausted);
+            auto queued = enqueue_pair(*request.gate_up,
+                                       *request.down,
+                                       false,
+                                       request.residency_group,
+                                       request.prepared_key,
+                                       request.victim_execution,
+                                       nullptr,
+                                       &temporarily_exhausted);
             if (queued)
             {
                 ready_entries[index] = std::move(queued).value();

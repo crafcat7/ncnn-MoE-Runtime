@@ -43,28 +43,25 @@ struct SpeculativeProposal
 
 using SpeculativeSampler = std::function<Result<int32_t>(const std::vector<float>& logits)>;
 
-[[nodiscard]] Result<std::vector<std::vector<float>>> forward_model(
-    const CompiledModel& model,
-    std::span<const int32_t> input_ids,
-    SessionStatistics& statistics,
-    SessionState& state,
-    uint64_t position_offset,
-    LogitsOutput logits_output = LogitsOutput::All);
+[[nodiscard]] Result<std::vector<std::vector<float>>> forward_model(const CompiledModel& model,
+                                                                    std::span<const int32_t> input_ids,
+                                                                    SessionStatistics& statistics,
+                                                                    SessionState& state,
+                                                                    uint64_t position_offset,
+                                                                    LogitsOutput logits_output = LogitsOutput::All);
 
 [[nodiscard]] Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel& model, std::span<const DecodeBatchEntry> entries);
 
-[[nodiscard]] Result<void> update_speculative_context(
-    const CompiledModel& model,
-    SessionStatistics& statistics,
-    SessionState& state);
+[[nodiscard]] Result<void> update_speculative_context(const CompiledModel& model,
+                                                      SessionStatistics& statistics,
+                                                      SessionState& state);
 
-[[nodiscard]] Result<SpeculativeProposal> propose_speculative(
-    const CompiledModel& model,
-    int32_t input_id,
-    SessionStatistics& statistics,
-    SessionState& state,
-    uint64_t position_offset,
-    const SpeculativeSampler& sampler);
+[[nodiscard]] Result<SpeculativeProposal> propose_speculative(const CompiledModel& model,
+                                                              int32_t input_id,
+                                                              SessionStatistics& statistics,
+                                                              SessionState& state,
+                                                              uint64_t position_offset,
+                                                              const SpeculativeSampler& sampler);
 
 } // namespace moe
 } // namespace ncnn

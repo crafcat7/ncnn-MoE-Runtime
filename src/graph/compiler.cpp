@@ -296,12 +296,11 @@ static Result<TensorHandle> require_tensor(const WeightStore& weights, const std
     return handle;
 }
 
-static Result<void> assign_required_tensor(
-    const WeightStore& weights,
-    const std::string& name,
-    std::initializer_list<uint32_t> shape,
-    DType dtype,
-    TensorHandle& destination)
+static Result<void> assign_required_tensor(const WeightStore& weights,
+                                           const std::string& name,
+                                           std::initializer_list<uint32_t> shape,
+                                           DType dtype,
+                                           TensorHandle& destination)
 {
     auto tensor = require_tensor(weights, name, shape, dtype);
     if (!tensor)
@@ -310,44 +309,38 @@ static Result<void> assign_required_tensor(
     return {};
 }
 
-static Result<void> compile_gated_residual_plan(
-    const WeightStore& weights,
-    const std::string& prefix,
-    const MoeModelDescriptor& descriptor,
-    bool with_injection,
-    GatedResidualPlan& plan)
+static Result<void> compile_gated_residual_plan(const WeightStore& weights,
+                                                const std::string& prefix,
+                                                const MoeModelDescriptor& descriptor,
+                                                bool with_injection,
+                                                GatedResidualPlan& plan)
 {
     const uint32_t expanded_size = descriptor.hyper_connection_multiplier * descriptor.hidden_size;
-    Result<void> status = assign_required_tensor(
-        weights, prefix + "norm.weight", {expanded_size},
-        descriptor.activation_dtype, plan.norm_weight);
+    Result<void> status = assign_required_tensor(weights, prefix + "norm.weight", {expanded_size},
+                                                 descriptor.activation_dtype, plan.norm_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        weights, prefix + "mix_down.weight",
-        {descriptor.hyper_connection_low_rank, expanded_size},
-        descriptor.activation_dtype, plan.mix_down_weight);
+    status = assign_required_tensor(weights, prefix + "mix_down.weight",
+                                    {descriptor.hyper_connection_low_rank, expanded_size},
+                                    descriptor.activation_dtype, plan.mix_down_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        weights, prefix + "mix_up.weight",
-        {expanded_size, descriptor.hyper_connection_low_rank},
-        descriptor.activation_dtype, plan.mix_up_weight);
+    status = assign_required_tensor(weights, prefix + "mix_up.weight",
+                                    {expanded_size, descriptor.hyper_connection_low_rank},
+                                    descriptor.activation_dtype, plan.mix_up_weight);
     if (!status)
         return status.error();
     if (!with_injection)
         return {};
-    return assign_required_tensor(
-        weights, prefix + "inject.weight",
-        {descriptor.hyper_connection_multiplier, expanded_size},
-        descriptor.activation_dtype, plan.inject_weight);
+    return assign_required_tensor(weights, prefix + "inject.weight",
+                                  {descriptor.hyper_connection_multiplier, expanded_size},
+                                  descriptor.activation_dtype, plan.inject_weight);
 }
 
-static Result<void> compile_ple_plan(
-    CompiledModel& compiled,
-    const std::string& layer_name,
-    const PleDescriptor& descriptor,
-    PleBlockPlan& plan)
+static Result<void> compile_ple_plan(CompiledModel& compiled,
+                                     const std::string& layer_name,
+                                     const PleDescriptor& descriptor,
+                                     PleBlockPlan& plan)
 {
     if (!descriptor.enabled())
         return {};
@@ -366,53 +359,44 @@ static Result<void> compile_ple_plan(
     const uint32_t expanded_size = compiled.descriptor.hyper_connection_multiplier
                                    * compiled.descriptor.hidden_size;
     const uint32_t head_dimension = descriptor.embedding_dimension / head_count;
-    Result<void> status = assign_required_tensor(
-        compiled.weights, layer_name + "ple.key.weight",
-        {expanded_size, compiled.descriptor.hidden_size},
-        compiled.descriptor.activation_dtype, plan.key_weight);
+    Result<void> status = assign_required_tensor(compiled.weights, layer_name + "ple.key.weight",
+                                                 {expanded_size, compiled.descriptor.hidden_size},
+                                                 compiled.descriptor.activation_dtype, plan.key_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights, layer_name + "ple.value.weight",
-        {compiled.descriptor.hidden_size, compiled.descriptor.hidden_size},
-        compiled.descriptor.activation_dtype, plan.value_weight);
+    status = assign_required_tensor(compiled.weights, layer_name + "ple.value.weight",
+                                    {compiled.descriptor.hidden_size, compiled.descriptor.hidden_size},
+                                    compiled.descriptor.activation_dtype, plan.value_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights, layer_name + "ple.key_norm.weight", {expanded_size},
-        compiled.descriptor.activation_dtype, plan.key_norm_weight);
+    status = assign_required_tensor(compiled.weights, layer_name + "ple.key_norm.weight", {expanded_size},
+                                    compiled.descriptor.activation_dtype, plan.key_norm_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights, layer_name + "ple.query_norm.weight", {expanded_size},
-        compiled.descriptor.activation_dtype, plan.query_norm_weight);
+    status = assign_required_tensor(compiled.weights, layer_name + "ple.query_norm.weight", {expanded_size},
+                                    compiled.descriptor.activation_dtype, plan.query_norm_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights, layer_name + "ple.convolution_norm.weight",
-        {expanded_size}, compiled.descriptor.activation_dtype,
-        plan.convolution_norm_weight);
+    status = assign_required_tensor(compiled.weights, layer_name + "ple.convolution_norm.weight",
+                                    {expanded_size}, compiled.descriptor.activation_dtype,
+                                    plan.convolution_norm_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights, layer_name + "ple.convolution.weight",
-        {expanded_size, 1, descriptor.convolution_kernel_size},
-        compiled.descriptor.activation_dtype, plan.convolution_weight);
+    status = assign_required_tensor(compiled.weights, layer_name + "ple.convolution.weight",
+                                    {expanded_size, 1, descriptor.convolution_kernel_size},
+                                    compiled.descriptor.activation_dtype, plan.convolution_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights, layer_name + "ple.hash_multipliers",
-        {descriptor.ngram_size}, DType::Int64, plan.hash_multipliers);
+    status = assign_required_tensor(compiled.weights, layer_name + "ple.hash_multipliers",
+                                    {descriptor.ngram_size}, DType::Int64, plan.hash_multipliers);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights, layer_name + "ple.head_vocabulary_sizes",
-        {head_count}, DType::Int64, plan.head_vocabulary_sizes);
+    status = assign_required_tensor(compiled.weights, layer_name + "ple.head_vocabulary_sizes",
+                                    {head_count}, DType::Int64, plan.head_vocabulary_sizes);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights, layer_name + "ple.head_offsets",
-        {head_count}, DType::Int64, plan.head_offsets);
+    status = assign_required_tensor(compiled.weights, layer_name + "ple.head_offsets",
+                                    {head_count}, DType::Int64, plan.head_offsets);
     if (!status)
         return status.error();
 
@@ -466,12 +450,11 @@ static Result<void> compile_ple_plan(
     return {};
 }
 
-static Result<void> compile_latent_attention(
-    const WeightStore& weights,
-    const std::string& layer_name,
-    const MoeModelDescriptor& descriptor,
-    const AttentionDescriptor& attention,
-    AttentionBlockPlan& plan)
+static Result<void> compile_latent_attention(const WeightStore& weights,
+                                             const std::string& layer_name,
+                                             const MoeModelDescriptor& descriptor,
+                                             const AttentionDescriptor& attention,
+                                             AttentionBlockPlan& plan)
 {
     if (attention.query_lora_rank == 0
         || attention.head_count == 0
@@ -574,12 +557,11 @@ static Result<void> compile_latent_attention(
     return assign_required_tensor(weights, layer_name + "attention.indexer.weights.weight", {attention.index_head_count, descriptor.hidden_size}, descriptor.activation_dtype, plan.indexer_weights_weight);
 }
 
-static Result<void> compile_gated_delta_attention(
-    const WeightStore& weights,
-    const std::string& layer_name,
-    const MoeModelDescriptor& descriptor,
-    const AttentionDescriptor& attention,
-    AttentionBlockPlan& plan)
+static Result<void> compile_gated_delta_attention(const WeightStore& weights,
+                                                  const std::string& layer_name,
+                                                  const MoeModelDescriptor& descriptor,
+                                                  const AttentionDescriptor& attention,
+                                                  AttentionBlockPlan& plan)
 {
     if (attention.head_count == 0
         || attention.kv_head_count == 0
@@ -609,91 +591,80 @@ static Result<void> compile_gated_delta_attention(
     Result<void> status;
     if (descriptor.hyper_connection_kind != HyperConnectionKind::GatedResidual)
     {
-        status = assign_required_tensor(
-            weights,
-            layer_name + "pre_attention_norm.weight",
-            {descriptor.hidden_size},
-            descriptor.activation_dtype,
-            plan.pre_attention_norm_weight);
+        status = assign_required_tensor(weights,
+                                        layer_name + "pre_attention_norm.weight",
+                                        {descriptor.hidden_size},
+                                        descriptor.activation_dtype,
+                                        plan.pre_attention_norm_weight);
         if (!status)
             return status.error();
     }
-    status = assign_required_tensor(
-        weights,
-        layer_name + "attention.delta.qkv.weight",
-        {convolution_size, descriptor.hidden_size},
-        descriptor.activation_dtype,
-        plan.delta_qkv_weight);
+    status = assign_required_tensor(weights,
+                                    layer_name + "attention.delta.qkv.weight",
+                                    {convolution_size, descriptor.hidden_size},
+                                    descriptor.activation_dtype,
+                                    plan.delta_qkv_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        weights,
-        layer_name + "attention.delta.z.weight",
-        {value_size, descriptor.hidden_size},
-        descriptor.activation_dtype,
-        plan.delta_z_weight);
+    status = assign_required_tensor(weights,
+                                    layer_name + "attention.delta.z.weight",
+                                    {value_size, descriptor.hidden_size},
+                                    descriptor.activation_dtype,
+                                    plan.delta_z_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        weights,
-        layer_name + "attention.delta.beta.weight",
-        {attention.head_count, descriptor.hidden_size},
-        descriptor.activation_dtype,
-        plan.delta_beta_weight);
+    status = assign_required_tensor(weights,
+                                    layer_name + "attention.delta.beta.weight",
+                                    {attention.head_count, descriptor.hidden_size},
+                                    descriptor.activation_dtype,
+                                    plan.delta_beta_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        weights,
-        layer_name + "attention.delta.alpha.weight",
-        {attention.head_count, descriptor.hidden_size},
-        descriptor.activation_dtype,
-        plan.delta_alpha_weight);
+    status = assign_required_tensor(weights,
+                                    layer_name + "attention.delta.alpha.weight",
+                                    {attention.head_count, descriptor.hidden_size},
+                                    descriptor.activation_dtype,
+                                    plan.delta_alpha_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        weights,
-        layer_name + "attention.delta.convolution.weight",
-        {convolution_size, 1, attention.convolution_kernel_size},
-        descriptor.activation_dtype,
-        plan.delta_convolution_weight);
+    status = assign_required_tensor(weights,
+                                    layer_name + "attention.delta.convolution.weight",
+                                    {convolution_size, 1, attention.convolution_kernel_size},
+                                    descriptor.activation_dtype,
+                                    plan.delta_convolution_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        weights,
-        layer_name + "attention.delta.time_bias",
-        {attention.head_count},
-        descriptor.activation_dtype,
-        plan.delta_time_bias);
+    status = assign_required_tensor(weights,
+                                    layer_name + "attention.delta.time_bias",
+                                    {attention.head_count},
+                                    descriptor.activation_dtype,
+                                    plan.delta_time_bias);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        weights,
-        layer_name + "attention.delta.decay_log",
-        {attention.head_count},
-        descriptor.activation_dtype,
-        plan.delta_decay_log);
+    status = assign_required_tensor(weights,
+                                    layer_name + "attention.delta.decay_log",
+                                    {attention.head_count},
+                                    descriptor.activation_dtype,
+                                    plan.delta_decay_log);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        weights,
-        layer_name + "attention.delta.norm.weight",
-        {attention.value_head_dimension},
-        descriptor.activation_dtype,
-        plan.delta_norm_weight);
+    status = assign_required_tensor(weights,
+                                    layer_name + "attention.delta.norm.weight",
+                                    {attention.value_head_dimension},
+                                    descriptor.activation_dtype,
+                                    plan.delta_norm_weight);
     if (!status)
         return status.error();
-    return assign_required_tensor(
-        weights,
-        layer_name + "attention.output.weight",
-        {descriptor.hidden_size, value_size},
-        descriptor.activation_dtype,
-        plan.output_weight);
+    return assign_required_tensor(weights,
+                                  layer_name + "attention.output.weight",
+                                  {descriptor.hidden_size, value_size},
+                                  descriptor.activation_dtype,
+                                  plan.output_weight);
 }
 
-static Result<void> compile_standard_attention(
-    const WeightStore& weights, const std::string& layer_name,
-    const MoeModelDescriptor& descriptor, const LayerDescriptor& layer,
-    AttentionBlockPlan& plan)
+static Result<void> compile_standard_attention(const WeightStore& weights, const std::string& layer_name,
+                                               const MoeModelDescriptor& descriptor, const LayerDescriptor& layer,
+                                               AttentionBlockPlan& plan)
 {
     const AttentionDescriptor& attention = layer.attention;
     plan.kind = AttentionKind::Standard;
@@ -817,12 +788,11 @@ static Result<void> compile_standard_attention(
     }
     if (has_flag(plan.flags, AttentionBlockQsa))
     {
-        ret = assign_required_tensor(
-            weights,
-            layer_name + "attention.qsa.query_key.weight",
-            {(attention.index_head_count + 1) * attention.index_head_dimension,
-             descriptor.hidden_size},
-            descriptor.activation_dtype, plan.qsa_query_key_weight);
+        ret = assign_required_tensor(weights,
+                                     layer_name + "attention.qsa.query_key.weight",
+                                     {(attention.index_head_count + 1) * attention.index_head_dimension,
+                                      descriptor.hidden_size},
+                                     descriptor.activation_dtype, plan.qsa_query_key_weight);
         if (!ret)
             return ret.error();
         ret = assign_required_tensor(weights, layer_name + "attention.qsa.query_norm.weight", {attention.index_head_dimension}, descriptor.activation_dtype, plan.qsa_query_norm_weight);
@@ -881,10 +851,9 @@ static uint64_t expert_weight_size(const WeightStore& weights, const ExpertPlan&
     return size;
 }
 
-static Result<void> compile_shared_expert(
-    const WeightStore& weights, const std::string& layer_name,
-    const MoeModelDescriptor& descriptor, const MoeDescriptor& moe,
-    ExpertPlan& shared)
+static Result<void> compile_shared_expert(const WeightStore& weights, const std::string& layer_name,
+                                          const MoeModelDescriptor& descriptor, const MoeDescriptor& moe,
+                                          ExpertPlan& shared)
 {
     shared.activation = moe.activation;
     shared.activation_limit = moe.activation_limit;
@@ -916,30 +885,27 @@ static bool is_mapped_bfloat16_expert_tensor(const TensorData& tensor) noexcept
            && tensor.bfloat16_values().size() == elements;
 }
 
-static bool is_cache_file_backed_expert_tensor(
-    const TensorData& tensor,
-    bool allow_bfloat16) noexcept
+static bool is_cache_file_backed_expert_tensor(const TensorData& tensor,
+                                               bool allow_bfloat16) noexcept
 {
     return static_cast<bool>(tensor.mxfp4_file_storage)
            || (allow_bfloat16
                && is_mapped_bfloat16_expert_tensor(tensor));
 }
 
-static bool is_cache_file_backed_expert_pair(
-    const TensorData& gate_up,
-    const TensorData& down,
-    bool allow_bfloat16) noexcept
+static bool is_cache_file_backed_expert_pair(const TensorData& gate_up,
+                                             const TensorData& down,
+                                             bool allow_bfloat16) noexcept
 {
     return is_cache_file_backed_expert_tensor(gate_up, allow_bfloat16)
            && is_cache_file_backed_expert_tensor(down, allow_bfloat16);
 }
 
-static Result<void> combine_qnk_gate_up_weights(
-    WeightStore& weights,
-    TensorHandle gate_handle,
-    TensorHandle up_handle,
-    uint32_t rows,
-    uint32_t columns)
+static Result<void> combine_qnk_gate_up_weights(WeightStore& weights,
+                                                TensorHandle gate_handle,
+                                                TensorHandle up_handle,
+                                                uint32_t rows,
+                                                uint32_t columns)
 {
     if (gate_handle == invalid_tensor_handle || up_handle == invalid_tensor_handle)
         return Error{ErrorCode::InvalidArgument, "Qn_K gate/up handles cannot be invalid"};
@@ -1013,9 +979,8 @@ static uint32_t choose_layer_device(bool use_vulkan, const std::vector<uint32_t>
     return devices[selected];
 }
 
-static Result<void> compile_mtp_speculative_model(
-    CompiledModel& compiled,
-    bool use_file_backed_experts)
+static Result<void> compile_mtp_speculative_model(CompiledModel& compiled,
+                                                  bool use_file_backed_experts)
 {
     if (compiled.descriptor.speculative_layer_count != 1
         || compiled.descriptor.speculative_block_size == 0
@@ -1032,36 +997,32 @@ static Result<void> compile_mtp_speculative_model(
     speculative.kind = SpeculativeModelKind::Mtp;
     speculative.block_size = compiled.descriptor.speculative_block_size;
     const uint32_t hidden_size = compiled.descriptor.hidden_size;
-    Result<void> status = assign_required_tensor(
-        compiled.weights,
-        "speculative.mtp.embedding_norm.weight",
-        {hidden_size},
-        compiled.descriptor.activation_dtype,
-        speculative.mtp_embedding_norm_weight);
+    Result<void> status = assign_required_tensor(compiled.weights,
+                                                 "speculative.mtp.embedding_norm.weight",
+                                                 {hidden_size},
+                                                 compiled.descriptor.activation_dtype,
+                                                 speculative.mtp_embedding_norm_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        "speculative.mtp.hidden_norm.weight",
-        {hidden_size},
-        compiled.descriptor.activation_dtype,
-        speculative.mtp_hidden_norm_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    "speculative.mtp.hidden_norm.weight",
+                                    {hidden_size},
+                                    compiled.descriptor.activation_dtype,
+                                    speculative.mtp_hidden_norm_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        "speculative.mtp.input_projection.weight",
-        {hidden_size, hidden_size * 2},
-        compiled.descriptor.activation_dtype,
-        speculative.mtp_input_projection_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    "speculative.mtp.input_projection.weight",
+                                    {hidden_size, hidden_size * 2},
+                                    compiled.descriptor.activation_dtype,
+                                    speculative.mtp_input_projection_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        "speculative.final_norm.weight",
-        {hidden_size},
-        compiled.descriptor.activation_dtype,
-        speculative.final_norm_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    "speculative.final_norm.weight",
+                                    {hidden_size},
+                                    compiled.descriptor.activation_dtype,
+                                    speculative.final_norm_weight);
     if (!status)
         return status.error();
     const std::string layer_name = speculative_layer_prefix(0);
@@ -1078,73 +1039,65 @@ static Result<void> compile_mtp_speculative_model(
     attention.value_bias = invalid_tensor_handle;
     attention.output_bias = invalid_tensor_handle;
 
-    status = assign_required_tensor(
-        compiled.weights,
-        layer_name + "pre_attention_norm.weight",
-        {hidden_size},
-        compiled.descriptor.activation_dtype,
-        attention.pre_attention_norm_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    layer_name + "pre_attention_norm.weight",
+                                    {hidden_size},
+                                    compiled.descriptor.activation_dtype,
+                                    attention.pre_attention_norm_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        layer_name + "attention.query.weight",
-        {attention.head_count * attention.head_dimension, hidden_size},
-        compiled.descriptor.activation_dtype,
-        attention.query_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    layer_name + "attention.query.weight",
+                                    {attention.head_count * attention.head_dimension, hidden_size},
+                                    compiled.descriptor.activation_dtype,
+                                    attention.query_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        layer_name + "attention.key.weight",
-        {attention.kv_head_count * attention.head_dimension, hidden_size},
-        compiled.descriptor.activation_dtype,
-        attention.key_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    layer_name + "attention.key.weight",
+                                    {attention.kv_head_count * attention.head_dimension, hidden_size},
+                                    compiled.descriptor.activation_dtype,
+                                    attention.key_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        layer_name + "attention.value.weight",
-        {attention.kv_head_count * attention.head_dimension, hidden_size},
-        compiled.descriptor.activation_dtype,
-        attention.value_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    layer_name + "attention.value.weight",
+                                    {attention.kv_head_count * attention.head_dimension, hidden_size},
+                                    compiled.descriptor.activation_dtype,
+                                    attention.value_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        layer_name + "attention.output.weight",
-        {hidden_size, attention.head_count * attention.head_dimension},
-        compiled.descriptor.activation_dtype,
-        attention.output_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    layer_name + "attention.output.weight",
+                                    {hidden_size, attention.head_count * attention.head_dimension},
+                                    compiled.descriptor.activation_dtype,
+                                    attention.output_weight);
     if (!status)
         return status.error();
     if (has_flag(attention.flags, AttentionBlockQueryKeyNorm))
     {
-        status = assign_required_tensor(
-            compiled.weights,
-            layer_name + "attention.query_norm.weight",
-            {attention.head_dimension},
-            compiled.descriptor.activation_dtype,
-            attention.query_norm_weight);
+        status = assign_required_tensor(compiled.weights,
+                                        layer_name + "attention.query_norm.weight",
+                                        {attention.head_dimension},
+                                        compiled.descriptor.activation_dtype,
+                                        attention.query_norm_weight);
         if (!status)
             return status.error();
-        status = assign_required_tensor(
-            compiled.weights,
-            layer_name + "attention.key_norm.weight",
-            {attention.head_dimension},
-            compiled.descriptor.activation_dtype,
-            attention.key_norm_weight);
+        status = assign_required_tensor(compiled.weights,
+                                        layer_name + "attention.key_norm.weight",
+                                        {attention.head_dimension},
+                                        compiled.descriptor.activation_dtype,
+                                        attention.key_norm_weight);
         if (!status)
             return status.error();
     }
     if (has_flag(attention.flags, AttentionBlockOutputGate))
     {
-        status = assign_required_tensor(
-            compiled.weights,
-            layer_name + "attention.output_gate.weight",
-            {attention.head_count * attention.head_dimension, hidden_size},
-            compiled.descriptor.activation_dtype,
-            attention.output_gate_weight);
+        status = assign_required_tensor(compiled.weights,
+                                        layer_name + "attention.output_gate.weight",
+                                        {attention.head_count * attention.head_dimension, hidden_size},
+                                        compiled.descriptor.activation_dtype,
+                                        attention.output_gate_weight);
         if (!status)
             return status.error();
     }
@@ -1155,35 +1108,31 @@ static Result<void> compile_mtp_speculative_model(
     compiled_moe.token_experts = invalid_tensor_handle;
     compiled_moe.experts.clear();
     compiled_moe.shared_expert = {};
-    status = assign_required_tensor(
-        compiled.weights,
-        layer_name + "pre_ffn_norm.weight",
-        {hidden_size},
-        compiled.descriptor.activation_dtype,
-        compiled_moe.pre_ffn_norm_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    layer_name + "pre_ffn_norm.weight",
+                                    {hidden_size},
+                                    compiled.descriptor.activation_dtype,
+                                    compiled_moe.pre_ffn_norm_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        layer_name + "router.weight",
-        {moe.expert_count, hidden_size},
-        compiled.descriptor.activation_dtype,
-        compiled_moe.router_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    layer_name + "router.weight",
+                                    {moe.expert_count, hidden_size},
+                                    compiled.descriptor.activation_dtype,
+                                    compiled_moe.router_weight);
     if (!status)
         return status.error();
-    status = compile_shared_expert(
-        compiled.weights, layer_name, compiled.descriptor, moe,
-        compiled_moe.shared_expert);
+    status = compile_shared_expert(compiled.weights, layer_name, compiled.descriptor, moe,
+                                   compiled_moe.shared_expert);
     if (!status)
         return status.error();
     if (has_flag(moe.flags, MoeDescriptorSharedExpertGate))
     {
-        status = assign_required_tensor(
-            compiled.weights,
-            layer_name + "shared_expert.router_gate.weight",
-            {1, hidden_size},
-            compiled.descriptor.activation_dtype,
-            compiled_moe.shared_expert_gate_weight);
+        status = assign_required_tensor(compiled.weights,
+                                        layer_name + "shared_expert.router_gate.weight",
+                                        {1, hidden_size},
+                                        compiled.descriptor.activation_dtype,
+                                        compiled_moe.shared_expert_gate_weight);
         if (!status)
             return status.error();
     }
@@ -1195,24 +1144,22 @@ static Result<void> compile_mtp_speculative_model(
         expert.layout = moe.layout;
         expert.activation_limit = moe.activation_limit;
         const std::string prefix = speculative_expert_prefix(0, expert_id);
-        status = assign_required_tensor(
-            compiled.weights,
-            prefix + "gate_up.weight",
-            {moe.intermediate_size * 2, hidden_size},
-            moe.expert_weight_dtype,
-            expert.gate_up_weight);
+        status = assign_required_tensor(compiled.weights,
+                                        prefix + "gate_up.weight",
+                                        {moe.intermediate_size * 2, hidden_size},
+                                        moe.expert_weight_dtype,
+                                        expert.gate_up_weight);
         if (!status)
             return status.error();
         if (is_qnk_dtype(compiled.weights.at(expert.gate_up_weight).dtype))
         {
             compiled.weights.at_mutable(expert.gate_up_weight).qnk_interleave_rows = moe.layout == ExpertLayout::InterleavedGateUpDown;
         }
-        status = assign_required_tensor(
-            compiled.weights,
-            prefix + "down.weight",
-            {hidden_size, moe.intermediate_size},
-            moe.expert_weight_dtype,
-            expert.down_weight);
+        status = assign_required_tensor(compiled.weights,
+                                        prefix + "down.weight",
+                                        {hidden_size, moe.intermediate_size},
+                                        moe.expert_weight_dtype,
+                                        expert.down_weight);
         if (!status)
             return status.error();
         expert.weight_size = expert_weight_size(compiled.weights, expert);
@@ -1221,8 +1168,7 @@ static Result<void> compile_mtp_speculative_model(
         const bool use_file_backed_bfloat16 = use_file_backed_experts
                                               && moe.expert_weight_dtype == DType::BFloat16
                                               && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
-        if (is_cache_file_backed_expert_pair(
-                gate_up_weight, down_weight, use_file_backed_bfloat16))
+        if (is_cache_file_backed_expert_pair(gate_up_weight, down_weight, use_file_backed_bfloat16))
             expert.cache_key = ExpertCache::make_pair_key(gate_up_weight, down_weight);
         else if (is_qnk_dtype(gate_up_weight.dtype) && gate_up_weight.dtype == down_weight.dtype)
             expert.cache_key = "qnk:" + prefix;
@@ -1231,9 +1177,8 @@ static Result<void> compile_mtp_speculative_model(
     return {};
 }
 
-static Result<void> compile_speculative_model(
-    CompiledModel& compiled,
-    bool use_file_backed_experts)
+static Result<void> compile_speculative_model(CompiledModel& compiled,
+                                              bool use_file_backed_experts)
 {
     if (compiled.descriptor.speculative_layer_count == 0)
         return {};
@@ -1256,76 +1201,67 @@ static Result<void> compile_speculative_model(
     const uint32_t hidden_size = compiled.descriptor.hidden_size;
     const uint32_t multiplier = compiled.descriptor.hyper_connection_multiplier;
     const uint32_t hyper_columns = multiplier * hidden_size;
-    Result<void> status = assign_required_tensor(
-        compiled.weights,
-        "speculative.main_projection.weight",
-        {hidden_size, hidden_size * static_cast<uint32_t>(speculative.target_layer_ids.size())},
-        DType::Float8E4M3,
-        speculative.main_projection_weight);
+    Result<void> status = assign_required_tensor(compiled.weights,
+                                                 "speculative.main_projection.weight",
+                                                 {hidden_size, hidden_size * static_cast<uint32_t>(speculative.target_layer_ids.size())},
+                                                 DType::Float8E4M3,
+                                                 speculative.main_projection_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        "speculative.main_norm.weight",
-        {hidden_size},
-        compiled.descriptor.activation_dtype,
-        speculative.main_norm_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    "speculative.main_norm.weight",
+                                    {hidden_size},
+                                    compiled.descriptor.activation_dtype,
+                                    speculative.main_norm_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        "speculative.final_norm.weight",
-        {hidden_size},
-        compiled.descriptor.activation_dtype,
-        speculative.final_norm_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    "speculative.final_norm.weight",
+                                    {hidden_size},
+                                    compiled.descriptor.activation_dtype,
+                                    speculative.final_norm_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        "speculative.hyper.head.function",
-        {multiplier, hyper_columns},
-        DType::Float32,
-        speculative.hyper_head_function);
+    status = assign_required_tensor(compiled.weights,
+                                    "speculative.hyper.head.function",
+                                    {multiplier, hyper_columns},
+                                    DType::Float32,
+                                    speculative.hyper_head_function);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        "speculative.hyper.head.base",
-        {multiplier},
-        DType::Float32,
-        speculative.hyper_head_base);
+    status = assign_required_tensor(compiled.weights,
+                                    "speculative.hyper.head.base",
+                                    {multiplier},
+                                    DType::Float32,
+                                    speculative.hyper_head_base);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        "speculative.hyper.head.scale",
-        {1},
-        DType::Float32,
-        speculative.hyper_head_scale);
+    status = assign_required_tensor(compiled.weights,
+                                    "speculative.hyper.head.scale",
+                                    {1},
+                                    DType::Float32,
+                                    speculative.hyper_head_scale);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        "speculative.markov.embedding.weight",
-        {compiled.descriptor.vocabulary_size, speculative.markov_rank},
-        compiled.descriptor.activation_dtype,
-        speculative.markov_embedding_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    "speculative.markov.embedding.weight",
+                                    {compiled.descriptor.vocabulary_size, speculative.markov_rank},
+                                    compiled.descriptor.activation_dtype,
+                                    speculative.markov_embedding_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        "speculative.markov.head.weight",
-        {compiled.descriptor.vocabulary_size, speculative.markov_rank},
-        compiled.descriptor.activation_dtype,
-        speculative.markov_head_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    "speculative.markov.head.weight",
+                                    {compiled.descriptor.vocabulary_size, speculative.markov_rank},
+                                    compiled.descriptor.activation_dtype,
+                                    speculative.markov_head_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(
-        compiled.weights,
-        "speculative.confidence.weight",
-        {1, hidden_size + speculative.markov_rank},
-        compiled.descriptor.activation_dtype,
-        speculative.confidence_weight);
+    status = assign_required_tensor(compiled.weights,
+                                    "speculative.confidence.weight",
+                                    {1, hidden_size + speculative.markov_rank},
+                                    compiled.descriptor.activation_dtype,
+                                    speculative.confidence_weight);
     if (!status)
         return status.error();
 
@@ -1348,90 +1284,79 @@ static Result<void> compile_speculative_model(
         layer_plan.moe.has_shared_expert = true;
 
         const uint32_t mix_count = (2 + multiplier) * multiplier;
-        status = assign_required_tensor(
-            compiled.weights,
-            layer_name + "hyper.attention.function",
-            {mix_count, hyper_columns},
-            DType::Float32,
-            layer_plan.hyper_connection.attention_function);
+        status = assign_required_tensor(compiled.weights,
+                                        layer_name + "hyper.attention.function",
+                                        {mix_count, hyper_columns},
+                                        DType::Float32,
+                                        layer_plan.hyper_connection.attention_function);
         if (!status)
             return status.error();
-        status = assign_required_tensor(
-            compiled.weights,
-            layer_name + "hyper.attention.base",
-            {mix_count},
-            DType::Float32,
-            layer_plan.hyper_connection.attention_base);
+        status = assign_required_tensor(compiled.weights,
+                                        layer_name + "hyper.attention.base",
+                                        {mix_count},
+                                        DType::Float32,
+                                        layer_plan.hyper_connection.attention_base);
         if (!status)
             return status.error();
-        status = assign_required_tensor(
-            compiled.weights,
-            layer_name + "hyper.attention.scale",
-            {3},
-            DType::Float32,
-            layer_plan.hyper_connection.attention_scale);
+        status = assign_required_tensor(compiled.weights,
+                                        layer_name + "hyper.attention.scale",
+                                        {3},
+                                        DType::Float32,
+                                        layer_plan.hyper_connection.attention_scale);
         if (!status)
             return status.error();
-        status = assign_required_tensor(
-            compiled.weights,
-            layer_name + "hyper.ffn.function",
-            {mix_count, hyper_columns},
-            DType::Float32,
-            layer_plan.hyper_connection.ffn_function);
+        status = assign_required_tensor(compiled.weights,
+                                        layer_name + "hyper.ffn.function",
+                                        {mix_count, hyper_columns},
+                                        DType::Float32,
+                                        layer_plan.hyper_connection.ffn_function);
         if (!status)
             return status.error();
-        status = assign_required_tensor(
-            compiled.weights,
-            layer_name + "hyper.ffn.base",
-            {mix_count},
-            DType::Float32,
-            layer_plan.hyper_connection.ffn_base);
+        status = assign_required_tensor(compiled.weights,
+                                        layer_name + "hyper.ffn.base",
+                                        {mix_count},
+                                        DType::Float32,
+                                        layer_plan.hyper_connection.ffn_base);
         if (!status)
             return status.error();
-        status = assign_required_tensor(
-            compiled.weights,
-            layer_name + "hyper.ffn.scale",
-            {3},
-            DType::Float32,
-            layer_plan.hyper_connection.ffn_scale);
+        status = assign_required_tensor(compiled.weights,
+                                        layer_name + "hyper.ffn.scale",
+                                        {3},
+                                        DType::Float32,
+                                        layer_plan.hyper_connection.ffn_scale);
         if (!status)
             return status.error();
 
-        status = compile_latent_attention(
-            compiled.weights,
-            layer_name,
-            compiled.descriptor,
-            draft_layer.attention,
-            layer_plan.attention);
+        status = compile_latent_attention(compiled.weights,
+                                          layer_name,
+                                          compiled.descriptor,
+                                          draft_layer.attention,
+                                          layer_plan.attention);
         if (!status)
             return status.error();
-        status = assign_required_tensor(
-            compiled.weights,
-            layer_name + "pre_ffn_norm.weight",
-            {hidden_size},
-            compiled.descriptor.activation_dtype,
-            layer_plan.moe.pre_ffn_norm_weight);
+        status = assign_required_tensor(compiled.weights,
+                                        layer_name + "pre_ffn_norm.weight",
+                                        {hidden_size},
+                                        compiled.descriptor.activation_dtype,
+                                        layer_plan.moe.pre_ffn_norm_weight);
         if (!status)
             return status.error();
-        status = assign_required_tensor(
-            compiled.weights,
-            layer_name + "router.weight",
-            {moe.expert_count, hidden_size},
-            compiled.descriptor.activation_dtype,
-            layer_plan.moe.router_weight);
+        status = assign_required_tensor(compiled.weights,
+                                        layer_name + "router.weight",
+                                        {moe.expert_count, hidden_size},
+                                        compiled.descriptor.activation_dtype,
+                                        layer_plan.moe.router_weight);
         if (!status)
             return status.error();
-        status = assign_required_tensor(
-            compiled.weights,
-            layer_name + "router.selection_bias",
-            {moe.expert_count},
-            DType::Float32,
-            layer_plan.moe.router_selection_bias);
+        status = assign_required_tensor(compiled.weights,
+                                        layer_name + "router.selection_bias",
+                                        {moe.expert_count},
+                                        DType::Float32,
+                                        layer_plan.moe.router_selection_bias);
         if (!status)
             return status.error();
-        status = compile_shared_expert(
-            compiled.weights, layer_name, compiled.descriptor, moe,
-            layer_plan.moe.shared_expert);
+        status = compile_shared_expert(compiled.weights, layer_name, compiled.descriptor, moe,
+                                       layer_plan.moe.shared_expert);
         if (!status)
             return status.error();
         layer_plan.moe.experts.reserve(moe.expert_count);
@@ -1442,20 +1367,18 @@ static Result<void> compile_speculative_model(
             expert.layout = ExpertLayout::InterleavedGateUpDown;
             expert.activation_limit = moe.activation_limit;
             const std::string prefix = speculative_expert_prefix(layer_id, expert_id);
-            status = assign_required_tensor(
-                compiled.weights,
-                prefix + "gate_up.weight",
-                {moe.intermediate_size * 2, hidden_size},
-                moe.expert_weight_dtype,
-                expert.gate_up_weight);
+            status = assign_required_tensor(compiled.weights,
+                                            prefix + "gate_up.weight",
+                                            {moe.intermediate_size * 2, hidden_size},
+                                            moe.expert_weight_dtype,
+                                            expert.gate_up_weight);
             if (!status)
                 return status.error();
-            status = assign_required_tensor(
-                compiled.weights,
-                prefix + "down.weight",
-                {hidden_size, moe.intermediate_size},
-                moe.expert_weight_dtype,
-                expert.down_weight);
+            status = assign_required_tensor(compiled.weights,
+                                            prefix + "down.weight",
+                                            {hidden_size, moe.intermediate_size},
+                                            moe.expert_weight_dtype,
+                                            expert.down_weight);
             if (!status)
                 return status.error();
             expert.weight_size = expert_weight_size(compiled.weights, expert);
@@ -1464,8 +1387,7 @@ static Result<void> compile_speculative_model(
             const bool use_file_backed_bfloat16 = use_file_backed_experts
                                                   && moe.expert_weight_dtype == DType::BFloat16
                                                   && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
-            if (is_cache_file_backed_expert_pair(
-                    gate_up_weight, down_weight, use_file_backed_bfloat16))
+            if (is_cache_file_backed_expert_pair(gate_up_weight, down_weight, use_file_backed_bfloat16))
                 expert.cache_key = ExpertCache::make_pair_key(gate_up_weight, down_weight);
             layer_plan.moe.experts.push_back(std::move(expert));
         }
@@ -1473,10 +1395,9 @@ static Result<void> compile_speculative_model(
     return {};
 }
 
-static Result<void> compile_moe_layer(
-    CompiledModel& compiled, const std::string& layer_name,
-    const LayerDescriptor& layer, CompiledLayerPlan& layer_plan,
-    bool use_file_backed_experts)
+static Result<void> compile_moe_layer(CompiledModel& compiled, const std::string& layer_name,
+                                      const LayerDescriptor& layer, CompiledLayerPlan& layer_plan,
+                                      bool use_file_backed_experts)
 {
     const MoeDescriptor& moe = layer.moe;
     if (layer.pre_ffn_norm == NormType::RmsNorm)
@@ -1513,9 +1434,8 @@ static Result<void> compile_moe_layer(
     {
         if (moe.shared_expert_count != 1)
             return Error{ErrorCode::UnsupportedModel, "the CPU runtime supports one shared Expert per MoE block"};
-        ret = compile_shared_expert(
-            compiled.weights, layer_name, compiled.descriptor, moe,
-            layer_plan.moe.shared_expert);
+        ret = compile_shared_expert(compiled.weights, layer_name, compiled.descriptor, moe,
+                                    layer_plan.moe.shared_expert);
         if (!ret)
             return ret.error();
         if (has_flag(moe.flags, MoeDescriptorSharedExpertGate))
@@ -1527,9 +1447,8 @@ static Result<void> compile_moe_layer(
     }
 
     layer_plan.moe.experts.reserve(moe.expert_count);
-    const bool fuse_qnk_gate_up = has_flag(
-        compiled.opt.optimization_flags,
-        OptimizationVulkanQnK);
+    const bool fuse_qnk_gate_up = has_flag(compiled.opt.optimization_flags,
+                                           OptimizationVulkanQnK);
     for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
     {
         ExpertPlan expert;
@@ -1567,12 +1486,11 @@ static Result<void> compile_moe_layer(
             && expert.gate_weight != invalid_tensor_handle
             && expert.up_weight != invalid_tensor_handle)
         {
-            auto fused = combine_qnk_gate_up_weights(
-                compiled.weights,
-                expert.gate_weight,
-                expert.up_weight,
-                moe.intermediate_size,
-                compiled.descriptor.hidden_size);
+            auto fused = combine_qnk_gate_up_weights(compiled.weights,
+                                                     expert.gate_weight,
+                                                     expert.up_weight,
+                                                     moe.intermediate_size,
+                                                     compiled.descriptor.hidden_size);
             if (fused)
             {
                 expert.gate_up_weight = expert.gate_weight;
@@ -1609,15 +1527,13 @@ static Result<void> compile_moe_layer(
         {
             const TensorData& gate_up_weight = compiled.weights.at(expert.gate_up_weight);
             if (use_file_backed_bfloat16
-                && !is_cache_file_backed_expert_pair(
-                    gate_up_weight, down_weight, true))
+                && !is_cache_file_backed_expert_pair(gate_up_weight, down_weight, true))
             {
                 return Error{
                     ErrorCode::InvalidModel,
                     "file-backed BF16 Expert weights must remain memory-mapped"};
             }
-            if (is_cache_file_backed_expert_pair(
-                    gate_up_weight, down_weight, use_file_backed_bfloat16))
+            if (is_cache_file_backed_expert_pair(gate_up_weight, down_weight, use_file_backed_bfloat16))
             {
                 expert.cache_key = ExpertCache::make_pair_key(gate_up_weight, down_weight);
             }
@@ -1668,8 +1584,7 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
     compiled.vulkan_runtime = opt.vulkan_runtime;
     const bool hybrid_requests_vulkan = hybrid_mode == HybridMode::HybridExperts;
     const bool use_vulkan_dense = hybrid_requests_vulkan && has_flag(opt.flags, BackendVulkanDense);
-    const bool use_file_backed_experts = has_flag(
-        opt.flags, BackendFileBackedExperts);
+    const bool use_file_backed_experts = has_flag(opt.flags, BackendFileBackedExperts);
     std::vector<uint32_t> dense_device_indices = opt.device_indices;
     if (dense_device_indices.empty() && opt.device_index != automatic_vulkan_device_index)
     {
@@ -1780,9 +1695,8 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
         {
             return Error{ErrorCode::InvalidModel, "invalid gated-residual configuration"};
         }
-        auto status = compile_gated_residual_plan(
-            compiled.weights, "gated_residual.head.", compiled.descriptor,
-            false, compiled.gated_residual_head);
+        auto status = compile_gated_residual_plan(compiled.weights, "gated_residual.head.", compiled.descriptor,
+                                                  false, compiled.gated_residual_head);
         if (!status)
             return status.error();
     }
@@ -1848,16 +1762,14 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
         }
         else if (compiled.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
         {
-            auto status = compile_gated_residual_plan(
-                compiled.weights, layer_name + "gated_residual.attention.",
-                compiled.descriptor, true,
-                layer_plan.attention_gated_residual);
+            auto status = compile_gated_residual_plan(compiled.weights, layer_name + "gated_residual.attention.",
+                                                      compiled.descriptor, true,
+                                                      layer_plan.attention_gated_residual);
             if (!status)
                 return status.error();
-            status = compile_gated_residual_plan(
-                compiled.weights, layer_name + "gated_residual.ffn.",
-                compiled.descriptor, true,
-                layer_plan.ffn_gated_residual);
+            status = compile_gated_residual_plan(compiled.weights, layer_name + "gated_residual.ffn.",
+                                                 compiled.descriptor, true,
+                                                 layer_plan.ffn_gated_residual);
             if (!status)
                 return status.error();
         }
@@ -1877,44 +1789,38 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
             }
             else if (attention.kind == AttentionKind::GatedDeltaNet)
             {
-                auto status = compile_gated_delta_attention(
-                    compiled.weights,
-                    layer_name,
-                    compiled.descriptor,
-                    attention,
-                    plan);
+                auto status = compile_gated_delta_attention(compiled.weights,
+                                                            layer_name,
+                                                            compiled.descriptor,
+                                                            attention,
+                                                            plan);
                 if (!status)
                     return status.error();
             }
             else
             {
-                auto status = compile_standard_attention(
-                    compiled.weights, layer_name, compiled.descriptor, layer, plan);
+                auto status = compile_standard_attention(compiled.weights, layer_name, compiled.descriptor, layer, plan);
                 if (!status)
                     return status.error();
             }
         }
 
-        auto ple_status = compile_ple_plan(
-            compiled, layer_name, layer.ple, layer_plan.ple);
+        auto ple_status = compile_ple_plan(compiled, layer_name, layer.ple, layer_plan.ple);
         if (!ple_status)
             return ple_status.error();
 
-        auto ret = compile_moe_layer(
-            compiled, layer_name, layer, layer_plan, use_file_backed_experts);
+        auto ret = compile_moe_layer(compiled, layer_name, layer, layer_plan, use_file_backed_experts);
         if (!ret)
             return ret.error();
     }
 
-    auto speculative = compile_speculative_model(
-        compiled, use_file_backed_experts);
+    auto speculative = compile_speculative_model(compiled, use_file_backed_experts);
     if (!speculative)
         return speculative.error();
     auto prepared = prepare_model_pipeline(compiled, opt);
     if (!prepared)
         return prepared.error();
-    auto graph = build_graph(
-        compiled, has_flag(opt.flags, BackendVulkanExperts));
+    auto graph = build_graph(compiled, has_flag(opt.flags, BackendVulkanExperts));
     if (!graph)
         return graph.error();
     if (has_flag(opt.flags, BackendReleaseVulkanDenseHostStorage))

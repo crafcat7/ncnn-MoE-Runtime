@@ -112,20 +112,17 @@ static ActivationBuffer make_input(uint32_t token_count, uint32_t columns)
     return input;
 }
 
-static TensorData make_bfloat16_matrix(
-    uint32_t output_columns,
-    uint32_t input_columns)
+static TensorData make_bfloat16_matrix(uint32_t output_columns,
+                                       uint32_t input_columns)
 {
     if (input_columns % 4 != 0)
     {
-        throw std::invalid_argument(
-            "packed BF16 input columns must be divisible by 4");
+        throw std::invalid_argument("packed BF16 input columns must be divisible by 4");
     }
     TensorData matrix;
     matrix.dtype = DType::BFloat16;
     matrix.shape = {output_columns, input_columns};
-    matrix.bfloat16_data.resize(
-        static_cast<size_t>(output_columns) * input_columns);
+    matrix.bfloat16_data.resize(static_cast<size_t>(output_columns) * input_columns);
     for (size_t index = 0; index < matrix.bfloat16_data.size(); ++index)
     {
         const float value = static_cast<float>(static_cast<int>((index * 17 + 5) % 67) - 33)
@@ -143,12 +140,10 @@ static TensorData make_float8_matrix(uint32_t output_columns,
     matrix.dtype = DType::Float8E4M3;
     matrix.shape = {output_columns, input_columns};
     const size_t element_count = static_cast<size_t>(output_columns) * input_columns;
-    std::shared_ptr<uint8_t[]> storage(
-        new uint8_t[element_count], std::default_delete<uint8_t[]>());
+    std::shared_ptr<uint8_t[]> storage(new uint8_t[element_count], std::default_delete<uint8_t[]>());
     for (size_t index = 0; index < element_count; ++index)
     {
-        const float value = static_cast<float>(
-                                static_cast<int>((index * 17 + seed * 13) % 61) - 30)
+        const float value = static_cast<float>(static_cast<int>((index * 17 + seed * 13) % 61) - 30)
                             * 0.03125f;
         storage[index] = float_to_float8_e4m3(value);
     }
@@ -156,8 +151,7 @@ static TensorData make_float8_matrix(uint32_t output_columns,
     matrix.mapped_size = element_count;
     const uint32_t output_blocks = (output_columns + 127) / 128;
     const uint32_t input_blocks = (input_columns + 127) / 128;
-    matrix.quantization_scales.resize(
-        static_cast<size_t>(output_blocks) * input_blocks);
+    matrix.quantization_scales.resize(static_cast<size_t>(output_blocks) * input_blocks);
     for (size_t index = 0; index < matrix.quantization_scales.size(); ++index)
     {
         matrix.quantization_scales[index] = std::ldexp(1.0f, static_cast<int>((index + seed) % 5) - 3);
@@ -179,9 +173,8 @@ static double elapsed_milliseconds(std::chrono::steady_clock::time_point start)
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
-static void print_command_statistics(
-    const VulkanStatistics& before,
-    const VulkanStatistics& after)
+static void print_command_statistics(const VulkanStatistics& before,
+                                     const VulkanStatistics& after)
 {
     std::cout << "command recording: "
               << after.command_dispatches - before.command_dispatches
@@ -256,16 +249,15 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
     std::cout << "weight bytes: " << weight_size << '\n';
     std::cout << "CPU median: " << cpu_ms << " ms, " << bandwidth(cpu_ms) << " effective GiB/s\n";
 
-    auto vulkan = Mxfp4Expert_vulkan::create(
-        gate_up,
-        nullptr,
-        down,
-        nullptr,
-        7.0f,
-        device_index,
-        ExpertActivation::GptOssSwiGlu,
-        vulkan_runtime,
-        optimization_flags);
+    auto vulkan = Mxfp4Expert_vulkan::create(gate_up,
+                                             nullptr,
+                                             down,
+                                             nullptr,
+                                             7.0f,
+                                             device_index,
+                                             ExpertActivation::GptOssSwiGlu,
+                                             vulkan_runtime,
+                                             optimization_flags);
     if (!vulkan)
     {
         std::cout << "Vulkan MXFP4 expert unavailable\n";
@@ -313,11 +305,10 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
     return maximum_normalized_error <= 1e-4f ? 0 : 1;
 }
 
-static int benchmark_cpu_mxfp4_q8_expert(
-    uint32_t input_columns,
-    uint32_t intermediate_columns,
-    uint32_t token_count,
-    uint32_t repeats)
+static int benchmark_cpu_mxfp4_q8_expert(uint32_t input_columns,
+                                         uint32_t intermediate_columns,
+                                         uint32_t token_count,
+                                         uint32_t repeats)
 {
     if (!mxfp4_q8_kernel_available())
     {
@@ -403,9 +394,8 @@ static int benchmark_cpu_mxfp4_q8_expert(
         {
             const float error = std::abs(candidate.row(row)[column] - reference.row(row)[column]);
             maximum_error = std::max(maximum_error, error);
-            maximum_normalized_error = std::max(
-                maximum_normalized_error,
-                error / std::max(1.0f, std::abs(reference.row(row)[column])));
+            maximum_normalized_error = std::max(maximum_normalized_error,
+                                                error / std::max(1.0f, std::abs(reference.row(row)[column])));
         }
     }
     const double reference_ms = median_milliseconds(reference_times);
@@ -432,35 +422,31 @@ static int benchmark_cpu_mxfp4_q8_expert(
     return 0;
 }
 
-static int benchmark_bfloat16_projection(
-    uint32_t input_columns,
-    uint32_t output_columns,
-    uint32_t token_count,
-    uint32_t repeats,
-    uint32_t device_index)
+static int benchmark_bfloat16_projection(uint32_t input_columns,
+                                         uint32_t output_columns,
+                                         uint32_t token_count,
+                                         uint32_t repeats,
+                                         uint32_t device_index)
 {
     constexpr uint64_t optimization_flags = OptimizationDefaultFlags;
     const VulkanRuntimePtr vulkan_runtime = create_vulkan_runtime();
-    TensorData matrix = make_bfloat16_matrix(
-        output_columns,
-        input_columns);
+    TensorData matrix = make_bfloat16_matrix(output_columns,
+                                             input_columns);
     ActivationBuffer input = make_input(token_count, input_columns);
     for (size_t row = 0; row < input.rows(); ++row)
     {
         for (uint32_t column = 0; column < input.columns(); ++column)
         {
-            input.row(row)[column] += static_cast<float>(
-                                          static_cast<int>((row * 7 + column * 3) % 11) - 5)
+            input.row(row)[column] += static_cast<float>(static_cast<int>((row * 7 + column * 3) % 11) - 5)
                                       * 1e-5f;
         }
     }
     const ActivationBuffer reference = linear_batch(matrix, input, optimization_flags);
-    auto vulkan = Bfloat16Linear_vulkan::create(
-        matrix,
-        nullptr,
-        device_index,
-        vulkan_runtime,
-        optimization_flags);
+    auto vulkan = Bfloat16Linear_vulkan::create(matrix,
+                                                nullptr,
+                                                device_index,
+                                                vulkan_runtime,
+                                                optimization_flags);
     if (!vulkan)
     {
         std::cout << "Vulkan packed-BF16 projection unavailable\n";
@@ -501,15 +487,13 @@ static int benchmark_bfloat16_projection(
             const float expected = reference.row(row)[column];
             const float error = std::abs(output.row(row)[column] - expected);
             maximum_error = std::max(maximum_error, error);
-            maximum_normalized_error = std::max(
-                maximum_normalized_error,
-                error / std::max(1.0f, std::abs(expected)));
+            maximum_normalized_error = std::max(maximum_normalized_error,
+                                                error / std::max(1.0f, std::abs(expected)));
             squared_error += static_cast<double>(error) * error;
         }
     }
-    const double rms_error = std::sqrt(
-        squared_error
-        / static_cast<double>(reference.rows() * reference.columns()));
+    const double rms_error = std::sqrt(squared_error
+                                       / static_cast<double>(reference.rows() * reference.columns()));
     const uint64_t weight_size = matrix.bfloat16_data.size() * sizeof(uint16_t);
     const double milliseconds = median_milliseconds(times);
     const double effective_bandwidth = static_cast<double>(weight_size) * token_count
@@ -545,11 +529,10 @@ static int benchmark_bfloat16_projection(
     return maximum_normalized_error <= 5e-3f ? 0 : 1;
 }
 
-static int benchmark_cpu_bfloat16_projection(
-    uint32_t input_columns,
-    uint32_t output_columns,
-    uint32_t token_count,
-    uint32_t repeats)
+static int benchmark_cpu_bfloat16_projection(uint32_t input_columns,
+                                             uint32_t output_columns,
+                                             uint32_t token_count,
+                                             uint32_t repeats)
 {
     constexpr uint64_t base_optimization_flags = OptimizationDefaultFlags;
     constexpr uint64_t policy_flags = OptimizationCpuBfloat16Batched;
@@ -561,8 +544,7 @@ static int benchmark_cpu_bfloat16_projection(
     {
         for (uint32_t column = 0; column < input.columns(); ++column)
         {
-            input.row(row)[column] += static_cast<float>(
-                                          static_cast<int>((row * 7 + column * 3) % 11) - 5)
+            input.row(row)[column] += static_cast<float>(static_cast<int>((row * 7 + column * 3) % 11) - 5)
                                       * 1e-5f;
         }
     }
@@ -612,15 +594,13 @@ static int benchmark_cpu_bfloat16_projection(
             const float expected = reference.row(row)[column];
             const float error = std::abs(candidate.row(row)[column] - expected);
             maximum_error = std::max(maximum_error, error);
-            maximum_normalized_error = std::max(
-                maximum_normalized_error,
-                error / std::max(1.0f, std::abs(expected)));
+            maximum_normalized_error = std::max(maximum_normalized_error,
+                                                error / std::max(1.0f, std::abs(expected)));
             squared_error += static_cast<double>(error) * error;
         }
     }
-    const double rms_error = std::sqrt(
-        squared_error
-        / static_cast<double>(reference.rows() * reference.columns()));
+    const double rms_error = std::sqrt(squared_error
+                                       / static_cast<double>(reference.rows() * reference.columns()));
     const double reference_ms = median_milliseconds(reference_times);
     const double candidate_ms = median_milliseconds(candidate_times);
     const uint64_t logical_weight_bytes = matrix.bfloat16_data.size() * sizeof(uint16_t) * token_count;
@@ -665,9 +645,8 @@ static int benchmark_cpu_float8_expert(uint32_t input_columns,
         for (size_t token_index = 0; token_index < quantized.rows();
              ++token_index)
         {
-            quantize_float8_e4m3_inplace(
-                quantized.row(token_index), quantized.columns(), block_size,
-                true, optimization_flags);
+            quantize_float8_e4m3_inplace(quantized.row(token_index), quantized.columns(), block_size,
+                                         true, optimization_flags);
         }
         ActivationBuffer result(source.rows(), matrix.shape[0]);
         const uint32_t input_blocks = (matrix.shape[1] + block_size - 1) / block_size;
@@ -682,10 +661,9 @@ static int benchmark_cpu_float8_expert(uint32_t input_columns,
             for (size_t token_index = 0; token_index < source.rows();
                  ++token_index)
             {
-                float8_e4m3_block_dot_rows4(
-                    weights, matrix.shape[1], scales,
-                    quantized.row(token_index), matrix.shape[1], block_size,
-                    row_count, result.row(token_index) + first_row);
+                float8_e4m3_block_dot_rows4(weights, matrix.shape[1], scales,
+                                            quantized.row(token_index), matrix.shape[1], block_size,
+                                            row_count, result.row(token_index) + first_row);
             }
         }
         return result;
@@ -725,9 +703,8 @@ static int benchmark_cpu_float8_expert(uint32_t input_columns,
     };
     auto candidate = [&]() {
         ActivationBuffer activated;
-        if (!fused_float8_gate_up_batch(
-                gate, up, input, ExpertActivation::Silu, 0.0f,
-                activated, optimization_flags))
+        if (!fused_float8_gate_up_batch(gate, up, input, ExpertActivation::Silu, 0.0f,
+                                        activated, optimization_flags))
         {
             throw std::runtime_error("fused CPU FP8 gate/up unavailable");
         }
@@ -780,9 +757,8 @@ static int benchmark_cpu_float8_expert(uint32_t input_columns,
             const float expected = fp32_reference.row(token_index)[column];
             const float error = std::abs(fused.row(token_index)[column] - expected);
             maximum_error = std::max(maximum_error, error);
-            maximum_normalized_error = std::max(
-                maximum_normalized_error,
-                error / std::max(1.0f, std::abs(expected)));
+            maximum_normalized_error = std::max(maximum_normalized_error,
+                                                error / std::max(1.0f, std::abs(expected)));
         }
     }
     const double baseline_ms = median_milliseconds(baseline_times);
@@ -820,41 +796,36 @@ int main(int argc, char** argv)
         }
         if (mode == "bfloat16")
         {
-            return ncnn::moe::benchmark_bfloat16_projection(
-                input_columns,
-                output_columns,
-                token_count,
-                repeats,
-                device_index);
+            return ncnn::moe::benchmark_bfloat16_projection(input_columns,
+                                                            output_columns,
+                                                            token_count,
+                                                            repeats,
+                                                            device_index);
         }
         if (mode == "cpu-bfloat16")
         {
-            return ncnn::moe::benchmark_cpu_bfloat16_projection(
-                input_columns,
-                output_columns,
-                token_count,
-                repeats);
+            return ncnn::moe::benchmark_cpu_bfloat16_projection(input_columns,
+                                                                output_columns,
+                                                                token_count,
+                                                                repeats);
         }
         if (mode == "cpu-float8-expert")
         {
-            return ncnn::moe::benchmark_cpu_float8_expert(
-                input_columns,
-                output_columns,
-                token_count,
-                repeats);
+            return ncnn::moe::benchmark_cpu_float8_expert(input_columns,
+                                                          output_columns,
+                                                          token_count,
+                                                          repeats);
         }
         if (mode == "cpu-mxfp4-q8-expert")
         {
-            return ncnn::moe::benchmark_cpu_mxfp4_q8_expert(
-                input_columns,
-                output_columns,
-                token_count,
-                repeats);
+            return ncnn::moe::benchmark_cpu_mxfp4_q8_expert(input_columns,
+                                                            output_columns,
+                                                            token_count,
+                                                            repeats);
         }
         if (mode != "projection")
         {
-            throw std::invalid_argument(
-                "mode must be projection, bfloat16, cpu-bfloat16, cpu-float8-expert, cpu-mxfp4-q8-expert, or expert");
+            throw std::invalid_argument("mode must be projection, bfloat16, cpu-bfloat16, cpu-float8-expert, cpu-mxfp4-q8-expert, or expert");
         }
 
         ncnn::moe::TensorData matrix = ncnn::moe::make_matrix(output_columns, input_columns);
@@ -871,35 +842,32 @@ int main(int argc, char** argv)
         }
 
         const ncnn::moe::VulkanRuntimePtr vulkan_runtime = ncnn::moe::create_vulkan_runtime();
-        auto vulkan = ncnn::moe::Mxfp4Linear_vulkan::create(
-            matrix,
-            nullptr,
-            device_index,
-            vulkan_runtime,
-            optimization_flags);
+        auto vulkan = ncnn::moe::Mxfp4Linear_vulkan::create(matrix,
+                                                            nullptr,
+                                                            device_index,
+                                                            vulkan_runtime,
+                                                            optimization_flags);
         if (!vulkan)
         {
             std::cout << "Vulkan MXFP4 projection unavailable\n";
             return 0;
         }
-        auto bfloat16_vulkan = ncnn::moe::Linear::create(
-            bfloat16_matrix,
-            nullptr,
-            ncnn::moe::LinearDevice::Vulkan,
-            device_index,
-            vulkan_runtime,
-            optimization_flags);
+        auto bfloat16_vulkan = ncnn::moe::Linear::create(bfloat16_matrix,
+                                                         nullptr,
+                                                         ncnn::moe::LinearDevice::Vulkan,
+                                                         device_index,
+                                                         vulkan_runtime,
+                                                         optimization_flags);
         if (!bfloat16_vulkan)
         {
             std::cout << "Vulkan BF16-source projection unavailable\n";
             return 0;
         }
-        auto packed_bfloat16_vulkan = ncnn::moe::Bfloat16Linear_vulkan::create(
-            bfloat16_matrix,
-            nullptr,
-            device_index,
-            vulkan_runtime,
-            optimization_flags);
+        auto packed_bfloat16_vulkan = ncnn::moe::Bfloat16Linear_vulkan::create(bfloat16_matrix,
+                                                                               nullptr,
+                                                                               device_index,
+                                                                               vulkan_runtime,
+                                                                               optimization_flags);
         if (!packed_bfloat16_vulkan)
         {
             std::cout << "Vulkan packed-BF16 projection unavailable\n";
@@ -918,9 +886,8 @@ int main(int argc, char** argv)
             return 1;
         }
         ncnn::moe::ActivationBuffer packed_bfloat16_vulkan_output;
-        if (!packed_bfloat16_vulkan->forward(
-                input,
-                packed_bfloat16_vulkan_output))
+        if (!packed_bfloat16_vulkan->forward(input,
+                                             packed_bfloat16_vulkan_output))
         {
             std::cerr << "Vulkan packed-BF16 warm-up failed\n";
             return 1;
@@ -950,16 +917,13 @@ int main(int argc, char** argv)
             bfloat16_vulkan_times.push_back(ncnn::moe::elapsed_milliseconds(bfloat16_started));
 
             const auto packed_bfloat16_started = std::chrono::steady_clock::now();
-            if (!packed_bfloat16_vulkan->forward(
-                    input,
-                    packed_bfloat16_vulkan_output))
+            if (!packed_bfloat16_vulkan->forward(input,
+                                                 packed_bfloat16_vulkan_output))
             {
                 std::cerr << "Vulkan packed-BF16 projection failed\n";
                 return 1;
             }
-            packed_bfloat16_vulkan_times.push_back(
-                ncnn::moe::elapsed_milliseconds(
-                    packed_bfloat16_started));
+            packed_bfloat16_vulkan_times.push_back(ncnn::moe::elapsed_milliseconds(packed_bfloat16_started));
         }
 
         float maximum_error = 0.0f;
@@ -972,11 +936,9 @@ int main(int argc, char** argv)
             {
                 maximum_error = std::max(maximum_error, std::abs(cpu_output.row(row)[column] - vulkan_output.row(row)[column]));
                 maximum_bfloat16_error = std::max(maximum_bfloat16_error, std::abs(cpu_output.row(row)[column] - bfloat16_vulkan_output.row(row)[column]));
-                maximum_packed_bfloat16_error = std::max(
-                    maximum_packed_bfloat16_error,
-                    std::abs(
-                        cpu_output.row(row)[column]
-                        - packed_bfloat16_vulkan_output.row(row)[column]));
+                maximum_packed_bfloat16_error = std::max(maximum_packed_bfloat16_error,
+                                                         std::abs(cpu_output.row(row)[column]
+                                                                  - packed_bfloat16_vulkan_output.row(row)[column]));
                 row_errors[row] = std::max(row_errors[row], std::abs(cpu_output.row(row)[column] - vulkan_output.row(row)[column]));
             }
         }
@@ -986,8 +948,7 @@ int main(int argc, char** argv)
         const double cpu_ms = ncnn::moe::median_milliseconds(cpu_times);
         const double vulkan_ms = ncnn::moe::median_milliseconds(vulkan_times);
         const double bfloat16_vulkan_ms = ncnn::moe::median_milliseconds(bfloat16_vulkan_times);
-        const double packed_bfloat16_vulkan_ms = ncnn::moe::median_milliseconds(
-            packed_bfloat16_vulkan_times);
+        const double packed_bfloat16_vulkan_ms = ncnn::moe::median_milliseconds(packed_bfloat16_vulkan_times);
         const auto bandwidth = [weight_size, token_count](double milliseconds) { return static_cast<double>(weight_size) * token_count / (1024.0 * 1024.0 * 1024.0) / (milliseconds / 1000.0); };
         const auto bfloat16_bandwidth = [bfloat16_device_bytes, token_count](double milliseconds) {
             return static_cast<double>(bfloat16_device_bytes) * token_count / (1024.0 * 1024.0 * 1024.0) / (milliseconds / 1000.0);

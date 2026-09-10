@@ -37,11 +37,10 @@ ReuseFilteredExpertVictimCache::ReuseFilteredExpertVictimCache(std::shared_ptr<E
 {
 }
 
-void ReuseFilteredExpertVictimCache::admit(
-    std::string key,
-    std::shared_ptr<const TensorData> gate_up,
-    std::shared_ptr<const TensorData> down,
-    ExpertVictimExecutionMetadata execution)
+void ReuseFilteredExpertVictimCache::admit(std::string key,
+                                           std::shared_ptr<const TensorData> gate_up,
+                                           std::shared_ptr<const TensorData> down,
+                                           ExpertVictimExecutionMetadata execution)
 {
     bool reused = false;
     if (reuse_probe_interval > 1)
@@ -84,10 +83,9 @@ void ReuseFilteredExpertVictimCache::admit(
     inner->admit(std::move(key), std::move(gate_up), std::move(down), execution);
 }
 
-std::optional<ExpertVictimPair> ReuseFilteredExpertVictimCache::restore(
-    const std::string& key,
-    const TensorData& gate_up_source,
-    const TensorData& down_source)
+std::optional<ExpertVictimPair> ReuseFilteredExpertVictimCache::restore(const std::string& key,
+                                                                        const TensorData& gate_up_source,
+                                                                        const TensorData& down_source)
 {
     return inner->restore(key, gate_up_source, down_source);
 }
@@ -150,19 +148,17 @@ ShardedExpertVictimCache::ShardedExpertVictimCache(std::vector<std::shared_ptr<E
         total_size += item->capacity();
 }
 
-void ShardedExpertVictimCache::admit(
-    std::string key,
-    std::shared_ptr<const TensorData> gate_up,
-    std::shared_ptr<const TensorData> down,
-    ExpertVictimExecutionMetadata execution)
+void ShardedExpertVictimCache::admit(std::string key,
+                                     std::shared_ptr<const TensorData> gate_up,
+                                     std::shared_ptr<const TensorData> down,
+                                     ExpertVictimExecutionMetadata execution)
 {
     shard(key).admit(std::move(key), std::move(gate_up), std::move(down), execution);
 }
 
-std::optional<ExpertVictimPair> ShardedExpertVictimCache::restore(
-    const std::string& key,
-    const TensorData& gate_up_source,
-    const TensorData& down_source)
+std::optional<ExpertVictimPair> ShardedExpertVictimCache::restore(const std::string& key,
+                                                                  const TensorData& gate_up_source,
+                                                                  const TensorData& down_source)
 {
     return shard(key).restore(key, gate_up_source, down_source);
 }

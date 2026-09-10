@@ -269,20 +269,17 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             }
             else if (argument == "--speculative-confidence")
             {
-                generation_options.speculative_confidence_threshold = std::stof(ncnn::moe::require_value(
-                    argc,
-                    argv,
-                    index,
-                    "--speculative-confidence"));
+                generation_options.speculative_confidence_threshold = std::stof(ncnn::moe::require_value(argc,
+                                                                                                         argv,
+                                                                                                         index,
+                                                                                                         "--speculative-confidence"));
             }
             else if (argument == "--speculative-max-draft")
             {
-                generation_options.speculative_max_draft_tokens = static_cast<uint32_t>(std::stoul(
-                    ncnn::moe::require_value(
-                        argc,
-                        argv,
-                        index,
-                        "--speculative-max-draft")));
+                generation_options.speculative_max_draft_tokens = static_cast<uint32_t>(std::stoul(ncnn::moe::require_value(argc,
+                                                                                                                            argv,
+                                                                                                                            index,
+                                                                                                                            "--speculative-max-draft")));
             }
             else if (argument == "--expert-cache-mb")
             {
@@ -384,11 +381,10 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             }
             else if (argument == "--cpu-packed-weights")
             {
-                const std::string mode = ncnn::moe::require_value(
-                    argc,
-                    argv,
-                    index,
-                    "--cpu-packed-weights");
+                const std::string mode = ncnn::moe::require_value(argc,
+                                                                  argv,
+                                                                  index,
+                                                                  "--cpu-packed-weights");
                 if (mode == "on")
                 {
                     opt.cpu_packed_weight_mode = ncnn::moe::CpuPackedWeightMode::Enabled;
@@ -698,22 +694,20 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             futures.reserve(parallel_sessions);
             for (uint32_t session_index = 0; session_index < parallel_sessions; ++session_index)
             {
-                futures.push_back(std::async(
-                    std::launch::async,
-                    [&, session_index]() {
-                        return active_sessions[session_index]->generate(
-                            prompt,
-                            generation_options,
-                            [&, session_index](const ncnn::moe::StreamToken& token) {
-                                if (stream_token_ids)
-                                {
-                                    std::lock_guard<std::mutex> lock(stream_mutex);
-                                    std::cout << "generated session " << session_index << " token id: " << token.token_id << '\n'
-                                              << std::flush;
-                                }
-                                return true;
-                            });
-                    }));
+                futures.push_back(std::async(std::launch::async,
+                                             [&, session_index]() {
+                                                 return active_sessions[session_index]->generate(prompt,
+                                                                                                 generation_options,
+                                                                                                 [&, session_index](const ncnn::moe::StreamToken& token) {
+                                                                                                     if (stream_token_ids)
+                                                                                                     {
+                                                                                                         std::lock_guard<std::mutex> lock(stream_mutex);
+                                                                                                         std::cout << "generated session " << session_index << " token id: " << token.token_id << '\n'
+                                                                                                                   << std::flush;
+                                                                                                     }
+                                                                                                     return true;
+                                                                                                 });
+                                             }));
             }
             for (uint32_t session_index = 0; session_index < parallel_sessions; ++session_index)
             {
@@ -751,8 +745,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                     prompt,
                 });
             }
-            auto prefill_future = scheduler.value()->submit_prefill(
-                std::move(prefill_requests));
+            auto prefill_future = scheduler.value()->submit_prefill(std::move(prefill_requests));
             std::vector<ncnn::moe::Result<ncnn::moe::PrefillResult>>
                 prefilled = prefill_future.get();
             if (prefilled.size() != parallel_sessions)

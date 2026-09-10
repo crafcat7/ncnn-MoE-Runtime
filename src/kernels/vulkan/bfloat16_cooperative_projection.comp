@@ -72,31 +72,23 @@ uvec4 load_weight_bits(uint output_base, uint column_base, uint packed_index)
     const uint input_column = column_base + row;
     if (output_base + column < p.output_columns)
     {
-        const uint word = packed_words[
-            ((output_base + column) * p.input_columns + input_column) >> 1];
-        values.x =
-            (input_column & 1) == 0 ? word & 65535u : word >> 16;
+        const uint word = packed_words[((output_base + column) * p.input_columns + input_column) >> 1];
+        values.x = (input_column & 1) == 0 ? word & 65535u : word >> 16;
     }
     if (output_base + column + 1 < p.output_columns)
     {
-        const uint word = packed_words[
-            ((output_base + column + 1) * p.input_columns + input_column) >> 1];
-        values.y =
-            (input_column & 1) == 0 ? word & 65535u : word >> 16;
+        const uint word = packed_words[((output_base + column + 1) * p.input_columns + input_column) >> 1];
+        values.y = (input_column & 1) == 0 ? word & 65535u : word >> 16;
     }
     if (output_base + column + 2 < p.output_columns)
     {
-        const uint word = packed_words[
-            ((output_base + column + 2) * p.input_columns + input_column) >> 1];
-        values.z =
-            (input_column & 1) == 0 ? word & 65535u : word >> 16;
+        const uint word = packed_words[((output_base + column + 2) * p.input_columns + input_column) >> 1];
+        values.z = (input_column & 1) == 0 ? word & 65535u : word >> 16;
     }
     if (output_base + column + 3 < p.output_columns)
     {
-        const uint word = packed_words[
-            ((output_base + column + 3) * p.input_columns + input_column) >> 1];
-        values.w =
-            (input_column & 1) == 0 ? word & 65535u : word >> 16;
+        const uint word = packed_words[((output_base + column + 3) * p.input_columns + input_column) >> 1];
+        values.w = (input_column & 1) == 0 ? word & 65535u : word >> 16;
     }
     return values;
 }
@@ -112,9 +104,9 @@ void main()
     const uint output_base = output_tile_index * TILE_N;
 
     coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N,
-            gl_MatrixUseAccumulator> sum =
-        coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N,
-                gl_MatrixUseAccumulator>(0.0);
+            gl_MatrixUseAccumulator>
+        sum = coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N,
+                      gl_MatrixUseAccumulator>(0.0);
 
     for (uint column_base = 0;
          column_base < p.input_columns;
@@ -124,54 +116,49 @@ void main()
              index < (TILE_M * TILE_K + 3) / 4;
              index += gl_SubgroupSize)
         {
-            const vec4 values = load_input_values(
-                token_base,
-                column_base,
-                index);
-            input_tile[index] = uvec2(
-                packBFloat2x16(values.xy),
-                packBFloat2x16(values.zw));
+            const vec4 values = load_input_values(token_base,
+                                                  column_base,
+                                                  index);
+            input_tile[index] = uvec2(packBFloat2x16(values.xy),
+                                      packBFloat2x16(values.zw));
         }
         for (uint index = lane;
              index < (TILE_K * TILE_N + 3) / 4;
              index += gl_SubgroupSize)
         {
-            const uvec4 values = load_weight_bits(
-                output_base,
-                column_base,
-                index);
-            weight_tile[index] = uvec2(
-                values.x | values.y << 16,
-                values.z | values.w << 16);
+            const uvec4 values = load_weight_bits(output_base,
+                                                  column_base,
+                                                  index);
+            weight_tile[index] = uvec2(values.x | values.y << 16,
+                                       values.z | values.w << 16);
         }
         barrier();
 
         coopmat<bfloat16_t, gl_ScopeSubgroup, TILE_M, TILE_K,
-                gl_MatrixUseA> activation;
+                gl_MatrixUseA>
+            activation;
         coopmat<bfloat16_t, gl_ScopeSubgroup, TILE_K, TILE_N,
-                gl_MatrixUseB> weight;
-        coopMatLoad(
-            activation,
-            input_tile,
-            0,
-            (TILE_K + 3) / 4,
-            gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(
-            weight,
-            weight_tile,
-            0,
-            (TILE_N + 3) / 4,
-            gl_CooperativeMatrixLayoutRowMajor);
+                gl_MatrixUseB>
+            weight;
+        coopMatLoad(activation,
+                    input_tile,
+                    0,
+                    (TILE_K + 3) / 4,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(weight,
+                    weight_tile,
+                    0,
+                    (TILE_N + 3) / 4,
+                    gl_CooperativeMatrixLayoutRowMajor);
         sum = coopMatMulAdd(activation, weight, sum);
         barrier();
     }
 
-    coopMatStore(
-        sum,
-        result_tile,
-        0,
-        TILE_N,
-        gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(sum,
+                 result_tile,
+                 0,
+                 TILE_N,
+                 gl_CooperativeMatrixLayoutRowMajor);
     barrier();
     for (uint index = lane;
          index < TILE_M * TILE_N;
@@ -183,8 +170,7 @@ void main()
             && output_base + column < p.output_columns)
         {
             output_data[(token_base + row) * p.output_columns
-                        + output_base + column] =
-                result_tile[index] + bias_data[output_base + column];
+                        + output_base + column] = result_tile[index] + bias_data[output_base + column];
         }
     }
 }

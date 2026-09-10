@@ -78,11 +78,10 @@ static void select_topk_routes(const float* scores, std::span<const float> selec
     }
 }
 
-static Result<void> dispatch_experts_general_into(
-    std::span<const float> router_logits,
-    uint32_t token_count,
-    const ExpertDispatchOptions& options,
-    ExpertDispatchPlan& result)
+static Result<void> dispatch_experts_general_into(std::span<const float> router_logits,
+                                                  uint32_t token_count,
+                                                  const ExpertDispatchOptions& options,
+                                                  ExpertDispatchPlan& result)
 {
     if (token_count == 0)
         return Error{ErrorCode::InvalidArgument, "expert dispatch requires at least one token"};

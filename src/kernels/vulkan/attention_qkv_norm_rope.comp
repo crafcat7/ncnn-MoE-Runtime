@@ -79,8 +79,8 @@ void main()
     const bool is_query = head < p.query_head_count;
     const uint local_head = is_query ? head : head - p.query_head_count;
     const uint source_base = token * p.total_columns
-        + (is_query ? local_head * p.head_dimension
-                    : p.query_columns + local_head * p.head_dimension);
+                             + (is_query ? local_head * p.head_dimension
+                                         : p.query_columns + local_head * p.head_dimension);
     float square_sum = 0.0;
     for (uint dimension = lane; dimension < p.head_dimension; dimension += 32)
     {
@@ -95,31 +95,30 @@ void main()
             partial[lane] += partial[lane + stride];
         barrier();
     }
-    const float inverse_rms = inversesqrt(
-        partial[0] / float(p.head_dimension) + p.epsilon);
+    const float inverse_rms = inversesqrt(partial[0] / float(p.head_dimension) + p.epsilon);
     barrier();
 
     const uint rope_half = p.rope_dimension / 2;
     if (is_query)
     {
         const uint destination_base = local_head * p.query_cstep
-            + token * p.head_dimension;
+                                      + token * p.head_dimension;
         const uint gate_base = token * p.query_columns
-            + local_head * p.head_dimension;
+                               + local_head * p.head_dimension;
         for (uint pair = lane; pair < rope_half; pair += 32)
         {
             const float first = fused_qkv_data[source_base + pair]
-                * inverse_rms * query_norm_data[pair];
+                                * inverse_rms * query_norm_data[pair];
             const float second = fused_qkv_data[source_base + rope_half + pair]
-                * inverse_rms * query_norm_data[rope_half + pair];
+                                 * inverse_rms * query_norm_data[rope_half + pair];
             const float angle = float(p.position_offset + token)
-                * cosine_data[pair];
+                                * cosine_data[pair];
             const float cosine = p.device_rope != 0
-                ? cos(angle) * p.rope_concentration
-                : cosine_data[token * rope_half + pair];
+                                     ? cos(angle) * p.rope_concentration
+                                     : cosine_data[token * rope_half + pair];
             const float sine = p.device_rope != 0
-                ? sin(angle) * p.rope_concentration
-                : sine_data[token * rope_half + pair];
+                                   ? sin(angle) * p.rope_concentration
+                                   : sine_data[token * rope_half + pair];
             query_data[destination_base + pair] = first * cosine - second * sine;
             query_data[destination_base + rope_half + pair] = first * sine + second * cosine;
         }
@@ -127,40 +126,38 @@ void main()
         {
             if (dimension >= p.rope_dimension)
             {
-                query_data[destination_base + dimension] =
-                    fused_qkv_data[source_base + dimension]
-                    * inverse_rms * query_norm_data[dimension];
+                query_data[destination_base + dimension] = fused_qkv_data[source_base + dimension]
+                                                           * inverse_rms * query_norm_data[dimension];
             }
             const uint gate_source = token * p.total_columns
-                + p.query_columns + p.key_value_columns * 2
-                + local_head * p.head_dimension + dimension;
-            gate_data[gate_base + dimension] =
-                1.0 / (1.0 + exp(-fused_qkv_data[gate_source]));
+                                     + p.query_columns + p.key_value_columns * 2
+                                     + local_head * p.head_dimension + dimension;
+            gate_data[gate_base + dimension] = 1.0 / (1.0 + exp(-fused_qkv_data[gate_source]));
         }
     }
     else
     {
         const uint destination_row = p.direct_ring != 0
-            ? (p.destination_start + token) % p.ring_capacity
-            : token;
+                                         ? (p.destination_start + token) % p.ring_capacity
+                                         : token;
         const uint destination_base = local_head * p.key_cstep
-            + destination_row * p.head_dimension;
+                                      + destination_row * p.head_dimension;
         const uint value_destination_base = local_head * p.value_cstep
-            + destination_row * p.head_dimension;
+                                            + destination_row * p.head_dimension;
         for (uint pair = lane; pair < rope_half; pair += 32)
         {
             const float first = fused_qkv_data[source_base + pair]
-                * inverse_rms * key_norm_data[pair];
+                                * inverse_rms * key_norm_data[pair];
             const float second = fused_qkv_data[source_base + rope_half + pair]
-                * inverse_rms * key_norm_data[rope_half + pair];
+                                 * inverse_rms * key_norm_data[rope_half + pair];
             const float angle = float(p.position_offset + token)
-                * cosine_data[pair];
+                                * cosine_data[pair];
             const float cosine = p.device_rope != 0
-                ? cos(angle) * p.rope_concentration
-                : cosine_data[token * rope_half + pair];
+                                     ? cos(angle) * p.rope_concentration
+                                     : cosine_data[token * rope_half + pair];
             const float sine = p.device_rope != 0
-                ? sin(angle) * p.rope_concentration
-                : sine_data[token * rope_half + pair];
+                                   ? sin(angle) * p.rope_concentration
+                                   : sine_data[token * rope_half + pair];
             const float rotated_first = first * cosine - second * sine;
             const float rotated_second = first * sine + second * cosine;
             buffer_st1(key_data, destination_base + pair, rotated_first);
@@ -168,7 +165,7 @@ void main()
             if (p.direct_ring != 0)
             {
                 const uint duplicate = destination_base
-                    + p.ring_capacity * p.head_dimension;
+                                       + p.ring_capacity * p.head_dimension;
                 buffer_st1(key_data, duplicate + pair, rotated_first);
                 buffer_st1(key_data, duplicate + rope_half + pair, rotated_second);
             }
@@ -177,33 +174,30 @@ void main()
         {
             if (dimension >= p.rope_dimension)
             {
-                const float normalized =
-                    fused_qkv_data[source_base + dimension]
-                    * inverse_rms * key_norm_data[dimension];
+                const float normalized = fused_qkv_data[source_base + dimension]
+                                         * inverse_rms * key_norm_data[dimension];
                 buffer_st1(key_data, destination_base + dimension, normalized);
                 if (p.direct_ring != 0)
                 {
-                    buffer_st1(
-                        key_data,
-                        destination_base
-                            + p.ring_capacity * p.head_dimension
-                            + dimension,
-                        normalized);
+                    buffer_st1(key_data,
+                               destination_base
+                                   + p.ring_capacity * p.head_dimension
+                                   + dimension,
+                               normalized);
                 }
             }
             const uint value_source = token * p.total_columns
-                + p.query_columns + p.key_value_columns
-                + local_head * p.head_dimension + dimension;
+                                      + p.query_columns + p.key_value_columns
+                                      + local_head * p.head_dimension + dimension;
             const float value = fused_qkv_data[value_source];
             buffer_st1(value_data, value_destination_base + dimension, value);
             if (p.direct_ring != 0)
             {
-                buffer_st1(
-                    value_data,
-                    value_destination_base
-                        + p.ring_capacity * p.head_dimension
-                        + dimension,
-                    value);
+                buffer_st1(value_data,
+                           value_destination_base
+                               + p.ring_capacity * p.head_dimension
+                               + dimension,
+                           value);
             }
         }
     }

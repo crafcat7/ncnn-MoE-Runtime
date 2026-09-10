@@ -46,10 +46,9 @@ struct QnKPack
     }
 };
 
-[[nodiscard]] inline const uint8_t* qnk_packed_block(
-    const QnKPack& weights,
-    size_t row,
-    uint32_t block) noexcept
+[[nodiscard]] inline const uint8_t* qnk_packed_block(const QnKPack& weights,
+                                                     size_t row,
+                                                     uint32_t block) noexcept
 {
     const size_t tile = row / weights.tile_rows;
     const size_t lane = row % weights.tile_rows;
@@ -60,38 +59,33 @@ struct QnKPack
 
 void qnk_dequantize_block(DType dtype, const uint8_t* block, float* output) noexcept;
 
-[[nodiscard]] float qnk_dot_block(
-    DType dtype,
-    const uint8_t* block,
-    const float* input) noexcept;
+[[nodiscard]] float qnk_dot_block(DType dtype,
+                                  const uint8_t* block,
+                                  const float* input) noexcept;
 
 // Quantize float32 activations to Q8_K blocks.
-void qnk_q8k_quantize(
-    const float* source,
-    uint8_t* output,
-    uint32_t columns) noexcept;
+void qnk_q8k_quantize(const float* source,
+                      uint8_t* output,
+                      uint32_t columns) noexcept;
 
-void qnk_q8k_quantize_batch(
-    const float* source,
-    size_t input_stride,
-    size_t rows,
-    uint32_t columns,
-    std::vector<uint8_t>& output) noexcept;
+void qnk_q8k_quantize_batch(const float* source,
+                            size_t input_stride,
+                            size_t rows,
+                            uint32_t columns,
+                            std::vector<uint8_t>& output) noexcept;
 
-[[nodiscard]] bool qnk_pack_weights(
-    const uint8_t* raw,
-    size_t raw_bytes,
-    DType dtype,
-    size_t rows,
-    uint32_t columns,
-    QnKPack& output) noexcept;
+[[nodiscard]] bool qnk_pack_weights(const uint8_t* raw,
+                                    size_t raw_bytes,
+                                    DType dtype,
+                                    size_t rows,
+                                    uint32_t columns,
+                                    QnKPack& output) noexcept;
 
-[[nodiscard]] bool qnk_linear_batch_into(
-    const TensorData& matrix,
-    const ActivationBuffer& input,
-    ActivationBuffer& output,
-    bool use_packed_weights,
-    std::shared_ptr<const QnKPack>* sidecar = nullptr) noexcept;
+[[nodiscard]] bool qnk_linear_batch_into(const TensorData& matrix,
+                                         const ActivationBuffer& input,
+                                         ActivationBuffer& output,
+                                         bool use_packed_weights,
+                                         std::shared_ptr<const QnKPack>* sidecar = nullptr) noexcept;
 
 } // namespace moe
 } // namespace ncnn

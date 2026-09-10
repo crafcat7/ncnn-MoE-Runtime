@@ -173,11 +173,10 @@ std::optional<VulkanExpertVictimCache::DeviceOperationLease> VulkanExpertVictimC
         static_cast<size_t>(entry->down_blocks_offset),
         static_cast<size_t>(entry->down_scales_offset),
     };
-    auto operation = Mxfp4Expert_vulkan ::create_from_device_storage(
-        gate_up, entry->execution.gate_up_bias, down, entry->execution.down_bias, entry->execution.activation_limit,
-        static_cast<uint32_t>(context->device()->info.device_index()), entry->data, entry->execution.activation,
-        context->runtime(),
-        context->optimization_flags());
+    auto operation = Mxfp4Expert_vulkan ::create_from_device_storage(gate_up, entry->execution.gate_up_bias, down, entry->execution.down_bias, entry->execution.activation_limit,
+                                                                     static_cast<uint32_t>(context->device()->info.device_index()), entry->data, entry->execution.activation,
+                                                                     context->runtime(),
+                                                                     context->optimization_flags());
     if (!operation)
         return std::nullopt;
     {
@@ -513,10 +512,9 @@ std::shared_ptr<ExpertVictimCache> create_vulkan_victim_cache(uint64_t cache_siz
                                                               uint64_t optimization_flags)
 {
 #if NCNN_MOE_WITH_VULKAN
-    const std::shared_ptr<VulkanContext> context = VulkanContext::acquire(
-        device_index,
-        vulkan_runtime,
-        optimization_flags);
+    const std::shared_ptr<VulkanContext> context = VulkanContext::acquire(device_index,
+                                                                          vulkan_runtime,
+                                                                          optimization_flags);
     if (!context || cache_size == 0)
         return {};
     return std::make_shared<VulkanExpertVictimCache>(context, cache_size);
@@ -530,22 +528,20 @@ std::shared_ptr<ExpertVictimCache> create_vulkan_victim_cache(uint64_t cache_siz
 }
 
 #if NCNN_MOE_WITH_VULKAN
-VulkanExpertBackend::VulkanExpertBackend(
-    uint64_t _cache_size,
-    uint32_t _vulkan_device_index,
-    std::shared_ptr<VulkanExpertVictimCache> _device_weight_source,
-    VulkanRuntimePtr _vulkan_runtime,
-    uint64_t _optimization_flags)
+VulkanExpertBackend::VulkanExpertBackend(uint64_t _cache_size,
+                                         uint32_t _vulkan_device_index,
+                                         std::shared_ptr<VulkanExpertVictimCache> _device_weight_source,
+                                         VulkanRuntimePtr _vulkan_runtime,
+                                         uint64_t _optimization_flags)
     : cache_size(_cache_size),
       vulkan_device_index(_vulkan_device_index),
       vulkan_runtime(std::move(_vulkan_runtime)),
       optimization_flags(_optimization_flags),
       device_weight_source(std::move(_device_weight_source))
 {
-    vulkan_context = VulkanContext::acquire(
-        vulkan_device_index,
-        vulkan_runtime,
-        optimization_flags);
+    vulkan_context = VulkanContext::acquire(vulkan_device_index,
+                                            vulkan_runtime,
+                                            optimization_flags);
     if (vulkan_context && cache_size != 0)
     {
         const uint64_t allocator_block_size = std::min<uint64_t>(cache_size, UINT64_C(64) * 1024 * 1024);
@@ -762,10 +758,9 @@ std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<co
                 continue;
             if (work->private_aggregation.rows() == 0)
             {
-                work->private_aggregation.reset(
-                    client_aggregation->rows(),
-                    client_aggregation->columns(),
-                    true);
+                work->private_aggregation.reset(client_aggregation->rows(),
+                                                client_aggregation->columns(),
+                                                true);
             }
             private_request.route_aggregation.output = &work->private_aggregation;
             private_request.route_aggregation.completed = &work->private_route_completed[request_index];
@@ -1017,13 +1012,12 @@ void VulkanExpertBackend::Submission::abort() noexcept
     aborted = true;
 }
 
-bool VulkanExpertBackend::route_aggregation_enabled(
-    std::span<const ExpertBackendRequest> requests,
-    std::span<const Selection> selected,
-    uint32_t output_columns,
-    ActivationBuffer*& output,
-    uint32_t& token_count,
-    uint64_t optimization_flags)
+bool VulkanExpertBackend::route_aggregation_enabled(std::span<const ExpertBackendRequest> requests,
+                                                    std::span<const Selection> selected,
+                                                    uint32_t output_columns,
+                                                    ActivationBuffer*& output,
+                                                    uint32_t& token_count,
+                                                    uint64_t optimization_flags)
 {
     output = nullptr;
     token_count = 0;
@@ -1031,9 +1025,8 @@ bool VulkanExpertBackend::route_aggregation_enabled(
     if (selected.empty())
         return false;
 
-    const bool enabled = has_flag(
-        optimization_flags,
-        OptimizationVulkanRouteAggregation);
+    const bool enabled = has_flag(optimization_flags,
+                                  OptimizationVulkanRouteAggregation);
     if (!enabled)
         return false;
 
@@ -1082,12 +1075,11 @@ bool VulkanExpertBackend::route_aggregation_enabled(
     return true;
 }
 
-bool VulkanExpertBackend::build_route_aggregation_metadata(
-    std::span<const ExpertBackendRequest> requests,
-    std::span<const Selection> selected,
-    std::vector<uint32_t>& offsets,
-    std::vector<uint32_t>& rows,
-    std::vector<float>& weights)
+bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const ExpertBackendRequest> requests,
+                                                           std::span<const Selection> selected,
+                                                           std::vector<uint32_t>& offsets,
+                                                           std::vector<uint32_t>& rows,
+                                                           std::vector<float>& weights)
 {
     if (selected.empty())
         return false;
@@ -1528,9 +1520,8 @@ void VulkanExpertBackend::worker_loop()
             batch.push_back(std::move(pending.front()));
             pending.pop_front();
             ++active_admissions;
-            if (has_flag(
-                    optimization_flags,
-                    OptimizationVulkanExpertBatchAdmission)
+            if (has_flag(optimization_flags,
+                         OptimizationVulkanExpertBatchAdmission)
                 && batch.front().gate_up
                 && batch.front().gate_up->dtype == DType::MxFp4)
             {
@@ -1562,46 +1553,43 @@ void VulkanExpertBackend::worker_loop()
                 std::shared_ptr<Bfloat16Expert_vulkan> bfloat16_operation;
                 if (admission.gate_up->dtype == DType::MxFp4)
                 {
-                    operation = Mxfp4Expert_vulkan::create_with_allocator(
-                        *admission.gate_up,
-                        admission.gate_up_bias.get(),
-                        *admission.down,
-                        admission.down_bias.get(),
-                        admission.activation_limit,
-                        vulkan_device_index,
-                        expert_weight_allocator.get(),
-                        admission.activation,
-                        vulkan_runtime,
-                        optimization_flags,
-                        upload_batch ? &*upload_batch : nullptr);
+                    operation = Mxfp4Expert_vulkan::create_with_allocator(*admission.gate_up,
+                                                                          admission.gate_up_bias.get(),
+                                                                          *admission.down,
+                                                                          admission.down_bias.get(),
+                                                                          admission.activation_limit,
+                                                                          vulkan_device_index,
+                                                                          expert_weight_allocator.get(),
+                                                                          admission.activation,
+                                                                          vulkan_runtime,
+                                                                          optimization_flags,
+                                                                          upload_batch ? &*upload_batch : nullptr);
                 }
                 else if (admission.gate_up->dtype == DType::BFloat16)
                 {
-                    bfloat16_operation = Bfloat16Expert_vulkan::create_with_allocator(
-                        *admission.gate_up,
-                        admission.gate_up_bias.get(),
-                        *admission.down,
-                        admission.down_bias.get(),
-                        admission.activation_limit,
-                        vulkan_device_index,
-                        expert_weight_allocator.get(),
-                        admission.activation,
-                        vulkan_runtime,
-                        optimization_flags);
+                    bfloat16_operation = Bfloat16Expert_vulkan::create_with_allocator(*admission.gate_up,
+                                                                                      admission.gate_up_bias.get(),
+                                                                                      *admission.down,
+                                                                                      admission.down_bias.get(),
+                                                                                      admission.activation_limit,
+                                                                                      vulkan_device_index,
+                                                                                      expert_weight_allocator.get(),
+                                                                                      admission.activation,
+                                                                                      vulkan_runtime,
+                                                                                      optimization_flags);
                 }
                 else
                 {
-                    qnk_operation = QnkExpert_vulkan::create_with_allocator(
-                        *admission.gate_up,
-                        admission.gate_up_bias.get(),
-                        *admission.down,
-                        admission.down_bias.get(),
-                        admission.activation_limit,
-                        vulkan_device_index,
-                        expert_weight_allocator.get(),
-                        admission.activation,
-                        vulkan_runtime,
-                        optimization_flags);
+                    qnk_operation = QnkExpert_vulkan::create_with_allocator(*admission.gate_up,
+                                                                            admission.gate_up_bias.get(),
+                                                                            *admission.down,
+                                                                            admission.down_bias.get(),
+                                                                            admission.activation_limit,
+                                                                            vulkan_device_index,
+                                                                            expert_weight_allocator.get(),
+                                                                            admission.activation,
+                                                                            vulkan_runtime,
+                                                                            optimization_flags);
                 }
                 if (operation || qnk_operation || bfloat16_operation)
                 {
@@ -1684,9 +1672,8 @@ void VulkanExpertBackend::worker_loop()
     }
 }
 
-bool VulkanExpertBackend::forward_bfloat16_batch(
-    std::span<const ExpertBackendRequest> requests,
-    std::span<const Selection> selected)
+bool VulkanExpertBackend::forward_bfloat16_batch(std::span<const ExpertBackendRequest> requests,
+                                                 std::span<const Selection> selected)
 {
     if (selected.empty())
         return true;
@@ -1721,18 +1708,16 @@ bool VulkanExpertBackend::forward_bfloat16_batch(
     const uint32_t output_columns = selected.front().entry->bfloat16_operation->output_columns();
     ActivationBuffer* aggregated_output = nullptr;
     uint32_t aggregated_token_count = 0;
-    const bool use_route_aggregation = route_aggregation_enabled(
-        requests,
-        selected,
-        output_columns,
-        aggregated_output,
-        aggregated_token_count,
-        optimization_flags);
+    const bool use_route_aggregation = route_aggregation_enabled(requests,
+                                                                 selected,
+                                                                 output_columns,
+                                                                 aggregated_output,
+                                                                 aggregated_token_count,
+                                                                 optimization_flags);
 
-    if (!Bfloat16Expert_vulkan::forward_batch(
-            experts,
-            inputs,
-            outputs))
+    if (!Bfloat16Expert_vulkan::forward_batch(experts,
+                                              inputs,
+                                              outputs))
     {
         return false;
     }
@@ -1795,13 +1780,12 @@ bool VulkanExpertBackend::forward_qnk_batch(std::span<const ExpertBackendRequest
 
     ActivationBuffer* aggregated_output = nullptr;
     uint32_t aggregated_token_count = 0;
-    const bool use_route_aggregation = route_aggregation_enabled(
-        requests,
-        selected,
-        output_columns,
-        aggregated_output,
-        aggregated_token_count,
-        optimization_flags);
+    const bool use_route_aggregation = route_aggregation_enabled(requests,
+                                                                 selected,
+                                                                 output_columns,
+                                                                 aggregated_output,
+                                                                 aggregated_token_count,
+                                                                 optimization_flags);
     if (selected.size() == 1)
     {
         const Selection& selection = selected.front();
@@ -1876,12 +1860,11 @@ std::shared_ptr<ExpertBackend> create_vulkan_expert_backend(uint64_t cache_size,
     {
         return {};
     }
-    return std::make_shared<VulkanExpertBackend>(
-        cache_size,
-        device_index,
-        std::move(source),
-        vulkan_runtime,
-        optimization_flags);
+    return std::make_shared<VulkanExpertBackend>(cache_size,
+                                                 device_index,
+                                                 std::move(source),
+                                                 vulkan_runtime,
+                                                 optimization_flags);
 #else
     (void)cache_size;
     (void)device_index;

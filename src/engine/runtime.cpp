@@ -87,7 +87,7 @@ Runtime::Runtime()
     if (!runtime_info.gpu_infos.empty())
     {
         runtime_info.flags |= RuntimeVulkan | RuntimeVulkanCpu | RuntimeVulkanAttention | RuntimeVulkanVictim
-                              | RuntimeVulkanDoubleBuffer | RuntimeMxfp4Vulkan;
+                           | RuntimeVulkanDoubleBuffer | RuntimeMxfp4Vulkan;
         const uint32_t default_gpu_index = get_default_gpu_index();
         if (default_gpu_index < runtime_info.gpu_infos.size())
             runtime_info.default_gpu_index = default_gpu_index;

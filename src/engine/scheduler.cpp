@@ -33,17 +33,14 @@ public:
     SchedulerStatistics statistics() const noexcept;
 
 private:
-    [[nodiscard]] static Result<std::vector<Session*>> get_session_lock_order(
-        std::span<Session* const> sessions,
-        const char* null_message,
-        const char* duplicate_message);
+    [[nodiscard]] static Result<std::vector<Session*>> get_session_lock_order(std::span<Session* const> sessions,
+                                                                              const char* null_message,
+                                                                              const char* duplicate_message);
     [[nodiscard]] static bool compatible(std::span<Session* const> sessions) noexcept;
-    [[nodiscard]] static Result<std::vector<PrefillResult>> prefill(
-        std::span<Session* const> sessions,
-        std::span<const PrefillBatchRequest> requests);
-    [[nodiscard]] static Result<std::vector<DecodeResult>> decode(
-        std::span<Session* const> sessions,
-        std::span<const DecodeBatchRequest> requests);
+    [[nodiscard]] static Result<std::vector<PrefillResult>> prefill(std::span<Session* const> sessions,
+                                                                    std::span<const PrefillBatchRequest> requests);
+    [[nodiscard]] static Result<std::vector<DecodeResult>> decode(std::span<Session* const> sessions,
+                                                                  std::span<const DecodeBatchRequest> requests);
 
     void stop_workers();
     void worker_loop();
@@ -52,10 +49,9 @@ private:
     void release_sessions(std::span<Session* const> sessions);
 
 #if defined(_OPENMP)
-    [[nodiscard]] uint32_t prepare_staging_team(
-        uint64_t work_units,
-        uint32_t independent_work_items,
-        CpuThreadBudgetController::Lease& extra_compute);
+    [[nodiscard]] uint32_t prepare_staging_team(uint64_t work_units,
+                                                uint32_t independent_work_items,
+                                                CpuThreadBudgetController::Lease& extra_compute);
 #endif // defined(_OPENMP)
 
     CpuThreadBudgetController cpu_budget;
@@ -74,10 +70,9 @@ private:
     std::atomic<uint64_t> staged_decode_batches{0};
 };
 
-Result<std::vector<Session*>> BatchSchedulerPrivate::get_session_lock_order(
-    std::span<Session* const> sessions,
-    const char* null_message,
-    const char* duplicate_message)
+Result<std::vector<Session*>> BatchSchedulerPrivate::get_session_lock_order(std::span<Session* const> sessions,
+                                                                            const char* null_message,
+                                                                            const char* duplicate_message)
 {
     std::vector<Session*> lock_order(sessions.begin(), sessions.end());
     for (const Session* session : lock_order)
@@ -104,9 +99,8 @@ bool BatchSchedulerPrivate::compatible(std::span<Session* const> sessions) noexc
     return true;
 }
 
-Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(
-    std::span<Session* const> sessions,
-    std::span<const PrefillBatchRequest> requests)
+Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(std::span<Session* const> sessions,
+                                                                  std::span<const PrefillBatchRequest> requests)
 {
     if (sessions.empty() || sessions.size() != requests.size())
     {
@@ -115,10 +109,9 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(
             "staged prefill requires one input sequence per session"};
     }
 
-    auto lock_order = get_session_lock_order(
-        sessions,
-        "staged prefill session cannot be null",
-        "staged prefill requires unique sessions");
+    auto lock_order = get_session_lock_order(sessions,
+                                             "staged prefill session cannot be null",
+                                             "staged prefill requires unique sessions");
     if (!lock_order)
         return lock_order.error();
     std::vector<std::unique_lock<std::mutex>> locks;
@@ -155,9 +148,8 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(
         if (max_context_length > 0
             && requests[index].input_ids.size()
                    > max_context_length
-                         - std::min<uint64_t>(
-                             session.token_count,
-                             max_context_length))
+                         - std::min<uint64_t>(session.token_count,
+                                              max_context_length))
         {
             return Error{
                 ErrorCode::InvalidArgument,
@@ -192,9 +184,8 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(
             });
         }
 
-        auto logits = forward_decode_batch(
-            compiled,
-            entries);
+        auto logits = forward_decode_batch(compiled,
+                                           entries);
         if (!logits)
             return logits.error();
         if (logits.value().size() != entries.size())
@@ -212,10 +203,9 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(
             if (token_index >= requests[session_index].input_ids.size())
                 continue;
             Session& session = *sessions[session_index];
-            auto speculative_context = update_speculative_context(
-                compiled,
-                session.stats_scratch,
-                *session.state);
+            auto speculative_context = update_speculative_context(compiled,
+                                                                  session.stats_scratch,
+                                                                  *session.state);
             if (!speculative_context)
                 return speculative_context.error();
             results[session_index].logits = std::move(logits.value()[active_index++]);
@@ -231,19 +221,17 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(
     return results;
 }
 
-Result<std::vector<DecodeResult>> BatchSchedulerPrivate::decode(
-    std::span<Session* const> sessions,
-    std::span<const DecodeBatchRequest> requests)
+Result<std::vector<DecodeResult>> BatchSchedulerPrivate::decode(std::span<Session* const> sessions,
+                                                                std::span<const DecodeBatchRequest> requests)
 {
     if (sessions.empty() || sessions.size() != requests.size())
     {
         return Error{ErrorCode::InvalidArgument, "staged decode requires one input id per session"};
     }
 
-    auto lock_order = get_session_lock_order(
-        sessions,
-        "staged decode session cannot be null",
-        "staged decode requires unique sessions");
+    auto lock_order = get_session_lock_order(sessions,
+                                             "staged decode session cannot be null",
+                                             "staged decode requires unique sessions");
     if (!lock_order)
         return lock_order.error();
     std::vector<std::unique_lock<std::mutex>> locks;
@@ -289,10 +277,9 @@ Result<std::vector<DecodeResult>> BatchSchedulerPrivate::decode(
     }
     for (size_t index = 0; index < sessions.size(); ++index)
     {
-        auto speculative_context = update_speculative_context(
-            compiled,
-            sessions[index]->stats_scratch,
-            *sessions[index]->state);
+        auto speculative_context = update_speculative_context(compiled,
+                                                              sessions[index]->stats_scratch,
+                                                              *sessions[index]->state);
         if (!speculative_context)
             return speculative_context.error();
     }
@@ -313,9 +300,7 @@ BatchSchedulerPrivate::BatchSchedulerPrivate(const SchedulerOptions& opt)
       use_staged_decode(opt.use_staged_decode)
 {
     const CpuThreadBudget& thread_budget = cpu_budget.budget();
-    uint32_t num_threads = opt.num_threads == 0
-                               ? std::min(4u, thread_budget.num_threads)
-                               : opt.num_threads;
+    uint32_t num_threads = opt.num_threads == 0 ? std::min(4u, thread_budget.num_threads) : opt.num_threads;
     num_threads = std::max(1u, std::min(num_threads, thread_budget.num_threads));
 #if defined(_OPENMP)
     team_size = std::max(1u, thread_budget.num_threads / num_threads);
@@ -486,8 +471,7 @@ std::future<std::vector<Result<DecodeResult>>> BatchSchedulerPrivate::submit_dec
         Session* session = request.session.get();
         if (!session || !unique_sessions.insert(session).second)
         {
-            state->promise.set_value(std::vector<Result<DecodeResult>>(
-                requests.size(), Error{ErrorCode::InvalidArgument, "a decode batch requires unique non-null sessions"}));
+            state->promise.set_value(std::vector<Result<DecodeResult>>(requests.size(), Error{ErrorCode::InvalidArgument, "a decode batch requires unique non-null sessions"}));
             return future;
         }
         if (can_stage)
@@ -572,42 +556,33 @@ SchedulerStatistics BatchSchedulerPrivate::statistics() const noexcept
     SchedulerStatistics result;
     result.prefill_batches = prefill_batches.load(std::memory_order_relaxed);
     result.decode_batches = decode_batches.load(std::memory_order_relaxed);
-    result.staged_prefill_batches = staged_prefill_batches.load(
-        std::memory_order_relaxed);
-    result.staged_decode_batches = staged_decode_batches.load(
-        std::memory_order_relaxed);
+    result.staged_prefill_batches = staged_prefill_batches.load(std::memory_order_relaxed);
+    result.staged_decode_batches = staged_decode_batches.load(std::memory_order_relaxed);
     result.num_threads = static_cast<uint32_t>(workers.size());
     return result;
 }
 
 #if defined(_OPENMP)
-uint32_t BatchSchedulerPrivate::prepare_staging_team(
-    uint64_t work_units,
-    uint32_t independent_work_items,
-    CpuThreadBudgetController::Lease& extra_compute)
+uint32_t BatchSchedulerPrivate::prepare_staging_team(uint64_t work_units,
+                                                     uint32_t independent_work_items,
+                                                     CpuThreadBudgetController::Lease& extra_compute)
 {
     const uint32_t current_team_size = cpu_openmp_thread_limit();
-    const uint32_t available_for_team = std::max(
-        1u,
-        std::min(
-            cpu_budget.budget().max_threads,
-            current_team_size + cpu_budget.available()));
-    const uint32_t desired_team_size = choose_cpu_team_size(
-        work_units,
-        independent_work_items,
-        team_size,
-        available_for_team);
+    const uint32_t available_for_team = std::max(1u,
+                                                 std::min(cpu_budget.budget().max_threads,
+                                                          current_team_size + cpu_budget.available()));
+    const uint32_t desired_team_size = choose_cpu_team_size(work_units,
+                                                            independent_work_items,
+                                                            team_size,
+                                                            available_for_team);
     if (desired_team_size > current_team_size)
     {
-        extra_compute = cpu_budget.try_acquire_compute(
-            desired_team_size - current_team_size,
-            true);
+        extra_compute = cpu_budget.try_acquire_compute(desired_team_size - current_team_size,
+                                                       true);
     }
-    return std::max(
-        1u,
-        std::min(
-            desired_team_size,
-            current_team_size + extra_compute.size()));
+    return std::max(1u,
+                    std::min(desired_team_size,
+                             current_team_size + extra_compute.size()));
 }
 #endif // defined(_OPENMP)
 
@@ -702,9 +677,8 @@ void BatchSchedulerPrivate::worker_loop()
             work = std::move(queue.front());
             queue.pop_front();
         }
-        CpuThreadBudgetController::Lease compute_lease = cpu_budget.acquire_compute(
-            team_size,
-            false);
+        CpuThreadBudgetController::Lease compute_lease = cpu_budget.acquire_compute(team_size,
+                                                                                    false);
         thread_limit.set(std::max(1u, compute_lease.size()));
         work();
     }
@@ -717,8 +691,7 @@ BatchScheduler::BatchScheduler(const SchedulerOptions& opt)
 
 BatchScheduler::~BatchScheduler() = default;
 
-std::future<std::vector<Result<PrefillResult>>> BatchScheduler::submit_prefill(
-    std::vector<PrefillBatchRequest> requests)
+std::future<std::vector<Result<PrefillResult>>> BatchScheduler::submit_prefill(std::vector<PrefillBatchRequest> requests)
 {
     return d->submit_prefill(std::move(requests));
 }

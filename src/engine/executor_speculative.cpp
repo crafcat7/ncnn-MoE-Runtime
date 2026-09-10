@@ -23,25 +23,23 @@
 namespace ncnn {
 namespace moe {
 
-static uint64_t elapsed_microseconds(
-    std::chrono::steady_clock::time_point start,
-    std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now())
+static uint64_t elapsed_microseconds(std::chrono::steady_clock::time_point start,
+                                     std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now())
 {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
 }
 
-static Result<void> execute_speculative_layer(
-    const CompiledModel& model,
-    const SpeculativeModelPlan::LayerNodes& execution,
-    size_t layer_plan_index,
-    uint64_t position_offset,
-    LayerCache& cache,
-    ActivationBuffer& hidden,
-    SessionStatistics& statistics,
-    LayerGraphState& layer_state,
-    ExpertScratch& scratch,
-    HyperConnectionScratch& hyper_connection_scratch,
-    AttentionScratch& attention_scratch)
+static Result<void> execute_speculative_layer(const CompiledModel& model,
+                                              const SpeculativeModelPlan::LayerNodes& execution,
+                                              size_t layer_plan_index,
+                                              uint64_t position_offset,
+                                              LayerCache& cache,
+                                              ActivationBuffer& hidden,
+                                              SessionStatistics& statistics,
+                                              LayerGraphState& layer_state,
+                                              ExpertScratch& scratch,
+                                              HyperConnectionScratch& hyper_connection_scratch,
+                                              AttentionScratch& attention_scratch)
 {
     const ExecutionGraph& graph = model.speculative.graph;
     if (layer_plan_index >= graph.layer_plans.size()
@@ -70,65 +68,61 @@ static Result<void> execute_speculative_layer(
     const ActivationBuffer* attention_input = &hidden;
     if (multiplier > 1)
     {
-        auto mixed = hyper_connection_pre(
-            hidden,
-            model.weights.at(layer.hyper_connection.attention_function),
-            model.weights.at(layer.hyper_connection.attention_scale),
-            model.weights.at(layer.hyper_connection.attention_base),
-            multiplier,
-            model.descriptor.hyper_connection_iterations,
-            model.descriptor.norm_epsilon,
-            model.descriptor.hyper_connection_epsilon,
-            attention_mix,
-            hyper_connection_scratch,
-            model.opt.optimization_flags);
+        auto mixed = hyper_connection_pre(hidden,
+                                          model.weights.at(layer.hyper_connection.attention_function),
+                                          model.weights.at(layer.hyper_connection.attention_scale),
+                                          model.weights.at(layer.hyper_connection.attention_base),
+                                          multiplier,
+                                          model.descriptor.hyper_connection_iterations,
+                                          model.descriptor.norm_epsilon,
+                                          model.descriptor.hyper_connection_epsilon,
+                                          attention_mix,
+                                          hyper_connection_scratch,
+                                          model.opt.optimization_flags);
         if (!mixed)
             return mixed.error();
         attention_input = &attention_mix.reduced;
     }
     if (model.speculative.kind == SpeculativeModelKind::Mtp)
     {
-        auto attention = forward_attention(
-            model.weights,
-            model.operators,
-            layer.attention,
-            attention_backend,
-            model.descriptor.norm_epsilon,
-            model.descriptor.kv_cache_dtype,
-            position_offset,
-            cache,
-            attention_scratch,
-            *attention_input,
-            attention_scratch.output,
-            model.opt.optimization_flags);
+        auto attention = forward_attention(model.weights,
+                                           model.operators,
+                                           layer.attention,
+                                           attention_backend,
+                                           model.descriptor.norm_epsilon,
+                                           model.descriptor.kv_cache_dtype,
+                                           position_offset,
+                                           cache,
+                                           attention_scratch,
+                                           *attention_input,
+                                           attention_scratch.output,
+                                           model.opt.optimization_flags);
         if (!attention)
             return attention.error();
         hidden.swap(attention_scratch.output);
     }
     else
     {
-        auto attention = forward_dspark_attention(
-            model.weights,
-            model.operators,
-            layer.attention,
-            attention_backend,
-            model.descriptor.norm_epsilon,
-            position_offset,
-            cache,
-            attention_scratch,
-            *attention_input,
-            attention_scratch.output,
-            model.opt.optimization_flags);
+        auto attention = forward_dspark_attention(model.weights,
+                                                  model.operators,
+                                                  layer.attention,
+                                                  attention_backend,
+                                                  model.descriptor.norm_epsilon,
+                                                  position_offset,
+                                                  cache,
+                                                  attention_scratch,
+                                                  *attention_input,
+                                                  attention_scratch.output,
+                                                  model.opt.optimization_flags);
         if (!attention)
             return attention.error();
         if (multiplier > 1)
         {
-            auto connected = hyper_connection_post(
-                attention_scratch.output,
-                hidden,
-                attention_mix,
-                multiplier,
-                scratch.staged_output);
+            auto connected = hyper_connection_post(attention_scratch.output,
+                                                   hidden,
+                                                   attention_mix,
+                                                   multiplier,
+                                                   scratch.staged_output);
             if (!connected)
                 return connected.error();
             hidden.swap(scratch.staged_output);
@@ -144,18 +138,17 @@ static Result<void> execute_speculative_layer(
     layer_state.router_start = std::chrono::steady_clock::now();
     if (multiplier > 1)
     {
-        auto mixed = hyper_connection_pre(
-            hidden,
-            model.weights.at(layer.hyper_connection.ffn_function),
-            model.weights.at(layer.hyper_connection.ffn_scale),
-            model.weights.at(layer.hyper_connection.ffn_base),
-            multiplier,
-            model.descriptor.hyper_connection_iterations,
-            model.descriptor.norm_epsilon,
-            model.descriptor.hyper_connection_epsilon,
-            layer_state.ffn_hyper_mix,
-            hyper_connection_scratch,
-            model.opt.optimization_flags);
+        auto mixed = hyper_connection_pre(hidden,
+                                          model.weights.at(layer.hyper_connection.ffn_function),
+                                          model.weights.at(layer.hyper_connection.ffn_scale),
+                                          model.weights.at(layer.hyper_connection.ffn_base),
+                                          multiplier,
+                                          model.descriptor.hyper_connection_iterations,
+                                          model.descriptor.norm_epsilon,
+                                          model.descriptor.hyper_connection_epsilon,
+                                          layer_state.ffn_hyper_mix,
+                                          hyper_connection_scratch,
+                                          model.opt.optimization_flags);
         if (!mixed)
             return mixed.error();
         rms_norm_batch_into(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset, model.opt.optimization_flags);
@@ -164,12 +157,11 @@ static Result<void> execute_speculative_layer(
     {
         rms_norm_batch_into(hidden, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset, model.opt.optimization_flags);
     }
-    linear_batch_into(
-        model.weights.at(moe.router_weight),
-        layer_state.normalized,
-        layer_state.router_logits,
-        model.opt.optimization_flags,
-        model.operators.find_weight(moe.router_weight));
+    linear_batch_into(model.weights.at(moe.router_weight),
+                      layer_state.normalized,
+                      layer_state.router_logits,
+                      model.opt.optimization_flags,
+                      model.operators.find_weight(moe.router_weight));
     ExpertDispatchOptions dispatch_options;
     dispatch_options.expert_count = static_cast<uint32_t>(moe.experts.size());
     dispatch_options.top_k = moe.top_k;
@@ -196,15 +188,14 @@ static Result<void> execute_speculative_layer(
     layer_state.expert_start = std::chrono::steady_clock::now();
 
     const auto expert_engine_start = std::chrono::steady_clock::now();
-    auto executed = forward_moe(
-        model,
-        moe,
-        layer_state,
-        statistics,
-        scratch,
-        layer.layer_id,
-        expert_backend,
-        cpu_prefetch);
+    auto executed = forward_moe(model,
+                                moe,
+                                layer_state,
+                                statistics,
+                                scratch,
+                                layer.layer_id,
+                                expert_backend,
+                                cpu_prefetch);
     statistics.expert_engine_time_microseconds += elapsed_microseconds(expert_engine_start);
     if (!executed)
         return executed.error();
@@ -212,20 +203,18 @@ static Result<void> execute_speculative_layer(
     if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0)
     {
         ExpertExecutionMetrics shared_metrics;
-        forward_shared_expert(
-            model,
-            moe,
-            layer_state.normalized,
-            layer_state.shared_expert_output,
-            shared_metrics,
-            model.opt.optimization_flags);
+        forward_shared_expert(model,
+                              moe,
+                              layer_state.normalized,
+                              layer_state.shared_expert_output,
+                              shared_metrics,
+                              model.opt.optimization_flags);
     }
     ActivationBuffer& moe_output = layer_state.normalized;
-    const bool has_backend_aggregation = initialize_backend_aggregated_output(
-        scratch,
-        hidden.rows(),
-        model.descriptor.hidden_size,
-        moe_output);
+    const bool has_backend_aggregation = initialize_backend_aggregated_output(scratch,
+                                                                              hidden.rows(),
+                                                                              model.descriptor.hidden_size,
+                                                                              moe_output);
     for (size_t active_index = 0; active_index < layer_state.active_experts().size(); ++active_index)
     {
         const ActiveExpertExecution& active = layer_state.active_experts()[active_index];
@@ -250,12 +239,11 @@ static Result<void> execute_speculative_layer(
         add_batch_inplace(moe_output, layer_state.shared_expert_output);
     if (multiplier > 1)
     {
-        auto connected = hyper_connection_post(
-            moe_output,
-            hidden,
-            layer_state.ffn_hyper_mix,
-            multiplier,
-            scratch.staged_output);
+        auto connected = hyper_connection_post(moe_output,
+                                               hidden,
+                                               layer_state.ffn_hyper_mix,
+                                               multiplier,
+                                               scratch.staged_output);
         if (!connected)
             return connected.error();
         hidden.swap(scratch.staged_output);
@@ -270,10 +258,9 @@ static Result<void> execute_speculative_layer(
     return {};
 }
 
-static Result<ActivationBuffer> prepare_mtp_hidden(
-    const CompiledModel& model,
-    std::span<const int32_t> input_ids,
-    const ActivationBuffer& target_hidden)
+static Result<ActivationBuffer> prepare_mtp_hidden(const CompiledModel& model,
+                                                   std::span<const int32_t> input_ids,
+                                                   const ActivationBuffer& target_hidden)
 {
     if (input_ids.empty()
         || input_ids.size() != target_hidden.rows()
@@ -285,52 +272,42 @@ static Result<ActivationBuffer> prepare_mtp_hidden(
     }
 
     ActivationBuffer embeddings;
-    embedding_batch_into(
-        model.weights.at(model.token_embedding),
-        input_ids,
-        embeddings);
-    rms_norm_batch_into(
-        embeddings,
-        model.weights.at(
-            model.speculative.mtp_embedding_norm_weight),
-        model.descriptor.norm_epsilon,
-        embeddings,
-        model.descriptor.norm_weight_offset,
-        model.opt.optimization_flags);
-    ActivationBuffer normalized_hidden = rms_norm_batch(
-        target_hidden,
-        model.weights.at(model.speculative.mtp_hidden_norm_weight),
-        model.descriptor.norm_epsilon,
-        model.descriptor.norm_weight_offset,
-        model.opt.optimization_flags);
-    ActivationBuffer packed(
-        target_hidden.rows(),
-        model.descriptor.hidden_size * 2);
+    embedding_batch_into(model.weights.at(model.token_embedding),
+                         input_ids,
+                         embeddings);
+    rms_norm_batch_into(embeddings,
+                        model.weights.at(model.speculative.mtp_embedding_norm_weight),
+                        model.descriptor.norm_epsilon,
+                        embeddings,
+                        model.descriptor.norm_weight_offset,
+                        model.opt.optimization_flags);
+    ActivationBuffer normalized_hidden = rms_norm_batch(target_hidden,
+                                                        model.weights.at(model.speculative.mtp_hidden_norm_weight),
+                                                        model.descriptor.norm_epsilon,
+                                                        model.descriptor.norm_weight_offset,
+                                                        model.opt.optimization_flags);
+    ActivationBuffer packed(target_hidden.rows(),
+                            model.descriptor.hidden_size * 2);
     for (size_t row = 0; row < target_hidden.rows(); ++row)
     {
-        std::copy_n(
-            embeddings.row(row),
-            model.descriptor.hidden_size,
-            packed.row(row));
-        std::copy_n(
-            normalized_hidden.row(row),
-            model.descriptor.hidden_size,
-            packed.row(row) + model.descriptor.hidden_size);
+        std::copy_n(embeddings.row(row),
+                    model.descriptor.hidden_size,
+                    packed.row(row));
+        std::copy_n(normalized_hidden.row(row),
+                    model.descriptor.hidden_size,
+                    packed.row(row) + model.descriptor.hidden_size);
     }
-    return linear_batch(
-        model.weights.at(
-            model.speculative.mtp_input_projection_weight),
-        packed,
-        model.opt.optimization_flags,
-        model.operators.find_weight(model.speculative.mtp_input_projection_weight));
+    return linear_batch(model.weights.at(model.speculative.mtp_input_projection_weight),
+                        packed,
+                        model.opt.optimization_flags,
+                        model.operators.find_weight(model.speculative.mtp_input_projection_weight));
 }
 
-static Result<ActivationBuffer> execute_mtp_batch(
-    const CompiledModel& model,
-    const SpeculativeModelPlan::LayerNodes& execution,
-    std::span<const int32_t> input_ids, const ActivationBuffer& target_hidden,
-    uint64_t position_offset, SessionStatistics& statistics,
-    SessionState& state)
+static Result<ActivationBuffer> execute_mtp_batch(const CompiledModel& model,
+                                                  const SpeculativeModelPlan::LayerNodes& execution,
+                                                  std::span<const int32_t> input_ids, const ActivationBuffer& target_hidden,
+                                                  uint64_t position_offset, SessionStatistics& statistics,
+                                                  SessionState& state)
 {
     if (state.speculative_layers.size() != 1)
     {
@@ -338,44 +315,40 @@ static Result<ActivationBuffer> execute_mtp_batch(
             ErrorCode::InvalidArgument,
             "invalid Qwen MTP execution state"};
     }
-    auto prepared = prepare_mtp_hidden(
-        model,
-        input_ids,
-        target_hidden);
+    auto prepared = prepare_mtp_hidden(model,
+                                       input_ids,
+                                       target_hidden);
     if (!prepared)
         return prepared.error();
     ActivationBuffer hidden = std::move(prepared).value();
-    auto executed = execute_speculative_layer(
-        model,
-        execution,
-        0,
-        position_offset,
-        state.speculative_layers.front(),
-        hidden,
-        statistics,
-        state.execution_state,
-        state.expert_scratch,
-        state.hyper_connection_scratch,
-        state.attention_scratch);
+    auto executed = execute_speculative_layer(model,
+                                              execution,
+                                              0,
+                                              position_offset,
+                                              state.speculative_layers.front(),
+                                              hidden,
+                                              statistics,
+                                              state.execution_state,
+                                              state.expert_scratch,
+                                              state.hyper_connection_scratch,
+                                              state.attention_scratch);
     state.execution_state.reset();
     if (!executed)
         return executed.error();
-    rms_norm_batch_into(
-        hidden,
-        model.weights.at(model.speculative.final_norm_weight),
-        model.descriptor.norm_epsilon,
-        hidden,
-        model.descriptor.norm_weight_offset,
-        model.opt.optimization_flags);
+    rms_norm_batch_into(hidden,
+                        model.weights.at(model.speculative.final_norm_weight),
+                        model.descriptor.norm_epsilon,
+                        hidden,
+                        model.descriptor.norm_weight_offset,
+                        model.opt.optimization_flags);
     return hidden;
 }
 
-static Result<void> append_mtp_context(
-    const CompiledModel& model,
-    std::span<const int32_t> input_ids,
-    const ActivationBuffer& target_hidden,
-    uint64_t position_offset,
-    SessionState& state)
+static Result<void> append_mtp_context(const CompiledModel& model,
+                                       std::span<const int32_t> input_ids,
+                                       const ActivationBuffer& target_hidden,
+                                       uint64_t position_offset,
+                                       SessionState& state)
 {
     const std::vector<SpeculativeModelPlan::LayerNodes>& layer_nodes = model.speculative.layer_nodes;
     const ExecutionGraph& graph = model.speculative.graph;
@@ -392,10 +365,9 @@ static Result<void> append_mtp_context(
             ErrorCode::InvalidArgument,
             "invalid Qwen MTP context state"};
     }
-    auto prepared = prepare_mtp_hidden(
-        model,
-        input_ids,
-        target_hidden);
+    auto prepared = prepare_mtp_hidden(model,
+                                       input_ids,
+                                       target_hidden);
     if (!prepared)
         return prepared.error();
     const SpeculativeModelPlan::LayerNodes& execution = layer_nodes.front();
@@ -406,24 +378,22 @@ static Result<void> append_mtp_context(
             "speculative execution graph has an incomplete layer binding"};
     }
     const CompiledLayerPlan& layer = graph.layer_plans.front();
-    auto appended = append_attention_context(
-        model.weights,
-        model.operators,
-        layer.attention,
-        graph.nodes[execution.attention].backend,
-        model.descriptor.norm_epsilon,
-        model.descriptor.kv_cache_dtype,
-        position_offset,
-        state.speculative_layers.front(),
-        state.attention_scratch,
-        prepared.value(),
-        model.opt.optimization_flags);
+    auto appended = append_attention_context(model.weights,
+                                             model.operators,
+                                             layer.attention,
+                                             graph.nodes[execution.attention].backend,
+                                             model.descriptor.norm_epsilon,
+                                             model.descriptor.kv_cache_dtype,
+                                             position_offset,
+                                             state.speculative_layers.front(),
+                                             state.attention_scratch,
+                                             prepared.value(),
+                                             model.opt.optimization_flags);
     return appended;
 }
 
-static Result<void> update_mtp_context(
-    const CompiledModel& model,
-    SessionState& state)
+static Result<void> update_mtp_context(const CompiledModel& model,
+                                       SessionState& state)
 {
     const ActivationBuffer& target_hidden = state.speculative_main_hidden;
     if (target_hidden.rows() == 0
@@ -470,9 +440,8 @@ static Result<void> update_mtp_context(
                                     : (has_pending ? 1 : 0) + target_hidden.rows() - 1;
     if (aligned_rows != 0)
     {
-        ActivationBuffer aligned_hidden(
-            aligned_rows,
-            model.descriptor.hidden_size);
+        ActivationBuffer aligned_hidden(aligned_rows,
+                                        model.descriptor.hidden_size);
         std::vector<int32_t> aligned_ids;
         aligned_ids.reserve(aligned_rows);
         size_t output_row = 0;
@@ -480,41 +449,35 @@ static Result<void> update_mtp_context(
         if (!direct_alignment && has_pending)
         {
             aligned_position = state.mtp_pending_target_position;
-            std::copy_n(
-                state.mtp_pending_target_hidden.row(0),
-                model.descriptor.hidden_size,
-                aligned_hidden.row(output_row++));
+            std::copy_n(state.mtp_pending_target_hidden.row(0),
+                        model.descriptor.hidden_size,
+                        aligned_hidden.row(output_row++));
             aligned_ids.push_back(input_ids.front());
         }
         for (size_t row = 0;
              row + 1 < target_hidden.rows();
              ++row)
         {
-            std::copy_n(
-                target_hidden.row(row),
-                model.descriptor.hidden_size,
-                aligned_hidden.row(output_row++));
-            aligned_ids.push_back(
-                input_ids[row + (direct_alignment ? 0 : 1)]);
+            std::copy_n(target_hidden.row(row),
+                        model.descriptor.hidden_size,
+                        aligned_hidden.row(output_row++));
+            aligned_ids.push_back(input_ids[row + (direct_alignment ? 0 : 1)]);
         }
-        auto aligned = append_mtp_context(
-            model,
-            aligned_ids,
-            aligned_hidden,
-            aligned_position,
-            state);
+        auto aligned = append_mtp_context(model,
+                                          aligned_ids,
+                                          aligned_hidden,
+                                          aligned_position,
+                                          state);
         if (!aligned)
             return aligned.error();
     }
 
-    state.mtp_pending_target_hidden.reset(
-        1,
-        model.descriptor.hidden_size,
-        false);
-    std::copy_n(
-        target_hidden.row(target_hidden.rows() - 1),
-        model.descriptor.hidden_size,
-        state.mtp_pending_target_hidden.row(0));
+    state.mtp_pending_target_hidden.reset(1,
+                                          model.descriptor.hidden_size,
+                                          false);
+    std::copy_n(target_hidden.row(target_hidden.rows() - 1),
+                model.descriptor.hidden_size,
+                state.mtp_pending_target_hidden.row(0));
     state.mtp_pending_target_position = state.speculative_main_hidden_position
                                         + target_hidden.rows() - 1;
     state.speculative_input_ids.clear();
@@ -528,15 +491,13 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
         || !state.use_speculative_context)
         return {};
     Bfloat16BatchedLinearExecutionCounter cpu_bfloat16_execution;
-    const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(
-        &cpu_bfloat16_execution);
+    const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(&cpu_bfloat16_execution);
     const auto started = std::chrono::steady_clock::now();
     const VulkanStatistics vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
     if (model.speculative.kind == SpeculativeModelKind::Mtp)
     {
-        auto updated = update_mtp_context(
-            model,
-            state);
+        auto updated = update_mtp_context(model,
+                                          state);
         if (!updated)
             return updated.error();
         const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
@@ -554,18 +515,16 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
             ErrorCode::InternalError,
             "target execution did not capture DSpark context features"};
     }
-    ActivationBuffer projected = linear_batch(
-        model.weights.at(model.speculative.main_projection_weight),
-        state.speculative_main_hidden,
-        model.opt.optimization_flags,
-        model.operators.find_weight(model.speculative.main_projection_weight));
-    rms_norm_batch_into(
-        projected,
-        model.weights.at(model.speculative.main_norm_weight),
-        model.descriptor.norm_epsilon,
-        projected,
-        model.descriptor.norm_weight_offset,
-        model.opt.optimization_flags);
+    ActivationBuffer projected = linear_batch(model.weights.at(model.speculative.main_projection_weight),
+                                              state.speculative_main_hidden,
+                                              model.opt.optimization_flags,
+                                              model.operators.find_weight(model.speculative.main_projection_weight));
+    rms_norm_batch_into(projected,
+                        model.weights.at(model.speculative.main_norm_weight),
+                        model.descriptor.norm_epsilon,
+                        projected,
+                        model.descriptor.norm_weight_offset,
+                        model.opt.optimization_flags);
     const std::vector<SpeculativeModelPlan::LayerNodes>& layer_nodes = model.speculative.layer_nodes;
     const ExecutionGraph& graph = model.speculative.graph;
     if (layer_nodes.size() != graph.layer_plans.size())
@@ -586,14 +545,13 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
                 "speculative execution graph has an incomplete layer binding"};
         }
         const CompiledLayerPlan& layer = graph.layer_plans[layer_index];
-        auto appended = append_dspark_attention_context(
-            model.weights,
-            model.operators,
-            layer.attention,
-            graph.nodes[execution.attention].backend,
-            model.descriptor.norm_epsilon,
-            state.speculative_main_hidden_position, state.speculative_layers[layer_index], projected,
-            model.opt.optimization_flags);
+        auto appended = append_dspark_attention_context(model.weights,
+                                                        model.operators,
+                                                        layer.attention,
+                                                        graph.nodes[execution.attention].backend,
+                                                        model.descriptor.norm_epsilon,
+                                                        state.speculative_main_hidden_position, state.speculative_layers[layer_index], projected,
+                                                        model.opt.optimization_flags);
         if (!appended)
             return appended.error();
     }
@@ -604,13 +562,12 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
     return {};
 }
 
-static Result<SpeculativeProposal> propose_mtp(
-    const CompiledModel& model,
-    int32_t input_id,
-    SessionStatistics& statistics,
-    SessionState& state,
-    uint64_t position_offset,
-    const SpeculativeSampler& sampler)
+static Result<SpeculativeProposal> propose_mtp(const CompiledModel& model,
+                                               int32_t input_id,
+                                               SessionStatistics& statistics,
+                                               SessionState& state,
+                                               uint64_t position_offset,
+                                               const SpeculativeSampler& sampler)
 {
     if (!sampler)
     {
@@ -660,8 +617,7 @@ static Result<SpeculativeProposal> propose_mtp(
     SpeculativeProposal proposal;
     proposal.token_ids.reserve(model.speculative.block_size);
     proposal.logits.reserve(model.speculative.block_size);
-    proposal.confidence_logits.reserve(
-        model.speculative.block_size);
+    proposal.confidence_logits.reserve(model.speculative.block_size);
     proposal.committed_context_rows = 1;
     ActivationBuffer previous_hidden = state.mtp_pending_target_hidden;
     int32_t previous_token = input_id;
@@ -669,31 +625,26 @@ static Result<SpeculativeProposal> propose_mtp(
          row < model.speculative.block_size;
          ++row)
     {
-        const std::span<const int32_t> token(
-            &previous_token,
-            1);
-        auto mtp_hidden = execute_mtp_batch(
-            model, execution,
-            token, previous_hidden,
-            state.mtp_pending_target_position + row, statistics, state);
+        const std::span<const int32_t> token(&previous_token,
+                                             1);
+        auto mtp_hidden = execute_mtp_batch(model, execution,
+                                            token, previous_hidden,
+                                            state.mtp_pending_target_position + row, statistics, state);
         if (!mtp_hidden)
             return mtp_hidden.error();
-        ActivationBuffer logits = linear_batch(
-            model.weights.at(model.lm_head_weight),
-            mtp_hidden.value(),
-            model.opt.optimization_flags,
-            model.operators.find_weight(model.lm_head_weight));
-        std::vector<float> row_logits(
-            logits.row(0),
-            logits.row(0) + logits.columns());
+        ActivationBuffer logits = linear_batch(model.weights.at(model.lm_head_weight),
+                                               mtp_hidden.value(),
+                                               model.opt.optimization_flags,
+                                               model.operators.find_weight(model.lm_head_weight));
+        std::vector<float> row_logits(logits.row(0),
+                                      logits.row(0) + logits.columns());
         auto sampled = sampler(row_logits);
         if (!sampled)
             return sampled.error();
         previous_token = sampled.value();
         proposal.token_ids.push_back(previous_token);
         proposal.logits.push_back(std::move(row_logits));
-        proposal.confidence_logits.push_back(
-            std::numeric_limits<float>::infinity());
+        proposal.confidence_logits.push_back(std::numeric_limits<float>::infinity());
         previous_hidden = std::move(mtp_hidden).value();
     }
     state.mtp_pending_target_hidden.clear();
@@ -705,10 +656,9 @@ static Result<SpeculativeProposal> propose_mtp(
     }
     if (model.expert_backend)
     {
-        record_expert_backend_delta(
-            statistics,
-            backend_before,
-            model.expert_backend->statistics());
+        record_expert_backend_delta(statistics,
+                                    backend_before,
+                                    model.expert_backend->statistics());
     }
     const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
     record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
@@ -728,17 +678,15 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
             "the model does not provide a speculative execution plan"};
     }
     Bfloat16BatchedLinearExecutionCounter cpu_bfloat16_execution;
-    const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(
-        &cpu_bfloat16_execution);
+    const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(&cpu_bfloat16_execution);
     if (model.speculative.kind == SpeculativeModelKind::Mtp)
     {
-        auto proposal = propose_mtp(
-            model,
-            input_id,
-            statistics,
-            state,
-            position_offset,
-            sampler);
+        auto proposal = propose_mtp(model,
+                                    input_id,
+                                    statistics,
+                                    state,
+                                    position_offset,
+                                    sampler);
         if (proposal)
         {
             statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
@@ -794,49 +742,45 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
     hyper_connection_expand(hidden, model.descriptor.hyper_connection_multiplier, state.expert_scratch.staged_output);
     for (size_t layer_index = 0; layer_index < layer_nodes.size(); ++layer_index)
     {
-        auto executed = execute_speculative_layer(
-            model,
-            layer_nodes[layer_index],
-            layer_index,
-            position_offset,
-            state.speculative_layers[layer_index],
-            hidden,
-            statistics,
-            state.execution_state,
-            state.expert_scratch,
-            state.hyper_connection_scratch,
-            state.attention_scratch);
+        auto executed = execute_speculative_layer(model,
+                                                  layer_nodes[layer_index],
+                                                  layer_index,
+                                                  position_offset,
+                                                  state.speculative_layers[layer_index],
+                                                  hidden,
+                                                  statistics,
+                                                  state.execution_state,
+                                                  state.expert_scratch,
+                                                  state.hyper_connection_scratch,
+                                                  state.attention_scratch);
         state.execution_state.reset();
         if (!executed)
             return executed.error();
     }
 
-    auto headed = hyper_connection_head(
-        hidden,
-        model.weights.at(model.speculative.hyper_head_function),
-        model.weights.at(model.speculative.hyper_head_scale),
-        model.weights.at(model.speculative.hyper_head_base),
-        model.descriptor.hyper_connection_multiplier,
-        model.descriptor.norm_epsilon,
-        model.descriptor.hyper_connection_epsilon,
-        state.expert_scratch.staged_output,
-        state.hyper_connection_scratch,
-        model.opt.optimization_flags);
+    auto headed = hyper_connection_head(hidden,
+                                        model.weights.at(model.speculative.hyper_head_function),
+                                        model.weights.at(model.speculative.hyper_head_scale),
+                                        model.weights.at(model.speculative.hyper_head_base),
+                                        model.descriptor.hyper_connection_multiplier,
+                                        model.descriptor.norm_epsilon,
+                                        model.descriptor.hyper_connection_epsilon,
+                                        state.expert_scratch.staged_output,
+                                        state.hyper_connection_scratch,
+                                        model.opt.optimization_flags);
     if (!headed)
         return headed.error();
-    rms_norm_batch_into(
-        state.expert_scratch.staged_output,
-        model.weights.at(model.speculative.final_norm_weight),
-        model.descriptor.norm_epsilon,
-        state.final_norm,
-        model.descriptor.norm_weight_offset,
-        model.opt.optimization_flags);
-    linear_batch_into(
-        model.weights.at(model.lm_head_weight),
-        state.final_norm,
-        state.expert_scratch.staged_merged,
-        model.opt.optimization_flags,
-        model.operators.find_weight(model.lm_head_weight));
+    rms_norm_batch_into(state.expert_scratch.staged_output,
+                        model.weights.at(model.speculative.final_norm_weight),
+                        model.descriptor.norm_epsilon,
+                        state.final_norm,
+                        model.descriptor.norm_weight_offset,
+                        model.opt.optimization_flags);
+    linear_batch_into(model.weights.at(model.lm_head_weight),
+                      state.final_norm,
+                      state.expert_scratch.staged_merged,
+                      model.opt.optimization_flags,
+                      model.operators.find_weight(model.lm_head_weight));
     const ActivationBuffer& head_hidden = state.expert_scratch.staged_output;
     const ActivationBuffer& base_logits = state.expert_scratch.staged_merged;
 
@@ -856,12 +800,11 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
     {
         const std::span<const int32_t> previous(&previous_token, 1);
         embedding_batch_into(markov_embedding_weight, previous, markov_embedding);
-        linear_batch_into(
-            markov_head_weight,
-            markov_embedding,
-            markov_logits,
-            model.opt.optimization_flags,
-            markov_head_operator);
+        linear_batch_into(markov_head_weight,
+                          markov_embedding,
+                          markov_logits,
+                          model.opt.optimization_flags,
+                          markov_head_operator);
         std::vector<float> row_logits(model.descriptor.vocabulary_size);
         for (uint32_t token_id = 0; token_id < model.descriptor.vocabulary_size; ++token_id)
         {

@@ -100,11 +100,10 @@ void main()
                         + (sink_token
                                ? 0.0
                                : current_weight
-                                     * buffer_ld1(
-                                         value_data,
-                                         value_base
-                                             + token * p.head_dimension
-                                             + lane));
+                                     * buffer_ld1(value_data,
+                                                  value_base
+                                                      + token * p.head_dimension
+                                                      + lane));
         }
     }
 

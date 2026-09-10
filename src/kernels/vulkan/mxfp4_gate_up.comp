@@ -105,14 +105,12 @@ void main()
             const uint gate_nibble = (lane & 1) == 0 ? gate_value & 15 : gate_value >> 4;
             const uint up_nibble = (lane & 1) == 0 ? up_value & 15 : up_value >> 4;
             const float input_value = input_data[input_row + block * 32 + lane];
-            gate_sum += mxfp4_product(
-                decode_mxfp4(gate_nibble),
-                input_value,
-                decode_scale(scale_byte(gate_scale_row + block)));
-            up_sum += mxfp4_product(
-                decode_mxfp4(up_nibble),
-                input_value,
-                decode_scale(scale_byte(up_scale_row + block)));
+            gate_sum += mxfp4_product(decode_mxfp4(gate_nibble),
+                                      input_value,
+                                      decode_scale(scale_byte(gate_scale_row + block)));
+            up_sum += mxfp4_product(decode_mxfp4(up_nibble),
+                                    input_value,
+                                    decode_scale(scale_byte(up_scale_row + block)));
         }
     }
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic

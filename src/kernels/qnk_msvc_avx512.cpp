@@ -78,11 +78,10 @@ static float load_f16(const uint8_t* source) noexcept
     return half_to_float(value);
 }
 
-static void get_scale_min_k4(
-    int index,
-    const uint8_t* scales,
-    uint8_t& scale,
-    uint8_t& minimum) noexcept
+static void get_scale_min_k4(int index,
+                             const uint8_t* scales,
+                             uint8_t& scale,
+                             uint8_t& minimum) noexcept
 {
     if (index < 4)
     {
@@ -101,17 +100,15 @@ static __m128i load_u8x16(const uint8_t* source) noexcept
     return _mm_loadu_si128(reinterpret_cast<const __m128i*>(source));
 }
 
-static float dot_affine_u8x16(
-    __m128i values,
-    float scale,
-    float minimum,
-    const float* input) noexcept
+static float dot_affine_u8x16(__m128i values,
+                              float scale,
+                              float minimum,
+                              const float* input) noexcept
 {
     const __m512 value_float = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(values));
-    const __m512 scaled = _mm512_fmadd_ps(
-        value_float,
-        _mm512_set1_ps(scale),
-        _mm512_set1_ps(-minimum));
+    const __m512 scaled = _mm512_fmadd_ps(value_float,
+                                          _mm512_set1_ps(scale),
+                                          _mm512_set1_ps(-minimum));
     return horizontal_sum(_mm512_mul_ps(scaled, _mm512_loadu_ps(input)));
 }
 
@@ -119,9 +116,8 @@ static float dot_q6_u8x16(__m128i values, const float* input) noexcept
 {
     const __m512i offset = _mm512_set1_epi32(32);
     const __m512i signed_values = _mm512_sub_epi32(_mm512_cvtepu8_epi32(values), offset);
-    return horizontal_sum(_mm512_mul_ps(
-        _mm512_cvtepi32_ps(signed_values),
-        _mm512_loadu_ps(input)));
+    return horizontal_sum(_mm512_mul_ps(_mm512_cvtepi32_ps(signed_values),
+                                        _mm512_loadu_ps(input)));
 }
 
 static __m128i q5_values(__m128i low_bits, __m128i high_bits, uint8_t mask) noexcept
@@ -136,16 +132,14 @@ static __m128i q5_values(__m128i low_bits, __m128i high_bits, uint8_t mask) noex
 static __m128i q6_high_values(__m128i high_bits, int shift) noexcept
 {
     const __m128i source_mask = _mm_set1_epi8(static_cast<char>(0x03u << shift));
-    return _mm_and_si128(
-        _mm_srli_epi16(_mm_and_si128(high_bits, source_mask), shift),
-        _mm_set1_epi8(3));
+    return _mm_and_si128(_mm_srli_epi16(_mm_and_si128(high_bits, source_mask), shift),
+                         _mm_set1_epi8(3));
 }
 
 static __m128i q6_values(__m128i low_bits, __m128i high_bits, int low_shift, int high_shift) noexcept
 {
-    const __m128i low = _mm_and_si128(
-        low_shift == 0 ? low_bits : _mm_srli_epi16(low_bits, low_shift),
-        _mm_set1_epi8(0x0f));
+    const __m128i low = _mm_and_si128(low_shift == 0 ? low_bits : _mm_srli_epi16(low_bits, low_shift),
+                                      _mm_set1_epi8(0x0f));
     const __m128i high = _mm_slli_epi16(q6_high_values(high_bits, high_shift), 4);
     return _mm_or_si128(low, high);
 }
@@ -274,13 +268,12 @@ static float horizontal_max(__m512 value) noexcept
     return maximum;
 }
 
-void msvc_avx512_qnk_gemm(
-    const QnKPack& weights,
-    const float* input,
-    size_t input_stride,
-    size_t token_count,
-    float* output,
-    size_t output_stride) noexcept
+void msvc_avx512_qnk_gemm(const QnKPack& weights,
+                          const float* input,
+                          size_t input_stride,
+                          size_t token_count,
+                          float* output,
+                          size_t output_stride) noexcept
 {
     alignas(64) float decoded[qnk_block_elements];
     for (size_t row = 0; row < weights.rows; ++row)

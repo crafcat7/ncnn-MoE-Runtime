@@ -1,4 +1,6 @@
-# Synced with the upstream ncnn formatting policy.
+# Based on the upstream ncnn formatting policy.
+# Keep the first argument on the opening-parenthesis line and align continuations.
+# check_style.cmake enforces first-argument placement; ColumnLimit: 0 alone does not.
 # Requires clang-format 10 or newer.
 
 AccessModifierOffset: -4
@@ -8,9 +10,9 @@ AlignConsecutiveDeclarations: false
 AlignConsecutiveMacros: true
 AlignEscapedNewlines: Left
 AlignTrailingComments: true
-AllowAllArgumentsOnNextLine: true
+AllowAllArgumentsOnNextLine: false
 AllowAllConstructorInitializersOnNextLine: true
-AllowAllParametersOfDeclarationOnNextLine: true
+AllowAllParametersOfDeclarationOnNextLine: false
 AllowShortBlocksOnASingleLine: Always
 AllowShortCaseLabelsOnASingleLine: true
 AllowShortFunctionsOnASingleLine: None

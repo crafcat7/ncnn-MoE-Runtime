@@ -6,8 +6,7 @@
 namespace ncnn {
 namespace moe {
 
-ScopedExpertBackendForeground::ScopedExpertBackendForeground(
-    const std::shared_ptr<ExpertBackend>& _backend) noexcept
+ScopedExpertBackendForeground::ScopedExpertBackendForeground(const std::shared_ptr<ExpertBackend>& _backend) noexcept
     : backend(_backend)
 {
     if (backend)
@@ -69,15 +68,14 @@ void MultiDeviceExpertBackend::admit(std::string key, std::shared_ptr<const Tens
         const std::lock_guard<std::mutex> lock(placement_mutex);
         key_placements.insert_or_assign(key, backend_index);
     }
-    backends[backend_index]->admit(
-        std::move(key),
-        std::move(gate_up),
-        gate_up_bias,
-        std::move(down),
-        down_bias,
-        residency_group,
-        activation_limit,
-        activation);
+    backends[backend_index]->admit(std::move(key),
+                                   std::move(gate_up),
+                                   gate_up_bias,
+                                   std::move(down),
+                                   down_bias,
+                                   residency_group,
+                                   activation_limit,
+                                   activation);
 }
 
 ExpertBackendExecutionResult MultiDeviceExpertBackend::try_execute(const std::string& key, const ActivationBuffer& input, ActivationBuffer& output)

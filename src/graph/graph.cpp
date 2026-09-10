@@ -47,9 +47,8 @@ static Result<void> validate_graph(const ExecutionGraph& graph, std::vector<Exec
 
     std::vector<uint32_t> indegrees(nodes.size(), 0);
     std::vector<std::vector<ExecutionNodeId>> dependents(nodes.size());
-    std::vector<uint8_t> referenced_layer_plans(
-        layer_plans.size(),
-        0);
+    std::vector<uint8_t> referenced_layer_plans(layer_plans.size(),
+                                                0);
     for (size_t node_index = 0; node_index < nodes.size(); ++node_index)
     {
         const ExecutionNode& node = nodes[node_index];
@@ -350,64 +349,57 @@ static ExecutionNodeId add_node(ExecutionGraph& graph, ExecutionNodeType type, E
     return node_id;
 }
 
-static bool use_vulkan_attention(
-    const CompiledModel& compiled,
-    const AttentionBlockPlan& attention) noexcept
+static bool use_vulkan_attention(const CompiledModel& compiled,
+                                 const AttentionBlockPlan& attention) noexcept
 {
     if (compiled.opt.hybrid_mode == HybridMode::CpuOnly
-        || !has_flag(
-            compiled.opt.optimization_flags,
-            OptimizationVulkanAttention))
+        || !has_flag(compiled.opt.optimization_flags,
+                     OptimizationVulkanAttention))
     {
         return false;
     }
     return support_vulkan_attention(compiled.operators, attention);
 }
 
-static ExecutionNodeId add_moe_nodes(
-    ExecutionGraph& graph,
-    const CompiledModel& compiled,
-    size_t plan_index,
-    const std::string& prefix,
-    ExecutionNodeId previous,
-    ExecutionTensorId& hidden,
-    bool use_vulkan_experts)
+static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
+                                     const CompiledModel& compiled,
+                                     size_t plan_index,
+                                     const std::string& prefix,
+                                     ExecutionNodeId previous,
+                                     ExecutionTensorId& hidden,
+                                     bool use_vulkan_experts)
 {
     const CompiledLayerPlan& layer = graph.layer_plans[plan_index];
-    const ExecutionTensorId router_scores = add_tensor(
-        graph,
-        prefix + "router.scores",
-        DType::Float32,
-        {0, static_cast<uint32_t>(layer.moe.experts.size())});
-    const ExecutionNodeId router = add_node(
-        graph,
-        ExecutionNodeType::Router,
-        ExecutionBackend::Cpu,
-        ExecutionBackendCpu,
-        prefix + "router",
-        {previous},
-        {hidden},
-        {router_scores},
-        static_cast<uint32_t>(plan_index),
-        invalid_execution_expert_id,
-        0);
-    const ExecutionTensorId assignments = add_tensor(
-        graph,
-        prefix + "expert_dispatch.assignments",
-        DType::Int32,
-        {0, 3});
-    const ExecutionNodeId dispatch = add_node(
-        graph,
-        ExecutionNodeType::ExpertDispatch,
-        ExecutionBackend::Cpu,
-        ExecutionBackendCpu,
-        prefix + "expert_dispatch",
-        {router},
-        {router_scores},
-        {assignments},
-        static_cast<uint32_t>(plan_index),
-        invalid_execution_expert_id,
-        0);
+    const ExecutionTensorId router_scores = add_tensor(graph,
+                                                       prefix + "router.scores",
+                                                       DType::Float32,
+                                                       {0, static_cast<uint32_t>(layer.moe.experts.size())});
+    const ExecutionNodeId router = add_node(graph,
+                                            ExecutionNodeType::Router,
+                                            ExecutionBackend::Cpu,
+                                            ExecutionBackendCpu,
+                                            prefix + "router",
+                                            {previous},
+                                            {hidden},
+                                            {router_scores},
+                                            static_cast<uint32_t>(plan_index),
+                                            invalid_execution_expert_id,
+                                            0);
+    const ExecutionTensorId assignments = add_tensor(graph,
+                                                     prefix + "expert_dispatch.assignments",
+                                                     DType::Int32,
+                                                     {0, 3});
+    const ExecutionNodeId dispatch = add_node(graph,
+                                              ExecutionNodeType::ExpertDispatch,
+                                              ExecutionBackend::Cpu,
+                                              ExecutionBackendCpu,
+                                              prefix + "expert_dispatch",
+                                              {router},
+                                              {router_scores},
+                                              {assignments},
+                                              static_cast<uint32_t>(plan_index),
+                                              invalid_execution_expert_id,
+                                              0);
 
     const bool can_use_vulkan_experts = compiled.opt.hybrid_mode != HybridMode::CpuOnly
                                         && use_vulkan_experts
@@ -418,29 +410,26 @@ static ExecutionNodeId add_moe_nodes(
     const uint32_t expert_flags = compiled.opt.hybrid_mode == HybridMode::HybridExperts
                                       ? ExecutionNodeCpuPrefetch
                                       : 0u;
-    const ExecutionTensorId expert_output = add_tensor(
-        graph,
-        prefix + "experts.output",
-        compiled.descriptor.activation_dtype,
-        {0, compiled.descriptor.hidden_size});
-    const ExecutionNodeId expert_group = add_node(
-        graph,
-        ExecutionNodeType::ExpertGroup,
-        expert_backend,
-        expert_backend_mask,
-        prefix + "experts",
-        {dispatch},
-        {hidden, assignments},
-        {expert_output},
-        static_cast<uint32_t>(plan_index),
-        invalid_execution_expert_id,
-        expert_flags);
+    const ExecutionTensorId expert_output = add_tensor(graph,
+                                                       prefix + "experts.output",
+                                                       compiled.descriptor.activation_dtype,
+                                                       {0, compiled.descriptor.hidden_size});
+    const ExecutionNodeId expert_group = add_node(graph,
+                                                  ExecutionNodeType::ExpertGroup,
+                                                  expert_backend,
+                                                  expert_backend_mask,
+                                                  prefix + "experts",
+                                                  {dispatch},
+                                                  {hidden, assignments},
+                                                  {expert_output},
+                                                  static_cast<uint32_t>(plan_index),
+                                                  invalid_execution_expert_id,
+                                                  expert_flags);
 
-    const ExecutionTensorId combined = add_tensor(
-        graph,
-        prefix + "combine.hidden",
-        compiled.descriptor.activation_dtype,
-        {0, compiled.descriptor.hidden_size});
+    const ExecutionTensorId combined = add_tensor(graph,
+                                                  prefix + "combine.hidden",
+                                                  compiled.descriptor.activation_dtype,
+                                                  {0, compiled.descriptor.hidden_size});
     std::vector<ExecutionTensorId> combine_inputs = {hidden, expert_output};
     std::vector<ExecutionNodeId> combine_dependencies = {expert_group};
     if (layer.moe.has_shared_expert)
@@ -449,45 +438,41 @@ static ExecutionNodeId add_moe_nodes(
                                    && support_vulkan_shared_experts(compiled.operators, layer.moe);
         const ExecutionBackend shared_backend = shared_vulkan ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
         const uint32_t shared_backend_mask = shared_vulkan ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
-        const ExecutionTensorId shared_output = add_tensor(
-            graph,
-            prefix + "shared_experts.output",
-            compiled.descriptor.activation_dtype,
-            {0, compiled.descriptor.hidden_size});
-        const ExecutionNodeId shared_node = add_node(
-            graph,
-            ExecutionNodeType::SharedExpertGroup,
-            shared_backend,
-            shared_backend_mask,
-            prefix + "shared_experts",
-            {expert_group},
-            {hidden},
-            {shared_output},
-            static_cast<uint32_t>(plan_index),
-            invalid_execution_expert_id,
-            0);
+        const ExecutionTensorId shared_output = add_tensor(graph,
+                                                           prefix + "shared_experts.output",
+                                                           compiled.descriptor.activation_dtype,
+                                                           {0, compiled.descriptor.hidden_size});
+        const ExecutionNodeId shared_node = add_node(graph,
+                                                     ExecutionNodeType::SharedExpertGroup,
+                                                     shared_backend,
+                                                     shared_backend_mask,
+                                                     prefix + "shared_experts",
+                                                     {expert_group},
+                                                     {hidden},
+                                                     {shared_output},
+                                                     static_cast<uint32_t>(plan_index),
+                                                     invalid_execution_expert_id,
+                                                     0);
         combine_dependencies.push_back(shared_node);
         combine_inputs.push_back(shared_output);
     }
-    const ExecutionNodeId combine = add_node(
-        graph,
-        ExecutionNodeType::Combine,
-        ExecutionBackend::Cpu,
-        ExecutionBackendCpu,
-        prefix + "combine",
-        std::move(combine_dependencies),
-        std::move(combine_inputs),
-        {combined},
-        static_cast<uint32_t>(plan_index),
-        invalid_execution_expert_id,
-        0);
+    const ExecutionNodeId combine = add_node(graph,
+                                             ExecutionNodeType::Combine,
+                                             ExecutionBackend::Cpu,
+                                             ExecutionBackendCpu,
+                                             prefix + "combine",
+                                             std::move(combine_dependencies),
+                                             std::move(combine_inputs),
+                                             {combined},
+                                             static_cast<uint32_t>(plan_index),
+                                             invalid_execution_expert_id,
+                                             0);
     hidden = combined;
     return combine;
 }
 
-static Result<void> build_speculative_graph(
-    CompiledModel& compiled,
-    bool use_vulkan_experts)
+static Result<void> build_speculative_graph(CompiledModel& compiled,
+                                            bool use_vulkan_experts)
 {
     if (!compiled.speculative.enabled())
         return {};
@@ -496,23 +481,21 @@ static Result<void> build_speculative_graph(
     graph.nodes.clear();
     graph.tensors.clear();
     ExecutionSchedule& schedule = compiled.speculative.schedule;
-    ExecutionTensorId hidden = add_tensor(
-        graph,
-        "speculative.input.hidden",
-        compiled.descriptor.activation_dtype,
-        {0, compiled.descriptor.hidden_size});
-    ExecutionNodeId previous = add_node(
-        graph,
-        ExecutionNodeType::TokenEmbedding,
-        ExecutionBackend::Cpu,
-        ExecutionBackendCpu,
-        "speculative.input",
-        {},
-        {},
-        {hidden},
-        invalid_execution_layer_id,
-        invalid_execution_expert_id,
-        0);
+    ExecutionTensorId hidden = add_tensor(graph,
+                                          "speculative.input.hidden",
+                                          compiled.descriptor.activation_dtype,
+                                          {0, compiled.descriptor.hidden_size});
+    ExecutionNodeId previous = add_node(graph,
+                                        ExecutionNodeType::TokenEmbedding,
+                                        ExecutionBackend::Cpu,
+                                        ExecutionBackendCpu,
+                                        "speculative.input",
+                                        {},
+                                        {},
+                                        {hidden},
+                                        invalid_execution_layer_id,
+                                        invalid_execution_expert_id,
+                                        0);
     graph.nodes[previous].weight_inputs = {compiled.token_embedding};
 
     for (size_t plan_index = 0; plan_index < graph.layer_plans.size(); ++plan_index)
@@ -538,34 +521,30 @@ static Result<void> build_speculative_graph(
                     layer.attention.value_head_dimension,
                 };
             }
-            const ExecutionTensorId cache = add_tensor(
-                graph,
-                prefix + "kv_cache",
-                layer.attention.kind == AttentionKind::GatedDeltaNet ? DType::Float32 : compiled.descriptor.kv_cache_dtype,
-                std::move(cache_shape));
-            const ExecutionTensorId attention_output = add_tensor(
-                graph,
-                prefix + "attention.hidden",
-                compiled.descriptor.activation_dtype,
-                {0, compiled.descriptor.hidden_size});
-            previous = add_node(
-                graph,
-                ExecutionNodeType::Attention,
-                backend,
-                backend_mask,
-                prefix + "attention",
-                {previous},
-                {hidden},
-                {attention_output, cache},
-                static_cast<uint32_t>(plan_index),
-                invalid_execution_expert_id,
-                0);
+            const ExecutionTensorId cache = add_tensor(graph,
+                                                       prefix + "kv_cache",
+                                                       layer.attention.kind == AttentionKind::GatedDeltaNet ? DType::Float32 : compiled.descriptor.kv_cache_dtype,
+                                                       std::move(cache_shape));
+            const ExecutionTensorId attention_output = add_tensor(graph,
+                                                                  prefix + "attention.hidden",
+                                                                  compiled.descriptor.activation_dtype,
+                                                                  {0, compiled.descriptor.hidden_size});
+            previous = add_node(graph,
+                                ExecutionNodeType::Attention,
+                                backend,
+                                backend_mask,
+                                prefix + "attention",
+                                {previous},
+                                {hidden},
+                                {attention_output, cache},
+                                static_cast<uint32_t>(plan_index),
+                                invalid_execution_expert_id,
+                                0);
             hidden = attention_output;
         }
 
-        previous = add_moe_nodes(
-            graph, compiled, plan_index, prefix, previous, hidden,
-            use_vulkan_experts);
+        previous = add_moe_nodes(graph, compiled, plan_index, prefix, previous, hidden,
+                                 use_vulkan_experts);
     }
 
     GraphOption options;
@@ -681,29 +660,25 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
                     layer.attention.value_head_dimension,
                 };
             }
-            const ExecutionTensorId cache = add_tensor(
-                graph,
-                prefix + "kv_cache",
-                gated_delta_attention ? DType::Float32 : compiled.descriptor.kv_cache_dtype,
-                std::move(cache_shape));
+            const ExecutionTensorId cache = add_tensor(graph,
+                                                       prefix + "kv_cache",
+                                                       gated_delta_attention ? DType::Float32 : compiled.descriptor.kv_cache_dtype,
+                                                       std::move(cache_shape));
             const ExecutionTensorId attention_output = add_tensor(graph, prefix + "attention.hidden", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size});
-            previous = add_node(
-                graph, ExecutionNodeType::Attention, backend, backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, prefix + "attention",
-                {previous}, {hidden}, {attention_output, cache},
-                static_cast<uint32_t>(plan_index), invalid_execution_expert_id, 0);
+            previous = add_node(graph, ExecutionNodeType::Attention, backend, backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, prefix + "attention",
+                                {previous}, {hidden}, {attention_output, cache},
+                                static_cast<uint32_t>(plan_index), invalid_execution_expert_id, 0);
             hidden = attention_output;
         }
 
-        previous = add_moe_nodes(
-            graph, compiled, plan_index, prefix, previous, hidden,
-            use_vulkan_experts);
+        previous = add_moe_nodes(graph, compiled, plan_index, prefix, previous, hidden,
+                                 use_vulkan_experts);
     }
 
     const ExecutionTensorId normalized = add_tensor(graph, "final_norm.hidden", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size});
-    previous = add_node(
-        graph, ExecutionNodeType::FinalNorm, ExecutionBackend::Cpu, ExecutionBackendCpu, "final_norm",
-        {previous}, {hidden}, {normalized},
-        invalid_execution_layer_id, invalid_execution_expert_id, 0);
+    previous = add_node(graph, ExecutionNodeType::FinalNorm, ExecutionBackend::Cpu, ExecutionBackendCpu, "final_norm",
+                        {previous}, {hidden}, {normalized},
+                        invalid_execution_layer_id, invalid_execution_expert_id, 0);
     graph.nodes[previous].weight_inputs = compiled.final_norm_weight == invalid_tensor_handle
                                               ? std::vector<TensorHandle>{compiled.lm_head_weight}
                                               : std::vector<TensorHandle>{compiled.final_norm_weight,
@@ -711,10 +686,9 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
 
     const ExecutionBackend lm_head_backend = compiled.opt.hybrid_mode == HybridMode::CpuOnly ? ExecutionBackend::Cpu : ExecutionBackend::Vulkan;
     const ExecutionTensorId logits = add_tensor(graph, "logits", DType::Float32, {0, compiled.descriptor.vocabulary_size});
-    const ExecutionNodeId lm_head_node = add_node(
-        graph, ExecutionNodeType::LmHead, lm_head_backend, lm_head_backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, "lm_head",
-        {previous}, {normalized}, {logits},
-        invalid_execution_layer_id, invalid_execution_expert_id, 0);
+    const ExecutionNodeId lm_head_node = add_node(graph, ExecutionNodeType::LmHead, lm_head_backend, lm_head_backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, "lm_head",
+                                                  {previous}, {normalized}, {logits},
+                                                  invalid_execution_layer_id, invalid_execution_expert_id, 0);
     graph.nodes[lm_head_node].weight_inputs = compiled.final_norm_weight == invalid_tensor_handle
                                                   ? std::vector<TensorHandle>{compiled.lm_head_weight}
                                                   : std::vector<TensorHandle>{compiled.lm_head_weight,

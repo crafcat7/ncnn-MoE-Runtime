@@ -68,13 +68,13 @@ void main()
         const uint destination = head * p.query_cstep + token * p.head_dimension + pair;
         const uint cache = token * half_dimension + pair;
         const float angle = float(p.position_offset + token)
-            * cosine_data[pair];
+                            * cosine_data[pair];
         const float cosine = p.device_rope != 0
-            ? cos(angle) * p.rope_concentration
-            : cosine_data[cache];
+                                 ? cos(angle) * p.rope_concentration
+                                 : cosine_data[cache];
         const float sine = p.device_rope != 0
-            ? sin(angle) * p.rope_concentration
-            : sine_data[cache];
+                               ? sin(angle) * p.rope_concentration
+                               : sine_data[cache];
         const float first = fused_qkv_data[source];
         const float second = fused_qkv_data[source + half_dimension];
         query_data[destination] = first * cosine - second * sine;
@@ -94,13 +94,13 @@ void main()
         const uint destination = head * p.key_cstep + destination_row * p.head_dimension + pair;
         const uint cache = token * half_dimension + pair;
         const float angle = float(p.position_offset + token)
-            * cosine_data[pair];
+                            * cosine_data[pair];
         const float cosine = p.device_rope != 0
-            ? cos(angle) * p.rope_concentration
-            : cosine_data[cache];
+                                 ? cos(angle) * p.rope_concentration
+                                 : cosine_data[cache];
         const float sine = p.device_rope != 0
-            ? sin(angle) * p.rope_concentration
-            : sine_data[cache];
+                               ? sin(angle) * p.rope_concentration
+                               : sine_data[cache];
         const float first = fused_qkv_data[source];
         const float second = fused_qkv_data[source + half_dimension];
         const float rotated_first = first * cosine - second * sine;
@@ -129,9 +129,8 @@ void main()
     buffer_st1(value_data, destination, fused_qkv_data[source]);
     if (p.direct_ring != 0)
     {
-        buffer_st1(
-            value_data,
-            destination + p.ring_capacity * p.head_dimension,
-            fused_qkv_data[source]);
+        buffer_st1(value_data,
+                   destination + p.ring_capacity * p.head_dimension,
+                   fused_qkv_data[source]);
     }
 }

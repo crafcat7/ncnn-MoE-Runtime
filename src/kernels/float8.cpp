@@ -123,20 +123,17 @@ __attribute__((target("avx2,fma"))) static __m256 decode_float8_e4m3_avx2(__m128
     const __m256i mantissa = _mm256_and_si256(bytes, _mm256_set1_epi32(7));
     const __m256i sign = _mm256_slli_epi32(_mm256_and_si256(bytes, _mm256_set1_epi32(128)), 24);
 
-    const __m256i normal_bits = _mm256_or_si256(
-        sign,
-        _mm256_or_si256(
-            _mm256_slli_epi32(_mm256_add_epi32(exponent, _mm256_set1_epi32(120)), 23),
-            _mm256_slli_epi32(mantissa, 20)));
+    const __m256i normal_bits = _mm256_or_si256(sign,
+                                                _mm256_or_si256(_mm256_slli_epi32(_mm256_add_epi32(exponent, _mm256_set1_epi32(120)), 23),
+                                                                _mm256_slli_epi32(mantissa, 20)));
     const __m256 normal = _mm256_castsi256_ps(normal_bits);
     const __m256 subnormal_magnitude = _mm256_mul_ps(_mm256_cvtepi32_ps(mantissa), _mm256_set1_ps(1.0f / 512.0f));
     const __m256 subnormal = _mm256_xor_ps(subnormal_magnitude, _mm256_castsi256_ps(sign));
     const __m256 exponent_zero = _mm256_castsi256_ps(_mm256_cmpeq_epi32(exponent, _mm256_setzero_si256()));
     __m256 decoded = _mm256_blendv_ps(normal, subnormal, exponent_zero);
 
-    const __m256i nan_mask = _mm256_and_si256(
-        _mm256_cmpeq_epi32(exponent, _mm256_set1_epi32(15)),
-        _mm256_cmpeq_epi32(mantissa, _mm256_set1_epi32(7)));
+    const __m256i nan_mask = _mm256_and_si256(_mm256_cmpeq_epi32(exponent, _mm256_set1_epi32(15)),
+                                              _mm256_cmpeq_epi32(mantissa, _mm256_set1_epi32(7)));
     const __m256 nan_value = _mm256_castsi256_ps(_mm256_or_si256(sign, _mm256_set1_epi32(0x7fc00000)));
     decoded = _mm256_blendv_ps(decoded, nan_value, _mm256_castsi256_ps(nan_mask));
     return decoded;
@@ -205,11 +202,9 @@ __attribute__((target("avx512f,avx512bw,avx512vl,fma"))) static __m512 decode_fl
     const __m512i mantissa = _mm512_and_si512(bytes, _mm512_set1_epi32(7));
     const __m512i sign = _mm512_slli_epi32(_mm512_and_si512(bytes, _mm512_set1_epi32(128)), 24);
 
-    const __m512i normal_bits = _mm512_or_si512(
-        sign,
-        _mm512_or_si512(
-            _mm512_slli_epi32(_mm512_add_epi32(exponent, _mm512_set1_epi32(120)), 23),
-            _mm512_slli_epi32(mantissa, 20)));
+    const __m512i normal_bits = _mm512_or_si512(sign,
+                                                _mm512_or_si512(_mm512_slli_epi32(_mm512_add_epi32(exponent, _mm512_set1_epi32(120)), 23),
+                                                                _mm512_slli_epi32(mantissa, 20)));
     const __m512 normal = _mm512_castsi512_ps(normal_bits);
     const __m512 subnormal_magnitude = _mm512_mul_ps(_mm512_cvtepi32_ps(mantissa), _mm512_set1_ps(1.0f / 512.0f));
     const __m512 subnormal = _mm512_castsi512_ps(_mm512_xor_si512(_mm512_castps_si512(subnormal_magnitude), sign));
@@ -368,60 +363,55 @@ float float8_e4m3_quantized_input_dot(const uint8_t* weights,
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
     if (use_bfloat16_float8_linear_dot(optimization_flags))
     {
-        return msvc_avx512_bfloat16_float8_e4m3_block_dot(
-            weights, scales, input, count, block_size);
+        return msvc_avx512_bfloat16_float8_e4m3_block_dot(weights, scales, input, count, block_size);
     }
 #endif
     return float8_e4m3_block_dot(weights, scales, input, count, block_size);
 }
 
-void float8_e4m3_quantized_input_dot_rows(
-    const uint8_t* weights,
-    uint32_t weight_row_stride,
-    const float* scales,
-    const float* input,
-    uint32_t count,
-    uint32_t block_size,
-    uint32_t row_count,
-    float* output,
-    uint64_t optimization_flags) noexcept
+void float8_e4m3_quantized_input_dot_rows(const uint8_t* weights,
+                                          uint32_t weight_row_stride,
+                                          const float* scales,
+                                          const float* input,
+                                          uint32_t count,
+                                          uint32_t block_size,
+                                          uint32_t row_count,
+                                          float* output,
+                                          uint64_t optimization_flags) noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
     if (use_bfloat16_float8_linear_dot(optimization_flags))
     {
         for (uint32_t first_row = 0; first_row < row_count; first_row += 8)
         {
-            msvc_avx512_bfloat16_float8_e4m3_block_dot_rows(
-                weights + static_cast<size_t>(first_row) * weight_row_stride,
-                weight_row_stride, scales, input, count, block_size,
-                std::min<uint32_t>(8, row_count - first_row),
-                output + first_row);
+            msvc_avx512_bfloat16_float8_e4m3_block_dot_rows(weights + static_cast<size_t>(first_row) * weight_row_stride,
+                                                            weight_row_stride, scales, input, count, block_size,
+                                                            std::min<uint32_t>(8, row_count - first_row),
+                                                            output + first_row);
         }
         return;
     }
 #endif
     for (uint32_t first_row = 0; first_row < row_count; first_row += 4)
     {
-        float8_e4m3_block_dot_rows4(
-            weights + static_cast<size_t>(first_row) * weight_row_stride,
-            weight_row_stride, scales, input, count, block_size,
-            std::min<uint32_t>(4, row_count - first_row), output + first_row);
+        float8_e4m3_block_dot_rows4(weights + static_cast<size_t>(first_row) * weight_row_stride,
+                                    weight_row_stride, scales, input, count, block_size,
+                                    std::min<uint32_t>(4, row_count - first_row), output + first_row);
     }
 }
 
 #if !defined(NCNN_MOE_MSVC_X86_SIMD)
-static void float8_e4m3_quantized_input_dot_rows_batch_tile(
-    const uint8_t* weights,
-    uint32_t weight_row_stride,
-    const float* scales,
-    const float* input,
-    size_t input_stride,
-    uint32_t count,
-    uint32_t block_size,
-    uint32_t row_count,
-    size_t output_stride,
-    size_t token_count,
-    float* output)
+static void float8_e4m3_quantized_input_dot_rows_batch_tile(const uint8_t* weights,
+                                                            uint32_t weight_row_stride,
+                                                            const float* scales,
+                                                            const float* input,
+                                                            size_t input_stride,
+                                                            uint32_t count,
+                                                            uint32_t block_size,
+                                                            uint32_t row_count,
+                                                            size_t output_stride,
+                                                            size_t token_count,
+                                                            float* output)
 {
     const uint32_t input_blocks = (count + block_size - 1) / block_size;
     for (uint32_t first_row = 0; first_row < row_count; first_row += 4)
@@ -443,8 +433,7 @@ static void float8_e4m3_quantized_input_dot_rows_batch_tile(
                     for (uint32_t row = 0; row < rows; ++row)
                     {
                         const uint32_t matrix_row = first_row + row;
-                        const float weight = float8_e4m3_to_float(
-                            weights[static_cast<size_t>(matrix_row) * weight_row_stride + column]);
+                        const float weight = float8_e4m3_to_float(weights[static_cast<size_t>(matrix_row) * weight_row_stride + column]);
                         const float scale = scales[static_cast<size_t>(matrix_row / block_size) * input_blocks + block];
                         for (size_t token = 0; token < tokens; ++token)
                             accum[token][row] += weight * scale * inputs[token];
@@ -459,19 +448,18 @@ static void float8_e4m3_quantized_input_dot_rows_batch_tile(
 }
 #endif
 
-void float8_e4m3_quantized_input_dot_rows_batch(
-    const uint8_t* weights,
-    uint32_t weight_row_stride,
-    const float* scales,
-    const float* input,
-    size_t input_stride,
-    uint32_t count,
-    uint32_t block_size,
-    uint32_t row_count,
-    size_t output_stride,
-    size_t token_count,
-    float* output,
-    uint64_t optimization_flags) noexcept
+void float8_e4m3_quantized_input_dot_rows_batch(const uint8_t* weights,
+                                                uint32_t weight_row_stride,
+                                                const float* scales,
+                                                const float* input,
+                                                size_t input_stride,
+                                                uint32_t count,
+                                                uint32_t block_size,
+                                                uint32_t row_count,
+                                                size_t output_stride,
+                                                size_t token_count,
+                                                float* output,
+                                                uint64_t optimization_flags) noexcept
 {
     if (row_count == 0 || token_count == 0)
         return;
@@ -487,18 +475,17 @@ void float8_e4m3_quantized_input_dot_rows_batch(
         && row_count >= 4
         && count >= block_size)
     {
-        float8_e4m3_quantized_input_dot_rows_batch_tile(
-            weights,
-            weight_row_stride,
-            scales,
-            input,
-            input_stride,
-            count,
-            block_size,
-            row_count,
-            output_stride,
-            token_count,
-            output);
+        float8_e4m3_quantized_input_dot_rows_batch_tile(weights,
+                                                        weight_row_stride,
+                                                        scales,
+                                                        input,
+                                                        input_stride,
+                                                        count,
+                                                        block_size,
+                                                        row_count,
+                                                        output_stride,
+                                                        token_count,
+                                                        output);
         return;
     }
 #endif
@@ -507,16 +494,14 @@ void float8_e4m3_quantized_input_dot_rows_batch(
     {
         for (uint32_t first_row = 0; first_row < row_count; first_row += 4)
         {
-            const uint32_t rows = std::min<uint32_t>(
-                4, row_count - first_row);
+            const uint32_t rows = std::min<uint32_t>(4, row_count - first_row);
             for (size_t token = 0; token < token_count; ++token)
             {
-                float8_e4m3_quantized_input_dot_rows(
-                    weights
-                        + static_cast<size_t>(first_row) * weight_row_stride,
-                    weight_row_stride, scales,
-                    input + token * input_stride, count, block_size, rows,
-                    output + token * output_stride + first_row, optimization_flags);
+                float8_e4m3_quantized_input_dot_rows(weights
+                                                         + static_cast<size_t>(first_row) * weight_row_stride,
+                                                     weight_row_stride, scales,
+                                                     input + token * input_stride, count, block_size, rows,
+                                                     output + token * output_stride + first_row, optimization_flags);
             }
         }
         return;
@@ -532,23 +517,21 @@ void float8_e4m3_quantized_input_dot_rows_batch(
                  first_token += 4)
             {
                 const size_t tokens = std::min<size_t>(4, token_count - first_token);
-                msvc_avx512_bfloat16_float8_e4m3_block_dot_rows_batch(
-                    weights + static_cast<size_t>(first_row) * weight_row_stride,
-                    weight_row_stride, scales,
-                    input + first_token * input_stride, input_stride, count,
-                    block_size, rows, output_stride, tokens,
-                    output + first_token * output_stride + first_row);
+                msvc_avx512_bfloat16_float8_e4m3_block_dot_rows_batch(weights + static_cast<size_t>(first_row) * weight_row_stride,
+                                                                      weight_row_stride, scales,
+                                                                      input + first_token * input_stride, input_stride, count,
+                                                                      block_size, rows, output_stride, tokens,
+                                                                      output + first_token * output_stride + first_row);
             }
             continue;
         }
 #endif
         for (size_t token = 0; token < token_count; ++token)
         {
-            float8_e4m3_quantized_input_dot_rows(
-                weights + static_cast<size_t>(first_row) * weight_row_stride,
-                weight_row_stride, scales, input + token * input_stride,
-                count, block_size, rows,
-                output + token * output_stride + first_row, optimization_flags);
+            float8_e4m3_quantized_input_dot_rows(weights + static_cast<size_t>(first_row) * weight_row_stride,
+                                                 weight_row_stride, scales, input + token * input_stride,
+                                                 count, block_size, rows,
+                                                 output + token * output_stride + first_row, optimization_flags);
         }
     }
 }
@@ -599,8 +582,7 @@ void quantize_float8_e4m3(const float* source, float* values, uint32_t count,
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
     if (simd_float8_quantization_enabled(optimization_flags))
     {
-        msvc_avx512_quantize_float8_e4m3(
-            source, values, count, block_size, power_of_two_scale);
+        msvc_avx512_quantize_float8_e4m3(source, values, count, block_size, power_of_two_scale);
         return;
     }
 #endif

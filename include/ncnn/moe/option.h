@@ -167,11 +167,9 @@ inline constexpr uint64_t OptimizationDefaultFlags = OptimizationCpuSimdRmsNorm
 
 inline constexpr uint64_t OptimizationAllFlags = (UINT64_C(1) << (NCNN_MOE_OPT_CPU_PACKED_WEIGHTS_BIT + 1)) - 1;
 inline constexpr uint64_t OptimizationOptionalFlags = OptimizationCpuPackedWeights;
-static_assert(
-    (OptimizationDefaultFlags | OptimizationOptionalFlags)
-    == OptimizationAllFlags);
-static_assert(
-    (OptimizationDefaultFlags & OptimizationOptionalFlags) == 0);
+static_assert((OptimizationDefaultFlags | OptimizationOptionalFlags)
+              == OptimizationAllFlags);
+static_assert((OptimizationDefaultFlags & OptimizationOptionalFlags) == 0);
 
 // User-supplied model loading options. Zero-valued memory settings and Auto
 // enum values leave hardware- and model-specific decisions to Runtime.

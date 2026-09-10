@@ -400,8 +400,7 @@ CpuThreadBudget resolve_cpu_thread_budget(uint32_t num_io_threads) noexcept
     num_io_threads = std::min(num_io_threads, max_threads);
 
     // Leave one core for service work in addition to the I/O reservation.
-    const uint32_t reserved = static_cast<uint32_t>(std::min<uint64_t>(
-        max_threads, static_cast<uint64_t>(num_io_threads) + 1));
+    const uint32_t reserved = static_cast<uint32_t>(std::min<uint64_t>(max_threads, static_cast<uint64_t>(num_io_threads) + 1));
     return {std::max(1u, max_threads - reserved), num_io_threads, max_threads};
 }
 
@@ -439,8 +438,7 @@ uint32_t cpu_openmp_thread_limit() noexcept
 #endif
 }
 
-CpuThreadBudgetController::Lease::Lease(
-    CpuThreadBudgetController* _owner, uint32_t _count, uint32_t _base_count) noexcept
+CpuThreadBudgetController::Lease::Lease(CpuThreadBudgetController* _owner, uint32_t _count, uint32_t _base_count) noexcept
     : owner(_owner), count(_count), base_count(_base_count)
 {
 }
@@ -492,8 +490,7 @@ uint32_t CpuThreadBudgetController::available_locked(bool use_extra_threads) con
     return std::min(remaining, thread_budget.num_threads - active_base_threads);
 }
 
-CpuThreadBudgetController::Lease CpuThreadBudgetController::acquire_locked(
-    uint32_t requested, bool use_extra_threads) noexcept
+CpuThreadBudgetController::Lease CpuThreadBudgetController::acquire_locked(uint32_t requested, bool use_extra_threads) noexcept
 {
     const uint32_t count = std::min(requested, available_locked(use_extra_threads));
     if (count == 0)
@@ -504,8 +501,7 @@ CpuThreadBudgetController::Lease CpuThreadBudgetController::acquire_locked(
     return Lease(this, count, base_count);
 }
 
-CpuThreadBudgetController::Lease CpuThreadBudgetController::acquire_compute(
-    uint32_t requested, bool use_extra_threads)
+CpuThreadBudgetController::Lease CpuThreadBudgetController::acquire_compute(uint32_t requested, bool use_extra_threads)
 {
     requested = std::max(1u, requested);
     std::unique_lock<std::mutex> lock(mutex);
@@ -515,8 +511,7 @@ CpuThreadBudgetController::Lease CpuThreadBudgetController::acquire_compute(
     return acquire_locked(requested, use_extra_threads);
 }
 
-CpuThreadBudgetController::Lease CpuThreadBudgetController::try_acquire_compute(
-    uint32_t requested, bool use_extra_threads) noexcept
+CpuThreadBudgetController::Lease CpuThreadBudgetController::try_acquire_compute(uint32_t requested, bool use_extra_threads) noexcept
 {
     const std::lock_guard<std::mutex> lock(mutex);
     return acquire_locked(requested, use_extra_threads);
@@ -538,11 +533,10 @@ void CpuThreadBudgetController::release(const Lease& lease) noexcept
     changed.notify_all();
 }
 
-uint32_t choose_cpu_team_size(
-    uint64_t work_units,
-    uint32_t independent_work_items,
-    uint32_t threads_per_work_item,
-    uint32_t available_threads) noexcept
+uint32_t choose_cpu_team_size(uint64_t work_units,
+                              uint32_t independent_work_items,
+                              uint32_t threads_per_work_item,
+                              uint32_t available_threads) noexcept
 {
     available_threads = std::max(1u, available_threads);
     independent_work_items = std::max(1u, independent_work_items);
@@ -551,13 +545,11 @@ uint32_t choose_cpu_team_size(
         return 1;
 
     const uint64_t average_work = work_units / independent_work_items + (work_units % independent_work_items != 0);
-    const uint32_t useful_threads_per_item = static_cast<uint32_t>(std::min<uint64_t>(
-        threads_per_work_item,
-        std::max<uint64_t>(1, average_work)));
+    const uint32_t useful_threads_per_item = static_cast<uint32_t>(std::min<uint64_t>(threads_per_work_item,
+                                                                                      std::max<uint64_t>(1, average_work)));
     const uint64_t requested = static_cast<uint64_t>(independent_work_items) * useful_threads_per_item;
-    const uint32_t shape_limit = static_cast<uint32_t>(std::min<uint64_t>(
-        available_threads,
-        std::max<uint64_t>(1, requested)));
+    const uint32_t shape_limit = static_cast<uint32_t>(std::min<uint64_t>(available_threads,
+                                                                          std::max<uint64_t>(1, requested)));
     return std::max(1u, shape_limit);
 }
 

@@ -45,8 +45,7 @@ public:
                                                               uint32_t vulkan_device_index,
                                                               const VulkanRuntimePtr& vulkan_runtime,
                                                               uint64_t optimization_flags);
-    [[nodiscard]] static const char* cpu_small_bfloat16_linear_policy(
-        uint64_t optimization_flags) noexcept;
+    [[nodiscard]] static const char* cpu_small_bfloat16_linear_policy(uint64_t optimization_flags) noexcept;
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
     [[nodiscard]] bool uses_vulkan() const noexcept;
 
@@ -105,19 +104,15 @@ public:
 
     // Creates a graph using the Vulkan context and activation storage policy
     // of seed.  Returns null for CPU-only operators/devices.
-    [[nodiscard]] static std::unique_ptr<CommandGraph_vulkan> create(
-        const Linear& seed);
+    [[nodiscard]] static std::unique_ptr<CommandGraph_vulkan> create(const Linear& seed);
 
-    [[nodiscard]] bool upload(
-        const ActivationBuffer& input,
-        DeviceTensor_vulkan& output);
-    [[nodiscard]] bool linear(
-        const Linear& op,
-        const DeviceTensor_vulkan& input,
-        DeviceTensor_vulkan& output);
-    [[nodiscard]] bool download(
-        const DeviceTensor_vulkan& input,
-        ActivationBuffer& output);
+    [[nodiscard]] bool upload(const ActivationBuffer& input,
+                              DeviceTensor_vulkan& output);
+    [[nodiscard]] bool linear(const Linear& op,
+                              const DeviceTensor_vulkan& input,
+                              DeviceTensor_vulkan& output);
+    [[nodiscard]] bool download(const DeviceTensor_vulkan& input,
+                                ActivationBuffer& output);
     [[nodiscard]] bool submit();
     [[nodiscard]] bool wait();
 
@@ -133,47 +128,41 @@ class Bfloat16Linear_vulkan
 public:
     ~Bfloat16Linear_vulkan();
 
-    [[nodiscard]] static std::shared_ptr<Bfloat16Linear_vulkan> create(
-        const TensorData& matrix,
-        const TensorData* bias,
-        uint32_t vulkan_device_index,
-        const VulkanRuntimePtr& vulkan_runtime,
-        uint64_t optimization_flags);
-    [[nodiscard]] static std::shared_ptr<Bfloat16Linear_vulkan> create_fused(
-        const std::vector<const TensorData*>& matrices,
-        const std::vector<const TensorData*>& biases,
-        uint32_t vulkan_device_index,
-        const VulkanRuntimePtr& vulkan_runtime,
-        uint64_t optimization_flags);
-    [[nodiscard]] bool prepare_rms_norm(
-        const TensorData& weight,
-        float epsilon,
-        float weight_offset = 0.0f);
+    [[nodiscard]] static std::shared_ptr<Bfloat16Linear_vulkan> create(const TensorData& matrix,
+                                                                       const TensorData* bias,
+                                                                       uint32_t vulkan_device_index,
+                                                                       const VulkanRuntimePtr& vulkan_runtime,
+                                                                       uint64_t optimization_flags);
+    [[nodiscard]] static std::shared_ptr<Bfloat16Linear_vulkan> create_fused(const std::vector<const TensorData*>& matrices,
+                                                                             const std::vector<const TensorData*>& biases,
+                                                                             uint32_t vulkan_device_index,
+                                                                             const VulkanRuntimePtr& vulkan_runtime,
+                                                                             uint64_t optimization_flags);
+    [[nodiscard]] bool prepare_rms_norm(const TensorData& weight,
+                                        float epsilon,
+                                        float weight_offset = 0.0f);
     [[nodiscard]] bool has_rms_norm_chain() const noexcept;
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
     // Executes two independent BF16 projections from one input batch in a
     // single command buffer.  The outputs are downloaded separately, while
     // the input upload and submit/wait are shared.
-    [[nodiscard]] bool forward_parallel(
-        const ActivationBuffer& input,
-        const Bfloat16Linear_vulkan& parallel_operator,
-        ActivationBuffer& output,
-        ActivationBuffer& parallel_output) const;
-    [[nodiscard]] bool forward_rms_norm_chain(
-        const ActivationBuffer& input,
-        ActivationBuffer& output) const;
+    [[nodiscard]] bool forward_parallel(const ActivationBuffer& input,
+                                        const Bfloat16Linear_vulkan& parallel_operator,
+                                        ActivationBuffer& output,
+                                        ActivationBuffer& parallel_output) const;
+    [[nodiscard]] bool forward_rms_norm_chain(const ActivationBuffer& input,
+                                              ActivationBuffer& output) const;
     // Fuses a BF16 gate/up projection with SiLU gating and the BF16 Down
     // projection.  The fused input operator may contain one extra scalar
     // column for a shared-Expert router gate; that scalar is applied on the
     // device before the result is downloaded.
-    [[nodiscard]] bool forward_swiglu_chain(
-        const ActivationBuffer& input,
-        const Bfloat16Linear_vulkan& down_operator,
-        uint32_t intermediate_columns,
-        ExpertActivation activation,
-        float activation_limit,
-        bool apply_router_gate,
-        ActivationBuffer& output) const;
+    [[nodiscard]] bool forward_swiglu_chain(const ActivationBuffer& input,
+                                            const Bfloat16Linear_vulkan& down_operator,
+                                            uint32_t intermediate_columns,
+                                            ExpertActivation activation,
+                                            float activation_limit,
+                                            bool apply_router_gate,
+                                            ActivationBuffer& output) const;
 
 private:
     friend class Float8Linear_vulkan;
@@ -184,26 +173,23 @@ private:
     // Records a scalar device projection; the caller holds the Vulkan context lock.
     [[nodiscard]] int forward(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& cmd, const ncnn::Option& opt) const;
     // Caller provides allocated outputs and holds the context lock; scalar uses readonly bindings.
-    void record_scalar_projection(
-        const ncnn::VkMat& input,
-        ncnn::VkMat& output,
-        ncnn::VkCompute& cmd) const;
-    void record_rms_norm_projection(
-        const ncnn::VkMat& input,
-        ncnn::VkMat& output,
-        ncnn::VkCompute& cmd) const;
+    void record_scalar_projection(const ncnn::VkMat& input,
+                                  ncnn::VkMat& output,
+                                  ncnn::VkCompute& cmd) const;
+    void record_rms_norm_projection(const ncnn::VkMat& input,
+                                    ncnn::VkMat& output,
+                                    ncnn::VkCompute& cmd) const;
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
     [[nodiscard]] const ncnn::Option& option() const noexcept;
     [[nodiscard]] uint32_t input_columns() const noexcept;
     [[nodiscard]] uint32_t output_columns() const noexcept;
 
-    [[nodiscard]] static std::shared_ptr<Bfloat16Linear_vulkan> create_with_allocator(
-        const TensorData& matrix,
-        const TensorData* bias,
-        uint32_t vulkan_device_index,
-        ncnn::VkAllocator* weight_allocator,
-        const VulkanRuntimePtr& vulkan_runtime,
-        uint64_t optimization_flags);
+    [[nodiscard]] static std::shared_ptr<Bfloat16Linear_vulkan> create_with_allocator(const TensorData& matrix,
+                                                                                      const TensorData* bias,
+                                                                                      uint32_t vulkan_device_index,
+                                                                                      ncnn::VkAllocator* weight_allocator,
+                                                                                      const VulkanRuntimePtr& vulkan_runtime,
+                                                                                      uint64_t optimization_flags);
 
     class Implementation;
 
@@ -219,38 +205,34 @@ class Bfloat16Expert_vulkan
 public:
     ~Bfloat16Expert_vulkan();
 
-    [[nodiscard]] static std::shared_ptr<Bfloat16Expert_vulkan> create(
-        const TensorData& gate_up,
-        const TensorData* gate_up_bias,
-        const TensorData& down,
-        const TensorData* down_bias,
-        float activation_limit,
-        uint32_t vulkan_device_index,
-        ExpertActivation activation,
-        const VulkanRuntimePtr& vulkan_runtime,
-        uint64_t optimization_flags);
-    [[nodiscard]] bool forward(
-        const ActivationBuffer& input,
-        ActivationBuffer& output) const;
+    [[nodiscard]] static std::shared_ptr<Bfloat16Expert_vulkan> create(const TensorData& gate_up,
+                                                                       const TensorData* gate_up_bias,
+                                                                       const TensorData& down,
+                                                                       const TensorData* down_bias,
+                                                                       float activation_limit,
+                                                                       uint32_t vulkan_device_index,
+                                                                       ExpertActivation activation,
+                                                                       const VulkanRuntimePtr& vulkan_runtime,
+                                                                       uint64_t optimization_flags);
+    [[nodiscard]] bool forward(const ActivationBuffer& input,
+                               ActivationBuffer& output) const;
 
 private:
     friend class VulkanExpertBackend;
 
-    [[nodiscard]] static std::shared_ptr<Bfloat16Expert_vulkan> create_with_allocator(
-        const TensorData& gate_up,
-        const TensorData* gate_up_bias,
-        const TensorData& down,
-        const TensorData* down_bias,
-        float activation_limit,
-        uint32_t vulkan_device_index,
-        ncnn::VkAllocator* weight_allocator,
-        ExpertActivation activation,
-        const VulkanRuntimePtr& vulkan_runtime,
-        uint64_t optimization_flags);
-    [[nodiscard]] static bool forward_batch(
-        std::span<const Bfloat16Expert_vulkan*> experts,
-        std::span<const ActivationBuffer*> inputs,
-        std::span<ActivationBuffer*> outputs);
+    [[nodiscard]] static std::shared_ptr<Bfloat16Expert_vulkan> create_with_allocator(const TensorData& gate_up,
+                                                                                      const TensorData* gate_up_bias,
+                                                                                      const TensorData& down,
+                                                                                      const TensorData* down_bias,
+                                                                                      float activation_limit,
+                                                                                      uint32_t vulkan_device_index,
+                                                                                      ncnn::VkAllocator* weight_allocator,
+                                                                                      ExpertActivation activation,
+                                                                                      const VulkanRuntimePtr& vulkan_runtime,
+                                                                                      uint64_t optimization_flags);
+    [[nodiscard]] static bool forward_batch(std::span<const Bfloat16Expert_vulkan*> experts,
+                                            std::span<const ActivationBuffer*> inputs,
+                                            std::span<ActivationBuffer*> outputs);
     [[nodiscard]] uint32_t output_columns() const noexcept;
 
     class Implementation;
@@ -264,65 +246,58 @@ class Float8Linear_vulkan
 public:
     ~Float8Linear_vulkan();
 
-    [[nodiscard]] static std::shared_ptr<Float8Linear_vulkan> create(
-        const TensorData& matrix,
-        const TensorData* bias,
-        uint32_t input_group_count,
-        uint32_t vulkan_device_index,
-        const VulkanRuntimePtr& vulkan_runtime,
-        uint64_t optimization_flags);
+    [[nodiscard]] static std::shared_ptr<Float8Linear_vulkan> create(const TensorData& matrix,
+                                                                     const TensorData* bias,
+                                                                     uint32_t input_group_count,
+                                                                     uint32_t vulkan_device_index,
+                                                                     const VulkanRuntimePtr& vulkan_runtime,
+                                                                     uint64_t optimization_flags);
     [[nodiscard]] bool prepare_rms_norm(const TensorData& weight, float epsilon);
     [[nodiscard]] bool prepare_input_rms_norm(const TensorData& weight, float epsilon);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
     [[nodiscard]] bool forward_chain(const ActivationBuffer& input, const Float8Linear_vulkan& next, ActivationBuffer& output) const;
     [[nodiscard]] bool forward_rms_norm_chain(const ActivationBuffer& input, const Float8Linear_vulkan& next, ActivationBuffer& output) const;
-    [[nodiscard]] bool forward_rms_norm_chain_parallel(
-        const ActivationBuffer& input,
-        const Float8Linear_vulkan& next,
-        const Float8Linear_vulkan& parallel,
-        ActivationBuffer& output,
-        ActivationBuffer& parallel_output) const;
-    [[nodiscard]] bool forward_input_rms_norm_chain_parallel(
-        const ActivationBuffer& input,
-        const Float8Linear_vulkan& next,
-        const Float8Linear_vulkan& parallel,
-        ActivationBuffer& output,
-        ActivationBuffer& parallel_output) const;
+    [[nodiscard]] bool forward_rms_norm_chain_parallel(const ActivationBuffer& input,
+                                                       const Float8Linear_vulkan& next,
+                                                       const Float8Linear_vulkan& parallel,
+                                                       ActivationBuffer& output,
+                                                       ActivationBuffer& parallel_output) const;
+    [[nodiscard]] bool forward_input_rms_norm_chain_parallel(const ActivationBuffer& input,
+                                                             const Float8Linear_vulkan& next,
+                                                             const Float8Linear_vulkan& parallel,
+                                                             ActivationBuffer& output,
+                                                             ActivationBuffer& parallel_output) const;
     // Extends the FP8 Q/KV chain with one or more independent BF16
     // projections from the original (pre-FP8-quantized) input.  All
     // projections share one command submission; extra outputs are returned in
     // the same order as extra_operators.
-    [[nodiscard]] bool forward_rms_norm_chain_parallel_bfloat16(
-        const ActivationBuffer& input,
-        const Float8Linear_vulkan& next,
-        const Float8Linear_vulkan& parallel,
-        std::span<const Bfloat16Linear_vulkan*> extra_operators,
-        std::span<ActivationBuffer*> extra_outputs,
-        ActivationBuffer& output,
-        ActivationBuffer& parallel_output) const;
-    [[nodiscard]] bool forward_swiglu_chain(
-        const ActivationBuffer& input,
-        const Float8Linear_vulkan& up,
-        const Float8Linear_vulkan& down,
-        ExpertActivation activation,
-        float activation_limit,
-        ActivationBuffer& output) const;
+    [[nodiscard]] bool forward_rms_norm_chain_parallel_bfloat16(const ActivationBuffer& input,
+                                                                const Float8Linear_vulkan& next,
+                                                                const Float8Linear_vulkan& parallel,
+                                                                std::span<const Bfloat16Linear_vulkan*> extra_operators,
+                                                                std::span<ActivationBuffer*> extra_outputs,
+                                                                ActivationBuffer& output,
+                                                                ActivationBuffer& parallel_output) const;
+    [[nodiscard]] bool forward_swiglu_chain(const ActivationBuffer& input,
+                                            const Float8Linear_vulkan& up,
+                                            const Float8Linear_vulkan& down,
+                                            ExpertActivation activation,
+                                            float activation_limit,
+                                            ActivationBuffer& output) const;
 
 private:
     class Implementation;
 
-    [[nodiscard]] bool prepare_rms_norm_weight(
-        const TensorData& weight,
-        uint32_t expected_columns,
-        float epsilon,
-        ncnn::VkMat& destination);
-    [[nodiscard]] bool forward_rms_norm_chain_parallel_impl(
-        const ActivationBuffer& input,
-        const Float8Linear_vulkan& next,
-        const Float8Linear_vulkan& parallel,
-        ActivationBuffer& output,
-        ActivationBuffer& parallel_output,
-        bool normalize_input) const;
+    [[nodiscard]] bool prepare_rms_norm_weight(const TensorData& weight,
+                                               uint32_t expected_columns,
+                                               float epsilon,
+                                               ncnn::VkMat& destination);
+    [[nodiscard]] bool forward_rms_norm_chain_parallel_impl(const ActivationBuffer& input,
+                                                            const Float8Linear_vulkan& next,
+                                                            const Float8Linear_vulkan& parallel,
+                                                            ActivationBuffer& output,
+                                                            ActivationBuffer& parallel_output,
+                                                            bool normalize_input) const;
 
     Float8Linear_vulkan();
     std::unique_ptr<Implementation> d;
@@ -362,12 +337,11 @@ class QnkLinear_vulkan
 public:
     ~QnkLinear_vulkan();
 
-    [[nodiscard]] static std::shared_ptr<QnkLinear_vulkan> create(
-        const TensorData& matrix,
-        const TensorData* bias,
-        uint32_t vulkan_device_index,
-        const VulkanRuntimePtr& vulkan_runtime,
-        uint64_t optimization_flags);
+    [[nodiscard]] static std::shared_ptr<QnkLinear_vulkan> create(const TensorData& matrix,
+                                                                  const TensorData* bias,
+                                                                  uint32_t vulkan_device_index,
+                                                                  const VulkanRuntimePtr& vulkan_runtime,
+                                                                  uint64_t optimization_flags);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
     [[nodiscard]] DType dtype() const noexcept;
     [[nodiscard]] uint32_t input_columns() const noexcept;
@@ -376,13 +350,12 @@ public:
 private:
     friend class QnkExpert_vulkan;
 
-    [[nodiscard]] static std::shared_ptr<QnkLinear_vulkan> create_with_allocator(
-        const TensorData& matrix,
-        const TensorData* bias,
-        uint32_t vulkan_device_index,
-        ncnn::VkAllocator* weight_allocator,
-        const VulkanRuntimePtr& vulkan_runtime,
-        uint64_t optimization_flags);
+    [[nodiscard]] static std::shared_ptr<QnkLinear_vulkan> create_with_allocator(const TensorData& matrix,
+                                                                                 const TensorData* bias,
+                                                                                 uint32_t vulkan_device_index,
+                                                                                 ncnn::VkAllocator* weight_allocator,
+                                                                                 const VulkanRuntimePtr& vulkan_runtime,
+                                                                                 uint64_t optimization_flags);
     class Implementation;
 
     QnkLinear_vulkan();
@@ -395,36 +368,33 @@ class QnkExpert_vulkan
 public:
     ~QnkExpert_vulkan();
 
-    [[nodiscard]] static std::shared_ptr<QnkExpert_vulkan> create(
-        const TensorData& gate_up,
-        const TensorData* gate_up_bias,
-        const TensorData& down,
-        const TensorData* down_bias,
-        float activation_limit,
-        uint32_t vulkan_device_index,
-        ExpertActivation activation,
-        const VulkanRuntimePtr& vulkan_runtime,
-        uint64_t optimization_flags);
+    [[nodiscard]] static std::shared_ptr<QnkExpert_vulkan> create(const TensorData& gate_up,
+                                                                  const TensorData* gate_up_bias,
+                                                                  const TensorData& down,
+                                                                  const TensorData* down_bias,
+                                                                  float activation_limit,
+                                                                  uint32_t vulkan_device_index,
+                                                                  ExpertActivation activation,
+                                                                  const VulkanRuntimePtr& vulkan_runtime,
+                                                                  uint64_t optimization_flags);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
 
 private:
     friend class VulkanExpertBackend;
 
-    [[nodiscard]] static std::shared_ptr<QnkExpert_vulkan> create_with_allocator(
-        const TensorData& gate_up,
-        const TensorData* gate_up_bias,
-        const TensorData& down,
-        const TensorData* down_bias,
-        float activation_limit,
-        uint32_t vulkan_device_index,
-        ncnn::VkAllocator* weight_allocator,
-        ExpertActivation activation,
-        const VulkanRuntimePtr& vulkan_runtime,
-        uint64_t optimization_flags);
-    [[nodiscard]] static bool forward_batch(
-        std::span<const QnkExpert_vulkan*> experts,
-        std::span<const ActivationBuffer*> inputs,
-        std::span<ActivationBuffer*> outputs);
+    [[nodiscard]] static std::shared_ptr<QnkExpert_vulkan> create_with_allocator(const TensorData& gate_up,
+                                                                                 const TensorData* gate_up_bias,
+                                                                                 const TensorData& down,
+                                                                                 const TensorData* down_bias,
+                                                                                 float activation_limit,
+                                                                                 uint32_t vulkan_device_index,
+                                                                                 ncnn::VkAllocator* weight_allocator,
+                                                                                 ExpertActivation activation,
+                                                                                 const VulkanRuntimePtr& vulkan_runtime,
+                                                                                 uint64_t optimization_flags);
+    [[nodiscard]] static bool forward_batch(std::span<const QnkExpert_vulkan*> experts,
+                                            std::span<const ActivationBuffer*> inputs,
+                                            std::span<ActivationBuffer*> outputs);
     [[nodiscard]] uint32_t output_columns() const noexcept;
     class Implementation;
 
@@ -453,22 +423,20 @@ public:
                                                                     ExpertActivation activation,
                                                                     const VulkanRuntimePtr& vulkan_runtime,
                                                                     uint64_t optimization_flags);
-    [[nodiscard]] static std::shared_ptr<Mxfp4Expert_vulkan> create_from_device_storage(
-        const Mxfp4DeviceMatrixView_vulkan& gate_up, const TensorData* gate_up_bias, const Mxfp4DeviceMatrixView_vulkan& down,
-        const TensorData* down_bias, float activation_limit, uint32_t vulkan_device_index, const ncnn::VkMat& storage,
-        ExpertActivation activation, const VulkanRuntimePtr& vulkan_runtime,
-        uint64_t optimization_flags);
+    [[nodiscard]] static std::shared_ptr<Mxfp4Expert_vulkan> create_from_device_storage(const Mxfp4DeviceMatrixView_vulkan& gate_up, const TensorData* gate_up_bias, const Mxfp4DeviceMatrixView_vulkan& down,
+                                                                                        const TensorData* down_bias, float activation_limit, uint32_t vulkan_device_index, const ncnn::VkMat& storage,
+                                                                                        ExpertActivation activation, const VulkanRuntimePtr& vulkan_runtime,
+                                                                                        uint64_t optimization_flags);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
 
 private:
     friend class VulkanExpertBackend;
 
     // Caller preallocates FP32 buffers, holds the context lock, and keeps them alive until submit.
-    void record(
-        const ncnn::VkMat& input,
-        ncnn::VkMat& intermediate,
-        ncnn::VkMat& output,
-        ncnn::VkCompute& cmd) const;
+    void record(const ncnn::VkMat& input,
+                ncnn::VkMat& intermediate,
+                ncnn::VkMat& output,
+                ncnn::VkCompute& cmd) const;
 
     [[nodiscard]] static std::shared_ptr<Mxfp4Expert_vulkan> create_with_allocator(const TensorData& gate_up, const TensorData* gate_up_bias,
                                                                                    const TensorData& down, const TensorData* down_bias,

@@ -63,11 +63,10 @@ static float load_f16(const uint8_t* source) noexcept
     return half_to_float(load_u16(source));
 }
 
-static void get_scale_min_k4(
-    int index,
-    const uint8_t* scales,
-    uint8_t& scale,
-    uint8_t& minimum) noexcept
+static void get_scale_min_k4(int index,
+                             const uint8_t* scales,
+                             uint8_t& scale,
+                             uint8_t& minimum) noexcept
 {
     if (index < 4)
     {
@@ -262,13 +261,12 @@ static void dequantize_q8(const uint8_t* block, float* output) noexcept
         output[index] = scale * static_cast<float>(values[index]);
 }
 
-static void qnk_gemm_scalar(
-    const QnKPack& weights,
-    const float* input,
-    size_t input_stride,
-    size_t token_count,
-    float* output,
-    size_t output_stride) noexcept
+static void qnk_gemm_scalar(const QnKPack& weights,
+                            const float* input,
+                            size_t input_stride,
+                            size_t token_count,
+                            float* output,
+                            size_t output_stride) noexcept
 {
     for (size_t row = 0; row < weights.rows; ++row)
     {
@@ -283,16 +281,15 @@ static void qnk_gemm_scalar(
     }
 }
 
-static void qnk_gemm_raw(
-    const uint8_t* weights,
-    DType dtype,
-    size_t rows,
-    uint32_t columns,
-    const float* input,
-    size_t input_stride,
-    size_t token_count,
-    float* output,
-    size_t output_stride) noexcept
+static void qnk_gemm_raw(const uint8_t* weights,
+                         DType dtype,
+                         size_t rows,
+                         uint32_t columns,
+                         const float* input,
+                         size_t input_stride,
+                         size_t token_count,
+                         float* output,
+                         size_t output_stride) noexcept
 {
     const uint32_t block_count = columns / qnk_block_elements;
     const size_t block_bytes = qnk_block_bytes(dtype);
@@ -306,20 +303,18 @@ static void qnk_gemm_raw(
             {
                 const uint8_t* encoded = weights
                                          + ((row * static_cast<size_t>(block_count) + block) * block_bytes);
-                sum += qnk_dot_block(
-                    dtype,
-                    encoded,
-                    token_input + static_cast<size_t>(block) * qnk_block_elements);
+                sum += qnk_dot_block(dtype,
+                                     encoded,
+                                     token_input + static_cast<size_t>(block) * qnk_block_elements);
             }
             output[token * output_stride + row] = sum;
         }
     }
 }
 
-static void scalar_qnk_q8k_quantize(
-    const float* source,
-    uint8_t* output,
-    uint32_t columns) noexcept
+static void scalar_qnk_q8k_quantize(const float* source,
+                                    uint8_t* output,
+                                    uint32_t columns) noexcept
 {
     const uint32_t block_count = columns / qnk_block_elements;
     for (uint32_t block_index = 0; block_index < block_count; ++block_index)
@@ -361,11 +356,10 @@ static void scalar_qnk_q8k_quantize(
     }
 }
 
-static std::shared_ptr<const QnKPack> get_qnk_packed_weights(
-    const TensorData& matrix,
-    std::shared_ptr<const QnKPack>* sidecar,
-    size_t rows,
-    uint32_t columns) noexcept
+static std::shared_ptr<const QnKPack> get_qnk_packed_weights(const TensorData& matrix,
+                                                             std::shared_ptr<const QnKPack>* sidecar,
+                                                             size_t rows,
+                                                             uint32_t columns) noexcept
 {
     static std::mutex build_locks[64];
     const std::span<const uint8_t> raw = matrix.qnk_values();
@@ -490,12 +484,11 @@ void qnk_q8k_quantize(const float* source, uint8_t* output, uint32_t columns) no
     scalar_qnk_q8k_quantize(source, output, columns);
 }
 
-void qnk_q8k_quantize_batch(
-    const float* source,
-    size_t input_stride,
-    size_t rows,
-    uint32_t columns,
-    std::vector<uint8_t>& output) noexcept
+void qnk_q8k_quantize_batch(const float* source,
+                            size_t input_stride,
+                            size_t rows,
+                            uint32_t columns,
+                            std::vector<uint8_t>& output) noexcept
 {
     if (!source || rows == 0 || !qnk_shape_supported(DType::Q8K, rows, columns))
     {
@@ -508,13 +501,12 @@ void qnk_q8k_quantize_batch(
         qnk_q8k_quantize(source + row * input_stride, output.data() + row * row_bytes, columns);
 }
 
-bool qnk_pack_weights(
-    const uint8_t* raw,
-    size_t raw_bytes,
-    DType dtype,
-    size_t rows,
-    uint32_t columns,
-    QnKPack& output) noexcept
+bool qnk_pack_weights(const uint8_t* raw,
+                      size_t raw_bytes,
+                      DType dtype,
+                      size_t rows,
+                      uint32_t columns,
+                      QnKPack& output) noexcept
 {
     const uint64_t expected = qnk_storage_bytes(dtype, rows, columns);
     const uint64_t packed_bytes = qnk_packed_storage_bytes(dtype, rows, columns);
@@ -553,12 +545,11 @@ bool qnk_pack_weights(
     return true;
 }
 
-bool qnk_linear_batch_into(
-    const TensorData& matrix,
-    const ActivationBuffer& input,
-    ActivationBuffer& output,
-    bool use_packed_weights,
-    std::shared_ptr<const QnKPack>* sidecar) noexcept
+bool qnk_linear_batch_into(const TensorData& matrix,
+                           const ActivationBuffer& input,
+                           ActivationBuffer& output,
+                           bool use_packed_weights,
+                           std::shared_ptr<const QnKPack>* sidecar) noexcept
 {
     if (!is_qnk_dtype(matrix.dtype) || matrix.shape.size() != 2)
         return false;
@@ -572,16 +563,15 @@ bool qnk_linear_batch_into(
     output.reset(input.rows(), static_cast<uint32_t>(rows), false);
     if (!use_packed_weights)
     {
-        qnk_gemm_raw(
-            raw.data(),
-            matrix.dtype,
-            rows,
-            columns,
-            input.row(0),
-            columns,
-            input.rows(),
-            output.row(0),
-            output.columns());
+        qnk_gemm_raw(raw.data(),
+                     matrix.dtype,
+                     rows,
+                     columns,
+                     input.row(0),
+                     columns,
+                     input.rows(),
+                     output.row(0),
+                     output.columns());
         return true;
     }
     const std::shared_ptr<const QnKPack> packed = get_qnk_packed_weights(matrix, sidecar, rows, columns);

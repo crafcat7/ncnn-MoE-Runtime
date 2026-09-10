@@ -407,10 +407,9 @@ static std::string gpu_telemetry_json(const GpuTelemetrySampler& sampler)
     return result.finish();
 }
 
-static std::string runtime_metrics_json(
-    ProcessTelemetrySampler& sampler,
-    const GpuTelemetrySampler& gpu_sampler,
-    const SessionMetrics& metrics)
+static std::string runtime_metrics_json(ProcessTelemetrySampler& sampler,
+                                        const GpuTelemetrySampler& gpu_sampler,
+                                        const SessionMetrics& metrics)
 {
     JsonObject result;
     result.add_optional_double("prompt_tok_per_second", metrics.timing.prompt_tokens_per_second);
@@ -485,13 +484,11 @@ static ExpertMemoryMode parse_expert_memory_mode(const std::string& value)
     throw std::invalid_argument("unknown Expert memory mode: " + value);
 }
 
-static CpuPackedWeightMode parse_cpu_packed_weight_mode(
-    const std::string& value)
+static CpuPackedWeightMode parse_cpu_packed_weight_mode(const std::string& value)
 {
     if (value == "on") return CpuPackedWeightMode::Enabled;
     if (value == "off") return CpuPackedWeightMode::Disabled;
-    throw std::invalid_argument(
-        "CPU packed-weight mode must be on or off");
+    throw std::invalid_argument("CPU packed-weight mode must be on or off");
 }
 
 static Option parse_options(int argc, char** argv, int first_argument)
@@ -521,8 +518,7 @@ static Option parse_options(int argc, char** argv, int first_argument)
         else if (argument == "--expert-memory")
             result.expert_memory_mode = parse_expert_memory_mode(require_value(argc, argv, index, "--expert-memory"));
         else if (argument == "--cpu-packed-weights")
-            result.cpu_packed_weight_mode = parse_cpu_packed_weight_mode(
-                require_value(argc, argv, index, "--cpu-packed-weights"));
+            result.cpu_packed_weight_mode = parse_cpu_packed_weight_mode(require_value(argc, argv, index, "--cpu-packed-weights"));
         else if (argument == "--vulkan-device")
             result.vulkan_device_index = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--vulkan-device")));
         else if (argument == "--vulkan-devices")
@@ -684,9 +680,8 @@ private:
         info_json.add_uint("openmp_thread_count", info.num_threads);
         info_json.add_uint("flags", info.flags);
         info_json.add_string("cpu_isa", cpu_isa_names(info.cpu_isa_flags));
-        info_json.add_string(
-            "bfloat16_batched_linear_kernel",
-            bfloat16_batched_linear_kernel_name(effective.optimization_flags));
+        info_json.add_string("bfloat16_batched_linear_kernel",
+                             bfloat16_batched_linear_kernel_name(effective.optimization_flags));
         info_json.add_uint("vulkan_device_count", info.gpu_infos.size());
         info_json.add_uint("selected_vulkan_device_index", info.default_gpu_index);
         info_json.add_raw("vulkan_devices", gpu_infos_json(info.gpu_infos));
@@ -743,24 +738,23 @@ private:
                     }
                 });
             }
-            auto generated = session->generate(
-                request.prompt_tokens,
-                request.options,
-                [this, &request, started](const StreamToken& token) {
-                    JsonObject event;
-                    event.add_string("event", "token");
-                    event.add_string("request_id", request.request_id);
-                    event.add_string("session_id", request.session_id);
-                    event.add_uint("index", token.index);
-                    event.add_int("token_id", token.token_id);
-                    event.add_double("probability", token.probability);
-                    event.add_bool("is_stop_token", token.is_stop_token);
-                    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-                    event.add_double("elapsed_seconds", elapsed);
-                    emit(event.finish());
+            auto generated = session->generate(request.prompt_tokens,
+                                               request.options,
+                                               [this, &request, started](const StreamToken& token) {
+                                                   JsonObject event;
+                                                   event.add_string("event", "token");
+                                                   event.add_string("request_id", request.request_id);
+                                                   event.add_string("session_id", request.session_id);
+                                                   event.add_uint("index", token.index);
+                                                   event.add_int("token_id", token.token_id);
+                                                   event.add_double("probability", token.probability);
+                                                   event.add_bool("is_stop_token", token.is_stop_token);
+                                                   const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+                                                   event.add_double("elapsed_seconds", elapsed);
+                                                   emit(event.finish());
 
-                    return !cancel_requested.load();
-                });
+                                                   return !cancel_requested.load();
+                                               });
             if (metrics_thread.joinable())
             {
                 metrics_thread.request_stop();

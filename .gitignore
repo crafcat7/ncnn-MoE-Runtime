@@ -83,6 +83,7 @@ CMakeUserPresets.json
 !/memories/repo/
 /memories/repo/*
 !/memories/repo/code-conventions.md
+!/memories/repo/architecture-guide.md
 /.cache/
 *.log
 *.tmp

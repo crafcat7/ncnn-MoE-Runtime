@@ -96,3 +96,15 @@ endforeach()
 if(NCNN_MOE_STYLE_ERRORS)
     message(FATAL_ERROR "ncnn_moe style violations:\n${NCNN_MOE_STYLE_ERRORS}")
 endif()
+
+# ColumnLimit: 0 preserves existing newlines, so clang-format alone does not
+# reject a first argument placed below the opening parenthesis.
+find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${NCNN_MOE_SOURCE_DIR}/cmake/check_format.py"
+        --source-dir "${NCNN_MOE_SOURCE_DIR}"
+    RESULT_VARIABLE NCNN_MOE_FORMAT_RESULT
+)
+if(NOT NCNN_MOE_FORMAT_RESULT EQUAL 0)
+    message(FATAL_ERROR "ncnn_moe argument placement or clang-format check failed")
+endif()

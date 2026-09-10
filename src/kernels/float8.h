@@ -16,19 +16,18 @@ void float8_e4m3_block_dot_rows4(const uint8_t* weights, uint32_t weight_row_str
                                                     uint32_t block_size, uint64_t optimization_flags) noexcept;
 void float8_e4m3_quantized_input_dot_rows(const uint8_t* weights, uint32_t weight_row_stride, const float* scales, const float* input, uint32_t count,
                                           uint32_t block_size, uint32_t row_count, float* output, uint64_t optimization_flags) noexcept;
-void float8_e4m3_quantized_input_dot_rows_batch(
-    const uint8_t* weights,
-    uint32_t weight_row_stride,
-    const float* scales,
-    const float* input,
-    size_t input_stride,
-    uint32_t count,
-    uint32_t block_size,
-    uint32_t row_count,
-    size_t output_stride,
-    size_t token_count,
-    float* output,
-    uint64_t optimization_flags) noexcept;
+void float8_e4m3_quantized_input_dot_rows_batch(const uint8_t* weights,
+                                                uint32_t weight_row_stride,
+                                                const float* scales,
+                                                const float* input,
+                                                size_t input_stride,
+                                                uint32_t count,
+                                                uint32_t block_size,
+                                                uint32_t row_count,
+                                                size_t output_stride,
+                                                size_t token_count,
+                                                float* output,
+                                                uint64_t optimization_flags) noexcept;
 [[nodiscard]] const char* float8_kernel_name() noexcept;
 [[nodiscard]] const char* float8_linear_kernel_name(uint64_t optimization_flags) noexcept;
 [[nodiscard]] uint32_t float8_linear_row_group_size(uint64_t optimization_flags) noexcept;

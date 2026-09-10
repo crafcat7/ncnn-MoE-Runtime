@@ -75,11 +75,10 @@ static float load_f16(const uint8_t* source) noexcept
     return half_to_float(value);
 }
 
-static void get_scale_min_k4(
-    int index,
-    const uint8_t* scales,
-    uint8_t& scale,
-    uint8_t& minimum) noexcept
+static void get_scale_min_k4(int index,
+                             const uint8_t* scales,
+                             uint8_t& scale,
+                             uint8_t& minimum) noexcept
 {
     if (index < 4)
     {
@@ -98,31 +97,27 @@ static __m128i load_u8x8(const uint8_t* source) noexcept
     return _mm_loadl_epi64(reinterpret_cast<const __m128i*>(source));
 }
 
-static float dot_affine_u8x8(
-    __m128i values,
-    float scale,
-    float minimum,
-    const float* input) noexcept
+static float dot_affine_u8x8(__m128i values,
+                             float scale,
+                             float minimum,
+                             const float* input) noexcept
 {
     const __m256 value_float = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(values));
-    const __m256 scaled = _mm256_fmadd_ps(
-        value_float,
-        _mm256_set1_ps(scale),
-        _mm256_set1_ps(-minimum));
+    const __m256 scaled = _mm256_fmadd_ps(value_float,
+                                          _mm256_set1_ps(scale),
+                                          _mm256_set1_ps(-minimum));
     return horizontal_sum(_mm256_mul_ps(scaled, _mm256_loadu_ps(input)));
 }
 
-static float dot_affine_i8x8(
-    __m128i values,
-    float scale,
-    float minimum,
-    const float* input) noexcept
+static float dot_affine_i8x8(__m128i values,
+                             float scale,
+                             float minimum,
+                             const float* input) noexcept
 {
     const __m256 value_float = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(values));
-    const __m256 scaled = _mm256_fmadd_ps(
-        value_float,
-        _mm256_set1_ps(scale),
-        _mm256_set1_ps(-minimum));
+    const __m256 scaled = _mm256_fmadd_ps(value_float,
+                                          _mm256_set1_ps(scale),
+                                          _mm256_set1_ps(-minimum));
     return horizontal_sum(_mm256_mul_ps(scaled, _mm256_loadu_ps(input)));
 }
 
@@ -153,9 +148,8 @@ static __m128i q6_high_values(__m128i high_bits, int shift) noexcept
 
 static __m128i q6_values(__m128i low_bits, __m128i high_bits, int low_shift, int high_shift) noexcept
 {
-    const __m128i low = _mm_and_si128(
-        low_shift == 0 ? low_bits : _mm_srli_epi16(low_bits, low_shift),
-        _mm_set1_epi8(0x0f));
+    const __m128i low = _mm_and_si128(low_shift == 0 ? low_bits : _mm_srli_epi16(low_bits, low_shift),
+                                      _mm_set1_epi8(0x0f));
     const __m128i high = _mm_slli_epi16(q6_high_values(high_bits, high_shift), 4);
     return _mm_or_si128(low, high);
 }
@@ -163,9 +157,8 @@ static __m128i q6_values(__m128i low_bits, __m128i high_bits, int low_shift, int
 static __m128i q2_values(__m128i encoded, int shift) noexcept
 {
     const __m128i source_mask = _mm_set1_epi8(static_cast<char>(0x03u << shift));
-    return _mm_and_si128(
-        _mm_srli_epi16(_mm_and_si128(encoded, source_mask), shift),
-        _mm_set1_epi8(3));
+    return _mm_and_si128(_mm_srli_epi16(_mm_and_si128(encoded, source_mask), shift),
+                         _mm_set1_epi8(3));
 }
 
 static __m128i q3_values(__m128i encoded, __m128i high_bits, int shift, uint8_t mask) noexcept
@@ -246,16 +239,14 @@ static float dot_q3_block(const uint8_t* block, const float* input) noexcept
             const float* second_input = first_input + 16;
             for (uint32_t lane = 0; lane < 16; lane += 8)
             {
-                const __m128i first_values = q3_values(
-                    load_u8x8(half_values + lane),
-                    load_u8x8(half_high_bits + lane),
-                    shift,
-                    mask);
-                const __m128i second_values = q3_values(
-                    load_u8x8(half_values + 16 + lane),
-                    load_u8x8(half_high_bits + 16 + lane),
-                    shift,
-                    mask);
+                const __m128i first_values = q3_values(load_u8x8(half_values + lane),
+                                                       load_u8x8(half_high_bits + lane),
+                                                       shift,
+                                                       mask);
+                const __m128i second_values = q3_values(load_u8x8(half_values + 16 + lane),
+                                                        load_u8x8(half_high_bits + 16 + lane),
+                                                        shift,
+                                                        mask);
                 sum += dot_affine_i8x8(first_values, first_scale, 0.0f, first_input + lane);
                 sum += dot_affine_i8x8(second_values, second_scale, 0.0f, second_input + lane);
             }
@@ -276,22 +267,18 @@ static float dot_q8_block(const uint8_t* block, const float* input) noexcept
     __m256 sum3 = _mm256_setzero_ps();
     for (uint32_t lane = 0; lane < qnk_block_elements; lane += 32)
     {
-        sum0 = _mm256_fmadd_ps(
-            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(load_u8x8(values + lane))),
-            _mm256_loadu_ps(input + lane),
-            sum0);
-        sum1 = _mm256_fmadd_ps(
-            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(load_u8x8(values + lane + 8))),
-            _mm256_loadu_ps(input + lane + 8),
-            sum1);
-        sum2 = _mm256_fmadd_ps(
-            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(load_u8x8(values + lane + 16))),
-            _mm256_loadu_ps(input + lane + 16),
-            sum2);
-        sum3 = _mm256_fmadd_ps(
-            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(load_u8x8(values + lane + 24))),
-            _mm256_loadu_ps(input + lane + 24),
-            sum3);
+        sum0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(load_u8x8(values + lane))),
+                               _mm256_loadu_ps(input + lane),
+                               sum0);
+        sum1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(load_u8x8(values + lane + 8))),
+                               _mm256_loadu_ps(input + lane + 8),
+                               sum1);
+        sum2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(load_u8x8(values + lane + 16))),
+                               _mm256_loadu_ps(input + lane + 16),
+                               sum2);
+        sum3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(load_u8x8(values + lane + 24))),
+                               _mm256_loadu_ps(input + lane + 24),
+                               sum3);
     }
     return scale * horizontal_sum(_mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3)));
 }
@@ -432,13 +419,12 @@ static float horizontal_max(__m256 value) noexcept
     return _mm_cvtss_f32(_mm_max_ss(pairs, _mm_movehdup_ps(pairs)));
 }
 
-void msvc_avx2_qnk_gemm(
-    const QnKPack& weights,
-    const float* input,
-    size_t input_stride,
-    size_t token_count,
-    float* output,
-    size_t output_stride) noexcept
+void msvc_avx2_qnk_gemm(const QnKPack& weights,
+                        const float* input,
+                        size_t input_stride,
+                        size_t token_count,
+                        float* output,
+                        size_t output_stride) noexcept
 {
     for (size_t row = 0; row < weights.rows; ++row)
     {
@@ -447,10 +433,9 @@ void msvc_avx2_qnk_gemm(
             const float* token_input = input + token * input_stride;
             float sum = 0.0f;
             for (uint32_t block = 0; block < weights.block_count; ++block)
-                sum += msvc_avx2_qnk_dot_block(
-                    weights.dtype,
-                    qnk_packed_block(weights, row, block),
-                    token_input + static_cast<size_t>(block) * qnk_block_elements);
+                sum += msvc_avx2_qnk_dot_block(weights.dtype,
+                                               qnk_packed_block(weights, row, block),
+                                               token_input + static_cast<size_t>(block) * qnk_block_elements);
             output[token * output_stride + row] = sum;
         }
     }

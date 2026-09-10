@@ -131,9 +131,8 @@ void main()
                                                    + p.value_size + value_head]);
             const uint alpha_base = input_row + p.convolution_size + p.value_size
                                     + p.head_count;
-            const float decay = exp(
-                -exp(decay_log[value_head])
-                * softplus(fused_input[alpha_base + value_head] + time_bias[value_head]));
+            const float decay = exp(-exp(decay_log[value_head])
+                                    * softplus(fused_input[alpha_base + value_head] + time_bias[value_head]));
 
             for (uint value_column = lane;
                  value_column < p.value_head_dimension;
@@ -143,8 +142,8 @@ void main()
                 for (uint key_column = 0; key_column < p.head_dimension; ++key_column)
                 {
                     memory_value += recurrent_state[recurrent_base
-                                                       + key_column * p.value_head_dimension
-                                                       + value_column]
+                                                    + key_column * p.value_head_dimension
+                                                    + value_column]
                                     * decay * fused_input[key_base + key_column];
                 }
                 const float value = fused_input[value_base + value_column];
@@ -154,9 +153,10 @@ void main()
                     recurrent_state[recurrent_base
                                     + key_column * p.value_head_dimension
                                     + value_column] = recurrent_state[recurrent_base
-                                                                       + key_column * p.value_head_dimension
-                                                                       + value_column] * decay
-                                                       + fused_input[key_base + key_column] * delta;
+                                                                      + key_column * p.value_head_dimension
+                                                                      + value_column]
+                                                          * decay
+                                                      + fused_input[key_base + key_column] * delta;
                 }
                 float output_value = 0.0;
                 for (uint key_column = 0; key_column < p.head_dimension; ++key_column)
@@ -164,7 +164,7 @@ void main()
                     output_value += recurrent_state[recurrent_base
                                                     + key_column * p.value_head_dimension
                                                     + value_column]
-                                   * fused_input[query_base + key_column];
+                                    * fused_input[query_base + key_column];
                 }
                 output_data[output_base + value_column] = output_value * query_scale;
             }
@@ -185,9 +185,7 @@ void main()
                     partial_sum[lane] += partial_sum[lane + stride];
                 barrier();
             }
-            const float inverse_rms = 1.0 / sqrt(
-                partial_sum[0] / float(p.value_head_dimension)
-                + p.norm_epsilon);
+            const float inverse_rms = 1.0 / sqrt(partial_sum[0] / float(p.value_head_dimension) + p.norm_epsilon);
             const uint gate_base = input_row + p.convolution_size;
             for (uint value_column = lane;
                  value_column < p.value_head_dimension;
@@ -197,8 +195,8 @@ void main()
                                                + value_head * p.value_head_dimension
                                                + value_column];
                 output_data[output_base + value_column] *= inverse_rms
-                    * norm_weight[value_column]
-                    * (p.sigmoid_gate != 0 ? sigmoid(gate) : gate * sigmoid(gate));
+                                                           * norm_weight[value_column]
+                                                           * (p.sigmoid_gate != 0 ? sigmoid(gate) : gate * sigmoid(gate));
             }
             barrier();
         }

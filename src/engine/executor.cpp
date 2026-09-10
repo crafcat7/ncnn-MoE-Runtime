@@ -69,43 +69,38 @@ struct PendingRouterPrediction
     std::future<Result<RouterPredictionOutcome>> result;
 };
 
-static uint64_t elapsed_microseconds(
-    std::chrono::steady_clock::time_point start,
-    std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now())
+static uint64_t elapsed_microseconds(std::chrono::steady_clock::time_point start,
+                                     std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now())
 {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
 }
 
-static void resolve_router_predictions(
-    const CompiledModel& model,
-    const CompiledLayerPlan& layer,
-    const ExpertDispatchPlan& plan,
-    SessionState& state,
-    SessionStatistics& statistics,
-    bool resolve_unused_predictions);
+static void resolve_router_predictions(const CompiledModel& model,
+                                       const CompiledLayerPlan& layer,
+                                       const ExpertDispatchPlan& plan,
+                                       SessionState& state,
+                                       SessionStatistics& statistics,
+                                       bool resolve_unused_predictions);
 
-[[nodiscard]] static Result<void> complete_router_prediction(
-    const CompiledModel& model,
-    uint32_t layer_id,
-    PendingRouterPrediction& pending,
-    SessionState& state,
-    SessionStatistics& statistics,
-    size_t token_count);
+[[nodiscard]] static Result<void> complete_router_prediction(const CompiledModel& model,
+                                                             uint32_t layer_id,
+                                                             PendingRouterPrediction& pending,
+                                                             SessionState& state,
+                                                             SessionStatistics& statistics,
+                                                             size_t token_count);
 
-[[nodiscard]] static Result<void> predict_next_router_routes(
-    const CompiledModel& model,
-    const CompiledLayerPlan& layer,
-    const ActivationBuffer& router_input,
-    SessionState& state,
-    SessionStatistics& statistics,
-    PendingRouterPrediction& pending);
+[[nodiscard]] static Result<void> predict_next_router_routes(const CompiledModel& model,
+                                                             const CompiledLayerPlan& layer,
+                                                             const ActivationBuffer& router_input,
+                                                             SessionState& state,
+                                                             SessionStatistics& statistics,
+                                                             PendingRouterPrediction& pending);
 
-static void capture_speculative_hidden(
-    const ActivationBuffer& hidden,
-    uint32_t hidden_size,
-    uint32_t multiplier,
-    size_t target_index,
-    ActivationBuffer& destination)
+static void capture_speculative_hidden(const ActivationBuffer& hidden,
+                                       uint32_t hidden_size,
+                                       uint32_t multiplier,
+                                       size_t target_index,
+                                       ActivationBuffer& destination)
 {
     const float inverse_multiplier = 1.0f / static_cast<float>(multiplier);
     for (size_t row = 0; row < hidden.rows(); ++row)
@@ -123,21 +118,18 @@ static void capture_speculative_hidden(
     }
 }
 
-static bool has_unknown_vulkan_attention_state(
-    const SessionState& state) noexcept
+static bool has_unknown_vulkan_attention_state(const SessionState& state) noexcept
 {
-    return std::any_of(
-        state.layers.begin(),
-        state.layers.end(),
-        [](const LayerCache& cache) {
-            return cache.vulkan_attention_state_unknown;
-        });
+    return std::any_of(state.layers.begin(),
+                       state.layers.end(),
+                       [](const LayerCache& cache) {
+                           return cache.vulkan_attention_state_unknown;
+                       });
 }
 
-static void prepare_execution_state(
-    const CompiledModel& model,
-    SessionStatistics& statistics,
-    SessionState& state)
+static void prepare_execution_state(const CompiledModel& model,
+                                    SessionStatistics& statistics,
+                                    SessionState& state)
 {
     if (statistics.expert_token_counts.size() < model.descriptor.expert_count)
         statistics.expert_token_counts.resize(model.descriptor.expert_count, 0);
@@ -146,16 +138,14 @@ static void prepare_execution_state(
     state.execution_state.reset();
 }
 
-Result<std::vector<std::vector<float>>> forward_model(
-    const CompiledModel& model,
-    std::span<const int32_t> input_ids,
-    SessionStatistics& statistics,
-    SessionState& state,
-    uint64_t position_offset,
-    LogitsOutput logits_output)
+Result<std::vector<std::vector<float>>> forward_model(const CompiledModel& model,
+                                                      std::span<const int32_t> input_ids,
+                                                      SessionStatistics& statistics,
+                                                      SessionState& state,
+                                                      uint64_t position_offset,
+                                                      LogitsOutput logits_output)
 {
-    const ScopedExpertBackendForeground expert_backend_foreground(
-        model.expert_backend);
+    const ScopedExpertBackendForeground expert_backend_foreground(model.expert_backend);
     if (has_unknown_vulkan_attention_state(state))
     {
         return Error{
@@ -164,8 +154,7 @@ Result<std::vector<std::vector<float>>> forward_model(
     }
     const VulkanStatistics initial_vulkan_execution = get_vulkan_statistics(model.vulkan_runtime);
     Bfloat16BatchedLinearExecutionCounter cpu_bfloat16_execution;
-    const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(
-        &cpu_bfloat16_execution);
+    const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(&cpu_bfloat16_execution);
     for (int32_t token_id : input_ids)
     {
         if (token_id < 0 || static_cast<uint32_t>(token_id) >= model.descriptor.vocabulary_size)
@@ -190,20 +179,17 @@ Result<std::vector<std::vector<float>>> forward_model(
         const uint32_t speculative_hidden_columns = model.speculative.kind == SpeculativeModelKind::Mtp
                                                         ? model.descriptor.hidden_size
                                                         : model.descriptor.hidden_size
-                                                              * static_cast<uint32_t>(
-                                                                  model.speculative.target_layer_ids.size());
-        state.speculative_main_hidden.reset(
-            input_ids.size(),
-            speculative_hidden_columns,
-            true);
+                                                              * static_cast<uint32_t>(model.speculative.target_layer_ids.size());
+        state.speculative_main_hidden.reset(input_ids.size(),
+                                            speculative_hidden_columns,
+                                            true);
         state.speculative_main_hidden_position = position_offset;
         if (state.speculative_layers.size() != model.speculative.graph.layer_plans.size())
             state.speculative_layers.resize(model.speculative.graph.layer_plans.size());
         if (model.speculative.kind == SpeculativeModelKind::Mtp)
         {
-            state.speculative_input_ids.assign(
-                input_ids.begin(),
-                input_ids.end());
+            state.speculative_input_ids.assign(input_ids.begin(),
+                                               input_ids.end());
             state.speculative_direct_alignment_ids.clear();
         }
     }
@@ -231,10 +217,9 @@ Result<std::vector<std::vector<float>>> forward_model(
                 if (node->weight_inputs.size() != 1)
                     return Error{ErrorCode::InternalError, "token embedding node has an invalid weight binding"};
                 const auto embedding_start = std::chrono::steady_clock::now();
-                embedding_batch_into(
-                    model.weights.at(node->weight_inputs[0]),
-                    input_ids,
-                    hidden);
+                embedding_batch_into(model.weights.at(node->weight_inputs[0]),
+                                     input_ids,
+                                     hidden);
                 hyper_connection_expand(hidden, model.descriptor.hyper_connection_multiplier, state.expert_scratch.staged_output);
                 statistics.embedding_time_microseconds += elapsed_microseconds(embedding_start);
                 continue;
@@ -259,48 +244,45 @@ Result<std::vector<std::vector<float>>> forward_model(
                 const auto final_norm_start = std::chrono::steady_clock::now();
                 if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
                 {
-                    auto head = hyper_connection_head(
-                        hidden,
-                        model.weights.at(model.hyper_head_function),
-                        model.weights.at(model.hyper_head_scale),
-                        model.weights.at(model.hyper_head_base),
-                        model.descriptor.hyper_connection_multiplier,
-                        model.descriptor.norm_epsilon,
-                        model.descriptor.hyper_connection_epsilon,
-                        state.expert_scratch.staged_output,
-                        state.hyper_connection_scratch,
-                        model.opt.optimization_flags);
+                    auto head = hyper_connection_head(hidden,
+                                                      model.weights.at(model.hyper_head_function),
+                                                      model.weights.at(model.hyper_head_scale),
+                                                      model.weights.at(model.hyper_head_base),
+                                                      model.descriptor.hyper_connection_multiplier,
+                                                      model.descriptor.norm_epsilon,
+                                                      model.descriptor.hyper_connection_epsilon,
+                                                      state.expert_scratch.staged_output,
+                                                      state.hyper_connection_scratch,
+                                                      model.opt.optimization_flags);
                     if (!head)
                         return head.error();
                     hidden.swap(state.expert_scratch.staged_output);
                 }
                 else if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
                 {
-                    auto head = gated_residual_head(
-                        hidden,
-                        model.weights.at(model.gated_residual_head.norm_weight),
-                        model.weights.at(model.gated_residual_head.mix_down_weight),
-                        model.weights.at(model.gated_residual_head.mix_up_weight),
-                        model.descriptor.hyper_connection_multiplier,
-                        model.descriptor.hidden_size,
-                        model.descriptor.norm_epsilon,
-                        model.descriptor.norm_weight_offset,
-                        state.expert_scratch.staged_output,
-                        state.hyper_connection_scratch,
-                        model.opt.optimization_flags);
+                    auto head = gated_residual_head(hidden,
+                                                    model.weights.at(model.gated_residual_head.norm_weight),
+                                                    model.weights.at(model.gated_residual_head.mix_down_weight),
+                                                    model.weights.at(model.gated_residual_head.mix_up_weight),
+                                                    model.descriptor.hyper_connection_multiplier,
+                                                    model.descriptor.hidden_size,
+                                                    model.descriptor.norm_epsilon,
+                                                    model.descriptor.norm_weight_offset,
+                                                    state.expert_scratch.staged_output,
+                                                    state.hyper_connection_scratch,
+                                                    model.opt.optimization_flags);
                     if (!head)
                         return head.error();
                     hidden.swap(state.expert_scratch.staged_output);
                 }
                 if (model.descriptor.final_norm == NormType::RmsNorm)
                 {
-                    rms_norm_batch_into(
-                        hidden,
-                        model.weights.at(node->weight_inputs[0]),
-                        model.descriptor.norm_epsilon,
-                        state.expert_scratch.staged_output,
-                        model.descriptor.norm_weight_offset,
-                        model.opt.optimization_flags);
+                    rms_norm_batch_into(hidden,
+                                        model.weights.at(node->weight_inputs[0]),
+                                        model.descriptor.norm_epsilon,
+                                        state.expert_scratch.staged_output,
+                                        model.descriptor.norm_weight_offset,
+                                        model.opt.optimization_flags);
                     hidden.swap(state.expert_scratch.staged_output);
                 }
                 if (model.speculative.kind == SpeculativeModelKind::Mtp
@@ -308,10 +290,9 @@ Result<std::vector<std::vector<float>>> forward_model(
                 {
                     for (size_t row = 0; row < hidden.rows(); ++row)
                     {
-                        std::copy_n(
-                            hidden.row(row),
-                            model.descriptor.hidden_size,
-                            state.speculative_main_hidden.row(row));
+                        std::copy_n(hidden.row(row),
+                                    model.descriptor.hidden_size,
+                                    state.speculative_main_hidden.row(row));
                     }
                 }
                 statistics.final_norm_time_microseconds += elapsed_microseconds(final_norm_start);
@@ -336,18 +317,16 @@ Result<std::vector<std::vector<float>>> forward_model(
                     {
                         ActivationBuffer& last_hidden = state.expert_scratch.staged_merged;
                         last_hidden.reset(1, hidden.columns(), false);
-                        std::copy_n(
-                            hidden.row(hidden.rows() - 1),
-                            hidden.columns(),
-                            last_hidden.row(0));
+                        std::copy_n(hidden.row(hidden.rows() - 1),
+                                    hidden.columns(),
+                                    last_hidden.row(0));
                         lm_head_input = &last_hidden;
                     }
                 }
                 if (deferred_final_norm
                     && lm_head_operator.bfloat16
-                    && lm_head_operator.bfloat16->forward_rms_norm_chain(
-                        *lm_head_input,
-                        state.expert_scratch.staged_output))
+                    && lm_head_operator.bfloat16->forward_rms_norm_chain(*lm_head_input,
+                                                                         state.expert_scratch.staged_output))
                 {
                     logits = batch_to_vectors(state.expert_scratch.staged_output);
                     deferred_final_norm = false;
@@ -357,13 +336,12 @@ Result<std::vector<std::vector<float>>> forward_model(
                 ActivationBuffer& normalized = state.final_norm;
                 if (deferred_final_norm)
                 {
-                    rms_norm_batch_into(
-                        *lm_head_input,
-                        model.weights.at(node->weight_inputs[1]),
-                        model.descriptor.norm_epsilon,
-                        normalized,
-                        model.descriptor.norm_weight_offset,
-                        model.opt.optimization_flags);
+                    rms_norm_batch_into(*lm_head_input,
+                                        model.weights.at(node->weight_inputs[1]),
+                                        model.descriptor.norm_epsilon,
+                                        normalized,
+                                        model.descriptor.norm_weight_offset,
+                                        model.opt.optimization_flags);
                     if (logits_output == LogitsOutput::All)
                     {
                         hidden.swap(normalized);
@@ -375,13 +353,12 @@ Result<std::vector<std::vector<float>>> forward_model(
                     }
                     deferred_final_norm = false;
                 }
-                linear_batch_into(
-                    lm_head,
-                    *lm_head_input,
-                    state.expert_scratch.staged_output,
-                    model.opt.optimization_flags,
-                    model.operators.find_weight(node->weight_inputs[0]),
-                    node->backend);
+                linear_batch_into(lm_head,
+                                  *lm_head_input,
+                                  state.expert_scratch.staged_output,
+                                  model.opt.optimization_flags,
+                                  model.operators.find_weight(node->weight_inputs[0]),
+                                  node->backend);
                 logits = batch_to_vectors(state.expert_scratch.staged_output);
                 statistics.lm_head_time_microseconds += elapsed_microseconds(lm_head_start);
                 continue;
@@ -399,14 +376,13 @@ Result<std::vector<std::vector<float>>> forward_model(
                 const auto attention_start = std::chrono::steady_clock::now();
                 if (layer.ple.enabled())
                 {
-                    auto ple = execute_ple_into(
-                        model.weights, layer.ple,
-                        model.descriptor.hyper_connection_multiplier,
-                        model.descriptor.hidden_size,
-                        model.descriptor.norm_epsilon,
-                        model.descriptor.norm_weight_offset,
-                        input_ids, state.layers[layer.layer_id], hidden,
-                        model.opt.optimization_flags);
+                    auto ple = execute_ple_into(model.weights, layer.ple,
+                                                model.descriptor.hyper_connection_multiplier,
+                                                model.descriptor.hidden_size,
+                                                model.descriptor.norm_epsilon,
+                                                model.descriptor.norm_weight_offset,
+                                                input_ids, state.layers[layer.layer_id], hidden,
+                                                model.opt.optimization_flags);
                     if (!ple)
                         return ple.error();
                 }
@@ -414,45 +390,42 @@ Result<std::vector<std::vector<float>>> forward_model(
                 const ActivationBuffer* gated_attention_input = &hidden;
                 if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
                 {
-                    auto mixed = gated_residual_pre(
-                        hidden,
-                        model.weights.at(layer.attention_gated_residual.norm_weight),
-                        model.weights.at(layer.attention_gated_residual.mix_down_weight),
-                        model.weights.at(layer.attention_gated_residual.mix_up_weight),
-                        model.weights.at(layer.attention_gated_residual.inject_weight),
-                        model.descriptor.hyper_connection_multiplier,
-                        model.descriptor.hidden_size,
-                        model.descriptor.norm_epsilon,
-                        model.descriptor.norm_weight_offset,
-                        gated_attention_mix,
-                        state.hyper_connection_scratch,
-                        model.opt.optimization_flags);
+                    auto mixed = gated_residual_pre(hidden,
+                                                    model.weights.at(layer.attention_gated_residual.norm_weight),
+                                                    model.weights.at(layer.attention_gated_residual.mix_down_weight),
+                                                    model.weights.at(layer.attention_gated_residual.mix_up_weight),
+                                                    model.weights.at(layer.attention_gated_residual.inject_weight),
+                                                    model.descriptor.hyper_connection_multiplier,
+                                                    model.descriptor.hidden_size,
+                                                    model.descriptor.norm_epsilon,
+                                                    model.descriptor.norm_weight_offset,
+                                                    gated_attention_mix,
+                                                    state.hyper_connection_scratch,
+                                                    model.opt.optimization_flags);
                     if (!mixed)
                         return mixed.error();
                     gated_attention_input = &gated_attention_mix.reduced;
                 }
                 if (layer.attention.kind == AttentionKind::GatedDeltaNet)
                 {
-                    auto gated_delta = forward_gated_delta(
-                        model.weights,
-                        model.operators,
-                        layer.attention,
-                        node->backend,
-                        model.descriptor.norm_epsilon,
-                        state.layers[layer.layer_id],
-                        state.gated_delta_scratch,
-                        *gated_attention_input,
-                        state.gated_delta_scratch.output,
-                        model.opt.optimization_flags);
+                    auto gated_delta = forward_gated_delta(model.weights,
+                                                           model.operators,
+                                                           layer.attention,
+                                                           node->backend,
+                                                           model.descriptor.norm_epsilon,
+                                                           state.layers[layer.layer_id],
+                                                           state.gated_delta_scratch,
+                                                           *gated_attention_input,
+                                                           state.gated_delta_scratch.output,
+                                                           model.opt.optimization_flags);
                     if (!gated_delta)
                         return gated_delta.error();
                     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
                     {
-                        auto connected = gated_residual_post(
-                            state.gated_delta_scratch.output, hidden,
-                            gated_attention_mix,
-                            model.descriptor.hyper_connection_multiplier,
-                            hidden);
+                        auto connected = gated_residual_post(state.gated_delta_scratch.output, hidden,
+                                                             gated_attention_mix,
+                                                             model.descriptor.hyper_connection_multiplier,
+                                                             hidden);
                         if (!connected)
                             return connected.error();
                     }
@@ -467,43 +440,40 @@ Result<std::vector<std::vector<float>>> forward_model(
                     const ActivationBuffer* attention_input = &hidden;
                     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
                     {
-                        auto mixed = hyper_connection_pre(
-                            hidden,
-                            model.weights.at(layer.hyper_connection.attention_function),
-                            model.weights.at(layer.hyper_connection.attention_scale),
-                            model.weights.at(layer.hyper_connection.attention_base),
-                            model.descriptor.hyper_connection_multiplier,
-                            model.descriptor.hyper_connection_iterations,
-                            model.descriptor.norm_epsilon,
-                            model.descriptor.hyper_connection_epsilon,
-                            hyper_mix,
-                            state.hyper_connection_scratch,
-                            model.opt.optimization_flags);
+                        auto mixed = hyper_connection_pre(hidden,
+                                                          model.weights.at(layer.hyper_connection.attention_function),
+                                                          model.weights.at(layer.hyper_connection.attention_scale),
+                                                          model.weights.at(layer.hyper_connection.attention_base),
+                                                          model.descriptor.hyper_connection_multiplier,
+                                                          model.descriptor.hyper_connection_iterations,
+                                                          model.descriptor.norm_epsilon,
+                                                          model.descriptor.hyper_connection_epsilon,
+                                                          hyper_mix,
+                                                          state.hyper_connection_scratch,
+                                                          model.opt.optimization_flags);
                         if (!mixed)
                             return mixed.error();
                         attention_input = &hyper_mix.reduced;
                     }
                     ActivationBuffer& attention_output = state.attention_scratch.output;
-                    auto output = forward_latent_attention(
-                        model.weights,
-                        model.operators,
-                        layer.attention,
-                        node->backend,
-                        model.descriptor.norm_epsilon,
-                        position_offset,
-                        state.layers[layer.layer_id],
-                        state.attention_scratch,
-                        *attention_input,
-                        attention_output,
-                        model.opt.optimization_flags);
+                    auto output = forward_latent_attention(model.weights,
+                                                           model.operators,
+                                                           layer.attention,
+                                                           node->backend,
+                                                           model.descriptor.norm_epsilon,
+                                                           position_offset,
+                                                           state.layers[layer.layer_id],
+                                                           state.attention_scratch,
+                                                           *attention_input,
+                                                           attention_output,
+                                                           model.opt.optimization_flags);
                     if (!output)
                         return output.error();
                     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
                     {
-                        auto connected = hyper_connection_post(
-                            attention_output, hidden, hyper_mix,
-                            model.descriptor.hyper_connection_multiplier,
-                            state.expert_scratch.staged_output);
+                        auto connected = hyper_connection_post(attention_output, hidden, hyper_mix,
+                                                               model.descriptor.hyper_connection_multiplier,
+                                                               state.expert_scratch.staged_output);
                         if (!connected)
                             return connected.error();
                         hidden.swap(state.expert_scratch.staged_output);
@@ -515,28 +485,26 @@ Result<std::vector<std::vector<float>>> forward_model(
                 }
                 else
                 {
-                    auto attention = forward_attention(
-                        model.weights,
-                        model.operators,
-                        layer.attention,
-                        node->backend,
-                        model.descriptor.norm_epsilon,
-                        model.descriptor.kv_cache_dtype,
-                        position_offset,
-                        state.layers[layer.layer_id],
-                        state.attention_scratch,
-                        *gated_attention_input,
-                        state.attention_scratch.output,
-                        model.opt.optimization_flags);
+                    auto attention = forward_attention(model.weights,
+                                                       model.operators,
+                                                       layer.attention,
+                                                       node->backend,
+                                                       model.descriptor.norm_epsilon,
+                                                       model.descriptor.kv_cache_dtype,
+                                                       position_offset,
+                                                       state.layers[layer.layer_id],
+                                                       state.attention_scratch,
+                                                       *gated_attention_input,
+                                                       state.attention_scratch.output,
+                                                       model.opt.optimization_flags);
                     if (!attention)
                         return attention.error();
                     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
                     {
-                        auto connected = gated_residual_post(
-                            state.attention_scratch.output, hidden,
-                            gated_attention_mix,
-                            model.descriptor.hyper_connection_multiplier,
-                            hidden);
+                        auto connected = gated_residual_post(state.attention_scratch.output, hidden,
+                                                             gated_attention_mix,
+                                                             model.descriptor.hyper_connection_multiplier,
+                                                             hidden);
                         if (!connected)
                             return connected.error();
                     }
@@ -550,31 +518,29 @@ Result<std::vector<std::vector<float>>> forward_model(
             }
             if (node->type == ExecutionNodeType::Router)
             {
-                auto completed_prediction = complete_router_prediction(
-                    model,
-                    layer.layer_id,
-                    pending_router_prediction,
-                    state,
-                    statistics,
-                    hidden.rows());
+                auto completed_prediction = complete_router_prediction(model,
+                                                                       layer.layer_id,
+                                                                       pending_router_prediction,
+                                                                       state,
+                                                                       statistics,
+                                                                       hidden.rows());
                 if (!completed_prediction)
                     return completed_prediction.error();
                 layer_state.router_start = std::chrono::steady_clock::now();
                 if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
                 {
-                    auto mixed = gated_residual_pre(
-                        hidden,
-                        model.weights.at(layer.ffn_gated_residual.norm_weight),
-                        model.weights.at(layer.ffn_gated_residual.mix_down_weight),
-                        model.weights.at(layer.ffn_gated_residual.mix_up_weight),
-                        model.weights.at(layer.ffn_gated_residual.inject_weight),
-                        model.descriptor.hyper_connection_multiplier,
-                        model.descriptor.hidden_size,
-                        model.descriptor.norm_epsilon,
-                        model.descriptor.norm_weight_offset,
-                        layer_state.ffn_hyper_mix,
-                        state.hyper_connection_scratch,
-                        model.opt.optimization_flags);
+                    auto mixed = gated_residual_pre(hidden,
+                                                    model.weights.at(layer.ffn_gated_residual.norm_weight),
+                                                    model.weights.at(layer.ffn_gated_residual.mix_down_weight),
+                                                    model.weights.at(layer.ffn_gated_residual.mix_up_weight),
+                                                    model.weights.at(layer.ffn_gated_residual.inject_weight),
+                                                    model.descriptor.hyper_connection_multiplier,
+                                                    model.descriptor.hidden_size,
+                                                    model.descriptor.norm_epsilon,
+                                                    model.descriptor.norm_weight_offset,
+                                                    layer_state.ffn_hyper_mix,
+                                                    state.hyper_connection_scratch,
+                                                    model.opt.optimization_flags);
                     if (!mixed)
                         return mixed.error();
                     // GatedResidual post needs only the injection coefficients.
@@ -582,18 +548,17 @@ Result<std::vector<std::vector<float>>> forward_model(
                 }
                 else if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
                 {
-                    auto mixed = hyper_connection_pre(
-                        hidden,
-                        model.weights.at(layer.hyper_connection.ffn_function),
-                        model.weights.at(layer.hyper_connection.ffn_scale),
-                        model.weights.at(layer.hyper_connection.ffn_base),
-                        model.descriptor.hyper_connection_multiplier,
-                        model.descriptor.hyper_connection_iterations,
-                        model.descriptor.norm_epsilon,
-                        model.descriptor.hyper_connection_epsilon,
-                        layer_state.ffn_hyper_mix,
-                        state.hyper_connection_scratch,
-                        model.opt.optimization_flags);
+                    auto mixed = hyper_connection_pre(hidden,
+                                                      model.weights.at(layer.hyper_connection.ffn_function),
+                                                      model.weights.at(layer.hyper_connection.ffn_scale),
+                                                      model.weights.at(layer.hyper_connection.ffn_base),
+                                                      model.descriptor.hyper_connection_multiplier,
+                                                      model.descriptor.hyper_connection_iterations,
+                                                      model.descriptor.norm_epsilon,
+                                                      model.descriptor.hyper_connection_epsilon,
+                                                      layer_state.ffn_hyper_mix,
+                                                      state.hyper_connection_scratch,
+                                                      model.opt.optimization_flags);
                     if (!mixed)
                         return mixed.error();
                     rms_norm_batch_into(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset, model.opt.optimization_flags);
@@ -602,21 +567,19 @@ Result<std::vector<std::vector<float>>> forward_model(
                 {
                     rms_norm_batch_into(hidden, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset, model.opt.optimization_flags);
                 }
-                auto predicted = predict_next_router_routes(
-                    model,
-                    layer,
-                    layer_state.normalized,
-                    state,
-                    statistics,
-                    pending_router_prediction);
+                auto predicted = predict_next_router_routes(model,
+                                                            layer,
+                                                            layer_state.normalized,
+                                                            state,
+                                                            statistics,
+                                                            pending_router_prediction);
                 if (!predicted)
                     return predicted.error();
-                linear_batch_into(
-                    model.weights.at(moe.router_weight),
-                    layer_state.normalized,
-                    layer_state.router_logits,
-                    model.opt.optimization_flags,
-                    model.operators.find_weight(moe.router_weight));
+                linear_batch_into(model.weights.at(moe.router_weight),
+                                  layer_state.normalized,
+                                  layer_state.router_logits,
+                                  model.opt.optimization_flags,
+                                  model.operators.find_weight(moe.router_weight));
                 if (moe.router_bias != invalid_tensor_handle)
                 {
                     add_bias_inplace(layer_state.router_logits, model.weights.at(moe.router_bias));
@@ -674,15 +637,14 @@ Result<std::vector<std::vector<float>>> forward_model(
                 if (layer_state.experts_executed)
                     continue;
                 const auto expert_engine_start = std::chrono::steady_clock::now();
-                auto executed = forward_moe(
-                    model,
-                    moe,
-                    layer_state,
-                    statistics,
-                    state.expert_scratch,
-                    layer.layer_id,
-                    node->backend,
-                    has_flag(node->flags, ExecutionNodeCpuPrefetch));
+                auto executed = forward_moe(model,
+                                            moe,
+                                            layer_state,
+                                            statistics,
+                                            state.expert_scratch,
+                                            layer.layer_id,
+                                            node->backend,
+                                            has_flag(node->flags, ExecutionNodeCpuPrefetch));
                 statistics.expert_engine_time_microseconds += elapsed_microseconds(expert_engine_start);
                 if (!executed)
                     return executed.error();
@@ -694,13 +656,12 @@ Result<std::vector<std::vector<float>>> forward_model(
                     return Error{ErrorCode::InternalError, "Shared Expert executed before routed Expert group"};
                 const auto shared_start = std::chrono::steady_clock::now();
                 ExpertExecutionMetrics shared_metrics;
-                forward_shared_expert(
-                    model,
-                    moe,
-                    layer_state.normalized,
-                    layer_state.shared_expert_output,
-                    shared_metrics,
-                    model.opt.optimization_flags);
+                forward_shared_expert(model,
+                                      moe,
+                                      layer_state.normalized,
+                                      layer_state.shared_expert_output,
+                                      shared_metrics,
+                                      model.opt.optimization_flags);
                 statistics.expert_compute_time_microseconds += elapsed_microseconds(shared_start);
                 continue;
             }
@@ -714,11 +675,10 @@ Result<std::vector<std::vector<float>>> forward_model(
                 if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0)
                     return Error{ErrorCode::InternalError, "Combine executed before Shared Expert group"};
                 ActivationBuffer& moe_output = layer_state.normalized;
-                const bool has_backend_aggregation = initialize_backend_aggregated_output(
-                    state.expert_scratch,
-                    hidden.rows(),
-                    model.descriptor.hidden_size,
-                    moe_output);
+                const bool has_backend_aggregation = initialize_backend_aggregated_output(state.expert_scratch,
+                                                                                          hidden.rows(),
+                                                                                          model.descriptor.hidden_size,
+                                                                                          moe_output);
                 for (size_t active_index = 0; active_index < layer_state.active_experts().size(); ++active_index)
                 {
                     const ActiveExpertExecution& active = layer_state.active_experts()[active_index];
@@ -745,19 +705,17 @@ Result<std::vector<std::vector<float>>> forward_model(
                 }
                 if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
                 {
-                    auto connected = gated_residual_post(
-                        moe_output, hidden, layer_state.ffn_hyper_mix,
-                        model.descriptor.hyper_connection_multiplier,
-                        hidden);
+                    auto connected = gated_residual_post(moe_output, hidden, layer_state.ffn_hyper_mix,
+                                                         model.descriptor.hyper_connection_multiplier,
+                                                         hidden);
                     if (!connected)
                         return connected.error();
                 }
                 else if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
                 {
-                    auto connected = hyper_connection_post(
-                        moe_output, hidden, layer_state.ffn_hyper_mix,
-                        model.descriptor.hyper_connection_multiplier,
-                        state.expert_scratch.staged_output);
+                    auto connected = hyper_connection_post(moe_output, hidden, layer_state.ffn_hyper_mix,
+                                                           model.descriptor.hyper_connection_multiplier,
+                                                           state.expert_scratch.staged_output);
                     if (!connected)
                         return connected.error();
                     hidden.swap(state.expert_scratch.staged_output);
@@ -776,19 +734,17 @@ Result<std::vector<std::vector<float>>> forward_model(
                 statistics.expert_combine_time_microseconds += elapsed_microseconds(combine_start, combine_end);
 
                 statistics.expert_time_microseconds += elapsed_microseconds(layer_state.expert_start, combine_end);
-                const auto target = std::find(
-                    model.speculative.target_layer_ids.begin(),
-                    model.speculative.target_layer_ids.end(),
-                    layer.layer_id);
+                const auto target = std::find(model.speculative.target_layer_ids.begin(),
+                                              model.speculative.target_layer_ids.end(),
+                                              layer.layer_id);
                 if (target != model.speculative.target_layer_ids.end()
                     && state.use_speculative_context)
                 {
-                    capture_speculative_hidden(
-                        hidden,
-                        model.descriptor.hidden_size,
-                        model.descriptor.hyper_connection_multiplier,
-                        static_cast<size_t>(std::distance(model.speculative.target_layer_ids.begin(), target)),
-                        state.speculative_main_hidden);
+                    capture_speculative_hidden(hidden,
+                                               model.descriptor.hidden_size,
+                                               model.descriptor.hyper_connection_multiplier,
+                                               static_cast<size_t>(std::distance(model.speculative.target_layer_ids.begin(), target)),
+                                               state.speculative_main_hidden);
                 }
                 layer_state.reset();
                 continue;
@@ -811,18 +767,16 @@ Result<std::vector<std::vector<float>>> forward_model(
     if (logits_output == LogitsOutput::Last && logits.size() != 1)
         return Error{ErrorCode::InternalError, "execution graph produced an invalid final logits row count"};
     const VulkanStatistics final_vulkan_execution = get_vulkan_statistics(model.vulkan_runtime);
-    record_vulkan_execution_delta(
-        statistics,
-        initial_vulkan_execution,
-        final_vulkan_execution);
+    record_vulkan_execution_delta(statistics,
+                                  initial_vulkan_execution,
+                                  final_vulkan_execution);
     statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
     return logits;
 }
 
 Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel& model, std::span<const DecodeBatchEntry> entries)
 {
-    const ScopedExpertBackendForeground expert_backend_foreground(
-        model.expert_backend);
+    const ScopedExpertBackendForeground expert_backend_foreground(model.expert_backend);
     if (entries.empty())
         return Error{ErrorCode::InvalidArgument, "decode batch cannot be empty"};
 
@@ -835,10 +789,9 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             if (!entry.statistics || !entry.state)
                 return Error{ErrorCode::InvalidArgument, "decode batch entry is incomplete"};
             const std::array<int32_t, 1> input = {entry.input_id};
-            auto executed = forward_model(
-                model, input, *entry.statistics, *entry.state,
-                entry.position_offset,
-                entry.output_logits ? LogitsOutput::All : LogitsOutput::None);
+            auto executed = forward_model(model, input, *entry.statistics, *entry.state,
+                                          entry.position_offset,
+                                          entry.output_logits ? LogitsOutput::All : LogitsOutput::None);
             if (!executed)
                 return executed.error();
             if (entry.output_logits && executed.value().size() != 1)
@@ -858,14 +811,12 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
     }
 
     const size_t session_count = entries.size();
-    const size_t requested_count = static_cast<size_t>(std::count_if(
-        entries.begin(), entries.end(), [](const DecodeBatchEntry& entry) {
-            return entry.output_logits;
-        }));
+    const size_t requested_count = static_cast<size_t>(std::count_if(entries.begin(), entries.end(), [](const DecodeBatchEntry& entry) {
+        return entry.output_logits;
+    }));
     const bool all_output_logits = requested_count == session_count;
     Bfloat16BatchedLinearExecutionCounter cpu_bfloat16_execution;
-    const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(
-        &cpu_bfloat16_execution);
+    const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(&cpu_bfloat16_execution);
     for (const DecodeBatchEntry& entry : entries)
     {
         if (!entry.statistics || !entry.state)
@@ -906,8 +857,7 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
         const uint32_t speculative_hidden_columns = model.speculative.kind == SpeculativeModelKind::Mtp
                                                         ? model.descriptor.hidden_size
                                                         : model.descriptor.hidden_size
-                                                              * static_cast<uint32_t>(
-                                                                  model.speculative.target_layer_ids.size());
+                                                              * static_cast<uint32_t>(model.speculative.target_layer_ids.size());
         for (const DecodeBatchEntry& entry : entries)
         {
             if (!entry.state->use_speculative_context)
@@ -920,9 +870,8 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             }
             if (model.speculative.kind == SpeculativeModelKind::Mtp)
             {
-                entry.state->speculative_input_ids.assign(
-                    1,
-                    entry.input_id);
+                entry.state->speculative_input_ids.assign(1,
+                                                          entry.input_id);
                 entry.state->speculative_direct_alignment_ids.clear();
             }
         }
@@ -940,10 +889,9 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             {
                 return false;
             }
-            std::copy_n(
-                hidden.row(0),
-                merged.columns(),
-                merged.row(session_index));
+            std::copy_n(hidden.row(0),
+                        merged.columns(),
+                        merged.row(session_index));
         }
         return true;
     };
@@ -954,10 +902,9 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
         {
             ActivationBuffer& hidden = entries[session_index].state->hidden;
             hidden.reset(1, merged.columns(), false);
-            std::copy_n(
-                merged.row(session_index),
-                merged.columns(),
-                hidden.row(0));
+            std::copy_n(merged.row(session_index),
+                        merged.columns(),
+                        hidden.row(0));
         }
         return true;
     };
@@ -969,10 +916,9 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             std::copy_n(merged.row(session_index), merged.columns(), batches[session_index].row(0));
         }
     };
-    const bool use_speculative_context = std::any_of(
-        entries.begin(), entries.end(), [](const DecodeBatchEntry& entry) {
-            return entry.state->use_speculative_context;
-        });
+    const bool use_speculative_context = std::any_of(entries.begin(), entries.end(), [](const DecodeBatchEntry& entry) {
+        return entry.state->use_speculative_context;
+    });
     bool deferred_final_norm = false;
     for (const ExecutionBackendRun& backend_run : model.schedule.backend_runs)
     {
@@ -1002,10 +948,9 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 {
                     input_ids[session_index] = entries[session_index].input_id;
                 }
-                embedding_batch_into(
-                    model.weights.at(node->weight_inputs[0]),
-                    input_ids,
-                    scratch.staged_output);
+                embedding_batch_into(model.weights.at(node->weight_inputs[0]),
+                                     input_ids,
+                                     scratch.staged_output);
                 if (hyper_multiplier > 1)
                 {
                     hyper_connection_expand(scratch.staged_output, hyper_multiplier, scratch.staged_merged);
@@ -1021,8 +966,7 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             {
                 if (node->weight_inputs.size() != 2)
                     return Error{ErrorCode::InternalError, "final norm node has an invalid weight binding"};
-                const CompiledOperator& lm_head_operator = model.operators.at_weight(
-                    node->weight_inputs[1]);
+                const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weight_inputs[1]);
                 if (hyper_multiplier == 1
                     && !use_speculative_context
                     && requested_count > 0
@@ -1043,17 +987,16 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                             ErrorCode::InternalError,
                             "cannot merge staged hyper head rows"};
                     }
-                    auto head = hyper_connection_head(
-                        merged_hyper,
-                        model.weights.at(model.hyper_head_function),
-                        model.weights.at(model.hyper_head_scale),
-                        model.weights.at(model.hyper_head_base),
-                        hyper_multiplier,
-                        model.descriptor.norm_epsilon,
-                        hyper_epsilon,
-                        scratch.staged_output,
-                        entries.front().state->hyper_connection_scratch,
-                        model.opt.optimization_flags);
+                    auto head = hyper_connection_head(merged_hyper,
+                                                      model.weights.at(model.hyper_head_function),
+                                                      model.weights.at(model.hyper_head_scale),
+                                                      model.weights.at(model.hyper_head_base),
+                                                      hyper_multiplier,
+                                                      model.descriptor.norm_epsilon,
+                                                      hyper_epsilon,
+                                                      scratch.staged_output,
+                                                      entries.front().state->hyper_connection_scratch,
+                                                      model.opt.optimization_flags);
                     if (!head)
                         return head.error();
                     if (!split_hidden_rows(scratch.staged_output))
@@ -1077,10 +1020,9 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                         SessionState& state = *entries[session_index].state;
                         if (!state.use_speculative_context)
                             continue;
-                        std::copy_n(
-                            entries[session_index].state->hidden.row(0),
-                            model.descriptor.hidden_size,
-                            state.speculative_main_hidden.row(0));
+                        std::copy_n(entries[session_index].state->hidden.row(0),
+                                    model.descriptor.hidden_size,
+                                    state.speculative_main_hidden.row(0));
                     }
                 }
                 const uint64_t elapsed = elapsed_microseconds(start);
@@ -1123,19 +1065,17 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                         {
                             return Error{ErrorCode::InternalError, "staged LM head rows have an invalid shape"};
                         }
-                        std::copy_n(
-                            hidden.row(0),
-                            hidden_columns,
-                            merged.row(output_index++));
+                        std::copy_n(hidden.row(0),
+                                    hidden_columns,
+                                    merged.row(output_index++));
                     }
                 }
                 const auto& lm_head = model.weights.at(node->weight_inputs[0]);
                 const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weight_inputs[0]);
                 if (deferred_final_norm
                     && lm_head_operator.bfloat16
-                    && lm_head_operator.bfloat16->forward_rms_norm_chain(
-                        merged,
-                        scratch.staged_output))
+                    && lm_head_operator.bfloat16->forward_rms_norm_chain(merged,
+                                                                         scratch.staged_output))
                 {
                     deferred_final_norm = false;
                 }
@@ -1144,31 +1084,28 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                     if (deferred_final_norm)
                     {
                         ActivationBuffer& normalized = entries.front().state->final_norm;
-                        rms_norm_batch_into(
-                            merged,
-                            model.weights.at(node->weight_inputs[1]),
-                            model.descriptor.norm_epsilon,
-                            normalized,
-                            model.descriptor.norm_weight_offset,
-                            model.opt.optimization_flags);
-                        linear_batch_into(
-                            lm_head,
-                            normalized,
-                            scratch.staged_output,
-                            model.opt.optimization_flags,
-                            model.operators.find_weight(node->weight_inputs[0]),
-                            node->backend);
+                        rms_norm_batch_into(merged,
+                                            model.weights.at(node->weight_inputs[1]),
+                                            model.descriptor.norm_epsilon,
+                                            normalized,
+                                            model.descriptor.norm_weight_offset,
+                                            model.opt.optimization_flags);
+                        linear_batch_into(lm_head,
+                                          normalized,
+                                          scratch.staged_output,
+                                          model.opt.optimization_flags,
+                                          model.operators.find_weight(node->weight_inputs[0]),
+                                          node->backend);
                         deferred_final_norm = false;
                     }
                     else
                     {
-                        linear_batch_into(
-                            lm_head,
-                            merged,
-                            scratch.staged_output,
-                            model.opt.optimization_flags,
-                            model.operators.find_weight(node->weight_inputs[0]),
-                            node->backend);
+                        linear_batch_into(lm_head,
+                                          merged,
+                                          scratch.staged_output,
+                                          model.opt.optimization_flags,
+                                          model.operators.find_weight(node->weight_inputs[0]),
+                                          node->backend);
                     }
                 }
                 if (scratch.staged_output.rows() != requested_count)
@@ -1182,9 +1119,8 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                         continue;
                     const size_t source_index = all_output_logits ? session_index : output_index++;
                     const float* source = scratch.staged_output.row(source_index);
-                    logits[session_index].assign(
-                        source,
-                        source + scratch.staged_output.columns());
+                    logits[session_index].assign(source,
+                                                 source + scratch.staged_output.columns());
                 }
                 const uint64_t elapsed = elapsed_microseconds(start);
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
@@ -1217,15 +1153,14 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                             &state.gated_delta_scratch.output};
                     }
                     const auto start = std::chrono::steady_clock::now();
-                    if (!forward_gated_delta_batch(
-                            model.weights,
-                            model.operators,
-                            layer.attention,
-                            node->backend,
-                            model.descriptor.norm_epsilon,
-                            gated_delta_entries,
-                            batch_scratch.gated_delta_device_entries,
-                            model.opt.optimization_flags))
+                    if (!forward_gated_delta_batch(model.weights,
+                                                   model.operators,
+                                                   layer.attention,
+                                                   node->backend,
+                                                   model.descriptor.norm_epsilon,
+                                                   gated_delta_entries,
+                                                   batch_scratch.gated_delta_device_entries,
+                                                   model.opt.optimization_flags))
                     {
                         return Error{
                             ErrorCode::InternalError,
@@ -1260,18 +1195,17 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                     const ActivationBuffer* attention_input = &merged_hidden;
                     if (hyper_multiplier > 1)
                     {
-                        auto mixed = hyper_connection_pre(
-                            merged_hidden,
-                            model.weights.at(layer.hyper_connection.attention_function),
-                            model.weights.at(layer.hyper_connection.attention_scale),
-                            model.weights.at(layer.hyper_connection.attention_base),
-                            hyper_multiplier,
-                            hyper_iterations,
-                            model.descriptor.norm_epsilon,
-                            hyper_epsilon,
-                            merged_mix,
-                            hyper_scratch,
-                            model.opt.optimization_flags);
+                        auto mixed = hyper_connection_pre(merged_hidden,
+                                                          model.weights.at(layer.hyper_connection.attention_function),
+                                                          model.weights.at(layer.hyper_connection.attention_scale),
+                                                          model.weights.at(layer.hyper_connection.attention_base),
+                                                          hyper_multiplier,
+                                                          hyper_iterations,
+                                                          model.descriptor.norm_epsilon,
+                                                          hyper_epsilon,
+                                                          merged_mix,
+                                                          hyper_scratch,
+                                                          model.opt.optimization_flags);
                         if (!mixed)
                             return mixed.error();
                         attention_input = &merged_mix.reduced;
@@ -1290,12 +1224,11 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                         return merged_output.error();
                     if (hyper_multiplier > 1)
                     {
-                        auto connected = hyper_connection_post(
-                            attention_output,
-                            merged_hidden,
-                            merged_mix,
-                            hyper_multiplier,
-                            batch_scratch.staged_output);
+                        auto connected = hyper_connection_post(attention_output,
+                                                               merged_hidden,
+                                                               merged_mix,
+                                                               hyper_multiplier,
+                                                               batch_scratch.staged_output);
                         if (!connected)
                             return connected.error();
                         if (!split_hidden_rows(batch_scratch.staged_output))
@@ -1335,12 +1268,11 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                             &state.attention_scratch.output};
                     }
                     const auto batch_start = std::chrono::steady_clock::now();
-                    auto batched = forward_attention_batch(
-                        model.operators,
-                        layer.attention,
-                        node->backend,
-                        attention_entries,
-                        model.opt.optimization_flags);
+                    auto batched = forward_attention_batch(model.operators,
+                                                           layer.attention,
+                                                           node->backend,
+                                                           attention_entries,
+                                                           model.opt.optimization_flags);
                     if (!batched)
                         return batched.error();
                     if (batched.value())
@@ -1351,8 +1283,7 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                              ++session_index)
                         {
                             SessionState& state = *entries[session_index].state;
-                            state.hidden.swap(
-                                state.attention_scratch.output);
+                            state.hidden.swap(state.attention_scratch.output);
                             SessionStatistics& statistics = *entries[session_index].statistics;
                             statistics.attention_time_microseconds += elapsed;
                         }
@@ -1365,10 +1296,9 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                             const VulkanStatistics fallback_batch_vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
                             for (const DecodeBatchEntry& entry : entries)
                             {
-                                record_vulkan_execution_delta(
-                                    *entry.statistics,
-                                    batch_vulkan_before,
-                                    fallback_batch_vulkan_after);
+                                record_vulkan_execution_delta(*entry.statistics,
+                                                              batch_vulkan_before,
+                                                              fallback_batch_vulkan_after);
                             }
                             batch_vulkan_before = fallback_batch_vulkan_after;
                         }
@@ -1378,19 +1308,18 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                         {
                             SessionState& state = *entries[session_index].state;
                             const auto start = std::chrono::steady_clock::now();
-                            auto attention = forward_attention(
-                                model.weights,
-                                model.operators,
-                                layer.attention,
-                                node->backend,
-                                model.descriptor.norm_epsilon,
-                                model.descriptor.kv_cache_dtype,
-                                entries[session_index].position_offset,
-                                state.layers[layer.layer_id],
-                                state.attention_scratch,
-                                state.hidden,
-                                state.attention_scratch.output,
-                                model.opt.optimization_flags);
+                            auto attention = forward_attention(model.weights,
+                                                               model.operators,
+                                                               layer.attention,
+                                                               node->backend,
+                                                               model.descriptor.norm_epsilon,
+                                                               model.descriptor.kv_cache_dtype,
+                                                               entries[session_index].position_offset,
+                                                               state.layers[layer.layer_id],
+                                                               state.attention_scratch,
+                                                               state.hidden,
+                                                               state.attention_scratch.output,
+                                                               model.opt.optimization_flags);
                             if (!attention)
                             {
                                 for (size_t affected_index = 0;
@@ -1405,14 +1334,12 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                             if (node->backend == ExecutionBackend::Vulkan)
                             {
                                 const VulkanStatistics solo_vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
-                                record_vulkan_execution_delta(
-                                    *entries[session_index].statistics,
-                                    batch_vulkan_before,
-                                    solo_vulkan_after);
+                                record_vulkan_execution_delta(*entries[session_index].statistics,
+                                                              batch_vulkan_before,
+                                                              solo_vulkan_after);
                                 batch_vulkan_before = solo_vulkan_after;
                             }
-                            state.hidden.swap(
-                                state.attention_scratch.output);
+                            state.hidden.swap(state.attention_scratch.output);
                             SessionStatistics& statistics = *entries[session_index].statistics;
                             statistics.attention_time_microseconds += elapsed_microseconds(start);
                         }
@@ -1435,18 +1362,17 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 }
                 if (hyper_multiplier > 1)
                 {
-                    auto mixed = hyper_connection_pre(
-                        merged_hyper,
-                        model.weights.at(layer.hyper_connection.ffn_function),
-                        model.weights.at(layer.hyper_connection.ffn_scale),
-                        model.weights.at(layer.hyper_connection.ffn_base),
-                        hyper_multiplier,
-                        hyper_iterations,
-                        model.descriptor.norm_epsilon,
-                        hyper_epsilon,
-                        hyper_scratch.transient_mix,
-                        hyper_scratch,
-                        model.opt.optimization_flags);
+                    auto mixed = hyper_connection_pre(merged_hyper,
+                                                      model.weights.at(layer.hyper_connection.ffn_function),
+                                                      model.weights.at(layer.hyper_connection.ffn_scale),
+                                                      model.weights.at(layer.hyper_connection.ffn_base),
+                                                      hyper_multiplier,
+                                                      hyper_iterations,
+                                                      model.descriptor.norm_epsilon,
+                                                      hyper_epsilon,
+                                                      hyper_scratch.transient_mix,
+                                                      hyper_scratch,
+                                                      model.opt.optimization_flags);
                     if (!mixed)
                         return mixed.error();
                     HyperConnectionMix& merged_mix = hyper_scratch.transient_mix;
@@ -1458,15 +1384,13 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                         LayerGraphState& layer_state = entries[session_index].state->execution_state;
                         layer_state.ffn_hyper_mix.reduced.clear();
                         layer_state.ffn_hyper_mix.post.resize(hyper_multiplier);
-                        std::copy_n(
-                            merged_mix.post.data() + session_index * hyper_multiplier,
-                            hyper_multiplier,
-                            layer_state.ffn_hyper_mix.post.data());
+                        std::copy_n(merged_mix.post.data() + session_index * hyper_multiplier,
+                                    hyper_multiplier,
+                                    layer_state.ffn_hyper_mix.post.data());
                         layer_state.ffn_hyper_mix.combine.resize(combine_stride);
-                        std::copy_n(
-                            merged_mix.combine.data() + session_index * combine_stride,
-                            combine_stride,
-                            layer_state.ffn_hyper_mix.combine.data());
+                        std::copy_n(merged_mix.combine.data() + session_index * combine_stride,
+                                    combine_stride,
+                                    layer_state.ffn_hyper_mix.combine.data());
                     }
                 }
                 else
@@ -1481,12 +1405,11 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                     std::copy_n(merged_hidden.row(session_index), merged_hidden.columns(), layer_state.normalized.row(0));
                 }
                 ActivationBuffer& merged_logits = scratch.staged_router_logits;
-                linear_batch_into(
-                    model.weights.at(moe.router_weight),
-                    merged_hidden,
-                    merged_logits,
-                    model.opt.optimization_flags,
-                    model.operators.find_weight(moe.router_weight));
+                linear_batch_into(model.weights.at(moe.router_weight),
+                                  merged_hidden,
+                                  merged_logits,
+                                  model.opt.optimization_flags,
+                                  model.operators.find_weight(moe.router_weight));
                 if (moe.router_bias != invalid_tensor_handle)
                 {
                     add_bias_inplace(merged_logits, model.weights.at(moe.router_bias));
@@ -1593,8 +1516,7 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                             ExpertRoute route = source.batch.routes[route_index];
                             route.token_index = static_cast<uint32_t>(session_index);
                             destination.batch.routes.push_back(route);
-                            origins[combined_index].push_back(
-                                {session_index, active_index, route_index});
+                            origins[combined_index].push_back({session_index, active_index, route_index});
                         }
                     }
                 }
@@ -1602,15 +1524,14 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 combined.resize_experts(combined_count);
                 SessionStatistics aggregate_statistics;
                 const auto engine_start = std::chrono::steady_clock::now();
-                auto executed = forward_moe(
-                    model,
-                    moe,
-                    combined,
-                    aggregate_statistics,
-                    entries.front().state->expert_scratch,
-                    layer.layer_id,
-                    node->backend,
-                    has_flag(node->flags, ExecutionNodeCpuPrefetch));
+                auto executed = forward_moe(model,
+                                            moe,
+                                            combined,
+                                            aggregate_statistics,
+                                            entries.front().state->expert_scratch,
+                                            layer.layer_id,
+                                            node->backend,
+                                            has_flag(node->flags, ExecutionNodeCpuPrefetch));
                 const uint64_t engine_elapsed = elapsed_microseconds(engine_start);
                 if (!executed)
                 {
@@ -1638,21 +1559,17 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 {
                     ExpertScratch& session_scratch = entries[session_index].state->expert_scratch;
                     const LayerGraphState& session_layer = entries[session_index].state->execution_state;
-                    session_scratch.backend_aggregated.assign(
-                        session_layer.active_experts().size(),
-                        0);
+                    session_scratch.backend_aggregated.assign(session_layer.active_experts().size(),
+                                                              0);
                     session_scratch.backend_aggregated_output_valid = has_combined_backend_aggregation;
                     if (has_combined_backend_aggregation)
                     {
-                        session_scratch.backend_aggregated_output.reset(
-                            1,
-                            model.descriptor.hidden_size,
-                            false);
-                        std::copy_n(
-                            combined_backend_aggregated_output.row(
-                                session_index),
-                            model.descriptor.hidden_size,
-                            session_scratch.backend_aggregated_output.row(0));
+                        session_scratch.backend_aggregated_output.reset(1,
+                                                                        model.descriptor.hidden_size,
+                                                                        false);
+                        std::copy_n(combined_backend_aggregated_output.row(session_index),
+                                    model.descriptor.hidden_size,
+                                    session_scratch.backend_aggregated_output.row(0));
                     }
                     else
                     {
@@ -1727,10 +1644,9 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                             origin_scratch.backend_aggregated[origin.active_index] = 1;
                             continue;
                         }
-                        std::copy_n(
-                            source.output.row(route_index),
-                            model.descriptor.hidden_size,
-                            destination.output.row(origin.route_index));
+                        std::copy_n(source.output.row(route_index),
+                                    model.descriptor.hidden_size,
+                                    destination.output.row(origin.route_index));
                     }
                 }
                 combined.reset();
@@ -1754,13 +1670,12 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 const auto shared_start = std::chrono::steady_clock::now();
                 ExpertExecutionMetrics shared_metrics;
                 ActivationBuffer& shared_output = batch_scratch.staged_output;
-                forward_shared_expert(
-                    model,
-                    moe,
-                    shared_input,
-                    shared_output,
-                    shared_metrics,
-                    model.opt.optimization_flags);
+                forward_shared_expert(model,
+                                      moe,
+                                      shared_input,
+                                      shared_output,
+                                      shared_metrics,
+                                      model.opt.optimization_flags);
                 const uint64_t shared_elapsed = elapsed_microseconds(shared_start);
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
                 {
@@ -1785,11 +1700,10 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                         return Error{ErrorCode::InternalError, "Combine executed before Shared Expert group"};
                     ActivationBuffer& moe_output = layer_state.normalized;
                     ExpertScratch& expert_scratch = entries[session_index].state->expert_scratch;
-                    const bool has_backend_aggregation = initialize_backend_aggregated_output(
-                        expert_scratch,
-                        1,
-                        model.descriptor.hidden_size,
-                        moe_output);
+                    const bool has_backend_aggregation = initialize_backend_aggregated_output(expert_scratch,
+                                                                                              1,
+                                                                                              model.descriptor.hidden_size,
+                                                                                              moe_output);
                     for (size_t active_index = 0; active_index < layer_state.active_experts().size(); ++active_index)
                     {
                         const ActiveExpertExecution& active = layer_state.active_experts()[active_index];
@@ -1820,12 +1734,11 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                     for (size_t session_index = 0; session_index < session_count; ++session_index)
                     {
                         LayerGraphState& layer_state = entries[session_index].state->execution_state;
-                        auto connected = hyper_connection_post(
-                            layer_state.normalized,
-                            entries[session_index].state->hidden,
-                            layer_state.ffn_hyper_mix,
-                            hyper_multiplier,
-                            batch_scratch.staged_output);
+                        auto connected = hyper_connection_post(layer_state.normalized,
+                                                               entries[session_index].state->hidden,
+                                                               layer_state.ffn_hyper_mix,
+                                                               hyper_multiplier,
+                                                               batch_scratch.staged_output);
                         if (!connected)
                             return connected.error();
                         entries[session_index].state->hidden.swap(batch_scratch.staged_output);
@@ -1840,13 +1753,11 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 }
                 const auto combine_end = std::chrono::steady_clock::now();
                 const uint64_t combine_elapsed = elapsed_microseconds(combine_start, combine_end);
-                const auto target = std::find(
-                    model.speculative.target_layer_ids.begin(),
-                    model.speculative.target_layer_ids.end(),
-                    layer.layer_id);
-                const size_t target_index = static_cast<size_t>(std::distance(
-                    model.speculative.target_layer_ids.begin(),
-                    target));
+                const auto target = std::find(model.speculative.target_layer_ids.begin(),
+                                              model.speculative.target_layer_ids.end(),
+                                              layer.layer_id);
+                const size_t target_index = static_cast<size_t>(std::distance(model.speculative.target_layer_ids.begin(),
+                                                                              target));
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
                 {
                     LayerGraphState& layer_state = entries[session_index].state->execution_state;
@@ -1891,9 +1802,8 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
     return logits;
 }
 
-static void collect_ranked_experts(
-    const ExpertDispatchPlan& plan,
-    std::span<uint32_t> ranked)
+static void collect_ranked_experts(const ExpertDispatchPlan& plan,
+                                   std::span<uint32_t> ranked)
 {
     const uint32_t invalid_expert = std::numeric_limits<uint32_t>::max();
     std::fill(ranked.begin(), ranked.end(), invalid_expert);
@@ -1907,9 +1817,8 @@ static void collect_ranked_experts(
     }
 }
 
-static void configure_router_prefetch(
-    LayerCache& cache,
-    uint32_t target_top_k)
+static void configure_router_prefetch(LayerCache& cache,
+                                      uint32_t target_top_k)
 {
     if (cache.router_target_top_k == target_top_k)
         return;
@@ -1919,10 +1828,9 @@ static void configure_router_prefetch(
     cache.router_last_adjustment = 0;
 }
 
-static void adapt_router_prefetch_width(
-    LayerCache& cache,
-    const SessionStatistics& statistics,
-    bool adaptive)
+static void adapt_router_prefetch_width(LayerCache& cache,
+                                        const SessionStatistics& statistics,
+                                        bool adaptive)
 {
     if (!adaptive)
     {
@@ -1968,13 +1876,12 @@ static void adapt_router_prefetch_width(
     }
 }
 
-static void resolve_router_predictions(
-    const CompiledModel& model,
-    const CompiledLayerPlan& layer,
-    const ExpertDispatchPlan& plan,
-    SessionState& state,
-    SessionStatistics& statistics,
-    bool resolve_unused_predictions)
+static void resolve_router_predictions(const CompiledModel& model,
+                                       const CompiledLayerPlan& layer,
+                                       const ExpertDispatchPlan& plan,
+                                       SessionState& state,
+                                       SessionStatistics& statistics,
+                                       bool resolve_unused_predictions)
 {
     if (!model.expert_cache
         || layer.layer_id >= state.layers.size()
@@ -2028,20 +1935,18 @@ static void resolve_router_predictions(
     }
     if (resolve_unused_predictions && model.opt.num_concurrent_sessions == 1)
     {
-        model.expert_cache->resolve_predictions(
-            layer.layer_id,
-            std::span<const std::string_view>(demanded_keys.data(), demanded_key_count));
+        model.expert_cache->resolve_predictions(layer.layer_id,
+                                                std::span<const std::string_view>(demanded_keys.data(), demanded_key_count));
     }
 
     cache.predicted_expert_ids.clear();
 }
 
-static const CompiledLayerPlan* prepare_next_router_prediction(
-    const CompiledModel& model,
-    const CompiledLayerPlan& layer,
-    const ActivationBuffer& router_input,
-    SessionState& state,
-    SessionStatistics& statistics)
+static const CompiledLayerPlan* prepare_next_router_prediction(const CompiledModel& model,
+                                                               const CompiledLayerPlan& layer,
+                                                               const ActivationBuffer& router_input,
+                                                               SessionState& state,
+                                                               SessionStatistics& statistics)
 {
     if (!model.expert_cache
         || model.opt.num_concurrent_sessions != 1
@@ -2073,35 +1978,30 @@ static const CompiledLayerPlan* prepare_next_router_prediction(
         return nullptr;
 
     LayerCache& source_cache = state.layers[layer.layer_id];
-    configure_router_prefetch(
-        source_cache,
-        next_layer->moe.top_k);
-    adapt_router_prefetch_width(
-        source_cache,
-        statistics,
-        has_flag(model.opt.flags, OptionRankAdaptivePrefetch));
+    configure_router_prefetch(source_cache,
+                              next_layer->moe.top_k);
+    adapt_router_prefetch_width(source_cache,
+                                statistics,
+                                has_flag(model.opt.flags, OptionRankAdaptivePrefetch));
     return next_layer;
 }
 
-static Result<RouterPredictionOutcome> run_router_prediction(
-    const CompiledModel& model,
-    const CompiledLayerPlan& next_layer,
-    const ActivationBuffer& router_input,
-    uint32_t prefetch_width)
+static Result<RouterPredictionOutcome> run_router_prediction(const CompiledModel& model,
+                                                             const CompiledLayerPlan& next_layer,
+                                                             const ActivationBuffer& router_input,
+                                                             uint32_t prefetch_width)
 {
     const auto started = std::chrono::steady_clock::now();
     ActivationBuffer predicted_logits;
-    linear_batch_into(
-        model.weights.at(next_layer.moe.router_weight),
-        router_input,
-        predicted_logits,
-        model.opt.optimization_flags,
-        model.operators.find_weight(next_layer.moe.router_weight));
+    linear_batch_into(model.weights.at(next_layer.moe.router_weight),
+                      router_input,
+                      predicted_logits,
+                      model.opt.optimization_flags,
+                      model.operators.find_weight(next_layer.moe.router_weight));
     if (next_layer.moe.router_bias != invalid_tensor_handle)
     {
-        add_bias_inplace(
-            predicted_logits,
-            model.weights.at(next_layer.moe.router_bias));
+        add_bias_inplace(predicted_logits,
+                         model.weights.at(next_layer.moe.router_bias));
     }
 
     ExpertDispatchOptions options;
@@ -2115,11 +2015,10 @@ static Result<RouterPredictionOutcome> run_router_prediction(
         options.selection_bias = model.weights.at(next_layer.moe.router_selection_bias).float32_values();
     }
     ExpertDispatchPlan predicted_plan;
-    auto dispatched = dispatch_experts_into(
-        predicted_logits.values(),
-        1,
-        options,
-        predicted_plan);
+    auto dispatched = dispatch_experts_into(predicted_logits.values(),
+                                            1,
+                                            options,
+                                            predicted_plan);
     if (!dispatched)
         return dispatched.error();
 
@@ -2140,9 +2039,8 @@ static Result<RouterPredictionOutcome> run_router_prediction(
         predicted_experts = predicted_fallback;
     }
     RouterPredictionOutcome outcome;
-    outcome.predicted_expert_ids.assign(
-        next_layer.moe.top_k,
-        invalid_expert);
+    outcome.predicted_expert_ids.assign(next_layer.moe.top_k,
+                                        invalid_expert);
     const uint32_t width = std::min(prefetch_width, next_layer.moe.top_k);
     for (uint32_t rank = 0; rank < width; ++rank)
     {
@@ -2158,11 +2056,10 @@ static Result<RouterPredictionOutcome> run_router_prediction(
         const TensorData& down = model.weights.at(predicted.down_weight);
         if (predicted.cache_key.empty())
             continue;
-        const auto prediction = model.expert_cache->prefetch_pair(
-            gate_up,
-            down,
-            next_layer.layer_id,
-            predicted.cache_key);
+        const auto prediction = model.expert_cache->prefetch_pair(gate_up,
+                                                                  down,
+                                                                  next_layer.layer_id,
+                                                                  predicted.cache_key);
         if (prediction && prediction.value())
             ++outcome.cache_hits;
         else
@@ -2172,11 +2069,10 @@ static Result<RouterPredictionOutcome> run_router_prediction(
     return outcome;
 }
 
-static Result<void> apply_router_prediction(
-    uint32_t target_layer_id,
-    RouterPredictionOutcome outcome,
-    SessionState& state,
-    SessionStatistics& statistics)
+static Result<void> apply_router_prediction(uint32_t target_layer_id,
+                                            RouterPredictionOutcome outcome,
+                                            SessionState& state,
+                                            SessionStatistics& statistics)
 {
     if (target_layer_id >= state.layers.size())
     {
@@ -2202,11 +2098,10 @@ static Result<void> apply_router_prediction(
     return {};
 }
 
-static void admit_ready_router_prediction(
-    const CompiledModel& model,
-    const CompiledLayerPlan& layer,
-    SessionState& state,
-    size_t token_count)
+static void admit_ready_router_prediction(const CompiledModel& model,
+                                          const CompiledLayerPlan& layer,
+                                          SessionState& state,
+                                          size_t token_count)
 {
     if (!model.expert_cache
         || !model.expert_backend
@@ -2226,10 +2121,9 @@ static void admit_ready_router_prediction(
         if (expert_id == std::numeric_limits<uint32_t>::max()
             || expert_id >= layer.moe.experts.size()
             || admitted_count == admitted_ids.size()
-            || std::find(
-                   admitted_ids.begin(),
-                   admitted_ids.begin() + admitted_count,
-                   expert_id)
+            || std::find(admitted_ids.begin(),
+                         admitted_ids.begin() + admitted_count,
+                         expert_id)
                    != admitted_ids.begin() + admitted_count)
         {
             continue;
@@ -2257,40 +2151,37 @@ static void admit_ready_router_prediction(
             expert.cache_key,
             victim_metadata(model, expert, 1)};
         ExpertCacheLease lease;
-        auto ready = model.expert_cache->try_acquire_ready_pairs(
-            std::span<const ExpertCachePairRequest>(&request, 1),
-            std::span<ExpertCacheLease>(&lease, 1));
+        auto ready = model.expert_cache->try_acquire_ready_pairs(std::span<const ExpertCachePairRequest>(&request, 1),
+                                                                 std::span<ExpertCacheLease>(&lease, 1));
         if (!ready || !ready.value())
             continue;
 
         if (token_count >= vulkan_expert_gpu_admission_min_rows
             || model.opt.hybrid_mode == HybridMode::HybridExperts)
         {
-            model.expert_backend->admit(
-                expert.cache_key,
-                std::move(lease.gate_up),
-                expert.gate_up_bias == invalid_tensor_handle
-                    ? nullptr
-                    : &model.weights.at(expert.gate_up_bias),
-                std::move(lease.down),
-                expert.down_bias == invalid_tensor_handle
-                    ? nullptr
-                    : &model.weights.at(expert.down_bias),
-                layer.layer_id,
-                expert.activation_limit,
-                expert.activation);
+            model.expert_backend->admit(expert.cache_key,
+                                        std::move(lease.gate_up),
+                                        expert.gate_up_bias == invalid_tensor_handle
+                                            ? nullptr
+                                            : &model.weights.at(expert.gate_up_bias),
+                                        std::move(lease.down),
+                                        expert.down_bias == invalid_tensor_handle
+                                            ? nullptr
+                                            : &model.weights.at(expert.down_bias),
+                                        layer.layer_id,
+                                        expert.activation_limit,
+                                        expert.activation);
         }
         admitted_ids[admitted_count++] = expert_id;
     }
 }
 
-static Result<void> complete_router_prediction(
-    const CompiledModel& model,
-    uint32_t layer_id,
-    PendingRouterPrediction& pending,
-    SessionState& state,
-    SessionStatistics& statistics,
-    size_t token_count)
+static Result<void> complete_router_prediction(const CompiledModel& model,
+                                               uint32_t layer_id,
+                                               PendingRouterPrediction& pending,
+                                               SessionState& state,
+                                               SessionStatistics& statistics,
+                                               size_t token_count)
 {
     if (!pending.result.valid())
         return {};
@@ -2329,50 +2220,44 @@ static Result<void> complete_router_prediction(
     if (!completed)
         return completed.error();
     ++statistics.expert_route_prediction_async_completions;
-    auto applied = apply_router_prediction(
-        target_layer_id,
-        std::move(completed).value(),
-        state,
-        statistics);
+    auto applied = apply_router_prediction(target_layer_id,
+                                           std::move(completed).value(),
+                                           state,
+                                           statistics);
     if (!applied)
         return applied.error();
 
     if (layer_id < model.graph.layer_plans.size())
     {
         // Admit predicted weights to the GPU queue after the host pair is ready.
-        admit_ready_router_prediction(
-            model,
-            model.graph.layer_plans[layer_id],
-            state,
-            token_count);
+        admit_ready_router_prediction(model,
+                                      model.graph.layer_plans[layer_id],
+                                      state,
+                                      token_count);
     }
     return {};
 }
 
-static Result<void> predict_next_router_routes(
-    const CompiledModel& model,
-    const CompiledLayerPlan& layer,
-    const ActivationBuffer& router_input,
-    SessionState& state,
-    SessionStatistics& statistics,
-    PendingRouterPrediction& pending)
+static Result<void> predict_next_router_routes(const CompiledModel& model,
+                                               const CompiledLayerPlan& layer,
+                                               const ActivationBuffer& router_input,
+                                               SessionState& state,
+                                               SessionStatistics& statistics,
+                                               PendingRouterPrediction& pending)
 {
-    const CompiledLayerPlan* next_layer = prepare_next_router_prediction(
-        model,
-        layer,
-        router_input,
-        state,
-        statistics);
+    const CompiledLayerPlan* next_layer = prepare_next_router_prediction(model,
+                                                                         layer,
+                                                                         router_input,
+                                                                         state,
+                                                                         statistics);
     if (!next_layer)
         return {};
-    const LayerCache& source_cache = state.layers[layer.layer_id];
-    const uint32_t prefetch_width = std::min(
-        source_cache.router_prefetch_width,
-        next_layer->moe.top_k);
 
-    if (has_flag(
-            model.opt.flags,
-            OptionAsyncRouterPrediction))
+    const LayerCache& source_cache = state.layers[layer.layer_id];
+    const uint32_t prefetch_width = std::min(source_cache.router_prefetch_width,
+                                             next_layer->moe.top_k);
+
+    if (has_flag(model.opt.flags, OptionAsyncRouterPrediction))
     {
         try
         {
@@ -2381,41 +2266,35 @@ static Result<void> predict_next_router_routes(
                 state.router_prediction_worker = std::make_unique<CpuTaskWorker>(2);
             }
             ActivationBuffer copied_input = router_input;
-            auto promise = std::make_shared<
-                std::promise<Result<RouterPredictionOutcome>>>();
+            auto promise = std::make_shared<std::promise<Result<RouterPredictionOutcome>>>();
             std::future<Result<RouterPredictionOutcome>> future = promise->get_future();
             Bfloat16BatchedLinearExecutionCounter* const bfloat16_counter = current_bfloat16_batched_linear_execution_counter();
-            if (state.router_prediction_worker->try_submit(
-                    [&model,
-                     next_layer,
-                     copied_input = std::move(copied_input),
-                     prefetch_width,
-                     bfloat16_counter,
-                     promise]() mutable {
-                        const ScopedBfloat16BatchedLinearExecutionCounter
-                            bfloat16_scope(bfloat16_counter);
-                        try
-                        {
-                            promise->set_value(run_router_prediction(
-                                model,
-                                *next_layer,
-                                copied_input,
-                                prefetch_width));
-                        }
-                        catch (const std::exception& error)
-                        {
-                            promise->set_value(Error{
-                                ErrorCode::InternalError,
-                                std::string("Router prediction failed: ")
-                                    + error.what()});
-                        }
-                        catch (...)
-                        {
-                            promise->set_value(Error{
-                                ErrorCode::InternalError,
-                                "Router prediction failed"});
-                        }
-                    }))
+            if (state.router_prediction_worker->try_submit([&model,
+                                                            next_layer,
+                                                            copied_input = std::move(copied_input),
+                                                            prefetch_width,
+                                                            bfloat16_counter,
+                                                            promise]() mutable {
+                    const ScopedBfloat16BatchedLinearExecutionCounter
+                        bfloat16_scope(bfloat16_counter);
+                    try
+                    {
+                        promise->set_value(run_router_prediction(model,
+                                                                 *next_layer,
+                                                                 copied_input,
+                                                                 prefetch_width));
+                    }
+                    catch (const std::exception& error)
+                    {
+                        promise->set_value(Error{ErrorCode::InternalError,
+                                                 std::string("Router prediction failed: ")
+                                                     + error.what()});
+                    }
+                    catch (...)
+                    {
+                        promise->set_value(Error{ErrorCode::InternalError, "Router prediction failed"});
+                    }
+                }))
             {
                 pending.target_layer_id = next_layer->layer_id;
                 pending.result = std::move(future);
@@ -2430,20 +2309,19 @@ static Result<void> predict_next_router_routes(
         ++statistics.expert_route_prediction_async_fallbacks;
     }
 
-    auto outcome = run_router_prediction(
-        model,
-        *next_layer,
-        router_input,
-        prefetch_width);
+    auto outcome = run_router_prediction(model,
+                                         *next_layer,
+                                         router_input,
+                                         prefetch_width);
     if (!outcome)
         return outcome.error();
-    auto applied = apply_router_prediction(
-        next_layer->layer_id,
-        std::move(outcome).value(),
-        state,
-        statistics);
+
+    auto applied = apply_router_prediction(next_layer->layer_id,
+                                           std::move(outcome).value(),
+                                           state, statistics);
     if (!applied)
         return applied.error();
+
     admit_ready_router_prediction(model, *next_layer, state, router_input.rows());
     return {};
 }

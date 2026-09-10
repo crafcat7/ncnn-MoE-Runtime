@@ -74,39 +74,36 @@ struct AttentionBatchEntry
     ActivationBuffer* output = nullptr;
 };
 
-[[nodiscard]] Result<bool> forward_attention_batch(
-    const CompiledOperatorTable& operators,
-    const AttentionBlockPlan& plan,
-    ExecutionBackend backend,
-    std::span<AttentionBatchEntry> entries,
-    uint64_t optimization_flags);
+[[nodiscard]] Result<bool> forward_attention_batch(const CompiledOperatorTable& operators,
+                                                   const AttentionBlockPlan& plan,
+                                                   ExecutionBackend backend,
+                                                   std::span<AttentionBatchEntry> entries,
+                                                   uint64_t optimization_flags);
 
-[[nodiscard]] Result<void> forward_attention(
-    const WeightStore& weights,
-    const CompiledOperatorTable& operators,
-    const AttentionBlockPlan& plan,
-    ExecutionBackend backend,
-    float norm_epsilon,
-    DType kv_cache_dtype,
-    uint64_t position_offset,
-    LayerCache& cache,
-    AttentionScratch& scratch,
-    const ActivationBuffer& hidden,
-    ActivationBuffer& output,
-    uint64_t optimization_flags);
+[[nodiscard]] Result<void> forward_attention(const WeightStore& weights,
+                                             const CompiledOperatorTable& operators,
+                                             const AttentionBlockPlan& plan,
+                                             ExecutionBackend backend,
+                                             float norm_epsilon,
+                                             DType kv_cache_dtype,
+                                             uint64_t position_offset,
+                                             LayerCache& cache,
+                                             AttentionScratch& scratch,
+                                             const ActivationBuffer& hidden,
+                                             ActivationBuffer& output,
+                                             uint64_t optimization_flags);
 
-[[nodiscard]] Result<void> append_attention_context(
-    const WeightStore& weights,
-    const CompiledOperatorTable& operators,
-    const AttentionBlockPlan& plan,
-    ExecutionBackend backend,
-    float norm_epsilon,
-    DType kv_cache_dtype,
-    uint64_t position_offset,
-    LayerCache& cache,
-    AttentionScratch& scratch,
-    const ActivationBuffer& hidden,
-    uint64_t optimization_flags);
+[[nodiscard]] Result<void> append_attention_context(const WeightStore& weights,
+                                                    const CompiledOperatorTable& operators,
+                                                    const AttentionBlockPlan& plan,
+                                                    ExecutionBackend backend,
+                                                    float norm_epsilon,
+                                                    DType kv_cache_dtype,
+                                                    uint64_t position_offset,
+                                                    LayerCache& cache,
+                                                    AttentionScratch& scratch,
+                                                    const ActivationBuffer& hidden,
+                                                    uint64_t optimization_flags);
 
 } // namespace moe
 } // namespace ncnn

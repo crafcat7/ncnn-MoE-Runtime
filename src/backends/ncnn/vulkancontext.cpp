@@ -13,11 +13,10 @@ namespace moe {
 
 #if NCNN_MOE_WITH_VULKAN
 
-static bool has_batch_shape(
-    const ncnn::VkMat& buffer,
-    size_t rows,
-    uint32_t columns,
-    size_t element_size)
+static bool has_batch_shape(const ncnn::VkMat& buffer,
+                            size_t rows,
+                            uint32_t columns,
+                            size_t element_size)
 {
     return buffer.dims == 2
            && buffer.w == static_cast<int>(columns)
@@ -26,20 +25,18 @@ static bool has_batch_shape(
            && buffer.elempack == 1;
 }
 
-bool prepare_staging_batch(
-    ncnn::VkMat& buffer,
-    size_t rows,
-    uint32_t columns,
-    ncnn::VkAllocator* allocator,
-    VulkanRuntimeState& runtime_state,
-    size_t element_size)
+bool prepare_staging_batch(ncnn::VkMat& buffer,
+                           size_t rows,
+                           uint32_t columns,
+                           ncnn::VkAllocator* allocator,
+                           VulkanRuntimeState& runtime_state,
+                           size_t element_size)
 {
     const bool reused = has_batch_shape(buffer, rows, columns, element_size);
-    buffer.create(
-        static_cast<int>(columns),
-        static_cast<int>(rows),
-        element_size,
-        allocator);
+    buffer.create(static_cast<int>(columns),
+                  static_cast<int>(rows),
+                  element_size,
+                  allocator);
     if (buffer.empty() || !buffer.mapped_ptr())
         return false;
     if (reused)
@@ -49,14 +46,13 @@ bool prepare_staging_batch(
     return true;
 }
 
-bool prepare_staging_tensor(
-    ncnn::VkMat& buffer,
-    int width,
-    int height,
-    int channels,
-    size_t element_size,
-    ncnn::VkAllocator* allocator,
-    VulkanRuntimeState& runtime_state)
+bool prepare_staging_tensor(ncnn::VkMat& buffer,
+                            int width,
+                            int height,
+                            int channels,
+                            size_t element_size,
+                            ncnn::VkAllocator* allocator,
+                            VulkanRuntimeState& runtime_state)
 {
     const bool reused = buffer.dims == 3
                         && buffer.w == width
@@ -74,11 +70,10 @@ bool prepare_staging_tensor(
     return true;
 }
 
-bool record_mapped_upload(
-    ncnn::VkMat& staging,
-    ncnn::VkMat& destination,
-    ncnn::VkCompute& command,
-    const ncnn::Option& option)
+bool record_mapped_upload(ncnn::VkMat& staging,
+                          ncnn::VkMat& destination,
+                          ncnn::VkCompute& command,
+                          const ncnn::Option& option)
 {
     staging.allocator->flush(staging.data);
     staging.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
@@ -87,9 +82,8 @@ bool record_mapped_upload(
     return !destination.empty();
 }
 
-static ncnn::Option activation_source_option(
-    const ncnn::Option& option,
-    DType source_dtype)
+static ncnn::Option activation_source_option(const ncnn::Option& option,
+                                             DType source_dtype)
 {
     ncnn::Option source_option = option;
     if (source_dtype == DType::BFloat16)
@@ -109,13 +103,12 @@ static ncnn::Option activation_source_option(
     return source_option;
 }
 
-bool record_mapped_activation_upload(
-    ncnn::VkMat& staging,
-    ncnn::VkMat& destination,
-    ncnn::VkCompute& command,
-    ncnn::VulkanDevice* device,
-    const ncnn::Option& option,
-    DType source_dtype)
+bool record_mapped_activation_upload(ncnn::VkMat& staging,
+                                     ncnn::VkMat& destination,
+                                     ncnn::VkCompute& command,
+                                     ncnn::VulkanDevice* device,
+                                     const ncnn::Option& option,
+                                     DType source_dtype)
 {
     if (vulkan_activation_storage_variant(option) == 0)
     {
@@ -128,13 +121,12 @@ bool record_mapped_activation_upload(
         staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
         const ncnn::Option source_option = activation_source_option(option, source_dtype);
         const int destination_elempack = staging.h % 4 == 0 ? 4 : 1;
-        device->convert_packing(
-            staging,
-            destination,
-            destination_elempack,
-            1,
-            command,
-            source_option);
+        device->convert_packing(staging,
+                                destination,
+                                destination_elempack,
+                                1,
+                                command,
+                                source_option);
         return !destination.empty();
     }
     if (!device || staging.empty() || !staging.mapped_ptr())
@@ -144,20 +136,18 @@ bool record_mapped_activation_upload(
     staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
     const int cast_type = option.use_bf16_storage ? 5 : 2;
     const ncnn::Option source_option = activation_source_option(option, source_dtype);
-    device->convert_packing(
-        staging,
-        destination,
-        1,
-        cast_type,
-        command,
-        source_option);
+    device->convert_packing(staging,
+                            destination,
+                            1,
+                            cast_type,
+                            command,
+                            source_option);
     return !destination.empty()
            && destination.elemsize == vulkan_activation_element_size(option);
 }
 
-ncnn::VkMat bind_direct_host_input(
-    ncnn::VkMat& staging,
-    VulkanRuntimeState& runtime_state)
+ncnn::VkMat bind_direct_host_input(ncnn::VkMat& staging,
+                                   VulkanRuntimeState& runtime_state)
 {
     staging.allocator->flush(staging.data);
     staging.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
@@ -166,9 +156,8 @@ ncnn::VkMat bind_direct_host_input(
     return staging;
 }
 
-ncnn::VkMat prepare_direct_host_output(
-    ncnn::VkMat& staging,
-    VulkanRuntimeState& runtime_state)
+ncnn::VkMat prepare_direct_host_output(ncnn::VkMat& staging,
+                                       VulkanRuntimeState& runtime_state)
 {
     staging.data->access_flags = VK_ACCESS_HOST_READ_BIT;
     staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
@@ -176,11 +165,10 @@ ncnn::VkMat prepare_direct_host_output(
     return staging;
 }
 
-bool fill_staging_upload(
-    const ActivationBuffer& input,
-    ncnn::VkMat& staging,
-    ncnn::VkAllocator* allocator,
-    VulkanRuntimeState& runtime_state)
+bool fill_staging_upload(const ActivationBuffer& input,
+                         ncnn::VkMat& staging,
+                         ncnn::VkAllocator* allocator,
+                         VulkanRuntimeState& runtime_state)
 {
     const size_t element_size = input.element_size();
     if (element_size == 0
@@ -190,13 +178,12 @@ bool fill_staging_upload(
     {
         return false;
     }
-    if (!prepare_staging_batch(
-            staging,
-            input.rows(),
-            input.columns(),
-            allocator,
-            runtime_state,
-            element_size))
+    if (!prepare_staging_batch(staging,
+                               input.rows(),
+                               input.columns(),
+                               allocator,
+                               runtime_state,
+                               element_size))
     {
         return false;
     }
@@ -211,13 +198,12 @@ bool fill_staging_upload(
     return true;
 }
 
-bool fill_staging_values(
-    const void* source,
-    size_t count,
-    size_t element_size,
-    ncnn::VkMat& staging,
-    ncnn::VkAllocator* allocator,
-    VulkanRuntimeState& runtime_state)
+bool fill_staging_values(const void* source,
+                         size_t count,
+                         size_t element_size,
+                         ncnn::VkMat& staging,
+                         ncnn::VkAllocator* allocator,
+                         VulkanRuntimeState& runtime_state)
 {
     if (!source
         || count == 0
@@ -226,13 +212,12 @@ bool fill_staging_values(
     {
         return false;
     }
-    if (!prepare_staging_batch(
-            staging,
-            1,
-            static_cast<uint32_t>(count),
-            allocator,
-            runtime_state,
-            element_size))
+    if (!prepare_staging_batch(staging,
+                               1,
+                               static_cast<uint32_t>(count),
+                               allocator,
+                               runtime_state,
+                               element_size))
     {
         return false;
     }
@@ -246,14 +231,13 @@ bool fill_staging_values(
     return true;
 }
 
-bool record_prepared_staging_upload(
-    const ncnn::VkMat& staging,
-    size_t rows,
-    ncnn::VkMat& destination,
-    ncnn::VkCompute& command,
-    ncnn::VulkanDevice* device,
-    const ncnn::Option& option,
-    DType source_dtype)
+bool record_prepared_staging_upload(const ncnn::VkMat& staging,
+                                    size_t rows,
+                                    ncnn::VkMat& destination,
+                                    ncnn::VkCompute& command,
+                                    ncnn::VulkanDevice* device,
+                                    const ncnn::Option& option,
+                                    DType source_dtype)
 {
     if (!device || staging.empty() || !staging.mapped_ptr())
         return false;
@@ -269,23 +253,21 @@ bool record_prepared_staging_upload(
         cast_type = 1;
     }
     const ncnn::Option source_option = activation_source_option(option, source_dtype);
-    device->convert_packing(
-        staging,
-        destination,
-        destination_elempack,
-        cast_type,
-        command,
-        source_option);
+    device->convert_packing(staging,
+                            destination,
+                            destination_elempack,
+                            cast_type,
+                            command,
+                            source_option);
     return !destination.empty();
 }
 
-bool record_prepared_staging_download(
-    const ncnn::VkMat& source,
-    size_t rows,
-    uint32_t columns,
-    ncnn::VkMat& staging,
-    ncnn::VkCompute& command,
-    const ncnn::Option& option)
+bool record_prepared_staging_download(const ncnn::VkMat& source,
+                                      size_t rows,
+                                      uint32_t columns,
+                                      ncnn::VkMat& staging,
+                                      ncnn::VkCompute& command,
+                                      const ncnn::Option& option)
 {
     if (!has_batch_shape(staging, rows, columns, sizeof(float)))
         return false;
@@ -297,15 +279,14 @@ bool record_prepared_staging_download(
     return !staging.empty();
 }
 
-bool record_prepared_activation_staging_download(
-    const ncnn::VkMat& source,
-    size_t rows,
-    uint32_t columns,
-    ncnn::VkMat& staging,
-    ncnn::VkCompute& command,
-    ncnn::VulkanDevice* device,
-    const ncnn::Option& option,
-    DType output_dtype)
+bool record_prepared_activation_staging_download(const ncnn::VkMat& source,
+                                                 size_t rows,
+                                                 uint32_t columns,
+                                                 ncnn::VkMat& staging,
+                                                 ncnn::VkCompute& command,
+                                                 ncnn::VulkanDevice* device,
+                                                 const ncnn::Option& option,
+                                                 DType output_dtype)
 {
     const size_t output_element_size = output_dtype == DType::Float32
                                            ? sizeof(float)
@@ -328,23 +309,21 @@ bool record_prepared_activation_staging_download(
         && output_dtype == DType::Float32
         && source_matches_cpu_batch)
     {
-        return record_prepared_staging_download(
-            source,
-            rows,
-            columns,
-            staging,
-            command,
-            option);
+        return record_prepared_staging_download(source,
+                                                rows,
+                                                columns,
+                                                staging,
+                                                command,
+                                                option);
     }
     if (!device)
         return false;
     if (!staging.allocator)
         return false;
-    staging.create(
-        static_cast<int>(columns),
-        static_cast<int>(rows),
-        output_element_size,
-        staging.allocator);
+    staging.create(static_cast<int>(columns),
+                   static_cast<int>(rows),
+                   output_element_size,
+                   staging.allocator);
     if (staging.empty() || !staging.mapped_ptr())
         return false;
     if (!has_batch_shape(staging, rows, columns, output_element_size))
@@ -353,24 +332,21 @@ bool record_prepared_activation_staging_download(
     staging_option.blob_vkallocator = staging.allocator;
     staging_option.workspace_vkallocator = staging.allocator;
     staging_option.staging_vkallocator = staging.allocator;
-    device->convert_packing(
-        source,
-        staging,
-        1,
-        output_cast_type,
-        command,
-        staging_option);
-    const bool matches = has_batch_shape(
-        staging,
-        rows,
-        columns,
-        output_element_size);
+    device->convert_packing(source,
+                            staging,
+                            1,
+                            output_cast_type,
+                            command,
+                            staging_option);
+    const bool matches = has_batch_shape(staging,
+                                         rows,
+                                         columns,
+                                         output_element_size);
     return matches;
 }
 
-bool copy_staging_to_cpu_batch(
-    ncnn::VkMat& staging,
-    ActivationBuffer& output)
+bool copy_staging_to_cpu_batch(ncnn::VkMat& staging,
+                               ActivationBuffer& output)
 {
     const size_t element_size = output.element_size();
     if (element_size == 0 || staging.elemsize != element_size)
@@ -389,20 +365,18 @@ bool copy_staging_to_cpu_batch(
     const size_t row_bytes = static_cast<size_t>(output.columns()) * element_size;
     const auto* source = static_cast<const std::byte*>(mapped.data);
     for (size_t row_index = 0; row_index < output.rows(); ++row_index)
-        std::memcpy(
-            output.mutable_row_bytes(row_index).data(),
-            source + row_index * row_bytes,
-            row_bytes);
+        std::memcpy(output.mutable_row_bytes(row_index).data(),
+                    source + row_index * row_bytes,
+                    row_bytes);
     staging.data->access_flags = VK_ACCESS_HOST_READ_BIT;
     staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
     return true;
 }
 
-bool copy_staging_to_cpu_batches(
-    ncnn::VkMat& staging,
-    std::span<const ActivationBuffer*> inputs,
-    std::span<ActivationBuffer*> outputs,
-    uint32_t columns)
+bool copy_staging_to_cpu_batches(ncnn::VkMat& staging,
+                                 std::span<const ActivationBuffer*> inputs,
+                                 std::span<ActivationBuffer*> outputs,
+                                 uint32_t columns)
 {
     if (inputs.empty()
         || inputs.size() != outputs.size()
@@ -484,10 +458,9 @@ bool copy_staging_to_cpu_batches(
     {
         ActivationBuffer& output = *outputs[index];
         const size_t output_bytes = output.rows() * row_bytes;
-        std::memcpy(
-            output.mutable_bytes().data(),
-            source + row_offset * row_bytes,
-            output_bytes);
+        std::memcpy(output.mutable_bytes().data(),
+                    source + row_offset * row_bytes,
+                    output_bytes);
         row_offset += output.rows();
     }
     staging.data->access_flags = VK_ACCESS_HOST_READ_BIT;
@@ -495,9 +468,8 @@ bool copy_staging_to_cpu_batches(
     return true;
 }
 
-bool prepare_float_tensor_upload(
-    const TensorData& source,
-    ncnn::Mat& destination)
+bool prepare_float_tensor_upload(const TensorData& source,
+                                 ncnn::Mat& destination)
 {
     if (source.element_count() == 0
         || source.element_count()
@@ -622,8 +594,7 @@ std::vector<GpuInfo> get_gpu_infos()
     return infos;
 }
 
-VulkanStatistics get_vulkan_statistics(
-    const VulkanRuntimePtr& vulkan_runtime) noexcept
+VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& vulkan_runtime) noexcept
 {
 #if NCNN_MOE_WITH_VULKAN
     return vulkan_runtime ? vulkan_runtime->state.snapshot()
@@ -638,27 +609,23 @@ VulkanStatistics get_vulkan_statistics(
 static uint32_t vulkan_command_optimization_flags(uint64_t optimization_flags) noexcept
 {
     uint32_t flags = 0;
-    if (has_flag(
-            optimization_flags,
-            OptimizationVulkanPipelineBindElision))
+    if (has_flag(optimization_flags,
+                 OptimizationVulkanPipelineBindElision))
     {
         flags |= ncnn::VkComputeOptimizationPipelineBindElision;
     }
-    if (has_flag(
-            optimization_flags,
-            OptimizationVulkanReadonlyBindings))
+    if (has_flag(optimization_flags,
+                 OptimizationVulkanReadonlyBindings))
     {
         flags |= ncnn::VkComputeOptimizationReadonlyBindings;
     }
-    if (has_flag(
-            optimization_flags,
-            OptimizationVulkanBatchBufferBarriers))
+    if (has_flag(optimization_flags,
+                 OptimizationVulkanBatchBufferBarriers))
     {
         flags |= ncnn::VkComputeOptimizationBatchBufferBarriers;
     }
-    if (has_flag(
-            optimization_flags,
-            OptimizationVulkanStackDescriptorPayload))
+    if (has_flag(optimization_flags,
+                 OptimizationVulkanStackDescriptorPayload))
     {
         flags |= ncnn::VkComputeOptimizationStackDescriptorPayload;
     }
@@ -712,15 +679,13 @@ VulkanStatistics VulkanRuntimeState::snapshot() const noexcept
     return result;
 }
 
-int submit_compute_and_wait(
-    ncnn::VkCompute& command,
-    VulkanRuntimeState& runtime_state)
+int submit_compute_and_wait(ncnn::VkCompute& command,
+                            VulkanRuntimeState& runtime_state)
 {
     const ncnn::VkComputeCommandStatistics command_recording = command.command_statistics();
     const auto started = std::chrono::steady_clock::now();
     const int result = command.submit_and_wait();
-    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - started);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started);
     runtime_state.submit_wait_time_microseconds += static_cast<uint64_t>(elapsed.count());
     runtime_state.command_dispatches += command_recording.dispatches;
     runtime_state.command_pipeline_binds += command_recording.pipeline_binds;
@@ -748,16 +713,14 @@ VulkanContext::~VulkanContext()
     }
 }
 
-std::shared_ptr<VulkanContext> VulkanContext::acquire(
-    uint32_t requested_device_index,
-    const VulkanRuntimePtr& vulkan_runtime,
-    uint64_t optimization_flags)
+std::shared_ptr<VulkanContext> VulkanContext::acquire(uint32_t requested_device_index,
+                                                      const VulkanRuntimePtr& vulkan_runtime,
+                                                      uint64_t optimization_flags)
 {
     if (!vulkan_runtime)
         return {};
     {
-        const std::lock_guard<std::mutex> lock(
-            vulkan_runtime->initialization_mutex);
+        const std::lock_guard<std::mutex> lock(vulkan_runtime->initialization_mutex);
         if (!vulkan_runtime->initialization_attempted)
         {
             vulkan_runtime->initialization_attempted = true;
@@ -783,8 +746,7 @@ std::shared_ptr<VulkanContext> VulkanContext::acquire(
     const VulkanContextCacheKey context_key{
         device_index,
         optimization_flags};
-    const std::lock_guard<std::mutex> lock(
-        vulkan_runtime->context_mutex);
+    const std::lock_guard<std::mutex> lock(vulkan_runtime->context_mutex);
     const auto existing = vulkan_runtime->contexts.find(context_key);
     if (existing != vulkan_runtime->contexts.end())
     {
@@ -794,20 +756,18 @@ std::shared_ptr<VulkanContext> VulkanContext::acquire(
         }
         vulkan_runtime->contexts.erase(existing);
     }
-    auto context = std::shared_ptr<VulkanContext>(new VulkanContext(
-        device,
-        vulkan_runtime,
-        optimization_flags,
-        command_flags));
+    auto context = std::shared_ptr<VulkanContext>(new VulkanContext(device,
+                                                                    vulkan_runtime,
+                                                                    optimization_flags,
+                                                                    command_flags));
     vulkan_runtime->contexts.emplace(context_key, context);
     return context;
 }
 
-std::shared_ptr<const std::vector<uint32_t>> VulkanContext::shader_binary(
-    const char* source,
-    int source_length,
-    const ncnn::Option& option,
-    uint64_t variant)
+std::shared_ptr<const std::vector<uint32_t>> VulkanContext::shader_binary(const char* source,
+                                                                          int source_length,
+                                                                          const ncnn::Option& option,
+                                                                          uint64_t variant)
 {
     if (!source || source_length <= 0)
         return {};
@@ -817,11 +777,10 @@ std::shared_ptr<const std::vector<uint32_t>> VulkanContext::shader_binary(
     if (cached != shader_binaries.end())
         return cached->second;
     std::vector<uint32_t> spirv;
-    if (ncnn::compile_spirv_module(
-            source,
-            source_length,
-            option,
-            spirv)
+    if (ncnn::compile_spirv_module(source,
+                                   source_length,
+                                   option,
+                                   spirv)
             != 0
         || spirv.empty())
     {
@@ -834,9 +793,8 @@ std::shared_ptr<const std::vector<uint32_t>> VulkanContext::shader_binary(
     return binary;
 }
 
-std::shared_ptr<ncnn::Pipeline> VulkanContext::find_pipeline(
-    const char* source,
-    uint64_t variant) const
+std::shared_ptr<ncnn::Pipeline> VulkanContext::find_pipeline(const char* source,
+                                                             uint64_t variant) const
 {
     const std::lock_guard<std::mutex> lock(pipeline_cache_mutex);
     const auto cached = pipelines.find({source, variant});
@@ -845,10 +803,9 @@ std::shared_ptr<ncnn::Pipeline> VulkanContext::find_pipeline(
     return cached->second.lock();
 }
 
-void VulkanContext::cache_pipeline(
-    const char* source,
-    uint64_t variant,
-    const std::shared_ptr<ncnn::Pipeline>& pipeline)
+void VulkanContext::cache_pipeline(const char* source,
+                                   uint64_t variant,
+                                   const std::shared_ptr<ncnn::Pipeline>& pipeline)
 {
     const std::lock_guard<std::mutex> lock(pipeline_cache_mutex);
     pipelines[{source, variant}] = pipeline;
@@ -868,11 +825,10 @@ VulkanTransferLease VulkanContext::acquire_transfer_slot()
     return VulkanTransferLease(slot, std::move(lock));
 }
 
-VulkanContext::VulkanContext(
-    ncnn::VulkanDevice* device,
-    VulkanRuntimePtr _vulkan_runtime,
-    uint64_t optimization_flags,
-    uint32_t command_optimization_flags)
+VulkanContext::VulkanContext(ncnn::VulkanDevice* device,
+                             VulkanRuntimePtr _vulkan_runtime,
+                             uint64_t optimization_flags,
+                             uint32_t command_optimization_flags)
     : vkdev(device),
       vulkan_runtime(std::move(_vulkan_runtime)),
       flags(optimization_flags),
@@ -895,11 +851,10 @@ VulkanWeightUploadBatch::VulkanWeightUploadBatch(const std::shared_ptr<VulkanCon
 {
 }
 
-bool VulkanWeightUploadBatch::record(
-    const ncnn::Mat& source,
-    ncnn::VkMat& destination,
-    const ncnn::Option& option,
-    ncnn::VkAllocator* weight_allocator)
+bool VulkanWeightUploadBatch::record(const ncnn::Mat& source,
+                                     ncnn::VkMat& destination,
+                                     const ncnn::Option& option,
+                                     ncnn::VkAllocator* weight_allocator)
 {
     if (!context || !weight_allocator || source.empty())
         return false;

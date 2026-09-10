@@ -95,10 +95,9 @@ void main()
             const float scale = decode_scale(scale_byte(scale_row + block));
             const uint value = packed_byte(packed_row + block * 16 + lane / 2);
             const uint nibble = (lane & 1) == 0 ? value & 15 : value >> 4;
-            sum += mxfp4_product(
-                decode_mxfp4(nibble),
-                input_data[input_row + block * 32 + lane],
-                scale);
+            sum += mxfp4_product(decode_mxfp4(nibble),
+                                 input_data[input_row + block * 32 + lane],
+                                 scale);
         }
     }
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic

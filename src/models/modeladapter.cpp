@@ -78,8 +78,7 @@ static bool append_json_codepoint(uint32_t codepoint, std::string& output)
     return true;
 }
 
-static bool parse_json_hex_escape(
-    const std::string& json, size_t& position, uint32_t& codepoint)
+static bool parse_json_hex_escape(const std::string& json, size_t& position, uint32_t& codepoint)
 {
     if (json.size() - position < 4)
         return false;
@@ -96,10 +95,9 @@ static bool parse_json_hex_escape(
     return true;
 }
 
-static bool parse_json_string(
-    const std::string& json,
-    size_t& position,
-    std::string* decoded)
+static bool parse_json_string(const std::string& json,
+                              size_t& position,
+                              std::string* decoded)
 {
     if (position >= json.size() || json[position++] != '"')
         return false;
@@ -298,10 +296,9 @@ static bool scan_json_value(const std::string& json, size_t& position)
     return true;
 }
 
-static bool scan_json_array(
-    const std::string& json,
-    size_t& position,
-    std::vector<std::string>& elements)
+static bool scan_json_array(const std::string& json,
+                            size_t& position,
+                            std::vector<std::string>& elements)
 {
     if (position >= json.size() || json[position++] != '[')
         return false;
@@ -336,8 +333,7 @@ static bool scan_json_array(
     return false;
 }
 
-std::optional<std::string> find_manifest_member(
-    const std::string& json, const std::string& key)
+std::optional<std::string> find_manifest_member(const std::string& json, const std::string& key)
 {
     size_t position = 0;
     skip_json_whitespace(json, position);
@@ -381,8 +377,7 @@ std::optional<std::string> find_manifest_member(
     return std::nullopt;
 }
 
-Result<std::string> read_manifest_object(
-    const std::string& json, const std::string& key, const char* prefix)
+Result<std::string> read_manifest_object(const std::string& json, const std::string& key, const char* prefix)
 {
     const std::optional<std::string> value = find_manifest_member(json, key);
     if (!value)
@@ -479,8 +474,7 @@ Result<bool> read_manifest_bool(const std::string& json, const std::string& key,
     return *value == "true";
 }
 
-Result<std::vector<uint32_t>> read_manifest_uint32_array(
-    const std::string& json, const std::string& key, const char* prefix)
+Result<std::vector<uint32_t>> read_manifest_uint32_array(const std::string& json, const std::string& key, const char* prefix)
 {
     const std::optional<std::string> value = find_manifest_member(json, key);
     if (!value)
@@ -518,8 +512,7 @@ Result<std::vector<uint32_t>> read_manifest_uint32_array(
     return result;
 }
 
-Result<std::vector<std::string>> read_manifest_string_array(
-    const std::string& json, const std::string& key, const char* prefix)
+Result<std::vector<std::string>> read_manifest_string_array(const std::string& json, const std::string& key, const char* prefix)
 {
     const std::optional<std::string> value = find_manifest_member(json, key);
     if (!value)
@@ -553,10 +546,9 @@ float optional_manifest_float(const std::string& json, const std::string& key, f
     return value ? value.value() : fallback;
 }
 
-Result<uint32_t> get_rotary_dimension(
-    uint32_t head_dimension,
-    float partial_rotary_factor,
-    const char* description)
+Result<uint32_t> get_rotary_dimension(uint32_t head_dimension,
+                                      float partial_rotary_factor,
+                                      const char* description)
 {
     const float value = static_cast<float>(head_dimension) * partial_rotary_factor;
     const float rounded = std::round(value);
@@ -575,9 +567,8 @@ Result<uint32_t> get_rotary_dimension(
     return dimension;
 }
 
-static Result<uint64_t> fnv1a64_file(
-    const std::filesystem::path& path,
-    const char* description)
+static Result<uint64_t> fnv1a64_file(const std::filesystem::path& path,
+                                     const char* description)
 {
     std::ifstream stream(path, std::ios::binary);
     if (!stream)
@@ -602,9 +593,8 @@ static Result<uint64_t> fnv1a64_file(
     return hash;
 }
 
-Result<bool> optional_artifact_exists(
-    const std::filesystem::path& path,
-    const char* description)
+Result<bool> optional_artifact_exists(const std::filesystem::path& path,
+                                      const char* description)
 {
     std::error_code error;
     const bool exists = std::filesystem::exists(path, error);
@@ -617,15 +607,14 @@ Result<bool> optional_artifact_exists(
     return exists;
 }
 
-static std::string mxfp4_artifact_identity_name(
-    const char* prefix,
-    uint32_t layer_count,
-    uint32_t mtp_layer_count,
-    uint32_t expert_count,
-    uint32_t hidden_size,
-    uint32_t intermediate_size,
-    uint64_t config_hash,
-    uint64_t index_hash)
+static std::string mxfp4_artifact_identity_name(const char* prefix,
+                                                uint32_t layer_count,
+                                                uint32_t mtp_layer_count,
+                                                uint32_t expert_count,
+                                                uint32_t hidden_size,
+                                                uint32_t intermediate_size,
+                                                uint64_t config_hash,
+                                                uint64_t index_hash)
 {
     std::ostringstream name;
     name << prefix
@@ -639,11 +628,10 @@ static std::string mxfp4_artifact_identity_name(
     return name.str();
 }
 
-static Result<void> validate_u8_artifact_tensor(
-    const SafetensorsArchive& archive,
-    const std::string& name,
-    const std::vector<uint32_t>& shape,
-    const char* description)
+static Result<void> validate_u8_artifact_tensor(const SafetensorsArchive& archive,
+                                                const std::string& name,
+                                                const std::vector<uint32_t>& shape,
+                                                const char* description)
 {
     const SafetensorInfo* info = archive.find(name);
     if (!info)
@@ -664,17 +652,16 @@ static Result<void> validate_u8_artifact_tensor(
     return {};
 }
 
-Result<void> validate_mxfp4_artifact_identity(
-    const SafetensorsArchive& archive,
-    const ModelPackage& package,
-    const char* identity_prefix,
-    uint32_t layer_count,
-    uint32_t mtp_layer_count,
-    uint32_t expert_count,
-    uint32_t hidden_size,
-    uint32_t intermediate_size,
-    const char* identity_description,
-    const char* artifact_description)
+Result<void> validate_mxfp4_artifact_identity(const SafetensorsArchive& archive,
+                                              const ModelPackage& package,
+                                              const char* identity_prefix,
+                                              uint32_t layer_count,
+                                              uint32_t mtp_layer_count,
+                                              uint32_t expert_count,
+                                              uint32_t hidden_size,
+                                              uint32_t intermediate_size,
+                                              const char* identity_description,
+                                              const char* artifact_description)
 {
     uint64_t config_hash = UINT64_C(14695981039346656037);
     for (unsigned char value : package.manifest.raw_json)
@@ -685,15 +672,14 @@ Result<void> validate_mxfp4_artifact_identity(
     auto index_hash = fnv1a64_file(package.root / "model.safetensors.index.json", identity_description);
     if (!index_hash)
         return index_hash.error();
-    const std::string identity = mxfp4_artifact_identity_name(
-        identity_prefix,
-        layer_count,
-        mtp_layer_count,
-        expert_count,
-        hidden_size,
-        intermediate_size,
-        config_hash,
-        index_hash.value());
+    const std::string identity = mxfp4_artifact_identity_name(identity_prefix,
+                                                              layer_count,
+                                                              mtp_layer_count,
+                                                              expert_count,
+                                                              hidden_size,
+                                                              intermediate_size,
+                                                              config_hash,
+                                                              index_hash.value());
     auto status = validate_u8_artifact_tensor(archive, identity, {0}, artifact_description);
     if (!status)
     {
@@ -705,50 +691,44 @@ Result<void> validate_mxfp4_artifact_identity(
     return {};
 }
 
-Result<void> validate_mxfp4_artifact_expert_bank(
-    const SafetensorsArchive& archive,
-    const std::string& prefix,
-    uint32_t expert_count,
-    uint32_t hidden_size,
-    uint32_t intermediate_size,
-    const char* description)
+Result<void> validate_mxfp4_artifact_expert_bank(const SafetensorsArchive& archive,
+                                                 const std::string& prefix,
+                                                 uint32_t expert_count,
+                                                 uint32_t hidden_size,
+                                                 uint32_t intermediate_size,
+                                                 const char* description)
 {
-    auto status = validate_u8_artifact_tensor(
-        archive,
-        prefix + "gate_up.blocks",
-        {expert_count, intermediate_size * 2, hidden_size / 32, 16},
-        description);
+    auto status = validate_u8_artifact_tensor(archive,
+                                              prefix + "gate_up.blocks",
+                                              {expert_count, intermediate_size * 2, hidden_size / 32, 16},
+                                              description);
     if (!status)
         return status.error();
 
-    status = validate_u8_artifact_tensor(
-        archive,
-        prefix + "gate_up.scales",
-        {expert_count, intermediate_size * 2, hidden_size / 32},
-        description);
+    status = validate_u8_artifact_tensor(archive,
+                                         prefix + "gate_up.scales",
+                                         {expert_count, intermediate_size * 2, hidden_size / 32},
+                                         description);
     if (!status)
         return status.error();
 
-    status = validate_u8_artifact_tensor(
-        archive,
-        prefix + "down.blocks",
-        {expert_count, hidden_size, intermediate_size / 32, 16},
-        description);
+    status = validate_u8_artifact_tensor(archive,
+                                         prefix + "down.blocks",
+                                         {expert_count, hidden_size, intermediate_size / 32, 16},
+                                         description);
     if (!status)
         return status.error();
 
-    return validate_u8_artifact_tensor(
-        archive,
-        prefix + "down.scales",
-        {expert_count, hidden_size, intermediate_size / 32},
-        description);
+    return validate_u8_artifact_tensor(archive,
+                                       prefix + "down.scales",
+                                       {expert_count, hidden_size, intermediate_size / 32},
+                                       description);
 }
 
-Result<void> add_tensor(
-    WeightMapping& mapping,
-    const SafetensorsArchive& archive,
-    const std::string& target,
-    const std::string& source)
+Result<void> add_tensor(WeightMapping& mapping,
+                        const SafetensorsArchive& archive,
+                        const std::string& target,
+                        const std::string& source)
 {
     auto tensor = archive.load_tensor(source);
     if (!tensor)
@@ -758,13 +738,12 @@ Result<void> add_tensor(
     return {};
 }
 
-Result<void> add_bfloat16_slice(
-    WeightMapping& mapping,
-    const SafetensorsArchive& archive,
-    const std::string& target_name,
-    const std::string& source_name,
-    uint32_t index,
-    std::vector<uint32_t> shape)
+Result<void> add_bfloat16_slice(WeightMapping& mapping,
+                                const SafetensorsArchive& archive,
+                                const std::string& target_name,
+                                const std::string& source_name,
+                                uint32_t index,
+                                std::vector<uint32_t> shape)
 {
     auto tensor = archive.load_bfloat16_slice(source_name, index, std::move(shape));
     if (!tensor)
@@ -773,14 +752,13 @@ Result<void> add_bfloat16_slice(
     return {};
 }
 
-Result<void> add_bfloat16_expert_bank(
-    WeightMapping& mapping,
-    const SafetensorsArchive& archive,
-    const std::string& target_prefix,
-    const std::string& target_suffix,
-    const std::string& source_name,
-    uint32_t expert_count,
-    const std::vector<uint32_t>& shape)
+Result<void> add_bfloat16_expert_bank(WeightMapping& mapping,
+                                      const SafetensorsArchive& archive,
+                                      const std::string& target_prefix,
+                                      const std::string& target_suffix,
+                                      const std::string& source_name,
+                                      uint32_t expert_count,
+                                      const std::vector<uint32_t>& shape)
 {
     const SafetensorInfo* source = archive.find(source_name);
     if (!source || source->dtype != "BF16" || expert_count == 0 || shape.empty()
@@ -835,37 +813,33 @@ Result<void> add_bfloat16_expert_bank(
             slice.dtype = DType::BFloat16;
             slice.shape = shape;
             const size_t byte_offset = static_cast<size_t>(static_cast<uint64_t>(expert_id) * slice_size);
-            slice.mapped_data = std::shared_ptr<const uint8_t>(
-                bank_data, bank_data.get() + byte_offset);
+            slice.mapped_data = std::shared_ptr<const uint8_t>(bank_data, bank_data.get() + byte_offset);
             slice.mapped_size = slice_size;
-            mapping.emplace(
-                target_prefix + "experts." + std::to_string(expert_id) + "." + target_suffix,
-                std::move(slice));
+            mapping.emplace(target_prefix + "experts." + std::to_string(expert_id) + "." + target_suffix,
+                            std::move(slice));
         }
         return {};
     }
 
     for (uint32_t expert_id = 0; expert_id < expert_count; ++expert_id)
     {
-        auto status = add_bfloat16_slice(
-            mapping, archive,
-            target_prefix + "experts." + std::to_string(expert_id) + "." + target_suffix,
-            source_name, expert_id, shape);
+        auto status = add_bfloat16_slice(mapping, archive,
+                                         target_prefix + "experts." + std::to_string(expert_id) + "." + target_suffix,
+                                         source_name, expert_id, shape);
         if (!status)
             return status.error();
     }
     return {};
 }
 
-static Result<void> add_query_gate(
-    WeightMapping& mapping,
-    const SafetensorsArchive& archive,
-    const std::string& source,
-    const std::string& target_prefix,
-    uint32_t head_count,
-    uint32_t head_dimension,
-    uint32_t hidden_size,
-    const char* description)
+static Result<void> add_query_gate(WeightMapping& mapping,
+                                   const SafetensorsArchive& archive,
+                                   const std::string& source,
+                                   const std::string& target_prefix,
+                                   uint32_t head_count,
+                                   uint32_t head_dimension,
+                                   uint32_t hidden_size,
+                                   const char* description)
 {
     const uint64_t query_rows = static_cast<uint64_t>(head_count) * head_dimension;
     if (query_rows == 0 || query_rows > std::numeric_limits<uint32_t>::max() / 2 || hidden_size == 0)
@@ -910,14 +884,12 @@ static Result<void> add_query_gate(
     return {};
 }
 
-Result<void> add_qwen_attention(
-    WeightMapping& mapping, const SafetensorsArchive& archive,
-    const std::string& source_prefix, const std::string& target_prefix,
-    uint32_t head_count, uint32_t head_dimension, uint32_t hidden_size, const char* description)
+Result<void> add_qwen_attention(WeightMapping& mapping, const SafetensorsArchive& archive,
+                                const std::string& source_prefix, const std::string& target_prefix,
+                                uint32_t head_count, uint32_t head_dimension, uint32_t hidden_size, const char* description)
 {
-    auto ret = add_query_gate(
-        mapping, archive, source_prefix + "self_attn.q_proj.weight", target_prefix,
-        head_count, head_dimension, hidden_size, description);
+    auto ret = add_query_gate(mapping, archive, source_prefix + "self_attn.q_proj.weight", target_prefix,
+                              head_count, head_dimension, hidden_size, description);
     if (!ret)
         return ret.error();
 
@@ -937,9 +909,8 @@ Result<void> add_qwen_attention(
     return {};
 }
 
-Result<void> add_qwen_gated_delta_net(
-    WeightMapping& mapping, const SafetensorsArchive& archive,
-    const std::string& source_prefix, const std::string& target_prefix)
+Result<void> add_qwen_gated_delta_net(WeightMapping& mapping, const SafetensorsArchive& archive,
+                                      const std::string& source_prefix, const std::string& target_prefix)
 {
     const std::pair<const char*, const char*> delta_tensors[] = {
         {"attention.delta.qkv.weight", "linear_attn.in_proj_qkv.weight"},
@@ -961,9 +932,8 @@ Result<void> add_qwen_gated_delta_net(
     return {};
 }
 
-Result<void> add_qwen_shared_expert(
-    WeightMapping& mapping, const SafetensorsArchive& archive,
-    const std::string& source_prefix, const std::string& target_prefix)
+Result<void> add_qwen_shared_expert(WeightMapping& mapping, const SafetensorsArchive& archive,
+                                    const std::string& source_prefix, const std::string& target_prefix)
 {
     const std::pair<const char*, const char*> shared_expert_tensors[] = {
         {"shared_expert.gate.weight", "mlp.shared_expert.gate_proj.weight"},
@@ -980,16 +950,15 @@ Result<void> add_qwen_shared_expert(
     return {};
 }
 
-Result<void> add_mxfp4_expert(
-    WeightMapping& mapping,
-    const SafetensorsArchive& archive,
-    const std::string& target_name,
-    const std::string& blocks_name,
-    const std::string& scales_name,
-    uint32_t expert_id,
-    uint32_t rows,
-    uint32_t columns,
-    uint32_t flags)
+Result<void> add_mxfp4_expert(WeightMapping& mapping,
+                              const SafetensorsArchive& archive,
+                              const std::string& target_name,
+                              const std::string& blocks_name,
+                              const std::string& scales_name,
+                              uint32_t expert_id,
+                              uint32_t rows,
+                              uint32_t columns,
+                              uint32_t flags)
 {
     auto tensor = archive.load_mxfp4_expert(blocks_name, scales_name, expert_id, rows, columns, flags);
     if (!tensor)

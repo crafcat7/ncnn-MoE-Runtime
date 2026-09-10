@@ -92,14 +92,13 @@ public:
                                                                   std::shared_ptr<Linear> fused_qkv,
                                                                   std::shared_ptr<Linear> output_projection,
                                                                   const AttentionConfig_vulkan& config);
-    [[nodiscard]] static std::shared_ptr<Attention_vulkan> create(
-        const TensorData& norm_weight,
-        const TensorData& query_norm_weight,
-        const TensorData& key_norm_weight,
-        const TensorData* sinks,
-        std::shared_ptr<Bfloat16Linear_vulkan> fused_qkv_gate,
-        std::shared_ptr<Bfloat16Linear_vulkan> output_projection,
-        const AttentionConfig_vulkan& config);
+    [[nodiscard]] static std::shared_ptr<Attention_vulkan> create(const TensorData& norm_weight,
+                                                                  const TensorData& query_norm_weight,
+                                                                  const TensorData& key_norm_weight,
+                                                                  const TensorData* sinks,
+                                                                  std::shared_ptr<Bfloat16Linear_vulkan> fused_qkv_gate,
+                                                                  std::shared_ptr<Bfloat16Linear_vulkan> output_projection,
+                                                                  const AttentionConfig_vulkan& config);
     // One upload, one submission, and one download per Attention block.
     [[nodiscard]] bool forward(uint64_t position_offset, LayerCache& cache, const ActivationBuffer& input, ActivationBuffer& output) const;
     // Materializes an otherwise valid device KV ring into the CPU cache.  This
@@ -108,8 +107,7 @@ public:
     [[nodiscard]] bool materialize_device_cache(LayerCache& cache) const;
     void record_cpu_fallback() const noexcept;
     // Independent one-row Session caches recorded into one queue submission.
-    [[nodiscard]] AttentionBatchResult_vulkan forward_batch(
-        std::span<const AttentionBatchEntry_vulkan> entries) const;
+    [[nodiscard]] AttentionBatchResult_vulkan forward_batch(std::span<const AttentionBatchEntry_vulkan> entries) const;
 
 private:
     class Implementation;
@@ -117,36 +115,34 @@ private:
 #if NCNN_MOE_WITH_VULKAN
     [[nodiscard]] bool support_qkv_rope(size_t token_count) const noexcept;
 
-    [[nodiscard]] bool record_qkv_rope(
-        const ncnn::VkMat& fused_qkv,
-        const ncnn::VkMat& cosine,
-        const ncnn::VkMat& sine,
-        size_t token_count,
-        uint64_t position_offset,
-        bool device_rope,
-        const AttentionCache_vulkan* ring,
-        uint64_t ring_capacity,
-        uint64_t destination_start,
-        ncnn::VkMat& query,
-        ncnn::VkMat& key,
-        ncnn::VkMat& value,
-        ncnn::VkCompute& cmd) const;
+    [[nodiscard]] bool record_qkv_rope(const ncnn::VkMat& fused_qkv,
+                                       const ncnn::VkMat& cosine,
+                                       const ncnn::VkMat& sine,
+                                       size_t token_count,
+                                       uint64_t position_offset,
+                                       bool device_rope,
+                                       const AttentionCache_vulkan* ring,
+                                       uint64_t ring_capacity,
+                                       uint64_t destination_start,
+                                       ncnn::VkMat& query,
+                                       ncnn::VkMat& key,
+                                       ncnn::VkMat& value,
+                                       ncnn::VkCompute& cmd) const;
 
-    [[nodiscard]] bool record_qkv_norm_rope(
-        const ncnn::VkMat& fused_qkv,
-        const ncnn::VkMat& cosine,
-        const ncnn::VkMat& sine,
-        size_t token_count,
-        uint64_t position_offset,
-        bool device_rope,
-        const AttentionCache_vulkan* ring,
-        uint64_t ring_capacity,
-        uint64_t destination_start,
-        ncnn::VkMat& query,
-        ncnn::VkMat& key,
-        ncnn::VkMat& value,
-        ncnn::VkMat& gate,
-        ncnn::VkCompute& cmd) const;
+    [[nodiscard]] bool record_qkv_norm_rope(const ncnn::VkMat& fused_qkv,
+                                            const ncnn::VkMat& cosine,
+                                            const ncnn::VkMat& sine,
+                                            size_t token_count,
+                                            uint64_t position_offset,
+                                            bool device_rope,
+                                            const AttentionCache_vulkan* ring,
+                                            uint64_t ring_capacity,
+                                            uint64_t destination_start,
+                                            ncnn::VkMat& query,
+                                            ncnn::VkMat& key,
+                                            ncnn::VkMat& value,
+                                            ncnn::VkMat& gate,
+                                            ncnn::VkCompute& cmd) const;
 #endif
 
     Attention_vulkan();

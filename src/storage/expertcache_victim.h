@@ -77,16 +77,14 @@ class ReuseFilteredExpertVictimCache final : public ExpertVictimCache
 public:
     ReuseFilteredExpertVictimCache(std::shared_ptr<ExpertVictimCache> _inner, uint32_t _reuse_probe_interval);
 
-    void admit(
-        std::string key,
-        std::shared_ptr<const TensorData> gate_up,
-        std::shared_ptr<const TensorData> down,
-        ExpertVictimExecutionMetadata execution) override;
+    void admit(std::string key,
+               std::shared_ptr<const TensorData> gate_up,
+               std::shared_ptr<const TensorData> down,
+               ExpertVictimExecutionMetadata execution) override;
 
-    std::optional<ExpertVictimPair> restore(
-        const std::string& key,
-        const TensorData& gate_up_source,
-        const TensorData& down_source) override;
+    std::optional<ExpertVictimPair> restore(const std::string& key,
+                                            const TensorData& gate_up_source,
+                                            const TensorData& down_source) override;
 
     void wait_for_background_work() override;
 
@@ -118,16 +116,14 @@ class ShardedExpertVictimCache final : public ExpertVictimCache
 public:
     explicit ShardedExpertVictimCache(std::vector<std::shared_ptr<ExpertVictimCache>> _shards);
 
-    void admit(
-        std::string key,
-        std::shared_ptr<const TensorData> gate_up,
-        std::shared_ptr<const TensorData> down,
-        ExpertVictimExecutionMetadata execution) override;
+    void admit(std::string key,
+               std::shared_ptr<const TensorData> gate_up,
+               std::shared_ptr<const TensorData> down,
+               ExpertVictimExecutionMetadata execution) override;
 
-    std::optional<ExpertVictimPair> restore(
-        const std::string& key,
-        const TensorData& gate_up_source,
-        const TensorData& down_source) override;
+    std::optional<ExpertVictimPair> restore(const std::string& key,
+                                            const TensorData& gate_up_source,
+                                            const TensorData& down_source) override;
 
     void wait_for_background_work() override;
 

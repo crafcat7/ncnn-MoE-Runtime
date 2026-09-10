@@ -103,38 +103,34 @@ enum ExpertCacheOptionFlag : uint32_t
 class ExpertCache
 {
 public:
-    explicit ExpertCache(
-        uint64_t _cache_size,
-        uint32_t num_io_threads = 0,
-        std::shared_ptr<ExpertVictimCache> _victim_cache = {},
-        ExpertIoMode _io_mode = ExpertIoMode::Auto,
-        uint32_t _flags = 0,
-        uint32_t num_residency_groups = 0,
-        bool _reserve_cpu_packed_weights = false);
+    explicit ExpertCache(uint64_t _cache_size,
+                         uint32_t num_io_threads = 0,
+                         std::shared_ptr<ExpertVictimCache> _victim_cache = {},
+                         ExpertIoMode _io_mode = ExpertIoMode::Auto,
+                         uint32_t _flags = 0,
+                         uint32_t num_residency_groups = 0,
+                         bool _reserve_cpu_packed_weights = false);
     ~ExpertCache();
 
     ExpertCache(const ExpertCache&) = delete;
     ExpertCache& operator=(const ExpertCache&) = delete;
 
     // Queues an exact read and reports readiness at the same lock point.
-    [[nodiscard]] Result<bool> request_pair(
-        const TensorData& gate_up,
-        const TensorData& down,
-        uint32_t residency_group = std::numeric_limits<uint32_t>::max(),
-        std::string_view prepared_key = {},
-        ExpertVictimExecutionMetadata victim_execution = {});
+    [[nodiscard]] Result<bool> request_pair(const TensorData& gate_up,
+                                            const TensorData& down,
+                                            uint32_t residency_group = std::numeric_limits<uint32_t>::max(),
+                                            std::string_view prepared_key = {},
+                                            ExpertVictimExecutionMetadata victim_execution = {});
     // Best-effort admission; exact reads retain priority.
-    [[nodiscard]] Result<bool> prefetch_pair(
-        const TensorData& gate_up,
-        const TensorData& down,
-        uint32_t residency_group = std::numeric_limits<uint32_t>::max(),
-        std::string_view prepared_key = {});
-    [[nodiscard]] Result<ExpertCacheLease> acquire_pair(
-        const TensorData& gate_up,
-        const TensorData& down,
-        uint32_t residency_group = std::numeric_limits<uint32_t>::max(),
-        std::string_view prepared_key = {},
-        ExpertVictimExecutionMetadata victim_execution = {});
+    [[nodiscard]] Result<bool> prefetch_pair(const TensorData& gate_up,
+                                             const TensorData& down,
+                                             uint32_t residency_group = std::numeric_limits<uint32_t>::max(),
+                                             std::string_view prepared_key = {});
+    [[nodiscard]] Result<ExpertCacheLease> acquire_pair(const TensorData& gate_up,
+                                                        const TensorData& down,
+                                                        uint32_t residency_group = std::numeric_limits<uint32_t>::max(),
+                                                        std::string_view prepared_key = {},
+                                                        ExpertVictimExecutionMetadata victim_execution = {});
     // Acquires a ready group under one cache lock.
     [[nodiscard]] Result<bool> try_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests, std::span<ExpertCacheLease> leases);
     // Enqueues as many pairs as the current cache capacity permits, waits for
@@ -172,23 +168,21 @@ private:
     [[nodiscard]] Result<ExpertVictimPair> load_independent_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_range_count, uint64_t& mapped_size);
     [[nodiscard]] Result<ExpertVictimPair> load_interleaved_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_range_count, uint64_t& mapped_size);
     [[nodiscard]] Result<ExpertVictimPair> load_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_range_count, uint64_t& mapped_size);
-    [[nodiscard]] Result<std::vector<ExpertVictimPair>> load_coalesced_pairs(
-        std::span<const std::shared_ptr<Entry>> batch,
-        uint64_t& mapped_range_count,
-        uint64_t& mapped_size,
-        uint64_t& saved_range_count,
-        bool& coalesced);
+    [[nodiscard]] Result<std::vector<ExpertVictimPair>> load_coalesced_pairs(std::span<const std::shared_ptr<Entry>> batch,
+                                                                             uint64_t& mapped_range_count,
+                                                                             uint64_t& mapped_size,
+                                                                             uint64_t& saved_range_count,
+                                                                             bool& coalesced);
     [[nodiscard]] static Result<uint64_t> stored_size(const TensorData& tensor);
     [[nodiscard]] static Result<uint64_t> packed_weight_size(const TensorData& tensor);
-    [[nodiscard]] Result<std::shared_ptr<Entry>> enqueue_pair(
-        const TensorData& gate_up,
-        const TensorData& down,
-        bool speculative,
-        uint32_t residency_group,
-        std::string_view prepared_key,
-        ExpertVictimExecutionMetadata victim_execution = {},
-        bool* already_ready = nullptr,
-        bool* temporarily_exhausted = nullptr);
+    [[nodiscard]] Result<std::shared_ptr<Entry>> enqueue_pair(const TensorData& gate_up,
+                                                              const TensorData& down,
+                                                              bool speculative,
+                                                              uint32_t residency_group,
+                                                              std::string_view prepared_key,
+                                                              ExpertVictimExecutionMetadata victim_execution = {},
+                                                              bool* already_ready = nullptr,
+                                                              bool* temporarily_exhausted = nullptr);
     [[nodiscard]] bool evict_one_locked(bool incoming_from_frequent_ghost, bool speculative_admission, uint32_t incoming_group, uint64_t required_size);
     void insert_resident_locked(Entry& entry, bool frequent);
     void touch_resident_locked(Entry& entry, bool repeated);
@@ -199,12 +193,11 @@ private:
     void trim_ghosts_locked();
     [[nodiscard]] uint64_t arc_delta(uint64_t required_size, uint64_t numerator, uint64_t denominator) const;
     [[nodiscard]] bool consume_ghost_locked(std::string_view key, uint64_t required_size, bool& frequent, bool& from_frequent_ghost);
-    [[nodiscard]] Entry* find_victim_locked(
-        const std::list<Entry*>& list,
-        bool speculative,
-        uint32_t residency_group,
-        uint32_t forward_anchor = invalid_residency_group,
-        bool allow_predicted_victim = false);
+    [[nodiscard]] Entry* find_victim_locked(const std::list<Entry*>& list,
+                                            bool speculative,
+                                            uint32_t residency_group,
+                                            uint32_t forward_anchor = invalid_residency_group,
+                                            bool allow_predicted_victim = false);
     void stop_workers();
     void worker_loop();
 

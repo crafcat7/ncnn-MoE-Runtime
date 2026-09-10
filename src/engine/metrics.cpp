@@ -15,11 +15,10 @@
 namespace ncnn {
 namespace moe {
 
-void record_model_resource_delta(
-    const CompiledModel& model,
-    SessionStatistics& statistics,
-    const ExpertCacheStatistics& execution_cache_before,
-    const ExpertBackendStatistics& expert_backend_before)
+void record_model_resource_delta(const CompiledModel& model,
+                                 SessionStatistics& statistics,
+                                 const ExpertCacheStatistics& execution_cache_before,
+                                 const ExpertBackendStatistics& expert_backend_before)
 {
     if (model.expert_cache)
     {
@@ -32,11 +31,10 @@ void record_model_resource_delta(
     }
 }
 
-void record_batch_resource_delta(
-    const CompiledModel& model,
-    std::span<const DecodeBatchEntry> entries,
-    const ExpertCacheStatistics& cache_before,
-    const ExpertBackendStatistics& backend_before)
+void record_batch_resource_delta(const CompiledModel& model,
+                                 std::span<const DecodeBatchEntry> entries,
+                                 const ExpertCacheStatistics& cache_before,
+                                 const ExpertBackendStatistics& backend_before)
 {
     // Each participating Session retains the logical batch resource delta.
     if (model.expert_cache)
@@ -85,10 +83,9 @@ void record_expert_weight_demand(const ExpertPlan& expert, size_t route_count, S
     add_saturating(saturating_weight_product(expert.weight_size, route_count), statistics.expert_route_weight_bytes);
 }
 
-void record_expert_cache_delta(
-    SessionStatistics& statistics,
-    const ExpertCacheStatistics& before,
-    const ExpertCacheStatistics& after)
+void record_expert_cache_delta(SessionStatistics& statistics,
+                               const ExpertCacheStatistics& before,
+                               const ExpertCacheStatistics& after)
 {
     statistics.expert_cache_hits += after.hits - before.hits;
     statistics.expert_cache_misses += after.misses - before.misses;
@@ -126,10 +123,9 @@ void record_expert_cache_delta(
     record_expert_victim_cache_delta(statistics, before.victim, after.victim);
 }
 
-void record_vulkan_execution_delta(
-    SessionStatistics& statistics,
-    const VulkanStatistics& before,
-    const VulkanStatistics& after)
+void record_vulkan_execution_delta(SessionStatistics& statistics,
+                                   const VulkanStatistics& before,
+                                   const VulkanStatistics& after)
 {
     statistics.vulkan_linear_dispatches += after.dispatches - before.dispatches;
     statistics.vulkan_attention_blocks += after.attention_blocks - before.attention_blocks;
@@ -241,9 +237,8 @@ static uint64_t counter_delta(uint64_t current, uint64_t baseline) noexcept
     return current >= baseline ? current - baseline : 0;
 }
 
-RuntimeMetricCounters runtime_metric_counters(
-    const SessionStatistics& statistics,
-    const RuntimeMetricCounters* baseline)
+RuntimeMetricCounters runtime_metric_counters(const SessionStatistics& statistics,
+                                              const RuntimeMetricCounters* baseline)
 {
     const RuntimeMetricCounters empty;
     const RuntimeMetricCounters& start = baseline == nullptr ? empty : *baseline;
@@ -253,87 +248,61 @@ RuntimeMetricCounters runtime_metric_counters(
     result.expert_cache_hits = counter_delta(statistics.expert_cache_hits, start.expert_cache_hits);
     result.expert_cache_misses = counter_delta(statistics.expert_cache_misses, start.expert_cache_misses);
     result.expert_io_bytes = counter_delta(statistics.expert_cache_bytes_read, start.expert_io_bytes);
-    result.expert_compute_time_microseconds = counter_delta(
-        statistics.expert_compute_time_microseconds,
-        start.expert_compute_time_microseconds);
-    result.gpu_submit_count = counter_delta(
-        statistics.vulkan_compute_submissions,
-        start.gpu_submit_count);
-    result.gpu_wait_time_microseconds = counter_delta(
-        statistics.vulkan_submit_wait_time_microseconds,
-        start.gpu_wait_time_microseconds);
-    result.gpu_kernel_time_microseconds = counter_delta(
-        statistics.expert_gpu_execution_time_microseconds,
-        start.gpu_kernel_time_microseconds);
-    result.gpu_kernel_time_available = counter_delta(
-                                           statistics.expert_gpu_executions,
-                                           start.expert_gpu_executions)
+    result.expert_compute_time_microseconds = counter_delta(statistics.expert_compute_time_microseconds,
+                                                            start.expert_compute_time_microseconds);
+    result.gpu_submit_count = counter_delta(statistics.vulkan_compute_submissions,
+                                            start.gpu_submit_count);
+    result.gpu_wait_time_microseconds = counter_delta(statistics.vulkan_submit_wait_time_microseconds,
+                                                      start.gpu_wait_time_microseconds);
+    result.gpu_kernel_time_microseconds = counter_delta(statistics.expert_gpu_execution_time_microseconds,
+                                                        start.gpu_kernel_time_microseconds);
+    result.gpu_kernel_time_available = counter_delta(statistics.expert_gpu_executions,
+                                                     start.expert_gpu_executions)
                                        != 0;
-    result.vulkan_linear_dispatches = counter_delta(
-        statistics.vulkan_linear_dispatches,
-        start.vulkan_linear_dispatches);
-    result.vulkan_attention_blocks = counter_delta(
-        statistics.vulkan_attention_blocks,
-        start.vulkan_attention_blocks);
-    result.vulkan_batch_uploads = counter_delta(
-        statistics.vulkan_batch_uploads,
-        start.vulkan_batch_uploads);
-    result.vulkan_batch_downloads = counter_delta(
-        statistics.vulkan_batch_downloads,
-        start.vulkan_batch_downloads);
-    result.vulkan_attention_qkv_rope_fusions = counter_delta(
-        statistics.vulkan_attention_qkv_rope_fusions,
-        start.vulkan_attention_qkv_rope_fusions);
-    result.vulkan_attention_device_rope_fusions = counter_delta(
-        statistics.vulkan_attention_device_rope_fusions,
-        start.vulkan_attention_device_rope_fusions);
-    result.vulkan_attention_qkv_ring_fusions = counter_delta(
-        statistics.vulkan_attention_qkv_ring_fusions,
-        start.vulkan_attention_qkv_ring_fusions);
-    result.vulkan_attention_cache_materializations = counter_delta(
-        statistics.vulkan_attention_cache_materializations,
-        start.vulkan_attention_cache_materializations);
-    result.vulkan_attention_cpu_fallbacks = counter_delta(
-        statistics.vulkan_attention_cpu_fallbacks,
-        start.vulkan_attention_cpu_fallbacks);
-    result.vulkan_gated_delta_fusions = counter_delta(
-        statistics.vulkan_gated_delta_fusions,
-        start.vulkan_gated_delta_fusions);
-    result.vulkan_gated_delta_submissions = counter_delta(
-        statistics.vulkan_gated_delta_submissions,
-        start.vulkan_gated_delta_submissions);
-    result.expert_gpu_cache_hits = counter_delta(
-        statistics.expert_gpu_cache_hits,
-        start.expert_gpu_cache_hits);
-    result.expert_gpu_cache_misses = counter_delta(
-        statistics.expert_gpu_cache_misses,
-        start.expert_gpu_cache_misses);
-    result.expert_gpu_cache_admissions = counter_delta(
-        statistics.expert_gpu_cache_admissions,
-        start.expert_gpu_cache_admissions);
-    result.expert_gpu_cache_stores = counter_delta(
-        statistics.expert_gpu_cache_stores,
-        start.expert_gpu_cache_stores);
-    result.expert_gpu_cache_dropped_admissions = counter_delta(
-        statistics.expert_gpu_cache_dropped_admissions,
-        start.expert_gpu_cache_dropped_admissions);
+    result.vulkan_linear_dispatches = counter_delta(statistics.vulkan_linear_dispatches,
+                                                    start.vulkan_linear_dispatches);
+    result.vulkan_attention_blocks = counter_delta(statistics.vulkan_attention_blocks,
+                                                   start.vulkan_attention_blocks);
+    result.vulkan_batch_uploads = counter_delta(statistics.vulkan_batch_uploads,
+                                                start.vulkan_batch_uploads);
+    result.vulkan_batch_downloads = counter_delta(statistics.vulkan_batch_downloads,
+                                                  start.vulkan_batch_downloads);
+    result.vulkan_attention_qkv_rope_fusions = counter_delta(statistics.vulkan_attention_qkv_rope_fusions,
+                                                             start.vulkan_attention_qkv_rope_fusions);
+    result.vulkan_attention_device_rope_fusions = counter_delta(statistics.vulkan_attention_device_rope_fusions,
+                                                                start.vulkan_attention_device_rope_fusions);
+    result.vulkan_attention_qkv_ring_fusions = counter_delta(statistics.vulkan_attention_qkv_ring_fusions,
+                                                             start.vulkan_attention_qkv_ring_fusions);
+    result.vulkan_attention_cache_materializations = counter_delta(statistics.vulkan_attention_cache_materializations,
+                                                                   start.vulkan_attention_cache_materializations);
+    result.vulkan_attention_cpu_fallbacks = counter_delta(statistics.vulkan_attention_cpu_fallbacks,
+                                                          start.vulkan_attention_cpu_fallbacks);
+    result.vulkan_gated_delta_fusions = counter_delta(statistics.vulkan_gated_delta_fusions,
+                                                      start.vulkan_gated_delta_fusions);
+    result.vulkan_gated_delta_submissions = counter_delta(statistics.vulkan_gated_delta_submissions,
+                                                          start.vulkan_gated_delta_submissions);
+    result.expert_gpu_cache_hits = counter_delta(statistics.expert_gpu_cache_hits,
+                                                 start.expert_gpu_cache_hits);
+    result.expert_gpu_cache_misses = counter_delta(statistics.expert_gpu_cache_misses,
+                                                   start.expert_gpu_cache_misses);
+    result.expert_gpu_cache_admissions = counter_delta(statistics.expert_gpu_cache_admissions,
+                                                       start.expert_gpu_cache_admissions);
+    result.expert_gpu_cache_stores = counter_delta(statistics.expert_gpu_cache_stores,
+                                                   start.expert_gpu_cache_stores);
+    result.expert_gpu_cache_dropped_admissions = counter_delta(statistics.expert_gpu_cache_dropped_admissions,
+                                                               start.expert_gpu_cache_dropped_admissions);
     result.expert_gpu_cache_resident_size = statistics.expert_gpu_cache_resident_size;
     result.expert_gpu_cache_pending_size = statistics.expert_gpu_cache_pending_size;
-    result.expert_gpu_executions = counter_delta(
-        statistics.expert_gpu_executions,
-        start.expert_gpu_executions);
-    result.expert_gpu_execution_failures = counter_delta(
-        statistics.expert_gpu_execution_failures,
-        start.expert_gpu_execution_failures);
-    result.expert_gpu_route_aggregation_batches = counter_delta(
-        statistics.expert_gpu_route_aggregation_batches,
-        start.expert_gpu_route_aggregation_batches);
-    result.expert_gpu_route_aggregation_routes = counter_delta(
-        statistics.expert_gpu_route_aggregation_routes,
-        start.expert_gpu_route_aggregation_routes);
-    result.expert_gpu_route_aggregation_bytes_saved = counter_delta(
-        statistics.expert_gpu_route_aggregation_bytes_saved,
-        start.expert_gpu_route_aggregation_bytes_saved);
+    result.expert_gpu_executions = counter_delta(statistics.expert_gpu_executions,
+                                                 start.expert_gpu_executions);
+    result.expert_gpu_execution_failures = counter_delta(statistics.expert_gpu_execution_failures,
+                                                         start.expert_gpu_execution_failures);
+    result.expert_gpu_route_aggregation_batches = counter_delta(statistics.expert_gpu_route_aggregation_batches,
+                                                                start.expert_gpu_route_aggregation_batches);
+    result.expert_gpu_route_aggregation_routes = counter_delta(statistics.expert_gpu_route_aggregation_routes,
+                                                               start.expert_gpu_route_aggregation_routes);
+    result.expert_gpu_route_aggregation_bytes_saved = counter_delta(statistics.expert_gpu_route_aggregation_bytes_saved,
+                                                                    start.expert_gpu_route_aggregation_bytes_saved);
     result.expert_cache_resident_size = statistics.expert_cache_resident_size;
     result.kv_cache_logical_size = statistics.kv_cache_logical_size;
     result.kv_cache_allocated_size = statistics.kv_cache_allocated_size;
@@ -355,8 +324,7 @@ void Session::finish_generation() noexcept
 {
     if (!generation_active)
         return;
-    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - generation_start_time);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - generation_start_time);
     generation_elapsed_microseconds = static_cast<uint64_t>(elapsed.count());
     generation_active = false;
 }
@@ -374,8 +342,7 @@ SessionMetrics Session::metrics_unlocked() const
     uint64_t elapsed_microseconds = generation_elapsed_microseconds;
     if (generation_active)
     {
-        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - generation_start_time);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - generation_start_time);
         elapsed_microseconds = static_cast<uint64_t>(elapsed.count());
     }
     result.timing.elapsed_microseconds = elapsed_microseconds;
@@ -383,8 +350,7 @@ SessionMetrics Session::metrics_unlocked() const
     uint64_t ttft_microseconds = 0;
     if (generation_output_tokens != 0)
     {
-        const auto ttft = std::chrono::duration_cast<std::chrono::microseconds>(
-            generation_first_token_time - generation_start_time);
+        const auto ttft = std::chrono::duration_cast<std::chrono::microseconds>(generation_first_token_time - generation_start_time);
         ttft_microseconds = static_cast<uint64_t>(ttft.count());
         result.timing.prompt_elapsed_microseconds = ttft_microseconds;
         result.timing.ttft_microseconds = ttft_microseconds;

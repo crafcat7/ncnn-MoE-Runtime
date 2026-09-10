@@ -86,8 +86,7 @@ Result<MoeModelDescriptor> GptOssModelAdapter::parse_model(const ModelPackage& p
     const std::string* rope_json = &json;
     if (find_manifest_member(json, "rope_scaling"))
     {
-        auto parsed_rope_scaling = read_manifest_object(
-            json, "rope_scaling", "GPT-OSS ");
+        auto parsed_rope_scaling = read_manifest_object(json, "rope_scaling", "GPT-OSS ");
         if (!parsed_rope_scaling)
             return parsed_rope_scaling.error();
         rope_scaling_json = std::move(parsed_rope_scaling).value();
@@ -191,29 +190,25 @@ Result<WeightMapping> GptOssModelAdapter::map_weights(const ModelPackage& packag
         const std::string gate_up_scales = source + "mlp.experts.gate_up_proj_scales";
         const std::string down_blocks = source + "mlp.experts.down_proj_blocks";
         const std::string down_scales = source + "mlp.experts.down_proj_scales";
-        status = add_bfloat16_expert_bank(
-            mapping, archive, target, "gate_up.bias", gate_up_bias,
-            descriptor.expert_count, {descriptor.intermediate_size * 2});
+        status = add_bfloat16_expert_bank(mapping, archive, target, "gate_up.bias", gate_up_bias,
+                                          descriptor.expert_count, {descriptor.intermediate_size * 2});
         if (!status)
             return status.error();
-        status = add_bfloat16_expert_bank(
-            mapping, archive, target, "down.bias", down_bias,
-            descriptor.expert_count, {descriptor.hidden_size});
+        status = add_bfloat16_expert_bank(mapping, archive, target, "down.bias", down_bias,
+                                          descriptor.expert_count, {descriptor.hidden_size});
         if (!status)
             return status.error();
         for (uint32_t expert_id = 0; expert_id < descriptor.expert_count; ++expert_id)
         {
             const std::string expert = expert_prefix(layer_id, expert_id);
-            status = add_mxfp4_expert(
-                mapping, archive, expert + "gate_up.weight", gate_up_blocks, gate_up_scales,
-                expert_id, descriptor.intermediate_size * 2, descriptor.hidden_size,
-                expert_load_flags);
+            status = add_mxfp4_expert(mapping, archive, expert + "gate_up.weight", gate_up_blocks, gate_up_scales,
+                                      expert_id, descriptor.intermediate_size * 2, descriptor.hidden_size,
+                                      expert_load_flags);
             if (!status)
                 return status.error();
-            status = add_mxfp4_expert(
-                mapping, archive, expert + "down.weight", down_blocks, down_scales,
-                expert_id, descriptor.hidden_size, descriptor.intermediate_size,
-                expert_load_flags);
+            status = add_mxfp4_expert(mapping, archive, expert + "down.weight", down_blocks, down_scales,
+                                      expert_id, descriptor.hidden_size, descriptor.intermediate_size,
+                                      expert_load_flags);
             if (!status)
                 return status.error();
         }

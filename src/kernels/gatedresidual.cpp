@@ -32,20 +32,19 @@ static bool valid_bfloat16_vector(const TensorData& tensor, uint32_t size) noexc
            && tensor.bfloat16_values().size() == tensor.element_count();
 }
 
-static Result<void> gated_residual_pre_impl(
-    const ActivationBuffer& input,
-    const TensorData& norm_weight,
-    const TensorData& mix_down_weight,
-    const TensorData& mix_up_weight,
-    const TensorData* inject_weight,
-    uint32_t multiplier,
-    uint32_t hidden_size,
-    float norm_epsilon,
-    float norm_weight_offset,
-    ActivationBuffer& reduced_output,
-    std::vector<float>* post_output,
-    HyperConnectionScratch& scratch,
-    uint64_t optimization_flags)
+static Result<void> gated_residual_pre_impl(const ActivationBuffer& input,
+                                            const TensorData& norm_weight,
+                                            const TensorData& mix_down_weight,
+                                            const TensorData& mix_up_weight,
+                                            const TensorData* inject_weight,
+                                            uint32_t multiplier,
+                                            uint32_t hidden_size,
+                                            float norm_epsilon,
+                                            float norm_weight_offset,
+                                            ActivationBuffer& reduced_output,
+                                            std::vector<float>* post_output,
+                                            HyperConnectionScratch& scratch,
+                                            uint64_t optimization_flags)
 {
     if (multiplier == 0 || hidden_size == 0
         || input.columns() != static_cast<size_t>(multiplier) * hidden_size
@@ -144,43 +143,40 @@ static Result<void> gated_residual_pre_impl(
     return {};
 }
 
-Result<void> gated_residual_pre(
-    const ActivationBuffer& input,
-    const TensorData& norm_weight,
-    const TensorData& mix_down_weight,
-    const TensorData& mix_up_weight,
-    const TensorData& inject_weight,
-    uint32_t multiplier,
-    uint32_t hidden_size,
-    float norm_epsilon,
-    float norm_weight_offset,
-    HyperConnectionMix& result,
-    HyperConnectionScratch& scratch,
-    uint64_t optimization_flags)
+Result<void> gated_residual_pre(const ActivationBuffer& input,
+                                const TensorData& norm_weight,
+                                const TensorData& mix_down_weight,
+                                const TensorData& mix_up_weight,
+                                const TensorData& inject_weight,
+                                uint32_t multiplier,
+                                uint32_t hidden_size,
+                                float norm_epsilon,
+                                float norm_weight_offset,
+                                HyperConnectionMix& result,
+                                HyperConnectionScratch& scratch,
+                                uint64_t optimization_flags)
 {
     result.combine.resize(0);
-    return gated_residual_pre_impl(
-        input,
-        norm_weight,
-        mix_down_weight,
-        mix_up_weight,
-        &inject_weight,
-        multiplier,
-        hidden_size,
-        norm_epsilon,
-        norm_weight_offset,
-        result.reduced,
-        &result.post,
-        scratch,
-        optimization_flags);
+    return gated_residual_pre_impl(input,
+                                   norm_weight,
+                                   mix_down_weight,
+                                   mix_up_weight,
+                                   &inject_weight,
+                                   multiplier,
+                                   hidden_size,
+                                   norm_epsilon,
+                                   norm_weight_offset,
+                                   result.reduced,
+                                   &result.post,
+                                   scratch,
+                                   optimization_flags);
 }
 
-Result<void> gated_residual_post(
-    const ActivationBuffer& branch,
-    const ActivationBuffer& residual,
-    const HyperConnectionMix& mix,
-    uint32_t multiplier,
-    ActivationBuffer& output)
+Result<void> gated_residual_post(const ActivationBuffer& branch,
+                                 const ActivationBuffer& residual,
+                                 const HyperConnectionMix& mix,
+                                 uint32_t multiplier,
+                                 ActivationBuffer& output)
 {
     if (multiplier == 0 || branch.rows() != residual.rows()
         || residual.columns() != branch.columns() * multiplier
@@ -207,35 +203,33 @@ Result<void> gated_residual_post(
     return {};
 }
 
-Result<void> gated_residual_head(
-    const ActivationBuffer& input,
-    const TensorData& norm_weight,
-    const TensorData& mix_down_weight,
-    const TensorData& mix_up_weight,
-    uint32_t multiplier,
-    uint32_t hidden_size,
-    float norm_epsilon,
-    float norm_weight_offset,
-    ActivationBuffer& output,
-    HyperConnectionScratch& scratch,
-    uint64_t optimization_flags)
+Result<void> gated_residual_head(const ActivationBuffer& input,
+                                 const TensorData& norm_weight,
+                                 const TensorData& mix_down_weight,
+                                 const TensorData& mix_up_weight,
+                                 uint32_t multiplier,
+                                 uint32_t hidden_size,
+                                 float norm_epsilon,
+                                 float norm_weight_offset,
+                                 ActivationBuffer& output,
+                                 HyperConnectionScratch& scratch,
+                                 uint64_t optimization_flags)
 {
     if (&output == &input)
         return Error{ErrorCode::InvalidArgument, "gated-residual head output must not alias input"};
-    auto mixed = gated_residual_pre_impl(
-        input,
-        norm_weight,
-        mix_down_weight,
-        mix_up_weight,
-        nullptr,
-        multiplier,
-        hidden_size,
-        norm_epsilon,
-        norm_weight_offset,
-        output,
-        nullptr,
-        scratch,
-        optimization_flags);
+    auto mixed = gated_residual_pre_impl(input,
+                                         norm_weight,
+                                         mix_down_weight,
+                                         mix_up_weight,
+                                         nullptr,
+                                         multiplier,
+                                         hidden_size,
+                                         norm_epsilon,
+                                         norm_weight_offset,
+                                         output,
+                                         nullptr,
+                                         scratch,
+                                         optimization_flags);
     if (!mixed)
         return mixed.error();
     return {};

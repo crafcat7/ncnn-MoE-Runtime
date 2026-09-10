@@ -16,13 +16,11 @@ namespace ncnn {
 namespace moe {
 
 static_assert(std::is_same_v<
-              decltype(std::declval<ModelAdapter&>().parse_model(
-                  std::declval<const ModelPackage&>())),
+              decltype(std::declval<ModelAdapter&>().parse_model(std::declval<const ModelPackage&>())),
               Result<MoeModelDescriptor>>);
 static_assert(std::is_same_v<
-              decltype(std::declval<ModelAdapter&>().map_weights(
-                  std::declval<const ModelPackage&>(),
-                  std::declval<const MoeModelDescriptor&>())),
+              decltype(std::declval<ModelAdapter&>().map_weights(std::declval<const ModelPackage&>(),
+                                                                 std::declval<const MoeModelDescriptor&>())),
               Result<WeightMapping>>);
 
 static int test_public_api()

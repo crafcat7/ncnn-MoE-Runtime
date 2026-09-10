@@ -20,13 +20,12 @@ static std::string mxfp4_expert_prefix(uint32_t layer_id)
     return "__ncnn_moe_qwen3_8_mxfp4__.layers." + std::to_string(layer_id) + ".experts.";
 }
 
-static Result<void> validate_mxfp4_artifact(
-    const ModelPackage& package,
-    uint32_t layer_count,
-    uint32_t mtp_layer_count,
-    uint32_t expert_count,
-    uint32_t hidden_size,
-    uint32_t intermediate_size)
+static Result<void> validate_mxfp4_artifact(const ModelPackage& package,
+                                            uint32_t layer_count,
+                                            uint32_t mtp_layer_count,
+                                            uint32_t expert_count,
+                                            uint32_t hidden_size,
+                                            uint32_t intermediate_size)
 {
     if (hidden_size % 32 != 0 || intermediate_size % 32 != 0)
         return Error{ErrorCode::InvalidModel, "Qwen4 Exp MXFP4 artifact dimensions must be divisible by 32"};
@@ -34,29 +33,27 @@ static Result<void> validate_mxfp4_artifact(
     if (!opened)
         return opened.error();
     SafetensorsArchive archive = std::move(opened).value();
-    auto status = validate_mxfp4_artifact_identity(
-        archive,
-        package,
-        "__ncnn_moe_qwen3_8_mxfp4__.identity.v1.",
-        layer_count,
-        mtp_layer_count,
-        expert_count,
-        hidden_size,
-        intermediate_size,
-        "Qwen4 Exp artifact identity source",
-        "Qwen4 Exp MXFP4 artifact");
+    auto status = validate_mxfp4_artifact_identity(archive,
+                                                   package,
+                                                   "__ncnn_moe_qwen3_8_mxfp4__.identity.v1.",
+                                                   layer_count,
+                                                   mtp_layer_count,
+                                                   expert_count,
+                                                   hidden_size,
+                                                   intermediate_size,
+                                                   "Qwen4 Exp artifact identity source",
+                                                   "Qwen4 Exp MXFP4 artifact");
     if (!status)
         return status.error();
 
     for (uint32_t layer_id = 0; layer_id < layer_count; ++layer_id)
     {
-        status = validate_mxfp4_artifact_expert_bank(
-            archive,
-            mxfp4_expert_prefix(layer_id),
-            expert_count,
-            hidden_size,
-            intermediate_size,
-            "Qwen4 Exp MXFP4 artifact");
+        status = validate_mxfp4_artifact_expert_bank(archive,
+                                                     mxfp4_expert_prefix(layer_id),
+                                                     expert_count,
+                                                     hidden_size,
+                                                     intermediate_size,
+                                                     "Qwen4 Exp MXFP4 artifact");
         if (!status)
             return status.error();
     }
@@ -77,11 +74,10 @@ static bool is_prime(uint64_t value) noexcept
     return true;
 }
 
-static Result<uint64_t> ple_embedding_rows(
-    uint32_t ngram_size,
-    uint32_t heads_per_ngram,
-    uint32_t vocabulary_base,
-    uint32_t alignment)
+static Result<uint64_t> ple_embedding_rows(uint32_t ngram_size,
+                                           uint32_t heads_per_ngram,
+                                           uint32_t vocabulary_base,
+                                           uint32_t alignment)
 {
     if (ngram_size < 2 || heads_per_ngram == 0
         || vocabulary_base == 0 || alignment == 0)
@@ -143,8 +139,7 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
     if (package.manifest.model_type != "qwen4_exp")
         return Error{ErrorCode::UnsupportedModel, "unsupported Qwen4 Exp model_type: " + package.manifest.model_type};
 
-    auto text_config = read_manifest_object(
-        package.manifest.raw_json, "text_config", "Qwen4 Exp ");
+    auto text_config = read_manifest_object(package.manifest.raw_json, "text_config", "Qwen4 Exp ");
     if (!text_config)
         return text_config.error();
     const std::string& json = text_config.value();
@@ -152,8 +147,7 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
     const std::string* rope_json = &json;
     if (find_manifest_member(json, "rope_parameters"))
     {
-        auto parsed_rope_parameters = read_manifest_object(
-            json, "rope_parameters", "Qwen4 Exp ");
+        auto parsed_rope_parameters = read_manifest_object(json, "rope_parameters", "Qwen4 Exp ");
         if (!parsed_rope_parameters)
             return parsed_rope_parameters.error();
         rope_parameters_json = std::move(parsed_rope_parameters).value();
@@ -213,8 +207,7 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
     auto rope_theta = read_manifest_float(*rope_json, "rope_theta", "Qwen4 Exp ");
     if (!rope_theta)
         return rope_theta.error();
-    auto partial_rotary_factor = read_manifest_float(
-        *rope_json, "partial_rotary_factor", "Qwen4 Exp ");
+    auto partial_rotary_factor = read_manifest_float(*rope_json, "partial_rotary_factor", "Qwen4 Exp ");
     if (!partial_rotary_factor)
         return partial_rotary_factor.error();
     auto index_head_count = read_manifest_uint32(json, "indexer_n_heads", "Qwen4 Exp ");
@@ -253,8 +246,7 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
     auto ngram_vocabulary_base = read_manifest_uint32(json, "ngram_vocab_size_base", "Qwen4 Exp ");
     if (!ngram_vocabulary_base)
         return ngram_vocabulary_base.error();
-    auto ngram_vocabulary_alignment = read_manifest_uint32(
-        json, "make_ngram_vocab_size_divisible_by", "Qwen4 Exp ");
+    auto ngram_vocabulary_alignment = read_manifest_uint32(json, "make_ngram_vocab_size_divisible_by", "Qwen4 Exp ");
     if (!ngram_vocabulary_alignment)
         return ngram_vocabulary_alignment.error();
     auto embedding_shards = read_manifest_uint32(json, "split_ngram_parts", "Qwen4 Exp ");
@@ -285,9 +277,8 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
     if (!attention_bias)
         return attention_bias.error();
 
-    auto rotary_dimension_result = get_rotary_dimension(
-        head_dimension.value(), partial_rotary_factor.value(),
-        "unsupported Qwen4 Exp architectural dimensions");
+    auto rotary_dimension_result = get_rotary_dimension(head_dimension.value(), partial_rotary_factor.value(),
+                                                        "unsupported Qwen4 Exp architectural dimensions");
     if (!rotary_dimension_result)
         return rotary_dimension_result.error();
     const uint32_t rotary_dimension = rotary_dimension_result.value();
@@ -321,9 +312,8 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
     {
         return Error{ErrorCode::InvalidModel, "unsupported Qwen4 Exp architectural dimensions"};
     }
-    auto ple_embedding_row_count = ple_embedding_rows(
-        ngram_size.value(), heads_per_ngram.value(),
-        ngram_vocabulary_base.value(), ngram_vocabulary_alignment.value());
+    auto ple_embedding_row_count = ple_embedding_rows(ngram_size.value(), heads_per_ngram.value(),
+                                                      ngram_vocabulary_base.value(), ngram_vocabulary_alignment.value());
     if (!ple_embedding_row_count)
         return ple_embedding_row_count.error();
 
@@ -366,26 +356,23 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
     uint32_t mtp_layer_count = 0;
     if (find_manifest_member(json, "mtp_num_hidden_layers"))
     {
-        auto parsed_mtp_layer_count = read_manifest_uint32(
-            json, "mtp_num_hidden_layers", "Qwen4 Exp ");
+        auto parsed_mtp_layer_count = read_manifest_uint32(json, "mtp_num_hidden_layers", "Qwen4 Exp ");
         if (!parsed_mtp_layer_count)
             return parsed_mtp_layer_count.error();
         mtp_layer_count = parsed_mtp_layer_count.value();
     }
-    auto artifact_status = optional_artifact_exists(
-        package.root / mxfp4_artifact_name, "Qwen4 Exp MXFP4 artifact");
+    auto artifact_status = optional_artifact_exists(package.root / mxfp4_artifact_name, "Qwen4 Exp MXFP4 artifact");
     if (!artifact_status)
         return artifact_status.error();
     const bool artifact_exists = artifact_status.value();
     if (artifact_exists)
     {
-        auto artifact_status = validate_mxfp4_artifact(
-            package,
-            layer_count.value(),
-            mtp_layer_count,
-            expert_count.value(),
-            hidden_size.value(),
-            intermediate_size.value());
+        auto artifact_status = validate_mxfp4_artifact(package,
+                                                       layer_count.value(),
+                                                       mtp_layer_count,
+                                                       expert_count.value(),
+                                                       hidden_size.value(),
+                                                       intermediate_size.value());
         if (!artifact_status)
             return artifact_status.error();
     }
@@ -482,28 +469,26 @@ Result<WeightMapping> Qwen4ExpModelAdapter::map_weights(const ModelPackage& pack
             for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
             {
                 const std::string expert = expert_prefix(layer_id, expert_id);
-                status = add_mxfp4_expert(
-                    mapping,
-                    archive,
-                    expert + "gate_up.weight",
-                    artifact_experts + "gate_up.blocks",
-                    artifact_experts + "gate_up.scales",
-                    expert_id,
-                    moe.intermediate_size * 2,
-                    descriptor.hidden_size,
-                    expert_load_flags);
+                status = add_mxfp4_expert(mapping,
+                                          archive,
+                                          expert + "gate_up.weight",
+                                          artifact_experts + "gate_up.blocks",
+                                          artifact_experts + "gate_up.scales",
+                                          expert_id,
+                                          moe.intermediate_size * 2,
+                                          descriptor.hidden_size,
+                                          expert_load_flags);
                 if (!status)
                     return status.error();
-                status = add_mxfp4_expert(
-                    mapping,
-                    archive,
-                    expert + "down.weight",
-                    artifact_experts + "down.blocks",
-                    artifact_experts + "down.scales",
-                    expert_id,
-                    descriptor.hidden_size,
-                    moe.intermediate_size,
-                    expert_load_flags);
+                status = add_mxfp4_expert(mapping,
+                                          archive,
+                                          expert + "down.weight",
+                                          artifact_experts + "down.blocks",
+                                          artifact_experts + "down.scales",
+                                          expert_id,
+                                          descriptor.hidden_size,
+                                          moe.intermediate_size,
+                                          expert_load_flags);
                 if (!status)
                     return status.error();
             }
@@ -512,16 +497,14 @@ Result<WeightMapping> Qwen4ExpModelAdapter::map_weights(const ModelPackage& pack
         {
             if (moe.intermediate_size > std::numeric_limits<uint32_t>::max() / 2)
                 return Error{ErrorCode::InvalidModel, "Qwen4 Exp BF16 Expert dimensions overflow"};
-            status = add_bfloat16_expert_bank(
-                mapping, archive, target, "gate_up.weight",
-                source + "mlp.experts.gate_up_proj", moe.expert_count,
-                {moe.intermediate_size * 2, descriptor.hidden_size});
+            status = add_bfloat16_expert_bank(mapping, archive, target, "gate_up.weight",
+                                              source + "mlp.experts.gate_up_proj", moe.expert_count,
+                                              {moe.intermediate_size * 2, descriptor.hidden_size});
             if (!status)
                 return status.error();
-            status = add_bfloat16_expert_bank(
-                mapping, archive, target, "down.weight",
-                source + "mlp.experts.down_proj", moe.expert_count,
-                {descriptor.hidden_size, moe.intermediate_size});
+            status = add_bfloat16_expert_bank(mapping, archive, target, "down.weight",
+                                              source + "mlp.experts.down_proj", moe.expert_count,
+                                              {descriptor.hidden_size, moe.intermediate_size});
             if (!status)
                 return status.error();
         }
@@ -535,10 +518,9 @@ Result<WeightMapping> Qwen4ExpModelAdapter::map_weights(const ModelPackage& pack
         }
         else
         {
-            status = add_qwen_attention(
-                mapping, archive, source, target,
-                attention.head_count, attention.head_dimension,
-                descriptor.hidden_size, "Qwen4 Exp");
+            status = add_qwen_attention(mapping, archive, source, target,
+                                        attention.head_count, attention.head_dimension,
+                                        descriptor.hidden_size, "Qwen4 Exp");
             if (!status)
                 return status.error();
             const std::pair<const char*, const char*> qsa_tensors[] = {

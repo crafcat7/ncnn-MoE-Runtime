@@ -164,10 +164,9 @@ public:
             if (count > remaining() / sizeof(uint16_t))
                 return Error{ErrorCode::InvalidModel, "weight file ends before bfloat16 tensor: " + name};
             tensor.bfloat16_data.resize(count);
-            std::memcpy(
-                tensor.bfloat16_data.data(),
-                bytes_.data() + offset_,
-                count * sizeof(uint16_t));
+            std::memcpy(tensor.bfloat16_data.data(),
+                        bytes_.data() + offset_,
+                        count * sizeof(uint16_t));
             offset_ += count * sizeof(uint16_t);
         }
         else if (dtype == DType::Int8)
@@ -467,10 +466,9 @@ Result<WeightMapping> FixtureModelAdapter::map_weights(const ModelPackage& packa
          layer_id < descriptor.layers.size() && layer_id < descriptor.hash_routing_layer_count;
          ++layer_id)
     {
-        status = add(
-            layer_prefix(layer_id) + "router.token_experts",
-            {descriptor.vocabulary_size, descriptor.layers[layer_id].moe.top_k},
-            DType::Int64);
+        status = add(layer_prefix(layer_id) + "router.token_experts",
+                     {descriptor.vocabulary_size, descriptor.layers[layer_id].moe.top_k},
+                     DType::Int64);
         if (!status)
             return status.error();
     }

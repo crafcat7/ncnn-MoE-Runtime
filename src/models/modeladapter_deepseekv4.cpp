@@ -9,25 +9,22 @@
 namespace ncnn {
 namespace moe {
 
-static Result<void> add_experts(
-    WeightMapping& mapping, const SafetensorsArchive& archive,
-    const std::string& source, const std::string& target,
-    uint32_t expert_count, uint32_t hidden_size, uint32_t intermediate_size, uint32_t flags)
+static Result<void> add_experts(WeightMapping& mapping, const SafetensorsArchive& archive,
+                                const std::string& source, const std::string& target,
+                                uint32_t expert_count, uint32_t hidden_size, uint32_t intermediate_size, uint32_t flags)
 {
     for (uint32_t expert_id = 0; expert_id < expert_count; ++expert_id)
     {
         const std::string expert_source = source + "ffn.experts." + std::to_string(expert_id) + ".";
         const std::string expert_target = target + "experts." + std::to_string(expert_id) + ".";
-        auto gate_up = archive.load_interleaved_mxfp4_tensor(
-            expert_source + "w1.weight", expert_source + "w1.scale",
-            expert_source + "w3.weight", expert_source + "w3.scale",
-            intermediate_size, hidden_size, flags);
+        auto gate_up = archive.load_interleaved_mxfp4_tensor(expert_source + "w1.weight", expert_source + "w1.scale",
+                                                             expert_source + "w3.weight", expert_source + "w3.scale",
+                                                             intermediate_size, hidden_size, flags);
         if (!gate_up)
             return gate_up.error();
         mapping.emplace(expert_target + "gate_up.weight", std::move(gate_up).value());
-        auto down = archive.load_mxfp4_tensor(
-            expert_source + "w2.weight", expert_source + "w2.scale",
-            hidden_size, intermediate_size, flags);
+        auto down = archive.load_mxfp4_tensor(expert_source + "w2.weight", expert_source + "w2.scale",
+                                              hidden_size, intermediate_size, flags);
         if (!down)
             return down.error();
         mapping.emplace(expert_target + "down.weight", std::move(down).value());
@@ -98,8 +95,7 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
     const std::string* rope_json = &json;
     if (find_manifest_member(json, "rope_scaling"))
     {
-        auto parsed_rope_scaling = read_manifest_object(
-            json, "rope_scaling", "DeepSeek-V4 ");
+        auto parsed_rope_scaling = read_manifest_object(json, "rope_scaling", "DeepSeek-V4 ");
         if (!parsed_rope_scaling)
             return parsed_rope_scaling.error();
         rope_scaling_json = std::move(parsed_rope_scaling).value();
@@ -108,8 +104,7 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
     const std::string& initial_context_json = find_manifest_member(*rope_json, "original_max_position_embeddings")
                                                   ? *rope_json
                                                   : json;
-    auto initial_context = read_manifest_uint32(
-        initial_context_json, "original_max_position_embeddings", "DeepSeek-V4 ");
+    auto initial_context = read_manifest_uint32(initial_context_json, "original_max_position_embeddings", "DeepSeek-V4 ");
     if (!initial_context)
         return initial_context.error();
     auto hash_layer_count = read_manifest_uint32(json, "num_hash_layers", "DeepSeek-V4 ");
@@ -130,8 +125,7 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
     auto hyper_iterations = read_manifest_uint32(json, "hc_sinkhorn_iters", "DeepSeek-V4 ");
     if (!hyper_iterations)
         return hyper_iterations.error();
-    auto compress_ratios = read_manifest_uint32_array(
-        json, "compress_ratios", "DeepSeek-V4 ");
+    auto compress_ratios = read_manifest_uint32_array(json, "compress_ratios", "DeepSeek-V4 ");
     if (!compress_ratios)
         return compress_ratios.error();
     if (compress_ratios.value().empty())
@@ -146,27 +140,22 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
     const std::string* quantization_json = &json;
     if (find_manifest_member(json, "quantization_config"))
     {
-        auto parsed_quantization_config = read_manifest_object(
-            json, "quantization_config", "DeepSeek-V4 ");
+        auto parsed_quantization_config = read_manifest_object(json, "quantization_config", "DeepSeek-V4 ");
         if (!parsed_quantization_config)
             return parsed_quantization_config.error();
         quantization_config_json = std::move(parsed_quantization_config).value();
         quantization_json = &quantization_config_json;
     }
-    auto quantization_method = read_manifest_string(
-        *quantization_json, "quant_method", "DeepSeek-V4 ");
+    auto quantization_method = read_manifest_string(*quantization_json, "quant_method", "DeepSeek-V4 ");
     if (!quantization_method)
         return quantization_method.error();
-    auto quantization_format = read_manifest_string(
-        *quantization_json, "fmt", "DeepSeek-V4 ");
+    auto quantization_format = read_manifest_string(*quantization_json, "fmt", "DeepSeek-V4 ");
     if (!quantization_format)
         return quantization_format.error();
-    auto scale_format = read_manifest_string(
-        *quantization_json, "scale_fmt", "DeepSeek-V4 ");
+    auto scale_format = read_manifest_string(*quantization_json, "scale_fmt", "DeepSeek-V4 ");
     if (!scale_format)
         return scale_format.error();
-    auto weight_block_size = read_manifest_uint32_array(
-        *quantization_json, "weight_block_size", "DeepSeek-V4 ");
+    auto weight_block_size = read_manifest_uint32_array(*quantization_json, "weight_block_size", "DeepSeek-V4 ");
     if (!weight_block_size)
         return weight_block_size.error();
     if (weight_block_size.value().empty())
@@ -182,8 +171,7 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
                             || find_manifest_member(json, "dspark_markov_rank").has_value();
     if (has_dspark)
     {
-        auto targets = read_manifest_uint32_array(
-            json, "dspark_target_layer_ids", "DeepSeek-V4 ");
+        auto targets = read_manifest_uint32_array(json, "dspark_target_layer_ids", "DeepSeek-V4 ");
         if (!targets)
             return targets.error();
         if (targets.value().empty())
@@ -308,9 +296,8 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
     return descriptor;
 }
 
-static Result<void> add_common_layer_tensors(
-    WeightMapping& mapping, const SafetensorsArchive& archive,
-    const std::string& source, const std::string& target)
+static Result<void> add_common_layer_tensors(WeightMapping& mapping, const SafetensorsArchive& archive,
+                                             const std::string& source, const std::string& target)
 {
     const std::pair<const char*, const char*> tensors[] = {
         {"hyper.attention.function", "hc_attn_fn"},
@@ -344,9 +331,8 @@ static Result<void> add_float8(WeightMapping& mapping, const SafetensorsArchive&
     return {};
 }
 
-static Result<void> add_float8_layer_tensors(
-    WeightMapping& mapping, const SafetensorsArchive& archive,
-    const std::string& source, const std::string& target)
+static Result<void> add_float8_layer_tensors(WeightMapping& mapping, const SafetensorsArchive& archive,
+                                             const std::string& source, const std::string& target)
 {
     const std::pair<const char*, const char*> tensors[] = {
         {"attention.query_a.weight", "attn.wq_a"},
@@ -487,10 +473,9 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
         }
 
         const MoeDescriptor& moe = descriptor.layers[layer_id].moe;
-        status = add_experts(
-            mapping, archive, source, target,
-            descriptor.expert_count, descriptor.hidden_size,
-            moe.intermediate_size, expert_flags);
+        status = add_experts(mapping, archive, source, target,
+                             descriptor.expert_count, descriptor.hidden_size,
+                             moe.intermediate_size, expert_flags);
         if (!status)
             return status.error();
     }
@@ -511,10 +496,9 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
         status = add_float8_layer_tensors(mapping, archive, source, target);
         if (!status)
             return status.error();
-        status = add_experts(
-            mapping, archive, source, target,
-            descriptor.expert_count, descriptor.hidden_size,
-            descriptor.intermediate_size, expert_flags);
+        status = add_experts(mapping, archive, source, target,
+                             descriptor.expert_count, descriptor.hidden_size,
+                             descriptor.intermediate_size, expert_flags);
         if (!status)
             return status.error();
     }

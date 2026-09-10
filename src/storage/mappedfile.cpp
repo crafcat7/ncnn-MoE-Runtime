@@ -37,8 +37,7 @@ void prefetch_mapped_memory(const void* data, size_t byte_count) noexcept
         HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
         if (!kernel32)
             return static_cast<PrefetchVirtualMemoryFunction>(nullptr);
-        return reinterpret_cast<PrefetchVirtualMemoryFunction>(
-            GetProcAddress(kernel32, "PrefetchVirtualMemory"));
+        return reinterpret_cast<PrefetchVirtualMemoryFunction>(GetProcAddress(kernel32, "PrefetchVirtualMemory"));
     }();
     if (!prefetch)
         return;
@@ -76,17 +75,16 @@ Result<std::shared_ptr<MappedFileRange>> MappedFileRange::open(const std::filesy
     uint64_t file_size = 0;
     uint64_t granularity = 0;
 #if defined(_WIN32)
-    range->file_handle = CreateFileW(
-        path.wstring().c_str(),
-        GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        OPEN_EXISTING,
-        // Expert routing touches slices in a demand-driven order across
-        // layers; retain the random-access hint for the bounded working
-        // set used by on-demand mappings.
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
-        nullptr);
+    range->file_handle = CreateFileW(path.wstring().c_str(),
+                                     GENERIC_READ,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     nullptr,
+                                     OPEN_EXISTING,
+                                     // Expert routing touches slices in a demand-driven order across
+                                     // layers; retain the random-access hint for the bounded working
+                                     // set used by on-demand mappings.
+                                     FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
+                                     nullptr);
     if (range->file_handle == INVALID_HANDLE_VALUE)
     {
         return Error{
@@ -152,12 +150,11 @@ Result<std::shared_ptr<MappedFileRange>> MappedFileRange::open(const std::filesy
     range->view_size = static_cast<size_t>(view_size);
     range->data_size = static_cast<size_t>(byte_count);
 #if defined(_WIN32)
-    range->view = MapViewOfFile(
-        range->mapping_handle,
-        FILE_MAP_READ,
-        static_cast<DWORD>(aligned_offset >> 32),
-        static_cast<DWORD>(aligned_offset),
-        range->view_size);
+    range->view = MapViewOfFile(range->mapping_handle,
+                                FILE_MAP_READ,
+                                static_cast<DWORD>(aligned_offset >> 32),
+                                static_cast<DWORD>(aligned_offset),
+                                range->view_size);
     if (range->view == nullptr)
     {
         return Error{
@@ -169,13 +166,12 @@ Result<std::shared_ptr<MappedFileRange>> MappedFileRange::open(const std::filesy
     {
         return Error{ErrorCode::InvalidModel, "model shard mapping offset is too large"};
     }
-    range->view = mmap(
-        nullptr,
-        range->view_size,
-        PROT_READ,
-        MAP_PRIVATE,
-        range->file_handle,
-        static_cast<off_t>(aligned_offset));
+    range->view = mmap(nullptr,
+                       range->view_size,
+                       PROT_READ,
+                       MAP_PRIVATE,
+                       range->file_handle,
+                       static_cast<off_t>(aligned_offset));
     if (range->view == MAP_FAILED)
     {
         range->view = nullptr;

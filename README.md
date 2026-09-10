@@ -475,6 +475,32 @@ and per-session recovery boundaries remain in place. Recorders consume their
 operator's pipelines and weights directly, and batch entries retain only
 per-entry state and resources that must survive submission.
 
+## Code format
+
+Project-owned C/C++ code and Vulkan shaders follow `.clang-format`. For multiline
+declarations and calls, keep the first parameter or argument beside the opening
+`(` and align later arguments with it, including nested calls. A leading comment
+or preprocessor directive may require its own line; raw string contents remain
+unchanged.
+
+```cpp
+auto result = run_router_prediction(model,
+                                    next_layer,
+                                    input,
+                                    prefetch_width);
+```
+
+Run the full style check without configuring or building the runtime:
+
+```bash
+cmake -DNCNN_MOE_SOURCE_DIR=. -P cmake/check_style.cmake
+```
+
+The check requires Python 3.10+ and clang-format 10+ on PATH. It scans `include/`,
+`src/`, `examples/`, and `tests/`, including `.comp` shaders, and is also part of
+the `ncnn_moe_style` CTest. First-argument placement is checked separately because
+clang-format with `ColumnLimit: 0` can preserve existing newlines.
+
 ## License
 
 See [LICENSE](LICENSE). This project builds on the pinned

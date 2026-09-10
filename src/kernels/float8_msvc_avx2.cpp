@@ -22,20 +22,17 @@ static __m256 decode_float8_e4m3(__m128i packed) noexcept
     const __m256i mantissa = _mm256_and_si256(bytes, _mm256_set1_epi32(7));
     const __m256i sign = _mm256_slli_epi32(_mm256_and_si256(bytes, _mm256_set1_epi32(128)), 24);
 
-    const __m256i normal_bits = _mm256_or_si256(
-        sign,
-        _mm256_or_si256(
-            _mm256_slli_epi32(_mm256_add_epi32(exponent, _mm256_set1_epi32(120)), 23),
-            _mm256_slli_epi32(mantissa, 20)));
+    const __m256i normal_bits = _mm256_or_si256(sign,
+                                                _mm256_or_si256(_mm256_slli_epi32(_mm256_add_epi32(exponent, _mm256_set1_epi32(120)), 23),
+                                                                _mm256_slli_epi32(mantissa, 20)));
     const __m256 normal = _mm256_castsi256_ps(normal_bits);
     const __m256 subnormal_magnitude = _mm256_mul_ps(_mm256_cvtepi32_ps(mantissa), _mm256_set1_ps(1.0f / 512.0f));
     const __m256 subnormal = _mm256_xor_ps(subnormal_magnitude, _mm256_castsi256_ps(sign));
     const __m256 exponent_zero = _mm256_castsi256_ps(_mm256_cmpeq_epi32(exponent, _mm256_setzero_si256()));
     __m256 decoded = _mm256_blendv_ps(normal, subnormal, exponent_zero);
 
-    const __m256i nan_mask = _mm256_and_si256(
-        _mm256_cmpeq_epi32(exponent, _mm256_set1_epi32(15)),
-        _mm256_cmpeq_epi32(mantissa, _mm256_set1_epi32(7)));
+    const __m256i nan_mask = _mm256_and_si256(_mm256_cmpeq_epi32(exponent, _mm256_set1_epi32(15)),
+                                              _mm256_cmpeq_epi32(mantissa, _mm256_set1_epi32(7)));
     const __m256 nan_value = _mm256_castsi256_ps(_mm256_or_si256(sign, _mm256_set1_epi32(0x7fc00000)));
     decoded = _mm256_blendv_ps(decoded, nan_value, _mm256_castsi256_ps(nan_mask));
     return decoded;

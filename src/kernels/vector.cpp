@@ -40,16 +40,15 @@ static float scalar_float_dot(const float* left, const float* right, uint32_t co
     return result;
 }
 
-static void scalar_float_gemm_4x4(
-    const float* weights,
-    size_t weight_stride,
-    const float* input,
-    size_t input_stride,
-    uint32_t input_columns,
-    uint32_t output_count,
-    uint32_t token_count,
-    float* output,
-    size_t output_stride) noexcept
+static void scalar_float_gemm_4x4(const float* weights,
+                                  size_t weight_stride,
+                                  const float* input,
+                                  size_t input_stride,
+                                  uint32_t input_columns,
+                                  uint32_t output_count,
+                                  uint32_t token_count,
+                                  float* output,
+                                  size_t output_stride) noexcept
 {
     float accumulators[4][4] = {};
     for (uint32_t column = 0; column < input_columns; ++column)
@@ -68,16 +67,15 @@ static void scalar_float_gemm_4x4(
             output[static_cast<size_t>(token) * output_stride + output_index] = accumulators[token][output_index];
 }
 
-static void scalar_float_gemm_4x8(
-    const float* weights,
-    size_t weight_stride,
-    const float* input,
-    size_t input_stride,
-    uint32_t input_columns,
-    uint32_t output_count,
-    uint32_t token_count,
-    float* output,
-    size_t output_stride) noexcept
+static void scalar_float_gemm_4x8(const float* weights,
+                                  size_t weight_stride,
+                                  const float* input,
+                                  size_t input_stride,
+                                  uint32_t input_columns,
+                                  uint32_t output_count,
+                                  uint32_t token_count,
+                                  float* output,
+                                  size_t output_stride) noexcept
 {
     float accumulators[4][8] = {};
     for (uint32_t column = 0; column < input_columns; ++column)
@@ -97,16 +95,15 @@ static void scalar_float_gemm_4x8(
             output[static_cast<size_t>(token) * output_stride + output_index] = accumulators[token][output_index];
 }
 
-static void scalar_bfloat16_gemm_4x8(
-    const uint16_t* weights,
-    size_t weight_stride,
-    const float* input,
-    size_t input_stride,
-    uint32_t input_columns,
-    uint32_t output_count,
-    uint32_t token_count,
-    float* output,
-    size_t output_stride) noexcept
+static void scalar_bfloat16_gemm_4x8(const uint16_t* weights,
+                                     size_t weight_stride,
+                                     const float* input,
+                                     size_t input_stride,
+                                     uint32_t input_columns,
+                                     uint32_t output_count,
+                                     uint32_t token_count,
+                                     float* output,
+                                     size_t output_stride) noexcept
 {
     float accumulators[4][8] = {};
     for (uint32_t column = 0; column < input_columns; ++column)
@@ -116,8 +113,7 @@ static void scalar_bfloat16_gemm_4x8(
             input_values[token] = input[static_cast<size_t>(token) * input_stride + column];
         for (uint32_t output_index = 0; output_index < output_count; ++output_index)
         {
-            const uint32_t bits = static_cast<uint32_t>(
-                                      weights[static_cast<size_t>(output_index) * weight_stride + column])
+            const uint32_t bits = static_cast<uint32_t>(weights[static_cast<size_t>(output_index) * weight_stride + column])
                                   << 16;
             const float weight = std::bit_cast<float>(bits);
             for (uint32_t token = 0; token < token_count; ++token)
@@ -129,10 +125,9 @@ static void scalar_bfloat16_gemm_4x8(
             output[static_cast<size_t>(token) * output_stride + output_index] = accumulators[token][output_index];
 }
 
-static float scalar_int8_float_dot(
-    const int8_t* left,
-    const float* right,
-    uint32_t count) noexcept
+static float scalar_int8_float_dot(const int8_t* left,
+                                   const float* right,
+                                   uint32_t count) noexcept
 {
     float result = 0.0f;
     for (uint32_t index = 0; index < count; ++index)
@@ -176,23 +171,21 @@ static void scalar_float_l2_scale_inplace(float* values, float epsilon, uint32_t
         values[index] *= inverse_norm;
 }
 
-static void scalar_float_scale_add(
-    float* output,
-    float output_scale,
-    const float* input,
-    float input_scale,
-    uint32_t count) noexcept
+static void scalar_float_scale_add(float* output,
+                                   float output_scale,
+                                   const float* input,
+                                   float input_scale,
+                                   uint32_t count) noexcept
 {
     for (uint32_t index = 0; index < count; ++index)
         output[index] = output[index] * output_scale + input[index] * input_scale;
 }
 
-static void scalar_float_scale_inplace_and_scaled_add(
-    float* values,
-    float value_scale,
-    float* output,
-    float output_scale,
-    uint32_t count) noexcept
+static void scalar_float_scale_inplace_and_scaled_add(float* values,
+                                                      float value_scale,
+                                                      float* output,
+                                                      float output_scale,
+                                                      uint32_t count) noexcept
 {
     for (uint32_t index = 0; index < count; ++index)
     {
@@ -201,14 +194,13 @@ static void scalar_float_scale_inplace_and_scaled_add(
     }
 }
 
-static void scalar_float_scale_inplace_and_scaled_add_and_accumulate(
-    float* values,
-    float value_scale,
-    const float* input,
-    float input_scale,
-    float* output,
-    float output_scale,
-    uint32_t count) noexcept
+static void scalar_float_scale_inplace_and_scaled_add_and_accumulate(float* values,
+                                                                     float value_scale,
+                                                                     const float* input,
+                                                                     float input_scale,
+                                                                     float* output,
+                                                                     float output_scale,
+                                                                     uint32_t count) noexcept
 {
     for (uint32_t index = 0; index < count; ++index)
     {
@@ -233,13 +225,12 @@ static void scalar_bfloat16_weighted_scale(float* output, const float* input, co
     }
 }
 
-static void scalar_float_rms_norm(
-    float* output,
-    const float* input,
-    const float* weight,
-    float epsilon,
-    float weight_offset,
-    uint32_t count) noexcept
+static void scalar_float_rms_norm(float* output,
+                                  const float* input,
+                                  const float* weight,
+                                  float epsilon,
+                                  float weight_offset,
+                                  uint32_t count) noexcept
 {
     if (count == 0)
         return;
@@ -251,13 +242,12 @@ static void scalar_float_rms_norm(
         output[index] = input[index] * inverse_rms * (weight[index] + weight_offset);
 }
 
-static void scalar_bfloat16_rms_norm(
-    float* output,
-    const float* input,
-    const uint16_t* weight,
-    float epsilon,
-    float weight_offset,
-    uint32_t count) noexcept
+static void scalar_bfloat16_rms_norm(float* output,
+                                     const float* input,
+                                     const uint16_t* weight,
+                                     float epsilon,
+                                     float weight_offset,
+                                     uint32_t count) noexcept
 {
     if (count == 0)
         return;
@@ -272,11 +262,10 @@ static void scalar_bfloat16_rms_norm(
     }
 }
 
-static void scalar_float_rope_inplace(
-    float* values,
-    const float* cosine,
-    const float* sine,
-    uint32_t dimension) noexcept
+static void scalar_float_rope_inplace(float* values,
+                                      const float* cosine,
+                                      const float* sine,
+                                      uint32_t dimension) noexcept
 {
     const uint32_t half_dimension = dimension / 2;
     for (uint32_t index = 0; index < half_dimension; ++index)
@@ -288,14 +277,13 @@ static void scalar_float_rope_inplace(
     }
 }
 
-static void scalar_float_hc_pre_4(
-    float* output,
-    const float* input,
-    float scale0,
-    float scale1,
-    float scale2,
-    float scale3,
-    uint32_t hidden_size) noexcept
+static void scalar_float_hc_pre_4(float* output,
+                                  const float* input,
+                                  float scale0,
+                                  float scale1,
+                                  float scale2,
+                                  float scale3,
+                                  uint32_t hidden_size) noexcept
 {
     const float* input1 = input + hidden_size;
     const float* input2 = input1 + hidden_size;
@@ -307,13 +295,12 @@ static void scalar_float_hc_pre_4(
                         + input3[index] * scale3;
 }
 
-static void scalar_float_hc_post_4(
-    float* output,
-    const float* branch,
-    const float* residual,
-    const float* post,
-    const float* combine,
-    uint32_t hidden_size) noexcept
+static void scalar_float_hc_post_4(float* output,
+                                   const float* branch,
+                                   const float* residual,
+                                   const float* post,
+                                   const float* combine,
+                                   uint32_t hidden_size) noexcept
 {
     for (uint32_t index = 0; index < hidden_size; ++index)
     {
@@ -330,11 +317,10 @@ static void scalar_float_hc_post_4(
     }
 }
 
-static void scalar_float_sigmoid_mul(
-    float* output,
-    const float* gate,
-    const float* input,
-    uint32_t count) noexcept
+static void scalar_float_sigmoid_mul(float* output,
+                                     const float* gate,
+                                     const float* input,
+                                     uint32_t count) noexcept
 {
     for (uint32_t index = 0; index < count; ++index)
         output[index] = input[index] / (1.0f + float_approximate_exp(-gate[index]));
@@ -611,124 +597,112 @@ float float_dot(const float* left, const float* right, uint32_t count) noexcept
     return function(left, right, count);
 }
 
-void float_gemm_4x4(
-    const float* weights,
-    size_t weight_stride,
-    const float* input,
-    size_t input_stride,
-    uint32_t input_columns,
-    uint32_t output_count,
-    uint32_t token_count,
-    float* output,
-    size_t output_stride) noexcept
+void float_gemm_4x4(const float* weights,
+                    size_t weight_stride,
+                    const float* input,
+                    size_t input_stride,
+                    uint32_t input_columns,
+                    uint32_t output_count,
+                    uint32_t token_count,
+                    float* output,
+                    size_t output_stride) noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
     {
-        msvc_avx512_float_gemm_4x4(
-            weights,
-            weight_stride,
-            input,
-            input_stride,
-            input_columns,
-            output_count,
-            token_count,
-            output,
-            output_stride);
+        msvc_avx512_float_gemm_4x4(weights,
+                                   weight_stride,
+                                   input,
+                                   input_stride,
+                                   input_columns,
+                                   output_count,
+                                   token_count,
+                                   output,
+                                   output_stride);
         return;
     }
     if ((isa & CpuIsaX86Avx2Fma) != 0)
     {
-        msvc_avx2_float_gemm_4x4(
-            weights,
-            weight_stride,
-            input,
-            input_stride,
-            input_columns,
-            output_count,
-            token_count,
-            output,
-            output_stride);
+        msvc_avx2_float_gemm_4x4(weights,
+                                 weight_stride,
+                                 input,
+                                 input_stride,
+                                 input_columns,
+                                 output_count,
+                                 token_count,
+                                 output,
+                                 output_stride);
         return;
     }
 #endif
-    scalar_float_gemm_4x4(
-        weights,
-        weight_stride,
-        input,
-        input_stride,
-        input_columns,
-        output_count,
-        token_count,
-        output,
-        output_stride);
+    scalar_float_gemm_4x4(weights,
+                          weight_stride,
+                          input,
+                          input_stride,
+                          input_columns,
+                          output_count,
+                          token_count,
+                          output,
+                          output_stride);
 }
 
-void float_gemm_4x8(
-    const float* weights,
-    size_t weight_stride,
-    const float* input,
-    size_t input_stride,
-    uint32_t input_columns,
-    uint32_t output_count,
-    uint32_t token_count,
-    float* output,
-    size_t output_stride) noexcept
+void float_gemm_4x8(const float* weights,
+                    size_t weight_stride,
+                    const float* input,
+                    size_t input_stride,
+                    uint32_t input_columns,
+                    uint32_t output_count,
+                    uint32_t token_count,
+                    float* output,
+                    size_t output_stride) noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
     {
-        msvc_avx512_float_gemm_4x8(
-            weights, weight_stride, input, input_stride, input_columns,
-            output_count, token_count, output, output_stride);
+        msvc_avx512_float_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
+                                   output_count, token_count, output, output_stride);
         return;
     }
     if ((isa & CpuIsaX86Avx2Fma) != 0)
     {
-        msvc_avx2_float_gemm_4x8(
-            weights, weight_stride, input, input_stride, input_columns,
-            output_count, token_count, output, output_stride);
+        msvc_avx2_float_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
+                                 output_count, token_count, output, output_stride);
         return;
     }
 #endif
-    scalar_float_gemm_4x8(
-        weights, weight_stride, input, input_stride, input_columns,
-        output_count, token_count, output, output_stride);
+    scalar_float_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
+                          output_count, token_count, output, output_stride);
 }
 
-void bfloat16_gemm_4x8(
-    const uint16_t* weights,
-    size_t weight_stride,
-    const float* input,
-    size_t input_stride,
-    uint32_t input_columns,
-    uint32_t output_count,
-    uint32_t token_count,
-    float* output,
-    size_t output_stride) noexcept
+void bfloat16_gemm_4x8(const uint16_t* weights,
+                       size_t weight_stride,
+                       const float* input,
+                       size_t input_stride,
+                       uint32_t input_columns,
+                       uint32_t output_count,
+                       uint32_t token_count,
+                       float* output,
+                       size_t output_stride) noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
     {
-        msvc_avx512_bfloat16_gemm_4x8(
-            weights, weight_stride, input, input_stride, input_columns,
-            output_count, token_count, output, output_stride);
+        msvc_avx512_bfloat16_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
+                                      output_count, token_count, output, output_stride);
         return;
     }
     if ((isa & CpuIsaX86Avx2Fma) != 0)
     {
-        msvc_avx2_bfloat16_gemm_4x8(
-            weights, weight_stride, input, input_stride, input_columns,
-            output_count, token_count, output, output_stride);
+        msvc_avx2_bfloat16_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
+                                    output_count, token_count, output, output_stride);
         return;
     }
 #endif
-    scalar_bfloat16_gemm_4x8(
-        weights, weight_stride, input, input_stride, input_columns,
-        output_count, token_count, output, output_stride);
+    scalar_bfloat16_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
+                             output_count, token_count, output, output_stride);
 }
 
 void float_exp_inplace(float* values, uint32_t count) noexcept
@@ -800,36 +774,33 @@ void float_scaled_add(float* output, const float* input, float scale, uint32_t c
     function(output, input, scale, count);
 }
 
-void float_scale_add(
-    float* output,
-    float output_scale,
-    const float* input,
-    float input_scale,
-    uint32_t count) noexcept
+void float_scale_add(float* output,
+                     float output_scale,
+                     const float* input,
+                     float input_scale,
+                     uint32_t count) noexcept
 {
     static const FloatScaleAddFunction function = select_float_scale_add();
     function(output, output_scale, input, input_scale, count);
 }
 
-void float_scale_inplace_and_scaled_add(
-    float* values,
-    float value_scale,
-    float* output,
-    float output_scale,
-    uint32_t count) noexcept
+void float_scale_inplace_and_scaled_add(float* values,
+                                        float value_scale,
+                                        float* output,
+                                        float output_scale,
+                                        uint32_t count) noexcept
 {
     static const FloatScaleInplaceAndScaledAddFunction function = select_float_scale_inplace_and_scaled_add();
     function(values, value_scale, output, output_scale, count);
 }
 
-void float_scale_inplace_and_scaled_add_and_accumulate(
-    float* values,
-    float value_scale,
-    const float* input,
-    float input_scale,
-    float* output,
-    float output_scale,
-    uint32_t count) noexcept
+void float_scale_inplace_and_scaled_add_and_accumulate(float* values,
+                                                       float value_scale,
+                                                       const float* input,
+                                                       float input_scale,
+                                                       float* output,
+                                                       float output_scale,
+                                                       uint32_t count) noexcept
 {
     static const FloatScaleInplaceAndScaledAddAndAccumulateFunction function = select_float_scale_inplace_and_scaled_add_and_accumulate();
     function(values, value_scale, input, input_scale, output, output_scale, count);
@@ -847,11 +818,10 @@ void bfloat16_weighted_scale(float* output, const float* input, const uint16_t* 
     function(output, input, weight, scale, weight_offset, count);
 }
 
-void float_sigmoid_mul(
-    float* output,
-    const float* gate,
-    const float* input,
-    uint32_t count) noexcept
+void float_sigmoid_mul(float* output,
+                       const float* gate,
+                       const float* input,
+                       uint32_t count) noexcept
 {
     static const FloatSigmoidMulFunction function = select_float_sigmoid_mul();
     function(output, gate, input, count);

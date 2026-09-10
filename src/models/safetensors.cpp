@@ -131,12 +131,11 @@ static Result<std::vector<uint32_t>> parse_shape(const std::string& text)
     return shape;
 }
 
-static Result<void> parse_header(
-    const std::filesystem::path& path,
-    const std::string& json,
-    uint64_t data_start,
-    uint64_t file_size,
-    std::unordered_map<std::string, SafetensorInfo>& tensors)
+static Result<void> parse_header(const std::filesystem::path& path,
+                                 const std::string& json,
+                                 uint64_t data_start,
+                                 uint64_t file_size,
+                                 std::unordered_map<std::string, SafetensorInfo>& tensors)
 {
     const std::regex dtype_expression("\"dtype\"\\s*:\\s*\"([^\"]+)\"");
     const std::regex shape_expression("\"shape\"\\s*:\\s*\\[([^\\]]*)\\]");
@@ -195,9 +194,8 @@ static Result<void> parse_header(
     return {};
 }
 
-static Result<void> open_safetensors_file(
-    const std::filesystem::path& path,
-    std::unordered_map<std::string, SafetensorInfo>& tensors)
+static Result<void> open_safetensors_file(const std::filesystem::path& path,
+                                          std::unordered_map<std::string, SafetensorInfo>& tensors)
 {
     std::error_code size_error;
     const uint64_t file_size = std::filesystem::file_size(path, size_error);
@@ -217,12 +215,11 @@ static Result<void> open_safetensors_file(
     stream.read(header.data(), static_cast<std::streamsize>(header_length));
     if (!stream)
         return Error{ErrorCode::InvalidModel, "truncated safetensors header: " + path.string()};
-    return parse_header(
-        path,
-        header,
-        sizeof(header_length) + header_length,
-        file_size,
-        tensors);
+    return parse_header(path,
+                        header,
+                        sizeof(header_length) + header_length,
+                        file_size,
+                        tensors);
 }
 
 Result<SafetensorsArchive> SafetensorsArchive::open(const std::filesystem::path& root)
@@ -262,11 +259,10 @@ const SafetensorInfo* SafetensorsArchive::find(const std::string& name) const no
     return iterator == tensors.end() ? nullptr : &iterator->second;
 }
 
-std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(
-    const std::string& name,
-    uint32_t expert_count,
-    uint32_t rows,
-    uint32_t columns) const noexcept
+std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(const std::string& name,
+                                                               uint32_t expert_count,
+                                                               uint32_t rows,
+                                                               uint32_t columns) const noexcept
 {
     if (expert_count == 0 || !qnk_shape_supported(DType::Q2K, rows, columns))
         return {};
@@ -368,11 +364,10 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) cons
     return tensor;
 }
 
-Result<TensorData> SafetensorsArchive::load_qnk_tensor(
-    const std::string& name,
-    DType dtype,
-    uint32_t rows,
-    uint32_t columns) const
+Result<TensorData> SafetensorsArchive::load_qnk_tensor(const std::string& name,
+                                                       DType dtype,
+                                                       uint32_t rows,
+                                                       uint32_t columns) const
 {
     if (!qnk_shape_supported(dtype, rows, columns))
         return Error{ErrorCode::InvalidArgument, "invalid Qn_K tensor shape: " + name};
@@ -399,13 +394,12 @@ Result<TensorData> SafetensorsArchive::load_qnk_tensor(
     return tensor;
 }
 
-Result<TensorData> SafetensorsArchive::load_qnk_expert(
-    const std::string& name,
-    DType dtype,
-    uint32_t expert_id,
-    uint32_t expert_count,
-    uint32_t rows,
-    uint32_t columns) const
+Result<TensorData> SafetensorsArchive::load_qnk_expert(const std::string& name,
+                                                       DType dtype,
+                                                       uint32_t expert_id,
+                                                       uint32_t expert_count,
+                                                       uint32_t rows,
+                                                       uint32_t columns) const
 {
     if (expert_count == 0 || expert_id >= expert_count || !qnk_shape_supported(dtype, rows, columns))
         return Error{ErrorCode::InvalidArgument, "invalid Qn_K Expert shape: " + name};
@@ -662,13 +656,12 @@ Result<TensorData> SafetensorsArchive::load_bfloat16_slice(const std::string& na
     return tensor;
 }
 
-Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
-    const std::string& blocks_name,
-    const std::string& scales_name,
-    uint32_t expert_id,
-    uint32_t rows,
-    uint32_t columns,
-    uint32_t flags) const
+Result<TensorData> SafetensorsArchive::load_mxfp4_expert(const std::string& blocks_name,
+                                                         const std::string& scales_name,
+                                                         uint32_t expert_id,
+                                                         uint32_t rows,
+                                                         uint32_t columns,
+                                                         uint32_t flags) const
 {
     const SafetensorInfo* blocks = find(blocks_name);
     const SafetensorInfo* scales = find(scales_name);

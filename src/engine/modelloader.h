@@ -14,11 +14,10 @@ class ModelLoader
 {
 public:
     // The caller supplies a fresh unpublished model and discards it on failure.
-    ModelLoader(
-        const RuntimeInfo& _info,
-        const std::vector<std::shared_ptr<ModelAdapter>>& _adapters,
-        const Option& _opt,
-        CompiledModel& _model);
+    ModelLoader(const RuntimeInfo& _info,
+                const std::vector<std::shared_ptr<ModelAdapter>>& _adapters,
+                const Option& _opt,
+                CompiledModel& _model);
 
     [[nodiscard]] Result<void> load(const std::filesystem::path& model_path);
 
@@ -29,15 +28,12 @@ private:
     [[nodiscard]] Result<void> plan_memory();
     [[nodiscard]] Result<void> compile_model();
     [[nodiscard]] Result<void> configure_expert_cache();
-    [[nodiscard]] Result<void> resolve_gpu_cache_sizes(
-        std::vector<uint64_t>& gpu_cache_sizes,
-        std::vector<uint64_t>& gpu_victim_cache_sizes);
-    [[nodiscard]] Result<std::shared_ptr<ExpertVictimCache>> create_expert_victim_cache(
-        const std::vector<uint64_t>& gpu_victim_cache_sizes,
-        std::vector<std::shared_ptr<ExpertVictimCache>>& victim_caches);
-    [[nodiscard]] Result<void> create_expert_backend(
-        const std::vector<uint64_t>& gpu_cache_sizes,
-        const std::vector<std::shared_ptr<ExpertVictimCache>>& victim_caches);
+    [[nodiscard]] Result<void> resolve_gpu_cache_sizes(std::vector<uint64_t>& gpu_cache_sizes,
+                                                       std::vector<uint64_t>& gpu_victim_cache_sizes);
+    [[nodiscard]] Result<std::shared_ptr<ExpertVictimCache>> create_expert_victim_cache(const std::vector<uint64_t>& gpu_victim_cache_sizes,
+                                                                                        std::vector<std::shared_ptr<ExpertVictimCache>>& victim_caches);
+    [[nodiscard]] Result<void> create_expert_backend(const std::vector<uint64_t>& gpu_cache_sizes,
+                                                     const std::vector<std::shared_ptr<ExpertVictimCache>>& victim_caches);
     [[nodiscard]] Result<void> configure_resident_qnk_backend();
 
     [[nodiscard]] uint32_t resolve_expert_io_threads() const;

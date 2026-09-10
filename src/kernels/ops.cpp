@@ -31,9 +31,8 @@ namespace moe {
 
 static bool cpu_mxfp4_q8_enabled(uint64_t optimization_flags) noexcept
 {
-    return has_flag(
-               optimization_flags,
-               OptimizationCpuMxfp4Q8)
+    return has_flag(optimization_flags,
+                    OptimizationCpuMxfp4Q8)
            && mxfp4_q8_kernel_available();
 }
 
@@ -49,15 +48,13 @@ static bool dense_host_storage_available(const TensorData& tensor) noexcept
     return true;
 }
 
-static void require_dense_host_storage(
-    const TensorData& tensor,
-    const char* role)
+static void require_dense_host_storage(const TensorData& tensor,
+                                       const char* role)
 {
     if (!dense_host_storage_available(tensor))
     {
-        throw std::runtime_error(
-            std::string("Vulkan ") + role
-            + " execution failed after its host storage was released");
+        throw std::runtime_error(std::string("Vulkan ") + role
+                                 + " execution failed after its host storage was released");
     }
 }
 
@@ -109,15 +106,13 @@ static float selected_scaled_silu(float value, float sigmoid_scale, bool approxi
     return approximate ? approximate_scaled_silu(value, sigmoid_scale) : exact_scaled_silu(value, sigmoid_scale);
 }
 
-float scaled_silu(
-    float value,
-    float sigmoid_scale,
-    uint64_t optimization_flags) noexcept
+float scaled_silu(float value,
+                  float sigmoid_scale,
+                  uint64_t optimization_flags) noexcept
 {
-    return selected_scaled_silu(
-        value,
-        sigmoid_scale,
-        has_flag(optimization_flags, OptimizationCpuFastSilu));
+    return selected_scaled_silu(value,
+                                sigmoid_scale,
+                                has_flag(optimization_flags, OptimizationCpuFastSilu));
 }
 
 const char* scaled_silu_kernel_name(uint64_t optimization_flags) noexcept
@@ -183,11 +178,10 @@ static int openmp_mxfp4_group_team_size(uint64_t operation_count) noexcept
 #endif
 }
 
-static float expert_activation(
-    float value,
-    ExpertActivation activation,
-    float limit,
-    uint64_t optimization_flags) noexcept
+static float expert_activation(float value,
+                               ExpertActivation activation,
+                               float limit,
+                               uint64_t optimization_flags) noexcept
 {
     switch (activation)
     {
@@ -212,14 +206,13 @@ static float expert_activation(
     return value;
 }
 
-static void apply_float8_gate_up_activation(
-    float* output,
-    const float* gate,
-    const float* up,
-    uint32_t count,
-    ExpertActivation activation,
-    float activation_limit,
-    uint64_t optimization_flags)
+static void apply_float8_gate_up_activation(float* output,
+                                            const float* gate,
+                                            const float* up,
+                                            uint32_t count,
+                                            ExpertActivation activation,
+                                            float activation_limit,
+                                            uint64_t optimization_flags)
 {
     if (has_flag(optimization_flags, OptimizationCpuFastSilu)
         && activation_limit <= 0.0f
@@ -272,8 +265,7 @@ static void prepare_quantized_float8_input(ActivationBuffer& scratch, const Acti
     scratch.reset(input.rows(), input.columns(), false);
     for (size_t row = 0; row < input.rows(); ++row)
     {
-        quantize_float8_e4m3(
-            input.row(row), scratch.row(row), input.columns(), 128, true, optimization_flags);
+        quantize_float8_e4m3(input.row(row), scratch.row(row), input.columns(), 128, true, optimization_flags);
     }
 }
 
@@ -283,15 +275,14 @@ static bool cpu_float8_fused_projections_enabled(uint64_t optimization_flags) no
                     OptimizationCpuFloat8FusedProjections);
 }
 
-static void float8_linear_group_into(
-    const TensorData& matrix,
-    const ActivationBuffer& quantized_input,
-    ActivationBuffer& output,
-    uint32_t first_output_column,
-    uint32_t group_size,
-    uint32_t input_blocks,
-    uint32_t block_size,
-    uint64_t optimization_flags)
+static void float8_linear_group_into(const TensorData& matrix,
+                                     const ActivationBuffer& quantized_input,
+                                     ActivationBuffer& output,
+                                     uint32_t first_output_column,
+                                     uint32_t group_size,
+                                     uint32_t input_blocks,
+                                     uint32_t block_size,
+                                     uint64_t optimization_flags)
 {
     const uint32_t input_columns = matrix.shape[1];
     const std::span<const uint8_t> matrix_values = matrix.float8_values();
@@ -301,11 +292,10 @@ static void float8_linear_group_into(
                           + static_cast<size_t>(first_output_column / block_size) * input_blocks;
     if (quantized_input.rows() > 1)
     {
-        float8_e4m3_quantized_input_dot_rows_batch(
-            weights, input_columns, scales, quantized_input.row(0),
-            quantized_input.columns(), input_columns, block_size, group_size,
-            output.columns(), quantized_input.rows(),
-            output.row(0) + first_output_column, optimization_flags);
+        float8_e4m3_quantized_input_dot_rows_batch(weights, input_columns, scales, quantized_input.row(0),
+                                                   quantized_input.columns(), input_columns, block_size, group_size,
+                                                   output.columns(), quantized_input.rows(),
+                                                   output.row(0) + first_output_column, optimization_flags);
         return;
     }
     for (size_t token_index = 0; token_index < quantized_input.rows();
@@ -313,31 +303,27 @@ static void float8_linear_group_into(
     {
         if (group_size == 1)
         {
-            output.row(token_index)[first_output_column] = float8_e4m3_quantized_input_dot(
-                weights, scales, quantized_input.row(token_index),
-                input_columns, block_size, optimization_flags);
+            output.row(token_index)[first_output_column] = float8_e4m3_quantized_input_dot(weights, scales, quantized_input.row(token_index),
+                                                                                           input_columns, block_size, optimization_flags);
         }
         else
         {
-            float8_e4m3_quantized_input_dot_rows(
-                weights, input_columns, scales,
-                quantized_input.row(token_index), input_columns, block_size,
-                group_size, output.row(token_index) + first_output_column,
-                optimization_flags);
+            float8_e4m3_quantized_input_dot_rows(weights, input_columns, scales,
+                                                 quantized_input.row(token_index), input_columns, block_size,
+                                                 group_size, output.row(token_index) + first_output_column,
+                                                 optimization_flags);
         }
     }
 }
 
-static uint32_t float8_linear_row_group_size_for_shape(
-    const TensorData& matrix,
-    size_t token_count,
-    uint64_t optimization_flags) noexcept;
+static uint32_t float8_linear_row_group_size_for_shape(const TensorData& matrix,
+                                                       size_t token_count,
+                                                       uint64_t optimization_flags) noexcept;
 
-static void float8_linear_quantized_into(
-    const TensorData& matrix,
-    const ActivationBuffer& quantized_input,
-    ActivationBuffer& output,
-    uint64_t optimization_flags)
+static void float8_linear_quantized_into(const TensorData& matrix,
+                                         const ActivationBuffer& quantized_input,
+                                         ActivationBuffer& output,
+                                         uint64_t optimization_flags)
 {
     assert(matrix.shape.size() == 2);
     const uint32_t output_columns = matrix.shape[0];
@@ -359,8 +345,7 @@ static void float8_linear_quantized_into(
     const bool parallelize_linear = linear_team_size > 1;
     const int64_t parallel_output_columns = static_cast<int64_t>(output_columns);
 
-    const uint32_t row_group_size = float8_linear_row_group_size_for_shape(
-        matrix, quantized_input.rows(), optimization_flags);
+    const uint32_t row_group_size = float8_linear_row_group_size_for_shape(matrix, quantized_input.rows(), optimization_flags);
 #pragma omp parallel for num_threads(linear_team_size) if (parallelize_linear)
     for (int64_t output_group = 0;
          output_group < (parallel_output_columns + row_group_size - 1)
@@ -370,17 +355,15 @@ static void float8_linear_quantized_into(
         const uint32_t first_output_column = static_cast<uint32_t>(output_group) * row_group_size;
         const uint32_t group_size = std::min(row_group_size,
                                              output_columns - first_output_column);
-        float8_linear_group_into(
-            matrix, quantized_input, output, first_output_column, group_size,
-            input_blocks, block_size, optimization_flags);
+        float8_linear_group_into(matrix, quantized_input, output, first_output_column, group_size,
+                                 input_blocks, block_size, optimization_flags);
     }
 }
 
-static bool float32_linear_gemm_tile_into(
-    const TensorData& matrix,
-    const ActivationBuffer& input,
-    ActivationBuffer& output,
-    int team_size)
+static bool float32_linear_gemm_tile_into(const TensorData& matrix,
+                                          const ActivationBuffer& input,
+                                          ActivationBuffer& output,
+                                          int team_size)
 {
     // GEMV stays row-parallel; larger batches use an MxN tile.
     if (input.rows() < 2 || matrix.shape[0] < 2 || matrix.shape[1] < 16)
@@ -403,39 +386,36 @@ static bool float32_linear_gemm_tile_into(
         const uint32_t valid_tokens = std::min<uint32_t>(4, static_cast<uint32_t>(input.rows()) - first_token);
         if (output_tile == 8)
         {
-            float_gemm_4x8(
-                weights.data() + static_cast<size_t>(first_output) * input_columns,
-                input_columns,
-                input.row(first_token),
-                input.columns(),
-                input_columns,
-                valid_outputs,
-                valid_tokens,
-                output.row(first_token) + first_output,
-                output.columns());
+            float_gemm_4x8(weights.data() + static_cast<size_t>(first_output) * input_columns,
+                           input_columns,
+                           input.row(first_token),
+                           input.columns(),
+                           input_columns,
+                           valid_outputs,
+                           valid_tokens,
+                           output.row(first_token) + first_output,
+                           output.columns());
         }
         else
         {
-            float_gemm_4x4(
-                weights.data() + static_cast<size_t>(first_output) * input_columns,
-                input_columns,
-                input.row(first_token),
-                input.columns(),
-                input_columns,
-                valid_outputs,
-                valid_tokens,
-                output.row(first_token) + first_output,
-                output.columns());
+            float_gemm_4x4(weights.data() + static_cast<size_t>(first_output) * input_columns,
+                           input_columns,
+                           input.row(first_token),
+                           input.columns(),
+                           input_columns,
+                           valid_outputs,
+                           valid_tokens,
+                           output.row(first_token) + first_output,
+                           output.columns());
         }
     }
     return true;
 }
 
-static bool bfloat16_linear_gemm_tile_into(
-    const TensorData& matrix,
-    const ActivationBuffer& input,
-    ActivationBuffer& output,
-    int team_size)
+static bool bfloat16_linear_gemm_tile_into(const TensorData& matrix,
+                                           const ActivationBuffer& input,
+                                           ActivationBuffer& output,
+                                           int team_size)
 {
     if (input.rows() < 2 || matrix.shape[0] < 2 || matrix.shape[1] < 16)
         return false;
@@ -455,24 +435,22 @@ static bool bfloat16_linear_gemm_tile_into(
         const uint32_t first_token = token_group * 4;
         const uint32_t valid_outputs = std::min(output_tile, output_columns - first_output);
         const uint32_t valid_tokens = std::min<uint32_t>(4, static_cast<uint32_t>(input.rows()) - first_token);
-        bfloat16_gemm_4x8(
-            weights.data() + static_cast<size_t>(first_output) * input_columns,
-            input_columns,
-            input.row(first_token),
-            input.columns(),
-            input_columns,
-            valid_outputs,
-            valid_tokens,
-            output.row(first_token) + first_output,
-            output.columns());
+        bfloat16_gemm_4x8(weights.data() + static_cast<size_t>(first_output) * input_columns,
+                          input_columns,
+                          input.row(first_token),
+                          input.columns(),
+                          input_columns,
+                          valid_outputs,
+                          valid_tokens,
+                          output.row(first_token) + first_output,
+                          output.columns());
     }
     return true;
 }
 
-static uint32_t float8_linear_row_group_size_for_shape(
-    const TensorData& matrix,
-    size_t token_count,
-    uint64_t optimization_flags) noexcept
+static uint32_t float8_linear_row_group_size_for_shape(const TensorData& matrix,
+                                                       size_t token_count,
+                                                       uint64_t optimization_flags) noexcept
 {
     const uint32_t kernel_group = float8_linear_row_group_size(optimization_flags);
     if (token_count == 1 || matrix.shape[0] < 8)
@@ -481,16 +459,15 @@ static uint32_t float8_linear_row_group_size_for_shape(
     return std::max(8u, kernel_group);
 }
 
-bool float8_linear_pair_batch_into(
-    const TensorData& first,
-    const TensorData& second,
-    const ActivationBuffer& input,
-    ActivationBuffer& first_output,
-    ActivationBuffer& second_output,
-    uint64_t optimization_flags,
-    const CompiledOperator* first_executable,
-    const CompiledOperator* second_executable,
-    ActivationBuffer* quantized_input_scratch)
+bool float8_linear_pair_batch_into(const TensorData& first,
+                                   const TensorData& second,
+                                   const ActivationBuffer& input,
+                                   ActivationBuffer& first_output,
+                                   ActivationBuffer& second_output,
+                                   uint64_t optimization_flags,
+                                   const CompiledOperator* first_executable,
+                                   const CompiledOperator* second_executable,
+                                   ActivationBuffer* quantized_input_scratch)
 {
     assert(!quantized_input_scratch
            || (quantized_input_scratch != &input
@@ -569,9 +546,8 @@ bool float8_linear_pair_batch_into(
             const uint32_t first_output_column = static_cast<uint32_t>(output_group) * row_group_size;
             const uint32_t group_size = std::min(row_group_size,
                                                  first.shape[0] - first_output_column);
-            float8_linear_group_into(
-                first, quantized_input, first_output, first_output_column,
-                group_size, first_input_blocks, block_size, optimization_flags);
+            float8_linear_group_into(first, quantized_input, first_output, first_output_column,
+                                     group_size, first_input_blocks, block_size, optimization_flags);
         }
 #pragma omp for schedule(static)
         for (int64_t output_group = 0; output_group < second_group_count;
@@ -580,23 +556,21 @@ bool float8_linear_pair_batch_into(
             const uint32_t first_output_column = static_cast<uint32_t>(output_group) * row_group_size;
             const uint32_t group_size = std::min(row_group_size,
                                                  second.shape[0] - first_output_column);
-            float8_linear_group_into(
-                second, quantized_input, second_output, first_output_column,
-                group_size, second_input_blocks, block_size, optimization_flags);
+            float8_linear_group_into(second, quantized_input, second_output, first_output_column,
+                                     group_size, second_input_blocks, block_size, optimization_flags);
         }
     }
     return true;
 }
 
-bool float8_linear_rms_norm_batch_into(
-    const TensorData& matrix,
-    const ActivationBuffer& input,
-    const TensorData& norm_weight,
-    float epsilon,
-    ActivationBuffer& output,
-    uint64_t optimization_flags,
-    const CompiledOperator* executable,
-    ActivationBuffer* quantized_input_scratch)
+bool float8_linear_rms_norm_batch_into(const TensorData& matrix,
+                                       const ActivationBuffer& input,
+                                       const TensorData& norm_weight,
+                                       float epsilon,
+                                       ActivationBuffer& output,
+                                       uint64_t optimization_flags,
+                                       const CompiledOperator* executable,
+                                       ActivationBuffer* quantized_input_scratch)
 {
     assert(!quantized_input_scratch
            || (quantized_input_scratch != &input
@@ -629,30 +603,27 @@ bool float8_linear_rms_norm_batch_into(
         float* destination = quantized_input.row(token_index);
         if (use_simd && norm_weight.dtype == DType::Float32)
         {
-            float_rms_norm(
-                destination,
-                source,
-                norm_weight.float32_values().data(),
-                epsilon,
-                0.0f,
-                input.columns());
+            float_rms_norm(destination,
+                           source,
+                           norm_weight.float32_values().data(),
+                           epsilon,
+                           0.0f,
+                           input.columns());
         }
         else if (use_simd && norm_weight.dtype == DType::BFloat16)
         {
-            bfloat16_rms_norm(
-                destination,
-                source,
-                norm_weight.bfloat16_values().data(),
-                epsilon,
-                0.0f,
-                input.columns());
+            bfloat16_rms_norm(destination,
+                              source,
+                              norm_weight.bfloat16_values().data(),
+                              epsilon,
+                              0.0f,
+                              input.columns());
         }
         else
         {
-            const float square_sum = std::inner_product(
-                source,
-                source + input.columns(), source,
-                0.0f);
+            const float square_sum = std::inner_product(source,
+                                                        source + input.columns(), source,
+                                                        0.0f);
             const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(input.columns()) + epsilon);
             for (uint32_t column = 0; column < input.columns(); ++column)
             {
@@ -662,8 +633,7 @@ bool float8_linear_rms_norm_batch_into(
                 destination[column] = source[column] * inverse_rms * weight_value;
             }
         }
-        quantize_float8_e4m3_inplace(
-            destination, input.columns(), 128, true, optimization_flags);
+        quantize_float8_e4m3_inplace(destination, input.columns(), 128, true, optimization_flags);
     }
 
     float8_linear_quantized_into(matrix, quantized_input, output, optimization_flags);
@@ -671,18 +641,15 @@ bool float8_linear_rms_norm_batch_into(
 }
 
 static std::shared_ptr<const Mxfp4Q8PackedMatrix>
-get_mxfp4_q8_packed_weights(
-    const TensorData& matrix,
-    std::shared_ptr<const Mxfp4Q8PackedMatrix>* sidecar,
-    uint32_t block_count,
-    size_t row_count)
+get_mxfp4_q8_packed_weights(const TensorData& matrix,
+                            std::shared_ptr<const Mxfp4Q8PackedMatrix>* sidecar,
+                            uint32_t block_count,
+                            size_t row_count)
 {
     // Protect the first immutable sidecar build.
     static std::mutex build_locks[64];
-    const uintptr_t storage_key = reinterpret_cast<uintptr_t>(
-        matrix.mxfp4_blocks.data());
-    std::lock_guard<std::mutex> build_lock(
-        build_locks[(storage_key >> 6) & 63u]);
+    const uintptr_t storage_key = reinterpret_cast<uintptr_t>(matrix.mxfp4_blocks.data());
+    std::lock_guard<std::mutex> build_lock(build_locks[(storage_key >> 6) & 63u]);
     std::shared_ptr<const Mxfp4Q8PackedMatrix> cached = sidecar ? *sidecar : nullptr;
     if (cached && cached->valid()
         && cached->rows == row_count
@@ -692,12 +659,11 @@ get_mxfp4_q8_packed_weights(
     }
 
     auto packed = std::make_shared<Mxfp4Q8PackedMatrix>();
-    if (!mxfp4_q8_pack_weights(
-            matrix.mxfp4_blocks.data(),
-            matrix.mxfp4_scales.data(),
-            block_count,
-            row_count,
-            *packed))
+    if (!mxfp4_q8_pack_weights(matrix.mxfp4_blocks.data(),
+                               matrix.mxfp4_scales.data(),
+                               block_count,
+                               row_count,
+                               *packed))
     {
         return {};
     }
@@ -706,11 +672,10 @@ get_mxfp4_q8_packed_weights(
     return packed;
 }
 
-static bool try_vulkan_linear_batch(
-    const CompiledOperator* executable,
-    const ActivationBuffer& input,
-    ActivationBuffer& output,
-    ExecutionBackend backend)
+static bool try_vulkan_linear_batch(const CompiledOperator* executable,
+                                    const ActivationBuffer& input,
+                                    ActivationBuffer& output,
+                                    ExecutionBackend backend)
 {
     if (backend != ExecutionBackend::Vulkan || !executable)
         return false;
@@ -740,12 +705,11 @@ void linear_batch_into(const TensorData& matrix, const ActivationBuffer& input, 
     if (try_vulkan_linear_batch(executable, input, output, backend))
         return;
     if (is_qnk_dtype(matrix.dtype)
-        && qnk_linear_batch_into(
-            matrix,
-            input,
-            output,
-            has_flag(optimization_flags, OptimizationCpuPackedWeights),
-            executable ? &executable->qnk_packed : nullptr))
+        && qnk_linear_batch_into(matrix,
+                                 input,
+                                 output,
+                                 has_flag(optimization_flags, OptimizationCpuPackedWeights),
+                                 executable ? &executable->qnk_packed : nullptr))
         return;
     require_dense_host_storage(matrix, "linear weight");
     output.reset(input.rows(), output_columns, false);
@@ -840,33 +804,30 @@ void linear_batch_into(const TensorData& matrix, const ActivationBuffer& input, 
                             && input_columns % 32 == 0;
         if (use_q8)
         {
-            mxfp4_q8_quantize_batch(
-                input.row(0),
-                input.columns(),
-                input.rows(),
-                input_columns,
-                q8_input);
+            mxfp4_q8_quantize_batch(input.row(0),
+                                    input.columns(),
+                                    input.rows(),
+                                    input_columns,
+                                    q8_input);
             if (has_flag(optimization_flags, OptimizationCpuPackedWeights)
                 && output_columns >= 4
                 && mxfp4_q8_packed_kernel_available())
             {
                 const std::shared_ptr<const Mxfp4Q8PackedMatrix>
-                    packed_weights = get_mxfp4_q8_packed_weights(
-                        matrix,
-                        executable ? &executable->mxfp4_q8_packed : nullptr,
-                        blocks_per_row,
-                        output_columns);
+                    packed_weights = get_mxfp4_q8_packed_weights(matrix,
+                                                                 executable ? &executable->mxfp4_q8_packed : nullptr,
+                                                                 blocks_per_row,
+                                                                 output_columns);
                 if (packed_weights)
                 {
-                    mxfp4_q8_packed_gemm(
-                        *packed_weights,
-                        q8_input.row(0),
-                        q8_input.columns,
-                        q8_input.row_scales(0),
-                        (input_columns + 31) / 32,
-                        input.rows(),
-                        output.row(0),
-                        output.columns());
+                    mxfp4_q8_packed_gemm(*packed_weights,
+                                         q8_input.row(0),
+                                         q8_input.columns,
+                                         q8_input.row_scales(0),
+                                         (input_columns + 31) / 32,
+                                         input.rows(),
+                                         output.row(0),
+                                         output.columns());
                     return;
                 }
             }
@@ -884,21 +845,20 @@ void linear_batch_into(const TensorData& matrix, const ActivationBuffer& input, 
                 const uint8_t* second_scales = matrix.mxfp4_scales.data() + static_cast<size_t>(second_row) * blocks_per_row;
                 if (use_q8)
                 {
-                    mxfp4_q8_matmul_rows2(
-                        first_blocks,
-                        first_scales,
-                        second_blocks,
-                        second_scales,
-                        blocks_per_row,
-                        q8_input.row(0),
-                        input.columns(),
-                        q8_input.row_scales(0),
-                        (input_columns + 31) / 32,
-                        input.rows(),
-                        output.row(0) + first_row,
-                        output.columns(),
-                        output.row(0) + second_row,
-                        output.columns());
+                    mxfp4_q8_matmul_rows2(first_blocks,
+                                          first_scales,
+                                          second_blocks,
+                                          second_scales,
+                                          blocks_per_row,
+                                          q8_input.row(0),
+                                          input.columns(),
+                                          q8_input.row_scales(0),
+                                          (input_columns + 31) / 32,
+                                          input.rows(),
+                                          output.row(0) + first_row,
+                                          output.columns(),
+                                          output.row(0) + second_row,
+                                          output.columns());
                 }
                 else
                 {
@@ -916,17 +876,16 @@ void linear_batch_into(const TensorData& matrix, const ActivationBuffer& input, 
             {
                 if (use_q8)
                 {
-                    mxfp4_q8_gemm_row(
-                        first_blocks,
-                        first_scales,
-                        blocks_per_row,
-                        q8_input.row(0),
-                        input.columns(),
-                        q8_input.row_scales(0),
-                        (input_columns + 31) / 32,
-                        input.rows(),
-                        output.row(0) + first_row,
-                        output.columns());
+                    mxfp4_q8_gemm_row(first_blocks,
+                                      first_scales,
+                                      blocks_per_row,
+                                      q8_input.row(0),
+                                      input.columns(),
+                                      q8_input.row_scales(0),
+                                      (input_columns + 31) / 32,
+                                      input.rows(),
+                                      output.row(0) + first_row,
+                                      output.columns());
                 }
                 else
                 {
@@ -1023,31 +982,26 @@ bool fused_float8_gate_up_batch(const TensorData& gate,
             float up_output[8] = {};
             if (row_group_size == 1)
             {
-                gate_output[0] = float8_e4m3_quantized_input_dot(
-                    gate_weights, gate_scales,
-                    quantized_input.row(token_index), input_columns,
-                    block_size, optimization_flags);
-                up_output[0] = float8_e4m3_quantized_input_dot(
-                    up_weights, up_scales,
-                    quantized_input.row(token_index), input_columns,
-                    block_size, optimization_flags);
+                gate_output[0] = float8_e4m3_quantized_input_dot(gate_weights, gate_scales,
+                                                                 quantized_input.row(token_index), input_columns,
+                                                                 block_size, optimization_flags);
+                up_output[0] = float8_e4m3_quantized_input_dot(up_weights, up_scales,
+                                                               quantized_input.row(token_index), input_columns,
+                                                               block_size, optimization_flags);
             }
             else
             {
-                float8_e4m3_quantized_input_dot_rows(
-                    gate_weights, input_columns, gate_scales,
-                    quantized_input.row(token_index), input_columns,
-                    block_size, group_size, gate_output, optimization_flags);
-                float8_e4m3_quantized_input_dot_rows(
-                    up_weights, input_columns, up_scales,
-                    quantized_input.row(token_index), input_columns,
-                    block_size, group_size, up_output, optimization_flags);
+                float8_e4m3_quantized_input_dot_rows(gate_weights, input_columns, gate_scales,
+                                                     quantized_input.row(token_index), input_columns,
+                                                     block_size, group_size, gate_output, optimization_flags);
+                float8_e4m3_quantized_input_dot_rows(up_weights, input_columns, up_scales,
+                                                     quantized_input.row(token_index), input_columns,
+                                                     block_size, group_size, up_output, optimization_flags);
             }
             float* destination = output.row(token_index)
                                  + first_output_column;
-            apply_float8_gate_up_activation(
-                destination, gate_output, up_output, group_size, activation,
-                activation_limit, optimization_flags);
+            apply_float8_gate_up_activation(destination, gate_output, up_output, group_size, activation,
+                                            activation_limit, optimization_flags);
         }
     }
     return true;
@@ -1072,12 +1026,11 @@ ActivationBuffer fused_mxfp4_gate_up_batch(const TensorData& matrix, const Tenso
                         && input_columns % 32 == 0;
     if (use_q8)
     {
-        mxfp4_q8_quantize_batch(
-            input.row(0),
-            input.columns(),
-            input.rows(),
-            input_columns,
-            q8_input);
+        mxfp4_q8_quantize_batch(input.row(0),
+                                input.columns(),
+                                input.rows(),
+                                input_columns,
+                                q8_input);
     }
     const auto matmul_rows2 = [&](const uint8_t* first_packed,
                                   const uint8_t* first_scales,
@@ -1093,37 +1046,35 @@ ActivationBuffer fused_mxfp4_gate_up_batch(const TensorData& matrix, const Tenso
                                   size_t second_output_stride) {
         if (use_q8)
         {
-            mxfp4_q8_matmul_rows2(
-                first_packed,
-                first_scales,
-                second_packed,
-                second_scales,
-                block_count,
-                q8_input.row(0),
-                input.columns(),
-                q8_input.row_scales(0),
-                (input_columns + 31) / 32,
-                token_count,
-                first_output,
-                first_output_stride,
-                second_output,
-                second_output_stride);
+            mxfp4_q8_matmul_rows2(first_packed,
+                                  first_scales,
+                                  second_packed,
+                                  second_scales,
+                                  block_count,
+                                  q8_input.row(0),
+                                  input.columns(),
+                                  q8_input.row_scales(0),
+                                  (input_columns + 31) / 32,
+                                  token_count,
+                                  first_output,
+                                  first_output_stride,
+                                  second_output,
+                                  second_output_stride);
         }
         else
         {
-            mxfp4_matmul_rows2(
-                first_packed,
-                first_scales,
-                second_packed,
-                second_scales,
-                block_count,
-                float_input,
-                input_stride,
-                token_count,
-                first_output,
-                first_output_stride,
-                second_output,
-                second_output_stride);
+            mxfp4_matmul_rows2(first_packed,
+                               first_scales,
+                               second_packed,
+                               second_scales,
+                               block_count,
+                               float_input,
+                               input_stride,
+                               token_count,
+                               first_output,
+                               first_output_stride,
+                               second_output,
+                               second_output_stride);
         }
     };
     const auto matmul_row_pairs = [&](const uint8_t* packed,
@@ -1141,39 +1092,37 @@ ActivationBuffer fused_mxfp4_gate_up_batch(const TensorData& matrix, const Tenso
                                       size_t second_token_stride) {
         if (use_q8)
         {
-            mxfp4_q8_matmul_row_pairs(
-                packed,
-                scales,
-                block_count,
-                row_pair_count,
-                q8_input.row(0),
-                input.columns(),
-                q8_input.row_scales(0),
-                (input_columns + 31) / 32,
-                token_count,
-                first_output,
-                first_pair_stride,
-                first_token_stride,
-                second_output,
-                second_pair_stride,
-                second_token_stride);
+            mxfp4_q8_matmul_row_pairs(packed,
+                                      scales,
+                                      block_count,
+                                      row_pair_count,
+                                      q8_input.row(0),
+                                      input.columns(),
+                                      q8_input.row_scales(0),
+                                      (input_columns + 31) / 32,
+                                      token_count,
+                                      first_output,
+                                      first_pair_stride,
+                                      first_token_stride,
+                                      second_output,
+                                      second_pair_stride,
+                                      second_token_stride);
         }
         else
         {
-            mxfp4_matmul_row_pairs(
-                packed,
-                scales,
-                block_count,
-                row_pair_count,
-                float_input,
-                input_stride,
-                token_count,
-                first_output,
-                first_pair_stride,
-                first_token_stride,
-                second_output,
-                second_pair_stride,
-                second_token_stride);
+            mxfp4_matmul_row_pairs(packed,
+                                   scales,
+                                   block_count,
+                                   row_pair_count,
+                                   float_input,
+                                   input_stride,
+                                   token_count,
+                                   first_output,
+                                   first_pair_stride,
+                                   first_token_stride,
+                                   second_output,
+                                   second_pair_stride,
+                                   second_token_stride);
         }
     };
 
@@ -1191,20 +1140,19 @@ ActivationBuffer fused_mxfp4_gate_up_batch(const TensorData& matrix, const Tenso
             const uint32_t first_column = static_cast<uint32_t>(pair_group) * pair_chunk_size;
             const uint32_t pair_count = std::min(pair_chunk_size, intermediate_size - first_column);
             const size_t first_row = static_cast<size_t>(first_column) * 2;
-            matmul_row_pairs(
-                matrix.mxfp4_blocks.data() + first_row * input_columns / 2,
-                matrix.mxfp4_scales.data() + first_row * blocks_per_row,
-                blocks_per_row,
-                pair_count,
-                input.row(0),
-                input.columns(),
-                1,
-                output.row(0) + first_column,
-                1,
-                output.columns(),
-                linear.data() + first_column,
-                1,
-                1);
+            matmul_row_pairs(matrix.mxfp4_blocks.data() + first_row * input_columns / 2,
+                             matrix.mxfp4_scales.data() + first_row * blocks_per_row,
+                             blocks_per_row,
+                             pair_count,
+                             input.row(0),
+                             input.columns(),
+                             1,
+                             output.row(0) + first_column,
+                             1,
+                             output.columns(),
+                             linear.data() + first_column,
+                             1,
+                             1);
 
             if (has_flag(optimization_flags, OptimizationCpuFastSilu)
                 && bias == nullptr
@@ -1215,13 +1163,12 @@ ActivationBuffer fused_mxfp4_gate_up_batch(const TensorData& matrix, const Tenso
             {
                 const float sigmoid_scale = activation == ExpertActivation::GptOssSwiGlu ? 1.702f : 1.0f;
                 const float up_offset = activation == ExpertActivation::GptOssSwiGlu ? 1.0f : 0.0f;
-                float_silu_mul(
-                    output.row(0) + first_column,
-                    output.row(0) + first_column,
-                    linear.data() + first_column,
-                    sigmoid_scale,
-                    up_offset,
-                    pair_count);
+                float_silu_mul(output.row(0) + first_column,
+                               output.row(0) + first_column,
+                               linear.data() + first_column,
+                               sigmoid_scale,
+                               up_offset,
+                               pair_count);
                 continue;
             }
 
@@ -1267,8 +1214,7 @@ ActivationBuffer fused_mxfp4_gate_up_batch(const TensorData& matrix, const Tenso
     if (parallel_enabled)
         scratch_worker_count = static_cast<size_t>(linear_team_size);
 #endif
-    std::vector<float> linear_scratch(
-        scratch_worker_count * input.rows());
+    std::vector<float> linear_scratch(scratch_worker_count * input.rows());
     const int64_t parallel_columns = static_cast<int64_t>(intermediate_size);
 #pragma omp parallel for num_threads(linear_team_size) if (parallel_enabled)
     for (int64_t column = 0; column < parallel_columns; ++column)
@@ -1368,11 +1314,10 @@ static void locate_mxfp4_group(uint64_t flat_index, std::span<const Mxfp4Task> t
     local_index = 0;
 }
 
-static size_t find_shared_q8_input_owner(
-    std::span<const Mxfp4Task> tasks,
-    std::span<const size_t> owners,
-    size_t task_index,
-    size_t invalid_owner) noexcept
+static size_t find_shared_q8_input_owner(std::span<const Mxfp4Task> tasks,
+                                         std::span<const size_t> owners,
+                                         size_t task_index,
+                                         size_t invalid_owner) noexcept
 {
     const Mxfp4Task& task = tasks[task_index];
     if (!task.input)
@@ -1398,10 +1343,9 @@ static size_t find_shared_q8_input_owner(
     return task_index;
 }
 
-bool mxfp4_expert_decode(
-    std::span<const Mxfp4Task> tasks,
-    Mxfp4Scratch* scratch,
-    uint64_t optimization_flags)
+bool mxfp4_expert_decode(std::span<const Mxfp4Task> tasks,
+                         Mxfp4Scratch* scratch,
+                         uint64_t optimization_flags)
 {
     Mxfp4Scratch local_scratch;
     Mxfp4Scratch& buffers = scratch ? *scratch : local_scratch;
@@ -1466,29 +1410,26 @@ bool mxfp4_expert_decode(
                 && task.down->shape[0] >= 4
                 && mxfp4_q8_packed_kernel_available())
             {
-                q8_down_packed[task_index] = get_mxfp4_q8_packed_weights(
-                    *task.down,
-                    task.down_operator ? &task.down_operator->mxfp4_q8_packed : nullptr,
-                    intermediate_size / 32,
-                    task.down->shape[0]);
+                q8_down_packed[task_index] = get_mxfp4_q8_packed_weights(*task.down,
+                                                                         task.down_operator ? &task.down_operator->mxfp4_q8_packed : nullptr,
+                                                                         intermediate_size / 32,
+                                                                         task.down->shape[0]);
             }
         }
         if (use_q8 && task.input->columns() % 32 == 0)
         {
-            const size_t input_owner = find_shared_q8_input_owner(
-                tasks,
-                q8_input_owner,
-                task_index,
-                invalid_q8_owner);
+            const size_t input_owner = find_shared_q8_input_owner(tasks,
+                                                                  q8_input_owner,
+                                                                  task_index,
+                                                                  invalid_q8_owner);
             q8_input_owner[task_index] = input_owner;
             if (input_owner == task_index)
             {
-                mxfp4_q8_quantize_batch(
-                    task.input->row(0),
-                    task.input->columns(),
-                    1,
-                    task.input->columns(),
-                    q8_inputs[input_owner]);
+                mxfp4_q8_quantize_batch(task.input->row(0),
+                                        task.input->columns(),
+                                        1,
+                                        task.input->columns(),
+                                        q8_inputs[input_owner]);
             }
             if (has_flag(optimization_flags, OptimizationCpuPackedWeights)
                 && task.gate_up->shape[0] >= 4
@@ -1549,25 +1490,22 @@ bool mxfp4_expert_decode(
             const Mxfp4Task& task = tasks[static_cast<size_t>(task_index)];
             const size_t input_owner = q8_input_owner[static_cast<size_t>(task_index)];
             const std::shared_ptr<const Mxfp4Q8PackedMatrix>
-                packed_weights = get_mxfp4_q8_packed_weights(
-                    *task.gate_up,
-                    task.gate_up_operator ? &task.gate_up_operator->mxfp4_q8_packed : nullptr,
-                    task.input->columns() / 32,
-                    task.gate_up->shape[0]);
+                packed_weights = get_mxfp4_q8_packed_weights(*task.gate_up,
+                                                             task.gate_up_operator ? &task.gate_up_operator->mxfp4_q8_packed : nullptr,
+                                                             task.input->columns() / 32,
+                                                             task.gate_up->shape[0]);
             if (!packed_weights)
             {
                 q8_gate_packed[static_cast<size_t>(task_index)] = 0;
                 continue;
             }
-            packed_gate_up[static_cast<size_t>(task_index)].reset(
-                1,
-                task.gate_up->shape[0],
-                false);
-            mxfp4_q8_packed_gemv(
-                *packed_weights,
-                q8_inputs[input_owner].row(0),
-                q8_inputs[input_owner].row_scales(0),
-                packed_gate_up[static_cast<size_t>(task_index)].row(0));
+            packed_gate_up[static_cast<size_t>(task_index)].reset(1,
+                                                                  task.gate_up->shape[0],
+                                                                  false);
+            mxfp4_q8_packed_gemv(*packed_weights,
+                                 q8_inputs[input_owner].row(0),
+                                 q8_inputs[input_owner].row_scales(0),
+                                 packed_gate_up[static_cast<size_t>(task_index)].row(0));
         }
 
 #pragma omp for schedule(static)
@@ -1601,39 +1539,37 @@ bool mxfp4_expert_decode(
             else if (use_q8 && input_columns % 32 == 0)
             {
                 const size_t input_owner = q8_input_owner[task_index];
-                mxfp4_q8_matmul_row_pairs(
-                    matrix.mxfp4_blocks.data() + gate_row * input_columns / 2,
-                    matrix.mxfp4_scales.data() + gate_row * blocks_per_row,
-                    blocks_per_row,
-                    column_count,
-                    q8_inputs[input_owner].row(0),
-                    input_columns,
-                    q8_inputs[input_owner].row_scales(0),
-                    (input_columns + 31) / 32,
-                    1,
-                    gates,
-                    1,
-                    1,
-                    linears,
-                    1,
-                    1);
+                mxfp4_q8_matmul_row_pairs(matrix.mxfp4_blocks.data() + gate_row * input_columns / 2,
+                                          matrix.mxfp4_scales.data() + gate_row * blocks_per_row,
+                                          blocks_per_row,
+                                          column_count,
+                                          q8_inputs[input_owner].row(0),
+                                          input_columns,
+                                          q8_inputs[input_owner].row_scales(0),
+                                          (input_columns + 31) / 32,
+                                          1,
+                                          gates,
+                                          1,
+                                          1,
+                                          linears,
+                                          1,
+                                          1);
             }
             else
             {
-                mxfp4_matmul_row_pairs(
-                    matrix.mxfp4_blocks.data() + gate_row * input_columns / 2,
-                    matrix.mxfp4_scales.data() + gate_row * blocks_per_row,
-                    blocks_per_row,
-                    column_count,
-                    task.input->row(0),
-                    task.input->columns(),
-                    1,
-                    gates,
-                    1,
-                    1,
-                    linears,
-                    1,
-                    1);
+                mxfp4_matmul_row_pairs(matrix.mxfp4_blocks.data() + gate_row * input_columns / 2,
+                                       matrix.mxfp4_scales.data() + gate_row * blocks_per_row,
+                                       blocks_per_row,
+                                       column_count,
+                                       task.input->row(0),
+                                       task.input->columns(),
+                                       1,
+                                       gates,
+                                       1,
+                                       1,
+                                       linears,
+                                       1,
+                                       1);
             }
             for (uint32_t local_column = 0; local_column < column_count; ++local_column)
             {
@@ -1676,12 +1612,11 @@ bool mxfp4_expert_decode(
                 if (q8_down_enabled[static_cast<size_t>(task_index)])
                 {
                     const ActivationBuffer& task_activated = activated[static_cast<size_t>(task_index)];
-                    mxfp4_q8_quantize_batch(
-                        task_activated.row(0),
-                        task_activated.columns(),
-                        task_activated.rows(),
-                        task_activated.columns(),
-                        q8_activated[static_cast<size_t>(task_index)]);
+                    mxfp4_q8_quantize_batch(task_activated.row(0),
+                                            task_activated.columns(),
+                                            task_activated.rows(),
+                                            task_activated.columns(),
+                                            q8_activated[static_cast<size_t>(task_index)]);
                 }
             }
         }
@@ -1694,11 +1629,10 @@ bool mxfp4_expert_decode(
             if (!q8_down_packed[static_cast<size_t>(task_index)])
                 continue;
             const Mxfp4Task& task = tasks[static_cast<size_t>(task_index)];
-            mxfp4_q8_packed_gemv(
-                *q8_down_packed[static_cast<size_t>(task_index)],
-                q8_activated[static_cast<size_t>(task_index)].row(0),
-                q8_activated[static_cast<size_t>(task_index)].row_scales(0),
-                task.output->row(0));
+            mxfp4_q8_packed_gemv(*q8_down_packed[static_cast<size_t>(task_index)],
+                                 q8_activated[static_cast<size_t>(task_index)].row(0),
+                                 q8_activated[static_cast<size_t>(task_index)].row_scales(0),
+                                 task.output->row(0));
         }
 
 #pragma omp for schedule(static)
@@ -1725,22 +1659,21 @@ bool mxfp4_expert_decode(
                 }
                 else if (q8_down_enabled[task_index])
                 {
-                    mxfp4_q8_matmul_row_pairs(
-                        matrix.mxfp4_blocks.data() + static_cast<size_t>(first_row) * input_columns / 2,
-                        matrix.mxfp4_scales.data() + static_cast<size_t>(first_row) * blocks_per_row,
-                        blocks_per_row,
-                        pair_count,
-                        q8_activated[task_index].row(0),
-                        activated[task_index].columns(),
-                        q8_activated[task_index].row_scales(0),
-                        (activated[task_index].columns() + 31) / 32,
-                        1,
-                        first_output,
-                        2,
-                        1,
-                        first_output + 1,
-                        2,
-                        1);
+                    mxfp4_q8_matmul_row_pairs(matrix.mxfp4_blocks.data() + static_cast<size_t>(first_row) * input_columns / 2,
+                                              matrix.mxfp4_scales.data() + static_cast<size_t>(first_row) * blocks_per_row,
+                                              blocks_per_row,
+                                              pair_count,
+                                              q8_activated[task_index].row(0),
+                                              activated[task_index].columns(),
+                                              q8_activated[task_index].row_scales(0),
+                                              (activated[task_index].columns() + 31) / 32,
+                                              1,
+                                              first_output,
+                                              2,
+                                              1,
+                                              first_output + 1,
+                                              2,
+                                              1);
                 }
                 else
                 {
@@ -1766,18 +1699,16 @@ bool mxfp4_expert_decode(
                 }
                 else if (q8_down_enabled[task_index])
                 {
-                    odd_output[0] = mxfp4_q8_dot(
-                        matrix.mxfp4_blocks.data() + static_cast<size_t>(odd_row) * input_columns / 2,
-                        matrix.mxfp4_scales.data() + static_cast<size_t>(odd_row) * blocks_per_row,
-                        blocks_per_row,
-                        q8_activated[task_index].row(0),
-                        q8_activated[task_index].row_scales(0));
+                    odd_output[0] = mxfp4_q8_dot(matrix.mxfp4_blocks.data() + static_cast<size_t>(odd_row) * input_columns / 2,
+                                                 matrix.mxfp4_scales.data() + static_cast<size_t>(odd_row) * blocks_per_row,
+                                                 blocks_per_row,
+                                                 q8_activated[task_index].row(0),
+                                                 q8_activated[task_index].row_scales(0));
                 }
                 else
                 {
-                    odd_output[0] = mxfp4_dot(
-                        matrix.mxfp4_blocks.data() + static_cast<size_t>(odd_row) * input_columns / 2,
-                        matrix.mxfp4_scales.data() + static_cast<size_t>(odd_row) * blocks_per_row, blocks_per_row, activated[task_index].row(0));
+                    odd_output[0] = mxfp4_dot(matrix.mxfp4_blocks.data() + static_cast<size_t>(odd_row) * input_columns / 2,
+                                              matrix.mxfp4_scales.data() + static_cast<size_t>(odd_row) * blocks_per_row, blocks_per_row, activated[task_index].row(0));
                 }
                 if (task.down_bias)
                 {
@@ -1789,18 +1720,16 @@ bool mxfp4_expert_decode(
     return true;
 }
 
-static uint64_t exact_float_row_hash(
-    const float* values,
-    uint32_t count) noexcept
+static uint64_t exact_float_row_hash(const float* values,
+                                     uint32_t count) noexcept
 {
     uint64_t hash = UINT64_C(1469598103934665603);
     for (uint32_t index = 0; index < count; ++index)
     {
         uint32_t bits = 0;
-        std::memcpy(
-            &bits,
-            values + index,
-            sizeof(bits));
+        std::memcpy(&bits,
+                    values + index,
+                    sizeof(bits));
         hash ^= bits;
         hash *= UINT64_C(1099511628211);
     }
@@ -1825,9 +1754,8 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
     {
         if (scratch)
         {
-            scratch->physical_input_rows.assign(
-                tasks.size(),
-                1);
+            scratch->physical_input_rows.assign(tasks.size(),
+                                                1);
             if (scratch->unique_row_maps.size() < tasks.size())
                 scratch->unique_row_maps.resize(tasks.size());
             for (size_t task_index = 0;
@@ -1848,9 +1776,8 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
         buffers.unique_output.resize(tasks.size());
     if (buffers.unique_row_maps.size() < tasks.size())
         buffers.unique_row_maps.resize(tasks.size());
-    buffers.effective_tasks.assign(
-        tasks.begin(),
-        tasks.end());
+    buffers.effective_tasks.assign(tasks.begin(),
+                                   tasks.end());
     buffers.physical_input_rows.resize(tasks.size());
     std::vector<uint32_t> representatives;
     std::vector<uint64_t> representative_hashes;
@@ -1880,22 +1807,18 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
              row < task.input->rows();
              ++row)
         {
-            uint32_t selected = static_cast<uint32_t>(
-                representatives.size());
-            const uint64_t row_hash = exact_float_row_hash(
-                task.input->row(row),
-                task.input->columns());
+            uint32_t selected = static_cast<uint32_t>(representatives.size());
+            const uint64_t row_hash = exact_float_row_hash(task.input->row(row),
+                                                           task.input->columns());
             for (size_t unique_row = 0;
                  unique_row < representatives.size();
                  ++unique_row)
             {
                 if (representative_hashes[unique_row]
                         == row_hash
-                    && std::memcmp(
-                           task.input->row(row),
-                           task.input->row(
-                               representatives[unique_row]),
-                           row_bytes)
+                    && std::memcmp(task.input->row(row),
+                                   task.input->row(representatives[unique_row]),
+                                   row_bytes)
                            == 0)
                 {
                     selected = static_cast<uint32_t>(unique_row);
@@ -1904,14 +1827,12 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
             }
             if (selected == representatives.size())
             {
-                representatives.push_back(
-                    static_cast<uint32_t>(row));
+                representatives.push_back(static_cast<uint32_t>(row));
                 representative_hashes.push_back(row_hash);
             }
             row_map[row] = selected;
         }
-        buffers.physical_input_rows[task_index] = static_cast<uint32_t>(
-            representatives.size());
+        buffers.physical_input_rows[task_index] = static_cast<uint32_t>(representatives.size());
         if (representatives.size()
             == task.input->rows())
         {
@@ -1920,19 +1841,16 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
         }
 
         ActivationBuffer& unique_input = buffers.unique_input[task_index];
-        unique_input.reset(
-            representatives.size(),
-            task.input->columns(),
-            false);
+        unique_input.reset(representatives.size(),
+                           task.input->columns(),
+                           false);
         for (size_t unique_row = 0;
              unique_row < representatives.size();
              ++unique_row)
         {
-            std::copy_n(
-                task.input->row(
-                    representatives[unique_row]),
-                task.input->columns(),
-                unique_input.row(unique_row));
+            std::copy_n(task.input->row(representatives[unique_row]),
+                        task.input->columns(),
+                        unique_input.row(unique_row));
         }
         buffers.effective_tasks[task_index].input = &unique_input;
         buffers.effective_tasks[task_index].output = &buffers.unique_output[task_index];
@@ -1990,20 +1908,18 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
                                      || use_q8_single);
         if (task_use_q8 && task.input->columns() % 32 == 0)
         {
-            const size_t input_owner = find_shared_q8_input_owner(
-                execution_tasks,
-                q8_input_owner,
-                task_index,
-                invalid_q8_owner);
+            const size_t input_owner = find_shared_q8_input_owner(execution_tasks,
+                                                                  q8_input_owner,
+                                                                  task_index,
+                                                                  invalid_q8_owner);
             q8_input_owner[task_index] = input_owner;
             if (input_owner == task_index)
             {
-                mxfp4_q8_quantize_batch(
-                    task.input->row(0),
-                    task.input->columns(),
-                    task.input->rows(),
-                    task.input->columns(),
-                    q8_inputs[input_owner]);
+                mxfp4_q8_quantize_batch(task.input->row(0),
+                                        task.input->columns(),
+                                        task.input->rows(),
+                                        task.input->columns(),
+                                        q8_inputs[input_owner]);
             }
         }
         task.output->reset(task.input->rows(), task.down->shape[0], false);
@@ -2066,39 +1982,37 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
             if (task_use_q8 && input_columns % 32 == 0)
             {
                 const size_t input_owner = q8_input_owner[task_index];
-                mxfp4_q8_matmul_row_pairs(
-                    matrix.mxfp4_blocks.data() + first_row * input_columns / 2,
-                    matrix.mxfp4_scales.data() + first_row * blocks_per_row,
-                    blocks_per_row,
-                    static_cast<uint32_t>(local_end - local_begin),
-                    q8_inputs[input_owner].row(0),
-                    task.input->columns(),
-                    q8_inputs[input_owner].row_scales(0),
-                    (task.input->columns() + 31) / 32,
-                    task.input->rows(),
-                    activated[task_index].row(0) + local_begin,
-                    1,
-                    activated[task_index].columns(),
-                    linear[task_index].row(0) + local_begin,
-                    1,
-                    linear[task_index].columns());
+                mxfp4_q8_matmul_row_pairs(matrix.mxfp4_blocks.data() + first_row * input_columns / 2,
+                                          matrix.mxfp4_scales.data() + first_row * blocks_per_row,
+                                          blocks_per_row,
+                                          static_cast<uint32_t>(local_end - local_begin),
+                                          q8_inputs[input_owner].row(0),
+                                          task.input->columns(),
+                                          q8_inputs[input_owner].row_scales(0),
+                                          (task.input->columns() + 31) / 32,
+                                          task.input->rows(),
+                                          activated[task_index].row(0) + local_begin,
+                                          1,
+                                          activated[task_index].columns(),
+                                          linear[task_index].row(0) + local_begin,
+                                          1,
+                                          linear[task_index].columns());
             }
             else
             {
-                mxfp4_matmul_row_pairs(
-                    matrix.mxfp4_blocks.data() + first_row * input_columns / 2,
-                    matrix.mxfp4_scales.data() + first_row * blocks_per_row,
-                    blocks_per_row,
-                    static_cast<uint32_t>(local_end - local_begin),
-                    task.input->row(0),
-                    task.input->columns(),
-                    task.input->rows(),
-                    activated[task_index].row(0) + local_begin,
-                    1,
-                    activated[task_index].columns(),
-                    linear[task_index].row(0) + local_begin,
-                    1,
-                    linear[task_index].columns());
+                mxfp4_matmul_row_pairs(matrix.mxfp4_blocks.data() + first_row * input_columns / 2,
+                                       matrix.mxfp4_scales.data() + first_row * blocks_per_row,
+                                       blocks_per_row,
+                                       static_cast<uint32_t>(local_end - local_begin),
+                                       task.input->row(0),
+                                       task.input->columns(),
+                                       task.input->rows(),
+                                       activated[task_index].row(0) + local_begin,
+                                       1,
+                                       activated[task_index].columns(),
+                                       linear[task_index].row(0) + local_begin,
+                                       1,
+                                       linear[task_index].columns());
             }
             task_begin = task_end;
         }
@@ -2126,13 +2040,12 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
                 {
                     const float sigmoid_scale = task.activation == ExpertActivation::GptOssSwiGlu ? 1.702f : 1.0f;
                     const float up_offset = task.activation == ExpertActivation::GptOssSwiGlu ? 1.0f : 0.0f;
-                    float_silu_mul(
-                        gate_values,
-                        gate_values,
-                        linear_values,
-                        sigmoid_scale,
-                        up_offset,
-                        static_cast<uint32_t>(task.gate_up->shape[0] / 2));
+                    float_silu_mul(gate_values,
+                                   gate_values,
+                                   linear_values,
+                                   sigmoid_scale,
+                                   up_offset,
+                                   static_cast<uint32_t>(task.gate_up->shape[0] / 2));
                     continue;
                 }
                 for (uint32_t column = 0; column < task.gate_up->shape[0] / 2; ++column)
@@ -2161,10 +2074,9 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
                     }
                     else
                     {
-                        const float silu = selected_scaled_silu(
-                            gate,
-                            1.702f,
-                            approximate_activation);
+                        const float silu = selected_scaled_silu(gate,
+                                                                1.702f,
+                                                                approximate_activation);
                         gate_values[column] = silu * (up + 1.0f);
                     }
                 }
@@ -2185,12 +2097,11 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
                                          || use_q8_single);
             if (task_use_q8 && task_activated.columns() % 32 == 0)
             {
-                mxfp4_q8_quantize_batch(
-                    task_activated.row(0),
-                    task_activated.columns(),
-                    task_activated.rows(),
-                    task_activated.columns(),
-                    q8_activated[static_cast<size_t>(task_index)]);
+                mxfp4_q8_quantize_batch(task_activated.row(0),
+                                        task_activated.columns(),
+                                        task_activated.rows(),
+                                        task_activated.columns(),
+                                        q8_activated[static_cast<size_t>(task_index)]);
             }
         }
     }
@@ -2229,39 +2140,37 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
                                          || use_q8_single);
             if (task_use_q8 && input_columns % 32 == 0)
             {
-                mxfp4_q8_matmul_row_pairs(
-                    matrix.mxfp4_blocks.data() + first_row * input_columns / 2,
-                    matrix.mxfp4_scales.data() + first_row * blocks_per_row,
-                    blocks_per_row,
-                    static_cast<uint32_t>(local_end - local_begin),
-                    q8_activated[task_index].row(0),
-                    activated[task_index].columns(),
-                    q8_activated[task_index].row_scales(0),
-                    (activated[task_index].columns() + 31) / 32,
-                    activated[task_index].rows(),
-                    task.output->row(0) + first_row,
-                    2,
-                    task.output->columns(),
-                    task.output->row(0) + first_row + 1,
-                    2,
-                    task.output->columns());
+                mxfp4_q8_matmul_row_pairs(matrix.mxfp4_blocks.data() + first_row * input_columns / 2,
+                                          matrix.mxfp4_scales.data() + first_row * blocks_per_row,
+                                          blocks_per_row,
+                                          static_cast<uint32_t>(local_end - local_begin),
+                                          q8_activated[task_index].row(0),
+                                          activated[task_index].columns(),
+                                          q8_activated[task_index].row_scales(0),
+                                          (activated[task_index].columns() + 31) / 32,
+                                          activated[task_index].rows(),
+                                          task.output->row(0) + first_row,
+                                          2,
+                                          task.output->columns(),
+                                          task.output->row(0) + first_row + 1,
+                                          2,
+                                          task.output->columns());
             }
             else
             {
-                mxfp4_matmul_row_pairs(
-                    matrix.mxfp4_blocks.data() + first_row * input_columns / 2,
-                    matrix.mxfp4_scales.data() + first_row * blocks_per_row,
-                    blocks_per_row,
-                    static_cast<uint32_t>(local_end - local_begin),
-                    activated[task_index].row(0),
-                    activated[task_index].columns(),
-                    activated[task_index].rows(),
-                    task.output->row(0) + first_row,
-                    2,
-                    task.output->columns(),
-                    task.output->row(0) + first_row + 1,
-                    2,
-                    task.output->columns());
+                mxfp4_matmul_row_pairs(matrix.mxfp4_blocks.data() + first_row * input_columns / 2,
+                                       matrix.mxfp4_scales.data() + first_row * blocks_per_row,
+                                       blocks_per_row,
+                                       static_cast<uint32_t>(local_end - local_begin),
+                                       activated[task_index].row(0),
+                                       activated[task_index].columns(),
+                                       activated[task_index].rows(),
+                                       task.output->row(0) + first_row,
+                                       2,
+                                       task.output->columns(),
+                                       task.output->row(0) + first_row + 1,
+                                       2,
+                                       task.output->columns());
             }
             if (task.down_bias)
             {
@@ -2293,29 +2202,27 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
                                      || use_q8_single);
         if (task_use_q8 && matrix.shape[1] % 32 == 0)
         {
-            mxfp4_q8_gemm_row(
-                matrix.mxfp4_blocks.data() + static_cast<size_t>(row) * matrix.shape[1] / 2,
-                matrix.mxfp4_scales.data() + static_cast<size_t>(row) * blocks_per_row,
-                blocks_per_row,
-                q8_activated[task_index].row(0),
-                activated[task_index].columns(),
-                q8_activated[task_index].row_scales(0),
-                (activated[task_index].columns() + 31) / 32,
-                activated[task_index].rows(),
-                task.output->row(0) + row,
-                task.output->columns());
+            mxfp4_q8_gemm_row(matrix.mxfp4_blocks.data() + static_cast<size_t>(row) * matrix.shape[1] / 2,
+                              matrix.mxfp4_scales.data() + static_cast<size_t>(row) * blocks_per_row,
+                              blocks_per_row,
+                              q8_activated[task_index].row(0),
+                              activated[task_index].columns(),
+                              q8_activated[task_index].row_scales(0),
+                              (activated[task_index].columns() + 31) / 32,
+                              activated[task_index].rows(),
+                              task.output->row(0) + row,
+                              task.output->columns());
         }
         else
         {
-            mxfp4_gemm_row(
-                matrix.mxfp4_blocks.data() + static_cast<size_t>(row) * matrix.shape[1] / 2,
-                matrix.mxfp4_scales.data() + static_cast<size_t>(row) * blocks_per_row,
-                blocks_per_row,
-                activated[task_index].row(0),
-                activated[task_index].columns(),
-                activated[task_index].rows(),
-                task.output->row(0) + row,
-                task.output->columns());
+            mxfp4_gemm_row(matrix.mxfp4_blocks.data() + static_cast<size_t>(row) * matrix.shape[1] / 2,
+                           matrix.mxfp4_scales.data() + static_cast<size_t>(row) * blocks_per_row,
+                           blocks_per_row,
+                           activated[task_index].row(0),
+                           activated[task_index].columns(),
+                           activated[task_index].rows(),
+                           task.output->row(0) + row,
+                           task.output->columns());
         }
         if (task.down_bias)
         {
@@ -2335,16 +2242,14 @@ bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch,
             continue;
         const Mxfp4Task& task = tasks[task_index];
         const ActivationBuffer& unique_output = buffers.unique_output[task_index];
-        task.output->reset(
-            row_map.size(),
-            unique_output.columns(),
-            false);
+        task.output->reset(row_map.size(),
+                           unique_output.columns(),
+                           false);
         for (size_t row = 0; row < row_map.size(); ++row)
         {
-            std::copy_n(
-                unique_output.row(row_map[row]),
-                unique_output.columns(),
-                task.output->row(row));
+            std::copy_n(unique_output.row(row_map[row]),
+                        unique_output.columns(),
+                        task.output->row(row));
         }
     }
     return true;
@@ -2404,23 +2309,21 @@ void rms_norm_batch_into(const ActivationBuffer& input, const TensorData& weight
         {
             if (weight.dtype == DType::Float32)
             {
-                float_rms_norm(
-                    destination,
-                    source,
-                    weight.float32_values().data(),
-                    epsilon,
-                    weight_offset,
-                    input.columns());
+                float_rms_norm(destination,
+                               source,
+                               weight.float32_values().data(),
+                               epsilon,
+                               weight_offset,
+                               input.columns());
             }
             else
             {
-                bfloat16_rms_norm(
-                    destination,
-                    source,
-                    weight.bfloat16_values().data(),
-                    epsilon,
-                    weight_offset,
-                    input.columns());
+                bfloat16_rms_norm(destination,
+                                  source,
+                                  weight.bfloat16_values().data(),
+                                  epsilon,
+                                  weight_offset,
+                                  input.columns());
             }
             continue;
         }
@@ -2483,9 +2386,8 @@ std::vector<std::vector<float>> batch_to_vectors(const ActivationBuffer& batch)
     if (batch.columns() == 0)
         return output;
     for (size_t row_index = 0; row_index < batch.rows(); ++row_index)
-        output[row_index].assign(
-            batch.row(row_index),
-            batch.row(row_index) + batch.columns());
+        output[row_index].assign(batch.row(row_index),
+                                 batch.row(row_index) + batch.columns());
     return output;
 }
 

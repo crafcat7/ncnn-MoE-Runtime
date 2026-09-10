@@ -35,8 +35,7 @@ struct VulkanContextCacheKey
     uint32_t device_index = 0;
     uint64_t optimization_flags = 0;
 
-    [[nodiscard]] bool operator==(
-        const VulkanContextCacheKey& other) const noexcept
+    [[nodiscard]] bool operator==(const VulkanContextCacheKey& other) const noexcept
     {
         return device_index == other.device_index
                && optimization_flags == other.optimization_flags;
@@ -45,8 +44,7 @@ struct VulkanContextCacheKey
 
 struct VulkanContextCacheKeyHash
 {
-    [[nodiscard]] size_t operator()(
-        const VulkanContextCacheKey& key) const noexcept
+    [[nodiscard]] size_t operator()(const VulkanContextCacheKey& key) const noexcept
     {
         const size_t device_hash = std::hash<uint32_t>{}(key.device_index);
         const size_t flags_hash = std::hash<uint64_t>{}(key.optimization_flags);
@@ -132,43 +130,37 @@ struct VulkanRuntimeState
     [[nodiscard]] VulkanStatistics snapshot() const noexcept;
 };
 
-int submit_compute_and_wait(
-    ncnn::VkCompute& command,
-    VulkanRuntimeState& runtime_state);
+int submit_compute_and_wait(ncnn::VkCompute& command,
+                            VulkanRuntimeState& runtime_state);
 
-bool prepare_staging_batch(
-    ncnn::VkMat& buffer,
-    size_t rows,
-    uint32_t columns,
-    ncnn::VkAllocator* allocator,
-    VulkanRuntimeState& runtime_state,
-    size_t element_size = sizeof(float));
+bool prepare_staging_batch(ncnn::VkMat& buffer,
+                           size_t rows,
+                           uint32_t columns,
+                           ncnn::VkAllocator* allocator,
+                           VulkanRuntimeState& runtime_state,
+                           size_t element_size = sizeof(float));
 
-bool prepare_staging_tensor(
-    ncnn::VkMat& buffer,
-    int width,
-    int height,
-    int channels,
-    size_t element_size,
-    ncnn::VkAllocator* allocator,
-    VulkanRuntimeState& runtime_state);
+bool prepare_staging_tensor(ncnn::VkMat& buffer,
+                            int width,
+                            int height,
+                            int channels,
+                            size_t element_size,
+                            ncnn::VkAllocator* allocator,
+                            VulkanRuntimeState& runtime_state);
 
-bool record_mapped_upload(
-    ncnn::VkMat& staging,
-    ncnn::VkMat& destination,
-    ncnn::VkCompute& command,
-    const ncnn::Option& option);
+bool record_mapped_upload(ncnn::VkMat& staging,
+                          ncnn::VkMat& destination,
+                          ncnn::VkCompute& command,
+                          const ncnn::Option& option);
 
-bool record_mapped_activation_upload(
-    ncnn::VkMat& staging,
-    ncnn::VkMat& destination,
-    ncnn::VkCompute& command,
-    ncnn::VulkanDevice* device,
-    const ncnn::Option& option,
-    DType source_dtype = DType::Float32);
+bool record_mapped_activation_upload(ncnn::VkMat& staging,
+                                     ncnn::VkMat& destination,
+                                     ncnn::VkCompute& command,
+                                     ncnn::VulkanDevice* device,
+                                     const ncnn::Option& option,
+                                     DType source_dtype = DType::Float32);
 
-[[nodiscard]] inline size_t vulkan_activation_storage_variant(
-    const ncnn::Option& option) noexcept
+[[nodiscard]] inline size_t vulkan_activation_storage_variant(const ncnn::Option& option) noexcept
 {
     return option.use_fp16_storage
                ? 1
@@ -176,18 +168,16 @@ bool record_mapped_activation_upload(
                                      : 0;
 }
 
-[[nodiscard]] inline size_t vulkan_activation_element_size(
-    const ncnn::Option& option) noexcept
+[[nodiscard]] inline size_t vulkan_activation_element_size(const ncnn::Option& option) noexcept
 {
     return vulkan_activation_storage_variant(option) == 0
                ? sizeof(float)
                : sizeof(uint16_t);
 }
 
-[[nodiscard]] inline ncnn::VkMat row_view(
-    const ncnn::VkMat& source,
-    size_t first_row,
-    size_t rows)
+[[nodiscard]] inline ncnn::VkMat row_view(const ncnn::VkMat& source,
+                                          size_t first_row,
+                                          size_t rows)
 {
     if (source.empty() || source.dims != 2
         || first_row + rows > static_cast<size_t>(source.h))
@@ -200,75 +190,64 @@ bool record_mapped_activation_upload(
     return view;
 }
 
-ncnn::VkMat bind_direct_host_input(
-    ncnn::VkMat& staging,
-    VulkanRuntimeState& runtime_state);
+ncnn::VkMat bind_direct_host_input(ncnn::VkMat& staging,
+                                   VulkanRuntimeState& runtime_state);
 
-ncnn::VkMat prepare_direct_host_output(
-    ncnn::VkMat& staging,
-    VulkanRuntimeState& runtime_state);
+ncnn::VkMat prepare_direct_host_output(ncnn::VkMat& staging,
+                                       VulkanRuntimeState& runtime_state);
 
-bool fill_staging_upload(
-    const ActivationBuffer& input,
-    ncnn::VkMat& staging,
-    ncnn::VkAllocator* allocator,
-    VulkanRuntimeState& runtime_state);
+bool fill_staging_upload(const ActivationBuffer& input,
+                         ncnn::VkMat& staging,
+                         ncnn::VkAllocator* allocator,
+                         VulkanRuntimeState& runtime_state);
 
-bool fill_staging_values(
-    const void* source,
-    size_t count,
-    size_t element_size,
-    ncnn::VkMat& staging,
-    ncnn::VkAllocator* allocator,
-    VulkanRuntimeState& runtime_state);
+bool fill_staging_values(const void* source,
+                         size_t count,
+                         size_t element_size,
+                         ncnn::VkMat& staging,
+                         ncnn::VkAllocator* allocator,
+                         VulkanRuntimeState& runtime_state);
 
-bool record_prepared_staging_upload(
-    const ncnn::VkMat& staging,
-    size_t rows,
-    ncnn::VkMat& destination,
-    ncnn::VkCompute& command,
-    ncnn::VulkanDevice* device,
-    const ncnn::Option& option,
-    DType source_dtype = DType::Float32);
+bool record_prepared_staging_upload(const ncnn::VkMat& staging,
+                                    size_t rows,
+                                    ncnn::VkMat& destination,
+                                    ncnn::VkCompute& command,
+                                    ncnn::VulkanDevice* device,
+                                    const ncnn::Option& option,
+                                    DType source_dtype = DType::Float32);
 
-bool record_prepared_staging_download(
-    const ncnn::VkMat& source,
-    size_t rows,
-    uint32_t columns,
-    ncnn::VkMat& staging,
-    ncnn::VkCompute& command,
-    const ncnn::Option& option);
+bool record_prepared_staging_download(const ncnn::VkMat& source,
+                                      size_t rows,
+                                      uint32_t columns,
+                                      ncnn::VkMat& staging,
+                                      ncnn::VkCompute& command,
+                                      const ncnn::Option& option);
 
-bool record_prepared_activation_staging_download(
-    const ncnn::VkMat& source,
-    size_t rows,
-    uint32_t columns,
-    ncnn::VkMat& staging,
-    ncnn::VkCompute& command,
-    ncnn::VulkanDevice* device,
-    const ncnn::Option& option,
-    DType output_dtype = DType::Float32);
+bool record_prepared_activation_staging_download(const ncnn::VkMat& source,
+                                                 size_t rows,
+                                                 uint32_t columns,
+                                                 ncnn::VkMat& staging,
+                                                 ncnn::VkCompute& command,
+                                                 ncnn::VulkanDevice* device,
+                                                 const ncnn::Option& option,
+                                                 DType output_dtype = DType::Float32);
 
-bool copy_staging_to_cpu_batch(
-    ncnn::VkMat& staging,
-    ActivationBuffer& output);
+bool copy_staging_to_cpu_batch(ncnn::VkMat& staging,
+                               ActivationBuffer& output);
 
 // Batch scatter requires distinct outputs; only same-index input/output alias is allowed.
-bool copy_staging_to_cpu_batches(
-    ncnn::VkMat& staging,
-    std::span<const ActivationBuffer*> inputs,
-    std::span<ActivationBuffer*> outputs,
-    uint32_t columns);
+bool copy_staging_to_cpu_batches(ncnn::VkMat& staging,
+                                 std::span<const ActivationBuffer*> inputs,
+                                 std::span<ActivationBuffer*> outputs,
+                                 uint32_t columns);
 
-bool prepare_float_tensor_upload(
-    const TensorData& source,
-    ncnn::Mat& destination);
+bool prepare_float_tensor_upload(const TensorData& source,
+                                 ncnn::Mat& destination);
 
 class VulkanRuntime
 {
     friend class VulkanContext;
-    friend VulkanStatistics get_vulkan_statistics(
-        const VulkanRuntimePtr& vulkan_runtime) noexcept;
+    friend VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& vulkan_runtime) noexcept;
 
     mutable std::mutex initialization_mutex;
     bool initialization_attempted = false;
@@ -360,10 +339,9 @@ public:
 
     ~VulkanContext();
 
-    [[nodiscard]] static std::shared_ptr<VulkanContext> acquire(
-        uint32_t requested_device_index,
-        const VulkanRuntimePtr& vulkan_runtime,
-        uint64_t optimization_flags);
+    [[nodiscard]] static std::shared_ptr<VulkanContext> acquire(uint32_t requested_device_index,
+                                                                const VulkanRuntimePtr& vulkan_runtime,
+                                                                uint64_t optimization_flags);
 
     [[nodiscard]] ncnn::VulkanDevice* device() const noexcept
     {
@@ -411,20 +389,17 @@ public:
         return vulkan_runtime->state;
     }
 
-    [[nodiscard]] std::shared_ptr<const std::vector<uint32_t>> shader_binary(
-        const char* source,
-        int source_length,
-        const ncnn::Option& option,
-        uint64_t variant);
+    [[nodiscard]] std::shared_ptr<const std::vector<uint32_t>> shader_binary(const char* source,
+                                                                             int source_length,
+                                                                             const ncnn::Option& option,
+                                                                             uint64_t variant);
 
-    [[nodiscard]] std::shared_ptr<ncnn::Pipeline> find_pipeline(
-        const char* source,
-        uint64_t variant) const;
+    [[nodiscard]] std::shared_ptr<ncnn::Pipeline> find_pipeline(const char* source,
+                                                                uint64_t variant) const;
 
-    void cache_pipeline(
-        const char* source,
-        uint64_t variant,
-        const std::shared_ptr<ncnn::Pipeline>& pipeline);
+    void cache_pipeline(const char* source,
+                        uint64_t variant,
+                        const std::shared_ptr<ncnn::Pipeline>& pipeline);
 
     [[nodiscard]] std::mutex& command_mutex() noexcept
     {
@@ -434,11 +409,10 @@ public:
     [[nodiscard]] VulkanTransferLease acquire_transfer_slot();
 
 private:
-    explicit VulkanContext(
-        ncnn::VulkanDevice* device,
-        VulkanRuntimePtr _vulkan_runtime,
-        uint64_t optimization_flags,
-        uint32_t command_optimization_flags);
+    explicit VulkanContext(ncnn::VulkanDevice* device,
+                           VulkanRuntimePtr _vulkan_runtime,
+                           uint64_t optimization_flags,
+                           uint32_t command_optimization_flags);
 
     // ncnn owns Vulkan teardown through atexit; transfer commands share that lifetime.
 
@@ -479,11 +453,10 @@ public:
     VulkanWeightUploadBatch(const VulkanWeightUploadBatch&) = delete;
     VulkanWeightUploadBatch& operator=(const VulkanWeightUploadBatch&) = delete;
 
-    [[nodiscard]] bool record(
-        const ncnn::Mat& source,
-        ncnn::VkMat& destination,
-        const ncnn::Option& option,
-        ncnn::VkAllocator* weight_allocator);
+    [[nodiscard]] bool record(const ncnn::Mat& source,
+                              ncnn::VkMat& destination,
+                              const ncnn::Option& option,
+                              ncnn::VkAllocator* weight_allocator);
 
     [[nodiscard]] bool submit();
 

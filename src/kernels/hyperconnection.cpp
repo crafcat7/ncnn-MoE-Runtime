@@ -104,11 +104,10 @@ Result<void> hyper_connection_pre(const ActivationBuffer& input, const TensorDat
             {
                 const float pre = hyper_sigmoid(mixed[copy] * scales[0] + bases[copy]) + hyper_epsilon;
                 post[copy] = 2.0f * hyper_sigmoid(mixed[multiplier + copy] * scales[1] + bases[multiplier + copy]);
-                float_scaled_add(
-                    reduced,
-                    source + static_cast<size_t>(copy) * hidden_size,
-                    pre,
-                    hidden_size);
+                float_scaled_add(reduced,
+                                 source + static_cast<size_t>(copy) * hidden_size,
+                                 pre,
+                                 hidden_size);
             }
         }
 
@@ -207,11 +206,10 @@ Result<void> hyper_connection_post(const ActivationBuffer& branch, const Activat
                 std::copy_n(branch_row, branch.columns(), output_row);
                 float_scale_inplace(output_row, post[copy], branch.columns());
                 for (uint32_t residual_copy = 0; residual_copy < multiplier; ++residual_copy)
-                    float_scaled_add(
-                        output_row,
-                        residual_row + static_cast<size_t>(residual_copy) * branch.columns(),
-                        combine[residual_copy * multiplier + copy],
-                        branch.columns());
+                    float_scaled_add(output_row,
+                                     residual_row + static_cast<size_t>(residual_copy) * branch.columns(),
+                                     combine[residual_copy * multiplier + copy],
+                                     branch.columns());
             }
         }
     }
@@ -263,11 +261,10 @@ Result<void> hyper_connection_head(const ActivationBuffer& input, const TensorDa
             for (uint32_t copy = 0; copy < multiplier; ++copy)
             {
                 const float pre = hyper_sigmoid(mixed[copy] * scale_value + bases[copy]) + hyper_epsilon;
-                float_scaled_add(
-                    destination,
-                    source + static_cast<size_t>(copy) * hidden_size,
-                    pre,
-                    hidden_size);
+                float_scaled_add(destination,
+                                 source + static_cast<size_t>(copy) * hidden_size,
+                                 pre,
+                                 hidden_size);
             }
         }
     }

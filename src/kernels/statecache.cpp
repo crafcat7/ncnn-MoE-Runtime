@@ -5,27 +5,22 @@
 namespace ncnn {
 namespace moe {
 
-static void capture_gated_delta_snapshot(
-    const LayerCache& cache,
-    GatedDeltaSnapshot& snapshot)
+static void capture_gated_delta_snapshot(const LayerCache& cache,
+                                         GatedDeltaSnapshot& snapshot)
 {
     snapshot.gated_delta_convolution = cache.gated_delta_convolution;
     snapshot.gated_delta_recurrent = cache.gated_delta_recurrent;
 }
 
-static void restore_gated_delta_snapshot(
-    LayerCache& cache,
-    GatedDeltaSnapshot& snapshot) noexcept
+static void restore_gated_delta_snapshot(LayerCache& cache,
+                                         GatedDeltaSnapshot& snapshot) noexcept
 {
-    cache.gated_delta_convolution.swap(
-        snapshot.gated_delta_convolution);
-    cache.gated_delta_recurrent.swap(
-        snapshot.gated_delta_recurrent);
+    cache.gated_delta_convolution.swap(snapshot.gated_delta_convolution);
+    cache.gated_delta_recurrent.swap(snapshot.gated_delta_recurrent);
 }
 
-Result<void> begin_state_cache_transaction(
-    std::span<LayerCache> caches,
-    size_t expected_rows)
+Result<void> begin_state_cache_transaction(std::span<LayerCache> caches,
+                                           size_t expected_rows)
 {
     for (const LayerCache& cache : caches)
     {
@@ -67,8 +62,7 @@ Result<void> begin_state_cache_transaction(
     {
         if (cache.gated_delta_device_state)
         {
-            if (!cache.gated_delta_device_state->begin_transaction(
-                    expected_rows))
+            if (!cache.gated_delta_device_state->begin_transaction(expected_rows))
             {
                 for (GatedDeltaState_vulkan* state : device_transactions)
                 {
@@ -85,8 +79,7 @@ Result<void> begin_state_cache_transaction(
                     ErrorCode::InternalError,
                     "failed to begin Vulkan Gated DeltaNet transaction"};
             }
-            device_transactions.push_back(
-                cache.gated_delta_device_state.get());
+            device_transactions.push_back(cache.gated_delta_device_state.get());
             cache.device_allocated_size = cache.gated_delta_device_state->allocated_bytes();
         }
     }
@@ -108,11 +101,9 @@ Result<void> begin_state_cache_transaction(
             if (!cache.gated_delta_convolution.empty()
                 || !cache.gated_delta_recurrent.empty())
             {
-                capture_gated_delta_snapshot(
-                    cache,
-                    transaction.initial);
-                transaction.rows.resize(
-                    expected_rows > 0 ? expected_rows - 1 : 0);
+                capture_gated_delta_snapshot(cache,
+                                             transaction.initial);
+                transaction.rows.resize(expected_rows > 0 ? expected_rows - 1 : 0);
             }
             transaction.active = true;
         }
@@ -145,9 +136,8 @@ Result<void> begin_state_cache_transaction(
     return {};
 }
 
-void record_standard_cache_transaction_rows(
-    LayerCache& cache,
-    size_t rows)
+void record_standard_cache_transaction_rows(LayerCache& cache,
+                                            size_t rows)
 {
     LayerCacheTransaction& transaction = cache.transaction;
     if (!transaction.active)
@@ -155,8 +145,7 @@ void record_standard_cache_transaction_rows(
     transaction.recorded_rows += rows;
 }
 
-void record_gated_delta_cache_transaction_row(
-    LayerCache& cache)
+void record_gated_delta_cache_transaction_row(LayerCache& cache)
 {
     LayerCacheTransaction& transaction = cache.transaction;
     if (!transaction.active)
@@ -172,9 +161,8 @@ void record_gated_delta_cache_transaction_row(
     }
 }
 
-Result<void> finish_state_cache_transaction(
-    std::span<LayerCache> caches,
-    size_t committed_rows)
+Result<void> finish_state_cache_transaction(std::span<LayerCache> caches,
+                                            size_t committed_rows)
 {
     for (const LayerCache& cache : caches)
     {
@@ -217,9 +205,8 @@ Result<void> finish_state_cache_transaction(
         LayerCacheTransaction& transaction = cache.transaction;
         if (!transaction.active || !cache.gated_delta_device_state)
             continue;
-        if (!cache.gated_delta_device_state->prepare_transaction_finish(
-                committed_rows,
-                transaction.recorded_rows))
+        if (!cache.gated_delta_device_state->prepare_transaction_finish(committed_rows,
+                                                                        transaction.recorded_rows))
         {
             return Error{
                 ErrorCode::InternalError,
@@ -258,9 +245,8 @@ Result<void> finish_state_cache_transaction(
             {
                 if (!cache.gated_delta_device_state)
                 {
-                    restore_gated_delta_snapshot(
-                        cache,
-                        transaction.rows[committed_rows - 1]);
+                    restore_gated_delta_snapshot(cache,
+                                                 transaction.rows[committed_rows - 1]);
                 }
             }
             cache.gated_delta_token_count = transaction.initial_gated_delta_token_count

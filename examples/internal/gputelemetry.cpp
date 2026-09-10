@@ -166,13 +166,10 @@ struct GpuTelemetrySampler::Impl
         get_count = reinterpret_cast<NvmlGetCountFn>(load_symbol(library, "nvmlDeviceGetCount_v2"));
         if (get_count == nullptr)
             get_count = reinterpret_cast<NvmlGetCountFn>(load_symbol(library, "nvmlDeviceGetCount"));
-        get_handle_by_index = reinterpret_cast<NvmlGetHandleByIndexFn>(
-            load_symbol(library, "nvmlDeviceGetHandleByIndex_v2"));
+        get_handle_by_index = reinterpret_cast<NvmlGetHandleByIndexFn>(load_symbol(library, "nvmlDeviceGetHandleByIndex_v2"));
         if (get_handle_by_index == nullptr)
-            get_handle_by_index = reinterpret_cast<NvmlGetHandleByIndexFn>(
-                load_symbol(library, "nvmlDeviceGetHandleByIndex"));
-        get_utilization = reinterpret_cast<NvmlGetUtilizationFn>(
-            load_symbol(library, "nvmlDeviceGetUtilizationRates"));
+            get_handle_by_index = reinterpret_cast<NvmlGetHandleByIndexFn>(load_symbol(library, "nvmlDeviceGetHandleByIndex"));
+        get_utilization = reinterpret_cast<NvmlGetUtilizationFn>(load_symbol(library, "nvmlDeviceGetUtilizationRates"));
         get_memory_info = reinterpret_cast<NvmlGetMemoryInfoFn>(load_symbol(library, "nvmlDeviceGetMemoryInfo"));
         get_name = reinterpret_cast<NvmlGetNameFn>(load_symbol(library, "nvmlDeviceGetName"));
         error_string = reinterpret_cast<NvmlErrorStringFn>(load_symbol(library, "nvmlErrorString"));

@@ -69,12 +69,11 @@ static bool cached_rope_coefficients_enabled(uint64_t optimization_flags) noexce
     return has_flag(optimization_flags, OptimizationCpuRopeCache);
 }
 
-static void prepare_rope_coefficients(
-    uint32_t dimension,
-    uint64_t position,
-    const AttentionBlockPlan& plan,
-    std::vector<float>& cosine,
-    std::vector<float>& sine)
+static void prepare_rope_coefficients(uint32_t dimension,
+                                      uint64_t position,
+                                      const AttentionBlockPlan& plan,
+                                      std::vector<float>& cosine,
+                                      std::vector<float>& sine)
 {
     const uint32_t half_dimension = dimension / 2;
     cosine.resize(half_dimension);
@@ -108,11 +107,10 @@ static void prepare_rope_coefficients(
     }
 }
 
-static void apply_prepared_rope(
-    float* vector,
-    uint32_t dimension,
-    const std::vector<float>& cosine,
-    const std::vector<float>& sine)
+static void apply_prepared_rope(float* vector,
+                                uint32_t dimension,
+                                const std::vector<float>& cosine,
+                                const std::vector<float>& sine)
 {
     assert(cosine.size() >= dimension / 2 && sine.size() >= dimension / 2);
     float_rope_inplace(vector, cosine.data(), sine.data(), dimension);
@@ -232,14 +230,12 @@ static void append_cache(LayerCache& cache, DType dtype, const ActivationBuffer&
         {
             uint16_t* key_destination = cache.bfloat16_keys.data() + slot * cache.columns;
             uint16_t* value_destination = cache.bfloat16_values.data() + slot * cache.columns;
-            float_to_bfloat16_array(
-                key_destination,
-                key.row(token_index),
-                cache.columns);
-            float_to_bfloat16_array(
-                value_destination,
-                value.row(token_index),
-                cache.columns);
+            float_to_bfloat16_array(key_destination,
+                                    key.row(token_index),
+                                    cache.columns);
+            float_to_bfloat16_array(value_destination,
+                                    value.row(token_index),
+                                    cache.columns);
         }
         else
         {
@@ -278,10 +274,9 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
     {
         for (size_t query_index = 0; query_index < query.rows(); ++query_index)
         {
-            maximum_selected_keys = std::max(
-                maximum_selected_keys,
-                selected_offsets[query_index + 1]
-                    - selected_offsets[query_index]);
+            maximum_selected_keys = std::max(maximum_selected_keys,
+                                             selected_offsets[query_index + 1]
+                                                 - selected_offsets[query_index]);
         }
     }
     logits.resize(has_selected_keys
@@ -344,23 +339,20 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
             }
             else
             {
-                std::copy_n(
-                    cache.keys.data() + static_cast<size_t>(slot) * cache.columns,
-                    cache.columns,
-                    key_destination);
-                std::copy_n(
-                    cache.values.data() + static_cast<size_t>(slot) * cache.columns,
-                    cache.columns,
-                    value_destination);
+                std::copy_n(cache.keys.data() + static_cast<size_t>(slot) * cache.columns,
+                            cache.columns,
+                            key_destination);
+                std::copy_n(cache.values.data() + static_cast<size_t>(slot) * cache.columns,
+                            cache.columns,
+                            value_destination);
             }
         }
         key_values = key_cache.data();
         value_values = value_cache.data();
     }
 
-    const bool flash_prefill_enabled = has_flag(
-                                           optimization_flags,
-                                           OptimizationCpuFlashAttention)
+    const bool flash_prefill_enabled = has_flag(optimization_flags,
+                                                OptimizationCpuFlashAttention)
                                        && query.rows() > 1
                                        && cache.token_count >= 64
                                        && !has_selected_keys;
@@ -369,9 +361,8 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
     if (omp_in_parallel() == 0)
         attention_team_size = static_cast<int>(cpu_linear_num_threads());
 #endif
-    const bool split_kv_enabled = has_flag(
-                                      optimization_flags,
-                                      OptimizationCpuSplitKvAttention)
+    const bool split_kv_enabled = has_flag(optimization_flags,
+                                           OptimizationCpuSplitKvAttention)
                                   && query.rows() == 1
                                   && cache.token_count >= 512
                                   && attention_team_size > 1
@@ -442,9 +433,8 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                                                  std::vector<float>& tile_logits) {
                 const size_t query_group = static_cast<size_t>(job / head_count) * query_tile_size;
                 const uint32_t query_head = static_cast<uint32_t>(job % head_count);
-                const uint32_t query_count = static_cast<uint32_t>(std::min<size_t>(
-                    query_tile_size,
-                    query.rows() - query_group));
+                const uint32_t query_count = static_cast<uint32_t>(std::min<size_t>(query_tile_size,
+                                                                                    query.rows() - query_group));
                 const uint32_t kv_head = query_head / heads_per_group;
                 const float* query_values = query.row(query_group) + static_cast<size_t>(query_head) * head_dimension;
                 const float* key_values_for_head = key_values + static_cast<size_t>(kv_head) * head_dimension;
@@ -452,10 +442,9 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                 std::array<float, query_tile_size> normalizer = {};
                 for (uint32_t query_offset = 0; query_offset < query_count; ++query_offset)
                 {
-                    std::fill(
-                        running.begin() + static_cast<size_t>(query_offset) * head_dimension,
-                        running.begin() + static_cast<size_t>(query_offset + 1) * head_dimension,
-                        0.0f);
+                    std::fill(running.begin() + static_cast<size_t>(query_offset) * head_dimension,
+                              running.begin() + static_cast<size_t>(query_offset + 1) * head_dimension,
+                              0.0f);
                     maximum[query_offset] = sink_value(query_head);
                     normalizer[query_offset] = sinks ? 1.0f : 0.0f;
                 }
@@ -466,19 +455,17 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                     tile_maximum.fill(-std::numeric_limits<float>::infinity());
                     for (uint64_t key_begin = tile_begin; key_begin < tile_end; key_begin += key_gemm_tile_size)
                     {
-                        const uint32_t key_count = static_cast<uint32_t>(std::min<uint64_t>(
-                            key_gemm_tile_size,
-                            tile_end - key_begin));
-                        float_gemm_4x8(
-                            key_values_for_head + static_cast<size_t>(key_begin) * cache.columns,
-                            cache.columns,
-                            query_values,
-                            query.columns(),
-                            head_dimension,
-                            key_count,
-                            query_count,
-                            tile_logits.data() + static_cast<size_t>(key_begin - tile_begin),
-                            key_tile_size);
+                        const uint32_t key_count = static_cast<uint32_t>(std::min<uint64_t>(key_gemm_tile_size,
+                                                                                            tile_end - key_begin));
+                        float_gemm_4x8(key_values_for_head + static_cast<size_t>(key_begin) * cache.columns,
+                                       cache.columns,
+                                       query_values,
+                                       query.columns(),
+                                       head_dimension,
+                                       key_count,
+                                       query_count,
+                                       tile_logits.data() + static_cast<size_t>(key_begin - tile_begin),
+                                       key_tile_size);
                         for (uint32_t query_offset = 0; query_offset < query_count; ++query_offset)
                         {
                             for (uint32_t key_offset = 0; key_offset < key_count; ++key_offset)
@@ -520,12 +507,11 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                                                     ? float_approximate_exp(maximum[query_offset] - new_maximum)
                                                     : 0.0f;
                         const float tile_scale = float_approximate_exp(tile_maximum[query_offset] - new_maximum);
-                        float_scale_add(
-                            running.data() + static_cast<size_t>(query_offset) * head_dimension,
-                            old_scale,
-                            query_tile_output,
-                            tile_scale,
-                            head_dimension);
+                        float_scale_add(running.data() + static_cast<size_t>(query_offset) * head_dimension,
+                                        old_scale,
+                                        query_tile_output,
+                                        tile_scale,
+                                        head_dimension);
                         normalizer[query_offset] = normalizer[query_offset] * old_scale + tile_normalizer * tile_scale;
                         maximum[query_offset] = new_maximum;
                     }
@@ -536,10 +522,9 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                     {
                         float* destination = output.row(query_group + query_offset)
                                              + static_cast<size_t>(query_head) * head_dimension;
-                        std::copy_n(
-                            running.data() + static_cast<size_t>(query_offset) * head_dimension,
-                            head_dimension,
-                            destination);
+                        std::copy_n(running.data() + static_cast<size_t>(query_offset) * head_dimension,
+                                    head_dimension,
+                                    destination);
                         float_scale_inplace(destination, 1.0f / normalizer[query_offset], head_dimension);
                     }
                 }
@@ -745,16 +730,14 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                         const uint16_t* key_vector = bfloat16_key_values
                                                      + static_cast<size_t>(slot) * cache.columns
                                                      + static_cast<size_t>(kv_head) * head_dimension;
-                        dot = bfloat16_dot(
-                            key_vector, query_vector, head_dimension);
+                        dot = bfloat16_dot(key_vector, query_vector, head_dimension);
                     }
                     else
                     {
                         const float* key_vector = key_values
                                                   + static_cast<size_t>(key_index) * cache.columns
                                                   + static_cast<size_t>(kv_head) * head_dimension;
-                        dot = float_dot(
-                            query_vector, key_vector, head_dimension);
+                        dot = float_dot(query_vector, key_vector, head_dimension);
                     }
                     logits[logit_index] = dot * scale;
                     maximum = std::max(maximum, logits[logit_index]);
@@ -765,10 +748,8 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                 {
                     const float sink_value = sinks->dtype == DType::Float32
                                                  ? sinks->float32_values()[query_head]
-                                                 : bfloat16_to_float(
-                                                       sinks->bfloat16_values()[query_head]);
-                    normalizer = float_approximate_exp(
-                        sink_value - maximum);
+                                                 : bfloat16_to_float(sinks->bfloat16_values()[query_head]);
+                    normalizer = float_approximate_exp(sink_value - maximum);
                 }
                 for (size_t selected_index = selected_begin;
                      selected_index < selected_end; ++selected_index)
@@ -776,8 +757,7 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                     const size_t logit_index = selected_index - selected_begin;
                     if (std::isfinite(logits[logit_index]))
                     {
-                        logits[logit_index] = float_approximate_exp(
-                            logits[logit_index] - maximum);
+                        logits[logit_index] = float_approximate_exp(logits[logit_index] - maximum);
                         normalizer += logits[logit_index];
                     }
                     else
@@ -804,18 +784,16 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                             const uint16_t* value_vector = bfloat16_value_values
                                                            + static_cast<size_t>(slot) * cache.columns
                                                            + static_cast<size_t>(kv_head) * head_dimension;
-                            bfloat16_scaled_add(
-                                output_vector, value_vector, probability,
-                                head_dimension);
+                            bfloat16_scaled_add(output_vector, value_vector, probability,
+                                                head_dimension);
                         }
                         else
                         {
                             const float* value_vector = value_values
                                                         + static_cast<size_t>(key_index) * cache.columns
                                                         + static_cast<size_t>(kv_head) * head_dimension;
-                            float_scaled_add(
-                                output_vector, value_vector, probability,
-                                head_dimension);
+                            float_scaled_add(output_vector, value_vector, probability,
+                                             head_dimension);
                         }
                     }
                 }
@@ -971,25 +949,23 @@ static void apply_head_rms_norm(ActivationBuffer& batch, uint32_t head_count, ui
             if (has_flag(optimization_flags, OptimizationCpuSimdRmsNorm)
                 && weight.dtype == DType::Float32)
             {
-                float_rms_norm(
-                    values,
-                    values,
-                    weight.float32_values().data(),
-                    epsilon,
-                    weight_offset,
-                    head_dimension);
+                float_rms_norm(values,
+                               values,
+                               weight.float32_values().data(),
+                               epsilon,
+                               weight_offset,
+                               head_dimension);
                 continue;
             }
             if (has_flag(optimization_flags, OptimizationCpuSimdRmsNorm)
                 && weight.dtype == DType::BFloat16)
             {
-                bfloat16_rms_norm(
-                    values,
-                    values,
-                    weight.bfloat16_values().data(),
-                    epsilon,
-                    weight_offset,
-                    head_dimension);
+                bfloat16_rms_norm(values,
+                                  values,
+                                  weight.bfloat16_values().data(),
+                                  epsilon,
+                                  weight_offset,
+                                  head_dimension);
                 continue;
             }
             float square_sum = 0.0f;
@@ -1004,23 +980,21 @@ static void apply_head_rms_norm(ActivationBuffer& batch, uint32_t head_count, ui
     }
 }
 
-static Result<void> project_and_append_qsa_keys(
-    const WeightStore& weights,
-    const CompiledOperatorTable& operators,
-    const AttentionBlockPlan& plan,
-    const ActivationBuffer& normalized,
-    LayerCache& cache,
-    AttentionScratch& scratch,
-    uint64_t optimization_flags)
+static Result<void> project_and_append_qsa_keys(const WeightStore& weights,
+                                                const CompiledOperatorTable& operators,
+                                                const AttentionBlockPlan& plan,
+                                                const ActivationBuffer& normalized,
+                                                LayerCache& cache,
+                                                AttentionScratch& scratch,
+                                                uint64_t optimization_flags)
 {
     if (!has_flag(plan.flags, AttentionBlockQsa))
         return {};
     if (cache.transaction.active)
         return Error{ErrorCode::UnsupportedModel, "QSA cache transactions are not supported"};
-    attention_linear_into(
-        weights, operators, plan.qsa_query_key_weight,
-        invalid_tensor_handle, normalized, scratch.qsa_query_key,
-        optimization_flags);
+    attention_linear_into(weights, operators, plan.qsa_query_key_weight,
+                          invalid_tensor_handle, normalized, scratch.qsa_query_key,
+                          optimization_flags);
     const uint32_t query_columns = plan.index_head_count * plan.index_head_dimension;
     const uint32_t expected_columns = query_columns + plan.index_head_dimension;
     if (scratch.qsa_query_key.columns() != expected_columns)
@@ -1032,29 +1006,26 @@ static Result<void> project_and_append_qsa_keys(
     }
     scratch.qsa_query.reset(normalized.rows(), query_columns, false);
     const size_t previous_size = cache.qsa_index_keys.size();
-    cache.qsa_index_keys.resize(
-        previous_size + normalized.rows() * plan.index_head_dimension);
+    cache.qsa_index_keys.resize(previous_size + normalized.rows() * plan.index_head_dimension);
     for (size_t row_index = 0; row_index < normalized.rows(); ++row_index)
     {
         const float* source = scratch.qsa_query_key.row(row_index);
         std::copy_n(source, query_columns, scratch.qsa_query.row(row_index));
-        float_to_bfloat16_array(
-            cache.qsa_index_keys.data() + previous_size
-                + row_index * plan.index_head_dimension,
-            source + query_columns,
-            plan.index_head_dimension);
+        float_to_bfloat16_array(cache.qsa_index_keys.data() + previous_size
+                                    + row_index * plan.index_head_dimension,
+                                source + query_columns,
+                                plan.index_head_dimension);
     }
     return {};
 }
 
-static Result<void> prepare_qsa_selection(
-    const WeightStore& weights,
-    const AttentionBlockPlan& plan,
-    uint64_t position_offset,
-    float norm_epsilon,
-    LayerCache& cache,
-    AttentionScratch& scratch,
-    uint64_t optimization_flags)
+static Result<void> prepare_qsa_selection(const WeightStore& weights,
+                                          const AttentionBlockPlan& plan,
+                                          uint64_t position_offset,
+                                          float norm_epsilon,
+                                          LayerCache& cache,
+                                          AttentionScratch& scratch,
+                                          uint64_t optimization_flags)
 {
     if (!has_flag(plan.flags, AttentionBlockQsa))
     {
@@ -1067,11 +1038,10 @@ static Result<void> prepare_qsa_selection(
     {
         return Error{ErrorCode::InternalError, "QSA key cache is out of sync after append"};
     }
-    apply_head_rms_norm(
-        scratch.qsa_query, plan.index_head_count,
-        plan.index_head_dimension,
-        weights.at(plan.qsa_query_norm_weight), norm_epsilon,
-        plan.norm_weight_offset, optimization_flags);
+    apply_head_rms_norm(scratch.qsa_query, plan.index_head_count,
+                        plan.index_head_dimension,
+                        weights.at(plan.qsa_query_norm_weight), norm_epsilon,
+                        plan.norm_weight_offset, optimization_flags);
     const uint32_t rope_dimension = plan.rope_head_dimension == 0
                                         ? plan.index_head_dimension
                                         : plan.rope_head_dimension;
@@ -1079,10 +1049,9 @@ static Result<void> prepare_qsa_selection(
     {
         for (uint32_t head = 0; head < plan.index_head_count; ++head)
         {
-            apply_rope(
-                scratch.qsa_query.row(row_index)
-                    + static_cast<size_t>(head) * plan.index_head_dimension,
-                rope_dimension, position_offset + row_index, plan);
+            apply_rope(scratch.qsa_query.row(row_index)
+                           + static_cast<size_t>(head) * plan.index_head_dimension,
+                       rope_dimension, position_offset + row_index, plan);
         }
     }
 
@@ -1098,12 +1067,10 @@ static Result<void> prepare_qsa_selection(
     {
         return Error{ErrorCode::InvalidModel, "QSA selection storage size overflows"};
     }
-    scratch.qsa_selected_offsets.assign(
-        scratch.qsa_query.rows() + 1, 0);
+    scratch.qsa_selected_offsets.assign(scratch.qsa_query.rows() + 1, 0);
     scratch.qsa_selected_indices.clear();
-    scratch.qsa_selected_indices.reserve(
-        scratch.qsa_query.rows()
-        * static_cast<size_t>(maximum_selected_per_query));
+    scratch.qsa_selected_indices.reserve(scratch.qsa_query.rows()
+                                         * static_cast<size_t>(maximum_selected_per_query));
     const float scale = 1.0f / std::sqrt(static_cast<float>(plan.index_head_dimension));
     std::vector<std::pair<float, uint32_t>> scores;
     std::vector<float> pooled(plan.index_head_dimension);
@@ -1112,9 +1079,8 @@ static Result<void> prepare_qsa_selection(
         const uint64_t query_position = position_offset + query_index;
         const uint64_t visible_count = query_position < cache.start_position
                                            ? 0
-                                           : std::min<uint64_t>(
-                                                 cache.token_count,
-                                                 query_position - cache.start_position + 1);
+                                           : std::min<uint64_t>(cache.token_count,
+                                                                query_position - cache.start_position + 1);
         const uint64_t complete_blocks = visible_count / plan.compression_ratio;
         scores.clear();
         scores.reserve(static_cast<size_t>(complete_blocks));
@@ -1160,13 +1126,12 @@ static Result<void> prepare_qsa_selection(
             scores.emplace_back(score * scale, block);
         }
         const size_t selected_count = std::min<size_t>(plan.index_top_k, scores.size());
-        std::partial_sort(
-            scores.begin(), scores.begin() + selected_count, scores.end(),
-            [](const auto& left, const auto& right) {
-                if (left.first != right.first)
-                    return left.first > right.first;
-                return left.second < right.second;
-            });
+        std::partial_sort(scores.begin(), scores.begin() + selected_count, scores.end(),
+                          [](const auto& left, const auto& right) {
+                              if (left.first != right.first)
+                                  return left.first > right.first;
+                              return left.second < right.second;
+                          });
         const size_t selection_begin = scratch.qsa_selected_indices.size();
         for (size_t index = 0; index < selected_count; ++index)
         {
@@ -1175,36 +1140,32 @@ static Result<void> prepare_qsa_selection(
             for (uint32_t token = 0;
                  token < plan.compression_ratio; ++token)
             {
-                scratch.qsa_selected_indices.push_back(
-                    static_cast<uint32_t>(first_token + token));
+                scratch.qsa_selected_indices.push_back(static_cast<uint32_t>(first_token + token));
             }
         }
         for (uint64_t token = complete_blocks * plan.compression_ratio;
              token < visible_count; ++token)
         {
-            scratch.qsa_selected_indices.push_back(
-                static_cast<uint32_t>(token));
+            scratch.qsa_selected_indices.push_back(static_cast<uint32_t>(token));
         }
-        std::sort(
-            scratch.qsa_selected_indices.begin() + selection_begin,
-            scratch.qsa_selected_indices.end());
+        std::sort(scratch.qsa_selected_indices.begin() + selection_begin,
+                  scratch.qsa_selected_indices.end());
         scratch.qsa_selected_offsets[query_index + 1] = scratch.qsa_selected_indices.size();
     }
     return {};
 }
 
-Result<void> append_attention_context(
-    const WeightStore& weights,
-    const CompiledOperatorTable& operators,
-    const AttentionBlockPlan& plan,
-    ExecutionBackend backend,
-    float norm_epsilon,
-    DType kv_cache_dtype,
-    uint64_t position_offset,
-    LayerCache& cache,
-    AttentionScratch& scratch,
-    const ActivationBuffer& hidden,
-    uint64_t optimization_flags)
+Result<void> append_attention_context(const WeightStore& weights,
+                                      const CompiledOperatorTable& operators,
+                                      const AttentionBlockPlan& plan,
+                                      ExecutionBackend backend,
+                                      float norm_epsilon,
+                                      DType kv_cache_dtype,
+                                      uint64_t position_offset,
+                                      LayerCache& cache,
+                                      AttentionScratch& scratch,
+                                      const ActivationBuffer& hidden,
+                                      uint64_t optimization_flags)
 {
     if (cache.vulkan_attention_cache)
     {
@@ -1225,16 +1186,14 @@ Result<void> append_attention_context(
             "state cache transaction does not support sliding Attention"};
     }
 
-    configure_cache(
-        cache, plan.kv_head_count * plan.head_dimension,
-        kv_cache_dtype);
+    configure_cache(cache, plan.kv_head_count * plan.head_dimension,
+                    kv_cache_dtype);
     if (plan.pre_attention_norm_weight == invalid_tensor_handle)
         scratch.normalized = hidden;
     else
         rms_norm_batch_into(hidden, weights.at(plan.pre_attention_norm_weight), norm_epsilon, scratch.normalized, plan.norm_weight_offset, optimization_flags);
-    auto qsa_status = project_and_append_qsa_keys(
-        weights, operators, plan, scratch.normalized, cache, scratch,
-        optimization_flags);
+    auto qsa_status = project_and_append_qsa_keys(weights, operators, plan, scratch.normalized, cache, scratch,
+                                                  optimization_flags);
     if (!qsa_status)
         return qsa_status.error();
     ActivationBuffer& key = scratch.key;
@@ -1244,17 +1203,14 @@ Result<void> append_attention_context(
     const CompiledOperator& fused_qkv_operator = operators.at(plan.fused_qkv_operator);
     if (backend == ExecutionBackend::Vulkan
         && ((fused_qkv_gate_operator.bfloat16
-             && fused_qkv_gate_operator.bfloat16->forward(
-                 scratch.normalized,
-                 fused_qkv))
+             && fused_qkv_gate_operator.bfloat16->forward(scratch.normalized,
+                                                          fused_qkv))
             || (fused_qkv_operator.bfloat16
-                && fused_qkv_operator.bfloat16->forward(
-                    scratch.normalized,
-                    fused_qkv))
+                && fused_qkv_operator.bfloat16->forward(scratch.normalized,
+                                                        fused_qkv))
             || (fused_qkv_operator.linear
-                && fused_qkv_operator.linear->forward(
-                    scratch.normalized,
-                    fused_qkv))))
+                && fused_qkv_operator.linear->forward(scratch.normalized,
+                                                      fused_qkv))))
     {
         const uint32_t query_columns = plan.head_count * plan.head_dimension;
         const uint32_t key_value_columns = plan.kv_head_count * plan.head_dimension;
@@ -1285,19 +1241,17 @@ Result<void> append_attention_context(
         const uint64_t position = position_offset + token_index;
         if (cached_rope_coefficients_enabled(optimization_flags))
         {
-            prepare_rope_coefficients(
-                rope_dimension,
-                position,
-                plan,
-                scratch.rope_cosine,
-                scratch.rope_sine);
+            prepare_rope_coefficients(rope_dimension,
+                                      position,
+                                      plan,
+                                      scratch.rope_cosine,
+                                      scratch.rope_sine);
             for (uint32_t head = 0; head < plan.kv_head_count; ++head)
             {
-                apply_prepared_rope(
-                    key.row(token_index) + head * plan.head_dimension,
-                    rope_dimension,
-                    scratch.rope_cosine,
-                    scratch.rope_sine);
+                apply_prepared_rope(key.row(token_index) + head * plan.head_dimension,
+                                    rope_dimension,
+                                    scratch.rope_cosine,
+                                    scratch.rope_sine);
             }
         }
         else
@@ -1314,12 +1268,11 @@ Result<void> append_attention_context(
     return {};
 }
 
-Result<bool> forward_attention_batch(
-    const CompiledOperatorTable& operators,
-    const AttentionBlockPlan& plan,
-    ExecutionBackend backend,
-    std::span<AttentionBatchEntry> entries,
-    uint64_t optimization_flags)
+Result<bool> forward_attention_batch(const CompiledOperatorTable& operators,
+                                     const AttentionBlockPlan& plan,
+                                     ExecutionBackend backend,
+                                     std::span<AttentionBatchEntry> entries,
+                                     uint64_t optimization_flags)
 {
     (void)optimization_flags;
     const CompiledOperator& attention_operator = operators.at(plan.vulkan_attention_operator);
@@ -1358,19 +1311,18 @@ Result<bool> forward_attention_batch(
     return false;
 }
 
-Result<void> forward_attention(
-    const WeightStore& weights,
-    const CompiledOperatorTable& operators,
-    const AttentionBlockPlan& plan,
-    ExecutionBackend backend,
-    float norm_epsilon,
-    DType kv_cache_dtype,
-    uint64_t position_offset,
-    LayerCache& cache,
-    AttentionScratch& scratch,
-    const ActivationBuffer& hidden,
-    ActivationBuffer& output,
-    uint64_t optimization_flags)
+Result<void> forward_attention(const WeightStore& weights,
+                               const CompiledOperatorTable& operators,
+                               const AttentionBlockPlan& plan,
+                               ExecutionBackend backend,
+                               float norm_epsilon,
+                               DType kv_cache_dtype,
+                               uint64_t position_offset,
+                               LayerCache& cache,
+                               AttentionScratch& scratch,
+                               const ActivationBuffer& hidden,
+                               ActivationBuffer& output,
+                               uint64_t optimization_flags)
 {
     if (cache.vulkan_attention_state_unknown)
     {
@@ -1388,11 +1340,10 @@ Result<void> forward_attention(
     const CompiledOperator& attention_operator = operators.at(plan.vulkan_attention_operator);
     if (backend == ExecutionBackend::Vulkan && attention_operator.attention)
     {
-        if (attention_operator.attention->forward(
-                position_offset,
-                cache,
-                hidden,
-                output))
+        if (attention_operator.attention->forward(position_offset,
+                                                  cache,
+                                                  hidden,
+                                                  output))
         {
             return {};
         }
@@ -1400,8 +1351,7 @@ Result<void> forward_attention(
         if (cache.vulkan_attention_cache)
         {
             if (!cache.vulkan_attention_state_unknown
-                && attention_operator.attention->materialize_device_cache(
-                    cache))
+                && attention_operator.attention->materialize_device_cache(cache))
             {
                 // The failed dispatch restored the CPU cache; use CPU Attention.
             }
@@ -1414,16 +1364,14 @@ Result<void> forward_attention(
         }
     }
 
-    configure_cache(
-        cache, plan.kv_head_count * plan.head_dimension,
-        kv_cache_dtype);
+    configure_cache(cache, plan.kv_head_count * plan.head_dimension,
+                    kv_cache_dtype);
     if (plan.pre_attention_norm_weight == invalid_tensor_handle)
         scratch.normalized = hidden;
     else
         rms_norm_batch_into(hidden, weights.at(plan.pre_attention_norm_weight), norm_epsilon, scratch.normalized, plan.norm_weight_offset, optimization_flags);
-    auto qsa_status = project_and_append_qsa_keys(
-        weights, operators, plan, scratch.normalized, cache, scratch,
-        optimization_flags);
+    auto qsa_status = project_and_append_qsa_keys(weights, operators, plan, scratch.normalized, cache, scratch,
+                                                  optimization_flags);
     if (!qsa_status)
         return qsa_status.error();
     ActivationBuffer& query = scratch.query;
@@ -1434,20 +1382,17 @@ Result<void> forward_attention(
     const CompiledOperator& fused_qkv_operator = operators.at(plan.fused_qkv_operator);
     const bool fused_output_gate = backend == ExecutionBackend::Vulkan
                                    && fused_qkv_gate_operator.bfloat16
-                                   && fused_qkv_gate_operator.bfloat16->forward(
-                                       scratch.normalized,
-                                       fused_qkv);
+                                   && fused_qkv_gate_operator.bfloat16->forward(scratch.normalized,
+                                                                                fused_qkv);
     const bool fused_projection = fused_output_gate
                                   || (backend == ExecutionBackend::Vulkan
                                       && fused_qkv_operator.bfloat16
-                                      && fused_qkv_operator.bfloat16->forward(
-                                          scratch.normalized,
-                                          fused_qkv))
+                                      && fused_qkv_operator.bfloat16->forward(scratch.normalized,
+                                                                              fused_qkv))
                                   || (backend == ExecutionBackend::Vulkan
                                       && fused_qkv_operator.linear
-                                      && fused_qkv_operator.linear->forward(
-                                          scratch.normalized,
-                                          fused_qkv));
+                                      && fused_qkv_operator.linear->forward(scratch.normalized,
+                                                                            fused_qkv));
     if (fused_projection)
     {
         const uint32_t query_columns = plan.head_count * plan.head_dimension;
@@ -1468,10 +1413,9 @@ Result<void> forward_attention(
             source += key_value_columns;
             if (fused_output_gate)
             {
-                std::copy_n(
-                    source,
-                    query_columns,
-                    scratch.gate.row(token_index));
+                std::copy_n(source,
+                            query_columns,
+                            scratch.gate.row(token_index));
             }
         }
     }
@@ -1494,27 +1438,24 @@ Result<void> forward_attention(
         const uint64_t position = position_offset + token_index;
         if (cached_rope_coefficients_enabled(optimization_flags))
         {
-            prepare_rope_coefficients(
-                rope_dimension,
-                position,
-                plan,
-                scratch.rope_cosine,
-                scratch.rope_sine);
+            prepare_rope_coefficients(rope_dimension,
+                                      position,
+                                      plan,
+                                      scratch.rope_cosine,
+                                      scratch.rope_sine);
             for (uint32_t head = 0; head < plan.head_count; ++head)
             {
-                apply_prepared_rope(
-                    query.row(token_index) + head * plan.head_dimension,
-                    rope_dimension,
-                    scratch.rope_cosine,
-                    scratch.rope_sine);
+                apply_prepared_rope(query.row(token_index) + head * plan.head_dimension,
+                                    rope_dimension,
+                                    scratch.rope_cosine,
+                                    scratch.rope_sine);
             }
             for (uint32_t head = 0; head < plan.kv_head_count; ++head)
             {
-                apply_prepared_rope(
-                    key.row(token_index) + head * plan.head_dimension,
-                    rope_dimension,
-                    scratch.rope_cosine,
-                    scratch.rope_sine);
+                apply_prepared_rope(key.row(token_index) + head * plan.head_dimension,
+                                    rope_dimension,
+                                    scratch.rope_cosine,
+                                    scratch.rope_sine);
             }
         }
         else
@@ -1529,39 +1470,36 @@ Result<void> forward_attention(
     if (cache.token_count == 0)
         cache.start_position = position_offset;
     append_cache(cache, kv_cache_dtype, key, value);
-    qsa_status = prepare_qsa_selection(
-        weights, plan, position_offset, norm_epsilon, cache, scratch,
-        optimization_flags);
+    qsa_status = prepare_qsa_selection(weights, plan, position_offset, norm_epsilon, cache, scratch,
+                                       optimization_flags);
     if (!qsa_status)
         return qsa_status.error();
-    scaled_dot_product_attention_into(
-        plan,
-        plan.sinks == invalid_tensor_handle ? nullptr : &weights.at(plan.sinks),
-        position_offset,
-        query,
-        cache,
-        scratch.attention,
-        scratch.logits,
-        scratch.key_cache,
-        scratch.value_cache,
-        scratch.flash_partial_max,
-        scratch.flash_partial_sum,
-        scratch.flash_partial_output,
-        scratch.qsa_selected_offsets,
-        scratch.qsa_selected_indices,
-        optimization_flags);
+    scaled_dot_product_attention_into(plan,
+                                      plan.sinks == invalid_tensor_handle ? nullptr : &weights.at(plan.sinks),
+                                      position_offset,
+                                      query,
+                                      cache,
+                                      scratch.attention,
+                                      scratch.logits,
+                                      scratch.key_cache,
+                                      scratch.value_cache,
+                                      scratch.flash_partial_max,
+                                      scratch.flash_partial_sum,
+                                      scratch.flash_partial_output,
+                                      scratch.qsa_selected_offsets,
+                                      scratch.qsa_selected_indices,
+                                      optimization_flags);
     if (has_flag(plan.flags, AttentionBlockOutputGate))
     {
         if (!fused_output_gate)
         {
-            attention_linear_into(
-                weights,
-                operators,
-                plan.output_gate_weight,
-                invalid_tensor_handle,
-                scratch.normalized,
-                scratch.gate,
-                optimization_flags);
+            attention_linear_into(weights,
+                                  operators,
+                                  plan.output_gate_weight,
+                                  invalid_tensor_handle,
+                                  scratch.normalized,
+                                  scratch.gate,
+                                  optimization_flags);
         }
         for (size_t token_index = 0; token_index < scratch.attention.rows(); ++token_index)
         {
@@ -1569,11 +1507,10 @@ Result<void> forward_attention(
             const float* gate_row = scratch.gate.row(token_index);
             if (has_flag(optimization_flags, OptimizationCpuFastSilu))
             {
-                float_sigmoid_mul(
-                    attention_row,
-                    gate_row,
-                    attention_row,
-                    scratch.attention.columns());
+                float_sigmoid_mul(attention_row,
+                                  gate_row,
+                                  attention_row,
+                                  scratch.attention.columns());
             }
             else
             {

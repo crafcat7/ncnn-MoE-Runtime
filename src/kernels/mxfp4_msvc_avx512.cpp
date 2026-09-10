@@ -25,11 +25,10 @@ static const std::array<float, 256>& avx512_scale_table()
     return values;
 }
 
-void msvc_avx512_mxfp4_q8_quantize(
-    const float* source,
-    int8_t* values,
-    float* scales,
-    uint32_t columns) noexcept
+void msvc_avx512_mxfp4_q8_quantize(const float* source,
+                                   int8_t* values,
+                                   float* scales,
+                                   uint32_t columns) noexcept
 {
     if (!source || !values || !scales || columns == 0)
         return;
@@ -49,9 +48,8 @@ void msvc_avx512_mxfp4_q8_quantize(
         for (; index + 16 <= count; index += 16)
         {
             const __m512 current = _mm512_loadu_ps(source + begin + index);
-            maximum_values = _mm512_max_ps(
-                maximum_values,
-                _mm512_andnot_ps(sign_mask, current));
+            maximum_values = _mm512_max_ps(maximum_values,
+                                           _mm512_andnot_ps(sign_mask, current));
         }
         float maximum = _mm512_reduce_max_ps(maximum_values);
         for (; index < count; ++index)
@@ -63,12 +61,10 @@ void msvc_avx512_mxfp4_q8_quantize(
         index = 0;
         for (; index + 16 <= count; index += 16)
         {
-            __m512 normalized = _mm512_mul_ps(
-                _mm512_loadu_ps(source + begin + index),
-                inverse_scale);
-            normalized = _mm512_max_ps(
-                lower_bound,
-                _mm512_min_ps(upper_bound, normalized));
+            __m512 normalized = _mm512_mul_ps(_mm512_loadu_ps(source + begin + index),
+                                              inverse_scale);
+            normalized = _mm512_max_ps(lower_bound,
+                                       _mm512_min_ps(upper_bound, normalized));
             const __m512i quantized = _mm512_cvtps_epi32(normalized);
             alignas(64) int32_t quantized_values[16];
             _mm512_storeu_si512(quantized_values, quantized);
@@ -77,10 +73,9 @@ void msvc_avx512_mxfp4_q8_quantize(
         }
         for (; index < count; ++index)
         {
-            const float normalized = std::clamp(
-                source[begin + index] / scale,
-                -127.0f,
-                127.0f);
+            const float normalized = std::clamp(source[begin + index] / scale,
+                                                -127.0f,
+                                                127.0f);
             values[begin + index] = static_cast<int8_t>(std::lrintf(normalized));
         }
     }
@@ -154,9 +149,8 @@ static __forceinline void avx512_accumulate_contiguous_rows4_tokens2_block(const
 
 static __forceinline int32_t avx512_reduce_8_epi32(__m256i values) noexcept
 {
-    __m128i sum = _mm_add_epi32(
-        _mm256_castsi256_si128(values),
-        _mm256_extracti128_si256(values, 1));
+    __m128i sum = _mm_add_epi32(_mm256_castsi256_si128(values),
+                                _mm256_extracti128_si256(values, 1));
     sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(2, 3, 0, 1)));
     sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(1, 0, 3, 2)));
     return _mm_cvtsi128_si32(sum);
@@ -166,42 +160,33 @@ static __forceinline int32_t avx512_reduce_8_epi32(__m256i values) noexcept
 // [8 scales][8 bytes for row 0..7 of chunk 0][8 bytes for row 0..7 of chunk 1].
 // Decode the two rows in each 128-bit lane together, then use madd_epi16 to
 // produce two independent eight-term integer dot products.
-static __forceinline void avx512_mxfp4_q8_packed_chunk_dot(
-    const uint8_t* packed,
-    const int8_t* input,
-    int32_t (&dots)[8]) noexcept
+static __forceinline void avx512_mxfp4_q8_packed_chunk_dot(const uint8_t* packed,
+                                                           const int8_t* input,
+                                                           int32_t (&dots)[8]) noexcept
 {
     const __m512i bytes = _mm512_loadu_si512(reinterpret_cast<const void*>(packed));
     const __m512i nibble_mask = _mm512_set1_epi8(0x0f);
     const __m512i low = _mm512_and_si512(bytes, nibble_mask);
     const __m512i high = _mm512_and_si512(_mm512_srli_epi16(bytes, 4), nibble_mask);
-    const __m128i value_table_128 = _mm_setr_epi8(
-        0, 1, 2, 3, 4, 6, 8, 12,
-        0, -1, -2, -3, -4, -6, -8, -12);
+    const __m128i value_table_128 = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12,
+                                                  0, -1, -2, -3, -4, -6, -8, -12);
     const __m512i value_table = _mm512_broadcast_i32x4(value_table_128);
-    const __m512i even_rows = _mm512_shuffle_epi8(
-        value_table,
-        _mm512_unpacklo_epi8(low, high));
-    const __m512i odd_rows = _mm512_shuffle_epi8(
-        value_table,
-        _mm512_unpackhi_epi8(low, high));
-    const __m128i input_values_128 = _mm_loadu_si128(
-        reinterpret_cast<const __m128i*>(input));
-    const __m512i input_values = _mm512_cvtepi8_epi16(
-        _mm256_set_m128i(input_values_128, input_values_128));
+    const __m512i even_rows = _mm512_shuffle_epi8(value_table,
+                                                  _mm512_unpacklo_epi8(low, high));
+    const __m512i odd_rows = _mm512_shuffle_epi8(value_table,
+                                                 _mm512_unpackhi_epi8(low, high));
+    const __m128i input_values_128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(input));
+    const __m512i input_values = _mm512_cvtepi8_epi16(_mm256_set_m128i(input_values_128, input_values_128));
 
-#define NCNN_MOE_AVX512_PACKED_ROW_LANE(lane)                                   \
-    {                                                                           \
-        const __m128i even_values = _mm512_extracti32x4_epi32(even_rows, lane); \
-        const __m128i odd_values = _mm512_extracti32x4_epi32(odd_rows, lane);   \
-        const __m256i values = _mm256_set_m128i(odd_values, even_values);       \
-        const __m512i products = _mm512_madd_epi16(                             \
-            _mm512_cvtepi8_epi16(values),                                       \
-            input_values);                                                      \
-        dots[(lane) * 2] = avx512_reduce_8_epi32(                               \
-            _mm512_castsi512_si256(products));                                  \
-        dots[(lane) * 2 + 1] = avx512_reduce_8_epi32(                           \
-            _mm512_extracti64x4_epi64(products, 1));                            \
+#define NCNN_MOE_AVX512_PACKED_ROW_LANE(lane)                                                 \
+    {                                                                                         \
+        const __m128i even_values = _mm512_extracti32x4_epi32(even_rows, lane);               \
+        const __m128i odd_values = _mm512_extracti32x4_epi32(odd_rows, lane);                 \
+        const __m256i values = _mm256_set_m128i(odd_values, even_values);                     \
+        const __m512i products = _mm512_madd_epi16(_mm512_cvtepi8_epi16(values),              \
+                                                   input_values);                             \
+        dots[(lane) * 2] = avx512_reduce_8_epi32(_mm512_castsi512_si256(products));           \
+        dots[(lane) * 2 + 1] = avx512_reduce_8_epi32(_mm512_extracti64x4_epi64(products, 1)); \
     }
     NCNN_MOE_AVX512_PACKED_ROW_LANE(0);
     NCNN_MOE_AVX512_PACKED_ROW_LANE(1);
@@ -219,50 +204,33 @@ float msvc_avx512_bfloat16_dot(const uint16_t* weights, const float* input, uint
     uint32_t index = 0;
     for (; index + 64 <= count; index += 64)
     {
-        const __m256i packed0 = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(weights + index));
-        const __m256i packed1 = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(weights + index + 16));
-        const __m256i packed2 = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(weights + index + 32));
-        const __m256i packed3 = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(weights + index + 48));
-        const __m512 values0 = _mm512_castsi512_ps(
-            _mm512_slli_epi32(
-                _mm512_cvtepu16_epi32(packed0),
-                16));
-        const __m512 values1 = _mm512_castsi512_ps(
-            _mm512_slli_epi32(
-                _mm512_cvtepu16_epi32(packed1),
-                16));
-        const __m512 values2 = _mm512_castsi512_ps(
-            _mm512_slli_epi32(
-                _mm512_cvtepu16_epi32(packed2),
-                16));
-        const __m512 values3 = _mm512_castsi512_ps(
-            _mm512_slli_epi32(
-                _mm512_cvtepu16_epi32(packed3),
-                16));
-        accumulator0 = _mm512_fmadd_ps(
-            values0,
-            _mm512_loadu_ps(input + index),
-            accumulator0);
-        accumulator1 = _mm512_fmadd_ps(
-            values1,
-            _mm512_loadu_ps(input + index + 16),
-            accumulator1);
-        accumulator2 = _mm512_fmadd_ps(
-            values2,
-            _mm512_loadu_ps(input + index + 32),
-            accumulator2);
-        accumulator3 = _mm512_fmadd_ps(
-            values3,
-            _mm512_loadu_ps(input + index + 48),
-            accumulator3);
+        const __m256i packed0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights + index));
+        const __m256i packed1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights + index + 16));
+        const __m256i packed2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights + index + 32));
+        const __m256i packed3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights + index + 48));
+        const __m512 values0 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(packed0),
+                                                                     16));
+        const __m512 values1 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(packed1),
+                                                                     16));
+        const __m512 values2 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(packed2),
+                                                                     16));
+        const __m512 values3 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(packed3),
+                                                                     16));
+        accumulator0 = _mm512_fmadd_ps(values0,
+                                       _mm512_loadu_ps(input + index),
+                                       accumulator0);
+        accumulator1 = _mm512_fmadd_ps(values1,
+                                       _mm512_loadu_ps(input + index + 16),
+                                       accumulator1);
+        accumulator2 = _mm512_fmadd_ps(values2,
+                                       _mm512_loadu_ps(input + index + 32),
+                                       accumulator2);
+        accumulator3 = _mm512_fmadd_ps(values3,
+                                       _mm512_loadu_ps(input + index + 48),
+                                       accumulator3);
     }
-    __m512 accumulator = _mm512_add_ps(
-        _mm512_add_ps(accumulator0, accumulator1),
-        _mm512_add_ps(accumulator2, accumulator3));
+    __m512 accumulator = _mm512_add_ps(_mm512_add_ps(accumulator0, accumulator1),
+                                       _mm512_add_ps(accumulator2, accumulator3));
     for (; index + 16 <= count; index += 16)
     {
         const __m256i packed = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights + index));
@@ -280,19 +248,16 @@ float msvc_avx512_bfloat16_dot(const uint16_t* weights, const float* input, uint
     return sum;
 }
 
-void msvc_avx512_float_to_bfloat16_array(
-    uint16_t* output,
-    const float* input,
-    uint32_t count) noexcept
+void msvc_avx512_float_to_bfloat16_array(uint16_t* output,
+                                         const float* input,
+                                         uint32_t count) noexcept
 {
     uint32_t index = 0;
     for (; index + 16 <= count; index += 16)
     {
-        const __m256i packed = (__m256i)_mm512_cvtneps_pbh(
-            _mm512_loadu_ps(input + index));
-        _mm256_storeu_si256(
-            reinterpret_cast<__m256i*>(output + index),
-            packed);
+        const __m256i packed = (__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(input + index));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(output + index),
+                            packed);
     }
     for (; index < count; ++index)
     {
@@ -303,19 +268,17 @@ void msvc_avx512_float_to_bfloat16_array(
     }
 }
 
-float msvc_avx512_bfloat16_pair_dot(
-    const uint16_t* left,
-    const uint16_t* right,
-    uint32_t count) noexcept
+float msvc_avx512_bfloat16_pair_dot(const uint16_t* left,
+                                    const uint16_t* right,
+                                    uint32_t count) noexcept
 {
     __m512 accumulator = _mm512_setzero_ps();
     uint32_t index = 0;
     for (; index + 32 <= count; index += 32)
     {
-        accumulator = _mm512_dpbf16_ps(
-            accumulator,
-            (__m512bh)_mm512_loadu_si512(left + index),
-            (__m512bh)_mm512_loadu_si512(right + index));
+        accumulator = _mm512_dpbf16_ps(accumulator,
+                                       (__m512bh)_mm512_loadu_si512(left + index),
+                                       (__m512bh)_mm512_loadu_si512(right + index));
     }
     float sum = _mm512_reduce_add_ps(accumulator);
     for (; index < count; ++index)
@@ -424,11 +387,10 @@ static __forceinline void avx512_bfloat16_linear_tile4x4(const uint16_t* weights
     }
 }
 
-static __forceinline void avx512_bfloat16_linear_tile1x4(
-    const uint16_t* weights,
-    const uint16_t* input,
-    uint32_t input_columns,
-    float* output) noexcept
+static __forceinline void avx512_bfloat16_linear_tile1x4(const uint16_t* weights,
+                                                         const uint16_t* input,
+                                                         uint32_t input_columns,
+                                                         float* output) noexcept
 {
     __m512 sum0 = _mm512_setzero_ps();
     __m512 sum1 = _mm512_setzero_ps();
@@ -438,12 +400,9 @@ static __forceinline void avx512_bfloat16_linear_tile1x4(
     {
         const __m512bh input_values = (__m512bh)_mm512_loadu_si512(input + column);
         const __m512bh weight0 = (__m512bh)_mm512_loadu_si512(weights + column);
-        const __m512bh weight1 = (__m512bh)_mm512_loadu_si512(
-            weights + input_columns + column);
-        const __m512bh weight2 = (__m512bh)_mm512_loadu_si512(
-            weights + static_cast<size_t>(input_columns) * 2 + column);
-        const __m512bh weight3 = (__m512bh)_mm512_loadu_si512(
-            weights + static_cast<size_t>(input_columns) * 3 + column);
+        const __m512bh weight1 = (__m512bh)_mm512_loadu_si512(weights + input_columns + column);
+        const __m512bh weight2 = (__m512bh)_mm512_loadu_si512(weights + static_cast<size_t>(input_columns) * 2 + column);
+        const __m512bh weight3 = (__m512bh)_mm512_loadu_si512(weights + static_cast<size_t>(input_columns) * 3 + column);
         sum0 = _mm512_dpbf16_ps(sum0, input_values, weight0);
         sum1 = _mm512_dpbf16_ps(sum1, input_values, weight1);
         sum2 = _mm512_dpbf16_ps(sum2, input_values, weight2);
@@ -493,11 +452,10 @@ void msvc_avx512_bfloat16_batched_linear(const uint16_t* weights,
              ++output_group)
         {
             const uint32_t first_output = static_cast<uint32_t>(output_group) * 4;
-            avx512_bfloat16_linear_tile1x4(
-                weights + static_cast<size_t>(first_output) * input_columns,
-                packed_input_data,
-                input_columns,
-                output + first_output);
+            avx512_bfloat16_linear_tile1x4(weights + static_cast<size_t>(first_output) * input_columns,
+                                           packed_input_data,
+                                           input_columns,
+                                           output + first_output);
         }
         return;
     }
@@ -557,44 +515,26 @@ void msvc_avx512_bfloat16_single_token_linear(const uint16_t* weights,
             const __m512 input1 = _mm512_loadu_ps(input + column + 16);
             const __m512 input2 = _mm512_loadu_ps(input + column + 32);
             const __m512 input3 = _mm512_loadu_ps(input + column + 48);
-            const __m256i packed00 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + column));
-            const __m256i packed01 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + column + 16));
-            const __m256i packed02 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + column + 32));
-            const __m256i packed03 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + column + 48));
-            const __m256i packed10 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + input_columns + column));
-            const __m256i packed11 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + input_columns + column + 16));
-            const __m256i packed12 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + input_columns + column + 32));
-            const __m256i packed13 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + input_columns + column + 48));
-            const __m256i packed20 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column));
-            const __m256i packed21 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column + 16));
-            const __m256i packed22 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column + 32));
-            const __m256i packed23 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column + 48));
-            const __m256i packed30 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column));
-            const __m256i packed31 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column + 16));
-            const __m256i packed32 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column + 32));
-            const __m256i packed33 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column + 48));
-#define NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator, packed, input_values) \
-    accumulator = _mm512_fmadd_ps(                                        \
-        _mm512_castsi512_ps(_mm512_slli_epi32(                            \
-            _mm512_cvtepu16_epi32(packed), 16)),                          \
-        input_values,                                                     \
-        accumulator)
+            const __m256i packed00 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + column));
+            const __m256i packed01 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + column + 16));
+            const __m256i packed02 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + column + 32));
+            const __m256i packed03 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + column + 48));
+            const __m256i packed10 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + input_columns + column));
+            const __m256i packed11 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + input_columns + column + 16));
+            const __m256i packed12 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + input_columns + column + 32));
+            const __m256i packed13 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + input_columns + column + 48));
+            const __m256i packed20 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column));
+            const __m256i packed21 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column + 16));
+            const __m256i packed22 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column + 32));
+            const __m256i packed23 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column + 48));
+            const __m256i packed30 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column));
+            const __m256i packed31 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column + 16));
+            const __m256i packed32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column + 32));
+            const __m256i packed33 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column + 48));
+#define NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator, packed, input_values)                                    \
+    accumulator = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(packed), 16)), \
+                                  input_values,                                                              \
+                                  accumulator)
             NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator00, packed00, input0);
             NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator01, packed01, input1);
             NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator02, packed02, input2);
@@ -613,49 +553,33 @@ void msvc_avx512_bfloat16_single_token_linear(const uint16_t* weights,
             NCNN_MOE_BF16_SINGLE_TOKEN_FMA(accumulator33, packed33, input3);
 #undef NCNN_MOE_BF16_SINGLE_TOKEN_FMA
         }
-        __m512 sum0 = _mm512_add_ps(
-            _mm512_add_ps(accumulator00, accumulator01),
-            _mm512_add_ps(accumulator02, accumulator03));
-        __m512 sum1 = _mm512_add_ps(
-            _mm512_add_ps(accumulator10, accumulator11),
-            _mm512_add_ps(accumulator12, accumulator13));
-        __m512 sum2 = _mm512_add_ps(
-            _mm512_add_ps(accumulator20, accumulator21),
-            _mm512_add_ps(accumulator22, accumulator23));
-        __m512 sum3 = _mm512_add_ps(
-            _mm512_add_ps(accumulator30, accumulator31),
-            _mm512_add_ps(accumulator32, accumulator33));
+        __m512 sum0 = _mm512_add_ps(_mm512_add_ps(accumulator00, accumulator01),
+                                    _mm512_add_ps(accumulator02, accumulator03));
+        __m512 sum1 = _mm512_add_ps(_mm512_add_ps(accumulator10, accumulator11),
+                                    _mm512_add_ps(accumulator12, accumulator13));
+        __m512 sum2 = _mm512_add_ps(_mm512_add_ps(accumulator20, accumulator21),
+                                    _mm512_add_ps(accumulator22, accumulator23));
+        __m512 sum3 = _mm512_add_ps(_mm512_add_ps(accumulator30, accumulator31),
+                                    _mm512_add_ps(accumulator32, accumulator33));
         for (; column + 16 <= input_columns; column += 16)
         {
             const __m512 input_values = _mm512_loadu_ps(input + column);
-            const __m256i packed0 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + column));
-            const __m256i packed1 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + input_columns + column));
-            const __m256i packed2 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column));
-            const __m256i packed3 = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column));
-            sum0 = _mm512_fmadd_ps(
-                _mm512_castsi512_ps(_mm512_slli_epi32(
-                    _mm512_cvtepu16_epi32(packed0), 16)),
-                input_values,
-                sum0);
-            sum1 = _mm512_fmadd_ps(
-                _mm512_castsi512_ps(_mm512_slli_epi32(
-                    _mm512_cvtepu16_epi32(packed1), 16)),
-                input_values,
-                sum1);
-            sum2 = _mm512_fmadd_ps(
-                _mm512_castsi512_ps(_mm512_slli_epi32(
-                    _mm512_cvtepu16_epi32(packed2), 16)),
-                input_values,
-                sum2);
-            sum3 = _mm512_fmadd_ps(
-                _mm512_castsi512_ps(_mm512_slli_epi32(
-                    _mm512_cvtepu16_epi32(packed3), 16)),
-                input_values,
-                sum3);
+            const __m256i packed0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + column));
+            const __m256i packed1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + input_columns + column));
+            const __m256i packed2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 2 + column));
+            const __m256i packed3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_weights + static_cast<size_t>(input_columns) * 3 + column));
+            sum0 = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(packed0), 16)),
+                                   input_values,
+                                   sum0);
+            sum1 = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(packed1), 16)),
+                                   input_values,
+                                   sum1);
+            sum2 = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(packed2), 16)),
+                                   input_values,
+                                   sum2);
+            sum3 = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(packed3), 16)),
+                                   input_values,
+                                   sum3);
         }
         output[first_output] = _mm512_reduce_add_ps(sum0);
         output[first_output + 1] = _mm512_reduce_add_ps(sum1);
@@ -679,18 +603,17 @@ float msvc_avx512_mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32
     return _mm512_reduce_add_ps(total);
 }
 
-void msvc_avx512_mxfp4_q8_packed_gemm(
-    const uint8_t* packed,
-    uint32_t row_count,
-    uint32_t block_count,
-    uint32_t tile_rows,
-    const int8_t* input,
-    size_t input_stride,
-    const float* input_scales,
-    size_t scale_stride,
-    size_t token_count,
-    float* output,
-    size_t output_stride) noexcept
+void msvc_avx512_mxfp4_q8_packed_gemm(const uint8_t* packed,
+                                      uint32_t row_count,
+                                      uint32_t block_count,
+                                      uint32_t tile_rows,
+                                      const int8_t* input,
+                                      size_t input_stride,
+                                      const float* input_scales,
+                                      size_t scale_stride,
+                                      size_t token_count,
+                                      float* output,
+                                      size_t output_stride) noexcept
 {
     if (!packed || !input || !input_scales || !output || row_count == 0
         || block_count == 0 || tile_rows != 8 || token_count == 0)
@@ -702,10 +625,9 @@ void msvc_avx512_mxfp4_q8_packed_gemm(
     const std::array<float, 256>& scales_by_exponent = avx512_scale_table();
     for (size_t token = 0; token < token_count; ++token)
     {
-        std::fill(
-            output + token * output_stride,
-            output + token * output_stride + row_count,
-            0.0f);
+        std::fill(output + token * output_stride,
+                  output + token * output_stride + row_count,
+                  0.0f);
     }
 
     for (size_t group = 0; group < group_count; ++group)
@@ -725,10 +647,9 @@ void msvc_avx512_mxfp4_q8_packed_gemm(
                 for (uint32_t chunk = 0; chunk < 2; ++chunk)
                 {
                     int32_t dots[8] = {};
-                    avx512_mxfp4_q8_packed_chunk_dot(
-                        packed_values + static_cast<size_t>(chunk) * 64,
-                        input_block + chunk * 16,
-                        dots);
+                    avx512_mxfp4_q8_packed_chunk_dot(packed_values + static_cast<size_t>(chunk) * 64,
+                                                     input_block + chunk * 16,
+                                                     dots);
                     for (uint32_t row = 0; row < 8; ++row)
                     {
                         const size_t matrix_row = group * 8 + row;
@@ -897,10 +818,8 @@ void msvc_avx512_mxfp4_matmul_row_pairs(const uint8_t* packed, const uint8_t* sc
             }
             for (uint32_t local_pair = 0; local_pair < pairs_per_group; ++local_pair)
             {
-                first_output[static_cast<size_t>(pair + local_pair) * first_pair_stride] = _mm512_reduce_add_ps(
-                    _mm512_add_ps(totals[local_pair * 2], alternate_totals[local_pair * 2]));
-                second_output[static_cast<size_t>(pair + local_pair) * second_pair_stride] = _mm512_reduce_add_ps(
-                    _mm512_add_ps(totals[local_pair * 2 + 1], alternate_totals[local_pair * 2 + 1]));
+                first_output[static_cast<size_t>(pair + local_pair) * first_pair_stride] = _mm512_reduce_add_ps(_mm512_add_ps(totals[local_pair * 2], alternate_totals[local_pair * 2]));
+                second_output[static_cast<size_t>(pair + local_pair) * second_pair_stride] = _mm512_reduce_add_ps(_mm512_add_ps(totals[local_pair * 2 + 1], alternate_totals[local_pair * 2 + 1]));
             }
         }
     }

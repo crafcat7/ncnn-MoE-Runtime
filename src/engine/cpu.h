@@ -148,11 +148,10 @@ private:
 };
 
 // Select a team size for the given work shape.
-[[nodiscard]] uint32_t choose_cpu_team_size(
-    uint64_t work_units,
-    uint32_t independent_work_items,
-    uint32_t threads_per_work_item,
-    uint32_t available_threads) noexcept;
+[[nodiscard]] uint32_t choose_cpu_team_size(uint64_t work_units,
+                                            uint32_t independent_work_items,
+                                            uint32_t threads_per_work_item,
+                                            uint32_t available_threads) noexcept;
 
 } // namespace moe
 } // namespace ncnn

@@ -218,12 +218,11 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
     }
 
     uint64_t total = 0;
-    Result<void> status = add_matrix_size(
-        descriptor.vocabulary_size,
-        descriptor.hidden_size,
-        DType::BFloat16,
-        "Vulkan LM head",
-        total);
+    Result<void> status = add_matrix_size(descriptor.vocabulary_size,
+                                          descriptor.hidden_size,
+                                          DType::BFloat16,
+                                          "Vulkan LM head",
+                                          total);
     if (!status)
         return status.error();
 
@@ -247,51 +246,46 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
         };
         for (const auto& matrix : matrices)
         {
-            status = add_matrix_size(
-                matrix.first,
-                matrix.second,
-                DType::Float8E4M3,
-                "Vulkan latent projection",
-                total);
+            status = add_matrix_size(matrix.first,
+                                     matrix.second,
+                                     DType::Float8E4M3,
+                                     "Vulkan latent projection",
+                                     total);
             if (!status)
                 return status.error();
         }
         if (attention.compression_ratio == 4)
         {
-            status = add_matrix_size(
-                static_cast<uint64_t>(attention.index_head_count) * attention.index_head_dimension,
-                attention.query_lora_rank,
-                DType::Float8E4M3,
-                "Vulkan index query",
-                total);
+            status = add_matrix_size(static_cast<uint64_t>(attention.index_head_count) * attention.index_head_dimension,
+                                     attention.query_lora_rank,
+                                     DType::Float8E4M3,
+                                     "Vulkan index query",
+                                     total);
             if (!status)
                 return status.error();
         }
 
         if (layer.moe.shared_expert_count != 0)
         {
-            status = add_matrix_size(
-                layer.moe.intermediate_size,
-                descriptor.hidden_size,
-                layer.moe.shared_expert_weight_dtype,
-                "Vulkan shared Expert input",
-                total);
+            status = add_matrix_size(layer.moe.intermediate_size,
+                                     descriptor.hidden_size,
+                                     layer.moe.shared_expert_weight_dtype,
+                                     "Vulkan shared Expert input",
+                                     total);
             if (!status)
                 return status.error();
-            status = add_matrix_size(
-                layer.moe.intermediate_size,
-                descriptor.hidden_size,
-                layer.moe.shared_expert_weight_dtype,
-                "Vulkan shared Expert input",
-                total);
+            status = add_matrix_size(layer.moe.intermediate_size,
+                                     descriptor.hidden_size,
+                                     layer.moe.shared_expert_weight_dtype,
+                                     "Vulkan shared Expert input",
+                                     total);
             if (!status)
                 return status.error();
-            status = add_matrix_size(
-                descriptor.hidden_size,
-                layer.moe.intermediate_size,
-                layer.moe.shared_expert_weight_dtype,
-                "Vulkan shared Expert output",
-                total);
+            status = add_matrix_size(descriptor.hidden_size,
+                                     layer.moe.intermediate_size,
+                                     layer.moe.shared_expert_weight_dtype,
+                                     "Vulkan shared Expert output",
+                                     total);
             if (!status)
                 return status.error();
         }
@@ -361,10 +355,9 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
                 key_value = checked_multiply(convolution_size, attention.convolution_kernel_size, "gated DeltaNet convolution");
                 if (key_value)
                 {
-                    key_value = checked_add(
-                        key_value.value(),
-                        attention.head_count * 2ull + attention.value_head_dimension,
-                        "gated DeltaNet parameters");
+                    key_value = checked_add(key_value.value(),
+                                            attention.head_count * 2ull + attention.value_head_dimension,
+                                            "gated DeltaNet parameters");
                 }
                 output = checked_multiply(descriptor.hidden_size, linear_value_size, "gated DeltaNet output projection");
             }
@@ -422,19 +415,16 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
             {
                 const uint64_t index_columns = (static_cast<uint64_t>(attention.index_head_count) + 1)
                                                * attention.index_head_dimension;
-                auto index_projection = checked_multiply(
-                    index_columns, descriptor.hidden_size, "QSA index projection");
+                auto index_projection = checked_multiply(index_columns, descriptor.hidden_size, "QSA index projection");
                 if (!index_projection)
                     return index_projection.error();
-                auto index_weights = checked_add(
-                    index_projection.value(),
-                    static_cast<uint64_t>(attention.index_head_dimension) * 2,
-                    "QSA index weights");
+                auto index_weights = checked_add(index_projection.value(),
+                                                 static_cast<uint64_t>(attention.index_head_dimension) * 2,
+                                                 "QSA index weights");
                 if (!index_weights)
                     return index_weights.error();
-                auto with_index = checked_add(
-                    layer_elements, index_weights.value(),
-                    "layer dense weights");
+                auto with_index = checked_add(layer_elements, index_weights.value(),
+                                              "layer dense weights");
                 if (!with_index)
                     return with_index.error();
                 layer_elements = with_index.value();
@@ -456,48 +446,39 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
             }
             const uint64_t expanded_size = static_cast<uint64_t>(descriptor.hyper_connection_multiplier)
                                            * descriptor.hidden_size;
-            auto key_projection = checked_multiply(
-                expanded_size, descriptor.hidden_size, "PLE key projection");
+            auto key_projection = checked_multiply(expanded_size, descriptor.hidden_size, "PLE key projection");
             if (!key_projection)
                 return key_projection.error();
-            auto value_projection = checked_multiply(
-                descriptor.hidden_size, descriptor.hidden_size, "PLE value projection");
+            auto value_projection = checked_multiply(descriptor.hidden_size, descriptor.hidden_size, "PLE value projection");
             if (!value_projection)
                 return value_projection.error();
-            auto ple_elements = checked_add(
-                key_projection.value(), value_projection.value(),
-                "PLE projections");
+            auto ple_elements = checked_add(key_projection.value(), value_projection.value(),
+                                            "PLE projections");
             if (!ple_elements)
                 return ple_elements.error();
-            auto norm_and_convolution = checked_multiply(
-                expanded_size,
-                3ull + layer.ple.convolution_kernel_size,
-                "PLE norms and convolution");
+            auto norm_and_convolution = checked_multiply(expanded_size,
+                                                         3ull + layer.ple.convolution_kernel_size,
+                                                         "PLE norms and convolution");
             if (!norm_and_convolution)
                 return norm_and_convolution.error();
-            ple_elements = checked_add(
-                ple_elements.value(), norm_and_convolution.value(),
-                "PLE dense weights");
+            ple_elements = checked_add(ple_elements.value(), norm_and_convolution.value(),
+                                       "PLE dense weights");
             if (!ple_elements)
                 return ple_elements.error();
-            auto with_ple = checked_add(
-                layer_elements, ple_elements.value(),
-                "layer dense weights");
+            auto with_ple = checked_add(layer_elements, ple_elements.value(),
+                                        "layer dense weights");
             if (!with_ple)
                 return with_ple.error();
             layer_elements = with_ple.value();
-            auto head_metadata_count = checked_multiply(
-                head_count, 2, "PLE metadata");
+            auto head_metadata_count = checked_multiply(head_count, 2, "PLE metadata");
             if (!head_metadata_count)
                 return head_metadata_count.error();
-            auto metadata_count = checked_add(
-                layer.ple.ngram_size, head_metadata_count.value(),
-                "PLE metadata");
+            auto metadata_count = checked_add(layer.ple.ngram_size, head_metadata_count.value(),
+                                              "PLE metadata");
             if (!metadata_count)
                 return metadata_count.error();
-            auto metadata_size = checked_multiply(
-                metadata_count.value(), sizeof(int64_t),
-                "PLE metadata");
+            auto metadata_size = checked_multiply(metadata_count.value(), sizeof(int64_t),
+                                                  "PLE metadata");
             if (!metadata_size)
                 return metadata_size.error();
             layer_auxiliary_size = metadata_size.value();
@@ -507,33 +488,27 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
         {
             const uint64_t expanded_size = static_cast<uint64_t>(descriptor.hyper_connection_multiplier)
                                            * descriptor.hidden_size;
-            auto projections = checked_multiply(
-                expanded_size, descriptor.hyper_connection_low_rank * 2ull,
-                "gated-residual projections");
+            auto projections = checked_multiply(expanded_size, descriptor.hyper_connection_low_rank * 2ull,
+                                                "gated-residual projections");
             if (!projections)
                 return projections.error();
-            auto block_elements = checked_add(
-                expanded_size, projections.value(),
-                "gated-residual block");
+            auto block_elements = checked_add(expanded_size, projections.value(),
+                                              "gated-residual block");
             if (!block_elements)
                 return block_elements.error();
-            auto injection = checked_multiply(
-                descriptor.hyper_connection_multiplier, expanded_size,
-                "gated-residual injection");
+            auto injection = checked_multiply(descriptor.hyper_connection_multiplier, expanded_size,
+                                              "gated-residual injection");
             if (!injection)
                 return injection.error();
-            block_elements = checked_add(
-                block_elements.value(), injection.value(),
-                "gated-residual block");
+            block_elements = checked_add(block_elements.value(), injection.value(),
+                                         "gated-residual block");
             if (!block_elements)
                 return block_elements.error();
-            auto layer_gated_residual = checked_multiply(
-                block_elements.value(), 2, "gated-residual layer");
+            auto layer_gated_residual = checked_multiply(block_elements.value(), 2, "gated-residual layer");
             if (!layer_gated_residual)
                 return layer_gated_residual.error();
-            auto with_gated_residual = checked_add(
-                layer_elements, layer_gated_residual.value(),
-                "layer dense weights");
+            auto with_gated_residual = checked_add(layer_elements, layer_gated_residual.value(),
+                                                   "layer dense weights");
             if (!with_gated_residual)
                 return with_gated_residual.error();
             layer_elements = with_gated_residual.value();
@@ -589,9 +564,8 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
         auto with_layer = checked_add(total, layer_size.value(), "dense weights");
         if (!with_layer)
             return with_layer.error();
-        with_layer = checked_add(
-            with_layer.value(), layer_auxiliary_size,
-            "dense weights");
+        with_layer = checked_add(with_layer.value(), layer_auxiliary_size,
+                                 "dense weights");
         if (!with_layer)
             return with_layer.error();
         total = with_layer.value();
@@ -646,10 +620,9 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
             return status.error();
         if (moe.shared_expert_count != 0)
         {
-            auto shared = matrix_elements(
-                static_cast<uint64_t>(descriptor.hidden_size) * moe.intermediate_size * 3ull,
-                moe.shared_expert_count,
-                "MTP shared Expert");
+            auto shared = matrix_elements(static_cast<uint64_t>(descriptor.hidden_size) * moe.intermediate_size * 3ull,
+                                          moe.shared_expert_count,
+                                          "MTP shared Expert");
             if (!shared)
                 return shared.error();
             status = add_elements(shared.value(), "MTP shared Expert");
@@ -675,19 +648,16 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
     {
         const uint64_t expanded_size = static_cast<uint64_t>(descriptor.hyper_connection_multiplier)
                                        * descriptor.hidden_size;
-        auto head_projections = checked_multiply(
-            expanded_size, descriptor.hyper_connection_low_rank * 2ull,
-            "gated-residual head projections");
+        auto head_projections = checked_multiply(expanded_size, descriptor.hyper_connection_low_rank * 2ull,
+                                                 "gated-residual head projections");
         if (!head_projections)
             return head_projections.error();
-        auto head_elements = checked_add(
-            expanded_size, head_projections.value(),
-            "gated-residual head");
+        auto head_elements = checked_add(expanded_size, head_projections.value(),
+                                         "gated-residual head");
         if (!head_elements)
             return head_elements.error();
-        auto head_size = checked_multiply(
-            head_elements.value(), element_size,
-            "gated-residual head");
+        auto head_size = checked_multiply(head_elements.value(), element_size,
+                                          "gated-residual head");
         if (!head_size)
             return head_size.error();
         auto with_head = checked_add(total, head_size.value(), "dense weights");
@@ -699,8 +669,7 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
     const uint64_t final_norm_elements = descriptor.final_norm == NormType::None
                                              ? 0
                                              : descriptor.hidden_size;
-    auto final_norm = checked_multiply(
-        final_norm_elements, element_size, "final norm");
+    auto final_norm = checked_multiply(final_norm_elements, element_size, "final norm");
     if (!final_norm)
         return final_norm.error();
     return checked_add(total, final_norm.value(), "dense weights");
@@ -724,28 +693,25 @@ static Result<uint64_t> expert_pair_size(const MoeModelDescriptor& descriptor, D
 {
     if (dtype == DType::MxFp4)
         return mxfp4_pair_size(descriptor);
-    auto gate_up = matrix_storage_size(
-        static_cast<uint64_t>(descriptor.intermediate_size) * 2,
-        descriptor.hidden_size,
-        dtype,
-        "expert gate/up");
+    auto gate_up = matrix_storage_size(static_cast<uint64_t>(descriptor.intermediate_size) * 2,
+                                       descriptor.hidden_size,
+                                       dtype,
+                                       "expert gate/up");
     if (!gate_up)
         return gate_up.error();
-    auto down = matrix_storage_size(
-        descriptor.hidden_size,
-        descriptor.intermediate_size,
-        dtype,
-        "expert down");
+    auto down = matrix_storage_size(descriptor.hidden_size,
+                                    descriptor.intermediate_size,
+                                    dtype,
+                                    "expert down");
     if (!down)
         return down.error();
     return checked_add(gate_up.value(), down.value(), "expert pair");
 }
 
-static Result<uint64_t> packed_matrix_storage_size(
-    uint64_t rows,
-    uint64_t columns,
-    DType dtype,
-    const char* name)
+static Result<uint64_t> packed_matrix_storage_size(uint64_t rows,
+                                                   uint64_t columns,
+                                                   DType dtype,
+                                                   const char* name)
 {
     if (dtype == DType::MxFp4)
     {
@@ -758,9 +724,8 @@ static Result<uint64_t> packed_matrix_storage_size(
         {
             return Error{ErrorCode::InvalidModel, std::string(name) + " has invalid MXFP4 dimensions"};
         }
-        const uint64_t size = mxfp4_q8_packed_storage_bytes(
-            static_cast<size_t>(rows),
-            static_cast<uint32_t>(columns / 32));
+        const uint64_t size = mxfp4_q8_packed_storage_bytes(static_cast<size_t>(rows),
+                                                            static_cast<uint32_t>(columns / 32));
         if (size == 0)
             return Error{ErrorCode::InvalidModel, std::string(name) + " packed byte estimate overflows"};
         return size;
@@ -772,10 +737,9 @@ static Result<uint64_t> packed_matrix_storage_size(
         {
             return Error{ErrorCode::InvalidModel, std::string(name) + " has invalid Qn_K dimensions"};
         }
-        const uint64_t size = qnk_packed_storage_bytes(
-            dtype,
-            static_cast<size_t>(rows),
-            static_cast<uint32_t>(columns));
+        const uint64_t size = qnk_packed_storage_bytes(dtype,
+                                                       static_cast<size_t>(rows),
+                                                       static_cast<uint32_t>(columns));
         if (size == 0)
             return Error{ErrorCode::InvalidModel, std::string(name) + " has invalid Qn_K dimensions"};
         return size;
@@ -785,18 +749,16 @@ static Result<uint64_t> packed_matrix_storage_size(
 
 static Result<uint64_t> packed_expert_pair_size(const MoeModelDescriptor& descriptor, DType dtype)
 {
-    auto gate_up = packed_matrix_storage_size(
-        static_cast<uint64_t>(descriptor.intermediate_size) * 2,
-        descriptor.hidden_size,
-        dtype,
-        "packed expert gate/up");
+    auto gate_up = packed_matrix_storage_size(static_cast<uint64_t>(descriptor.intermediate_size) * 2,
+                                              descriptor.hidden_size,
+                                              dtype,
+                                              "packed expert gate/up");
     if (!gate_up)
         return gate_up.error();
-    auto down = packed_matrix_storage_size(
-        descriptor.hidden_size,
-        descriptor.intermediate_size,
-        dtype,
-        "packed expert down");
+    auto down = packed_matrix_storage_size(descriptor.hidden_size,
+                                           descriptor.intermediate_size,
+                                           dtype,
+                                           "packed expert down");
     if (!down)
         return down.error();
     return checked_add(gate_up.value(), down.value(), "packed expert pair");
@@ -870,10 +832,9 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         auto packed_pair_size = packed_expert_pair_size(descriptor, moe.expert_weight_dtype);
         if (!packed_pair_size)
             return packed_pair_size.error();
-        auto resident_pair_size = checked_add(
-            plan.expert_pair_size,
-            packed_pair_size.value(),
-            "resident expert pair");
+        auto resident_pair_size = checked_add(plan.expert_pair_size,
+                                              packed_pair_size.value(),
+                                              "resident expert pair");
         if (!resident_pair_size)
             return resident_pair_size.error();
         plan.expert_pair_resident_size = resident_pair_size.value();
@@ -889,17 +850,15 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
     if (!expert_size)
         return expert_size.error();
     plan.estimated_expert_size = expert_size.value();
-    auto packed_expert_size = checked_multiply(
-        plan.expert_pair_resident_size - plan.expert_pair_size,
-        expert_count.value(),
-        "packed expert weights");
+    auto packed_expert_size = checked_multiply(plan.expert_pair_resident_size - plan.expert_pair_size,
+                                               expert_count.value(),
+                                               "packed expert weights");
     if (!packed_expert_size)
         return packed_expert_size.error();
     plan.estimated_cpu_packed_expert_size = packed_expert_size.value();
-    auto resident_expert_size = checked_add(
-        plan.estimated_expert_size,
-        plan.estimated_cpu_packed_expert_size,
-        "resident expert weights");
+    auto resident_expert_size = checked_add(plan.estimated_expert_size,
+                                            plan.estimated_cpu_packed_expert_size,
+                                            "resident expert weights");
     if (!resident_expert_size)
         return resident_expert_size.error();
     plan.estimated_expert_resident_size = resident_expert_size.value();

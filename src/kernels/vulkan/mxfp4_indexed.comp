@@ -163,15 +163,14 @@ shared float partial_sum_2[32];
 shared float partial_sum_3[32];
 #endif
 
-void accumulate_indexed_row(
-    uint slot,
-    uint row,
-    uint output_column,
-    bool gate_mode,
-    uint matrix_input_columns,
-    uint block_count,
-    inout float sum_0,
-    inout float sum_1)
+void accumulate_indexed_row(uint slot,
+                            uint row,
+                            uint output_column,
+                            bool gate_mode,
+                            uint matrix_input_columns,
+                            uint block_count,
+                            inout float sum_0,
+                            inout float sum_1)
 {
     const uint weight_row = gate_mode ? output_column * 2u : output_column;
     const uint packed_row_base = weight_row * block_count * 16u;
@@ -200,8 +199,7 @@ void store_indexed_result(uint slot, uint row, uint output_column, float sum_0, 
 {
     if (p.mode == 1u)
     {
-        output_data[row * p.down_output_columns + output_column] =
-            sum_0 + bias_value(slot, output_column);
+        output_data[row * p.down_output_columns + output_column] = sum_0 + bias_value(slot, output_column);
         return;
     }
 
@@ -215,8 +213,7 @@ void store_indexed_result(uint slot, uint row, uint output_column, float sum_0, 
     const float silu = p.activation == 0u
                            ? gate / (1.0 + exp(-1.702 * gate))
                            : gate / (1.0 + exp(-gate));
-    output_data[row * (p.gate_output_columns / 2u) + output_column] =
-        p.activation == 0u ? silu * (up + 1.0) : silu * up;
+    output_data[row * (p.gate_output_columns / 2u) + output_column] = p.activation == 0u ? silu * (up + 1.0) : silu * up;
 }
 
 void main()
@@ -333,8 +330,7 @@ void main()
     {
         if (!gate_mode)
         {
-            output_data[row * p.down_output_columns + output_column] =
-                reduced_0 + bias_value(slot, output_column);
+            output_data[row * p.down_output_columns + output_column] = reduced_0 + bias_value(slot, output_column);
         }
         else
         {
@@ -348,8 +344,7 @@ void main()
             const float silu = p.activation == 0u
                                    ? gate / (1.0 + exp(-1.702 * gate))
                                    : gate / (1.0 + exp(-gate));
-            output_data[row * (p.gate_output_columns / 2u) + output_column] =
-                p.activation == 0u ? silu * (up + 1.0) : silu * up;
+            output_data[row * (p.gate_output_columns / 2u) + output_column] = p.activation == 0u ? silu * (up + 1.0) : silu * up;
         }
     }
 #else
@@ -369,8 +364,7 @@ void main()
     {
         if (!gate_mode)
         {
-            output_data[row * p.down_output_columns + output_column] =
-                partial_sum_0[0] + bias_value(slot, output_column);
+            output_data[row * p.down_output_columns + output_column] = partial_sum_0[0] + bias_value(slot, output_column);
         }
         else
         {
@@ -384,8 +378,7 @@ void main()
             const float silu = p.activation == 0u
                                    ? gate / (1.0 + exp(-1.702 * gate))
                                    : gate / (1.0 + exp(-gate));
-            output_data[row * (p.gate_output_columns / 2u) + output_column] =
-                p.activation == 0u ? silu * (up + 1.0) : silu * up;
+            output_data[row * (p.gate_output_columns / 2u) + output_column] = p.activation == 0u ? silu * (up + 1.0) : silu * up;
         }
     }
 #endif

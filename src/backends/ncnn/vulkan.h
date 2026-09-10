@@ -64,8 +64,7 @@ struct VulkanStatistics
 [[nodiscard]] uint32_t get_gpu_count() noexcept;
 [[nodiscard]] uint32_t get_default_gpu_index() noexcept;
 [[nodiscard]] std::vector<GpuInfo> get_gpu_infos();
-[[nodiscard]] VulkanStatistics get_vulkan_statistics(
-    const VulkanRuntimePtr& vulkan_runtime) noexcept;
+[[nodiscard]] VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& vulkan_runtime) noexcept;
 
 [[nodiscard]] VulkanRuntimePtr
 create_vulkan_runtime();

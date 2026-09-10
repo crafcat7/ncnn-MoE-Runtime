@@ -26,14 +26,18 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#endif // NCNN_MOE_WITH_VULKAN
 
 namespace ncnn {
 
+#if NCNN_MOE_WITH_VULKAN
 class Pipeline;
 class VkBlobAllocator;
+#endif // NCNN_MOE_WITH_VULKAN
 
 namespace moe {
 
+#if NCNN_MOE_WITH_VULKAN
 class VulkanContext;
 class Mxfp4Expert_vulkan;
 class QnkExpert_vulkan;
@@ -161,12 +165,11 @@ private:
 class VulkanExpertBackend final : public ExpertBackend
 {
 public:
-    VulkanExpertBackend(
-        uint64_t _cache_size,
-        uint32_t _vulkan_device_index,
-        std::shared_ptr<VulkanExpertVictimCache> _device_weight_source,
-        VulkanRuntimePtr _vulkan_runtime,
-        uint64_t _optimization_flags);
+    VulkanExpertBackend(uint64_t _cache_size,
+                        uint32_t _vulkan_device_index,
+                        std::shared_ptr<VulkanExpertVictimCache> _device_weight_source,
+                        VulkanRuntimePtr _vulkan_runtime,
+                        uint64_t _optimization_flags);
 
     ~VulkanExpertBackend() override;
 
@@ -269,20 +272,18 @@ private:
     using GhostList = std::list<ExpertKeySize>;
     using GhostIndex = std::unordered_map<std::string, GhostList::iterator, ExpertKeyHash, std::equal_to<>>;
 
-    static bool route_aggregation_enabled(
-        std::span<const ExpertBackendRequest> requests,
-        std::span<const Selection> selected,
-        uint32_t output_columns,
-        ActivationBuffer*& output,
-        uint32_t& token_count,
-        uint64_t optimization_flags);
+    static bool route_aggregation_enabled(std::span<const ExpertBackendRequest> requests,
+                                          std::span<const Selection> selected,
+                                          uint32_t output_columns,
+                                          ActivationBuffer*& output,
+                                          uint32_t& token_count,
+                                          uint64_t optimization_flags);
 
-    static bool build_route_aggregation_metadata(
-        std::span<const ExpertBackendRequest> requests,
-        std::span<const Selection> selected,
-        std::vector<uint32_t>& offsets,
-        std::vector<uint32_t>& rows,
-        std::vector<float>& weights);
+    static bool build_route_aggregation_metadata(std::span<const ExpertBackendRequest> requests,
+                                                 std::span<const Selection> selected,
+                                                 std::vector<uint32_t>& offsets,
+                                                 std::vector<uint32_t>& rows,
+                                                 std::vector<float>& weights);
 
     static uint64_t mxfp4_bytes(const TensorData& tensor);
 
@@ -314,9 +315,8 @@ private:
 
     bool forward_batch(std::span<const ExpertBackendRequest> requests, std::span<const Selection> selected);
 
-    bool forward_bfloat16_batch(
-        std::span<const ExpertBackendRequest> requests,
-        std::span<const Selection> selected);
+    bool forward_bfloat16_batch(std::span<const ExpertBackendRequest> requests,
+                                std::span<const Selection> selected);
 
     bool forward_qnk_batch(std::span<const ExpertBackendRequest> requests, std::span<const Selection> selected);
 
@@ -386,21 +386,14 @@ private:
     std::thread execution_worker;
 };
 
-} // namespace moe
-} // namespace ncnn
 #endif // NCNN_MOE_WITH_VULKAN
 
-namespace ncnn {
-namespace moe {
+[[nodiscard]] std::shared_ptr<ExpertBackend> create_vulkan_expert_backend(uint64_t cache_size, uint32_t device_index,
+                                                                          std::shared_ptr<ExpertVictimCache> device_weight_source,
+                                                                          const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags);
 
-[[nodiscard]] std::shared_ptr<ExpertBackend> create_vulkan_expert_backend(
-    uint64_t cache_size, uint32_t device_index,
-    std::shared_ptr<ExpertVictimCache> device_weight_source,
-    const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags);
-
-[[nodiscard]] std::shared_ptr<ExpertVictimCache> create_vulkan_victim_cache(
-    uint64_t cache_size, uint32_t device_index,
-    const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags);
+[[nodiscard]] std::shared_ptr<ExpertVictimCache> create_vulkan_victim_cache(uint64_t cache_size, uint32_t device_index,
+                                                                            const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags);
 
 } // namespace moe
 } // namespace ncnn

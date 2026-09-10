@@ -48,44 +48,39 @@ struct Mxfp4Scratch
     std::vector<uint32_t> physical_input_rows;
 };
 
-[[nodiscard]] bool mxfp4_expert_decode(
-    std::span<const Mxfp4Task> tasks,
-    Mxfp4Scratch* scratch,
-    uint64_t optimization_flags);
+[[nodiscard]] bool mxfp4_expert_decode(std::span<const Mxfp4Task> tasks,
+                                       Mxfp4Scratch* scratch,
+                                       uint64_t optimization_flags);
 
 [[nodiscard]] float bfloat16_to_float(uint16_t value) noexcept;
 [[nodiscard]] uint16_t float_to_bfloat16(float value) noexcept;
-[[nodiscard]] float scaled_silu(
-    float value,
-    float sigmoid_scale,
-    uint64_t optimization_flags) noexcept;
+[[nodiscard]] float scaled_silu(float value,
+                                float sigmoid_scale,
+                                uint64_t optimization_flags) noexcept;
 [[nodiscard]] float approximate_scaled_silu(float value, float sigmoid_scale = 1.0f) noexcept;
-[[nodiscard]] const char* scaled_silu_kernel_name(
-    uint64_t optimization_flags) noexcept;
+[[nodiscard]] const char* scaled_silu_kernel_name(uint64_t optimization_flags) noexcept;
 [[nodiscard]] uint32_t cpu_linear_num_threads() noexcept;
 void embedding_batch_into(const TensorData& embedding, std::span<const int32_t> input_ids, ActivationBuffer& output);
 [[nodiscard]] ActivationBuffer linear_batch(const TensorData& matrix, const ActivationBuffer& input, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
 // A quantized input scratch, when supplied, must not alias input or output.
 void linear_batch_into(const TensorData& matrix, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu, ActivationBuffer* quantized_input_scratch = nullptr);
-[[nodiscard]] bool float8_linear_pair_batch_into(
-    const TensorData& first,
-    const TensorData& second,
-    const ActivationBuffer& input,
-    ActivationBuffer& first_output,
-    ActivationBuffer& second_output,
-    uint64_t optimization_flags,
-    const CompiledOperator* first_executable = nullptr,
-    const CompiledOperator* second_executable = nullptr,
-    ActivationBuffer* quantized_input_scratch = nullptr);
-[[nodiscard]] bool float8_linear_rms_norm_batch_into(
-    const TensorData& matrix,
-    const ActivationBuffer& input,
-    const TensorData& norm_weight,
-    float epsilon,
-    ActivationBuffer& output,
-    uint64_t optimization_flags,
-    const CompiledOperator* executable = nullptr,
-    ActivationBuffer* quantized_input_scratch = nullptr);
+[[nodiscard]] bool float8_linear_pair_batch_into(const TensorData& first,
+                                                 const TensorData& second,
+                                                 const ActivationBuffer& input,
+                                                 ActivationBuffer& first_output,
+                                                 ActivationBuffer& second_output,
+                                                 uint64_t optimization_flags,
+                                                 const CompiledOperator* first_executable = nullptr,
+                                                 const CompiledOperator* second_executable = nullptr,
+                                                 ActivationBuffer* quantized_input_scratch = nullptr);
+[[nodiscard]] bool float8_linear_rms_norm_batch_into(const TensorData& matrix,
+                                                     const ActivationBuffer& input,
+                                                     const TensorData& norm_weight,
+                                                     float epsilon,
+                                                     ActivationBuffer& output,
+                                                     uint64_t optimization_flags,
+                                                     const CompiledOperator* executable = nullptr,
+                                                     ActivationBuffer* quantized_input_scratch = nullptr);
 [[nodiscard]] ActivationBuffer linear_batch(const TensorData& matrix, const TensorData& bias, const ActivationBuffer& input, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
 void linear_batch_into(const TensorData& matrix, const TensorData& bias, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu, ActivationBuffer* quantized_input_scratch = nullptr);
 [[nodiscard]] bool fused_float8_gate_up_batch(const TensorData& gate, const TensorData& up, const ActivationBuffer& input,

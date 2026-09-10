@@ -29,10 +29,9 @@ inline float float_approximate_exp(float value) noexcept
     constexpr float inverse_log_two = 0x1.715476p+0f;
     constexpr float rounding = 0x1.8p23f;
     const float exponent = std::fma(value, inverse_log_two, rounding) - rounding;
-    const float remainder = std::fma(
-        exponent,
-        -0x1.62e4p-1f,
-        std::fma(exponent, -0x1.7f7d1cp-20f, value));
+    const float remainder = std::fma(exponent,
+                                     -0x1.62e4p-1f,
+                                     std::fma(exponent, -0x1.7f7d1cp-20f, value));
 
     // Degree-7 minimax-like polynomial from ncnn/simplemath.cpp.
     float polynomial = 1.37805939e-3f;

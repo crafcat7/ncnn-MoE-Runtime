@@ -22,11 +22,10 @@
 namespace ncnn {
 namespace moe {
 
-static LatentVectorUndo capture_vector_undo(
-    const std::vector<float>& values,
-    size_t expected_size,
-    size_t offset,
-    size_t count)
+static LatentVectorUndo capture_vector_undo(const std::vector<float>& values,
+                                            size_t expected_size,
+                                            size_t offset,
+                                            size_t count)
 {
     LatentVectorUndo undo;
     undo.original_size = values.size();
@@ -39,9 +38,8 @@ static LatentVectorUndo capture_vector_undo(
     undo.offset = offset;
     const size_t available = offset < values.size() ? values.size() - offset : 0;
     const size_t copied = std::min(count, available);
-    undo.values.assign(
-        values.begin() + std::min(offset, values.size()),
-        values.begin() + std::min(offset + copied, values.size()));
+    undo.values.assign(values.begin() + std::min(offset, values.size()),
+                       values.begin() + std::min(offset + copied, values.size()));
     return undo;
 }
 
@@ -61,10 +59,9 @@ static void restore_vector_undo(std::vector<float>& values, const LatentVectorUn
     values.resize(undo.original_size);
     if (!undo.values.empty())
     {
-        std::copy(
-            undo.values.begin(),
-            undo.values.end(),
-            values.begin() + undo.offset);
+        std::copy(undo.values.begin(),
+                  undo.values.end(),
+                  values.begin() + undo.offset);
     }
 }
 
@@ -242,12 +239,11 @@ static bool parallel_latent_output_groups_enabled(uint64_t optimization_flags) n
                     OptimizationCpuLatentOutputGroups);
 }
 
-static void prepare_rope_coefficients(
-    uint32_t dimension,
-    uint64_t position,
-    const AttentionBlockPlan& plan,
-    std::vector<float>& cosines,
-    std::vector<float>& sines)
+static void prepare_rope_coefficients(uint32_t dimension,
+                                      uint64_t position,
+                                      const AttentionBlockPlan& plan,
+                                      std::vector<float>& cosines,
+                                      std::vector<float>& sines)
 {
     const bool yarn = plan.compression_ratio != 0;
     const float base = yarn ? plan.compressed_rope_theta : plan.rope_theta;
@@ -273,11 +269,10 @@ static void prepare_rope_coefficients(
             const float ramp_denominator = correction_low == correction_high
                                                ? 0.001f
                                                : static_cast<float>(correction_high - correction_low);
-            const float ramp = std::clamp(
-                (static_cast<float>(pair) - static_cast<float>(correction_low))
-                    / ramp_denominator,
-                0.0f,
-                1.0f);
+            const float ramp = std::clamp((static_cast<float>(pair) - static_cast<float>(correction_low))
+                                              / ramp_denominator,
+                                          0.0f,
+                                          1.0f);
             const float smooth = 1.0f - ramp;
             frequency = frequency / plan.rope_scaling_factor * (1.0f - smooth)
                         + frequency * smooth;
@@ -288,12 +283,11 @@ static void prepare_rope_coefficients(
     }
 }
 
-static void apply_prepared_rope(
-    float* values,
-    uint32_t dimension,
-    std::span<const float> cosines,
-    std::span<const float> sines,
-    bool inverse)
+static void apply_prepared_rope(float* values,
+                                uint32_t dimension,
+                                std::span<const float> cosines,
+                                std::span<const float> sines,
+                                bool inverse)
 {
     const uint32_t pair_count = dimension / 2;
     assert(cosines.size() >= pair_count && sines.size() >= pair_count);
@@ -332,24 +326,22 @@ static void normalize_vector(float* values, uint32_t count, const TensorData& we
 {
     if (simd_latent_norm_enabled(optimization_flags) && weight.dtype == DType::BFloat16)
     {
-        bfloat16_rms_norm(
-            values,
-            values,
-            weight.bfloat16_values().data(),
-            epsilon,
-            0.0f,
-            count);
+        bfloat16_rms_norm(values,
+                          values,
+                          weight.bfloat16_values().data(),
+                          epsilon,
+                          0.0f,
+                          count);
         return;
     }
     if (simd_latent_norm_enabled(optimization_flags) && weight.dtype == DType::Float32)
     {
-        float_rms_norm(
-            values,
-            values,
-            weight.float32_values().data(),
-            epsilon,
-            0.0f,
-            count);
+        float_rms_norm(values,
+                       values,
+                       weight.float32_values().data(),
+                       epsilon,
+                       0.0f,
+                       count);
         return;
     }
     float square_sum = 0.0f;
@@ -399,14 +391,13 @@ static void normalize_unit(float* values, uint32_t count, float epsilon, uint64_
     float_scale_inplace(values, inverse_rms, count);
 }
 
-static void normalize_unit_prepared_rope(
-    float* values,
-    uint32_t count,
-    uint32_t rope_dimension,
-    float epsilon,
-    std::span<const float> cosines,
-    std::span<const float> sines,
-    uint64_t optimization_flags)
+static void normalize_unit_prepared_rope(float* values,
+                                         uint32_t count,
+                                         uint32_t rope_dimension,
+                                         float epsilon,
+                                         std::span<const float> cosines,
+                                         std::span<const float> sines,
+                                         uint64_t optimization_flags)
 {
     if (simd_latent_norm_enabled(optimization_flags))
     {
@@ -450,36 +441,33 @@ static void normalize_unit_prepared_rope(
     }
 }
 
-static bool scored_index_precedes(
-    const LayerCache::LatentScoredIndex& left,
-    const LayerCache::LatentScoredIndex& right)
+static bool scored_index_precedes(const LayerCache::LatentScoredIndex& left,
+                                  const LayerCache::LatentScoredIndex& right)
 {
     return left.score > right.score || (left.score == right.score && left.index < right.index);
 }
 
-static bool vulkan_latent_compressor_enabled(
-    ExecutionBackend backend,
-    uint64_t optimization_flags) noexcept
+static bool vulkan_latent_compressor_enabled(ExecutionBackend backend,
+                                             uint64_t optimization_flags) noexcept
 {
     return backend == ExecutionBackend::Vulkan
            && has_flag(optimization_flags,
                        OptimizationVulkanLatentCompressor);
 }
 
-static void append_compressed_value(
-    const WeightStore& weights,
-    const CompiledOperatorTable& operators,
-    const AttentionBlockPlan& plan,
-    ExecutionBackend backend,
-    const ActivationBuffer& input,
-    uint64_t position,
-    float norm_epsilon,
-    bool indexer,
-    LayerCache& cache,
-    ActivationBuffer& quantized_input,
-    uint64_t optimization_flags,
-    const float* projected_values_override = nullptr,
-    const float* projected_scores_override = nullptr)
+static void append_compressed_value(const WeightStore& weights,
+                                    const CompiledOperatorTable& operators,
+                                    const AttentionBlockPlan& plan,
+                                    ExecutionBackend backend,
+                                    const ActivationBuffer& input,
+                                    uint64_t position,
+                                    float norm_epsilon,
+                                    bool indexer,
+                                    LayerCache& cache,
+                                    ActivationBuffer& quantized_input,
+                                    uint64_t optimization_flags,
+                                    const float* projected_values_override = nullptr,
+                                    const float* projected_scores_override = nullptr)
 {
     const uint32_t ratio = plan.compression_ratio;
     const uint32_t dimension = indexer ? plan.index_head_dimension : plan.head_dimension;
@@ -497,25 +485,21 @@ static void append_compressed_value(
                                   && vulkan_latent_compressor_enabled(backend, optimization_flags)
                                   && value_operator.bfloat16
                                   && gate_operator.bfloat16
-                                  && value_operator.bfloat16->forward_parallel(
-                                      input,
-                                      *gate_operator.bfloat16,
-                                      cache.compressor_values,
-                                      cache.compressor_scores);
+                                  && value_operator.bfloat16->forward_parallel(input,
+                                                                               *gate_operator.bfloat16,
+                                                                               cache.compressor_values,
+                                                                               cache.compressor_scores);
     if (!has_projected_pair
         && !used_vulkan_pair
-        && !float8_linear_pair_batch_into(
-            value_weight, gate_weight, input,
-            cache.compressor_values, cache.compressor_scores, optimization_flags,
-            operators.find_weight(value_handle), operators.find_weight(gate_handle),
-            &quantized_input))
+        && !float8_linear_pair_batch_into(value_weight, gate_weight, input,
+                                          cache.compressor_values, cache.compressor_scores, optimization_flags,
+                                          operators.find_weight(value_handle), operators.find_weight(gate_handle),
+                                          &quantized_input))
     {
-        linear_batch_into(
-            value_weight, input, cache.compressor_values, optimization_flags,
-            operators.find_weight(value_handle), backend, &quantized_input);
-        linear_batch_into(
-            gate_weight, input, cache.compressor_scores, optimization_flags,
-            operators.find_weight(gate_handle), backend, &quantized_input);
+        linear_batch_into(value_weight, input, cache.compressor_values, optimization_flags,
+                          operators.find_weight(value_handle), backend, &quantized_input);
+        linear_batch_into(gate_weight, input, cache.compressor_scores, optimization_flags,
+                          operators.find_weight(gate_handle), backend, &quantized_input);
     }
 
     std::vector<float>& pending_values = indexer ? cache.index_compressor_pending_values : cache.compressor_pending_values;
@@ -616,16 +600,15 @@ static void append_compressed_value(
     compressed.insert(compressed.end(), pooled.begin(), pooled.begin() + dimension);
 }
 
-static bool select_compressed_indices(
-    const WeightStore& weights,
-    const CompiledOperatorTable& operators,
-    const AttentionBlockPlan& plan,
-    ExecutionBackend backend,
-    const ActivationBuffer& normalized,
-    const ActivationBuffer& query_rank,
-    uint64_t position,
-    LayerCache& cache,
-    uint64_t optimization_flags)
+static bool select_compressed_indices(const WeightStore& weights,
+                                      const CompiledOperatorTable& operators,
+                                      const AttentionBlockPlan& plan,
+                                      ExecutionBackend backend,
+                                      const ActivationBuffer& normalized,
+                                      const ActivationBuffer& query_rank,
+                                      uint64_t position,
+                                      LayerCache& cache,
+                                      uint64_t optimization_flags)
 {
     const uint32_t compressed_count = static_cast<uint32_t>(cache.latent_compressed.size() / plan.head_dimension);
     cache.latent_selected_indices.clear();
@@ -677,12 +660,11 @@ static bool select_compressed_indices(
     return true;
 }
 
-static void fp8_matrix_rows_dot(
-    const TensorData& matrix,
-    uint32_t first_row,
-    uint32_t row_count,
-    const float* input,
-    float* output)
+static void fp8_matrix_rows_dot(const TensorData& matrix,
+                                uint32_t first_row,
+                                uint32_t row_count,
+                                const float* input,
+                                float* output)
 {
     const uint32_t columns = matrix.shape[1];
     const uint32_t input_blocks = (columns + 127) / 128;
@@ -693,29 +675,26 @@ static void fp8_matrix_rows_dot(
         // Scales are shared by 128 output rows.  Do not let the small
         // multi-row kernel cross that boundary.
         const uint32_t scale_rows = 128 - row % 128;
-        const uint32_t rows = std::min<uint32_t>(
-            {4, row_count - processed, scale_rows});
-        float8_e4m3_block_dot_rows4(
-            matrix.float8_values().data()
-                + static_cast<size_t>(row) * columns,
-            columns,
-            matrix.quantization_scales.data()
-                + static_cast<size_t>(row / 128) * input_blocks,
-            input,
-            columns,
-            128,
-            rows,
-            output + processed);
+        const uint32_t rows = std::min<uint32_t>({4, row_count - processed, scale_rows});
+        float8_e4m3_block_dot_rows4(matrix.float8_values().data()
+                                        + static_cast<size_t>(row) * columns,
+                                    columns,
+                                    matrix.quantization_scales.data()
+                                        + static_cast<size_t>(row / 128) * input_blocks,
+                                    input,
+                                    columns,
+                                    128,
+                                    rows,
+                                    output + processed);
         processed += rows;
     }
 }
 
-static int latent_output_group_team_size(
-    size_t row_count,
-    uint32_t group_count,
-    uint32_t group_columns,
-    uint32_t rank,
-    uint64_t optimization_flags) noexcept
+static int latent_output_group_team_size(size_t row_count,
+                                         uint32_t group_count,
+                                         uint32_t group_columns,
+                                         uint32_t rank,
+                                         uint64_t optimization_flags) noexcept
 {
 #if defined(_OPENMP)
     const uint64_t operations = static_cast<uint64_t>(row_count) * group_count * group_columns
@@ -723,10 +702,9 @@ static int latent_output_group_team_size(
     if (!parallel_latent_output_groups_enabled(optimization_flags)
         || operations < 1024 * 1024)
         return 1;
-    return std::max(
-        1,
-        std::min(static_cast<int>(row_count * group_count),
-                 static_cast<int>(cpu_linear_num_threads())));
+    return std::max(1,
+                    std::min(static_cast<int>(row_count * group_count),
+                             static_cast<int>(cpu_linear_num_threads())));
 #else
     (void)row_count;
     (void)group_count;
@@ -736,18 +714,17 @@ static int latent_output_group_team_size(
 #endif
 }
 
-Result<void> forward_latent_attention_batch(
-    const WeightStore& weights,
-    const CompiledOperatorTable& operators,
-    const AttentionBlockPlan& plan,
-    ExecutionBackend backend,
-    float norm_epsilon,
-    std::span<const uint64_t> positions,
-    std::span<LayerCache* const> caches,
-    AttentionScratch& scratch,
-    const ActivationBuffer& input,
-    ActivationBuffer& output,
-    uint64_t optimization_flags)
+Result<void> forward_latent_attention_batch(const WeightStore& weights,
+                                            const CompiledOperatorTable& operators,
+                                            const AttentionBlockPlan& plan,
+                                            ExecutionBackend backend,
+                                            float norm_epsilon,
+                                            std::span<const uint64_t> positions,
+                                            std::span<LayerCache* const> caches,
+                                            AttentionScratch& scratch,
+                                            const ActivationBuffer& input,
+                                            ActivationBuffer& output,
+                                            uint64_t optimization_flags)
 {
     if (plan.kind != AttentionKind::MultiHeadLatent
         || input.columns() != weights.at(plan.pre_attention_norm_weight).shape[0]
@@ -774,9 +751,8 @@ Result<void> forward_latent_attention_batch(
     bool key_value_ready = false;
     if (plan.compression_ratio != 0)
     {
-        rms_norm_batch_into(
-            input, weights.at(plan.pre_attention_norm_weight), norm_epsilon,
-            normalized, 0.0f, optimization_flags);
+        rms_norm_batch_into(input, weights.at(plan.pre_attention_norm_weight), norm_epsilon,
+                            normalized, 0.0f, optimization_flags);
         normalized_ready = true;
     }
     const TensorData& query_a = weights.at(plan.query_a_weight);
@@ -790,19 +766,17 @@ Result<void> forward_latent_attention_batch(
     for (size_t row = 0; row < caches.size(); ++row)
     {
         const LayerCache* cache = caches[row];
-        auto projected = std::find_if(
-            projected_compressed_counts.begin(),
-            projected_compressed_counts.end(),
-            [cache](const auto& item) {
-                return item.first == cache;
-            });
+        auto projected = std::find_if(projected_compressed_counts.begin(),
+                                      projected_compressed_counts.end(),
+                                      [cache](const auto& item) {
+                                          return item.first == cache;
+                                      });
         if (projected == projected_compressed_counts.end())
         {
             const uint32_t current_count = plan.head_dimension == 0
                                                ? 0u
-                                               : static_cast<uint32_t>(
-                                                     cache->latent_compressed.size()
-                                                     / plan.head_dimension);
+                                               : static_cast<uint32_t>(cache->latent_compressed.size()
+                                                                       / plan.head_dimension);
             projected_compressed_counts.push_back({cache, current_count});
             projected = projected_compressed_counts.end() - 1;
         }
@@ -845,16 +819,14 @@ Result<void> forward_latent_attention_batch(
             fused_compressor_outputs[fused_compressor_count] = &gate_output;
             ++fused_compressor_count;
         };
-        add_compressor_pair(
-            plan.compressor_key_value_weight,
-            plan.compressor_gate_weight,
-            fused_compressor_values,
-            fused_compressor_scores);
-        add_compressor_pair(
-            plan.indexer_compressor_key_value_weight,
-            plan.indexer_compressor_gate_weight,
-            fused_index_compressor_values,
-            fused_index_compressor_scores);
+        add_compressor_pair(plan.compressor_key_value_weight,
+                            plan.compressor_gate_weight,
+                            fused_compressor_values,
+                            fused_compressor_scores);
+        add_compressor_pair(plan.indexer_compressor_key_value_weight,
+                            plan.indexer_compressor_gate_weight,
+                            fused_index_compressor_values,
+                            fused_index_compressor_scores);
         if (fused_compressor_count != 4)
             fused_compressor_count = 0;
     }
@@ -870,18 +842,15 @@ Result<void> forward_latent_attention_batch(
         {
             if (fused_compressor_count != 0)
             {
-                chained_query = query_a_operator.float8->forward_rms_norm_chain_parallel_bfloat16(
-                    normalized,
-                    *query_b_operator.float8,
-                    *key_value_operator.float8,
-                    std::span<const Bfloat16Linear_vulkan*>(
-                        fused_compressor_operators.data(),
-                        fused_compressor_count),
-                    std::span<ActivationBuffer*>(
-                        fused_compressor_outputs.data(),
-                        fused_compressor_count),
-                    query,
-                    key_value);
+                chained_query = query_a_operator.float8->forward_rms_norm_chain_parallel_bfloat16(normalized,
+                                                                                                  *query_b_operator.float8,
+                                                                                                  *key_value_operator.float8,
+                                                                                                  std::span<const Bfloat16Linear_vulkan*>(fused_compressor_operators.data(),
+                                                                                                                                          fused_compressor_count),
+                                                                                                  std::span<ActivationBuffer*>(fused_compressor_outputs.data(),
+                                                                                                                               fused_compressor_count),
+                                                                                                  query,
+                                                                                                  key_value);
                 key_value_ready = chained_query;
                 fused_compressor = chained_query;
             }
@@ -891,30 +860,27 @@ Result<void> forward_latent_attention_batch(
                     && has_flag(optimization_flags,
                                 OptimizationVulkanLatentInputRmsNorm))
                 {
-                    chained_query = query_a_operator.float8->forward_input_rms_norm_chain_parallel(
-                        input,
-                        *query_b_operator.float8,
-                        *key_value_operator.float8,
-                        query,
-                        key_value);
+                    chained_query = query_a_operator.float8->forward_input_rms_norm_chain_parallel(input,
+                                                                                                   *query_b_operator.float8,
+                                                                                                   *key_value_operator.float8,
+                                                                                                   query,
+                                                                                                   key_value);
                     key_value_ready = chained_query;
                 }
                 if (!chained_query)
                 {
                     if (!normalized_ready)
                     {
-                        rms_norm_batch_into(
-                            input,
-                            weights.at(plan.pre_attention_norm_weight),
-                            norm_epsilon, normalized, 0.0f, optimization_flags);
+                        rms_norm_batch_into(input,
+                                            weights.at(plan.pre_attention_norm_weight),
+                                            norm_epsilon, normalized, 0.0f, optimization_flags);
                         normalized_ready = true;
                     }
-                    chained_query = query_a_operator.float8->forward_rms_norm_chain_parallel(
-                        normalized,
-                        *query_b_operator.float8,
-                        *key_value_operator.float8,
-                        query,
-                        key_value);
+                    chained_query = query_a_operator.float8->forward_rms_norm_chain_parallel(normalized,
+                                                                                             *query_b_operator.float8,
+                                                                                             *key_value_operator.float8,
+                                                                                             query,
+                                                                                             key_value);
                     key_value_ready = chained_query;
                 }
             }
@@ -923,10 +889,9 @@ Result<void> forward_latent_attention_batch(
         {
             if (!normalized_ready)
             {
-                rms_norm_batch_into(
-                    input,
-                    weights.at(plan.pre_attention_norm_weight),
-                    norm_epsilon, normalized, 0.0f, optimization_flags);
+                rms_norm_batch_into(input,
+                                    weights.at(plan.pre_attention_norm_weight),
+                                    norm_epsilon, normalized, 0.0f, optimization_flags);
                 normalized_ready = true;
             }
             chained_query = query_a_operator.float8->forward_rms_norm_chain(normalized, *query_b_operator.float8, query);
@@ -943,32 +908,27 @@ Result<void> forward_latent_attention_batch(
     {
         if (!normalized_ready)
         {
-            rms_norm_batch_into(
-                input,
-                weights.at(plan.pre_attention_norm_weight),
-                norm_epsilon, normalized, 0.0f, optimization_flags);
+            rms_norm_batch_into(input,
+                                weights.at(plan.pre_attention_norm_weight),
+                                norm_epsilon, normalized, 0.0f, optimization_flags);
             normalized_ready = true;
         }
-        auto graph = CommandGraph_vulkan::create(
-            *query_a_operator.linear);
+        auto graph = CommandGraph_vulkan::create(*query_a_operator.linear);
         DeviceTensor_vulkan normalized_device;
         DeviceTensor_vulkan query_rank_device;
         DeviceTensor_vulkan query_device;
         DeviceTensor_vulkan key_value_device;
         chained_query = graph
                         && graph->upload(normalized, normalized_device)
-                        && graph->linear(
-                            *query_a_operator.linear,
-                            normalized_device,
-                            query_rank_device)
-                        && graph->linear(
-                            *query_b_operator.linear,
-                            query_rank_device,
-                            query_device)
-                        && graph->linear(
-                            *key_value_operator.linear,
-                            normalized_device,
-                            key_value_device)
+                        && graph->linear(*query_a_operator.linear,
+                                         normalized_device,
+                                         query_rank_device)
+                        && graph->linear(*query_b_operator.linear,
+                                         query_rank_device,
+                                         query_device)
+                        && graph->linear(*key_value_operator.linear,
+                                         normalized_device,
+                                         key_value_device)
                         && graph->download(query_device, query)
                         && graph->download(key_value_device, key_value)
                         && graph->submit()
@@ -979,57 +939,49 @@ Result<void> forward_latent_attention_batch(
     {
         if (!normalized_ready)
         {
-            rms_norm_batch_into(
-                input,
-                weights.at(plan.pre_attention_norm_weight),
-                norm_epsilon, normalized, 0.0f, optimization_flags);
+            rms_norm_batch_into(input,
+                                weights.at(plan.pre_attention_norm_weight),
+                                norm_epsilon, normalized, 0.0f, optimization_flags);
             normalized_ready = true;
         }
-        const bool paired_projection = float8_linear_pair_batch_into(
-            query_a, key_value_weight, normalized, query_rank,
-            key_value, optimization_flags,
-            operators.find_weight(plan.query_a_weight), operators.find_weight(plan.key_value_weight),
-            &scratch.quantized_input);
+        const bool paired_projection = float8_linear_pair_batch_into(query_a, key_value_weight, normalized, query_rank,
+                                                                     key_value, optimization_flags,
+                                                                     operators.find_weight(plan.query_a_weight), operators.find_weight(plan.key_value_weight),
+                                                                     &scratch.quantized_input);
         if (!paired_projection)
         {
-            linear_batch_into(
-                query_a, normalized, query_rank, optimization_flags,
-                operators.find_weight(plan.query_a_weight), backend,
-                &scratch.quantized_input);
+            linear_batch_into(query_a, normalized, query_rank, optimization_flags,
+                              operators.find_weight(plan.query_a_weight), backend,
+                              &scratch.quantized_input);
         }
         else
             key_value_ready = true;
         query_rank_ready = true;
         const bool query_projection_fused = query_rank_not_required
-                                            && float8_linear_rms_norm_batch_into(
-                                                query_b, query_rank,
-                                                weights.at(plan.query_norm_weight), norm_epsilon, query,
-                                                optimization_flags, operators.find_weight(plan.query_b_weight),
-                                                &scratch.quantized_input);
+                                            && float8_linear_rms_norm_batch_into(query_b, query_rank,
+                                                                                 weights.at(plan.query_norm_weight), norm_epsilon, query,
+                                                                                 optimization_flags, operators.find_weight(plan.query_b_weight),
+                                                                                 &scratch.quantized_input);
         if (!query_projection_fused)
         {
-            rms_norm_batch_into(
-                query_rank, weights.at(plan.query_norm_weight),
-                norm_epsilon, query_rank, 0.0f, optimization_flags);
-            linear_batch_into(
-                query_b, query_rank, query, optimization_flags,
-                operators.find_weight(plan.query_b_weight), backend,
-                &scratch.quantized_input);
+            rms_norm_batch_into(query_rank, weights.at(plan.query_norm_weight),
+                                norm_epsilon, query_rank, 0.0f, optimization_flags);
+            linear_batch_into(query_b, query_rank, query, optimization_flags,
+                              operators.find_weight(plan.query_b_weight), backend,
+                              &scratch.quantized_input);
         }
         else
             query_rank_ready = false;
     }
     if (!key_value_ready)
     {
-        linear_batch_into(
-            key_value_weight, normalized, key_value, optimization_flags,
-            operators.find_weight(plan.key_value_weight), backend,
-            &scratch.quantized_input);
+        linear_batch_into(key_value_weight, normalized, key_value, optimization_flags,
+                          operators.find_weight(plan.key_value_weight), backend,
+                          &scratch.quantized_input);
         key_value_ready = true;
     }
-    rms_norm_batch_into(
-        key_value, weights.at(plan.key_value_norm_weight), norm_epsilon,
-        key_value, 0.0f, optimization_flags);
+    rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), norm_epsilon,
+                        key_value, 0.0f, optimization_flags);
     attention_output.reset(input.rows(), plan.head_count * plan.head_dimension, true);
 
     const std::span<const float> sinks = weights.at(plan.sinks).float32_values();
@@ -1056,27 +1008,24 @@ Result<void> forward_latent_attention_batch(
             float* key = key_value.row(row_index);
             if (prepared_latent_rope_enabled(optimization_flags))
             {
-                prepare_rope_coefficients(
-                    plan.rope_head_dimension,
-                    position,
-                    plan,
-                    cache.latent_rope_cosines,
-                    cache.latent_rope_sines);
-                apply_prepared_rope(
-                    key + plan.head_dimension - plan.rope_head_dimension,
-                    plan.rope_head_dimension,
-                    cache.latent_rope_cosines,
-                    cache.latent_rope_sines,
-                    false);
+                prepare_rope_coefficients(plan.rope_head_dimension,
+                                          position,
+                                          plan,
+                                          cache.latent_rope_cosines,
+                                          cache.latent_rope_sines);
+                apply_prepared_rope(key + plan.head_dimension - plan.rope_head_dimension,
+                                    plan.rope_head_dimension,
+                                    cache.latent_rope_cosines,
+                                    cache.latent_rope_sines,
+                                    false);
             }
             else
             {
-                apply_rope(
-                    key + plan.head_dimension - plan.rope_head_dimension,
-                    plan.rope_head_dimension,
-                    position,
-                    plan,
-                    false);
+                apply_rope(key + plan.head_dimension - plan.rope_head_dimension,
+                           plan.rope_head_dimension,
+                           position,
+                           plan,
+                           false);
             }
             quantize_float8_e4m3_inplace(key, plan.head_dimension - plan.rope_head_dimension, 64, true, optimization_flags);
             std::copy_n(key, plan.head_dimension, cache.latent_window.data() + static_cast<size_t>(position % plan.sliding_window) * plan.head_dimension);
@@ -1100,20 +1049,19 @@ Result<void> forward_latent_attention_batch(
                     fused_values = fused_compressor_values.row(row_index);
                     fused_scores = fused_compressor_scores.row(row_index);
                 }
-                append_compressed_value(
-                    weights,
-                    operators,
-                    plan,
-                    backend,
-                    token_input,
-                    position,
-                    norm_epsilon,
-                    false,
-                    cache,
-                    scratch.quantized_input,
-                    optimization_flags,
-                    fused_values,
-                    fused_scores);
+                append_compressed_value(weights,
+                                        operators,
+                                        plan,
+                                        backend,
+                                        token_input,
+                                        position,
+                                        norm_epsilon,
+                                        false,
+                                        cache,
+                                        scratch.quantized_input,
+                                        optimization_flags,
+                                        fused_values,
+                                        fused_scores);
                 if (plan.compression_ratio == 4)
                 {
                     fused_values = nullptr;
@@ -1123,20 +1071,19 @@ Result<void> forward_latent_attention_batch(
                         fused_values = fused_index_compressor_values.row(row_index);
                         fused_scores = fused_index_compressor_scores.row(row_index);
                     }
-                    append_compressed_value(
-                        weights,
-                        operators,
-                        plan,
-                        backend,
-                        token_input,
-                        position,
-                        norm_epsilon,
-                        true,
-                        cache,
-                        scratch.quantized_input,
-                        optimization_flags,
-                        fused_values,
-                        fused_scores);
+                    append_compressed_value(weights,
+                                            operators,
+                                            plan,
+                                            backend,
+                                            token_input,
+                                            position,
+                                            norm_epsilon,
+                                            true,
+                                            cache,
+                                            scratch.quantized_input,
+                                            optimization_flags,
+                                            fused_values,
+                                            fused_scores);
                 }
             }
             LatentAttentionRowContext& context = row_contexts[row_index];
@@ -1159,8 +1106,7 @@ Result<void> forward_latent_attention_batch(
             }
             else
             {
-                cache.latent_attention_logits.resize(
-                    static_cast<size_t>(plan.head_count) * candidate_count);
+                cache.latent_attention_logits.resize(static_cast<size_t>(plan.head_count) * candidate_count);
                 context.logits = cache.latent_attention_logits;
             }
         }
@@ -1175,24 +1121,22 @@ Result<void> forward_latent_attention_batch(
         float* query_head = query.row(row_index) + static_cast<size_t>(head) * plan.head_dimension;
         if (prepared_latent_rope_enabled(optimization_flags))
         {
-            normalize_unit_prepared_rope(
-                query_head,
-                plan.head_dimension,
-                plan.rope_head_dimension,
-                norm_epsilon,
-                cache.latent_rope_cosines,
-                cache.latent_rope_sines,
-                optimization_flags);
+            normalize_unit_prepared_rope(query_head,
+                                         plan.head_dimension,
+                                         plan.rope_head_dimension,
+                                         norm_epsilon,
+                                         cache.latent_rope_cosines,
+                                         cache.latent_rope_sines,
+                                         optimization_flags);
         }
         else
         {
             normalize_unit(query_head, plan.head_dimension, norm_epsilon, optimization_flags);
-            apply_rope(
-                query_head + plan.head_dimension - plan.rope_head_dimension,
-                plan.rope_head_dimension,
-                position,
-                plan,
-                false);
+            apply_rope(query_head + plan.head_dimension - plan.rope_head_dimension,
+                       plan.rope_head_dimension,
+                       position,
+                       plan,
+                       false);
         }
         float* output_head = attention_output.row(row_index)
                              + static_cast<size_t>(head) * plan.head_dimension;
@@ -1213,9 +1157,8 @@ Result<void> forward_latent_attention_batch(
                 {
                     const uint64_t candidate_position = context.window_begin + candidate;
                     candidate_key = cache.latent_window.data()
-                                    + static_cast<size_t>(
-                                          candidate_position
-                                          % plan.sliding_window)
+                                    + static_cast<size_t>(candidate_position
+                                                          % plan.sliding_window)
                                           * plan.head_dimension;
                 }
                 else
@@ -1228,45 +1171,39 @@ Result<void> forward_latent_attention_batch(
                                     + static_cast<size_t>(compressed_index)
                                           * plan.head_dimension;
                 }
-                const float score = float_dot(
-                                        query_head, candidate_key,
-                                        plan.head_dimension)
+                const float score = float_dot(query_head, candidate_key,
+                                              plan.head_dimension)
                                     * softmax_scale;
                 if (score > maximum)
                 {
                     const float rescale = float_approximate_exp(maximum - score);
-                    float_scale_inplace(
-                        output_head, rescale, plan.head_dimension);
+                    float_scale_inplace(output_head, rescale, plan.head_dimension);
                     denominator *= rescale;
                     maximum = score;
                 }
                 const float weight = float_approximate_exp(score - maximum);
                 denominator += weight;
-                float_scaled_add(
-                    output_head, candidate_key, weight,
-                    plan.head_dimension);
+                float_scaled_add(output_head, candidate_key, weight,
+                                 plan.head_dimension);
             }
-            float_scale_inplace(
-                output_head, 1.0f / denominator, plan.head_dimension);
+            float_scale_inplace(output_head, 1.0f / denominator, plan.head_dimension);
             if (prepared_latent_rope_enabled(optimization_flags))
             {
-                apply_prepared_rope(
-                    output_head + plan.head_dimension
-                        - plan.rope_head_dimension,
-                    plan.rope_head_dimension,
-                    cache.latent_rope_cosines,
-                    cache.latent_rope_sines,
-                    true);
+                apply_prepared_rope(output_head + plan.head_dimension
+                                        - plan.rope_head_dimension,
+                                    plan.rope_head_dimension,
+                                    cache.latent_rope_cosines,
+                                    cache.latent_rope_sines,
+                                    true);
             }
             else
             {
-                apply_rope(
-                    output_head + plan.head_dimension
-                        - plan.rope_head_dimension,
-                    plan.rope_head_dimension,
-                    position,
-                    plan,
-                    true);
+                apply_rope(output_head + plan.head_dimension
+                               - plan.rope_head_dimension,
+                           plan.rope_head_dimension,
+                           position,
+                           plan,
+                           true);
             }
             return;
         }
@@ -1322,21 +1259,19 @@ Result<void> forward_latent_attention_batch(
         }
         if (prepared_latent_rope_enabled(optimization_flags))
         {
-            apply_prepared_rope(
-                output_head + plan.head_dimension - plan.rope_head_dimension,
-                plan.rope_head_dimension,
-                cache.latent_rope_cosines,
-                cache.latent_rope_sines,
-                true);
+            apply_prepared_rope(output_head + plan.head_dimension - plan.rope_head_dimension,
+                                plan.rope_head_dimension,
+                                cache.latent_rope_cosines,
+                                cache.latent_rope_sines,
+                                true);
         }
         else
         {
-            apply_rope(
-                output_head + plan.head_dimension - plan.rope_head_dimension,
-                plan.rope_head_dimension,
-                position,
-                plan,
-                true);
+            apply_rope(output_head + plan.head_dimension - plan.rope_head_dimension,
+                       plan.rope_head_dimension,
+                       position,
+                       plan,
+                       true);
         }
     };
 
@@ -1392,10 +1327,9 @@ Result<void> forward_latent_attention_batch(
     ActivationBuffer& output_rank = scratch.projected;
     if (backend == ExecutionBackend::Vulkan && output_a_operator.float8)
     {
-        linear_batch_into(
-            output_a, attention_output, output_rank, optimization_flags,
-            operators.find_weight(plan.output_a_weight), backend,
-            &scratch.quantized_input);
+        linear_batch_into(output_a, attention_output, output_rank, optimization_flags,
+                          operators.find_weight(plan.output_a_weight), backend,
+                          &scratch.quantized_input);
     }
     else
     {
@@ -1403,9 +1337,8 @@ Result<void> forward_latent_attention_batch(
         const uint32_t heads_per_group = plan.head_count / plan.output_group_count;
         const uint32_t group_columns = heads_per_group * plan.head_dimension;
 #if defined(_OPENMP)
-        const int output_team_size = latent_output_group_team_size(
-            input.rows(), plan.output_group_count, group_columns,
-            plan.output_lora_rank, optimization_flags);
+        const int output_team_size = latent_output_group_team_size(input.rows(), plan.output_group_count, group_columns,
+                                                                   plan.output_lora_rank, optimization_flags);
         const int64_t output_tasks = static_cast<int64_t>(input.rows())
                                      * plan.output_group_count;
 #pragma omp parallel for schedule(static) num_threads(output_team_size) if (output_team_size > 1)
@@ -1425,62 +1358,56 @@ Result<void> forward_latent_attention_batch(
             float* group_output = output_rank.row(row_index)
                                   + static_cast<size_t>(group)
                                         * plan.output_lora_rank;
-            fp8_matrix_rows_dot(
-                output_a,
-                group * plan.output_lora_rank,
-                plan.output_lora_rank,
-                group_input,
-                group_output);
+            fp8_matrix_rows_dot(output_a,
+                                group * plan.output_lora_rank,
+                                plan.output_lora_rank,
+                                group_input,
+                                group_output);
         }
     }
-    linear_batch_into(
-        output_b, output_rank, output, optimization_flags,
-        operators.find_weight(plan.output_b_weight), backend,
-        &scratch.quantized_input);
+    linear_batch_into(output_b, output_rank, output, optimization_flags,
+                      operators.find_weight(plan.output_b_weight), backend,
+                      &scratch.quantized_input);
     return {};
 }
 
-Result<void> forward_latent_attention(
-    const WeightStore& weights,
-    const CompiledOperatorTable& operators,
-    const AttentionBlockPlan& plan,
-    ExecutionBackend backend,
-    float norm_epsilon,
-    uint64_t position_offset,
-    LayerCache& cache,
-    AttentionScratch& scratch,
-    const ActivationBuffer& input,
-    ActivationBuffer& output,
-    uint64_t optimization_flags)
+Result<void> forward_latent_attention(const WeightStore& weights,
+                                      const CompiledOperatorTable& operators,
+                                      const AttentionBlockPlan& plan,
+                                      ExecutionBackend backend,
+                                      float norm_epsilon,
+                                      uint64_t position_offset,
+                                      LayerCache& cache,
+                                      AttentionScratch& scratch,
+                                      const ActivationBuffer& input,
+                                      ActivationBuffer& output,
+                                      uint64_t optimization_flags)
 {
     if (input.rows() == 1)
     {
         const std::array<uint64_t, 1> positions = {position_offset};
         std::array<LayerCache*, 1> caches = {&cache};
-        return forward_latent_attention_batch(
-            weights, operators, plan, backend, norm_epsilon, positions, caches,
-            scratch, input, output, optimization_flags);
+        return forward_latent_attention_batch(weights, operators, plan, backend, norm_epsilon, positions, caches,
+                                              scratch, input, output, optimization_flags);
     }
     scratch.latent_positions.resize(input.rows());
     scratch.latent_caches.assign(input.rows(), &cache);
     for (size_t row = 0; row < input.rows(); ++row)
         scratch.latent_positions[row] = position_offset + row;
-    return forward_latent_attention_batch(
-        weights, operators, plan, backend, norm_epsilon,
-        scratch.latent_positions, scratch.latent_caches,
-        scratch, input, output, optimization_flags);
+    return forward_latent_attention_batch(weights, operators, plan, backend, norm_epsilon,
+                                          scratch.latent_positions, scratch.latent_caches,
+                                          scratch, input, output, optimization_flags);
 }
 
-Result<void> append_dspark_attention_context(
-    const WeightStore& weights,
-    const CompiledOperatorTable& operators,
-    const AttentionBlockPlan& plan,
-    ExecutionBackend backend,
-    float norm_epsilon,
-    uint64_t position_offset,
-    LayerCache& cache,
-    const ActivationBuffer& input,
-    uint64_t optimization_flags)
+Result<void> append_dspark_attention_context(const WeightStore& weights,
+                                             const CompiledOperatorTable& operators,
+                                             const AttentionBlockPlan& plan,
+                                             ExecutionBackend backend,
+                                             float norm_epsilon,
+                                             uint64_t position_offset,
+                                             LayerCache& cache,
+                                             const ActivationBuffer& input,
+                                             uint64_t optimization_flags)
 {
     if (plan.kind != AttentionKind::MultiHeadLatent
         || plan.compression_ratio != 0
@@ -1489,15 +1416,13 @@ Result<void> append_dspark_attention_context(
     {
         return Error{ErrorCode::InvalidArgument, "invalid DSpark context append"};
     }
-    ActivationBuffer key_value = linear_batch(
-        weights.at(plan.key_value_weight),
-        input,
-        optimization_flags,
-        operators.find_weight(plan.key_value_weight),
-        backend);
-    rms_norm_batch_into(
-        key_value, weights.at(plan.key_value_norm_weight), norm_epsilon,
-        key_value, 0.0f, optimization_flags);
+    ActivationBuffer key_value = linear_batch(weights.at(plan.key_value_weight),
+                                              input,
+                                              optimization_flags,
+                                              operators.find_weight(plan.key_value_weight),
+                                              backend);
+    rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), norm_epsilon,
+                        key_value, 0.0f, optimization_flags);
     const size_t window_elements = static_cast<size_t>(plan.sliding_window) * plan.head_dimension;
     if (cache.latent_window.size() != window_elements)
         cache.latent_window.assign(window_elements, 0.0f);
@@ -1517,18 +1442,17 @@ Result<void> append_dspark_attention_context(
     return {};
 }
 
-Result<void> forward_dspark_attention(
-    const WeightStore& weights,
-    const CompiledOperatorTable& operators,
-    const AttentionBlockPlan& plan,
-    ExecutionBackend backend,
-    float norm_epsilon,
-    uint64_t position_offset,
-    const LayerCache& cache,
-    AttentionScratch& scratch,
-    const ActivationBuffer& input,
-    ActivationBuffer& output,
-    uint64_t optimization_flags)
+Result<void> forward_dspark_attention(const WeightStore& weights,
+                                      const CompiledOperatorTable& operators,
+                                      const AttentionBlockPlan& plan,
+                                      ExecutionBackend backend,
+                                      float norm_epsilon,
+                                      uint64_t position_offset,
+                                      const LayerCache& cache,
+                                      AttentionScratch& scratch,
+                                      const ActivationBuffer& input,
+                                      ActivationBuffer& output,
+                                      uint64_t optimization_flags)
 {
     if (plan.kind != AttentionKind::MultiHeadLatent
         || plan.compression_ratio != 0
@@ -1566,39 +1490,35 @@ Result<void> forward_dspark_attention(
             if (has_flag(optimization_flags,
                          OptimizationVulkanLatentInputRmsNorm))
             {
-                chained_query = query_a_operator.float8->forward_input_rms_norm_chain_parallel(
-                    input,
-                    *query_b_operator.float8,
-                    *key_value_operator.float8,
-                    query,
-                    key_value);
+                chained_query = query_a_operator.float8->forward_input_rms_norm_chain_parallel(input,
+                                                                                               *query_b_operator.float8,
+                                                                                               *key_value_operator.float8,
+                                                                                               query,
+                                                                                               key_value);
                 key_value_ready = chained_query;
             }
             if (!chained_query)
             {
                 if (!normalized_ready)
                 {
-                    rms_norm_batch_into(
-                        input,
-                        weights.at(plan.pre_attention_norm_weight),
-                        norm_epsilon, normalized, 0.0f, optimization_flags);
+                    rms_norm_batch_into(input,
+                                        weights.at(plan.pre_attention_norm_weight),
+                                        norm_epsilon, normalized, 0.0f, optimization_flags);
                     normalized_ready = true;
                 }
-                chained_query = query_a_operator.float8->forward_rms_norm_chain_parallel(
-                    normalized,
-                    *query_b_operator.float8,
-                    *key_value_operator.float8,
-                    query,
-                    key_value);
+                chained_query = query_a_operator.float8->forward_rms_norm_chain_parallel(normalized,
+                                                                                         *query_b_operator.float8,
+                                                                                         *key_value_operator.float8,
+                                                                                         query,
+                                                                                         key_value);
                 key_value_ready = chained_query;
             }
         }
         else
         {
-            rms_norm_batch_into(
-                input,
-                weights.at(plan.pre_attention_norm_weight),
-                norm_epsilon, normalized, 0.0f, optimization_flags);
+            rms_norm_batch_into(input,
+                                weights.at(plan.pre_attention_norm_weight),
+                                norm_epsilon, normalized, 0.0f, optimization_flags);
             normalized_ready = true;
             chained_query = query_a_operator.float8->forward_rms_norm_chain(normalized, *query_b_operator.float8, query);
         }
@@ -1607,51 +1527,43 @@ Result<void> forward_dspark_attention(
     {
         if (!normalized_ready)
         {
-            rms_norm_batch_into(
-                input,
-                weights.at(plan.pre_attention_norm_weight),
-                norm_epsilon, normalized, 0.0f, optimization_flags);
+            rms_norm_batch_into(input,
+                                weights.at(plan.pre_attention_norm_weight),
+                                norm_epsilon, normalized, 0.0f, optimization_flags);
             normalized_ready = true;
         }
-        const bool paired_projection = float8_linear_pair_batch_into(
-            query_a, key_value_weight, normalized, query_rank,
-            key_value, optimization_flags,
-            operators.find_weight(plan.query_a_weight), operators.find_weight(plan.key_value_weight),
-            &scratch.quantized_input);
+        const bool paired_projection = float8_linear_pair_batch_into(query_a, key_value_weight, normalized, query_rank,
+                                                                     key_value, optimization_flags,
+                                                                     operators.find_weight(plan.query_a_weight), operators.find_weight(plan.key_value_weight),
+                                                                     &scratch.quantized_input);
         if (!paired_projection)
         {
-            linear_batch_into(
-                query_a, normalized, query_rank, optimization_flags,
-                operators.find_weight(plan.query_a_weight), backend,
-                &scratch.quantized_input);
+            linear_batch_into(query_a, normalized, query_rank, optimization_flags,
+                              operators.find_weight(plan.query_a_weight), backend,
+                              &scratch.quantized_input);
         }
         else
             key_value_ready = true;
-        if (!float8_linear_rms_norm_batch_into(
-                query_b, query_rank, weights.at(plan.query_norm_weight),
-                norm_epsilon, query, optimization_flags,
-                operators.find_weight(plan.query_b_weight), &scratch.quantized_input))
+        if (!float8_linear_rms_norm_batch_into(query_b, query_rank, weights.at(plan.query_norm_weight),
+                                               norm_epsilon, query, optimization_flags,
+                                               operators.find_weight(plan.query_b_weight), &scratch.quantized_input))
         {
-            rms_norm_batch_into(
-                query_rank, weights.at(plan.query_norm_weight),
-                norm_epsilon, query_rank, 0.0f, optimization_flags);
-            linear_batch_into(
-                query_b, query_rank, query, optimization_flags,
-                operators.find_weight(plan.query_b_weight), backend,
-                &scratch.quantized_input);
+            rms_norm_batch_into(query_rank, weights.at(plan.query_norm_weight),
+                                norm_epsilon, query_rank, 0.0f, optimization_flags);
+            linear_batch_into(query_b, query_rank, query, optimization_flags,
+                              operators.find_weight(plan.query_b_weight), backend,
+                              &scratch.quantized_input);
         }
     }
     if (!key_value_ready)
     {
-        linear_batch_into(
-            key_value_weight, normalized, key_value, optimization_flags,
-            operators.find_weight(plan.key_value_weight), backend,
-            &scratch.quantized_input);
+        linear_batch_into(key_value_weight, normalized, key_value, optimization_flags,
+                          operators.find_weight(plan.key_value_weight), backend,
+                          &scratch.quantized_input);
         key_value_ready = true;
     }
-    rms_norm_batch_into(
-        key_value, weights.at(plan.key_value_norm_weight), norm_epsilon,
-        key_value, 0.0f, optimization_flags);
+    rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), norm_epsilon,
+                        key_value, 0.0f, optimization_flags);
 
     for (size_t row = 0; row < input.rows(); ++row)
     {
@@ -1684,9 +1596,8 @@ Result<void> forward_dspark_attention(
             {
                 const float* key = candidate < window_count
                                        ? cache.latent_window.data()
-                                             + static_cast<size_t>(
-                                                   (window_begin + candidate)
-                                                   % plan.sliding_window)
+                                             + static_cast<size_t>((window_begin + candidate)
+                                                                   % plan.sliding_window)
                                                    * plan.head_dimension
                                        : key_value.row(candidate - window_count);
                 const float dot = float_dot(query_head, key, plan.head_dimension);
@@ -1711,17 +1622,15 @@ Result<void> forward_dspark_attention(
             {
                 const float* key = candidate < window_count
                                        ? cache.latent_window.data()
-                                             + static_cast<size_t>(
-                                                   (window_begin + candidate)
-                                                   % plan.sliding_window)
+                                             + static_cast<size_t>((window_begin + candidate)
+                                                                   % plan.sliding_window)
                                                    * plan.head_dimension
                                        : key_value.row(candidate - window_count);
                 const float probability = logits[candidate] / denominator;
                 float_scaled_add(output_head, key, probability, plan.head_dimension);
             }
-            apply_rope(
-                output_head + plan.head_dimension - plan.rope_head_dimension,
-                plan.rope_head_dimension, position, plan, true);
+            apply_rope(output_head + plan.head_dimension - plan.rope_head_dimension,
+                       plan.rope_head_dimension, position, plan, true);
         }
     }
 
@@ -1739,10 +1648,9 @@ Result<void> forward_dspark_attention(
     ActivationBuffer& output_rank = scratch.projected;
     if (backend == ExecutionBackend::Vulkan && output_a_operator.float8)
     {
-        linear_batch_into(
-            output_a, attention_output, output_rank, optimization_flags,
-            operators.find_weight(plan.output_a_weight), backend,
-            &scratch.quantized_input);
+        linear_batch_into(output_a, attention_output, output_rank, optimization_flags,
+                          operators.find_weight(plan.output_a_weight), backend,
+                          &scratch.quantized_input);
     }
     else
     {
@@ -1750,9 +1658,8 @@ Result<void> forward_dspark_attention(
         const uint32_t heads_per_group = plan.head_count / plan.output_group_count;
         const uint32_t group_columns = heads_per_group * plan.head_dimension;
 #if defined(_OPENMP)
-        const int output_team_size = latent_output_group_team_size(
-            input.rows(), plan.output_group_count, group_columns,
-            plan.output_lora_rank, optimization_flags);
+        const int output_team_size = latent_output_group_team_size(input.rows(), plan.output_group_count, group_columns,
+                                                                   plan.output_lora_rank, optimization_flags);
         const int64_t output_tasks = static_cast<int64_t>(input.rows())
                                      * plan.output_group_count;
 #pragma omp parallel for schedule(static) num_threads(output_team_size) if (output_team_size > 1)
@@ -1772,18 +1679,16 @@ Result<void> forward_dspark_attention(
             float* group_output = output_rank.row(row)
                                   + static_cast<size_t>(group)
                                         * plan.output_lora_rank;
-            fp8_matrix_rows_dot(
-                output_a,
-                group * plan.output_lora_rank,
-                plan.output_lora_rank,
-                group_input,
-                group_output);
+            fp8_matrix_rows_dot(output_a,
+                                group * plan.output_lora_rank,
+                                plan.output_lora_rank,
+                                group_input,
+                                group_output);
         }
     }
-    linear_batch_into(
-        output_b, output_rank, output, optimization_flags,
-        operators.find_weight(plan.output_b_weight), backend,
-        &scratch.quantized_input);
+    linear_batch_into(output_b, output_rank, output, optimization_flags,
+                      operators.find_weight(plan.output_b_weight), backend,
+                      &scratch.quantized_input);
     return {};
 }
 

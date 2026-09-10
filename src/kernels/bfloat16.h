@@ -22,14 +22,11 @@ private:
 class ScopedBfloat16BatchedLinearExecutionCounter
 {
 public:
-    explicit ScopedBfloat16BatchedLinearExecutionCounter(
-        Bfloat16BatchedLinearExecutionCounter* counter) noexcept;
+    explicit ScopedBfloat16BatchedLinearExecutionCounter(Bfloat16BatchedLinearExecutionCounter* counter) noexcept;
     ~ScopedBfloat16BatchedLinearExecutionCounter();
 
-    ScopedBfloat16BatchedLinearExecutionCounter(
-        const ScopedBfloat16BatchedLinearExecutionCounter&) = delete;
-    ScopedBfloat16BatchedLinearExecutionCounter& operator=(
-        const ScopedBfloat16BatchedLinearExecutionCounter&) = delete;
+    ScopedBfloat16BatchedLinearExecutionCounter(const ScopedBfloat16BatchedLinearExecutionCounter&) = delete;
+    ScopedBfloat16BatchedLinearExecutionCounter& operator=(const ScopedBfloat16BatchedLinearExecutionCounter&) = delete;
 
 private:
     Bfloat16BatchedLinearExecutionCounter* previous = nullptr;
@@ -44,17 +41,15 @@ current_bfloat16_batched_linear_execution_counter() noexcept;
 
 // Runtime-dispatched round-to-nearest-even conversion used by the KV cache
 // and optional BF16 attention packing paths.
-void float_to_bfloat16_array(
-    uint16_t* output,
-    const float* input,
-    uint32_t count) noexcept;
+void float_to_bfloat16_array(uint16_t* output,
+                             const float* input,
+                             uint32_t count) noexcept;
 
 // BF16-by-BF16 dot product. AVX512-BF16 implementations use dpbf16; callers
 // can query availability before accepting the additional input quantization.
-[[nodiscard]] float bfloat16_pair_dot(
-    const uint16_t* left,
-    const uint16_t* right,
-    uint32_t count) noexcept;
+[[nodiscard]] float bfloat16_pair_dot(const uint16_t* left,
+                                      const uint16_t* right,
+                                      uint32_t count) noexcept;
 [[nodiscard]] bool bfloat16_pair_dot_available() noexcept;
 
 // Runtime-dispatched accumulation of BF16 values into an FP32 vector.
