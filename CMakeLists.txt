@@ -332,7 +332,10 @@ if(NCNN_MOE_BUILD_TESTS)
     target_link_libraries(ncnn_moe_tests PRIVATE ncnn::moe)
     target_compile_features(ncnn_moe_tests PRIVATE cxx_std_20)
     target_include_directories(ncnn_moe_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(ncnn_moe_tests PRIVATE NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>)
+    target_compile_definitions(ncnn_moe_tests PRIVATE
+        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+    )
     add_test(NAME ncnn_moe_tests COMMAND ncnn_moe_tests)
 
     # This consumer must not inherit the runtime's private src include path.

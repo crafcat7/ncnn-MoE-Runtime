@@ -132,7 +132,7 @@ struct GraphOption
                                           const GraphOption& options);
 
 // Build and schedule the target and speculative graph regions.
-[[nodiscard]] Result<void> _graph(CompiledModel& compiled, bool use_vulkan_experts);
+[[nodiscard]] Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts);
 
 } // namespace moe
 } // namespace ncnn

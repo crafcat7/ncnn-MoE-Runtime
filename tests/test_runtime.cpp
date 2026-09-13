@@ -109,6 +109,13 @@ static float bfloat16_storage_tolerance(float value) noexcept
 
 inline uint64_t g_test_optimization_flags = OptimizationDefaultFlags;
 
+static bool has_usable_vulkan_device(const RuntimeInfo& info, uint32_t capability_flag) noexcept
+{
+    return has_flag(info.flags, capability_flag)
+           && info.default_gpu_index < info.gpu_infos.size()
+           && info.gpu_infos[info.default_gpu_index].type != VulkanDeviceType::Cpu;
+}
+
 class TestRuntime final : public Runtime
 {
 public:
@@ -6276,7 +6283,7 @@ void test_cross_session_batch_scheduler()
         check(static_cast<bool>(statistics.num_threads <= large_scheduler_options.num_threads));
     }
 
-    if (has_flag(runtime.info().flags, RuntimeVulkanCpu))
+    if (has_usable_vulkan_device(runtime.info(), RuntimeVulkanCpu))
     {
         AttentionPackage attention_package;
         Option hybrid_options;
@@ -7220,7 +7227,7 @@ void test_attention_graph_without_bias_or_sink()
     auto cpu_prefill = cpu_session.value()->prefill(prompt);
     check(static_cast<bool>(cpu_prefill));
 
-    if (has_flag(runtime.info().flags, RuntimeVulkanAttention))
+    if (has_usable_vulkan_device(runtime.info(), RuntimeVulkanAttention))
     {
         Option hybrid_options;
         hybrid_options.hybrid_mode = HybridMode::HybridExperts;
@@ -12189,8 +12196,7 @@ void test_backend_capabilities_and_hybrid_execution()
     Option automatic_options;
     automatic_options.hybrid_mode = HybridMode::Auto;
     const uint32_t automatic_device_index = runtime.info().default_gpu_index;
-    const bool automatic_uses_vulkan = has_flag(runtime.info().flags, RuntimeVulkanCpu) && automatic_device_index < runtime.info().gpu_infos.size()
-                                       && runtime.info().gpu_infos[automatic_device_index].type != VulkanDeviceType::Cpu;
+    const bool automatic_uses_vulkan = has_usable_vulkan_device(runtime.info(), RuntimeVulkanCpu);
     auto automatic_model = runtime.load_model(package.path(), automatic_options);
     check(static_cast<bool>(automatic_model));
     check(static_cast<bool>(runtime.synchronize_model_caches(automatic_model.value())));
@@ -12272,7 +12278,7 @@ void test_backend_capabilities_and_hybrid_execution()
     Option hybrid_options;
     hybrid_options.hybrid_mode = HybridMode::HybridExperts;
     auto hybrid_model = runtime.load_model(package.path(), hybrid_options);
-    if (has_flag(runtime.info().flags, RuntimeVulkanCpu))
+    if (has_usable_vulkan_device(runtime.info(), RuntimeVulkanCpu))
     {
         check(static_cast<bool>(hybrid_model));
         check(static_cast<bool>(hybrid_model.value()->hybrid_mode() == HybridMode::HybridExperts));
@@ -12545,6 +12551,7 @@ void test_backend_capabilities_and_hybrid_execution()
     }
     else
     {
+        // Vulkan CPU/software devices are not eligible for heterogeneous placement.
         check(static_cast<bool>(!hybrid_model));
         check(static_cast<bool>(hybrid_model.error().code == ErrorCode::UnsupportedModel));
     }
@@ -12592,6 +12599,20 @@ void test_flag_defaults()
     check(static_cast<bool>(has_flag(info.flags, RuntimeCpu)));
     check(static_cast<bool>(has_flag(info.flags, RuntimeMxfp4Cpu)));
     check(static_cast<bool>(has_flag(info.flags, RuntimeCrossSession)));
+
+    RuntimeInfo vulkan_info;
+    vulkan_info.flags |= RuntimeVulkanCpu;
+    check(static_cast<bool>(!has_usable_vulkan_device(vulkan_info, RuntimeVulkanCpu)));
+    vulkan_info.gpu_infos.resize(1);
+    vulkan_info.gpu_infos.front().type = VulkanDeviceType::Cpu;
+    check(static_cast<bool>(!has_usable_vulkan_device(vulkan_info, RuntimeVulkanCpu)));
+    vulkan_info.gpu_infos.front().type = VulkanDeviceType::Integrated;
+    check(static_cast<bool>(has_usable_vulkan_device(vulkan_info, RuntimeVulkanCpu)));
+    vulkan_info.default_gpu_index = 1;
+    check(static_cast<bool>(!has_usable_vulkan_device(vulkan_info, RuntimeVulkanCpu)));
+    vulkan_info.default_gpu_index = 0;
+    vulkan_info.flags &= ~RuntimeVulkanCpu;
+    check(static_cast<bool>(!has_usable_vulkan_device(vulkan_info, RuntimeVulkanCpu)));
 
     SchedulerOptions scheduler;
     check(static_cast<bool>(scheduler.num_threads == 0));
