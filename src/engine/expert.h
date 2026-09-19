@@ -41,6 +41,19 @@ ExpertVictimExecutionMetadata victim_metadata(const CompiledModel& model,
                                               const ExpertPlan& expert,
                                               size_t token_count);
 
+// Transfer dispatched routes into reusable execution slots and record demand.
+void prepare_moe_experts(const MoeBlockPlan& moe,
+                         LayerGraphState& layer_state,
+                         SessionStatistics& statistics);
+
+// Submit exact reads without waiting or acquiring compute-time leases.
+[[nodiscard]] Result<void> request_moe_experts(const CompiledModel& model,
+                                               const MoeBlockPlan& moe,
+                                               const LayerGraphState& layer_state,
+                                               ExpertScratch& scratch,
+                                               uint32_t residency_group,
+                                               SessionStatistics& statistics);
+
 [[nodiscard]] Result<void> forward_moe(const CompiledModel& model,
                                        const MoeBlockPlan& moe,
                                        LayerGraphState& layer_state,

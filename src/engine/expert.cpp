@@ -2,6 +2,7 @@
 
 #include "sessionstate.h"
 #include "expertbackend.h"
+#include "metrics.h"
 #include "graph/compiledmodel.h"
 #include "kernels/bfloat16.h"
 #include "kernels/fastmath.h"
@@ -714,6 +715,35 @@ static uint64_t run_experts(const CompiledModel& model,
 #if defined(_OPENMP)
     expert_team_size = std::min(static_cast<int>(active_indices.size()), static_cast<int>(cpu_linear_num_threads()));
     parallelize_experts = expert_team_size > 1;
+    if (parallelize_experts && layer_state.normalized.rows() == 1
+        && expert_team_size <= static_cast<int>(cpu_linear_num_threads() / 2))
+    {
+        // Single-token BF16 Experts may underfill the outer team. Prefer
+        // matrix teams only when every projection can use at least twice
+        // as many threads. Keep batched Experts parallel across Experts.
+        bool parallelize_matrices = true;
+        for (const Mxfp4Task& task : decode_tasks)
+        {
+            for (const TensorData* matrix : {task.gate_up, task.down})
+            {
+                if (!matrix || matrix->shape.size() != 2 || matrix->dtype != DType::BFloat16)
+                {
+                    parallelize_matrices = false;
+                    break;
+                }
+                const uint64_t operation_count = static_cast<uint64_t>(matrix->shape[0])
+                                                 * matrix->shape[1] * task.input->rows();
+                if (cpu_linear_team_size(operation_count, matrix->dtype) / 2 < expert_team_size)
+                {
+                    parallelize_matrices = false;
+                    break;
+                }
+            }
+            if (!parallelize_matrices)
+                break;
+        }
+        parallelize_experts = !parallelize_matrices;
+    }
 #endif
     const int64_t parallel_expert_count = static_cast<int64_t>(active_indices.size());
     Bfloat16BatchedLinearExecutionCounter* const bfloat16_counter = current_bfloat16_batched_linear_execution_counter();
@@ -1329,6 +1359,55 @@ static Result<void> run_hybrid_expert_blocks(const CompiledModel& model,
         ++statistics.expert_batches;
     }
     layer_state.experts_executed = true;
+    return {};
+}
+
+void prepare_moe_experts(const MoeBlockPlan& moe,
+                         LayerGraphState& layer_state,
+                         SessionStatistics& statistics)
+{
+    ExpertDispatchPlan& plan = layer_state.dispatch_plan;
+    statistics.expert_assignments += plan.assignment_count;
+    layer_state.resize_experts(plan.batches.size());
+    for (size_t batch_index = 0; batch_index < plan.batches.size(); ++batch_index)
+    {
+        ExpertBatch& batch = plan.batches[batch_index];
+        statistics.expert_token_counts[batch.expert_id] += batch.routes.size();
+        record_expert_weight_demand(moe.experts[batch.expert_id], batch.routes.size(), statistics);
+        layer_state.active_experts()[batch_index].prepare(batch);
+    }
+}
+
+Result<void> request_moe_experts(const CompiledModel& model,
+                                 const MoeBlockPlan& moe,
+                                 const LayerGraphState& layer_state,
+                                 ExpertScratch& scratch,
+                                 uint32_t residency_group,
+                                 SessionStatistics& statistics)
+{
+    if (!model.expert_cache)
+        return {};
+    const auto request_start = std::chrono::steady_clock::now();
+    std::vector<ExpertCachePairRequest>& requests = scratch.cache_requests;
+    requests.clear();
+    requests.reserve(layer_state.active_experts().size());
+    for (const ActiveExpertExecution& active : layer_state.active_experts())
+    {
+        const ExpertPlan& expert = moe.experts[active.batch.expert_id];
+        if (expert.gate_up_weight == invalid_tensor_handle || expert.cache_key.empty())
+            continue;
+        requests.push_back({
+            &model.weights.at(expert.gate_up_weight),
+            &model.weights.at(expert.down_weight),
+            residency_group,
+            expert.cache_key,
+            victim_metadata(model, expert, layer_state.normalized.rows()),
+        });
+    }
+    auto requested = model.expert_cache->request_pairs(requests);
+    statistics.expert_cache_management_time_microseconds += elapsed_microseconds(request_start);
+    if (!requested)
+        return requested.error();
     return {};
 }
 

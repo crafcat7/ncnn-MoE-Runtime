@@ -40,11 +40,6 @@ static float gated_delta_softplus(float value)
     return std::log1p(float_approximate_exp(value));
 }
 
-static bool gated_delta_simd_enabled(uint64_t optimization_flags) noexcept
-{
-    return has_flag(optimization_flags, OptimizationCpuGatedDeltaSimd);
-}
-
 static void configure_gated_delta_cache(LayerCache& cache, const AttentionBlockPlan& plan)
 {
     const uint32_t key_size = plan.kv_head_count * plan.head_dimension;
@@ -66,8 +61,7 @@ static void execute_depthwise_convolution_row(const TensorData& weight,
                                               uint32_t kernel_size,
                                               std::vector<float>& state,
                                               float* values,
-                                              uint32_t columns,
-                                              bool vectorized)
+                                              uint32_t columns)
 {
     assert(weight.shape.size() == 3);
     assert(weight.shape[0] == columns);
@@ -90,11 +84,7 @@ static void execute_depthwise_convolution_row(const TensorData& weight,
             sum += history[3] * taps[3];
             values[channel] = sum;
         }
-        if (vectorized)
-            float_silu_inplace(values, columns);
-        else
-            for (uint32_t channel = 0; channel < columns; ++channel)
-                values[channel] *= gated_delta_sigmoid(values[channel]);
+        float_silu_inplace(values, columns);
         return;
     }
     if (kernel_size == 4 && weight.dtype == DType::BFloat16)
@@ -114,11 +104,7 @@ static void execute_depthwise_convolution_row(const TensorData& weight,
             sum += history[3] * bfloat16_to_float(filter[offset + 3]);
             values[channel] = sum;
         }
-        if (vectorized)
-            float_silu_inplace(values, columns);
-        else
-            for (uint32_t channel = 0; channel < columns; ++channel)
-                values[channel] *= gated_delta_sigmoid(values[channel]);
+        float_silu_inplace(values, columns);
         return;
     }
     for (uint32_t channel = 0; channel < columns; ++channel)
@@ -136,11 +122,7 @@ static void execute_depthwise_convolution_row(const TensorData& weight,
         }
         values[channel] = sum;
     }
-    if (vectorized)
-        float_silu_inplace(values, columns);
-    else
-        for (uint32_t channel = 0; channel < columns; ++channel)
-            values[channel] *= gated_delta_sigmoid(values[channel]);
+    float_silu_inplace(values, columns);
 }
 
 static void execute_gated_delta_recurrence_row(const WeightStore& weights,
@@ -153,8 +135,7 @@ static void execute_gated_delta_recurrence_row(const WeightStore& weights,
                                                const float* alpha_values,
                                                std::vector<float>& memory,
                                                std::vector<float>& delta,
-                                               float* recurrent_output,
-                                               uint64_t optimization_flags)
+                                               float* recurrent_output)
 {
     const uint32_t key_size = plan.kv_head_count * plan.head_dimension;
     const uint32_t head_ratio = plan.head_count / plan.kv_head_count;
@@ -162,7 +143,6 @@ static void execute_gated_delta_recurrence_row(const WeightStore& weights,
     const TensorData& time_bias = weights.at(plan.delta_time_bias);
     const TensorData& decay_log = weights.at(plan.delta_decay_log);
     const TensorData& norm_weight = weights.at(plan.delta_norm_weight);
-    const bool vectorized = gated_delta_simd_enabled(optimization_flags);
 
     // Every value head in a KV group shares the same query/key head.  Normalize
     // each pair once instead of recomputing both norms and their inverse
@@ -172,45 +152,19 @@ static void execute_gated_delta_recurrence_row(const WeightStore& weights,
         float* query = qkv + static_cast<size_t>(key_head) * plan.head_dimension;
         float* key = qkv + key_size
                      + static_cast<size_t>(key_head) * plan.head_dimension;
-        if (vectorized)
-        {
-            float_l2_scale_inplace(query, 1e-6f, plan.head_dimension);
-            float_l2_scale_inplace(key, 1e-6f, plan.head_dimension);
-        }
-        else
-        {
-            float query_square_sum = 0.0f;
-            float key_square_sum = 0.0f;
-            for (uint32_t column = 0; column < plan.head_dimension; ++column)
-            {
-                query_square_sum += query[column] * query[column];
-                key_square_sum += key[column] * key[column];
-            }
-            const float query_inverse_norm = 1.0f / std::sqrt(query_square_sum + 1e-6f);
-            const float key_inverse_norm = 1.0f / std::sqrt(key_square_sum + 1e-6f);
-            for (uint32_t column = 0; column < plan.head_dimension; ++column)
-            {
-                query[column] *= query_inverse_norm;
-                key[column] *= key_inverse_norm;
-            }
-        }
+        float_l2_scale_inplace(query, 1e-6f, plan.head_dimension);
+        float_l2_scale_inplace(key, 1e-6f, plan.head_dimension);
     }
 
-    const uint32_t head_team_size = vectorized
-                                        ? std::min(plan.head_count,
-                                                   cpu_linear_num_threads())
-                                        : 1;
+    const uint32_t head_team_size = std::min(plan.head_count, cpu_linear_num_threads());
     const bool parallelize_value_heads = head_team_size > 1;
-    if (vectorized)
-    {
-        const size_t scratch_head_count = head_team_size > 1
-                                              ? plan.head_count
-                                              : 1;
-        memory.resize(static_cast<size_t>(scratch_head_count)
-                      * plan.value_head_dimension);
-        delta.resize(static_cast<size_t>(scratch_head_count)
-                     * plan.value_head_dimension);
-    }
+    const size_t scratch_head_count = head_team_size > 1
+                                          ? plan.head_count
+                                          : 1;
+    memory.resize(static_cast<size_t>(scratch_head_count)
+                  * plan.value_head_dimension);
+    delta.resize(static_cast<size_t>(scratch_head_count)
+                 * plan.value_head_dimension);
 
 #pragma omp parallel for schedule(static) num_threads(head_team_size) if (parallelize_value_heads)
     for (int64_t value_head_index = 0;
@@ -236,125 +190,56 @@ static void execute_gated_delta_recurrence_row(const WeightStore& weights,
         float* head_output = recurrent_output
                              + static_cast<size_t>(value_head)
                                    * plan.value_head_dimension;
-        float* memory_values = vectorized
-                                   ? memory.data()
-                                         + static_cast<size_t>(parallelize_value_heads
-                                                                   ? value_head
-                                                                   : 0)
-                                               * plan.value_head_dimension
-                                   : nullptr;
-        float* delta_values = vectorized
-                                  ? delta.data()
-                                        + static_cast<size_t>(parallelize_value_heads
-                                                                  ? value_head
-                                                                  : 0)
-                                              * plan.value_head_dimension
-                                  : nullptr;
-        if (vectorized)
+        float* memory_values = memory.data() + static_cast<size_t>(parallelize_value_heads ? value_head : 0) * plan.value_head_dimension;
+        float* delta_values = delta.data() + static_cast<size_t>(parallelize_value_heads ? value_head : 0) * plan.value_head_dimension;
+        // Keep the state in its public [key][value] layout, but traverse it
+        // row-wise.  Decay and the first matrix-vector product share one
+        // load/store pass: the state is updated in place and the decayed
+        // row is accumulated into memory before moving to the next key.
+        std::fill(memory_values,
+                  memory_values + plan.value_head_dimension,
+                  0.0f);
+        for (uint32_t key_column = 0;
+             key_column < plan.head_dimension;
+             ++key_column)
         {
-            // Keep the state in its public [key][value] layout, but traverse it
-            // row-wise.  Decay and the first matrix-vector product share one
-            // load/store pass: the state is updated in place and the decayed
-            // row is accumulated into memory before moving to the next key.
-            std::fill(memory_values,
-                      memory_values + plan.value_head_dimension,
-                      0.0f);
-            for (uint32_t key_column = 0;
-                 key_column < plan.head_dimension;
-                 ++key_column)
-            {
-                float_scale_inplace_and_scaled_add(recurrent
-                                                       + static_cast<size_t>(key_column)
-                                                             * plan.value_head_dimension,
-                                                   decay,
-                                                   memory_values,
-                                                   key[key_column],
-                                                   plan.value_head_dimension);
-            }
-            for (uint32_t value_column = 0;
-                 value_column < plan.value_head_dimension;
-                 ++value_column)
-            {
-                delta_values[value_column] = (value[value_column] - memory_values[value_column]) * beta;
-            }
-            std::fill(head_output,
-                      head_output + plan.value_head_dimension,
-                      0.0f);
-            for (uint32_t key_column = 0;
-                 key_column < plan.head_dimension;
-                 ++key_column)
-            {
-                float_scale_inplace_and_scaled_add_and_accumulate(recurrent
-                                                                      + static_cast<size_t>(key_column)
-                                                                            * plan.value_head_dimension,
-                                                                  1.0f,
-                                                                  delta_values,
-                                                                  key[key_column],
-                                                                  head_output,
-                                                                  query[key_column],
-                                                                  plan.value_head_dimension);
-            }
-            float_scale_inplace(head_output,
-                                query_scale,
-                                plan.value_head_dimension);
+            float_scale_inplace_and_scaled_add(recurrent
+                                                   + static_cast<size_t>(key_column)
+                                                         * plan.value_head_dimension,
+                                               decay,
+                                               memory_values,
+                                               key[key_column],
+                                               plan.value_head_dimension);
         }
-        else
+        for (uint32_t value_column = 0;
+             value_column < plan.value_head_dimension;
+             ++value_column)
         {
-            for (uint32_t key_column = 0;
-                 key_column < plan.head_dimension;
-                 ++key_column)
-            {
-                float* recurrent_row = recurrent
-                                       + static_cast<size_t>(key_column)
-                                             * plan.value_head_dimension;
-                for (uint32_t value_column = 0;
-                     value_column < plan.value_head_dimension;
-                     ++value_column)
-                {
-                    recurrent_row[value_column] *= decay;
-                }
-            }
-            for (uint32_t value_column = 0;
-                 value_column < plan.value_head_dimension;
-                 ++value_column)
-            {
-                float memory_value = 0.0f;
-                for (uint32_t key_column = 0;
-                     key_column < plan.head_dimension;
-                     ++key_column)
-                {
-                    memory_value += recurrent[static_cast<size_t>(key_column)
-                                                  * plan.value_head_dimension
-                                              + value_column]
-                                    * key[key_column];
-                }
-                const float value_delta = (value[value_column] - memory_value) * beta;
-                for (uint32_t key_column = 0;
-                     key_column < plan.head_dimension;
-                     ++key_column)
-                {
-                    recurrent[static_cast<size_t>(key_column)
-                                  * plan.value_head_dimension
-                              + value_column] += key[key_column] * value_delta;
-                }
-                float output_value = 0.0f;
-                for (uint32_t key_column = 0;
-                     key_column < plan.head_dimension;
-                     ++key_column)
-                {
-                    output_value += recurrent[static_cast<size_t>(key_column)
-                                                  * plan.value_head_dimension
-                                              + value_column]
-                                    * query[key_column];
-                }
-                head_output[value_column] = output_value * query_scale;
-            }
+            delta_values[value_column] = (value[value_column] - memory_values[value_column]) * beta;
         }
+        std::fill(head_output,
+                  head_output + plan.value_head_dimension,
+                  0.0f);
+        for (uint32_t key_column = 0;
+             key_column < plan.head_dimension;
+             ++key_column)
+        {
+            float_scale_inplace_and_scaled_add_and_accumulate(recurrent
+                                                                  + static_cast<size_t>(key_column)
+                                                                        * plan.value_head_dimension,
+                                                              1.0f,
+                                                              delta_values,
+                                                              key[key_column],
+                                                              head_output,
+                                                              query[key_column],
+                                                              plan.value_head_dimension);
+        }
+        float_scale_inplace(head_output,
+                            query_scale,
+                            plan.value_head_dimension);
 
-        const bool vectorized_norm = vectorized
-                                     && (norm_weight.dtype == DType::Float32
-                                         || norm_weight.dtype == DType::BFloat16);
-        if (vectorized_norm && norm_weight.dtype == DType::Float32)
+        const bool fused_norm = norm_weight.dtype == DType::Float32 || norm_weight.dtype == DType::BFloat16;
+        if (fused_norm && norm_weight.dtype == DType::Float32)
         {
             float_rms_norm(head_output,
                            head_output,
@@ -363,7 +248,7 @@ static void execute_gated_delta_recurrence_row(const WeightStore& weights,
                            0.0f,
                            plan.value_head_dimension);
         }
-        else if (vectorized_norm)
+        else if (fused_norm)
         {
             bfloat16_rms_norm(head_output,
                               head_output,
@@ -372,7 +257,7 @@ static void execute_gated_delta_recurrence_row(const WeightStore& weights,
                               0.0f,
                               plan.value_head_dimension);
         }
-        if (vectorized_norm)
+        if (fused_norm)
         {
             const float* head_gate = z + static_cast<size_t>(value_head) * plan.value_head_dimension;
             if (has_flag(plan.flags, AttentionBlockSigmoidGate))
@@ -392,18 +277,7 @@ static void execute_gated_delta_recurrence_row(const WeightStore& weights,
         }
         else
         {
-            const float square_sum = vectorized
-                                         ? float_dot(head_output,
-                                                     head_output,
-                                                     plan.value_head_dimension)
-                                         : [&]() {
-                                               float sum = 0.0f;
-                                               for (uint32_t value_column = 0;
-                                                    value_column < plan.value_head_dimension;
-                                                    ++value_column)
-                                                   sum += head_output[value_column] * head_output[value_column];
-                                               return sum;
-                                           }();
+            const float square_sum = float_dot(head_output, head_output, plan.value_head_dimension);
             const float inverse_rms = 1.0f
                                       / std::sqrt(square_sum
                                                       / static_cast<float>(plan.value_head_dimension)
@@ -453,8 +327,7 @@ Result<void> forward_gated_delta(const WeightStore& weights,
                                     weights.at(plan.pre_attention_norm_weight),
                                     norm_epsilon,
                                     scratch.normalized,
-                                    plan.norm_weight_offset,
-                                    optimization_flags);
+                                    plan.norm_weight_offset);
             normalized_ready = true;
         }
         const bool device_executed = device_input_rms_norm
@@ -522,8 +395,7 @@ Result<void> forward_gated_delta(const WeightStore& weights,
                                 weights.at(plan.pre_attention_norm_weight),
                                 norm_epsilon,
                                 scratch.normalized,
-                                plan.norm_weight_offset,
-                                optimization_flags);
+                                plan.norm_weight_offset);
         normalized_ready = true;
     }
 
@@ -590,8 +462,7 @@ Result<void> forward_gated_delta(const WeightStore& weights,
                                           plan.convolution_kernel_size,
                                           cache.gated_delta_convolution,
                                           qkv,
-                                          convolution_size,
-                                          gated_delta_simd_enabled(optimization_flags));
+                                          convolution_size);
         execute_gated_delta_recurrence_row(weights,
                                            plan,
                                            norm_epsilon,
@@ -602,8 +473,7 @@ Result<void> forward_gated_delta(const WeightStore& weights,
                                            alpha,
                                            scratch.recurrent_memory,
                                            scratch.recurrent_delta,
-                                           scratch.recurrent_output.row(token_index),
-                                           optimization_flags);
+                                           scratch.recurrent_output.row(token_index));
         record_gated_delta_cache_transaction_row(cache);
     }
     linear_batch_into(weights.at(plan.output_weight), scratch.recurrent_output, scratch.projected, optimization_flags, operators.find_weight(plan.output_weight));
@@ -671,8 +541,7 @@ bool forward_gated_delta_batch(const WeightStore& weights,
                                 weights.at(plan.pre_attention_norm_weight),
                                 norm_epsilon,
                                 entry.scratch->normalized,
-                                plan.norm_weight_offset,
-                                optimization_flags);
+                                plan.norm_weight_offset);
         device_entries.push_back({&entry.scratch->normalized,
                                   entry.cache,
                                   &entry.scratch->projected});

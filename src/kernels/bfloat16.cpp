@@ -192,14 +192,39 @@ static void neon_float_to_bfloat16_array(uint16_t* output,
 
 static float neon_bfloat16_dot(const uint16_t* weights, const float* input, uint32_t count) noexcept
 {
-    float32x4_t accumulator = vdupq_n_f32(0.0f);
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
+    float32x4_t sum2 = vdupq_n_f32(0.0f);
+    float32x4_t sum3 = vdupq_n_f32(0.0f);
     uint32_t index = 0;
-    for (; index + 4 <= count; index += 4)
+    for (; count - index >= 16; index += 16)
+    {
+        const uint32x4_t expanded0 = vshlq_n_u32(vmovl_u16(vld1_u16(weights + index)), 16);
+        const uint32x4_t expanded1 = vshlq_n_u32(vmovl_u16(vld1_u16(weights + index + 4)), 16);
+        const uint32x4_t expanded2 = vshlq_n_u32(vmovl_u16(vld1_u16(weights + index + 8)), 16);
+        const uint32x4_t expanded3 = vshlq_n_u32(vmovl_u16(vld1_u16(weights + index + 12)), 16);
+        sum0 = vfmaq_f32(sum0,
+                         vreinterpretq_f32_u32(expanded0),
+                         vld1q_f32(input + index));
+        sum1 = vfmaq_f32(sum1,
+                         vreinterpretq_f32_u32(expanded1),
+                         vld1q_f32(input + index + 4));
+        sum2 = vfmaq_f32(sum2,
+                         vreinterpretq_f32_u32(expanded2),
+                         vld1q_f32(input + index + 8));
+        sum3 = vfmaq_f32(sum3,
+                         vreinterpretq_f32_u32(expanded3),
+                         vld1q_f32(input + index + 12));
+    }
+    sum0 = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
+    for (; count - index >= 4; index += 4)
     {
         const uint32x4_t expanded = vshlq_n_u32(vmovl_u16(vld1_u16(weights + index)), 16);
-        accumulator = vfmaq_f32(accumulator, vreinterpretq_f32_u32(expanded), vld1q_f32(input + index));
+        sum0 = vfmaq_f32(sum0,
+                         vreinterpretq_f32_u32(expanded),
+                         vld1q_f32(input + index));
     }
-    float sum = vaddvq_f32(accumulator);
+    float sum = vaddvq_f32(sum0);
     for (; index < count; ++index)
     {
         const uint32_t bits = static_cast<uint32_t>(weights[index]) << 16;

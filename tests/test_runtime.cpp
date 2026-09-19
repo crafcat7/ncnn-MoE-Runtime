@@ -44,6 +44,10 @@
 #include "kernels/vector_msvc.h"
 #endif
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1390,8 +1394,7 @@ void test_released_dense_host_storage_guard()
                             released_norm,
                             1e-5f,
                             output,
-                            0.0f,
-                            g_test_optimization_flags);
+                            0.0f);
     }
     catch (const std::runtime_error& error)
     {
@@ -1498,8 +1501,7 @@ void test_ncnn_vulkan_float8_operator()
     const ActivationBuffer normalized_cpu_output = rms_norm_batch(cpu_output,
                                                                   norm_weight,
                                                                   norm_epsilon,
-                                                                  0.0f,
-                                                                  g_test_optimization_flags);
+                                                                  0.0f);
     const ActivationBuffer cpu_norm_chain = linear_batch(second_matrix,
                                                          normalized_cpu_output,
                                                          g_test_optimization_flags);
@@ -1795,8 +1797,7 @@ void test_ncnn_vulkan_bfloat16_operator()
     const ActivationBuffer normalized_cpu = rms_norm_batch(input,
                                                            norm_weight,
                                                            norm_epsilon,
-                                                           0.0f,
-                                                           g_test_optimization_flags);
+                                                           0.0f);
     const ActivationBuffer norm_chain_cpu = linear_batch(first,
                                                          first_bias,
                                                          normalized_cpu,
@@ -5147,11 +5148,50 @@ void test_file_backed_bfloat16_expert_cache()
     const TensorData down_two = mapped_bfloat16({2, 2}, {13.0f, 14.0f, 15.0f, 16.0f});
     const TensorData gate_up_three = mapped_bfloat16({2, 2}, {17.0f, 18.0f, 19.0f, 20.0f});
     const TensorData down_three = mapped_bfloat16({2, 2}, {21.0f, 22.0f, 23.0f, 24.0f});
+    const std::array<std::string, 3> request_keys = {
+        ExpertCache::make_pair_key(gate_up, down),
+        ExpertCache::make_pair_key(gate_up_two, down_two),
+        ExpertCache::make_pair_key(gate_up_three, down_three),
+    };
     const std::array<ExpertCachePairRequest, 3> requests = {{
-        {&gate_up, &down, 0, ExpertCache::make_pair_key(gate_up, down)},
-        {&gate_up_two, &down_two, 0, ExpertCache::make_pair_key(gate_up_two, down_two)},
-        {&gate_up_three, &down_three, 0, ExpertCache::make_pair_key(gate_up_three, down_three)},
+        {&gate_up, &down, 0, request_keys[0]},
+        {&gate_up_two, &down_two, 0, request_keys[1]},
+        {&gate_up_three, &down_three, 0, request_keys[2]},
     }};
+    // Read-ahead must preserve a bounded prefix even when these tiny reads
+    // complete during submission, and must never wait for an active lease.
+    ExpertCache read_ahead_cache(pair_size * 2);
+    auto requested = read_ahead_cache.request_pairs(requests);
+    check(static_cast<bool>(requested));
+    check(requested.value() == 2);
+    read_ahead_cache.wait_for_background_work();
+    check(read_ahead_cache.is_ready(gate_up, down, requests[0].prepared_key));
+    check(read_ahead_cache.is_ready(gate_up_two, down_two, requests[1].prepared_key));
+    check(!read_ahead_cache.is_ready(gate_up_three, down_three, requests[2].prepared_key));
+    check(read_ahead_cache.statistics().queued_reads == 2);
+    check(read_ahead_cache.statistics().hits == 0);
+    std::array<ExpertCacheLease, 2> pinned;
+    auto pinned_ready = read_ahead_cache.try_acquire_ready_pairs(std::span(requests).first(2), pinned);
+    check(static_cast<bool>(pinned_ready) && pinned_ready.value());
+    requested = read_ahead_cache.request_pairs(std::span(requests).last(1));
+    check(static_cast<bool>(requested));
+    check(requested.value() == 0);
+    check(read_ahead_cache.statistics().queued_reads == 2);
+    pinned = {};
+    requested = read_ahead_cache.request_pairs(std::span(requests).last(1));
+    check(static_cast<bool>(requested));
+    check(requested.value() == 1);
+    read_ahead_cache.wait_for_background_work();
+    check(read_ahead_cache.is_ready(gate_up_three, down_three, requests[2].prepared_key));
+    check(read_ahead_cache.statistics().resident_size <= pair_size * 2);
+    requested = read_ahead_cache.request_pairs({});
+    check(static_cast<bool>(requested) && requested.value() == 0);
+    ExpertCache invalid_read_ahead(pair_size * 2);
+    auto invalid_requests = requests;
+    invalid_requests[2].down = nullptr;
+    check(!invalid_read_ahead.request_pairs(invalid_requests));
+    check(invalid_read_ahead.statistics().queued_reads == 0);
+
     ExpertCache bounded_cache(pair_size * 2);
     std::array<uint8_t, 3> acquired_pairs{};
     size_t acquired_count = 0;
@@ -7435,6 +7475,98 @@ void test_shared_expert_descriptor()
     CompiledModel nonzero_shared_model;
     auto nonzero_shared_status = compile_model(shared_descriptor, std::move(nonzero_mapping).value(), nonzero_shared_model);
     check(static_cast<bool>(nonzero_shared_status));
+    // Keep the previous routed-then-shared schedule as an independent
+    // numerical reference for both ordinary and staged execution.
+    const auto restore_serial_shared_schedule = [](ExecutionGraph& graph, ExecutionSchedule& schedule) {
+        ExecutionNode* dispatch = nullptr;
+        ExecutionNode* routed = nullptr;
+        ExecutionNode* shared = nullptr;
+        for (ExecutionNode& node : graph.nodes)
+        {
+            if (node.type == ExecutionNodeType::ExpertDispatch)
+                dispatch = &node;
+            else if (node.type == ExecutionNodeType::ExpertGroup)
+                routed = &node;
+            else if (node.type == ExecutionNodeType::SharedExpertGroup)
+                shared = &node;
+        }
+        check(dispatch != nullptr && routed != nullptr && shared != nullptr);
+        check(has_flag(dispatch->flags, ExecutionNodeRequestExperts));
+        check(std::find(schedule.node_order.begin(), schedule.node_order.end(), shared->id)
+              < std::find(schedule.node_order.begin(), schedule.node_order.end(), routed->id));
+        dispatch->flags &= ~ExecutionNodeRequestExperts;
+        routed->dependencies = {dispatch->id};
+        shared->dependencies = {routed->id};
+        check(static_cast<bool>(schedule_graph(graph, schedule, {})));
+    };
+    CompiledModel serial_shared_model = nonzero_shared_model;
+    restore_serial_shared_schedule(serial_shared_model.graph, serial_shared_model.schedule);
+    SessionState reordered_state;
+    SessionState serial_state;
+    SessionStatistics reordered_statistics;
+    SessionStatistics serial_statistics;
+    for (const std::vector<int32_t>& tokens : {std::vector<int32_t>{0, 1, 2}, std::vector<int32_t>{3}})
+    {
+        const uint64_t position = tokens.size() == 1 ? 3 : 0;
+        auto actual = forward_model(nonzero_shared_model, tokens, reordered_statistics, reordered_state, position);
+        auto expected = forward_model(serial_shared_model, tokens, serial_statistics, serial_state, position);
+        check(static_cast<bool>(actual) && static_cast<bool>(expected));
+        check(actual.value() == expected.value());
+        check(reordered_statistics.expert_assignments == serial_statistics.expert_assignments);
+        check(reordered_statistics.expert_token_counts == serial_statistics.expert_token_counts);
+    }
+
+    // The speculative executor uses compiled node bindings rather than the
+    // main execution loop. It must honor the same shared-expert ordering.
+    CompiledModel mtp_shared_model = nonzero_shared_model;
+    SpeculativeModelPlan& mtp = mtp_shared_model.speculative;
+    mtp.kind = SpeculativeModelKind::Mtp;
+    mtp.block_size = 2;
+    mtp.graph.layer_plans = mtp_shared_model.graph.layer_plans;
+    AttentionBlockPlan& mtp_attention = mtp.graph.layer_plans.front().attention;
+    mtp_attention.kind = AttentionKind::Standard;
+    mtp_attention.head_count = 1;
+    mtp_attention.kv_head_count = 1;
+    mtp_attention.head_dimension = 2;
+    mtp_attention.value_head_dimension = 2;
+    mtp_attention.pre_attention_norm_weight = mtp_shared_model.final_norm_weight;
+    mtp_attention.query_weight = mtp.graph.layer_plans.front().moe.shared_expert.up_weight;
+    mtp_attention.key_weight = mtp_attention.query_weight;
+    mtp_attention.value_weight = mtp_attention.query_weight;
+    mtp_attention.output_weight = mtp_attention.query_weight;
+    mtp.mtp_embedding_norm_weight = mtp_shared_model.final_norm_weight;
+    mtp.mtp_hidden_norm_weight = mtp_shared_model.final_norm_weight;
+    mtp.final_norm_weight = mtp_shared_model.final_norm_weight;
+    TensorData mtp_projection;
+    mtp_projection.dtype = DType::Float32;
+    mtp_projection.shape = {2, 4};
+    mtp_projection.float32_data = {1.0f, 0.0f, 0.25f, 0.0f, 0.0f, 1.0f, 0.0f, 0.5f};
+    auto projection_handle = mtp_shared_model.weights.add("test.mtp.projection", std::move(mtp_projection));
+    check(static_cast<bool>(projection_handle));
+    mtp.mtp_input_projection_weight = projection_handle.value();
+    auto mtp_graph = build_graph(mtp_shared_model, false);
+    if (!mtp_graph)
+        throw std::runtime_error("shared MTP graph failed: " + mtp_graph.error().message);
+    CompiledModel serial_mtp_model = mtp_shared_model;
+    restore_serial_shared_schedule(serial_mtp_model.speculative.graph, serial_mtp_model.speculative.schedule);
+    std::array<SessionState, 2> mtp_states;
+    std::array<SessionStatistics, 2> mtp_statistics;
+    for (size_t index = 0; index < mtp_states.size(); ++index)
+    {
+        mtp_states[index].speculative_layers.resize(1);
+        mtp_states[index].mtp_pending_target_hidden.reset(1, 2, false);
+        mtp_states[index].mtp_pending_target_hidden.row(0)[0] = 1.0f;
+        mtp_states[index].mtp_pending_target_hidden.row(0)[1] = 0.25f;
+        mtp_statistics[index].expert_token_counts.resize(shared_descriptor.expert_count);
+    }
+    const SpeculativeSampler first_token = [](const std::vector<float>&) -> Result<int32_t> { return 0; };
+    auto mtp_actual = propose_speculative(mtp_shared_model, 1, mtp_statistics[0], mtp_states[0], 1, first_token);
+    auto mtp_expected = propose_speculative(serial_mtp_model, 1, mtp_statistics[1], mtp_states[1], 1, first_token);
+    check(static_cast<bool>(mtp_actual) && static_cast<bool>(mtp_expected));
+    check(mtp_actual.value().logits == mtp_expected.value().logits);
+    check(mtp_actual.value().token_ids == mtp_expected.value().token_ids);
+    check(mtp_statistics[0].expert_assignments == mtp_statistics[1].expert_assignments);
+
     const MoeBlockPlan& nonzero_shared_plan = nonzero_shared_model.graph.layer_plans.front().moe;
     ActivationBuffer nonzero_shared_input(2, shared_descriptor.hidden_size);
     nonzero_shared_input.row(0)[0] = 1.0f;
@@ -7466,7 +7598,7 @@ void test_shared_expert_descriptor()
             SessionState reference_state;
             SessionStatistics reference_statistics;
             const std::array<int32_t, 1> input = {entries[session_index].input_id};
-            auto expected = forward_model(nonzero_shared_model, input,
+            auto expected = forward_model(serial_shared_model, input,
                                           reference_statistics, reference_state, 0);
             check(static_cast<bool>(expected));
             check(expected.value().size() == 1);
@@ -9071,8 +9203,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
     const ActivationBuffer normalized_fused_input = rms_norm_batch(fused_input,
                                                                    rms_weight,
                                                                    1e-6f,
-                                                                   0.0f,
-                                                                   g_test_optimization_flags);
+                                                                   0.0f);
     const ActivationBuffer reference_rms_projection = linear_batch(float8_gate,
                                                                    normalized_fused_input,
                                                                    g_test_optimization_flags);
@@ -12574,8 +12705,6 @@ void test_flag_defaults()
     check(static_cast<bool>(has_flag(OptimizationDefaultFlags,
                                      OptimizationVulkanLatentInputRmsNorm)));
     check(static_cast<bool>(has_flag(OptimizationDefaultFlags,
-                                     OptimizationCpuSimdRmsNorm)));
-    check(static_cast<bool>(has_flag(OptimizationDefaultFlags,
                                      OptimizationVulkanRouteAggregation)));
     check(static_cast<bool>(has_flag(OptimizationDefaultFlags,
                                      OptimizationVulkanExpertGpuPriority)));
@@ -12789,6 +12918,102 @@ void test_float_dot()
                expected,
                1e-4f);
     check_near(float_dot(left.data(), right.data(), 0), 0.0f, 1e-6f);
+
+    // Exercise unaligned inputs, SIMD boundaries and long reductions against
+    // a double-precision reference instead of another float kernel.
+    for (uint32_t count : {0u, 1u, 3u, 4u, 5u, 15u, 16u, 17u, 31u, 32u, 33u, 127u, 129u, 1024u, 1027u, 4099u})
+    {
+        std::vector<float> a(count + 1, std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> b(count + 1, std::numeric_limits<float>::quiet_NaN());
+        double reference = 0.0;
+        double magnitude = 0.0;
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            a[index + 1] = static_cast<float>(static_cast<int>((index * 17 + 3) % 101) - 50) / 57.0f;
+            b[index + 1] = static_cast<float>(static_cast<int>((index * 23 + 7) % 97) - 48) / 61.0f;
+            const double product = static_cast<double>(a[index + 1]) * b[index + 1];
+            reference += product;
+            magnitude += std::abs(product);
+        }
+        const float tolerance = static_cast<float>(8.0 * std::numeric_limits<float>::epsilon()
+                                                   * std::max(1.0, magnitude));
+        check_near(float_dot(a.data() + 1, b.data() + 1, count),
+                   static_cast<float>(reference), tolerance);
+    }
+}
+
+void test_dense_gemm_tails()
+{
+    constexpr float sentinel = 12345.5f;
+    for (uint32_t kernel = 0; kernel < 3; ++kernel)
+    {
+        const bool bfloat16 = kernel == 2;
+        const uint32_t tile_size = kernel == 0 ? 4 : 8;
+        for (uint32_t columns : {0u, 1u, 3u, 4u, 5u, 15u, 16u, 17u, 31u, 33u, 129u, 1027u})
+        {
+            for (uint32_t tokens = 0; tokens <= 4; ++tokens)
+            {
+                for (uint32_t outputs = 0; outputs <= tile_size; ++outputs)
+                {
+                    const size_t weight_stride = columns + 3;
+                    const size_t input_stride = columns + 5;
+                    const size_t output_stride = tile_size + 3;
+                    std::vector<float> weights(tile_size * weight_stride + 1, std::numeric_limits<float>::quiet_NaN());
+                    std::vector<uint16_t> bfloat16_weights(weights.size(), float_to_bfloat16(std::numeric_limits<float>::quiet_NaN()));
+                    std::vector<float> input(4 * input_stride + 1, std::numeric_limits<float>::quiet_NaN());
+                    std::vector<float> output(4 * output_stride + 2, sentinel);
+                    for (uint32_t row = 0; row < outputs; ++row)
+                        for (uint32_t column = 0; column < columns; ++column)
+                        {
+                            weights[1 + row * weight_stride + column] = static_cast<float>(static_cast<int>((row * 11 + column * 7) % 37) - 18) / 23.0f;
+                            if (bfloat16)
+                            {
+                                const size_t index = 1 + row * weight_stride + column;
+                                bfloat16_weights[index] = float_to_bfloat16(weights[index]);
+                                weights[index] = bfloat16_to_float(bfloat16_weights[index]);
+                            }
+                        }
+                    for (uint32_t token = 0; token < tokens; ++token)
+                        for (uint32_t column = 0; column < columns; ++column)
+                            input[1 + token * input_stride + column] = static_cast<float>(static_cast<int>((token * 13 + column * 17) % 41) - 20) / 29.0f;
+                    if (bfloat16)
+                        bfloat16_gemm_4x8(bfloat16_weights.data() + 1, weight_stride, input.data() + 1, input_stride,
+                                          columns, outputs, tokens, output.data() + 1, output_stride);
+                    else if (tile_size == 4)
+                        float_gemm_4x4(weights.data() + 1, weight_stride, input.data() + 1, input_stride,
+                                       columns, outputs, tokens, output.data() + 1, output_stride);
+                    else
+                        float_gemm_4x8(weights.data() + 1, weight_stride, input.data() + 1, input_stride,
+                                       columns, outputs, tokens, output.data() + 1, output_stride);
+                    check(output.front() == sentinel && output.back() == sentinel);
+                    for (uint32_t token = 0; token < 4; ++token)
+                    {
+                        for (size_t row = 0; row < output_stride; ++row)
+                        {
+                            const float actual = output[1 + token * output_stride + row];
+                            if (token >= tokens || row >= outputs)
+                            {
+                                check(actual == sentinel);
+                                continue;
+                            }
+                            double reference = 0.0;
+                            double magnitude = 0.0;
+                            for (uint32_t column = 0; column < columns; ++column)
+                            {
+                                const double product = static_cast<double>(weights[1 + row * weight_stride + column])
+                                                       * input[1 + token * input_stride + column];
+                                reference += product;
+                                magnitude += std::abs(product);
+                            }
+                            const float tolerance = static_cast<float>(8.0 * std::numeric_limits<float>::epsilon()
+                                                                       * std::max(1.0, magnitude));
+                            check_near(actual, static_cast<float>(reference), tolerance);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 void test_float_exp_inplace()
@@ -12985,19 +13210,16 @@ void test_rms_vector_kernels()
             weight.float32_data.assign(float_weight.begin(), float_weight.end());
         else
             weight.bfloat16_data.assign(bfloat16_weight.begin(), bfloat16_weight.end());
-        for (uint64_t flags : {UINT64_C(0), static_cast<uint64_t>(OptimizationCpuSimdRmsNorm)})
-        {
-            const ActivationBuffer expected = rms_norm_batch(batch, weight, epsilon, weight_offset, flags);
-            ActivationBuffer inplace = batch;
-            const std::byte* storage = inplace.bytes().data();
-            rms_norm_batch_into(inplace, weight, epsilon, inplace, weight_offset, flags);
-            check(inplace.bytes().data() == storage);
-            check(inplace.rows() == batch.rows());
-            check(inplace.columns() == batch.columns());
-            for (size_t row = 0; row < batch.rows(); ++row)
-                for (uint32_t column = 0; column < count; ++column)
-                    check_near(inplace.row(row)[column], expected.row(row)[column], 0.0f);
-        }
+        const ActivationBuffer expected = rms_norm_batch(batch, weight, epsilon, weight_offset);
+        ActivationBuffer inplace = batch;
+        const std::byte* storage = inplace.bytes().data();
+        rms_norm_batch_into(inplace, weight, epsilon, inplace, weight_offset);
+        check(inplace.bytes().data() == storage);
+        check(inplace.rows() == batch.rows());
+        check(inplace.columns() == batch.columns());
+        for (size_t row = 0; row < batch.rows(); ++row)
+            for (uint32_t column = 0; column < count; ++column)
+                check_near(inplace.row(row)[column], expected.row(row)[column], 0.0f);
     }
 }
 
@@ -13134,6 +13356,87 @@ void test_float_sigmoid_mul()
                    5e-4f);
 }
 
+void test_dense_expert_thread_budget()
+{
+    // Compare the same Expert outputs across outer Expert teams, inner
+    // matrix teams and serial execution, including reused uneven batches.
+    for (DType dtype : {DType::Float32, DType::BFloat16})
+    {
+        for (uint32_t hidden : {32u, 1024u})
+        {
+            const uint32_t intermediate = hidden * 2;
+            CompiledModel model;
+            model.descriptor.hidden_size = hidden;
+            model.opt.hybrid_mode = HybridMode::CpuOnly;
+            model.opt.optimization_flags = g_test_optimization_flags;
+            MoeBlockPlan moe;
+            moe.experts.resize(2);
+            const auto add_weight = [&](const std::string& name, uint32_t rows, uint32_t columns, uint32_t seed) {
+                std::vector<float> values(static_cast<size_t>(rows) * columns);
+                for (size_t index = 0; index < values.size(); ++index)
+                    values[index] = static_cast<float>(static_cast<int>((index * 17 + seed) % 37) - 18) * 0.003f;
+                if (dtype == DType::BFloat16)
+                    return add_bfloat16_tensor(model.weights, name, {rows, columns}, values);
+                return add_float_tensor(model.weights, name, {rows, columns}, std::move(values));
+            };
+            for (uint32_t expert_id = 0; expert_id < moe.experts.size(); ++expert_id)
+            {
+                ExpertPlan& expert = moe.experts[expert_id];
+                const std::string prefix = "expert." + std::to_string(expert_id) + ".";
+                expert.layout = ExpertLayout::PackedGateUpDown;
+                expert.activation = ExpertActivation::Silu;
+                expert.gate_up_weight = add_weight(prefix + "gate_up", intermediate * 2, hidden, expert_id + 1);
+                expert.down_weight = add_weight(prefix + "down", hidden, intermediate, expert_id + 9);
+                expert.gate_up_bias = add_float_tensor(model.weights, prefix + "gate_up_bias", {intermediate * 2}, std::vector<float>(intermediate * 2, 0.01f));
+                expert.down_bias = add_float_tensor(model.weights, prefix + "down_bias", {hidden}, std::vector<float>(hidden, -0.02f));
+            }
+
+            LayerGraphState state;
+            state.resize_experts(moe.experts.size());
+            ExpertScratch scratch;
+            CpuOpenMpThreadLimitScope thread_limit;
+            for (uint32_t token_count : {1u, 3u, 1u})
+            {
+                state.normalized.reset(token_count, hidden, false);
+                for (uint32_t row = 0; row < token_count; ++row)
+                    for (uint32_t column = 0; column < hidden; ++column)
+                        state.normalized.row(row)[column] = static_cast<float>(static_cast<int>((column * 7 + row * 5) % 31) - 15) * 0.03f;
+                for (uint32_t expert_id = 0; expert_id < moe.experts.size(); ++expert_id)
+                {
+                    ActiveExpertExecution& active = state.active_experts()[expert_id];
+                    active.batch.expert_id = expert_id;
+                    active.batch.routes.clear();
+                    const uint32_t rows = expert_id == 0 ? token_count : 1;
+                    for (uint32_t row = 0; row < rows; ++row)
+                        active.batch.routes.push_back({token_count - row - 1, expert_id, 0.5f});
+                }
+                std::vector<ActivationBuffer> reference;
+                for (uint32_t threads : {1u, 2u, 4u})
+                {
+                    thread_limit.set(threads);
+                    state.reset();
+                    SessionStatistics statistics;
+                    check(static_cast<bool>(forward_moe(model, moe, state, statistics, scratch, 0, ExecutionBackend::Cpu, false)));
+                    check(state.experts_executed);
+                    for (const ActiveExpertExecution& active : state.active_experts())
+                    {
+                        check(active.output.rows() == active.batch.routes.size());
+                        check(active.output.columns() == hidden);
+                        if (threads == 1)
+                        {
+                            reference.push_back(active.output);
+                            continue;
+                        }
+                        const ActivationBuffer& expected = reference[active.batch.expert_id];
+                        for (size_t index = 0; index < active.output.values().size(); ++index)
+                            check_near(active.output.values()[index], expected.values()[index], 1e-5f + 1e-5f * std::abs(expected.values()[index]));
+                    }
+                }
+            }
+        }
+    }
+}
+
 void test_bfloat16_vector_kernels()
 {
     std::array<uint16_t, 129> weights = {};
@@ -13177,6 +13480,59 @@ void test_bfloat16_vector_kernels()
         bfloat16_scaled_add(output.data(), weights.data(), scale, count);
         for (uint32_t index = 0; index < count; ++index)
             check_near(output[index], expected_output[index], 1e-5f);
+    }
+}
+
+void test_bfloat16_dot_reduction()
+{
+    const auto next_u32 = [](uint32_t& state) noexcept {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return state;
+    };
+    for (uint32_t count : {
+             0u, 1u, 3u, 4u, 5u, 15u, 16u, 17u, 31u, 32u, 33u,
+             63u, 64u, 65u, 127u, 128u, 129u, 1023u, 1024u,
+             1025u, 4099u})
+    {
+        std::vector<uint16_t> weights(count + 8, 0x7fc0u);
+        std::vector<float> input(count + 8, std::numeric_limits<float>::quiet_NaN());
+        uint32_t weight_state = 0x1234abcdu ^ count;
+        uint32_t input_state = 0x9e3779b9u ^ count;
+        bool weight_positive = false;
+        bool weight_negative = false;
+        bool input_positive = false;
+        bool input_negative = false;
+        double reference = 0.0;
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            const int weight_sample = static_cast<int>(next_u32(weight_state) % 2001u) - 1000;
+            const int input_sample = static_cast<int>(next_u32(input_state) % 2001u) - 1000;
+            const float weight_value = static_cast<float>(weight_sample) * (1.0f / 256.0f);
+            const float input_value = static_cast<float>(input_sample) * (1.0f / 512.0f);
+            weights[index + 1] = float_to_bfloat16(weight_value);
+            input[index + 1] = input_value;
+            weight_positive = weight_positive || weight_sample > 0;
+            weight_negative = weight_negative || weight_sample < 0;
+            input_positive = input_positive || input_sample > 0;
+            input_negative = input_negative || input_sample < 0;
+            reference += static_cast<double>(bfloat16_to_float(weights[index + 1]))
+                         * static_cast<double>(input[index + 1]);
+        }
+        if (count >= 16)
+        {
+            check(weight_positive && weight_negative);
+            check(input_positive && input_negative);
+        }
+
+        const float actual = bfloat16_dot(weights.data() + 1,
+                                          input.data() + 1,
+                                          count);
+        const double error = std::abs(static_cast<double>(actual) - reference);
+        const double tolerance = 2.0e-5 + 2.0e-5 * std::abs(reference);
+        check(std::isfinite(actual));
+        check(error <= tolerance);
     }
 }
 
@@ -13956,6 +14312,14 @@ void benchmark_vulkan_qnk_expert()
 void test_cpu_resource_coordination()
 {
     const CpuThreadBudget budget = resolve_cpu_thread_budget(1);
+#if defined(__APPLE__)
+    uint32_t physical_cores = 0;
+    size_t size = sizeof(physical_cores);
+    check(sysctlbyname("hw.physicalcpu", &physical_cores, &size, nullptr, 0) == 0);
+    check(physical_cores != 0);
+    check(get_physical_cpu_count() == physical_cores);
+    check(budget.max_threads == physical_cores);
+#endif
     check(budget.num_threads >= 1);
     check(budget.num_threads <= budget.max_threads);
     check(budget.num_io_threads == 1);
@@ -14059,6 +14423,7 @@ int main(int argc, char** argv)
         ncnn::moe::test_float_scale_inplace_and_scaled_add();
         ncnn::moe::test_float_scale_add();
         ncnn::moe::test_float_dot();
+        ncnn::moe::test_dense_gemm_tails();
         ncnn::moe::test_float_exp_inplace();
         ncnn::moe::test_float_approximate_exp();
         ncnn::moe::test_int8_float_dot();
@@ -14069,7 +14434,9 @@ int main(int argc, char** argv)
         ncnn::moe::test_float_rope_kernel();
         ncnn::moe::test_float_silu_mul();
         ncnn::moe::test_float_sigmoid_mul();
+        ncnn::moe::test_dense_expert_thread_budget();
         ncnn::moe::test_bfloat16_vector_kernels();
+        ncnn::moe::test_bfloat16_dot_reduction();
         ncnn::moe::test_float_to_bfloat16_array();
         ncnn::moe::test_activation_buffer_reset();
         ncnn::moe::test_bfloat16_batched_linear_kernel();

@@ -63,6 +63,11 @@ static Result<void> validate_graph(const ExecutionGraph& graph, std::vector<Exec
         {
             return Error{ErrorCode::InvalidModel, "execution node selected backend is not allowed by its backend mask"};
         }
+        if (has_flag(node.flags, ExecutionNodeRequestExperts)
+            && node.type != ExecutionNodeType::ExpertDispatch)
+        {
+            return Error{ErrorCode::InvalidModel, "exact Expert reads must be scheduled by ExpertDispatch"};
+        }
         for (auto it = node.dependencies.begin(); it != node.dependencies.end(); ++it)
         {
             const ExecutionNodeId dependency = *it;
@@ -434,6 +439,7 @@ static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
     std::vector<ExecutionNodeId> combine_dependencies = {expert_group};
     if (layer.moe.has_shared_expert)
     {
+        const bool shared_before_routed = compiled.opt.hybrid_mode == HybridMode::CpuOnly;
         const bool shared_vulkan = compiled.opt.hybrid_mode != HybridMode::CpuOnly
                                    && support_vulkan_shared_experts(compiled.operators, layer.moe);
         const ExecutionBackend shared_backend = shared_vulkan ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
@@ -447,12 +453,17 @@ static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
                                                      shared_backend,
                                                      shared_backend_mask,
                                                      prefix + "shared_experts",
-                                                     {expert_group},
+                                                     {shared_before_routed ? dispatch : expert_group},
                                                      {hidden},
                                                      {shared_output},
                                                      static_cast<uint32_t>(plan_index),
                                                      invalid_execution_expert_id,
                                                      0);
+        if (shared_before_routed)
+        {
+            graph.nodes[dispatch].flags |= ExecutionNodeRequestExperts;
+            graph.nodes[expert_group].dependencies = {shared_node};
+        }
         combine_dependencies.push_back(shared_node);
         combine_inputs.push_back(shared_output);
     }

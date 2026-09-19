@@ -281,8 +281,7 @@ Result<std::vector<std::vector<float>>> forward_model(const CompiledModel& model
                                         model.weights.at(node->weight_inputs[0]),
                                         model.descriptor.norm_epsilon,
                                         state.expert_scratch.staged_output,
-                                        model.descriptor.norm_weight_offset,
-                                        model.opt.optimization_flags);
+                                        model.descriptor.norm_weight_offset);
                     hidden.swap(state.expert_scratch.staged_output);
                 }
                 if (model.speculative.kind == SpeculativeModelKind::Mtp
@@ -340,8 +339,7 @@ Result<std::vector<std::vector<float>>> forward_model(const CompiledModel& model
                                         model.weights.at(node->weight_inputs[1]),
                                         model.descriptor.norm_epsilon,
                                         normalized,
-                                        model.descriptor.norm_weight_offset,
-                                        model.opt.optimization_flags);
+                                        model.descriptor.norm_weight_offset);
                     if (logits_output == LogitsOutput::All)
                     {
                         hidden.swap(normalized);
@@ -561,11 +559,11 @@ Result<std::vector<std::vector<float>>> forward_model(const CompiledModel& model
                                                       model.opt.optimization_flags);
                     if (!mixed)
                         return mixed.error();
-                    rms_norm_batch_into(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset, model.opt.optimization_flags);
+                    rms_norm_batch_into(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
                 }
                 else
                 {
-                    rms_norm_batch_into(hidden, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset, model.opt.optimization_flags);
+                    rms_norm_batch_into(hidden, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
                 }
                 auto predicted = predict_next_router_routes(model,
                                                             layer,
@@ -614,22 +612,18 @@ Result<std::vector<std::vector<float>>> forward_model(const CompiledModel& model
                     return dispatched.error();
 
                 ExpertDispatchPlan& plan = layer_state.dispatch_plan;
-                statistics.expert_assignments += static_cast<uint64_t>(plan.assignment_count);
-                layer_state.resize_experts(plan.batches.size());
                 if (hidden.rows() == 1 && layer.layer_id < state.layers.size())
                     resolve_router_predictions(model, layer, plan, state, statistics, true);
-                for (size_t batch_index = 0; batch_index < plan.batches.size(); ++batch_index)
-                {
-                    ExpertBatch& batch = plan.batches[batch_index];
-                    statistics.expert_token_counts[batch.expert_id] += static_cast<uint64_t>(batch.routes.size());
-                    const ExpertPlan& expert = moe.experts[batch.expert_id];
-                    record_expert_weight_demand(expert, batch.routes.size(), statistics);
-                    ActiveExpertExecution& active = layer_state.active_experts()[batch_index];
-                    active.prepare(batch);
-                }
+                prepare_moe_experts(moe, layer_state, statistics);
                 statistics.router_time_microseconds += elapsed_microseconds(layer_state.router_start);
                 layer_state.expert_start = std::chrono::steady_clock::now();
-
+                if (has_flag(node->flags, ExecutionNodeRequestExperts))
+                {
+                    auto requested = request_moe_experts(model, moe, layer_state,
+                                                         state.expert_scratch, layer.layer_id, statistics);
+                    if (!requested)
+                        return requested.error();
+                }
                 continue;
             }
             if (node->type == ExecutionNodeType::Expert || node->type == ExecutionNodeType::ExpertGroup)
@@ -652,8 +646,8 @@ Result<std::vector<std::vector<float>>> forward_model(const CompiledModel& model
             }
             if (node->type == ExecutionNodeType::SharedExpertGroup)
             {
-                if (!layer_state.experts_executed || !moe.has_shared_expert)
-                    return Error{ErrorCode::InternalError, "Shared Expert executed before routed Expert group"};
+                if (!moe.has_shared_expert)
+                    return Error{ErrorCode::InternalError, "Shared Expert graph node has no shared Expert plan"};
                 const auto shared_start = std::chrono::steady_clock::now();
                 ExpertExecutionMetrics shared_metrics;
                 forward_shared_expert(model,
@@ -1008,7 +1002,7 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                     return Error{ErrorCode::InternalError, "cannot merge staged hidden rows"};
                 }
                 rms_norm_batch_into(merged, model.weights.at(node->weight_inputs[0]), model.descriptor.norm_epsilon, scratch.staged_output,
-                                    model.descriptor.norm_weight_offset, model.opt.optimization_flags);
+                                    model.descriptor.norm_weight_offset);
                 if (!split_hidden_rows(scratch.staged_output))
                     return Error{ErrorCode::InternalError, "cannot split staged final norm rows"};
                 if (model.speculative.kind == SpeculativeModelKind::Mtp)
@@ -1088,8 +1082,7 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                                             model.weights.at(node->weight_inputs[1]),
                                             model.descriptor.norm_epsilon,
                                             normalized,
-                                            model.descriptor.norm_weight_offset,
-                                            model.opt.optimization_flags);
+                                            model.descriptor.norm_weight_offset);
                         linear_batch_into(lm_head,
                                           normalized,
                                           scratch.staged_output,
@@ -1377,7 +1370,7 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                         return mixed.error();
                     HyperConnectionMix& merged_mix = hyper_scratch.transient_mix;
                     rms_norm_batch_into(merged_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, merged_hidden,
-                                        model.descriptor.norm_weight_offset, model.opt.optimization_flags);
+                                        model.descriptor.norm_weight_offset);
                     const size_t combine_stride = static_cast<size_t>(hyper_multiplier) * hyper_multiplier;
                     for (size_t session_index = 0; session_index < session_count; ++session_index)
                     {
@@ -1396,7 +1389,7 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 else
                 {
                     rms_norm_batch_into(merged_hyper, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, merged_hidden,
-                                        model.descriptor.norm_weight_offset, model.opt.optimization_flags);
+                                        model.descriptor.norm_weight_offset);
                 }
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
                 {
@@ -1461,24 +1454,10 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                     if (!dispatched)
                         return dispatched.error();
                     ExpertDispatchPlan& plan = layer_state.dispatch_plan;
-                    statistics.expert_assignments += plan.assignment_count;
-                    layer_state.resize_experts(plan.batches.size());
                     resolve_router_predictions(model, layer, plan, state, statistics, false);
-                    for (size_t batch_index = 0; batch_index < plan.batches.size(); ++batch_index)
-                    {
-                        ExpertBatch& batch = plan.batches[batch_index];
-                        statistics.expert_token_counts[batch.expert_id] += batch.routes.size();
-                        const ExpertPlan& expert = moe.experts[batch.expert_id];
-                        record_expert_weight_demand(expert, batch.routes.size(), statistics);
-                        ActiveExpertExecution& active = layer_state.active_experts()[batch_index];
-                        active.prepare(batch);
-                    }
+                    prepare_moe_experts(moe, layer_state, statistics);
                     layer_state.expert_start = std::chrono::steady_clock::now();
                 }
-                continue;
-            }
-            if (node->type == ExecutionNodeType::Expert || node->type == ExecutionNodeType::ExpertGroup)
-            {
                 LayerGraphState& combined = batch_scratch.staged_state;
                 combined.reset();
                 // Router already produced the complete normalized batch here.
@@ -1522,6 +1501,22 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 }
 
                 combined.resize_experts(combined_count);
+                if (has_flag(node->flags, ExecutionNodeRequestExperts))
+                {
+                    SessionStatistics request_statistics;
+                    auto requested = request_moe_experts(model, moe, combined, batch_scratch,
+                                                         layer.layer_id, request_statistics);
+                    for (const DecodeBatchEntry& entry : entries)
+                        entry.statistics->expert_cache_management_time_microseconds += request_statistics.expert_cache_management_time_microseconds;
+                    if (!requested)
+                        return requested.error();
+                }
+                continue;
+            }
+            if (node->type == ExecutionNodeType::Expert || node->type == ExecutionNodeType::ExpertGroup)
+            {
+                LayerGraphState& combined = batch_scratch.staged_state;
+                const std::vector<std::vector<DecodeRouteOrigin>>& origins = batch_scratch.staged_route_origins;
                 SessionStatistics aggregate_statistics;
                 const auto engine_start = std::chrono::steady_clock::now();
                 auto executed = forward_moe(model,

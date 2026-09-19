@@ -60,6 +60,9 @@ struct Mxfp4Scratch
 [[nodiscard]] float approximate_scaled_silu(float value, float sigmoid_scale = 1.0f) noexcept;
 [[nodiscard]] const char* scaled_silu_kernel_name(uint64_t optimization_flags) noexcept;
 [[nodiscard]] uint32_t cpu_linear_num_threads() noexcept;
+// Shares Linear's workload threshold and current thread budget with callers
+// choosing between operator-level and outer task parallelism.
+[[nodiscard]] int cpu_linear_team_size(uint64_t operation_count, DType dtype) noexcept;
 void embedding_batch_into(const TensorData& embedding, std::span<const int32_t> input_ids, ActivationBuffer& output);
 [[nodiscard]] ActivationBuffer linear_batch(const TensorData& matrix, const ActivationBuffer& input, uint64_t optimization_flags, const CompiledOperator* executable = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
 // A quantized input scratch, when supplied, must not alias input or output.
@@ -90,9 +93,9 @@ void linear_batch_into(const TensorData& matrix, const TensorData& bias, const A
 [[nodiscard]] ActivationBuffer fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* bias, const ActivationBuffer& input, ExpertActivation activation, float activation_limit,
                                                          uint64_t optimization_flags);
 [[nodiscard]] bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch, uint64_t optimization_flags);
-[[nodiscard]] ActivationBuffer rms_norm_batch(const ActivationBuffer& input, const TensorData& weight, float epsilon, float weight_offset, uint64_t optimization_flags);
+[[nodiscard]] ActivationBuffer rms_norm_batch(const ActivationBuffer& input, const TensorData& weight, float epsilon, float weight_offset);
 // Input and output may be the same buffer; each row's RMS is computed before writing it.
-void rms_norm_batch_into(const ActivationBuffer& input, const TensorData& weight, float epsilon, ActivationBuffer& output, float weight_offset, uint64_t optimization_flags);
+void rms_norm_batch_into(const ActivationBuffer& input, const TensorData& weight, float epsilon, ActivationBuffer& output, float weight_offset);
 void add_bias_inplace(ActivationBuffer& destination, const TensorData& bias);
 void add_batch_inplace(ActivationBuffer& destination, const ActivationBuffer& source);
 [[nodiscard]] std::vector<std::vector<float>> batch_to_vectors(const ActivationBuffer& batch);

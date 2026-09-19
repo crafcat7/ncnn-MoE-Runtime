@@ -121,6 +121,9 @@ public:
                                             uint32_t residency_group = std::numeric_limits<uint32_t>::max(),
                                             std::string_view prepared_key = {},
                                             ExpertVictimExecutionMetadata victim_execution = {});
+    // Submit a capacity-bounded prefix of exact reads without waiting. A
+    // temporarily full cache returns a short count, including zero.
+    [[nodiscard]] Result<size_t> request_pairs(std::span<const ExpertCachePairRequest> requests);
     // Best-effort admission; exact reads retain priority.
     [[nodiscard]] Result<bool> prefetch_pair(const TensorData& gate_up,
                                              const TensorData& down,

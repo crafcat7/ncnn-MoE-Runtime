@@ -311,6 +311,18 @@ uint32_t get_physical_cpu_count()
         offset += entry->Size;
     }
     return physical_cpu_count;
+#elif defined(__APPLE__)
+    uint32_t physical_cpu_count = 0;
+    size_t size = sizeof(physical_cpu_count);
+    if (sysctlbyname("hw.physicalcpu", &physical_cpu_count, &size, nullptr, 0) == 0
+        && physical_cpu_count != 0)
+    {
+        return physical_cpu_count;
+    }
+    size = sizeof(physical_cpu_count);
+    if (sysctlbyname("hw.physicalcpu_max", &physical_cpu_count, &size, nullptr, 0) == 0)
+        return physical_cpu_count;
+    return 0;
 #else
     return 0;
 #endif

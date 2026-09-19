@@ -1,11 +1,16 @@
 #include "vector.h"
 
 #include "fastmath.h"
+#include "bfloat16.h"
 #include "engine/cpu.h"
 #include "ncnn/moe/runtime.h"
 
 #include <bit>
 #include <cmath>
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
 
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
 #include "vector_msvc.h"
@@ -39,6 +44,138 @@ static float scalar_float_dot(const float* left, const float* right, uint32_t co
         result += left[index] * right[index];
     return result;
 }
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+static float neon_float_dot(const float* left, const float* right, uint32_t count) noexcept
+{
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
+    float32x4_t sum2 = vdupq_n_f32(0.0f);
+    float32x4_t sum3 = vdupq_n_f32(0.0f);
+    uint32_t index = 0;
+    for (; count - index >= 16; index += 16)
+    {
+        sum0 = vfmaq_f32(sum0, vld1q_f32(left + index), vld1q_f32(right + index));
+        sum1 = vfmaq_f32(sum1, vld1q_f32(left + index + 4), vld1q_f32(right + index + 4));
+        sum2 = vfmaq_f32(sum2, vld1q_f32(left + index + 8), vld1q_f32(right + index + 8));
+        sum3 = vfmaq_f32(sum3, vld1q_f32(left + index + 12), vld1q_f32(right + index + 12));
+    }
+    sum0 = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
+    for (; count - index >= 4; index += 4)
+        sum0 = vfmaq_f32(sum0, vld1q_f32(left + index), vld1q_f32(right + index));
+    float result = vaddvq_f32(sum0);
+    for (; index < count; ++index)
+        result += left[index] * right[index];
+    return result;
+}
+
+static void neon_float_gemm(const float* weights,
+                            size_t weight_stride,
+                            const float* input,
+                            size_t input_stride,
+                            uint32_t input_columns,
+                            uint32_t output_count,
+                            uint32_t token_count,
+                            float* output,
+                            size_t output_stride) noexcept
+{
+    // Four outputs keep the sixteen vector accumulators in registers. The
+    // 4x8 entry point reuses this tile instead of doubling register pressure.
+    uint32_t first_output = 0;
+    if (token_count == 4)
+    {
+        for (; output_count - first_output >= 4; first_output += 4)
+        {
+            const float* tile_weights = weights + static_cast<size_t>(first_output) * weight_stride;
+            float32x4_t sums[4][4] = {};
+            uint32_t column = 0;
+            for (; input_columns - column >= 4; column += 4)
+            {
+                float32x4_t inputs[4];
+                float32x4_t weight_rows[4];
+                for (uint32_t row = 0; row < 4; ++row)
+                {
+                    inputs[row] = vld1q_f32(input + static_cast<size_t>(row) * input_stride + column);
+                    weight_rows[row] = vld1q_f32(tile_weights + static_cast<size_t>(row) * weight_stride + column);
+                }
+                for (uint32_t token = 0; token < 4; ++token)
+                    for (uint32_t row = 0; row < 4; ++row)
+                        sums[token][row] = vfmaq_f32(sums[token][row], inputs[token], weight_rows[row]);
+            }
+            for (uint32_t token = 0; token < 4; ++token)
+            {
+                for (uint32_t row = 0; row < 4; ++row)
+                {
+                    float sum = vaddvq_f32(sums[token][row]);
+                    for (uint32_t tail = column; tail < input_columns; ++tail)
+                        sum += input[static_cast<size_t>(token) * input_stride + tail]
+                               * tile_weights[static_cast<size_t>(row) * weight_stride + tail];
+                    output[static_cast<size_t>(token) * output_stride + first_output + row] = sum;
+                }
+            }
+        }
+    }
+    // Partial output/token tiles must not read padding or adjacent rows.
+    for (uint32_t token = 0; token < token_count; ++token)
+        for (uint32_t row = first_output; row < output_count; ++row)
+            output[static_cast<size_t>(token) * output_stride + row] = neon_float_dot(weights + static_cast<size_t>(row) * weight_stride,
+                                                                                      input + static_cast<size_t>(token) * input_stride,
+                                                                                      input_columns);
+}
+
+static void neon_bfloat16_gemm(const uint16_t* weights,
+                               size_t weight_stride,
+                               const float* input,
+                               size_t input_stride,
+                               uint32_t input_columns,
+                               uint32_t output_count,
+                               uint32_t token_count,
+                               float* output,
+                               size_t output_stride) noexcept
+{
+    // Expand each BF16 weight vector once for four input rows. Accumulation
+    // and activations stay FP32, requiring only the baseline ARM64 NEON ISA.
+    uint32_t first_output = 0;
+    if (token_count == 4)
+    {
+        for (; output_count - first_output >= 4; first_output += 4)
+        {
+            const uint16_t* tile_weights = weights + static_cast<size_t>(first_output) * weight_stride;
+            float32x4_t sums[4][4] = {};
+            uint32_t column = 0;
+            for (; input_columns - column >= 4; column += 4)
+            {
+                float32x4_t inputs[4];
+                float32x4_t weight_rows[4];
+                for (uint32_t row = 0; row < 4; ++row)
+                {
+                    inputs[row] = vld1q_f32(input + static_cast<size_t>(row) * input_stride + column);
+                    weight_rows[row] = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(tile_weights + static_cast<size_t>(row) * weight_stride + column), 16));
+                }
+                for (uint32_t token = 0; token < 4; ++token)
+                    for (uint32_t row = 0; row < 4; ++row)
+                        sums[token][row] = vfmaq_f32(sums[token][row], inputs[token], weight_rows[row]);
+            }
+            for (uint32_t token = 0; token < 4; ++token)
+            {
+                for (uint32_t row = 0; row < 4; ++row)
+                {
+                    float sum = vaddvq_f32(sums[token][row]);
+                    for (uint32_t tail = column; tail < input_columns; ++tail)
+                        sum += input[static_cast<size_t>(token) * input_stride + tail]
+                               * std::bit_cast<float>(static_cast<uint32_t>(tile_weights[static_cast<size_t>(row) * weight_stride + tail]) << 16);
+                    output[static_cast<size_t>(token) * output_stride + first_output + row] = sum;
+                }
+            }
+        }
+    }
+    for (uint32_t token = 0; token < token_count; ++token)
+        for (uint32_t row = first_output; row < output_count; ++row)
+            output[static_cast<size_t>(token) * output_stride + row] = bfloat16_dot(weights + static_cast<size_t>(row) * weight_stride,
+                                                                                    input + static_cast<size_t>(token) * input_stride,
+                                                                                    input_columns);
+}
+#endif
 
 static void scalar_float_gemm_4x4(const float* weights,
                                   size_t weight_stride,
@@ -348,7 +485,9 @@ static void scalar_float_silu_inplace(float* values, uint32_t count) noexcept
 
 static FloatDotFunction select_float_dot() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return neon_float_dot;
+#elif defined(NCNN_MOE_MSVC_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return msvc_avx512_float_dot;
@@ -607,7 +746,11 @@ void float_gemm_4x4(const float* weights,
                     float* output,
                     size_t output_stride) noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(__aarch64__) || defined(_M_ARM64)
+    neon_float_gemm(weights, weight_stride, input, input_stride, input_columns,
+                    output_count, token_count, output, output_stride);
+    return;
+#elif defined(NCNN_MOE_MSVC_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
     {
@@ -657,7 +800,11 @@ void float_gemm_4x8(const float* weights,
                     float* output,
                     size_t output_stride) noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(__aarch64__) || defined(_M_ARM64)
+    neon_float_gemm(weights, weight_stride, input, input_stride, input_columns,
+                    output_count, token_count, output, output_stride);
+    return;
+#elif defined(NCNN_MOE_MSVC_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
     {
@@ -686,7 +833,11 @@ void bfloat16_gemm_4x8(const uint16_t* weights,
                        float* output,
                        size_t output_stride) noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(__aarch64__) || defined(_M_ARM64)
+    neon_bfloat16_gemm(weights, weight_stride, input, input_stride, input_columns,
+                       output_count, token_count, output, output_stride);
+    return;
+#elif defined(NCNN_MOE_MSVC_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
     {

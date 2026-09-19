@@ -142,7 +142,7 @@ uint32_t cpu_linear_num_threads() noexcept
 #endif
 }
 
-static int openmp_linear_team_size(uint64_t operation_count, DType dtype) noexcept
+int cpu_linear_team_size(uint64_t operation_count, DType dtype) noexcept
 {
 #if defined(_OPENMP)
     // Scale the OpenMP team by operation count.
@@ -341,7 +341,7 @@ static void float8_linear_quantized_into(const TensorData& matrix,
     output.reset(quantized_input.rows(), output_columns, false);
     const uint64_t operation_count = static_cast<uint64_t>(output_columns) * input_columns
                                      * quantized_input.rows();
-    const int linear_team_size = openmp_linear_team_size(operation_count, matrix.dtype);
+    const int linear_team_size = cpu_linear_team_size(operation_count, matrix.dtype);
     const bool parallelize_linear = linear_team_size > 1;
     const int64_t parallel_output_columns = static_cast<int64_t>(output_columns);
 
@@ -535,7 +535,7 @@ bool float8_linear_pair_batch_into(const TensorData& first,
     {
         operation_count += second_operations;
     }
-    const int team_size = openmp_linear_team_size(operation_count, DType::Float8E4M3);
+    const int team_size = cpu_linear_team_size(operation_count, DType::Float8E4M3);
     const bool parallelize = team_size > 1;
 #pragma omp parallel num_threads(team_size) if (parallelize)
     {
@@ -596,12 +596,11 @@ bool float8_linear_rms_norm_batch_into(const TensorData& matrix,
                                             ? *quantized_input_scratch
                                             : local_quantized_input;
     prepare_float8_input(quantized_input, input);
-    const bool use_simd = has_flag(optimization_flags, OptimizationCpuSimdRmsNorm);
     for (size_t token_index = 0; token_index < input.rows(); ++token_index)
     {
         const float* source = input.row(token_index);
         float* destination = quantized_input.row(token_index);
-        if (use_simd && norm_weight.dtype == DType::Float32)
+        if (norm_weight.dtype == DType::Float32)
         {
             float_rms_norm(destination,
                            source,
@@ -610,7 +609,7 @@ bool float8_linear_rms_norm_batch_into(const TensorData& matrix,
                            0.0f,
                            input.columns());
         }
-        else if (use_simd && norm_weight.dtype == DType::BFloat16)
+        else
         {
             bfloat16_rms_norm(destination,
                               source,
@@ -618,20 +617,6 @@ bool float8_linear_rms_norm_batch_into(const TensorData& matrix,
                               epsilon,
                               0.0f,
                               input.columns());
-        }
-        else
-        {
-            const float square_sum = std::inner_product(source,
-                                                        source + input.columns(), source,
-                                                        0.0f);
-            const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(input.columns()) + epsilon);
-            for (uint32_t column = 0; column < input.columns(); ++column)
-            {
-                const float weight_value = norm_weight.dtype == DType::Float32
-                                               ? norm_weight.float32_values()[column]
-                                               : bfloat16_to_float(norm_weight.bfloat16_values()[column]);
-                destination[column] = source[column] * inverse_rms * weight_value;
-            }
         }
         quantize_float8_e4m3_inplace(destination, input.columns(), 128, true, optimization_flags);
     }
@@ -715,7 +700,7 @@ void linear_batch_into(const TensorData& matrix, const ActivationBuffer& input, 
     output.reset(input.rows(), output_columns, false);
     const int64_t parallel_output_columns = static_cast<int64_t>(output_columns);
     const uint64_t operation_count = static_cast<uint64_t>(output_columns) * input_columns * input.rows();
-    const int linear_team_size = openmp_linear_team_size(operation_count, matrix.dtype);
+    const int linear_team_size = cpu_linear_team_size(operation_count, matrix.dtype);
     const bool parallelize_linear = linear_team_size > 1;
     if (matrix.dtype == DType::BFloat16
         && bfloat16_batched_linear(matrix.bfloat16_values().data(),
@@ -955,7 +940,7 @@ bool fused_float8_gate_up_batch(const TensorData& gate,
                                        / row_group_size;
     const uint64_t operation_count = static_cast<uint64_t>(output_columns) * input_columns * input.rows()
                                      * 2;
-    const int team_size = openmp_linear_team_size(operation_count, DType::Float8E4M3);
+    const int team_size = cpu_linear_team_size(operation_count, DType::Float8E4M3);
     const bool parallelize = team_size > 1;
     const std::span<const uint8_t> gate_values = gate.float8_values();
     const std::span<const uint8_t> up_values = up.float8_values();
@@ -1127,8 +1112,7 @@ ActivationBuffer fused_mxfp4_gate_up_batch(const TensorData& matrix, const Tenso
     };
 
     // Keep the row-pair producer and apply the activation epilogue in chunks.
-    if (input.rows() == 1
-        && has_flag(optimization_flags, OptimizationCpuMxfp4RowPairs))
+    if (input.rows() == 1)
     {
         std::vector<float> linear(intermediate_size);
         const uint32_t pair_chunk_size = 16;
@@ -2291,21 +2275,20 @@ ActivationBuffer linear_batch(const TensorData& matrix, const TensorData& bias, 
     return output;
 }
 
-void rms_norm_batch_into(const ActivationBuffer& input, const TensorData& weight, float epsilon, ActivationBuffer& output, float weight_offset, uint64_t optimization_flags)
+void rms_norm_batch_into(const ActivationBuffer& input, const TensorData& weight, float epsilon, ActivationBuffer& output, float weight_offset)
 {
     assert(weight.element_count() == input.columns());
     require_dense_host_storage(weight, "normalization weight");
     output.reset(input.rows(), input.columns(), false);
     const int64_t row_count = static_cast<int64_t>(input.rows());
-#pragma omp parallel for schedule(static) if (row_count > 1 && allow_openmp_parallel_region())
+    const int team_size = static_cast<int>(std::min<int64_t>(std::max<int64_t>(1, row_count), cpu_linear_num_threads()));
+#pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1 && allow_openmp_parallel_region())
     for (int64_t token = 0; token < row_count; ++token)
     {
         const size_t token_index = static_cast<size_t>(token);
         const float* source = input.row(token_index);
         float* destination = output.row(token_index);
-        if (has_flag(optimization_flags, OptimizationCpuSimdRmsNorm)
-            && (weight.dtype == DType::Float32
-                || weight.dtype == DType::BFloat16))
+        if (weight.dtype == DType::Float32 || weight.dtype == DType::BFloat16)
         {
             if (weight.dtype == DType::Float32)
             {
@@ -2336,10 +2319,10 @@ void rms_norm_batch_into(const ActivationBuffer& input, const TensorData& weight
     }
 }
 
-ActivationBuffer rms_norm_batch(const ActivationBuffer& input, const TensorData& weight, float epsilon, float weight_offset, uint64_t optimization_flags)
+ActivationBuffer rms_norm_batch(const ActivationBuffer& input, const TensorData& weight, float epsilon, float weight_offset)
 {
     ActivationBuffer output;
-    rms_norm_batch_into(input, weight, epsilon, output, weight_offset, optimization_flags);
+    rms_norm_batch_into(input, weight, epsilon, output, weight_offset);
     return output;
 }
 

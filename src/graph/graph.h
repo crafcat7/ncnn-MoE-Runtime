@@ -52,13 +52,16 @@ enum ExecutionBackendMask : uint32_t
     ExecutionBackendVulkan = UINT32_C(1) << NCNN_MOE_BACKEND_VULKAN_BIT
 };
 
-#define NCNN_MOE_NODE_CONDITIONAL_BIT  0
-#define NCNN_MOE_NODE_CPU_PREFETCH_BIT 1
+#define NCNN_MOE_NODE_CONDITIONAL_BIT     0
+#define NCNN_MOE_NODE_CPU_PREFETCH_BIT    1
+#define NCNN_MOE_NODE_REQUEST_EXPERTS_BIT 2
 
 enum ExecutionNodeFlag : uint32_t
 {
     ExecutionNodeConditional = UINT32_C(1) << NCNN_MOE_NODE_CONDITIONAL_BIT,
-    ExecutionNodeCpuPrefetch = UINT32_C(1) << NCNN_MOE_NODE_CPU_PREFETCH_BIT
+    ExecutionNodeCpuPrefetch = UINT32_C(1) << NCNN_MOE_NODE_CPU_PREFETCH_BIT,
+    // Submit exact reads during dispatch, before independent shared CPU work.
+    ExecutionNodeRequestExperts = UINT32_C(1) << NCNN_MOE_NODE_REQUEST_EXPERTS_BIT
 };
 
 struct ExecutionTensor

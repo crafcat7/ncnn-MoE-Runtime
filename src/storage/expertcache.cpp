@@ -1867,6 +1867,53 @@ Result<bool> ExpertCache::request_pair(const TensorData& gate_up,
     return already_ready;
 }
 
+Result<size_t> ExpertCache::request_pairs(std::span<const ExpertCachePairRequest> requests)
+{
+    for (const ExpertCachePairRequest& request : requests)
+    {
+        if (!request.gate_up
+            || !request.down
+            || !is_supported_file_backed_pair(*request.gate_up, *request.down)
+            || request.prepared_key.empty())
+        {
+            return Error{ErrorCode::InvalidArgument, "Expert cache read requests require prepared file-backed pairs"};
+        }
+    }
+
+    // Keep the admitted prefix pinned until all submissions finish. Even if
+    // an early read completes immediately, a later request must not evict it.
+    static constexpr size_t inline_entry_count = 16;
+    std::array<std::shared_ptr<Entry>, inline_entry_count> inline_entries;
+    std::vector<std::shared_ptr<Entry>> overflow_entries;
+    std::shared_ptr<Entry>* admitted = inline_entries.data();
+    if (requests.size() > inline_entry_count)
+    {
+        overflow_entries.resize(requests.size());
+        admitted = overflow_entries.data();
+    }
+    size_t count = 0;
+    for (const ExpertCachePairRequest& request : requests)
+    {
+        bool temporarily_exhausted = false;
+        auto queued = enqueue_pair(*request.gate_up,
+                                   *request.down,
+                                   false,
+                                   request.residency_group,
+                                   request.prepared_key,
+                                   request.victim_execution,
+                                   nullptr,
+                                   &temporarily_exhausted);
+        if (!queued)
+        {
+            if (temporarily_exhausted)
+                break;
+            return queued.error();
+        }
+        admitted[count++] = std::move(queued).value();
+    }
+    return count;
+}
+
 Result<bool> ExpertCache::prefetch_pair(const TensorData& gate_up,
                                         const TensorData& down,
                                         uint32_t residency_group,

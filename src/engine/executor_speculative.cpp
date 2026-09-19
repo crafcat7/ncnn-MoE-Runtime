@@ -151,11 +151,11 @@ static Result<void> execute_speculative_layer(const CompiledModel& model,
                                           model.opt.optimization_flags);
         if (!mixed)
             return mixed.error();
-        rms_norm_batch_into(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset, model.opt.optimization_flags);
+        rms_norm_batch_into(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
     }
     else
     {
-        rms_norm_batch_into(hidden, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset, model.opt.optimization_flags);
+        rms_norm_batch_into(hidden, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
     }
     linear_batch_into(model.weights.at(moe.router_weight),
                       layer_state.normalized,
@@ -175,17 +175,23 @@ static Result<void> execute_speculative_layer(const CompiledModel& model,
     auto dispatched = dispatch_experts_into(layer_state.router_logits.values(), static_cast<uint32_t>(layer_state.router_logits.rows()), dispatch_options, layer_state.dispatch_plan);
     if (!dispatched)
         return dispatched.error();
-    statistics.expert_assignments += layer_state.dispatch_plan.assignment_count;
-    layer_state.resize_experts(layer_state.dispatch_plan.batches.size());
-    for (size_t batch_index = 0; batch_index < layer_state.dispatch_plan.batches.size(); ++batch_index)
-    {
-        ExpertBatch& batch = layer_state.dispatch_plan.batches[batch_index];
-        statistics.expert_token_counts[batch.expert_id] += batch.routes.size();
-        record_expert_weight_demand(moe.experts[batch.expert_id], batch.routes.size(), statistics);
-        layer_state.active_experts()[batch_index].prepare(batch);
-    }
+    prepare_moe_experts(moe, layer_state, statistics);
     statistics.router_time_microseconds += elapsed_microseconds(layer_state.router_start);
     layer_state.expert_start = std::chrono::steady_clock::now();
+
+    if (has_flag(graph.nodes[execution.expert_dispatch].flags, ExecutionNodeRequestExperts))
+    {
+        if (!moe.has_shared_expert || execution.shared_expert_group >= graph.nodes.size())
+            return Error{ErrorCode::InternalError, "speculative execution graph has no shared Expert binding"};
+        auto requested = request_moe_experts(model, moe, layer_state, scratch, layer.layer_id, statistics);
+        if (!requested)
+            return requested.error();
+        const auto shared_start = std::chrono::steady_clock::now();
+        ExpertExecutionMetrics shared_metrics;
+        forward_shared_expert(model, moe, layer_state.normalized, layer_state.shared_expert_output,
+                              shared_metrics, model.opt.optimization_flags);
+        statistics.expert_compute_time_microseconds += elapsed_microseconds(shared_start);
+    }
 
     const auto expert_engine_start = std::chrono::steady_clock::now();
     auto executed = forward_moe(model,
@@ -279,13 +285,11 @@ static Result<ActivationBuffer> prepare_mtp_hidden(const CompiledModel& model,
                         model.weights.at(model.speculative.mtp_embedding_norm_weight),
                         model.descriptor.norm_epsilon,
                         embeddings,
-                        model.descriptor.norm_weight_offset,
-                        model.opt.optimization_flags);
+                        model.descriptor.norm_weight_offset);
     ActivationBuffer normalized_hidden = rms_norm_batch(target_hidden,
                                                         model.weights.at(model.speculative.mtp_hidden_norm_weight),
                                                         model.descriptor.norm_epsilon,
-                                                        model.descriptor.norm_weight_offset,
-                                                        model.opt.optimization_flags);
+                                                        model.descriptor.norm_weight_offset);
     ActivationBuffer packed(target_hidden.rows(),
                             model.descriptor.hidden_size * 2);
     for (size_t row = 0; row < target_hidden.rows(); ++row)
@@ -339,8 +343,7 @@ static Result<ActivationBuffer> execute_mtp_batch(const CompiledModel& model,
                         model.weights.at(model.speculative.final_norm_weight),
                         model.descriptor.norm_epsilon,
                         hidden,
-                        model.descriptor.norm_weight_offset,
-                        model.opt.optimization_flags);
+                        model.descriptor.norm_weight_offset);
     return hidden;
 }
 
@@ -523,8 +526,7 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
                         model.weights.at(model.speculative.main_norm_weight),
                         model.descriptor.norm_epsilon,
                         projected,
-                        model.descriptor.norm_weight_offset,
-                        model.opt.optimization_flags);
+                        model.descriptor.norm_weight_offset);
     const std::vector<SpeculativeModelPlan::LayerNodes>& layer_nodes = model.speculative.layer_nodes;
     const ExecutionGraph& graph = model.speculative.graph;
     if (layer_nodes.size() != graph.layer_plans.size())
@@ -774,8 +776,7 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
                         model.weights.at(model.speculative.final_norm_weight),
                         model.descriptor.norm_epsilon,
                         state.final_norm,
-                        model.descriptor.norm_weight_offset,
-                        model.opt.optimization_flags);
+                        model.descriptor.norm_weight_offset);
     linear_batch_into(model.weights.at(model.lm_head_weight),
                       state.final_norm,
                       state.expert_scratch.staged_merged,

@@ -937,7 +937,7 @@ static float attention_weight_value(const TensorData& tensor, size_t index)
     return bfloat16_to_float(tensor.bfloat16_values()[index]);
 }
 
-static void apply_head_rms_norm(ActivationBuffer& batch, uint32_t head_count, uint32_t head_dimension, const TensorData& weight, float epsilon, float weight_offset, uint64_t optimization_flags)
+static void apply_head_rms_norm(ActivationBuffer& batch, uint32_t head_count, uint32_t head_dimension, const TensorData& weight, float epsilon, float weight_offset)
 {
     assert(weight.element_count() == head_dimension);
     for (size_t token_index = 0; token_index < batch.rows(); ++token_index)
@@ -946,8 +946,7 @@ static void apply_head_rms_norm(ActivationBuffer& batch, uint32_t head_count, ui
         for (uint32_t head = 0; head < head_count; ++head)
         {
             float* values = token + head * head_dimension;
-            if (has_flag(optimization_flags, OptimizationCpuSimdRmsNorm)
-                && weight.dtype == DType::Float32)
+            if (weight.dtype == DType::Float32)
             {
                 float_rms_norm(values,
                                values,
@@ -957,8 +956,7 @@ static void apply_head_rms_norm(ActivationBuffer& batch, uint32_t head_count, ui
                                head_dimension);
                 continue;
             }
-            if (has_flag(optimization_flags, OptimizationCpuSimdRmsNorm)
-                && weight.dtype == DType::BFloat16)
+            if (weight.dtype == DType::BFloat16)
             {
                 bfloat16_rms_norm(values,
                                   values,
@@ -1041,7 +1039,7 @@ static Result<void> prepare_qsa_selection(const WeightStore& weights,
     apply_head_rms_norm(scratch.qsa_query, plan.index_head_count,
                         plan.index_head_dimension,
                         weights.at(plan.qsa_query_norm_weight), norm_epsilon,
-                        plan.norm_weight_offset, optimization_flags);
+                        plan.norm_weight_offset);
     const uint32_t rope_dimension = plan.rope_head_dimension == 0
                                         ? plan.index_head_dimension
                                         : plan.rope_head_dimension;
@@ -1191,7 +1189,7 @@ Result<void> append_attention_context(const WeightStore& weights,
     if (plan.pre_attention_norm_weight == invalid_tensor_handle)
         scratch.normalized = hidden;
     else
-        rms_norm_batch_into(hidden, weights.at(plan.pre_attention_norm_weight), norm_epsilon, scratch.normalized, plan.norm_weight_offset, optimization_flags);
+        rms_norm_batch_into(hidden, weights.at(plan.pre_attention_norm_weight), norm_epsilon, scratch.normalized, plan.norm_weight_offset);
     auto qsa_status = project_and_append_qsa_keys(weights, operators, plan, scratch.normalized, cache, scratch,
                                                   optimization_flags);
     if (!qsa_status)
@@ -1232,7 +1230,7 @@ Result<void> append_attention_context(const WeightStore& weights,
 
     if (has_flag(plan.flags, AttentionBlockQueryKeyNorm))
     {
-        apply_head_rms_norm(key, plan.kv_head_count, plan.head_dimension, weights.at(plan.key_norm_weight), norm_epsilon, plan.norm_weight_offset, optimization_flags);
+        apply_head_rms_norm(key, plan.kv_head_count, plan.head_dimension, weights.at(plan.key_norm_weight), norm_epsilon, plan.norm_weight_offset);
     }
 
     const uint32_t rope_dimension = plan.rope_head_dimension == 0 ? plan.head_dimension : plan.rope_head_dimension;
@@ -1369,7 +1367,7 @@ Result<void> forward_attention(const WeightStore& weights,
     if (plan.pre_attention_norm_weight == invalid_tensor_handle)
         scratch.normalized = hidden;
     else
-        rms_norm_batch_into(hidden, weights.at(plan.pre_attention_norm_weight), norm_epsilon, scratch.normalized, plan.norm_weight_offset, optimization_flags);
+        rms_norm_batch_into(hidden, weights.at(plan.pre_attention_norm_weight), norm_epsilon, scratch.normalized, plan.norm_weight_offset);
     auto qsa_status = project_and_append_qsa_keys(weights, operators, plan, scratch.normalized, cache, scratch,
                                                   optimization_flags);
     if (!qsa_status)
@@ -1428,8 +1426,8 @@ Result<void> forward_attention(const WeightStore& weights,
 
     if (has_flag(plan.flags, AttentionBlockQueryKeyNorm))
     {
-        apply_head_rms_norm(query, plan.head_count, plan.head_dimension, weights.at(plan.query_norm_weight), norm_epsilon, plan.norm_weight_offset, optimization_flags);
-        apply_head_rms_norm(key, plan.kv_head_count, plan.head_dimension, weights.at(plan.key_norm_weight), norm_epsilon, plan.norm_weight_offset, optimization_flags);
+        apply_head_rms_norm(query, plan.head_count, plan.head_dimension, weights.at(plan.query_norm_weight), norm_epsilon, plan.norm_weight_offset);
+        apply_head_rms_norm(key, plan.kv_head_count, plan.head_dimension, weights.at(plan.key_norm_weight), norm_epsilon, plan.norm_weight_offset);
     }
 
     const uint32_t rope_dimension = plan.rope_head_dimension == 0 ? plan.head_dimension : plan.rope_head_dimension;

@@ -31,10 +31,10 @@ enum OptionFlag : uint32_t
     OptionDisableGpuExpertExecution = UINT32_C(1) << NCNN_MOE_OPTION_DISABLE_GPU_EXPERT_BIT
 };
 
-// Kernel choices use a separate bitmap from storage and admission policy.
-#define NCNN_MOE_OPT_CPU_SIMD_RMS_NORM_BIT               0
+// Algorithm and backend choices use a separate bitmap from storage policy.
+// Normalization, GatedDelta and row/group scheduling are automatic. Retired
+// bits 0, 2, 11, 13 and 15 stay unused so remaining flag values do not change.
 #define NCNN_MOE_OPT_CPU_FAST_SILU_BIT                   1
-#define NCNN_MOE_OPT_CPU_MXFP4_ROW_PAIRS_BIT             2
 #define NCNN_MOE_OPT_CPU_FLOAT8_FUSED_GATE_UP_BIT        3
 #define NCNN_MOE_OPT_CPU_FLOAT8_BF16_DOT_BIT             4
 #define NCNN_MOE_OPT_CPU_FLOAT8_BATCH_TILE_BIT           5
@@ -43,11 +43,8 @@ enum OptionFlag : uint32_t
 #define NCNN_MOE_OPT_CPU_BFLOAT16_BATCHED_BIT            8
 #define NCNN_MOE_OPT_CPU_ROPE_CACHE_BIT                  9
 #define NCNN_MOE_OPT_CPU_BF16_DIRECT_ATTENTION_BIT       10
-#define NCNN_MOE_OPT_CPU_GATED_DELTA_SIMD_BIT            11
 #define NCNN_MOE_OPT_CPU_LATENT_PREPARED_ROPE_BIT        12
-#define NCNN_MOE_OPT_CPU_LATENT_SIMD_NORM_BIT            13
 #define NCNN_MOE_OPT_CPU_LATENT_ONLINE_SOFTMAX_BIT       14
-#define NCNN_MOE_OPT_CPU_LATENT_OUTPUT_GROUPS_BIT        15
 #define NCNN_MOE_OPT_NCNN_CPU_BFLOAT16_LINEAR_BIT        16
 #define NCNN_MOE_OPT_VULKAN_BFLOAT16_COOP_MATRIX_BIT     17
 #define NCNN_MOE_OPT_VULKAN_ATTENTION_BIT                18
@@ -77,9 +74,7 @@ enum OptionFlag : uint32_t
 
 enum OptimizationFlag : uint64_t
 {
-    OptimizationCpuSimdRmsNorm = UINT64_C(1) << NCNN_MOE_OPT_CPU_SIMD_RMS_NORM_BIT,
     OptimizationCpuFastSilu = UINT64_C(1) << NCNN_MOE_OPT_CPU_FAST_SILU_BIT,
-    OptimizationCpuMxfp4RowPairs = UINT64_C(1) << NCNN_MOE_OPT_CPU_MXFP4_ROW_PAIRS_BIT,
     OptimizationCpuFloat8FusedGateUp = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLOAT8_FUSED_GATE_UP_BIT,
     OptimizationCpuFloat8Bf16Dot = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLOAT8_BF16_DOT_BIT,
     OptimizationCpuFloat8BatchTile = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLOAT8_BATCH_TILE_BIT,
@@ -88,11 +83,8 @@ enum OptimizationFlag : uint64_t
     OptimizationCpuBfloat16Batched = UINT64_C(1) << NCNN_MOE_OPT_CPU_BFLOAT16_BATCHED_BIT,
     OptimizationCpuRopeCache = UINT64_C(1) << NCNN_MOE_OPT_CPU_ROPE_CACHE_BIT,
     OptimizationCpuBf16DirectAttention = UINT64_C(1) << NCNN_MOE_OPT_CPU_BF16_DIRECT_ATTENTION_BIT,
-    OptimizationCpuGatedDeltaSimd = UINT64_C(1) << NCNN_MOE_OPT_CPU_GATED_DELTA_SIMD_BIT,
     OptimizationCpuLatentPreparedRope = UINT64_C(1) << NCNN_MOE_OPT_CPU_LATENT_PREPARED_ROPE_BIT,
-    OptimizationCpuLatentSimdNorm = UINT64_C(1) << NCNN_MOE_OPT_CPU_LATENT_SIMD_NORM_BIT,
     OptimizationCpuLatentOnlineSoftmax = UINT64_C(1) << NCNN_MOE_OPT_CPU_LATENT_ONLINE_SOFTMAX_BIT,
-    OptimizationCpuLatentOutputGroups = UINT64_C(1) << NCNN_MOE_OPT_CPU_LATENT_OUTPUT_GROUPS_BIT,
     OptimizationNcnnCpuBfloat16Linear = UINT64_C(1) << NCNN_MOE_OPT_NCNN_CPU_BFLOAT16_LINEAR_BIT,
     OptimizationVulkanBfloat16CoopMatrix = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_BFLOAT16_COOP_MATRIX_BIT,
     OptimizationVulkanAttention = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_ATTENTION_BIT,
@@ -123,9 +115,7 @@ enum OptimizationFlag : uint64_t
     OptimizationCpuPackedWeights = UINT64_C(1) << NCNN_MOE_OPT_CPU_PACKED_WEIGHTS_BIT
 };
 
-inline constexpr uint64_t OptimizationDefaultFlags = OptimizationCpuSimdRmsNorm
-                                                     | OptimizationCpuFastSilu
-                                                     | OptimizationCpuMxfp4RowPairs
+inline constexpr uint64_t OptimizationDefaultFlags = OptimizationCpuFastSilu
                                                      | OptimizationCpuFloat8FusedGateUp
                                                      | OptimizationCpuFloat8Bf16Dot
                                                      | OptimizationCpuFloat8BatchTile
@@ -136,11 +126,8 @@ inline constexpr uint64_t OptimizationDefaultFlags = OptimizationCpuSimdRmsNorm
                                                      | OptimizationCpuBf16DirectAttention
                                                      | OptimizationCpuFlashAttention
                                                      | OptimizationCpuSplitKvAttention
-                                                     | OptimizationCpuGatedDeltaSimd
                                                      | OptimizationCpuLatentPreparedRope
-                                                     | OptimizationCpuLatentSimdNorm
                                                      | OptimizationCpuLatentOnlineSoftmax
-                                                     | OptimizationCpuLatentOutputGroups
                                                      | OptimizationCpuMxfp4Q8
                                                      | OptimizationNcnnCpuBfloat16Linear
                                                      | OptimizationVulkanBfloat16CoopMatrix
@@ -165,10 +152,8 @@ inline constexpr uint64_t OptimizationDefaultFlags = OptimizationCpuSimdRmsNorm
                                                      | OptimizationVulkanIndexedExperts
                                                      | OptimizationVulkanQnK;
 
-inline constexpr uint64_t OptimizationAllFlags = (UINT64_C(1) << (NCNN_MOE_OPT_CPU_PACKED_WEIGHTS_BIT + 1)) - 1;
 inline constexpr uint64_t OptimizationOptionalFlags = OptimizationCpuPackedWeights;
-static_assert((OptimizationDefaultFlags | OptimizationOptionalFlags)
-              == OptimizationAllFlags);
+inline constexpr uint64_t OptimizationAllFlags = OptimizationDefaultFlags | OptimizationOptionalFlags;
 static_assert((OptimizationDefaultFlags & OptimizationOptionalFlags) == 0);
 
 // User-supplied model loading options. Zero-valued memory settings and Auto

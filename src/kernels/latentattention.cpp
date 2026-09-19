@@ -211,13 +211,6 @@ static bool prepared_latent_rope_enabled(uint64_t optimization_flags) noexcept
                     OptimizationCpuLatentPreparedRope);
 }
 
-static bool simd_latent_norm_enabled(uint64_t optimization_flags) noexcept
-{
-    return has_flag(optimization_flags, OptimizationCpuSimdRmsNorm)
-           && has_flag(optimization_flags,
-                       OptimizationCpuLatentSimdNorm);
-}
-
 static bool online_latent_softmax_enabled(uint64_t optimization_flags) noexcept
 {
     return has_flag(optimization_flags,
@@ -232,12 +225,6 @@ static bool vector_latent_softmax_enabled(uint64_t optimization_flags) noexcept
 }
 
 static constexpr uint32_t vector_latent_softmax_min_candidates = 64;
-
-static bool parallel_latent_output_groups_enabled(uint64_t optimization_flags) noexcept
-{
-    return has_flag(optimization_flags,
-                    OptimizationCpuLatentOutputGroups);
-}
 
 static void prepare_rope_coefficients(uint32_t dimension,
                                       uint64_t position,
@@ -322,73 +309,12 @@ static void hadamard_rotate(float* values, uint32_t count)
         values[index] *= scale;
 }
 
-static void normalize_vector(float* values, uint32_t count, const TensorData& weight, float epsilon, uint64_t optimization_flags)
+static void normalize_vector(float* values, uint32_t count, const TensorData& weight, float epsilon)
 {
-    if (simd_latent_norm_enabled(optimization_flags) && weight.dtype == DType::BFloat16)
-    {
-        bfloat16_rms_norm(values,
-                          values,
-                          weight.bfloat16_values().data(),
-                          epsilon,
-                          0.0f,
-                          count);
-        return;
-    }
-    if (simd_latent_norm_enabled(optimization_flags) && weight.dtype == DType::Float32)
-    {
-        float_rms_norm(values,
-                       values,
-                       weight.float32_values().data(),
-                       epsilon,
-                       0.0f,
-                       count);
-        return;
-    }
-    float square_sum = 0.0f;
-    if (simd_latent_norm_enabled(optimization_flags))
-        square_sum = float_dot(values, values, count);
-    else
-    {
-        for (uint32_t index = 0; index < count; ++index)
-            square_sum += values[index] * values[index];
-    }
-    const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
     if (weight.dtype == DType::BFloat16)
-    {
-        const std::span<const uint16_t> weights = weight.bfloat16_values();
-        if (simd_latent_norm_enabled(optimization_flags))
-            bfloat16_weighted_scale(values, values, weights.data(), inverse_rms, 0.0f, count);
-        else
-        {
-            for (uint32_t index = 0; index < count; ++index)
-                values[index] *= inverse_rms * bfloat16_to_float(weights[index]);
-        }
-    }
+        bfloat16_rms_norm(values, values, weight.bfloat16_values().data(), epsilon, 0.0f, count);
     else
-    {
-        const std::span<const float> weights = weight.float32_values();
-        if (simd_latent_norm_enabled(optimization_flags))
-            float_weighted_scale(values, values, weights.data(), inverse_rms, 0.0f, count);
-        else
-        {
-            for (uint32_t index = 0; index < count; ++index)
-                values[index] *= inverse_rms * weights[index];
-        }
-    }
-}
-
-static void normalize_unit(float* values, uint32_t count, float epsilon, uint64_t optimization_flags)
-{
-    if (simd_latent_norm_enabled(optimization_flags))
-    {
-        float_rms_scale_inplace(values, epsilon, count);
-        return;
-    }
-    float square_sum = 0.0f;
-    for (uint32_t index = 0; index < count; ++index)
-        square_sum += values[index] * values[index];
-    const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
-    float_scale_inplace(values, inverse_rms, count);
+        float_rms_norm(values, values, weight.float32_values().data(), epsilon, 0.0f, count);
 }
 
 static void normalize_unit_prepared_rope(float* values,
@@ -396,46 +322,18 @@ static void normalize_unit_prepared_rope(float* values,
                                          uint32_t rope_dimension,
                                          float epsilon,
                                          std::span<const float> cosines,
-                                         std::span<const float> sines,
-                                         uint64_t optimization_flags)
+                                         std::span<const float> sines)
 {
-    if (simd_latent_norm_enabled(optimization_flags))
-    {
-        float_rms_scale_inplace(values, epsilon, count);
-        const uint32_t rope_offset = count - rope_dimension;
-        const uint32_t pair_count = rope_dimension / 2;
-        assert(cosines.size() >= pair_count && sines.size() >= pair_count);
-        for (uint32_t pair = 0; pair < pair_count; ++pair)
-        {
-            const float cosine = cosines[pair];
-            const float sine = sines[pair];
-            const float real = values[rope_offset + pair * 2];
-            const float imaginary = values[rope_offset + pair * 2 + 1];
-            values[rope_offset + pair * 2] = real * cosine - imaginary * sine;
-            values[rope_offset + pair * 2 + 1] = real * sine + imaginary * cosine;
-        }
-        return;
-    }
-    const float square_sum = simd_latent_norm_enabled(optimization_flags)
-                                 ? float_dot(values, values, count)
-                                 : [&]() {
-                                       float sum = 0.0f;
-                                       for (uint32_t index = 0; index < count; ++index)
-                                           sum += values[index] * values[index];
-                                       return sum;
-                                   }();
-    const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
+    float_rms_scale_inplace(values, epsilon, count);
     const uint32_t rope_offset = count - rope_dimension;
-    float_scale_inplace(values, inverse_rms, rope_offset);
-
     const uint32_t pair_count = rope_dimension / 2;
     assert(cosines.size() >= pair_count && sines.size() >= pair_count);
     for (uint32_t pair = 0; pair < pair_count; ++pair)
     {
         const float cosine = cosines[pair];
         const float sine = sines[pair];
-        const float real = values[rope_offset + pair * 2] * inverse_rms;
-        const float imaginary = values[rope_offset + pair * 2 + 1] * inverse_rms;
+        const float real = values[rope_offset + pair * 2];
+        const float imaginary = values[rope_offset + pair * 2 + 1];
         values[rope_offset + pair * 2] = real * cosine - imaginary * sine;
         values[rope_offset + pair * 2 + 1] = real * sine + imaginary * cosine;
     }
@@ -586,7 +484,7 @@ static void append_compressed_value(const WeightStore& weights,
         }
     }
 
-    normalize_vector(pooled.data(), dimension, weights.at(norm_handle), norm_epsilon, optimization_flags);
+    normalize_vector(pooled.data(), dimension, weights.at(norm_handle), norm_epsilon);
     apply_rope(pooled.data() + dimension - plan.rope_head_dimension, plan.rope_head_dimension, position + 1 - ratio, plan, false);
     if (indexer)
     {
@@ -693,14 +591,12 @@ static void fp8_matrix_rows_dot(const TensorData& matrix,
 static int latent_output_group_team_size(size_t row_count,
                                          uint32_t group_count,
                                          uint32_t group_columns,
-                                         uint32_t rank,
-                                         uint64_t optimization_flags) noexcept
+                                         uint32_t rank) noexcept
 {
 #if defined(_OPENMP)
     const uint64_t operations = static_cast<uint64_t>(row_count) * group_count * group_columns
                                 * rank;
-    if (!parallel_latent_output_groups_enabled(optimization_flags)
-        || operations < 1024 * 1024)
+    if (operations < 1024 * 1024)
         return 1;
     return std::max(1,
                     std::min(static_cast<int>(row_count * group_count),
@@ -752,7 +648,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
     if (plan.compression_ratio != 0)
     {
         rms_norm_batch_into(input, weights.at(plan.pre_attention_norm_weight), norm_epsilon,
-                            normalized, 0.0f, optimization_flags);
+                            normalized, 0.0f);
         normalized_ready = true;
     }
     const TensorData& query_a = weights.at(plan.query_a_weight);
@@ -873,7 +769,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                     {
                         rms_norm_batch_into(input,
                                             weights.at(plan.pre_attention_norm_weight),
-                                            norm_epsilon, normalized, 0.0f, optimization_flags);
+                                            norm_epsilon, normalized, 0.0f);
                         normalized_ready = true;
                     }
                     chained_query = query_a_operator.float8->forward_rms_norm_chain_parallel(normalized,
@@ -891,7 +787,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
             {
                 rms_norm_batch_into(input,
                                     weights.at(plan.pre_attention_norm_weight),
-                                    norm_epsilon, normalized, 0.0f, optimization_flags);
+                                    norm_epsilon, normalized, 0.0f);
                 normalized_ready = true;
             }
             chained_query = query_a_operator.float8->forward_rms_norm_chain(normalized, *query_b_operator.float8, query);
@@ -910,7 +806,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         {
             rms_norm_batch_into(input,
                                 weights.at(plan.pre_attention_norm_weight),
-                                norm_epsilon, normalized, 0.0f, optimization_flags);
+                                norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
         }
         auto graph = CommandGraph_vulkan::create(*query_a_operator.linear);
@@ -941,7 +837,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         {
             rms_norm_batch_into(input,
                                 weights.at(plan.pre_attention_norm_weight),
-                                norm_epsilon, normalized, 0.0f, optimization_flags);
+                                norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
         }
         const bool paired_projection = float8_linear_pair_batch_into(query_a, key_value_weight, normalized, query_rank,
@@ -965,7 +861,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         if (!query_projection_fused)
         {
             rms_norm_batch_into(query_rank, weights.at(plan.query_norm_weight),
-                                norm_epsilon, query_rank, 0.0f, optimization_flags);
+                                norm_epsilon, query_rank, 0.0f);
             linear_batch_into(query_b, query_rank, query, optimization_flags,
                               operators.find_weight(plan.query_b_weight), backend,
                               &scratch.quantized_input);
@@ -981,7 +877,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         key_value_ready = true;
     }
     rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), norm_epsilon,
-                        key_value, 0.0f, optimization_flags);
+                        key_value, 0.0f);
     attention_output.reset(input.rows(), plan.head_count * plan.head_dimension, true);
 
     const std::span<const float> sinks = weights.at(plan.sinks).float32_values();
@@ -1126,12 +1022,11 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                                          plan.rope_head_dimension,
                                          norm_epsilon,
                                          cache.latent_rope_cosines,
-                                         cache.latent_rope_sines,
-                                         optimization_flags);
+                                         cache.latent_rope_sines);
         }
         else
         {
-            normalize_unit(query_head, plan.head_dimension, norm_epsilon, optimization_flags);
+            float_rms_scale_inplace(query_head, norm_epsilon, plan.head_dimension);
             apply_rope(query_head + plan.head_dimension - plan.rope_head_dimension,
                        plan.rope_head_dimension,
                        position,
@@ -1338,7 +1233,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         const uint32_t group_columns = heads_per_group * plan.head_dimension;
 #if defined(_OPENMP)
         const int output_team_size = latent_output_group_team_size(input.rows(), plan.output_group_count, group_columns,
-                                                                   plan.output_lora_rank, optimization_flags);
+                                                                   plan.output_lora_rank);
         const int64_t output_tasks = static_cast<int64_t>(input.rows())
                                      * plan.output_group_count;
 #pragma omp parallel for schedule(static) num_threads(output_team_size) if (output_team_size > 1)
@@ -1422,7 +1317,7 @@ Result<void> append_dspark_attention_context(const WeightStore& weights,
                                               operators.find_weight(plan.key_value_weight),
                                               backend);
     rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), norm_epsilon,
-                        key_value, 0.0f, optimization_flags);
+                        key_value, 0.0f);
     const size_t window_elements = static_cast<size_t>(plan.sliding_window) * plan.head_dimension;
     if (cache.latent_window.size() != window_elements)
         cache.latent_window.assign(window_elements, 0.0f);
@@ -1503,7 +1398,7 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
                 {
                     rms_norm_batch_into(input,
                                         weights.at(plan.pre_attention_norm_weight),
-                                        norm_epsilon, normalized, 0.0f, optimization_flags);
+                                        norm_epsilon, normalized, 0.0f);
                     normalized_ready = true;
                 }
                 chained_query = query_a_operator.float8->forward_rms_norm_chain_parallel(normalized,
@@ -1518,7 +1413,7 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
         {
             rms_norm_batch_into(input,
                                 weights.at(plan.pre_attention_norm_weight),
-                                norm_epsilon, normalized, 0.0f, optimization_flags);
+                                norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
             chained_query = query_a_operator.float8->forward_rms_norm_chain(normalized, *query_b_operator.float8, query);
         }
@@ -1529,7 +1424,7 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
         {
             rms_norm_batch_into(input,
                                 weights.at(plan.pre_attention_norm_weight),
-                                norm_epsilon, normalized, 0.0f, optimization_flags);
+                                norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
         }
         const bool paired_projection = float8_linear_pair_batch_into(query_a, key_value_weight, normalized, query_rank,
@@ -1549,7 +1444,7 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
                                                operators.find_weight(plan.query_b_weight), &scratch.quantized_input))
         {
             rms_norm_batch_into(query_rank, weights.at(plan.query_norm_weight),
-                                norm_epsilon, query_rank, 0.0f, optimization_flags);
+                                norm_epsilon, query_rank, 0.0f);
             linear_batch_into(query_b, query_rank, query, optimization_flags,
                               operators.find_weight(plan.query_b_weight), backend,
                               &scratch.quantized_input);
@@ -1563,7 +1458,7 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
         key_value_ready = true;
     }
     rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), norm_epsilon,
-                        key_value, 0.0f, optimization_flags);
+                        key_value, 0.0f);
 
     for (size_t row = 0; row < input.rows(); ++row)
     {
@@ -1589,7 +1484,7 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
         for (uint32_t head = 0; head < plan.head_count; ++head)
         {
             float* query_head = query.row(row) + static_cast<size_t>(head) * plan.head_dimension;
-            normalize_unit(query_head, plan.head_dimension, norm_epsilon, optimization_flags);
+            float_rms_scale_inplace(query_head, norm_epsilon, plan.head_dimension);
             apply_rope(query_head + plan.head_dimension - plan.rope_head_dimension, plan.rope_head_dimension, position, plan, false);
             float maximum = sinks[head];
             for (uint32_t candidate = 0; candidate < candidate_count; ++candidate)
@@ -1659,7 +1554,7 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
         const uint32_t group_columns = heads_per_group * plan.head_dimension;
 #if defined(_OPENMP)
         const int output_team_size = latent_output_group_team_size(input.rows(), plan.output_group_count, group_columns,
-                                                                   plan.output_lora_rank, optimization_flags);
+                                                                   plan.output_lora_rank);
         const int64_t output_tasks = static_cast<int64_t>(input.rows())
                                      * plan.output_group_count;
 #pragma omp parallel for schedule(static) num_threads(output_team_size) if (output_team_size > 1)
