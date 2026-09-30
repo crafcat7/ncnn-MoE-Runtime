@@ -1,4 +1,9 @@
-"""Benchmark one tokenizer-backed prompt through the native worker.
+"""Benchmark one prompt through the native worker.
+
+String prompts automatically use native text handling when the worker supports
+it; native JSON output leaves ``prompt_tokens`` null and includes
+``prompt_token_count``.  Reported ``done`` metrics retain their runtime timing
+definitions.
 
 This intentionally reports native ``done`` metrics instead of inferring GPU
 execution from device memory occupancy.  It is useful for before/after
@@ -19,7 +24,8 @@ TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from ncnn_moe_protocol import WorkerClient  # noqa: E402
+from ncnn_moe import load_adapter  # noqa: E402
+from ncnn_moe_protocol import WorkerClient, WorkerError  # noqa: E402
 
 
 DEFAULT_PROMPT = "你好，你能做些什么"
@@ -205,13 +211,16 @@ def main() -> int:
     adapter = None
     if arguments.prompt_token_ids is not None:
         prompt_tokens = list(arguments.prompt_token_ids)
+        messages = None
+        prompt_token_count = len(prompt_tokens)
+        native_text = False
         stop_tokens: list[int] = []
     else:
-        from ncnn_moe_adapters import create_adapter
-
-        adapter = create_adapter(model)
-        prompt_tokens = adapter.encode_messages([{"role": "user", "content": arguments.prompt}])
-        stop_tokens = adapter.stop_tokens
+        prompt_tokens = None
+        messages = [{"role": "user", "content": arguments.prompt}]
+        prompt_token_count = None
+        native_text = False
+        stop_tokens = []
     done_events: list[dict[str, Any]] = []
     generated: list[list[int]] = []
 
@@ -221,20 +230,49 @@ def main() -> int:
             prefill_chunk_size=arguments.prefill_chunk_size,
             enable_speculative_context=arguments.enable_speculative,
         )
+        if messages is not None:
+            adapter = load_adapter(arguments, model, client.ready)
+            native_text = bool(getattr(adapter, "native_text", False))
+            if not native_text:
+                prompt_tokens = adapter.encode_messages(messages)
+                stop_tokens = adapter.stop_tokens
+                prompt_token_count = len(prompt_tokens)
         for run_index in range(arguments.warmup + arguments.runs):
             if run_index:
                 client.reset("prompt-benchmark")
-            done, token_ids = client.generate(
-                "prompt-benchmark",
-                prompt_tokens,
-                request_id=f"prompt-benchmark-{run_index}",
-                max_new_tokens=arguments.max_new_tokens,
-                temperature=0.0,
-                stop_tokens=stop_tokens,
-                enable_speculative=arguments.enable_speculative,
-                metrics_enabled=False,
-                metrics_interval_ms=0,
-            )
+            options = {
+                "request_id": f"prompt-benchmark-{run_index}",
+                "max_new_tokens": arguments.max_new_tokens,
+                "temperature": 0.0,
+                "enable_speculative": arguments.enable_speculative,
+                "metrics_enabled": False,
+                "metrics_interval_ms": 0,
+            }
+            if native_text:
+                assert adapter is not None and messages is not None
+                done, token_ids = client.generate(
+                    "prompt-benchmark",
+                    messages=messages,
+                    thinking=adapter.thinking,
+                    **options,
+                )
+            else:
+                assert prompt_tokens is not None
+                done, token_ids = client.generate(
+                    "prompt-benchmark",
+                    prompt_tokens,
+                    stop_tokens=stop_tokens,
+                    **options,
+                )
+            if native_text:
+                metrics = done.get("metrics")
+                count = metrics.get("input_tokens") if isinstance(metrics, dict) else None
+                if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+                    raise WorkerError("worker did not return a valid native prompt token count", done)
+                if prompt_token_count is None:
+                    prompt_token_count = count
+                elif prompt_token_count != count:
+                    raise WorkerError("worker returned inconsistent native prompt token counts", done)
             if run_index >= arguments.warmup:
                 done_events.append(done)
                 generated.append(token_ids)
@@ -245,6 +283,7 @@ def main() -> int:
         "prompt": arguments.prompt if arguments.prompt_token_ids is None else None,
         "adapter": getattr(adapter, "name", None),
         "prompt_tokens": prompt_tokens,
+        "prompt_token_count": prompt_token_count,
         "model": str(model),
         "worker": str(worker),
         "backend": arguments.backend,
@@ -258,7 +297,7 @@ def main() -> int:
             print("prompt token ids:", *result["prompt_tokens"])
         else:
             print(f"prompt: {result['prompt']}")
-        print(f"backend: {result['backend']}, prompt tokens: {len(prompt_tokens)}, generated: {result['generated_tokens']}")
+        print(f"backend: {result['backend']}, prompt tokens: {result['prompt_token_count']}, generated: {result['generated_tokens']}")
         print(f"prompt Token/s: {result['prompt_tokens_per_second']}")
         print(f"median Prompt Token/s: {_format_metric(result['median_prompt_tokens_per_second'])}")
         print(f"generation Token/s: {result['generation_tokens_per_second']}")

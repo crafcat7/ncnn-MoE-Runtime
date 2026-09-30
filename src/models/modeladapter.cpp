@@ -12,14 +12,15 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
-#include <span>
 #include <sstream>
+#include <span>
+#include <string_view>
 #include <utility>
 
 namespace ncnn {
 namespace moe {
 
-static void skip_json_whitespace(const std::string& json, size_t& position) noexcept
+static void skip_json_whitespace(std::string_view json, size_t& position) noexcept
 {
     while (position < json.size()
            && (json[position] == ' ' || json[position] == '\t'
@@ -78,7 +79,7 @@ static bool append_json_codepoint(uint32_t codepoint, std::string& output)
     return true;
 }
 
-static bool parse_json_hex_escape(const std::string& json, size_t& position, uint32_t& codepoint)
+static bool parse_json_hex_escape(std::string_view json, size_t& position, uint32_t& codepoint)
 {
     if (json.size() - position < 4)
         return false;
@@ -95,9 +96,9 @@ static bool parse_json_hex_escape(const std::string& json, size_t& position, uin
     return true;
 }
 
-static bool parse_json_string(const std::string& json,
-                              size_t& position,
-                              std::string* decoded)
+bool parse_json_string(std::string_view json,
+                       size_t& position,
+                       std::string* decoded)
 {
     if (position >= json.size() || json[position++] != '"')
         return false;
@@ -235,7 +236,7 @@ static bool is_json_number(const std::string& value) noexcept
     return position == value.size();
 }
 
-static bool scan_json_value(const std::string& json, size_t& position)
+static bool scan_json_value(std::string_view json, size_t& position)
 {
     skip_json_whitespace(json, position);
     if (position >= json.size())
@@ -333,7 +334,8 @@ static bool scan_json_array(const std::string& json,
     return false;
 }
 
-std::optional<std::string> find_manifest_member(const std::string& json, const std::string& key)
+std::optional<std::string_view> find_manifest_member(std::string_view json,
+                                                     std::string_view key)
 {
     size_t position = 0;
     skip_json_whitespace(json, position);
@@ -360,7 +362,7 @@ std::optional<std::string> find_manifest_member(const std::string& json, const s
         skip_json_whitespace(json, delimiter);
         if (delimiter >= json.size() || (json[delimiter] != ',' && json[delimiter] != '}'))
             return std::nullopt;
-        if (name == key)
+        if (std::string_view(name) == key)
             return json.substr(value_start, value_end - value_start);
 
         position = delimiter;
@@ -375,6 +377,15 @@ std::optional<std::string> find_manifest_member(const std::string& json, const s
             return std::nullopt;
     }
     return std::nullopt;
+}
+
+std::optional<std::string> find_manifest_member(const std::string& json,
+                                                const std::string& key)
+{
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
+    if (!value)
+        return std::nullopt;
+    return std::string(*value);
 }
 
 Result<std::string> read_manifest_object(const std::string& json, const std::string& key, const char* prefix)

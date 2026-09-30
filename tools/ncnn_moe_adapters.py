@@ -108,6 +108,9 @@ def _normalize_token_ids(value: Any) -> list[int]:
     if not isinstance(value, (list, tuple)) or not value:
         raise AdapterError("the Qwen chat template did not return token IDs")
 
+    if all(type(token) is int for token in value):
+        return list(value)
+
     tokens: list[int] = []
     for token in value:
         item = getattr(token, "item", None)
@@ -200,11 +203,18 @@ class ModelAdapter:
     def decode_completion(self, tokens: list[int]) -> Completion:
         return _split_thinking(self.decode_text(tokens), self.thinking)
 
+    def decode_completion_text(self, text: str) -> Completion:
+        return _split_thinking(text, self.thinking)
+
     def validate(self) -> None:
         _required(self.model, "config.json")
 
     def stream_visible(self, tokens: list[int], *, final_only: bool = False) -> str:
         completion = self.decode_completion(tokens)
+        return self.visible_completion(completion, final_only=final_only)
+
+    @staticmethod
+    def visible_completion(completion: Completion, *, final_only: bool = False) -> str:
         if final_only:
             return completion.answer
         if completion.answer:
@@ -330,12 +340,54 @@ class DeepSeekAdapter(ModelAdapter):
 class QwenAdapter(ModelAdapter):
     name = "qwen3.6"
 
+    def _fingerprint(self) -> str:
+        legacy_fingerprint = ModelAdapter._fingerprint(self)
+        self._legacy_model_fingerprint = legacy_fingerprint
+        digest = hashlib.sha256()
+        digest.update(legacy_fingerprint.encode("ascii"))
+        digest.update(b"ncnn-moe-tokenizer-json-v1\0")
+        if self.model_type == "qwen3_5_moe":
+            semantic_version = getattr(
+                self, "native_text_version", "ncnn-moe-qwen3.6-nfc9-regex16-v1"
+            )
+            digest.update(semantic_version.encode("utf-8") + b"\0")
+        for name in (
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "generation_config.json",
+        ):
+            path = self.model / name
+            digest.update(name.encode("utf-8") + b"\0")
+            if not path.is_file():
+                digest.update(b"\0")
+                continue
+            digest.update(b"\1")
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+        return digest.hexdigest()[:20]
+
     def __init__(self, model: Path, **options: Any) -> None:
         super().__init__(model, **options)
         _required(self.model, "config.json", "tokenizer.json")
         if self.model_type in {"qwen4_exp", "qwen4_exp_text"}:
             self.name = "qwen3.8"
-        self.tokenizer = _load_transformers_tokenizer(self.model)
+        os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+        try:
+            from transformers import PreTrainedTokenizerFast
+        except ImportError as error:  # pragma: no cover - dependency availability varies
+            raise AdapterError(
+                "transformers is required for this model; install it with "
+                "'python -m pip install -U transformers'"
+            ) from error
+        try:
+            self.tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                str(self.model), local_files_only=True
+            )
+        except Exception as error:  # pragma: no cover - tokenizer implementation varies
+            raise AdapterError(f"cannot load the serialized Qwen tokenizer: {error}") from error
         if not callable(getattr(self.tokenizer, "apply_chat_template", None)):
             raise AdapterError("the official Qwen tokenizer does not provide a chat template")
         stop_tokens: list[int] = []
@@ -383,6 +435,38 @@ class QwenAdapter(ModelAdapter):
             # before its EOS token. It is tokenizer framing, not user text.
             text = text.rstrip().rstrip("\ufffd").rstrip()
         return text
+
+
+class NativeQwenAdapter(ModelAdapter):
+    name = "qwen3.6"
+    native_text = True
+
+    def __init__(
+        self,
+        model: Path,
+        *,
+        native_text_version: str,
+        native_stop_tokens: list[int],
+        **options: Any,
+    ) -> None:
+        self.native_text_version = native_text_version
+        if any(isinstance(token, bool) or not isinstance(token, int) or token < 0 for token in native_stop_tokens):
+            raise AdapterError("worker native stop-token metadata is invalid")
+        self._stop_tokens = list(dict.fromkeys(native_stop_tokens))
+        super().__init__(model, **options)
+        _required(self.model, "config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja")
+
+    def _fingerprint(self) -> str:
+        return QwenAdapter._fingerprint(self)
+
+    @property
+    def stop_tokens(self) -> list[int]:
+        return list(self._stop_tokens)
+
+    def decode_native_completion(self, text: str, tokens: list[int]) -> Completion:
+        if tokens and tokens[-1] in self._stop_tokens:
+            text = text.rstrip().rstrip("\ufffd").rstrip()
+        return self.decode_completion_text(text)
 
 
 def create_adapter(model: Path, **options: Any) -> ModelAdapter:

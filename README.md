@@ -189,18 +189,29 @@ multi-config Windows generator the default worker is
 different build explicitly.
 
 Build `ncnn_moe_worker` with the examples. The worker owns Runtime/Model and
-Session lifetime and communicates through token-ID JSONL; the Python adapters
-own tokenizers, chat templates, reasoning channels, persistent history, and
-TUI presentation. `inspect` reports the detected hardware and the effective
-backend, memory, Expert-cache, and I/O plan. `chat` adds resumable sessions,
-context budgeting, compaction, and live token/CPU/GPU/I/O metrics. Install
-`openai-harmony` for GPT-OSS or `transformers` and the Hugging Face packages
-for DeepSeek/Qwen; `rich` and `prompt-toolkit` are optional TUI upgrades.
+Session lifetime and communicates through token-ID JSONL. For the validated
+Qwen3.6 profile, the worker can automatically handle message formatting,
+tokenization, and incremental text decoding in C++, using the canonical
+serialized tokenizer regex and chat template. This path requires optional
+Worker-only ICU 76 or newer with Unicode data 16 or newer. When that profile is
+unavailable, the CLI continues through the Python tokenizer and token-ID path.
+Python owns the CLI, persistent history, conversation summaries, reasoning
+display, and TUI presentation. `inspect` reports the detected hardware and the
+effective backend, memory, Expert-cache, and I/O plan. `chat` adds resumable
+sessions, context budgeting, compaction, and live token/CPU/GPU/I/O metrics.
+Install `openai-harmony` for GPT-OSS or `transformers` and the Hugging Face
+packages for DeepSeek/Qwen; `rich` and `prompt-toolkit` are optional TUI
+upgrades.
 Human-readable resource sizes in `inspect` and metrics use decimal `GB`; the
 machine-readable JSONL fields retain their exact byte values.
 Persistent session history, user configuration, and tuning profiles are stored
 under `.ncnn-moe/` in the project root; use `--config-dir` when another
 location is required. Native KV and runtime cache state remain in memory.
+Both native and Python Qwen3.6 paths follow the serialized `tokenizer.json`
+tokenizer. Saved conversations replay through the selected profile, and their
+fingerprint updates only after successful replay; an empty history can be
+migrated without replay. The canonical regex includes Unicode Marks, so some
+token IDs can differ from those produced by the older AutoTokenizer wrapper.
 Text generation streams by default, reasoning is shown by default, and the
 periodic metrics trace is disabled by default. Use `--no-stream`,
 `--hide-reasoning`, or `--metrics` to override these choices for one command.
@@ -300,10 +311,14 @@ not the number of busy threads. Benchmark reports no longer emit the duplicate
 Applications add model families that describe supported model semantics through
 `ModelAdapter::can_load`, `parse_model`, and `map_weights`; execution code
 consumes only compiled plans. The unified Python CLI is the text and
-conversation entry point, while
-`ncnn_moe_worker` is the tokenizer-neutral token-ID protocol boundary.
-Model-specific tokenization, chat templates, reasoning/final-channel decoding,
-and stop-token policy stay in Python adapters.
+conversation entry point. It selects the native Qwen3.6 text path from the
+worker's reported capability, then sends message history through the existing
+generate, compact, and stats operations for canonical template replay. The
+worker admits only the validated Qwen3.6 tokenizer/profile and its supported
+string-message schema. Python adapters continue to tokenize other model
+families and provide conversation history, summaries, and reasoning/final
+channel presentation. ICU remains an optional private Worker dependency; the
+SDK and its public options do not depend on it.
 
 ## Architecture
 

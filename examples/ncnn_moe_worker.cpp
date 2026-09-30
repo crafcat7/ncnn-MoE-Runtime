@@ -1,5 +1,6 @@
 #include "internal/jsonline.h"
 #include "internal/gputelemetry.h"
+#include "internal/tokenizer.h"
 #include "ncnn/moe/runtime.h"
 #include "engine/cpu.h"
 #include "graph/compiledmodel.h"
@@ -8,11 +9,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -545,9 +548,11 @@ static Option parse_options(int argc, char** argv, int first_argument)
 
 static uint32_t request_uint(std::string_view request, std::string_view key, uint32_t default_value)
 {
+    if (!find_manifest_member(request, key))
+        return default_value;
     const auto value = json_integer(request, key);
     if (!value)
-        return default_value;
+        throw std::invalid_argument(std::string(key) + " must be an integer");
     if (*value < 0 || static_cast<uint64_t>(*value) > std::numeric_limits<uint32_t>::max())
         throw std::invalid_argument(std::string(key) + " is outside the uint32 range");
     return static_cast<uint32_t>(*value);
@@ -555,8 +560,12 @@ static uint32_t request_uint(std::string_view request, std::string_view key, uin
 
 static bool request_bool(std::string_view request, std::string_view key, bool default_value)
 {
+    if (!find_manifest_member(request, key))
+        return default_value;
     const auto value = json_boolean(request, key);
-    return value ? *value : default_value;
+    if (!value)
+        throw std::invalid_argument(std::string(key) + " must be a boolean");
+    return *value;
 }
 
 static std::vector<int32_t> request_tokens(std::string_view request, std::string_view key, bool required)
@@ -564,7 +573,7 @@ static std::vector<int32_t> request_tokens(std::string_view request, std::string
     const auto values = json_integer_array(request, key);
     if (!values)
     {
-        if (required)
+        if (required || find_manifest_member(request, key))
             throw std::invalid_argument(std::string(key) + " must be an integer array");
         return {};
     }
@@ -587,7 +596,16 @@ struct GenerateRequest
     std::string session_id;
     std::vector<int32_t> prompt_tokens;
     GenerationOptions options;
+    uint64_t prompt_count = 0;
+    bool track_prefix = false;
+    bool prefix_reused = false;
     uint32_t metrics_interval_ms = 1000;
+};
+
+struct WorkerSession
+{
+    SessionPtr session;
+    std::vector<int32_t> committed_tokens;
 };
 
 class Worker
@@ -595,7 +613,9 @@ class Worker
 private:
     Runtime& runtime;
     ModelPtr model;
-    std::unordered_map<std::string, SessionPtr> sessions;
+    Tokenizer tokenizer;
+    bool native_text_supported = false;
+    std::unordered_map<std::string, WorkerSession> sessions;
     std::mutex output_mutex;
     std::thread generation_thread;
     std::atomic<bool> generation_running{false};
@@ -629,6 +649,19 @@ private:
         }
     }
 
+    void emit_context_overflow(std::string_view request_id, uint64_t prompt_count, uint32_t context_limit)
+    {
+        JsonObject result;
+        result.add_string("event", "error");
+        if (!request_id.empty())
+            result.add_string("request_id", request_id);
+        result.add_string("code", "context_overflow");
+        result.add_string("message", "prompt and generation budget exceed the context limit");
+        result.add_uint("prompt_count", prompt_count);
+        result.add_uint("context_limit", context_limit);
+        emit(result.finish());
+    }
+
     void emit_ready()
     {
         const RuntimeInfo& info = runtime.info();
@@ -643,6 +676,21 @@ private:
         model_json.add_uint("expert_count", model->descriptor().expert_count);
         model_json.add_uint("experts_per_token", model->descriptor().experts_per_token);
         model_json.add_uint("max_context_tokens", maximum_context_tokens());
+        model_json.add_bool("native_text_supported", native_text_supported);
+        if (native_text_supported)
+        {
+            model_json.add_string("native_text_version", "ncnn-moe-qwen3.6-nfc9-regex16-v1");
+            const std::vector<int32_t>& native_stop_tokens = tokenizer.stop_tokens();
+            std::string stop_tokens = "[";
+            for (size_t index = 0; index < native_stop_tokens.size(); ++index)
+            {
+                if (index != 0)
+                    stop_tokens.push_back(',');
+                stop_tokens += std::to_string(native_stop_tokens[index]);
+            }
+            stop_tokens.push_back(']');
+            model_json.add_raw("native_stop_tokens", stop_tokens);
+        }
 
         JsonObject resources;
         resources.add_string("backend", hybrid_mode_name(effective.hybrid_mode));
@@ -706,11 +754,50 @@ private:
         return maximum;
     }
 
-    void execute_generate(GenerateRequest request, SessionPtr session)
+    void execute_generate(GenerateRequest request, WorkerSession& worker_session)
     {
+        const SessionPtr session = worker_session.session;
+        const auto started = std::chrono::steady_clock::now();
+        std::string pending_utf8;
+        std::vector<std::pair<StreamToken, double>> pending_tokens;
+        const auto emit_token = [this, &request](const StreamToken& token,
+                                                 std::string_view text,
+                                                 double elapsed_seconds) {
+            JsonObject event;
+            event.add_string("event", "token");
+            event.add_string("request_id", request.request_id);
+            event.add_string("session_id", request.session_id);
+            event.add_uint("index", token.index);
+            event.add_int("token_id", token.token_id);
+            if (native_text_supported)
+                event.add_string("text", text);
+            event.add_double("probability", token.probability);
+            event.add_bool("is_stop_token", token.is_stop_token);
+            event.add_double("elapsed_seconds", elapsed_seconds);
+            emit(event.finish());
+        };
+        const auto emit_pending_tokens = [&]() {
+            for (const auto& pending : pending_tokens)
+                emit_token(pending.first, pending.first.text, pending.second);
+            pending_tokens.clear();
+        };
+        const auto reset_session = [&]() -> std::string {
+            try
+            {
+                auto reset = session->reset();
+                return reset ? std::string() : reset.error().message;
+            }
+            catch (const std::exception& exception)
+            {
+                return exception.what();
+            }
+            catch (...)
+            {
+                return "unknown reset exception";
+            }
+        };
         try
         {
-            const auto started = std::chrono::steady_clock::now();
             std::mutex metrics_mutex;
             std::condition_variable_any metrics_condition;
             std::exception_ptr metrics_error;
@@ -740,18 +827,27 @@ private:
             }
             auto generated = session->generate(request.prompt_tokens,
                                                request.options,
-                                               [this, &request, started](const StreamToken& token) {
-                                                   JsonObject event;
-                                                   event.add_string("event", "token");
-                                                   event.add_string("request_id", request.request_id);
-                                                   event.add_string("session_id", request.session_id);
-                                                   event.add_uint("index", token.index);
-                                                   event.add_int("token_id", token.token_id);
-                                                   event.add_double("probability", token.probability);
-                                                   event.add_bool("is_stop_token", token.is_stop_token);
+                                               [this, &emit_token, &pending_utf8, &pending_tokens,
+                                                &emit_pending_tokens, started](const StreamToken& token) {
                                                    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-                                                   event.add_double("elapsed_seconds", elapsed);
-                                                   emit(event.finish());
+                                                   if (!native_text_supported)
+                                                   {
+                                                       emit_token(token, {}, elapsed);
+                                                   }
+                                                   else
+                                                   {
+                                                       std::string text = tokenizer.decode(token.token_id, pending_utf8);
+                                                       if (!pending_tokens.empty() || !pending_utf8.empty())
+                                                       {
+                                                           StreamToken buffered_token = token;
+                                                           buffered_token.text = std::move(text);
+                                                           pending_tokens.emplace_back(std::move(buffered_token), elapsed);
+                                                           if (pending_utf8.empty())
+                                                               emit_pending_tokens();
+                                                       }
+                                                       else
+                                                           emit_token(token, text, elapsed);
+                                                   }
 
                                                    return !cancel_requested.load();
                                                });
@@ -764,12 +860,44 @@ private:
                 std::rethrow_exception(metrics_error);
             if (!generated)
             {
+                pending_utf8.clear();
+                emit_pending_tokens();
+                worker_session.committed_tokens.clear();
+                const std::string reset_error = reset_session();
                 generation_running.store(false);
-                emit_error(request.request_id, generated.error().message, error_code_name(generated.error().code));
+                if (reset_error.empty())
+                    emit_error(request.request_id, generated.error().message, error_code_name(generated.error().code));
+                else
+                    emit_error(request.request_id,
+                               generated.error().message + "; session reset failed: " + reset_error,
+                               "worker_exception");
             }
             else
             {
                 const GenerationResult& generation = generated.value();
+                if (native_text_supported)
+                {
+                    if (generation.stopped_by_callback || cancel_requested.load() || generation.stopped_by_stop_token)
+                        pending_utf8.clear();
+                    else if (!pending_utf8.empty())
+                    {
+                        if (!pending_tokens.empty())
+                            pending_tokens.back().first.text += tokenizer.decode(-1, pending_utf8, true);
+                        else
+                            pending_utf8.clear();
+                    }
+                    emit_pending_tokens();
+                }
+                const uint64_t sequence_length = session->sequence_length();
+                if (request.track_prefix
+                    && request.prompt_count <= sequence_length
+                    && sequence_length - request.prompt_count <= generation.tokens.size())
+                {
+                    for (uint64_t index = 0; index < sequence_length - request.prompt_count; ++index)
+                        worker_session.committed_tokens.push_back(generation.tokens[static_cast<size_t>(index)].token_id);
+                }
+                else
+                    worker_session.committed_tokens.clear();
                 JsonObject done;
                 done.add_string("event", "done");
                 done.add_string("request_id", request.request_id);
@@ -792,7 +920,8 @@ private:
                 done.add_optional_uint("generation_elapsed_microseconds", metrics.timing.generation_elapsed_microseconds);
                 done.add_optional_uint("ttft_microseconds", metrics.timing.ttft_microseconds);
                 done.add_optional_double("tpot_microseconds", metrics.timing.tpot_microseconds);
-                done.add_uint("sequence_length", session->sequence_length());
+                done.add_uint("sequence_length", sequence_length);
+                done.add_bool("prefix_reused", request.prefix_reused);
                 done.add_raw("metrics", runtime_metrics_json(telemetry_sampler, gpu_telemetry_sampler, metrics));
                 done.add_raw("stats", stats_json(metrics));
                 done.add_raw("telemetry", process_telemetry_json(telemetry_sampler));
@@ -805,13 +934,31 @@ private:
         }
         catch (const std::exception& exception)
         {
+            pending_utf8.clear();
+            emit_pending_tokens();
+            worker_session.committed_tokens.clear();
+            const std::string reset_error = reset_session();
             generation_running.store(false);
-            emit_error(request.request_id, exception.what(), "worker_exception");
+            if (reset_error.empty())
+                emit_error(request.request_id, exception.what(), "worker_exception");
+            else
+                emit_error(request.request_id,
+                           std::string(exception.what()) + "; session reset failed: " + reset_error,
+                           "worker_exception");
         }
         catch (...)
         {
+            pending_utf8.clear();
+            emit_pending_tokens();
+            worker_session.committed_tokens.clear();
+            const std::string reset_error = reset_session();
             generation_running.store(false);
-            emit_error(request.request_id, "unknown exception in generation", "worker_exception");
+            if (reset_error.empty())
+                emit_error(request.request_id, "unknown exception in generation", "worker_exception");
+            else
+                emit_error(request.request_id,
+                           "unknown exception in generation; session reset failed: " + reset_error,
+                           "worker_exception");
         }
     }
 
@@ -842,7 +989,9 @@ private:
         auto session = runtime.create_session(model, options);
         if (!session)
             throw std::runtime_error(session.error().message);
-        sessions.emplace(*session_id, std::move(session).value());
+        WorkerSession entry;
+        entry.session = std::move(session).value();
+        sessions.emplace(*session_id, std::move(entry));
         JsonObject result;
         result.add_string("event", "session_created");
         result.add_string("session_id", *session_id);
@@ -860,9 +1009,13 @@ private:
         const auto iterator = sessions.find(*session_id);
         if (iterator == sessions.end())
             throw std::invalid_argument("unknown session: " + *session_id);
-        auto reset = iterator->second->reset();
+        iterator->second.committed_tokens.clear();
+        auto reset = iterator->second.session->reset();
         if (!reset)
-            throw std::runtime_error(reset.error().message);
+        {
+            emit_error("", reset.error().message, error_code_name(reset.error().code));
+            return;
+        }
         JsonObject result;
         result.add_string("event", "reset");
         result.add_string("session_id", *session_id);
@@ -879,21 +1032,80 @@ private:
         const auto iterator = sessions.find(*session_id);
         if (iterator == sessions.end())
             throw std::invalid_argument("unknown session: " + *session_id);
-        std::vector<int32_t> replay_tokens = request_tokens(request, "replay_tokens", false);
-        auto reset = iterator->second->reset();
+        WorkerSession& worker_session = iterator->second;
+        const auto messages = find_manifest_member(request, "messages");
+        const auto replay = find_manifest_member(request, "replay_tokens");
+        if (messages.has_value() == replay.has_value())
+            throw std::invalid_argument("compact requires exactly one of messages or replay_tokens");
+        bool native_messages = false;
+        std::vector<int32_t> replay_tokens;
+        if (messages)
+        {
+            if (!native_text_supported)
+                throw std::invalid_argument("native message input is not supported for this model");
+            const bool thinking = request_bool(request, "enable_thinking", true);
+            replay_tokens = tokenizer.apply_chat(*messages, thinking);
+            if (replay_tokens.empty())
+                throw std::invalid_argument("chat template did not produce prompt tokens");
+            native_messages = true;
+        }
+        else
+            replay_tokens = request_tokens(request, "replay_tokens", true);
+        const uint32_t model_limit = maximum_context_tokens();
+        const uint32_t requested_limit = request_uint(request, "context_tokens", 0);
+        const uint32_t context_limit = model_limit == 0
+                                           ? requested_limit
+                                       : requested_limit == 0 ? model_limit
+                                                              : std::min(model_limit, requested_limit);
+        if (context_limit != 0 && replay_tokens.size() > context_limit)
+        {
+            emit_context_overflow("", replay_tokens.size(), context_limit);
+            return;
+        }
+        worker_session.committed_tokens.clear();
+        auto reset = worker_session.session->reset();
         if (!reset)
-            throw std::runtime_error(reset.error().message);
+        {
+            emit_error("", reset.error().message, error_code_name(reset.error().code));
+            return;
+        }
         if (!replay_tokens.empty())
         {
-            auto replay = iterator->second->prefill(replay_tokens);
-            if (!replay)
-                throw std::runtime_error(replay.error().message);
+            auto replay_result = worker_session.session->prefill(replay_tokens);
+            if (!replay_result)
+            {
+                const std::string reset_error = [&]() {
+                    try
+                    {
+                        auto cleanup = worker_session.session->reset();
+                        return cleanup ? std::string() : cleanup.error().message;
+                    }
+                    catch (const std::exception& exception)
+                    {
+                        return std::string(exception.what());
+                    }
+                    catch (...)
+                    {
+                        return std::string("unknown reset exception");
+                    }
+                }();
+                const std::string message = reset_error.empty()
+                                                ? replay_result.error().message
+                                                : replay_result.error().message + "; session reset failed: " + reset_error;
+                const char* code = reset_error.empty()
+                                       ? error_code_name(replay_result.error().code)
+                                       : "worker_exception";
+                emit_error("", message, code);
+                return;
+            }
         }
+        if (native_messages)
+            worker_session.committed_tokens = std::move(replay_tokens);
         JsonObject result;
         result.add_string("event", "compacted");
         result.add_string("session_id", *session_id);
-        result.add_uint("replayed_tokens", replay_tokens.size());
-        result.add_uint("sequence_length", iterator->second->sequence_length());
+        result.add_uint("replayed_tokens", worker_session.session->sequence_length());
+        result.add_uint("sequence_length", worker_session.session->sequence_length());
         emit(result.finish());
     }
 
@@ -905,11 +1117,22 @@ private:
         const auto iterator = sessions.find(*session_id);
         if (iterator == sessions.end())
             throw std::invalid_argument("unknown session: " + *session_id);
+        const auto messages = find_manifest_member(request, "messages");
+        std::vector<int32_t> prompt_tokens;
+        if (messages)
+        {
+            if (!native_text_supported)
+                throw std::invalid_argument("native message input is not supported for this model");
+            const bool thinking = request_bool(request, "enable_thinking", true);
+            prompt_tokens = tokenizer.apply_chat(*messages, thinking);
+        }
         JsonObject result;
         result.add_string("event", "stats");
         result.add_string("session_id", *session_id);
-        result.add_uint("sequence_length", iterator->second->sequence_length());
-        result.add_raw("stats", stats_json(iterator->second->metrics()));
+        result.add_uint("sequence_length", iterator->second.session->sequence_length());
+        if (messages)
+            result.add_uint("prompt_count", prompt_tokens.size());
+        result.add_raw("stats", stats_json(iterator->second.session->metrics()));
         emit(result.finish());
     }
 
@@ -922,22 +1145,82 @@ private:
         GenerateRequest parsed;
         parsed.request_id = json_string(request, "request_id").value_or("generate");
         parsed.session_id = json_string(request, "session_id").value_or("main");
-        parsed.prompt_tokens = request_tokens(request, "prompt_tokens", true);
+        const auto messages = find_manifest_member(request, "messages");
+        const auto prompt = find_manifest_member(request, "prompt_tokens");
+        if (messages.has_value() == prompt.has_value())
+            throw std::invalid_argument("generate requires exactly one of messages or prompt_tokens");
+        std::vector<int32_t> full_prompt;
+        if (messages)
+        {
+            if (!native_text_supported)
+                throw std::invalid_argument("native message input is not supported for this model");
+            const bool thinking = request_bool(request, "enable_thinking", true);
+            full_prompt = tokenizer.apply_chat(*messages, thinking);
+            if (full_prompt.empty())
+                throw std::invalid_argument("chat template did not produce prompt tokens");
+        }
+        else
+        {
+            parsed.prompt_tokens = request_tokens(request, "prompt_tokens", true);
+            const uint32_t vocabulary_size = model->descriptor().vocabulary_size;
+            for (const int32_t token_id : parsed.prompt_tokens)
+            {
+                if (token_id < 0 || static_cast<uint32_t>(token_id) >= vocabulary_size)
+                    throw std::invalid_argument("prompt_tokens contains an ID outside the model vocabulary");
+            }
+        }
         parsed.options.max_new_tokens = request_uint(request, "max_new_tokens", parsed.options.max_new_tokens);
         parsed.options.use_speculative = request_bool(request, "enable_speculative", true);
-        parsed.options.stop_tokens = request_tokens(request, "stop_tokens", false);
-        if (const auto value = json_number(request, "temperature"))
+        if (find_manifest_member(request, "stop_tokens"))
+            parsed.options.stop_tokens = request_tokens(request, "stop_tokens", false);
+        else if (messages)
+            parsed.options.stop_tokens = tokenizer.stop_tokens();
+        if (find_manifest_member(request, "temperature"))
+        {
+            const auto value = json_number(request, "temperature");
+            if (!value)
+                throw std::invalid_argument("temperature must be a number");
             parsed.options.sampling.temperature = static_cast<float>(*value);
+        }
         else
             parsed.options.sampling.temperature = 0.0f;
-        if (const auto value = json_integer(request, "top_k"))
+        if (find_manifest_member(request, "top_k"))
             parsed.options.sampling.top_k = request_uint(request, "top_k", 0);
-        if (const auto value = json_number(request, "top_p"))
+        if (find_manifest_member(request, "top_p"))
+        {
+            const auto value = json_number(request, "top_p");
+            if (!value)
+                throw std::invalid_argument("top_p must be a number");
             parsed.options.sampling.top_p = static_cast<float>(*value);
-        if (const auto value = json_number(request, "min_p"))
+        }
+        if (find_manifest_member(request, "min_p"))
+        {
+            const auto value = json_number(request, "min_p");
+            if (!value)
+                throw std::invalid_argument("min_p must be a number");
             parsed.options.sampling.min_p = static_cast<float>(*value);
-        if (const auto value = json_number(request, "speculative_confidence"))
+        }
+        if (find_manifest_member(request, "speculative_confidence"))
+        {
+            const auto value = json_number(request, "speculative_confidence");
+            if (!value)
+                throw std::invalid_argument("speculative_confidence must be a number");
             parsed.options.speculative_confidence_threshold = static_cast<float>(*value);
+        }
+        if (!std::isfinite(parsed.options.sampling.temperature) || parsed.options.sampling.temperature < 0.0f)
+            throw std::invalid_argument("temperature must be finite and non-negative");
+        if (!std::isfinite(parsed.options.sampling.top_p)
+            || parsed.options.sampling.top_p <= 0.0f
+            || parsed.options.sampling.top_p > 1.0f)
+            throw std::invalid_argument("top_p must be in the range (0, 1]");
+        if (!std::isfinite(parsed.options.sampling.min_p)
+            || parsed.options.sampling.min_p < 0.0f
+            || parsed.options.sampling.min_p > 1.0f)
+            throw std::invalid_argument("min_p must be in the range [0, 1]");
+        if (!std::isfinite(parsed.options.speculative_confidence_threshold)
+            || parsed.options.speculative_confidence_threshold < 0.0f
+            || parsed.options.speculative_confidence_threshold > 1.0f)
+            throw std::invalid_argument("speculative_confidence must be in the range [0, 1]");
         parsed.options.speculative_max_draft_tokens = request_uint(request, "speculative_max_draft", 0);
         parsed.metrics_interval_ms = request_uint(request, "metrics_interval_ms", 1000);
         if (!request_bool(request, "metrics_enabled", true))
@@ -945,27 +1228,89 @@ private:
         const auto iterator = sessions.find(parsed.session_id);
         if (iterator == sessions.end())
             throw std::invalid_argument("unknown session: " + parsed.session_id);
+        WorkerSession& worker_session = iterator->second;
+        const uint32_t model_limit = maximum_context_tokens();
+        const uint32_t requested_limit = request_uint(request, "context_tokens", 0);
+        const uint32_t context_limit = model_limit == 0
+                                           ? requested_limit
+                                       : requested_limit == 0 ? model_limit
+                                                              : std::min(model_limit, requested_limit);
+        if (messages)
+            parsed.prompt_count = full_prompt.size();
+        else
+        {
+            const uint64_t sequence_length = worker_session.session->sequence_length();
+            if (parsed.prompt_tokens.size() > std::numeric_limits<uint64_t>::max() - sequence_length)
+                throw std::invalid_argument("prompt token count exceeds the uint64 range");
+            parsed.prompt_count = sequence_length + parsed.prompt_tokens.size();
+        }
         if (parsed.options.max_new_tokens == 0)
         {
-            const uint32_t max_context = maximum_context_tokens();
-            const uint64_t sequence_length = iterator->second->sequence_length();
-            if (max_context == 0 || sequence_length >= max_context)
-                throw std::invalid_argument("unlimited generation requires remaining model context");
-            parsed.options.max_new_tokens = static_cast<uint32_t>(max_context - sequence_length);
+            if (context_limit == 0 || parsed.prompt_count >= context_limit)
+            {
+                if (context_limit != 0)
+                {
+                    emit_context_overflow(parsed.request_id, parsed.prompt_count, context_limit);
+                    return;
+                }
+                throw std::invalid_argument("unlimited generation requires a known remaining context");
+            }
+            parsed.options.max_new_tokens = static_cast<uint32_t>(context_limit - parsed.prompt_count);
         }
+        if (context_limit != 0
+            && (parsed.prompt_count > context_limit
+                || parsed.options.max_new_tokens > context_limit - parsed.prompt_count))
+        {
+            emit_context_overflow(parsed.request_id, parsed.prompt_count, context_limit);
+            return;
+        }
+        if (messages)
+        {
+            const std::vector<int32_t>& committed = worker_session.committed_tokens;
+            const uint64_t sequence_length = worker_session.session->sequence_length();
+            parsed.prefix_reused = !committed.empty()
+                                   && committed.size() == sequence_length
+                                   && full_prompt.size() > committed.size()
+                                   && std::equal(committed.begin(), committed.end(), full_prompt.begin());
+            if (parsed.prefix_reused)
+            {
+                parsed.prompt_tokens.assign(full_prompt.begin() + static_cast<std::ptrdiff_t>(committed.size()),
+                                            full_prompt.end());
+            }
+            else
+            {
+                auto reset = worker_session.session->reset();
+                if (!reset)
+                {
+                    worker_session.committed_tokens.clear();
+                    emit_error(parsed.request_id, reset.error().message, error_code_name(reset.error().code));
+                    return;
+                }
+                worker_session.committed_tokens.clear();
+                parsed.prompt_tokens = std::move(full_prompt);
+            }
+            worker_session.committed_tokens.insert(worker_session.committed_tokens.end(),
+                                                   parsed.prompt_tokens.begin(),
+                                                   parsed.prompt_tokens.end());
+            parsed.track_prefix = true;
+        }
+        else
+            worker_session.committed_tokens.clear();
         // Only the request loop owns the active ID; the worker publishes completion.
         active_request_id = parsed.request_id;
+        const std::string request_id = parsed.request_id;
         cancel_requested.store(false);
         generation_running.store(true);
         try
         {
-            generation_thread = std::thread(&Worker::execute_generate, this, std::move(parsed), iterator->second);
+            generation_thread = std::thread(&Worker::execute_generate, this, std::move(parsed), std::ref(worker_session));
         }
         catch (...)
         {
+            worker_session.committed_tokens.clear();
             generation_running.store(false);
             active_request_id.clear();
-            throw;
+            emit_error(request_id, "could not start generation thread", "worker_exception");
         }
     }
 
@@ -985,9 +1330,12 @@ private:
     }
 
 public:
-    Worker(Runtime& _runtime, ModelPtr _model)
+    Worker(Runtime& _runtime, ModelPtr _model, const std::filesystem::path& model_directory)
         : runtime(_runtime), model(std::move(_model)), gpu_telemetry_sampler(runtime.info(), model_compiled(*model).opt)
     {
+        const std::string& model_type = model->descriptor().model_type;
+        native_text_supported = model_type == "qwen3_5_moe"
+                                && tokenizer.load(model_directory.string(), model->descriptor().vocabulary_size);
         (void)telemetry_sampler.sample();
         emit_ready();
     }
@@ -1041,7 +1389,10 @@ public:
             catch (const std::exception& exception)
             {
                 const auto request_id = json_string(line, "request_id").value_or("");
-                emit_error(request_id, exception.what());
+                const auto* invalid_argument = dynamic_cast<const std::invalid_argument*>(&exception);
+                emit_error(request_id,
+                           exception.what(),
+                           invalid_argument ? "invalid_request" : "worker_exception");
             }
         }
         cancel_requested.store(true);
@@ -1088,7 +1439,7 @@ int main(int argc, char** argv)
                       << std::flush;
             return 1;
         }
-        ncnn::moe::Worker worker(runtime, std::move(model).value());
+        ncnn::moe::Worker worker(runtime, std::move(model).value(), std::filesystem::path(argv[1]));
         return worker.run();
     }
     catch (const std::exception& exception)

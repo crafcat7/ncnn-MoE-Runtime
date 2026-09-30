@@ -1,6 +1,8 @@
 #ifndef NCNN_MOE_JSONLINE_H
 #define NCNN_MOE_JSONLINE_H
 
+#include "models/modeladapter.h"
+
 #include <charconv>
 #include <cmath>
 #include <cstddef>
@@ -32,57 +34,23 @@ inline std::size_t skip_space(std::string_view value, std::size_t offset)
 
 inline std::optional<std::size_t> json_value_offset(std::string_view object, std::string_view key)
 {
-    std::string needle;
-    needle.reserve(key.size() + 2);
-    needle.push_back('"');
-    needle.append(key);
-    needle.push_back('"');
-    std::size_t search = 0;
-    while (true)
-    {
-        const std::size_t key_offset = object.find(needle, search);
-        if (key_offset == std::string_view::npos)
-            return std::nullopt;
-        std::size_t offset = skip_space(object, key_offset + needle.size());
-        if (offset < object.size() && object[offset] == ':')
-            return skip_space(object, offset + 1);
-        search = key_offset + needle.size();
-    }
+    const std::optional<std::string_view> value = find_manifest_member(object, key);
+    if (!value)
+        return std::nullopt;
+    return static_cast<std::size_t>(value->data() - object.data());
 }
 
 inline std::optional<std::string> json_string(std::string_view object, std::string_view key)
 {
-    const auto offset_result = json_value_offset(object, key);
-    if (!offset_result || *offset_result >= object.size() || object[*offset_result] != '"')
+    const std::optional<std::string_view> value = find_manifest_member(object, key);
+    if (!value || value->empty() || value->front() != '"')
         return std::nullopt;
 
-    std::string result;
-    for (std::size_t offset = *offset_result + 1; offset < object.size(); ++offset)
-    {
-        const char value = object[offset];
-        if (value == '"')
-            return result;
-        if (value != '\\')
-        {
-            result.push_back(value);
-            continue;
-        }
-        if (++offset >= object.size())
-            return std::nullopt;
-        switch (object[offset])
-        {
-        case '"': result.push_back('"'); break;
-        case '\\': result.push_back('\\'); break;
-        case '/': result.push_back('/'); break;
-        case 'b': result.push_back('\b'); break;
-        case 'f': result.push_back('\f'); break;
-        case 'n': result.push_back('\n'); break;
-        case 'r': result.push_back('\r'); break;
-        case 't': result.push_back('\t'); break;
-        default: return std::nullopt;
-        }
-    }
-    return std::nullopt;
+    std::size_t position = 0;
+    std::string decoded;
+    if (!parse_json_string(*value, position, &decoded) || position != value->size())
+        return std::nullopt;
+    return decoded;
 }
 
 inline std::optional<int64_t> json_integer(std::string_view object, std::string_view key)
@@ -130,49 +98,58 @@ inline std::optional<double> json_number(std::string_view object, std::string_vi
 
 inline std::optional<bool> json_boolean(std::string_view object, std::string_view key)
 {
-    const auto offset_result = json_value_offset(object, key);
-    if (!offset_result)
+    const std::optional<std::string_view> value = find_manifest_member(object, key);
+    if (!value)
         return std::nullopt;
-    if (object.substr(*offset_result, 4) == "true")
+    if (*value == "true")
         return true;
-    if (object.substr(*offset_result, 5) == "false")
+    if (*value == "false")
         return false;
     return std::nullopt;
 }
 
 inline std::optional<std::vector<int64_t>> json_integer_array(std::string_view object, std::string_view key)
 {
-    const auto offset_result = json_value_offset(object, key);
-    if (!offset_result || *offset_result >= object.size() || object[*offset_result] != '[')
+    const std::optional<std::string_view> value = find_manifest_member(object, key);
+    if (!value || value->empty() || value->front() != '[')
         return std::nullopt;
 
+    const std::string_view array = *value;
     std::vector<int64_t> result;
-    std::size_t offset = skip_space(object, *offset_result + 1);
-    if (offset < object.size() && object[offset] == ']')
+    std::size_t offset = skip_space(array, 1);
+    if (offset < array.size() && array[offset] == ']')
+    {
+        if (offset + 1 != array.size())
+            return std::nullopt;
         return result;
-    while (offset < object.size())
+    }
+    while (offset < array.size())
     {
         const std::size_t value_start = offset;
-        while (offset < object.size()
-               && object[offset] != ','
-               && object[offset] != ']'
-               && !is_space(object[offset]))
+        while (offset < array.size()
+               && array[offset] != ','
+               && array[offset] != ']'
+               && !is_space(array[offset]))
         {
             ++offset;
         }
-        int64_t value = 0;
-        const auto parsed = std::from_chars(object.data() + value_start, object.data() + offset, value);
-        if (parsed.ec != std::errc() || parsed.ptr != object.data() + offset)
+        int64_t item = 0;
+        const auto parsed = std::from_chars(array.data() + value_start, array.data() + offset, item);
+        if (parsed.ec != std::errc() || parsed.ptr != array.data() + offset)
             return std::nullopt;
-        result.push_back(value);
-        offset = skip_space(object, offset);
-        if (offset >= object.size())
+        result.push_back(item);
+        offset = skip_space(array, offset);
+        if (offset >= array.size())
             return std::nullopt;
-        if (object[offset] == ']')
+        if (array[offset] == ']')
+        {
+            if (offset + 1 != array.size())
+                return std::nullopt;
             return result;
-        if (object[offset] != ',')
+        }
+        if (array[offset] != ',')
             return std::nullopt;
-        offset = skip_space(object, offset + 1);
+        offset = skip_space(array, offset + 1);
     }
     return std::nullopt;
 }
@@ -195,7 +172,13 @@ inline std::string json_escape(std::string_view value)
         case '\t': result += "\\t"; break;
         default:
             if (static_cast<unsigned char>(character) < 0x20)
-                result += "?";
+            {
+                constexpr char hex[] = "0123456789abcdef";
+                const unsigned char value = static_cast<unsigned char>(character);
+                result += "\\u00";
+                result.push_back(hex[value >> 4]);
+                result.push_back(hex[value & 0x0f]);
+            }
             else
                 result.push_back(character);
             break;

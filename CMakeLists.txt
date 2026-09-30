@@ -448,7 +448,8 @@ if(NCNN_MOE_BUILD_EXAMPLES)
     add_executable(
         ncnn_moe_worker
         examples/ncnn_moe_worker.cpp
-        examples/internal/gputelemetry.cpp)
+        examples/internal/gputelemetry.cpp
+        examples/internal/tokenizer.cpp)
     target_link_libraries(
         ncnn_moe_worker
         PRIVATE ncnn::moe)
@@ -458,6 +459,16 @@ if(NCNN_MOE_BUILD_EXAMPLES)
     target_include_directories(
         ncnn_moe_worker
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    find_package(ICU 76 COMPONENTS i18n uc data QUIET)
+    if(ICU_FOUND)
+        set_source_files_properties(
+            examples/internal/tokenizer.cpp
+            PROPERTIES COMPILE_DEFINITIONS NCNN_MOE_TOKENIZER_ICU=1)
+        target_link_libraries(
+            ncnn_moe_worker
+            PRIVATE ICU::i18n ICU::uc ICU::data)
+    endif()
     if(WIN32)
         target_link_libraries(ncnn_moe_worker PRIVATE psapi)
     endif()
@@ -466,6 +477,8 @@ if(NCNN_MOE_BUILD_EXAMPLES)
     endif()
     install(TARGETS ncnn_moe_worker
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES examples/internal/tokenizer.LICENSE
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/ncnn-moe-runtime/licenses)
 
     if(NCNN_MOE_BUILD_MXFP4_BENCHMARK)
         add_executable(

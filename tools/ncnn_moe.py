@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from ncnn_moe_adapters import AdapterError, Completion, ModelAdapter, create_adapter
+    from ncnn_moe_adapters import AdapterError, Completion, ModelAdapter, NativeQwenAdapter, create_adapter
     from ncnn_moe_protocol import WorkerClient, WorkerError
     from ncnn_moe_state import (
         SessionStore,
@@ -25,7 +25,7 @@ try:
         runtime_args_from_settings,
     )
 except ModuleNotFoundError:  # Installed entry point: tools is a package.
-    from .ncnn_moe_adapters import AdapterError, Completion, ModelAdapter, create_adapter
+    from .ncnn_moe_adapters import AdapterError, Completion, ModelAdapter, NativeQwenAdapter, create_adapter
     from .ncnn_moe_protocol import WorkerClient, WorkerError
     from .ncnn_moe_state import (
         SessionStore,
@@ -504,7 +504,8 @@ def open_worker(
     *,
     adapter: ModelAdapter | None = None,
     session: dict[str, Any] | None = None,
-) -> tuple[WorkerClient, dict[str, Any], dict[str, Any] | None]:
+    select_adapter: bool = False,
+) -> tuple[WorkerClient, dict[str, Any], dict[str, Any] | None, ModelAdapter | None]:
     source_root = Path(__file__).resolve().parents[1]
     root = source_root if (source_root / "CMakeLists.txt").is_file() else Path.cwd().resolve()
     worker = find_worker(getattr(arguments, "worker", None), root)
@@ -520,6 +521,12 @@ def open_worker(
         runtime_args_from_settings(initial),
         verbose=getattr(arguments, "verbose", False),
     )
+    if select_adapter and adapter is None:
+        try:
+            adapter = load_adapter(arguments, model, client.ready)
+        except BaseException:
+            client.close()
+            raise
     model_fingerprint = adapter.model_fingerprint if adapter else lightweight_model_fingerprint(model)
     budget = context_budget(adapter, arguments, client.ready) if adapter else int(getattr(arguments, "context_tokens", 0) or 0)
     budget = budget or int(client.ready.get("model", {}).get("max_context_tokens", 0) or 0)
@@ -547,7 +554,7 @@ def open_worker(
             runtime_args_from_settings(merged),
             verbose=getattr(arguments, "verbose", False),
         )
-    return client, merged, profile_record
+    return client, merged, profile_record, adapter
 
 
 def default_generation_values(adapter: ModelAdapter, arguments: argparse.Namespace) -> tuple[float, int, float]:
@@ -567,8 +574,8 @@ def default_generation_values(adapter: ModelAdapter, arguments: argparse.Namespa
 
 
 def validate_generation_arguments(arguments: argparse.Namespace) -> None:
-    if arguments.max_new_tokens <= 0:
-        raise ValueError("--max-new-tokens must be greater than zero")
+    if arguments.max_new_tokens < 0:
+        raise ValueError("--max-new-tokens must be non-negative")
     if arguments.top_k is not None and arguments.top_k < 0:
         raise ValueError("--top-k must be non-negative")
     if arguments.speculative_max_draft < 0:
@@ -623,7 +630,9 @@ class ConversationApp:
         self.summary_session_created = False
         self.messages: list[dict[str, str]] = []
         self.summary = ""
-        self.native_context_tokens: list[int] = []
+        if not self.native_text:
+            self.native_context_tokens: list[int] = []
+        self.native_context_count = 0
         self.last_reasoning = ""
         self.last_metrics: dict[str, Any] = {}
         self.record = record or {
@@ -646,26 +655,124 @@ class ConversationApp:
             self.summary = str(record.get("summary", "") or "")
         if getattr(arguments, "system", "") and not any(message.get("role") == "system" for message in self.messages):
             self.messages.insert(0, {"role": "system", "content": arguments.system})
+        if self.adapter.model_type == "qwen3_5_moe":
+            leading_system_count = 0
+            while (
+                leading_system_count < len(self.messages)
+                and self.messages[leading_system_count].get("role") == "system"
+            ):
+                leading_system_count += 1
+            if leading_system_count > 1:
+                summary_marker = f"Conversation summary:\n{self.summary}" if self.summary else ""
+                summary_suffix = f"\n\n{summary_marker}" if summary_marker else ""
+                summary_seen = False
+                system_parts: list[str] = []
+                for message in self.messages[:leading_system_count]:
+                    content = message["content"]
+                    if summary_marker and content == summary_marker:
+                        if summary_seen:
+                            continue
+                        summary_seen = True
+                    elif summary_suffix and content.endswith(summary_suffix):
+                        original = content[: -len(summary_suffix)]
+                        if summary_seen:
+                            content = original
+                        else:
+                            if original:
+                                system_parts.append(original)
+                            system_parts.append(summary_marker)
+                            summary_seen = True
+                            continue
+                    if content:
+                        system_parts.append(content)
+                merged_system = "\n\n".join(system_parts)
+                self.messages = [
+                    {"role": "system", "content": merged_system},
+                    *self.messages[leading_system_count:],
+                ]
         self.client.create_session(
             self.native_session_id,
             seed=arguments.seed,
             prefill_chunk_size=arguments.prefill_chunk_size,
             enable_speculative_context=not arguments.no_speculative,
         )
+        replay_succeeded = False
         if record and self.messages:
             try:
-                replay_tokens = self.adapter.encode_messages(self.messages)
-                self._status(f"resuming {record.get('id')} · replaying {len(replay_tokens)} context tokens")
-                self.client.compact(self.native_session_id, replay_tokens)
-                self.native_context_tokens = replay_tokens
-                self._status(f"resumed {record.get('id')} ({len(self.messages)} messages)")
+                replay = self._compact_messages(self.native_session_id, self.messages)
+                self.native_context_count = int(replay.get("sequence_length", 0) or 0)
+                replay_succeeded = True
+                self._status(f"resumed {record.get('id')} ({len(self.messages)} messages, {self.native_context_count} context tokens)")
             except (AdapterError, WorkerError, ValueError) as error:
-                self.native_context_tokens = []
+                if not self.native_text:
+                    self.native_context_tokens = []
+                self.native_context_count = 0
                 self._status(f"session replay deferred: {error}")
+        if (
+            record
+            and hasattr(self.adapter, "_legacy_model_fingerprint")
+            and record.get("model_fingerprint") != self.adapter.model_fingerprint
+            and (replay_succeeded or not self.messages)
+        ):
+            self._save()
 
     @property
     def context_limit(self) -> int | None:
         return context_budget(self.adapter, self.arguments, self.client.ready)
+
+    @property
+    def native_text(self) -> bool:
+        return bool(getattr(self.adapter, "native_text", False))
+
+    @property
+    def worker_context_tokens(self) -> int | None:
+        override = int(getattr(self.arguments, "context_tokens", 0) or 0)
+        if override > 0:
+            return override
+        model_limit = int(self.client.ready.get("model", {}).get("max_context_tokens", 0) or 0)
+        return model_limit or None
+
+    def _generate_messages(self, session_id: str, messages: list[dict[str, str]], **options: Any) -> tuple[dict[str, Any], list[int]]:
+        if self.native_text:
+            options.pop("stop_tokens", None)
+            return self.client.generate(
+                session_id,
+                messages=messages,
+                thinking=self.adapter.thinking,
+                context_tokens=self.worker_context_tokens,
+                **options,
+            )
+        return self.client.generate(session_id, self.adapter.encode_messages(messages), **options)
+
+    def _compact_messages(self, session_id: str, messages: list[dict[str, str]]) -> dict[str, Any]:
+        if self.native_text:
+            return self.client.compact(
+                session_id,
+                messages=messages,
+                thinking=self.adapter.thinking,
+                context_tokens=self.worker_context_tokens,
+            )
+        prompt_tokens = self.adapter.encode_messages(messages)
+        replay = self.client.compact(session_id, prompt_tokens)
+        sequence_length = replay.get("sequence_length")
+        if (
+            isinstance(sequence_length, int)
+            and not isinstance(sequence_length, bool)
+            and sequence_length == len(prompt_tokens)
+        ):
+            self.native_context_tokens = prompt_tokens
+        else:
+            self.native_context_tokens = []
+        return replay
+
+    def _prompt_count(self, session_id: str, messages: list[dict[str, str]]) -> int:
+        if self.native_text:
+            event = self.client.stats(session_id, messages=messages, thinking=self.adapter.thinking)
+            count = event.get("prompt_count")
+            if isinstance(count, bool) or not isinstance(count, int):
+                raise WorkerError("worker did not return the native prompt count", event)
+            return count
+        return len(self.adapter.encode_messages(messages))
 
     def _status(self, message: str) -> None:
         if self.console:
@@ -688,10 +795,30 @@ class ConversationApp:
         self.record["settings"] = self.settings
         self.record["model"] = str(self.adapter.model)
         self.record["model_type"] = self.adapter.model_type
-        self.record["model_fingerprint"] = self.adapter.model_fingerprint
-        self.record["context_token_count"] = len(self.native_context_tokens)
+        stored_fingerprint = self.record.get("model_fingerprint")
+        legacy_fingerprint = getattr(self.adapter, "_legacy_model_fingerprint", None)
+        migration_ready = not self.messages or (
+            self.native_context_count > 0 if self.native_text else bool(self.native_context_tokens)
+        )
+        fingerprint_migrated = False
+        if hasattr(self.adapter, "_legacy_model_fingerprint"):
+            compatible_fingerprint = (
+                stored_fingerprint is None
+                or stored_fingerprint == self.adapter.model_fingerprint
+                or stored_fingerprint == legacy_fingerprint
+            )
+            if compatible_fingerprint and (
+                stored_fingerprint == self.adapter.model_fingerprint or migration_ready
+            ):
+                fingerprint_migrated = stored_fingerprint != self.adapter.model_fingerprint
+                self.record["model_fingerprint"] = self.adapter.model_fingerprint
+        else:
+            self.record["model_fingerprint"] = self.adapter.model_fingerprint
+        self.record["context_token_count"] = self.native_context_count if self.native_text else len(self.native_context_tokens)
         if not self.ephemeral:
             self.store.save(self.record)
+            if fingerprint_migrated:
+                self._status("session tokenizer profile updated")
 
     def _transcript(self) -> str:
         parts = []
@@ -715,7 +842,6 @@ class ConversationApp:
                 {"role": "system", "content": summary_system},
                 {"role": "user", "content": self._transcript()},
             ]
-            prompt_tokens = self.adapter.encode_messages(summary_prompt)
             if not self.summary_session_created:
                 self.client.create_session(
                     self.summary_session_id,
@@ -726,11 +852,13 @@ class ConversationApp:
                 self.summary_session_created = True
             else:
                 self.client.reset(self.summary_session_id)
-            _, tokens = self.client.generate(
+            summary_tokens: list[int] = []
+            summary_stream: dict[str, Any] = {}
+            _, tokens = self._generate_messages(
                 self.summary_session_id,
-                prompt_tokens,
+                summary_prompt,
                 request_id="compact-summary",
-                max_new_tokens=min(512, self.arguments.max_new_tokens),
+                max_new_tokens=min(512, self.arguments.max_new_tokens) if self.arguments.max_new_tokens else 512,
                 temperature=0.0,
                 top_k=0,
                 top_p=1.0,
@@ -739,8 +867,11 @@ class ConversationApp:
                 enable_speculative=False,
                 metrics_enabled=metrics_trace_enabled(self.arguments),
                 metrics_interval_ms=self.arguments.metrics_interval_ms,
+                on_event=lambda event: self._on_generation_event(
+                    event, summary_tokens, summary_stream, display=False
+                ),
             )
-            completion = self.adapter.decode_completion(tokens)
+            completion = self._decode_completion(tokens, summary_stream)
             summary = completion.answer or completion.reasoning or completion.text
             if summary.strip():
                 return summary.strip()
@@ -754,7 +885,9 @@ class ConversationApp:
                 self.client.compact(self.native_session_id, [])
             except WorkerError:
                 self.client.reset(self.native_session_id)
-            self.native_context_tokens = []
+            if not self.native_text:
+                self.native_context_tokens = []
+            self.native_context_count = 0
             if announce:
                 self._status("context reset; not enough history to summarize")
             return
@@ -763,32 +896,59 @@ class ConversationApp:
         summary = self._summarize()
         system_messages = [message for message in old_messages if message.get("role") == "system"]
         retained = [message for message in old_messages if message.get("role") != "system"][-4:]
-        summary_message = {"role": "system", "content": f"Conversation summary:\n{summary}"}
-        self.messages = system_messages[:1] + [summary_message] + retained
+        previous_summary = f"Conversation summary:\n{old_summary}" if old_summary else ""
+        previous_suffix = f"\n\n{previous_summary}" if previous_summary else ""
+        system_content_parts = []
+        for message in system_messages:
+            content = message["content"]
+            if previous_summary and content == previous_summary:
+                continue
+            if previous_suffix and content.endswith(previous_suffix):
+                content = content[: -len(previous_suffix)]
+            if content:
+                system_content_parts.append(content)
+        system_content = "\n\n".join(system_content_parts)
+        summary_content = f"Conversation summary:\n{summary}"
+        combined_system = "\n\n".join(content for content in (system_content, summary_content) if content)
+        self.messages = [{"role": "system", "content": combined_system}] + retained
         self.summary = summary
         try:
-            self.client.compact(self.native_session_id, [])
+            if self.native_text:
+                replay = self._compact_messages(self.native_session_id, self.messages)
+                self.native_context_count = int(replay.get("sequence_length", 0) or 0)
+            else:
+                self.client.compact(self.native_session_id, [])
+                self.native_context_tokens = []
         except WorkerError:
             self.messages = old_messages
             self.summary = old_summary
             self._trim_sliding_window()
             self.client.reset(self.native_session_id)
-            self.native_context_tokens = []
+            if not self.native_text:
+                self.native_context_tokens = []
+            self.native_context_count = 0
             if announce:
                 self._status("native compact failed; using sliding-window fallback")
             return
-        self.native_context_tokens = []
+        if not self.native_text:
+            self.native_context_tokens = []
+            self.native_context_count = 0
         if announce:
             self._status(f"context compacted · retained {len(self.messages)} messages")
 
-    def _trim_sliding_window(self) -> None:
-        budget = self.context_limit
+    def _trim_sliding_window(self, prompt_count: int | None = None) -> None:
+        budget = self.worker_context_tokens if self.native_text else self.context_limit
         if budget is None:
             return
+        if type(prompt_count) is not int or prompt_count <= 0:
+            prompt_count = None
         for _ in range(100):
-            tokens = self.adapter.encode_messages(self.messages)
-            if len(tokens) + self.arguments.max_new_tokens <= budget:
+            if prompt_count is None:
+                prompt_count = self._prompt_count(self.native_session_id, self.messages)
+            generation_budget = self.arguments.max_new_tokens or 1
+            if prompt_count + generation_budget <= budget:
                 return
+            prompt_count = None
             non_system = [index for index, message in enumerate(self.messages) if message.get("role") != "system"]
             if len(non_system) <= 1:
                 if non_system:
@@ -809,68 +969,268 @@ class ConversationApp:
                 tokens = self.adapter.encode_messages(self.messages)
         return tokens
 
-    def _on_generation_event(self, event: dict[str, Any], generated_tokens: list[int], streamed: dict[str, str]) -> None:
+    def _on_generation_event(
+        self,
+        event: dict[str, Any],
+        generated_tokens: list[int],
+        streamed: dict[str, Any],
+        *,
+        display: bool = True,
+    ) -> None:
         if event.get("event") == "metrics":
             streamed["metrics"] = json.dumps(event.get("metrics", {}), ensure_ascii=False)
             self.last_metrics = event.get("metrics", {})
-            self._status(_format_runtime_metrics(self.last_metrics))
+            if display:
+                self._status(_format_runtime_metrics(self.last_metrics))
             return
-        if event.get("event") != "token" or not self.arguments.stream:
+        if event.get("event") != "token":
             return
-        generated_tokens.append(int(event["token_id"]))
-        visible = self.adapter.stream_visible(
-            generated_tokens,
-            final_only=self.arguments.stream_final_only or not self.arguments.show_reasoning,
-        )
-        previous = streamed.get("text", "")
-        if visible.startswith(previous):
-            delta = visible[len(previous) :]
-            if delta:
-                sys.stdout.write(delta)
-                sys.stdout.flush()
-        streamed["text"] = visible
+        token_id = int(event["token_id"])
+        text = event.get("text")
+        if self.native_text and not isinstance(text, str):
+            raise WorkerError("native Worker token event did not include decoded text", event)
+        if self.native_text and isinstance(text, str):
+            streamed.setdefault("decoded_chunks", []).append(text)
+            streamed["native_started"] = True
+        if not display or not self.arguments.stream:
+            return
+        chunks = streamed.setdefault("chunks", [])
+        if not self.native_text:
+            generated_tokens.append(token_id)
+            visible = self.adapter.stream_visible(
+                generated_tokens,
+                final_only=self.arguments.stream_final_only or not self.arguments.show_reasoning,
+            )
+            printed = "".join(chunks)
+            if visible.startswith(printed):
+                delta = visible[len(printed) :]
+                if delta:
+                    chunks.append(delta)
+                    streamed["printed_length"] = streamed.get("printed_length", 0) + len(delta)
+                    sys.stdout.write(delta)
+                    sys.stdout.flush()
+            return
+
+        if not isinstance(text, str):
+            return
+        if "phase" not in streamed:
+            streamed["phase"] = "reasoning" if self.adapter.thinking else "body"
+            streamed["marker_carry"] = ""
+            streamed["tail"] = []
+            streamed["reasoning_leading"] = True
+            streamed["body_leading"] = True
+            streamed["answer_leading"] = True
+            streamed["reasoning_nonempty"] = False
+            streamed["answer_nonempty"] = False
+
+        output: list[str] = []
+        marker = "</think>"
+        phase = streamed["phase"]
+        segments: list[tuple[str, str, bool]]
+        if phase == "reasoning":
+            combined = streamed["marker_carry"] + text
+            marker_index = combined.find(marker)
+            if marker_index >= 0:
+                segments = [
+                    ("reasoning", combined[:marker_index], True),
+                    ("answer", combined[marker_index + len(marker) :], False),
+                ]
+                streamed["phase"] = "answer"
+                streamed["marker_carry"] = ""
+            else:
+                carry_length = 0
+                for length in range(min(len(marker) - 1, len(combined)), 0, -1):
+                    if combined.endswith(marker[:length]):
+                        carry_length = length
+                        break
+                streamed["marker_carry"] = combined[-carry_length:] if carry_length else ""
+                safe_text = combined[:-carry_length] if carry_length else combined
+                segments = [("reasoning", safe_text, False)]
+        else:
+            segments = [(phase, text, False)]
+
+        final_only = self.arguments.stream_final_only or not self.arguments.show_reasoning
+        tail: list[str] = streamed["tail"]
+        for kind, segment, terminal in segments:
+            position = 0
+            if kind == "reasoning":
+                while position < len(segment) and streamed["reasoning_leading"] and segment[position].isspace():
+                    position += 1
+                if position < len(segment):
+                    streamed["reasoning_leading"] = False
+            elif kind == "body":
+                while position < len(segment) and streamed["body_leading"] and segment[position].isspace():
+                    position += 1
+                if position < len(segment):
+                    streamed["body_leading"] = False
+            else:
+                while position < len(segment) and streamed["answer_leading"] and segment[position] in "\r\n":
+                    position += 1
+                if position < len(segment):
+                    streamed["answer_leading"] = False
+
+            while position < len(segment):
+                start = position
+                candidate = segment[position].isspace() or segment[position] == "\ufffd"
+                position += 1
+                if candidate:
+                    while position < len(segment) and (segment[position].isspace() or segment[position] == "\ufffd"):
+                        position += 1
+                    tail.append(segment[start:position])
+                    continue
+                while position < len(segment) and not (segment[position].isspace() or segment[position] == "\ufffd"):
+                    position += 1
+                safe_text = segment[start:position]
+                pending = "".join(tail)
+                tail.clear()
+                if kind == "reasoning":
+                    if not final_only:
+                        if not streamed["reasoning_nonempty"]:
+                            output.append("[reasoning]\n")
+                        if pending:
+                            output.append(pending)
+                        output.append(safe_text)
+                    streamed["reasoning_nonempty"] = True
+                elif kind == "answer":
+                    if not final_only and not streamed["answer_nonempty"]:
+                        label = "\n[answer]\n" if streamed["reasoning_nonempty"] else "[answer]\n"
+                        output.append(label)
+                    if pending:
+                        output.append(pending)
+                    output.append(safe_text)
+                    streamed["answer_nonempty"] = True
+                else:
+                    if not final_only and not streamed["answer_nonempty"]:
+                        output.append("[answer]\n")
+                    if pending:
+                        output.append(pending)
+                    output.append(safe_text)
+                    streamed["answer_nonempty"] = True
+
+            if terminal:
+                pending = "".join(tail).rstrip()
+                tail.clear()
+                if pending:
+                    if not final_only:
+                        if not streamed["reasoning_nonempty"]:
+                            output.append("[reasoning]\n")
+                        output.append(pending)
+                    streamed["reasoning_nonempty"] = True
+
+        delta = "".join(output)
+        if delta:
+            chunks.append(delta)
+            streamed["printed_length"] = streamed.get("printed_length", 0) + len(delta)
+            sys.stdout.write(delta)
+            sys.stdout.flush()
+
+    def _decode_completion(self, tokens: list[int], streamed: dict[str, Any]) -> Completion:
+        if self.native_text:
+            text = "".join(streamed.get("decoded_chunks", []))
+            return self.adapter.decode_native_completion(text, tokens)
+        return self.adapter.decode_completion(tokens)
 
     def send(self, user_text: str) -> tuple[Completion, dict[str, Any], bool]:
         self.messages.append({"role": "user", "content": user_text})
-        prompt_tokens = self._prompt_tokens_with_budget()
-        reused = bool(self.native_context_tokens and prompt_tokens[: len(self.native_context_tokens)] == self.native_context_tokens)
-        if reused:
-            input_tokens = prompt_tokens[len(self.native_context_tokens) :]
-            native_base = list(self.native_context_tokens)
-        else:
-            self.client.reset(self.native_session_id)
-            input_tokens = prompt_tokens
-            native_base = []
-        if not input_tokens:
-            self.client.reset(self.native_session_id)
-            input_tokens = prompt_tokens
-            native_base = []
         generated_tokens: list[int] = []
-        streamed: dict[str, str] = {}
+        streamed: dict[str, Any] = {"chunks": [], "decoded_chunks": []}
         temperature, top_k, top_p = default_generation_values(self.adapter, self.arguments)
-        done, generated_tokens = self.client.generate(
-            self.native_session_id,
-            input_tokens,
-            request_id=f"chat-{int(time.time() * 1000)}",
-            max_new_tokens=self.arguments.max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            min_p=self.arguments.min_p,
-            stop_tokens=self.adapter.stop_tokens,
-            enable_speculative=not self.arguments.no_speculative,
-            speculative_confidence=self.arguments.speculative_confidence,
-            speculative_max_draft=self.arguments.speculative_max_draft,
-            metrics_enabled=metrics_trace_enabled(self.arguments),
-            metrics_interval_ms=self.arguments.metrics_interval_ms,
-            on_event=lambda event: self._on_generation_event(event, generated_tokens, streamed),
-        )
-        completion = self.adapter.decode_completion(generated_tokens)
+        request_id = f"chat-{int(time.time() * 1000)}"
+        options = {
+            "request_id": request_id,
+            "max_new_tokens": self.arguments.max_new_tokens,
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "min_p": self.arguments.min_p,
+            "stop_tokens": self.adapter.stop_tokens,
+            "enable_speculative": not self.arguments.no_speculative,
+            "speculative_confidence": self.arguments.speculative_confidence,
+            "speculative_max_draft": self.arguments.speculative_max_draft,
+            "metrics_enabled": metrics_trace_enabled(self.arguments),
+            "metrics_interval_ms": self.arguments.metrics_interval_ms,
+            "on_event": lambda event: self._on_generation_event(event, generated_tokens, streamed),
+        }
+        if self.native_text:
+            def generate_native() -> tuple[dict[str, Any], list[int]]:
+                try:
+                    return self._generate_messages(self.native_session_id, self.messages, **options)
+                except WorkerError as error:
+                    if error.event.get("code") not in {"context_overflow", "invalid_request"}:
+                        self.native_context_count = 0
+                    raise
+
+            try:
+                done, generated_tokens = generate_native()
+            except WorkerError as error:
+                if error.event.get("code") != "context_overflow":
+                    raise
+                pending_user = self.messages.pop()
+                self.compact()
+                self.messages.append(pending_user)
+                try:
+                    done, generated_tokens = generate_native()
+                except WorkerError as retry_error:
+                    if retry_error.event.get("code") != "context_overflow":
+                        raise
+                    self._trim_sliding_window(retry_error.event.get("prompt_count"))
+                    done, generated_tokens = generate_native()
+            reused = bool(done.get("prefix_reused", False))
+            completion = self._decode_completion(generated_tokens, streamed)
+            if self.arguments.stream and streamed.get("native_started"):
+                visible = self.adapter.visible_completion(
+                    completion,
+                    final_only=self.arguments.stream_final_only or not self.arguments.show_reasoning,
+                )
+                chunks = streamed["chunks"]
+                printed = "".join(chunks)
+                if visible.startswith(printed):
+                    delta = visible[len(printed) :]
+                    if delta:
+                        chunks.append(delta)
+                        streamed["printed_length"] = streamed.get("printed_length", 0) + len(delta)
+                        sys.stdout.write(delta)
+                        sys.stdout.flush()
+            sequence_length = done.get("sequence_length")
+            self.native_context_count = (
+                sequence_length
+                if isinstance(sequence_length, int) and not isinstance(sequence_length, bool)
+                else 0
+            )
+        else:
+            prompt_tokens = self._prompt_tokens_with_budget()
+            reused = bool(self.native_context_tokens and prompt_tokens[: len(self.native_context_tokens)] == self.native_context_tokens)
+            if reused:
+                input_tokens = prompt_tokens[len(self.native_context_tokens) :]
+                native_base = list(self.native_context_tokens)
+            else:
+                self.client.reset(self.native_session_id)
+                input_tokens = prompt_tokens
+                native_base = []
+            if not input_tokens:
+                self.client.reset(self.native_session_id)
+                input_tokens = prompt_tokens
+                native_base = []
+            self.native_context_tokens = []
+            done, generated_tokens = self.client.generate(self.native_session_id, input_tokens, **options)
+            completion = self._decode_completion(generated_tokens, streamed)
+            base_count = len(native_base) + len(input_tokens)
+            sequence_length = done.get("sequence_length")
+            if (
+                isinstance(sequence_length, int)
+                and not isinstance(sequence_length, bool)
+                and base_count <= sequence_length <= base_count + len(generated_tokens)
+            ):
+                committed_count = sequence_length - base_count
+                native_base.extend(input_tokens)
+                native_base.extend(generated_tokens[:committed_count])
+                self.native_context_tokens = native_base
+            else:
+                self.native_context_tokens = []
         self.last_reasoning = completion.reasoning
         self.messages.append({"role": "assistant", "content": completion.answer or completion.reasoning})
-        self.native_context_tokens = native_base + input_tokens + generated_tokens
         self._save()
-        if self.arguments.stream and streamed.get("text"):
+        if self.arguments.stream and streamed.get("printed_length", 0):
             sys.stdout.write("\n")
             sys.stdout.flush()
         return completion, done, reused
@@ -890,20 +1250,21 @@ class ConversationApp:
     def status_after(self, done: dict[str, Any], reused: bool) -> None:
         metrics = done.get("metrics", {})
         self.last_metrics = metrics if isinstance(metrics, dict) else {}
+        context_count = self.native_context_count if self.native_text else len(self.native_context_tokens)
         self._status(
             _format_runtime_metrics(self.last_metrics)
             + "\n  Context "
-            + f"{len(self.native_context_tokens)}/{self.context_limit or 'auto'}"
+            + f"{context_count}/{self.context_limit or 'auto'}"
             + " tokens"
             + f" · prefix {'reused' if reused else 'replayed'}"
         )
 
     def show_context(self) -> None:
-        tokens = self.adapter.encode_messages(self.messages) if self.messages else []
+        tokens = self._prompt_count(self.native_session_id, self.messages) if self.messages else 0
         budget = self.context_limit
         self._status(
-            f"messages={len(self.messages)} prompt_tokens={len(tokens)} "
-            f"budget={budget or 'unknown'} native_sequence={len(self.native_context_tokens)}"
+            f"messages={len(self.messages)} prompt_tokens={tokens} "
+            f"budget={budget or 'unknown'} native_sequence={self.native_context_count if self.native_text else len(self.native_context_tokens)}"
         )
 
     def show_settings(self) -> None:
@@ -919,13 +1280,12 @@ class ConversationApp:
                 self.tune_session_created = True
             else:
                 self.client.reset(tune_session)
-            prompt_tokens = self.adapter.encode_messages([{"role": "user", "content": prompt}])
             temperature, top_k, top_p = default_generation_values(self.adapter, self.arguments)
-            done, _ = self.client.generate(
+            done, _ = self._generate_messages(
                 tune_session,
-                prompt_tokens,
+                [{"role": "user", "content": prompt}],
                 request_id="tune-live",
-                max_new_tokens=min(32, self.arguments.max_new_tokens),
+                max_new_tokens=min(32, self.arguments.max_new_tokens) if self.arguments.max_new_tokens else 32,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
@@ -969,7 +1329,9 @@ class ConversationApp:
         self.messages = []
         if self.arguments.system:
             self.messages.append({"role": "system", "content": self.arguments.system})
-        self.native_context_tokens = []
+        if not self.native_text:
+            self.native_context_tokens = []
+        self.native_context_count = 0
         self.record = {
             "id": self.store.new_id(),
             "title": "New conversation",
@@ -1001,8 +1363,10 @@ class ConversationApp:
         elif command == "/compact":
             self.compact()
         elif command == "/reset":
+            if not self.native_text:
+                self.native_context_tokens = []
+            self.native_context_count = 0
             self.client.reset(self.native_session_id)
-            self.native_context_tokens = []
             self.messages = [message for message in self.messages if message.get("role") == "system"]
             self._save()
             self._status("conversation reset")
@@ -1054,9 +1418,33 @@ class ConversationApp:
         return 0
 
 
-def load_adapter(arguments: argparse.Namespace, model: Path) -> ModelAdapter:
+def load_adapter(arguments: argparse.Namespace, model: Path, ready: dict[str, Any] | None = None) -> ModelAdapter:
     thinking_mode = getattr(arguments, "thinking_mode", "thinking")
     thinking = thinking_mode != "chat" and not getattr(arguments, "no_thinking", False)
+    model_info = ready.get("model", {}) if isinstance(ready, dict) else {}
+    native_version = model_info.get("native_text_version") if isinstance(model_info, dict) else None
+    if (
+        isinstance(model_info, dict)
+        and model_info.get("native_text_supported") is True
+        and native_version == "ncnn-moe-qwen3.6-nfc9-regex16-v1"
+    ):
+        stop_tokens = model_info.get("native_stop_tokens")
+        if not isinstance(stop_tokens, list) or not stop_tokens:
+            stop_tokens = None
+        if stop_tokens is None:
+            return create_adapter(model, thinking=thinking, thinking_mode=thinking_mode)
+        try:
+            adapter = NativeQwenAdapter(
+                model,
+                native_text_version=native_version,
+                native_stop_tokens=stop_tokens,
+                thinking=thinking,
+                thinking_mode=thinking_mode,
+            )
+            adapter.validate()
+            return adapter
+        except (AdapterError, OSError):
+            pass
     return create_adapter(model, thinking=thinking, thinking_mode=thinking_mode)
 
 
@@ -1065,9 +1453,9 @@ def run_command(arguments: argparse.Namespace) -> int:
     model = resolve_model(arguments)
     prompt = resolve_prompt(arguments)
     assert model is not None and prompt is not None
-    adapter = load_adapter(arguments, model)
     store = SessionStore()
-    client, settings, _ = open_worker(arguments, model, store, adapter=adapter)
+    client, settings, _, adapter = open_worker(arguments, model, store, select_adapter=True)
+    assert adapter is not None
     record = None
     try:
         app = ConversationApp(
@@ -1096,11 +1484,18 @@ def chat_command(arguments: argparse.Namespace) -> int:
     record = store.load(arguments.session) if arguments.session else None
     if arguments.session and record is None:
         raise ValueError(f"session does not exist: {arguments.session}")
-    adapter = load_adapter(arguments, model)
-    if record and record.get("model_fingerprint") not in {None, adapter.model_fingerprint}:
-        raise ValueError("the requested session belongs to a different model fingerprint")
-    client, settings, _ = open_worker(arguments, model, store, adapter=adapter, session=record)
+    client, settings, _, adapter = open_worker(arguments, model, store, session=record, select_adapter=True)
+    assert adapter is not None
     try:
+        legacy_fingerprint = getattr(adapter, "_legacy_model_fingerprint", None)
+        stored_fingerprint = record.get("model_fingerprint") if record else None
+        if (
+            record
+            and stored_fingerprint is not None
+            and stored_fingerprint != adapter.model_fingerprint
+            and stored_fingerprint != legacy_fingerprint
+        ):
+            raise ValueError("the requested session belongs to a different model fingerprint")
         app = ConversationApp(
             adapter=adapter,
             client=client,
@@ -1119,7 +1514,7 @@ def inspect_command(arguments: argparse.Namespace) -> int:
     model = resolve_model(arguments)
     assert model is not None
     store = SessionStore()
-    client, _, _ = open_worker(arguments, model, store)
+    client, _, _, _ = open_worker(arguments, model, store)
     try:
         if arguments.json:
             print(json.dumps(client.ready, ensure_ascii=False, indent=2, sort_keys=True))
@@ -1161,30 +1556,43 @@ def tune_command(arguments: argparse.Namespace) -> int:
     model = resolve_model(arguments)
     prompt = resolve_prompt(arguments)
     assert model is not None and prompt is not None
-    adapter = load_adapter(arguments, model)
     store = SessionStore()
-    client, settings, _ = open_worker(arguments, model, store, adapter=adapter)
+    client, settings, _, adapter = open_worker(arguments, model, store, select_adapter=True)
+    assert adapter is not None
     try:
         client.create_session("tune", seed=arguments.seed, prefill_chunk_size=arguments.prefill_chunk_size, enable_speculative_context=False)
-        prompt_tokens = adapter.encode_messages([{"role": "user", "content": prompt}])
+        prompt_messages = [{"role": "user", "content": prompt}]
+        native_text = bool(getattr(adapter, "native_text", False))
+        prompt_tokens = None if native_text else adapter.encode_messages(prompt_messages)
         temperature = 0.0 if adapter.name == "gpt-oss" else 1.0
         rates: list[float] = []
         for index in range(arguments.warmup + arguments.runs):
             if index:
                 client.reset("tune")
-            done, _ = client.generate(
-                "tune",
-                prompt_tokens,
-                request_id=f"tune-{index}",
-                max_new_tokens=arguments.max_new_tokens,
-                temperature=temperature,
-                top_k=0,
-                top_p=1.0,
-                stop_tokens=adapter.stop_tokens,
-                enable_speculative=False,
-                metrics_enabled=metrics_trace_enabled(arguments),
-                metrics_interval_ms=arguments.metrics_interval_ms if hasattr(arguments, "metrics_interval_ms") else 1000,
-            )
+            options: dict[str, Any] = {
+                "request_id": f"tune-{index}",
+                "max_new_tokens": arguments.max_new_tokens,
+                "temperature": temperature,
+                "top_k": 0,
+                "top_p": 1.0,
+                "enable_speculative": False,
+                "metrics_enabled": metrics_trace_enabled(arguments),
+                "metrics_interval_ms": arguments.metrics_interval_ms if hasattr(arguments, "metrics_interval_ms") else 1000,
+            }
+            if not native_text:
+                options["stop_tokens"] = adapter.stop_tokens
+            if native_text:
+                model_limit = int(client.ready.get("model", {}).get("max_context_tokens", 0) or 0)
+                context_tokens = int(getattr(arguments, "context_tokens", 0) or 0) or model_limit or None
+                done, _ = client.generate(
+                    "tune",
+                    messages=prompt_messages,
+                    thinking=adapter.thinking,
+                    context_tokens=context_tokens,
+                    **options,
+                )
+            else:
+                done, _ = client.generate("tune", prompt_tokens, **options)
             if index >= arguments.warmup and isinstance(done.get("tokens_per_second"), (int, float)):
                 rates.append(float(done["tokens_per_second"]))
         average = sum(rates) / len(rates) if rates else 0.0

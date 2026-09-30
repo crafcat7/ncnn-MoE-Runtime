@@ -129,8 +129,11 @@ class WorkerClient:
     def generate(
         self,
         session_id: str,
-        prompt_tokens: list[int],
+        prompt_tokens: list[int] | None = None,
         *,
+        messages: list[dict[str, str]] | None = None,
+        thinking: bool | None = None,
+        context_tokens: int | None = None,
         request_id: str = "generate",
         max_new_tokens: int = 1024,
         temperature: float = 0.0,
@@ -145,35 +148,50 @@ class WorkerClient:
         metrics_interval_ms: int = 1000,
         on_event: EventCallback | None = None,
     ) -> tuple[dict[str, Any], list[int]]:
-        self._send(
-            {
-                "op": "generate",
-                "request_id": request_id,
-                "session_id": session_id,
-                "prompt_tokens": prompt_tokens,
-                "max_new_tokens": max_new_tokens,
-                "temperature": temperature,
-                "top_k": top_k,
-                "top_p": top_p,
-                "min_p": min_p,
-                "stop_tokens": stop_tokens or [],
-                "enable_speculative": enable_speculative,
-                "speculative_confidence": speculative_confidence,
-                "speculative_max_draft": speculative_max_draft,
-                "metrics_enabled": metrics_enabled,
-                "metrics_interval_ms": metrics_interval_ms,
-            }
-        )
+        if (prompt_tokens is None) == (messages is None):
+            raise WorkerError("generate requires exactly one of prompt_tokens or messages")
+        payload: dict[str, Any] = {
+            "op": "generate",
+            "request_id": request_id,
+            "session_id": session_id,
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "min_p": min_p,
+            "enable_speculative": enable_speculative,
+            "speculative_confidence": speculative_confidence,
+            "speculative_max_draft": speculative_max_draft,
+            "metrics_enabled": metrics_enabled,
+            "metrics_interval_ms": metrics_interval_ms,
+        }
+        if stop_tokens is not None:
+            payload["stop_tokens"] = stop_tokens
+        if messages is None:
+            payload["prompt_tokens"] = prompt_tokens
+        else:
+            payload["messages"] = messages
+            if thinking is not None:
+                payload["enable_thinking"] = thinking
+            if context_tokens is not None:
+                payload["context_tokens"] = context_tokens
+        self._send(payload)
         tokens: list[int] = []
+        callback_error: Exception | None = None
         try:
             while True:
                 event = self._read_event()
                 self._raise_for_error(event)
-                if on_event is not None:
-                    on_event(event)
+                if on_event is not None and callback_error is None:
+                    try:
+                        on_event(event)
+                    except Exception as error:
+                        callback_error = error
                 if event.get("event") == "token":
                     tokens.append(int(event["token_id"]))
                 elif event.get("event") == "done":
+                    if callback_error is not None:
+                        raise callback_error
                     return event, tokens
         except KeyboardInterrupt as error:
             # A synchronous client cannot call cancel() while it is reading a
@@ -184,7 +202,7 @@ class WorkerClient:
                 while True:
                     event = self._read_event()
                     self._raise_for_error(event)
-                    if on_event is not None:
+                    if on_event is not None and callback_error is None:
                         on_event(event)
                     if event.get("event") == "token":
                         tokens.append(int(event["token_id"]))
@@ -199,19 +217,45 @@ class WorkerClient:
             {"op": "reset", "session_id": session_id}, expected="reset"
         )
 
-    def compact(self, session_id: str, replay_tokens: list[int]) -> dict[str, Any]:
+    def compact(
+        self,
+        session_id: str,
+        replay_tokens: list[int] | None = None,
+        *,
+        messages: list[dict[str, str]] | None = None,
+        thinking: bool | None = None,
+        context_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        if (replay_tokens is None) == (messages is None):
+            raise WorkerError("compact requires exactly one of replay_tokens or messages")
+        payload: dict[str, Any] = {"op": "compact", "session_id": session_id}
+        if messages is None:
+            payload["replay_tokens"] = replay_tokens
+        else:
+            payload["messages"] = messages
+            if thinking is not None:
+                payload["enable_thinking"] = thinking
+            if context_tokens is not None:
+                payload["context_tokens"] = context_tokens
         return self.request(
-            {
-                "op": "compact",
-                "session_id": session_id,
-                "replay_tokens": replay_tokens,
-            },
+            payload,
             expected="compacted",
         )
 
-    def stats(self, session_id: str) -> dict[str, Any]:
+    def stats(
+        self,
+        session_id: str,
+        *,
+        messages: list[dict[str, str]] | None = None,
+        thinking: bool | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"op": "stats", "session_id": session_id}
+        if messages is not None:
+            payload["messages"] = messages
+            if thinking is not None:
+                payload["enable_thinking"] = thinking
         return self.request(
-            {"op": "stats", "session_id": session_id}, expected="stats"
+            payload, expected="stats"
         )
 
     def cancel(self, request_id: str = "") -> dict[str, Any]:
