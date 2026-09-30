@@ -1277,6 +1277,8 @@ static Result<void> compile_speculative_model(CompiledModel& compiled,
         CompiledLayerPlan& layer_plan = speculative.graph.layer_plans.emplace_back();
         layer_plan.layer_id = main_layer_count + layer_id;
         layer_plan.vulkan_device_index = compiled.opt.vulkan_device_index;
+        layer_plan.attention.norm_epsilon = compiled.descriptor.norm_epsilon;
+        layer_plan.attention.kv_cache_dtype = compiled.descriptor.kv_cache_dtype;
         layer_plan.moe.top_k = moe.top_k;
         layer_plan.moe.score_function = moe.score_function;
         layer_plan.moe.normalization = RouterNormalization::SelectedExperts;
@@ -1781,6 +1783,8 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
                      && layer.pre_attention_norm == NormType::None))
                 return Error{ErrorCode::UnsupportedModel, "attention requires a pre-attention RMSNorm"};
             AttentionBlockPlan& plan = layer_plan.attention;
+            plan.norm_epsilon = compiled.descriptor.norm_epsilon;
+            plan.kv_cache_dtype = compiled.descriptor.kv_cache_dtype;
             if (attention.kind == AttentionKind::MultiHeadLatent)
             {
                 auto status = compile_latent_attention(compiled.weights, layer_name, compiled.descriptor, attention, plan);

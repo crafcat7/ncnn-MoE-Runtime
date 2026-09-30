@@ -10,7 +10,6 @@
 #include "graph/compiledmodel.h"
 
 #include <chrono>
-#include <limits>
 
 namespace ncnn {
 namespace moe {
@@ -54,33 +53,6 @@ void record_batch_resource_delta(const CompiledModel& model,
             record_expert_backend_delta(*entry.statistics, backend_before, backend_after);
         }
     }
-}
-
-static uint64_t saturating_weight_product(uint64_t bytes, size_t count) noexcept
-{
-    if (bytes != 0 && count > std::numeric_limits<uint64_t>::max() / bytes)
-    {
-        return std::numeric_limits<uint64_t>::max();
-    }
-    return bytes * static_cast<uint64_t>(count);
-}
-
-static void add_saturating(uint64_t value, uint64_t& destination) noexcept
-{
-    if (destination > std::numeric_limits<uint64_t>::max() - value)
-    {
-        destination = std::numeric_limits<uint64_t>::max();
-    }
-    else
-    {
-        destination += value;
-    }
-}
-
-void record_expert_weight_demand(const ExpertPlan& expert, size_t route_count, SessionStatistics& statistics) noexcept
-{
-    add_saturating(expert.weight_size, statistics.expert_batch_weight_bytes);
-    add_saturating(saturating_weight_product(expert.weight_size, route_count), statistics.expert_route_weight_bytes);
 }
 
 void record_expert_cache_delta(SessionStatistics& statistics,
@@ -329,8 +301,9 @@ void Session::finish_generation() noexcept
     generation_active = false;
 }
 
-SessionMetrics Session::metrics_unlocked() const
+SessionMetrics Session::metrics() const
 {
+    const std::lock_guard<std::mutex> lock(mutex);
     SessionMetrics result;
     result.generation = runtime_metric_counters(stats, &generation_start_counters);
     result.cumulative = runtime_metric_counters(stats, nullptr);
@@ -374,12 +347,6 @@ SessionMetrics Session::metrics_unlocked() const
         }
     }
     return result;
-}
-
-SessionMetrics Session::metrics() const
-{
-    const std::lock_guard<std::mutex> lock(mutex);
-    return metrics_unlocked();
 }
 
 } // namespace moe

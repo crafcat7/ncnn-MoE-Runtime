@@ -1,23 +1,40 @@
-#include "vector_msvc.h"
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+
+#include "vector_x86.h"
 
 #include "fastmath.h"
 #include <bit>
 #include <cmath>
 #include <immintrin.h>
 
+#if defined(__clang__)
+#pragma clang attribute push(__attribute__((target("avx512f,avx512bw,avx512vl"))), apply_to = function)
+#elif defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC target("avx512f,avx512bw,avx512vl")
+#endif
+
 namespace ncnn {
 namespace moe {
 
-static __m512 msvc_avx512_expf(__m512 value) noexcept
+static __m512 avx512_expf(__m512 value) noexcept
 {
+    // Preserve scalar boundary and non-finite behavior outside the fast range.
+
+    if (_mm512_cmp_ps_mask(_mm512_abs_ps(value), _mm512_set1_ps(80.0f), _CMP_NLT_UQ) != 0)
+    {
+        alignas(64) float lanes[16];
+        _mm512_store_ps(lanes, value);
+        for (float& lane : lanes)
+            lane = float_approximate_exp(lane);
+        return _mm512_load_ps(lanes);
+    }
+
     const __m512 rounding = _mm512_set1_ps(0x1.8p23f);
     const __m512 scaled = _mm512_fmadd_ps(value, _mm512_set1_ps(0x1.715476p+0f), rounding);
     const __m512 exponent = _mm512_sub_ps(scaled, rounding);
     const __m512 remainder = _mm512_fnmadd_ps(exponent, _mm512_set1_ps(0x1.7f7d1cp-20f),
                                               _mm512_fnmadd_ps(exponent, _mm512_set1_ps(0x1.62e4p-1f), value));
-    const __m512i exponent_bits = _mm512_slli_epi32(_mm512_castps_si512(scaled), 23);
-    const __m512 power = _mm512_castsi512_ps(_mm512_add_epi32(exponent_bits, _mm512_castps_si512(_mm512_set1_ps(1.0f))));
-    const __mmask16 large = _mm512_cmp_ps_mask(_mm512_abs_ps(exponent), _mm512_set1_ps(126.0f), _CMP_GT_OQ);
     const __m512 remainder_squared = _mm512_mul_ps(remainder, remainder);
     const __m512 polynomial = _mm512_fmadd_ps(_mm512_fmadd_ps(_mm512_fmadd_ps(_mm512_set1_ps(0x1.0e4020p-7f), remainder,
                                                                               _mm512_set1_ps(0x1.573e2ep-5f)),
@@ -27,20 +44,13 @@ static __m512 msvc_avx512_expf(__m512 value) noexcept
                                               remainder_squared,
                                               _mm512_fmadd_ps(_mm512_set1_ps(0x1.ffffecp-1f), remainder,
                                                               _mm512_set1_ps(1.0f)));
-    const __m512 result = _mm512_scalef_ps(polynomial, exponent);
-    if (_mm512_kortestz(large, large))
-        return result;
-
-    const __m512 zero = _mm512_setzero_ps();
-    const __m512 alternate = _mm512_mask_blend_ps(_mm512_cmp_ps_mask(exponent, zero, _CMP_LE_OQ),
-                                                  _mm512_set1_ps(INFINITY), zero);
-    return _mm512_mask_blend_ps(large, result, alternate);
+    return _mm512_scalef_ps(polynomial, exponent);
 }
 
-void msvc_avx512_float_sigmoid_mul(float* output,
-                                   const float* gate,
-                                   const float* input,
-                                   uint32_t count) noexcept
+void avx512_float_sigmoid_mul(float* output,
+                              const float* gate,
+                              const float* input,
+                              uint32_t count) noexcept
 {
     const __m512 one = _mm512_set1_ps(1.0f);
     const __m512 zero = _mm512_setzero_ps();
@@ -49,7 +59,7 @@ void msvc_avx512_float_sigmoid_mul(float* output,
     {
         const __m512 gate_values = _mm512_loadu_ps(gate + index);
         const __m512 sigmoid = _mm512_div_ps(one,
-                                             _mm512_add_ps(one, msvc_avx512_expf(_mm512_sub_ps(zero, gate_values))));
+                                             _mm512_add_ps(one, avx512_expf(_mm512_sub_ps(zero, gate_values))));
         _mm512_storeu_ps(output + index,
                          _mm512_mul_ps(sigmoid, _mm512_loadu_ps(input + index)));
     }
@@ -57,8 +67,8 @@ void msvc_avx512_float_sigmoid_mul(float* output,
         output[index] = input[index] / (1.0f + float_approximate_exp(-gate[index]));
 }
 
-void msvc_avx512_float_silu_mul(float* output, const float* gate, const float* up,
-                                float sigmoid_scale, float up_offset, uint32_t count) noexcept
+void avx512_float_silu_mul(float* output, const float* gate, const float* up,
+                           float sigmoid_scale, float up_offset, uint32_t count) noexcept
 {
     const __m512 scale = _mm512_set1_ps(sigmoid_scale);
     const __m512 offset = _mm512_set1_ps(up_offset);
@@ -69,19 +79,21 @@ void msvc_avx512_float_silu_mul(float* output, const float* gate, const float* u
     {
         const __m512 gate_values = _mm512_loadu_ps(gate + index);
         const __m512 silu = _mm512_div_ps(gate_values,
-                                          _mm512_add_ps(one, msvc_avx512_expf(_mm512_sub_ps(zero, _mm512_mul_ps(scale, gate_values)))));
-        _mm512_storeu_ps(output + index,
-                         _mm512_mul_ps(silu, _mm512_add_ps(_mm512_loadu_ps(up + index), offset)));
+                                          _mm512_add_ps(one, avx512_expf(_mm512_sub_ps(zero, _mm512_mul_ps(scale, gate_values)))));
+        const __m512 up_values = _mm512_loadu_ps(up + index);
+        const __m512 biased_up = up_offset == 0.0f ? up_values : _mm512_add_ps(up_values, offset);
+        _mm512_storeu_ps(output + index, _mm512_mul_ps(silu, biased_up));
     }
     for (; index < count; ++index)
     {
         const float gate_value = gate[index];
+        const float biased_up = up_offset == 0.0f ? up[index] : up[index] + up_offset;
         output[index] = gate_value / (1.0f + float_approximate_exp(-sigmoid_scale * gate_value))
-                        * (up[index] + up_offset);
+                        * biased_up;
     }
 }
 
-void msvc_avx512_float_silu_inplace(float* values, uint32_t count) noexcept
+void avx512_float_silu_inplace(float* values, uint32_t count) noexcept
 {
     const __m512 one = _mm512_set1_ps(1.0f);
     const __m512 zero = _mm512_setzero_ps();
@@ -90,7 +102,7 @@ void msvc_avx512_float_silu_inplace(float* values, uint32_t count) noexcept
     {
         const __m512 input = _mm512_loadu_ps(values + index);
         const __m512 silu = _mm512_div_ps(input,
-                                          _mm512_add_ps(one, msvc_avx512_expf(_mm512_sub_ps(zero, input))));
+                                          _mm512_add_ps(one, avx512_expf(_mm512_sub_ps(zero, input))));
         _mm512_storeu_ps(values + index, silu);
     }
     for (; index < count; ++index)
@@ -100,7 +112,7 @@ void msvc_avx512_float_silu_inplace(float* values, uint32_t count) noexcept
     }
 }
 
-float msvc_avx512_float_dot(const float* left, const float* right, uint32_t count) noexcept
+float avx512_float_dot(const float* left, const float* right, uint32_t count) noexcept
 {
     __m512 accumulator0 = _mm512_setzero_ps();
     __m512 accumulator1 = _mm512_setzero_ps();
@@ -121,11 +133,11 @@ float msvc_avx512_float_dot(const float* left, const float* right, uint32_t coun
     return result;
 }
 
-void msvc_avx512_float_l2_scale_inplace(float* values, float epsilon, uint32_t count) noexcept
+void avx512_float_l2_scale_inplace(float* values, float epsilon, uint32_t count) noexcept
 {
     if (count == 0)
         return;
-    const float square_sum = msvc_avx512_float_dot(values, values, count);
+    const float square_sum = avx512_float_dot(values, values, count);
     const float inverse_norm = 1.0f / std::sqrt(square_sum + epsilon);
     const __m512 scale = _mm512_set1_ps(inverse_norm);
     uint32_t index = 0;
@@ -135,11 +147,11 @@ void msvc_avx512_float_l2_scale_inplace(float* values, float epsilon, uint32_t c
         values[index] *= inverse_norm;
 }
 
-void msvc_avx512_float_rms_scale_inplace(float* values, float epsilon, uint32_t count) noexcept
+void avx512_float_rms_scale_inplace(float* values, float epsilon, uint32_t count) noexcept
 {
     if (count == 0)
         return;
-    const float square_sum = msvc_avx512_float_dot(values, values, count);
+    const float square_sum = avx512_float_dot(values, values, count);
     const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
     const __m512 scale = _mm512_set1_ps(inverse_rms);
     uint32_t index = 0;
@@ -149,16 +161,16 @@ void msvc_avx512_float_rms_scale_inplace(float* values, float epsilon, uint32_t 
         values[index] *= inverse_rms;
 }
 
-void msvc_avx512_float_rms_norm(float* output,
-                                const float* input,
-                                const float* weight,
-                                float epsilon,
-                                float weight_offset,
-                                uint32_t count) noexcept
+void avx512_float_rms_norm(float* output,
+                           const float* input,
+                           const float* weight,
+                           float epsilon,
+                           float weight_offset,
+                           uint32_t count) noexcept
 {
     if (count == 0)
         return;
-    const float square_sum = msvc_avx512_float_dot(input, input, count);
+    const float square_sum = avx512_float_dot(input, input, count);
     const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
     const __m512 inverse_values = _mm512_set1_ps(inverse_rms);
     const __m512 offset_values = _mm512_set1_ps(weight_offset);
@@ -173,16 +185,16 @@ void msvc_avx512_float_rms_norm(float* output,
         output[index] = input[index] * inverse_rms * (weight[index] + weight_offset);
 }
 
-void msvc_avx512_bfloat16_rms_norm(float* output,
-                                   const float* input,
-                                   const uint16_t* weight,
-                                   float epsilon,
-                                   float weight_offset,
-                                   uint32_t count) noexcept
+void avx512_bfloat16_rms_norm(float* output,
+                              const float* input,
+                              const uint16_t* weight,
+                              float epsilon,
+                              float weight_offset,
+                              uint32_t count) noexcept
 {
     if (count == 0)
         return;
-    const float square_sum = msvc_avx512_float_dot(input, input, count);
+    const float square_sum = avx512_float_dot(input, input, count);
     const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
     const __m512 inverse_values = _mm512_set1_ps(inverse_rms);
     const __m512 offset_values = _mm512_set1_ps(weight_offset);
@@ -202,10 +214,10 @@ void msvc_avx512_bfloat16_rms_norm(float* output,
     }
 }
 
-void msvc_avx512_float_rope_inplace(float* values,
-                                    const float* cosine,
-                                    const float* sine,
-                                    uint32_t dimension) noexcept
+void avx512_float_rope_inplace(float* values,
+                               const float* cosine,
+                               const float* sine,
+                               uint32_t dimension) noexcept
 {
     const uint32_t half_dimension = dimension / 2;
     uint32_t index = 0;
@@ -229,13 +241,13 @@ void msvc_avx512_float_rope_inplace(float* values,
     }
 }
 
-void msvc_avx512_float_hc_pre_4(float* output,
-                                const float* input,
-                                float scale0,
-                                float scale1,
-                                float scale2,
-                                float scale3,
-                                uint32_t hidden_size) noexcept
+void avx512_float_hc_pre_4(float* output,
+                           const float* input,
+                           float scale0,
+                           float scale1,
+                           float scale2,
+                           float scale3,
+                           uint32_t hidden_size) noexcept
 {
     const float* input1 = input + hidden_size;
     const float* input2 = input1 + hidden_size;
@@ -260,12 +272,12 @@ void msvc_avx512_float_hc_pre_4(float* output,
                         + input3[index] * scale3;
 }
 
-void msvc_avx512_float_hc_post_4(float* output,
-                                 const float* branch,
-                                 const float* residual,
-                                 const float* post,
-                                 const float* combine,
-                                 uint32_t hidden_size) noexcept
+void avx512_float_hc_post_4(float* output,
+                            const float* branch,
+                            const float* residual,
+                            const float* post,
+                            const float* combine,
+                            uint32_t hidden_size) noexcept
 {
     const float* residual1 = residual + hidden_size;
     const float* residual2 = residual1 + hidden_size;
@@ -313,15 +325,15 @@ void msvc_avx512_float_hc_post_4(float* output,
     }
 }
 
-void msvc_avx512_float_gemm_4x4(const float* weights,
-                                size_t weight_stride,
-                                const float* input,
-                                size_t input_stride,
-                                uint32_t input_columns,
-                                uint32_t output_count,
-                                uint32_t token_count,
-                                float* output,
-                                size_t output_stride) noexcept
+void avx512_float_gemm_4x4(const float* weights,
+                           size_t weight_stride,
+                           const float* input,
+                           size_t input_stride,
+                           uint32_t input_columns,
+                           uint32_t output_count,
+                           uint32_t token_count,
+                           float* output,
+                           size_t output_stride) noexcept
 {
     __m512 accumulators[4][4] = {};
     uint32_t column = 0;
@@ -366,15 +378,15 @@ void msvc_avx512_float_gemm_4x4(const float* weights,
             output[static_cast<size_t>(token) * output_stride + output_index] = results[token][output_index];
 }
 
-void msvc_avx512_float_gemm_4x8(const float* weights,
-                                size_t weight_stride,
-                                const float* input,
-                                size_t input_stride,
-                                uint32_t input_columns,
-                                uint32_t output_count,
-                                uint32_t token_count,
-                                float* output,
-                                size_t output_stride) noexcept
+void avx512_float_gemm_4x8(const float* weights,
+                           size_t weight_stride,
+                           const float* input,
+                           size_t input_stride,
+                           uint32_t input_columns,
+                           uint32_t output_count,
+                           uint32_t token_count,
+                           float* output,
+                           size_t output_stride) noexcept
 {
     __m512 accumulators[4][8] = {};
     uint32_t column = 0;
@@ -412,15 +424,15 @@ void msvc_avx512_float_gemm_4x8(const float* weights,
             output[static_cast<size_t>(token) * output_stride + output_index] = results[token][output_index];
 }
 
-void msvc_avx512_bfloat16_gemm_4x8(const uint16_t* weights,
-                                   size_t weight_stride,
-                                   const float* input,
-                                   size_t input_stride,
-                                   uint32_t input_columns,
-                                   uint32_t output_count,
-                                   uint32_t token_count,
-                                   float* output,
-                                   size_t output_stride) noexcept
+void avx512_bfloat16_gemm_4x8(const uint16_t* weights,
+                              size_t weight_stride,
+                              const float* input,
+                              size_t input_stride,
+                              uint32_t input_columns,
+                              uint32_t output_count,
+                              uint32_t token_count,
+                              float* output,
+                              size_t output_stride) noexcept
 {
     __m512 accumulators[4][8] = {};
     uint32_t column = 0;
@@ -463,18 +475,18 @@ void msvc_avx512_bfloat16_gemm_4x8(const uint16_t* weights,
             output[static_cast<size_t>(token) * output_stride + output_index] = results[token][output_index];
 }
 
-void msvc_avx512_float_exp_inplace(float* values, uint32_t count) noexcept
+void avx512_float_exp_inplace(float* values, uint32_t count) noexcept
 {
     uint32_t index = 0;
     for (; index + 16 <= count; index += 16)
-        _mm512_storeu_ps(values + index, msvc_avx512_expf(_mm512_loadu_ps(values + index)));
+        _mm512_storeu_ps(values + index, avx512_expf(_mm512_loadu_ps(values + index)));
     for (; index < count; ++index)
         values[index] = float_approximate_exp(values[index]);
 }
 
-float msvc_avx512_int8_float_dot(const int8_t* left,
-                                 const float* right,
-                                 uint32_t count) noexcept
+float avx512_int8_float_dot(const int8_t* left,
+                            const float* right,
+                            uint32_t count) noexcept
 {
     __m512 accumulator0 = _mm512_setzero_ps();
     __m512 accumulator1 = _mm512_setzero_ps();
@@ -509,7 +521,7 @@ float msvc_avx512_int8_float_dot(const int8_t* left,
     return result;
 }
 
-void msvc_avx512_float_scale_inplace(float* values, float scale, uint32_t count) noexcept
+void avx512_float_scale_inplace(float* values, float scale, uint32_t count) noexcept
 {
     const __m512 scale_values = _mm512_set1_ps(scale);
     uint32_t index = 0;
@@ -519,7 +531,7 @@ void msvc_avx512_float_scale_inplace(float* values, float scale, uint32_t count)
         values[index] *= scale;
 }
 
-void msvc_avx512_float_scaled_add(float* output, const float* input, float scale, uint32_t count) noexcept
+void avx512_float_scaled_add(float* output, const float* input, float scale, uint32_t count) noexcept
 {
     const __m512 scale_values = _mm512_set1_ps(scale);
     uint32_t index = 0;
@@ -533,11 +545,11 @@ void msvc_avx512_float_scaled_add(float* output, const float* input, float scale
         output[index] += scale * input[index];
 }
 
-void msvc_avx512_float_scale_add(float* output,
-                                 float output_scale,
-                                 const float* input,
-                                 float input_scale,
-                                 uint32_t count) noexcept
+void avx512_float_scale_add(float* output,
+                            float output_scale,
+                            const float* input,
+                            float input_scale,
+                            uint32_t count) noexcept
 {
     const __m512 output_scale_values = _mm512_set1_ps(output_scale);
     const __m512 input_scale_values = _mm512_set1_ps(input_scale);
@@ -552,11 +564,11 @@ void msvc_avx512_float_scale_add(float* output,
         output[index] = output[index] * output_scale + input[index] * input_scale;
 }
 
-void msvc_avx512_float_scale_inplace_and_scaled_add(float* values,
-                                                    float value_scale,
-                                                    float* output,
-                                                    float output_scale,
-                                                    uint32_t count) noexcept
+void avx512_float_scale_inplace_and_scaled_add(float* values,
+                                               float value_scale,
+                                               float* output,
+                                               float output_scale,
+                                               uint32_t count) noexcept
 {
     const __m512 value_scale_values = _mm512_set1_ps(value_scale);
     const __m512 output_scale_values = _mm512_set1_ps(output_scale);
@@ -576,13 +588,13 @@ void msvc_avx512_float_scale_inplace_and_scaled_add(float* values,
     }
 }
 
-void msvc_avx512_float_scale_inplace_and_scaled_add_and_accumulate(float* values,
-                                                                   float value_scale,
-                                                                   const float* input,
-                                                                   float input_scale,
-                                                                   float* output,
-                                                                   float output_scale,
-                                                                   uint32_t count) noexcept
+void avx512_float_scale_inplace_and_scaled_add_and_accumulate(float* values,
+                                                              float value_scale,
+                                                              const float* input,
+                                                              float input_scale,
+                                                              float* output,
+                                                              float output_scale,
+                                                              uint32_t count) noexcept
 {
     const __m512 value_scale_values = _mm512_set1_ps(value_scale);
     const __m512 input_scale_values = _mm512_set1_ps(input_scale);
@@ -606,7 +618,7 @@ void msvc_avx512_float_scale_inplace_and_scaled_add_and_accumulate(float* values
     }
 }
 
-void msvc_avx512_float_weighted_scale(float* output, const float* input, const float* weight, float scale, float weight_offset, uint32_t count) noexcept
+void avx512_float_weighted_scale(float* output, const float* input, const float* weight, float scale, float weight_offset, uint32_t count) noexcept
 {
     const __m512 scale_values = _mm512_set1_ps(scale);
     const __m512 offset_values = _mm512_set1_ps(weight_offset);
@@ -621,7 +633,7 @@ void msvc_avx512_float_weighted_scale(float* output, const float* input, const f
         output[index] = input[index] * scale * (weight[index] + weight_offset);
 }
 
-void msvc_avx512_bfloat16_weighted_scale(float* output, const float* input, const uint16_t* weight, float scale, float weight_offset, uint32_t count) noexcept
+void avx512_bfloat16_weighted_scale(float* output, const float* input, const uint16_t* weight, float scale, float weight_offset, uint32_t count) noexcept
 {
     const __m512 scale_values = _mm512_set1_ps(scale);
     const __m512 offset_values = _mm512_set1_ps(weight_offset);
@@ -643,3 +655,11 @@ void msvc_avx512_bfloat16_weighted_scale(float* output, const float* input, cons
 
 } // namespace moe
 } // namespace ncnn
+
+#if defined(__clang__)
+#pragma clang attribute pop
+#elif defined(__GNUC__)
+#pragma GCC pop_options
+#endif
+
+#endif // x86

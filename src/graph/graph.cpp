@@ -223,6 +223,11 @@ Result<void> ExecutionSchedule::validate(const ExecutionGraph& graph) const
         positions[node_id] = static_cast<uint32_t>(order_index);
         // Execution reuses one FFN workspace from Router through Combine.
         const ExecutionNode& node = graph.nodes[node_id];
+        const uint32_t selected_backend = node.backend == ExecutionBackend::Cpu ? ExecutionBackendCpu : ExecutionBackendVulkan;
+        if (!has_flag(node.backend_mask, selected_backend))
+        {
+            return Error{ErrorCode::InvalidModel, "execution schedule node backend is not allowed by its backend mask"};
+        }
         if (active_ffn != invalid_execution_layer_id && node.layer_plan_index != active_ffn)
             return Error{ErrorCode::InvalidModel, "execution schedule overlaps an unfinished FFN layer"};
         if (node.type == ExecutionNodeType::Router)
@@ -251,39 +256,12 @@ Result<void> ExecutionSchedule::validate(const ExecutionGraph& graph) const
     if (active_ffn != invalid_execution_layer_id)
         return Error{ErrorCode::InvalidModel, "execution schedule leaves an unfinished FFN layer"};
 
-    uint32_t covered_nodes = 0;
-    ExecutionBackend previous_backend = ExecutionBackend::Cpu;
-    bool has_previous_backend = false;
-    for (const ExecutionBackendRun& run : backend_runs)
-    {
-        if (run.node_count == 0
-            || run.first_node != covered_nodes
-            || run.node_count > node_order.size() - covered_nodes)
-        {
-            return Error{ErrorCode::InvalidModel, "execution schedule backend runs are not contiguous"};
-        }
-        if (has_previous_backend && run.backend == previous_backend)
-            return Error{ErrorCode::InvalidModel, "execution schedule contains adjacent backend runs"};
-        for (uint32_t offset = 0; offset < run.node_count; ++offset)
-        {
-            const ExecutionNodeId node_id = node_order[run.first_node + offset];
-            const ExecutionBackend node_backend = graph.nodes[node_id].backend;
-            if (node_backend != run.backend)
-                return Error{ErrorCode::InvalidModel, "execution schedule backend run disagrees with node placement"};
-        }
-        covered_nodes += run.node_count;
-        previous_backend = run.backend;
-        has_previous_backend = true;
-    }
-    if (covered_nodes != node_order.size())
-        return Error{ErrorCode::InvalidModel, "execution schedule backend runs do not cover the graph"};
     return {};
 }
 
 Result<void> schedule_graph(ExecutionGraph& graph, ExecutionSchedule& schedule, const GraphOption& opt)
 {
     schedule.node_order.clear();
-    schedule.backend_runs.clear();
     if (opt.available_backends == 0)
         return Error{ErrorCode::InvalidArgument, "runtime scheduler requires at least one backend"};
 
@@ -305,15 +283,6 @@ Result<void> schedule_graph(ExecutionGraph& graph, ExecutionSchedule& schedule, 
     if (!ret)
         return ret.error();
 
-    schedule.backend_runs.reserve(schedule.node_order.size());
-    for (uint32_t i = 0; i < schedule.node_order.size(); ++i)
-    {
-        const ExecutionBackend backend = graph.nodes[schedule.node_order[i]].backend;
-        if (schedule.backend_runs.empty() || schedule.backend_runs.back().backend != backend)
-            schedule.backend_runs.push_back({backend, i, 1});
-        else
-            ++schedule.backend_runs.back().node_count;
-    }
     ret = schedule.validate(graph);
     if (!ret)
         return ret.error();

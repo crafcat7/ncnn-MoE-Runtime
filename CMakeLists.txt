@@ -87,6 +87,10 @@ set(NCNN_MOE_SOURCES
 add_library(ncnn_moe STATIC ${NCNN_MOE_SOURCES})
 source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_SOURCES})
 
+if(APPLE)
+    target_link_libraries(ncnn_moe PRIVATE "-framework Accelerate")
+endif()
+
 if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
     set(NCNN_MOE_MSVC_SIMD_SOURCES
         src/kernels/float8_msvc_avx2.cpp
@@ -95,8 +99,8 @@ if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
         src/kernels/mxfp4_msvc_avx512.cpp
         src/kernels/qnk_msvc_avx2.cpp
         src/kernels/qnk_msvc_avx512.cpp
-        src/kernels/vector_msvc_avx2.cpp
-        src/kernels/vector_msvc_avx512.cpp
+        src/kernels/vector_x86_avx2.cpp
+        src/kernels/vector_x86_avx512.cpp
     )
     target_sources(ncnn_moe PRIVATE ${NCNN_MOE_MSVC_SIMD_SOURCES})
     source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_MSVC_SIMD_SOURCES})
@@ -104,17 +108,41 @@ if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
         src/kernels/float8_msvc_avx2.cpp
         src/kernels/mxfp4_msvc_avx2.cpp
         src/kernels/qnk_msvc_avx2.cpp
-        src/kernels/vector_msvc_avx2.cpp
+        src/kernels/vector_x86_avx2.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX2"
     )
     set_source_files_properties(
         src/kernels/float8_msvc_avx512.cpp
         src/kernels/mxfp4_msvc_avx512.cpp
         src/kernels/qnk_msvc_avx512.cpp
-        src/kernels/vector_msvc_avx512.cpp
+        src/kernels/vector_x86_avx512.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX512"
     )
-    target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_MSVC_X86_SIMD=1)
+    target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_MSVC_X86_SIMD=1 NCNN_MOE_X86_SIMD=1)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set(NCNN_MOE_TARGET_HAS_X86 OFF)
+    if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+        foreach(NCNN_MOE_ARCH IN LISTS CMAKE_OSX_ARCHITECTURES)
+            if(NCNN_MOE_ARCH MATCHES "^(x86_64|AMD64|amd64|X86|x86|x64|i[3-6]86)$")
+                set(NCNN_MOE_TARGET_HAS_X86 ON)
+            endif()
+        endforeach()
+    elseif(
+        CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|X86|x86|x64|i[3-6]86)$"
+        OR CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "^(x86_64|AMD64|amd64|X86|x86|x64|i[3-6]86)$"
+    )
+        set(NCNN_MOE_TARGET_HAS_X86 ON)
+    endif()
+
+    if(NCNN_MOE_TARGET_HAS_X86)
+        set(NCNN_MOE_X86_SIMD_SOURCES
+            src/kernels/vector_x86_avx2.cpp
+            src/kernels/vector_x86_avx512.cpp
+        )
+        target_sources(ncnn_moe PRIVATE ${NCNN_MOE_X86_SIMD_SOURCES})
+        source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_X86_SIMD_SOURCES})
+        target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_X86_SIMD=1)
+    endif()
 endif()
 
 if(
@@ -327,6 +355,8 @@ if(NCNN_MOE_BUILD_TESTS)
     enable_testing()
     add_executable(ncnn_moe_tests
         tests/modeladapter_fixture.cpp
+        tests/test_batch_combine.cpp
+        tests/test_scratch.cpp
         tests/test_runtime.cpp
     )
     target_link_libraries(ncnn_moe_tests PRIVATE ncnn::moe)

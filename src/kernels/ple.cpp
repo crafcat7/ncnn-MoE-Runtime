@@ -91,7 +91,8 @@ Result<void> execute_ple_into(const WeightStore& weights,
     const uint32_t head_count = (plan.ngram_size - 1) * plan.heads_per_ngram;
     if (multiplier == 0 || hidden.rows() != input_ids.size()
         || hidden.columns() != expanded_size || plan.ngram_size < 2
-        || head_count == 0 || plan.embedding_dimension % head_count != 0)
+        || plan.convolution_kernel_size == 0 || head_count == 0
+        || plan.embedding_dimension % head_count != 0)
     {
         return Error{ErrorCode::InvalidArgument, "invalid PLE execution dimensions"};
     }
@@ -189,9 +190,18 @@ Result<void> execute_ple_into(const WeightStore& weights,
     const uint32_t state_length = (plan.convolution_kernel_size - 1) * plan.ngram_size;
     const size_t state_elements = static_cast<size_t>(state_length) * expanded_size;
     if (cache.ple_convolution_state.empty())
+    {
         cache.ple_convolution_state.assign(state_elements, 0.0f);
+        cache.ple_first_slot = 0;
+    }
     else if (cache.ple_convolution_state.size() != state_elements)
         return Error{ErrorCode::InternalError, "invalid PLE convolution state"};
+    if (state_length == 0)
+        cache.ple_first_slot = 0;
+    else if (cache.ple_first_slot >= state_length)
+        return Error{ErrorCode::InternalError, "invalid PLE convolution cursor"};
+
+    uint32_t first_slot = cache.ple_first_slot;
     const std::span<const uint16_t> convolution_weight = weights.at(plan.convolution_weight).bfloat16_values();
     for (size_t row_index = 0; row_index < input_ids.size(); ++row_index)
     {
@@ -199,26 +209,33 @@ Result<void> execute_ple_into(const WeightStore& weights,
         for (uint32_t channel = 0; channel < expanded_size; ++channel)
         {
             float convolution = 0.0f;
-            for (uint32_t kernel = 0; kernel < plan.convolution_kernel_size; ++kernel)
+            size_t tap = first_slot;
+            for (uint32_t kernel = 0; kernel + 1 < plan.convolution_kernel_size; ++kernel)
             {
-                const uint32_t lag = (plan.convolution_kernel_size - 1 - kernel) * plan.ngram_size;
-                const float sample = lag == 0
-                                         ? current[channel]
-                                         : cache.ple_convolution_state[static_cast<size_t>(state_length - lag) * expanded_size + channel];
+                const float sample = cache.ple_convolution_state[static_cast<size_t>(tap) * expanded_size + channel];
                 convolution += sample * bfloat16_to_float(convolution_weight[static_cast<size_t>(channel) * plan.convolution_kernel_size + kernel]);
+                tap += plan.ngram_size;
+                if (tap >= state_length)
+                    tap -= state_length;
             }
+            convolution += current[channel]
+                           * bfloat16_to_float(convolution_weight[static_cast<size_t>(channel) * plan.convolution_kernel_size
+                                                                  + plan.convolution_kernel_size - 1]);
             hidden.row(row_index)[channel] += gated.row(row_index)[channel]
                                               + scaled_silu(convolution, 1.0f, optimization_flags);
         }
         if (state_length != 0)
         {
-            std::move(cache.ple_convolution_state.begin() + expanded_size,
-                      cache.ple_convolution_state.end(),
-                      cache.ple_convolution_state.begin());
-            std::copy_n(current, expanded_size,
-                        cache.ple_convolution_state.end() - expanded_size);
+            std::copy_n(current,
+                        expanded_size,
+                        cache.ple_convolution_state.data()
+                            + static_cast<size_t>(first_slot) * expanded_size);
+            ++first_slot;
+            if (first_slot == state_length)
+                first_slot = 0;
         }
     }
+    cache.ple_first_slot = first_slot;
     return {};
 }
 

@@ -75,7 +75,8 @@ struct CpuThreadBudget
 
 [[nodiscard]] CpuThreadBudget resolve_cpu_thread_budget(uint32_t num_io_threads = 0) noexcept;
 
-// Per-thread OpenMP limit used by scheduler workers.
+// Scopes thread limits and parallel wait time; explicit wait settings win,
+// and prior runtime state is restored.
 class CpuOpenMpThreadLimitScope
 {
 public:
@@ -88,7 +89,9 @@ public:
     void set(uint32_t limit) noexcept;
 
 private:
-    uint32_t previous = 0;
+    [[maybe_unused]] uint32_t previous = 0;
+    [[maybe_unused]] int previous_blocktime = 0;
+    [[maybe_unused]] bool restore_blocktime = false;
 };
 
 // Returns the current thread's OpenMP limit.
@@ -111,9 +114,13 @@ public:
         Lease& operator=(Lease&& other) noexcept;
 
         [[nodiscard]] uint32_t size() const noexcept
-        { return count; }
+        {
+            return count;
+        }
         [[nodiscard]] bool empty() const noexcept
-        { return count == 0; }
+        {
+            return count == 0;
+        }
 
     private:
         friend class CpuThreadBudgetController;
@@ -128,7 +135,9 @@ public:
     explicit CpuThreadBudgetController(CpuThreadBudget _thread_budget) noexcept;
 
     [[nodiscard]] const CpuThreadBudget& budget() const noexcept
-    { return thread_budget; }
+    {
+        return thread_budget;
+    }
 
     // Workers use the base capacity; staged teams can also use extra capacity.
     [[nodiscard]] Lease acquire_compute(uint32_t requested, bool use_extra_threads = true);

@@ -44,11 +44,13 @@ struct ExpertDispatchPlan
     size_t assignment_count = 0;
 };
 
-// Input is token-major; output is stable and ordered by Expert id.
-[[nodiscard]] Result<ExpertDispatchPlan> dispatch_experts(std::span<const float> router_logits, uint32_t token_count, const ExpertDispatchOptions& options);
-
-// Reuses caller storage; routing errors leave the published batches unchanged.
-[[nodiscard]] Result<void> dispatch_experts_into(std::span<const float> router_logits, uint32_t token_count, const ExpertDispatchOptions& options, ExpertDispatchPlan& result);
+// Input rows are token-major. Published batches are ordered by Expert id and
+// keep each expert's routes in input order. Reuses caller storage; routing
+// errors leave the published batches unchanged.
+[[nodiscard]] Result<void> dispatch_experts(std::span<const float> router_logits,
+                                            uint32_t token_count,
+                                            const ExpertDispatchOptions& options,
+                                            ExpertDispatchPlan& result);
 
 } // namespace moe
 } // namespace ncnn

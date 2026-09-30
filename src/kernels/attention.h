@@ -57,6 +57,7 @@ struct AttentionScratch
     std::vector<float> flash_partial_max;
     std::vector<float> flash_partial_sum;
     std::vector<float> flash_partial_output;
+    std::vector<float> workspace;
     std::vector<float> rope_cosine;
     std::vector<float> rope_sine;
     std::vector<LatentAttentionRowContext> latent_row_contexts;
@@ -84,8 +85,6 @@ struct AttentionBatchEntry
                                              const CompiledOperatorTable& operators,
                                              const AttentionBlockPlan& plan,
                                              ExecutionBackend backend,
-                                             float norm_epsilon,
-                                             DType kv_cache_dtype,
                                              uint64_t position_offset,
                                              LayerCache& cache,
                                              AttentionScratch& scratch,
@@ -97,8 +96,6 @@ struct AttentionBatchEntry
                                                     const CompiledOperatorTable& operators,
                                                     const AttentionBlockPlan& plan,
                                                     ExecutionBackend backend,
-                                                    float norm_epsilon,
-                                                    DType kv_cache_dtype,
                                                     uint64_t position_offset,
                                                     LayerCache& cache,
                                                     AttentionScratch& scratch,

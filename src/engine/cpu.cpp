@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <fstream>
 #include <set>
 #include <string>
@@ -42,6 +43,10 @@
 
 #if defined(_OPENMP)
 #include <omp.h>
+#endif
+
+#if defined(_OPENMP) && defined(NCNN_MOE_USE_NCNN) && NCNN_MOE_USE_NCNN
+#include <cpu.h>
 #endif
 
 namespace ncnn {
@@ -421,10 +426,30 @@ CpuOpenMpThreadLimitScope::CpuOpenMpThreadLimitScope() noexcept
     : previous(cpu_openmp_thread_limit_override)
 #endif
 {
+#if defined(_OPENMP) && defined(NCNN_MOE_USE_NCNN) && NCNN_MOE_USE_NCNN
+    if (cpu_openmp_thread_limit() <= 1
+        || std::getenv("KMP_BLOCKTIME")
+        || std::getenv("OMP_WAIT_POLICY")
+        || std::getenv("KMP_LIBRARY"))
+    {
+        return;
+    }
+
+    previous_blocktime = ncnn::get_kmp_blocktime();
+    if (previous_blocktime != 1)
+    {
+        ncnn::set_kmp_blocktime(1);
+        restore_blocktime = true;
+    }
+#endif
 }
 
 CpuOpenMpThreadLimitScope::~CpuOpenMpThreadLimitScope() noexcept
 {
+#if defined(_OPENMP) && defined(NCNN_MOE_USE_NCNN) && NCNN_MOE_USE_NCNN
+    if (restore_blocktime)
+        ncnn::set_kmp_blocktime(previous_blocktime);
+#endif
 #if defined(_OPENMP)
     cpu_openmp_thread_limit_override = previous;
 #endif

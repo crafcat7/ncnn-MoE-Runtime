@@ -14,9 +14,10 @@ namespace moe {
 struct CompiledModel;
 struct ExpertExecutionMetrics;
 struct ExpertScratch;
+struct ExpertWorkspace;
 struct ExpertPlan;
 struct ExpertVictimExecutionMetadata;
-struct LayerGraphState;
+struct LayerState;
 struct MoeBlockPlan;
 struct SessionStatistics;
 struct TensorData;
@@ -29,10 +30,10 @@ void forward_shared_expert(const CompiledModel& model,
                            const MoeBlockPlan& moe,
                            const ActivationBuffer& input,
                            ActivationBuffer& output,
-                           ExpertExecutionMetrics& metrics,
-                           uint64_t optimization_flags);
+                           ExpertWorkspace& workspace,
+                           ExpertExecutionMetrics& metrics);
 
-bool can_run_vulkan_expert(const ExpertPlan& expert,
+bool support_vulkan_expert(const ExpertPlan& expert,
                            const TensorData& gate_up,
                            const TensorData& down,
                            uint64_t optimization_flags);
@@ -43,20 +44,20 @@ ExpertVictimExecutionMetadata victim_metadata(const CompiledModel& model,
 
 // Transfer dispatched routes into reusable execution slots and record demand.
 void prepare_moe_experts(const MoeBlockPlan& moe,
-                         LayerGraphState& layer_state,
+                         LayerState& layer_state,
                          SessionStatistics& statistics);
 
 // Submit exact reads without waiting or acquiring compute-time leases.
 [[nodiscard]] Result<void> request_moe_experts(const CompiledModel& model,
                                                const MoeBlockPlan& moe,
-                                               const LayerGraphState& layer_state,
+                                               const LayerState& layer_state,
                                                ExpertScratch& scratch,
                                                uint32_t residency_group,
                                                SessionStatistics& statistics);
 
 [[nodiscard]] Result<void> forward_moe(const CompiledModel& model,
                                        const MoeBlockPlan& moe,
-                                       LayerGraphState& layer_state,
+                                       LayerState& layer_state,
                                        SessionStatistics& statistics,
                                        ExpertScratch& scratch,
                                        uint32_t residency_group,

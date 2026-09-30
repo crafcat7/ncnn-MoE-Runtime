@@ -169,8 +169,8 @@ void main()
         if (token_base + row < p.token_count
             && output_base + column < p.output_columns)
         {
-            output_data[(token_base + row) * p.output_columns
-                        + output_base + column] = result_tile[index] + bias_data[output_base + column];
+            const uint output_index = (token_base + row) * p.output_columns + output_base + column;
+            output_data[output_index] = result_tile[index] + bias_data[output_base + column];
         }
     }
 }

@@ -334,6 +334,8 @@ class Session
 public:
     ~Session();
 
+    // Argument validation leaves the session usable; an execution failure may
+    // leave partial state and requires reset before another operation.
     [[nodiscard]] Result<PrefillResult> prefill(std::span<const int32_t> input_ids);
     [[nodiscard]] Result<DecodeResult> decode(int32_t input_id);
     [[nodiscard]] Result<SampledToken> sample(std::span<const float> logits, const SamplingOptions& opt = {});
@@ -355,8 +357,8 @@ public:
 private:
     explicit Session(ModelPtr _model, const SessionOptions& opt);
     [[nodiscard]] static uint32_t get_max_context_length(const MoeModelDescriptor& descriptor) noexcept;
-    [[nodiscard]] Result<PrefillResult> prefill_unlocked(std::span<const int32_t> input_ids);
-    [[nodiscard]] Result<DecodeResult> decode_unlocked(int32_t input_id);
+    [[nodiscard]] Result<void> prefill_unlocked(std::span<const int32_t> input_ids);
+    [[nodiscard]] Result<void> decode_unlocked(int32_t input_id);
     [[nodiscard]] Result<SampledToken> sample_unlocked(std::span<const float> logits, const SamplingOptions& opt);
     [[nodiscard]] Result<GenerationResult> generate_unlocked(std::span<const int32_t> input_ids, const GenerationOptions& opt, const TokenStreamCallback& on_token, const TokenTextDecoder& decode_text, std::unique_lock<std::mutex>& lock);
     [[nodiscard]] Result<GenerationResult> generate_speculative(std::vector<float> logits, const GenerationOptions& opt, const TokenStreamCallback& on_token, const TokenTextDecoder& decode_text, std::unique_lock<std::mutex>& lock);
@@ -386,8 +388,6 @@ private:
     std::vector<int32_t> sampling_token_ids;
     std::array<std::vector<SampledToken>, 2> sampling_candidates;
     std::vector<float> sampling_residual;
-
-    [[nodiscard]] SessionMetrics metrics_unlocked() const;
 
     friend class Runtime;
     friend class BatchSchedulerPrivate;

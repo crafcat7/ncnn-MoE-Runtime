@@ -577,10 +577,10 @@ static Result<void> prepare_latent_attention_operators(CompiledModel& compiled,
     if (query_a.float8 && query_b.float8)
     {
         if (!query_a.float8->prepare_rms_norm(compiled.weights.at(plan.query_norm_weight),
-                                              compiled.descriptor.norm_epsilon))
+                                              plan.norm_epsilon))
             return Error{ErrorCode::InternalError, "failed to prepare " + std::string(diagnostic_prefix) + "Vulkan FP8 query RMSNorm chain"};
         if (!query_a.float8->prepare_input_rms_norm(compiled.weights.at(plan.pre_attention_norm_weight),
-                                                    compiled.descriptor.norm_epsilon))
+                                                    plan.norm_epsilon))
             return Error{ErrorCode::InternalError, "failed to prepare " + std::string(diagnostic_prefix) + "Vulkan FP8 latent input RMSNorm chain"};
     }
     return {};
@@ -621,7 +621,7 @@ static void prepare_gated_delta_attention_operators(CompiledModel& compiled,
     if (plan.pre_attention_norm_weight != invalid_tensor_handle)
     {
         (void)fused_input_operator->prepare_rms_norm(compiled.weights.at(plan.pre_attention_norm_weight),
-                                                     compiled.descriptor.norm_epsilon,
+                                                     plan.norm_epsilon,
                                                      plan.norm_weight_offset);
     }
 
@@ -644,7 +644,7 @@ static void prepare_gated_delta_attention_operators(CompiledModel& compiled,
                                                                                         plan.head_dimension,
                                                                                         plan.value_head_dimension,
                                                                                         plan.convolution_kernel_size,
-                                                                                        compiled.descriptor.norm_epsilon,
+                                                                                        plan.norm_epsilon,
                                                                                         has_flag(plan.flags, AttentionBlockSigmoidGate),
                                                                                         layer_plan.vulkan_device_index,
                                                                                         compiled.vulkan_runtime,
@@ -718,14 +718,14 @@ static Result<void> prepare_standard_attention_operators(CompiledModel& compiled
         attention_config.rope_head_dimension = plan.rope_head_dimension;
         attention_config.sliding_window = plan.sliding_window;
         attention_config.initial_context_length = plan.initial_context_length;
-        attention_config.norm_epsilon = compiled.descriptor.norm_epsilon;
+        attention_config.norm_epsilon = plan.norm_epsilon;
         attention_config.norm_weight_offset = plan.norm_weight_offset;
         attention_config.rope_theta = plan.rope_theta;
         attention_config.rope_scaling_factor = plan.rope_scaling_factor;
         attention_config.rope_ntk_alpha = plan.rope_ntk_alpha;
         attention_config.rope_ntk_beta = plan.rope_ntk_beta;
         attention_config.activation_dtype = compiled.descriptor.activation_dtype;
-        attention_config.kv_cache_dtype = compiled.descriptor.kv_cache_dtype;
+        attention_config.kv_cache_dtype = plan.kv_cache_dtype;
         attention_config.optimization_flags = compiled.opt.optimization_flags;
         if (!fused_vulkan_attention_eligible)
             attention_config.flags |= AttentionQueryKeyNorm | AttentionOutputGate;

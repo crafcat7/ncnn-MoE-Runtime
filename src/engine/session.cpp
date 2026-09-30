@@ -42,6 +42,27 @@ namespace moe {
                                                                        std::vector<float>& residual,
                                                                        std::mt19937_64& random_generator);
 
+static constexpr const char* token_id_error_message = "token id is outside the model vocabulary";
+static constexpr const char* execution_failure_error_message = "session is unavailable after an execution failure; reset is required";
+
+[[nodiscard]] static Result<void> validate_token_ids(const MoeModelDescriptor& descriptor,
+                                                     std::span<const int32_t> input_ids)
+{
+    for (int32_t token_id : input_ids)
+    {
+        if (token_id < 0 || static_cast<uint32_t>(token_id) >= descriptor.vocabulary_size)
+            return Error{ErrorCode::InvalidArgument, token_id_error_message};
+    }
+    return {};
+}
+
+[[nodiscard]] static Result<void> validate_execution_state(const SessionState& state)
+{
+    if (state.execution_failed)
+        return Error{ErrorCode::InternalError, execution_failure_error_message};
+    return {};
+}
+
 uint32_t Session::get_max_context_length(const MoeModelDescriptor& descriptor) noexcept
 {
     if (descriptor.layers.empty())
@@ -78,10 +99,14 @@ void Session::commit_execution(uint64_t prefill_tokens, uint64_t decode_tokens)
     }
     stats.kv_cache_logical_size = kv_cache_logical_size;
     stats.kv_cache_allocated_size = kv_cache_allocated_size;
+    state->execution_failed = false;
 }
 
-Result<PrefillResult> Session::prefill_unlocked(std::span<const int32_t> input_ids)
+Result<void> Session::prefill_unlocked(std::span<const int32_t> input_ids)
 {
+    auto valid_state = validate_execution_state(*state);
+    if (!valid_state)
+        return valid_state.error();
     if (input_ids.empty())
         return Error{ErrorCode::InvalidArgument, "prefill requires at least one token"};
     if (input_ids.size() > std::numeric_limits<uint32_t>::max())
@@ -89,11 +114,14 @@ Result<PrefillResult> Session::prefill_unlocked(std::span<const int32_t> input_i
     const uint32_t max_context_length = get_max_context_length(model->descriptor());
     if (max_context_length > 0 && input_ids.size() > max_context_length - std::min<uint64_t>(token_count, max_context_length))
         return Error{ErrorCode::InvalidArgument, "prefill exceeds the model context length"};
+    auto valid_tokens = validate_token_ids(model->descriptor(), input_ids);
+    if (!valid_tokens)
+        return valid_tokens.error();
 
     const CompiledModel& compiled = model_compiled(*model);
+    state->execution_failed = true;
     stats_scratch = stats;
     SessionStatistics& updated_statistics = stats_scratch;
-    std::vector<float> final_logits;
     size_t processed_tokens = 0;
     while (processed_tokens < input_ids.size())
     {
@@ -103,27 +131,26 @@ Result<PrefillResult> Session::prefill_unlocked(std::span<const int32_t> input_i
         const LogitsOutput logits_output = processed_tokens + chunk_size == input_ids.size()
                                                ? LogitsOutput::Last
                                                : LogitsOutput::None;
-        auto chunk_logits = forward_model(compiled,
-                                          chunk,
-                                          updated_statistics,
-                                          *state,
-                                          token_count + processed_tokens,
-                                          logits_output);
-        if (!chunk_logits)
-            return chunk_logits.error();
+        auto executed = forward_model(compiled,
+                                      chunk,
+                                      updated_statistics,
+                                      *state,
+                                      token_count + processed_tokens,
+                                      logits_output);
+        if (!executed)
+            return executed.error();
         auto speculative_context = update_speculative_context(compiled,
                                                               updated_statistics,
                                                               *state);
         if (!speculative_context)
             return speculative_context.error();
-        std::vector<std::vector<float>>& rows = chunk_logits.value();
         if (logits_output == LogitsOutput::Last)
         {
-            if (rows.size() != 1)
+            if (state->logits.rows() != 1
+                || state->logits.columns() != model->descriptor().vocabulary_size)
                 return Error{ErrorCode::InternalError, "final prefill chunk produced an invalid logits row count"};
-            final_logits = std::move(rows.front());
         }
-        else if (!rows.empty())
+        else if (state->logits.rows() != 0)
         {
             return Error{ErrorCode::InternalError, "intermediate prefill chunk produced unexpected logits"};
         }
@@ -132,33 +159,49 @@ Result<PrefillResult> Session::prefill_unlocked(std::span<const int32_t> input_i
 
     commit_execution(input_ids.size(), 0);
 
-    PrefillResult result;
-    result.logits = std::move(final_logits);
-    result.processed_tokens = static_cast<uint32_t>(input_ids.size());
-    return result;
+    return {};
 }
 
 Result<PrefillResult> Session::prefill(std::span<const int32_t> input_ids)
 {
     const std::lock_guard<std::mutex> lock(mutex);
-    auto result = prefill_unlocked(input_ids);
-    if (result)
-        generation_start_counters = runtime_metric_counters(stats, nullptr);
+    PrefillResult result;
+    // Reserve the public result before execution arms the failure marker.
+    result.logits.reserve(model->descriptor().vocabulary_size);
+    auto executed = prefill_unlocked(input_ids);
+    if (!executed)
+        return executed.error();
+    const std::span<const float> logits = state->logits.values();
+    result.logits.assign(logits.begin(), logits.end());
+    result.processed_tokens = static_cast<uint32_t>(input_ids.size());
+    generation_start_counters = runtime_metric_counters(stats, nullptr);
     return result;
 }
 
-Result<DecodeResult> Session::decode_unlocked(int32_t input_id)
+Result<void> Session::decode_unlocked(int32_t input_id)
 {
+    auto valid_state = validate_execution_state(*state);
+    if (!valid_state)
+        return valid_state.error();
     const uint32_t max_context_length = get_max_context_length(model->descriptor());
     if (max_context_length > 0 && token_count >= max_context_length)
         return Error{ErrorCode::InvalidArgument, "decode exceeds the model context length"};
+    const std::array<int32_t, 1> input = {input_id};
+    auto valid_tokens = validate_token_ids(model->descriptor(), input);
+    if (!valid_tokens)
+        return valid_tokens.error();
     const CompiledModel& compiled = model_compiled(*model);
+    state->execution_failed = true;
     stats_scratch = stats;
     SessionStatistics& updated_statistics = stats_scratch;
-    const std::span<const int32_t> input(&input_id, 1);
-    auto all_logits = forward_model(compiled, input, updated_statistics, *state, token_count);
-    if (!all_logits)
-        return all_logits.error();
+    auto executed = forward_model(compiled, input, updated_statistics, *state, token_count, LogitsOutput::All);
+    if (!executed)
+        return executed.error();
+    if (state->logits.rows() != 1
+        || state->logits.columns() != model->descriptor().vocabulary_size)
+    {
+        return Error{ErrorCode::InternalError, "decode produced an invalid logits row"};
+    }
     auto speculative_context = update_speculative_context(compiled,
                                                           updated_statistics,
                                                           *state);
@@ -167,18 +210,22 @@ Result<DecodeResult> Session::decode_unlocked(int32_t input_id)
 
     commit_execution(0, 1);
 
-    DecodeResult result;
-    result.logits = std::move(all_logits.value().front());
-    result.sequence_length = token_count;
-    return result;
+    return {};
 }
 
 Result<DecodeResult> Session::decode(int32_t input_id)
 {
     const std::lock_guard<std::mutex> lock(mutex);
-    auto result = decode_unlocked(input_id);
-    if (result)
-        generation_start_counters = runtime_metric_counters(stats, nullptr);
+    DecodeResult result;
+    // Reserve the public result before execution arms the failure marker.
+    result.logits.reserve(model->descriptor().vocabulary_size);
+    auto executed = decode_unlocked(input_id);
+    if (!executed)
+        return executed.error();
+    const std::span<const float> logits = state->logits.values();
+    result.logits.assign(logits.begin(), logits.end());
+    result.sequence_length = token_count;
+    generation_start_counters = runtime_metric_counters(stats, nullptr);
     return result;
 }
 
@@ -210,6 +257,9 @@ static bool contains_token(const std::vector<int32_t>& tokens, int32_t token)
 Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, const GenerationOptions& opt, TokenStreamCallback on_token, TokenTextDecoder decode_text)
 {
     std::unique_lock<std::mutex> lock(mutex);
+    auto valid_state = validate_execution_state(*state);
+    if (!valid_state)
+        return valid_state.error();
     if (opt.max_new_tokens == 0)
         return Error{ErrorCode::InvalidArgument, "max_new_tokens must be non-zero"};
     if (!std::isfinite(opt.speculative_confidence_threshold)
@@ -289,15 +339,18 @@ Result<GenerationResult> Session::generate_unlocked(std::span<const int32_t> inp
     if (!prefill_result)
         return prefill_result.error();
 
-    std::vector<float> logits = std::move(prefill_result).value().logits;
     if (use_speculative)
+    {
+        const std::span<const float> initial_logits = state->logits.values();
+        std::vector<float> logits(initial_logits.begin(), initial_logits.end());
         return generate_speculative(std::move(logits), opt, on_token, decode_text, lock);
+    }
 
     GenerationResult result;
     result.tokens.reserve(opt.max_new_tokens);
     for (uint32_t index = 0; index < opt.max_new_tokens; ++index)
     {
-        auto sampled = sample_unlocked(logits, opt.sampling);
+        auto sampled = sample_unlocked(state->logits.values(), opt.sampling);
         if (!sampled)
             return sampled.error();
 
@@ -327,7 +380,6 @@ Result<GenerationResult> Session::generate_unlocked(std::span<const int32_t> inp
         auto decoded = decode_unlocked(token.token_id);
         if (!decoded)
             return decoded.error();
-        logits = std::move(decoded).value().logits;
     }
     return result;
 }
@@ -351,13 +403,18 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
         return {};
     };
     const auto finish_cache_transaction =
-        [state_cache_transactions](std::span<LayerCache> caches,
-                                   size_t committed_rows) -> Result<void> {
-        return state_cache_transactions
-                   ? finish_state_cache_transaction(caches,
-                                                    committed_rows)
-                   : finish_latent_cache_transaction(caches,
-                                                     committed_rows);
+        [this, state_cache_transactions](std::span<LayerCache> caches,
+                                         size_t committed_rows) -> Result<void> {
+        const bool previous_execution_failure = state->execution_failed;
+        state->execution_failed = true;
+        auto finished = state_cache_transactions
+                            ? finish_state_cache_transaction(caches,
+                                                             committed_rows)
+                            : finish_latent_cache_transaction(caches,
+                                                              committed_rows);
+        if (finished)
+            state->execution_failed = previous_execution_failure;
+        return finished;
     };
     try
     {
@@ -394,8 +451,7 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                 auto decoded = decode_unlocked(anchor);
                 if (!decoded)
                     return decoded.error();
-                auto sampled = sample_unlocked(decoded.value().logits,
-                                               opt.sampling);
+                auto sampled = sample_unlocked(state->logits.values(), opt.sampling);
                 if (!sampled)
                     return sampled.error();
                 StreamToken token;
@@ -491,11 +547,15 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                 [&]() -> Result<std::vector<std::vector<float>>> {
                 if (!state_cache_transactions)
                 {
-                    return forward_model(compiled,
-                                         verify_input_ids,
-                                         stats_scratch,
-                                         *state,
-                                         token_count);
+                    auto executed = forward_model(compiled,
+                                                  verify_input_ids,
+                                                  stats_scratch,
+                                                  *state,
+                                                  token_count,
+                                                  LogitsOutput::All);
+                    if (!executed)
+                        return executed.error();
+                    return batch_to_vectors(state->logits);
                 }
 
                 std::vector<std::vector<float>> logits;
@@ -508,22 +568,24 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                 {
                     const std::span<const int32_t> input(&verify_input_ids[index],
                                                          1);
-                    auto row_logits = forward_model(compiled,
-                                                    input,
-                                                    stats_scratch,
-                                                    *state,
-                                                    token_count + index);
-                    if (!row_logits)
-                        return row_logits.error();
-                    std::vector<std::vector<float>> rows = std::move(row_logits).value();
-                    if (rows.size() != 1
+                    auto executed = forward_model(compiled,
+                                                  input,
+                                                  stats_scratch,
+                                                  *state,
+                                                  token_count + index,
+                                                  LogitsOutput::All);
+                    if (!executed)
+                        return executed.error();
+                    if (state->logits.rows() != 1
+                        || state->logits.columns() != compiled.descriptor.vocabulary_size
                         || state->speculative_main_hidden.rows() != 1)
                     {
                         return Error{
                             ErrorCode::InternalError,
                             "sequential MTP verification produced invalid rows"};
                     }
-                    logits.push_back(std::move(rows.front()));
+                    const std::span<const float> values = state->logits.values();
+                    logits.emplace_back(values.begin(), values.end());
                     std::copy_n(state->speculative_main_hidden.row(0),
                                 compiled.descriptor.hidden_size,
                                 verified_hidden.row(index));
@@ -700,6 +762,7 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                 }
             }
 
+            state->execution_failed = true;
             auto committed = finish_cache_transaction(state->layers,
                                                       emitted);
             if (!committed)

@@ -179,10 +179,6 @@ public:
                const TensorData* down_bias, uint32_t residency_group, float activation_limit,
                ExpertActivation activation) override;
 
-    ExpertBackendExecutionResult try_execute(const std::string& key, const ActivationBuffer& input, ActivationBuffer& output) override;
-
-    std::vector<ExpertBackendExecutionResult> try_execute_batch(std::span<const ExpertBackendRequest> requests) override;
-
     std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) override;
 
     void wait_for_background_work() override;

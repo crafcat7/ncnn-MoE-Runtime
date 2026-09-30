@@ -359,7 +359,6 @@ static void append_compressed_value(const WeightStore& weights,
                                     ExecutionBackend backend,
                                     const ActivationBuffer& input,
                                     uint64_t position,
-                                    float norm_epsilon,
                                     bool indexer,
                                     LayerCache& cache,
                                     ActivationBuffer& quantized_input,
@@ -484,7 +483,7 @@ static void append_compressed_value(const WeightStore& weights,
         }
     }
 
-    normalize_vector(pooled.data(), dimension, weights.at(norm_handle), norm_epsilon);
+    normalize_vector(pooled.data(), dimension, weights.at(norm_handle), plan.norm_epsilon);
     apply_rope(pooled.data() + dimension - plan.rope_head_dimension, plan.rope_head_dimension, position + 1 - ratio, plan, false);
     if (indexer)
     {
@@ -614,7 +613,6 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                                             const CompiledOperatorTable& operators,
                                             const AttentionBlockPlan& plan,
                                             ExecutionBackend backend,
-                                            float norm_epsilon,
                                             std::span<const uint64_t> positions,
                                             std::span<LayerCache* const> caches,
                                             AttentionScratch& scratch,
@@ -647,7 +645,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
     bool key_value_ready = false;
     if (plan.compression_ratio != 0)
     {
-        rms_norm_batch_into(input, weights.at(plan.pre_attention_norm_weight), norm_epsilon,
+        rms_norm_batch_into(input, weights.at(plan.pre_attention_norm_weight), plan.norm_epsilon,
                             normalized, 0.0f);
         normalized_ready = true;
     }
@@ -769,7 +767,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                     {
                         rms_norm_batch_into(input,
                                             weights.at(plan.pre_attention_norm_weight),
-                                            norm_epsilon, normalized, 0.0f);
+                                            plan.norm_epsilon, normalized, 0.0f);
                         normalized_ready = true;
                     }
                     chained_query = query_a_operator.float8->forward_rms_norm_chain_parallel(normalized,
@@ -787,7 +785,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
             {
                 rms_norm_batch_into(input,
                                     weights.at(plan.pre_attention_norm_weight),
-                                    norm_epsilon, normalized, 0.0f);
+                                    plan.norm_epsilon, normalized, 0.0f);
                 normalized_ready = true;
             }
             chained_query = query_a_operator.float8->forward_rms_norm_chain(normalized, *query_b_operator.float8, query);
@@ -806,7 +804,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         {
             rms_norm_batch_into(input,
                                 weights.at(plan.pre_attention_norm_weight),
-                                norm_epsilon, normalized, 0.0f);
+                                plan.norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
         }
         auto graph = CommandGraph_vulkan::create(*query_a_operator.linear);
@@ -837,7 +835,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         {
             rms_norm_batch_into(input,
                                 weights.at(plan.pre_attention_norm_weight),
-                                norm_epsilon, normalized, 0.0f);
+                                plan.norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
         }
         const bool paired_projection = float8_linear_pair_batch_into(query_a, key_value_weight, normalized, query_rank,
@@ -855,13 +853,13 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         query_rank_ready = true;
         const bool query_projection_fused = query_rank_not_required
                                             && float8_linear_rms_norm_batch_into(query_b, query_rank,
-                                                                                 weights.at(plan.query_norm_weight), norm_epsilon, query,
+                                                                                 weights.at(plan.query_norm_weight), plan.norm_epsilon, query,
                                                                                  optimization_flags, operators.find_weight(plan.query_b_weight),
                                                                                  &scratch.quantized_input);
         if (!query_projection_fused)
         {
             rms_norm_batch_into(query_rank, weights.at(plan.query_norm_weight),
-                                norm_epsilon, query_rank, 0.0f);
+                                plan.norm_epsilon, query_rank, 0.0f);
             linear_batch_into(query_b, query_rank, query, optimization_flags,
                               operators.find_weight(plan.query_b_weight), backend,
                               &scratch.quantized_input);
@@ -876,7 +874,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                           &scratch.quantized_input);
         key_value_ready = true;
     }
-    rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), norm_epsilon,
+    rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), plan.norm_epsilon,
                         key_value, 0.0f);
     attention_output.reset(input.rows(), plan.head_count * plan.head_dimension, true);
 
@@ -951,7 +949,6 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                                         backend,
                                         token_input,
                                         position,
-                                        norm_epsilon,
                                         false,
                                         cache,
                                         scratch.quantized_input,
@@ -973,7 +970,6 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                                             backend,
                                             token_input,
                                             position,
-                                            norm_epsilon,
                                             true,
                                             cache,
                                             scratch.quantized_input,
@@ -1020,13 +1016,13 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
             normalize_unit_prepared_rope(query_head,
                                          plan.head_dimension,
                                          plan.rope_head_dimension,
-                                         norm_epsilon,
+                                         plan.norm_epsilon,
                                          cache.latent_rope_cosines,
                                          cache.latent_rope_sines);
         }
         else
         {
-            float_rms_scale_inplace(query_head, norm_epsilon, plan.head_dimension);
+            float_rms_scale_inplace(query_head, plan.norm_epsilon, plan.head_dimension);
             apply_rope(query_head + plan.head_dimension - plan.rope_head_dimension,
                        plan.rope_head_dimension,
                        position,
@@ -1270,7 +1266,6 @@ Result<void> forward_latent_attention(const WeightStore& weights,
                                       const CompiledOperatorTable& operators,
                                       const AttentionBlockPlan& plan,
                                       ExecutionBackend backend,
-                                      float norm_epsilon,
                                       uint64_t position_offset,
                                       LayerCache& cache,
                                       AttentionScratch& scratch,
@@ -1282,14 +1277,14 @@ Result<void> forward_latent_attention(const WeightStore& weights,
     {
         const std::array<uint64_t, 1> positions = {position_offset};
         std::array<LayerCache*, 1> caches = {&cache};
-        return forward_latent_attention_batch(weights, operators, plan, backend, norm_epsilon, positions, caches,
+        return forward_latent_attention_batch(weights, operators, plan, backend, positions, caches,
                                               scratch, input, output, optimization_flags);
     }
     scratch.latent_positions.resize(input.rows());
     scratch.latent_caches.assign(input.rows(), &cache);
     for (size_t row = 0; row < input.rows(); ++row)
         scratch.latent_positions[row] = position_offset + row;
-    return forward_latent_attention_batch(weights, operators, plan, backend, norm_epsilon,
+    return forward_latent_attention_batch(weights, operators, plan, backend,
                                           scratch.latent_positions, scratch.latent_caches,
                                           scratch, input, output, optimization_flags);
 }
@@ -1298,7 +1293,6 @@ Result<void> append_dspark_attention_context(const WeightStore& weights,
                                              const CompiledOperatorTable& operators,
                                              const AttentionBlockPlan& plan,
                                              ExecutionBackend backend,
-                                             float norm_epsilon,
                                              uint64_t position_offset,
                                              LayerCache& cache,
                                              const ActivationBuffer& input,
@@ -1316,7 +1310,7 @@ Result<void> append_dspark_attention_context(const WeightStore& weights,
                                               optimization_flags,
                                               operators.find_weight(plan.key_value_weight),
                                               backend);
-    rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), norm_epsilon,
+    rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), plan.norm_epsilon,
                         key_value, 0.0f);
     const size_t window_elements = static_cast<size_t>(plan.sliding_window) * plan.head_dimension;
     if (cache.latent_window.size() != window_elements)
@@ -1341,7 +1335,6 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
                                       const CompiledOperatorTable& operators,
                                       const AttentionBlockPlan& plan,
                                       ExecutionBackend backend,
-                                      float norm_epsilon,
                                       uint64_t position_offset,
                                       const LayerCache& cache,
                                       AttentionScratch& scratch,
@@ -1398,7 +1391,7 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
                 {
                     rms_norm_batch_into(input,
                                         weights.at(plan.pre_attention_norm_weight),
-                                        norm_epsilon, normalized, 0.0f);
+                                        plan.norm_epsilon, normalized, 0.0f);
                     normalized_ready = true;
                 }
                 chained_query = query_a_operator.float8->forward_rms_norm_chain_parallel(normalized,
@@ -1413,7 +1406,7 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
         {
             rms_norm_batch_into(input,
                                 weights.at(plan.pre_attention_norm_weight),
-                                norm_epsilon, normalized, 0.0f);
+                                plan.norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
             chained_query = query_a_operator.float8->forward_rms_norm_chain(normalized, *query_b_operator.float8, query);
         }
@@ -1424,7 +1417,7 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
         {
             rms_norm_batch_into(input,
                                 weights.at(plan.pre_attention_norm_weight),
-                                norm_epsilon, normalized, 0.0f);
+                                plan.norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
         }
         const bool paired_projection = float8_linear_pair_batch_into(query_a, key_value_weight, normalized, query_rank,
@@ -1440,11 +1433,11 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
         else
             key_value_ready = true;
         if (!float8_linear_rms_norm_batch_into(query_b, query_rank, weights.at(plan.query_norm_weight),
-                                               norm_epsilon, query, optimization_flags,
+                                               plan.norm_epsilon, query, optimization_flags,
                                                operators.find_weight(plan.query_b_weight), &scratch.quantized_input))
         {
             rms_norm_batch_into(query_rank, weights.at(plan.query_norm_weight),
-                                norm_epsilon, query_rank, 0.0f);
+                                plan.norm_epsilon, query_rank, 0.0f);
             linear_batch_into(query_b, query_rank, query, optimization_flags,
                               operators.find_weight(plan.query_b_weight), backend,
                               &scratch.quantized_input);
@@ -1457,7 +1450,7 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
                           &scratch.quantized_input);
         key_value_ready = true;
     }
-    rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), norm_epsilon,
+    rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), plan.norm_epsilon,
                         key_value, 0.0f);
 
     for (size_t row = 0; row < input.rows(); ++row)
@@ -1484,7 +1477,7 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
         for (uint32_t head = 0; head < plan.head_count; ++head)
         {
             float* query_head = query.row(row) + static_cast<size_t>(head) * plan.head_dimension;
-            float_rms_scale_inplace(query_head, norm_epsilon, plan.head_dimension);
+            float_rms_scale_inplace(query_head, plan.norm_epsilon, plan.head_dimension);
             apply_rope(query_head + plan.head_dimension - plan.rope_head_dimension, plan.rope_head_dimension, position, plan, false);
             float maximum = sinks[head];
             for (uint32_t candidate = 0; candidate < candidate_count; ++candidate)

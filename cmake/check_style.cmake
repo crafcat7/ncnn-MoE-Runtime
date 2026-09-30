@@ -77,7 +77,9 @@ foreach(SOURCE_FILE IN LISTS NCNN_MOE_STYLE_FILES)
         string(APPEND NCNN_MOE_STYLE_ERRORS
             "${RELATIVE_FILE}: name bitmap positions with NCNN_MOE_*_BIT macros\n")
     endif()
-    if(SOURCE_TEXT MATCHES "\n[ \t]+(=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=)[ \t]+")
+    # Newer clang-format may place a pure virtual '= 0;' on its own line.
+    string(REGEX REPLACE "\n[ \t]+= 0;" "" ASSIGNMENT_CHECK_TEXT "${SOURCE_TEXT}")
+    if(ASSIGNMENT_CHECK_TEXT MATCHES "\n[ \t]+(=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=)[ \t]+")
         string(APPEND NCNN_MOE_STYLE_ERRORS
             "${RELATIVE_FILE}: keep an assignment operator with its left-hand side\n")
     endif()

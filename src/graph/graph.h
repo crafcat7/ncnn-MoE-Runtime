@@ -103,20 +103,9 @@ struct ExecutionGraph
     [[nodiscard]] Result<void> validate() const;
 };
 
-// A contiguous backend run in the immutable execution reservation.  The
-// scheduler owns the order; executors must not reconstruct it from the graph
-// or from layer metadata at execution time.
-struct ExecutionBackendRun
-{
-    ExecutionBackend backend = ExecutionBackend::Cpu;
-    uint32_t first_node = 0;
-    uint32_t node_count = 0;
-};
-
 struct ExecutionSchedule
 {
     std::vector<ExecutionNodeId> node_order;
-    std::vector<ExecutionBackendRun> backend_runs;
 
     [[nodiscard]] Result<void> validate(const ExecutionGraph& graph) const;
 };

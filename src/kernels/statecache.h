@@ -168,6 +168,8 @@ struct LayerCache
     std::vector<uint16_t> qsa_index_keys;
     std::vector<int32_t> ple_token_history;
     std::vector<float> ple_convolution_state;
+    // Physical row of the oldest token in ple_convolution_state.
+    uint32_t ple_first_slot = 0;
 
     [[nodiscard]] uint64_t allocated_bytes() const noexcept
     {

@@ -135,25 +135,8 @@ public:
                        const TensorData* down_bias,
                        uint32_t residency_group,
                        float activation_limit,
-                       ExpertActivation activation = ExpertActivation::GptOssSwiGlu) = 0;
-
-    [[nodiscard]] virtual ExpertBackendExecutionResult try_execute(const std::string& key, const ActivationBuffer& input, ActivationBuffer& output) = 0;
-
-    [[nodiscard]] virtual std::vector<ExpertBackendExecutionResult> try_execute_batch(std::span<const ExpertBackendRequest> requests)
-    {
-        std::vector<ExpertBackendExecutionResult> results;
-        results.reserve(requests.size());
-        for (const ExpertBackendRequest& request : requests)
-        {
-            if (!request.input || !request.output)
-            {
-                results.push_back(ExpertBackendExecutionResult ::Failed);
-                continue;
-            }
-            results.push_back(try_execute(std::string(request.key), *request.input, *request.output));
-        }
-        return results;
-    }
+                       ExpertActivation activation = ExpertActivation::GptOssSwiGlu)
+        = 0;
 
     [[nodiscard]] virtual std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) = 0;
 
@@ -179,10 +162,6 @@ public:
     void admit(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
                float activation_limit, ExpertActivation activation) override;
 
-    ExpertBackendExecutionResult try_execute(const std::string& key, const ActivationBuffer& input, ActivationBuffer& output) override;
-
-    std::vector<ExpertBackendExecutionResult> try_execute_batch(std::span<const ExpertBackendRequest> requests) override;
-
     std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) override;
 
     void set_foreground_active(bool active) noexcept override;
@@ -194,8 +173,6 @@ public:
     uint64_t capacity() const noexcept override;
 
 private:
-    size_t backend_for_key(std::string_view key) const;
-
     struct ChildSubmission
     {
         std::vector<size_t> request_indices;

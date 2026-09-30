@@ -36,7 +36,7 @@ static Result<void> execute_speculative_layer(const CompiledModel& model,
                                               LayerCache& cache,
                                               ActivationBuffer& hidden,
                                               SessionStatistics& statistics,
-                                              LayerGraphState& layer_state,
+                                              LayerState& layer_state,
                                               ExpertScratch& scratch,
                                               HyperConnectionScratch& hyper_connection_scratch,
                                               AttentionScratch& attention_scratch)
@@ -89,8 +89,6 @@ static Result<void> execute_speculative_layer(const CompiledModel& model,
                                            model.operators,
                                            layer.attention,
                                            attention_backend,
-                                           model.descriptor.norm_epsilon,
-                                           model.descriptor.kv_cache_dtype,
                                            position_offset,
                                            cache,
                                            attention_scratch,
@@ -107,7 +105,6 @@ static Result<void> execute_speculative_layer(const CompiledModel& model,
                                                   model.operators,
                                                   layer.attention,
                                                   attention_backend,
-                                                  model.descriptor.norm_epsilon,
                                                   position_offset,
                                                   cache,
                                                   attention_scratch,
@@ -172,7 +169,10 @@ static Result<void> execute_speculative_layer(const CompiledModel& model,
     {
         dispatch_options.selection_bias = model.weights.at(moe.router_selection_bias).float32_values();
     }
-    auto dispatched = dispatch_experts_into(layer_state.router_logits.values(), static_cast<uint32_t>(layer_state.router_logits.rows()), dispatch_options, layer_state.dispatch_plan);
+    auto dispatched = dispatch_experts(layer_state.router_logits.values(),
+                                       static_cast<uint32_t>(layer_state.router_logits.rows()),
+                                       dispatch_options,
+                                       layer_state.dispatch_plan);
     if (!dispatched)
         return dispatched.error();
     prepare_moe_experts(moe, layer_state, statistics);
@@ -189,7 +189,8 @@ static Result<void> execute_speculative_layer(const CompiledModel& model,
         const auto shared_start = std::chrono::steady_clock::now();
         ExpertExecutionMetrics shared_metrics;
         forward_shared_expert(model, moe, layer_state.normalized, layer_state.shared_expert_output,
-                              shared_metrics, model.opt.optimization_flags);
+                              layer_state.shared_expert_workspace,
+                              shared_metrics);
         statistics.expert_compute_time_microseconds += elapsed_microseconds(shared_start);
     }
 
@@ -213,8 +214,8 @@ static Result<void> execute_speculative_layer(const CompiledModel& model,
                               moe,
                               layer_state.normalized,
                               layer_state.shared_expert_output,
-                              shared_metrics,
-                              model.opt.optimization_flags);
+                              layer_state.shared_expert_workspace,
+                              shared_metrics);
     }
     ActivationBuffer& moe_output = layer_state.normalized;
     const bool has_backend_aggregation = initialize_backend_aggregated_output(scratch,
@@ -223,7 +224,7 @@ static Result<void> execute_speculative_layer(const CompiledModel& model,
                                                                               moe_output);
     for (size_t active_index = 0; active_index < layer_state.active_experts().size(); ++active_index)
     {
-        const ActiveExpertExecution& active = layer_state.active_experts()[active_index];
+        const ExpertState& active = layer_state.active_experts()[active_index];
         if (has_backend_aggregation
             && active_index < scratch.backend_aggregated.size()
             && scratch.backend_aggregated[active_index] != 0)
@@ -385,8 +386,6 @@ static Result<void> append_mtp_context(const CompiledModel& model,
                                              model.operators,
                                              layer.attention,
                                              graph.nodes[execution.attention].backend,
-                                             model.descriptor.norm_epsilon,
-                                             model.descriptor.kv_cache_dtype,
                                              position_offset,
                                              state.speculative_layers.front(),
                                              state.attention_scratch,
@@ -496,15 +495,20 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
     Bfloat16BatchedLinearExecutionCounter cpu_bfloat16_execution;
     const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(&cpu_bfloat16_execution);
     const auto started = std::chrono::steady_clock::now();
-    const VulkanStatistics vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
+    VulkanStatistics vulkan_before;
+    if (model.vulkan_runtime)
+        vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
     if (model.speculative.kind == SpeculativeModelKind::Mtp)
     {
         auto updated = update_mtp_context(model,
                                           state);
         if (!updated)
             return updated.error();
-        const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
-        record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
+        if (model.vulkan_runtime)
+        {
+            const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
+            record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
+        }
         statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
         statistics.speculative_context_time_microseconds += elapsed_microseconds(started);
         return {};
@@ -551,14 +555,16 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
                                                         model.operators,
                                                         layer.attention,
                                                         graph.nodes[execution.attention].backend,
-                                                        model.descriptor.norm_epsilon,
                                                         state.speculative_main_hidden_position, state.speculative_layers[layer_index], projected,
                                                         model.opt.optimization_flags);
         if (!appended)
             return appended.error();
     }
-    const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
-    record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
+    if (model.vulkan_runtime)
+    {
+        const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
+        record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
+    }
     statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
     statistics.speculative_context_time_microseconds += elapsed_microseconds(started);
     return {};
@@ -594,7 +600,9 @@ static Result<SpeculativeProposal> propose_mtp(const CompiledModel& model,
     }
 
     const auto started = std::chrono::steady_clock::now();
-    const VulkanStatistics vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
+    VulkanStatistics vulkan_before;
+    if (model.vulkan_runtime)
+        vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
     ExpertCacheStatistics cache_before;
     if (model.expert_cache)
         cache_before = model.expert_cache->statistics();
@@ -662,8 +670,11 @@ static Result<SpeculativeProposal> propose_mtp(const CompiledModel& model,
                                     backend_before,
                                     model.expert_backend->statistics());
     }
-    const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
-    record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
+    if (model.vulkan_runtime)
+    {
+        const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
+        record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
+    }
     ++statistics.speculative_proposals;
     statistics.speculative_draft_tokens += proposal.token_ids.size();
     statistics.speculative_draft_time_microseconds += elapsed_microseconds(started);
@@ -729,7 +740,9 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
     }
 
     const auto started = std::chrono::steady_clock::now();
-    const VulkanStatistics vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
+    VulkanStatistics vulkan_before;
+    if (model.vulkan_runtime)
+        vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
     ExpertCacheStatistics cache_before;
     if (model.expert_cache)
         cache_before = model.expert_cache->statistics();
@@ -842,8 +855,11 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
     {
         record_expert_backend_delta(statistics, backend_before, model.expert_backend->statistics());
     }
-    const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
-    record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
+    if (model.vulkan_runtime)
+    {
+        const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
+        record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
+    }
     statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
     ++statistics.speculative_proposals;
     statistics.speculative_draft_tokens += proposal.token_ids.size();

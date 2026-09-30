@@ -78,56 +78,6 @@ void MultiDeviceExpertBackend::admit(std::string key, std::shared_ptr<const Tens
                                    activation);
 }
 
-ExpertBackendExecutionResult MultiDeviceExpertBackend::try_execute(const std::string& key, const ActivationBuffer& input, ActivationBuffer& output)
-{
-    if (backends.empty())
-        return ExpertBackendExecutionResult::Failed;
-    return backends[backend_for_key(key)]->try_execute(key, input, output);
-}
-
-std::vector<ExpertBackendExecutionResult> MultiDeviceExpertBackend::try_execute_batch(std::span<const ExpertBackendRequest> requests)
-{
-    if (backends.size() == 1)
-        return backends.front()->try_execute_batch(requests);
-    auto submission = submit_batch(requests);
-    if (!submission)
-        return std::vector<ExpertBackendExecutionResult>(requests.size(), ExpertBackendExecutionResult::Failed);
-    const std::span<const ExpertBackendExecutionResult> planned = submission->reservations();
-    std::vector<ExpertBackendExecutionResult> results = submission->wait();
-    if (planned.size() != requests.size() || results.size() != requests.size())
-    {
-        submission->abort();
-        return std::vector<ExpertBackendExecutionResult>(requests.size(), ExpertBackendExecutionResult::Failed);
-    }
-    for (size_t index = 0; index < results.size(); ++index)
-    {
-        if (results[index] == ExpertBackendExecutionResult::Executed
-            && planned[index] != ExpertBackendExecutionResult::Executed)
-        {
-            submission->abort();
-            return std::vector<ExpertBackendExecutionResult>(requests.size(), ExpertBackendExecutionResult::Failed);
-        }
-    }
-    bool has_executed = false;
-    for (ExpertBackendExecutionResult result : results)
-        has_executed = has_executed || result == ExpertBackendExecutionResult::Executed;
-    if (has_executed)
-    {
-        if (!submission->commit())
-        {
-            for (ExpertBackendExecutionResult& result : results)
-            {
-                if (result == ExpertBackendExecutionResult::Executed)
-                    result = ExpertBackendExecutionResult::Failed;
-            }
-            submission->abort();
-        }
-    }
-    else
-        submission->abort();
-    return results;
-}
-
 std::unique_ptr<ExpertSubmission> MultiDeviceExpertBackend::submit_batch(std::span<const ExpertBackendRequest> requests)
 {
     std::vector<std::vector<size_t>> request_indices(backends.size());
@@ -169,13 +119,6 @@ uint64_t MultiDeviceExpertBackend::capacity() const noexcept
     for (const auto& backend : backends)
         total_size += backend->capacity();
     return total_size;
-}
-
-size_t MultiDeviceExpertBackend::backend_for_key(std::string_view key) const
-{
-    const std::lock_guard<std::mutex> lock(placement_mutex);
-    const auto placed = key_placements.find(key);
-    return placed == key_placements.end() ? fallback_backend(key) : placed->second;
 }
 
 MultiDeviceExpertBackend::Submission::Submission(MultiDeviceExpertBackend* owner, std::span<const ExpertBackendRequest> requests, std::vector<std::vector<size_t>> request_indices)

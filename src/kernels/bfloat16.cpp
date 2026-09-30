@@ -654,8 +654,7 @@ static float scalar_bfloat16_pair_dot(const uint16_t* left,
 
 // Scoped instrumentation context only. Model weights, activation scratch,
 // scheduling, and session state never use thread-local storage.
-static thread_local Bfloat16BatchedLinearExecutionCounter*
-    current_bfloat16_execution_counter = nullptr;
+static thread_local Bfloat16BatchedLinearExecutionCounter* current_bfloat16_execution_counter = nullptr;
 
 uint64_t Bfloat16BatchedLinearExecutionCounter::dispatch_count() const noexcept
 {

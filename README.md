@@ -71,7 +71,7 @@ requiring a resident copy of every routed weight.
 | Runtime API | `Runtime`, immutable shared `Model`, per-request `Session`, and cross-Session `BatchScheduler` |
 | Model integration | Public `ModelAdapter` contract and model-neutral `MoeModelDescriptor`; built-in GPT-OSS, DeepSeek V4, Qwen3.6, and Qwen3.8 text adapters |
 | Compiler | Descriptor validation, weight resolution, execution-graph construction, and immutable compilation |
-| Execution graph | Tensor and node dependencies, backend candidates and placement, and dependency-ordered backend runs |
+| Execution graph | Tensor and node dependencies, backend candidates and placement, and dependency-ordered nodes |
 | Dense path | Portable CPU with runtime-dispatched FP8 E4M3 scalar/AVX2/AVX-512 Linear, and mixed ncnn Vulkan Dense/Attention execution |
 | Attention | RMSNorm, GQA, full/sliding Attention, Gated DeltaNet, latent Attention with learned compressed history, RoPE/YaRN variants, output gates, sinks, persistent KV/recurrent state, fused QKV+RoPE, and option-controlled fused Decode SDPA |
 | Experts | Stable Top-K regrouping, Softmax/Sigmoid/square-root-Softplus scoring, hash routes, gated shared Experts, float32/BF16/FP8/INT8/Q2_K-Q6_K execution, and fused-decode FP4 kernels selected at runtime for scalar, NEON, SVE2, AVX2/FMA, or AVX-512 |
@@ -277,6 +277,16 @@ exclusive I/O flags. The remaining `OptionFlag` bit positions are compacted;
 C++ callers must use the current named constants rather than old numeric masks.
 The CLI options `--mmap-experts`, `--direct-expert-io`, and
 `--buffered-expert-io` are unchanged.
+
+CPU normalization kernels, GatedDelta kernels, MXFP4 single-token row pairing,
+and latent-attention output-group threading are selected automatically using
+the existing ISA dispatch and workload/thread-budget checks. Their former
+implementation switches (`OptimizationCpuSimdRmsNorm`,
+`OptimizationCpuLatentSimdNorm`, `OptimizationCpuGatedDeltaSimd`,
+`OptimizationCpuMxfp4RowPairs`, and `OptimizationCpuLatentOutputGroups`) have
+been removed. C++ callers should remove references to those constants; the
+remaining optimization flags retain their numeric values. Precision, packed
+weight storage, and backend controls remain explicit options.
 
 Statistics retain execution, fusion, transfer, cache, and CPU-fallback results.
 The per-stage Vulkan Attention failure fields (`vulkan_attention_*_failures`)

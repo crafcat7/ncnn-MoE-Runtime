@@ -264,6 +264,10 @@ def main() -> int:
             process.stdin.write('{"op":"cancel","request_id":"cancel-me"}\n')
             process.stdin.flush()
             cancelled = True
+        elif event.get("event") == "error":
+            process.terminate()
+            process.wait(timeout=5)
+            raise AssertionError(f"cancellation generation failed: {event}")
         elif event.get("event") == "done":
             completed = True
             assert event.get("cancelled") is True

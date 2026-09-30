@@ -14,7 +14,6 @@ struct DecodeBatchEntry;
 struct ExpertBackendStatistics;
 struct ExpertCacheStatistics;
 struct ExpertVictimCacheStatistics;
-struct ExpertPlan;
 struct SessionStatistics;
 struct RuntimeMetricCounters;
 
@@ -27,8 +26,6 @@ void record_batch_resource_delta(const CompiledModel& model,
                                  std::span<const DecodeBatchEntry> entries,
                                  const ExpertCacheStatistics& cache_before,
                                  const ExpertBackendStatistics& backend_before);
-
-void record_expert_weight_demand(const ExpertPlan& expert, size_t route_count, SessionStatistics& statistics) noexcept;
 
 void record_expert_cache_delta(SessionStatistics& statistics,
                                const ExpertCacheStatistics& before,

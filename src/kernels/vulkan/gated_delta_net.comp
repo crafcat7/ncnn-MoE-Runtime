@@ -150,13 +150,9 @@ void main()
                 const float delta = (value - memory_value) * beta;
                 for (uint key_column = 0; key_column < p.head_dimension; ++key_column)
                 {
-                    recurrent_state[recurrent_base
-                                    + key_column * p.value_head_dimension
-                                    + value_column] = recurrent_state[recurrent_base
-                                                                      + key_column * p.value_head_dimension
-                                                                      + value_column]
-                                                          * decay
-                                                      + fused_input[key_base + key_column] * delta;
+                    const uint state_index = recurrent_base + key_column * p.value_head_dimension + value_column;
+                    recurrent_state[state_index] = recurrent_state[state_index] * decay
+                                                   + fused_input[key_base + key_column] * delta;
                 }
                 float output_value = 0.0;
                 for (uint key_column = 0; key_column < p.head_dimension; ++key_column)

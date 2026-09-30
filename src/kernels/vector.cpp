@@ -12,8 +12,10 @@
 #include <arm_neon.h>
 #endif
 
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
-#include "vector_msvc.h"
+#if defined(NCNN_MOE_X86_SIMD) \
+    && (defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__))
+#define NCNN_MOE_VECTOR_X86_SIMD 1
+#include "vector_x86.h"
 #endif
 
 namespace ncnn {
@@ -102,14 +104,18 @@ static void neon_float_gemm(const float* weights,
                     for (uint32_t row = 0; row < 4; ++row)
                         sums[token][row] = vfmaq_f32(sums[token][row], inputs[token], weight_rows[row]);
             }
+            const uint32_t remain = input_columns & 3u;
             for (uint32_t token = 0; token < 4; ++token)
             {
                 for (uint32_t row = 0; row < 4; ++row)
                 {
                     float sum = vaddvq_f32(sums[token][row]);
-                    for (uint32_t tail = column; tail < input_columns; ++tail)
-                        sum += input[static_cast<size_t>(token) * input_stride + tail]
-                               * tile_weights[static_cast<size_t>(row) * weight_stride + tail];
+                    for (uint32_t tail = 0; tail < remain; ++tail)
+                    {
+                        const uint32_t index = column + tail;
+                        sum += input[static_cast<size_t>(token) * input_stride + index]
+                               * tile_weights[static_cast<size_t>(row) * weight_stride + index];
+                    }
                     output[static_cast<size_t>(token) * output_stride + first_output + row] = sum;
                 }
             }
@@ -136,6 +142,36 @@ static void neon_bfloat16_gemm(const uint16_t* weights,
     // Expand each BF16 weight vector once for four input rows. Accumulation
     // and activations stay FP32, requiring only the baseline ARM64 NEON ISA.
     uint32_t first_output = 0;
+    // Share input loads across four output channels during decode.
+    if (token_count == 1)
+    {
+        for (; output_count - first_output >= 4; first_output += 4)
+        {
+            const uint16_t* w = weights + static_cast<size_t>(first_output) * weight_stride;
+            float32x4_t sums[4][4] = {};
+            uint32_t k = 0;
+            for (; input_columns - k >= 16; k += 16)
+            {
+                float32x4_t x[4];
+                for (uint32_t j = 0; j < 4; ++j)
+                    x[j] = vld1q_f32(input + k + j * 4);
+                for (uint32_t r = 0; r < 4; ++r)
+                    for (uint32_t j = 0; j < 4; ++j)
+                        sums[r][j] = vfmaq_f32(sums[r][j], x[j], vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(w + r * weight_stride + k + j * 4), 16)));
+            }
+            for (uint32_t r = 0; r < 4; ++r)
+            {
+                float32x4_t sum = vaddq_f32(vaddq_f32(sums[r][0], sums[r][1]), vaddq_f32(sums[r][2], sums[r][3]));
+                uint32_t j = k;
+                for (; input_columns - j >= 4; j += 4)
+                    sum = vfmaq_f32(sum, vld1q_f32(input + j), vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(w + r * weight_stride + j), 16)));
+                float value = vaddvq_f32(sum);
+                for (; j < input_columns; ++j)
+                    value += input[j] * std::bit_cast<float>(static_cast<uint32_t>(w[r * weight_stride + j]) << 16);
+                output[first_output + r] = value;
+            }
+        }
+    }
     if (token_count == 4)
     {
         for (; output_count - first_output >= 4; first_output += 4)
@@ -174,6 +210,55 @@ static void neon_bfloat16_gemm(const uint16_t* weights,
             output[static_cast<size_t>(token) * output_stride + row] = bfloat16_dot(weights + static_cast<size_t>(row) * weight_stride,
                                                                                     input + static_cast<size_t>(token) * input_stride,
                                                                                     input_columns);
+}
+
+static float32x4_t neon_expf(float32x4_t values) noexcept
+{
+    // Match float_approximate_exp: negative inputs use reciprocal positive exp,
+    // NaNs pass through, and +/-104 keep their explicit scalar boundaries.
+    const uint32x4_t input_bits = vreinterpretq_u32_f32(values);
+    const uint32x4_t magnitude_bits = vandq_u32(input_bits, vdupq_n_u32(0x7fffffffu));
+    const uint32x4_t is_nan = vcgtq_u32(magnitude_bits, vdupq_n_u32(0x7f800000u));
+    const uint32x4_t is_negative = vandq_u32(vcgtq_u32(input_bits, vdupq_n_u32(0x7fffffffu)),
+                                             vcgtq_u32(magnitude_bits, vdupq_n_u32(0u)));
+    const uint32x4_t below_limit = vcltq_u32(magnitude_bits, vdupq_n_u32(0x42d00000u));
+    const float32x4_t magnitude = vreinterpretq_f32_u32(vandq_u32(magnitude_bits, below_limit));
+
+    const float32x4_t rounding = vdupq_n_f32(0x1.8p23f);
+    float32x4_t exponent = vfmaq_f32(rounding, magnitude, vdupq_n_f32(0x1.715476p+0f));
+    exponent = vsubq_f32(exponent, rounding);
+    float32x4_t remainder = vfmaq_f32(magnitude, exponent, vdupq_n_f32(-0x1.7f7d1cp-20f));
+    remainder = vfmaq_f32(remainder, exponent, vdupq_n_f32(-0x1.62e4p-1f));
+
+    float32x4_t polynomial = vdupq_n_f32(1.37805939e-3f);
+    polynomial = vfmaq_f32(vdupq_n_f32(8.37312452e-3f), polynomial, remainder);
+    polynomial = vfmaq_f32(vdupq_n_f32(4.16695364e-2f), polynomial, remainder);
+    polynomial = vfmaq_f32(vdupq_n_f32(1.66664720e-1f), polynomial, remainder);
+    polynomial = vfmaq_f32(vdupq_n_f32(4.99999851e-1f), polynomial, remainder);
+    polynomial = vfmaq_f32(vdupq_n_f32(1.0f), polynomial, remainder);
+    polynomial = vfmaq_f32(vdupq_n_f32(1.0f), polynomial, remainder);
+
+    const int32x4_t exponent_integer = vcvtq_s32_f32(exponent);
+    const uint32x4_t exponent_bits = vshlq_n_u32(vreinterpretq_u32_s32(exponent_integer), 23);
+    const uint32x4_t has_positive_exponent = vcgtq_s32(exponent_integer, vdupq_n_s32(0));
+    const uint32x4_t underflow_bias = vbslq_u32(has_positive_exponent,
+                                                vdupq_n_u32(0u),
+                                                vdupq_n_u32(0x83000000u));
+    const float32x4_t scale_high = vreinterpretq_f32_u32(vaddq_u32(vdupq_n_u32(0x7f000000u),
+                                                                   underflow_bias));
+    const float32x4_t scale_low = vreinterpretq_f32_u32(vsubq_u32(exponent_bits, underflow_bias));
+    const float32x4_t positive_result = vmulq_f32(vmulq_f32(polynomial, scale_high), scale_low);
+    float32x4_t result = vbslq_f32(is_negative,
+                                   vdivq_f32(vdupq_n_f32(1.0f), positive_result),
+                                   positive_result);
+
+    const uint32x4_t at_limit = vcgeq_u32(magnitude_bits, vdupq_n_u32(0x42d00000u));
+    const uint32x4_t positive_limit = vandq_u32(vandq_u32(at_limit, vmvnq_u32(is_negative)),
+                                                vmvnq_u32(is_nan));
+    const uint32x4_t negative_limit = vandq_u32(vandq_u32(at_limit, is_negative), vmvnq_u32(is_nan));
+    result = vbslq_f32(positive_limit, vdupq_n_f32(INFINITY), result);
+    result = vbslq_f32(negative_limit, vdupq_n_f32(0.0f), result);
+    return vbslq_f32(is_nan, values, result);
 }
 #endif
 
@@ -469,8 +554,10 @@ static void scalar_float_silu_mul(float* output, const float* gate, const float*
     for (uint32_t index = 0; index < count; ++index)
     {
         const float gate_value = gate[index];
+        const float up_value = up[index];
+        const float biased_up = up_offset == 0.0f ? up_value : up_value + up_offset;
         output[index] = gate_value / (1.0f + float_approximate_exp(-sigmoid_scale * gate_value))
-                        * (up[index] + up_offset);
+                        * biased_up;
     }
 }
 
@@ -487,84 +574,84 @@ static FloatDotFunction select_float_dot() noexcept
 {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return neon_float_dot;
-#elif defined(NCNN_MOE_MSVC_X86_SIMD)
+#elif defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_dot;
+        return avx512_float_dot;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_dot;
+        return avx2_float_dot;
 #endif
     return scalar_float_dot;
 }
 
 static FloatExpInplaceFunction select_float_exp_inplace() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_exp_inplace;
+        return avx512_float_exp_inplace;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_exp_inplace;
+        return avx2_float_exp_inplace;
 #endif
     return nullptr;
 }
 
 static Int8FloatDotFunction select_int8_float_dot() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_int8_float_dot;
+        return avx512_int8_float_dot;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_int8_float_dot;
+        return avx2_int8_float_dot;
 #endif
     return scalar_int8_float_dot;
 }
 
 static FloatScaledAddFunction select_float_scaled_add() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_scaled_add;
+        return avx512_float_scaled_add;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_scaled_add;
+        return avx2_float_scaled_add;
 #endif
     return scalar_float_scaled_add;
 }
 
 static FloatScaleFunction select_float_scale() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_scale_inplace;
+        return avx512_float_scale_inplace;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_scale_inplace;
+        return avx2_float_scale_inplace;
 #endif
     return scalar_float_scale_inplace;
 }
 
 static FloatScaleAddFunction select_float_scale_add() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_scale_add;
+        return avx512_float_scale_add;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_scale_add;
+        return avx2_float_scale_add;
 #endif
     return scalar_float_scale_add;
 }
 
 static FloatScaleInplaceAndScaledAddFunction select_float_scale_inplace_and_scaled_add() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_scale_inplace_and_scaled_add;
+        return avx512_float_scale_inplace_and_scaled_add;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_scale_inplace_and_scaled_add;
+        return avx2_float_scale_inplace_and_scaled_add;
 #endif
     return scalar_float_scale_inplace_and_scaled_add;
 }
@@ -572,120 +659,120 @@ static FloatScaleInplaceAndScaledAddFunction select_float_scale_inplace_and_scal
 static FloatScaleInplaceAndScaledAddAndAccumulateFunction
 select_float_scale_inplace_and_scaled_add_and_accumulate() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_scale_inplace_and_scaled_add_and_accumulate;
+        return avx512_float_scale_inplace_and_scaled_add_and_accumulate;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_scale_inplace_and_scaled_add_and_accumulate;
+        return avx2_float_scale_inplace_and_scaled_add_and_accumulate;
 #endif
     return scalar_float_scale_inplace_and_scaled_add_and_accumulate;
 }
 
 static FloatWeightedScaleFunction select_float_weighted_scale() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_weighted_scale;
+        return avx512_float_weighted_scale;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_weighted_scale;
+        return avx2_float_weighted_scale;
 #endif
     return scalar_float_weighted_scale;
 }
 
 static Bfloat16WeightedScaleFunction select_bfloat16_weighted_scale() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_bfloat16_weighted_scale;
+        return avx512_bfloat16_weighted_scale;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_bfloat16_weighted_scale;
+        return avx2_bfloat16_weighted_scale;
 #endif
     return scalar_bfloat16_weighted_scale;
 }
 
 static FloatRmsScaleFunction select_float_rms_scale() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_rms_scale_inplace;
+        return avx512_float_rms_scale_inplace;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_rms_scale_inplace;
+        return avx2_float_rms_scale_inplace;
 #endif
     return scalar_float_rms_scale_inplace;
 }
 
 static FloatL2ScaleFunction select_float_l2_scale() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_l2_scale_inplace;
+        return avx512_float_l2_scale_inplace;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_l2_scale_inplace;
+        return avx2_float_l2_scale_inplace;
 #endif
     return scalar_float_l2_scale_inplace;
 }
 
 static FloatRmsNormFunction select_float_rms_norm() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_rms_norm;
+        return avx512_float_rms_norm;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_rms_norm;
+        return avx2_float_rms_norm;
 #endif
     return scalar_float_rms_norm;
 }
 
 static Bfloat16RmsNormFunction select_bfloat16_rms_norm() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_bfloat16_rms_norm;
+        return avx512_bfloat16_rms_norm;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_bfloat16_rms_norm;
+        return avx2_bfloat16_rms_norm;
 #endif
     return scalar_bfloat16_rms_norm;
 }
 
 static FloatRopeFunction select_float_rope() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_rope_inplace;
+        return avx512_float_rope_inplace;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_rope_inplace;
+        return avx2_float_rope_inplace;
 #endif
     return scalar_float_rope_inplace;
 }
 
 static FloatHcPre4Function select_float_hc_pre_4() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_hc_pre_4;
+        return avx512_float_hc_pre_4;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_hc_pre_4;
+        return avx2_float_hc_pre_4;
 #endif
     return scalar_float_hc_pre_4;
 }
 
 static FloatHcPost4Function select_float_hc_post_4() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_hc_post_4;
+        return avx512_float_hc_post_4;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_hc_post_4;
+        return avx2_float_hc_post_4;
 #endif
     return scalar_float_hc_post_4;
 }
@@ -696,36 +783,36 @@ using FloatSiluInplaceFunction = void (*)(float*, uint32_t) noexcept;
 
 static FloatSigmoidMulFunction select_float_sigmoid_mul() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_sigmoid_mul;
+        return avx512_float_sigmoid_mul;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_sigmoid_mul;
+        return avx2_float_sigmoid_mul;
 #endif
     return scalar_float_sigmoid_mul;
 }
 
 static FloatSiluMulFunction select_float_silu_mul() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_silu_mul;
+        return avx512_float_silu_mul;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_silu_mul;
+        return avx2_float_silu_mul;
 #endif
     return scalar_float_silu_mul;
 }
 
 static FloatSiluInplaceFunction select_float_silu_inplace() noexcept
 {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
-        return msvc_avx512_float_silu_inplace;
+        return avx512_float_silu_inplace;
     if ((isa & CpuIsaX86Avx2Fma) != 0)
-        return msvc_avx2_float_silu_inplace;
+        return avx2_float_silu_inplace;
 #endif
     return scalar_float_silu_inplace;
 }
@@ -750,32 +837,32 @@ void float_gemm_4x4(const float* weights,
     neon_float_gemm(weights, weight_stride, input, input_stride, input_columns,
                     output_count, token_count, output, output_stride);
     return;
-#elif defined(NCNN_MOE_MSVC_X86_SIMD)
+#elif defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
     {
-        msvc_avx512_float_gemm_4x4(weights,
-                                   weight_stride,
-                                   input,
-                                   input_stride,
-                                   input_columns,
-                                   output_count,
-                                   token_count,
-                                   output,
-                                   output_stride);
+        avx512_float_gemm_4x4(weights,
+                              weight_stride,
+                              input,
+                              input_stride,
+                              input_columns,
+                              output_count,
+                              token_count,
+                              output,
+                              output_stride);
         return;
     }
     if ((isa & CpuIsaX86Avx2Fma) != 0)
     {
-        msvc_avx2_float_gemm_4x4(weights,
-                                 weight_stride,
-                                 input,
-                                 input_stride,
-                                 input_columns,
-                                 output_count,
-                                 token_count,
-                                 output,
-                                 output_stride);
+        avx2_float_gemm_4x4(weights,
+                            weight_stride,
+                            input,
+                            input_stride,
+                            input_columns,
+                            output_count,
+                            token_count,
+                            output,
+                            output_stride);
         return;
     }
 #endif
@@ -804,18 +891,18 @@ void float_gemm_4x8(const float* weights,
     neon_float_gemm(weights, weight_stride, input, input_stride, input_columns,
                     output_count, token_count, output, output_stride);
     return;
-#elif defined(NCNN_MOE_MSVC_X86_SIMD)
+#elif defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
     {
-        msvc_avx512_float_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
-                                   output_count, token_count, output, output_stride);
+        avx512_float_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
+                              output_count, token_count, output, output_stride);
         return;
     }
     if ((isa & CpuIsaX86Avx2Fma) != 0)
     {
-        msvc_avx2_float_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
-                                 output_count, token_count, output, output_stride);
+        avx2_float_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
+                            output_count, token_count, output, output_stride);
         return;
     }
 #endif
@@ -837,18 +924,18 @@ void bfloat16_gemm_4x8(const uint16_t* weights,
     neon_bfloat16_gemm(weights, weight_stride, input, input_stride, input_columns,
                        output_count, token_count, output, output_stride);
     return;
-#elif defined(NCNN_MOE_MSVC_X86_SIMD)
+#elif defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
     {
-        msvc_avx512_bfloat16_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
-                                      output_count, token_count, output, output_stride);
+        avx512_bfloat16_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
+                                 output_count, token_count, output, output_stride);
         return;
     }
     if ((isa & CpuIsaX86Avx2Fma) != 0)
     {
-        msvc_avx2_bfloat16_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
-                                    output_count, token_count, output, output_stride);
+        avx2_bfloat16_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
+                               output_count, token_count, output, output_stride);
         return;
     }
 #endif
@@ -859,19 +946,28 @@ void bfloat16_gemm_4x8(const uint16_t* weights,
 void float_exp_inplace(float* values, uint32_t count) noexcept
 {
     static const FloatExpInplaceFunction function = select_float_exp_inplace();
-    if (function)
+    uint32_t index = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    for (; count - index >= 4; index += 4)
+        vst1q_f32(values + index, neon_expf(vld1q_f32(values + index)));
+#endif
+    if (function && index < count)
     {
-        function(values, count);
+        function(values + index, count - index);
         return;
     }
-    for (uint32_t index = 0; index < count; ++index)
+    for (; index < count; ++index)
         values[index] = float_approximate_exp(values[index]);
 }
 
 bool float_exp_simd_available() noexcept
 {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return true;
+#else
     static const FloatExpInplaceFunction function = select_float_exp_inplace();
     return function != nullptr;
+#endif
 }
 
 float int8_float_dot(const int8_t* left, const float* right, uint32_t count) noexcept
@@ -975,20 +1071,65 @@ void float_sigmoid_mul(float* output,
                        uint32_t count) noexcept
 {
     static const FloatSigmoidMulFunction function = select_float_sigmoid_mul();
-    function(output, gate, input, count);
+    uint32_t index = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    for (; count - index >= 4; index += 4)
+    {
+        const float32x4_t gate_values = vld1q_f32(gate + index);
+        const float32x4_t input_values = vld1q_f32(input + index);
+        const float32x4_t exponentials = neon_expf(vnegq_f32(gate_values));
+        const float32x4_t result = vdivq_f32(input_values, vaddq_f32(one, exponentials));
+        vst1q_f32(output + index, result);
+    }
+#endif
+    if (index < count)
+        function(output + index, gate + index, input + index, count - index);
 }
 
 void float_silu_mul(float* output, const float* gate, const float* up,
                     float sigmoid_scale, float up_offset, uint32_t count) noexcept
 {
     static const FloatSiluMulFunction function = select_float_silu_mul();
-    function(output, gate, up, sigmoid_scale, up_offset, count);
+    uint32_t index = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const float32x4_t scale = vdupq_n_f32(sigmoid_scale);
+    const float32x4_t offset = vdupq_n_f32(up_offset);
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    for (; count - index >= 4; index += 4)
+    {
+        const float32x4_t gate_values = vld1q_f32(gate + index);
+        const float32x4_t up_values = vld1q_f32(up + index);
+        const float32x4_t exponentials = neon_expf(vnegq_f32(vmulq_f32(scale, gate_values)));
+        const float32x4_t silu = vdivq_f32(gate_values, vaddq_f32(one, exponentials));
+        const float32x4_t biased_up = up_offset == 0.0f ? up_values : vaddq_f32(up_values, offset);
+        vst1q_f32(output + index, vmulq_f32(silu, biased_up));
+    }
+#endif
+    if (index < count)
+        function(output + index,
+                 gate + index,
+                 up + index,
+                 sigmoid_scale,
+                 up_offset,
+                 count - index);
 }
 
 void float_silu_inplace(float* values, uint32_t count) noexcept
 {
     static const FloatSiluInplaceFunction function = select_float_silu_inplace();
-    function(values, count);
+    uint32_t index = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    for (; count - index >= 4; index += 4)
+    {
+        const float32x4_t input = vld1q_f32(values + index);
+        const float32x4_t exponentials = neon_expf(vnegq_f32(input));
+        vst1q_f32(values + index, vdivq_f32(input, vaddq_f32(one, exponentials)));
+    }
+#endif
+    if (index < count)
+        function(values + index, count - index);
 }
 
 void float_hc_pre_4(float* output, const float* input,

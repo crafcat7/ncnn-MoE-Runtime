@@ -9,6 +9,7 @@
 #include "graph/graph.h"
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -46,6 +47,9 @@ struct Mxfp4Scratch
     std::vector<std::vector<uint32_t>> unique_row_maps;
     std::vector<Mxfp4Task> effective_tasks;
     std::vector<uint32_t> physical_input_rows;
+    std::vector<uint8_t> q8_down_enabled;
+    std::vector<uint8_t> q8_gate_packed;
+    std::vector<std::shared_ptr<const Mxfp4Q8PackedMatrix>> q8_down_packed;
 };
 
 [[nodiscard]] bool mxfp4_expert_decode(std::span<const Mxfp4Task> tasks,
@@ -90,8 +94,9 @@ void linear_batch_into(const TensorData& matrix, const TensorData& bias, const A
                                               ExpertActivation activation, float activation_limit, ActivationBuffer& output, uint64_t optimization_flags,
                                               const CompiledOperator* gate_executable = nullptr,
                                               const CompiledOperator* up_executable = nullptr);
-[[nodiscard]] ActivationBuffer fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* bias, const ActivationBuffer& input, ExpertActivation activation, float activation_limit,
-                                                         uint64_t optimization_flags);
+// Input and output must be distinct Float32 buffers.
+void fused_mxfp4_gate_up_batch(const TensorData& matrix, const TensorData* bias, const ActivationBuffer& input, ExpertActivation activation, float activation_limit,
+                               ActivationBuffer& output, uint64_t optimization_flags);
 [[nodiscard]] bool mxfp4_expert_batch(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch, uint64_t optimization_flags);
 [[nodiscard]] ActivationBuffer rms_norm_batch(const ActivationBuffer& input, const TensorData& weight, float epsilon, float weight_offset);
 // Input and output may be the same buffer; each row's RMS is computed before writing it.

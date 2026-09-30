@@ -180,16 +180,10 @@ static Result<void> dispatch_experts_general_into(std::span<const float> router_
     return {};
 }
 
-Result<ExpertDispatchPlan> dispatch_experts(std::span<const float> router_logits, uint32_t token_count, const ExpertDispatchOptions& options)
-{
-    ExpertDispatchPlan result;
-    auto dispatched = dispatch_experts_general_into(router_logits, token_count, options, result);
-    if (!dispatched)
-        return dispatched.error();
-    return result;
-}
-
-Result<void> dispatch_experts_into(std::span<const float> router_logits, uint32_t token_count, const ExpertDispatchOptions& options, ExpertDispatchPlan& result)
+Result<void> dispatch_experts(std::span<const float> router_logits,
+                              uint32_t token_count,
+                              const ExpertDispatchOptions& options,
+                              ExpertDispatchPlan& result)
 {
     static constexpr uint32_t stack_top_k = 16;
     if (token_count != 1

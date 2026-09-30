@@ -692,54 +692,6 @@ void VulkanExpertBackend::admit(std::string key, std::shared_ptr<const TensorDat
     work_available.notify_one();
 }
 
-ExpertBackendExecutionResult VulkanExpertBackend::try_execute(const std::string& key, const ActivationBuffer& input, ActivationBuffer& output)
-{
-    const ExpertBackendRequest request{key, &input, &output};
-    std::vector<ExpertBackendExecutionResult> results = try_execute_batch(std::span<const ExpertBackendRequest>(&request, 1));
-    return results.empty() ? ExpertBackendExecutionResult ::Failed : results.front();
-}
-
-std::vector<ExpertBackendExecutionResult> VulkanExpertBackend::try_execute_batch(std::span<const ExpertBackendRequest> requests)
-{
-    auto submission = submit_batch(requests);
-    if (!submission)
-        return std::vector<ExpertBackendExecutionResult>(requests.size(), ExpertBackendExecutionResult ::Failed);
-    const std::span<const ExpertBackendExecutionResult> planned = submission->reservations();
-    std::vector<ExpertBackendExecutionResult> results = submission->wait();
-    if (planned.size() != requests.size() || results.size() != requests.size())
-    {
-        submission->abort();
-        return std::vector<ExpertBackendExecutionResult>(requests.size(), ExpertBackendExecutionResult ::Failed);
-    }
-    for (size_t index = 0; index < results.size(); ++index)
-    {
-        if (results[index] == ExpertBackendExecutionResult::Executed
-            && planned[index] != ExpertBackendExecutionResult::Executed)
-        {
-            submission->abort();
-            return std::vector<ExpertBackendExecutionResult>(requests.size(), ExpertBackendExecutionResult ::Failed);
-        }
-    }
-    bool has_executed = false;
-    for (ExpertBackendExecutionResult result : results)
-        has_executed = has_executed || result == ExpertBackendExecutionResult::Executed;
-    if (has_executed)
-    {
-        if (!submission->commit())
-        {
-            for (ExpertBackendExecutionResult& result : results)
-            {
-                if (result == ExpertBackendExecutionResult::Executed)
-                    result = ExpertBackendExecutionResult::Failed;
-            }
-            submission->abort();
-        }
-    }
-    else
-        submission->abort();
-    return results;
-}
-
 std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<const ExpertBackendRequest> requests)
 {
     auto work = std::make_shared<WorkItem>();

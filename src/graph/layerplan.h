@@ -127,6 +127,8 @@ struct AttentionBlockPlan
     float rope_ntk_alpha = 1.0f;
     float rope_ntk_beta = 32.0f;
     float norm_weight_offset = 0.0f;
+    float norm_epsilon = 1e-5f;
+    DType kv_cache_dtype = DType::Float32;
     AttentionKind kind = AttentionKind::None;
     uint32_t flags = 0;
 };
