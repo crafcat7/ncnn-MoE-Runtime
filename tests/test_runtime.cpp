@@ -14916,12 +14916,32 @@ void test_dense_gemm_tails()
     constexpr std::array shapes = {
         Shape{31, 33, 65},
         Shape{32, 255, 129},
+        Shape{32, 256, 64},
+        Shape{63, 257, 257},
+        Shape{64, 257, 257},
+        Shape{65, 257, 257},
+        Shape{33, 256, 63},
+        Shape{33, 257, 64},
+        Shape{33, 511, 129},
         Shape{33, 512, 65},
+        Shape{32, 513, 65},
         Shape{128, 1025, 129},
+        Shape{128, 1027, 257},
+        Shape{128, 2047, 129},
         Shape{128, 2048, 65},
+        Shape{65, 2048, 513},
         Shape{128, 33, 129},
         Shape{31, 2048, 129},
         Shape{33, 255, 129},
+        Shape{1, 513, 1025},
+        Shape{1, 1023, 1025},
+        Shape{1, 1024, 2048},
+        Shape{1, 1024, 2049},
+        Shape{32, 513, 257},
+        Shape{33, 1025, 513},
+        Shape{32, 2049, 257},
+        Shape{32, 4097, 257},
+        Shape{31, 4097, 257},
     };
     ActivationBuffer output;
     ActivationBuffer quantized_input_scratch(2, 7);
@@ -14980,7 +15000,7 @@ void test_dense_gemm_tails()
         }
     };
 
-    for (uint32_t requested_threads : {1u, 2u})
+    for (uint32_t requested_threads : {1u, 2u, 8u})
     {
         CpuOpenMpThreadLimitScope thread_limit;
         thread_limit.set(requested_threads);
@@ -15082,11 +15102,14 @@ void test_dense_gemm_tails()
                 };
 
 #if defined(__APPLE__) && TARGET_OS_OSX && defined(__MAC_15_0)
-                if (requested_threads == 1
-                    && bfloat16
-                    && shape.rows == 128
-                    && shape.input_columns == 1025
-                    && shape.output_columns == 129)
+                if (bfloat16
+                    && ((requested_threads == 1
+                         && shape.rows == 128
+                         && shape.input_columns == 1025
+                         && shape.output_columns == 129)
+                        || (shape.rows == 65
+                            && shape.input_columns == 2048
+                            && shape.output_columns == 513)))
                 {
                     if (__builtin_available(macOS 15.0, *))
                     {
@@ -15352,6 +15375,55 @@ void test_rms_vector_kernels()
                    input[index] * inverse_rms
                        * (bfloat16_to_float(bfloat16_weight[index]) + weight_offset),
                    2e-4f);
+    }
+
+    for (uint32_t long_count : {2049u, 4097u})
+    {
+        std::vector<float> long_input(long_count, 1e-4f);
+        long_input.front() = 1.0f;
+        long_input.back() = 0.5f;
+        std::vector<float> long_float_weight(long_count);
+        std::vector<uint16_t> long_bfloat16_weight(long_count);
+        for (uint32_t index = 0; index < long_count; ++index)
+        {
+            long_float_weight[index] = 0.5f + static_cast<float>(index % 7) * 0.0625f;
+            long_bfloat16_weight[index] = float_to_bfloat16(long_float_weight[index]);
+        }
+
+        double long_square_sum = 0.0;
+        for (float value : long_input)
+            long_square_sum += static_cast<double>(value) * value;
+        const double long_inverse_rms = 1.0 / std::sqrt(long_square_sum / static_cast<double>(long_count) + static_cast<double>(epsilon));
+        std::vector<float> long_float_output(long_count);
+        std::vector<float> long_bfloat16_output(long_count);
+        float_rms_norm(long_float_output.data(), long_input.data(), long_float_weight.data(),
+                       epsilon, weight_offset, long_count);
+        bfloat16_rms_norm(long_bfloat16_output.data(), long_input.data(),
+                          long_bfloat16_weight.data(), epsilon, weight_offset, long_count);
+
+        std::vector<float> long_float_alias = long_input;
+        std::vector<float> long_bfloat16_alias = long_input;
+        float_rms_norm(long_float_alias.data(), long_float_alias.data(), long_float_weight.data(),
+                       epsilon, weight_offset, long_count);
+        bfloat16_rms_norm(long_bfloat16_alias.data(), long_bfloat16_alias.data(),
+                          long_bfloat16_weight.data(), epsilon, weight_offset, long_count);
+
+        for (uint32_t index = 0; index < long_count; ++index)
+        {
+            const double float_expected = static_cast<double>(long_input[index]) * long_inverse_rms
+                                          * (static_cast<double>(long_float_weight[index])
+                                             + static_cast<double>(weight_offset));
+            const double bfloat16_weight_value = static_cast<double>(bfloat16_to_float(long_bfloat16_weight[index]));
+            const double bfloat16_expected = static_cast<double>(long_input[index]) * long_inverse_rms
+                                             * (bfloat16_weight_value
+                                                + static_cast<double>(weight_offset));
+            check(std::abs(static_cast<double>(long_float_output[index]) - float_expected)
+                  <= 3e-5 * std::abs(float_expected));
+            check(std::abs(static_cast<double>(long_bfloat16_output[index]) - bfloat16_expected)
+                  <= 3e-5 * std::abs(bfloat16_expected));
+            check(long_float_alias[index] == long_float_output[index]);
+            check(long_bfloat16_alias[index] == long_bfloat16_output[index]);
+        }
     }
 
     std::array<float, count> normalized = input;

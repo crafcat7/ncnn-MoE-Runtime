@@ -331,8 +331,7 @@ static void forward_expert(const CompiledModel& model,
                       gate,
                       metrics,
                       optimization_flags);
-        const bool vector_silu = up.rows() > 1
-                                 && up.columns() >= 4
+        const bool vector_silu = up.columns() >= 4
                                  && expert.activation_limit <= 0.0f
                                  && has_flag(optimization_flags, OptimizationCpuFastSilu)
                                  && (expert.activation == ExpertActivation::Silu

@@ -199,10 +199,12 @@ static float neon_bfloat16_dot(const uint16_t* weights, const float* input, uint
     uint32_t index = 0;
     for (; count - index >= 16; index += 16)
     {
-        const uint32x4_t expanded0 = vshlq_n_u32(vmovl_u16(vld1_u16(weights + index)), 16);
-        const uint32x4_t expanded1 = vshlq_n_u32(vmovl_u16(vld1_u16(weights + index + 4)), 16);
-        const uint32x4_t expanded2 = vshlq_n_u32(vmovl_u16(vld1_u16(weights + index + 8)), 16);
-        const uint32x4_t expanded3 = vshlq_n_u32(vmovl_u16(vld1_u16(weights + index + 12)), 16);
+        const uint16x8_t weights0 = vld1q_u16(weights + index);
+        const uint16x8_t weights1 = vld1q_u16(weights + index + 8);
+        const uint32x4_t expanded0 = vshll_n_u16(vget_low_u16(weights0), 16);
+        const uint32x4_t expanded1 = vshll_n_u16(vget_high_u16(weights0), 16);
+        const uint32x4_t expanded2 = vshll_n_u16(vget_low_u16(weights1), 16);
+        const uint32x4_t expanded3 = vshll_n_u16(vget_high_u16(weights1), 16);
         sum0 = vfmaq_f32(sum0,
                          vreinterpretq_f32_u32(expanded0),
                          vld1q_f32(input + index));

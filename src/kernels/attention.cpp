@@ -833,6 +833,10 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
         return;
     }
 
+    const bool use_simd_exp = decode_all_keys_valid
+                              && cache.token_count >= 4
+                              && cache.token_count <= std::numeric_limits<uint32_t>::max()
+                              && float_exp_simd_available();
     const int head_threads = query.rows() == 1 && !has_selected_keys
                                      && head_count >= 4 && cache.token_count >= 64
                                  ? std::min<uint32_t>(static_cast<uint32_t>(cpu_linear_team_size(2 * split_kv_work, cache.dtype)), head_count)
@@ -1030,16 +1034,31 @@ static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, co
                 const float sink_value = sinks->dtype == DType::Float32 ? sinks->float32_values()[query_head] : bfloat16_to_float(sinks->bfloat16_values()[query_head]);
                 normalizer = float_approximate_exp(sink_value - maximum);
             }
-            for (uint64_t key_index = 0; key_index < cache.token_count; ++key_index)
+            if (use_simd_exp)
             {
-                if (std::isfinite(head_logits[key_index]))
+                const float negative_infinity = -std::numeric_limits<float>::infinity();
+                for (uint64_t key_index = 0; key_index < cache.token_count; ++key_index)
                 {
-                    head_logits[key_index] = float_approximate_exp(head_logits[key_index] - maximum);
-                    normalizer += head_logits[key_index];
+                    const float score = head_logits[key_index];
+                    head_logits[key_index] = std::isfinite(score) ? score - maximum : negative_infinity;
                 }
-                else
+                float_exp_inplace(head_logits, static_cast<uint32_t>(cache.token_count));
+                for (uint64_t key_index = 0; key_index < cache.token_count; ++key_index)
+                    normalizer += head_logits[key_index];
+            }
+            else
+            {
+                for (uint64_t key_index = 0; key_index < cache.token_count; ++key_index)
                 {
-                    head_logits[key_index] = 0.0f;
+                    if (std::isfinite(head_logits[key_index]))
+                    {
+                        head_logits[key_index] = float_approximate_exp(head_logits[key_index] - maximum);
+                        normalizer += head_logits[key_index];
+                    }
+                    else
+                    {
+                        head_logits[key_index] = 0.0f;
+                    }
                 }
             }
 

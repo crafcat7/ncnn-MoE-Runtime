@@ -23,6 +23,7 @@
 #include <string>
 
 #if defined(__APPLE__)
+#include <atomic>
 #include <TargetConditionals.h>
 #if defined(__has_include)
 #if __has_include(<vecLib/cblas_new.h>) && !defined(ACCELERATE_NEW_LAPACK)
@@ -354,8 +355,7 @@ static void float8_linear_quantized_into(const TensorData& matrix,
     constexpr uint32_t block_size = 128;
     const uint32_t input_blocks = (input_columns + block_size - 1) / block_size;
     const uint32_t output_blocks = (output_columns + block_size - 1) / block_size;
-    const std::span<const uint8_t> matrix_values = matrix.float8_values();
-    assert(matrix_values.size() == matrix.element_count());
+    assert(matrix.float8_values().size() == matrix.element_count());
     assert(matrix.quantization_scales.size()
            == static_cast<size_t>(output_blocks) * input_blocks);
     (void)output_blocks;
@@ -439,9 +439,12 @@ static bool bfloat16_linear_gemm_tile_into(const TensorData& matrix,
                                            ActivationBuffer& output,
                                            int team_size)
 {
-    // Larger decode matrices retain the streaming GEMV path.
+    // Keep large decode streaming; allow small single-worker tiles.
+    const size_t max_elements = team_size == 1 && matrix.shape[1] <= 1024
+                                    ? 2u * 1024u * 1024u
+                                    : 512u * 1024u;
     if (input.rows() == 0 || matrix.shape[0] < 2 || matrix.shape[1] < 16
-        || (input.rows() == 1 && matrix.element_count() > 512u * 1024u))
+        || (input.rows() == 1 && matrix.element_count() > max_elements))
         return false;
     const uint32_t output_columns = matrix.shape[0];
     const uint32_t input_columns = matrix.shape[1];
@@ -452,100 +455,166 @@ static bool bfloat16_linear_gemm_tile_into(const TensorData& matrix,
     const std::span<const uint16_t> weights = matrix.bfloat16_values();
     // Expand each small weight tile once and reuse it across the token batch.
     if (input.rows() >= 8
-        && input_columns <= 2048
         && output_tile == 8
         && output_groups >= std::max(8u, static_cast<uint32_t>(team_size) * 2u))
     {
         uint32_t panel_columns = output_tile;
+        uint32_t block_k = std::min(input_columns, 2048u);
 #if defined(__APPLE__) && TARGET_OS_OSX && defined(__MAC_15_0)
         bool use_blas = false;
-        BLAS_THREADING previous_threading{};
-        if (team_size == 1
-            && input.rows() >= 32
-            && input_columns >= 32
-            && input.rows() <= static_cast<size_t>(std::numeric_limits<int>::max())
-            && output_columns <= static_cast<uint32_t>(std::numeric_limits<int>::max())
-            && input_columns <= static_cast<uint32_t>(std::numeric_limits<int>::max()))
+        const bool blas_shape = input.rows() >= 32
+                                && input_columns >= 32
+                                && input.rows() <= static_cast<size_t>(std::numeric_limits<int>::max())
+                                && output_columns <= static_cast<uint32_t>(std::numeric_limits<int>::max())
+                                && input_columns <= static_cast<uint32_t>(std::numeric_limits<int>::max());
+        bool serial = true;
+#if defined(_OPENMP)
+        if (input_columns > 2048u)
+            serial = omp_in_parallel() == 0;
+#endif
+        if (blas_shape
+            && output_columns >= 256u
+            && (input_columns <= 2048u
+                || (cpu_linear_num_threads() == 1 && serial)))
         {
             if (__builtin_available(macOS 15.0, *))
             {
-                previous_threading = BLASGetThreading();
-                if (BLASSetThreading(BLAS_THREADING_SINGLE_THREADED) == 0)
-                {
-                    panel_columns = std::min(64u, (16384u / input_columns) & ~7u);
-                    use_blas = true;
-                }
+                block_k = std::min(input_columns, 512u);
+                panel_columns = 64;
+                use_blas = true;
             }
         }
 #endif
         const int64_t groups = static_cast<int64_t>((static_cast<uint64_t>(output_columns)
                                                      + panel_columns - 1)
                                                     / panel_columns);
-#pragma omp parallel for num_threads(team_size) if (team_size > 1)
-        for (int64_t g = 0;
-             g < groups;
-             ++g)
-        {
-            const uint32_t first_output = static_cast<uint32_t>(g) * panel_columns;
-            const uint32_t valid_outputs = std::min(panel_columns, output_columns - first_output);
-            alignas(64) float packed[8 * 2048];
-            const size_t source_offset = static_cast<size_t>(first_output) * input_columns;
-            for (uint32_t row = 0; row < valid_outputs; ++row)
-            {
-                for (uint32_t column = 0; column < input_columns; ++column)
-                {
-                    const uint16_t value = weights[source_offset
-                                                   + static_cast<size_t>(row) * input_columns
-                                                   + column];
-                    packed[static_cast<size_t>(row) * input_columns + column] = std::bit_cast<float>(static_cast<uint32_t>(value) << 16);
-                }
-            }
-
 #if defined(__APPLE__) && TARGET_OS_OSX && defined(__MAC_15_0)
+        const int threads = use_blas
+                                ? std::min(team_size, static_cast<int>(groups))
+                                : team_size;
+        std::atomic<bool> complete{true};
+#pragma omp parallel num_threads(threads) if (threads > 1)
+#else
+#pragma omp parallel num_threads(team_size) if (team_size > 1)
+#endif
+        {
+#if defined(__APPLE__) && TARGET_OS_OSX && defined(__MAC_15_0)
+            BLAS_THREADING threading{};
+            bool blas_ready = false;
             if (use_blas)
             {
                 if (__builtin_available(macOS 15.0, *))
                 {
-                    cblas_sgemm(CblasRowMajor,
-                                CblasNoTrans,
-                                CblasTrans,
-                                static_cast<int>(input.rows()),
-                                static_cast<int>(valid_outputs),
-                                static_cast<int>(input_columns),
-                                1.0f,
-                                input.row(0),
-                                static_cast<int>(input_columns),
-                                packed,
-                                static_cast<int>(input_columns),
-                                0.0f,
-                                output.row(0) + first_output,
-                                static_cast<int>(output_columns));
-                    continue;
+                    threading = BLASGetThreading();
+                    blas_ready = BLASSetThreading(BLAS_THREADING_SINGLE_THREADED) == 0;
                 }
+                if (!blas_ready)
+                    complete.store(false, std::memory_order_relaxed);
             }
 #endif
-            for (uint32_t token_group = 0; token_group < token_groups; ++token_group)
+#pragma omp for schedule(static) nowait
+            for (int64_t g = 0; g < groups; ++g)
             {
-                const uint32_t first_token = token_group * 4;
-                const uint32_t valid_tokens = std::min<uint32_t>(4,
-                                                                 static_cast<uint32_t>(input.rows()) - first_token);
-                float_gemm_4x8(packed,
-                               input_columns,
-                               input.row(first_token),
-                               input.columns(),
-                               input_columns,
-                               valid_outputs,
-                               valid_tokens,
-                               output.row(first_token) + first_output,
-                               output.columns());
+#if defined(__APPLE__) && TARGET_OS_OSX && defined(__MAC_15_0)
+                if (use_blas && !blas_ready)
+                    continue;
+#endif
+                const uint32_t first_output = static_cast<uint32_t>(g) * panel_columns;
+                const uint32_t valid_outputs = std::min(panel_columns, output_columns - first_output);
+#if defined(__APPLE__) && TARGET_OS_OSX && defined(__MAC_15_0)
+                alignas(64) float packed[64 * 512];
+#else
+                alignas(64) float packed[8 * 2048];
+#endif
+                for (uint32_t first_k = 0; first_k < input_columns;
+                     first_k += std::min(block_k, input_columns - first_k))
+                {
+                    const uint32_t valid_k = std::min(block_k, input_columns - first_k);
+                    const size_t source_offset = static_cast<size_t>(first_output) * input_columns
+                                                 + first_k;
+                    for (uint32_t row = 0; row < valid_outputs; ++row)
+                    {
+                        for (uint32_t column = 0; column < valid_k; ++column)
+                        {
+                            const uint16_t value = weights[source_offset
+                                                           + static_cast<size_t>(row) * input_columns
+                                                           + column];
+                            packed[static_cast<size_t>(row) * valid_k + column] = std::bit_cast<float>(static_cast<uint32_t>(value) << 16);
+                        }
+                    }
+#if defined(__APPLE__) && TARGET_OS_OSX && defined(__MAC_15_0)
+                    if (use_blas)
+                    {
+                        if (__builtin_available(macOS 15.0, *))
+                        {
+                            cblas_sgemm(CblasRowMajor,
+                                        CblasNoTrans,
+                                        CblasTrans,
+                                        static_cast<int>(input.rows()),
+                                        static_cast<int>(valid_outputs),
+                                        static_cast<int>(valid_k),
+                                        1.0f,
+                                        input.row(0) + first_k,
+                                        static_cast<int>(input.columns()),
+                                        packed,
+                                        static_cast<int>(valid_k),
+                                        first_k == 0 ? 0.0f : 1.0f,
+                                        output.row(0) + first_output,
+                                        static_cast<int>(output_columns));
+                            continue;
+                        }
+                        complete.store(false, std::memory_order_relaxed);
+                        break;
+                    }
+#endif
+                    for (uint32_t token_group = 0; token_group < token_groups; ++token_group)
+                    {
+                        const uint32_t first_token = token_group * 4;
+                        const uint32_t valid_tokens = std::min<uint32_t>(4,
+                                                                         static_cast<uint32_t>(input.rows()) - first_token);
+                        alignas(64) float partial_output[4 * 8];
+                        float* const block_output = first_k == 0
+                                                        ? output.row(first_token) + first_output
+                                                        : partial_output;
+                        const size_t block_output_stride = first_k == 0 ? output.columns() : 8;
+                        float_gemm_4x8(packed,
+                                       valid_k,
+                                       input.row(first_token) + first_k,
+                                       input.columns(),
+                                       valid_k,
+                                       valid_outputs,
+                                       valid_tokens,
+                                       block_output,
+                                       block_output_stride);
+                        if (first_k != 0)
+                        {
+                            for (uint32_t token = 0; token < valid_tokens; ++token)
+                            {
+                                float* const output_row = output.row(first_token + token) + first_output;
+                                const float* const partial_row = partial_output + static_cast<size_t>(token) * 8;
+                                for (uint32_t output_column = 0; output_column < valid_outputs; ++output_column)
+                                    output_row[output_column] += partial_row[output_column];
+                            }
+                        }
+                    }
+                }
             }
+#if defined(__APPLE__) && TARGET_OS_OSX && defined(__MAC_15_0)
+            if (blas_ready)
+            {
+                if (__builtin_available(macOS 15.0, *))
+                {
+                    if (BLASSetThreading(threading) != 0)
+                        complete.store(false, std::memory_order_relaxed);
+                }
+                else
+                    complete.store(false, std::memory_order_relaxed);
+            }
+#endif
         }
 #if defined(__APPLE__) && TARGET_OS_OSX && defined(__MAC_15_0)
-        if (use_blas)
-        {
-            if (__builtin_available(macOS 15.0, *))
-                BLASSetThreading(previous_threading);
-        }
+        if (use_blas && !complete.load(std::memory_order_relaxed))
+            return false;
 #endif
         return true;
     }

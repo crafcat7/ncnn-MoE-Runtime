@@ -456,9 +456,13 @@ static void scalar_float_rms_norm(float* output,
 {
     if (count == 0)
         return;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const float square_sum = neon_float_dot(input, input, count);
+#else
     float square_sum = 0.0f;
     for (uint32_t index = 0; index < count; ++index)
         square_sum += input[index] * input[index];
+#endif
     const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
     for (uint32_t index = 0; index < count; ++index)
         output[index] = input[index] * inverse_rms * (weight[index] + weight_offset);
@@ -473,9 +477,13 @@ static void scalar_bfloat16_rms_norm(float* output,
 {
     if (count == 0)
         return;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const float square_sum = neon_float_dot(input, input, count);
+#else
     float square_sum = 0.0f;
     for (uint32_t index = 0; index < count; ++index)
         square_sum += input[index] * input[index];
+#endif
     const float inverse_rms = 1.0f / std::sqrt(square_sum / static_cast<float>(count) + epsilon);
     for (uint32_t index = 0; index < count; ++index)
     {
