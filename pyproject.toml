@@ -10,8 +10,7 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-gpt-oss = ["openai-harmony"]
-hf = ["transformers", "tokenizers", "jinja2", "huggingface-hub", "numpy"]
+hf = ["huggingface-hub", "numpy"]
 tui = ["rich", "prompt-toolkit"]
 telemetry = ["psutil", "pynvml"]
 

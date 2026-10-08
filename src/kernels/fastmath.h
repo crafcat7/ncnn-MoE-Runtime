@@ -52,6 +52,16 @@ inline float float_approximate_exp(float value) noexcept
     return (polynomial * scale_high) * scale_low;
 }
 
+// Degree-7 approximation over one range-reduced log2 interval.
+inline float float_silu(float value, float sigmoid_scale = 1.0f) noexcept
+{
+    const float scaled_value = sigmoid_scale * value;
+    if (scaled_value >= 0.0f)
+        return value / (1.0f + float_approximate_exp(-scaled_value));
+    const float exponential = float_approximate_exp(scaled_value);
+    return value * exponential / (1.0f + exponential);
+}
+
 } // namespace moe
 } // namespace ncnn
 

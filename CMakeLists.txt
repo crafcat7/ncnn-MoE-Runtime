@@ -24,7 +24,6 @@ set(NCNN_MOE_USE_NCNN_DEFAULT ON)
 option(NCNN_MOE_USE_NCNN "Use ncnn optimized CPU operators when available" ${NCNN_MOE_USE_NCNN_DEFAULT})
 set(NCNN_MOE_USE_VULKAN_DEFAULT ON)
 option(NCNN_MOE_USE_VULKAN "Build ncnn with Vulkan support" ${NCNN_MOE_USE_VULKAN_DEFAULT})
-option(NCNN_MOE_ENABLE_EXPERIMENTAL_MACOS_VULKAN "Enable the experimental MoltenVK hybrid backend on macOS" ON)
 include(GNUInstallDirs)
 
 if(MSVC)
@@ -79,6 +78,7 @@ set(NCNN_MOE_SOURCES
     src/models/modeladapter_qwen3_5.cpp
     src/models/modeladapter_qwen4exp.cpp
     src/models/safetensors.cpp
+    src/models/tokenizer.cpp
     src/storage/expertcache.cpp
     src/storage/expertcache_victim.cpp
     src/storage/mappedfile.cpp
@@ -86,6 +86,16 @@ set(NCNN_MOE_SOURCES
 )
 add_library(ncnn_moe STATIC ${NCNN_MOE_SOURCES})
 source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_SOURCES})
+
+find_package(ICU 76 COMPONENTS i18n uc data QUIET)
+set(NCNN_MOE_WITH_ICU ${ICU_FOUND})
+if(ICU_FOUND)
+    set_source_files_properties(src/models/tokenizer.cpp
+        PROPERTIES COMPILE_DEFINITIONS NCNN_MOE_TOKENIZER_ICU=1)
+    target_link_libraries(ncnn_moe PRIVATE ICU::i18n ICU::uc ICU::data)
+endif()
+install(FILES src/models/tokenizer.LICENSE
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/ncnn-moe-runtime/licenses)
 
 if(APPLE)
     target_link_libraries(ncnn_moe PRIVATE "-framework Accelerate")
@@ -199,7 +209,7 @@ if(APPLE)
         "Path to libMoltenVK.dylib used by ncnn_moe on macOS")
 endif()
 if(NCNN_MOE_USE_NCNN)
-    if(APPLE AND NCNN_MOE_USE_VULKAN AND NCNN_MOE_ENABLE_EXPERIMENTAL_MACOS_VULKAN)
+    if(APPLE AND NCNN_MOE_USE_VULKAN)
         message(STATUS
             "macOS Vulkan support uses MoltenVK. Build the bundled ncnn submodule "
             "with a local MoltenVK installation.")
@@ -249,7 +259,7 @@ if(NCNN_MOE_USE_NCNN)
     set(NCNN_BUILD_TOOLS OFF CACHE BOOL "Build ncnn tools")
     set(NCNN_VULKAN ${NCNN_MOE_USE_VULKAN} CACHE BOOL "Build ncnn with Vulkan support" FORCE)
     set(NCNN_BF16 ON CACHE BOOL "Build ncnn with bfloat16 support")
-    add_subdirectory(third_party/ncnn EXCLUDE_FROM_ALL)
+    add_subdirectory(third_party/ncnn)
     if(TARGET ncnn)
         target_link_libraries(ncnn_moe PUBLIC ncnn)
         target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_USE_NCNN=1)
@@ -260,8 +270,7 @@ if(NCNN_MOE_USE_NCNN)
                 "NCNN_VULKAN=OFF. Reconfigure with -DNCNN_MOE_USE_VULKAN=ON."
             )
         endif()
-        if(NCNN_MOE_USE_VULKAN AND NCNN_VULKAN
-            AND (NOT APPLE OR NCNN_MOE_ENABLE_EXPERIMENTAL_MACOS_VULKAN))
+        if(NCNN_MOE_USE_VULKAN AND NCNN_VULKAN)
             target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_WITH_VULKAN=1)
             set(NCNN_MOE_WITH_VULKAN ON)
             if(APPLE)
@@ -269,12 +278,6 @@ if(NCNN_MOE_USE_NCNN)
                     NCNN_MOE_MOLTENVK_LIBRARY_PATH="${NCNN_MOE_MOLTENVK_LIBRARY}"
                 )
             endif()
-        endif()
-        if(APPLE AND NCNN_MOE_USE_VULKAN AND NCNN_VULKAN
-            AND NOT NCNN_MOE_ENABLE_EXPERIMENTAL_MACOS_VULKAN)
-            message(STATUS
-                "The MoltenVK hybrid backend is disabled by configuration on macOS; "
-                "set NCNN_MOE_ENABLE_EXPERIMENTAL_MACOS_VULKAN=ON to enable it.")
         endif()
     endif()
 endif()
@@ -374,6 +377,11 @@ if(NCNN_MOE_BUILD_TESTS)
     add_test(NAME ncnn_moe_public_api_test COMMAND ncnn_moe_public_api_test)
     set_tests_properties(ncnn_moe_public_api_test PROPERTIES TIMEOUT 60)
 
+    # Asset-driven tokenizer parity checks use tools/test_tokenizer.py.
+    add_executable(ncnn_moe_tokenizer_test tests/test_tokenizer.cpp)
+    target_link_libraries(ncnn_moe_tokenizer_test PRIVATE ncnn::moe)
+    target_include_directories(ncnn_moe_tokenizer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
     if(NCNN_MOE_WITH_VULKAN)
         add_test(
             NAME ncnn_moe_pipeline_bind_elision_disabled
@@ -448,8 +456,7 @@ if(NCNN_MOE_BUILD_EXAMPLES)
     add_executable(
         ncnn_moe_worker
         examples/ncnn_moe_worker.cpp
-        examples/internal/gputelemetry.cpp
-        examples/internal/tokenizer.cpp)
+        examples/internal/gputelemetry.cpp)
     target_link_libraries(
         ncnn_moe_worker
         PRIVATE ncnn::moe)
@@ -460,15 +467,6 @@ if(NCNN_MOE_BUILD_EXAMPLES)
         ncnn_moe_worker
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-    find_package(ICU 76 COMPONENTS i18n uc data QUIET)
-    if(ICU_FOUND)
-        set_source_files_properties(
-            examples/internal/tokenizer.cpp
-            PROPERTIES COMPILE_DEFINITIONS NCNN_MOE_TOKENIZER_ICU=1)
-        target_link_libraries(
-            ncnn_moe_worker
-            PRIVATE ICU::i18n ICU::uc ICU::data)
-    endif()
     if(WIN32)
         target_link_libraries(ncnn_moe_worker PRIVATE psapi)
     endif()
@@ -477,8 +475,6 @@ if(NCNN_MOE_BUILD_EXAMPLES)
     endif()
     install(TARGETS ncnn_moe_worker
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-    install(FILES examples/internal/tokenizer.LICENSE
-        DESTINATION ${CMAKE_INSTALL_DATADIR}/ncnn-moe-runtime/licenses)
 
     if(NCNN_MOE_BUILD_MXFP4_BENCHMARK)
         add_executable(

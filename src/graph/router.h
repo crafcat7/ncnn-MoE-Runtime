@@ -25,6 +25,13 @@ struct ExpertBatch
     std::vector<ExpertRoute> routes;
 };
 
+struct RouteCandidate
+{
+    uint32_t expert_id = 0;
+    float score = 0.0f;
+    uint32_t rank = 0;
+};
+
 struct ExpertDispatchOptions
 {
     uint32_t expert_count = 0;
@@ -41,16 +48,18 @@ struct ExpertDispatchPlan
     std::vector<ExpertBatch> batches;
     // Pending routes indexed by Expert id; retain storage across prefill calls.
     std::vector<std::vector<ExpertRoute>> route_scratch;
+    std::vector<float> scores;
+    std::vector<RouteCandidate> selected;
     size_t assignment_count = 0;
 };
 
 // Input rows are token-major. Published batches are ordered by Expert id and
 // keep each expert's routes in input order. Reuses caller storage; routing
 // errors leave the published batches unchanged.
-[[nodiscard]] Result<void> dispatch_experts(std::span<const float> router_logits,
-                                            uint32_t token_count,
-                                            const ExpertDispatchOptions& options,
-                                            ExpertDispatchPlan& result);
+[[nodiscard]] Result<void> forward_router(std::span<const float> router_logits,
+                                          uint32_t token_count,
+                                          const ExpertDispatchOptions& options,
+                                          ExpertDispatchPlan& result);
 
 } // namespace moe
 } // namespace ncnn

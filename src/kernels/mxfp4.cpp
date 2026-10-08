@@ -475,7 +475,11 @@ static void scalar_packed_gemm(const Mxfp4Q8PackedMatrix& weights, const int8_t*
     }
 }
 
-uint32_t mxfp4_q8_packed_tile_rows(size_t row_count) noexcept
+// Returns the default interleave width for a matrix with row_count outputs.
+// x86 AVX2/AVX512 uses 8-row blocks when possible; scalar/ARM and small tails
+// use the 4-row layout. Passing an explicit tile_rows to pack_weights must
+// be either 4 or 8.
+static uint32_t mxfp4_q8_packed_tile_rows(size_t row_count) noexcept
 {
     if (row_count >= 8 && (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2 || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512))
         return 8;

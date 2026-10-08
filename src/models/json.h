@@ -1,7 +1,7 @@
-#ifndef NCNN_MOE_JSONLINE_H
-#define NCNN_MOE_JSONLINE_H
+#ifndef NCNN_MOE_MODELS_JSON_H
+#define NCNN_MOE_MODELS_JSON_H
 
-#include "models/modeladapter.h"
+#include "modeladapter.h"
 
 #include <charconv>
 #include <cmath>
@@ -279,4 +279,4 @@ private:
 } // namespace moe
 } // namespace ncnn
 
-#endif // NCNN_MOE_JSONLINE_H
+#endif // NCNN_MOE_MODELS_JSON_H

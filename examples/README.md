@@ -26,14 +26,17 @@ directories or executables on `PATH`. On Windows its default worker path is
 
 `ncnn_moe_worker` loads Runtime/Model once and accepts one JSON object per line
 on stdin. It emits `ready`, `token`, `metrics`, `done`, and `error` events. Its
-native sessions contain token IDs and KV state only:
+native sessions contain token IDs and KV state:
 
-- Python adapters provide the official tokenizer and chat template for each
-  model family.
-- Python session state provides messages, context budgeting, prefix reuse,
-  compaction, persistence, and continuous chat.
-- The worker provides model loading, native Session state, generation, reset,
-  cancellation, and runtime statistics.
+- Runtime owns the model's tokenizer, text-message template, stop IDs, and
+  incremental text decoding for all supported model families.
+- Python provides message history, summaries, compaction policy, persistence,
+  and reasoning/final presentation. It requires no model tokenizer package.
+- Worker validates context limits and reuses committed token prefixes, then
+  invokes Session generation, reset, cancellation, and runtime statistics.
+
+Text prompts require a build with ICU 76+ and the supported tokenizer assets.
+The CLI reports an unsupported text profile instead of falling back to Python.
 
 Use `inspect` before a run to see the detected CPU/Vulkan devices and effective
 resource plan; human-readable memory and I/O sizes are shown as decimal `GB`.
@@ -59,7 +62,8 @@ CPU Expert weight repacking is an explicit experiment. Pass
 when the option is absent, the worker keeps repack off and does not reserve an
 in-memory packed sidecar.
 
-The CLI is intentionally the only public text entry point. The four
+The CLI is the interactive text entry point; C++ consumers can use
+`Model::encode`, `Model::decode`, and `Model::stop_tokens`. The four
 model-named native executables (`ncnn_moe_gpt_oss`,
 `ncnn_moe_deepseek_v4`, `ncnn_moe_qwen3_6`, and `ncnn_moe_qwen3_8`) remain
 reference/benchmark
@@ -117,12 +121,10 @@ token; it is also exposed under the compatibility field
 `decode_tokens_per_second`. `TTFT` uses the same prompt boundary and `TPOT`
 is the average interval for the remaining output tokens.
 
-The native public boundary is `Option`, token IDs, token-ID generation
-config, Session state, and the stable `SessionMetrics` view. The generic
-`SamplingOptions` controls distribution selection over token IDs; it does not
-own a tokenizer or chat policy. Tokenizers, chat templates, stop-policy
-selection, reasoning/final-channel decoding, conversation history, and
-human-readable formatting remain in the Python adapters and CLI.
+The native public boundary includes Model text encoding/decoding, `Option`,
+token IDs, generation controls, Session state, and `SessionMetrics`.
+`SamplingOptions` controls distribution selection over token IDs. Python
+retains conversation history and human-readable channel presentation.
 
 ## Optional Python dependencies
 
@@ -132,17 +134,13 @@ For a complete local Example setup, run this from the repository root:
 python -m pip install -r requirements.txt
 ```
 
-This installs all supported adapter, model-download, Qwen artifact-build, TUI,
-and telemetry dependencies. The DeepSeek-V4 `encoding/encoding_dsv4.py` file
-is supplied by the checkpoint and is self-contained; the ncnn Runtime CLI does
-not require the model repository's PyTorch inference stack. The minimal and
-grouped installations remain available when a smaller environment is
-preferred:
+This installs model-download, Qwen artifact-build, TUI, and telemetry tools.
+The CLI no longer loads the checkpoint's Python encoding script or any Python
+tokenizer package. Smaller installations remain available:
 
 ```powershell
 python -m pip install -e .
 python -m pip install -e ".[tui]"
-python -m pip install -e ".[gpt-oss]"
 python -m pip install -e ".[hf]"
 python -m pip install -e ".[telemetry]"
 ```
@@ -169,5 +167,5 @@ runtime Expert/GPU caches remain process-local and are not written to disk.
 
 For the JSONL operation schema, see
 `tools/ncnn_moe_protocol.py` and the native implementation in
-`examples/ncnn_moe_worker.cpp`. The native boundary deliberately does not
-contain tokenizer or model-family chat logic.
+`examples/ncnn_moe_worker.cpp`. Private tokenizer and template handling live
+in `src/models/tokenizer.cpp` and are loaded with the Model.

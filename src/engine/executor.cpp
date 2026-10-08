@@ -218,9 +218,9 @@ Result<void> forward_model(const CompiledModel& model,
             if (node->weight_inputs.size() != 1)
                 return Error{ErrorCode::InternalError, "token embedding node has an invalid weight binding"};
             const auto embedding_start = std::chrono::steady_clock::now();
-            embedding_batch_into(model.weights.at(node->weight_inputs[0]),
-                                 input_ids,
-                                 hidden);
+            forward_embedding(model.weights.at(node->weight_inputs[0]),
+                              input_ids,
+                              hidden);
             hyper_connection_expand(hidden, model.descriptor.hyper_connection_multiplier, state.expert_scratch.staged_output);
             statistics.embedding_time_microseconds += elapsed_microseconds(embedding_start);
             continue;
@@ -252,44 +252,44 @@ Result<void> forward_model(const CompiledModel& model,
             const auto final_norm_start = std::chrono::steady_clock::now();
             if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
             {
-                auto head = hyper_connection_head(hidden,
-                                                  model.weights.at(model.hyper_head_function),
-                                                  model.weights.at(model.hyper_head_scale),
-                                                  model.weights.at(model.hyper_head_base),
-                                                  model.descriptor.hyper_connection_multiplier,
-                                                  model.descriptor.norm_epsilon,
-                                                  model.descriptor.hyper_connection_epsilon,
-                                                  state.expert_scratch.staged_output,
-                                                  state.hyper_connection_scratch,
-                                                  model.opt.optimization_flags);
+                auto head = forward_hyper_connection_head(hidden,
+                                                          model.weights.at(model.hyper_head_function),
+                                                          model.weights.at(model.hyper_head_scale),
+                                                          model.weights.at(model.hyper_head_base),
+                                                          model.descriptor.hyper_connection_multiplier,
+                                                          model.descriptor.norm_epsilon,
+                                                          model.descriptor.hyper_connection_epsilon,
+                                                          state.expert_scratch.staged_output,
+                                                          state.hyper_connection_scratch,
+                                                          model.opt.optimization_flags);
                 if (!head)
                     return head.error();
                 hidden.swap(state.expert_scratch.staged_output);
             }
             else if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
             {
-                auto head = gated_residual_head(hidden,
-                                                model.weights.at(model.gated_residual_head.norm_weight),
-                                                model.weights.at(model.gated_residual_head.mix_down_weight),
-                                                model.weights.at(model.gated_residual_head.mix_up_weight),
-                                                model.descriptor.hyper_connection_multiplier,
-                                                model.descriptor.hidden_size,
-                                                model.descriptor.norm_epsilon,
-                                                model.descriptor.norm_weight_offset,
-                                                state.expert_scratch.staged_output,
-                                                state.hyper_connection_scratch,
-                                                model.opt.optimization_flags);
+                auto head = forward_gated_residual_head(hidden,
+                                                        model.weights.at(model.gated_residual_head.norm_weight),
+                                                        model.weights.at(model.gated_residual_head.mix_down_weight),
+                                                        model.weights.at(model.gated_residual_head.mix_up_weight),
+                                                        model.descriptor.hyper_connection_multiplier,
+                                                        model.descriptor.hidden_size,
+                                                        model.descriptor.norm_epsilon,
+                                                        model.descriptor.norm_weight_offset,
+                                                        state.expert_scratch.staged_output,
+                                                        state.hyper_connection_scratch,
+                                                        model.opt.optimization_flags);
                 if (!head)
                     return head.error();
                 hidden.swap(state.expert_scratch.staged_output);
             }
             if (model.descriptor.final_norm == NormType::RmsNorm)
             {
-                rms_norm_batch_into(hidden,
-                                    model.weights.at(node->weight_inputs[0]),
-                                    model.descriptor.norm_epsilon,
-                                    state.expert_scratch.staged_output,
-                                    model.descriptor.norm_weight_offset);
+                forward_rms_norm(hidden,
+                                 model.weights.at(node->weight_inputs[0]),
+                                 model.descriptor.norm_epsilon,
+                                 state.expert_scratch.staged_output,
+                                 model.descriptor.norm_weight_offset);
                 hidden.swap(state.expert_scratch.staged_output);
             }
             if (needs_mtp_final_hidden)
@@ -345,11 +345,11 @@ Result<void> forward_model(const CompiledModel& model,
             if (deferred_final_norm)
             {
                 const auto final_norm_start = std::chrono::steady_clock::now();
-                rms_norm_batch_into(*lm_head_input,
-                                    model.weights.at(node->weight_inputs[1]),
-                                    model.descriptor.norm_epsilon,
-                                    normalized,
-                                    model.descriptor.norm_weight_offset);
+                forward_rms_norm(*lm_head_input,
+                                 model.weights.at(node->weight_inputs[1]),
+                                 model.descriptor.norm_epsilon,
+                                 normalized,
+                                 model.descriptor.norm_weight_offset);
                 norm_time = elapsed_microseconds(final_norm_start);
                 if (logits_output == LogitsOutput::All)
                 {
@@ -363,12 +363,12 @@ Result<void> forward_model(const CompiledModel& model,
                 statistics.final_norm_time_microseconds += norm_time;
                 deferred_final_norm = false;
             }
-            linear_batch_into(lm_head,
-                              *lm_head_input,
-                              state.logits,
-                              model.opt.optimization_flags,
-                              model.operators.find_weight(node->weight_inputs[0]),
-                              node->backend);
+            forward_linear(lm_head,
+                           *lm_head_input,
+                           state.logits,
+                           model.opt.optimization_flags,
+                           model.operators.find_weight(node->weight_inputs[0]),
+                           node->backend);
             produced_logits = true;
             statistics.lm_head_time_microseconds += elapsed_microseconds(lm_head_start)
                                                     - norm_time;
@@ -387,13 +387,13 @@ Result<void> forward_model(const CompiledModel& model,
             const auto attention_start = std::chrono::steady_clock::now();
             if (layer.ple.enabled())
             {
-                auto ple = execute_ple_into(model.weights, layer.ple,
-                                            model.descriptor.hyper_connection_multiplier,
-                                            model.descriptor.hidden_size,
-                                            model.descriptor.norm_epsilon,
-                                            model.descriptor.norm_weight_offset,
-                                            input_ids, state.layers[layer.layer_id], hidden,
-                                            model.opt.optimization_flags);
+                auto ple = forward_ple(model.weights, layer.ple,
+                                       model.descriptor.hyper_connection_multiplier,
+                                       model.descriptor.hidden_size,
+                                       model.descriptor.norm_epsilon,
+                                       model.descriptor.norm_weight_offset,
+                                       input_ids, state.layers[layer.layer_id], state.attention_scratch, hidden,
+                                       model.opt.optimization_flags);
                 if (!ple)
                     return ple.error();
             }
@@ -401,18 +401,18 @@ Result<void> forward_model(const CompiledModel& model,
             const ActivationBuffer* gated_attention_input = &hidden;
             if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
             {
-                auto mixed = gated_residual_pre(hidden,
-                                                model.weights.at(layer.attention_gated_residual.norm_weight),
-                                                model.weights.at(layer.attention_gated_residual.mix_down_weight),
-                                                model.weights.at(layer.attention_gated_residual.mix_up_weight),
-                                                model.weights.at(layer.attention_gated_residual.inject_weight),
-                                                model.descriptor.hyper_connection_multiplier,
-                                                model.descriptor.hidden_size,
-                                                model.descriptor.norm_epsilon,
-                                                model.descriptor.norm_weight_offset,
-                                                gated_attention_mix,
-                                                state.hyper_connection_scratch,
-                                                model.opt.optimization_flags);
+                auto mixed = forward_gated_residual_pre(hidden,
+                                                        model.weights.at(layer.attention_gated_residual.norm_weight),
+                                                        model.weights.at(layer.attention_gated_residual.mix_down_weight),
+                                                        model.weights.at(layer.attention_gated_residual.mix_up_weight),
+                                                        model.weights.at(layer.attention_gated_residual.inject_weight),
+                                                        model.descriptor.hyper_connection_multiplier,
+                                                        model.descriptor.hidden_size,
+                                                        model.descriptor.norm_epsilon,
+                                                        model.descriptor.norm_weight_offset,
+                                                        gated_attention_mix,
+                                                        state.hyper_connection_scratch,
+                                                        model.opt.optimization_flags);
                 if (!mixed)
                     return mixed.error();
                 gated_attention_input = &gated_attention_mix.reduced;
@@ -432,10 +432,10 @@ Result<void> forward_model(const CompiledModel& model,
                     return gated_delta.error();
                 if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
                 {
-                    auto connected = gated_residual_post(state.gated_delta_scratch.output, hidden,
-                                                         gated_attention_mix,
-                                                         model.descriptor.hyper_connection_multiplier,
-                                                         hidden);
+                    auto connected = forward_gated_residual_post(state.gated_delta_scratch.output, hidden,
+                                                                 gated_attention_mix,
+                                                                 model.descriptor.hyper_connection_multiplier,
+                                                                 hidden);
                     if (!connected)
                         return connected.error();
                 }
@@ -450,17 +450,17 @@ Result<void> forward_model(const CompiledModel& model,
                 const ActivationBuffer* attention_input = &hidden;
                 if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
                 {
-                    auto mixed = hyper_connection_pre(hidden,
-                                                      model.weights.at(layer.hyper_connection.attention_function),
-                                                      model.weights.at(layer.hyper_connection.attention_scale),
-                                                      model.weights.at(layer.hyper_connection.attention_base),
-                                                      model.descriptor.hyper_connection_multiplier,
-                                                      model.descriptor.hyper_connection_iterations,
-                                                      model.descriptor.norm_epsilon,
-                                                      model.descriptor.hyper_connection_epsilon,
-                                                      hyper_mix,
-                                                      state.hyper_connection_scratch,
-                                                      model.opt.optimization_flags);
+                    auto mixed = forward_hyper_connection_pre(hidden,
+                                                              model.weights.at(layer.hyper_connection.attention_function),
+                                                              model.weights.at(layer.hyper_connection.attention_scale),
+                                                              model.weights.at(layer.hyper_connection.attention_base),
+                                                              model.descriptor.hyper_connection_multiplier,
+                                                              model.descriptor.hyper_connection_iterations,
+                                                              model.descriptor.norm_epsilon,
+                                                              model.descriptor.hyper_connection_epsilon,
+                                                              hyper_mix,
+                                                              state.hyper_connection_scratch,
+                                                              model.opt.optimization_flags);
                     if (!mixed)
                         return mixed.error();
                     attention_input = &hyper_mix.reduced;
@@ -480,9 +480,9 @@ Result<void> forward_model(const CompiledModel& model,
                     return output.error();
                 if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
                 {
-                    auto connected = hyper_connection_post(attention_output, hidden, hyper_mix,
-                                                           model.descriptor.hyper_connection_multiplier,
-                                                           state.expert_scratch.staged_output);
+                    auto connected = forward_hyper_connection_post(attention_output, hidden, hyper_mix,
+                                                                   model.descriptor.hyper_connection_multiplier,
+                                                                   state.expert_scratch.staged_output);
                     if (!connected)
                         return connected.error();
                     hidden.swap(state.expert_scratch.staged_output);
@@ -508,10 +508,10 @@ Result<void> forward_model(const CompiledModel& model,
                     return attention.error();
                 if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
                 {
-                    auto connected = gated_residual_post(state.attention_scratch.output, hidden,
-                                                         gated_attention_mix,
-                                                         model.descriptor.hyper_connection_multiplier,
-                                                         hidden);
+                    auto connected = forward_gated_residual_post(state.attention_scratch.output, hidden,
+                                                                 gated_attention_mix,
+                                                                 model.descriptor.hyper_connection_multiplier,
+                                                                 hidden);
                     if (!connected)
                         return connected.error();
                 }
@@ -536,18 +536,18 @@ Result<void> forward_model(const CompiledModel& model,
             layer_state.router_start = std::chrono::steady_clock::now();
             if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
             {
-                auto mixed = gated_residual_pre(hidden,
-                                                model.weights.at(layer.ffn_gated_residual.norm_weight),
-                                                model.weights.at(layer.ffn_gated_residual.mix_down_weight),
-                                                model.weights.at(layer.ffn_gated_residual.mix_up_weight),
-                                                model.weights.at(layer.ffn_gated_residual.inject_weight),
-                                                model.descriptor.hyper_connection_multiplier,
-                                                model.descriptor.hidden_size,
-                                                model.descriptor.norm_epsilon,
-                                                model.descriptor.norm_weight_offset,
-                                                layer_state.ffn_hyper_mix,
-                                                state.hyper_connection_scratch,
-                                                model.opt.optimization_flags);
+                auto mixed = forward_gated_residual_pre(hidden,
+                                                        model.weights.at(layer.ffn_gated_residual.norm_weight),
+                                                        model.weights.at(layer.ffn_gated_residual.mix_down_weight),
+                                                        model.weights.at(layer.ffn_gated_residual.mix_up_weight),
+                                                        model.weights.at(layer.ffn_gated_residual.inject_weight),
+                                                        model.descriptor.hyper_connection_multiplier,
+                                                        model.descriptor.hidden_size,
+                                                        model.descriptor.norm_epsilon,
+                                                        model.descriptor.norm_weight_offset,
+                                                        layer_state.ffn_hyper_mix,
+                                                        state.hyper_connection_scratch,
+                                                        model.opt.optimization_flags);
                 if (!mixed)
                     return mixed.error();
                 // GatedResidual post needs only the injection coefficients.
@@ -555,24 +555,24 @@ Result<void> forward_model(const CompiledModel& model,
             }
             else if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
             {
-                auto mixed = hyper_connection_pre(hidden,
-                                                  model.weights.at(layer.hyper_connection.ffn_function),
-                                                  model.weights.at(layer.hyper_connection.ffn_scale),
-                                                  model.weights.at(layer.hyper_connection.ffn_base),
-                                                  model.descriptor.hyper_connection_multiplier,
-                                                  model.descriptor.hyper_connection_iterations,
-                                                  model.descriptor.norm_epsilon,
-                                                  model.descriptor.hyper_connection_epsilon,
-                                                  layer_state.ffn_hyper_mix,
-                                                  state.hyper_connection_scratch,
-                                                  model.opt.optimization_flags);
+                auto mixed = forward_hyper_connection_pre(hidden,
+                                                          model.weights.at(layer.hyper_connection.ffn_function),
+                                                          model.weights.at(layer.hyper_connection.ffn_scale),
+                                                          model.weights.at(layer.hyper_connection.ffn_base),
+                                                          model.descriptor.hyper_connection_multiplier,
+                                                          model.descriptor.hyper_connection_iterations,
+                                                          model.descriptor.norm_epsilon,
+                                                          model.descriptor.hyper_connection_epsilon,
+                                                          layer_state.ffn_hyper_mix,
+                                                          state.hyper_connection_scratch,
+                                                          model.opt.optimization_flags);
                 if (!mixed)
                     return mixed.error();
-                rms_norm_batch_into(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
+                forward_rms_norm(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
             }
             else
             {
-                rms_norm_batch_into(hidden, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
+                forward_rms_norm(hidden, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
             }
             auto predicted = predict_next_router_routes(model,
                                                         layer,
@@ -582,11 +582,11 @@ Result<void> forward_model(const CompiledModel& model,
                                                         pending_router_prediction);
             if (!predicted)
                 return predicted.error();
-            linear_batch_into(model.weights.at(moe.router_weight),
-                              layer_state.normalized,
-                              layer_state.router_logits,
-                              model.opt.optimization_flags,
-                              model.operators.find_weight(moe.router_weight));
+            forward_linear(model.weights.at(moe.router_weight),
+                           layer_state.normalized,
+                           layer_state.router_logits,
+                           model.opt.optimization_flags,
+                           model.operators.find_weight(moe.router_weight));
             if (moe.router_bias != invalid_tensor_handle)
             {
                 add_bias_inplace(layer_state.router_logits, model.weights.at(moe.router_bias));
@@ -616,20 +616,22 @@ Result<void> forward_model(const CompiledModel& model,
                 }
                 options.explicit_expert_ids = explicit_expert_ids;
             }
-            auto dispatched = dispatch_experts(layer_state.router_logits.values(), static_cast<uint32_t>(layer_state.router_logits.rows()), options, layer_state.dispatch_plan);
+            auto dispatched = forward_router(layer_state.router_logits.values(), static_cast<uint32_t>(layer_state.router_logits.rows()), options, layer_state.dispatch_plan);
             if (!dispatched)
                 return dispatched.error();
 
             ExpertDispatchPlan& plan = layer_state.dispatch_plan;
             if (hidden.rows() == 1 && layer.layer_id < state.layers.size())
                 resolve_router_predictions(model, layer, plan, state, statistics, true);
-            prepare_moe_experts(moe, layer_state, statistics);
+            prepare_experts(moe, layer_state, statistics);
             statistics.router_time_microseconds += elapsed_microseconds(layer_state.router_start);
             layer_state.expert_start = std::chrono::steady_clock::now();
             if (has_flag(node->flags, ExecutionNodeRequestExperts))
             {
-                auto requested = request_moe_experts(model, moe, layer_state,
-                                                     state.expert_scratch, layer.layer_id, statistics);
+                auto requested = request_experts(model, moe, layer_state,
+                                                 state.expert_scratch,
+                                                 layer.layer_id,
+                                                 statistics.expert_cache_management_time_microseconds);
                 if (!requested)
                     return requested.error();
             }
@@ -678,10 +680,10 @@ Result<void> forward_model(const CompiledModel& model,
             if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0)
                 return Error{ErrorCode::InternalError, "Combine executed before Shared Expert group"};
             ActivationBuffer& moe_output = layer_state.normalized;
-            const bool has_backend_aggregation = initialize_backend_aggregated_output(state.expert_scratch,
-                                                                                      hidden.rows(),
-                                                                                      model.descriptor.hidden_size,
-                                                                                      moe_output);
+            const bool has_backend_aggregation = init_moe_output(state.expert_scratch,
+                                                                 hidden.rows(),
+                                                                 model.descriptor.hidden_size,
+                                                                 moe_output);
             for (size_t active_index = 0; active_index < layer_state.active_experts().size(); ++active_index)
             {
                 const ExpertState& active = layer_state.active_experts()[active_index];
@@ -708,17 +710,17 @@ Result<void> forward_model(const CompiledModel& model,
             }
             if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
             {
-                auto connected = gated_residual_post(moe_output, hidden, layer_state.ffn_hyper_mix,
-                                                     model.descriptor.hyper_connection_multiplier,
-                                                     hidden);
+                auto connected = forward_gated_residual_post(moe_output, hidden, layer_state.ffn_hyper_mix,
+                                                             model.descriptor.hyper_connection_multiplier,
+                                                             hidden);
                 if (!connected)
                     return connected.error();
             }
             else if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
             {
-                auto connected = hyper_connection_post(moe_output, hidden, layer_state.ffn_hyper_mix,
-                                                       model.descriptor.hyper_connection_multiplier,
-                                                       state.expert_scratch.staged_output);
+                auto connected = forward_hyper_connection_post(moe_output, hidden, layer_state.ffn_hyper_mix,
+                                                               model.descriptor.hyper_connection_multiplier,
+                                                               state.expert_scratch.staged_output);
                 if (!connected)
                     return connected.error();
                 hidden.swap(state.expert_scratch.staged_output);
@@ -974,9 +976,9 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             {
                 input_ids[session_index] = entries[session_index].input_id;
             }
-            embedding_batch_into(model.weights.at(node->weight_inputs[0]),
-                                 input_ids,
-                                 scratch.staged_output);
+            forward_embedding(model.weights.at(node->weight_inputs[0]),
+                              input_ids,
+                              scratch.staged_output);
             if (hyper_multiplier > 1)
             {
                 hyper_connection_expand(scratch.staged_output, hyper_multiplier, scratch.staged_merged);
@@ -1014,16 +1016,16 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                         ErrorCode::InternalError,
                         "cannot merge staged hyper head rows"};
                 }
-                auto head = hyper_connection_head(merged_hyper,
-                                                  model.weights.at(model.hyper_head_function),
-                                                  model.weights.at(model.hyper_head_scale),
-                                                  model.weights.at(model.hyper_head_base),
-                                                  hyper_multiplier,
-                                                  model.descriptor.norm_epsilon,
-                                                  hyper_epsilon,
-                                                  scratch.staged_output,
-                                                  workspace.hyper_connection,
-                                                  model.opt.optimization_flags);
+                auto head = forward_hyper_connection_head(merged_hyper,
+                                                          model.weights.at(model.hyper_head_function),
+                                                          model.weights.at(model.hyper_head_scale),
+                                                          model.weights.at(model.hyper_head_base),
+                                                          hyper_multiplier,
+                                                          model.descriptor.norm_epsilon,
+                                                          hyper_epsilon,
+                                                          scratch.staged_output,
+                                                          workspace.hyper_connection,
+                                                          model.opt.optimization_flags);
                 if (!head)
                     return head.error();
                 if (!split_hidden_rows(scratch.staged_output))
@@ -1034,8 +1036,8 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             {
                 return Error{ErrorCode::InternalError, "cannot merge staged hidden rows"};
             }
-            rms_norm_batch_into(merged, model.weights.at(node->weight_inputs[0]), model.descriptor.norm_epsilon, scratch.staged_output,
-                                model.descriptor.norm_weight_offset);
+            forward_rms_norm(merged, model.weights.at(node->weight_inputs[0]), model.descriptor.norm_epsilon, scratch.staged_output,
+                             model.descriptor.norm_weight_offset);
             if (!split_hidden_rows(scratch.staged_output))
                 return Error{ErrorCode::InternalError, "cannot split staged final norm rows"};
             if (model.speculative.kind == SpeculativeModelKind::Mtp)
@@ -1111,19 +1113,19 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             {
                 if (deferred_final_norm)
                 {
-                    rms_norm_batch_into(merged,
-                                        model.weights.at(node->weight_inputs[1]),
-                                        model.descriptor.norm_epsilon,
-                                        merged,
-                                        model.descriptor.norm_weight_offset);
+                    forward_rms_norm(merged,
+                                     model.weights.at(node->weight_inputs[1]),
+                                     model.descriptor.norm_epsilon,
+                                     merged,
+                                     model.descriptor.norm_weight_offset);
                     deferred_final_norm = false;
                 }
-                linear_batch_into(lm_head,
-                                  merged,
-                                  scratch.staged_output,
-                                  model.opt.optimization_flags,
-                                  model.operators.find_weight(node->weight_inputs[0]),
-                                  node->backend);
+                forward_linear(lm_head,
+                               merged,
+                               scratch.staged_output,
+                               model.opt.optimization_flags,
+                               model.operators.find_weight(node->weight_inputs[0]),
+                               node->backend);
             }
             if (scratch.staged_output.rows() != requested_count)
             {
@@ -1211,17 +1213,17 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 const ActivationBuffer* attention_input = &merged_hidden;
                 if (hyper_multiplier > 1)
                 {
-                    auto mixed = hyper_connection_pre(merged_hidden,
-                                                      model.weights.at(layer.hyper_connection.attention_function),
-                                                      model.weights.at(layer.hyper_connection.attention_scale),
-                                                      model.weights.at(layer.hyper_connection.attention_base),
-                                                      hyper_multiplier,
-                                                      hyper_iterations,
-                                                      model.descriptor.norm_epsilon,
-                                                      hyper_epsilon,
-                                                      merged_mix,
-                                                      hyper_scratch,
-                                                      model.opt.optimization_flags);
+                    auto mixed = forward_hyper_connection_pre(merged_hidden,
+                                                              model.weights.at(layer.hyper_connection.attention_function),
+                                                              model.weights.at(layer.hyper_connection.attention_scale),
+                                                              model.weights.at(layer.hyper_connection.attention_base),
+                                                              hyper_multiplier,
+                                                              hyper_iterations,
+                                                              model.descriptor.norm_epsilon,
+                                                              hyper_epsilon,
+                                                              merged_mix,
+                                                              hyper_scratch,
+                                                              model.opt.optimization_flags);
                     if (!mixed)
                         return mixed.error();
                     attention_input = &merged_mix.reduced;
@@ -1240,11 +1242,11 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                     return merged_output.error();
                 if (hyper_multiplier > 1)
                 {
-                    auto connected = hyper_connection_post(attention_output,
-                                                           merged_hidden,
-                                                           merged_mix,
-                                                           hyper_multiplier,
-                                                           batch_scratch.staged_output);
+                    auto connected = forward_hyper_connection_post(attention_output,
+                                                                   merged_hidden,
+                                                                   merged_mix,
+                                                                   hyper_multiplier,
+                                                                   batch_scratch.staged_output);
                     if (!connected)
                         return connected.error();
                     if (!split_hidden_rows(batch_scratch.staged_output))
@@ -1378,22 +1380,22 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             }
             if (hyper_multiplier > 1)
             {
-                auto mixed = hyper_connection_pre(merged_hyper,
-                                                  model.weights.at(layer.hyper_connection.ffn_function),
-                                                  model.weights.at(layer.hyper_connection.ffn_scale),
-                                                  model.weights.at(layer.hyper_connection.ffn_base),
-                                                  hyper_multiplier,
-                                                  hyper_iterations,
-                                                  model.descriptor.norm_epsilon,
-                                                  hyper_epsilon,
-                                                  hyper_scratch.transient_mix,
-                                                  hyper_scratch,
-                                                  model.opt.optimization_flags);
+                auto mixed = forward_hyper_connection_pre(merged_hyper,
+                                                          model.weights.at(layer.hyper_connection.ffn_function),
+                                                          model.weights.at(layer.hyper_connection.ffn_scale),
+                                                          model.weights.at(layer.hyper_connection.ffn_base),
+                                                          hyper_multiplier,
+                                                          hyper_iterations,
+                                                          model.descriptor.norm_epsilon,
+                                                          hyper_epsilon,
+                                                          hyper_scratch.transient_mix,
+                                                          hyper_scratch,
+                                                          model.opt.optimization_flags);
                 if (!mixed)
                     return mixed.error();
                 HyperConnectionMix& merged_mix = hyper_scratch.transient_mix;
-                rms_norm_batch_into(merged_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, merged_hidden,
-                                    model.descriptor.norm_weight_offset);
+                forward_rms_norm(merged_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, merged_hidden,
+                                 model.descriptor.norm_weight_offset);
                 const size_t combine_stride = static_cast<size_t>(hyper_multiplier) * hyper_multiplier;
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
                 {
@@ -1411,8 +1413,8 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             }
             else
             {
-                rms_norm_batch_into(merged_hyper, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, merged_hidden,
-                                    model.descriptor.norm_weight_offset);
+                forward_rms_norm(merged_hyper, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, merged_hidden,
+                                 model.descriptor.norm_weight_offset);
             }
             for (size_t session_index = 0; session_index < session_count; ++session_index)
             {
@@ -1421,22 +1423,20 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 std::copy_n(merged_hidden.row(session_index), merged_hidden.columns(), layer_state.normalized.row(0));
             }
             ActivationBuffer& merged_logits = workspace.staged_router_logits;
-            linear_batch_into(model.weights.at(moe.router_weight),
-                              merged_hidden,
-                              merged_logits,
-                              model.opt.optimization_flags,
-                              model.operators.find_weight(moe.router_weight));
+            forward_linear(model.weights.at(moe.router_weight),
+                           merged_hidden,
+                           merged_logits,
+                           model.opt.optimization_flags,
+                           model.operators.find_weight(moe.router_weight));
             if (moe.router_bias != invalid_tensor_handle)
             {
                 add_bias_inplace(merged_logits, model.weights.at(moe.router_bias));
             }
-            const auto router_start = std::chrono::steady_clock::now();
             for (size_t session_index = 0; session_index < session_count; ++session_index)
             {
                 LayerState& layer_state = entries[session_index].state->execution_state;
                 layer_state.router_logits.reset(1, merged_logits.columns(), false);
                 std::copy_n(merged_logits.row(session_index), merged_logits.columns(), layer_state.router_logits.row(0));
-                layer_state.router_start = router_start;
             }
             const uint64_t elapsed = elapsed_microseconds(start);
             for (const DecodeBatchEntry& entry : entries)
@@ -1473,12 +1473,12 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                     }
                     options.explicit_expert_ids = explicit_expert_ids;
                 }
-                auto dispatched = dispatch_experts(layer_state.router_logits.values(), 1, options, layer_state.dispatch_plan);
+                auto dispatched = forward_router(layer_state.router_logits.values(), 1, options, layer_state.dispatch_plan);
                 if (!dispatched)
                     return dispatched.error();
                 ExpertDispatchPlan& plan = layer_state.dispatch_plan;
                 resolve_router_predictions(model, layer, plan, state, statistics, false);
-                prepare_moe_experts(moe, layer_state, statistics);
+                prepare_experts(moe, layer_state, statistics);
                 layer_state.expert_start = std::chrono::steady_clock::now();
             }
             LayerState& combined = workspace.staged_state;
@@ -1521,11 +1521,11 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             combined.resize_experts(combined_count);
             if (has_flag(node->flags, ExecutionNodeRequestExperts))
             {
-                SessionStatistics request_statistics;
-                auto requested = request_moe_experts(model, moe, combined, batch_scratch,
-                                                     layer.layer_id, request_statistics);
+                uint64_t request_cache_time = 0;
+                auto requested = request_experts(model, moe, combined, batch_scratch,
+                                                 layer.layer_id, request_cache_time);
                 for (const DecodeBatchEntry& entry : entries)
-                    entry.statistics->expert_cache_management_time_microseconds += request_statistics.expert_cache_management_time_microseconds;
+                    entry.statistics->expert_cache_management_time_microseconds += request_cache_time;
                 if (!requested)
                     return requested.error();
             }
@@ -1714,11 +1714,11 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
                 {
                     LayerState& layer_state = entries[session_index].state->execution_state;
-                    auto connected = hyper_connection_post(layer_state.normalized,
-                                                           entries[session_index].state->hidden,
-                                                           layer_state.ffn_hyper_mix,
-                                                           hyper_multiplier,
-                                                           batch_scratch.staged_output);
+                    auto connected = forward_hyper_connection_post(layer_state.normalized,
+                                                                   entries[session_index].state->hidden,
+                                                                   layer_state.ffn_hyper_mix,
+                                                                   hyper_multiplier,
+                                                                   batch_scratch.staged_output);
                     if (!connected)
                         return connected.error();
                     entries[session_index].state->hidden.swap(batch_scratch.staged_output);
@@ -1976,11 +1976,11 @@ static Result<RouterPredictionOutcome> run_router_prediction(const CompiledModel
 {
     const auto started = std::chrono::steady_clock::now();
     ActivationBuffer predicted_logits;
-    linear_batch_into(model.weights.at(next_layer.moe.router_weight),
-                      router_input,
-                      predicted_logits,
-                      model.opt.optimization_flags,
-                      model.operators.find_weight(next_layer.moe.router_weight));
+    forward_linear(model.weights.at(next_layer.moe.router_weight),
+                   router_input,
+                   predicted_logits,
+                   model.opt.optimization_flags,
+                   model.operators.find_weight(next_layer.moe.router_weight));
     if (next_layer.moe.router_bias != invalid_tensor_handle)
     {
         add_bias_inplace(predicted_logits,
@@ -1998,10 +1998,10 @@ static Result<RouterPredictionOutcome> run_router_prediction(const CompiledModel
         options.selection_bias = model.weights.at(next_layer.moe.router_selection_bias).float32_values();
     }
     ExpertDispatchPlan predicted_plan;
-    auto dispatched = dispatch_experts(predicted_logits.values(),
-                                       1,
-                                       options,
-                                       predicted_plan);
+    auto dispatched = forward_router(predicted_logits.values(),
+                                     1,
+                                     options,
+                                     predicted_plan);
     if (!dispatched)
         return dispatched.error();
 

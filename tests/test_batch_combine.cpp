@@ -15,7 +15,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <limits>
 #include <stdexcept>
 #include <span>
 #include <string>
@@ -141,7 +140,7 @@ static ActivationBuffer expert_output(const ExpertMatrices& expert,
                                       const ActivationBuffer& input,
                                       uint64_t optimization_flags)
 {
-    const ActivationBuffer gate_up = linear_batch(*expert.gate_up, input, optimization_flags);
+    const ActivationBuffer gate_up = forward_linear(*expert.gate_up, input, optimization_flags);
     const uint32_t intermediate = expert.gate_up->shape.front() / 2;
     ActivationBuffer activated(input.rows(), intermediate);
     for (size_t row = 0; row < input.rows(); ++row)
@@ -152,7 +151,7 @@ static ActivationBuffer expert_output(const ExpertMatrices& expert,
             destination[column] = scaled_silu(source[column], 1.0f, optimization_flags)
                                   * source[intermediate + column];
     }
-    return linear_batch(*expert.down, activated, optimization_flags);
+    return forward_linear(*expert.down, activated, optimization_flags);
 }
 
 class FakeSubmission final : public ExpertSubmission
@@ -326,11 +325,6 @@ public:
     ExpertBackendStatistics statistics() const override
     {
         return {};
-    }
-
-    uint64_t capacity() const noexcept override
-    {
-        return std::numeric_limits<uint64_t>::max();
     }
 
 private:

@@ -102,11 +102,6 @@ struct Mxfp4Q8PackedMatrix
     }
 };
 
-// Returns the default interleave width for a matrix with row_count outputs.
-// x86 AVX2/AVX512 uses 8-row blocks when possible; scalar/ARM and small tails
-// use the 4-row layout.  Passing an explicit tile_rows to pack_weights must
-// be either 4 or 8.
-[[nodiscard]] uint32_t mxfp4_q8_packed_tile_rows(size_t row_count) noexcept;
 [[nodiscard]] uint64_t mxfp4_q8_packed_storage_bytes(size_t row_count,
                                                      uint32_t block_count,
                                                      uint32_t tile_rows = 0) noexcept;

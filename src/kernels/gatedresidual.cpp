@@ -91,7 +91,7 @@ static Result<void> gated_residual_pre_impl(const ActivationBuffer& input,
         }
     }
 
-    linear_batch_into(mix_down_weight, normalized, scratch.projection, optimization_flags);
+    forward_linear(mix_down_weight, normalized, scratch.projection, optimization_flags);
     const float inverse_multiplier = 1.0f / static_cast<float>(multiplier);
     for (size_t row_index = 0; row_index < scratch.projection.rows(); ++row_index)
     {
@@ -102,14 +102,14 @@ static Result<void> gated_residual_pre_impl(const ActivationBuffer& input,
             row[column] = row[column] * gated_sigmoid(row[column]);
         }
     }
-    linear_batch_into(mix_up_weight, scratch.projection, scratch.auxiliary, optimization_flags);
+    forward_linear(mix_up_weight, scratch.projection, scratch.auxiliary, optimization_flags);
 
     reduced_output.reset(input.rows(), hidden_size, true);
     if (inject_weight)
     {
         if (!post_output)
             return Error{ErrorCode::InternalError, "gated-residual post output is unavailable"};
-        linear_batch_into(*inject_weight, normalized, scratch.projection, optimization_flags);
+        forward_linear(*inject_weight, normalized, scratch.projection, optimization_flags);
         post_output->resize(input.rows() * multiplier);
         for (size_t row_index = 0; row_index < input.rows(); ++row_index)
         {
@@ -143,18 +143,18 @@ static Result<void> gated_residual_pre_impl(const ActivationBuffer& input,
     return {};
 }
 
-Result<void> gated_residual_pre(const ActivationBuffer& input,
-                                const TensorData& norm_weight,
-                                const TensorData& mix_down_weight,
-                                const TensorData& mix_up_weight,
-                                const TensorData& inject_weight,
-                                uint32_t multiplier,
-                                uint32_t hidden_size,
-                                float norm_epsilon,
-                                float norm_weight_offset,
-                                HyperConnectionMix& result,
-                                HyperConnectionScratch& scratch,
-                                uint64_t optimization_flags)
+Result<void> forward_gated_residual_pre(const ActivationBuffer& input,
+                                        const TensorData& norm_weight,
+                                        const TensorData& mix_down_weight,
+                                        const TensorData& mix_up_weight,
+                                        const TensorData& inject_weight,
+                                        uint32_t multiplier,
+                                        uint32_t hidden_size,
+                                        float norm_epsilon,
+                                        float norm_weight_offset,
+                                        HyperConnectionMix& result,
+                                        HyperConnectionScratch& scratch,
+                                        uint64_t optimization_flags)
 {
     result.combine.resize(0);
     return gated_residual_pre_impl(input,
@@ -172,11 +172,11 @@ Result<void> gated_residual_pre(const ActivationBuffer& input,
                                    optimization_flags);
 }
 
-Result<void> gated_residual_post(const ActivationBuffer& branch,
-                                 const ActivationBuffer& residual,
-                                 const HyperConnectionMix& mix,
-                                 uint32_t multiplier,
-                                 ActivationBuffer& output)
+Result<void> forward_gated_residual_post(const ActivationBuffer& branch,
+                                         const ActivationBuffer& residual,
+                                         const HyperConnectionMix& mix,
+                                         uint32_t multiplier,
+                                         ActivationBuffer& output)
 {
     if (multiplier == 0 || branch.rows() != residual.rows()
         || residual.columns() != branch.columns() * multiplier
@@ -203,17 +203,17 @@ Result<void> gated_residual_post(const ActivationBuffer& branch,
     return {};
 }
 
-Result<void> gated_residual_head(const ActivationBuffer& input,
-                                 const TensorData& norm_weight,
-                                 const TensorData& mix_down_weight,
-                                 const TensorData& mix_up_weight,
-                                 uint32_t multiplier,
-                                 uint32_t hidden_size,
-                                 float norm_epsilon,
-                                 float norm_weight_offset,
-                                 ActivationBuffer& output,
-                                 HyperConnectionScratch& scratch,
-                                 uint64_t optimization_flags)
+Result<void> forward_gated_residual_head(const ActivationBuffer& input,
+                                         const TensorData& norm_weight,
+                                         const TensorData& mix_down_weight,
+                                         const TensorData& mix_up_weight,
+                                         uint32_t multiplier,
+                                         uint32_t hidden_size,
+                                         float norm_epsilon,
+                                         float norm_weight_offset,
+                                         ActivationBuffer& output,
+                                         HyperConnectionScratch& scratch,
+                                         uint64_t optimization_flags)
 {
     if (&output == &input)
         return Error{ErrorCode::InvalidArgument, "gated-residual head output must not alias input"};

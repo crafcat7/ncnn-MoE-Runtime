@@ -484,23 +484,6 @@ void qnk_q8k_quantize(const float* source, uint8_t* output, uint32_t columns) no
     scalar_qnk_q8k_quantize(source, output, columns);
 }
 
-void qnk_q8k_quantize_batch(const float* source,
-                            size_t input_stride,
-                            size_t rows,
-                            uint32_t columns,
-                            std::vector<uint8_t>& output) noexcept
-{
-    if (!source || rows == 0 || !qnk_shape_supported(DType::Q8K, rows, columns))
-    {
-        output.clear();
-        return;
-    }
-    const size_t row_bytes = static_cast<size_t>(qnk_storage_bytes(DType::Q8K, 1, columns));
-    output.resize(rows * row_bytes);
-    for (size_t row = 0; row < rows; ++row)
-        qnk_q8k_quantize(source + row * input_stride, output.data() + row * row_bytes, columns);
-}
-
 bool qnk_pack_weights(const uint8_t* raw,
                       size_t raw_bytes,
                       DType dtype,
@@ -545,11 +528,11 @@ bool qnk_pack_weights(const uint8_t* raw,
     return true;
 }
 
-bool qnk_linear_batch_into(const TensorData& matrix,
-                           const ActivationBuffer& input,
-                           ActivationBuffer& output,
-                           bool use_packed_weights,
-                           std::shared_ptr<const QnKPack>* sidecar) noexcept
+bool forward_linear_qnk(const TensorData& matrix,
+                        const ActivationBuffer& input,
+                        ActivationBuffer& output,
+                        bool use_packed_weights,
+                        std::shared_ptr<const QnKPack>* sidecar) noexcept
 {
     if (!is_qnk_dtype(matrix.dtype) || matrix.shape.size() != 2)
         return false;

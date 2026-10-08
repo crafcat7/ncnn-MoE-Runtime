@@ -2,4 +2,4 @@
 #
 # The dependency groups remain defined in pyproject.toml so this file does
 # not duplicate package versions or drift from the installable package.
--e .[gpt-oss,hf,tui,telemetry]
+-e .[hf,tui,telemetry]

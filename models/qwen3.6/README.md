@@ -23,7 +23,7 @@ one-layer MTP payload as an experimental speculative-decoding option.
 | Mixed execution | Vulkan Dense projections and device-resident Gated DeltaNet when Vulkan Attention is available, with CPU fallback, routing, and BF16 Experts |
 | Speculation | One experimental Qwen MTP layer with sequential target verification and transactional Gated DeltaNet/KV state; opt-in and available only with Artifact v3 |
 | Generation | Greedy, temperature, Top-K, Top-P, Min-P, stop tokens, token-ID streaming, and optional MTP |
-| Text input | Official tokenizer and `chat_template.jinja` through the Python wrapper |
+| Text input | Official tokenizer and text chat template in Runtime |
 
 This admission is text-only. The vision encoder and image/video token path are
 not compiled or executed. The package's one-layer MTP payload is compiled only
@@ -89,11 +89,11 @@ Use `-DNCNN_MOE_USE_VULKAN=OFF` for a portable CPU-only build.
 
 ## Run text or chat
 
-The unified CLI applies the checkpoint's official tokenizer and chat template,
-then streams through `ncnn_moe_worker`:
+Runtime applies the checkpoint's official tokenizer and text chat template.
+The unified CLI sends messages and streams text through `ncnn_moe_worker`:
 
 ```powershell
-python -m pip install -e ".[hf]"
+python -m pip install -e .
 python tools\ncnn_moe.py run `
   --model .\models\qwen3.6\Qwen3.6-35B-A3B `
   --prompt "Briefly explain mixture-of-experts models." `

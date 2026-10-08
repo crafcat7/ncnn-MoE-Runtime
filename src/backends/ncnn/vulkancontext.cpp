@@ -262,23 +262,6 @@ bool record_prepared_staging_upload(const ncnn::VkMat& staging,
     return !destination.empty();
 }
 
-bool record_prepared_staging_download(const ncnn::VkMat& source,
-                                      size_t rows,
-                                      uint32_t columns,
-                                      ncnn::VkMat& staging,
-                                      ncnn::VkCompute& command,
-                                      const ncnn::Option& option)
-{
-    if (!has_batch_shape(staging, rows, columns, sizeof(float)))
-        return false;
-    ncnn::Option staging_option = option;
-    staging_option.blob_vkallocator = staging.allocator;
-    staging_option.workspace_vkallocator = staging.allocator;
-    staging_option.staging_vkallocator = staging.allocator;
-    command.record_clone(source, staging, staging_option);
-    return !staging.empty();
-}
-
 bool record_prepared_activation_staging_download(const ncnn::VkMat& source,
                                                  size_t rows,
                                                  uint32_t columns,
@@ -309,12 +292,14 @@ bool record_prepared_activation_staging_download(const ncnn::VkMat& source,
         && output_dtype == DType::Float32
         && source_matches_cpu_batch)
     {
-        return record_prepared_staging_download(source,
-                                                rows,
-                                                columns,
-                                                staging,
-                                                command,
-                                                option);
+        if (!has_batch_shape(staging, rows, columns, sizeof(float)))
+            return false;
+        ncnn::Option staging_option = option;
+        staging_option.blob_vkallocator = staging.allocator;
+        staging_option.workspace_vkallocator = staging.allocator;
+        staging_option.staging_vkallocator = staging.allocator;
+        command.record_clone(source, staging, staging_option);
+        return !staging.empty();
     }
     if (!device)
         return false;

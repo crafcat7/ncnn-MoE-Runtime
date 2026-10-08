@@ -63,7 +63,7 @@ static constexpr const char* execution_failure_error_message = "session is unava
     return {};
 }
 
-uint32_t Session::get_max_context_length(const MoeModelDescriptor& descriptor) noexcept
+uint32_t Session::context_limit(const MoeModelDescriptor& descriptor) noexcept
 {
     if (descriptor.layers.empty())
         return 0;
@@ -111,7 +111,7 @@ Result<void> Session::prefill_unlocked(std::span<const int32_t> input_ids)
         return Error{ErrorCode::InvalidArgument, "prefill requires at least one token"};
     if (input_ids.size() > std::numeric_limits<uint32_t>::max())
         return Error{ErrorCode::InvalidArgument, "prefill token count exceeds uint32 range"};
-    const uint32_t max_context_length = get_max_context_length(model->descriptor());
+    const uint32_t max_context_length = context_limit(model->descriptor());
     if (max_context_length > 0 && input_ids.size() > max_context_length - std::min<uint64_t>(token_count, max_context_length))
         return Error{ErrorCode::InvalidArgument, "prefill exceeds the model context length"};
     auto valid_tokens = validate_token_ids(model->descriptor(), input_ids);
@@ -183,7 +183,7 @@ Result<void> Session::decode_unlocked(int32_t input_id)
     auto valid_state = validate_execution_state(*state);
     if (!valid_state)
         return valid_state.error();
-    const uint32_t max_context_length = get_max_context_length(model->descriptor());
+    const uint32_t max_context_length = context_limit(model->descriptor());
     if (max_context_length > 0 && token_count >= max_context_length)
         return Error{ErrorCode::InvalidArgument, "decode exceeds the model context length"};
     const std::array<int32_t, 1> input = {input_id};
@@ -233,11 +233,34 @@ Result<void> Session::reset()
 {
     const std::lock_guard<std::mutex> lock(mutex);
     token_count = 0;
+    std::vector<uint64_t> counts = std::move(stats.expert_token_counts);
+    std::vector<uint64_t> scratch_counts = std::move(stats_scratch.expert_token_counts);
     stats = {};
+    stats.expert_token_counts = std::move(counts);
     stats.expert_token_counts.resize(model->descriptor().expert_count, 0);
+    std::fill(stats.expert_token_counts.begin(), stats.expert_token_counts.end(), 0);
     stats_scratch = {};
+    stats_scratch.expert_token_counts = std::move(scratch_counts);
     stats_scratch.expert_token_counts.resize(model->descriptor().expert_count, 0);
-    state.reset(new SessionState);
+    std::fill(stats_scratch.expert_token_counts.begin(), stats_scratch.expert_token_counts.end(), 0);
+    std::unique_ptr<SessionState> next(new SessionState);
+    if (!generation_active)
+    {
+        next->expert_scratch.expert_workspaces = std::move(state->expert_scratch.expert_workspaces);
+        next->attention_scratch = std::move(state->attention_scratch);
+        next->attention_scratch.latent_row_contexts.clear();
+        next->attention_scratch.latent_projected_compressed_counts.clear();
+        next->attention_scratch.latent_caches.clear();
+        next->hidden.swap(state->hidden);
+        next->hidden.clear();
+        next->final_norm.swap(state->final_norm);
+        next->final_norm.clear();
+        next->logits.swap(state->logits);
+        next->logits.clear();
+        next->lm_head_input.swap(state->lm_head_input);
+        next->lm_head_input.clear();
+    }
+    state = std::move(next);
     state->use_speculative_context = use_speculative_context;
     generation_start_counters = {};
     generation_active = false;

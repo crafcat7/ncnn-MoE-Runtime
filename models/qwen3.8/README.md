@@ -14,7 +14,7 @@ directly, so conversion is optional.
 | Input features | PLE n-gram embedding on the checkpoint-selected layer and four-stream hyper-connections |
 | Expert weights | Official file-backed BF16 or an optional checkpoint-bound MXFP4 Artifact |
 | Mixed execution | Vulkan Dense projections, Gated DeltaNet state, and resident compatible MXFP4 Experts; CPU fallback remains available |
-| Text input | Official tokenizer and chat template through the Python wrapper |
+| Text input | Official tokenizer and text chat template in Runtime |
 
 The vision encoder and multimodal token path are not admitted. The checkpoint's
 MTP tensors are also not executed, so the optional Artifact contains only the

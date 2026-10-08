@@ -1,8 +1,7 @@
 // Portions of byte-level BPE handling are derived from Palm-Infra's Apache-2.0
-// tokenizer implementation. See examples/internal/tokenizer.LICENSE. This
-// header is modified and narrows the interface to the pinned Qwen3.6 profile.
-#ifndef NCNN_MOE_EXAMPLES_INTERNAL_TOKENIZER_H
-#define NCNN_MOE_EXAMPLES_INTERNAL_TOKENIZER_H
+// tokenizer implementation. See tokenizer.LICENSE.
+#ifndef NCNN_MOE_MODELS_TOKENIZER_H
+#define NCNN_MOE_MODELS_TOKENIZER_H
 
 #include <array>
 #include <cstddef>
@@ -38,6 +37,7 @@ public:
     }
 
 private:
+    struct EncodeScratch;
     struct UnicodeProfile;
 
     enum : uint8_t
@@ -66,19 +66,36 @@ private:
         uint32_t id = 0;
     };
 
+    enum class Family : uint8_t
+    {
+        None,
+        GptOss,
+        DeepSeekV4,
+        Qwen36,
+        Qwen38
+    };
+
     bool load_impl(const std::string& model_directory, size_t vocabulary_size);
-    void bpe(std::string_view raw, std::vector<int32_t>& ids) const;
+    void encode_impl(std::string_view text,
+                     bool recognize_added_tokens,
+                     EncodeScratch& scratch,
+                     std::vector<int32_t>& ids) const;
+    void bpe(std::string_view raw, std::vector<int32_t>& ids, EncodeScratch& scratch) const;
 
     std::vector<Entry> index;
     std::vector<uint8_t> bytes;
     std::unordered_map<uint64_t, Merge> merges;
+    std::unordered_map<std::string, uint32_t> raw_piece_ids;
     std::vector<AddedToken> added_tokens;
+    std::array<std::pair<size_t, size_t>, 256> added_token_ranges{};
     std::vector<int32_t> stops;
     std::array<int32_t, 256> byte_ids{};
     std::unique_ptr<UnicodeProfile> unicode;
+    Family family = Family::None;
+    bool ignore_merges = false;
 };
 
 } // namespace moe
 } // namespace ncnn
 
-#endif // NCNN_MOE_EXAMPLES_INTERNAL_TOKENIZER_H
+#endif // NCNN_MOE_MODELS_TOKENIZER_H

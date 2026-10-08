@@ -68,12 +68,6 @@ void qnk_q8k_quantize(const float* source,
                       uint8_t* output,
                       uint32_t columns) noexcept;
 
-void qnk_q8k_quantize_batch(const float* source,
-                            size_t input_stride,
-                            size_t rows,
-                            uint32_t columns,
-                            std::vector<uint8_t>& output) noexcept;
-
 [[nodiscard]] bool qnk_pack_weights(const uint8_t* raw,
                                     size_t raw_bytes,
                                     DType dtype,
@@ -81,11 +75,11 @@ void qnk_q8k_quantize_batch(const float* source,
                                     uint32_t columns,
                                     QnKPack& output) noexcept;
 
-[[nodiscard]] bool qnk_linear_batch_into(const TensorData& matrix,
-                                         const ActivationBuffer& input,
-                                         ActivationBuffer& output,
-                                         bool use_packed_weights,
-                                         std::shared_ptr<const QnKPack>* sidecar = nullptr) noexcept;
+[[nodiscard]] bool forward_linear_qnk(const TensorData& matrix,
+                                      const ActivationBuffer& input,
+                                      ActivationBuffer& output,
+                                      bool use_packed_weights,
+                                      std::shared_ptr<const QnKPack>* sidecar = nullptr) noexcept;
 
 } // namespace moe
 } // namespace ncnn

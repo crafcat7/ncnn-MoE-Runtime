@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""Small dependency-light smoke test for the unified worker and GPT-OSS adapter."""
+"""Dependency-free tests for the native-text worker client and chat flow."""
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import contextlib
+import copy
+import io
 import json
 import os
-import subprocess
 import sys
 import tempfile
-from collections import UserDict
+import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ncnn_moe_adapters import (  # noqa: E402
+    AdapterError,
     Completion,
-    QwenAdapter,
-    _normalize_token_ids,
+    NATIVE_TEXT_VERSION,
     create_adapter,
 )
 from ncnn_moe import (  # noqa: E402
@@ -28,326 +30,759 @@ from ncnn_moe import (  # noqa: E402
     _format_runtime_metrics,
     default_worker_path,
     find_worker,
+    load_adapter,
     parse_arguments,
 )
 from ncnn_moe_protocol import WorkerClient, WorkerError  # noqa: E402
 from ncnn_moe_state import runtime_args_from_settings  # noqa: E402
+import benchmark_prompt  # noqa: E402
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--worker", type=Path, required=True)
-    parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--auto", action="store_true")
-    arguments = parser.parse_args()
+FAMILY_CASES = (
+    ("gpt_oss", "gpt-oss", [200002, 200012]),
+    ("deepseek_v4", "deepseek-v4", [1]),
+    ("qwen3_5_moe", "qwen3.6", [248046, 248044]),
+    ("qwen4_exp", "qwen3.8", [248046, 248044]),
+)
 
-    assert _format_bytes_gb(1_000_000_000) == "1.00 GB"
-    assert _format_bytes_gb(None) == "N/A"
-    formatted_metrics = _format_runtime_metrics(
-        {
-            "prompt_tok_per_second": 3.7,
-            "generation_tok_per_second": 13.33,
-            "tpot_microseconds": 75_030.0,
-            "gpu": {
-                "available": True,
-                "kernel_time_available": False,
-                "reason": "gpu_expert_execution_not_observed",
-            },
-            "gpu_device": {},
+
+def _model(root: Path, model_type: str, *, context: int = 2048) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": model_type,
+                "text_config": {"max_position_embeddings": context},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "tokenizer.json").write_text("{}", encoding="utf-8")
+    return root
+
+
+def _ready(stop_tokens: list[int] | None = None, *, supported: bool = True) -> dict[str, object]:
+    model: dict[str, object] = {
+        "native_text_supported": supported,
+        "native_text_version": NATIVE_TEXT_VERSION,
+        "native_stop_tokens": [1] if stop_tokens is None else stop_tokens,
+        "max_context_tokens": 4096,
+    }
+    return {"event": "ready", "model": model}
+
+
+def _arguments(**overrides: object) -> SimpleNamespace:
+    values: dict[str, object] = {
+        "system": "",
+        "title": "",
+        "seed": 7,
+        "prefill_chunk_size": 8,
+        "no_speculative": False,
+        "max_new_tokens": 8,
+        "temperature": None,
+        "top_k": None,
+        "top_p": None,
+        "min_p": 0.0,
+        "speculative_confidence": 0.5,
+        "speculative_max_draft": 0,
+        "metrics_enabled": False,
+        "metrics_interval_ms": 0,
+        "stream": False,
+        "stream_final_only": False,
+        "show_reasoning": True,
+        "context_tokens": 0,
+        "no_thinking": False,
+        "verbose": False,
+        "ephemeral": True,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+class FakeStore:
+    def __init__(self) -> None:
+        self.saved: list[dict[str, object]] = []
+        self._next_id = 0
+
+    def new_id(self) -> str:
+        self._next_id += 1
+        return f"session-{self._next_id}"
+
+    def save(self, record: dict[str, object]) -> None:
+        self.saved.append(copy.deepcopy(record))
+
+    def save_profile(self, *_: object) -> None:
+        pass
+
+    def list(self) -> list[dict[str, object]]:
+        return []
+
+
+def _message_count(messages: list[dict[str, str]]) -> int:
+    return sum(3 + max(1, (len(message.get("content", "")) + 3) // 4) for message in messages)
+
+
+class FakeWorkerClient:
+    def __init__(self, *, response: list[str | tuple[int, str]] | None = None) -> None:
+        self.ready = {
+            "model": {"max_context_tokens": 4096},
+            "resources": {"backend": "cpu"},
         }
-    )
-    assert "Prompt: 3.70 t/s | Generation: 13.33 t/s" in formatted_metrics
-    assert "kernel N/A (no GPU Expert execution)" in formatted_metrics
+        self.sessions: dict[str, list[dict[str, str]]] = {}
+        self.compact_payloads: list[tuple[str, list[dict[str, str]], bool, int | None]] = []
+        self.generate_payloads: list[list[dict[str, str]]] = []
+        self.stats_payloads: list[list[dict[str, str]] | None] = []
+        self.resets: list[str] = []
+        self.responses: list[list[str | tuple[int, str]]] = [response] if response is not None else []
 
-    defaults = parse_arguments(["run", "--model", "model", "--prompt", "hello"])
-    assert defaults.stream is True
-    assert defaults.show_reasoning is True
-    assert defaults.metrics_enabled is False
-    overrides = parse_arguments(
-        [
-            "run",
-            "--model",
-            "model",
-            "--prompt",
-            "hello",
-            "--no-stream",
-            "--hide-reasoning",
-            "--metrics",
-        ]
-    )
-    assert overrides.stream is False
-    assert overrides.show_reasoning is False
-    assert overrides.metrics_enabled is True
+    def create_session(self, session_id: str, **_: object) -> dict[str, object]:
+        self.sessions[session_id] = []
+        return {"event": "session_created", "session_id": session_id}
 
-    assert runtime_args_from_settings({"backend": "auto"}) == []
-    assert runtime_args_from_settings({"backend": "cpu"}) == ["--cpu"]
-    assert runtime_args_from_settings({"backend": "hybrid"}) == ["--hybrid"]
-    assert runtime_args_from_settings({"cpu_packed_weights": "off"}) == [
-        "--cpu-packed-weights",
-        "off",
-    ]
-    assert runtime_args_from_settings({"cpu_packed_weights": "on"}) == [
-        "--cpu-packed-weights",
-        "on",
-    ]
-    try:
-        runtime_args_from_settings({"cpu_packed_weights": "auto"})
-    except ValueError as error:
-        assert "must be off or on" in str(error)
-    else:
-        raise AssertionError("automatic CPU packed weights must not be accepted")
-    try:
-        runtime_args_from_settings({"backend": "vulkan"})
-    except ValueError as error:
-        assert "unknown backend" in str(error)
-    else:
-        raise AssertionError("Vulkan-only backend must not be accepted from saved settings")
+    def reset(self, session_id: str) -> dict[str, object]:
+        self.resets.append(session_id)
+        self.sessions[session_id] = []
+        return {"event": "reset", "session_id": session_id}
 
-    class FakeQwenTokenizer:
-        eos_token_id = 99
+    def compact(
+        self,
+        session_id: str,
+        replay_tokens: list[int] | None = None,
+        *,
+        messages: list[dict[str, str]] | None = None,
+        enable_thinking: bool | None = None,
+        context_tokens: int | None = None,
+    ) -> dict[str, object]:
+        del replay_tokens
+        copied = copy.deepcopy(messages or [])
+        self.compact_payloads.append((session_id, copied, bool(enable_thinking), context_tokens))
+        self.sessions[session_id] = copied
+        count = _message_count(copied)
+        return {"event": "compacted", "sequence_length": count, "replayed_tokens": count}
 
-        def decode(self, tokens: list[int], *, skip_special_tokens: bool) -> str:
-            assert skip_special_tokens
-            return "answer\ufffd" if tokens and tokens[-1] == self.eos_token_id else "partial\ufffd"
+    def stats(
+        self,
+        session_id: str,
+        *,
+        messages: list[dict[str, str]] | None = None,
+        enable_thinking: bool | None = None,
+    ) -> dict[str, object]:
+        del enable_thinking
+        self.stats_payloads.append(copy.deepcopy(messages))
+        current = messages if messages is not None else self.sessions.get(session_id, [])
+        return {
+            "event": "stats",
+            "prompt_count": _message_count(current),
+            "sequence_length": _message_count(self.sessions.get(session_id, [])),
+        }
 
-    qwen = object.__new__(QwenAdapter)
-    qwen.tokenizer = FakeQwenTokenizer()
-    assert qwen.decode_text([1, 99]) == "answer"
-    assert qwen.decode_text([1]) == "partial\ufffd"
+    def generate(
+        self,
+        session_id: str,
+        prompt_tokens: list[int] | None = None,
+        *,
+        messages: list[dict[str, str]] | None = None,
+        enable_thinking: bool | None = None,
+        context_tokens: int | None = None,
+        on_event: object = None,
+        **_: object,
+    ) -> tuple[dict[str, object], list[int]]:
+        del prompt_tokens, enable_thinking, context_tokens
+        assert messages is not None
+        previous = self.sessions.get(session_id, [])
+        reused = bool(previous) and messages[: len(previous)] == previous
+        copied = copy.deepcopy(messages)
+        self.generate_payloads.append(copied)
+        pieces = self.responses.pop(0) if self.responses else ["answer"]
+        if callable(on_event):
+            for index, piece in enumerate(pieces, start=1):
+                token_id, text = piece if isinstance(piece, tuple) else (300000 + index, piece)
+                on_event({"event": "token", "token_id": token_id, "text": text})
+        text_pieces = [piece[1] if isinstance(piece, tuple) else piece for piece in pieces]
+        count = _message_count(copied) + len(pieces)
+        self.sessions[session_id] = copied + [{"role": "assistant", "content": "".join(text_pieces)}]
+        return (
+            {
+                "event": "done",
+                "sequence_length": count,
+                "prefix_reused": reused,
+                "generated_tokens": len(pieces),
+                "metrics": {"input_tokens": _message_count(copied)},
+            },
+            [piece[0] if isinstance(piece, tuple) else 300000 + index for index, piece in enumerate(pieces, start=1)],
+        )
 
-    class FakeQwen4Tokenizer(FakeQwenTokenizer):
-        def apply_chat_template(self, messages: object, **options: object) -> list[int]:
-            del messages, options
-            return [1, 2, 3]
 
-    class FakeTokenizerLoader:
-        @staticmethod
-        def from_pretrained(model: str, *, local_files_only: bool) -> FakeQwen4Tokenizer:
-            assert Path(model).is_dir()
-            assert local_files_only
-            return FakeQwen4Tokenizer()
+class AdapterTests(unittest.TestCase):
+    def test_four_model_families_need_no_python_tokenizer_packages(self) -> None:
+        original_import = __import__
 
-    transformers = ModuleType("transformers")
-    transformers.PreTrainedTokenizerFast = FakeTokenizerLoader  # type: ignore[attr-defined]
-    previous_transformers = sys.modules.get("transformers")
-    sys.modules["transformers"] = transformers
-    try:
-        with tempfile.TemporaryDirectory(prefix="ncnn-moe-qwen4-adapter-") as directory:
-            qwen4_root = Path(directory)
-            (qwen4_root / "config.json").write_text(
-                json.dumps(
-                    {
-                        "model_type": "qwen4_exp",
-                        "text_config": {"max_position_embeddings": 262144},
-                    }
+        def import_without_tokenizer(name: str, *args: object, **kwargs: object) -> ModuleType:
+            if name == "transformers" or name == "openai_harmony" or name.startswith("transformers."):
+                raise AssertionError(f"Python tokenizer dependency imported: {name}")
+            return original_import(name, *args, **kwargs)
+
+        arguments = _arguments()
+        for command in ("run", "chat", "tune"):
+            with self.subTest(command=command):
+                parsed = parse_arguments([command, "--no-thinking"])
+                self.assertTrue(parsed.no_thinking)
+                self.assertFalse(parse_arguments([command]).no_thinking)
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-native-adapters-") as directory:
+            root = Path(directory)
+            for model_type, expected_name, expected_stops in FAMILY_CASES:
+                with self.subTest(model_type=model_type), patch("builtins.__import__", import_without_tokenizer):
+                    model = _model(root / model_type, model_type)
+                    adapter = load_adapter(arguments, model, _ready(expected_stops))
+                    self.assertEqual(adapter.name, expected_name)
+                    self.assertEqual(adapter.stop_tokens, expected_stops)
+                    self.assertEqual(adapter.context_limit, 2048)
+                    self.assertTrue(adapter.thinking)
+                    self.assertFalse(load_adapter(_arguments(no_thinking=True), model, _ready(expected_stops)).thinking)
+
+    def test_native_unavailable_or_wrong_protocol_fails_explicitly(self) -> None:
+        arguments = _arguments()
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-native-unavailable-") as directory:
+            model = _model(Path(directory), "gpt_oss")
+            cases = (
+                (_ready(supported=False), "ICU tokenizer assets"),
+                ({"event": "ready", "model": {"native_text_supported": True}}, "version"),
+                (
+                    {"event": "ready", "model": {
+                        "native_text_supported": True,
+                        "native_text_version": "ncnn-moe-text-v1",
+                        "native_stop_tokens": [1],
+                    }},
+                    NATIVE_TEXT_VERSION,
                 ),
-                encoding="utf-8",
+                (_ready([1, True]), "stop-token"),
+                (_ready([]), "stop-token"),
             )
-            (qwen4_root / "tokenizer.json").write_text("{}", encoding="utf-8")
-            (qwen4_root / "generation_config.json").write_text(
-                json.dumps({"eos_token_id": [248046, 248044]}),
-                encoding="utf-8",
+            for ready, expected in cases:
+                with self.subTest(ready=ready), self.assertRaisesRegex(AdapterError, expected):
+                    load_adapter(arguments, model, ready)
+
+    def test_gpt_completion_requires_token_id_aware_parser(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-harmony-") as directory:
+            model = _model(Path(directory), "gpt_oss")
+            adapter = create_adapter(model, thinking=False)
+            with self.assertRaisesRegex(AdapterError, "native token events"):
+                adapter.decode_completion_text("<|return|> is ordinary user-visible text")
+
+    def test_deepseek_and_qwen_text_modes_and_unicode(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-text-modes-") as directory:
+            root = Path(directory)
+            deepseek = create_adapter(_model(root / "ds", "deepseek_v4"), thinking=True)
+            self.assertEqual(
+                deepseek.decode_completion_text("I should reason.</think>\nAnswer"),
+                Completion("I should reason.", "Answer"),
             )
-            qwen4 = create_adapter(qwen4_root)
-            assert isinstance(qwen4, QwenAdapter)
-            assert qwen4.name == "qwen3.8"
-            assert qwen4.model_type == "qwen4_exp"
-            assert qwen4.context_limit == 262144
-            assert qwen4.stop_tokens == [99, 248046, 248044]
-    finally:
-        if previous_transformers is None:
-            del sys.modules["transformers"]
-        else:
-            sys.modules["transformers"] = previous_transformers
+            self.assertEqual(
+                deepseek.decode_completion_text("<｜Assistant｜> is body</think>Answer"),
+                Completion("<｜Assistant｜> is body", "Answer"),
+            )
+            chat = create_adapter(_model(root / "chat", "deepseek_v4"), thinking=False)
+            self.assertEqual(
+                chat.decode_completion_text("</think>\nPlain answer"),
+                Completion("", "</think>\nPlain answer"),
+            )
+            qwen = create_adapter(_model(root / "qwen", "qwen3_5_moe"), thinking=True)
+            self.assertEqual(qwen.decode_completion_text("still reasoning"), Completion("still reasoning", ""))
+            self.assertEqual(
+                qwen.decode_completion_text("body <think> is literal"),
+                Completion("body <think> is literal", ""),
+            )
+            self.assertEqual(
+                qwen.decode_completion_text("reason</think>  answer  "),
+                Completion("reason", "  answer  "),
+            )
+            plain = create_adapter(_model(root / "plain", "qwen4_exp"), thinking=False)
+            self.assertEqual(plain.decode_completion_text("你好🙂"), Completion("", "你好🙂"))
 
-    class PrefixClient:
-        def __init__(self) -> None:
-            self.responses: list[tuple[dict[str, object], list[int]] | Exception] = []
-            self.prompt_batches: list[list[int]] = []
-            self.resets: list[str] = []
+    def test_fingerprints_expose_previous_versions_and_protect_mismatches(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-fingerprint-") as directory:
+            root = Path(directory)
+            for model_type, _, _ in FAMILY_CASES:
+                with self.subTest(model_type=model_type):
+                    family = create_adapter(_model(root / model_type, model_type))
+                    self.assertIn(family.legacy_model_fingerprints[-1], family.legacy_model_fingerprints)
+                    self.assertNotIn(family.model_fingerprint, family.legacy_model_fingerprints)
+            model = _model(root / "qwen", "qwen3_5_moe")
+            (model / "tokenizer_config.json").write_text('{"eos_token":"x"}', encoding="utf-8")
+            original = create_adapter(model)
+            self.assertEqual(len(original.legacy_model_fingerprints), 2)
+            self.assertEqual(original.legacy_model_fingerprints[-1], original.legacy_model_fingerprints[1])
+            self.assertNotEqual(original.model_fingerprint, original.legacy_model_fingerprints[-1])
 
-        def reset(self, session_id: str) -> None:
-            self.resets.append(session_id)
+            changed_model = _model(root / "changed", "qwen3_5_moe", context=1024)
+            changed = create_adapter(changed_model)
+            self.assertNotEqual(original.model_fingerprint, changed.model_fingerprint)
+            self.assertTrue(set(original.legacy_model_fingerprints).isdisjoint(changed.legacy_model_fingerprints))
 
-        def generate(
-            self, session_id: str, prompt_tokens: list[int], **options: object
-        ) -> tuple[dict[str, object], list[int]]:
-            del session_id, options
-            self.prompt_batches.append(list(prompt_tokens))
-            response = self.responses.pop(0)
-            if isinstance(response, Exception):
-                raise response
-            return response
 
-    prefix_client = PrefixClient()
-    prefix_app = object.__new__(ConversationApp)
-    prefix_app.adapter = SimpleNamespace(
-        name="qwen3.6",
-        model=Path("prefix-test-model"),
-        model_type="qwen3_5",
-        model_fingerprint="prefix-test",
-        stop_tokens=[],
-        decode_completion=lambda tokens: Completion("", "answer"),
-    )
-    prefix_app.client = prefix_client
-    prefix_app.arguments = SimpleNamespace(
-        temperature=0.0,
-        top_k=0,
-        top_p=1.0,
-        no_speculative=True,
-        speculative_confidence=0.5,
-        speculative_max_draft=0,
-        max_new_tokens=4,
-        min_p=0.0,
-        metrics_enabled=False,
-        metrics_interval_ms=0,
-        stream=False,
-    )
-    prefix_app.native_session_id = "prefix-test"
-    prefix_app.native_context_tokens = []
-    prefix_app.messages = []
-    prefix_app.summary = ""
-    prefix_app.settings = {}
-    prefix_app.record = {}
-    prefix_app.ephemeral = True
+class ProtocolTests(unittest.TestCase):
+    class QueuedClient(WorkerClient):
+        def __init__(self, events: list[dict[str, object]], *, interrupt: bool = False) -> None:
+            self.events = list(events)
+            self.sent: list[dict[str, object]] = []
+            self.interrupt = interrupt
 
-    # The worker says only the first generated token reached KV. The second
-    # token must be sent with the next prompt instead of being treated as cache.
-    first_prompt = [10, 11]
-    second_prompt = [10, 11, 20, 21, 12]
-    prompts = iter((first_prompt, second_prompt))
-    prefix_app._prompt_tokens_with_budget = lambda: next(prompts)
-    prefix_client.responses.extend(
-        [
-            ({"sequence_length": 3}, [20, 21]),
-            ({"sequence_length": 6}, [30, 31]),
+        def _send(self, payload: dict[str, object]) -> None:
+            self.sent.append(payload)
+
+        def _read_event(self) -> dict[str, object]:
+            if self.interrupt:
+                self.interrupt = False
+                raise KeyboardInterrupt
+            return self.events.pop(0)
+
+    @staticmethod
+    def _failing_callback(_: dict[str, object]) -> None:
+        raise RuntimeError("callback failed")
+
+    def test_callback_failure_drains_done_and_keeps_next_request_synchronized(self) -> None:
+        normal = self.QueuedClient(
+            [
+                {"event": "token", "token_id": 1, "text": "a"},
+                {"event": "done"},
+                {"event": "stats", "sequence_length": 1},
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "callback failed"):
+            normal.generate("normal", [0], on_event=self._failing_callback)
+        self.assertEqual(normal.stats("normal")["sequence_length"], 1)
+        self.assertFalse(normal.events)
+
+        drain = self.QueuedClient(
+            [
+                {"event": "cancel_requested", "request_id": "interrupt"},
+                {"event": "token", "token_id": 2, "text": "b"},
+                {"event": "done"},
+                {"event": "stats", "sequence_length": 2},
+            ],
+            interrupt=True,
+        )
+        with self.assertRaisesRegex(WorkerError, "generation cancelled by user"):
+            drain.generate(
+                "drain",
+                [0],
+                request_id="interrupt",
+                on_event=self._failing_callback,
+            )
+        self.assertEqual(drain.sent[1], {"op": "cancel", "request_id": "interrupt"})
+        self.assertEqual(drain.stats("drain")["sequence_length"], 2)
+        self.assertFalse(drain.events)
+
+    def test_messages_protocol_has_enable_thinking_and_uses_runtime_stops(self) -> None:
+        client = self.QueuedClient(
+            [
+                {"event": "token", "token_id": 5, "text": "hi"},
+                {"event": "done"},
+            ]
+        )
+        client.generate(
+            "text",
+            messages=[{"role": "user", "content": "hi"}],
+            enable_thinking=False,
+            stop_tokens=[99],
+        )
+        payload = client.sent[0]
+        self.assertEqual(payload["messages"], [{"role": "user", "content": "hi"}])
+        self.assertIs(payload["enable_thinking"], False)
+        self.assertNotIn("stop_tokens", payload)
+
+
+class BenchmarkTests(unittest.TestCase):
+    def test_direct_token_benchmark_does_not_require_native_text(self) -> None:
+        class Client:
+            def __init__(self, stops: list[int] | None) -> None:
+                model: dict[str, object] = {"native_text_supported": False}
+                if stops is not None:
+                    model["native_stop_tokens"] = stops
+                self.ready = {"model": model}
+                self.call: tuple[str, list[int], dict[str, object]] | None = None
+
+            def __enter__(self) -> Client:
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                pass
+
+            def create_session(self, *_: object, **__: object) -> None:
+                pass
+
+            def generate(
+                self,
+                session_id: str,
+                prompt_tokens: list[int],
+                **options: object,
+            ) -> tuple[dict[str, object], list[int]]:
+                self.call = (session_id, list(prompt_tokens), dict(options))
+                return (
+                    {
+                        "prompt_tok_per_second": 1.0,
+                        "generation_tok_per_second": 2.0,
+                        "elapsed_seconds": 1.0,
+                        "ttft_microseconds": 1000,
+                        "tpot_microseconds": 2000,
+                        "generated_tokens": 1,
+                        "metrics": {"expert": {}, "gpu": {}, "cpu": {}},
+                    },
+                    [4],
+                )
+
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-token-benchmark-") as directory:
+            root = Path(directory)
+            arguments = SimpleNamespace(
+                model=root / "model-without-text-assets",
+                worker=root / "worker",
+                backend="cpu",
+                vulkan_device=0,
+                host_memory_mb=0,
+                expert_cache_mb=0,
+                expert_io_workers=0,
+                expert_gpu_cache_mb=0,
+                expert_gpu_victim_cache_mb=0,
+                prompt="unused",
+                prompt_token_ids=[0, 1, 2],
+                max_new_tokens=1,
+                warmup=0,
+                runs=1,
+                prefill_chunk_size=8,
+                expert_memory="auto",
+                enable_speculative=False,
+                json_output=True,
+            )
+            for ready_stops in (None, [88, 88]):
+                client = Client(ready_stops)
+                with (
+                    patch.object(benchmark_prompt, "_parse_args", return_value=arguments),
+                    patch.object(benchmark_prompt, "WorkerClient", return_value=client),
+                    patch.object(
+                        benchmark_prompt,
+                        "load_adapter",
+                        side_effect=AssertionError("direct token IDs must bypass text adapters"),
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(benchmark_prompt.main(), 0)
+                assert client.call is not None
+                self.assertEqual(client.call[1], [0, 1, 2])
+                self.assertEqual(client.call[2].get("stop_tokens"), [])
+
+
+class ConversationTests(unittest.TestCase):
+    def _app(
+        self,
+        model_type: str,
+        *,
+        response: list[str | tuple[int, str]] | None = None,
+        record: dict[str, object] | None = None,
+        arguments: SimpleNamespace | None = None,
+    ) -> tuple[ConversationApp, FakeWorkerClient, FakeStore]:
+        temporary = tempfile.TemporaryDirectory(prefix="ncnn-moe-conversation-")
+        self.addCleanup(temporary.cleanup)
+        model = _model(Path(temporary.name), model_type, context=4096)
+        stop_tokens = next(stops for family, _, stops in FAMILY_CASES if family == model_type)
+        adapter = create_adapter(
+            model,
+            thinking=not (arguments or _arguments()).no_thinking,
+            native_stop_tokens=stop_tokens,
+        )
+        client = FakeWorkerClient(response=response)
+        store = FakeStore()
+        with contextlib.redirect_stderr(io.StringIO()):
+            app = ConversationApp(
+                adapter=adapter,
+                client=client,  # type: ignore[arg-type]
+                store=store,  # type: ignore[arg-type]
+                arguments=arguments or _arguments(),
+                settings={},
+                record=record,
+                ephemeral=True,
+            )
+        app._status = lambda _: None  # type: ignore[method-assign]
+        return app, client, store
+
+    def test_resume_compact_reset_context_and_qwen_system_merge(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-resume-model-") as directory:
+            model = _model(Path(directory), "qwen3_5_moe")
+            adapter = create_adapter(model)
+            record: dict[str, object] = {
+                "id": "old-session",
+                "title": "Saved",
+                "model": str(model),
+                "model_type": "qwen3_5_moe",
+                "model_fingerprint": adapter.legacy_model_fingerprints[0],
+                "messages": [
+                    {"role": "system", "content": "base instructions"},
+                    {"role": "system", "content": "extra instructions"},
+                    {"role": "system", "content": "Conversation summary:\nprior summary"},
+                    {"role": "user", "content": "old question one"},
+                    {"role": "assistant", "content": "old answer one"},
+                    {"role": "user", "content": "old question two"},
+                    {"role": "assistant", "content": "old answer two"},
+                    {"role": "user", "content": "old question three"},
+                    {"role": "assistant", "content": "old answer three"},
+                ],
+                "summary": "prior summary",
+                "settings": {},
+            }
+            client = FakeWorkerClient()
+            store = FakeStore()
+            with contextlib.redirect_stderr(io.StringIO()):
+                app = ConversationApp(
+                    adapter=adapter,
+                    client=client,  # type: ignore[arg-type]
+                    store=store,  # type: ignore[arg-type]
+                    arguments=_arguments(system="configured system"),
+                    settings={},
+                    record=record,
+                    ephemeral=False,
+                )
+            app._status = lambda _: None  # type: ignore[method-assign]
+            self.assertEqual(client.compact_payloads[0][0], "main")
+            self.assertIn(
+                "base instructions\n\nextra instructions\n\nConversation summary:\nprior summary",
+                app.messages[0]["content"],
+            )
+            self.assertEqual(record["model_fingerprint"], adapter.model_fingerprint)
+            self.assertGreater(record["context_token_count"], 0)
+
+            self.assertEqual(app._prompt_count("main", app.messages), _message_count(app.messages))
+            app._summarize = lambda: "fresh summary"  # type: ignore[method-assign]
+            app.compact(announce=False)
+            self.assertEqual(app.summary, "fresh summary")
+            self.assertEqual(len([message for message in app.messages if message["role"] != "system"]), 4)
+            self.assertNotIn("old question one", app.messages[1]["content"])
+
+            app.command("/reset")
+            self.assertEqual(client.resets[-1], "main")
+            self.assertEqual([message["role"] for message in app.messages], ["system"])
+            self.assertEqual(app.native_context_count, 0)
+            app.new_session()
+            self.assertEqual(app.messages, [{"role": "system", "content": "configured system"}])
+            self.assertEqual(app.native_context_count, 0)
+            compact_calls = len(client.compact_payloads)
+            app.compact(announce=False)
+            self.assertEqual(client.resets[-1], app.native_session_id)
+            self.assertEqual(len(client.compact_payloads), compact_calls)
+            self.assertEqual(app.native_context_count, 0)
+
+    def test_send_does_not_preflight_prompt_stats(self) -> None:
+        app, client, _ = self._app("qwen3_5_moe")
+        self.assertEqual(client.stats_payloads, [])
+        app.send("question")
+        self.assertEqual(client.stats_payloads, [])
+        self.assertEqual(len(client.generate_payloads), 1)
+
+    def test_streaming_handles_harmony_thinking_without_open_marker_and_unicode(self) -> None:
+        harmony_events = [
+            (200006, "<|start|>"),
+            (300001, "assistant"),
+            (200005, "<|channel|>"),
+            (300002, "analysis"),
+            (200008, "<|message|>"),
+            (300003, "assistant is a role. literal <|return|>\n你好。"),
+            (200006, "\ufffd<|start|>"),
+            (300004, "assistant"),
+            (200005, "<|channel|>"),
+            (300005, "final"),
+            (200008, "<|message|>"),
+            (300006, "Final text, including assistant as prose."),
+            (200002, "\ufffd<|return|>"),
         ]
-    )
-    prefix_app.send("first turn")
-    assert prefix_app.native_context_tokens == [10, 11, 20]
-    prefix_app.send("second turn")
-    assert prefix_client.prompt_batches[-2:] == [[10, 11], [21, 12]]
-    assert prefix_app.native_context_tokens == [10, 11, 20, 21, 12, 30]
-    assert first_prompt == [10, 11]
-    assert second_prompt == [10, 11, 20, 21, 12]
-
-    # Use the reported committed count rather than assuming stop, max-token,
-    # cancellation, or speculative generation commits a fixed output suffix.
-    for reason, prompt, tokens, committed in (
-        ("stop", [1, 2], [50], 0),
-        ("max tokens", [3, 4], [60, 61, 62], 1),
-        ("cancel", [5, 6], [70, 71, 72], 2),
-        ("partial speculative output", [7, 8], [80, 81, 82], 3),
-    ):
-        prefix_app.native_context_tokens = []
-        prefix_app.messages = []
-        prefix_app._prompt_tokens_with_budget = lambda prompt=prompt: prompt
-        original_prompt = list(prompt)
-        prefix_client.responses.append(
-            ({"sequence_length": len(prompt) + committed}, tokens)
+        app, _, _ = self._app(
+            "gpt_oss",
+            response=harmony_events,
+            arguments=_arguments(stream=True, no_thinking=True, show_reasoning=True),
         )
-        prefix_app.send("counted turn")
-        assert prefix_app.native_context_tokens == prompt + tokens[:committed], reason
-        assert prompt == original_prompt
-
-    # A missing or malformed length makes the cache unusable; the next request
-    # must reset before sending a full prompt.
-    invalid_done_events = (
-        {},
-        {"sequence_length": None},
-        {"sequence_length": True},
-        {"sequence_length": "2"},
-        {"sequence_length": 2.0},
-        {"sequence_length": 1},
-        {"sequence_length": 5},
-    )
-    for invalid_done in invalid_done_events:
-        prefix_app.native_context_tokens = [3]
-        prefix_app.messages = []
-        prefix_app._prompt_tokens_with_budget = lambda: [3, 4]
-        reset_count = len(prefix_client.resets)
-        prefix_client.responses.append((invalid_done, [90, 91]))
-        prefix_app.send("invalid sequence length")
-        assert prefix_app.native_context_tokens == []
-        assert len(prefix_client.resets) == reset_count
-
-        prefix_app._prompt_tokens_with_budget = lambda: [3, 4, 5]
-        prefix_client.responses.append(({"sequence_length": 3}, [92]))
-        prefix_app.send("reset after invalid length")
-        assert len(prefix_client.resets) == reset_count + 1
-
-    # An interrupted or disconnected generate call may have changed native KV
-    # without returning a committed length. The next turn must reset and replay
-    # its complete prompt instead of reusing the stale Python prefix.
-    for failure in (
-        WorkerError("generation cancelled by user"),
-        WorkerError("worker exited before sending an event (return code 1)"),
-    ):
-        prefix_app.native_context_tokens = [41, 42]
-        prefix_app.messages = []
-        failed_prompt = [41, 42, 43]
-        prefix_app._prompt_tokens_with_budget = lambda: failed_prompt
-        reset_count = len(prefix_client.resets)
-        prefix_client.responses.append(failure)
-        try:
-            prefix_app.send("failed generation")
-        except WorkerError as error:
-            assert str(error) == str(failure)
-        else:
-            raise AssertionError("failed generation unexpectedly returned")
-        assert prefix_client.prompt_batches[-1] == [43]
-        assert prefix_app.native_context_tokens == []
-        assert len(prefix_client.resets) == reset_count
-
-        recovery_prompt = [41, 42, 43, 44]
-        prefix_app._prompt_tokens_with_budget = lambda: recovery_prompt
-        prefix_client.responses.append(({"sequence_length": 4}, [101]))
-        prefix_app.send("recovery generation")
-        assert prefix_client.prompt_batches[-1] == recovery_prompt
-        assert prefix_client.resets[-1] == "prefix-test"
-        assert len(prefix_client.resets) == reset_count + 1
-        assert prefix_app.native_context_tokens == recovery_prompt
-
-    with tempfile.TemporaryDirectory(prefix="ncnn-moe-worker-path-") as directory:
-        root = Path(directory)
-        worker_name = "ncnn_moe_worker.exe" if os.name == "nt" else "ncnn_moe_worker"
-        expected = root / "build-ncnn"
-        if os.name == "nt":
-            expected /= "Release"
-        expected /= worker_name
-        assert default_worker_path(root) == expected
-
-        other = root / "build-other" / "Release" / worker_name
-        other.parent.mkdir(parents=True)
-        other.touch()
-        try:
-            find_worker(None, root)
-        except ValueError as error:
-            assert "build-ncnn" in str(error)
-        else:
-            raise AssertionError("worker resolution must not scan other build directories")
-
-        assert find_worker(str(other), root) == other.resolve()
-
-    # Transformers returns BatchEncoding (a Mapping, not necessarily dict),
-    # and tensor-backed tokenizers may add a single batch dimension.
-    assert _normalize_token_ids(UserDict({"input_ids": [4, 5, 6]})) == [4, 5, 6]
-    assert _normalize_token_ids(UserDict({"input_ids": [[7, 8, 9]]})) == [7, 8, 9]
-
-    if importlib.util.find_spec("openai_harmony") is None:
-        print(
-            f"SKIP: openai_harmony is not installed for {sys.executable}; install with "
-            f'"{sys.executable}" -m pip install -e ".[gpt-oss]"',
-            file=sys.stderr,
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            completion, _, _ = app.send("question")
+        self.assertEqual(
+            completion,
+            Completion(
+                "assistant is a role. literal <|return|>\n你好。\ufffd",
+                "Final text, including assistant as prose.\ufffd",
+            ),
         )
-        return 77
+        self.assertEqual(
+            output.getvalue().rstrip("\n"),
+            "[reasoning]\nassistant is a role. literal <|return|>\n你好。\ufffd"
+            "\n[answer]\nFinal text, including assistant as prose.\ufffd",
+        )
 
-    adapter = create_adapter(arguments.model)
-    if adapter.model_type != "gpt_oss":
-        raise AssertionError(f"unexpected adapter: {adapter.model_type}")
+        # Non-streamed decoding must use event IDs too: marker-looking BPE text
+        # inside the body remains ordinary model output.
+        app, _, _ = self._app("gpt_oss", response=harmony_events)
+        completion, _, _ = app.send("question")
+        self.assertEqual(completion.answer, "Final text, including assistant as prose.\ufffd")
+        self.assertIn("literal <|return|>", completion.reasoning)
 
-    runtime_args = [] if arguments.auto else ["--cpu"]
-    with WorkerClient(arguments.worker, arguments.model, runtime_args) as client:
+        deepseek_events = [
+            (300001, "  consider"),
+            (300002, " the question\ufffd</thi"),
+            (300003, "nk>\r\n  Answer"),
+            (1, "\ufffd<｜end▁of▁sentence｜>"),
+        ]
+        app, _, _ = self._app(
+            "deepseek_v4",
+            response=deepseek_events,
+            arguments=_arguments(stream=True),
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            completion, _, _ = app.send("question")
+        self.assertEqual(
+            completion,
+            Completion("consider the question\ufffd", "Answer\ufffd"),
+        )
+        self.assertEqual(
+            output.getvalue().rstrip("\n"),
+            "[reasoning]\nconsider the question\ufffd\n[answer]\nAnswer\ufffd",
+        )
+        app, _, _ = self._app("deepseek_v4", response=deepseek_events)
+        replayed, _, _ = app.send("question")
+        self.assertEqual(replayed, completion)
+
+        app, _, _ = self._app(
+            "deepseek_v4",
+            response=["reasoning without an opening or closing marker"],
+            arguments=_arguments(stream=True),
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            completion, _, _ = app.send("question")
+        self.assertEqual(completion, Completion("reasoning without an opening or closing marker", ""))
+        self.assertEqual(
+            output.getvalue().rstrip("\n"),
+            "[reasoning]\nreasoning without an opening or closing marker",
+        )
+
+        app, _, _ = self._app(
+            "deepseek_v4",
+            response=["  ", "plain", " answer  "],
+            arguments=_arguments(stream=True, no_thinking=True),
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            completion, _, _ = app.send("question")
+        self.assertEqual(completion, Completion("", "plain answer"))
+        self.assertEqual(output.getvalue().rstrip("\n"), "[answer]\nplain answer")
+
+        app, _, _ = self._app(
+            "qwen4_exp",
+            response=["你", "好", "🙂"],
+            arguments=_arguments(stream=True, no_thinking=True),
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            completion, _, _ = app.send("question")
+        self.assertEqual(completion, Completion("", "你好🙂"))
+        self.assertEqual(output.getvalue().rstrip("\n"), "[answer]\n你好🙂")
+
+        qwen_events = [
+            (300001, "  reason\ufffd</thi"),
+            (300002, "nk>\r\n  answer\ufffd \t"),
+            (248046, ""),
+        ]
+        app, _, _ = self._app("qwen3_5_moe", response=qwen_events, arguments=_arguments(stream=True))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            completion, _, _ = app.send("question")
+        self.assertEqual(completion, Completion("reason\ufffd", "  answer"))
+        self.assertEqual(
+            output.getvalue().rstrip("\n"),
+            "[reasoning]\nreason\ufffd\n[answer]\n  answer",
+        )
+        app, _, _ = self._app("qwen3_5_moe", response=qwen_events)
+        replayed, _, _ = app.send("question")
+        self.assertEqual(replayed, completion)
+
+        qwen_max_token_events = [
+            (300001, "  reason\ufffd</thi"),
+            (300002, "nk>\r\n  answer\ufffd "),
+            (300003, "\t"),
+        ]
+        app, _, _ = self._app(
+            "qwen3_5_moe",
+            response=qwen_max_token_events,
+            arguments=_arguments(stream=True),
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            completion, _, _ = app.send("question")
+        self.assertEqual(completion, Completion("reason\ufffd", "  answer\ufffd \t"))
+        self.assertEqual(
+            output.getvalue(),
+            "[reasoning]\nreason\ufffd\n[answer]\n  answer\ufffd \t\n",
+        )
+
+    def test_only_matching_legacy_fingerprints_migrate(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-legacy-check-") as directory:
+            root = Path(directory)
+            original_model = _model(root / "original", "deepseek_v4")
+            original_adapter = create_adapter(original_model)
+            changed_model = _model(root / "changed", "deepseek_v4", context=1024)
+            changed_adapter = create_adapter(changed_model)
+            old_fingerprint = original_adapter.legacy_model_fingerprints[-1]
+            self.assertNotIn(old_fingerprint, changed_adapter.legacy_model_fingerprints)
+
+            record: dict[str, object] = {
+                "id": "foreign",
+                "title": "Foreign",
+                "model_fingerprint": old_fingerprint,
+                "messages": [{"role": "user", "content": "saved"}],
+                "settings": {},
+            }
+            client = FakeWorkerClient()
+            store = FakeStore()
+            with contextlib.redirect_stderr(io.StringIO()):
+                app = ConversationApp(
+                    adapter=changed_adapter,
+                    client=client,  # type: ignore[arg-type]
+                    store=store,  # type: ignore[arg-type]
+                    arguments=_arguments(),
+                    settings={},
+                    record=record,
+                    ephemeral=True,
+                )
+            self.assertEqual(record["model_fingerprint"], old_fingerprint)
+            app.native_context_count = 100
+            app._save()
+            self.assertEqual(record["model_fingerprint"], old_fingerprint)
+
+    def test_each_family_migrates_its_legacy_fingerprint_after_replay(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-family-fingerprint-migration-") as directory:
+            root = Path(directory)
+            for model_type, _, _ in FAMILY_CASES:
+                with self.subTest(model_type=model_type):
+                    model = _model(root / model_type, model_type)
+                    adapter = create_adapter(model)
+                    record: dict[str, object] = {
+                        "id": model_type,
+                        "title": "Saved",
+                        "model_fingerprint": adapter.legacy_model_fingerprints[0],
+                        "messages": [{"role": "user", "content": "saved turn"}],
+                        "settings": {},
+                    }
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        ConversationApp(
+                            adapter=adapter,
+                            client=FakeWorkerClient(),  # type: ignore[arg-type]
+                            store=FakeStore(),  # type: ignore[arg-type]
+                            arguments=_arguments(),
+                            settings={},
+                            record=record,
+                            ephemeral=True,
+                        )
+                    self.assertEqual(record["model_fingerprint"], adapter.model_fingerprint)
+
+
+def _runtime_smoke(worker: Path, model: Path, *, auto: bool) -> None:
+    runtime_args = [] if auto else ["--cpu"]
+    with WorkerClient(worker, model, runtime_args) as client:
         assert client.ready["event"] == "ready"
         assert client.ready["resources"]["backend"] in {"cpu", "hybrid"}
         assert "provider" in client.ready.get("telemetry", {})
@@ -358,15 +793,28 @@ def main() -> int:
             assert error.event.get("code") == "invalid_request"
         else:
             raise AssertionError("unknown worker operation did not return an error")
+
         client.create_session("first", enable_speculative_context=False)
-        client.create_session("second", enable_speculative_context=False)
         compacted = client.compact("first", [0, 1])
         assert compacted["replayed_tokens"] == 2
+        vocabulary_size = int(client.ready["model"]["vocabulary_size"])
+        for invalid_token in (-1, vocabulary_size):
+            try:
+                client.compact("first", [invalid_token])
+            except WorkerError as error:
+                assert error.event.get("code") == "invalid_request"
+            else:
+                raise AssertionError("compact accepted a token outside the vocabulary")
+            assert client.stats("first")["sequence_length"] == 2
+        empty = client.compact("first", [])
+        assert empty["replayed_tokens"] == 0
+        assert empty["sequence_length"] == 0
+
         events: list[dict[str, object]] = []
         done, tokens = client.generate(
             "first",
             [0],
-            request_id="fixture-generation",
+            request_id="python-smoke",
             max_new_tokens=3,
             temperature=0.0,
             enable_speculative=False,
@@ -377,181 +825,29 @@ def main() -> int:
         assert done["event"] == "done"
         assert len(tokens) == 3
         assert not any(event.get("event") == "metrics" for event in events)
-        assert "metrics" in done
         assert "prompt_tok_per_second" in done["metrics"]
         assert "generation_tok_per_second" in done["metrics"]
         assert "expert" in done["metrics"]
         assert "ttft_microseconds" in done["metrics"]
         assert "tpot_microseconds" in done["metrics"]
-        if arguments.auto and client.ready["resources"]["backend"] == "hybrid":
-            assert done["stats"]["generation_gpu"]["submit_count"] > 0
-        else:
-            assert done["metrics"]["gpu"]["submit_count"] is None
-            assert done["metrics"]["gpu"]["reason"] == "runtime_backend_cpu_only"
-        stats = client.stats("first")
-        assert stats["event"] == "stats"
-        assert stats["sequence_length"] == done["sequence_length"]
 
-        worker_tokens: list[int] = []
 
-        def decode_worker_tokens(tokens: list[int]) -> Completion:
-            worker_tokens[:] = tokens
-            return Completion("", "answer")
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", type=Path)
+    parser.add_argument("--model", type=Path)
+    parser.add_argument("--auto", action="store_true")
+    arguments = parser.parse_args()
 
-        worker_app = prefix_app
-        worker_app.adapter.name = "gpt-oss"
-        worker_app.adapter.model = arguments.model
-        worker_app.adapter.model_type = "gpt_oss"
-        worker_app.adapter.model_fingerprint = "prefix-worker-test"
-        worker_app.adapter.stop_tokens = []
-        worker_app.adapter.decode_completion = decode_worker_tokens
-        worker_app.client = client
-        worker_app.native_session_id = "prefix-reuse"
-        worker_app.native_context_tokens = []
-        worker_app.messages = []
-        client.create_session(
-            "prefix-reuse", seed=17, enable_speculative_context=False
-        )
-        client.create_session(
-            "prefix-fresh", seed=17, enable_speculative_context=False
-        )
-        first_worker_prompt = [0, 1]
-        worker_app._prompt_tokens_with_budget = lambda: first_worker_prompt
-        _, first_worker_done, first_reused = worker_app.send("first worker turn")
-        first_worker_output = list(worker_tokens)
-        assert not first_reused
-        committed_count = first_worker_done["sequence_length"] - len(first_worker_prompt)
-        assert 0 <= committed_count <= len(first_worker_output)
-        assert worker_app.native_context_tokens == (
-            first_worker_prompt + first_worker_output[:committed_count]
-        )
-        assert client.stats("prefix-reuse")["sequence_length"] == len(
-            worker_app.native_context_tokens
-        )
-
-        replay_prompt = first_worker_prompt + first_worker_output + [0]
-        worker_app._prompt_tokens_with_budget = lambda: replay_prompt
-        _, resumed_done, reused = worker_app.send("second worker turn")
-        resumed_output = list(worker_tokens)
-        assert reused
-        committed_count = resumed_done["sequence_length"] - len(replay_prompt)
-        assert 0 <= committed_count <= len(resumed_output)
-        assert worker_app.native_context_tokens == (
-            replay_prompt + resumed_output[:committed_count]
-        )
-        _, fresh_output = client.generate(
-            "prefix-fresh",
-            replay_prompt,
-            request_id="fresh-prefix-replay",
-            max_new_tokens=4,
-            temperature=0.0,
-            top_k=0,
-            top_p=1.0,
-            stop_tokens=[],
-            enable_speculative=False,
-            metrics_enabled=False,
-            metrics_interval_ms=0,
-        )
-        assert resumed_output == fresh_output
-        client.reset("first")
-        assert client.stats("first")["sequence_length"] == 0
-
-    process = subprocess.Popen(
-        [str(arguments.worker), str(arguments.model), *runtime_args],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-    )
-    assert process.stdin is not None and process.stdout is not None
-    ready = json.loads(process.stdout.readline())
-    assert ready["event"] == "ready"
-    for request, session_id in (
-        (r'{"op":"create_session","session_id":"json-\u4e2d\u6587\ud83d\ude00"}', "json-中文😀"),
-        (r'{"op":"create_session","session_id":"\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\u0008\u0009\u000a\u000b\u000c\u000d\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f"}', "".join(chr(codepoint) for codepoint in range(32))),
-        ('{"metadata":{"session_id":"shadow"},"op":"create_session","session_id":"json-top"}', "json-top"),
-        (r'{"op":"create_session","session_\u0069d":"json-key"}', "json-key"),
-    ):
-        process.stdin.write(request + "\n")
-        process.stdin.flush()
-        event = json.loads(process.stdout.readline())
-        assert event["event"] == "session_created", event
-        assert event["session_id"] == session_id, event
-    process.stdin.write(r'{"op":"create_session","session_id":"bad-\ud800"}' + "\n")
-    process.stdin.flush()
-    assert json.loads(process.stdout.readline())["event"] == "error"
-    process.stdin.write(
-        '{"metadata":{"prompt_tokens":[0,1,0,1]},"op":"generate",'
-        '"session_id":"json-top","prompt_tokens":[0,1],"max_new_tokens":1,'
-        '"temperature":0,"enable_speculative":false,"metrics_enabled":false}\n'
-    )
-    process.stdin.flush()
-    for line in process.stdout:
-        event = json.loads(line)
-        assert event["event"] != "error", event
-        if event["event"] == "done":
-            assert event["sequence_length"] == 2, event
-            break
-    else:
-        raise AssertionError("JSON field generation did not finish")
-    process.stdin.write('{"op":"create_session","session_id":"cancel"}\n')
-    process.stdin.flush()
-    assert json.loads(process.stdout.readline())["event"] == "session_created"
-    # Reject the old oversized budget before mutation, then exercise actual
-    # cancellation with a budget that fits the fixture's context.
-    process.stdin.write(
-        '{"op":"generate","request_id":"cancel-me","session_id":"cancel",'
-        '"prompt_tokens":[0,1,0,1],"max_new_tokens":1000,"temperature":0,'
-        '"enable_speculative":false}\n'
-    )
-    process.stdin.flush()
-    event = json.loads(process.stdout.readline())
-    assert event["event"] == "error" and event["code"] == "context_overflow", event
-    process.stdin.write('{"op":"stats","session_id":"cancel"}\n')
-    process.stdin.flush()
-    assert json.loads(process.stdout.readline())["sequence_length"] == 0
-    cancel_limit = min(1000, int(ready["model"]["max_context_tokens"]) - 4)
-    assert cancel_limit > 1
-    process.stdin.write(
-        json.dumps(
-            {
-                "op": "generate",
-                "request_id": "cancel-me",
-                "session_id": "cancel",
-                "prompt_tokens": [0, 1, 0, 1],
-                "max_new_tokens": cancel_limit,
-                "temperature": 0,
-                "enable_speculative": False,
-            }
-        )
-        + "\n"
-    )
-    process.stdin.flush()
-    cancelled = False
-    completed = False
-    for line in process.stdout:
-        event = json.loads(line)
-        if event.get("event") == "token" and not cancelled:
-            process.stdin.write('{"op":"cancel","request_id":"cancel-me"}\n')
-            process.stdin.flush()
-            cancelled = True
-        elif event.get("event") == "error":
-            process.terminate()
-            process.wait(timeout=5)
-            raise AssertionError(f"cancellation generation failed: {event}")
-        elif event.get("event") == "done":
-            completed = True
-            assert event.get("cancelled") is True
-            break
-    assert cancelled and completed
-    process.stdin.write('{"op":"shutdown"}\n')
-    process.stdin.flush()
-    assert json.loads(process.stdout.readline())["event"] == "shutdown"
-    process.wait(timeout=5)
-    print("ncnn_moe Python worker/adapter smoke test passed")
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    if not result.wasSuccessful():
+        return 1
+    if arguments.worker is None and arguments.model is None:
+        return 0
+    if arguments.worker is None or arguments.model is None:
+        parser.error("--worker and --model must be provided together")
+    _runtime_smoke(arguments.worker, arguments.model, auto=arguments.auto)
     return 0
 
 

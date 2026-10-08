@@ -43,6 +43,7 @@ struct ExpertWorkspace
 {
     ActivationBuffer projection;
     ActivationBuffer gate;
+    ActivationBuffer quantized_input;
 };
 
 struct ExpertState

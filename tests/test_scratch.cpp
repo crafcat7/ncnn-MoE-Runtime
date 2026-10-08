@@ -122,9 +122,9 @@ static void test_mxfp4_scratch_reuse()
     for (size_t index = 0; index < disabled_tasks.size(); ++index)
         disabled_tasks[index].output = &disabled_outputs[index];
     Mxfp4Scratch disabled_scratch;
-    scratch_check(mxfp4_expert_batch(std::span<const Mxfp4Task>(disabled_tasks.data(), disabled_tasks.size()),
-                                     &disabled_scratch,
-                                     scalar_flags),
+    scratch_check(forward_experts_mxfp4(std::span<const Mxfp4Task>(disabled_tasks.data(), disabled_tasks.size()),
+                                        &disabled_scratch,
+                                        scalar_flags),
                   "MXFP4 Q8-disabled batch");
     scratch_check(std::all_of(disabled_scratch.q8_down_enabled.begin(), disabled_scratch.q8_down_enabled.end(), [](uint8_t value) { return value == 0; }), "Q8-disabled down bookkeeping");
     scratch_check(std::all_of(disabled_scratch.q8_gate_packed.begin(), disabled_scratch.q8_gate_packed.end(), [](uint8_t value) { return value == 0; }), "Q8-disabled gate bookkeeping");
@@ -132,9 +132,9 @@ static void test_mxfp4_scratch_reuse()
         scratch_check(!packed, "Q8-disabled packed bookkeeping");
 
     Mxfp4Scratch scratch;
-    scratch_check(mxfp4_expert_batch(std::span<const Mxfp4Task>(tasks.data(), tasks.size()),
-                                     &scratch,
-                                     q8_flags),
+    scratch_check(forward_experts_mxfp4(std::span<const Mxfp4Task>(tasks.data(), tasks.size()),
+                                        &scratch,
+                                        q8_flags),
                   "MXFP4 initial batch");
     std::array<const std::byte*, 3> activated_storage = {};
     for (size_t index = 0; index < tasks.size(); ++index)
@@ -150,9 +150,9 @@ static void test_mxfp4_scratch_reuse()
     for (size_t index = 0; index < fresh_tasks.size(); ++index)
         fresh_tasks[index].output = &fresh_outputs[index];
     Mxfp4Scratch fresh_scratch;
-    scratch_check(mxfp4_expert_batch(std::span<const Mxfp4Task>(fresh_tasks.data(), fresh_tasks.size()),
-                                     &fresh_scratch,
-                                     q8_flags),
+    scratch_check(forward_experts_mxfp4(std::span<const Mxfp4Task>(fresh_tasks.data(), fresh_tasks.size()),
+                                        &fresh_scratch,
+                                        q8_flags),
                   "MXFP4 fresh Q8 batch");
     for (size_t index = 0; index < tasks.size(); ++index)
         check_mxfp4_outputs(outputs[index], fresh_outputs[index], 1e-5f);
@@ -162,9 +162,9 @@ static void test_mxfp4_scratch_reuse()
     {
         Mxfp4Task reference = tasks[index];
         reference.output = &expected[index];
-        scratch_check(mxfp4_expert_batch(std::span<const Mxfp4Task>(&reference, 1),
-                                         nullptr,
-                                         scalar_flags),
+        scratch_check(forward_experts_mxfp4(std::span<const Mxfp4Task>(&reference, 1),
+                                            nullptr,
+                                            scalar_flags),
                       "MXFP4 reference batch");
         check_mxfp4_outputs(outputs[index], expected[index], 2.0f);
     }
@@ -177,9 +177,9 @@ static void test_mxfp4_scratch_reuse()
     const size_t q8_gate_capacity = scratch.q8_gate_packed.capacity();
     const size_t q8_packed_capacity = scratch.q8_down_packed.capacity();
     Mxfp4Task disabled_reuse_task = tasks[0];
-    scratch_check(mxfp4_expert_batch(std::span<const Mxfp4Task>(&disabled_reuse_task, 1),
-                                     &scratch,
-                                     scalar_flags),
+    scratch_check(forward_experts_mxfp4(std::span<const Mxfp4Task>(&disabled_reuse_task, 1),
+                                        &scratch,
+                                        scalar_flags),
                   "MXFP4 reused Q8-disabled batch");
     scratch_check(scratch.q8_down_enabled.data() == q8_enabled_data,
                   "Q8-disabled bookkeeping pointer reuse");
@@ -202,13 +202,13 @@ static void test_mxfp4_scratch_reuse()
     Mxfp4Task fresh_shrink_task = tasks[0];
     fresh_shrink_task.output = &fresh_shrink_output;
     Mxfp4Scratch fresh_shrink_scratch;
-    scratch_check(mxfp4_expert_batch(std::span<const Mxfp4Task>(&fresh_shrink_task, 1),
-                                     &fresh_shrink_scratch,
-                                     q8_flags),
+    scratch_check(forward_experts_mxfp4(std::span<const Mxfp4Task>(&fresh_shrink_task, 1),
+                                        &fresh_shrink_scratch,
+                                        q8_flags),
                   "MXFP4 fresh Q8 shrink batch");
-    scratch_check(mxfp4_expert_batch(std::span<const Mxfp4Task>(tasks.data(), 1),
-                                     &scratch,
-                                     q8_flags),
+    scratch_check(forward_experts_mxfp4(std::span<const Mxfp4Task>(tasks.data(), 1),
+                                        &scratch,
+                                        q8_flags),
                   "MXFP4 shrink batch");
     check_mxfp4_outputs(outputs[0], fresh_shrink_output, 1e-5f);
     scratch_check(scratch.activated.size() == activated_size, "MXFP4 scratch size after shrink");
@@ -221,15 +221,15 @@ static void test_mxfp4_scratch_reuse()
     for (size_t index = 0; index < regrow_fresh_tasks.size(); ++index)
         regrow_fresh_tasks[index].output = &regrow_fresh_outputs[index];
     Mxfp4Scratch regrow_fresh_scratch;
-    scratch_check(mxfp4_expert_batch(std::span<const Mxfp4Task>(regrow_fresh_tasks.data(), regrow_fresh_tasks.size()),
-                                     &regrow_fresh_scratch,
-                                     q8_flags),
+    scratch_check(forward_experts_mxfp4(std::span<const Mxfp4Task>(regrow_fresh_tasks.data(), regrow_fresh_tasks.size()),
+                                        &regrow_fresh_scratch,
+                                        q8_flags),
                   "MXFP4 fresh Q8 regrow batch");
     for (size_t index = 0; index < tasks.size(); ++index)
         tasks[index].output = &outputs[index];
-    scratch_check(mxfp4_expert_batch(std::span<const Mxfp4Task>(tasks.data(), tasks.size()),
-                                     &scratch,
-                                     q8_flags),
+    scratch_check(forward_experts_mxfp4(std::span<const Mxfp4Task>(tasks.data(), tasks.size()),
+                                        &scratch,
+                                        q8_flags),
                   "MXFP4 regrow batch");
     scratch_check(scratch.activated.size() == activated_size, "MXFP4 scratch size after regrow");
     for (size_t index = 0; index < tasks.size(); ++index)
@@ -245,9 +245,9 @@ static void test_mxfp4_scratch_reuse()
     {
         CompiledOperator owner;
         tasks[0].down_operator = &owner;
-        scratch_check(mxfp4_expert_batch(std::span<const Mxfp4Task>(tasks.data(), 1),
-                                         &scratch,
-                                         q8_flags),
+        scratch_check(forward_experts_mxfp4(std::span<const Mxfp4Task>(tasks.data(), 1),
+                                            &scratch,
+                                            q8_flags),
                       "MXFP4 operator-owned packed batch");
         scratch_check(owner.mxfp4_q8_packed != nullptr, "operator packed sidecar creation");
         scratch_check(owner.mxfp4_q8_packed.use_count() == 1,
@@ -443,19 +443,119 @@ static void test_attention_scratch_reuse()
 
     LayerCache accelerated_cache;
     ActivationBuffer accelerated_long_output;
+    AttentionScratch flash_scratch;
     run_attention(weights,
                   operators,
                   plan,
                   0,
                   accelerated_cache,
-                  scratch,
+                  flash_scratch,
                   long_hidden,
                   accelerated_long_output,
                   accelerated_flags);
     check_mxfp4_outputs(accelerated_long_output, reference_long_output, 1e-4f);
-    scratch_check(!scratch.workspace.empty(), "flash worker storage allocation");
-    const float* worker_data = scratch.workspace.data();
-    const size_t worker_capacity = scratch.workspace.capacity();
+    scratch_check(flash_scratch.logits.empty(), "cold flash leaves logits untouched");
+    scratch_check(flash_scratch.logits.capacity() == 0, "cold flash does not allocate logits");
+    scratch_check(!flash_scratch.workspace.empty(), "flash worker storage allocation");
+    const float* worker_data = flash_scratch.workspace.data();
+    const size_t worker_capacity = flash_scratch.workspace.capacity();
+    const size_t flash_attention_rows = flash_scratch.attention.rows();
+    const uint32_t flash_attention_columns = flash_scratch.attention.columns();
+    const std::byte* flash_attention_data = flash_scratch.attention.bytes().data();
+    const std::vector<float> flash_attention_reference(flash_scratch.attention.values().begin(),
+                                                       flash_scratch.attention.values().end());
+    for (size_t row = 0; row < flash_scratch.attention.rows(); ++row)
+    {
+        std::fill_n(flash_scratch.attention.row(row),
+                    flash_scratch.attention.columns(),
+                    std::numeric_limits<float>::quiet_NaN());
+    }
+    LayerCache poisoned_flash_cache;
+    ActivationBuffer poisoned_flash_output;
+    run_attention(weights,
+                  operators,
+                  plan,
+                  0,
+                  poisoned_flash_cache,
+                  flash_scratch,
+                  long_hidden,
+                  poisoned_flash_output,
+                  accelerated_flags);
+    scratch_check(flash_scratch.attention.rows() == flash_attention_rows,
+                  "flash output scratch row reuse");
+    scratch_check(flash_scratch.attention.columns() == flash_attention_columns,
+                  "flash output scratch column reuse");
+    scratch_check(flash_scratch.attention.bytes().data() == flash_attention_data,
+                  "flash output scratch storage reuse");
+    scratch_check(poisoned_flash_output.rows() == accelerated_long_output.rows(),
+                  "flash output row count after poison");
+    scratch_check(poisoned_flash_output.columns() == accelerated_long_output.columns(),
+                  "flash output column count after poison");
+    for (size_t row = 0; row < flash_attention_rows; ++row)
+    {
+        for (uint32_t column = 0; column < flash_attention_columns; ++column)
+        {
+            scratch_check(flash_scratch.attention.row(row)[column]
+                              == flash_attention_reference[row * flash_attention_columns + column],
+                          "flash attention output after poisoned scratch");
+        }
+    }
+    for (size_t row = 0; row < accelerated_long_output.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < accelerated_long_output.columns(); ++column)
+        {
+            scratch_check(poisoned_flash_output.row(row)[column]
+                              == accelerated_long_output.row(row)[column],
+                          "flash final output after poisoned scratch");
+        }
+    }
+
+    LayerCache future_cache = make_float_attention_cache(plan.kv_head_count * plan.head_dimension,
+                                                         80, 160, 0);
+    future_cache.start_position = 1000;
+    for (size_t row = 0; row < flash_scratch.attention.rows(); ++row)
+    {
+        std::fill_n(flash_scratch.attention.row(row),
+                    flash_scratch.attention.columns(),
+                    std::numeric_limits<float>::quiet_NaN());
+    }
+    ActivationBuffer future_output;
+    run_attention(weights,
+                  operators,
+                  plan,
+                  0,
+                  future_cache,
+                  flash_scratch,
+                  long_hidden,
+                  future_output,
+                  accelerated_flags);
+    for (size_t row = 0; row < flash_scratch.attention.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < flash_scratch.attention.columns(); ++column)
+        {
+            const float value = flash_scratch.attention.row(row)[column];
+            scratch_check(std::isfinite(value) && value == 0.0f && !std::signbit(value),
+                          "all-future flash attention output is positive zero");
+        }
+    }
+    for (size_t row = 0; row < future_output.rows(); ++row)
+    {
+        for (uint32_t column = 0; column < future_output.columns(); ++column)
+        {
+            const float value = future_output.row(row)[column];
+            scratch_check(std::isfinite(value) && value == long_hidden.row(row)[column],
+                          "all-future flash final output preserves residual");
+        }
+    }
+
+    flash_scratch.logits.swap(scratch.logits);
+    std::fill(flash_scratch.logits.begin(),
+              flash_scratch.logits.end(),
+              123.0f);
+    const std::vector<float> poisoned_logits(flash_scratch.logits);
+    const float* logits_data = flash_scratch.logits.data();
+    const size_t logits_size = flash_scratch.logits.size();
+    const size_t logits_capacity = flash_scratch.logits.capacity();
 
     const ActivationBuffer short_hidden_again = make_attention_hidden(2);
     ActivationBuffer reference_short_output;
@@ -474,13 +574,23 @@ static void test_attention_scratch_reuse()
                   plan,
                   80,
                   accelerated_cache,
-                  scratch,
+                  flash_scratch,
                   short_hidden_again,
                   accelerated_short_output,
                   accelerated_flags);
     check_mxfp4_outputs(accelerated_short_output, reference_short_output, 1e-4f);
-    scratch_check(scratch.workspace.data() == worker_data, "flash worker storage reuse");
-    scratch_check(scratch.workspace.capacity() == worker_capacity, "flash worker capacity reuse");
+    scratch_check(flash_scratch.logits.data() == logits_data,
+                  "flash reuse preserves prior logits storage");
+    scratch_check(flash_scratch.logits.size() == logits_size,
+                  "flash reuse preserves prior logits size");
+    scratch_check(flash_scratch.logits.capacity() == logits_capacity,
+                  "flash reuse preserves prior logits capacity");
+    scratch_check(std::equal(flash_scratch.logits.begin(),
+                             flash_scratch.logits.end(),
+                             poisoned_logits.begin()),
+                  "flash reuse leaves prior logits untouched");
+    scratch_check(flash_scratch.workspace.data() == worker_data, "flash worker storage reuse");
+    scratch_check(flash_scratch.workspace.capacity() == worker_capacity, "flash worker capacity reuse");
 
     if (attention_test_thread_count > 1)
     {
@@ -549,6 +659,8 @@ static void test_attention_scratch_reuse()
                       split_reference_output,
                       reference_flags);
         check_mxfp4_outputs(split_output, split_reference_output, 1e-4f);
+        scratch_check(split_scratch.logits.empty(), "cold split-KV leaves logits untouched");
+        scratch_check(split_scratch.logits.capacity() == 0, "cold split-KV does not allocate logits");
         scratch_check(!split_scratch.workspace.empty(), "split worker storage allocation");
         scratch_check(split_scratch.flash_partial_max.size()
                           == static_cast<size_t>(split_plan.head_count) * attention_test_thread_count,
@@ -633,6 +745,57 @@ static void test_attention_scratch_reuse()
                       split_again_output,
                       accelerated_flags);
         check_mxfp4_outputs(split_again_output, split_reference_output, 1e-4f);
+
+        constexpr uint64_t multithread_context = 4096;
+        const LayerCache initial_multithread_cache = make_float_attention_cache(split_columns,
+                                                                                multithread_context,
+                                                                                multithread_context * 2,
+                                                                                0);
+        const uint64_t multithread_operation_count = static_cast<uint64_t>(split_plan.head_count)
+                                                     * split_plan.head_dimension
+                                                     * (multithread_context + 1);
+        const int expected_head_threads = cpu_linear_team_size(2 * multithread_operation_count,
+                                                               DType::Float32);
+        scratch_check(expected_head_threads > 1, "multithread logits fixture selects head workers");
+
+        LayerCache multithread_cache = initial_multithread_cache;
+        AttentionScratch multithread_scratch;
+        ActivationBuffer multithread_logits_output;
+        run_attention(weights,
+                      operators,
+                      split_plan,
+                      multithread_context,
+                      multithread_cache,
+                      multithread_scratch,
+                      split_token,
+                      multithread_logits_output,
+                      reference_flags);
+        const size_t expected_logits_size = static_cast<size_t>(multithread_context + 1)
+                                            * expected_head_threads;
+        scratch_check(multithread_scratch.logits.size() == expected_logits_size,
+                      "head workers use the logical logits stride");
+        const float* logits_data = multithread_scratch.logits.data();
+        const size_t logits_capacity = multithread_scratch.logits.capacity();
+        std::fill(multithread_scratch.logits.begin(),
+                  multithread_scratch.logits.end(),
+                  std::numeric_limits<float>::quiet_NaN());
+
+        LayerCache poisoned_cache = initial_multithread_cache;
+        ActivationBuffer poisoned_logits_output;
+        run_attention(weights,
+                      operators,
+                      split_plan,
+                      multithread_context,
+                      poisoned_cache,
+                      multithread_scratch,
+                      split_token,
+                      poisoned_logits_output,
+                      reference_flags);
+        check_mxfp4_outputs(poisoned_logits_output, multithread_logits_output, 1e-4f);
+        scratch_check(multithread_scratch.logits.data() == logits_data,
+                      "head logits storage reuse");
+        scratch_check(multithread_scratch.logits.capacity() == logits_capacity,
+                      "head logits capacity reuse");
     }
 }
 

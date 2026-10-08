@@ -47,12 +47,14 @@ void begin_latent_cache_transaction(std::span<LayerCache> caches);
                                                           ActivationBuffer& output,
                                                           uint64_t optimization_flags);
 
+// The input must not alias scratch.key, which owns the reusable projected keys.
 [[nodiscard]] Result<void> append_dspark_attention_context(const WeightStore& weights,
                                                            const CompiledOperatorTable& operators,
                                                            const AttentionBlockPlan& plan,
                                                            ExecutionBackend backend,
                                                            uint64_t position_offset,
                                                            LayerCache& cache,
+                                                           AttentionScratch& scratch,
                                                            const ActivationBuffer& input,
                                                            uint64_t optimization_flags);
 

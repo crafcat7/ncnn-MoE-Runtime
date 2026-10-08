@@ -195,13 +195,17 @@ struct ExpertCache::FileRangeReader
         }
 #endif
 
+#if defined(_WIN32)
         const auto buffered_started = std::chrono::steady_clock::now();
+#endif
         LoadedRange loaded;
         loaded.data.resize(static_cast<size_t>(size));
         auto status = read(path, offset, loaded.data);
         if (!status)
             return status.error();
+#if defined(_WIN32)
         const uint64_t buffered_elapsed = std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - buffered_started).count());
+#endif
         buffered_read_ranges.fetch_add(1, std::memory_order_relaxed);
         buffered_read_bytes.fetch_add(size, std::memory_order_relaxed);
 #if defined(_WIN32)

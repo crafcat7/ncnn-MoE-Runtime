@@ -115,6 +115,9 @@ requiring a resident copy of every routed weight.
 ## Quick start
 
 Requirements: a C++20 compiler, CMake 3.21 or newer, Python 3.10+, and Git.
+Text prompts also require ICU 76+ with Unicode data 16+ at build time. CMake
+detects ICU automatically; use its standard `ICU_ROOT` hint if needed. Builds
+without ICU retain the token-ID API and reference runners.
 
 Install the complete Python environment for the unified examples from the
 repository root:
@@ -124,13 +127,12 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-This installs the GPT-OSS Harmony adapter, Hugging Face-backed adapters,
-DeepSeek/Qwen model-download and artifact-build tools, the optional
-Rich/prompt-toolkit UI, and CPU/GPU telemetry providers. The file delegates to
-the extras in `pyproject.toml`, so the dependency groups have a single source
-of truth. For a smaller installation, use only the required extra, for example
-`python -m pip install -e ".[gpt-oss]"`. When the Python package is installed,
-the CLI is also available as the `ncnn-moe` console script.
+This installs model-download and artifact-build tools, the optional
+Rich/prompt-toolkit UI, and CPU/GPU telemetry providers. Prompt encoding and
+text decoding run in C++ for all supported model families; the CLI does not
+require `transformers`, `tokenizers`, or `openai-harmony`. A minimal CLI install
+is `python -m pip install -e .`. The `ncnn-moe` console script is equivalent to
+`python tools/ncnn_moe.py`.
 
 ```powershell
 git clone --recurse-submodules https://github.com/crafcat7/ncnn-MoE-Runtime.git
@@ -170,6 +172,13 @@ The pinned ncnn submodule is built with the runtime. Restore it with
 `git submodule update --init --recursive` when necessary. A CPU-only build can
 be selected with `-DNCNN_MOE_USE_VULKAN=OFF`.
 
+To compare native text handling with the official Python implementations, build
+`ncnn_moe_tokenizer_test` and run
+`python tools/test_tokenizer.py build/ncnn_moe_tokenizer_test MODEL_DIRECTORY`.
+The script lists its test-only dependencies and reads local tokenizer assets;
+model weights are not required. It checks exact token IDs, text-message
+templates, stop IDs, and incremental UTF-8 decoding.
+
 ## Unified examples
 
 The supported user-facing example entry point is the Python CLI:
@@ -189,32 +198,35 @@ multi-config Windows generator the default worker is
 different build explicitly.
 
 Build `ncnn_moe_worker` with the examples. The worker owns Runtime/Model and
-Session lifetime and communicates through token-ID JSONL. For the validated
-Qwen3.6 profile, the worker can automatically handle message formatting,
-tokenization, and incremental text decoding in C++, using the canonical
-serialized tokenizer regex and chat template. This path requires optional
-Worker-only ICU 76 or newer with Unicode data 16 or newer. When that profile is
-unavailable, the CLI continues through the Python tokenizer and token-ID path.
+Session lifetime and communicates through JSONL. Runtime loads the model's
+validated tokenizer assets once, applies the text-message template, and
+incrementally decodes tokens for GPT-OSS, DeepSeek-V4 (including DSpark),
+Qwen3.6, and Qwen3.8. Python sends message strings and presents the returned
+text. Unsupported tokenizer profiles are reported explicitly; there is no
+Python tokenizer fallback. Message objects contain `role` and string `content`.
+GPT-OSS uses Harmony framing, DeepSeek-V4 uses its built-in text-message format,
+and Qwen uses the validated checkpoint template. Custom templates and
+multimodal message content are outside this text API.
+
 Python owns the CLI, persistent history, conversation summaries, reasoning
 display, and TUI presentation. `inspect` reports the detected hardware and the
 effective backend, memory, Expert-cache, and I/O plan. `chat` adds resumable
 sessions, context budgeting, compaction, and live token/CPU/GPU/I/O metrics.
-Install `openai-harmony` for GPT-OSS or `transformers` and the Hugging Face
-packages for DeepSeek/Qwen; `rich` and `prompt-toolkit` are optional TUI
-upgrades.
+`rich` and `prompt-toolkit` are optional TUI upgrades.
 Human-readable resource sizes in `inspect` and metrics use decimal `GB`; the
 machine-readable JSONL fields retain their exact byte values.
 Persistent session history, user configuration, and tuning profiles are stored
 under `.ncnn-moe/` in the project root; use `--config-dir` when another
 location is required. Native KV and runtime cache state remain in memory.
-Both native and Python Qwen3.6 paths follow the serialized `tokenizer.json`
-tokenizer. Saved conversations replay through the selected profile, and their
+Runtime follows the checkpoint's serialized tokenizer profile. Saved
+conversations replay through the native profile, and their
 fingerprint updates only after successful replay; an empty history can be
-migrated without replay. The canonical regex includes Unicode Marks, so some
-token IDs can differ from those produced by the older AutoTokenizer wrapper.
+migrated without replay. Qwen3.6's canonical regex includes Unicode Marks, so
+some token IDs can differ from those produced by its older AutoTokenizer wrapper.
 Text generation streams by default, reasoning is shown by default, and the
 periodic metrics trace is disabled by default. Use `--no-stream`,
 `--hide-reasoning`, or `--metrics` to override these choices for one command.
+Use `--no-thinking` to request the model's non-thinking template where supported.
 
 See [examples/README.md](examples/README.md) for the protocol boundary and
 common commands. The model guides document model-specific package preparation
@@ -254,15 +266,14 @@ speedup, and checksum delta for all six formats.
 
 `Runtime` selects a registered adapter for the supplied model package, validates
 the model descriptor, compiles its execution plan, creates independent Session
-state, and
-exposes Prefill, Decode, or complete generation:
+state, and exposes text encoding, Prefill, Decode, or complete generation:
 
 ```cpp
 #include "ncnn/moe/runtime.h"
 
 ncnn::moe::Result<ncnn::moe::GenerationResult> run(
     const std::filesystem::path& model_path,
-    std::span<const int32_t> input_ids)
+    std::string_view messages_json)
 {
     ncnn::moe::Runtime runtime;
     ncnn::moe::Option opt;
@@ -272,13 +283,18 @@ ncnn::moe::Result<ncnn::moe::GenerationResult> run(
     if (!model)
         return model.error();
 
+    auto input_ids = model.value()->encode(messages_json);
+    if (!input_ids)
+        return input_ids.error();
+
     auto session = runtime.create_session(model.value());
     if (!session)
         return session.error();
 
     ncnn::moe::GenerationOptions generation_options;
     generation_options.max_new_tokens = 64;
-    return session.value()->generate(input_ids, generation_options);
+    generation_options.stop_tokens = model.value()->stop_tokens();
+    return session.value()->generate(input_ids.value(), generation_options);
 }
 ```
 
@@ -310,15 +326,18 @@ not the number of busy threads. Benchmark reports no longer emit the duplicate
 
 Applications add model families that describe supported model semantics through
 `ModelAdapter::can_load`, `parse_model`, and `map_weights`; execution code
-consumes only compiled plans. The unified Python CLI is the text and
-conversation entry point. It selects the native Qwen3.6 text path from the
-worker's reported capability, then sends message history through the existing
-generate, compact, and stats operations for canonical template replay. The
-worker admits only the validated Qwen3.6 tokenizer/profile and its supported
-string-message schema. Python adapters continue to tokenize other model
-families and provide conversation history, summaries, and reasoning/final
-channel presentation. ICU remains an optional private Worker dependency; the
-SDK and its public options do not depend on it.
+consumes only compiled plans. Model owns a shared immutable tokenizer, hidden
+inside Runtime. `Model::encode(messages_json, enable_thinking)` applies the
+model's text-message template, `Model::decode(token_id, pending, final)` decodes
+one stream, and `Model::stop_tokens()` supplies the model's stop IDs. Each
+stream owns its pending UTF-8 bytes. An empty stop list means native text is
+unavailable; token-ID execution remains usable. The public headers expose no
+ICU types. ICU is an optional private Runtime dependency and is resolved by
+the installed CMake package when the library was built with text support.
+
+The Python CLI sends messages through the existing generate, compact, and stats
+operations. Worker retains validated context limits and native prefix reuse;
+Python handles persistent history, summaries, and reasoning/final presentation.
 
 ## Architecture
 
@@ -329,7 +348,7 @@ consume that state through explicit contracts.
 
 | Boundary | Responsibility |
 | --- | --- |
-| MoE Runtime API | Hardware capabilities, model loading, immutable `Model` lifetime, mutable `Session` state, generation, sampling, cache synchronization, and `BatchScheduler` creation |
+| MoE Runtime API | Hardware capabilities, model loading, shared text encoding/decoding, immutable `Model` lifetime, mutable `Session` state, generation, sampling, cache synchronization, and `BatchScheduler` creation |
 | Adapter and compiler | Model-package parsing through `ModelAdapter` into `MoeModelDescriptor`, descriptor validation, weight resolution, memory planning, backend placement, and `CompiledModel` construction |
 | Execution | `ExecutionGraph` dependencies and Tensor locations, dependency-ordered backend runs, routing, and Expert dispatch |
 | Memory | `ModelMemoryPlan`, per-Session KV/recurrent state, host ARC residency, and optional Vulkan cache tiers |

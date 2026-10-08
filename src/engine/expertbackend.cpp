@@ -113,14 +113,6 @@ ExpertBackendStatistics MultiDeviceExpertBackend::statistics() const
     return aggregate;
 }
 
-uint64_t MultiDeviceExpertBackend::capacity() const noexcept
-{
-    uint64_t total_size = 0;
-    for (const auto& backend : backends)
-        total_size += backend->capacity();
-    return total_size;
-}
-
 MultiDeviceExpertBackend::Submission::Submission(MultiDeviceExpertBackend* owner, std::span<const ExpertBackendRequest> requests, std::vector<std::vector<size_t>> request_indices)
     : client_requests(requests.begin(), requests.end()),
       private_outputs(requests.size()),

@@ -36,17 +36,19 @@ hf download openai/gpt-oss-120b --local-dir .\models\gpt-oss\gpt-oss-120b
 ```
 
 Each directory must contain `config.json`, `model.safetensors.index.json`, and
-every shard referenced by the index. Build the examples by following the root
+every shard referenced by the index. Text prompts also require the official
+`tokenizer.json` and `tokenizer_config.json` assets and a Runtime built with
+ICU 76+. Build the examples by following the root
 [Quick start](../../README.md#quick-start), then build `ncnn_moe_worker` for
 normal text and chat usage.
 
 ## Run text or chat
 
-The unified CLI applies the official Harmony formatting and token decoding while
-the native worker remains tokenizer-free:
+Runtime applies Harmony formatting and token decoding from the local tokenizer
+assets. The unified CLI sends messages to the native worker:
 
 ```powershell
-python -m pip install -e ".[gpt-oss]"
+python -m pip install -e .
 python tools\ncnn_moe.py run `
   --model .\models\gpt-oss\gpt-oss-20b `
   --prompt "Reply with exactly: OK" `

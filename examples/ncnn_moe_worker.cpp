@@ -1,6 +1,5 @@
-#include "internal/jsonline.h"
+#include "models/json.h"
 #include "internal/gputelemetry.h"
-#include "internal/tokenizer.h"
 #include "ncnn/moe/runtime.h"
 #include "engine/cpu.h"
 #include "graph/compiledmodel.h"
@@ -410,9 +409,9 @@ static std::string gpu_telemetry_json(const GpuTelemetrySampler& sampler)
     return result.finish();
 }
 
-static std::string runtime_metrics_json(ProcessTelemetrySampler& sampler,
-                                        const GpuTelemetrySampler& gpu_sampler,
-                                        const SessionMetrics& metrics)
+static std::string runtime_metrics_json(const SessionMetrics& metrics,
+                                        const std::string& process_json,
+                                        const std::string& gpu_device_json)
 {
     JsonObject result;
     result.add_optional_double("prompt_tok_per_second", metrics.timing.prompt_tokens_per_second);
@@ -432,8 +431,8 @@ static std::string runtime_metrics_json(ProcessTelemetrySampler& sampler,
     result.add_raw("expert", expert_metrics_json(metrics.generation));
     result.add_raw("cpu", cpu_metrics_json(metrics.generation));
     result.add_raw("gpu", gpu_metrics_json(metrics.generation, metrics.gpu_available));
-    result.add_raw("process", process_telemetry_json(sampler));
-    result.add_raw("gpu_device", gpu_telemetry_json(gpu_sampler));
+    result.add_raw("process", process_json);
+    result.add_raw("gpu_device", gpu_device_json);
     result.add_raw("cumulative", expert_metrics_json(metrics.cumulative));
     result.add_raw("cumulative_cpu", cpu_metrics_json(metrics.cumulative));
     result.add_raw("cumulative_gpu", gpu_metrics_json(metrics.cumulative, metrics.gpu_available));
@@ -613,7 +612,6 @@ class Worker
 private:
     Runtime& runtime;
     ModelPtr model;
-    Tokenizer tokenizer;
     bool native_text_supported = false;
     std::unordered_map<std::string, WorkerSession> sessions;
     std::mutex output_mutex;
@@ -679,8 +677,8 @@ private:
         model_json.add_bool("native_text_supported", native_text_supported);
         if (native_text_supported)
         {
-            model_json.add_string("native_text_version", "ncnn-moe-qwen3.6-nfc9-regex16-v1");
-            const std::vector<int32_t>& native_stop_tokens = tokenizer.stop_tokens();
+            model_json.add_string("native_text_version", "ncnn-moe-text-v2");
+            const std::vector<int32_t>& native_stop_tokens = model->stop_tokens();
             std::string stop_tokens = "[";
             for (size_t index = 0; index < native_stop_tokens.size(); ++index)
             {
@@ -836,7 +834,10 @@ private:
                                                    }
                                                    else
                                                    {
-                                                       std::string text = tokenizer.decode(token.token_id, pending_utf8);
+                                                       auto decoded = model->decode(token.token_id, pending_utf8);
+                                                       if (!decoded)
+                                                           throw std::runtime_error(decoded.error().message);
+                                                       std::string text = std::move(decoded).value();
                                                        if (!pending_tokens.empty() || !pending_utf8.empty())
                                                        {
                                                            StreamToken buffered_token = token;
@@ -882,7 +883,12 @@ private:
                     else if (!pending_utf8.empty())
                     {
                         if (!pending_tokens.empty())
-                            pending_tokens.back().first.text += tokenizer.decode(-1, pending_utf8, true);
+                        {
+                            auto decoded = model->decode(-1, pending_utf8, true);
+                            if (!decoded)
+                                throw std::runtime_error(decoded.error().message);
+                            pending_tokens.back().first.text += std::move(decoded).value();
+                        }
                         else
                             pending_utf8.clear();
                     }
@@ -922,10 +928,12 @@ private:
                 done.add_optional_double("tpot_microseconds", metrics.timing.tpot_microseconds);
                 done.add_uint("sequence_length", sequence_length);
                 done.add_bool("prefix_reused", request.prefix_reused);
-                done.add_raw("metrics", runtime_metrics_json(telemetry_sampler, gpu_telemetry_sampler, metrics));
+                const std::string process_json = process_telemetry_json(telemetry_sampler);
+                const std::string gpu_device_json = gpu_telemetry_json(gpu_telemetry_sampler);
+                done.add_raw("metrics", runtime_metrics_json(metrics, process_json, gpu_device_json));
                 done.add_raw("stats", stats_json(metrics));
-                done.add_raw("telemetry", process_telemetry_json(telemetry_sampler));
-                done.add_raw("gpu", gpu_telemetry_json(gpu_telemetry_sampler));
+                done.add_raw("telemetry", process_json);
+                done.add_raw("gpu", gpu_device_json);
                 std::string response = done.finish();
                 // A terminal event may immediately trigger the next request.
                 generation_running.store(false);
@@ -971,7 +979,9 @@ private:
         event.add_string("request_id", request.request_id);
         event.add_string("session_id", request.session_id);
         event.add_double("elapsed_seconds", elapsed);
-        event.add_raw("metrics", runtime_metrics_json(telemetry_sampler, gpu_telemetry_sampler, metrics));
+        const std::string process_json = process_telemetry_json(telemetry_sampler);
+        const std::string gpu_device_json = gpu_telemetry_json(gpu_telemetry_sampler);
+        event.add_raw("metrics", runtime_metrics_json(metrics, process_json, gpu_device_json));
         emit(event.finish());
     }
 
@@ -1044,13 +1054,26 @@ private:
             if (!native_text_supported)
                 throw std::invalid_argument("native message input is not supported for this model");
             const bool thinking = request_bool(request, "enable_thinking", true);
-            replay_tokens = tokenizer.apply_chat(*messages, thinking);
+            auto encoded = model->encode(*messages, thinking);
+            if (!encoded)
+            {
+                if (encoded.error().code == ErrorCode::InvalidArgument)
+                    throw std::invalid_argument(encoded.error().message);
+                throw std::runtime_error(encoded.error().message);
+            }
+            replay_tokens = std::move(encoded).value();
             if (replay_tokens.empty())
                 throw std::invalid_argument("chat template did not produce prompt tokens");
             native_messages = true;
         }
         else
-            replay_tokens = request_tokens(request, "replay_tokens", true);
+            replay_tokens = request_tokens(request, "replay_tokens", false);
+        const uint32_t vocabulary_size = model->descriptor().vocabulary_size;
+        for (const int32_t token_id : replay_tokens)
+        {
+            if (token_id < 0 || static_cast<uint32_t>(token_id) >= vocabulary_size)
+                throw std::invalid_argument("replay_tokens contains an ID outside the model vocabulary");
+        }
         const uint32_t model_limit = maximum_context_tokens();
         const uint32_t requested_limit = request_uint(request, "context_tokens", 0);
         const uint32_t context_limit = model_limit == 0
@@ -1124,7 +1147,14 @@ private:
             if (!native_text_supported)
                 throw std::invalid_argument("native message input is not supported for this model");
             const bool thinking = request_bool(request, "enable_thinking", true);
-            prompt_tokens = tokenizer.apply_chat(*messages, thinking);
+            auto encoded = model->encode(*messages, thinking);
+            if (!encoded)
+            {
+                if (encoded.error().code == ErrorCode::InvalidArgument)
+                    throw std::invalid_argument(encoded.error().message);
+                throw std::runtime_error(encoded.error().message);
+            }
+            prompt_tokens = std::move(encoded).value();
         }
         JsonObject result;
         result.add_string("event", "stats");
@@ -1155,7 +1185,14 @@ private:
             if (!native_text_supported)
                 throw std::invalid_argument("native message input is not supported for this model");
             const bool thinking = request_bool(request, "enable_thinking", true);
-            full_prompt = tokenizer.apply_chat(*messages, thinking);
+            auto encoded = model->encode(*messages, thinking);
+            if (!encoded)
+            {
+                if (encoded.error().code == ErrorCode::InvalidArgument)
+                    throw std::invalid_argument(encoded.error().message);
+                throw std::runtime_error(encoded.error().message);
+            }
+            full_prompt = std::move(encoded).value();
             if (full_prompt.empty())
                 throw std::invalid_argument("chat template did not produce prompt tokens");
         }
@@ -1174,7 +1211,7 @@ private:
         if (find_manifest_member(request, "stop_tokens"))
             parsed.options.stop_tokens = request_tokens(request, "stop_tokens", false);
         else if (messages)
-            parsed.options.stop_tokens = tokenizer.stop_tokens();
+            parsed.options.stop_tokens = model->stop_tokens();
         if (find_manifest_member(request, "temperature"))
         {
             const auto value = json_number(request, "temperature");
@@ -1330,12 +1367,10 @@ private:
     }
 
 public:
-    Worker(Runtime& _runtime, ModelPtr _model, const std::filesystem::path& model_directory)
+    Worker(Runtime& _runtime, ModelPtr _model)
         : runtime(_runtime), model(std::move(_model)), gpu_telemetry_sampler(runtime.info(), model_compiled(*model).opt)
     {
-        const std::string& model_type = model->descriptor().model_type;
-        native_text_supported = model_type == "qwen3_5_moe"
-                                && tokenizer.load(model_directory.string(), model->descriptor().vocabulary_size);
+        native_text_supported = !model->stop_tokens().empty();
         (void)telemetry_sampler.sample();
         emit_ready();
     }
@@ -1439,7 +1474,7 @@ int main(int argc, char** argv)
                       << std::flush;
             return 1;
         }
-        ncnn::moe::Worker worker(runtime, std::move(model).value(), std::filesystem::path(argv[1]));
+        ncnn::moe::Worker worker(runtime, std::move(model).value());
         return worker.run();
     }
     catch (const std::exception& exception)

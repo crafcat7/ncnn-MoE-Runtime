@@ -39,11 +39,11 @@ hf download deepseek-ai/DeepSeek-V4-Flash-DSpark `
 ```
 
 The directory must contain `config.json`, `tokenizer.json`,
-`encoding/encoding_dsv4.py`, and every Safetensors shard referenced by the
+`tokenizer_config.json`, and every Safetensors shard referenced by the
 index. DSpark metadata and prediction tensors are required only for the DSpark
 package. DeepSeek-V4-Flash's conventional `mtp.0` payload is not used by the
-target-model runtime. The encoding file is loaded from the checkpoint and uses
-only the Python standard library; this project does not require the official
+target-model runtime. Text formatting and tokenization run in C++ with ICU 76+;
+the CLI does not execute `encoding/encoding_dsv4.py` or require the official
 PyTorch inference dependencies such as `torch`, `tilelang`, or
 `fast_hadamard_transform`. Build the examples by following the root
 [Quick start](../../README.md#quick-start), then build `ncnn_moe_worker` for
@@ -51,11 +51,11 @@ normal text and chat usage.
 
 ## Run text or chat
 
-The unified CLI applies the checkpoint's official message encoding and tokenizer
-while the native worker remains tokenizer-free:
+Runtime applies the checkpoint's text-message encoding and tokenizer. The
+unified CLI sends messages to the native worker:
 
 ```powershell
-python -m pip install -e ".[hf]"
+python -m pip install -e .
 python tools\ncnn_moe.py run `
   --model .\models\deepseek-v4\DeepSeek-V4-Flash `
   --prompt "Briefly introduce yourself." `
@@ -66,7 +66,7 @@ python tools\ncnn_moe.py chat `
 
 `run` streams tokens and metrics; `chat` keeps a persistent conversation and
 supports `/context`, `/compact`, `/reset`, `/new`, `/stats`, and `/tune`.
-`--thinking-mode chat` requests a direct answer, while
+`--no-thinking` requests a direct answer, while
 `--show-reasoning` or `/reasoning` expands the hidden reasoning channel. The
 CLI locates `ncnn_moe_worker` in common build directories, or accepts an
 explicit path with `--worker`. Scripted runs can add `--no-metrics` to suppress

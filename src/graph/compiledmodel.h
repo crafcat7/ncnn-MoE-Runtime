@@ -25,6 +25,7 @@ namespace moe {
 class Model;
 class ExpertCache;
 class ExpertBackend;
+class Tokenizer;
 
 // Runtime settings after hardware/resource Auto values have been resolved;
 // policy modes such as ExpertIoMode::Auto retain their adaptive meaning.
@@ -108,6 +109,7 @@ struct CompiledModel
     SpeculativeModelPlan speculative;
     std::shared_ptr<ExpertCache> expert_cache;
     std::shared_ptr<ExpertBackend> expert_backend;
+    std::shared_ptr<const Tokenizer> tokenizer;
     VulkanRuntimePtr vulkan_runtime;
     EffectiveOption opt;
 };

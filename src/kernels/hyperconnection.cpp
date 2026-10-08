@@ -50,9 +50,9 @@ static Result<void> validate_hyper_tensors(const ActivationBuffer& input, const 
     return {};
 }
 
-Result<void> hyper_connection_pre(const ActivationBuffer& input, const TensorData& function, const TensorData& scale, const TensorData& base,
-                                  uint32_t multiplier, uint32_t sinkhorn_iterations, float norm_epsilon, float hyper_epsilon,
-                                  HyperConnectionMix& result, HyperConnectionScratch& scratch, uint64_t optimization_flags)
+Result<void> forward_hyper_connection_pre(const ActivationBuffer& input, const TensorData& function, const TensorData& scale, const TensorData& base,
+                                          uint32_t multiplier, uint32_t sinkhorn_iterations, float norm_epsilon, float hyper_epsilon,
+                                          HyperConnectionMix& result, HyperConnectionScratch& scratch, uint64_t optimization_flags)
 {
     const uint32_t mix_count = (2 + multiplier) * multiplier;
     auto valid = validate_hyper_tensors(input, function, scale, base, multiplier, mix_count);
@@ -71,7 +71,7 @@ Result<void> hyper_connection_pre(const ActivationBuffer& input, const TensorDat
         std::copy_n(source, input.columns(), target);
         float_rms_scale_inplace(target, norm_epsilon, input.columns());
     }
-    linear_batch_into(function, normalized, scratch.projection, optimization_flags);
+    forward_linear(function, normalized, scratch.projection, optimization_flags);
     const std::span<const float> scales = scale.float32_values();
     const std::span<const float> bases = base.float32_values();
 
@@ -175,7 +175,7 @@ Result<void> hyper_connection_pre(const ActivationBuffer& input, const TensorDat
     return {};
 }
 
-Result<void> hyper_connection_post(const ActivationBuffer& branch, const ActivationBuffer& residual, const HyperConnectionMix& mix, uint32_t multiplier, ActivationBuffer& output)
+Result<void> forward_hyper_connection_post(const ActivationBuffer& branch, const ActivationBuffer& residual, const HyperConnectionMix& mix, uint32_t multiplier, ActivationBuffer& output)
 {
     if (multiplier == 0
         || branch.rows() != residual.rows()
@@ -216,9 +216,9 @@ Result<void> hyper_connection_post(const ActivationBuffer& branch, const Activat
     return {};
 }
 
-Result<void> hyper_connection_head(const ActivationBuffer& input, const TensorData& function, const TensorData& scale, const TensorData& base, uint32_t multiplier,
-                                   float norm_epsilon, float hyper_epsilon, ActivationBuffer& output, HyperConnectionScratch& scratch,
-                                   uint64_t optimization_flags)
+Result<void> forward_hyper_connection_head(const ActivationBuffer& input, const TensorData& function, const TensorData& scale, const TensorData& base, uint32_t multiplier,
+                                           float norm_epsilon, float hyper_epsilon, ActivationBuffer& output, HyperConnectionScratch& scratch,
+                                           uint64_t optimization_flags)
 {
     auto valid = validate_hyper_tensors(input, function, scale, base, multiplier, multiplier);
     if (!valid)
@@ -238,7 +238,7 @@ Result<void> hyper_connection_head(const ActivationBuffer& input, const TensorDa
         std::copy_n(source, input.columns(), target);
         float_rms_scale_inplace(target, norm_epsilon, input.columns());
     }
-    linear_batch_into(function, normalized, scratch.projection, optimization_flags);
+    forward_linear(function, normalized, scratch.projection, optimization_flags);
     // Generic multiplier paths accumulate into each destination row.
     output.reset(input.rows(), hidden_size, true);
     const float scale_value = scale.float32_values()[0];

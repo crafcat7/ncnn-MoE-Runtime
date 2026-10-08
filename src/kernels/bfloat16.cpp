@@ -785,20 +785,15 @@ void float_to_bfloat16_array(uint16_t* output,
     function(output, input, count);
 }
 
-bool bfloat16_pair_dot_available() noexcept
-{
-    return (cpu_isa_flags() & CpuIsaX86Avx512Bf16) != 0;
-}
-
 float bfloat16_pair_dot(const uint16_t* left,
                         const uint16_t* right,
                         uint32_t count) noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    if (bfloat16_pair_dot_available())
+    if ((cpu_isa_flags() & CpuIsaX86Avx512Bf16) != 0)
         return msvc_avx512_bfloat16_pair_dot(left, right, count);
 #elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
-    if (bfloat16_pair_dot_available())
+    if ((cpu_isa_flags() & CpuIsaX86Avx512Bf16) != 0)
         return avx512bf16_pair_dot(left, right, count);
 #endif
     return scalar_bfloat16_pair_dot(left, right, count);
@@ -826,16 +821,16 @@ const char* bfloat16_batched_linear_kernel_name(uint64_t optimization_flags) noe
     return "unavailable";
 }
 
-bool bfloat16_batched_linear(const uint16_t* weights,
-                             const float* input,
-                             size_t input_stride,
-                             size_t token_count,
-                             uint32_t output_columns,
-                             uint32_t input_columns,
-                             float* output,
-                             size_t output_stride,
-                             int thread_count,
-                             uint64_t optimization_flags)
+bool forward_linear_bf16(const uint16_t* weights,
+                         const float* input,
+                         size_t input_stride,
+                         size_t token_count,
+                         uint32_t output_columns,
+                         uint32_t input_columns,
+                         float* output,
+                         size_t output_stride,
+                         int thread_count,
+                         uint64_t optimization_flags)
 {
     if (!weights || !input || !output || token_count == 0
         || output_columns < 4 || output_columns % 4 != 0

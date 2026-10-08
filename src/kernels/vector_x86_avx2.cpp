@@ -607,23 +607,20 @@ void avx2_float_scale_inplace_and_scaled_add(float* values,
     }
 }
 
-void avx2_float_scale_inplace_and_scaled_add_and_accumulate(float* values,
-                                                            float value_scale,
-                                                            const float* input,
-                                                            float input_scale,
-                                                            float* output,
-                                                            float output_scale,
-                                                            uint32_t count) noexcept
+void avx2_float_scaled_add_and_accumulate(float* values,
+                                          const float* input,
+                                          float input_scale,
+                                          float* output,
+                                          float output_scale,
+                                          uint32_t count) noexcept
 {
-    const __m256 value_scale_values = _mm256_set1_ps(value_scale);
     const __m256 input_scale_values = _mm256_set1_ps(input_scale);
     const __m256 output_scale_values = _mm256_set1_ps(output_scale);
     uint32_t index = 0;
     for (; index + 8 <= count; index += 8)
     {
-        const __m256 scaled_values = _mm256_mul_ps(_mm256_loadu_ps(values + index), value_scale_values);
         const __m256 input_values = _mm256_mul_ps(_mm256_loadu_ps(input + index), input_scale_values);
-        const __m256 updated_values = _mm256_add_ps(scaled_values, input_values);
+        const __m256 updated_values = _mm256_add_ps(_mm256_loadu_ps(values + index), input_values);
         _mm256_storeu_ps(values + index, updated_values);
         _mm256_storeu_ps(output + index,
                          _mm256_add_ps(_mm256_loadu_ps(output + index),
@@ -631,8 +628,8 @@ void avx2_float_scale_inplace_and_scaled_add_and_accumulate(float* values,
     }
     for (; index < count; ++index)
     {
-        values[index] = values[index] * value_scale
-                        + input[index] * input_scale;
+        const float product = input[index] * input_scale;
+        values[index] += product;
         output[index] += output_scale * values[index];
     }
 }

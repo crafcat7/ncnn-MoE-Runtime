@@ -7,6 +7,7 @@
 #include "ops.h"
 #include "statecache.h"
 #include "vector.h"
+#include "graph/compiledoperator.h"
 #include "ncnn/moe/option.h"
 
 #include <algorithm>
@@ -339,10 +340,10 @@ static void normalize_unit_prepared_rope(float* values,
     }
 }
 
-static bool scored_index_precedes(const LayerCache::LatentScoredIndex& left,
-                                  const LayerCache::LatentScoredIndex& right)
+static bool scored_index_precedes(const std::pair<float, uint32_t>& left,
+                                  const std::pair<float, uint32_t>& right)
 {
-    return left.score > right.score || (left.score == right.score && left.index < right.index);
+    return left.first > right.first || (left.first == right.first && left.second < right.second);
 }
 
 static bool vulkan_latent_compressor_enabled(ExecutionBackend backend,
@@ -357,15 +358,15 @@ static void append_compressed_value(const WeightStore& weights,
                                     const CompiledOperatorTable& operators,
                                     const AttentionBlockPlan& plan,
                                     ExecutionBackend backend,
-                                    const ActivationBuffer& input,
                                     uint64_t position,
                                     bool indexer,
                                     LayerCache& cache,
-                                    ActivationBuffer& quantized_input,
+                                    AttentionScratch& scratch,
                                     uint64_t optimization_flags,
                                     const float* projected_values_override = nullptr,
                                     const float* projected_scores_override = nullptr)
 {
+    const ActivationBuffer& input = scratch.latent_token_input;
     const uint32_t ratio = plan.compression_ratio;
     const uint32_t dimension = indexer ? plan.index_head_dimension : plan.head_dimension;
     const TensorHandle value_handle = indexer ? plan.indexer_compressor_key_value_weight : plan.compressor_key_value_weight;
@@ -373,30 +374,37 @@ static void append_compressed_value(const WeightStore& weights,
     const TensorHandle position_handle = indexer ? plan.indexer_compressor_position : plan.compressor_position;
     const TensorHandle norm_handle = indexer ? plan.indexer_compressor_norm_weight : plan.compressor_norm_weight;
     const uint32_t projection_multiplier = ratio == 4 ? 2 : 1;
-    const TensorData& value_weight = weights.at(value_handle);
-    const TensorData& gate_weight = weights.at(gate_handle);
-    const CompiledOperator& value_operator = operators.at_weight(value_handle);
-    const CompiledOperator& gate_operator = operators.at_weight(gate_handle);
+    ActivationBuffer& compressor_values = indexer
+                                              ? scratch.latent_index_compressor_values
+                                              : scratch.latent_compressor_values;
+    ActivationBuffer& compressor_scores = indexer
+                                              ? scratch.latent_index_compressor_scores
+                                              : scratch.latent_compressor_scores;
     const bool has_projected_pair = projected_values_override && projected_scores_override;
-    const bool used_vulkan_pair = !has_projected_pair
-                                  && vulkan_latent_compressor_enabled(backend, optimization_flags)
-                                  && value_operator.bfloat16
-                                  && gate_operator.bfloat16
-                                  && value_operator.bfloat16->forward_parallel(input,
-                                                                               *gate_operator.bfloat16,
-                                                                               cache.compressor_values,
-                                                                               cache.compressor_scores);
-    if (!has_projected_pair
-        && !used_vulkan_pair
-        && !float8_linear_pair_batch_into(value_weight, gate_weight, input,
-                                          cache.compressor_values, cache.compressor_scores, optimization_flags,
-                                          operators.find_weight(value_handle), operators.find_weight(gate_handle),
-                                          &quantized_input))
+    if (!has_projected_pair)
     {
-        linear_batch_into(value_weight, input, cache.compressor_values, optimization_flags,
-                          operators.find_weight(value_handle), backend, &quantized_input);
-        linear_batch_into(gate_weight, input, cache.compressor_scores, optimization_flags,
-                          operators.find_weight(gate_handle), backend, &quantized_input);
+        const TensorData& value_weight = weights.at(value_handle);
+        const TensorData& gate_weight = weights.at(gate_handle);
+        const CompiledOperator& value_operator = operators.at_weight(value_handle);
+        const CompiledOperator& gate_operator = operators.at_weight(gate_handle);
+        const bool used_vulkan_pair = vulkan_latent_compressor_enabled(backend, optimization_flags)
+                                      && value_operator.bfloat16
+                                      && gate_operator.bfloat16
+                                      && value_operator.bfloat16->forward_parallel(input,
+                                                                                   *gate_operator.bfloat16,
+                                                                                   compressor_values,
+                                                                                   compressor_scores);
+        if (!used_vulkan_pair
+            && !forward_linear_pair_float8(value_weight, gate_weight, input,
+                                           compressor_values, compressor_scores, optimization_flags,
+                                           operators.find_weight(value_handle), operators.find_weight(gate_handle),
+                                           &scratch.quantized_input))
+        {
+            forward_linear(value_weight, input, compressor_values, optimization_flags,
+                           operators.find_weight(value_handle), backend, &scratch.quantized_input);
+            forward_linear(gate_weight, input, compressor_scores, optimization_flags,
+                           operators.find_weight(gate_handle), backend, &scratch.quantized_input);
+        }
     }
 
     std::vector<float>& pending_values = indexer ? cache.index_compressor_pending_values : cache.compressor_pending_values;
@@ -412,10 +420,10 @@ static void append_compressed_value(const WeightStore& weights,
     const uint32_t slot = static_cast<uint32_t>(position % ratio);
     const float* projected_values = has_projected_pair
                                         ? projected_values_override
-                                        : cache.compressor_values.row(0);
+                                        : compressor_values.row(0);
     const float* projected_scores = has_projected_pair
                                         ? projected_scores_override
-                                        : cache.compressor_scores.row(0);
+                                        : compressor_scores.row(0);
     const std::span<const float> positional = weights.at(position_handle).float32_values();
     for (uint32_t column = 0; column < projection_multiplier * dimension; ++column)
     {
@@ -426,14 +434,14 @@ static void append_compressed_value(const WeightStore& weights,
     if (slot + 1 != ratio)
         return;
 
-    std::vector<float>& pooled = cache.compressor_pooled;
+    std::vector<float>& pooled = scratch.latent_compressor_pooled;
     if (pooled.size() < dimension)
         pooled.resize(dimension);
     std::fill_n(pooled.data(), dimension, 0.0f);
     const bool overlap = ratio == 4;
     const bool has_previous = overlap && !previous_values.empty();
     const uint32_t candidate_count = ratio + (has_previous ? ratio : 0);
-    std::vector<float>& exponentials = cache.compressor_exponentials;
+    std::vector<float>& exponentials = scratch.latent_compressor_exponentials;
     exponentials.resize(candidate_count);
     for (uint32_t column = 0; column < dimension; ++column)
     {
@@ -501,19 +509,22 @@ static bool select_compressed_indices(const WeightStore& weights,
                                       const CompiledOperatorTable& operators,
                                       const AttentionBlockPlan& plan,
                                       ExecutionBackend backend,
-                                      const ActivationBuffer& normalized,
-                                      const ActivationBuffer& query_rank,
                                       uint64_t position,
                                       LayerCache& cache,
+                                      AttentionScratch& scratch,
                                       uint64_t optimization_flags)
 {
+    const ActivationBuffer& normalized = scratch.latent_token_input;
+    const ActivationBuffer& query_rank = scratch.latent_token_rank;
     const uint32_t compressed_count = static_cast<uint32_t>(cache.latent_compressed.size() / plan.head_dimension);
     cache.latent_selected_indices.clear();
     if (plan.compression_ratio != 4 || compressed_count <= plan.index_top_k)
         return false;
 
-    ActivationBuffer& query = cache.latent_index_query;
-    linear_batch_into(weights.at(plan.indexer_query_weight), query_rank, query, optimization_flags, operators.find_weight(plan.indexer_query_weight), backend);
+    ActivationBuffer& query = scratch.latent_index_query;
+    forward_linear(weights.at(plan.indexer_query_weight), query_rank, query, optimization_flags,
+                   operators.find_weight(plan.indexer_query_weight), backend,
+                   &scratch.quantized_input);
     for (uint32_t head = 0; head < plan.index_head_count; ++head)
     {
         float* values = query.row(0) + static_cast<size_t>(head) * plan.index_head_dimension;
@@ -521,25 +532,25 @@ static bool select_compressed_indices(const WeightStore& weights,
         hadamard_rotate(values, plan.index_head_dimension);
         quantize_float4_e2m1_inplace(values, plan.index_head_dimension, 32);
     }
-    ActivationBuffer& projected_weights = cache.latent_index_projected_weights;
-    linear_batch_into(weights.at(plan.indexer_weights_weight), normalized, projected_weights, optimization_flags, operators.find_weight(plan.indexer_weights_weight), backend);
+    ActivationBuffer& projected_weights = scratch.latent_index_projected_weights;
+    forward_linear(weights.at(plan.indexer_weights_weight), normalized, projected_weights,
+                   optimization_flags, operators.find_weight(plan.indexer_weights_weight),
+                   backend, &scratch.quantized_input);
     const float index_scale = 1.0f / std::sqrt(static_cast<float>(plan.index_head_dimension * plan.index_head_count));
-    std::vector<float>& scores = cache.latent_index_scores;
-    scores.assign(compressed_count, 0.0f);
+    std::vector<std::pair<float, uint32_t>>& scored = scratch.index_scores;
+    scored.resize(compressed_count);
     for (uint32_t compressed_index = 0; compressed_index < compressed_count; ++compressed_index)
     {
         const float* key = cache.latent_index_compressed.data() + static_cast<size_t>(compressed_index) * plan.index_head_dimension;
+        float score = 0.0f;
         for (uint32_t head = 0; head < plan.index_head_count; ++head)
         {
             const float* query_head = query.row(0) + static_cast<size_t>(head) * plan.index_head_dimension;
             const float dot = float_dot(query_head, key, plan.index_head_dimension);
-            scores[compressed_index] += std::max(0.0f, dot) * projected_weights.row(0)[head] * index_scale;
+            score += std::max(0.0f, dot) * projected_weights.row(0)[head] * index_scale;
         }
+        scored[compressed_index] = {score, compressed_index};
     }
-    std::vector<LayerCache::LatentScoredIndex>& scored = cache.latent_scored_indices;
-    scored.resize(compressed_count);
-    for (uint32_t index = 0; index < compressed_count; ++index)
-        scored[index] = {index, scores[index]};
     const uint32_t selected_count = std::min(plan.index_top_k, compressed_count);
     // The selector only needs the best K entries.  partial_sort performs an
     // O(N log K) heap maintenance pass over the complete compressed history;
@@ -553,7 +564,7 @@ static bool select_compressed_indices(const WeightStore& weights,
     std::vector<uint32_t>& selected_indices = cache.latent_selected_indices;
     selected_indices.resize(selected_count);
     for (uint32_t index = 0; index < selected_count; ++index)
-        selected_indices[index] = scored[index].index;
+        selected_indices[index] = scored[index].second;
     return true;
 }
 
@@ -645,8 +656,8 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
     bool key_value_ready = false;
     if (plan.compression_ratio != 0)
     {
-        rms_norm_batch_into(input, weights.at(plan.pre_attention_norm_weight), plan.norm_epsilon,
-                            normalized, 0.0f);
+        forward_rms_norm(input, weights.at(plan.pre_attention_norm_weight), plan.norm_epsilon,
+                         normalized, 0.0f);
         normalized_ready = true;
     }
     const TensorData& query_a = weights.at(plan.query_a_weight);
@@ -683,50 +694,100 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
     }
     const bool query_rank_not_required = plan.compression_ratio != 4 || maximum_projected_compressed_count <= plan.index_top_k;
     const TensorData& key_value_weight = weights.at(plan.key_value_weight);
-    ActivationBuffer& fused_compressor_values = scratch.latent_compressor_values;
-    ActivationBuffer& fused_compressor_scores = scratch.latent_compressor_scores;
-    ActivationBuffer& fused_index_compressor_values = scratch.latent_index_compressor_values;
-    ActivationBuffer& fused_index_compressor_scores = scratch.latent_index_compressor_scores;
+    ActivationBuffer& compressor_values = scratch.latent_compressor_values;
+    ActivationBuffer& compressor_scores = scratch.latent_compressor_scores;
+    ActivationBuffer& index_compressor_values = scratch.latent_index_compressor_values;
+    ActivationBuffer& index_compressor_scores = scratch.latent_index_compressor_scores;
     std::array<const Bfloat16Linear_vulkan*, 4> fused_compressor_operators{};
     std::array<ActivationBuffer*, 4> fused_compressor_outputs{};
     size_t fused_compressor_count = 0;
-    if (vulkan_latent_compressor_enabled(backend, optimization_flags)
-        && plan.compression_ratio == 4)
-    {
-        const auto add_compressor_pair = [&](TensorHandle value_handle,
+    const CompiledOperator& key_value_operator = operators.at_weight(plan.key_value_weight);
+    bool chained_query = false;
+    bool compressor_ready = false;
+    const auto prepare_compressor_pair = [&](TensorHandle value_handle,
                                              TensorHandle gate_handle,
                                              ActivationBuffer& value_output,
                                              ActivationBuffer& gate_output) {
-            if (value_handle == invalid_tensor_handle
-                || gate_handle == invalid_tensor_handle)
-                return;
-            const CompiledOperator& value_operator = operators.at_weight(value_handle);
-            const CompiledOperator& gate_operator = operators.at_weight(gate_handle);
-            if (!value_operator.bfloat16
-                || !gate_operator.bfloat16
-                || fused_compressor_count + 2 > fused_compressor_operators.size())
-                return;
-            fused_compressor_operators[fused_compressor_count] = value_operator.bfloat16.get();
-            fused_compressor_outputs[fused_compressor_count] = &value_output;
-            ++fused_compressor_count;
-            fused_compressor_operators[fused_compressor_count] = gate_operator.bfloat16.get();
-            fused_compressor_outputs[fused_compressor_count] = &gate_output;
-            ++fused_compressor_count;
-        };
-        add_compressor_pair(plan.compressor_key_value_weight,
-                            plan.compressor_gate_weight,
-                            fused_compressor_values,
-                            fused_compressor_scores);
-        add_compressor_pair(plan.indexer_compressor_key_value_weight,
-                            plan.indexer_compressor_gate_weight,
-                            fused_index_compressor_values,
-                            fused_index_compressor_scores);
+        if (value_handle == invalid_tensor_handle
+            || gate_handle == invalid_tensor_handle)
+            return false;
+        if (backend == ExecutionBackend::Cpu)
+        {
+            const TensorData& value_weight = weights.at(value_handle);
+            const TensorData& gate_weight = weights.at(gate_handle);
+            if (!forward_linear_pair_float8(value_weight,
+                                            gate_weight,
+                                            normalized,
+                                            value_output,
+                                            gate_output,
+                                            optimization_flags,
+                                            operators.find_weight(value_handle),
+                                            operators.find_weight(gate_handle),
+                                            &scratch.quantized_input))
+            {
+                // Keep the BF16 fallback input in float32, matching the single-row path.
+                const uint64_t compressor_flags = optimization_flags
+                                                  & ~static_cast<uint64_t>(OptimizationCpuBfloat16Batched);
+                forward_linear(value_weight,
+                               normalized,
+                               value_output,
+                               compressor_flags,
+                               operators.find_weight(value_handle),
+                               ExecutionBackend::Cpu,
+                               &scratch.quantized_input);
+                forward_linear(gate_weight,
+                               normalized,
+                               gate_output,
+                               compressor_flags,
+                               operators.find_weight(gate_handle),
+                               ExecutionBackend::Cpu,
+                               &scratch.quantized_input);
+            }
+            return true;
+        }
+
+        const CompiledOperator& value_operator = operators.at_weight(value_handle);
+        const CompiledOperator& gate_operator = operators.at_weight(gate_handle);
+        if (!value_operator.bfloat16
+            || !gate_operator.bfloat16
+            || fused_compressor_count + 2 > fused_compressor_operators.size())
+            return false;
+        fused_compressor_operators[fused_compressor_count] = value_operator.bfloat16.get();
+        fused_compressor_outputs[fused_compressor_count] = &value_output;
+        ++fused_compressor_count;
+        fused_compressor_operators[fused_compressor_count] = gate_operator.bfloat16.get();
+        fused_compressor_outputs[fused_compressor_count] = &gate_output;
+        ++fused_compressor_count;
+        return true;
+    };
+    if (backend == ExecutionBackend::Cpu
+        && input.rows() > 1
+        && plan.compression_ratio != 0)
+    {
+        compressor_ready = prepare_compressor_pair(plan.compressor_key_value_weight,
+                                                   plan.compressor_gate_weight,
+                                                   compressor_values,
+                                                   compressor_scores)
+                           && (plan.compression_ratio != 4
+                               || prepare_compressor_pair(plan.indexer_compressor_key_value_weight,
+                                                          plan.indexer_compressor_gate_weight,
+                                                          index_compressor_values,
+                                                          index_compressor_scores));
+    }
+    else if (vulkan_latent_compressor_enabled(backend, optimization_flags)
+             && plan.compression_ratio == 4)
+    {
+        prepare_compressor_pair(plan.compressor_key_value_weight,
+                                plan.compressor_gate_weight,
+                                compressor_values,
+                                compressor_scores);
+        prepare_compressor_pair(plan.indexer_compressor_key_value_weight,
+                                plan.indexer_compressor_gate_weight,
+                                index_compressor_values,
+                                index_compressor_scores);
         if (fused_compressor_count != 4)
             fused_compressor_count = 0;
     }
-    const CompiledOperator& key_value_operator = operators.at_weight(plan.key_value_weight);
-    bool chained_query = false;
-    bool fused_compressor = false;
     if (backend == ExecutionBackend::Vulkan
         && query_rank_not_required
         && query_a_operator.float8
@@ -746,7 +807,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                                                                                                   query,
                                                                                                   key_value);
                 key_value_ready = chained_query;
-                fused_compressor = chained_query;
+                compressor_ready = chained_query;
             }
             else
             {
@@ -765,9 +826,9 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                 {
                     if (!normalized_ready)
                     {
-                        rms_norm_batch_into(input,
-                                            weights.at(plan.pre_attention_norm_weight),
-                                            plan.norm_epsilon, normalized, 0.0f);
+                        forward_rms_norm(input,
+                                         weights.at(plan.pre_attention_norm_weight),
+                                         plan.norm_epsilon, normalized, 0.0f);
                         normalized_ready = true;
                     }
                     chained_query = query_a_operator.float8->forward_rms_norm_chain_parallel(normalized,
@@ -783,9 +844,9 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         {
             if (!normalized_ready)
             {
-                rms_norm_batch_into(input,
-                                    weights.at(plan.pre_attention_norm_weight),
-                                    plan.norm_epsilon, normalized, 0.0f);
+                forward_rms_norm(input,
+                                 weights.at(plan.pre_attention_norm_weight),
+                                 plan.norm_epsilon, normalized, 0.0f);
                 normalized_ready = true;
             }
             chained_query = query_a_operator.float8->forward_rms_norm_chain(normalized, *query_b_operator.float8, query);
@@ -802,9 +863,9 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
     {
         if (!normalized_ready)
         {
-            rms_norm_batch_into(input,
-                                weights.at(plan.pre_attention_norm_weight),
-                                plan.norm_epsilon, normalized, 0.0f);
+            forward_rms_norm(input,
+                             weights.at(plan.pre_attention_norm_weight),
+                             plan.norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
         }
         auto graph = CommandGraph_vulkan::create(*query_a_operator.linear);
@@ -833,49 +894,49 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
     {
         if (!normalized_ready)
         {
-            rms_norm_batch_into(input,
-                                weights.at(plan.pre_attention_norm_weight),
-                                plan.norm_epsilon, normalized, 0.0f);
+            forward_rms_norm(input,
+                             weights.at(plan.pre_attention_norm_weight),
+                             plan.norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
         }
-        const bool paired_projection = float8_linear_pair_batch_into(query_a, key_value_weight, normalized, query_rank,
-                                                                     key_value, optimization_flags,
-                                                                     operators.find_weight(plan.query_a_weight), operators.find_weight(plan.key_value_weight),
-                                                                     &scratch.quantized_input);
+        const bool paired_projection = forward_linear_pair_float8(query_a, key_value_weight, normalized, query_rank,
+                                                                  key_value, optimization_flags,
+                                                                  operators.find_weight(plan.query_a_weight), operators.find_weight(plan.key_value_weight),
+                                                                  &scratch.quantized_input);
         if (!paired_projection)
         {
-            linear_batch_into(query_a, normalized, query_rank, optimization_flags,
-                              operators.find_weight(plan.query_a_weight), backend,
-                              &scratch.quantized_input);
+            forward_linear(query_a, normalized, query_rank, optimization_flags,
+                           operators.find_weight(plan.query_a_weight), backend,
+                           &scratch.quantized_input);
         }
         else
             key_value_ready = true;
         query_rank_ready = true;
         const bool query_projection_fused = query_rank_not_required
-                                            && float8_linear_rms_norm_batch_into(query_b, query_rank,
-                                                                                 weights.at(plan.query_norm_weight), plan.norm_epsilon, query,
-                                                                                 optimization_flags, operators.find_weight(plan.query_b_weight),
-                                                                                 &scratch.quantized_input);
+                                            && forward_linear_rms_norm_float8(query_b, query_rank,
+                                                                              weights.at(plan.query_norm_weight), plan.norm_epsilon, query,
+                                                                              optimization_flags, operators.find_weight(plan.query_b_weight),
+                                                                              &scratch.quantized_input);
         if (!query_projection_fused)
         {
-            rms_norm_batch_into(query_rank, weights.at(plan.query_norm_weight),
-                                plan.norm_epsilon, query_rank, 0.0f);
-            linear_batch_into(query_b, query_rank, query, optimization_flags,
-                              operators.find_weight(plan.query_b_weight), backend,
-                              &scratch.quantized_input);
+            forward_rms_norm(query_rank, weights.at(plan.query_norm_weight),
+                             plan.norm_epsilon, query_rank, 0.0f);
+            forward_linear(query_b, query_rank, query, optimization_flags,
+                           operators.find_weight(plan.query_b_weight), backend,
+                           &scratch.quantized_input);
         }
         else
             query_rank_ready = false;
     }
     if (!key_value_ready)
     {
-        linear_batch_into(key_value_weight, normalized, key_value, optimization_flags,
-                          operators.find_weight(plan.key_value_weight), backend,
-                          &scratch.quantized_input);
+        forward_linear(key_value_weight, normalized, key_value, optimization_flags,
+                       operators.find_weight(plan.key_value_weight), backend,
+                       &scratch.quantized_input);
         key_value_ready = true;
     }
-    rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), plan.norm_epsilon,
-                        key_value, 0.0f);
+    forward_rms_norm(key_value, weights.at(plan.key_value_norm_weight), plan.norm_epsilon,
+                     key_value, 0.0f);
     attention_output.reset(input.rows(), plan.head_count * plan.head_dimension, true);
 
     const std::span<const float> sinks = weights.at(plan.sinks).float32_values();
@@ -924,8 +985,8 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
             quantize_float8_e4m3_inplace(key, plan.head_dimension - plan.rope_head_dimension, 64, true, optimization_flags);
             std::copy_n(key, plan.head_dimension, cache.latent_window.data() + static_cast<size_t>(position % plan.sliding_window) * plan.head_dimension);
 
-            ActivationBuffer& token_input = cache.latent_token_input;
-            ActivationBuffer& token_rank = cache.latent_token_rank;
+            ActivationBuffer& token_input = scratch.latent_token_input;
+            ActivationBuffer& token_rank = scratch.latent_token_rank;
             if (plan.compression_ratio != 0)
             {
                 token_input.reset(1, normalized.columns(), false);
@@ -938,20 +999,19 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                 }
                 const float* fused_values = nullptr;
                 const float* fused_scores = nullptr;
-                if (fused_compressor)
+                if (compressor_ready)
                 {
-                    fused_values = fused_compressor_values.row(row_index);
-                    fused_scores = fused_compressor_scores.row(row_index);
+                    fused_values = compressor_values.row(row_index);
+                    fused_scores = compressor_scores.row(row_index);
                 }
                 append_compressed_value(weights,
                                         operators,
                                         plan,
                                         backend,
-                                        token_input,
                                         position,
                                         false,
                                         cache,
-                                        scratch.quantized_input,
+                                        scratch,
                                         optimization_flags,
                                         fused_values,
                                         fused_scores);
@@ -959,20 +1019,19 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                 {
                     fused_values = nullptr;
                     fused_scores = nullptr;
-                    if (fused_compressor)
+                    if (compressor_ready)
                     {
-                        fused_values = fused_index_compressor_values.row(row_index);
-                        fused_scores = fused_index_compressor_scores.row(row_index);
+                        fused_values = index_compressor_values.row(row_index);
+                        fused_scores = index_compressor_scores.row(row_index);
                     }
                     append_compressed_value(weights,
                                             operators,
                                             plan,
                                             backend,
-                                            token_input,
                                             position,
                                             true,
                                             cache,
-                                            scratch.quantized_input,
+                                            scratch,
                                             optimization_flags,
                                             fused_values,
                                             fused_scores);
@@ -980,7 +1039,14 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
             }
             LatentAttentionRowContext& context = row_contexts[row_index];
             context.compressed_count = static_cast<uint32_t>(cache.latent_compressed.size() / plan.head_dimension);
-            context.selected_compressed_indices = select_compressed_indices(weights, operators, plan, backend, token_input, token_rank, position, cache, optimization_flags);
+            context.selected_compressed_indices = select_compressed_indices(weights,
+                                                                            operators,
+                                                                            plan,
+                                                                            backend,
+                                                                            position,
+                                                                            cache,
+                                                                            scratch,
+                                                                            optimization_flags);
             if (context.selected_compressed_indices)
                 context.compressed_indices = cache.latent_selected_indices;
             else
@@ -1218,9 +1284,9 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
     ActivationBuffer& output_rank = scratch.projected;
     if (backend == ExecutionBackend::Vulkan && output_a_operator.float8)
     {
-        linear_batch_into(output_a, attention_output, output_rank, optimization_flags,
-                          operators.find_weight(plan.output_a_weight), backend,
-                          &scratch.quantized_input);
+        forward_linear(output_a, attention_output, output_rank, optimization_flags,
+                       operators.find_weight(plan.output_a_weight), backend,
+                       &scratch.quantized_input);
     }
     else
     {
@@ -1256,9 +1322,9 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                                 group_output);
         }
     }
-    linear_batch_into(output_b, output_rank, output, optimization_flags,
-                      operators.find_weight(plan.output_b_weight), backend,
-                      &scratch.quantized_input);
+    forward_linear(output_b, output_rank, output, optimization_flags,
+                   operators.find_weight(plan.output_b_weight), backend,
+                   &scratch.quantized_input);
     return {};
 }
 
@@ -1295,6 +1361,7 @@ Result<void> append_dspark_attention_context(const WeightStore& weights,
                                              ExecutionBackend backend,
                                              uint64_t position_offset,
                                              LayerCache& cache,
+                                             AttentionScratch& scratch,
                                              const ActivationBuffer& input,
                                              uint64_t optimization_flags)
 {
@@ -1305,13 +1372,14 @@ Result<void> append_dspark_attention_context(const WeightStore& weights,
     {
         return Error{ErrorCode::InvalidArgument, "invalid DSpark context append"};
     }
-    ActivationBuffer key_value = linear_batch(weights.at(plan.key_value_weight),
-                                              input,
-                                              optimization_flags,
-                                              operators.find_weight(plan.key_value_weight),
-                                              backend);
-    rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), plan.norm_epsilon,
-                        key_value, 0.0f);
+    ActivationBuffer& key_value = scratch.key;
+    if (&input == &key_value)
+        return Error{ErrorCode::InvalidArgument, "DSpark context input/output must be distinct"};
+    forward_linear(weights.at(plan.key_value_weight), input, key_value,
+                   optimization_flags, operators.find_weight(plan.key_value_weight),
+                   backend, &scratch.quantized_input);
+    forward_rms_norm(key_value, weights.at(plan.key_value_norm_weight), plan.norm_epsilon,
+                     key_value, 0.0f);
     const size_t window_elements = static_cast<size_t>(plan.sliding_window) * plan.head_dimension;
     if (cache.latent_window.size() != window_elements)
         cache.latent_window.assign(window_elements, 0.0f);
@@ -1389,9 +1457,9 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
             {
                 if (!normalized_ready)
                 {
-                    rms_norm_batch_into(input,
-                                        weights.at(plan.pre_attention_norm_weight),
-                                        plan.norm_epsilon, normalized, 0.0f);
+                    forward_rms_norm(input,
+                                     weights.at(plan.pre_attention_norm_weight),
+                                     plan.norm_epsilon, normalized, 0.0f);
                     normalized_ready = true;
                 }
                 chained_query = query_a_operator.float8->forward_rms_norm_chain_parallel(normalized,
@@ -1404,9 +1472,9 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
         }
         else
         {
-            rms_norm_batch_into(input,
-                                weights.at(plan.pre_attention_norm_weight),
-                                plan.norm_epsilon, normalized, 0.0f);
+            forward_rms_norm(input,
+                             weights.at(plan.pre_attention_norm_weight),
+                             plan.norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
             chained_query = query_a_operator.float8->forward_rms_norm_chain(normalized, *query_b_operator.float8, query);
         }
@@ -1415,43 +1483,43 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
     {
         if (!normalized_ready)
         {
-            rms_norm_batch_into(input,
-                                weights.at(plan.pre_attention_norm_weight),
-                                plan.norm_epsilon, normalized, 0.0f);
+            forward_rms_norm(input,
+                             weights.at(plan.pre_attention_norm_weight),
+                             plan.norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
         }
-        const bool paired_projection = float8_linear_pair_batch_into(query_a, key_value_weight, normalized, query_rank,
-                                                                     key_value, optimization_flags,
-                                                                     operators.find_weight(plan.query_a_weight), operators.find_weight(plan.key_value_weight),
-                                                                     &scratch.quantized_input);
+        const bool paired_projection = forward_linear_pair_float8(query_a, key_value_weight, normalized, query_rank,
+                                                                  key_value, optimization_flags,
+                                                                  operators.find_weight(plan.query_a_weight), operators.find_weight(plan.key_value_weight),
+                                                                  &scratch.quantized_input);
         if (!paired_projection)
         {
-            linear_batch_into(query_a, normalized, query_rank, optimization_flags,
-                              operators.find_weight(plan.query_a_weight), backend,
-                              &scratch.quantized_input);
+            forward_linear(query_a, normalized, query_rank, optimization_flags,
+                           operators.find_weight(plan.query_a_weight), backend,
+                           &scratch.quantized_input);
         }
         else
             key_value_ready = true;
-        if (!float8_linear_rms_norm_batch_into(query_b, query_rank, weights.at(plan.query_norm_weight),
-                                               plan.norm_epsilon, query, optimization_flags,
-                                               operators.find_weight(plan.query_b_weight), &scratch.quantized_input))
+        if (!forward_linear_rms_norm_float8(query_b, query_rank, weights.at(plan.query_norm_weight),
+                                            plan.norm_epsilon, query, optimization_flags,
+                                            operators.find_weight(plan.query_b_weight), &scratch.quantized_input))
         {
-            rms_norm_batch_into(query_rank, weights.at(plan.query_norm_weight),
-                                plan.norm_epsilon, query_rank, 0.0f);
-            linear_batch_into(query_b, query_rank, query, optimization_flags,
-                              operators.find_weight(plan.query_b_weight), backend,
-                              &scratch.quantized_input);
+            forward_rms_norm(query_rank, weights.at(plan.query_norm_weight),
+                             plan.norm_epsilon, query_rank, 0.0f);
+            forward_linear(query_b, query_rank, query, optimization_flags,
+                           operators.find_weight(plan.query_b_weight), backend,
+                           &scratch.quantized_input);
         }
     }
     if (!key_value_ready)
     {
-        linear_batch_into(key_value_weight, normalized, key_value, optimization_flags,
-                          operators.find_weight(plan.key_value_weight), backend,
-                          &scratch.quantized_input);
+        forward_linear(key_value_weight, normalized, key_value, optimization_flags,
+                       operators.find_weight(plan.key_value_weight), backend,
+                       &scratch.quantized_input);
         key_value_ready = true;
     }
-    rms_norm_batch_into(key_value, weights.at(plan.key_value_norm_weight), plan.norm_epsilon,
-                        key_value, 0.0f);
+    forward_rms_norm(key_value, weights.at(plan.key_value_norm_weight), plan.norm_epsilon,
+                     key_value, 0.0f);
 
     for (size_t row = 0; row < input.rows(); ++row)
     {
@@ -1536,9 +1604,9 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
     ActivationBuffer& output_rank = scratch.projected;
     if (backend == ExecutionBackend::Vulkan && output_a_operator.float8)
     {
-        linear_batch_into(output_a, attention_output, output_rank, optimization_flags,
-                          operators.find_weight(plan.output_a_weight), backend,
-                          &scratch.quantized_input);
+        forward_linear(output_a, attention_output, output_rank, optimization_flags,
+                       operators.find_weight(plan.output_a_weight), backend,
+                       &scratch.quantized_input);
     }
     else
     {
@@ -1574,9 +1642,9 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
                                 group_output);
         }
     }
-    linear_batch_into(output_b, output_rank, output, optimization_flags,
-                      operators.find_weight(plan.output_b_weight), backend,
-                      &scratch.quantized_input);
+    forward_linear(output_b, output_rank, output, optimization_flags,
+                   operators.find_weight(plan.output_b_weight), backend,
+                   &scratch.quantized_input);
     return {};
 }
 

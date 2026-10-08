@@ -151,7 +151,6 @@ public:
     virtual void wait_for_background_work() = 0;
 
     [[nodiscard]] virtual ExpertBackendStatistics statistics() const = 0;
-    [[nodiscard]] virtual uint64_t capacity() const noexcept = 0;
 };
 
 class MultiDeviceExpertBackend final : public ExpertBackend
@@ -169,8 +168,6 @@ public:
     void wait_for_background_work() override;
 
     ExpertBackendStatistics statistics() const override;
-
-    uint64_t capacity() const noexcept override;
 
 private:
     struct ChildSubmission

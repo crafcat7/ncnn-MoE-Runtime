@@ -37,8 +37,7 @@ struct DecodeResult
     uint64_t sequence_length = 0;
 };
 
-// Model-neutral token-ID distribution controls.  This is intentionally not a
-// tokenizer, chat-template, or conversation policy.
+// Model-neutral token-ID distribution controls.
 struct SamplingOptions
 {
     float temperature = 1.0f;
@@ -58,13 +57,12 @@ struct StreamToken
     uint32_t index = 0;
     int32_t token_id = -1;
     float probability = 0.0f;
-    // Optional decoded text supplied by a caller-owned tokenizer boundary.
+    // Optional decoded text supplied by the generation decoder.
     std::string text;
     bool is_stop_token = false;
 };
 
-// Token-ID generation controls and stop IDs.  High-level chat policy remains
-// outside Runtime.
+// Token-ID generation controls; use Model::stop_tokens() for text generation.
 struct GenerationOptions
 {
     uint32_t max_new_tokens = 1;
@@ -82,8 +80,7 @@ struct GenerationResult
     bool stopped_by_callback = false;
 };
 
-// Token text decoding stays outside the model runtime and is supplied by the
-// application boundary when a caller wants decoded text in the result.
+// A generation decoder can use Model::decode with stream-local UTF-8 state.
 using TokenTextDecoder = std::function<std::string(int32_t token_id)>;
 using TokenStreamCallback = std::function<bool(const StreamToken& token)>;
 
@@ -356,7 +353,7 @@ public:
 
 private:
     explicit Session(ModelPtr _model, const SessionOptions& opt);
-    [[nodiscard]] static uint32_t get_max_context_length(const MoeModelDescriptor& descriptor) noexcept;
+    [[nodiscard]] static uint32_t context_limit(const MoeModelDescriptor& descriptor) noexcept;
     [[nodiscard]] Result<void> prefill_unlocked(std::span<const int32_t> input_ids);
     [[nodiscard]] Result<void> decode_unlocked(int32_t input_id);
     [[nodiscard]] Result<SampledToken> sample_unlocked(std::span<const float> logits, const SamplingOptions& opt);

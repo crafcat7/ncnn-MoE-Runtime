@@ -216,13 +216,6 @@ bool record_prepared_staging_upload(const ncnn::VkMat& staging,
                                     const ncnn::Option& option,
                                     DType source_dtype = DType::Float32);
 
-bool record_prepared_staging_download(const ncnn::VkMat& source,
-                                      size_t rows,
-                                      uint32_t columns,
-                                      ncnn::VkMat& staging,
-                                      ncnn::VkCompute& command,
-                                      const ncnn::Option& option);
-
 bool record_prepared_activation_staging_download(const ncnn::VkMat& source,
                                                  size_t rows,
                                                  uint32_t columns,

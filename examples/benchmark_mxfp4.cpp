@@ -228,7 +228,7 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
     for (uint32_t repeat = 0; repeat <= repeats; ++repeat)
     {
         const auto started = std::chrono::steady_clock::now();
-        if (!mxfp4_expert_batch(cpu_tasks, &cpu_scratch, optimization_flags))
+        if (!forward_experts_mxfp4(cpu_tasks, &cpu_scratch, optimization_flags))
         {
             std::cerr << "CPU MXFP4 expert failed\n";
             return 1;
@@ -329,15 +329,12 @@ static int benchmark_cpu_mxfp4_q8_expert(uint32_t input_columns,
     TensorData gate_up = make_matrix(intermediate_columns * 2, input_columns);
     TensorData down = make_matrix(input_columns, intermediate_columns);
     const ActivationBuffer input = make_input(token_count, input_columns);
-    const std::array<Mxfp4Task, 1> task_template = {{Mxfp4Task{
-        &gate_up,
-        nullptr,
-        &down,
-        nullptr,
-        &input,
-        nullptr,
-        ExpertActivation::GptOssSwiGlu,
-        7.0f}}};
+    Mxfp4Task task_template;
+    task_template.gate_up = &gate_up;
+    task_template.down = &down;
+    task_template.input = &input;
+    task_template.activation = ExpertActivation::GptOssSwiGlu;
+    task_template.activation_limit = 7.0f;
 
     ActivationBuffer reference;
     ActivationBuffer candidate;
@@ -346,10 +343,10 @@ static int benchmark_cpu_mxfp4_q8_expert(uint32_t input_columns,
     auto run = [&](uint64_t flags,
                    ActivationBuffer& output,
                    Mxfp4Scratch& scratch) {
-        Mxfp4Task task = task_template[0];
+        Mxfp4Task task = task_template;
         task.output = &output;
         const std::array<Mxfp4Task, 1> tasks = {task};
-        if (!mxfp4_expert_batch(tasks, &scratch, flags))
+        if (!forward_experts_mxfp4(tasks, &scratch, flags))
             throw std::runtime_error("CPU MXFP4 expert failed");
     };
     for (uint32_t warmup = 0; warmup < 3; ++warmup)
@@ -441,7 +438,7 @@ static int benchmark_bfloat16_projection(uint32_t input_columns,
                                       * 1e-5f;
         }
     }
-    const ActivationBuffer reference = linear_batch(matrix, input, optimization_flags);
+    const ActivationBuffer reference = forward_linear(matrix, input, optimization_flags);
     auto vulkan = Bfloat16Linear_vulkan::create(matrix,
                                                 nullptr,
                                                 device_index,
@@ -551,10 +548,10 @@ static int benchmark_cpu_bfloat16_projection(uint32_t input_columns,
 
     ActivationBuffer reference;
     for (uint32_t warmup = 0; warmup < 3; ++warmup)
-        reference = linear_batch(matrix, input, reference_optimization_flags);
+        reference = forward_linear(matrix, input, reference_optimization_flags);
     ActivationBuffer candidate;
     for (uint32_t warmup = 0; warmup < 3; ++warmup)
-        candidate = linear_batch(matrix, input, candidate_optimization_flags);
+        candidate = forward_linear(matrix, input, candidate_optimization_flags);
 
     std::vector<double> reference_times;
     std::vector<double> candidate_times;
@@ -562,12 +559,12 @@ static int benchmark_cpu_bfloat16_projection(uint32_t input_columns,
     candidate_times.reserve(repeats);
     auto run_reference = [&]() {
         const auto started = std::chrono::steady_clock::now();
-        reference = linear_batch(matrix, input, reference_optimization_flags);
+        reference = forward_linear(matrix, input, reference_optimization_flags);
         reference_times.push_back(elapsed_milliseconds(started));
     };
     auto run_candidate = [&]() {
         const auto started = std::chrono::steady_clock::now();
-        candidate = linear_batch(matrix, input, candidate_optimization_flags);
+        candidate = forward_linear(matrix, input, candidate_optimization_flags);
         candidate_times.push_back(elapsed_milliseconds(started));
     };
     for (uint32_t repeat = 0; repeat < repeats; ++repeat)
@@ -686,8 +683,8 @@ static int benchmark_cpu_float8_expert(uint32_t input_columns,
     };
 
     auto baseline = [&]() {
-        ActivationBuffer up_output = linear_batch(up, input, optimization_flags);
-        const ActivationBuffer gate_output = linear_batch(gate, input, optimization_flags);
+        ActivationBuffer up_output = forward_linear(up, input, optimization_flags);
+        const ActivationBuffer gate_output = forward_linear(gate, input, optimization_flags);
         for (size_t token_index = 0; token_index < up_output.rows();
              ++token_index)
         {
@@ -699,16 +696,16 @@ static int benchmark_cpu_float8_expert(uint32_t input_columns,
                 up_row[column] *= gate_value / (1.0f + std::exp(-gate_value));
             }
         }
-        return linear_batch(down, up_output, optimization_flags);
+        return forward_linear(down, up_output, optimization_flags);
     };
     auto candidate = [&]() {
         ActivationBuffer activated;
-        if (!fused_float8_gate_up_batch(gate, up, input, ExpertActivation::Silu, 0.0f,
-                                        activated, optimization_flags))
+        if (!forward_gate_up_float8(gate, up, input, ExpertActivation::Silu, 0.0f,
+                                    activated, optimization_flags))
         {
             throw std::runtime_error("fused CPU FP8 gate/up unavailable");
         }
-        return linear_batch(down, activated, optimization_flags);
+        return forward_linear(down, activated, optimization_flags);
     };
 
     ActivationBuffer reference;
@@ -831,13 +828,13 @@ int main(int argc, char** argv)
         ncnn::moe::TensorData matrix = ncnn::moe::make_matrix(output_columns, input_columns);
         ncnn::moe::TensorData bfloat16_matrix = ncnn::moe::decode_bfloat16_matrix(matrix);
         const ncnn::moe::ActivationBuffer input = ncnn::moe::make_input(token_count, input_columns);
-        ncnn::moe::ActivationBuffer cpu_output = ncnn::moe::linear_batch(matrix, input, optimization_flags);
+        ncnn::moe::ActivationBuffer cpu_output = ncnn::moe::forward_linear(matrix, input, optimization_flags);
         std::vector<double> cpu_times;
         cpu_times.reserve(repeats);
         for (uint32_t repeat = 0; repeat < repeats; ++repeat)
         {
             const auto started = std::chrono::steady_clock::now();
-            cpu_output = ncnn::moe::linear_batch(matrix, input, optimization_flags);
+            cpu_output = ncnn::moe::forward_linear(matrix, input, optimization_flags);
             cpu_times.push_back(ncnn::moe::elapsed_milliseconds(started));
         }
 

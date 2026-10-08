@@ -13,7 +13,6 @@ struct CompiledModel;
 struct DecodeBatchEntry;
 struct ExpertBackendStatistics;
 struct ExpertCacheStatistics;
-struct ExpertVictimCacheStatistics;
 struct SessionStatistics;
 struct RuntimeMetricCounters;
 
@@ -38,10 +37,6 @@ void record_vulkan_execution_delta(SessionStatistics& statistics,
 void record_expert_backend_delta(SessionStatistics& statistics,
                                  const ExpertBackendStatistics& before,
                                  const ExpertBackendStatistics& after);
-void record_expert_victim_cache_delta(SessionStatistics& statistics,
-                                      const ExpertVictimCacheStatistics& before,
-                                      const ExpertVictimCacheStatistics& after);
-
 RuntimeMetricCounters runtime_metric_counters(const SessionStatistics& statistics,
                                               const RuntimeMetricCounters* baseline);
 

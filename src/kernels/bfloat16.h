@@ -45,12 +45,10 @@ void float_to_bfloat16_array(uint16_t* output,
                              const float* input,
                              uint32_t count) noexcept;
 
-// BF16-by-BF16 dot product. AVX512-BF16 implementations use dpbf16; callers
-// can query availability before accepting the additional input quantization.
+// BF16-by-BF16 dot product. AVX512-BF16 implementations use dpbf16 when available.
 [[nodiscard]] float bfloat16_pair_dot(const uint16_t* left,
                                       const uint16_t* right,
                                       uint32_t count) noexcept;
-[[nodiscard]] bool bfloat16_pair_dot_available() noexcept;
 
 // Runtime-dispatched accumulation of BF16 values into an FP32 vector.
 void bfloat16_scaled_add(float* output, const uint16_t* input, float scale, uint32_t count) noexcept;
@@ -59,16 +57,16 @@ void bfloat16_scaled_add(float* output, const uint16_t* input, float scale, uint
 // amortize packing the FP32 activations to BF16.
 // Returns false without modifying output when the kernel is unavailable or not
 // admitted.
-[[nodiscard]] bool bfloat16_batched_linear(const uint16_t* weights,
-                                           const float* input,
-                                           size_t input_stride,
-                                           size_t token_count,
-                                           uint32_t output_columns,
-                                           uint32_t input_columns,
-                                           float* output,
-                                           size_t output_stride,
-                                           int thread_count,
-                                           uint64_t optimization_flags);
+[[nodiscard]] bool forward_linear_bf16(const uint16_t* weights,
+                                       const float* input,
+                                       size_t input_stride,
+                                       size_t token_count,
+                                       uint32_t output_columns,
+                                       uint32_t input_columns,
+                                       float* output,
+                                       size_t output_stride,
+                                       int thread_count,
+                                       uint64_t optimization_flags);
 [[nodiscard]] const char* bfloat16_batched_linear_kernel_name(uint64_t optimization_flags) noexcept;
 
 } // namespace moe

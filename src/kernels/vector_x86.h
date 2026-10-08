@@ -96,25 +96,23 @@ void avx2_float_scale_inplace_and_scaled_add(float* values,
                                              float* output,
                                              float output_scale,
                                              uint32_t count) noexcept;
-void avx2_float_scale_inplace_and_scaled_add_and_accumulate(float* values,
-                                                            float value_scale,
-                                                            const float* input,
-                                                            float input_scale,
-                                                            float* output,
-                                                            float output_scale,
-                                                            uint32_t count) noexcept;
+void avx2_float_scaled_add_and_accumulate(float* values,
+                                          const float* input,
+                                          float input_scale,
+                                          float* output,
+                                          float output_scale,
+                                          uint32_t count) noexcept;
 void avx512_float_scale_inplace_and_scaled_add(float* values,
                                                float value_scale,
                                                float* output,
                                                float output_scale,
                                                uint32_t count) noexcept;
-void avx512_float_scale_inplace_and_scaled_add_and_accumulate(float* values,
-                                                              float value_scale,
-                                                              const float* input,
-                                                              float input_scale,
-                                                              float* output,
-                                                              float output_scale,
-                                                              uint32_t count) noexcept;
+void avx512_float_scaled_add_and_accumulate(float* values,
+                                            const float* input,
+                                            float input_scale,
+                                            float* output,
+                                            float output_scale,
+                                            uint32_t count) noexcept;
 void avx2_float_weighted_scale(float* output, const float* input, const float* weight, float scale, float weight_offset, uint32_t count) noexcept;
 void avx512_float_weighted_scale(float* output, const float* input, const float* weight, float scale, float weight_offset, uint32_t count) noexcept;
 void avx2_bfloat16_weighted_scale(float* output, const float* input, const uint16_t* weight, float scale, float weight_offset, uint32_t count) noexcept;

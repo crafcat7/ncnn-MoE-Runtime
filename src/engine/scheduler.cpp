@@ -114,7 +114,7 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(std::span<Sess
 
     const ModelPtr& model = requests.front().session->model;
     const CompiledModel& compiled = model_compiled(*model);
-    const uint32_t max_context_length = Session::get_max_context_length(model->descriptor());
+    const uint32_t max_context_length = Session::context_limit(model->descriptor());
     size_t maximum_tokens = 0;
     for (size_t index = 0; index < requests.size(); ++index)
     {
@@ -237,7 +237,7 @@ Result<std::vector<DecodeResult>> BatchSchedulerPrivate::decode(std::span<Sessio
 
     const ModelPtr& model = requests.front().session->model;
     const CompiledModel& compiled = model_compiled(*model);
-    const uint32_t max_context_length = Session::get_max_context_length(model->descriptor());
+    const uint32_t max_context_length = Session::context_limit(model->descriptor());
     for (size_t index = 0; index < requests.size(); ++index)
     {
         Session& session = *requests[index].session;

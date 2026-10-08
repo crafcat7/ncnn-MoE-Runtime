@@ -1,7 +1,10 @@
 #include "ple.h"
 
+#include "attention.h"
+#include "fastmath.h"
 #include "ops.h"
 #include "statecache.h"
+#include "ncnn/moe/option.h"
 
 #include <algorithm>
 #include <bit>
@@ -19,9 +22,9 @@ static float ple_sigmoid(float value) noexcept
     return 1.0f / (1.0f + std::exp(-value));
 }
 
-static void grouped_rms_norm_into(const ActivationBuffer& input, const TensorData& weight,
-                                  uint32_t group_size, float epsilon,
-                                  float weight_offset, ActivationBuffer& output)
+static void forward_grouped_rms_norm(const ActivationBuffer& input, const TensorData& weight,
+                                     uint32_t group_size, float epsilon,
+                                     float weight_offset, ActivationBuffer& output)
 {
     output.reset(input.rows(), input.columns(), false);
     const std::span<const uint16_t> norm = weight.bfloat16_values();
@@ -74,16 +77,17 @@ static Result<const uint16_t*> embedding_row(const WeightStore& weights,
     return Error{ErrorCode::InvalidModel, "PLE hash index exceeds embedding shards"};
 }
 
-Result<void> execute_ple_into(const WeightStore& weights,
-                              const PleBlockPlan& plan,
-                              uint32_t multiplier,
-                              uint32_t hidden_size,
-                              float norm_epsilon,
-                              float norm_weight_offset,
-                              std::span<const int32_t> input_ids,
-                              LayerCache& cache,
-                              ActivationBuffer& hidden,
-                              uint64_t optimization_flags)
+Result<void> forward_ple(const WeightStore& weights,
+                         const PleBlockPlan& plan,
+                         uint32_t multiplier,
+                         uint32_t hidden_size,
+                         float norm_epsilon,
+                         float norm_weight_offset,
+                         std::span<const int32_t> input_ids,
+                         LayerCache& cache,
+                         AttentionScratch& scratch,
+                         ActivationBuffer& hidden,
+                         uint64_t flags)
 {
     if (!plan.enabled())
         return {};
@@ -110,23 +114,21 @@ Result<void> execute_ple_into(const WeightStore& weights,
     const uint32_t context_length = plan.ngram_size - 1;
     if (cache.ple_token_history.size() > context_length)
         return Error{ErrorCode::InternalError, "invalid PLE token history"};
-    std::vector<int32_t> token_history(context_length, static_cast<int32_t>(plan.eos_token_id));
-    const size_t existing_offset = context_length - cache.ple_token_history.size();
-    std::copy(cache.ple_token_history.begin(), cache.ple_token_history.end(),
-              token_history.begin() + static_cast<ptrdiff_t>(existing_offset));
-    token_history.insert(token_history.end(), input_ids.begin(), input_ids.end());
-
-    ActivationBuffer embeddings(input_ids.size(), plan.embedding_dimension);
+    ActivationBuffer& embeddings = scratch.normalized;
+    embeddings.reset(input_ids.size(), plan.embedding_dimension, false);
     for (size_t row_index = 0; row_index < input_ids.size(); ++row_index)
     {
-        const size_t current = context_length + row_index;
-        int64_t mixed = wrapped_product(token_history[current], multipliers.int64_values()[0]);
+        int64_t mixed = wrapped_product(input_ids[row_index], multipliers.int64_values()[0]);
         bool crossed_eos = false;
         uint32_t head = 0;
         for (uint32_t ngram = 2; ngram <= plan.ngram_size; ++ngram)
         {
             const uint32_t shift = ngram - 1;
-            const int32_t previous_token = token_history[current - shift];
+            int32_t previous_token = static_cast<int32_t>(plan.eos_token_id);
+            if (row_index >= shift)
+                previous_token = input_ids[row_index - shift];
+            else if (shift - row_index <= cache.ple_token_history.size())
+                previous_token = cache.ple_token_history[cache.ple_token_history.size() - (shift - row_index)];
             crossed_eos = crossed_eos || previous_token == static_cast<int32_t>(plan.eos_token_id);
             const int64_t token = crossed_eos ? static_cast<int64_t>(plan.eos_token_id)
                                               : static_cast<int64_t>(previous_token);
@@ -149,19 +151,32 @@ Result<void> execute_ple_into(const WeightStore& weights,
             }
         }
     }
-    cache.ple_token_history.assign(token_history.end() - context_length,
-                                   token_history.end());
+    std::vector<int32_t>& history = cache.ple_token_history;
+    if (input_ids.size() >= context_length)
+        history.assign(input_ids.end() - context_length, input_ids.end());
+    else
+    {
+        history.insert(history.begin(), context_length - history.size(), static_cast<int32_t>(plan.eos_token_id));
+        if (!input_ids.empty())
+        {
+            std::move(history.begin() + input_ids.size(), history.end(), history.begin());
+            std::copy(input_ids.begin(), input_ids.end(), history.end() - input_ids.size());
+        }
+    }
 
-    ActivationBuffer key = linear_batch(weights.at(plan.key_weight), embeddings, optimization_flags);
-    ActivationBuffer value = linear_batch(weights.at(plan.value_weight), embeddings, optimization_flags);
-    ActivationBuffer key_normed;
-    ActivationBuffer query_normed;
-    grouped_rms_norm_into(key, weights.at(plan.key_norm_weight), hidden_size,
-                          norm_epsilon, norm_weight_offset, key_normed);
-    grouped_rms_norm_into(hidden, weights.at(plan.query_norm_weight), hidden_size,
-                          norm_epsilon, norm_weight_offset, query_normed);
+    ActivationBuffer& key = scratch.key;
+    ActivationBuffer& value = scratch.value;
+    forward_linear(weights.at(plan.key_weight), embeddings, key, flags);
+    forward_linear(weights.at(plan.value_weight), embeddings, value, flags);
+    ActivationBuffer& key_normed = scratch.query;
+    ActivationBuffer& query_normed = scratch.gate;
+    forward_grouped_rms_norm(key, weights.at(plan.key_norm_weight), hidden_size,
+                             norm_epsilon, norm_weight_offset, key_normed);
+    forward_grouped_rms_norm(hidden, weights.at(plan.query_norm_weight), hidden_size,
+                             norm_epsilon, norm_weight_offset, query_normed);
 
-    ActivationBuffer gated(input_ids.size(), expanded_size);
+    ActivationBuffer& gated = scratch.attention;
+    gated.reset(input_ids.size(), expanded_size, false);
     const float inverse_sqrt_hidden = 1.0f / std::sqrt(static_cast<float>(hidden_size));
     for (size_t row_index = 0; row_index < input_ids.size(); ++row_index)
     {
@@ -183,11 +198,13 @@ Result<void> execute_ple_into(const WeightStore& weights,
         }
     }
 
-    ActivationBuffer convolution_input;
-    grouped_rms_norm_into(gated, weights.at(plan.convolution_norm_weight),
-                          hidden_size, norm_epsilon, norm_weight_offset,
-                          convolution_input);
-    const uint32_t state_length = (plan.convolution_kernel_size - 1) * plan.ngram_size;
+    ActivationBuffer& convolution_input = scratch.projected;
+    forward_grouped_rms_norm(gated, weights.at(plan.convolution_norm_weight),
+                             hidden_size, norm_epsilon, norm_weight_offset,
+                             convolution_input);
+    const uint32_t kernel_size = plan.convolution_kernel_size;
+    const uint32_t ngram_size = plan.ngram_size;
+    const uint32_t state_length = (kernel_size - 1) * ngram_size;
     const size_t state_elements = static_cast<size_t>(state_length) * expanded_size;
     if (cache.ple_convolution_state.empty())
     {
@@ -202,34 +219,38 @@ Result<void> execute_ple_into(const WeightStore& weights,
         return Error{ErrorCode::InternalError, "invalid PLE convolution cursor"};
 
     uint32_t first_slot = cache.ple_first_slot;
+    float* state = cache.ple_convolution_state.data();
     const std::span<const uint16_t> convolution_weight = weights.at(plan.convolution_weight).bfloat16_values();
+    const bool fast_silu = has_flag(flags, OptimizationCpuFastSilu);
     for (size_t row_index = 0; row_index < input_ids.size(); ++row_index)
     {
         const float* current = convolution_input.row(row_index);
+        const float* gated_row = gated.row(row_index);
+        float* hidden_row = hidden.row(row_index);
         for (uint32_t channel = 0; channel < expanded_size; ++channel)
         {
             float convolution = 0.0f;
             size_t tap = first_slot;
-            for (uint32_t kernel = 0; kernel + 1 < plan.convolution_kernel_size; ++kernel)
+            for (uint32_t kernel = 0; kernel + 1 < kernel_size; ++kernel)
             {
-                const float sample = cache.ple_convolution_state[static_cast<size_t>(tap) * expanded_size + channel];
-                convolution += sample * bfloat16_to_float(convolution_weight[static_cast<size_t>(channel) * plan.convolution_kernel_size + kernel]);
-                tap += plan.ngram_size;
+                const float sample = state[static_cast<size_t>(tap) * expanded_size + channel];
+                convolution += sample * bfloat16_to_float(convolution_weight[static_cast<size_t>(channel) * kernel_size + kernel]);
+                tap += ngram_size;
                 if (tap >= state_length)
                     tap -= state_length;
             }
             convolution += current[channel]
-                           * bfloat16_to_float(convolution_weight[static_cast<size_t>(channel) * plan.convolution_kernel_size
-                                                                  + plan.convolution_kernel_size - 1]);
-            hidden.row(row_index)[channel] += gated.row(row_index)[channel]
-                                              + scaled_silu(convolution, 1.0f, optimization_flags);
+                           * bfloat16_to_float(convolution_weight[static_cast<size_t>(channel) * kernel_size
+                                                                  + kernel_size - 1]);
+            hidden_row[channel] += gated_row[channel]
+                                   + (fast_silu ? float_silu(convolution)
+                                                : scaled_silu(convolution, 1.0f, flags));
         }
         if (state_length != 0)
         {
             std::copy_n(current,
                         expanded_size,
-                        cache.ple_convolution_state.data()
-                            + static_cast<size_t>(first_slot) * expanded_size);
+                        state + static_cast<size_t>(first_slot) * expanded_size);
             ++first_slot;
             if (first_slot == state_length)
                 first_slot = 0;

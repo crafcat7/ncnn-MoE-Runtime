@@ -1,9 +1,9 @@
 """Benchmark one prompt through the native worker.
 
-String prompts automatically use native text handling when the worker supports
-it; native JSON output leaves ``prompt_tokens`` null and includes
-``prompt_token_count``.  Reported ``done`` metrics retain their runtime timing
-definitions.
+String prompts use the model's native messages interface; native JSON output
+leaves ``prompt_tokens`` null and includes ``prompt_token_count``. Direct token
+IDs remain available for model-specific prompt measurements. Reported ``done``
+metrics retain their runtime timing definitions.
 
 This intentionally reports native ``done`` metrics instead of inferring GPU
 execution from device memory occupancy.  It is useful for before/after
@@ -208,19 +208,10 @@ def main() -> int:
         raise SystemExit("GPU Expert cache options require --backend hybrid")
     model = arguments.model.resolve()
     worker = arguments.worker.resolve()
-    adapter = None
-    if arguments.prompt_token_ids is not None:
-        prompt_tokens = list(arguments.prompt_token_ids)
-        messages = None
-        prompt_token_count = len(prompt_tokens)
-        native_text = False
-        stop_tokens: list[int] = []
-    else:
-        prompt_tokens = None
-        messages = [{"role": "user", "content": arguments.prompt}]
-        prompt_token_count = None
-        native_text = False
-        stop_tokens = []
+    direct_token_ids = arguments.prompt_token_ids is not None
+    prompt_tokens = list(arguments.prompt_token_ids) if direct_token_ids else None
+    messages = None if direct_token_ids else [{"role": "user", "content": arguments.prompt}]
+    prompt_token_count = len(prompt_tokens) if prompt_tokens is not None else None
     done_events: list[dict[str, Any]] = []
     generated: list[list[int]] = []
 
@@ -230,13 +221,8 @@ def main() -> int:
             prefill_chunk_size=arguments.prefill_chunk_size,
             enable_speculative_context=arguments.enable_speculative,
         )
-        if messages is not None:
-            adapter = load_adapter(arguments, model, client.ready)
-            native_text = bool(getattr(adapter, "native_text", False))
-            if not native_text:
-                prompt_tokens = adapter.encode_messages(messages)
-                stop_tokens = adapter.stop_tokens
-                prompt_token_count = len(prompt_tokens)
+        adapter = load_adapter(arguments, model, client.ready) if messages is not None else None
+        stop_tokens = [] if prompt_tokens is not None else None
         for run_index in range(arguments.warmup + arguments.runs):
             if run_index:
                 client.reset("prompt-benchmark")
@@ -248,12 +234,12 @@ def main() -> int:
                 "metrics_enabled": False,
                 "metrics_interval_ms": 0,
             }
-            if native_text:
-                assert adapter is not None and messages is not None
+            if messages is not None:
+                assert adapter is not None
                 done, token_ids = client.generate(
                     "prompt-benchmark",
                     messages=messages,
-                    thinking=adapter.thinking,
+                    enable_thinking=adapter.thinking,
                     **options,
                 )
             else:
@@ -264,7 +250,7 @@ def main() -> int:
                     stop_tokens=stop_tokens,
                     **options,
                 )
-            if native_text:
+            if messages is not None:
                 metrics = done.get("metrics")
                 count = metrics.get("input_tokens") if isinstance(metrics, dict) else None
                 if isinstance(count, bool) or not isinstance(count, int) or count <= 0:

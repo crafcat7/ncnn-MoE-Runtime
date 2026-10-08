@@ -92,7 +92,23 @@ void record_expert_cache_delta(SessionStatistics& statistics,
     statistics.expert_cache_io_read_time_microseconds += after.io_read_time_microseconds
                                                          - before.io_read_time_microseconds;
     statistics.expert_cache_resident_size = after.resident_size;
-    record_expert_victim_cache_delta(statistics, before.victim, after.victim);
+    statistics.expert_gpu_victim_cache_hits += after.victim.hits - before.victim.hits;
+    statistics.expert_gpu_victim_cache_misses += after.victim.misses - before.victim.misses;
+    statistics.expert_gpu_victim_cache_admissions += after.victim.admissions - before.victim.admissions;
+    statistics.expert_gpu_victim_cache_filtered_admissions += after.victim.filtered_admissions - before.victim.filtered_admissions;
+    statistics.expert_gpu_victim_cache_reused_admissions += after.victim.reused_admissions - before.victim.reused_admissions;
+    statistics.expert_gpu_victim_cache_probe_admissions += after.victim.probe_admissions - before.victim.probe_admissions;
+    statistics.expert_gpu_victim_cache_stores += after.victim.stores - before.victim.stores;
+    statistics.expert_gpu_victim_cache_evictions += after.victim.evictions - before.victim.evictions;
+    statistics.expert_gpu_victim_cache_dropped_admissions += after.victim.dropped_admissions - before.victim.dropped_admissions;
+    statistics.expert_gpu_victim_cache_restore_failures += after.victim.restore_failures - before.victim.restore_failures;
+    statistics.expert_gpu_victim_cache_bytes_uploaded += after.victim.bytes_uploaded - before.victim.bytes_uploaded;
+    statistics.expert_gpu_victim_cache_bytes_downloaded += after.victim.bytes_downloaded - before.victim.bytes_downloaded;
+    statistics.expert_gpu_victim_cache_restore_time_microseconds += after.victim.restore_time_microseconds - before.victim.restore_time_microseconds;
+    statistics.expert_gpu_victim_cache_mapped_stores += after.victim.mapped_stores - before.victim.mapped_stores;
+    statistics.expert_gpu_victim_cache_mapped_restores += after.victim.mapped_restores - before.victim.mapped_restores;
+    statistics.expert_gpu_victim_cache_resident_size = after.victim.resident_size;
+    statistics.expert_gpu_victim_cache_pending_size = after.victim.pending_size;
 }
 
 void record_vulkan_execution_delta(SessionStatistics& statistics,
@@ -181,27 +197,6 @@ void record_expert_backend_delta(SessionStatistics& statistics, const ExpertBack
     statistics.expert_gpu_route_aggregation_batches += after.route_aggregation_batches - before.route_aggregation_batches;
     statistics.expert_gpu_route_aggregation_routes += after.route_aggregation_routes - before.route_aggregation_routes;
     statistics.expert_gpu_route_aggregation_bytes_saved += after.route_aggregation_bytes_saved - before.route_aggregation_bytes_saved;
-}
-
-void record_expert_victim_cache_delta(SessionStatistics& statistics, const ExpertVictimCacheStatistics& before, const ExpertVictimCacheStatistics& after)
-{
-    statistics.expert_gpu_victim_cache_hits += after.hits - before.hits;
-    statistics.expert_gpu_victim_cache_misses += after.misses - before.misses;
-    statistics.expert_gpu_victim_cache_admissions += after.admissions - before.admissions;
-    statistics.expert_gpu_victim_cache_filtered_admissions += after.filtered_admissions - before.filtered_admissions;
-    statistics.expert_gpu_victim_cache_reused_admissions += after.reused_admissions - before.reused_admissions;
-    statistics.expert_gpu_victim_cache_probe_admissions += after.probe_admissions - before.probe_admissions;
-    statistics.expert_gpu_victim_cache_stores += after.stores - before.stores;
-    statistics.expert_gpu_victim_cache_evictions += after.evictions - before.evictions;
-    statistics.expert_gpu_victim_cache_dropped_admissions += after.dropped_admissions - before.dropped_admissions;
-    statistics.expert_gpu_victim_cache_restore_failures += after.restore_failures - before.restore_failures;
-    statistics.expert_gpu_victim_cache_bytes_uploaded += after.bytes_uploaded - before.bytes_uploaded;
-    statistics.expert_gpu_victim_cache_bytes_downloaded += after.bytes_downloaded - before.bytes_downloaded;
-    statistics.expert_gpu_victim_cache_restore_time_microseconds += after.restore_time_microseconds - before.restore_time_microseconds;
-    statistics.expert_gpu_victim_cache_mapped_stores += after.mapped_stores - before.mapped_stores;
-    statistics.expert_gpu_victim_cache_mapped_restores += after.mapped_restores - before.mapped_restores;
-    statistics.expert_gpu_victim_cache_resident_size = after.resident_size;
-    statistics.expert_gpu_victim_cache_pending_size = after.pending_size;
 }
 
 static uint64_t counter_delta(uint64_t current, uint64_t baseline) noexcept

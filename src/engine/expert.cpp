@@ -143,13 +143,22 @@ void record_mxfp4(const TensorData& matrix, size_t input_rows, ExpertExecutionMe
         metrics.mxfp4_prefill_gemm_rows += rows;
 }
 
-static void expert_linear(const TensorData& matrix, const TensorData* bias, const CompiledOperator* executable, const ActivationBuffer& input, ActivationBuffer& output, ExpertExecutionMetrics& metrics, uint64_t optimization_flags)
+static void expert_linear(const TensorData& matrix,
+                          const TensorData* bias,
+                          const CompiledOperator* executable,
+                          const ActivationBuffer& input,
+                          ActivationBuffer& output,
+                          ExpertExecutionMetrics& metrics,
+                          uint64_t optimization_flags,
+                          ActivationBuffer* quantized_input_scratch)
 {
     record_mxfp4(matrix, input.rows(), metrics);
     if (bias)
-        linear_batch_into(matrix, *bias, input, output, optimization_flags, executable);
+        forward_linear(matrix, *bias, input, output, optimization_flags, executable,
+                       ExecutionBackend::Cpu, quantized_input_scratch);
     else
-        linear_batch_into(matrix, input, output, optimization_flags, executable);
+        forward_linear(matrix, input, output, optimization_flags, executable,
+                       ExecutionBackend::Cpu, quantized_input_scratch);
 }
 
 static void forward_expert(const CompiledModel& model,
@@ -177,23 +186,25 @@ static void forward_expert(const CompiledModel& model,
         ActivationBuffer& activated = workspace.projection;
         if (gate_up_weight.dtype == DType::MxFp4)
         {
-            fused_mxfp4_gate_up_batch(gate_up_weight,
-                                      gate_up_bias,
-                                      input,
-                                      expert.activation,
-                                      expert.activation_limit,
-                                      activated,
-                                      optimization_flags);
+            forward_gate_up_mxfp4(gate_up_weight,
+                                  gate_up_bias,
+                                  input,
+                                  expert.activation,
+                                  expert.activation_limit,
+                                  activated,
+                                  optimization_flags);
             metrics.mxfp4_fused_gate_up_rows += static_cast<uint64_t>(activated.rows()) * activated.columns();
             record_mxfp4(gate_up_weight, input.rows(), metrics);
         }
         else if (expert.layout == ExpertLayout::PackedGateUpDown)
         {
-            expert_linear(gate_up_weight, gate_up_bias, gate_up_operator, input, activated, metrics, optimization_flags);
+            expert_linear(gate_up_weight, gate_up_bias, gate_up_operator, input, activated, metrics,
+                          optimization_flags, &workspace.quantized_input);
             const size_t rows = activated.rows();
             const uint32_t intermediate_size = activated.columns() / 2;
             const bool vector_silu = intermediate_size >= 4
                                      && expert.activation_limit <= 0.0f
+                                     && has_flag(optimization_flags, OptimizationCpuFastSilu)
                                      && (expert.activation == ExpertActivation::Silu
                                          || expert.activation == ExpertActivation::DeepSeekSwiGlu);
             // Compact forward while source rows still use the full gate/up stride.
@@ -228,7 +239,8 @@ static void forward_expert(const CompiledModel& model,
         }
         else
         {
-            expert_linear(gate_up_weight, gate_up_bias, gate_up_operator, input, activated, metrics, optimization_flags);
+            expert_linear(gate_up_weight, gate_up_bias, gate_up_operator, input, activated, metrics,
+                          optimization_flags, &workspace.quantized_input);
             const size_t rows = activated.rows();
             const uint32_t intermediate_size = activated.columns() / 2;
             for (size_t token_index = 0; token_index < rows; ++token_index)
@@ -261,7 +273,8 @@ static void forward_expert(const CompiledModel& model,
                       activated,
                       output,
                       metrics,
-                      optimization_flags);
+                      optimization_flags,
+                      &workspace.quantized_input);
         return;
     }
 
@@ -286,15 +299,16 @@ static void forward_expert(const CompiledModel& model,
                 gate_prefetched = true;
             }
             ActivationBuffer& activated = workspace.projection;
-            if (fused_float8_gate_up_batch(gate_weight,
-                                           up_weight,
-                                           input,
-                                           expert.activation,
-                                           expert.activation_limit,
-                                           activated,
-                                           optimization_flags,
-                                           gate_operator,
-                                           up_operator))
+            if (forward_gate_up_float8(gate_weight,
+                                       up_weight,
+                                       input,
+                                       expert.activation,
+                                       expert.activation_limit,
+                                       activated,
+                                       optimization_flags,
+                                       gate_operator,
+                                       up_operator,
+                                       &workspace.quantized_input))
             {
                 if (prefetch)
                 {
@@ -306,7 +320,8 @@ static void forward_expert(const CompiledModel& model,
                               activated,
                               output,
                               metrics,
-                              optimization_flags);
+                              optimization_flags,
+                              &workspace.quantized_input);
                 return;
             }
         }
@@ -318,7 +333,8 @@ static void forward_expert(const CompiledModel& model,
                   input,
                   up,
                   metrics,
-                  optimization_flags);
+                  optimization_flags,
+                  &workspace.quantized_input);
     if (expert.layout != ExpertLayout::UpDown)
     {
         if (prefetch && !gate_prefetched)
@@ -330,7 +346,8 @@ static void forward_expert(const CompiledModel& model,
                       input,
                       gate,
                       metrics,
-                      optimization_flags);
+                      optimization_flags,
+                      &workspace.quantized_input);
         const bool vector_silu = up.columns() >= 4
                                  && expert.activation_limit <= 0.0f
                                  && has_flag(optimization_flags, OptimizationCpuFastSilu)
@@ -381,7 +398,8 @@ static void forward_expert(const CompiledModel& model,
                   up,
                   output,
                   metrics,
-                  optimization_flags);
+                  optimization_flags,
+                  &workspace.quantized_input);
 }
 
 void forward_shared_expert(const CompiledModel& model,
@@ -450,7 +468,8 @@ void forward_shared_expert(const CompiledModel& model,
                               activated,
                               output,
                               metrics,
-                              optimization_flags);
+                              optimization_flags,
+                              &workspace.quantized_input);
                 if (has_router_gate)
                 {
                     for (size_t token_index = 0;
@@ -486,11 +505,13 @@ void forward_shared_expert(const CompiledModel& model,
     if (moe.shared_expert_gate_weight == invalid_tensor_handle)
         return;
     ActivationBuffer& gate = workspace.gate;
-    linear_batch_into(model.weights.at(moe.shared_expert_gate_weight),
-                      input,
-                      gate,
-                      optimization_flags,
-                      model.operators.find_weight(moe.shared_expert_gate_weight));
+    forward_linear(model.weights.at(moe.shared_expert_gate_weight),
+                   input,
+                   gate,
+                   optimization_flags,
+                   model.operators.find_weight(moe.shared_expert_gate_weight),
+                   ExecutionBackend::Cpu,
+                   &workspace.quantized_input);
     assert(gate.columns() == 1);
     for (size_t token_index = 0; token_index < output.rows(); ++token_index)
     {
@@ -742,9 +763,9 @@ static uint64_t forward_experts(const CompiledModel& model,
             }
         }
 
-        const bool grouped_decode = mxfp4_expert_batch(decode_tasks,
-                                                       &scratch.kernels,
-                                                       model.opt.optimization_flags);
+        const bool grouped_decode = forward_experts_mxfp4(decode_tasks,
+                                                          &scratch.kernels,
+                                                          model.opt.optimization_flags);
         if (grouped_decode)
         {
             for (size_t task_index = 0; task_index < active_indices.size(); ++task_index)
@@ -977,7 +998,7 @@ static bool should_use_hybrid_expert_blocks(const CompiledModel& model,
 static Result<void> run_hybrid_expert_blocks(const CompiledModel& model,
                                              const MoeBlockPlan& moe,
                                              LayerState& layer_state,
-                                             SessionStatistics& statistics,
+                                             SessionStatistics& stats,
                                              ExpertScratch& scratch,
                                              uint32_t residency_group,
                                              bool prefetch)
@@ -1243,7 +1264,7 @@ static Result<void> run_hybrid_expert_blocks(const CompiledModel& model,
         }
     }
 
-    statistics.expert_cache_management_time_microseconds += elapsed_microseconds(cache_management_start);
+    stats.expert_cache_management_time_microseconds += elapsed_microseconds(cache_management_start);
 
     const auto run_pending_cpu_blocks = [&]() -> Result<uint64_t> {
         uint64_t elapsed = 0;
@@ -1406,72 +1427,72 @@ static Result<void> run_hybrid_expert_blocks(const CompiledModel& model,
 
     compute_wall_time_microseconds = std::max(compute_wall_time_microseconds,
                                               elapsed_microseconds(backend_execution_start));
-    statistics.expert_compute_time_microseconds += compute_wall_time_microseconds;
+    stats.expert_compute_time_microseconds += compute_wall_time_microseconds;
     if (active_expert_count > 1)
-        statistics.expert_parallel_tasks += active_expert_count;
+        stats.expert_parallel_tasks += active_expert_count;
     for (const ExpertState& active : layer_state.active_experts())
     {
         const ExpertExecutionMetrics& metrics = active.metrics;
-        statistics.expert_cache_wait_time_microseconds += metrics.cache_wait_time_microseconds;
-        statistics.expert_regroup_time_microseconds += metrics.regroup_time_microseconds;
+        stats.expert_cache_wait_time_microseconds += metrics.cache_wait_time_microseconds;
+        stats.expert_regroup_time_microseconds += metrics.regroup_time_microseconds;
         if (metrics.hinted_bytes > 0)
         {
-            ++statistics.expert_prefetches;
-            statistics.expert_prefetch_bytes += metrics.hinted_bytes;
+            ++stats.expert_prefetches;
+            stats.expert_prefetch_bytes += metrics.hinted_bytes;
         }
-        statistics.mxfp4_decode_gemv_rows += metrics.mxfp4_decode_gemv_rows;
-        statistics.mxfp4_prefill_gemm_rows += metrics.mxfp4_prefill_gemm_rows;
-        statistics.mxfp4_paired_rows += metrics.mxfp4_paired_rows;
-        statistics.mxfp4_fused_gate_up_rows += metrics.mxfp4_fused_gate_up_rows;
-        statistics.mxfp4_reused_input_rows += metrics.mxfp4_reused_input_rows;
+        stats.mxfp4_decode_gemv_rows += metrics.mxfp4_decode_gemv_rows;
+        stats.mxfp4_prefill_gemm_rows += metrics.mxfp4_prefill_gemm_rows;
+        stats.mxfp4_paired_rows += metrics.mxfp4_paired_rows;
+        stats.mxfp4_fused_gate_up_rows += metrics.mxfp4_fused_gate_up_rows;
+        stats.mxfp4_reused_input_rows += metrics.mxfp4_reused_input_rows;
         for (const ExpertRoute& route : active.batch.routes)
         {
             if (route.rank >= maximum_expert_route_ranks)
                 continue;
-            ++statistics.expert_route_rank_demands[route.rank];
-            statistics.expert_route_rank_demand_queue_time_microseconds[route.rank] += metrics.cache_wait_time_microseconds;
+            ++stats.expert_route_rank_demands[route.rank];
+            stats.expert_route_rank_demand_queue_time_microseconds[route.rank] += metrics.cache_wait_time_microseconds;
         }
-        ++statistics.expert_batches;
+        ++stats.expert_batches;
     }
     layer_state.experts_executed = true;
     return {};
 }
 
-void prepare_moe_experts(const MoeBlockPlan& moe,
-                         LayerState& layer_state,
-                         SessionStatistics& statistics)
+void prepare_experts(const MoeBlockPlan& moe,
+                     LayerState& layer_state,
+                     SessionStatistics& stats)
 {
     ExpertDispatchPlan& plan = layer_state.dispatch_plan;
-    statistics.expert_assignments += plan.assignment_count;
+    stats.expert_assignments += plan.assignment_count;
     layer_state.resize_experts(plan.batches.size());
     for (size_t batch_index = 0; batch_index < plan.batches.size(); ++batch_index)
     {
         ExpertBatch& batch = plan.batches[batch_index];
-        statistics.expert_token_counts[batch.expert_id] += batch.routes.size();
+        stats.expert_token_counts[batch.expert_id] += batch.routes.size();
         const uint64_t weight_size = moe.experts[batch.expert_id].weight_size;
-        if (statistics.expert_batch_weight_bytes > std::numeric_limits<uint64_t>::max() - weight_size)
-            statistics.expert_batch_weight_bytes = std::numeric_limits<uint64_t>::max();
+        if (stats.expert_batch_weight_bytes > std::numeric_limits<uint64_t>::max() - weight_size)
+            stats.expert_batch_weight_bytes = std::numeric_limits<uint64_t>::max();
         else
-            statistics.expert_batch_weight_bytes += weight_size;
+            stats.expert_batch_weight_bytes += weight_size;
         const uint64_t route_count = static_cast<uint64_t>(batch.routes.size());
         const uint64_t route_weight_size = weight_size != 0
                                                    && batch.routes.size() > std::numeric_limits<uint64_t>::max() / weight_size
                                                ? std::numeric_limits<uint64_t>::max()
                                                : weight_size * route_count;
-        if (statistics.expert_route_weight_bytes > std::numeric_limits<uint64_t>::max() - route_weight_size)
-            statistics.expert_route_weight_bytes = std::numeric_limits<uint64_t>::max();
+        if (stats.expert_route_weight_bytes > std::numeric_limits<uint64_t>::max() - route_weight_size)
+            stats.expert_route_weight_bytes = std::numeric_limits<uint64_t>::max();
         else
-            statistics.expert_route_weight_bytes += route_weight_size;
+            stats.expert_route_weight_bytes += route_weight_size;
         layer_state.active_experts()[batch_index].prepare(batch);
     }
 }
 
-Result<void> request_moe_experts(const CompiledModel& model,
-                                 const MoeBlockPlan& moe,
-                                 const LayerState& layer_state,
-                                 ExpertScratch& scratch,
-                                 uint32_t residency_group,
-                                 SessionStatistics& statistics)
+Result<void> request_experts(const CompiledModel& model,
+                             const MoeBlockPlan& moe,
+                             const LayerState& layer_state,
+                             ExpertScratch& scratch,
+                             uint32_t residency_group,
+                             uint64_t& cache_time)
 {
     if (!model.expert_cache)
         return {};
@@ -1493,7 +1514,7 @@ Result<void> request_moe_experts(const CompiledModel& model,
         });
     }
     auto requested = model.expert_cache->request_pairs(requests);
-    statistics.expert_cache_management_time_microseconds += elapsed_microseconds(request_start);
+    cache_time += elapsed_microseconds(request_start);
     if (!requested)
         return requested.error();
     return {};
@@ -1502,7 +1523,7 @@ Result<void> request_moe_experts(const CompiledModel& model,
 Result<void> forward_moe(const CompiledModel& model,
                          const MoeBlockPlan& moe,
                          LayerState& layer_state,
-                         SessionStatistics& statistics,
+                         SessionStatistics& stats,
                          ExpertScratch& scratch,
                          uint32_t residency_group,
                          ExecutionBackend backend,
@@ -1512,26 +1533,32 @@ Result<void> forward_moe(const CompiledModel& model,
         return run_hybrid_expert_blocks(model,
                                         moe,
                                         layer_state,
-                                        statistics,
+                                        stats,
                                         scratch,
                                         residency_group,
                                         prefetch);
 
     const size_t active_expert_count = layer_state.active_experts().size();
-    uint64_t regroup_element_count = 0;
-    for (const ExpertState& active : layer_state.active_experts())
-    {
-        regroup_element_count += static_cast<uint64_t>(active.batch.routes.size()) * layer_state.normalized.columns();
-    }
-    static constexpr uint64_t minimum_parallel_regroup_elements = 256 * 1024;
-    bool parallelize_regroup = false;
     int expert_team_size = 1;
 #if defined(_OPENMP)
+    bool parallelize_regroup = false;
     expert_team_size = std::min(static_cast<int>(active_expert_count), static_cast<int>(cpu_linear_num_threads()));
-    parallelize_regroup = expert_team_size > 1 && regroup_element_count >= minimum_parallel_regroup_elements;
+    if (expert_team_size > 1)
+    {
+        uint64_t regroup_element_count = 0;
+        for (const ExpertState& active : layer_state.active_experts())
+        {
+            regroup_element_count += static_cast<uint64_t>(active.batch.routes.size())
+                                     * layer_state.normalized.columns();
+        }
+        static constexpr uint64_t minimum_parallel_regroup_elements = 256 * 1024;
+        parallelize_regroup = regroup_element_count >= minimum_parallel_regroup_elements;
+    }
 #endif
     const int64_t parallel_expert_count = static_cast<int64_t>(active_expert_count);
+#if defined(_OPENMP)
 #pragma omp parallel for schedule(static) num_threads(expert_team_size) if (parallelize_regroup)
+#endif
     for (int64_t expert_index = 0; expert_index < parallel_expert_count; ++expert_index)
     {
         ExpertState& active = layer_state.active_experts()[static_cast<size_t>(expert_index)];
@@ -1552,21 +1579,26 @@ Result<void> forward_moe(const CompiledModel& model,
     std::vector<uint8_t>& backend_aggregated = scratch.backend_aggregated;
     std::vector<size_t>& backend_indices = scratch.backend_indices;
     std::vector<ExpertBackendRequest>& backend_requests = scratch.backend_requests;
-    backend_executed.assign(active_expert_count, 0);
-    backend_aggregated.assign(active_expert_count, 0);
-    scratch.backend_aggregated_output_valid = false;
+    backend_executed.clear();
+    backend_aggregated.clear();
     backend_indices.clear();
     backend_requests.clear();
-    backend_indices.reserve(active_expert_count);
-    backend_requests.reserve(active_expert_count);
+    scratch.backend_aggregated_output_valid = false;
     std::unique_ptr<ExpertSubmission> backend_submission;
     std::chrono::steady_clock::time_point backend_execution_start;
     bool backend_reserved_work = false;
     bool backend_reservation_shape_valid = true;
     const bool gpu_expert_batch_eligible = layer_state.normalized.rows() >= vulkan_expert_gpu_min_rows
                                            || model.opt.hybrid_mode == HybridMode::HybridExperts;
-    if (backend == ExecutionBackend::Vulkan && model.expert_backend && gpu_expert_batch_eligible)
+    const bool use_backend_batch = backend == ExecutionBackend::Vulkan
+                                   && model.expert_backend
+                                   && gpu_expert_batch_eligible;
+    if (use_backend_batch)
     {
+        backend_executed.assign(active_expert_count, 0);
+        backend_aggregated.assign(active_expert_count, 0);
+        backend_indices.reserve(active_expert_count);
+        backend_requests.reserve(active_expert_count);
         for (size_t active_index = 0; active_index < active_expert_count; ++active_index)
         {
             ExpertState& active = layer_state.active_experts()[active_index];
@@ -1648,7 +1680,7 @@ Result<void> forward_moe(const CompiledModel& model,
     {
         ExpertState& active = layer_state.active_experts()[active_index];
         const ExpertPlan& expert = moe.experts[active.batch.expert_id];
-        if (backend_executed[active_index])
+        if (use_backend_batch && backend_executed[active_index])
             continue;
         const TensorData* gate_up = expert.gate_up_weight == invalid_tensor_handle ? nullptr : &model.weights.at(expert.gate_up_weight);
         if (!model.expert_cache || !gate_up || expert.cache_key.empty())
@@ -1700,7 +1732,7 @@ Result<void> forward_moe(const CompiledModel& model,
         }
     }
 
-    statistics.expert_cache_management_time_microseconds += elapsed_microseconds(cache_management_start);
+    stats.expert_cache_management_time_microseconds += elapsed_microseconds(cache_management_start);
     compute_wall_time_microseconds += forward_experts(model, moe, layer_state, uncached, scratch, prefetch);
 
     if (ready_batch_acquired)
@@ -1710,7 +1742,7 @@ Result<void> forward_moe(const CompiledModel& model,
         for (size_t active_index : pending)
             layer_state.active_experts()[active_index].lease = {};
         pending.clear();
-        statistics.expert_cache_management_time_microseconds += elapsed_microseconds(lease_release_start);
+        stats.expert_cache_management_time_microseconds += elapsed_microseconds(lease_release_start);
     }
 
     // The wait path admits only the subset that currently fits. This keeps
@@ -1885,7 +1917,7 @@ Result<void> forward_moe(const CompiledModel& model,
                                         backend);
                 }
             }
-            statistics.expert_cache_management_time_microseconds += elapsed_microseconds(fallback_cache_start);
+            stats.expert_cache_management_time_microseconds += elapsed_microseconds(fallback_cache_start);
             compute_wall_time_microseconds += forward_experts(model, moe, layer_state, failed_indices, scratch, prefetch);
             for (size_t active_index : failed_indices)
             {
@@ -1894,41 +1926,41 @@ Result<void> forward_moe(const CompiledModel& model,
         }
     }
 
-    statistics.expert_compute_time_microseconds += compute_wall_time_microseconds;
+    stats.expert_compute_time_microseconds += compute_wall_time_microseconds;
     if (expert_team_size > 1)
-        statistics.expert_parallel_tasks += active_expert_count;
+        stats.expert_parallel_tasks += active_expert_count;
     for (const ExpertState& active : layer_state.active_experts())
     {
         const ExpertExecutionMetrics& metrics = active.metrics;
-        statistics.expert_cache_wait_time_microseconds += metrics.cache_wait_time_microseconds;
-        statistics.expert_regroup_time_microseconds += metrics.regroup_time_microseconds;
+        stats.expert_cache_wait_time_microseconds += metrics.cache_wait_time_microseconds;
+        stats.expert_regroup_time_microseconds += metrics.regroup_time_microseconds;
         if (metrics.hinted_bytes > 0)
         {
-            ++statistics.expert_prefetches;
-            statistics.expert_prefetch_bytes += metrics.hinted_bytes;
+            ++stats.expert_prefetches;
+            stats.expert_prefetch_bytes += metrics.hinted_bytes;
         }
-        statistics.mxfp4_decode_gemv_rows += metrics.mxfp4_decode_gemv_rows;
-        statistics.mxfp4_prefill_gemm_rows += metrics.mxfp4_prefill_gemm_rows;
-        statistics.mxfp4_paired_rows += metrics.mxfp4_paired_rows;
-        statistics.mxfp4_fused_gate_up_rows += metrics.mxfp4_fused_gate_up_rows;
-        statistics.mxfp4_reused_input_rows += metrics.mxfp4_reused_input_rows;
+        stats.mxfp4_decode_gemv_rows += metrics.mxfp4_decode_gemv_rows;
+        stats.mxfp4_prefill_gemm_rows += metrics.mxfp4_prefill_gemm_rows;
+        stats.mxfp4_paired_rows += metrics.mxfp4_paired_rows;
+        stats.mxfp4_fused_gate_up_rows += metrics.mxfp4_fused_gate_up_rows;
+        stats.mxfp4_reused_input_rows += metrics.mxfp4_reused_input_rows;
         for (const ExpertRoute& route : active.batch.routes)
         {
             if (route.rank >= maximum_expert_route_ranks)
                 continue;
-            ++statistics.expert_route_rank_demands[route.rank];
-            statistics.expert_route_rank_demand_queue_time_microseconds[route.rank] += metrics.cache_wait_time_microseconds;
+            ++stats.expert_route_rank_demands[route.rank];
+            stats.expert_route_rank_demand_queue_time_microseconds[route.rank] += metrics.cache_wait_time_microseconds;
         }
-        ++statistics.expert_batches;
+        ++stats.expert_batches;
     }
     layer_state.experts_executed = true;
     return {};
 }
 
-bool initialize_backend_aggregated_output(ExpertScratch& scratch,
-                                          size_t rows,
-                                          uint32_t columns,
-                                          ActivationBuffer& output)
+bool init_moe_output(ExpertScratch& scratch,
+                     size_t rows,
+                     uint32_t columns,
+                     ActivationBuffer& output)
 {
     if (!scratch.backend_aggregated_output_valid
         || scratch.backend_aggregated_output.rows() != rows

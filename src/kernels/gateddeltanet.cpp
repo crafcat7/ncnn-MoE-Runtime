@@ -6,6 +6,7 @@
 #include "vector.h"
 #include "statecache.h"
 #include "backends/ncnn/linear.h"
+#include "graph/compiledoperator.h"
 #include "ncnn/moe/option.h"
 
 #include <algorithm>
@@ -251,15 +252,14 @@ static void forward_gated_delta_recurrence(const WeightStore& weights,
                  key_column < plan.head_dimension;
                  ++key_column)
             {
-                float_scale_inplace_and_scaled_add_and_accumulate(recurrent
-                                                                      + static_cast<size_t>(key_column)
-                                                                            * plan.value_head_dimension,
-                                                                  1.0f,
-                                                                  delta_values,
-                                                                  key[key_column],
-                                                                  head_output,
-                                                                  query[key_column],
-                                                                  plan.value_head_dimension);
+                float_scaled_add_and_accumulate(recurrent
+                                                    + static_cast<size_t>(key_column)
+                                                          * plan.value_head_dimension,
+                                                delta_values,
+                                                key[key_column],
+                                                head_output,
+                                                query[key_column],
+                                                plan.value_head_dimension);
             }
             float_scale_inplace(head_output,
                                 query_scale,
@@ -352,11 +352,11 @@ Result<void> forward_gated_delta(const WeightStore& weights,
         {
             if (plan.pre_attention_norm_weight != invalid_tensor_handle)
             {
-                rms_norm_batch_into(hidden,
-                                    weights.at(plan.pre_attention_norm_weight),
-                                    plan.norm_epsilon,
-                                    scratch.normalized,
-                                    plan.norm_weight_offset);
+                forward_rms_norm(hidden,
+                                 weights.at(plan.pre_attention_norm_weight),
+                                 plan.norm_epsilon,
+                                 scratch.normalized,
+                                 plan.norm_weight_offset);
                 normalized = &scratch.normalized;
             }
             normalized_ready = true;
@@ -422,11 +422,11 @@ Result<void> forward_gated_delta(const WeightStore& weights,
     {
         if (plan.pre_attention_norm_weight != invalid_tensor_handle)
         {
-            rms_norm_batch_into(hidden,
-                                weights.at(plan.pre_attention_norm_weight),
-                                plan.norm_epsilon,
-                                scratch.normalized,
-                                plan.norm_weight_offset);
+            forward_rms_norm(hidden,
+                             weights.at(plan.pre_attention_norm_weight),
+                             plan.norm_epsilon,
+                             scratch.normalized,
+                             plan.norm_weight_offset);
             normalized = &scratch.normalized;
         }
         normalized_ready = true;
@@ -453,26 +453,26 @@ Result<void> forward_gated_delta(const WeightStore& weights,
     }
     if (!fused_input)
     {
-        linear_batch_into(weights.at(plan.delta_qkv_weight),
-                          *normalized,
-                          scratch.qkv,
-                          optimization_flags,
-                          operators.find_weight(plan.delta_qkv_weight));
-        linear_batch_into(weights.at(plan.delta_z_weight),
-                          *normalized,
-                          scratch.z,
-                          optimization_flags,
-                          operators.find_weight(plan.delta_z_weight));
-        linear_batch_into(weights.at(plan.delta_beta_weight),
-                          *normalized,
-                          scratch.beta,
-                          optimization_flags,
-                          operators.find_weight(plan.delta_beta_weight));
-        linear_batch_into(weights.at(plan.delta_alpha_weight),
-                          *normalized,
-                          scratch.alpha,
-                          optimization_flags,
-                          operators.find_weight(plan.delta_alpha_weight));
+        forward_linear(weights.at(plan.delta_qkv_weight),
+                       *normalized,
+                       scratch.qkv,
+                       optimization_flags,
+                       operators.find_weight(plan.delta_qkv_weight));
+        forward_linear(weights.at(plan.delta_z_weight),
+                       *normalized,
+                       scratch.z,
+                       optimization_flags,
+                       operators.find_weight(plan.delta_z_weight));
+        forward_linear(weights.at(plan.delta_beta_weight),
+                       *normalized,
+                       scratch.beta,
+                       optimization_flags,
+                       operators.find_weight(plan.delta_beta_weight));
+        forward_linear(weights.at(plan.delta_alpha_weight),
+                       *normalized,
+                       scratch.alpha,
+                       optimization_flags,
+                       operators.find_weight(plan.delta_alpha_weight));
     }
     scratch.recurrent_output.reset(hidden.rows(),
                                    value_size,
@@ -506,11 +506,11 @@ Result<void> forward_gated_delta(const WeightStore& weights,
     ActivationBuffer& projected = (&output == &hidden || &output == &scratch.recurrent_output)
                                       ? scratch.projected
                                       : output;
-    linear_batch_into(weights.at(plan.output_weight),
-                      scratch.recurrent_output,
-                      projected,
-                      optimization_flags,
-                      operators.find_weight(plan.output_weight));
+    forward_linear(weights.at(plan.output_weight),
+                   scratch.recurrent_output,
+                   projected,
+                   optimization_flags,
+                   operators.find_weight(plan.output_weight));
     if (!has_flag(plan.flags, AttentionBlockExternalResidual))
         add_batch_inplace(projected, hidden);
     if (&projected != &output)
@@ -566,11 +566,11 @@ bool forward_gated_delta_batch(const WeightStore& weights,
         const ActivationBuffer* normalized = entry.hidden;
         if (plan.pre_attention_norm_weight != invalid_tensor_handle)
         {
-            rms_norm_batch_into(*entry.hidden,
-                                weights.at(plan.pre_attention_norm_weight),
-                                plan.norm_epsilon,
-                                entry.scratch->normalized,
-                                plan.norm_weight_offset);
+            forward_rms_norm(*entry.hidden,
+                             weights.at(plan.pre_attention_norm_weight),
+                             plan.norm_epsilon,
+                             entry.scratch->normalized,
+                             plan.norm_weight_offset);
             normalized = &entry.scratch->normalized;
         }
         device_entries.push_back({normalized,

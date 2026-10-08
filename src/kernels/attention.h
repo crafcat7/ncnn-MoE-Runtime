@@ -49,9 +49,16 @@ struct AttentionScratch
     ActivationBuffer latent_compressor_scores;
     ActivationBuffer latent_index_compressor_values;
     ActivationBuffer latent_index_compressor_scores;
+    ActivationBuffer latent_token_input;
+    ActivationBuffer latent_token_rank;
+    ActivationBuffer latent_index_query;
+    ActivationBuffer latent_index_projected_weights;
     std::vector<float> key_cache;
     std::vector<float> value_cache;
     std::vector<float> logits;
+    std::vector<std::pair<float, uint32_t>> index_scores;
+    std::vector<float> latent_compressor_pooled;
+    std::vector<float> latent_compressor_exponentials;
     std::vector<size_t> qsa_selected_offsets;
     std::vector<uint32_t> qsa_selected_indices;
     std::vector<float> flash_partial_max;

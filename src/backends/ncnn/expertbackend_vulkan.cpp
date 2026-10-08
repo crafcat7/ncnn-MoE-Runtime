@@ -843,11 +843,6 @@ ExpertBackendStatistics VulkanExpertBackend::statistics() const
     return result;
 }
 
-uint64_t VulkanExpertBackend::capacity() const noexcept
-{
-    return cache_size;
-}
-
 VulkanExpertBackend::Submission::Submission(std::shared_ptr<WorkItem> _work)
     : work(std::move(_work))
 {

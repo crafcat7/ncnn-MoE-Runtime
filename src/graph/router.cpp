@@ -11,13 +11,6 @@
 namespace ncnn {
 namespace moe {
 
-struct RouteCandidate
-{
-    uint32_t expert_id = 0;
-    float score = 0.0f;
-    uint32_t rank = 0;
-};
-
 static bool route_precedes(const RouteCandidate& left, const RouteCandidate& right)
 {
     return left.score > right.score || (left.score == right.score && left.expert_id < right.expert_id);
@@ -78,10 +71,10 @@ static void select_topk_routes(const float* scores, std::span<const float> selec
     }
 }
 
-static Result<void> dispatch_experts_general_into(std::span<const float> router_logits,
-                                                  uint32_t token_count,
-                                                  const ExpertDispatchOptions& options,
-                                                  ExpertDispatchPlan& result)
+static Result<void> dispatch_experts_general(std::span<const float> router_logits,
+                                             uint32_t token_count,
+                                             const ExpertDispatchOptions& options,
+                                             ExpertDispatchPlan& result)
 {
     if (token_count == 0)
         return Error{ErrorCode::InvalidArgument, "expert dispatch requires at least one token"};
@@ -108,10 +101,10 @@ static Result<void> dispatch_experts_general_into(std::span<const float> router_
     }
 
     const bool renormalize = options.normalization == RouterNormalization::SelectedExperts;
-    std::vector<float> scores;
+    std::vector<float>& scores = result.scores;
     scores.reserve(options.expert_count);
-    std::vector<RouteCandidate> selected;
-    selected.reserve(options.top_k);
+    std::vector<RouteCandidate>& selected = result.selected;
+    selected.reserve(static_cast<size_t>(options.top_k) + 1);
 
     // Stage by Expert id so a late routing error leaves the published plan intact.
     if (result.route_scratch.size() < options.expert_count)
@@ -180,16 +173,16 @@ static Result<void> dispatch_experts_general_into(std::span<const float> router_
     return {};
 }
 
-Result<void> dispatch_experts(std::span<const float> router_logits,
-                              uint32_t token_count,
-                              const ExpertDispatchOptions& options,
-                              ExpertDispatchPlan& result)
+Result<void> forward_router(std::span<const float> router_logits,
+                            uint32_t token_count,
+                            const ExpertDispatchOptions& options,
+                            ExpertDispatchPlan& result)
 {
     static constexpr uint32_t stack_top_k = 16;
     if (token_count != 1
         || options.top_k > stack_top_k)
     {
-        return dispatch_experts_general_into(router_logits, token_count, options, result);
+        return dispatch_experts_general(router_logits, token_count, options, result);
     }
     if (options.expert_count == 0 || options.top_k == 0 || options.top_k > options.expert_count)
     {
@@ -245,7 +238,7 @@ Result<void> dispatch_experts(std::span<const float> router_logits,
             {
                 if (options.explicit_expert_ids[previous] == expert_id)
                 {
-                    return dispatch_experts_general_into(router_logits, token_count, options, result);
+                    return dispatch_experts_general(router_logits, token_count, options, result);
                 }
             }
             selected[selected_count++] = {
@@ -280,12 +273,18 @@ Result<void> dispatch_experts(std::span<const float> router_logits,
         }
     }
 
+    if (options.explicit_expert_ids.empty() && !options.selection_bias.empty())
+    {
+        for (uint32_t index = 0; index < selected_count; ++index)
+            selected[index].score = score_for_expert(selected[index].expert_id);
+    }
+
     const bool renormalize = options.normalization == RouterNormalization::SelectedExperts;
     float denominator = 0.0f;
     if (renormalize)
     {
         for (uint32_t index = 0; index < selected_count; ++index)
-            denominator += score_for_expert(selected[index].expert_id);
+            denominator += selected[index].score;
         if (denominator <= 0.0f)
             return Error{ErrorCode::InvalidModel, "selected router weights have a non-positive sum"};
     }
@@ -322,7 +321,7 @@ Result<void> dispatch_experts(std::span<const float> router_logits,
         batch.routes.front() = {
             0,
             selected[index].rank,
-            (renormalize ? score_for_expert(selected[index].expert_id) / denominator : score_for_expert(selected[index].expert_id))
+            (renormalize ? selected[index].score / denominator : selected[index].score)
                 * options.routed_scaling_factor,
         };
     }

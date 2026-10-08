@@ -43,32 +43,32 @@ ExpertVictimExecutionMetadata victim_metadata(const CompiledModel& model,
                                               size_t token_count);
 
 // Transfer dispatched routes into reusable execution slots and record demand.
-void prepare_moe_experts(const MoeBlockPlan& moe,
-                         LayerState& layer_state,
-                         SessionStatistics& statistics);
+void prepare_experts(const MoeBlockPlan& moe,
+                     LayerState& layer_state,
+                     SessionStatistics& stats);
 
 // Submit exact reads without waiting or acquiring compute-time leases.
-[[nodiscard]] Result<void> request_moe_experts(const CompiledModel& model,
-                                               const MoeBlockPlan& moe,
-                                               const LayerState& layer_state,
-                                               ExpertScratch& scratch,
-                                               uint32_t residency_group,
-                                               SessionStatistics& statistics);
+[[nodiscard]] Result<void> request_experts(const CompiledModel& model,
+                                           const MoeBlockPlan& moe,
+                                           const LayerState& layer_state,
+                                           ExpertScratch& scratch,
+                                           uint32_t residency_group,
+                                           uint64_t& cache_time);
 
 [[nodiscard]] Result<void> forward_moe(const CompiledModel& model,
                                        const MoeBlockPlan& moe,
                                        LayerState& layer_state,
-                                       SessionStatistics& statistics,
+                                       SessionStatistics& stats,
                                        ExpertScratch& scratch,
                                        uint32_t residency_group,
                                        ExecutionBackend backend,
                                        bool prefetch);
 
 // Consume a committed aggregate, or initialize a zeroed CPU accumulator.
-bool initialize_backend_aggregated_output(ExpertScratch& scratch,
-                                          size_t rows,
-                                          uint32_t columns,
-                                          ActivationBuffer& output);
+bool init_moe_output(ExpertScratch& scratch,
+                     size_t rows,
+                     uint32_t columns,
+                     ActivationBuffer& output);
 
 } // namespace moe
 } // namespace ncnn

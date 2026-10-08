@@ -5,6 +5,7 @@
 #include "graph/compiler.h"
 #include "kernels/mxfp4.h"
 #include "models/modeladapter.h"
+#include "models/tokenizer.h"
 #include "storage/expertcache.h"
 #include "storage/expertcache_victim.h"
 #include "graph/memoryplan.h"
@@ -740,6 +741,10 @@ Result<void> ModelLoader::load(const std::filesystem::path& model_path)
     ret = configure_resident_qnk_backend();
     if (!ret)
         return ret.error();
+
+    auto tokenizer = std::make_shared<Tokenizer>();
+    if (tokenizer->load(package.root.string(), model.descriptor.vocabulary_size))
+        model.tokenizer = std::move(tokenizer);
 
     return {};
 }

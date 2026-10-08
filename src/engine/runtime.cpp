@@ -8,6 +8,7 @@
 #include "models/modeladapter_deepseekv4.h"
 #include "models/modeladapter_qwen3_5.h"
 #include "models/modeladapter_qwen4exp.h"
+#include "models/tokenizer.h"
 #include "kernels/mxfp4.h"
 #include "kernels/float8.h"
 #include "kernels/ops.h"
@@ -15,6 +16,7 @@
 #include "backends/ncnn/vulkan.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -48,6 +50,47 @@ uint32_t Model::vulkan_device_index() const noexcept
 const std::vector<uint32_t>& Model::vulkan_device_indices() const noexcept
 {
     return compiled->opt.vulkan_device_indices;
+}
+
+Result<std::vector<int32_t>> Model::encode(std::string_view messages, bool enable_thinking) const
+{
+    if (!compiled->tokenizer)
+        return Error{ErrorCode::UnsupportedModel, "native text requires ICU 76+ and supported tokenizer assets in the model directory"};
+    try
+    {
+        return compiled->tokenizer->apply_chat(messages, enable_thinking);
+    }
+    catch (const std::invalid_argument& error)
+    {
+        return Error{ErrorCode::InvalidArgument, error.what()};
+    }
+    catch (const std::exception& error)
+    {
+        return Error{ErrorCode::InternalError, error.what()};
+    }
+}
+
+Result<std::string> Model::decode(int32_t token_id, std::string& pending, bool final) const
+{
+    if (!compiled->tokenizer)
+        return Error{ErrorCode::UnsupportedModel, "native text requires ICU 76+ and supported tokenizer assets in the model directory"};
+    if (token_id < -1 || (token_id == -1 && !final)
+        || (token_id >= 0 && static_cast<uint32_t>(token_id) >= compiled->descriptor.vocabulary_size))
+        return Error{ErrorCode::InvalidArgument, "token ID is outside the model vocabulary"};
+    try
+    {
+        return compiled->tokenizer->decode(token_id, pending, final);
+    }
+    catch (const std::exception& error)
+    {
+        return Error{ErrorCode::InternalError, error.what()};
+    }
+}
+
+const std::vector<int32_t>& Model::stop_tokens() const noexcept
+{
+    static const std::vector<int32_t> empty;
+    return compiled->tokenizer ? compiled->tokenizer->stop_tokens() : empty;
 }
 
 const CompiledModel& model_compiled(const Model& model) noexcept

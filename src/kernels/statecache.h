@@ -1,7 +1,6 @@
 #ifndef NCNN_MOE_STATECACHE_H
 #define NCNN_MOE_STATECACHE_H
 
-#include "activationbuffer.h"
 #include "ncnn/moe/result.h"
 #include "ncnn/moe/types.h"
 
@@ -101,12 +100,6 @@ struct LayerCacheTransaction
 
 struct LayerCache
 {
-    struct LatentScoredIndex
-    {
-        uint32_t index = 0;
-        float score = 0.0f;
-    };
-
     // KV cache.
     std::vector<float> keys;
     std::vector<float> values;
@@ -141,16 +134,6 @@ struct LayerCache
     std::vector<float> index_compressor_pending_scores;
     std::vector<float> index_compressor_previous_values;
     std::vector<float> index_compressor_previous_scores;
-    std::vector<float> compressor_pooled;
-    std::vector<float> compressor_exponentials;
-    ActivationBuffer compressor_values;
-    ActivationBuffer compressor_scores;
-    ActivationBuffer latent_token_input;
-    ActivationBuffer latent_token_rank;
-    ActivationBuffer latent_index_query;
-    ActivationBuffer latent_index_projected_weights;
-    std::vector<float> latent_index_scores;
-    std::vector<LatentScoredIndex> latent_scored_indices;
     std::vector<uint32_t> latent_selected_indices;
     std::vector<float> latent_attention_logits;
     std::vector<float> latent_rope_cosines;
@@ -165,7 +148,10 @@ struct LayerCache
     uint32_t router_prefetch_width = 0;
     uint64_t router_decisions = 0;
     uint64_t router_last_adjustment = 0;
-    std::vector<uint16_t> qsa_index_keys;
+    // Full QSA blocks keep their normalized, RoPE'd representatives; only an
+    // incomplete final block retains raw BF16 keys.
+    std::vector<float> qsa_block_keys;
+    std::vector<uint16_t> qsa_index_key_tail;
     std::vector<int32_t> ple_token_history;
     std::vector<float> ple_convolution_state;
     // Physical row of the oldest token in ple_convolution_state.
@@ -180,18 +166,14 @@ struct LayerCache
                                      + compressor_previous_values.capacity() + compressor_previous_scores.capacity()
                                      + index_compressor_pending_values.capacity() + index_compressor_pending_scores.capacity()
                                      + index_compressor_previous_values.capacity() + index_compressor_previous_scores.capacity()
-                                     + compressor_pooled.capacity() + compressor_exponentials.capacity()
-                                     + latent_index_scores.capacity() + latent_attention_logits.capacity()
+                                     + latent_attention_logits.capacity()
                                      + latent_rope_cosines.capacity() + latent_rope_sines.capacity())
                    * sizeof(float)
-               + compressor_values.allocated_bytes() + compressor_scores.allocated_bytes()
-               + latent_token_input.allocated_bytes() + latent_token_rank.allocated_bytes()
-               + latent_index_query.allocated_bytes() + latent_index_projected_weights.allocated_bytes()
                + static_cast<uint64_t>(bfloat16_keys.capacity() + bfloat16_values.capacity()) * sizeof(uint16_t)
-               + static_cast<uint64_t>(latent_scored_indices.capacity()) * sizeof(LatentScoredIndex)
                + static_cast<uint64_t>(latent_selected_indices.capacity()) * sizeof(uint32_t)
                + static_cast<uint64_t>(predicted_expert_ids.capacity()) * sizeof(uint32_t)
-               + static_cast<uint64_t>(qsa_index_keys.capacity()) * sizeof(uint16_t)
+               + static_cast<uint64_t>(qsa_block_keys.capacity()) * sizeof(float)
+               + static_cast<uint64_t>(qsa_index_key_tail.capacity()) * sizeof(uint16_t)
                + static_cast<uint64_t>(ple_token_history.capacity()) * sizeof(int32_t)
                + static_cast<uint64_t>(ple_convolution_state.capacity()) * sizeof(float)
                + transaction.allocated_bytes()
@@ -200,7 +182,8 @@ struct LayerCache
 
     [[nodiscard]] uint64_t logical_bytes() const noexcept
     {
-        const uint64_t auxiliary_size = static_cast<uint64_t>(qsa_index_keys.size()) * sizeof(uint16_t)
+        const uint64_t auxiliary_size = static_cast<uint64_t>(qsa_block_keys.size()) * sizeof(float)
+                                        + static_cast<uint64_t>(qsa_index_key_tail.size()) * sizeof(uint16_t)
                                         + static_cast<uint64_t>(ple_token_history.size()) * sizeof(int32_t)
                                         + static_cast<uint64_t>(ple_convolution_state.size()) * sizeof(float);
         if (latent_cache)

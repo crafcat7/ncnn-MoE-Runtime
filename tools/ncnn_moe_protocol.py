@@ -132,7 +132,7 @@ class WorkerClient:
         prompt_tokens: list[int] | None = None,
         *,
         messages: list[dict[str, str]] | None = None,
-        thinking: bool | None = None,
+        enable_thinking: bool | None = None,
         context_tokens: int | None = None,
         request_id: str = "generate",
         max_new_tokens: int = 1024,
@@ -165,14 +165,14 @@ class WorkerClient:
             "metrics_enabled": metrics_enabled,
             "metrics_interval_ms": metrics_interval_ms,
         }
-        if stop_tokens is not None:
-            payload["stop_tokens"] = stop_tokens
         if messages is None:
             payload["prompt_tokens"] = prompt_tokens
+            if stop_tokens is not None:
+                payload["stop_tokens"] = stop_tokens
         else:
             payload["messages"] = messages
-            if thinking is not None:
-                payload["enable_thinking"] = thinking
+            if enable_thinking is not None:
+                payload["enable_thinking"] = enable_thinking
             if context_tokens is not None:
                 payload["context_tokens"] = context_tokens
         self._send(payload)
@@ -203,7 +203,10 @@ class WorkerClient:
                     event = self._read_event()
                     self._raise_for_error(event)
                     if on_event is not None and callback_error is None:
-                        on_event(event)
+                        try:
+                            on_event(event)
+                        except Exception as callback_exception:
+                            callback_error = callback_exception
                     if event.get("event") == "token":
                         tokens.append(int(event["token_id"]))
                     elif event.get("event") == "done":
@@ -223,7 +226,7 @@ class WorkerClient:
         replay_tokens: list[int] | None = None,
         *,
         messages: list[dict[str, str]] | None = None,
-        thinking: bool | None = None,
+        enable_thinking: bool | None = None,
         context_tokens: int | None = None,
     ) -> dict[str, Any]:
         if (replay_tokens is None) == (messages is None):
@@ -233,8 +236,8 @@ class WorkerClient:
             payload["replay_tokens"] = replay_tokens
         else:
             payload["messages"] = messages
-            if thinking is not None:
-                payload["enable_thinking"] = thinking
+            if enable_thinking is not None:
+                payload["enable_thinking"] = enable_thinking
             if context_tokens is not None:
                 payload["context_tokens"] = context_tokens
         return self.request(
@@ -247,13 +250,13 @@ class WorkerClient:
         session_id: str,
         *,
         messages: list[dict[str, str]] | None = None,
-        thinking: bool | None = None,
+        enable_thinking: bool | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"op": "stats", "session_id": session_id}
         if messages is not None:
             payload["messages"] = messages
-            if thinking is not None:
-                payload["enable_thinking"] = thinking
+            if enable_thinking is not None:
+                payload["enable_thinking"] = enable_thinking
         return self.request(
             payload, expected="stats"
         )

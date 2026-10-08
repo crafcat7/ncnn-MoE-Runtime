@@ -22,6 +22,9 @@ static_assert(std::is_same_v<
               decltype(std::declval<ModelAdapter&>().map_weights(std::declval<const ModelPackage&>(),
                                                                  std::declval<const MoeModelDescriptor&>())),
               Result<WeightMapping>>);
+static_assert(std::is_same_v<decltype(std::declval<const Model&>().encode(std::string_view{})), Result<std::vector<int32_t>>>);
+static_assert(std::is_same_v<decltype(std::declval<const Model&>().decode(0, std::declval<std::string&>())), Result<std::string>>);
+static_assert(std::is_same_v<decltype(std::declval<const Model&>().stop_tokens()), const std::vector<int32_t>&>);
 
 static int test_public_api()
 {

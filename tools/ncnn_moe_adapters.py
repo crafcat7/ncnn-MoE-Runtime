@@ -1,22 +1,19 @@
-"""Tokenizer and chat-template adapters for the unified ncnn_moe CLI."""
+"""Model identity and text presentation for the native ncnn-MoE worker."""
 
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
-import os
-import sys
-from collections.abc import Mapping
 from dataclasses import dataclass
-from numbers import Integral
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 
+NATIVE_TEXT_VERSION = "ncnn-moe-text-v2"
+
+
 class AdapterError(RuntimeError):
-    """The model is unsupported or its official text components are missing."""
+    """The model or native worker cannot provide the required text interface."""
 
 
 @dataclass(frozen=True)
@@ -27,16 +24,6 @@ class Completion:
     @property
     def text(self) -> str:
         return self.answer or self.reasoning
-
-
-def _split_thinking(text: str, thinking: bool) -> Completion:
-    marker = "</think>"
-    if not thinking:
-        return Completion("", text.strip())
-    if marker in text:
-        reasoning, answer = text.split(marker, 1)
-        return Completion(reasoning.strip(), answer.lstrip("\r\n"))
-    return Completion(text.strip(), "")
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -51,126 +38,68 @@ def _load_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _required(model: Path, *names: str) -> None:
-    for name in names:
-        if not (model / name).is_file():
-            raise AdapterError(f"{name} is missing from: {model}")
+def _split_thinking(text: str, thinking: bool) -> Completion:
+    """Split the first generated Qwen thinking boundary, if present."""
+    if not thinking:
+        return Completion("", text.strip())
+    marker = "</think>"
+    if marker in text:
+        reasoning, answer = text.split(marker, 1)
+        return Completion(reasoning.strip(), answer.lstrip("\r\n"))
+    return Completion(text.strip(), "")
 
 
-def _load_module(path: Path, name: str) -> ModuleType:
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise AdapterError(f"cannot load Python module: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception as error:  # pragma: no cover - depends on model package
-        raise AdapterError(f"cannot import {path}: {error}") from error
-    return module
-
-
-def _load_transformers_tokenizer(model: Path) -> Any:
-    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as error:  # pragma: no cover - dependency availability varies
-        raise AdapterError(
-            "transformers is required for this model; install it with "
-            "'python -m pip install -U transformers'"
-        ) from error
-    try:
-        return AutoTokenizer.from_pretrained(str(model), local_files_only=True)
-    except Exception as error:  # pragma: no cover - tokenizer implementation varies
-        raise AdapterError(f"cannot load the official tokenizer: {error}") from error
-
-
-def _normalize_token_ids(value: Any) -> list[int]:
-    """Normalize tokenizer output into the native worker's flat token list."""
-    if isinstance(value, Mapping):
-        value = value.get("input_ids")
-
-    tolist = getattr(value, "tolist", None)
-    if callable(tolist):
-        value = tolist()
-
-    # Tokenizers may return one batch dimension when tensors or a batch
-    # encoding is requested. The native protocol accepts one prompt only.
-    while isinstance(value, (list, tuple)) and len(value) == 1:
-        first = value[0]
-        first_tolist = getattr(first, "tolist", None)
-        if callable(first_tolist):
-            first = first_tolist()
-        if not isinstance(first, (list, tuple)):
-            break
-        value = first
-
-    if not isinstance(value, (list, tuple)) or not value:
-        raise AdapterError("the Qwen chat template did not return token IDs")
-
-    if all(type(token) is int for token in value):
-        return list(value)
-
-    tokens: list[int] = []
-    for token in value:
-        item = getattr(token, "item", None)
-        if callable(item):
-            token = item()
-        if isinstance(token, bool) or not isinstance(token, Integral):
-            raise AdapterError("the Qwen chat template did not return token IDs")
-        tokens.append(int(token))
-    return tokens
+def _decode_deepseek(text: str, thinking: bool) -> Completion:
+    if not thinking:
+        return Completion("", text.strip())
+    split = _split_thinking(text, thinking)
+    return Completion(split.reasoning.strip(), split.answer.strip())
 
 
 class ModelAdapter:
-    name = "generic"
+    """A small model profile; tokenization and decoding stay in the worker."""
 
-    def __init__(self, model: Path, *, thinking: bool = True, thinking_mode: str = "thinking") -> None:
-        self.model = model.resolve()
+    def __init__(
+        self,
+        model: Path,
+        *,
+        thinking: bool = True,
+        native_stop_tokens: list[int] | None = None,
+    ) -> None:
+        self.model = Path(model).resolve()
         self.config = _load_json(self.model / "config.json")
-        self.thinking = thinking
-        self.thinking_mode = thinking_mode
-        self.model_type = str(self.config.get("model_type", "unknown"))
-        self.model_fingerprint = self._fingerprint()
+        self.model_type = str(self.config.get("model_type", "unknown")).lower()
+        self.name = self._model_name(self.model_type)
+        self.thinking = bool(thinking)
+        self._stop_tokens = self._validate_stop_tokens(native_stop_tokens)
+        self.model_fingerprint, self.legacy_model_fingerprints = self._fingerprints()
 
-    @classmethod
-    def detect(cls, model: Path, **options: Any) -> "ModelAdapter":
-        config = _load_json(model.resolve() / "config.json")
-        model_type = str(config.get("model_type", "")).lower()
+    @staticmethod
+    def _model_name(model_type: str) -> str:
         if model_type in {"gpt_oss", "gpt-oss", "gpt_oss_moe"}:
-            return GptOssAdapter(model, **options)
+            return "gpt-oss"
         if model_type in {"deepseek_v4", "deepseek-v4", "deepseek_v4_flash"}:
-            return DeepSeekAdapter(model, **options)
-        if model_type in {
-            "qwen3_5_moe",
-            "qwen3_6",
-            "qwen3.6",
-            "qwen3_5",
-            "qwen4_exp",
-            "qwen4_exp_text",
-        }:
-            return QwenAdapter(model, **options)
+            return "deepseek-v4"
+        if model_type in {"qwen4_exp", "qwen4_exp_text"}:
+            return "qwen3.8"
+        if model_type in {"qwen3_5_moe", "qwen3_6", "qwen3.6", "qwen3_5"}:
+            return "qwen3.6"
         raise AdapterError(f"unsupported model_type: {model_type or '<missing>'}")
 
-    def _fingerprint(self) -> str:
-        digest = hashlib.sha256()
-        digest.update((self.model_type + "\0").encode("utf-8"))
-        digest.update((self.model / "config.json").read_bytes())
-        for name in ("tokenizer.json", "chat_template.jinja", "encoding/encoding_dsv4.py"):
-            path = self.model / name
-            if path.is_file():
-                digest.update(name.encode("utf-8"))
-                digest.update(str(path.stat().st_size).encode("ascii"))
-        for path in sorted(self.model.rglob("*.safetensors")):
-            relative = path.relative_to(self.model).as_posix()
-            digest.update(relative.encode("utf-8"))
-            digest.update(str(path.stat().st_size).encode("ascii"))
-            with path.open("rb") as stream:
-                digest.update(stream.read(4096))
-                if path.stat().st_size > 4096:
-                    stream.seek(-4096, 2)
-                    digest.update(stream.read(4096))
-        return digest.hexdigest()[:20]
+    @staticmethod
+    def _validate_stop_tokens(value: list[int] | None) -> list[int]:
+        if value is None:
+            return []
+        if not isinstance(value, list) or any(
+            isinstance(token, bool) or not isinstance(token, int) or token < 0
+            for token in value
+        ):
+            raise AdapterError("worker native stop-token metadata is invalid")
+        return list(dict.fromkeys(value))
+
+    @property
+    def stop_tokens(self) -> list[int]:
+        return list(self._stop_tokens)
 
     @property
     def context_limit(self) -> int | None:
@@ -190,28 +119,94 @@ class ModelAdapter:
                     return value
         return None
 
-    @property
-    def stop_tokens(self) -> list[int]:
-        return []
+    def _fingerprints(self) -> tuple[str, tuple[str, ...]]:
+        """Hash current and pre-v2 identities while scanning model weights once."""
+        legacy = hashlib.sha256()
+        legacy.update((self.model_type + "\0").encode("utf-8"))
+        config_path = self.model / "config.json"
+        if config_path.is_file():
+            legacy.update(config_path.read_bytes())
 
-    def encode_messages(self, messages: list[dict[str, str]]) -> list[int]:
-        raise NotImplementedError
+        current = hashlib.sha256()
+        current.update(
+            (NATIVE_TEXT_VERSION + "\0" + self.name + "\0" + self.model_type + "\0").encode("utf-8")
+        )
+        model_files = (
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "generation_config.json",
+        )
+        for name in model_files:
+            path = self.model / name
+            current.update(name.encode("utf-8") + b"\0")
+            if not path.is_file():
+                current.update(b"\0")
+                continue
+            current.update(b"\1")
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    current.update(block)
 
-    def decode_text(self, tokens: list[int]) -> str:
-        raise NotImplementedError
+        for name in ("tokenizer.json", "chat_template.jinja", "encoding/encoding_dsv4.py"):
+            path = self.model / name
+            if path.is_file():
+                legacy.update(name.encode("utf-8"))
+                legacy.update(str(path.stat().st_size).encode("ascii"))
 
-    def decode_completion(self, tokens: list[int]) -> Completion:
-        return _split_thinking(self.decode_text(tokens), self.thinking)
+        for path in sorted(self.model.rglob("*.safetensors")):
+            relative = path.relative_to(self.model).as_posix()
+            size = path.stat().st_size
+            legacy.update(relative.encode("utf-8"))
+            legacy.update(str(size).encode("ascii"))
+            current.update(relative.encode("utf-8") + b"\0" + str(size).encode("ascii") + b"\0")
+            with path.open("rb") as stream:
+                head = stream.read(4096)
+                tail = b""
+                if size > 4096:
+                    stream.seek(-4096, 2)
+                    tail = stream.read(4096)
+            legacy.update(head)
+            if tail:
+                legacy.update(tail)
+            current.update(head)
+            if tail:
+                current.update(tail)
 
-    def decode_completion_text(self, text: str) -> Completion:
-        return _split_thinking(text, self.thinking)
+        legacy_base = legacy.hexdigest()[:20]
+        prior_fingerprints = [legacy_base]
+        if self.name.startswith("qwen"):
+            old_qwen = hashlib.sha256()
+            old_qwen.update(legacy_base.encode("ascii"))
+            old_qwen.update(b"ncnn-moe-tokenizer-json-v1\0")
+            if self.model_type == "qwen3_5_moe":
+                old_qwen.update(b"ncnn-moe-qwen3.6-nfc9-regex16-v1\0")
+            for name in model_files:
+                path = self.model / name
+                old_qwen.update(name.encode("utf-8") + b"\0")
+                if not path.is_file():
+                    old_qwen.update(b"\0")
+                    continue
+                old_qwen.update(b"\1")
+                with path.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        old_qwen.update(block)
+            prior_fingerprints.insert(0, old_qwen.hexdigest()[:20])
+        return current.hexdigest()[:20], tuple(prior_fingerprints)
 
     def validate(self) -> None:
-        _required(self.model, "config.json")
+        if not (self.model / "config.json").is_file():
+            raise AdapterError(f"config.json is missing from: {self.model}")
 
-    def stream_visible(self, tokens: list[int], *, final_only: bool = False) -> str:
-        completion = self.decode_completion(tokens)
-        return self.visible_completion(completion, final_only=final_only)
+    def decode_completion_text(self, text: str) -> Completion:
+        if self.name == "gpt-oss":
+            raise AdapterError(
+                "GPT-OSS completion decoding requires native token events to preserve Harmony boundaries"
+            )
+        if self.name == "deepseek-v4":
+            return _decode_deepseek(text, self.thinking)
+        return _split_thinking(text, self.thinking)
 
     @staticmethod
     def visible_completion(completion: Completion, *, final_only: bool = False) -> str:
@@ -224,252 +219,7 @@ class ModelAdapter:
         return f"[reasoning]\n{completion.reasoning}" if completion.reasoning else ""
 
 
-class GptOssAdapter(ModelAdapter):
-    name = "gpt-oss"
-
-    def __init__(self, model: Path, **options: Any) -> None:
-        super().__init__(model, **options)
-        _required(self.model, "config.json")
-        try:
-            from openai_harmony import (
-                Conversation,
-                HarmonyEncodingName,
-                Message,
-                Role,
-                SystemContent,
-                load_harmony_encoding,
-            )
-        except ImportError as error:  # pragma: no cover - dependency availability varies
-            raise AdapterError(
-                "openai_harmony is required for GPT-OSS; install the official package"
-            ) from error
-        self._Conversation = Conversation
-        self._Message = Message
-        self._Role = Role
-        self._SystemContent = SystemContent
-        self.encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-
-    @property
-    def stop_tokens(self) -> list[int]:
-        return list(self.encoding.stop_tokens_for_assistant_actions())
-
-    def encode_messages(self, messages: list[dict[str, str]]) -> list[int]:
-        converted = []
-        for message in messages:
-            role_name = message.get("role", "user").lower()
-            try:
-                role = getattr(self._Role, role_name.upper())
-            except AttributeError as error:
-                raise AdapterError(f"GPT-OSS does not support message role: {role_name}") from error
-            content = message.get("content", "")
-            if role_name == "system" and not content:
-                content = self._SystemContent.new()
-            converted.append(self._Message.from_role_and_content(role, content))
-        conversation = self._Conversation.from_messages(converted)
-        return list(self.encoding.render_conversation_for_completion(conversation, self._Role.ASSISTANT))
-
-    def decode_text(self, tokens: list[int]) -> str:
-        text = self.encoding.decode(tokens)
-        return text.decode("utf-8", errors="replace") if isinstance(text, bytes) else str(text)
-
-    def decode_completion(self, tokens: list[int]) -> Completion:
-        reasoning: list[str] = []
-        answer: list[str] = []
-        try:
-            messages = self.encoding.parse_messages_from_completion_tokens(
-                tokens, self._Role.ASSISTANT, strict=False
-            )
-            for message in messages:
-                text = "".join(
-                    str(getattr(content, "text", ""))
-                    for content in getattr(message, "content", [])
-                    if getattr(content, "text", None)
-                )
-                if getattr(message, "channel", None) == "analysis":
-                    reasoning.append(text)
-                elif getattr(message, "channel", None) == "final":
-                    answer.append(text)
-        except (AssertionError, ValueError, TypeError):
-            pass
-        if reasoning or answer:
-            return Completion("".join(reasoning).strip(), "".join(answer).strip())
-        return Completion("", self.decode_text(tokens).strip())
-
-
-class DeepSeekAdapter(ModelAdapter):
-    name = "deepseek-v4"
-
-    def __init__(self, model: Path, **options: Any) -> None:
-        super().__init__(model, **options)
-        _required(self.model, "config.json", "tokenizer.json", "encoding/encoding_dsv4.py")
-        self.tokenizer = _load_transformers_tokenizer(self.model)
-        module = _load_module(
-            self.model / "encoding" / "encoding_dsv4.py",
-            f"ncnn_moe_encoding_dsv4_{self.model_fingerprint}",
-        )
-        if not hasattr(module, "encode_messages") or not hasattr(module, "parse_message_from_completion_text"):
-            raise AdapterError("encoding_dsv4.py must export encode_messages and parse_message_from_completion_text")
-        self._encode_messages = module.encode_messages
-        self._parse_message = module.parse_message_from_completion_text
-        if self.tokenizer.eos_token_id != 1:
-            raise AdapterError(f"expected DeepSeek V4 EOS token 1, got {self.tokenizer.eos_token_id}")
-
-    @property
-    def stop_tokens(self) -> list[int]:
-        return [int(self.tokenizer.eos_token_id)]
-
-    def encode_messages(self, messages: list[dict[str, str]]) -> list[int]:
-        text = self._encode_messages(messages, thinking_mode=self.thinking_mode)
-        return list(self.tokenizer.encode(text))
-
-    def decode_text(self, tokens: list[int]) -> str:
-        return str(self.tokenizer.decode(tokens, skip_special_tokens=False))
-
-    def decode_completion(self, tokens: list[int]) -> Completion:
-        text = self.decode_text(tokens)
-        try:
-            message = self._parse_message(text, thinking_mode=self.thinking_mode)
-            return Completion(
-                str(message.get("reasoning_content", "") or "").strip(),
-                str(message.get("content", "") or "").strip(),
-            )
-        except (AssertionError, ValueError, TypeError, KeyError):
-            return _split_thinking(text, self.thinking)
-
-
-class QwenAdapter(ModelAdapter):
-    name = "qwen3.6"
-
-    def _fingerprint(self) -> str:
-        legacy_fingerprint = ModelAdapter._fingerprint(self)
-        self._legacy_model_fingerprint = legacy_fingerprint
-        digest = hashlib.sha256()
-        digest.update(legacy_fingerprint.encode("ascii"))
-        digest.update(b"ncnn-moe-tokenizer-json-v1\0")
-        if self.model_type == "qwen3_5_moe":
-            semantic_version = getattr(
-                self, "native_text_version", "ncnn-moe-qwen3.6-nfc9-regex16-v1"
-            )
-            digest.update(semantic_version.encode("utf-8") + b"\0")
-        for name in (
-            "config.json",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "chat_template.jinja",
-            "generation_config.json",
-        ):
-            path = self.model / name
-            digest.update(name.encode("utf-8") + b"\0")
-            if not path.is_file():
-                digest.update(b"\0")
-                continue
-            digest.update(b"\1")
-            with path.open("rb") as stream:
-                for block in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(block)
-        return digest.hexdigest()[:20]
-
-    def __init__(self, model: Path, **options: Any) -> None:
-        super().__init__(model, **options)
-        _required(self.model, "config.json", "tokenizer.json")
-        if self.model_type in {"qwen4_exp", "qwen4_exp_text"}:
-            self.name = "qwen3.8"
-        os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-        try:
-            from transformers import PreTrainedTokenizerFast
-        except ImportError as error:  # pragma: no cover - dependency availability varies
-            raise AdapterError(
-                "transformers is required for this model; install it with "
-                "'python -m pip install -U transformers'"
-            ) from error
-        try:
-            self.tokenizer = PreTrainedTokenizerFast.from_pretrained(
-                str(self.model), local_files_only=True
-            )
-        except Exception as error:  # pragma: no cover - tokenizer implementation varies
-            raise AdapterError(f"cannot load the serialized Qwen tokenizer: {error}") from error
-        if not callable(getattr(self.tokenizer, "apply_chat_template", None)):
-            raise AdapterError("the official Qwen tokenizer does not provide a chat template")
-        stop_tokens: list[int] = []
-        tokenizer_eos = getattr(self.tokenizer, "eos_token_id", None)
-        if isinstance(tokenizer_eos, Integral):
-            stop_tokens.append(int(tokenizer_eos))
-        generation_path = self.model / "generation_config.json"
-        if generation_path.is_file():
-            generation = _load_json(generation_path)
-            configured_eos = generation.get("eos_token_id")
-            if isinstance(configured_eos, Integral):
-                configured_eos = [configured_eos]
-            if isinstance(configured_eos, list):
-                for token in configured_eos:
-                    if isinstance(token, Integral) and int(token) not in stop_tokens:
-                        stop_tokens.append(int(token))
-        self._stop_tokens = stop_tokens
-
-    @property
-    def stop_tokens(self) -> list[int]:
-        configured = getattr(self, "_stop_tokens", None)
-        if configured is not None:
-            return list(configured)
-        value = getattr(self.tokenizer, "eos_token_id", None)
-        return [] if value is None else [int(value)]
-
-    def encode_messages(self, messages: list[dict[str, str]]) -> list[int]:
-        try:
-            encoded = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                enable_thinking=self.thinking,
-            )
-        except TypeError:
-            encoded = self.tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True
-            )
-        return _normalize_token_ids(encoded)
-
-    def decode_text(self, tokens: list[int]) -> str:
-        text = str(self.tokenizer.decode(tokens, skip_special_tokens=True))
-        if tokens and tokens[-1] in self.stop_tokens:
-            # Qwen may expose an incomplete trailing byte as U+FFFD directly
-            # before its EOS token. It is tokenizer framing, not user text.
-            text = text.rstrip().rstrip("\ufffd").rstrip()
-        return text
-
-
-class NativeQwenAdapter(ModelAdapter):
-    name = "qwen3.6"
-    native_text = True
-
-    def __init__(
-        self,
-        model: Path,
-        *,
-        native_text_version: str,
-        native_stop_tokens: list[int],
-        **options: Any,
-    ) -> None:
-        self.native_text_version = native_text_version
-        if any(isinstance(token, bool) or not isinstance(token, int) or token < 0 for token in native_stop_tokens):
-            raise AdapterError("worker native stop-token metadata is invalid")
-        self._stop_tokens = list(dict.fromkeys(native_stop_tokens))
-        super().__init__(model, **options)
-        _required(self.model, "config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja")
-
-    def _fingerprint(self) -> str:
-        return QwenAdapter._fingerprint(self)
-
-    @property
-    def stop_tokens(self) -> list[int]:
-        return list(self._stop_tokens)
-
-    def decode_native_completion(self, text: str, tokens: list[int]) -> Completion:
-        if tokens and tokens[-1] in self._stop_tokens:
-            text = text.rstrip().rstrip("\ufffd").rstrip()
-        return self.decode_completion_text(text)
-
-
 def create_adapter(model: Path, **options: Any) -> ModelAdapter:
-    adapter = ModelAdapter.detect(model, **options)
+    adapter = ModelAdapter(model, **options)
     adapter.validate()
     return adapter

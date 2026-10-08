@@ -185,8 +185,6 @@ public:
 
     ExpertBackendStatistics statistics() const override;
 
-    uint64_t capacity() const noexcept override;
-
 private:
     enum class ArcList
     {
