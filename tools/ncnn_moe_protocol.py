@@ -20,7 +20,7 @@ EventCallback = Callable[[dict[str, Any]], None]
 
 
 class WorkerClient:
-    """Synchronous JSONL client; generation itself runs asynchronously in C++."""
+    """Strict UTF-8 JSONL client; generation runs asynchronously in C++."""
 
     def __init__(
         self,
@@ -43,7 +43,7 @@ class WorkerClient:
             stderr=None if verbose else subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
-            errors="replace",
+            errors="strict",
             bufsize=1,
         )
         self._closed = False
@@ -65,13 +65,19 @@ class WorkerClient:
     def _send(self, payload: dict[str, Any]) -> None:
         if self._closed or self._process.stdin is None:
             raise WorkerError("worker is closed")
-        self._process.stdin.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        try:
+            self._process.stdin.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except UnicodeEncodeError as error:
+            raise WorkerError("worker request must contain valid UTF-8 text") from error
         self._process.stdin.flush()
 
     def _read_event(self) -> dict[str, Any]:
         if self._process.stdout is None:
             raise WorkerError("worker stdout is unavailable")
-        line = self._process.stdout.readline()
+        try:
+            line = self._process.stdout.readline()
+        except UnicodeDecodeError as error:
+            raise WorkerError("worker emitted invalid UTF-8") from error
         if not line:
             return_code = self._process.poll()
             raise WorkerError(f"worker exited before sending an event (return code {return_code})")

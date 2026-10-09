@@ -14,10 +14,6 @@ if(@NCNN_MOE_WITH_NCNN@)
     find_dependency(ncnn CONFIG)
 endif()
 
-if(@NCNN_MOE_WITH_ICU@)
-    find_dependency(ICU 76 COMPONENTS i18n uc data)
-endif()
-
 include("${CMAKE_CURRENT_LIST_DIR}/ncnn_moeTargets.cmake")
 
 check_required_components(ncnn_moe)

@@ -28,6 +28,7 @@ from ncnn_moe import (  # noqa: E402
     ConversationApp,
     _format_bytes_gb,
     _format_runtime_metrics,
+    configure_standard_streams,
     default_worker_path,
     find_worker,
     load_adapter,
@@ -245,7 +246,7 @@ class AdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="ncnn-moe-native-unavailable-") as directory:
             model = _model(Path(directory), "gpt_oss")
             cases = (
-                (_ready(supported=False), "ICU tokenizer assets"),
+                (_ready(supported=False), "tokenizer assets"),
                 ({"event": "ready", "model": {"native_text_supported": True}}, "version"),
                 (
                     {"event": "ready", "model": {
@@ -339,6 +340,83 @@ class ProtocolTests(unittest.TestCase):
     @staticmethod
     def _failing_callback(_: dict[str, object]) -> None:
         raise RuntimeError("callback failed")
+
+    def test_console_codec_and_redirected_input_are_frontend_owned(self) -> None:
+        text = "中文 café 😀"
+        for tty, explicit_codec in ((True, False), (False, False), (False, True)):
+            with self.subTest(tty=tty, explicit_codec=explicit_codec):
+                encoding = "gbk" if tty or explicit_codec else "utf-8"
+                stdin = io.TextIOWrapper(io.BytesIO("中文\n".encode(encoding)), encoding="gbk")
+                stdout = io.TextIOWrapper(io.BytesIO(), encoding="gbk")
+                stderr = io.TextIOWrapper(io.BytesIO(), encoding="gbk")
+                try:
+                    with (
+                        patch.object(sys, "stdin", stdin),
+                        patch.object(sys, "stdout", stdout),
+                        patch.object(sys, "stderr", stderr),
+                        patch.object(stdin, "isatty", return_value=tty),
+                        patch.object(stdout, "isatty", return_value=tty),
+                        patch.object(stderr, "isatty", return_value=tty),
+                        patch.dict(os.environ, {"PYTHONIOENCODING": "gbk"} if explicit_codec else {}, clear=True),
+                    ):
+                        configure_standard_streams()
+                        self.assertEqual(stdin.readline(), "中文\n")
+                        for stream in (stdout, stderr):
+                            stream.write(text)
+                            stream.flush()
+                            self.assertEqual(stream.buffer.getvalue(), text.encode(encoding, errors="backslashreplace"))
+                finally:
+                    for stream in (stdin, stdout, stderr):
+                        stream.close()
+
+        with io.TextIOWrapper(io.BytesIO(b"\xc4\xe3\xba\xc3"), encoding="gbk") as stdin:
+            with (
+                patch.object(sys, "stdin", stdin),
+                patch.object(sys, "stdout", io.StringIO()),
+                patch.object(sys, "stderr", io.StringIO()),
+                patch.dict(os.environ, {}, clear=True),
+            ):
+                configure_standard_streams()
+                with self.assertRaises(UnicodeDecodeError):
+                    stdin.read()
+
+        with (
+            patch.object(sys, "stdin", io.StringIO()),
+            patch.object(sys, "stdout", io.StringIO()),
+            patch.object(sys, "stderr", io.StringIO()),
+        ):
+            configure_standard_streams()
+
+    def test_worker_protocol_preserves_utf8_and_rejects_invalid_text(self) -> None:
+        text = "中文 café 😀"
+        ready = json.dumps({"event": "ready", "text": text}, ensure_ascii=False) + "\n"
+        sent = io.BytesIO()
+        process = SimpleNamespace(
+            stdin=io.TextIOWrapper(sent, encoding="utf-8", errors="strict"),
+            stdout=io.TextIOWrapper(io.BytesIO(ready.encode("utf-8")), encoding="utf-8", errors="strict"),
+            poll=lambda: 0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("ncnn_moe_protocol.subprocess.Popen", return_value=process) as popen:
+                client = WorkerClient(Path(sys.executable), Path(directory))
+            try:
+                self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
+                self.assertEqual(popen.call_args.kwargs["errors"], "strict")
+                self.assertEqual(client.ready["text"], text)
+                payload = {"op": "generate", "messages": [{"role": "user", "content": text}]}
+                client._send(payload)
+                wire = sent.getvalue()
+                self.assertIn(text.encode("utf-8"), wire)
+                self.assertEqual(json.loads(wire.decode("utf-8")), payload)
+                with self.assertRaisesRegex(WorkerError, "valid UTF-8"):
+                    client._send({"op": "generate", "messages": [{"role": "user", "content": "\ud800"}]})
+                self.assertEqual(sent.getvalue(), wire)
+                process.stdout.close()
+                process.stdout = io.TextIOWrapper(io.BytesIO(b'{"event":"token","text":"\xff"}\n'), encoding="utf-8")
+                with self.assertRaisesRegex(WorkerError, "invalid UTF-8"):
+                    client._read_event()
+            finally:
+                client.close()
 
     def test_callback_failure_drains_done_and_keeps_next_request_synchronized(self) -> None:
         normal = self.QueuedClient(
@@ -503,6 +581,40 @@ class ConversationTests(unittest.TestCase):
             )
         app._status = lambda _: None  # type: ignore[method-assign]
         return app, client, store
+
+    def test_chat_accepts_text_streams_with_independent_source_encodings(self) -> None:
+        text = "中文 hello"
+        for encoding in ("utf-8", "gbk", "utf-16", "shift_jis"):
+            with self.subTest(encoding=encoding):
+                app, client, _ = self._app("qwen3_5_moe", response=["answer"], arguments=_arguments(stream=False))
+                with io.TextIOWrapper(io.BytesIO((text + "\r\n/exit\r\n").encode(encoding)), encoding=encoding) as source:
+                    with (
+                        contextlib.redirect_stdout(io.StringIO()),
+                        patch.object(app, "prompt_session_class", side_effect=AssertionError("input source invoked terminal UI")),
+                        patch("builtins.input", side_effect=AssertionError("input source invoked console input")),
+                    ):
+                        self.assertEqual(app.chat(source), 0)
+                    self.assertFalse(source.closed)
+                self.assertEqual(client.generate_payloads, [[{"role": "user", "content": text}]])
+                self.assertEqual(app.messages[-1], {"role": "assistant", "content": "answer"})
+
+    def test_chat_handles_redirected_eof_and_rejects_undecoded_input(self) -> None:
+        app, client, _ = self._app("qwen3_5_moe", response=["answer"], arguments=_arguments(stream=False))
+        with (
+            patch.object(sys, "stdin", io.StringIO("中文 hello")),
+            contextlib.redirect_stdout(io.StringIO()),
+            patch.object(app, "prompt_session_class", side_effect=AssertionError("pipe invoked terminal UI")),
+            patch("builtins.input", side_effect=AssertionError("pipe invoked console input")),
+        ):
+            self.assertEqual(app.chat(), 0)
+        self.assertEqual(client.generate_payloads, [[{"role": "user", "content": "中文 hello"}]])
+
+        for source in (io.BytesIO(b"hello"), io.TextIOWrapper(io.BytesIO(b"\xc4\xe3\xba\xc3"), encoding="utf-8")):
+            app, client, _ = self._app("qwen3_5_moe")
+            with source, contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises((ValueError, UnicodeDecodeError)):
+                    app.chat(source)  # type: ignore[arg-type]
+            self.assertFalse(client.generate_payloads)
 
     def test_resume_compact_reset_context_and_qwen_system_merge(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ncnn-moe-resume-model-") as directory:
@@ -795,6 +907,14 @@ def _runtime_smoke(worker: Path, model: Path, *, auto: bool) -> None:
             raise AssertionError("unknown worker operation did not return an error")
 
         client.create_session("first", enable_speculative_context=False)
+        for invalid_text in (b"\xc4\xe3\xba\xc3", b"\xed\xa0\x80", b"\xf4\x90\x80\x80"):
+            request = b'{"op":"stats","session_id":"first","messages":[{"role":"user","content":"' + invalid_text + b'"}]}\n'
+            client.process.stdin.buffer.write(request)
+            client.process.stdin.buffer.flush()
+            error = client._read_event()
+            assert error["event"] == "error" and error["code"] == "invalid_request", error
+            assert "UTF-8" in error["message"], error
+            assert client.stats("first")["sequence_length"] == 0
         compacted = client.compact("first", [0, 1])
         assert compacted["replayed_tokens"] == 2
         vocabulary_size = int(client.ready["model"]["vocabulary_size"])

@@ -283,7 +283,19 @@ def make_text_cases() -> list[tuple[str, str]]:
         ("korean", "안녕하세요 세계"),
         ("cjk-extension", "𠀀𪚥 test"),
         ("unicode-space", "a\u00a0b\u2003c\u202fd\u3000e"),
+        ("unicode-line-space", "a\u0085b\u2028c\u2029d\u000be\u000cf"),
         ("combining", "x\u0301\u0327 a\u20dd"),
+        ("nfc-reorder", "a\u0315\u0300 b\u0301\u0327"),
+        ("nfc-blocking", "A\u0305\u030a A\u030a\u0301"),
+        ("nfc-exclusions", "\u0344\u0f73\u212b\u0340\u0341"),
+        ("nfc-leading-marks", "\u0315\u0300\u0327A"),
+        ("nfc-long-marks", "a" + "\u0315\u0301" * 40),
+        ("nfc-new-mark-barrier", "x\U0001e4ec\u0301\u0315 y"),
+        ("case-fold-contractions", "'ſ 'S 's 'Ll 'rE I'M WE'VE"),
+        ("letter-case-boundaries", "AAA中文BBB Aa中AaA ǅǆαΩÉéK"),
+        ("mark-prefix-boundaries", "\u0301A A\u0301AAA !\u0301a /\u0301A"),
+        ("whitespace-backtracking", "  A  \r \n\tB\t\tC \r\n \t"),
+        ("deepseek-stage-boundaries", "1234中abcあカABC456!xyz/ABC7890"),
         ("special-im-start", "<|im_start|>user\nhello<|im_end|>\n"),
         ("special-thinking", "<think>\n推理😀\n</think>\n\n答案"),
         ("special-overlap", "a<|im_start|><|im_end|><|endoftext|>b"),
@@ -294,6 +306,7 @@ def make_text_cases() -> list[tuple[str, str]]:
         ("nul-control", "a\u0000b\u0001c"),
         ("mixed", "CPU x86/ARM，αβ 123\n\t😀 café cafe\u0301"),
         ("repetition", "naïve 😀 中文 " * 3),
+        ("long-bpe-chunks", "a" * 300 + "!?" * 150 + "中文" * 150),
         ("tabs-and-spaces", "\t  A   B\t\tC  "),
         ("number-repeat", "123 456 789 1234 5678 9012"),
         ("punctuation-cjk", "中文；English，punctuation？！【test】"),
@@ -322,6 +335,7 @@ def make_chat_cases() -> list[tuple[str, list[dict[str, Any]], bool]]:
         ("assistant-history", [{"role": "user", "content": "Reason?"}, {"role": "assistant", "content": "I reasoned."}, {"role": "user", "content": "Answer?"}]),
         ("assistant-empty", [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": ""}, {"role": "user", "content": "Again"}]),
         ("unicode-trim", [{"role": "user", "content": "\u3000中文\u00a0"}]),
+        ("unicode-control-trim", [{"role": "user", "content": "\u001c\u001d\u0085\u2003中文\u001e\u001f\u3000"}]),
         ("embedded-tags", [{"role": "user", "content": "Explain <think> and </think>."}]),
         ("literal-special-body", [{"role": "user", "content": "<|start|> <|channel|> <|reserved_200018|> <|reserved_200020|> <|reserved_201088|> <|return|>"}]),
         ("developer-user", [{"role": "developer", "content": "Follow the schema."}, {"role": "user", "content": "Proceed."}]),
@@ -334,6 +348,9 @@ def make_chat_cases() -> list[tuple[str, list[dict[str, Any]], bool]]:
         ("tool-without-name", [{"role": "tool", "content": "result"}]),
         ("two-users", [{"role": "user", "content": "First"}, {"role": "user", "content": "Second"}]),
         ("assistant-thinking-markers", [{"role": "user", "content": "Question"}, {"role": "assistant", "content": "<think>work</think>\nanswer"}, {"role": "user", "content": "Follow-up"}]),
+        ("repeated-chat-fragments", [{"role": role, "content": "cafe\u0301 café 中文 😀 café " * 4} for role in ("user", "assistant", "user", "assistant", "user")]),
+        ("assistant-thinking-trim", [{"role": "user", "content": "Question"}, {"role": "assistant", "content": "\u3000prefix<think>\n\n\u2003work\u00a0\n</think>ignored</think>\n\nanswer\u3000"}]),
+        ("padded-tool-response", [{"role": "user", "content": "Question"}, {"role": "user", "content": "\u3000<tool_response>result</tool_response>\u00a0"}]),
     ]
     return [(name, messages, thinking) for name, messages in conversations for thinking in (False, True)]
 
@@ -570,6 +587,8 @@ def main() -> int:
         [str(driver), str(model_dir)],
         input=payload,
         text=True,
+        encoding="utf-8",
+        errors="strict",
         capture_output=True,
         timeout=120,
         check=False,
@@ -578,7 +597,9 @@ def main() -> int:
         raise RuntimeError(
             f"native driver exited {completed.returncode}: {completed.stderr.strip()}"
         )
-    output_lines = completed.stdout.splitlines()
+    output_lines = completed.stdout.split("\n")
+    if output_lines[-1] == "":
+        output_lines.pop()
     if len(output_lines) != len(cases):
         raise RuntimeError(
             f"driver returned {len(output_lines)} JSONL records for {len(cases)} requests; "

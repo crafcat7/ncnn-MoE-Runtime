@@ -35,7 +35,7 @@ native sessions contain token IDs and KV state:
 - Worker validates context limits and reuses committed token prefixes, then
   invokes Session generation, reset, cancellation, and runtime statistics.
 
-Text prompts require a build with ICU 76+ and the supported tokenizer assets.
+Text prompts require the supported tokenizer assets in the model directory.
 The CLI reports an unsupported text profile instead of falling back to Python.
 
 Use `inspect` before a run to see the detected CPU/Vulkan devices and effective

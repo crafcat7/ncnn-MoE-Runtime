@@ -42,8 +42,8 @@ The directory must contain `config.json`, `tokenizer.json`,
 `tokenizer_config.json`, and every Safetensors shard referenced by the
 index. DSpark metadata and prediction tensors are required only for the DSpark
 package. DeepSeek-V4-Flash's conventional `mtp.0` payload is not used by the
-target-model runtime. Text formatting and tokenization run in C++ with ICU 76+;
-the CLI does not execute `encoding/encoding_dsv4.py` or require the official
+target-model runtime. Text formatting and tokenization run in C++ with built-in
+Unicode tables; the CLI does not execute `encoding/encoding_dsv4.py` or require the official
 PyTorch inference dependencies such as `torch`, `tilelang`, or
 `fast_hadamard_transform`. Build the examples by following the root
 [Quick start](../../README.md#quick-start), then build `ncnn_moe_worker` for

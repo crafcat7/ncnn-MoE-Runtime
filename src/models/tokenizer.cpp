@@ -2,11 +2,10 @@
 // tokenizer implementation. See tokenizer.LICENSE.
 #include "tokenizer.h"
 
-#if defined(NCNN_MOE_TOKENIZER_ICU)
 #include "json.h"
 #include "modeladapter.h"
 #include "storage/mappedfile.h"
-#endif
+#include "unicodedata.h"
 
 #include <algorithm>
 #include <charconv>
@@ -15,22 +14,161 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
 
-#if defined(NCNN_MOE_TOKENIZER_ICU)
-#include <unicode/normalizer2.h>
-#include <unicode/parseerr.h>
-#include <unicode/regex.h>
-#include <unicode/unistr.h>
-#include <unicode/uchar.h>
-#include <unicode/uniset.h>
-#endif
-
 namespace ncnn {
 namespace moe {
+
+static uint32_t unicode_props(uint32_t cp) noexcept
+{
+    if (cp < 128)
+        return unicode_ascii[cp];
+    const auto found = std::lower_bound(std::begin(unicode_ranges), std::end(unicode_ranges), cp,
+                                        [](const UnicodeRange& range, uint32_t value) { return range.end < value; });
+    return found == std::end(unicode_ranges) ? 0 : found->properties;
+}
+
+static uint32_t read_utf8(std::string_view text, size_t& offset)
+{
+    const uint8_t lead = static_cast<uint8_t>(text[offset++]);
+    if (lead < 0x80)
+        return lead;
+    const size_t length = lead >= 0xc2 && lead <= 0xdf   ? 2
+                          : lead >= 0xe0 && lead <= 0xef ? 3
+                          : lead >= 0xf0 && lead <= 0xf4 ? 4
+                                                         : 0;
+    if (length == 0 || text.size() - offset < length - 1)
+        throw std::invalid_argument("invalid UTF-8 text");
+    uint32_t cp = lead & (0x7f >> length);
+    for (size_t i = 1; i < length; ++i)
+    {
+        const uint8_t next = static_cast<uint8_t>(text[offset++]);
+        if ((next & 0xc0) != 0x80)
+            throw std::invalid_argument("invalid UTF-8 text");
+        cp = (cp << 6) | (next & 0x3f);
+    }
+    if ((length == 3 && cp < 0x800) || (length == 4 && cp < 0x10000)
+        || (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff)
+        throw std::invalid_argument("invalid UTF-8 text");
+    return cp;
+}
+
+static void append_utf8(uint32_t cp, std::string& text)
+{
+    if (cp < 0x80)
+        text.push_back(static_cast<char>(cp));
+    else if (cp < 0x800)
+    {
+        text.push_back(static_cast<char>(0xc0 | (cp >> 6)));
+        text.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    }
+    else if (cp < 0x10000)
+    {
+        text.push_back(static_cast<char>(0xe0 | (cp >> 12)));
+        text.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        text.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    }
+    else
+    {
+        text.push_back(static_cast<char>(0xf0 | (cp >> 18)));
+        text.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3f)));
+        text.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        text.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    }
+}
+
+static void unicode_decompose(uint32_t cp, std::vector<uint32_t>& output)
+{
+    if (cp < unicode_decompositions[0].codepoint)
+    {
+        output.push_back(cp);
+        return;
+    }
+    if (cp >= 0xac00 && cp < 0xac00 + 11172)
+    {
+        const uint32_t syllable = cp - 0xac00;
+        output.push_back(0x1100 + syllable / 588);
+        output.push_back(0x1161 + (syllable % 588) / 28);
+        if (syllable % 28 != 0)
+            output.push_back(0x11a7 + syllable % 28);
+        return;
+    }
+    const auto found = std::lower_bound(std::begin(unicode_decompositions), std::end(unicode_decompositions), cp,
+                                        [](const UnicodeDecomposition& item, uint32_t value) { return item.codepoint < value; });
+    if (found == std::end(unicode_decompositions) || found->codepoint != cp)
+        output.push_back(cp);
+    else
+    {
+        unicode_decompose(found->first, output);
+        if (found->second != 0)
+            unicode_decompose(found->second, output);
+    }
+}
+
+static uint32_t unicode_compose(uint32_t left, uint32_t right) noexcept
+{
+    // Unicode 9 canonical composition pairs start at U+0300 on the right.
+    if (right < 0x300)
+        return 0;
+    if (left >= 0x1100 && left < 0x1100 + 19 && right >= 0x1161 && right < 0x1161 + 21)
+        return 0xac00 + ((left - 0x1100) * 21 + right - 0x1161) * 28;
+    if (left >= 0xac00 && left < 0xac00 + 11172 && (left - 0xac00) % 28 == 0
+        && right > 0x11a7 && right < 0x11a7 + 28)
+        return left + right - 0x11a7;
+    const uint64_t pair = (static_cast<uint64_t>(left) << 21) | right;
+    const auto found = std::lower_bound(std::begin(unicode_compositions), std::end(unicode_compositions), pair,
+                                        [](const UnicodeComposition& item, uint64_t value) { return item.pair < value; });
+    return found == std::end(unicode_compositions) || found->pair != pair ? 0 : found->codepoint;
+}
+
+static void normalize_nfc(std::vector<uint32_t>& points, std::vector<uint32_t>& buffer)
+{
+    buffer.clear();
+    for (const uint32_t cp : points)
+        unicode_decompose(cp, buffer);
+    size_t begin = 0;
+    for (size_t end = 0; end <= buffer.size(); ++end)
+    {
+        if (end != buffer.size() && ((unicode_props(buffer[end]) >> 16) & 255) != 0)
+            continue;
+        auto less = [](uint32_t left, uint32_t right) { return ((unicode_props(left) >> 16) & 255) < ((unicode_props(right) >> 16) & 255); };
+        if (!std::is_sorted(buffer.begin() + begin, buffer.begin() + end, less))
+        {
+            if (end - begin <= 32)
+            {
+                for (size_t i = begin + 1; i < end; ++i)
+                    for (size_t j = i; j > begin && less(buffer[j], buffer[j - 1]); --j)
+                        std::swap(buffer[j], buffer[j - 1]);
+            }
+            else
+                std::stable_sort(buffer.begin() + begin, buffer.begin() + end, less);
+        }
+        begin = end + 1;
+    }
+    points.clear();
+    size_t starter = std::numeric_limits<size_t>::max();
+    uint32_t previous_ccc = 0;
+    for (const uint32_t cp : buffer)
+    {
+        const uint32_t ccc = (unicode_props(cp) >> 16) & 255;
+        const uint32_t composed = starter < points.size() && (previous_ccc == 0 || previous_ccc < ccc)
+                                      ? unicode_compose(points[starter], cp)
+                                      : 0;
+        if (composed != 0)
+            points[starter] = composed;
+        else
+        {
+            if (ccc == 0)
+                starter = points.size();
+            points.push_back(cp);
+            previous_ccc = ccc;
+        }
+    }
+}
 
 // Mix both token IDs before using them as an unordered_map key. The default
 // integer hash leaves low bits unchanged, which clusters packed IDs when the
@@ -46,7 +184,6 @@ static uint64_t merge_key(uint32_t left, uint32_t right) noexcept
     return key;
 }
 
-#if defined(NCNN_MOE_TOKENIZER_ICU)
 static const char qwen36_template[] = R"QWEN({%- set image_count = namespace(value=0) %}
 {%- set video_count = namespace(value=0) %}
 {%- macro render_content(content, do_vision_count, is_system_content=false) %}
@@ -373,17 +510,6 @@ static const char qwen38_template[] = R"QWEN38({%- set image_count = namespace(v
     {%- endif %}
 {%- endif %})QWEN38";
 
-#endif
-
-struct Tokenizer::UnicodeProfile
-{
-#if defined(NCNN_MOE_TOKENIZER_ICU)
-    std::vector<std::unique_ptr<const icu::RegexPattern>> patterns;
-    std::unique_ptr<icu::UnicodeSet> filter;
-    std::unique_ptr<icu::FilteredNormalizer2> nfc;
-#endif
-};
-
 struct Tokenizer::EncodeScratch
 {
     using Candidate = std::tuple<uint32_t, size_t, size_t, int32_t, int32_t, int32_t>;
@@ -398,10 +524,15 @@ struct Tokenizer::EncodeScratch
     std::vector<Candidate> candidates;
     std::vector<Node> nodes;
     std::string chunk;
-#if defined(NCNN_MOE_TOKENIZER_ICU)
-    std::vector<icu::UnicodeString> pieces;
-    std::vector<icu::UnicodeString> split;
-#endif
+    std::unordered_map<std::string, std::vector<int32_t>> cache;
+    size_t cache_size = 0;
+    std::vector<uint32_t> points;
+    std::vector<uint32_t> decomp;
+    std::vector<uint8_t> props;
+    std::vector<size_t> offsets;
+    std::vector<std::pair<size_t, size_t>> ranges;
+    std::vector<std::pair<size_t, size_t>> split;
+    std::string normalized;
 };
 
 Tokenizer::Tokenizer() = default;
@@ -430,13 +561,7 @@ bool Tokenizer::load(const std::string& model_directory, size_t vocabulary_size)
 
 bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_size)
 {
-#if !defined(NCNN_MOE_TOKENIZER_ICU)
-    (void)model_directory;
-    (void)vocabulary_size;
-    return false;
-#else
     static const std::string qwen_regex = R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
-    static const std::string icu_regex = R"NMR((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n[\p{L}&&\p{Age=16.0}][\p{N}&&\p{Age=16.0}]]?[[\p{L}&&\p{Age=16.0}][\p{M}&&\p{Age=16.0}]]+|[\p{N}&&\p{Age=16.0}]| ?[^\s[\p{L}&&\p{Age=16.0}][\p{M}&&\p{Age=16.0}][\p{N}&&\p{Age=16.0}]]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)NMR";
     static const std::string gpt_regex = R"GPT([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)GPT";
     static const std::array<std::string, 3> deepseek_regexes = {
         R"(\p{N}{1,3})",
@@ -789,35 +914,6 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
     const std::string_view vocab_json = member(model, "vocab");
     const std::string_view merges_json = member(model, "merges");
 
-    UVersionInfo unicode_version{};
-    u_getUnicodeVersion(unicode_version);
-    if (unicode_version[0] < 16)
-        return false;
-    std::unique_ptr<UnicodeProfile> unicode_profile(new UnicodeProfile);
-    UErrorCode status = U_ZERO_ERROR;
-    for (const std::string& regex : split_regexes)
-    {
-        UParseError parse_error{};
-        const std::string& compile_regex = has_nfc ? icu_regex : regex;
-        std::unique_ptr<const icu::RegexPattern> pattern(icu::RegexPattern::compile(icu::UnicodeString::fromUTF8(compile_regex), 0, parse_error, status));
-        if (U_FAILURE(status) || !pattern)
-            return false;
-        unicode_profile->patterns.push_back(std::move(pattern));
-        status = U_ZERO_ERROR;
-    }
-    if (has_nfc)
-    {
-        std::unique_ptr<icu::UnicodeSet> nfc_filter(new icu::UnicodeSet(icu::UnicodeString::fromUTF8("[\\p{Age=9.0}]"), status));
-        if (U_FAILURE(status) || !nfc_filter)
-            return false;
-        nfc_filter->freeze();
-        const icu::Normalizer2* base_nfc = icu::Normalizer2::getNFCInstance(status);
-        if (U_FAILURE(status) || !base_nfc)
-            return false;
-        unicode_profile->nfc.reset(new icu::FilteredNormalizer2(*base_nfc, *nfc_filter));
-        unicode_profile->filter = std::move(nfc_filter);
-    }
-
     std::array<int16_t, 512> byte_map;
     byte_map.fill(-1);
     std::array<uint32_t, 256> byte_codepoint{};
@@ -849,24 +945,6 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
             byte_codepoint[static_cast<size_t>(byte)] = codepoint++;
         }
     }
-    auto utf8_codepoint = [](uint32_t value) {
-        std::string text;
-        if (value < 0x80)
-            text.push_back(static_cast<char>(value));
-        else if (value < 0x800)
-        {
-            text.push_back(static_cast<char>(0xc0 | (value >> 6)));
-            text.push_back(static_cast<char>(0x80 | (value & 0x3f)));
-        }
-        else
-        {
-            text.push_back(static_cast<char>(0xe0 | (value >> 12)));
-            text.push_back(static_cast<char>(0x80 | ((value >> 6) & 0x3f)));
-            text.push_back(static_cast<char>(0x80 | (value & 0x3f)));
-        }
-        return text;
-    };
-
     std::vector<Entry> new_index;
     std::vector<uint8_t> new_bytes;
     std::unordered_map<uint64_t, Merge> new_merges;
@@ -1149,7 +1227,8 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
 
     for (size_t byte = 0; byte < byte_ids.size(); ++byte)
     {
-        const std::string symbol = utf8_codepoint(byte_codepoint[byte]);
+        std::string symbol;
+        append_utf8(byte_codepoint[byte], symbol);
         const auto found = vocab.find(symbol);
         if (found == vocab.end())
             return false;
@@ -1454,9 +1533,7 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
     stops.swap(new_stops);
     family = new_family;
     ignore_merges = profile_ignore_merges;
-    unicode = std::move(unicode_profile);
     return true;
-#endif
 }
 
 void Tokenizer::bpe(std::string_view raw,
@@ -1543,18 +1620,11 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text) const
 }
 
 void Tokenizer::encode_impl(std::string_view text,
-                            bool recognize_added_tokens,
+                            bool use_added,
                             EncodeScratch& scratch,
                             std::vector<int32_t>& ids) const
 {
-#if !defined(NCNN_MOE_TOKENIZER_ICU)
-    (void)text;
-    (void)recognize_added_tokens;
-    (void)scratch;
-    (void)ids;
-    throw std::runtime_error("tokenizer requires the ICU Runtime dependency");
-#else
-    if (index.empty() || !unicode)
+    if (index.empty())
         throw std::runtime_error("tokenizer is not loaded");
     if (text.empty())
         return;
@@ -1562,36 +1632,39 @@ void Tokenizer::encode_impl(std::string_view text,
     constexpr size_t cache_entries = 256;
     constexpr size_t cache_chunk_bytes = 256;
     constexpr size_t cache_limit = 64 * 1024;
-    std::unordered_map<std::string, std::vector<int32_t>> cache;
-    size_t cache_size = 0;
+    auto& cache = scratch.cache;
 
-    auto encode_range = [&](const icu::UnicodeString& piece, int32_t start, int32_t end) {
+    const bool qwen = family == Family::Qwen36 || family == Family::Qwen38;
+    const bool gpt = family == Family::GptOss;
+    const bool deepseek = family == Family::DeepSeekV4;
+    std::string_view input;
+    auto encode_range = [&](size_t start, size_t end) {
         if (end <= start)
             return;
-        std::string& chunk = scratch.chunk;
-        chunk.clear();
-        piece.tempSubStringBetween(start, end).toUTF8String(chunk);
-        if (chunk.empty())
-            return;
-        if (chunk.size() <= cache_chunk_bytes)
+        const std::string_view raw = input.substr(scratch.offsets[start], scratch.offsets[end] - scratch.offsets[start]);
+        if (raw.size() > cache_chunk_bytes)
         {
-            const auto found = cache.find(chunk);
-            if (found != cache.end())
-            {
-                ids.insert(ids.end(), found->second.begin(), found->second.end());
-                return;
-            }
+            bpe(raw, ids, scratch);
+            return;
+        }
+        std::string& chunk = scratch.chunk;
+        chunk.assign(raw);
+        const auto found = cache.find(chunk);
+        if (found != cache.end())
+        {
+            ids.insert(ids.end(), found->second.begin(), found->second.end());
+            return;
         }
         const size_t first_id = ids.size();
         bpe(chunk, ids, scratch);
         const size_t id_count = ids.size() - first_id;
-        if (chunk.size() <= cache_chunk_bytes && cache.size() < cache_entries && id_count <= (cache_limit - chunk.size()) / sizeof(int32_t))
+        if (cache.size() < cache_entries && id_count <= (cache_limit - chunk.size()) / sizeof(int32_t))
         {
             const size_t payload = chunk.size() + id_count * sizeof(int32_t);
-            if (payload <= cache_limit - cache_size)
+            if (payload <= cache_limit - scratch.cache_size)
             {
                 cache.emplace(chunk, std::vector<int32_t>(ids.begin() + first_id, ids.end()));
-                cache_size += payload;
+                scratch.cache_size += payload;
             }
         }
     };
@@ -1599,67 +1672,219 @@ void Tokenizer::encode_impl(std::string_view text,
     auto encode_segment = [&](std::string_view segment) {
         if (segment.empty())
             return;
-        icu::UnicodeString input = icu::UnicodeString::fromUTF8(segment);
-        if (unicode->nfc)
+        std::vector<uint32_t>& points = scratch.points;
+        std::vector<uint8_t>& props = scratch.props;
+        std::vector<size_t>& offsets = scratch.offsets;
+        points.clear();
+        props.clear();
+        offsets.clear();
+        bool normalize = false;
+        uint32_t previous_ccc = 0;
+        for (size_t offset = 0; offset < segment.size();)
         {
-            UErrorCode status = U_ZERO_ERROR;
-            icu::UnicodeString normalized;
-            unicode->nfc->normalize(input, normalized, status);
-            if (U_FAILURE(status))
-                throw std::runtime_error("tokenizer NFC normalization failed");
-            input = std::move(normalized);
-        }
-
-        std::vector<icu::UnicodeString>& pieces = scratch.pieces;
-        std::vector<icu::UnicodeString>& split = scratch.split;
-        pieces.clear();
-        split.clear();
-        pieces.emplace_back(std::move(input));
-        for (size_t pattern_index = 0; pattern_index < unicode->patterns.size(); ++pattern_index)
-        {
-            const auto& pattern = unicode->patterns[pattern_index];
-            const bool final_stage = pattern_index + 1 == unicode->patterns.size();
-            for (const icu::UnicodeString& piece : pieces)
+            offsets.push_back(offset);
+            const uint32_t cp = read_utf8(segment, offset);
+            points.push_back(cp);
+            const uint32_t category = unicode_props(cp);
+            props.push_back(static_cast<uint8_t>(category >> (qwen ? 0 : 8)));
+            if (qwen)
             {
-                auto emit_range = [&](int32_t start, int32_t end) {
-                    if (end <= start)
-                        return;
-                    if (final_stage)
-                        encode_range(piece, start, end);
-                    else
-                        split.emplace_back(piece, start, end - start);
-                };
-                UErrorCode status = U_ZERO_ERROR;
-                std::unique_ptr<icu::RegexMatcher> matcher(pattern->matcher(piece, status));
-                if (U_FAILURE(status) || !matcher)
-                    throw std::runtime_error("could not create tokenizer regex matcher");
-                int32_t cursor = 0;
-                while (matcher->find(status))
-                {
-                    const int32_t start = matcher->start(status);
-                    const int32_t end = matcher->end(status);
-                    if (U_FAILURE(status) || start < cursor || end <= start)
-                        throw std::runtime_error("tokenizer regex returned invalid span");
-                    if (start > cursor)
-                        emit_range(cursor, start);
-                    emit_range(start, end);
-                    cursor = end;
-                }
-                if (U_FAILURE(status))
-                    throw std::runtime_error("tokenizer regex matching failed");
-                if (cursor < piece.length())
-                    emit_range(cursor, piece.length());
+                const uint32_t ccc = (category >> 16) & 255;
+                normalize |= (category & UnicodeNfcCheck) != 0 || (ccc != 0 && previous_ccc > ccc);
+                previous_ccc = ccc;
             }
-            if (final_stage)
-                return;
-            pieces.swap(split);
-            split.clear();
         }
-        for (const icu::UnicodeString& piece : pieces)
-            encode_range(piece, 0, piece.length());
+        input = segment;
+        if (normalize)
+        {
+            normalize_nfc(points, scratch.decomp);
+            scratch.normalized.clear();
+            offsets.clear();
+            props.clear();
+            for (const uint32_t cp : points)
+            {
+                offsets.push_back(scratch.normalized.size());
+                append_utf8(cp, scratch.normalized);
+                props.push_back(static_cast<uint8_t>(unicode_props(cp)));
+            }
+            input = scratch.normalized;
+        }
+        offsets.push_back(input.size());
+
+        auto contraction = [&](size_t start, size_t end) {
+            if (start + 1 >= end || points[start] != '\'')
+                return start;
+            auto lower = [&](size_t pos) {
+                const uint32_t cp = points[pos];
+                return cp >= 'A' && cp <= 'Z' ? cp + 32 : cp == 0x17f ? static_cast<uint32_t>('s')
+                                                                      : cp;
+            };
+            const uint32_t first = lower(start + 1);
+            if (first == 's' || first == 't' || first == 'm' || first == 'd')
+                return start + 2;
+            if (start + 2 < end)
+            {
+                const uint32_t second = lower(start + 2);
+                if ((first == 'r' && second == 'e') || (first == 'v' && second == 'e') || (first == 'l' && second == 'l'))
+                    return start + 3;
+            }
+            return start;
+        };
+        auto match = [&](size_t stage, size_t start, size_t end) {
+            size_t pos = start;
+            if ((deepseek && stage == 0) || (!deepseek && (props[start] & UnicodeNumber) != 0))
+            {
+                const size_t limit = std::min(end, start + (qwen ? 1 : 3));
+                while (pos < limit && (props[pos] & UnicodeNumber) != 0)
+                    ++pos;
+                return pos;
+            }
+            if (deepseek && stage == 1)
+            {
+                while (pos < end && ((points[pos] >= 0x4e00 && points[pos] <= 0x9fa5) || (points[pos] >= 0x3040 && points[pos] <= 0x30ff)))
+                    ++pos;
+                return pos;
+            }
+            if (qwen)
+            {
+                pos = contraction(start, end);
+                if (pos != start)
+                    return pos;
+            }
+            if (deepseek && points[start] < 128 && (props[start] & (UnicodePunctuation | UnicodeSymbol)) != 0)
+            {
+                pos = start + 1;
+                while (pos < end && ((points[pos] >= 'A' && points[pos] <= 'Z') || (points[pos] >= 'a' && points[pos] <= 'z')))
+                    ++pos;
+                if (pos > start + 1)
+                    return pos;
+            }
+
+            const uint32_t prefix_mask = deepseek ? UnicodeLetter | UnicodePunctuation | UnicodeSymbol : UnicodeLetter | UnicodeNumber;
+            const bool prefix = points[start] != '\r' && points[start] != '\n' && (props[start] & prefix_mask) == 0;
+            // These scans preserve the alternative order and greedy backtracking
+            // of the fixed, validated tokenizer patterns without a regex engine.
+            for (size_t alternative = 0; alternative < (gpt ? 2 : 1); ++alternative)
+            {
+                for (size_t attempt = 0; attempt < (prefix ? 2 : 1); ++attempt)
+                {
+                    const size_t begin = start + (prefix && attempt == 0 ? 1 : 0);
+                    pos = begin;
+                    if (!gpt)
+                    {
+                        while (pos < end && (props[pos] & (UnicodeLetter | UnicodeMark)) != 0)
+                            ++pos;
+                    }
+                    else
+                    {
+                        auto upper = [&](size_t i) { return (props[i] & UnicodeMark) != 0 || ((props[i] & UnicodeLetter) != 0 && (props[i] & UnicodeLower) == 0); };
+                        auto lower = [&](size_t i) { return (props[i] & UnicodeMark) != 0 || ((props[i] & UnicodeLetter) != 0 && (props[i] & UnicodeUpper) == 0); };
+                        while (pos < end && upper(pos))
+                            ++pos;
+                        if (alternative == 0)
+                        {
+                            if (pos == end || !lower(pos))
+                            {
+                                while (pos > begin && !lower(pos - 1))
+                                    --pos;
+                                if (pos == begin)
+                                    continue;
+                                --pos;
+                            }
+                        }
+                        else if (pos == begin)
+                            continue;
+                        while (pos < end && lower(pos))
+                            ++pos;
+                    }
+                    if (pos > begin)
+                    {
+                        if (gpt)
+                            pos = contraction(pos, end);
+                        return pos;
+                    }
+                }
+            }
+
+            for (size_t attempt = 0; attempt < (points[start] == ' ' ? 2 : 1); ++attempt)
+            {
+                const size_t begin = start + (points[start] == ' ' && attempt == 0 ? 1 : 0);
+                pos = begin;
+                while (pos < end && (deepseek ? (props[pos] & (UnicodePunctuation | UnicodeSymbol)) != 0 : (props[pos] & (UnicodeSpace | UnicodeLetter | UnicodeNumber | (qwen ? UnicodeMark : 0))) == 0))
+                    ++pos;
+                if (pos > begin)
+                {
+                    while (pos < end && (points[pos] == '\r' || points[pos] == '\n' || (gpt && points[pos] == '/')))
+                        ++pos;
+                    return pos;
+                }
+            }
+            pos = start;
+            size_t newline_end = start;
+            while (pos < end && (props[pos] & UnicodeSpace) != 0)
+            {
+                if (points[pos] == '\r' || points[pos] == '\n')
+                    newline_end = pos + 1;
+                ++pos;
+            }
+            if (newline_end != start)
+                return newline_end;
+            if (pos < end && pos - start > 1)
+                return pos - 1;
+            return pos;
+        };
+
+        const std::pair<size_t, size_t> root{0, points.size()};
+        std::span<const std::pair<size_t, size_t>> ranges(&root, 1);
+        const size_t stages = deepseek ? 3 : 1;
+        for (size_t stage = 0; stage < stages; ++stage)
+        {
+            const bool final_stage = stage + 1 == stages;
+            if (!final_stage)
+                scratch.split.clear();
+            for (const auto& range : ranges)
+            {
+                size_t cursor = range.first;
+                size_t gap = cursor;
+                while (cursor < range.second)
+                {
+                    const size_t end = match(stage, cursor, range.second);
+                    if (end == cursor)
+                    {
+                        ++cursor;
+                        continue;
+                    }
+                    if (gap < cursor)
+                    {
+                        if (final_stage)
+                            encode_range(gap, cursor);
+                        else
+                            scratch.split.emplace_back(gap, cursor);
+                    }
+                    if (final_stage)
+                        encode_range(cursor, end);
+                    else
+                        scratch.split.emplace_back(cursor, end);
+                    cursor = end;
+                    gap = cursor;
+                }
+                if (gap < range.second)
+                {
+                    if (final_stage)
+                        encode_range(gap, range.second);
+                    else
+                        scratch.split.emplace_back(gap, range.second);
+                }
+            }
+            if (!final_stage)
+            {
+                scratch.ranges.swap(scratch.split);
+                ranges = scratch.ranges;
+            }
+        }
     };
 
-    if (!recognize_added_tokens || added_tokens.empty())
+    if (!use_added || added_tokens.empty())
     {
         encode_segment(text);
         return;
@@ -1698,23 +1923,18 @@ void Tokenizer::encode_impl(std::string_view text,
         ids.push_back(static_cast<int32_t>(best_token->id));
         cursor = best_pos + best_length;
     }
-#endif
 }
 
-std::vector<int32_t> Tokenizer::apply_chat(std::string_view messages_json, bool enable_thinking) const
+std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool enable_thinking) const
 {
-#if !defined(NCNN_MOE_TOKENIZER_ICU)
-    (void)messages_json;
-    (void)enable_thinking;
-    throw std::runtime_error("tokenizer requires the ICU Runtime dependency");
-#else
-    if (index.empty() || !unicode)
+    if (index.empty())
         throw std::runtime_error("tokenizer is not loaded");
     EncodeScratch scratch;
     struct Message
     {
         std::string role;
         std::string content;
+        std::string_view text{};
     };
     std::vector<Message> messages;
     size_t position = skip_space(messages_json, 0);
@@ -1927,47 +2147,61 @@ std::vector<int32_t> Tokenizer::apply_chat(std::string_view messages_json, bool 
 
     if (messages.empty())
         throw std::invalid_argument("No messages provided.");
-    auto python_space = [](UChar32 cp) {
-        return u_isUWhiteSpace(cp) || (cp >= 0x1c && cp <= 0x1f);
+    auto trim = [](std::string_view text) {
+        size_t begin = text.size();
+        size_t end = 0;
+        for (size_t offset = 0; offset < text.size();)
+        {
+            const size_t start = offset;
+            const uint32_t cp = read_utf8(text, offset);
+            if ((unicode_props(cp) & UnicodeSpace) == 0 && !(cp >= 0x1c && cp <= 0x1f))
+            {
+                begin = std::min(begin, start);
+                end = offset;
+            }
+        }
+        return end == 0 ? std::string_view() : text.substr(begin, end - begin);
     };
-    auto trim = [&](const std::string& text) {
-        const icu::UnicodeString value = icu::UnicodeString::fromUTF8(text);
-        int32_t begin = 0;
-        int32_t end = value.length();
-        while (begin < end && python_space(value.char32At(begin)))
-            begin = value.moveIndex32(begin, 1);
-        while (end > begin && python_space(value.char32At(value.moveIndex32(end, -1))))
-            end = value.moveIndex32(end, -1);
-        std::string result;
-        value.tempSubStringBetween(begin, end).toUTF8String(result);
-        return result;
-    };
+    for (Message& message : messages)
+        message.text = trim(message.content);
 
-    static constexpr std::string_view qwen38_reasoning_instruction = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+    static constexpr std::string_view reasoning_instruction = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
     std::string prompt;
     if (family == Family::Qwen38)
     {
-        const std::string instruction = enable_thinking ? std::string(qwen38_reasoning_instruction) : std::string();
+        const std::string_view instruction = enable_thinking ? reasoning_instruction : std::string_view();
         if (messages.front().role == "system")
         {
-            const std::string content = trim(messages.front().content);
+            const std::string_view content = messages.front().text;
             if (!content.empty())
             {
                 prompt += "<|im_start|>system\n";
                 if (!instruction.empty())
-                    prompt += instruction + "\n\n";
-                prompt += content + "<|im_end|>\n";
+                {
+                    prompt += instruction;
+                    prompt += "\n\n";
+                }
+                prompt += content;
+                prompt += "<|im_end|>\n";
             }
             else if (!instruction.empty())
-                prompt += "<|im_start|>system\n" + instruction + "<|im_end|>\n";
+            {
+                prompt += "<|im_start|>system\n";
+                prompt += instruction;
+                prompt += "<|im_end|>\n";
+            }
         }
         else if (!instruction.empty())
-            prompt += "<|im_start|>system\n" + instruction + "<|im_end|>\n";
+        {
+            prompt += "<|im_start|>system\n";
+            prompt += instruction;
+            prompt += "<|im_end|>\n";
+        }
     }
     else if (messages.front().role == "system")
     {
         prompt += "<|im_start|>system\n";
-        prompt += trim(messages.front().content);
+        prompt += messages.front().text;
         prompt += "<|im_end|>\n";
     }
 
@@ -1976,8 +2210,8 @@ std::vector<int32_t> Tokenizer::apply_chat(std::string_view messages_json, bool 
     {
         if (messages[i].role != "user")
             continue;
-        const std::string content = trim(messages[i].content);
-        if (!(content.rfind("<tool_response>", 0) == 0 && content.size() >= 16 && content.compare(content.size() - 16, 16, "</tool_response>") == 0))
+        const std::string_view content = messages[i].text;
+        if (!(content.starts_with("<tool_response>") && content.ends_with("</tool_response>")))
             last_user_index = static_cast<int32_t>(i);
     }
     if (last_user_index < 0)
@@ -1986,7 +2220,7 @@ std::vector<int32_t> Tokenizer::apply_chat(std::string_view messages_json, bool 
     for (size_t i = 0; i < messages.size(); ++i)
     {
         const Message& message = messages[i];
-        const std::string content = trim(message.content);
+        const std::string_view content = message.text;
         if (message.role == "system")
         {
             if (i != 0)
@@ -1994,46 +2228,51 @@ std::vector<int32_t> Tokenizer::apply_chat(std::string_view messages_json, bool 
         }
         else if (message.role == "user")
         {
-            prompt += "<|im_start|>user\n" + content + "<|im_end|>\n";
+            prompt += "<|im_start|>user\n";
+            prompt += content;
+            prompt += "<|im_end|>\n";
         }
         else if (message.role == "assistant")
         {
-            std::string reasoning;
-            std::string body = content;
+            std::string_view reasoning;
+            std::string_view body = content;
             if (family == Family::Qwen36)
             {
                 const size_t first_close = body.find("</think>");
-                if (first_close != std::string::npos)
+                if (first_close != std::string_view::npos)
                 {
                     reasoning = body.substr(0, first_close);
                     while (!reasoning.empty() && reasoning.back() == '\n')
-                        reasoning.pop_back();
+                        reasoning.remove_suffix(1);
                     const size_t open = reasoning.rfind("<think>");
-                    if (open != std::string::npos)
-                        reasoning.erase(0, open + 7);
+                    if (open != std::string_view::npos)
+                        reasoning.remove_prefix(open + 7);
                     while (!reasoning.empty() && reasoning.front() == '\n')
-                        reasoning.erase(reasoning.begin());
+                        reasoning.remove_prefix(1);
                     const size_t last_close = body.rfind("</think>");
-                    body.erase(0, last_close + 8);
+                    body.remove_prefix(last_close + 8);
                     while (!body.empty() && body.front() == '\n')
-                        body.erase(body.begin());
+                        body.remove_prefix(1);
                     reasoning = trim(reasoning);
                 }
             }
             prompt += "<|im_start|>assistant\n";
-            if (family == Family::Qwen38)
-                prompt += "<think>\n" + reasoning + "\n</think>\n\n" + body;
-            else if (static_cast<int32_t>(i) > last_user_index)
-                prompt += "<think>\n" + reasoning + "\n</think>\n\n" + body;
-            else
-                prompt += body;
+            if (family == Family::Qwen38 || static_cast<int32_t>(i) > last_user_index)
+            {
+                prompt += "<think>\n";
+                prompt += reasoning;
+                prompt += "\n</think>\n\n";
+            }
+            prompt += body;
             prompt += "<|im_end|>\n";
         }
         else if (message.role == "tool")
         {
             if (i > 0 && messages[i - 1].role != "tool")
                 prompt += "<|im_start|>user";
-            prompt += "\n<tool_response>\n" + content + "\n</tool_response>";
+            prompt += "\n<tool_response>\n";
+            prompt += content;
+            prompt += "\n</tool_response>";
             if ((i + 1 < messages.size() && messages[i + 1].role != "tool") || i + 1 == messages.size())
                 prompt += "<|im_end|>\n";
         }
@@ -2046,18 +2285,11 @@ std::vector<int32_t> Tokenizer::apply_chat(std::string_view messages_json, bool 
     std::vector<int32_t> ids;
     encode_impl(prompt, true, scratch, ids);
     return ids;
-#endif
 }
 
 std::string Tokenizer::decode(int32_t id, std::string& pending, bool final) const
 {
-#if !defined(NCNN_MOE_TOKENIZER_ICU)
-    (void)id;
-    (void)pending;
-    (void) final;
-    throw std::runtime_error("tokenizer requires the ICU Runtime dependency");
-#else
-    if (index.empty() || !unicode)
+    if (index.empty())
         throw std::runtime_error("tokenizer is not loaded");
     if (id >= 0 && static_cast<size_t>(id) < index.size())
     {
@@ -2129,7 +2361,6 @@ std::string Tokenizer::decode(int32_t id, std::string& pending, bool final) cons
     if (offset != 0)
         pending.erase(0, offset);
     return output;
-#endif
 }
 
 } // namespace moe

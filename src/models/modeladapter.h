@@ -4,12 +4,9 @@
 #include "ncnn/moe/result.h"
 #include "ncnn/moe/types.h"
 
-#include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <optional>
 #include <string>
-#include <string_view>
 #include <vector>
 
 namespace ncnn {
@@ -19,13 +16,6 @@ class SafetensorsArchive;
 struct ModelPackage;
 
 // Manifest readers inspect only direct members of the supplied JSON object.
-[[nodiscard]] std::optional<std::string_view> find_manifest_member(std::string_view json,
-                                                                   std::string_view key);
-[[nodiscard]] std::optional<std::string> find_manifest_member(const std::string& json,
-                                                              const std::string& key);
-[[nodiscard]] bool parse_json_string(std::string_view json,
-                                     std::size_t& position,
-                                     std::string* decoded);
 [[nodiscard]] Result<std::string> read_manifest_object(const std::string& json, const std::string& key, const char* prefix = "");
 [[nodiscard]] Result<uint32_t> read_manifest_uint32(const std::string& json, const std::string& key, const char* prefix = "");
 [[nodiscard]] Result<std::string> read_manifest_string(const std::string& json, const std::string& key, const char* prefix = "");

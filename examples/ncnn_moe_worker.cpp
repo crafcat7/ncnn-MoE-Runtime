@@ -1393,6 +1393,10 @@ public:
                 continue;
             try
             {
+                size_t position = skip_space(line, 0);
+                if (position == line.size() || line[position] != '{'
+                    || !parse_json_value(line, position) || skip_space(line, position) != line.size())
+                    throw std::invalid_argument("request must be a UTF-8 JSON object");
                 const auto operation = json_string(line, "op");
                 if (!operation)
                     throw std::invalid_argument("request requires an op string");

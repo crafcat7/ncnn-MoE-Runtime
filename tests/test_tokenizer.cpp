@@ -101,7 +101,7 @@ static std::string process_line(const Tokenizer& tokenizer, std::string_view lin
             if (!messages || messages->empty() || messages->front() != '[')
                 return error_record("chat requires a messages array");
             const auto thinking = json_boolean(line, "enable_thinking");
-            const std::vector<int32_t> ids = tokenizer.apply_chat(*messages, thinking.value_or(true));
+            const std::vector<int32_t> ids = tokenizer.encode_chat(*messages, thinking.value_or(true));
             JsonObject result;
             result.add_bool("ok", true);
             result.add_raw("ids", ids_json(ids));
@@ -225,7 +225,7 @@ int main(int argc, char** argv)
     expected_concurrency_ids.reserve(concurrency_texts.size());
     for (const std::string& text : concurrency_texts)
         expected_concurrency_ids.push_back(const_tokenizer.encode(text));
-    const std::vector<int32_t> expected_chat_ids = const_tokenizer.apply_chat(concurrency_chat, true);
+    const std::vector<int32_t> expected_chat_ids = const_tokenizer.encode_chat(concurrency_chat, true);
     std::atomic<bool> concurrency_ok{true};
     std::vector<std::thread> workers;
     try
@@ -248,7 +248,7 @@ int main(int argc, char** argv)
                                 return;
                             }
                         }
-                        if (const_tokenizer.apply_chat(concurrency_chat, true) != expected_chat_ids)
+                        if (const_tokenizer.encode_chat(concurrency_chat, true) != expected_chat_ids)
                         {
                             concurrency_ok.store(false, std::memory_order_relaxed);
                             return;

@@ -1,4 +1,5 @@
 #include "modeladapter_deepseekv4.h"
+#include "json.h"
 
 #include "tensornames.h"
 #include "modeladapter.h"

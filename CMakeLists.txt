@@ -87,18 +87,11 @@ set(NCNN_MOE_SOURCES
 add_library(ncnn_moe STATIC ${NCNN_MOE_SOURCES})
 source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_SOURCES})
 
-find_package(ICU 76 COMPONENTS i18n uc data QUIET)
-set(NCNN_MOE_WITH_ICU ${ICU_FOUND})
-if(ICU_FOUND)
-    set_source_files_properties(src/models/tokenizer.cpp
-        PROPERTIES COMPILE_DEFINITIONS NCNN_MOE_TOKENIZER_ICU=1)
-    target_link_libraries(ncnn_moe PRIVATE ICU::i18n ICU::uc ICU::data)
-endif()
 if(MSVC)
     # Tokenizer literals, templates, and parity fixtures must retain UTF-8 bytes.
     set_property(SOURCE src/models/tokenizer.cpp tests/test_tokenizer.cpp APPEND PROPERTY COMPILE_OPTIONS /utf-8)
 endif()
-install(FILES src/models/tokenizer.LICENSE
+install(FILES src/models/tokenizer.LICENSE src/models/unicode.LICENSE
     DESTINATION ${CMAKE_INSTALL_DATADIR}/ncnn-moe-runtime/licenses)
 
 if(APPLE)

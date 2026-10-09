@@ -1,5 +1,6 @@
 #include "modeladapter.h"
 
+#include "json.h"
 #include "ncnn/moe/modeladapter.h"
 #include "safetensors.h"
 #include "storage/mappedfile.h"
@@ -19,16 +20,6 @@
 
 namespace ncnn {
 namespace moe {
-
-static void skip_json_whitespace(std::string_view json, size_t& position) noexcept
-{
-    while (position < json.size()
-           && (json[position] == ' ' || json[position] == '\t'
-               || json[position] == '\r' || json[position] == '\n'))
-    {
-        ++position;
-    }
-}
 
 static bool is_json_digit(char value) noexcept
 {
@@ -181,8 +172,35 @@ bool parse_json_string(std::string_view json,
         }
         else
         {
-            if (static_cast<unsigned char>(value) < 0x20)
+            const unsigned char lead = static_cast<unsigned char>(value);
+            if (lead < 0x20)
                 return false;
+            if (lead >= 0x80)
+            {
+                const size_t length = lead >= 0xc2 && lead <= 0xdf   ? 2
+                                      : lead >= 0xe0 && lead <= 0xef ? 3
+                                      : lead >= 0xf0 && lead <= 0xf4 ? 4
+                                                                     : 0;
+                if (length == 0 || json.size() - position < length - 1)
+                    return false;
+                uint32_t codepoint = lead & (0x7f >> length);
+                for (size_t i = 0; i < length - 1; ++i)
+                {
+                    const unsigned char next = static_cast<unsigned char>(json[position + i]);
+                    if ((next & 0xc0) != 0x80)
+                        return false;
+                    codepoint = (codepoint << 6) | (next & 0x3f);
+                }
+                if ((length == 3 && codepoint < 0x800)
+                    || (length == 4 && codepoint < 0x10000)
+                    || (codepoint >= 0xd800 && codepoint <= 0xdfff)
+                    || codepoint > 0x10ffff)
+                    return false;
+                if (decoded)
+                    decoded->append(json.data() + position - 1, length);
+                position += length - 1;
+                continue;
+            }
             if (decoded)
                 decoded->push_back(value);
         }
@@ -190,7 +208,7 @@ bool parse_json_string(std::string_view json,
     return false;
 }
 
-static bool is_json_number(const std::string& value) noexcept
+static bool is_json_number(std::string_view value) noexcept
 {
     size_t position = 0;
     if (position < value.size() && value[position] == '-')
@@ -236,65 +254,95 @@ static bool is_json_number(const std::string& value) noexcept
     return position == value.size();
 }
 
-static bool scan_json_value(std::string_view json, size_t& position)
+bool parse_json_value(std::string_view json, size_t& position)
 {
-    skip_json_whitespace(json, position);
-    if (position >= json.size())
-        return false;
-
-    if (json[position] == '"')
+    enum : uint8_t
     {
-        if (!parse_json_string(json, position, nullptr))
+        Value,
+        Done,
+        ArrayFirst,
+        ArrayValue,
+        ArrayEnd,
+        ObjectFirst,
+        ObjectKey,
+        ObjectColon,
+        ObjectValue,
+        ObjectEnd
+    };
+    // Ordinary requests stay on the stack; deeper JSON remains iterative.
+    std::array<uint8_t, 64> states{};
+    std::vector<uint8_t> overflow;
+    size_t depth = 1;
+    for (;;)
+    {
+        uint8_t& state = depth <= states.size() ? states[depth - 1] : overflow.back();
+        if (state == Done)
+            return position == json.size() || is_space(json[position])
+                   || json[position] == ',' || json[position] == ']' || json[position] == '}';
+        position = skip_space(json, position);
+        if (position >= json.size())
             return false;
-    }
-    else if (json[position] == '{' || json[position] == '[')
-    {
-        const char opening = json[position++];
-        std::vector<char> delimiters{opening};
-        while (position < json.size() && !delimiters.empty())
-        {
-            if (json[position] == '"')
-            {
-                if (!parse_json_string(json, position, nullptr))
-                    return false;
-                continue;
-            }
-            if (json[position] == '{')
-                delimiters.push_back('{');
-            else if (json[position] == '[')
-                delimiters.push_back('[');
-            else if (json[position] == '}')
-            {
-                if (delimiters.empty() || delimiters.back() != '{')
-                    return false;
-                delimiters.pop_back();
-            }
-            else if (json[position] == ']')
-            {
-                if (delimiters.empty() || delimiters.back() != '[')
-                    return false;
-                delimiters.pop_back();
-            }
-            ++position;
-        }
-        if (!delimiters.empty())
-            return false;
-    }
-    else
-    {
-        const size_t value_start = position;
-        while (position < json.size()
-               && json[position] != ',' && json[position] != '}' && json[position] != ']'
-               && json[position] != ' ' && json[position] != '\t'
-               && json[position] != '\r' && json[position] != '\n')
+        const char c = json[position];
+        if (((state == ArrayFirst || state == ArrayEnd) && c == ']')
+            || ((state == ObjectFirst || state == ObjectEnd) && c == '}'))
         {
             ++position;
+            if (depth > states.size())
+                overflow.pop_back();
+            --depth;
+            continue;
         }
-        if (position == value_start)
-            return false;
+        if (state == ArrayEnd || state == ObjectEnd)
+        {
+            if (c != ',')
+                return false;
+            state = state == ArrayEnd ? ArrayValue : ObjectKey;
+            ++position;
+            continue;
+        }
+        if (state == ObjectFirst || state == ObjectKey)
+        {
+            if (!parse_json_string(json, position, nullptr))
+                return false;
+            state = ObjectColon;
+            continue;
+        }
+        if (state == ObjectColon)
+        {
+            if (c != ':')
+                return false;
+            state = ObjectValue;
+            ++position;
+            continue;
+        }
+        state = state == Value ? Done : state == ObjectValue ? ObjectEnd
+                                                             : ArrayEnd;
+        if (c == '{' || c == '[')
+        {
+            ++position;
+            const uint8_t next = c == '{' ? ObjectFirst : ArrayFirst;
+            if (depth < states.size())
+                states[depth] = next;
+            else
+                overflow.push_back(next);
+            ++depth;
+        }
+        else if (c == '"')
+        {
+            if (!parse_json_string(json, position, nullptr))
+                return false;
+        }
+        else
+        {
+            const size_t start = position;
+            while (position < json.size() && !is_space(json[position])
+                   && json[position] != ',' && json[position] != ']' && json[position] != '}')
+                ++position;
+            const std::string_view token = json.substr(start, position - start);
+            if (token != "true" && token != "false" && token != "null" && !is_json_number(token))
+                return false;
+        }
     }
-
-    return true;
 }
 
 static bool scan_json_array(const std::string& json,
@@ -303,7 +351,7 @@ static bool scan_json_array(const std::string& json,
 {
     if (position >= json.size() || json[position++] != '[')
         return false;
-    skip_json_whitespace(json, position);
+    position = skip_space(json, position);
     if (position < json.size() && json[position] == ']')
     {
         ++position;
@@ -312,12 +360,12 @@ static bool scan_json_array(const std::string& json,
 
     while (position < json.size())
     {
-        skip_json_whitespace(json, position);
+        position = skip_space(json, position);
         const size_t value_start = position;
-        if (!scan_json_value(json, position))
+        if (!parse_json_value(json, position))
             return false;
         elements.push_back(json.substr(value_start, position - value_start));
-        skip_json_whitespace(json, position);
+        position = skip_space(json, position);
         if (position >= json.size())
             return false;
         if (json[position] == ']')
@@ -327,7 +375,7 @@ static bool scan_json_array(const std::string& json,
         }
         if (json[position++] != ',')
             return false;
-        skip_json_whitespace(json, position);
+        position = skip_space(json, position);
         if (position >= json.size() || json[position] == ']')
             return false;
     }
@@ -338,10 +386,10 @@ std::optional<std::string_view> find_manifest_member(std::string_view json,
                                                      std::string_view key)
 {
     size_t position = 0;
-    skip_json_whitespace(json, position);
+    position = skip_space(json, position);
     if (position >= json.size() || json[position++] != '{')
         return std::nullopt;
-    skip_json_whitespace(json, position);
+    position = skip_space(json, position);
     if (position < json.size() && json[position] == '}')
         return std::nullopt;
 
@@ -350,16 +398,16 @@ std::optional<std::string_view> find_manifest_member(std::string_view json,
         std::string name;
         if (!parse_json_string(json, position, &name))
             return std::nullopt;
-        skip_json_whitespace(json, position);
+        position = skip_space(json, position);
         if (position >= json.size() || json[position++] != ':')
             return std::nullopt;
-        skip_json_whitespace(json, position);
+        position = skip_space(json, position);
         const size_t value_start = position;
-        if (!scan_json_value(json, position))
+        if (!parse_json_value(json, position))
             return std::nullopt;
         const size_t value_end = position;
         size_t delimiter = value_end;
-        skip_json_whitespace(json, delimiter);
+        delimiter = skip_space(json, delimiter);
         if (delimiter >= json.size() || (json[delimiter] != ',' && json[delimiter] != '}'))
             return std::nullopt;
         if (std::string_view(name) == key)
@@ -372,7 +420,7 @@ std::optional<std::string_view> find_manifest_member(std::string_view json,
             return std::nullopt;
         if (json[position++] != ',')
             return std::nullopt;
-        skip_json_whitespace(json, position);
+        position = skip_space(json, position);
         if (position >= json.size() || json[position] == '}')
             return std::nullopt;
     }
@@ -446,7 +494,7 @@ Result<std::string> read_manifest_string(const std::string& json, const std::str
     std::string decoded;
     if (!parse_json_string(*value, position, &decoded))
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string field: " + key};
-    skip_json_whitespace(*value, position);
+    position = skip_space(*value, position);
     if (position != value->size())
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string field: " + key};
     if (decoded.empty())
@@ -495,7 +543,7 @@ Result<std::vector<uint32_t>> read_manifest_uint32_array(const std::string& json
     size_t position = 0;
     if (!scan_json_array(*value, position, elements))
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
-    skip_json_whitespace(*value, position);
+    position = skip_space(*value, position);
     if (position != value->size())
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
 
@@ -533,7 +581,7 @@ Result<std::vector<std::string>> read_manifest_string_array(const std::string& j
     size_t position = 0;
     if (!scan_json_array(*value, position, elements))
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
-    skip_json_whitespace(*value, position);
+    position = skip_space(*value, position);
     if (position != value->size())
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
 
@@ -543,7 +591,7 @@ Result<std::vector<std::string>> read_manifest_string_array(const std::string& j
         std::string decoded;
         if (!parse_json_string(element, element_position, &decoded))
             return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
-        skip_json_whitespace(element, element_position);
+        element_position = skip_space(element, element_position);
         if (element_position != element.size())
             return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
         element = std::move(decoded);

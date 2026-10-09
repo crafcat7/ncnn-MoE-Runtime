@@ -1,8 +1,6 @@
 #ifndef NCNN_MOE_MODELS_JSON_H
 #define NCNN_MOE_MODELS_JSON_H
 
-#include "modeladapter.h"
-
 #include <charconv>
 #include <cmath>
 #include <cstddef>
@@ -19,6 +17,16 @@
 
 namespace ncnn {
 namespace moe {
+
+// Member lookup inspects only direct members of the supplied JSON object.
+[[nodiscard]] std::optional<std::string_view> find_manifest_member(std::string_view json,
+                                                                   std::string_view key);
+[[nodiscard]] std::optional<std::string> find_manifest_member(const std::string& json,
+                                                              const std::string& key);
+[[nodiscard]] bool parse_json_string(std::string_view json,
+                                     std::size_t& position,
+                                     std::string* decoded);
+[[nodiscard]] bool parse_json_value(std::string_view json, std::size_t& position);
 
 inline bool is_space(char value) noexcept
 {

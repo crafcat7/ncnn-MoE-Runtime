@@ -115,9 +115,9 @@ requiring a resident copy of every routed weight.
 ## Quick start
 
 Requirements: a C++20 compiler, CMake 3.21 or newer, Python 3.10+, and Git.
-Text prompts also require ICU 76+ with Unicode data 16+ at build time. CMake
-detects ICU automatically; use its standard `ICU_ROOT` hint if needed. Builds
-without ICU retain the token-ID API and reference runners.
+Text prompts use the Runtime's built-in Unicode tokenizer and require the
+supported tokenizer assets in the model directory. No external Unicode library
+is needed at build or runtime.
 
 Install the complete Python environment for the unified examples from the
 repository root:
@@ -331,9 +331,10 @@ inside Runtime. `Model::encode(messages_json, enable_thinking)` applies the
 model's text-message template, `Model::decode(token_id, pending, final)` decodes
 one stream, and `Model::stop_tokens()` supplies the model's stop IDs. Each
 stream owns its pending UTF-8 bytes. An empty stop list means native text is
-unavailable; token-ID execution remains usable. The public headers expose no
-ICU types. ICU is an optional private Runtime dependency and is resolved by
-the installed CMake package when the library was built with text support.
+unavailable; token-ID execution remains usable. The tokenizer uses private,
+generated Unicode tables with fixed versions for each model profile. Qwen uses
+Unicode 16 character categories and Unicode 9 NFC, while GPT-OSS and DeepSeek
+use Unicode 17 character categories. The installed SDK needs no Unicode library.
 
 The Python CLI sends messages through the existing generate, compact, and stats
 operations. Worker retains validated context limits and native prefix reuse;

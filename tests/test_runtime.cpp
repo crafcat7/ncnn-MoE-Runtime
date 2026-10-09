@@ -35,6 +35,7 @@
 #include "graph/router.h"
 #include "models/modeladapter_gptoss.h"
 #include "models/modeladapter.h"
+#include "models/json.h"
 #include "models/modeladapter_deepseekv4.h"
 #include "models/modeladapter_qwen3_5.h"
 #include "models/modeladapter_qwen4exp.h"
@@ -14807,6 +14808,50 @@ void test_manifest_readers()
     check(!isolated_high_surrogate);
     auto isolated_low_surrogate = read_manifest_string(R"({"text":"\uDE00"})", "text");
     check(!isolated_low_surrogate);
+
+    const std::string utf8_text = "\xc2\xa2\xe4\xbd\xa0\xe5\xa5\xbd\xf0\x9f\x98\x80";
+    auto utf8_string = read_manifest_string(std::string(R"({"text":")") + utf8_text + R"("})", "text");
+    check(static_cast<bool>(utf8_string));
+    check(utf8_string.value() == utf8_text);
+    for (const char* text : {"null", "true", "false", "-0", "1.25e-2", "[]", "{}",
+                             R"({"values":[null,true,false,-1,0.5,{},["text"]]})"})
+    {
+        size_t position = 0;
+        check(parse_json_value(text, position));
+        check(position == std::string_view(text).size());
+    }
+    for (const char* text : {"foo", "01", "-", ".5", "1.", "1e+", "truefalse", "[]garbage",
+                             "[1 2]", "[1,]", "[,1]", "[1,,2]", "[true:false]", "[}",
+                             R"({foo:1})", R"({"x" 1})", R"({"x":})", R"({"x":foo})",
+                             R"({"x":1,})", R"({"x":1 "y":2})", R"({"x":[]garbage})"})
+    {
+        size_t position = 0;
+        check(!parse_json_value(text, position));
+    }
+    size_t json_position = 0;
+    check(parse_json_value(" [1] , 2", json_position));
+    check(json_position == 4);
+    // Overflow nesting must not recurse or impose a new protocol limit.
+    const std::string deep_json = std::string(4096, '[') + "null" + std::string(4096, ']');
+    json_position = 0;
+    check(parse_json_value(deep_json, json_position));
+    check(json_position == deep_json.size());
+    json_position = 0;
+    check(!parse_json_value(std::string_view(deep_json).substr(0, deep_json.size() - 1), json_position));
+    for (const char* bytes : {"\x80", "\xc0\xaf", "\xc2", "\xe4\xbd", "\xe0\x80\xaf",
+                              "\xed\xa0\x80", "\xf0\x80\x80\xaf", "\xf4\x90\x80\x80",
+                              "\xf5\x80\x80\x80", "\xc4\xe3\xba\xc3"})
+    {
+        const std::string text = std::string("\"") + bytes + "\"";
+        check(!read_manifest_string(std::string(R"({"text":)") + text + "}", "text"));
+        // Parsing without decoding must enforce the same boundary.
+        size_t position = 0;
+        check(!parse_json_string(text, position, nullptr));
+        position = 0;
+        check(!parse_json_value(std::string(R"({"text":)") + text + "}", position));
+        position = 0;
+        check(!parse_json_value(std::string(R"({"text":1,)") + bytes + "}", position));
+    }
 
     auto balanced_object = read_manifest_object(R"({"object":{"value":7,"nested":{"flag":true}}})", "object");
     check(static_cast<bool>(balanced_object));

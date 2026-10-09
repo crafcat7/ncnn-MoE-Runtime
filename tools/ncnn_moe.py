@@ -12,7 +12,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 try:
     from ncnn_moe_adapters import AdapterError, Completion, ModelAdapter, NATIVE_TEXT_VERSION, create_adapter
@@ -37,10 +37,13 @@ except ModuleNotFoundError:  # Installed entry point: tools is a package.
 
 
 def configure_standard_streams() -> None:
-    for stream in (sys.stdout, sys.stderr):
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
-            reconfigure(encoding="utf-8", errors="replace")
+            # Keep Python's console/explicit codec; default redirected text to UTF-8.
+            encoding = stream.encoding if stream.isatty() or os.environ.get("PYTHONIOENCODING") else "utf-8"
+            errors = "strict" if stream is sys.stdin else "backslashreplace"
+            reconfigure(encoding=encoding, errors=errors)
 
 
 def _optional_rich() -> tuple[Any, Any]:
@@ -1397,12 +1400,23 @@ class ConversationApp:
             self._status(f"unknown command: {command}; use /help")
         return True
 
-    def chat(self) -> int:
+    def chat(self, source: TextIO | None = None) -> int:
+        """Read Unicode lines from a frontend-owned text stream or console."""
         self.show_ready()
-        prompt_session = self.prompt_session_class() if self.prompt_session_class else None
+        if source is None and not sys.stdin.isatty():
+            source = sys.stdin
+        prompt_session = self.prompt_session_class() if source is None and self.prompt_session_class else None
         while True:
             try:
-                line = prompt_session.prompt("you> ") if prompt_session else input("you> ")
+                if source is None:
+                    line = prompt_session.prompt("you> ") if prompt_session else input("you> ")
+                else:
+                    line = source.readline()
+                    if not isinstance(line, str):
+                        raise ValueError("chat input must be a decoded text stream")
+                    if not line:
+                        break
+                    line = line.rstrip("\r\n")
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
@@ -1431,7 +1445,7 @@ def load_adapter(arguments: argparse.Namespace, model: Path, ready: dict[str, An
     model_info = ready.get("model", {}) if isinstance(ready, dict) else {}
     if not isinstance(model_info, dict) or model_info.get("native_text_supported") is not True:
         raise AdapterError(
-            "native text is unavailable: this runtime or its ICU tokenizer assets "
+            "native text is unavailable: this runtime or its tokenizer assets "
             "do not support the model"
         )
     native_version = model_info.get("native_text_version")

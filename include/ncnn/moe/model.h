@@ -23,7 +23,8 @@ public:
     [[nodiscard]] uint32_t vulkan_device_index() const noexcept;
     [[nodiscard]] const std::vector<uint32_t>& vulkan_device_indices() const noexcept;
 
-    // Format a JSON array of text messages with the model's chat template.
+    // Format a UTF-8 JSON array of text messages with the model's chat template.
+    // Invalid UTF-8 is rejected; callers handle console or locale conversion.
     // Tokenizer assets are loaded once with the model. An empty stop list
     // means native text handling is unavailable; token-ID execution still works.
     [[nodiscard]] Result<std::vector<int32_t>> encode(std::string_view messages, bool enable_thinking = true) const;

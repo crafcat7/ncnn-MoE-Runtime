@@ -1,4 +1,5 @@
 #include "modeladapter_qwen3_5.h"
+#include "json.h"
 
 #include "tensornames.h"
 #include "modeladapter.h"

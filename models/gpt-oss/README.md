@@ -37,8 +37,7 @@ hf download openai/gpt-oss-120b --local-dir .\models\gpt-oss\gpt-oss-120b
 
 Each directory must contain `config.json`, `model.safetensors.index.json`, and
 every shard referenced by the index. Text prompts also require the official
-`tokenizer.json` and `tokenizer_config.json` assets and a Runtime built with
-ICU 76+. Build the examples by following the root
+`tokenizer.json` and `tokenizer_config.json` assets. Build the examples by following the root
 [Quick start](../../README.md#quick-start), then build `ncnn_moe_worker` for
 normal text and chat usage.
 

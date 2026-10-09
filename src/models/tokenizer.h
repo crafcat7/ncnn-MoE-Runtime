@@ -6,7 +6,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -29,7 +28,7 @@ public:
     bool load(const std::string& model_directory, size_t vocabulary_size = 0);
 
     std::vector<int32_t> encode(std::string_view text) const;
-    std::vector<int32_t> apply_chat(std::string_view messages_json, bool enable_thinking) const;
+    std::vector<int32_t> encode_chat(std::string_view messages_json, bool enable_thinking) const;
     std::string decode(int32_t id, std::string& pending, bool final = false) const;
     const std::vector<int32_t>& stop_tokens() const noexcept
     {
@@ -38,7 +37,6 @@ public:
 
 private:
     struct EncodeScratch;
-    struct UnicodeProfile;
 
     enum : uint8_t
     {
@@ -77,7 +75,7 @@ private:
 
     bool load_impl(const std::string& model_directory, size_t vocabulary_size);
     void encode_impl(std::string_view text,
-                     bool recognize_added_tokens,
+                     bool use_added,
                      EncodeScratch& scratch,
                      std::vector<int32_t>& ids) const;
     void bpe(std::string_view raw, std::vector<int32_t>& ids, EncodeScratch& scratch) const;
@@ -90,7 +88,6 @@ private:
     std::array<std::pair<size_t, size_t>, 256> added_token_ranges{};
     std::vector<int32_t> stops;
     std::array<int32_t, 256> byte_ids{};
-    std::unique_ptr<UnicodeProfile> unicode;
     Family family = Family::None;
     bool ignore_merges = false;
 };
