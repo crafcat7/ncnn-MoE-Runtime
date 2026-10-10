@@ -1204,15 +1204,15 @@ static void trim_sliding_cache(LayerCache& cache, const AttentionBlockPlan& plan
         compact_cache(cache, target_capacity);
 }
 
-static void attention_linear_into(const WeightStore& weights, const CompiledOperatorTable& operators, TensorHandle matrix, TensorHandle bias, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags)
+static void attention_linear_into(const WeightStore& weights, const CompiledOperatorTable& operators, TensorHandle matrix, TensorHandle bias, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, ExecutionBackend backend)
 {
     if (bias == invalid_tensor_handle)
     {
-        forward_linear(weights.at(matrix), input, output, optimization_flags, operators.find_weight(matrix));
+        forward_linear(weights.at(matrix), input, output, optimization_flags, operators.find_weight(matrix), backend);
     }
     else
     {
-        forward_linear(weights.at(matrix), weights.at(bias), input, output, optimization_flags, operators.find_weight(matrix));
+        forward_linear(weights.at(matrix), weights.at(bias), input, output, optimization_flags, operators.find_weight(matrix), backend);
     }
 }
 
@@ -1318,7 +1318,7 @@ static Result<void> project_and_append_qsa_keys(const WeightStore& weights,
     }
     attention_linear_into(weights, operators, plan.qsa_query_key_weight,
                           invalid_tensor_handle, normalized, scratch.qsa_query_key,
-                          optimization_flags);
+                          optimization_flags, ExecutionBackend::Cpu);
     const uint32_t query_columns = plan.index_head_count * plan.index_head_dimension;
     const uint32_t expected_columns = query_columns + plan.index_head_dimension;
     if (scratch.qsa_query_key.columns() != expected_columns)
@@ -1579,8 +1579,8 @@ Result<void> append_attention_context(const WeightStore& weights,
     }
     else
     {
-        attention_linear_into(weights, operators, plan.key_weight, plan.key_bias, *normalized, key, optimization_flags);
-        attention_linear_into(weights, operators, plan.value_weight, plan.value_bias, *normalized, value, optimization_flags);
+        attention_linear_into(weights, operators, plan.key_weight, plan.key_bias, *normalized, key, optimization_flags, backend);
+        attention_linear_into(weights, operators, plan.value_weight, plan.value_bias, *normalized, value, optimization_flags, backend);
     }
 
     if (has_flag(plan.flags, AttentionBlockQueryKeyNorm))
@@ -1784,9 +1784,9 @@ Result<void> forward_attention(const WeightStore& weights,
     }
     else
     {
-        attention_linear_into(weights, operators, plan.query_weight, plan.query_bias, *normalized, query, optimization_flags);
-        attention_linear_into(weights, operators, plan.key_weight, plan.key_bias, *normalized, key, optimization_flags);
-        attention_linear_into(weights, operators, plan.value_weight, plan.value_bias, *normalized, value, optimization_flags);
+        attention_linear_into(weights, operators, plan.query_weight, plan.query_bias, *normalized, query, optimization_flags, backend);
+        attention_linear_into(weights, operators, plan.key_weight, plan.key_bias, *normalized, key, optimization_flags, backend);
+        attention_linear_into(weights, operators, plan.value_weight, plan.value_bias, *normalized, value, optimization_flags, backend);
     }
 
     if (has_flag(plan.flags, AttentionBlockQueryKeyNorm))
@@ -1866,7 +1866,8 @@ Result<void> forward_attention(const WeightStore& weights,
                                   invalid_tensor_handle,
                                   *normalized,
                                   scratch.gate,
-                                  optimization_flags);
+                                  optimization_flags,
+                                  backend);
         }
         for (size_t token_index = 0; token_index < scratch.attention.rows(); ++token_index)
         {
@@ -1895,7 +1896,8 @@ Result<void> forward_attention(const WeightStore& weights,
                           plan.output_bias,
                           scratch.attention,
                           projected,
-                          optimization_flags);
+                          optimization_flags,
+                          backend);
     if (!has_flag(plan.flags, AttentionBlockExternalResidual))
         add_batch_inplace(projected, hidden);
     if (&projected != &output)

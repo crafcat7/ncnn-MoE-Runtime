@@ -16,18 +16,11 @@
 #include "ncnn/moe/session.h"
 
 #include <algorithm>
-#include <chrono>
 #include <limits>
 #include <utility>
 
 namespace ncnn {
 namespace moe {
-
-static uint64_t elapsed_microseconds(std::chrono::steady_clock::time_point start,
-                                     std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now())
-{
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
-}
 
 static Result<void> forward_speculative_layer(const CompiledModel& model,
                                               const SpeculativeModelPlan::LayerNodes& execution,
@@ -63,7 +56,6 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
     // Target and draft layers execute sequentially with the same FFN workspace.
     layer_state.reset();
     const uint32_t multiplier = model.descriptor.hyper_connection_multiplier;
-    const auto attention_start = std::chrono::steady_clock::now();
     HyperConnectionMix& attention_mix = hyper_connection_scratch.transient_mix;
     const ActivationBuffer* attention_input = &hidden;
     if (multiplier > 1)
@@ -129,10 +121,8 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
             add_batch_inplace(hidden, attention_scratch.output);
         }
     }
-    statistics.attention_time_microseconds += elapsed_microseconds(attention_start);
 
     const MoeBlockPlan& moe = layer.moe;
-    layer_state.router_start = std::chrono::steady_clock::now();
     if (multiplier > 1)
     {
         auto mixed = forward_hyper_connection_pre(hidden,
@@ -176,8 +166,6 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
     if (!dispatched)
         return dispatched.error();
     prepare_experts(moe, layer_state, statistics);
-    statistics.router_time_microseconds += elapsed_microseconds(layer_state.router_start);
-    layer_state.expert_start = std::chrono::steady_clock::now();
 
     if (has_flag(graph.nodes[execution.expert_dispatch].flags, ExecutionNodeRequestExperts))
     {
@@ -187,19 +175,13 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
                                          moe,
                                          layer_state,
                                          scratch,
-                                         layer.layer_id,
-                                         statistics.expert_cache_management_time_microseconds);
+                                         layer.layer_id);
         if (!requested)
             return requested.error();
-        const auto shared_start = std::chrono::steady_clock::now();
-        ExpertExecutionMetrics shared_metrics;
         forward_shared_expert(model, moe, layer_state.normalized, layer_state.shared_expert_output,
-                              layer_state.shared_expert_workspace,
-                              shared_metrics);
-        statistics.expert_compute_time_microseconds += elapsed_microseconds(shared_start);
+                              layer_state.shared_expert_workspace);
     }
 
-    const auto expert_engine_start = std::chrono::steady_clock::now();
     auto executed = forward_moe(model,
                                 moe,
                                 layer_state,
@@ -208,19 +190,15 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
                                 layer.layer_id,
                                 expert_backend,
                                 cpu_prefetch);
-    statistics.expert_engine_time_microseconds += elapsed_microseconds(expert_engine_start);
     if (!executed)
         return executed.error();
-    const auto combine_start = std::chrono::steady_clock::now();
     if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0)
     {
-        ExpertExecutionMetrics shared_metrics;
         forward_shared_expert(model,
                               moe,
                               layer_state.normalized,
                               layer_state.shared_expert_output,
-                              layer_state.shared_expert_workspace,
-                              shared_metrics);
+                              layer_state.shared_expert_workspace);
     }
     ActivationBuffer& moe_output = layer_state.normalized;
     const bool has_backend_aggregation = init_moe_output(scratch,
@@ -264,9 +242,6 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
     {
         add_batch_inplace(hidden, moe_output);
     }
-    const auto combine_end = std::chrono::steady_clock::now();
-    statistics.expert_combine_time_microseconds += elapsed_microseconds(combine_start, combine_end);
-    statistics.expert_time_microseconds += elapsed_microseconds(layer_state.expert_start, combine_end);
     return {};
 }
 
@@ -499,7 +474,6 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
         return {};
     Bfloat16BatchedLinearExecutionCounter cpu_bfloat16_execution;
     const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(&cpu_bfloat16_execution);
-    const auto started = std::chrono::steady_clock::now();
     VulkanStatistics vulkan_before;
     if (model.vulkan_runtime)
         vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
@@ -515,7 +489,6 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
             record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
         }
         statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
-        statistics.speculative_context_time_microseconds += elapsed_microseconds(started);
         return {};
     }
     const uint32_t expected_columns = model.descriptor.hidden_size
@@ -579,7 +552,6 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
         record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
     }
     statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
-    statistics.speculative_context_time_microseconds += elapsed_microseconds(started);
     return {};
 }
 
@@ -612,7 +584,6 @@ static Result<SpeculativeProposal> propose_mtp(const CompiledModel& model,
             "invalid Qwen MTP proposal state"};
     }
 
-    const auto started = std::chrono::steady_clock::now();
     VulkanStatistics vulkan_before;
     if (model.vulkan_runtime)
         vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
@@ -690,7 +661,6 @@ static Result<SpeculativeProposal> propose_mtp(const CompiledModel& model,
     }
     ++statistics.speculative_proposals;
     statistics.speculative_draft_tokens += proposal.token_ids.size();
-    statistics.speculative_draft_time_microseconds += elapsed_microseconds(started);
     return proposal;
 }
 
@@ -752,7 +722,6 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
         }
     }
 
-    const auto started = std::chrono::steady_clock::now();
     VulkanStatistics vulkan_before;
     if (model.vulkan_runtime)
         vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
@@ -876,7 +845,6 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
     statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
     ++statistics.speculative_proposals;
     statistics.speculative_draft_tokens += proposal.token_ids.size();
-    statistics.speculative_draft_time_microseconds += elapsed_microseconds(started);
     return proposal;
 }
 

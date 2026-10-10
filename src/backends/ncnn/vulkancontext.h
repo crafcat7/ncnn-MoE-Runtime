@@ -29,6 +29,8 @@ namespace moe {
 class ActivationBuffer;
 struct TensorData;
 class VulkanContext;
+class VulkanIndependentWeightTransfer;
+class VulkanExpertTransferPool;
 
 struct VulkanContextCacheKey
 {
@@ -86,20 +88,11 @@ private:
 struct VulkanRuntimeState
 {
     AtomicRuntimeCounter compute_submissions;
-    AtomicRuntimeCounter submit_wait_time_microseconds;
     AtomicRuntimeCounter batch_uploads;
     AtomicRuntimeCounter batch_downloads;
-    AtomicRuntimeCounter auxiliary_uploads;
-    AtomicRuntimeCounter auxiliary_upload_bytes;
-    AtomicRuntimeCounter staging_slot_resizes;
-    AtomicRuntimeCounter staging_slot_reuses;
-    AtomicRuntimeCounter staging_slot_acquisitions;
-    AtomicRuntimeCounter staging_slot_contentions;
     AtomicRuntimeCounter command_buffer_reuses;
     AtomicRuntimeCounter command_graph_submissions;
     AtomicRuntimeCounter command_graph_operations;
-    AtomicRuntimeCounter direct_host_input_bindings;
-    AtomicRuntimeCounter direct_host_output_bindings;
     AtomicRuntimeCounter attention_qkv_rope_fusions;
     AtomicRuntimeCounter attention_device_rope_fusions;
     AtomicRuntimeCounter attention_qkv_ring_fusions;
@@ -113,31 +106,28 @@ struct VulkanRuntimeState
     AtomicRuntimeCounter kv_ring_appends;
     AtomicRuntimeCounter kv_ring_resizes;
     AtomicRuntimeCounter kv_ring_wrapped_views;
-    AtomicRuntimeCounter kv_cache_promotions;
-    AtomicRuntimeCounter kv_cache_promotion_bytes;
     AtomicRuntimeCounter bfloat16_cooperative_matrix_dispatches;
-    AtomicRuntimeCounter command_dispatches;
-    AtomicRuntimeCounter command_pipeline_binds;
-    AtomicRuntimeCounter command_redundant_pipeline_binds;
-    AtomicRuntimeCounter command_descriptor_bindings;
-    AtomicRuntimeCounter command_push_constant_updates;
-    AtomicRuntimeCounter command_resource_barrier_calls;
-    AtomicRuntimeCounter command_buffer_resource_barriers;
-    AtomicRuntimeCounter command_image_resource_barriers;
     AtomicRuntimeCounter dispatches;
     AtomicRuntimeCounter attention_blocks;
 
     [[nodiscard]] VulkanStatistics snapshot() const noexcept;
 };
 
+// Wait an already submitted command without submitting it again. Return only
+// after its fence completes or the owning device is confirmed lost; callers
+// keep every command resource/owner alive through this call.
+int wait_submitted_compute(ncnn::VkCompute& command, const ncnn::VulkanDevice* probe_device);
+
+// The device must belong to this command and stay alive through the call. It
+// is used only to detect device loss after a failed fence wait. Without one,
+// the original wait keeps retrying until completion rather than release owners.
 int submit_compute_and_wait(ncnn::VkCompute& command,
-                            VulkanRuntimeState& runtime_state);
+                            const ncnn::VulkanDevice* probe_device);
 
 bool prepare_staging_batch(ncnn::VkMat& buffer,
                            size_t rows,
                            uint32_t columns,
                            ncnn::VkAllocator* allocator,
-                           VulkanRuntimeState& runtime_state,
                            size_t element_size = sizeof(float));
 
 bool prepare_staging_tensor(ncnn::VkMat& buffer,
@@ -145,8 +135,7 @@ bool prepare_staging_tensor(ncnn::VkMat& buffer,
                             int height,
                             int channels,
                             size_t element_size,
-                            ncnn::VkAllocator* allocator,
-                            VulkanRuntimeState& runtime_state);
+                            ncnn::VkAllocator* allocator);
 
 bool record_mapped_upload(ncnn::VkMat& staging,
                           ncnn::VkMat& destination,
@@ -179,34 +168,38 @@ bool record_mapped_activation_upload(ncnn::VkMat& staging,
                                           size_t first_row,
                                           size_t rows)
 {
-    if (source.empty() || source.dims != 2
-        || first_row + rows > static_cast<size_t>(source.h))
+    if (source.empty() || source.dims != 2 || rows == 0
+#if NCNN_BATCH
+        || source.n != 1
+#endif
+        || first_row > static_cast<size_t>(source.h)
+        || rows > static_cast<size_t>(source.h) - first_row)
     {
         return {};
     }
     ncnn::VkMat view = source;
     view.h = static_cast<int>(rows);
     view.offset += first_row * static_cast<size_t>(source.w) * source.elemsize;
+    view.cstep = static_cast<size_t>(source.w) * rows;
+#if NCNN_BATCH
+    view.nstep = view.cstep;
+#endif
     return view;
 }
 
-ncnn::VkMat bind_direct_host_input(ncnn::VkMat& staging,
-                                   VulkanRuntimeState& runtime_state);
+ncnn::VkMat bind_direct_host_input(ncnn::VkMat& staging);
 
-ncnn::VkMat prepare_direct_host_output(ncnn::VkMat& staging,
-                                       VulkanRuntimeState& runtime_state);
+ncnn::VkMat prepare_direct_host_output(ncnn::VkMat& staging);
 
 bool fill_staging_upload(const ActivationBuffer& input,
                          ncnn::VkMat& staging,
-                         ncnn::VkAllocator* allocator,
-                         VulkanRuntimeState& runtime_state);
+                         ncnn::VkAllocator* allocator);
 
 bool fill_staging_values(const void* source,
                          size_t count,
                          size_t element_size,
                          ncnn::VkMat& staging,
-                         ncnn::VkAllocator* allocator,
-                         VulkanRuntimeState& runtime_state);
+                         ncnn::VkAllocator* allocator);
 
 bool record_prepared_staging_upload(const ncnn::VkMat& staging,
                                     size_t rows,
@@ -239,6 +232,10 @@ bool prepare_float_tensor_upload(const TensorData& source,
 
 class VulkanRuntime
 {
+public:
+    VulkanRuntime() noexcept = default;
+
+private:
     friend class VulkanContext;
     friend VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& vulkan_runtime) noexcept;
 
@@ -256,6 +253,8 @@ class VulkanRuntime
 #else
 class VulkanRuntime
 {
+public:
+    VulkanRuntime() noexcept = default;
 };
 #endif
 
@@ -400,6 +399,8 @@ public:
     }
 
     [[nodiscard]] VulkanTransferLease acquire_transfer_slot();
+    [[nodiscard]] VulkanExpertTransferPool& expert_transfer_pool() noexcept
+    { return *weight_transfer_pool; }
 
 private:
     explicit VulkanContext(ncnn::VulkanDevice* device,
@@ -407,7 +408,8 @@ private:
                            uint64_t optimization_flags,
                            uint32_t command_optimization_flags);
 
-    // ncnn owns Vulkan teardown through atexit; transfer commands share that lifetime.
+    // Release dependent commands and tensors before returning borrowed allocators.
+    void release_resources() noexcept;
 
     ncnn::VulkanDevice* vkdev = nullptr;
     VulkanRuntimePtr vulkan_runtime;
@@ -419,6 +421,7 @@ private:
     // Staging slots require independent allocators while commands are in flight.
     std::array<VulkanTransferSlot, 2> transfer_slots;
     std::atomic<size_t> next_transfer_slot{0};
+    std::unique_ptr<VulkanExpertTransferPool> weight_transfer_pool;
     mutable std::mutex pipeline_cache_mutex;
     std::unordered_map<
         ShaderCacheKey,
@@ -432,16 +435,46 @@ private:
         pipelines;
 };
 
-// Weight admissions are produced by one background worker, but each Expert
-// used to create and wait for a separate transfer command. Keep one transfer
-// command and its staging allocator alive for a bounded group of MXFP4 Experts
-// so the device sees one submission for the whole group. The caller owns the
-// context command lock while the batch is recording; this keeps ncnn's
-// allocator and command domain serialized with foreground execution.
+// Caller serializes allocations and frees in the command domain. Only free
+// buffers are cached; retained upload commands keep their active buffers alive.
+class VulkanUploadStagingAllocator final : public ncnn::VkStagingAllocator
+{
+public:
+    VulkanUploadStagingAllocator(const ncnn::VulkanDevice* device, uint64_t cache_limit);
+
+    using ncnn::VkStagingAllocator::fastFree;
+    using ncnn::VkStagingAllocator::fastMalloc;
+    ncnn::VkBufferMemory* fastMalloc(size_t size) override;
+    void fastFree(ncnn::VkBufferMemory* buffer) override;
+    void clear() override;
+
+private:
+    struct CachedBuffer
+    {
+        ncnn::VkBufferMemory* buffer = nullptr;
+        uint64_t allocation_size = 0;
+    };
+    const uint64_t cache_limit;
+    std::array<CachedBuffer, 32> cached_buffers{};
+    size_t cached_count = 0;
+    uint64_t cached_size = 0;
+};
+
+// Bound one group of immutable Expert uploads. Runtime-owned weight buffers
+// use an isolated transfer command pool and concurrent queue-family sharing;
+// staging ownership remains local to the serialized admission lane. Legacy
+// allocators retain ncnn's transfer recorder and foreground command mutex.
 class VulkanWeightUploadBatch
 {
 public:
-    explicit VulkanWeightUploadBatch(const std::shared_ptr<VulkanContext>& _context);
+    // A borrowed staging allocator belongs exclusively to the admission
+    // transfer domain; do not reuse buffers previously owned by compute-family
+    // commands. The caller serializes its allocation/free operations.
+    explicit VulkanWeightUploadBatch(const std::shared_ptr<VulkanContext>& _context,
+                                     ncnn::VkAllocator* borrowed_staging_allocator = nullptr,
+                                     ncnn::Mat* borrowed_upload_scratch = nullptr);
+
+    ~VulkanWeightUploadBatch();
 
     VulkanWeightUploadBatch(const VulkanWeightUploadBatch&) = delete;
     VulkanWeightUploadBatch& operator=(const VulkanWeightUploadBatch&) = delete;
@@ -451,15 +484,43 @@ public:
                               const ncnn::Option& option,
                               ncnn::VkAllocator* weight_allocator);
 
+    // Pack the final GPU layout directly into mapped staging. Only runtime
+    // concurrent-family weight allocators support this path. Reservations
+    // cannot escape this batch; submission rejects an unrecorded reservation.
+    [[nodiscard]] std::span<uint8_t> prepare_storage(size_t bytes, ncnn::VkAllocator* weight_allocator);
+    [[nodiscard]] bool record_prepared_storage(ncnn::VkMat& destination,
+                                               const ncnn::Option& option,
+                                               ncnn::VkAllocator* weight_allocator);
     [[nodiscard]] bool submit();
 
+    // record_upload copies this source synchronously. Reuse at most 16 MiB
+    // of ordinary host scratch between matrices; larger sources are transient.
+    [[nodiscard]] ncnn::Mat host_storage(size_t bytes);
+
+    // Failed factories retain their last pipeline owners until this batch
+    // settles/destroys commands and releases any legacy context lock.
+    void retain_owner(std::shared_ptr<const void> owner);
+
 private:
+    void settle_legacy_upload() noexcept;
+
     std::shared_ptr<VulkanContext> context;
+    // Preallocated before native recording/submission, so an OOM recovery
+    // never allocates while retaining pending command/staging resources.
+    std::vector<VkQueue> legacy_queue_scratch;
     // Keep this before cmd so the allocator outlives VkTransfer's retained
     // staging VkMats during destruction.
     std::unique_ptr<ncnn::VkWeightStagingAllocator> staging_allocator;
-    ncnn::VkTransfer cmd;
+    ncnn::VkAllocator* borrowed_staging_allocator = nullptr;
+    ncnn::Mat* borrowed_upload_scratch = nullptr;
+    ncnn::Mat upload_scratch;
+    std::vector<std::shared_ptr<const void>> retained_owners;
+    // Destroy cmd (and return its staging buffers) before unlocking context.
     std::unique_lock<std::mutex> command_lock;
+    std::unique_ptr<ncnn::VkTransfer> cmd;
+    std::unique_ptr<VulkanIndependentWeightTransfer> independent_command;
+    bool failed = false;
+    bool submitted = false;
 };
 #endif // NCNN_MOE_WITH_VULKAN
 

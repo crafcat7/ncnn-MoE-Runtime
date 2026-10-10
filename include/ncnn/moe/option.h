@@ -71,6 +71,10 @@ enum OptionFlag : uint32_t
 #define NCNN_MOE_OPT_VULKAN_INDEXED_EXPERTS_BIT          39
 #define NCNN_MOE_OPT_VULKAN_QNK_BIT                      40
 #define NCNN_MOE_OPT_CPU_PACKED_WEIGHTS_BIT              41
+#define NCNN_MOE_OPT_VULKAN_JOINT_CACHE_EVICTION_BIT     42
+#define NCNN_MOE_OPT_VULKAN_MXFP4_ROW_TILE_BIT           43
+#define NCNN_MOE_OPT_VULKAN_EXPERT_DIRECT_STAGING_BIT    44
+#define NCNN_MOE_OPT_VULKAN_SHARED_EXPERT_OVERLAP_BIT    45
 
 enum OptimizationFlag : uint64_t
 {
@@ -110,6 +114,10 @@ enum OptimizationFlag : uint64_t
     OptimizationCpuSplitKvAttention = UINT64_C(1) << NCNN_MOE_OPT_CPU_SPLIT_KV_ATTENTION_BIT,
     OptimizationVulkanIndexedExperts = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_INDEXED_EXPERTS_BIT,
     OptimizationVulkanQnK = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_QNK_BIT,
+    OptimizationVulkanJointCacheEviction = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_JOINT_CACHE_EVICTION_BIT,
+    OptimizationVulkanMxfp4RowTile = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_MXFP4_ROW_TILE_BIT,
+    OptimizationVulkanExpertDirectStaging = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_EXPERT_DIRECT_STAGING_BIT,
+    OptimizationVulkanSharedExpertOverlap = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_SHARED_EXPERT_OVERLAP_BIT,
     // Internal execution bit selected from CpuPackedWeightMode. It is not
     // part of OptimizationDefaultFlags.
     OptimizationCpuPackedWeights = UINT64_C(1) << NCNN_MOE_OPT_CPU_PACKED_WEIGHTS_BIT
@@ -150,7 +158,11 @@ inline constexpr uint64_t OptimizationDefaultFlags = OptimizationCpuFastSilu
                                                      | OptimizationVulkanLatentInputRmsNorm
                                                      | OptimizationVulkanExpertGpuPriority
                                                      | OptimizationVulkanIndexedExperts
-                                                     | OptimizationVulkanQnK;
+                                                     | OptimizationVulkanQnK
+                                                     | OptimizationVulkanJointCacheEviction
+                                                     | OptimizationVulkanMxfp4RowTile
+                                                     | OptimizationVulkanExpertDirectStaging
+                                                     | OptimizationVulkanSharedExpertOverlap;
 
 inline constexpr uint64_t OptimizationOptionalFlags = OptimizationCpuPackedWeights;
 inline constexpr uint64_t OptimizationAllFlags = OptimizationDefaultFlags | OptimizationOptionalFlags;

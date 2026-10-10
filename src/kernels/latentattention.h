@@ -18,6 +18,10 @@ class CompiledOperatorTable;
 struct LayerCache;
 struct AttentionScratch;
 
+void record_latent_cache_transaction_row(LayerCache& cache,
+                                         const AttentionBlockPlan& plan,
+                                         uint64_t position);
+
 void begin_latent_cache_transaction(std::span<LayerCache> caches);
 
 [[nodiscard]] Result<void> finish_latent_cache_transaction(std::span<LayerCache> caches,

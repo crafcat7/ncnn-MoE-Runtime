@@ -1,6 +1,7 @@
 #ifndef NCNN_MOE_SESSIONSTATE_H
 #define NCNN_MOE_SESSIONSTATE_H
 
+#include "backends/ncnn/latentlayer_vulkan.h"
 #include "kernels/attention.h"
 #include "kernels/gateddeltanet.h"
 #include "kernels/hyperconnection.h"
@@ -14,7 +15,6 @@
 #include "ncnn/moe/types.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -29,14 +29,7 @@ struct SessionStatistics;
 
 struct ExpertExecutionMetrics
 {
-    uint64_t hinted_bytes = 0;
     uint64_t cache_wait_time_microseconds = 0;
-    uint64_t regroup_time_microseconds = 0;
-    uint64_t mxfp4_decode_gemv_rows = 0;
-    uint64_t mxfp4_prefill_gemm_rows = 0;
-    uint64_t mxfp4_paired_rows = 0;
-    uint64_t mxfp4_fused_gate_up_rows = 0;
-    uint64_t mxfp4_reused_input_rows = 0;
 };
 
 struct ExpertWorkspace
@@ -51,6 +44,7 @@ struct ExpertState
     ExpertBatch batch;
     ActivationBuffer input;
     ActivationBuffer output;
+    std::shared_ptr<DeviceTensor_vulkan> device_output;
     ExpertCacheLease lease;
     ExpertExecutionMetrics metrics;
 
@@ -61,6 +55,7 @@ struct ExpertState
         batch.routes.swap(next_batch.routes);
         next_batch.routes.clear();
         lease = {};
+        device_output.reset();
         metrics = {};
     }
 };
@@ -68,16 +63,16 @@ struct ExpertState
 struct LayerState
 {
     ActivationBuffer normalized;
+    std::shared_ptr<const DeviceTensor_vulkan> normalized_device;
     ActivationBuffer router_logits;
     HyperConnectionMix ffn_hyper_mix;
     ActivationBuffer shared_expert_output;
+    std::shared_ptr<const DeviceTensor_vulkan> shared_expert_device_output;
     ExpertWorkspace shared_expert_workspace;
     ExpertDispatchPlan dispatch_plan;
     // Keep inactive slots too, so changing route counts does not free buffers.
     std::vector<ExpertState> expert_slots;
     size_t active_expert_count = 0;
-    std::chrono::steady_clock::time_point router_start;
-    std::chrono::steady_clock::time_point expert_start;
     bool experts_executed = false;
 
     void resize_experts(size_t count)
@@ -102,8 +97,13 @@ struct LayerState
         // Router overwrites normalized/router_logits scratch before reuse.
         // Empty shared output means Shared Expert has not run for this pass.
         shared_expert_output.clear();
+        shared_expert_device_output.reset();
+        normalized_device.reset();
         for (ExpertState& active : expert_slots)
+        {
             active.lease = {};
+            active.device_output.reset();
+        }
         experts_executed = false;
     }
 };
@@ -122,7 +122,27 @@ struct ExpertScratch
     std::vector<uint8_t> backend_aggregated;
     std::vector<size_t> backend_indices;
     std::vector<ExpertBackendRequest> backend_requests;
+    // Final arrays are consumed synchronously before the next wait. Pending
+    // submissions keep their own reservations and never borrow this storage.
+    std::vector<ExpertBackendExecutionResult> backend_results;
     std::vector<size_t> failed_indices;
+    // Separate wave storage stays stable while asynchronous submissions own
+    // request spans. Clear owners after execution, retain vector capacity.
+    std::vector<size_t> prestaged_indices;
+    std::vector<ExpertDemandRequest> prestaged_demands;
+    std::vector<std::shared_ptr<const void>> prestaged_pins;
+    std::vector<size_t> prestaged_candidates;
+    std::vector<ExpertCachePairRequest> prestaged_cache_requests;
+    std::vector<ExpertCacheLease> prestaged_cache_leases;
+    std::vector<size_t> current_wave_indices;
+    std::vector<ExpertBackendRequest> current_wave_requests;
+    std::vector<size_t> next_wave_indices;
+    std::vector<ExpertBackendRequest> next_wave_requests;
+    std::vector<size_t> wave_failed_indices;
+    std::vector<size_t> wave_cpu_indices;
+    std::vector<ExpertDemandRequest> wave_demands;
+    std::vector<size_t> wave_demand_indices;
+    std::vector<std::shared_ptr<const void>> prepared_pins;
     bool backend_aggregated_output_valid = false;
     ActivationBuffer backend_aggregated_output;
     ActivationBuffer staged_merged;
@@ -135,6 +155,8 @@ struct ExpertScratch
 struct BatchWorkspace
 {
     ExpertScratch expert;
+    LatentLayerWorkspace_vulkan latent_layer;
+    ExpertDispatchPlan latent_routes;
     // Scratch that belongs to the in-flight staged batch rather than a
     // SessionState or an individual Expert execution.
     LayerState staged_state;
@@ -160,6 +182,9 @@ public:
     ExpertScratch expert_scratch;
     HyperConnectionScratch hyper_connection_scratch;
     AttentionScratch attention_scratch;
+    LatentLayerWorkspace_vulkan latent_layer;
+    std::vector<uint64_t> attention_positions;
+    std::vector<LayerCache*> attention_caches;
     GatedDeltaScratch gated_delta_scratch;
     std::unique_ptr<CpuTaskWorker> router_prediction_worker;
     ActivationBuffer hidden;

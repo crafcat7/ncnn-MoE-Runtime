@@ -565,7 +565,6 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                                                               verify_input_ids.size());
             if (!target_transaction)
                 return target_transaction.error();
-            const auto verify_started = std::chrono::steady_clock::now();
             auto execute_target_verify =
                 [&]() -> Result<std::vector<std::vector<float>>> {
                 if (!state_cache_transactions)
@@ -626,8 +625,6 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                     return rolled_back.error();
                 return target_logits.error();
             }
-            const auto target_verify_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - verify_started);
-            const uint64_t target_verify_microseconds = static_cast<uint64_t>(target_verify_elapsed.count());
             size_t accepted = 0;
             std::vector<float> accepted_probabilities;
             accepted_probabilities.reserve(draft_count);
@@ -712,7 +709,6 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                                                             0);
                 if (!rolled_back)
                     return rolled_back.error();
-                stats_scratch.speculative_verify_time_microseconds += target_verify_microseconds;
                 commit_execution(0, 0);
                 speculative_active = false;
                 continue;
@@ -809,8 +805,6 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
             if (!speculative_context)
                 return speculative_context.error();
             stats_scratch.speculative_accepted_tokens += emitted > 0 ? emitted - 1 : 0;
-            const auto verify_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - verify_started);
-            stats_scratch.speculative_verify_time_microseconds += static_cast<uint64_t>(verify_elapsed.count());
             commit_execution(0, emitted);
             if (!continue_generation)
                 break;

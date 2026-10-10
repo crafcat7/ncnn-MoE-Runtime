@@ -1,0 +1,186 @@
+#version 450
+
+#ifdef NCNN_fp16_arithmetic
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(binding = 0) readonly buffer input_blob
+{
+    float input_data[];
+};
+layout(binding = 1) readonly buffer packed_blob
+{
+    uint packed_words[];
+};
+layout(binding = 2) readonly buffer scale_blob
+{
+    uint scale_words[];
+};
+layout(binding = 3) readonly buffer bias_blob
+{
+    float bias_data[];
+};
+layout(binding = 4) writeonly buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint input_columns;
+    // Intermediate columns in mode 0, projection output columns in mode 1.
+    uint output_columns;
+    uint block_count;
+    uint token_count;
+    uint mode;
+    uint activation;
+    float activation_limit;
+}
+p;
+
+uint packed_byte(uint index)
+{
+    const uint word = packed_words[index >> 2u];
+    return (word >> ((index & 3u) * 8u)) & 255u;
+}
+
+uint scale_byte(uint index)
+{
+    const uint word = scale_words[index >> 2u];
+    return (word >> ((index & 3u) * 8u)) & 255u;
+}
+
+float decode_mxfp4(uint value)
+{
+    const float magnitudes[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    const float magnitude = magnitudes[value & 7u];
+    return (value & 8u) == 0u ? magnitude : -magnitude;
+}
+
+float decode_scale(uint value)
+{
+    return uintBitsToFloat(value == 0u ? 0x00400000u : value << 23u);
+}
+
+vec4 mxfp4_products(float value, vec4 inputs, float scale)
+{
+#ifdef NCNN_fp16_arithmetic
+    const float16_t weight_value = float16_t(value);
+    const float16_t scale_value = float16_t(scale);
+    return vec4(float(weight_value * float16_t(inputs.x) * scale_value),
+                float(weight_value * float16_t(inputs.y) * scale_value),
+                float(weight_value * float16_t(inputs.z) * scale_value),
+                float(weight_value * float16_t(inputs.w) * scale_value));
+#else
+    // Retain the scalar product order rather than pre-multiplying the weight
+    // and scale, including the intermediate FP16 rounding above.
+    return value * inputs * scale;
+#endif
+}
+
+#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
+shared vec4 sum_partial[32];
+shared vec4 up_partial[32];
+#endif
+
+void store_tile(uint first_row, uint output_column, vec4 sum, vec4 up_sum)
+{
+    vec4 result;
+    if (p.mode == 1u)
+    {
+        result = sum + vec4(bias_data[output_column]);
+    }
+    else
+    {
+        vec4 gate = sum + vec4(bias_data[output_column * 2u]);
+        vec4 up = up_sum + vec4(bias_data[output_column * 2u + 1u]);
+        if (p.activation_limit > 0.0)
+        {
+            gate = min(gate, vec4(p.activation_limit));
+            up = clamp(up, vec4(-p.activation_limit), vec4(p.activation_limit));
+        }
+        const vec4 silu = p.activation == 0u
+                              ? gate / (vec4(1.0) + exp(-1.702 * gate))
+                              : gate / (vec4(1.0) + exp(-gate));
+        result = p.activation == 0u ? silu * (up + vec4(1.0)) : silu * up;
+    }
+    for (uint row = 0u; row < 4u; ++row)
+    {
+        if (first_row + row < p.token_count)
+            output_data[(first_row + row) * p.output_columns + output_column] = result[row];
+    }
+}
+
+void main()
+{
+    const uint output_column = gl_WorkGroupID.x;
+    const uint first_row = gl_WorkGroupID.y * 4u;
+    const uint lane = gl_LocalInvocationID.x;
+    const bool gate_mode = p.mode == 0u;
+    const bool valid = output_column < p.output_columns && first_row < p.token_count;
+    vec4 sum = vec4(0.0);
+    vec4 up_sum = vec4(0.0);
+    if (valid && lane < 32u)
+    {
+        const uint weight_row = gate_mode ? output_column * 2u : output_column;
+        const uint packed_row = weight_row * p.block_count * 16u;
+        const uint scale_row = weight_row * p.block_count;
+        for (uint block = 0u; block < p.block_count; ++block)
+        {
+            const uint input_column = block * 32u + lane;
+            vec4 inputs = vec4(0.0);
+            for (uint row = 0u; row < 4u; ++row)
+            {
+                if (first_row + row < p.token_count)
+                    inputs[row] = input_data[(first_row + row) * p.input_columns + input_column];
+            }
+
+            // Decode each packed weight and scale once, then reuse them for
+            // four independent rows with the same accumulation order.
+            const uint packed_index = block * 16u + lane / 2u;
+            const uint value = packed_byte(packed_row + packed_index);
+            const uint nibble = (lane & 1u) == 0u ? value & 15u : value >> 4u;
+            const float weight = decode_mxfp4(nibble);
+            const float scale = decode_scale(scale_byte(scale_row + block));
+            sum += mxfp4_products(weight, inputs, scale);
+            if (gate_mode)
+            {
+                const uint up_value = packed_byte(packed_row + p.block_count * 16u + packed_index);
+                const uint up_nibble = (lane & 1u) == 0u ? up_value & 15u : up_value >> 4u;
+                const float up_weight = decode_mxfp4(up_nibble);
+                const float up_scale = decode_scale(scale_byte(scale_row + p.block_count + block));
+                up_sum += mxfp4_products(up_weight, inputs, up_scale);
+            }
+        }
+    }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const vec4 reduced_sum = subgroupAdd(sum);
+    vec4 reduced_up = vec4(0.0);
+    if (gate_mode)
+        reduced_up = subgroupAdd(up_sum);
+    if (valid && lane == 0u)
+        store_tile(first_row, output_column, reduced_sum, reduced_up);
+#else
+    sum_partial[lane] = sum;
+    up_partial[lane] = up_sum;
+    barrier();
+    for (uint stride = 16u; stride > 0u; stride >>= 1u)
+    {
+        if (lane < stride)
+        {
+            sum_partial[lane] += sum_partial[lane + stride];
+            if (gate_mode)
+                up_partial[lane] += up_partial[lane + stride];
+        }
+        barrier();
+    }
+    if (valid && lane == 0u)
+        store_tile(first_row, output_column, sum_partial[0], up_partial[0]);
+#endif
+}

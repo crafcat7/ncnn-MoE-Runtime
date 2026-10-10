@@ -31,7 +31,7 @@ from ncnn_moe_protocol import WorkerClient, WorkerError  # noqa: E402
 DEFAULT_PROMPT = "你好，你能做些什么"
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--worker", required=True, type=Path)
@@ -92,7 +92,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--enable-speculative", action="store_true")
     parser.add_argument("--json", action="store_true", dest="json_output")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _runtime_args(arguments: argparse.Namespace) -> list[str]:
@@ -173,8 +173,6 @@ def _summary(done_events: list[dict[str, Any]], generated: list[list[int]]) -> d
         "expert_gpu_cache_misses": int(expert.get("gpu_cache_miss", 0)),
         "expert_gpu_cache_pending_bytes": int(expert.get("gpu_cache_pending_bytes", 0)),
         "expert_gpu_cache_resident_bytes": int(expert.get("gpu_cache_resident_bytes", 0)),
-        "expert_cpu_seconds": float(metrics.get("cpu", {}).get("expert_compute_time_microseconds") or 0) / 1_000_000.0,
-        "gpu_wait_seconds": float(gpu.get("wait_time_microseconds") or 0) / 1_000_000.0,
         "gpu_available": bool(gpu.get("available", False)),
         "gpu_linear_dispatches": int(gpu.get("linear_dispatches", 0)),
         "gpu_attention_blocks": int(gpu.get("attention_blocks", 0)),
@@ -304,8 +302,8 @@ def main() -> int:
             "routes={expert_gpu_route_aggregation_routes}, bytes-saved={expert_gpu_route_aggregation_bytes_saved}".format(**result)
         )
         print(
-            "Expert: CPU={expert_cpu_seconds:.3f} s, GPU cache hit/miss={expert_gpu_cache_hits}/{expert_gpu_cache_misses}, "
-            "pending={expert_gpu_cache_pending_bytes} bytes, GPU wait={gpu_wait_seconds:.3f} s".format(**result)
+            f"GPU cache hit/miss={result['expert_gpu_cache_hits']}/{result['expert_gpu_cache_misses']}, "
+            f"pending={result['expert_gpu_cache_pending_bytes']} bytes"
         )
         print("generated token ids:", *result["generated_token_ids"])
         if not result["generated_sequences_match"]:

@@ -3,6 +3,12 @@
 #include "kernels/qnk.h"
 #include "linear.h"
 #include "attention_vulkan.h"
+#include "latentattention_vulkan.h"
+#include "latentlayer_vulkan.h"
+#include "hyperconnection_vulkan.h"
+#include "layerhead_vulkan.h"
+#include "rmsnorm_vulkan.h"
+#include "router_vulkan.h"
 #include "gateddeltanet_vulkan.h"
 #include "graph/compiler.h"
 #include "graph/compiledmodel.h"
@@ -188,8 +194,15 @@ bool support_vulkan_experts(const WeightStore& weights,
 bool support_vulkan_shared_experts(const CompiledOperatorTable& operators,
                                    const MoeBlockPlan& moe) noexcept
 {
-    return moe.fused_shared_input_bfloat16_operator != invalid_compiled_operator_handle
-           && static_cast<bool>(operators.at(moe.fused_shared_input_bfloat16_operator).bfloat16);
+    if (moe.fused_shared_input_bfloat16_operator != invalid_compiled_operator_handle
+        && operators.at(moe.fused_shared_input_bfloat16_operator).bfloat16)
+        return true;
+    const ExpertPlan& shared = moe.shared_expert;
+    return moe.shared_expert_gate_weight == invalid_tensor_handle
+           && shared.activation == ExpertActivation::DeepSeekSwiGlu
+           && operators.at_weight(shared.gate_weight).float8
+           && operators.at_weight(shared.up_weight).float8
+           && operators.at_weight(shared.down_weight).float8;
 }
 
 static uint64_t saturating_add_u64(uint64_t left, uint64_t right) noexcept
@@ -336,10 +349,29 @@ static void release_vulkan_dense_handle(CompiledModel& compiled, TensorHandle ha
 
 void release_vulkan_dense_host_copies(CompiledModel& compiled)
 {
+    // FP8 Shared Experts keep their CPU fallback even when optional dense host release is requested.
+    std::vector<TensorHandle> shared_fallback_handles;
+    const auto retain_shared = [&](const CompiledLayerPlan& layer) {
+        if (!layer.moe.has_shared_expert)
+            return;
+        const ExpertPlan& shared = layer.moe.shared_expert;
+        if (shared.gate_weight != invalid_tensor_handle
+            && compiled.weights.at(shared.gate_weight).dtype == DType::Float8E4M3)
+        {
+            shared_fallback_handles.push_back(shared.gate_weight);
+            shared_fallback_handles.push_back(shared.up_weight);
+            shared_fallback_handles.push_back(shared.down_weight);
+        }
+    };
+    for (const CompiledLayerPlan& layer : compiled.graph.layer_plans)
+        retain_shared(layer);
+    for (const CompiledLayerPlan& layer : compiled.speculative.graph.layer_plans)
+        retain_shared(layer);
     for (TensorHandle handle = 0; handle < compiled.weights.size(); ++handle)
     {
         TensorData& tensor = compiled.weights.at_mutable(handle);
-        if (uses_vulkan_dense_operator(compiled.operators.at_weight(handle)))
+        if (uses_vulkan_dense_operator(compiled.operators.at_weight(handle))
+            && std::find(shared_fallback_handles.begin(), shared_fallback_handles.end(), handle) == shared_fallback_handles.end())
             release_tensor_host_storage(tensor);
     }
 
@@ -403,6 +435,26 @@ static Result<void> prepare_shared_expert_operators(WeightStore& weights,
     const TensorData& gate = weights.at(shared.gate_weight);
     const TensorData& up = weights.at(shared.up_weight);
     const bool has_router_gate = moe.shared_expert_gate_weight != invalid_tensor_handle;
+    if (!has_router_gate && shared.activation == ExpertActivation::DeepSeekSwiGlu
+        && gate.dtype == DType::Float8E4M3 && up.dtype == DType::Float8E4M3
+        && weights.at(shared.down_weight).dtype == DType::Float8E4M3)
+    {
+        const TensorHandle handles[] = {shared.gate_weight, shared.up_weight, shared.down_weight};
+        std::shared_ptr<Float8Linear_vulkan> prepared[3];
+        // Shared GPU execution is optional. Keep all creation private until the
+        // whole chain is available, including on otherwise valid CPU shapes
+        // unsupported by the GPU kernel or when GPU allocation fails.
+        for (size_t index = 0; index < 3; ++index)
+        {
+            prepared[index] = Float8Linear_vulkan::create(weights.at(handles[index]), nullptr, 1,
+                                                          vulkan_device_index, vulkan_runtime, optimization_flags);
+            if (!prepared[index])
+                return {};
+        }
+        for (size_t index = 0; index < 3; ++index)
+            operators.at_weight_mutable(handles[index]).float8 = std::move(prepared[index]);
+        return {};
+    }
     if (gate.dtype != DType::BFloat16
         || up.dtype != DType::BFloat16
         || (has_router_gate
@@ -519,7 +571,8 @@ static Result<void> prepare_vulkan_qkv_operator(CompiledModel& compiled,
 
 static Result<void> prepare_latent_attention_operators(CompiledModel& compiled,
                                                        CompiledLayerPlan& layer_plan,
-                                                       const char* diagnostic_prefix = "")
+                                                       const char* diagnostic_prefix = "",
+                                                       bool attention_core_enabled = true)
 {
     AttentionBlockPlan& plan = layer_plan.attention;
     Result<void> prepared;
@@ -529,6 +582,7 @@ static Result<void> prepare_latent_attention_operators(CompiledModel& compiled,
         plan.key_value_weight,
         plan.output_b_weight,
         plan.indexer_query_weight,
+        plan.indexer_weights_weight,
     };
     for (TensorHandle handle : latent_linear_handles)
     {
@@ -542,7 +596,7 @@ static Result<void> prepare_latent_attention_operators(CompiledModel& compiled,
         if (!prepared)
             return prepared.error();
     }
-    if (plan.compression_ratio == 4
+    if ((plan.compression_ratio == 4 || plan.compression_ratio == 128)
         && has_flag(compiled.opt.optimization_flags, OptimizationVulkanLatentCompressor))
     {
         const TensorHandle compressor_linear_handles[] = {
@@ -583,7 +637,56 @@ static Result<void> prepare_latent_attention_operators(CompiledModel& compiled,
                                                     plan.norm_epsilon))
             return Error{ErrorCode::InternalError, "failed to prepare " + std::string(diagnostic_prefix) + "Vulkan FP8 latent input RMSNorm chain"};
     }
+    const CompiledOperator& output_a = compiled.operators.at_weight(plan.output_a_weight);
+    const CompiledOperator& output_b = compiled.operators.at_weight(plan.output_b_weight);
+    if (attention_core_enabled
+        && has_flag(compiled.opt.optimization_flags, OptimizationVulkanAttention)
+        && output_a.float8 && output_b.float8)
+    {
+        compiled.operators.at_weight_mutable(plan.query_a_weight).latent_attention = LatentAttention_vulkan::create(plan, compiled.weights.at(plan.sinks),
+                                                                                                                    output_a.float8, output_b.float8);
+        const auto& latent = compiled.operators.at_weight(plan.query_a_weight).latent_attention;
+        if (latent)
+            (void)latent->prepare(compiled.weights, compiled.operators, compiled.opt.optimization_flags);
+    }
     return {};
+}
+
+static void prepare_latent_layer_operators(CompiledModel& compiled, CompiledLayerPlan& layer)
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (compiled.descriptor.hyper_connection_kind != HyperConnectionKind::Sinkhorn
+        || layer.attention.kind != AttentionKind::MultiHeadLatent
+        || has_flag(compiled.opt.flags, OptionRouterPrediction))
+        return;
+    auto& op = compiled.operators.at_weight_mutable(layer.attention.query_a_weight);
+    if (!op.latent_attention || !op.latent_attention->can_record())
+        return;
+    const auto create_hyper = [&](TensorHandle function, TensorHandle scale, TensorHandle base) {
+        return HyperConnection_vulkan::create(compiled.weights.at(function), compiled.weights.at(scale), compiled.weights.at(base),
+                                              compiled.descriptor.hyper_connection_multiplier,
+                                              compiled.descriptor.hyper_connection_iterations,
+                                              compiled.descriptor.norm_epsilon, compiled.descriptor.hyper_connection_epsilon,
+                                              layer.vulkan_device_index, compiled.vulkan_runtime, compiled.opt.optimization_flags);
+    };
+    auto attention_hyper = create_hyper(layer.hyper_connection.attention_function, layer.hyper_connection.attention_scale,
+                                        layer.hyper_connection.attention_base);
+    auto ffn_hyper = create_hyper(layer.hyper_connection.ffn_function, layer.hyper_connection.ffn_scale,
+                                  layer.hyper_connection.ffn_base);
+    if (!attention_hyper || !ffn_hyper)
+        return;
+    auto norm = RmsNorm_vulkan::create(compiled.weights.at(layer.moe.pre_ffn_norm_weight), compiled.descriptor.norm_epsilon,
+                                       compiled.descriptor.norm_weight_offset, ffn_hyper->vulkan_context(), ffn_hyper->option());
+    const TensorData* bias = layer.moe.router_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(layer.moe.router_bias);
+    const TensorData* selection_bias = layer.moe.router_selection_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(layer.moe.router_selection_bias);
+    auto router = Router_vulkan::create(compiled.weights.at(layer.moe.router_weight), bias, selection_bias,
+                                        layer.vulkan_device_index, compiled.vulkan_runtime, compiled.opt.optimization_flags);
+    op.latent_layer = LatentLayer_vulkan::create(op.latent_attention, std::move(attention_hyper), std::move(ffn_hyper),
+                                                 std::move(norm), std::move(router));
+#else
+    (void)compiled;
+    (void)layer;
+#endif
 }
 
 static void prepare_gated_delta_attention_operators(CompiledModel& compiled,
@@ -670,7 +773,13 @@ static Result<void> prepare_standard_attention_operators(CompiledModel& compiled
                                                          CompiledLayerPlan& layer_plan)
 {
     AttentionBlockPlan& plan = layer_plan.attention;
-    const bool fused_vulkan_attention_eligible = !has_flag(plan.flags, AttentionBlockQueryKeyNorm)
+    // QSA selection and external residual mixing remain on the CPU.  Their
+    // projections can still use Vulkan without invoking the fused Attention
+    // operator, which does not implement these semantics.
+    const bool fused_vulkan_attention_supported = !has_flag(plan.flags, AttentionBlockQsa)
+                                                  && !has_flag(plan.flags, AttentionBlockExternalResidual);
+    const bool fused_vulkan_attention_eligible = fused_vulkan_attention_supported
+                                                 && !has_flag(plan.flags, AttentionBlockQueryKeyNorm)
                                                  && !has_flag(plan.flags, AttentionBlockOutputGate)
                                                  && (plan.rope_head_dimension == 0
                                                      || plan.rope_head_dimension == plan.head_dimension)
@@ -702,13 +811,14 @@ static Result<void> prepare_standard_attention_operators(CompiledModel& compiled
                 return prepared.error();
         }
     }
-    if (fused_vulkan_attention_eligible
-        || (has_flag(plan.flags, AttentionBlockQueryKeyNorm)
-            && has_flag(plan.flags, AttentionBlockOutputGate)
-            && plan.fused_qkv_gate_bfloat16_operator != invalid_compiled_operator_handle
-            && plan.query_norm_weight != invalid_tensor_handle
-            && plan.key_norm_weight != invalid_tensor_handle
-            && compiled.operators.at_weight(plan.output_weight).bfloat16))
+    if (fused_vulkan_attention_supported
+        && (fused_vulkan_attention_eligible
+            || (has_flag(plan.flags, AttentionBlockQueryKeyNorm)
+                && has_flag(plan.flags, AttentionBlockOutputGate)
+                && plan.fused_qkv_gate_bfloat16_operator != invalid_compiled_operator_handle
+                && plan.query_norm_weight != invalid_tensor_handle
+                && plan.key_norm_weight != invalid_tensor_handle
+                && compiled.operators.at_weight(plan.output_weight).bfloat16)))
     {
         AttentionConfig_vulkan attention_config;
         attention_config.hidden_size = compiled.descriptor.hidden_size;
@@ -769,8 +879,9 @@ static uint64_t gated_delta_vulkan_budget_size(const CompilerOption& opt,
     if (!use_vulkan_dense || opt.gpu_heap_budget == 0)
         return 0;
 
-    // File-backed Expert caches consume most of the free heap, so reserve a
-    // smaller concurrency-scaled fraction for persistent GDN state (1/64 vs 1/8).
+    // Explicit file-backed Expert caches retain their smaller attention
+    // allowance. Automatic caches are sized from the live free heap after
+    // these operators are allocated, so they do not need this extra reserve.
     const uint64_t heap_divisor = protects_file_backed_experts ? 64 : 8;
     const uint64_t concurrency = std::max(1u, opt.num_concurrent_sessions);
     return opt.gpu_heap_budget / (heap_divisor * concurrency);
@@ -848,6 +959,20 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled,
     if (!ret)
         return ret.error();
 
+    if (compiled.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn
+        && compiled.descriptor.final_norm == NormType::RmsNorm
+        && compiled.descriptor.norm_weight_offset == 0.0f
+        && !has_flag(compiled.opt.flags, OptionRouterPrediction))
+    {
+        auto head = LayerHead_vulkan::create(compiled.weights.at(compiled.hyper_head_function),
+                                             compiled.weights.at(compiled.hyper_head_scale),
+                                             compiled.weights.at(compiled.hyper_head_base), compiled.weights.at(compiled.final_norm_weight),
+                                             compiled.operators.at_weight(compiled.lm_head_weight), compiled.descriptor.hyper_connection_multiplier,
+                                             compiled.descriptor.norm_epsilon, compiled.descriptor.hyper_connection_epsilon,
+                                             compiled.opt.vulkan_device_index, compiled.vulkan_runtime, compiled.opt.optimization_flags);
+        compiled.operators.at_weight_mutable(compiled.hyper_head_function).layer_head = std::move(head);
+    }
+
     uint64_t planned_gated_delta_gpu_size = 0;
 
     for (size_t layer_id = 0; layer_id < compiled.graph.layer_plans.size(); ++layer_id)
@@ -858,8 +983,6 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled,
         if (attention.kind != AttentionKind::None)
         {
             if (attention.kind == AttentionKind::Standard
-                && !has_flag(attention.flags, AttentionDescriptorQsa)
-                && compiled.descriptor.hyper_connection_kind != HyperConnectionKind::GatedResidual
                 && has_flag(opt.flags, BackendVulkanAttention))
             {
                 ret = prepare_standard_attention_operators(compiled,
@@ -868,7 +991,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled,
             else if (attention.kind == AttentionKind::MultiHeadLatent)
             {
                 ret = prepare_latent_attention_operators(compiled,
-                                                         layer_plan);
+                                                         layer_plan, "", has_flag(opt.flags, BackendVulkanAttention));
             }
             else if (attention.kind == AttentionKind::GatedDeltaNet)
             {
@@ -876,7 +999,8 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled,
                                                            && has_flag(compiled.opt.optimization_flags,
                                                                        OptimizationVulkanAttention);
                 const bool protect_file_backed_experts = has_flag(opt.flags, BackendVulkanExperts)
-                                                         && has_flag(opt.flags, BackendFileBackedExperts);
+                                                         && has_flag(opt.flags, BackendFileBackedExperts)
+                                                         && opt.explicit_expert_gpu_cache;
                 const uint64_t gated_delta_gpu_budget = gated_delta_vulkan_budget_size(opt,
                                                                                        vulkan_delta_fusion_available,
                                                                                        protect_file_backed_experts);
@@ -900,6 +1024,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled,
             }
             if (!ret)
                 return ret.error();
+            prepare_latent_layer_operators(compiled, layer_plan);
         }
         if (layer_plan.moe.has_shared_expert)
         {

@@ -7,6 +7,7 @@
 #include "models/modeladapter.h"
 #include "models/tokenizer.h"
 #include "storage/expertcache.h"
+#include "storage/expertresidency.h"
 #include "storage/expertcache_victim.h"
 #include "graph/memoryplan.h"
 #include "backends/ncnn/vulkan.h"
@@ -375,6 +376,7 @@ Result<void> ModelLoader::compile_model()
         compiler_opt.vulkan_runtime = create_vulkan_runtime();
     compiler_opt.device_index = opt.vulkan_device_index;
     compiler_opt.num_concurrent_sessions = opt.num_concurrent_sessions;
+    compiler_opt.explicit_expert_gpu_cache = requested_gpu_cache_size != 0;
     compiler_opt.gpu_heap_budget = gpu_info ? gpu_info->heap_budget : 0;
 
     // Use the smallest heap as the common multi-device budget so persistent
@@ -469,12 +471,18 @@ Result<void> ModelLoader::resolve_gpu_cache_sizes(std::vector<uint64_t>& gpu_cac
         live_gpu_infos = get_gpu_infos();
     }
 #endif
-    const std::vector<GpuInfo>& gpu_infos = use_auto_gpu_cache
-                                                    && live_gpu_infos.size() == info.gpu_infos.size()
-                                                ? live_gpu_infos
-                                                : info.gpu_infos;
+    const bool use_live_gpu_infos = use_auto_gpu_cache
+                                    && live_gpu_infos.size() == info.gpu_infos.size()
+                                    && std::all_of(device_indices.begin(), device_indices.end(),
+                                                   [&live_gpu_infos](uint32_t device_index) {
+                                                       return device_index < live_gpu_infos.size();
+                                                   });
+    const std::vector<GpuInfo>& gpu_infos = use_live_gpu_infos ? live_gpu_infos : info.gpu_infos;
 
-    if (use_auto_gpu_cache)
+    // Loading-time free heap predates dense and persistent attention uploads.
+    // If the live query is unavailable, leave the automatic cache disabled
+    // instead of admitting Experts against stale free-memory information.
+    if (use_live_gpu_infos)
     {
         std::vector<uint64_t> sizes = get_auto_gpu_cache_sizes(plan.expert_pair_size,
                                                                device_indices,
@@ -645,6 +653,7 @@ Result<void> ModelLoader::configure_expert_cache()
     if (has_flag(opt.flags, OptionCrossExpertReadCoalescing))
         cache_flags |= ExpertCacheCrossExpertReadCoalescing;
 
+    const bool coordinate_gpu_caches = model.expert_backend || static_cast<bool>(victim_cache.value());
     model.expert_cache = std::make_shared<ExpertCache>(plan.expert_cache_size,
                                                        num_io_threads,
                                                        std::move(victim_cache).value(),
@@ -652,6 +661,13 @@ Result<void> ModelLoader::configure_expert_cache()
                                                        cache_flags,
                                                        static_cast<uint32_t>(group_count),
                                                        has_flag(model.opt.optimization_flags, OptimizationCpuPackedWeights));
+    if (coordinate_gpu_caches)
+    {
+        auto residency = std::make_shared<ExpertResidencyCoordinator>();
+        model.expert_cache->set_residency_coordinator(residency);
+        if (model.expert_backend)
+            model.expert_backend->set_residency_coordinator(std::move(residency));
+    }
     return {};
 }
 

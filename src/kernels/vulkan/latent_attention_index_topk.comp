@@ -1,0 +1,74 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer score_blob
+{ float scores[]; };
+layout(binding = 1) buffer index_blob
+{ uint indices[]; };
+layout(push_constant) uniform parameter
+{
+    uint count;
+    uint top_k;
+}
+p;
+
+bool worse(uint left, uint right)
+{
+    return scores[left] < scores[right] || (scores[left] == scores[right] && left > right);
+}
+
+void swap_indices(uint left, uint right)
+{
+    const uint value = indices[left];
+    indices[left] = indices[right];
+    indices[right] = value;
+}
+
+void sift_down(uint count)
+{
+    uint parent = 0;
+    for (;;)
+    {
+        const uint left = parent * 2 + 1;
+        if (left >= count)
+            return;
+        const uint right = left + 1;
+        const uint child = right < count && worse(indices[right], indices[left]) ? right : left;
+        if (!worse(indices[child], indices[parent]))
+            return;
+        swap_indices(child, parent);
+        parent = child;
+    }
+}
+
+void main()
+{
+    if (gl_LocalInvocationID.x != 0 || p.top_k == 0)
+        return;
+    for (uint index = 0; index < p.count; ++index)
+    {
+        if (index < p.top_k)
+        {
+            indices[index] = index;
+            uint child = index;
+            while (child > 0)
+            {
+                const uint parent = (child - 1) / 2;
+                if (!worse(indices[child], indices[parent]))
+                    break;
+                swap_indices(child, parent);
+                child = parent;
+            }
+        }
+        else if (worse(indices[0], index))
+        {
+            indices[0] = index;
+            sift_down(p.top_k);
+        }
+    }
+    for (uint count = p.top_k; count > 1; --count)
+    {
+        swap_indices(0, count - 1);
+        sift_down(count - 1);
+    }
+}

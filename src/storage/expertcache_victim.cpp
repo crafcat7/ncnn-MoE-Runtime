@@ -24,7 +24,6 @@ static void add_statistics(ExpertVictimCacheStatistics& destination, const Exper
     destination.restore_failures += source.restore_failures;
     destination.bytes_uploaded += source.bytes_uploaded;
     destination.bytes_downloaded += source.bytes_downloaded;
-    destination.restore_time_microseconds += source.restore_time_microseconds;
     destination.mapped_stores += source.mapped_stores;
     destination.mapped_restores += source.mapped_restores;
     destination.resident_size += source.resident_size;
@@ -35,6 +34,11 @@ ReuseFilteredExpertVictimCache::ReuseFilteredExpertVictimCache(std::shared_ptr<E
     : inner(std::move(_inner)),
       reuse_probe_interval(std::max(1u, _reuse_probe_interval))
 {
+}
+
+void ReuseFilteredExpertVictimCache::set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator)
+{
+    inner->set_residency_coordinator(std::move(coordinator));
 }
 
 void ReuseFilteredExpertVictimCache::admit(std::string key,
@@ -146,6 +150,12 @@ ShardedExpertVictimCache::ShardedExpertVictimCache(std::vector<std::shared_ptr<E
 {
     for (const auto& item : shards)
         total_size += item->capacity();
+}
+
+void ShardedExpertVictimCache::set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator)
+{
+    for (const auto& item : shards)
+        item->set_residency_coordinator(coordinator);
 }
 
 void ShardedExpertVictimCache::admit(std::string key,

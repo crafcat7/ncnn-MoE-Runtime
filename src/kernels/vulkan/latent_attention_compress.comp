@@ -1,0 +1,83 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer value_blob
+{ float projected_values[]; };
+layout(binding = 1) readonly buffer gate_blob
+{ float projected_scores[]; };
+layout(binding = 2) readonly buffer position_blob
+{ float positional_scores[]; };
+layout(binding = 3) buffer state_blob
+{ float state[]; };
+layout(binding = 4) writeonly buffer pooled_blob
+{ float pooled[]; };
+layout(binding = 5) writeonly buffer shadow_blob
+{ float shadow[]; };
+layout(push_constant) uniform parameter
+{
+    uint dimension;
+    uint ratio;
+    uint input_row;
+    uint slot;
+    uint has_previous;
+}
+p;
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint multiplier = p.ratio == 4 ? 2u : 1u;
+    const uint pending_size = p.ratio * multiplier * p.dimension;
+    const uint pending_base = p.slot * multiplier * p.dimension;
+    const uint input_base = p.input_row * multiplier * p.dimension;
+    for (uint column = lane; column < multiplier * p.dimension; column += 128)
+    {
+        const float value = projected_values[input_base + column];
+        const float score = projected_scores[input_base + column] + positional_scores[pending_base + column];
+        state[pending_base + column] = value;
+        state[pending_size + pending_base + column] = score;
+        shadow[column] = value;
+        shadow[multiplier * p.dimension + column] = score;
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (p.slot + 1 != p.ratio)
+        return;
+    const uint candidate_count = p.ratio * (p.has_previous != 0 ? 2u : 1u);
+    for (uint column = lane; column < p.dimension; column += 128)
+    {
+        float maximum = -3.402823466e+38;
+        for (uint token = 0; token < candidate_count; ++token)
+        {
+            const bool previous = p.has_previous != 0 && token < p.ratio;
+            const uint offset = previous ? token * p.dimension + column
+                                         : ((token - (p.has_previous != 0 ? p.ratio : 0u)) * multiplier + (multiplier - 1u)) * p.dimension + column;
+            const float score = state[(previous ? pending_size * 2 + p.ratio * p.dimension : pending_size) + offset];
+            maximum = max(maximum, score);
+        }
+        float denominator = 0.0;
+        float numerator = 0.0;
+        for (uint token = 0; token < candidate_count; ++token)
+        {
+            const bool previous = p.has_previous != 0 && token < p.ratio;
+            const uint offset = previous ? token * p.dimension + column
+                                         : ((token - (p.has_previous != 0 ? p.ratio : 0u)) * multiplier + (multiplier - 1u)) * p.dimension + column;
+            const float score = state[(previous ? pending_size * 2 + p.ratio * p.dimension : pending_size) + offset];
+            const float value = state[(previous ? pending_size * 2 : 0u) + offset];
+            const float weight = exp(score - maximum);
+            denominator += weight;
+            numerator += value * weight;
+        }
+        pooled[column] = numerator / denominator;
+        if (multiplier == 2)
+        {
+            for (uint token = 0; token < p.ratio; ++token)
+            {
+                const uint source = token * multiplier * p.dimension + column;
+                const uint destination = pending_size * 2 + token * p.dimension + column;
+                state[destination] = state[source];
+                state[destination + p.ratio * p.dimension] = state[pending_size + source];
+            }
+        }
+    }
+}

@@ -1,0 +1,62 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer score_blob
+{ float scores[]; };
+layout(binding = 1) readonly buffer input_blob
+{ uint input_indices[]; };
+layout(binding = 2) writeonly buffer output_blob
+{ uint output_indices[]; };
+layout(push_constant) uniform parameter
+{
+    uint count;
+    uint top_k;
+    uint run_count;
+    uint run_span;
+}
+p;
+
+bool better(uint left, uint right)
+{
+    return scores[left] > scores[right] || (scores[left] == scores[right] && left < right);
+}
+
+uint valid_count(uint run)
+{
+    const uint offset = run * p.run_span;
+    return run < p.run_count && offset < p.count ? min(p.top_k, min(p.run_span, p.count - offset)) : 0;
+}
+
+void main()
+{
+    const uint thread = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (65535u * 128u);
+    if (thread >= p.run_count * p.top_k || p.top_k == 0)
+        return;
+    const uint run = thread / p.top_k;
+    const uint slot = thread % p.top_k;
+    const uint partner = run ^ 1u;
+    const uint valid = valid_count(run);
+    const uint other_valid = valid_count(partner);
+    const uint destination = (run / 2u) * p.top_k;
+    // Only the left run fills trailing padding. Valid ranked candidates
+    // write the preceding positions, so no two invocations share a write.
+    if ((run & 1u) == 0u && slot >= min(p.top_k, valid + other_valid))
+        output_indices[destination + slot] = 0xffffffffu;
+    if (slot >= valid)
+        return;
+    const uint index = input_indices[thread];
+    uint low = 0;
+    uint high = other_valid;
+    while (low < high)
+    {
+        const uint middle = low + (high - low) / 2u;
+        const uint other = input_indices[partner * p.top_k + middle];
+        if (better(other, index))
+            low = middle + 1u;
+        else
+            high = middle;
+    }
+    const uint rank = slot + low;
+    if (rank < p.top_k)
+        output_indices[destination + rank] = index;
+}

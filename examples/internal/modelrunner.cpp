@@ -154,6 +154,10 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                                                                     " [--expert-gpu-cache-mb N]"
                                                                     " [--expert-gpu-victim-cache-mb N]"
                                                                     " [--expert-gpu-victim-reuse-probe N]"
+                                                                    " [--disable-vulkan-joint-cache-eviction]"
+                                                                    " [--disable-vulkan-mxfp4-row-tile]"
+                                                                    " [--disable-vulkan-expert-direct-staging]"
+                                                                    " [--disable-vulkan-shared-expert-overlap]"
                                                                     " [--disable-vulkan-indexed-experts]"
                                                                     " [--disable-gpu-expert-execution]"
                                                                     " [--disable-gpu-victim-execution]"
@@ -304,6 +308,22 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             else if (argument == "--expert-gpu-victim-reuse-probe")
             {
                 opt.expert_gpu_victim_reuse_probe_interval = static_cast<uint32_t>(std::stoul(ncnn::moe::require_value(argc, argv, index, "--expert-gpu-victim-reuse-probe")));
+            }
+            else if (argument == "--disable-vulkan-joint-cache-eviction")
+            {
+                opt.optimization_flags &= ~ncnn::moe::OptimizationVulkanJointCacheEviction;
+            }
+            else if (argument == "--disable-vulkan-mxfp4-row-tile")
+            {
+                opt.optimization_flags &= ~ncnn::moe::OptimizationVulkanMxfp4RowTile;
+            }
+            else if (argument == "--disable-vulkan-expert-direct-staging")
+            {
+                opt.optimization_flags &= ~ncnn::moe::OptimizationVulkanExpertDirectStaging;
+            }
+            else if (argument == "--disable-vulkan-shared-expert-overlap")
+            {
+                opt.optimization_flags &= ~ncnn::moe::OptimizationVulkanSharedExpertOverlap;
             }
             else if (argument == "--disable-vulkan-indexed-experts")
             {
@@ -846,18 +866,12 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         uint64_t speculative_proposals = 0;
         uint64_t speculative_draft_tokens = 0;
         uint64_t speculative_accepted_tokens = 0;
-        uint64_t speculative_context_time_microseconds = 0;
-        uint64_t speculative_draft_time_microseconds = 0;
-        uint64_t speculative_verify_time_microseconds = 0;
         for (const ncnn::moe::SessionPtr& session : active_sessions)
         {
             const ncnn::moe::SessionStatistics session_statistics = session->statistics();
             speculative_proposals += session_statistics.speculative_proposals;
             speculative_draft_tokens += session_statistics.speculative_draft_tokens;
             speculative_accepted_tokens += session_statistics.speculative_accepted_tokens;
-            speculative_context_time_microseconds += session_statistics.speculative_context_time_microseconds;
-            speculative_draft_time_microseconds += session_statistics.speculative_draft_time_microseconds;
-            speculative_verify_time_microseconds += session_statistics.speculative_verify_time_microseconds;
         }
         std::cout << "generated " << generation.tokens.size() << " token(s) in " << generation_seconds << " s\n";
         if (!prompt_text.empty())
@@ -927,27 +941,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         std::cout << "Vulkan linear dispatches: " << statistics.vulkan_linear_dispatches << '\n';
         std::cout << "Vulkan attention blocks: " << statistics.vulkan_attention_blocks << '\n';
         std::cout << "Vulkan compute submissions: " << statistics.vulkan_compute_submissions << '\n';
-        std::cout << "Vulkan submit/wait time: " << statistics.vulkan_submit_wait_time_microseconds / 1000.0 << " ms\n";
         std::cout << "Vulkan batch boundary requests: " << statistics.vulkan_batch_uploads << " host->device, " << statistics.vulkan_batch_downloads << " device->host\n";
-        std::cout << "Vulkan direct host binding attempts: " << statistics.vulkan_direct_host_input_bindings << " input(s), " << statistics.vulkan_direct_host_output_bindings << " output(s)\n";
-        std::cout << "Vulkan auxiliary uploads: " << statistics.vulkan_auxiliary_uploads << " upload(s), " << statistics.vulkan_auxiliary_upload_bytes << " bytes\n";
-        std::cout << "Vulkan staging slots: " << statistics.vulkan_staging_slot_resizes << " resize(s), " << statistics.vulkan_staging_slot_reuses << " reuse(s), " << statistics.vulkan_staging_slot_acquisitions << " acquisition(s), "
-                  << statistics.vulkan_staging_slot_contentions << " contention(s)\n";
-        std::cout << "Vulkan command buffer reuses: " << statistics.vulkan_command_buffer_reuses << '\n';
-        std::cout << "Vulkan command graphs: "
-                  << statistics.vulkan_command_graph_submissions
-                  << " submission(s), "
-                  << statistics.vulkan_command_graph_operations
-                  << " recorded operation(s)\n";
-        std::cout << "Vulkan command recording: "
-                  << statistics.vulkan_command_dispatches << " dispatch(es), "
-                  << statistics.vulkan_command_pipeline_binds << " pipeline bind(s), "
-                  << statistics.vulkan_command_descriptor_bindings << " descriptor binding(s), "
-                  << statistics.vulkan_command_push_constant_updates << " push constant update(s), "
-                  << statistics.vulkan_command_resource_barrier_calls << " resource barrier call(s), "
-                  << statistics.vulkan_command_buffer_resource_barriers << " buffer barrier(s), "
-                  << statistics.vulkan_command_image_resource_barriers << " image barrier(s), "
-                  << statistics.vulkan_command_redundant_pipeline_binds << " redundant pipeline bind candidate(s)\n";
         std::cout << "Vulkan attention fusion: " << statistics.vulkan_attention_qkv_rope_fusions << " QKV+RoPE block(s), " << statistics.vulkan_attention_device_rope_fusions << " device-RoPE block(s), " << statistics.vulkan_attention_qkv_ring_fusions << " QKV->ring block(s), "
                   << statistics.vulkan_attention_decode_sdpa_fusions << " Decode-SDPA block(s)\n";
         std::cout << "Vulkan shared Expert SwiGLU fusions: " << statistics.vulkan_shared_expert_swiglu_fusions << '\n';
@@ -959,36 +953,13 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                   << '\n';
         std::cout << "Vulkan Gated DeltaNet fusions: " << statistics.vulkan_gated_delta_fusions << ", submissions: " << statistics.vulkan_gated_delta_submissions << '\n';
         std::cout << "Vulkan RMSNorm+Linear fusions: " << statistics.vulkan_rms_norm_linear_fusions << '\n';
-        std::cout << "Vulkan KV ring: " << statistics.vulkan_kv_ring_appends << " append(s), " << statistics.vulkan_kv_ring_resizes << " resize(s), " << statistics.vulkan_kv_ring_wrapped_views << " wrapped view(s)\n";
-        std::cout << "Vulkan KV cache promotion: " << statistics.vulkan_kv_cache_promotions << " promotion(s), " << statistics.vulkan_kv_cache_promotion_bytes << " bytes uploaded\n";
-        std::cout << "Attention time: " << statistics.attention_time_microseconds / 1000.0 << " ms\n";
-        std::cout << "Router time: " << statistics.router_time_microseconds / 1000.0 << " ms\n";
-        std::cout << "Expert time: " << statistics.expert_time_microseconds / 1000.0 << " ms\n";
+        std::cout << "Vulkan KV ring: " << statistics.vulkan_kv_ring_appends << " append(s)\n";
         std::cout << "Expert weight demand: " << statistics.expert_batch_weight_bytes << " batched bytes, " << statistics.expert_route_weight_bytes << " route bytes\n";
-        std::cout << "Expert cache wait time: " << statistics.expert_cache_wait_time_microseconds / 1000.0 << " ms\n";
-        std::cout << "Expert cache management time: " << statistics.expert_cache_management_time_microseconds / 1000.0 << " ms\n";
-        std::cout << "Expert engine wall time: " << statistics.expert_engine_time_microseconds / 1000.0 << " ms\n";
-        std::cout << "Expert compute wall time: " << statistics.expert_compute_time_microseconds / 1000.0 << " ms\n";
-        const uint64_t expert_accounted_time = statistics.expert_compute_time_microseconds + statistics.expert_regroup_time_microseconds + statistics.expert_combine_time_microseconds + statistics.expert_cache_wait_time_microseconds
-                                               + statistics.expert_cache_management_time_microseconds;
-        const uint64_t expert_orchestration_time = statistics.expert_time_microseconds > expert_accounted_time ? statistics.expert_time_microseconds - expert_accounted_time : 0;
-        std::cout << "Expert orchestration wall time: " << expert_orchestration_time / 1000.0 << " ms\n";
-        std::cout << "Expert regroup time: " << statistics.expert_regroup_time_microseconds / 1000.0 << " ms\n";
-        std::cout << "Expert combine time: " << statistics.expert_combine_time_microseconds / 1000.0 << " ms\n";
-        std::cout << "Embedding time: " << statistics.embedding_time_microseconds / 1000.0 << " ms\n";
-        std::cout << "Final norm time: " << statistics.final_norm_time_microseconds / 1000.0 << " ms\n";
-        std::cout << "LM head time: " << statistics.lm_head_time_microseconds / 1000.0 << " ms\n";
         std::cout << "Speculative decoding: " << speculative_proposals << " proposal(s), "
                   << speculative_draft_tokens << " draft token(s), "
                   << speculative_accepted_tokens << " accepted token(s)\n";
-        std::cout << "Speculative time: " << speculative_context_time_microseconds / 1000.0 << " ms context, "
-                  << speculative_draft_time_microseconds / 1000.0 << " ms draft, "
-                  << speculative_verify_time_microseconds / 1000.0 << " ms verify\n";
-        std::cout << "Expert prefetches: " << statistics.expert_prefetches << " (" << statistics.expert_prefetch_bytes << " bytes hinted)\n";
         std::cout << "Expert route prediction: " << statistics.expert_route_predictions << " prediction(s), " << statistics.expert_route_prediction_matches << " match(es), " << statistics.expert_route_prediction_cache_hits
                   << " cache-ready, " << statistics.expert_route_prediction_cache_misses << " not-ready, "
-                  << statistics.expert_route_prediction_time_microseconds / 1000.0 << " ms predictor, "
-                  << statistics.expert_route_prediction_wait_time_microseconds / 1000.0 << " ms waiting, "
                   << statistics.expert_route_prediction_async_submissions << " async submission(s), "
                   << statistics.expert_route_prediction_async_completions << " completion(s), "
                   << statistics.expert_route_prediction_async_fallbacks << " fallback(s)\n";
@@ -1003,8 +974,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             std::cout << " r" << rank << ' '
                       << statistics.expert_route_rank_predictions[rank] << " predicted/"
                       << statistics.expert_route_rank_matches[rank] << " matched/"
-                      << statistics.expert_route_rank_demands[rank] << " demanded/"
-                      << statistics.expert_route_rank_demand_queue_time_microseconds[rank] << "us queued;";
+                      << statistics.expert_route_rank_demands[rank] << " demanded;";
         }
         std::cout << '\n';
         std::cout << "Expert cache: " << statistics.expert_cache_hits << " hit(s), " << statistics.expert_cache_misses << " miss(es), " << statistics.expert_cache_evictions << " eviction(s), " << statistics.expert_cache_bytes_read
@@ -1026,9 +996,7 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                   << statistics.expert_cache_direct_read_fallbacks << " fallback(s), " << statistics.expert_cache_buffered_read_ranges << " buffered range(s), " << statistics.expert_cache_buffered_read_bytes << " buffered byte(s), "
                   << statistics.expert_cache_coalesced_read_batches << " coalesced batch(es), " << statistics.expert_cache_coalesced_experts << " coalesced Expert(s), "
                   << statistics.expert_cache_coalesced_read_ranges_saved << " physical range(s) saved, io workers: "
-                  << statistics.expert_cache_num_io_threads << ", "
-                  << statistics.expert_cache_io_read_samples << " sample(s), "
-                  << statistics.expert_cache_io_read_time_microseconds / 1000.0 << " ms observed\n";
+                  << statistics.expert_cache_num_io_threads << '\n';
         std::cout << "Expert GPU execution cache: " << statistics.expert_gpu_cache_hits << " hit(s), " << statistics.expert_gpu_cache_misses << " miss(es), " << statistics.expert_gpu_cache_admissions << " admission(s), "
                   << statistics.expert_gpu_cache_stores << " store(s), " << statistics.expert_gpu_cache_evictions << " eviction(s), " << statistics.expert_gpu_cache_dropped_admissions << " dropped admission(s), "
                   << statistics.expert_gpu_cache_bytes_uploaded << " bytes uploaded, " << statistics.expert_gpu_cache_resident_size << " bytes resident, " << statistics.expert_gpu_cache_pending_size << " bytes pending\n";
@@ -1036,11 +1004,10 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                   << statistics.expert_gpu_victim_cache_filtered_admissions << " filtered admission(s), " << statistics.expert_gpu_victim_cache_reused_admissions << " reused admission(s), "
                   << statistics.expert_gpu_victim_cache_probe_admissions << " probe admission(s), " << statistics.expert_gpu_victim_cache_stores << " store(s), " << statistics.expert_gpu_victim_cache_evictions << " eviction(s), "
                   << statistics.expert_gpu_victim_cache_dropped_admissions << " dropped admission(s), " << statistics.expert_gpu_victim_cache_restore_failures << " restore failure(s), " << statistics.expert_gpu_victim_cache_bytes_uploaded
-                  << " bytes uploaded, " << statistics.expert_gpu_victim_cache_bytes_downloaded << " bytes downloaded, " << statistics.expert_gpu_victim_cache_restore_time_microseconds / 1000.0 << " ms restoring, "
+                  << " bytes uploaded, " << statistics.expert_gpu_victim_cache_bytes_downloaded << " bytes downloaded, "
                   << statistics.expert_gpu_victim_cache_mapped_stores << " mapped store(s), " << statistics.expert_gpu_victim_cache_mapped_restores << " mapped restore(s), " << statistics.expert_gpu_victim_cache_resident_size
                   << " bytes resident, " << statistics.expert_gpu_victim_cache_pending_size << " bytes pending\n";
-        std::cout << "Expert GPU execution: " << statistics.expert_gpu_executions << " execution(s), " << statistics.expert_gpu_execution_failures << " failure(s), "
-                  << statistics.expert_gpu_execution_time_microseconds / 1000.0 << " ms executing\n";
+        std::cout << "Expert GPU execution: " << statistics.expert_gpu_executions << " execution(s), " << statistics.expert_gpu_execution_failures << " failure(s)\n";
         std::cout << "Expert GPU route aggregation: " << statistics.expert_gpu_route_aggregation_batches << " batch(es), " << statistics.expert_gpu_route_aggregation_routes << " route(s), "
                   << statistics.expert_gpu_route_aggregation_bytes_saved << " CPU aggregation byte(s) saved\n";
         std::cout << "Expert GPU device source: " << statistics.expert_gpu_device_source_hits << " hit(s), " << statistics.expert_gpu_device_source_misses << " miss(es), " << statistics.expert_gpu_device_source_executions
@@ -1062,15 +1029,6 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         std::cout << "FP8 Linear row group: " << runtime.info().float8_linear_row_group_size << '\n';
         std::cout << "MXFP4 decode row-pair group: " << runtime.info().mxfp4_decode_row_pair_group_size << '\n';
         std::cout << "Activation CPU kernel: " << ncnn::moe::scaled_silu_kernel_name(effective_opt.optimization_flags) << '\n';
-        std::cout << "MXFP4 decode GEMV rows: " << statistics.mxfp4_decode_gemv_rows << '\n';
-        std::cout << "MXFP4 prefill GEMM rows: " << statistics.mxfp4_prefill_gemm_rows << '\n';
-        std::cout << "MXFP4 paired rows: " << statistics.mxfp4_paired_rows << '\n';
-        std::cout << "MXFP4 fused Gate/Up rows: " << statistics.mxfp4_fused_gate_up_rows << '\n';
-        std::cout
-            << "MXFP4 exact input rows reused: "
-            << statistics.mxfp4_reused_input_rows
-            << '\n';
-        std::cout << "Parallel expert tasks: " << statistics.expert_parallel_tasks << '\n';
         std::cout << "generated token ids:";
         for (const ncnn::moe::StreamToken& token : generation.tokens)
             std::cout << ' ' << token.token_id;

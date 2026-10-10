@@ -2,6 +2,7 @@
 
 #include "attention.h"
 #include "backends/ncnn/linear.h"
+#include "backends/ncnn/latentattention_vulkan.h"
 #include "fastmath.h"
 #include "float8.h"
 #include "ops.h"
@@ -66,7 +67,7 @@ static void restore_vector_undo(std::vector<float>& values, const LatentVectorUn
     }
 }
 
-static void record_latent_cache_undo(LayerCache& cache, const AttentionBlockPlan& plan, uint64_t position)
+void record_latent_cache_transaction_row(LayerCache& cache, const AttentionBlockPlan& plan, uint64_t position)
 {
     if (!cache.transaction.latent_active)
         return;
@@ -131,6 +132,8 @@ static void restore_latent_cache_undo(LayerCache& cache, const LatentCacheUndo& 
         restore_vector_undo(cache.index_compressor_previous_scores, undo.index_compressor_previous_scores);
     }
     cache.latent_token_count = undo.latent_token_count;
+    cache.latent_device_state.reset();
+    cache.device_allocated_size = 0;
 }
 
 void begin_latent_cache_transaction(std::span<LayerCache> caches)
@@ -646,11 +649,37 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
     if (&input == &output)
         return Error{ErrorCode::InvalidArgument, "latent attention input/output must be distinct"};
 
+    const auto& prepared_latent_operator = operators.at_weight(plan.query_a_weight).latent_attention;
+    if (backend == ExecutionBackend::Vulkan && prepared_latent_operator
+        && has_flag(optimization_flags, OptimizationVulkanAttention)
+        && has_flag(optimization_flags, OptimizationVulkanLatentInputRmsNorm)
+        && (plan.compression_ratio == 0 || vulkan_latent_compressor_enabled(backend, optimization_flags))
+        && prepared_latent_operator->forward_projected_batch(input, positions, caches, output))
+        return {};
+
     ActivationBuffer& normalized = scratch.normalized;
     ActivationBuffer& query_rank = scratch.projected;
     ActivationBuffer& query = scratch.query;
     ActivationBuffer& key_value = scratch.key;
     ActivationBuffer& attention_output = scratch.attention;
+    bool independent_caches = true;
+    for (size_t row = 0; row < caches.size() && independent_caches; ++row)
+    {
+        for (size_t previous = 0; previous < row; ++previous)
+        {
+            if (caches[previous] == caches[row])
+            {
+                independent_caches = false;
+                break;
+            }
+        }
+    }
+    const auto& latent_operator = operators.at_weight(plan.query_a_weight).latent_attention;
+    const bool use_vulkan_core = backend == ExecutionBackend::Vulkan && independent_caches
+                                 && latent_operator
+                                 && has_flag(optimization_flags, OptimizationVulkanAttention);
+    DeviceTensor_vulkan retained_query;
+    DeviceTensor_vulkan* retained_query_output = use_vulkan_core ? &retained_query : nullptr;
     bool normalized_ready = false;
     bool query_rank_ready = false;
     bool key_value_ready = false;
@@ -775,17 +804,18 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                                                           index_compressor_scores));
     }
     else if (vulkan_latent_compressor_enabled(backend, optimization_flags)
-             && plan.compression_ratio == 4)
+             && plan.compression_ratio != 0)
     {
         prepare_compressor_pair(plan.compressor_key_value_weight,
                                 plan.compressor_gate_weight,
                                 compressor_values,
                                 compressor_scores);
-        prepare_compressor_pair(plan.indexer_compressor_key_value_weight,
-                                plan.indexer_compressor_gate_weight,
-                                index_compressor_values,
-                                index_compressor_scores);
-        if (fused_compressor_count != 4)
+        if (plan.compression_ratio == 4)
+            prepare_compressor_pair(plan.indexer_compressor_key_value_weight,
+                                    plan.indexer_compressor_gate_weight,
+                                    index_compressor_values,
+                                    index_compressor_scores);
+        if (fused_compressor_count != (plan.compression_ratio == 4 ? 4 : 2))
             fused_compressor_count = 0;
     }
     if (backend == ExecutionBackend::Vulkan
@@ -805,7 +835,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                                                                                                   std::span<ActivationBuffer*>(fused_compressor_outputs.data(),
                                                                                                                                fused_compressor_count),
                                                                                                   query,
-                                                                                                  key_value);
+                                                                                                  key_value, retained_query_output);
                 key_value_ready = chained_query;
                 compressor_ready = chained_query;
             }
@@ -819,7 +849,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                                                                                                    *query_b_operator.float8,
                                                                                                    *key_value_operator.float8,
                                                                                                    query,
-                                                                                                   key_value);
+                                                                                                   key_value, retained_query_output);
                     key_value_ready = chained_query;
                 }
                 if (!chained_query)
@@ -835,7 +865,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                                                                                              *query_b_operator.float8,
                                                                                              *key_value_operator.float8,
                                                                                              query,
-                                                                                             key_value);
+                                                                                             key_value, retained_query_output);
                     key_value_ready = chained_query;
                 }
             }
@@ -958,10 +988,10 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
             cache.columns = plan.head_dimension;
             cache.capacity_tokens = plan.sliding_window;
             cache.latent_cache = true;
-            record_latent_cache_undo(cache, plan, position);
+            record_latent_cache_transaction_row(cache, plan, position);
             cache.latent_token_count = position + 1;
             float* key = key_value.row(row_index);
-            if (prepared_latent_rope_enabled(optimization_flags))
+            if (use_vulkan_core || prepared_latent_rope_enabled(optimization_flags))
             {
                 prepare_rope_coefficients(plan.rope_head_dimension,
                                           position,
@@ -1232,18 +1262,6 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         }
     };
 
-    bool independent_caches = true;
-    for (size_t row_index = 0; row_index < caches.size() && independent_caches; ++row_index)
-    {
-        for (size_t previous = 0; previous < row_index; ++previous)
-        {
-            if (caches[previous] == caches[row_index])
-            {
-                independent_caches = false;
-                break;
-            }
-        }
-    }
     if (!independent_caches)
     {
         for (size_t row_index = 0; row_index < input.rows(); ++row_index)
@@ -1257,6 +1275,17 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
     {
         for (size_t row_index = 0; row_index < input.rows(); ++row_index)
             prepare_attention_row(row_index);
+        if (use_vulkan_core)
+        {
+            const DeviceTensor_vulkan* device_query = retained_query.empty() ? nullptr : &retained_query;
+            if (latent_operator->forward_batch(positions, caches, row_contexts, query, device_query, output))
+                return {};
+            // Query retention skipped its download; materialize only for CPU fallback.
+            if (device_query
+                && (!query_a_operator.float8 || !query_a_operator.float8->materialize(retained_query, query)))
+                return Error{ErrorCode::InternalError, "failed to materialize latent query for CPU fallback"};
+            attention_output.reset(input.rows(), plan.head_count * plan.head_dimension, true);
+        }
         const int64_t task_count = static_cast<int64_t>(input.rows()) * plan.head_count;
 #if defined(_OPENMP)
         const int attention_team_size = std::max(1, std::min(static_cast<int>(task_count), static_cast<int>(cpu_linear_num_threads())));
@@ -1389,7 +1418,7 @@ Result<void> append_dspark_attention_context(const WeightStore& weights,
     for (size_t row = 0; row < input.rows(); ++row)
     {
         const uint64_t position = position_offset + row;
-        record_latent_cache_undo(cache, plan, position);
+        record_latent_cache_transaction_row(cache, plan, position);
         float* key = key_value.row(row);
         apply_rope(key + plan.head_dimension - plan.rope_head_dimension, plan.rope_head_dimension, position, plan, false);
         quantize_float8_e4m3_inplace(key, plan.head_dimension - plan.rope_head_dimension, 64, true, optimization_flags);

@@ -249,9 +249,17 @@ static void test_mxfp4_scratch_reuse()
                                             &scratch,
                                             q8_flags),
                       "MXFP4 operator-owned packed batch");
-        scratch_check(owner.mxfp4_q8_packed != nullptr, "operator packed sidecar creation");
-        scratch_check(owner.mxfp4_q8_packed.use_count() == 1,
-                      "scratch does not retain operator packed sidecar");
+        if (scratch.q8_down_enabled[0])
+        {
+            scratch_check(owner.mxfp4_q8_packed != nullptr, "operator packed sidecar creation");
+            scratch_check(owner.mxfp4_q8_packed.use_count() == 1,
+                          "scratch does not retain operator packed sidecar");
+        }
+        else
+        {
+            scratch_check(!owner.mxfp4_q8_packed, "FP32 row-pair path avoids packed sidecar");
+        }
+        check_mxfp4_outputs(outputs[0], regrow_fresh_outputs[0], 1e-5f);
     }
 }
 

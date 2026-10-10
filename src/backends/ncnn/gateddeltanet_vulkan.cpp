@@ -61,9 +61,13 @@ static bool create_pipeline(const std::shared_ptr<VulkanContext>& context,
         return false;
     }
     destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(),
-                                                  [context](ncnn::Pipeline* value) {
-                                                      const std::lock_guard<std::mutex> lock(context->command_mutex());
-                                                      delete value;
+                                                  [context = context](ncnn::Pipeline* value) mutable {
+                                                      {
+                                                          const std::lock_guard<std::mutex> lock(context->command_mutex());
+                                                          delete value;
+                                                      }
+                                                      // Weak cache entries retain the deleter control block after disposal.
+                                                      context.reset();
                                                   });
     context->cache_pipeline(gated_delta_net_shader, 0, destination);
     return true;
@@ -170,7 +174,7 @@ public:
                             vulkan_context->command_optimization_flags());
         cmd.record_clone(snapshot_convolution, convolution, opt);
         cmd.record_clone(snapshot_recurrent, recurrent, opt);
-        if (submit_compute_and_wait(cmd, runtime_state) != 0)
+        if (submit_compute_and_wait(cmd, vulkan_context->device()) != 0)
             return false;
         ++runtime_state.compute_submissions;
         return true;
@@ -605,13 +609,11 @@ bool GatedDeltaState_vulkan::download(std::vector<float>& convolution,
                                1,
                                static_cast<uint32_t>(convolution_count),
                                transfer_slot.staging_allocator,
-                               runtime_state,
                                sizeof(float))
         || !prepare_staging_batch(transfer_slot.download,
                                   1,
                                   static_cast<uint32_t>(recurrent_count),
                                   transfer_slot.staging_allocator,
-                                  runtime_state,
                                   sizeof(float)))
     {
         return false;
@@ -621,17 +623,22 @@ bool GatedDeltaState_vulkan::download(std::vector<float>& convolution,
     if (transfer_slot.command_used && cmd.reset() != 0)
         return false;
     transfer_slot.command_used = true;
-    // The two clones use separate staging buffers.  Reuse the slot's upload
-    // and download allocations only after the first copy has completed.
+    // record_clone creates its destination with blob_vkallocator even when
+    // a same-shaped destination already exists. Keep both copies in the
+    // slot's host-visible staging allocations rather than the state allocator.
+    ncnn::Option download_option = implementation.opt;
+    download_option.blob_vkallocator = transfer_slot.staging_allocator;
+    download_option.workspace_vkallocator = transfer_slot.staging_allocator;
+    download_option.staging_vkallocator = transfer_slot.staging_allocator;
     ncnn::VkMat convolution_staging = transfer_slot.upload;
     ncnn::VkMat recurrent_staging = transfer_slot.download;
     cmd.record_clone(implementation.convolution,
                      convolution_staging,
-                     implementation.opt);
+                     download_option);
     cmd.record_clone(implementation.recurrent,
                      recurrent_staging,
-                     implementation.opt);
-    if (submit_compute_and_wait(cmd, runtime_state) != 0)
+                     download_option);
+    if (submit_compute_and_wait(cmd, implementation.vulkan_context->device()) != 0)
         return false;
     convolution_staging.allocator->invalidate(convolution_staging.data);
     recurrent_staging.allocator->invalidate(recurrent_staging.data);
@@ -898,11 +905,11 @@ bool GatedDeltaNet_vulkan::forward_impl(const ActivationBuffer& input,
                                                                                                 input.dtype());
     if (!fill_staging_upload(input,
                              transfer_slot.upload,
-                             transfer_slot.staging_allocator, runtime_state)
+                             transfer_slot.staging_allocator)
         || !prepare_staging_batch(transfer_slot.download,
                                   input.rows(),
                                   output_columns,
-                                  transfer_slot.staging_allocator, runtime_state))
+                                  transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -922,7 +929,7 @@ bool GatedDeltaNet_vulkan::forward_impl(const ActivationBuffer& input,
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;
     if (direct_host_input)
-        input_gpu = bind_direct_host_input(transfer_slot.upload, runtime_state);
+        input_gpu = bind_direct_host_input(transfer_slot.upload);
     else if (!record_mapped_upload(transfer_slot.upload,
                                    input_gpu,
                                    cmd,
@@ -1020,7 +1027,7 @@ bool GatedDeltaNet_vulkan::forward_impl(const ActivationBuffer& input,
     {
         return false;
     }
-    if (submit_compute_and_wait(cmd, runtime_state) != 0)
+    if (submit_compute_and_wait(cmd, implementation.vulkan_context->device()) != 0)
     {
         transaction_recording.mark_submit_failed();
         if (!state_implementation.transaction_active
@@ -1238,11 +1245,11 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
                                                                                                 combined_normalized.dtype());
     if (!fill_staging_upload(combined_normalized,
                              transfer_slot.upload,
-                             transfer_slot.staging_allocator, runtime_state)
+                             transfer_slot.staging_allocator)
         || !prepare_staging_batch(transfer_slot.download,
                                   total_rows,
                                   output_columns,
-                                  transfer_slot.staging_allocator, runtime_state))
+                                  transfer_slot.staging_allocator))
     {
         return GatedDeltaBatchResult_vulkan::NotExecuted;
     }
@@ -1268,7 +1275,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;
     if (direct_host_input)
-        input_gpu = bind_direct_host_input(transfer_slot.upload, runtime_state);
+        input_gpu = bind_direct_host_input(transfer_slot.upload);
     else if (!record_mapped_upload(transfer_slot.upload,
                                    input_gpu,
                                    cmd,
@@ -1371,7 +1378,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
     {
         return GatedDeltaBatchResult_vulkan::NotExecuted;
     }
-    if (submit_compute_and_wait(cmd, runtime_state) != 0)
+    if (submit_compute_and_wait(cmd, implementation.vulkan_context->device()) != 0)
     {
         transaction_recording.mark_submit_failed();
         mark_nontransaction_existing_states_unknown();

@@ -170,32 +170,14 @@ static std::string expert_metrics_json(const RuntimeMetricCounters& counters)
     return result.finish();
 }
 
-static std::string cpu_metrics_json(const RuntimeMetricCounters& counters)
-{
-    JsonObject result;
-    result.add_uint("expert_compute_time_microseconds", counters.expert_compute_time_microseconds);
-    return result.finish();
-}
-
 static std::string gpu_metrics_json(const RuntimeMetricCounters& counters, bool available)
 {
     JsonObject result;
     result.add_bool("available", available);
     if (available)
-    {
         result.add_uint("submit_count", counters.gpu_submit_count);
-        result.add_uint("wait_time_microseconds", counters.gpu_wait_time_microseconds);
-    }
     else
-    {
         result.add_null("submit_count");
-        result.add_null("wait_time_microseconds");
-    }
-    if (available && counters.gpu_kernel_time_available)
-        result.add_uint("kernel_time_microseconds", counters.gpu_kernel_time_microseconds);
-    else
-        result.add_null("kernel_time_microseconds");
-    result.add_bool("kernel_time_available", counters.gpu_kernel_time_available);
     result.add_uint("linear_dispatches", counters.vulkan_linear_dispatches);
     result.add_uint("attention_blocks", counters.vulkan_attention_blocks);
     result.add_uint("gated_delta_fusions", counters.vulkan_gated_delta_fusions);
@@ -207,10 +189,6 @@ static std::string gpu_metrics_json(const RuntimeMetricCounters& counters, bool 
     result.add_uint("attention_qkv_ring_fusions", counters.vulkan_attention_qkv_ring_fusions);
     result.add_uint("attention_cache_materializations", counters.vulkan_attention_cache_materializations);
     result.add_uint("attention_cpu_fallbacks", counters.vulkan_attention_cpu_fallbacks);
-    if (available)
-        result.add_string("reason", counters.gpu_kernel_time_available ? "" : "gpu_expert_execution_not_observed");
-    else
-        result.add_string("reason", "runtime_backend_cpu_only");
     return result.finish();
 }
 
@@ -235,10 +213,8 @@ static std::string stats_json(const SessionMetrics& metrics)
 {
     JsonObject result;
     result.add_raw("generation", expert_metrics_json(metrics.generation));
-    result.add_raw("generation_cpu", cpu_metrics_json(metrics.generation));
     result.add_raw("generation_gpu", gpu_metrics_json(metrics.generation, metrics.gpu_available));
     result.add_raw("cumulative", expert_metrics_json(metrics.cumulative));
-    result.add_raw("cumulative_cpu", cpu_metrics_json(metrics.cumulative));
     result.add_raw("cumulative_gpu", gpu_metrics_json(metrics.cumulative, metrics.gpu_available));
     result.add_raw("timing", generation_timing_json(metrics.timing));
     result.add_bool("gpu_available", metrics.gpu_available);
@@ -429,12 +405,10 @@ static std::string runtime_metrics_json(const SessionMetrics& metrics,
     result.add_uint("output_tokens", metrics.timing.output_tokens);
     result.add_uint("elapsed_microseconds", metrics.timing.elapsed_microseconds);
     result.add_raw("expert", expert_metrics_json(metrics.generation));
-    result.add_raw("cpu", cpu_metrics_json(metrics.generation));
     result.add_raw("gpu", gpu_metrics_json(metrics.generation, metrics.gpu_available));
     result.add_raw("process", process_json);
     result.add_raw("gpu_device", gpu_device_json);
     result.add_raw("cumulative", expert_metrics_json(metrics.cumulative));
-    result.add_raw("cumulative_cpu", cpu_metrics_json(metrics.cumulative));
     result.add_raw("cumulative_gpu", gpu_metrics_json(metrics.cumulative, metrics.gpu_available));
     return result.finish();
 }
@@ -537,6 +511,14 @@ static Option parse_options(int argc, char** argv, int first_argument)
             result.flags |= OptionDisableGpuVictimExecution;
         else if (argument == "--disable-gpu-expert-execution")
             result.flags |= OptionDisableGpuExpertExecution;
+        else if (argument == "--disable-vulkan-joint-cache-eviction")
+            result.optimization_flags &= ~OptimizationVulkanJointCacheEviction;
+        else if (argument == "--disable-vulkan-mxfp4-row-tile")
+            result.optimization_flags &= ~OptimizationVulkanMxfp4RowTile;
+        else if (argument == "--disable-vulkan-expert-direct-staging")
+            result.optimization_flags &= ~OptimizationVulkanExpertDirectStaging;
+        else if (argument == "--disable-vulkan-shared-expert-overlap")
+            result.optimization_flags &= ~OptimizationVulkanSharedExpertOverlap;
         else if (argument == "--release-vulkan-dense-host")
             result.flags |= OptionReleaseVulkanDenseHostStorage;
         else
@@ -1450,7 +1432,11 @@ static void print_usage(const char* executable)
               << "           --vulkan-device N, --vulkan-devices N[,N...]\n"
               << "  io/cache: --mmap-experts, --direct-expert-io, --buffered-expert-io,\n"
               << "            --release-vulkan-dense-host, --disable-gpu-expert-execution,\n"
-              << "            --expected-concurrency N\n";
+              << "            --expected-concurrency N\n"
+              << "  debug: --disable-vulkan-joint-cache-eviction\n"
+              << "  debug: --disable-vulkan-mxfp4-row-tile\n"
+              << "  debug: --disable-vulkan-expert-direct-staging\n"
+              << "  debug: --disable-vulkan-shared-expert-overlap\n";
 }
 
 } // namespace moe

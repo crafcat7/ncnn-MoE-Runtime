@@ -1,11 +1,15 @@
 #include "vulkancontext.h"
+#include "vulkanwaitpolicy.h"
+#include "experttransfer_vulkan.h"
 #include "kernels/activationbuffer.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <span>
+#include <thread>
 #include <utility>
 
 namespace ncnn {
@@ -29,20 +33,14 @@ bool prepare_staging_batch(ncnn::VkMat& buffer,
                            size_t rows,
                            uint32_t columns,
                            ncnn::VkAllocator* allocator,
-                           VulkanRuntimeState& runtime_state,
                            size_t element_size)
 {
-    const bool reused = has_batch_shape(buffer, rows, columns, element_size);
     buffer.create(static_cast<int>(columns),
                   static_cast<int>(rows),
                   element_size,
                   allocator);
     if (buffer.empty() || !buffer.mapped_ptr())
         return false;
-    if (reused)
-        ++runtime_state.staging_slot_reuses;
-    else
-        ++runtime_state.staging_slot_resizes;
     return true;
 }
 
@@ -51,22 +49,11 @@ bool prepare_staging_tensor(ncnn::VkMat& buffer,
                             int height,
                             int channels,
                             size_t element_size,
-                            ncnn::VkAllocator* allocator,
-                            VulkanRuntimeState& runtime_state)
+                            ncnn::VkAllocator* allocator)
 {
-    const bool reused = buffer.dims == 3
-                        && buffer.w == width
-                        && buffer.h == height
-                        && buffer.c == channels
-                        && buffer.elemsize == element_size
-                        && buffer.elempack == 1;
     buffer.create(width, height, channels, element_size, allocator);
     if (buffer.empty() || !buffer.mapped_ptr())
         return false;
-    if (reused)
-        ++runtime_state.staging_slot_reuses;
-    else
-        ++runtime_state.staging_slot_resizes;
     return true;
 }
 
@@ -146,29 +133,24 @@ bool record_mapped_activation_upload(ncnn::VkMat& staging,
            && destination.elemsize == vulkan_activation_element_size(option);
 }
 
-ncnn::VkMat bind_direct_host_input(ncnn::VkMat& staging,
-                                   VulkanRuntimeState& runtime_state)
+ncnn::VkMat bind_direct_host_input(ncnn::VkMat& staging)
 {
     staging.allocator->flush(staging.data);
     staging.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
     staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
-    ++runtime_state.direct_host_input_bindings;
     return staging;
 }
 
-ncnn::VkMat prepare_direct_host_output(ncnn::VkMat& staging,
-                                       VulkanRuntimeState& runtime_state)
+ncnn::VkMat prepare_direct_host_output(ncnn::VkMat& staging)
 {
     staging.data->access_flags = VK_ACCESS_HOST_READ_BIT;
     staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
-    ++runtime_state.direct_host_output_bindings;
     return staging;
 }
 
 bool fill_staging_upload(const ActivationBuffer& input,
                          ncnn::VkMat& staging,
-                         ncnn::VkAllocator* allocator,
-                         VulkanRuntimeState& runtime_state)
+                         ncnn::VkAllocator* allocator)
 {
     const size_t element_size = input.element_size();
     if (element_size == 0
@@ -182,7 +164,6 @@ bool fill_staging_upload(const ActivationBuffer& input,
                                input.rows(),
                                input.columns(),
                                allocator,
-                               runtime_state,
                                element_size))
     {
         return false;
@@ -202,8 +183,7 @@ bool fill_staging_values(const void* source,
                          size_t count,
                          size_t element_size,
                          ncnn::VkMat& staging,
-                         ncnn::VkAllocator* allocator,
-                         VulkanRuntimeState& runtime_state)
+                         ncnn::VkAllocator* allocator)
 {
     if (!source
         || count == 0
@@ -216,7 +196,6 @@ bool fill_staging_values(const void* source,
                                1,
                                static_cast<uint32_t>(count),
                                allocator,
-                               runtime_state,
                                element_size))
     {
         return false;
@@ -623,20 +602,8 @@ VulkanStatistics VulkanRuntimeState::snapshot() const noexcept
     result.dispatches = dispatches.load();
     result.attention_blocks = attention_blocks.load();
     result.compute_submissions = compute_submissions.load();
-    result.submit_wait_time_microseconds = submit_wait_time_microseconds.load();
     result.batch_uploads = batch_uploads.load();
     result.batch_downloads = batch_downloads.load();
-    result.auxiliary_uploads = auxiliary_uploads.load();
-    result.auxiliary_upload_bytes = auxiliary_upload_bytes.load();
-    result.staging_slot_resizes = staging_slot_resizes.load();
-    result.staging_slot_reuses = staging_slot_reuses.load();
-    result.staging_slot_acquisitions = staging_slot_acquisitions.load();
-    result.staging_slot_contentions = staging_slot_contentions.load();
-    result.command_buffer_reuses = command_buffer_reuses.load();
-    result.command_graph_submissions = command_graph_submissions.load();
-    result.command_graph_operations = command_graph_operations.load();
-    result.direct_host_input_bindings = direct_host_input_bindings.load();
-    result.direct_host_output_bindings = direct_host_output_bindings.load();
     result.attention_qkv_rope_fusions = attention_qkv_rope_fusions.load();
     result.attention_device_rope_fusions = attention_device_rope_fusions.load();
     result.attention_qkv_ring_fusions = attention_qkv_ring_fusions.load();
@@ -648,39 +615,50 @@ VulkanStatistics VulkanRuntimeState::snapshot() const noexcept
     result.gated_delta_submissions = gated_delta_submissions.load();
     result.rms_norm_linear_fusions = rms_norm_linear_fusions.load();
     result.kv_ring_appends = kv_ring_appends.load();
+    result.bfloat16_cooperative_matrix_dispatches = bfloat16_cooperative_matrix_dispatches.load();
+    result.command_buffer_reuses = command_buffer_reuses.load();
+    result.command_graph_submissions = command_graph_submissions.load();
+    result.command_graph_operations = command_graph_operations.load();
     result.kv_ring_resizes = kv_ring_resizes.load();
     result.kv_ring_wrapped_views = kv_ring_wrapped_views.load();
-    result.kv_cache_promotions = kv_cache_promotions.load();
-    result.kv_cache_promotion_bytes = kv_cache_promotion_bytes.load();
-    result.bfloat16_cooperative_matrix_dispatches = bfloat16_cooperative_matrix_dispatches.load();
-    result.command_dispatches = command_dispatches.load();
-    result.command_pipeline_binds = command_pipeline_binds.load();
-    result.command_redundant_pipeline_binds = command_redundant_pipeline_binds.load();
-    result.command_descriptor_bindings = command_descriptor_bindings.load();
-    result.command_push_constant_updates = command_push_constant_updates.load();
-    result.command_resource_barrier_calls = command_resource_barrier_calls.load();
-    result.command_buffer_resource_barriers = command_buffer_resource_barriers.load();
-    result.command_image_resource_barriers = command_image_resource_barriers.load();
     return result;
 }
 
-int submit_compute_and_wait(ncnn::VkCompute& command,
-                            VulkanRuntimeState& runtime_state)
+int wait_submitted_compute(ncnn::VkCompute& command, const ncnn::VulkanDevice* probe_device)
 {
-    const ncnn::VkComputeCommandStatistics command_recording = command.command_statistics();
-    const auto started = std::chrono::steady_clock::now();
-    const int result = command.submit_and_wait();
-    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started);
-    runtime_state.submit_wait_time_microseconds += static_cast<uint64_t>(elapsed.count());
-    runtime_state.command_dispatches += command_recording.dispatches;
-    runtime_state.command_pipeline_binds += command_recording.pipeline_binds;
-    runtime_state.command_redundant_pipeline_binds += command_recording.redundant_pipeline_binds;
-    runtime_state.command_descriptor_bindings += command_recording.descriptor_bindings;
-    runtime_state.command_push_constant_updates += command_recording.push_constant_updates;
-    runtime_state.command_resource_barrier_calls += command_recording.resource_barrier_calls;
-    runtime_state.command_buffer_resource_barriers += command_recording.buffer_resource_barriers;
-    runtime_state.command_image_resource_barriers += command_recording.image_resource_barriers;
-    return result;
+    struct WaitContext
+    {
+        ncnn::VkCompute& command;
+        const ncnn::VulkanDevice* device;
+    } wait_context{command, probe_device};
+    // Concrete callbacks keep the common CPU-testable policy allocation-free.
+    const VulkanCompletionCallbacks callbacks{
+        &wait_context,
+        [](void* context) { return static_cast<WaitContext*>(context)->command.wait(); },
+        [](void* context) noexcept {
+            const ncnn::VulkanDevice* device = static_cast<WaitContext*>(context)->device;
+            if (!device)
+                return VulkanCompletionProbeResult::Retry;
+            const uint32_t family = device->info.compute_queue_family_index();
+            // The pool lease excludes every other host submission/access
+            // to this exact queue. Never wait idle on the whole device,
+            // which would race independent transfer/compute submissions.
+            const VkQueue queue = device->acquire_queue(family);
+            if (!queue)
+                return VulkanCompletionProbeResult::Retry;
+            const VkResult probe_result = vkQueueWaitIdle(queue);
+            device->reclaim_queue(family, queue);
+            return classify_vulkan_completion_probe(probe_result, VK_ERROR_DEVICE_LOST);
+        },
+        [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }};
+    return wait_for_vulkan_submission_completion(callbacks);
+}
+
+int submit_compute_and_wait(ncnn::VkCompute& command,
+                            const ncnn::VulkanDevice* probe_device)
+{
+    const int result = command.submit();
+    return result == 0 ? wait_submitted_compute(command, probe_device) : result;
 }
 
 VulkanTransferLease::VulkanTransferLease(VulkanTransferSlot& slot, std::unique_lock<std::mutex> _lock)
@@ -691,10 +669,53 @@ VulkanTransferLease::VulkanTransferLease(VulkanTransferSlot& slot, std::unique_l
 VulkanContext::~VulkanContext()
 {
     const std::lock_guard<std::mutex> lock(command_lock);
+    release_resources();
+}
+
+void VulkanContext::release_resources() noexcept
+{
+    // Active weight-transfer leases retain this Context, so all pooled lanes
+    // are idle before destruction or constructor-failure cleanup.
+    weight_transfer_pool.reset();
+    // VkCompute destruction waits for any submitted work and releases retained
+    // staging buffers. All commands must finish before any allocator is shared.
     for (VulkanTransferSlot& slot : transfer_slots)
     {
         delete slot.command;
         slot.command = nullptr;
+    }
+    for (VulkanTransferSlot& slot : transfer_slots)
+    {
+        slot.upload.release();
+        slot.download.release();
+        slot.expert_slots.release();
+        slot.expert_row_offsets.release();
+        slot.route_offsets.release();
+        slot.route_rows.release();
+        slot.route_weights.release();
+        slot.rope_cosine.release();
+        slot.rope_sine.release();
+        slot.attention_mask.release();
+        slot.attention_cache_key.release();
+        slot.attention_cache_value.release();
+    }
+    for (VulkanTransferSlot& slot : transfer_slots)
+    {
+        if (slot.staging_allocator)
+        {
+            vkdev->reclaim_staging_allocator(slot.staging_allocator);
+            slot.staging_allocator = nullptr;
+        }
+    }
+    if (staging_alloc)
+    {
+        vkdev->reclaim_staging_allocator(staging_alloc);
+        staging_alloc = nullptr;
+    }
+    if (blob_alloc)
+    {
+        vkdev->reclaim_blob_allocator(blob_alloc);
+        blob_alloc = nullptr;
     }
 }
 
@@ -803,10 +824,8 @@ VulkanTransferLease VulkanContext::acquire_transfer_slot()
     std::unique_lock<std::mutex> lock(slot.mutex, std::try_to_lock);
     if (!lock.owns_lock())
     {
-        ++runtime_state().staging_slot_contentions;
         lock.lock();
     }
-    ++runtime_state().staging_slot_acquisitions;
     return VulkanTransferLease(slot, std::move(lock));
 }
 
@@ -817,23 +836,155 @@ VulkanContext::VulkanContext(ncnn::VulkanDevice* device,
     : vkdev(device),
       vulkan_runtime(std::move(_vulkan_runtime)),
       flags(optimization_flags),
-      command_flags(command_optimization_flags),
-      blob_alloc(device->acquire_blob_allocator()),
-      staging_alloc(device->acquire_staging_allocator())
+      command_flags(command_optimization_flags)
 {
-    for (VulkanTransferSlot& slot : transfer_slots)
-        slot.staging_allocator = device->acquire_staging_allocator();
-    for (VulkanTransferSlot& slot : transfer_slots)
+    try
     {
-        slot.command = new ncnn::VkCompute(device, command_flags);
+        weight_transfer_pool = std::make_unique<VulkanExpertTransferPool>(device);
+        blob_alloc = device->acquire_blob_allocator();
+        staging_alloc = device->acquire_staging_allocator();
+        for (VulkanTransferSlot& slot : transfer_slots)
+            slot.staging_allocator = device->acquire_staging_allocator();
+        for (VulkanTransferSlot& slot : transfer_slots)
+            slot.command = new ncnn::VkCompute(device, command_flags);
+    }
+    catch (...)
+    {
+        // A throwing constructor does not invoke the context destructor.
+        release_resources();
+        throw;
     }
 }
 
-VulkanWeightUploadBatch::VulkanWeightUploadBatch(const std::shared_ptr<VulkanContext>& _context)
-    : context(_context),
-      cmd(_context ? _context->device() : nullptr),
-      command_lock(_context ? std::unique_lock<std::mutex>(_context->command_mutex()) : std::unique_lock<std::mutex>())
+VulkanUploadStagingAllocator::VulkanUploadStagingAllocator(const ncnn::VulkanDevice* device, uint64_t _cache_limit)
+    : ncnn::VkStagingAllocator(device), cache_limit(_cache_limit)
 {
+}
+
+ncnn::VkBufferMemory* VulkanUploadStagingAllocator::fastMalloc(size_t size)
+{
+    ncnn::VkBufferMemory* buffer = ncnn::VkStagingAllocator::fastMalloc(size);
+    if (!buffer)
+        throw std::bad_alloc();
+    for (size_t index = 0; index < cached_count; ++index)
+    {
+        if (cached_buffers[index].buffer != buffer)
+            continue;
+        cached_size -= cached_buffers[index].allocation_size;
+        cached_buffers[index] = cached_buffers[--cached_count];
+        cached_buffers[cached_count] = CachedBuffer{};
+        return buffer;
+    }
+    return buffer;
+}
+
+void VulkanUploadStagingAllocator::fastFree(ncnn::VkBufferMemory* buffer)
+{
+    if (!buffer)
+        return;
+    // Match ncnn's actual vkAllocateMemory size, including Vulkan alignment,
+    // rather than treating logical buffer capacity as retained host memory.
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(vkdev->vkdevice(), buffer->buffer, &requirements);
+    const uint64_t allocation_size = requirements.size;
+    if (cached_count == cached_buffers.size() || allocation_size > cache_limit - cached_size)
+        clear();
+    try
+    {
+        ncnn::VkStagingAllocator::fastFree(buffer);
+    }
+    catch (...)
+    {
+        // ncnn's free-list insertion allocates a std::list node. A failed
+        // insertion leaves the list unchanged; releasing a completed staging
+        // tensor must still be safe from a noexcept command/batch destructor.
+        if (buffer->mapped_ptr) vkUnmapMemory(vkdev->vkdevice(), buffer->memory);
+        vkDestroyBuffer(vkdev->vkdevice(), buffer->buffer, nullptr);
+        vkFreeMemory(vkdev->vkdevice(), buffer->memory, nullptr);
+        delete buffer;
+        return;
+    }
+    if (allocation_size > cache_limit)
+    {
+        clear();
+        return;
+    }
+    cached_buffers[cached_count++] = {buffer, allocation_size};
+    cached_size += allocation_size;
+}
+
+void VulkanUploadStagingAllocator::clear()
+{
+    ncnn::VkStagingAllocator::clear();
+    cached_buffers.fill(CachedBuffer{});
+    cached_count = 0;
+    cached_size = 0;
+}
+
+VulkanWeightUploadBatch::VulkanWeightUploadBatch(const std::shared_ptr<VulkanContext>& _context,
+                                                 ncnn::VkAllocator* _borrowed_staging_allocator,
+                                                 ncnn::Mat* _borrowed_upload_scratch)
+    : context(_context),
+      borrowed_staging_allocator(_borrowed_staging_allocator),
+      borrowed_upload_scratch(_borrowed_upload_scratch)
+{
+}
+
+VulkanWeightUploadBatch::~VulkanWeightUploadBatch() = default;
+
+ncnn::Mat VulkanWeightUploadBatch::host_storage(size_t bytes)
+{
+    if (failed || submitted || bytes == 0 || bytes > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return {};
+    static constexpr size_t maximum_cached_bytes = 16 * 1024 * 1024;
+    if (bytes > maximum_cached_bytes)
+        return ncnn::Mat(static_cast<int>(bytes), sizeof(uint8_t));
+    ncnn::Mat& scratch = borrowed_upload_scratch ? *borrowed_upload_scratch : upload_scratch;
+    if (scratch.empty() || scratch.total() * scratch.elemsize < bytes)
+        scratch.create(static_cast<int>(bytes), sizeof(uint8_t));
+    if (scratch.empty()) return {};
+    return scratch.range(0, static_cast<int>(bytes));
+}
+
+std::span<uint8_t> VulkanWeightUploadBatch::prepare_storage(size_t bytes, ncnn::VkAllocator* weight_allocator)
+{
+    auto* allocator = dynamic_cast<VulkanExpertWeightAllocator*>(weight_allocator);
+    if (failed || submitted || !context || !allocator || cmd
+        || (borrowed_staging_allocator && borrowed_staging_allocator->vkdev != context->device()))
+    {
+        failed = true;
+        return {};
+    }
+    try
+    {
+        if (!borrowed_staging_allocator && !staging_allocator)
+            staging_allocator = std::make_unique<ncnn::VkWeightStagingAllocator>(context->device());
+        if (!independent_command)
+            independent_command = std::make_unique<VulkanIndependentWeightTransfer>(context,
+                                                                                    borrowed_staging_allocator ? borrowed_staging_allocator : staging_allocator.get());
+        const auto storage = independent_command->prepare_storage(bytes, allocator);
+        if (!storage.empty()) return storage;
+    }
+    catch (...)
+    {
+    }
+    failed = true;
+    return {};
+}
+
+bool VulkanWeightUploadBatch::record_prepared_storage(ncnn::VkMat& destination,
+                                                      const ncnn::Option& option,
+                                                      ncnn::VkAllocator* weight_allocator)
+{
+    (void)option; // Byte storage requires no ncnn cast or packing operation.
+    auto* allocator = dynamic_cast<VulkanExpertWeightAllocator*>(weight_allocator);
+    if (failed || submitted || !independent_command || !allocator
+        || !independent_command->record_prepared_storage(destination, allocator))
+    {
+        failed = true;
+        return false;
+    }
+    return true;
 }
 
 bool VulkanWeightUploadBatch::record(const ncnn::Mat& source,
@@ -841,25 +992,146 @@ bool VulkanWeightUploadBatch::record(const ncnn::Mat& source,
                                      const ncnn::Option& option,
                                      ncnn::VkAllocator* weight_allocator)
 {
-    if (!context || !weight_allocator || source.empty())
+    if (failed || submitted || !context || !weight_allocator || source.empty()
+        || (borrowed_staging_allocator && borrowed_staging_allocator->vkdev != context->device()))
+    {
+        failed = true;
         return false;
-    if (!staging_allocator)
-        staging_allocator = std::make_unique<ncnn::VkWeightStagingAllocator>(context->device());
-    if (!staging_allocator)
-        return false;
-    ncnn::Option upload_option = option;
-    upload_option.blob_vkallocator = weight_allocator;
-    upload_option.workspace_vkallocator = weight_allocator;
-    upload_option.staging_vkallocator = staging_allocator.get();
-    cmd.record_upload(source, destination, upload_option);
-    if (destination.empty())
-        return false;
-    return true;
+    }
+    try
+    {
+        if (!borrowed_staging_allocator && !staging_allocator)
+            staging_allocator = std::make_unique<ncnn::VkWeightStagingAllocator>(context->device());
+        ncnn::Option upload_option = option;
+        upload_option.blob_vkallocator = weight_allocator;
+        upload_option.workspace_vkallocator = weight_allocator;
+        upload_option.staging_vkallocator = borrowed_staging_allocator ? borrowed_staging_allocator : staging_allocator.get();
+        if (auto* independent_allocator = dynamic_cast<VulkanExpertWeightAllocator*>(weight_allocator))
+        {
+            if (cmd)
+            {
+                failed = true;
+                return false;
+            }
+            if (!independent_command)
+                independent_command = std::make_unique<VulkanIndependentWeightTransfer>(context, upload_option.staging_vkallocator);
+            if (!independent_command->record(source, destination, independent_allocator))
+            {
+                failed = true;
+                return false;
+            }
+        }
+        else
+        {
+            if (independent_command)
+            {
+                failed = true;
+                return false;
+            }
+            if (!cmd)
+            {
+                const auto& info = context->device()->info;
+                const size_t queue_count = std::max(info.compute_queue_count(), info.transfer_queue_count());
+                if (queue_count == 0)
+                {
+                    failed = true;
+                    return false;
+                }
+                legacy_queue_scratch.resize(queue_count, VK_NULL_HANDLE);
+                command_lock = std::unique_lock<std::mutex>(context->command_mutex());
+                cmd = std::make_unique<ncnn::VkTransfer>(context->device());
+            }
+            cmd->record_upload(source, destination, upload_option);
+        }
+        if (!destination.empty())
+            return true;
+    }
+    catch (...)
+    {
+        // ncnn's transfer uploader assumes staging allocation succeeds. The
+        // bounded pool throws on allocation failure so no null mapped pointer
+        // is dereferenced and no incomplete destination can be published.
+        destination.release();
+    }
+    failed = true;
+    return false;
+}
+
+// Contexts with different flags/runtime owners can share the same VkDevice.
+// Serialize only error recovery: otherwise two drains could each lease part
+// of a family and block forever waiting for each other's remaining queues.
+static std::mutex legacy_queue_drain_mutex;
+
+void VulkanWeightUploadBatch::settle_legacy_upload() noexcept
+{
+    const std::lock_guard<std::mutex> recovery_lock(legacy_queue_drain_mutex);
+    struct DrainContext
+    {
+        const ncnn::VulkanDevice* device;
+        uint32_t family;
+        std::span<VkQueue> queues;
+    } drain{context->device(), 0, legacy_queue_scratch};
+    const VulkanQueueFamilyDrainCallbacks callbacks{
+        &drain, 0,
+        [](void* state, size_t index) noexcept {
+            auto& drain = *static_cast<DrainContext*>(state);
+            VkQueue queue = drain.device->acquire_queue(drain.family);
+            while (!queue)
+            {
+                // A missing lease cannot prove the unknown original queue is
+                // idle. Retain every owner and retry rather than free early.
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                queue = drain.device->acquire_queue(drain.family);
+            }
+            drain.queues[index] = queue;
+        },
+        [](void* state, size_t index) noexcept {
+            const auto& drain = *static_cast<DrainContext*>(state);
+            return static_cast<int>(vkQueueWaitIdle(drain.queues[index]));
+        },
+        [](void* state, size_t index) noexcept {
+            auto& drain = *static_cast<DrainContext*>(state);
+            drain.device->reclaim_queue(drain.family, drain.queues[index]);
+            drain.queues[index] = VK_NULL_HANDLE;
+        },
+        [](void*) noexcept { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }};
+    auto drain_family = [&](uint32_t family, uint32_t queue_count) noexcept {
+        drain.family = family;
+        VulkanQueueFamilyDrainCallbacks family_callbacks = callbacks;
+        family_callbacks.queue_count = queue_count;
+        drain_vulkan_queue_family(family_callbacks, VK_SUCCESS, VK_ERROR_DEVICE_LOST);
+    };
+    const auto& info = context->device()->info;
+    if (!info.unified_compute_transfer_queue())
+        drain_family(info.transfer_queue_family_index(), info.transfer_queue_count());
+    // Release the full transfer family before acquiring compute. Background
+    // raw uploads also release their copy queue before requesting visibility
+    // on compute, so neither path holds a cross-family queue dependency.
+    drain_family(info.compute_queue_family_index(), info.compute_queue_count());
 }
 
 bool VulkanWeightUploadBatch::submit()
 {
-    return context && cmd.submit_and_wait() == 0;
+    if (failed || submitted || !context)
+        return false;
+    submitted = true;
+    const bool success = independent_command ? independent_command->submit_and_wait()
+                                             : (cmd && cmd->submit_and_wait() == 0);
+    if (!success && cmd && !independent_command)
+    {
+        // ncnn has returned both queue leases even when its transfer CB is
+        // still pending. Settle all possible original queues before cmd frees
+        // staging/CBs. This rare path retains owners and performs no allocation.
+        settle_legacy_upload();
+    }
+    failed = !success;
+    return success;
+}
+
+void VulkanWeightUploadBatch::retain_owner(std::shared_ptr<const void> owner)
+{
+    if (owner)
+        retained_owners.push_back(std::move(owner));
 }
 #endif // NCNN_MOE_WITH_VULKAN
 

@@ -1,0 +1,51 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer query_blob
+{ float query_data[]; };
+layout(binding = 1) readonly buffer key_blob
+{ float key_data[]; };
+layout(binding = 2) readonly buffer weight_blob
+{ float weight_data[]; };
+layout(binding = 3) writeonly buffer score_blob
+{ float score_data[]; };
+layout(push_constant) uniform parameter
+{
+    uint dimension;
+    uint head_count;
+    uint count;
+    uint query_offset;
+    uint weight_offset;
+    float scale;
+}
+p;
+
+shared float partial[128];
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint index = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+    if (index >= p.count)
+        return;
+    float score = 0.0;
+    for (uint head = 0; head < p.head_count; ++head)
+    {
+        float dot = 0.0;
+        for (uint column = lane; column < p.dimension; column += 128)
+            dot += query_data[p.query_offset + head * p.dimension + column] * key_data[index * p.dimension + column];
+        partial[lane] = dot;
+        barrier();
+        for (uint stride = 64; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+                partial[lane] += partial[lane + stride];
+            barrier();
+        }
+        if (lane == 0)
+            score += max(0.0, partial[0]) * weight_data[p.weight_offset + head] * p.scale;
+        barrier();
+    }
+    if (lane == 0)
+        score_data[index] = score;
+}

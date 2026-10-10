@@ -140,8 +140,7 @@ static bool tensor_to_float_vector(const TensorData& tensor, std::vector<float>&
 }
 
 static bool fill_rope_staging_pair(ncnn::VkMat& cosine_staging, ncnn::VkMat& sine_staging, size_t token_count, uint64_t position_offset,
-                                   const std::vector<float>& inverse_frequencies, float concentration, bool bfloat16_storage, ncnn::VkAllocator* allocator,
-                                   VulkanRuntimeState& runtime_state)
+                                   const std::vector<float>& inverse_frequencies, float concentration, bool bfloat16_storage, ncnn::VkAllocator* allocator)
 {
     if (token_count > static_cast<size_t>(std::numeric_limits<int>::max())
         || inverse_frequencies.size() > static_cast<size_t>(std::numeric_limits<int>::max())
@@ -149,13 +148,11 @@ static bool fill_rope_staging_pair(ncnn::VkMat& cosine_staging, ncnn::VkMat& sin
                                   token_count,
                                   static_cast<uint32_t>(inverse_frequencies.size()),
                                   allocator,
-                                  runtime_state,
                                   bfloat16_storage ? sizeof(uint16_t) : sizeof(float))
         || !prepare_staging_batch(sine_staging,
                                   token_count,
                                   static_cast<uint32_t>(inverse_frequencies.size()),
                                   allocator,
-                                  runtime_state,
                                   bfloat16_storage ? sizeof(uint16_t) : sizeof(float)))
         return false;
 
@@ -191,12 +188,11 @@ static bool fill_rope_staging_pair(ncnn::VkMat& cosine_staging, ncnn::VkMat& sin
 
 static bool fill_attention_mask_staging(ncnn::VkMat& staging, size_t token_count, uint64_t destination_count, uint64_t position_offset,
                                         const LayerCache& cache, const AttentionConfig_vulkan& config, const std::vector<float>& sinks,
-                                        bool bfloat16_storage, ncnn::VkAllocator* allocator,
-                                        VulkanRuntimeState& runtime_state)
+                                        bool bfloat16_storage, ncnn::VkAllocator* allocator)
 {
     if (destination_count > static_cast<uint64_t>(std::numeric_limits<int>::max()) || token_count > static_cast<size_t>(std::numeric_limits<int>::max())
         || !prepare_staging_tensor(staging, static_cast<int>(destination_count), static_cast<int>(token_count), static_cast<int>(config.head_count),
-                                   bfloat16_storage ? sizeof(uint16_t) : sizeof(float), allocator, runtime_state))
+                                   bfloat16_storage ? sizeof(uint16_t) : sizeof(float), allocator))
         return false;
 
     // The finite sentinel avoids BF16 NaNs and still underflows after softmax.
@@ -270,8 +266,7 @@ static bool fill_attention_cache_promotion_staging(ncnn::VkMat& key_staging,
                                                    ncnn::VkMat& value_staging,
                                                    const LayerCache& cache,
                                                    const AttentionConfig_vulkan& config,
-                                                   ncnn::VkAllocator* allocator,
-                                                   VulkanRuntimeState& runtime_state)
+                                                   ncnn::VkAllocator* allocator)
 {
     const uint32_t columns = config.kv_head_count * config.head_dimension;
     if (cache.token_count == 0
@@ -305,15 +300,13 @@ static bool fill_attention_cache_promotion_staging(ncnn::VkMat& key_staging,
                                    static_cast<int>(cache.token_count),
                                    static_cast<int>(config.kv_head_count),
                                    sizeof(float),
-                                   allocator,
-                                   runtime_state)
+                                   allocator)
         || !prepare_staging_tensor(value_staging,
                                    static_cast<int>(config.head_dimension),
                                    static_cast<int>(cache.token_count),
                                    static_cast<int>(config.kv_head_count),
                                    sizeof(float),
-                                   allocator,
-                                   runtime_state))
+                                   allocator))
     {
         return false;
     }
@@ -392,9 +385,13 @@ static bool create_attention_pipeline(const std::shared_ptr<VulkanContext>& cont
         != 0)
         return false;
     destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(),
-                                                  [context](ncnn::Pipeline* value) {
-                                                      const std::lock_guard<std::mutex> lock(context->command_mutex());
-                                                      delete value;
+                                                  [context = context](ncnn::Pipeline* value) mutable {
+                                                      {
+                                                          const std::lock_guard<std::mutex> lock(context->command_mutex());
+                                                          delete value;
+                                                      }
+                                                      // Weak cache entries retain the deleter control block after disposal.
+                                                      context.reset();
                                                   });
     context->cache_pipeline(shader, storage_variant, destination);
     return true;
@@ -1607,21 +1604,21 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
                                    && implementation.vulkan_context->support_direct_host_buffer(static_cast<size_t>(config.hidden_size)
                                                                                                     * sizeof(float),
                                                                                                 input.dtype());
-    if (!fill_staging_upload(input, transfer_slot.upload, transfer_slot.staging_allocator, runtime_state)
+    if (!fill_staging_upload(input, transfer_slot.upload, transfer_slot.staging_allocator)
         || (!device_rope
             && !fill_rope_staging_pair(transfer_slot.rope_cosine, transfer_slot.rope_sine, input.rows(), position_offset,
                                        implementation.rope_inverse_frequencies, implementation.rope_concentration, bfloat16_storage,
-                                       transfer_slot.staging_allocator, runtime_state))
+                                       transfer_slot.staging_allocator))
         || (!use_decode_sdpa
             && !fill_attention_mask_staging(transfer_slot.attention_mask, input.rows(), destination_count, position_offset, cache, config, implementation.sinks,
-                                            bfloat16_storage, transfer_slot.staging_allocator, runtime_state))
+                                            bfloat16_storage, transfer_slot.staging_allocator))
         || (promote_host_cache
             && !fill_attention_cache_promotion_staging(transfer_slot.attention_cache_key,
                                                        transfer_slot.attention_cache_value,
                                                        cache,
                                                        config,
-                                                       transfer_slot.staging_allocator, runtime_state))
-        || !prepare_staging_batch(transfer_slot.download, input.rows(), config.hidden_size, transfer_slot.staging_allocator, runtime_state))
+                                                       transfer_slot.staging_allocator))
+        || !prepare_staging_batch(transfer_slot.download, input.rows(), config.hidden_size, transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -1649,7 +1646,7 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
     ncnn::VkMat promoted_key_gpu;
     ncnn::VkMat promoted_value_gpu;
     if (direct_host_input)
-        input_gpu = bind_direct_host_input(transfer_slot.upload, runtime_state);
+        input_gpu = bind_direct_host_input(transfer_slot.upload);
     else if (!record_prepared_staging_upload(transfer_slot.upload, input.rows(), input_gpu, command, vkdev, implementation.option, input.dtype()))
     {
         return false;
@@ -2050,7 +2047,7 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
                                                     + static_cast<uint64_t>(next_cache->value.cstep) * next_cache->value.c * next_cache->value.elemsize;
 
     output = ActivationBuffer(input.rows(), config.hidden_size);
-    const int submit_result = submit_compute_and_wait(command, runtime_state);
+    const int submit_result = submit_compute_and_wait(command, implementation.vulkan_context->device());
     if (submit_result != 0)
     {
         if (has_device_cache && !ring_resized)
@@ -2099,8 +2096,6 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     ++runtime_state.batch_downloads;
-    runtime_state.auxiliary_uploads += (!use_decode_sdpa ? 1 : 0) + (device_rope ? 0 : 2)
-                                       + (promote_host_cache ? 2 : 0);
     if (use_qkv_rope)
         ++runtime_state.attention_qkv_rope_fusions;
     if (device_rope)
@@ -2114,20 +2109,6 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
         ++runtime_state.kv_ring_resizes;
     if (ring_first_slot + destination_count > ring_capacity)
         ++runtime_state.kv_ring_wrapped_views;
-    if (promote_host_cache)
-    {
-        ++runtime_state.kv_cache_promotions;
-        runtime_state.kv_cache_promotion_bytes += promotion_transfer_bytes;
-    }
-    runtime_state.auxiliary_upload_bytes += (device_rope
-                                                 ? 0
-                                                 : transfer_slot.rope_cosine.buffer_capacity()
-                                                       + transfer_slot.rope_sine.buffer_capacity())
-                                            + (!use_decode_sdpa ? transfer_slot.attention_mask.buffer_capacity() : 0)
-                                            + (promote_host_cache
-                                                   ? transfer_slot.attention_cache_key.buffer_capacity()
-                                                         + transfer_slot.attention_cache_value.buffer_capacity()
-                                                   : 0);
     if (promote_host_cache)
         cache.vulkan_attention_promotion_disabled = false;
     return true;
@@ -2204,15 +2185,13 @@ bool Attention_vulkan::materialize_device_cache(LayerCache& cache) const
                                 static_cast<int>(cache.token_count),
                                 static_cast<int>(config.kv_head_count),
                                 element_size,
-                                transfer_slot.staging_allocator,
-                                runtime_state)
+                                transfer_slot.staging_allocator)
         || !prepare_staging_tensor(transfer_slot.attention_cache_value,
                                    static_cast<int>(config.head_dimension),
                                    static_cast<int>(cache.token_count),
                                    static_cast<int>(config.kv_head_count),
                                    element_size,
-                                   transfer_slot.staging_allocator,
-                                   runtime_state))
+                                   transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -2238,7 +2217,7 @@ bool Attention_vulkan::materialize_device_cache(LayerCache& cache) const
     if (key_staging.empty() || value_staging.empty())
         return false;
 
-    if (submit_compute_and_wait(command, runtime_state) != 0)
+    if (submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0)
         return false;
     key_staging.allocator->invalidate(key_staging.data);
     value_staging.allocator->invalidate(value_staging.data);
@@ -2594,8 +2573,7 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
 
         if (!fill_staging_upload(input,
                                  work.upload,
-                                 transfer_slot.staging_allocator,
-                                 runtime_state)
+                                 transfer_slot.staging_allocator)
             || (!work.device_rope
                 && !fill_rope_staging_pair(work.rope_cosine,
                                            work.rope_sine,
@@ -2604,8 +2582,7 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
                                            implementation.rope_inverse_frequencies,
                                            implementation.rope_concentration,
                                            bfloat16_storage,
-                                           transfer_slot.staging_allocator,
-                                           runtime_state))
+                                           transfer_slot.staging_allocator))
             || (!work.use_decode_sdpa
                 && !fill_attention_mask_staging(work.attention_mask,
                                                 1,
@@ -2615,13 +2592,11 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
                                                 config,
                                                 implementation.sinks,
                                                 bfloat16_storage,
-                                                transfer_slot.staging_allocator,
-                                                runtime_state))
+                                                transfer_slot.staging_allocator))
             || !prepare_staging_batch(work.download,
                                       1,
                                       config.hidden_size,
-                                      transfer_slot.staging_allocator,
-                                      runtime_state))
+                                      transfer_slot.staging_allocator))
         {
             return AttentionBatchResult_vulkan::NotExecuted;
         }
@@ -2649,7 +2624,7 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
         }
         if (direct_host_input
             && work.entry->input->dtype() == DType::Float32)
-            work.input_gpu = bind_direct_host_input(work.upload, runtime_state);
+            work.input_gpu = bind_direct_host_input(work.upload);
         else if (!record_prepared_staging_upload(work.upload,
                                                  1,
                                                  work.input_gpu,
@@ -3108,7 +3083,7 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
         for (const PreparedAttentionEntry& work : prepared)
             work.entry->cache->vulkan_attention_state_unknown = true;
     };
-    if (submit_compute_and_wait(command, runtime_state) != 0)
+    if (submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0)
     {
         mark_device_states_unknown();
         return AttentionBatchResult_vulkan::Failed;
@@ -3165,15 +3140,6 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
     {
         ++runtime_state.kv_ring_wrapped_views;
     }
-    runtime_state.auxiliary_uploads += (!representative.use_decode_sdpa ? 1 : 0)
-                                       + (representative.device_rope ? 0 : 2);
-    runtime_state.auxiliary_upload_bytes += (representative.device_rope
-                                                 ? 0
-                                                 : representative.rope_cosine.buffer_capacity()
-                                                       + representative.rope_sine.buffer_capacity())
-                                            + (!representative.use_decode_sdpa
-                                                   ? representative.attention_mask.buffer_capacity()
-                                                   : 0);
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     ++runtime_state.batch_downloads;

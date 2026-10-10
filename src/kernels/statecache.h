@@ -16,6 +16,7 @@ namespace moe {
 
 class AttentionCache_vulkan;
 class GatedDeltaState_vulkan;
+class LatentCache_vulkan;
 
 struct LatentVectorUndo
 {
@@ -139,6 +140,7 @@ struct LayerCache
     std::vector<float> latent_rope_cosines;
     std::vector<float> latent_rope_sines;
     uint64_t latent_token_count = 0;
+    std::shared_ptr<LatentCache_vulkan> latent_device_state;
     bool latent_cache = false;
 
     LayerCacheTransaction transaction;

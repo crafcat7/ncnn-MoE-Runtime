@@ -17,7 +17,11 @@
 #include "expert.h"
 #include "storage/expertcache.h"
 #include "backends/ncnn/attention_vulkan.h"
+#include "backends/ncnn/modelpipeline.h"
 #include "backends/ncnn/linear.h"
+#include "backends/ncnn/latentlayer_vulkan.h"
+#include "backends/ncnn/moecombine_vulkan.h"
+#include "backends/ncnn/layerhead_vulkan.h"
 
 #include "graph/router.h"
 #include "graph/compiledmodel.h"
@@ -26,10 +30,10 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cmath>
 #include <exception>
 #include <future>
+#include <functional>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -47,7 +51,6 @@ struct RouterPredictionOutcome
     std::vector<uint32_t> predicted_expert_ids;
     uint64_t cache_hits = 0;
     uint64_t cache_misses = 0;
-    uint64_t predictor_time_microseconds = 0;
 };
 
 struct PendingRouterPrediction
@@ -69,11 +72,24 @@ struct PendingRouterPrediction
     std::future<Result<RouterPredictionOutcome>> result;
 };
 
-static uint64_t elapsed_microseconds(std::chrono::steady_clock::time_point start,
-                                     std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now())
+struct ScopedLatentLayerWorkspace
 {
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
-}
+    explicit ScopedLatentLayerWorkspace(LatentLayerWorkspace_vulkan& _workspace)
+        : workspace(_workspace)
+    {
+        workspace.reset();
+    }
+    ~ScopedLatentLayerWorkspace()
+    {
+        workspace.reset();
+        // Bound inactive publication storage after a large prefill. Normal
+        // decode/batch capacities remain reusable for the next execution.
+        static constexpr uint64_t maximum_retained_host_size = 64 * 1024 * 1024;
+        if (workspace.allocated_bytes() > maximum_retained_host_size)
+            workspace.release();
+    }
+    LatentLayerWorkspace_vulkan& workspace;
+};
 
 static void resolve_router_predictions(const CompiledModel& model,
                                        const CompiledLayerPlan& layer,
@@ -136,6 +152,69 @@ static void prepare_execution_state(const CompiledModel& model,
     if (state.layers.size() != model.graph.layer_plans.size())
         state.layers.resize(model.graph.layer_plans.size());
     state.execution_state.reset();
+}
+
+static bool shared_expert_completed(const LayerState& state) noexcept
+{
+    return state.shared_expert_output.rows() != 0 || static_cast<bool>(state.shared_expert_device_output);
+}
+
+static void forward_layer_shared_expert(const CompiledModel& model,
+                                        const MoeBlockPlan& moe,
+                                        LayerState& state,
+                                        bool retain_device_output)
+{
+    if (shared_expert_completed(state)) return;
+    forward_shared_expert(model, moe, state.normalized, state.shared_expert_output,
+                          state.shared_expert_workspace, state.normalized_device,
+                          retain_device_output ? &state.shared_expert_device_output : nullptr);
+}
+
+static ExpertDispatchOptions latent_router_options(const CompiledModel& model,
+                                                   const MoeBlockPlan& moe,
+                                                   std::span<const int32_t> input_ids,
+                                                   std::vector<uint32_t>& explicit_ids)
+{
+    ExpertDispatchOptions options;
+    options.expert_count = static_cast<uint32_t>(moe.experts.size());
+    options.top_k = moe.top_k;
+    options.score_function = moe.score_function;
+    options.normalization = moe.normalization;
+    options.routed_scaling_factor = moe.routed_scaling_factor;
+    if (moe.router_selection_bias != invalid_tensor_handle)
+        options.selection_bias = model.weights.at(moe.router_selection_bias).float32_values();
+    explicit_ids.clear();
+    if (moe.token_experts != invalid_tensor_handle)
+    {
+        const auto table = model.weights.at(moe.token_experts).int64_values();
+        explicit_ids.resize(input_ids.size() * moe.top_k);
+        for (size_t token = 0; token < input_ids.size(); ++token)
+            for (uint32_t rank = 0; rank < moe.top_k; ++rank)
+                explicit_ids[token * moe.top_k + rank] = static_cast<uint32_t>(table[static_cast<size_t>(input_ids[token]) * moe.top_k + rank]);
+        options.explicit_expert_ids = explicit_ids;
+    }
+    return options;
+}
+
+static void split_latent_routes(const ExpertDispatchPlan& batch, uint32_t row, ExpertDispatchPlan& result)
+{
+    result.batches.clear();
+    result.assignment_count = 0;
+    for (const ExpertBatch& source : batch.batches)
+    {
+        ExpertBatch selected;
+        selected.expert_id = source.expert_id;
+        for (const ExpertRoute& route : source.routes)
+        {
+            if (route.token_index != row)
+                continue;
+            selected.routes.push_back({0, route.rank, route.weight});
+        }
+        if (selected.routes.empty())
+            continue;
+        result.assignment_count += selected.routes.size();
+        result.batches.push_back(std::move(selected));
+    }
 }
 
 Result<void> forward_model(const CompiledModel& model,
@@ -208,6 +287,13 @@ Result<void> forward_model(const CompiledModel& model,
     PendingRouterPrediction pending_router_prediction;
     bool deferred_final_norm = false;
     bool produced_logits = false;
+    LatentLayerWorkspace_vulkan& layer_workspace = state.latent_layer;
+    const ScopedLatentLayerWorkspace latent_workspace_scope(layer_workspace);
+    bool fused_router_ready = false;
+    bool deferred_gpu_head = false;
+    const bool use_layer_fusion = !use_speculative_context
+                                  && !has_flag(model.opt.flags, OptionRouterPrediction);
+    const auto& gpu_head = model.operators.at_weight(model.hyper_head_function).layer_head;
     for (const ExecutionNodeId node_id : model.schedule.node_order)
     {
         if (node_id >= model.graph.nodes.size())
@@ -217,12 +303,10 @@ Result<void> forward_model(const CompiledModel& model,
         {
             if (node->weight_inputs.size() != 1)
                 return Error{ErrorCode::InternalError, "token embedding node has an invalid weight binding"};
-            const auto embedding_start = std::chrono::steady_clock::now();
             forward_embedding(model.weights.at(node->weight_inputs[0]),
                               input_ids,
                               hidden);
             hyper_connection_expand(hidden, model.descriptor.hyper_connection_multiplier, state.expert_scratch.staged_output);
-            statistics.embedding_time_microseconds += elapsed_microseconds(embedding_start);
             continue;
         }
         if (node->type == ExecutionNodeType::FinalNorm)
@@ -249,7 +333,16 @@ Result<void> forward_model(const CompiledModel& model,
                 if (deferred_final_norm)
                     continue;
             }
-            const auto final_norm_start = std::chrono::steady_clock::now();
+            if (layer_workspace.active())
+            {
+                if (gpu_head && LatentLayer_vulkan::can_finish(layer_workspace, *gpu_head))
+                {
+                    deferred_gpu_head = true;
+                    continue;
+                }
+                if (!LatentLayer_vulkan::materialize_hidden(layer_workspace, hidden))
+                    return Error{ErrorCode::InternalError, "cannot materialize final latent hidden state"};
+            }
             if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
             {
                 auto head = forward_hyper_connection_head(hidden,
@@ -301,7 +394,6 @@ Result<void> forward_model(const CompiledModel& model,
                                 state.speculative_main_hidden.row(row));
                 }
             }
-            statistics.final_norm_time_microseconds += elapsed_microseconds(final_norm_start);
             continue;
         }
         if (node->type == ExecutionNodeType::LmHead)
@@ -309,10 +401,17 @@ Result<void> forward_model(const CompiledModel& model,
             const size_t expected_weights = model.descriptor.final_norm == NormType::None ? 1 : 2;
             if (node->weight_inputs.size() != expected_weights)
                 return Error{ErrorCode::InternalError, "LM head node has an invalid weight binding"};
+            if (deferred_gpu_head)
+            {
+                if (!LatentLayer_vulkan::finish(layer_workspace, *gpu_head, logits_output != LogitsOutput::None,
+                                                logits_output == LogitsOutput::Last, hidden, state.logits))
+                    return Error{ErrorCode::InternalError, "continuous latent LM head execution failed"};
+                produced_logits = logits_output != LogitsOutput::None;
+                deferred_gpu_head = false;
+                continue;
+            }
             if (logits_output == LogitsOutput::None)
                 continue;
-            const auto lm_head_start = std::chrono::steady_clock::now();
-            uint64_t norm_time = 0;
             const auto& lm_head = model.weights.at(node->weight_inputs[0]);
             const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weight_inputs[0]);
             const ActivationBuffer* lm_head_input = &hidden;
@@ -338,19 +437,16 @@ Result<void> forward_model(const CompiledModel& model,
             {
                 produced_logits = true;
                 deferred_final_norm = false;
-                statistics.lm_head_time_microseconds += elapsed_microseconds(lm_head_start);
                 continue;
             }
             ActivationBuffer& normalized = state.final_norm;
             if (deferred_final_norm)
             {
-                const auto final_norm_start = std::chrono::steady_clock::now();
                 forward_rms_norm(*lm_head_input,
                                  model.weights.at(node->weight_inputs[1]),
                                  model.descriptor.norm_epsilon,
                                  normalized,
                                  model.descriptor.norm_weight_offset);
-                norm_time = elapsed_microseconds(final_norm_start);
                 if (logits_output == LogitsOutput::All)
                 {
                     hidden.swap(normalized);
@@ -360,7 +456,6 @@ Result<void> forward_model(const CompiledModel& model,
                 {
                     lm_head_input = &normalized;
                 }
-                statistics.final_norm_time_microseconds += norm_time;
                 deferred_final_norm = false;
             }
             forward_linear(lm_head,
@@ -370,8 +465,6 @@ Result<void> forward_model(const CompiledModel& model,
                            model.operators.find_weight(node->weight_inputs[0]),
                            node->backend);
             produced_logits = true;
-            statistics.lm_head_time_microseconds += elapsed_microseconds(lm_head_start)
-                                                    - norm_time;
             continue;
         }
         if (node->layer_plan_index >= model.graph.layer_plans.size())
@@ -384,7 +477,10 @@ Result<void> forward_model(const CompiledModel& model,
         const MoeBlockPlan& moe = layer.moe;
         if (node->type == ExecutionNodeType::Attention)
         {
-            const auto attention_start = std::chrono::steady_clock::now();
+            if (layer_workspace.active()
+                && (layer.ple.enabled() || layer.attention.kind != AttentionKind::MultiHeadLatent)
+                && !LatentLayer_vulkan::materialize_hidden(layer_workspace, hidden))
+                return Error{ErrorCode::InternalError, "cannot materialize latent state for the next attention input"};
             if (layer.ple.enabled())
             {
                 auto ple = forward_ple(model.weights, layer.ple,
@@ -446,6 +542,26 @@ Result<void> forward_model(const CompiledModel& model,
             }
             else if (layer.attention.kind == AttentionKind::MultiHeadLatent)
             {
+                const auto& fused = model.operators.at_weight(layer.attention.query_a_weight).latent_layer;
+                if (use_layer_fusion && node->backend == ExecutionBackend::Vulkan && fused)
+                {
+                    auto& positions = state.attention_positions;
+                    auto& caches = state.attention_caches;
+                    positions.resize(input_ids.size());
+                    caches.assign(input_ids.size(), &state.layers[layer.layer_id]);
+                    for (size_t row = 0; row < positions.size(); ++row)
+                        positions[row] = position_offset + row;
+                    auto options = latent_router_options(model, moe, input_ids, state.expert_scratch.explicit_expert_ids);
+                    if (fused->forward(hidden, positions, caches, options, layer_state.normalized,
+                                       layer_state.dispatch_plan, layer_workspace))
+                    {
+                        layer_state.normalized_device = layer_workspace.device_input();
+                        fused_router_ready = true;
+                        continue;
+                    }
+                }
+                if (layer_workspace.active() && !LatentLayer_vulkan::materialize_hidden(layer_workspace, hidden))
+                    return Error{ErrorCode::InternalError, "cannot materialize latent fallback state"};
                 HyperConnectionMix& hyper_mix = state.hyper_connection_scratch.transient_mix;
                 const ActivationBuffer* attention_input = &hidden;
                 if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
@@ -520,11 +636,15 @@ Result<void> forward_model(const CompiledModel& model,
                     hidden.swap(state.attention_scratch.output);
                 }
             }
-            statistics.attention_time_microseconds += elapsed_microseconds(attention_start);
             continue;
         }
         if (node->type == ExecutionNodeType::Router)
         {
+            if (fused_router_ready)
+            {
+                continue;
+            }
+            layer_state.normalized_device.reset();
             auto completed_prediction = complete_router_prediction(model,
                                                                    layer.layer_id,
                                                                    pending_router_prediction,
@@ -533,7 +653,6 @@ Result<void> forward_model(const CompiledModel& model,
                                                                    hidden.rows());
             if (!completed_prediction)
                 return completed_prediction.error();
-            layer_state.router_start = std::chrono::steady_clock::now();
             if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
             {
                 auto mixed = forward_gated_residual_pre(hidden,
@@ -616,22 +735,22 @@ Result<void> forward_model(const CompiledModel& model,
                 }
                 options.explicit_expert_ids = explicit_expert_ids;
             }
-            auto dispatched = forward_router(layer_state.router_logits.values(), static_cast<uint32_t>(layer_state.router_logits.rows()), options, layer_state.dispatch_plan);
-            if (!dispatched)
-                return dispatched.error();
+            if (!fused_router_ready)
+            {
+                auto dispatched = forward_router(layer_state.router_logits.values(), static_cast<uint32_t>(layer_state.router_logits.rows()), options, layer_state.dispatch_plan);
+                if (!dispatched)
+                    return dispatched.error();
+            }
 
             ExpertDispatchPlan& plan = layer_state.dispatch_plan;
             if (hidden.rows() == 1 && layer.layer_id < state.layers.size())
                 resolve_router_predictions(model, layer, plan, state, statistics, true);
             prepare_experts(moe, layer_state, statistics);
-            statistics.router_time_microseconds += elapsed_microseconds(layer_state.router_start);
-            layer_state.expert_start = std::chrono::steady_clock::now();
             if (has_flag(node->flags, ExecutionNodeRequestExperts))
             {
                 auto requested = request_experts(model, moe, layer_state,
                                                  state.expert_scratch,
-                                                 layer.layer_id,
-                                                 statistics.expert_cache_management_time_microseconds);
+                                                 layer.layer_id);
                 if (!requested)
                     return requested.error();
             }
@@ -641,7 +760,17 @@ Result<void> forward_model(const CompiledModel& model,
         {
             if (layer_state.experts_executed)
                 continue;
-            const auto expert_engine_start = std::chrono::steady_clock::now();
+            std::function<void()> shared_work;
+            // Both host-normalized and resident inputs are independent of
+            // routed weight supply; capability, rather than MLA, selects GPU work.
+            if (moe.has_shared_expert && node->backend == ExecutionBackend::Vulkan
+                && has_flag(model.opt.optimization_flags, OptimizationVulkanSharedExpertOverlap)
+                && support_vulkan_shared_experts(model.operators, moe))
+            {
+                shared_work = [&] {
+                    forward_layer_shared_expert(model, moe, layer_state, fused_router_ready);
+                };
+            }
             auto executed = forward_moe(model,
                                         moe,
                                         layer_state,
@@ -649,8 +778,7 @@ Result<void> forward_model(const CompiledModel& model,
                                         state.expert_scratch,
                                         layer.layer_id,
                                         node->backend,
-                                        has_flag(node->flags, ExecutionNodeCpuPrefetch));
-            statistics.expert_engine_time_microseconds += elapsed_microseconds(expert_engine_start);
+                                        has_flag(node->flags, ExecutionNodeCpuPrefetch), shared_work);
             if (!executed)
                 return executed.error();
             continue;
@@ -659,15 +787,7 @@ Result<void> forward_model(const CompiledModel& model,
         {
             if (!moe.has_shared_expert)
                 return Error{ErrorCode::InternalError, "Shared Expert graph node has no shared Expert plan"};
-            const auto shared_start = std::chrono::steady_clock::now();
-            ExpertExecutionMetrics shared_metrics;
-            forward_shared_expert(model,
-                                  moe,
-                                  layer_state.normalized,
-                                  layer_state.shared_expert_output,
-                                  layer_state.shared_expert_workspace,
-                                  shared_metrics);
-            statistics.expert_compute_time_microseconds += elapsed_microseconds(shared_start);
+            forward_layer_shared_expert(model, moe, layer_state, fused_router_ready);
             continue;
         }
         if (node->type == ExecutionNodeType::Combine)
@@ -676,69 +796,96 @@ Result<void> forward_model(const CompiledModel& model,
             {
                 return Error{ErrorCode::InternalError, "Combine executed before its Expert wave"};
             }
-            const auto combine_start = std::chrono::steady_clock::now();
-            if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0)
+            if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0
+                && !layer_state.shared_expert_device_output)
                 return Error{ErrorCode::InternalError, "Combine executed before Shared Expert group"};
-            ActivationBuffer& moe_output = layer_state.normalized;
-            const bool has_backend_aggregation = init_moe_output(state.expert_scratch,
-                                                                 hidden.rows(),
-                                                                 model.descriptor.hidden_size,
-                                                                 moe_output);
-            for (size_t active_index = 0; active_index < layer_state.active_experts().size(); ++active_index)
+            bool device_combined = false;
+            std::vector<MoeCombineInput_vulkan> device_inputs;
+            bool has_device_output = static_cast<bool>(layer_state.shared_expert_device_output);
+            for (const auto& active : layer_state.active_experts())
             {
-                const ExpertState& active = layer_state.active_experts()[active_index];
-                if (has_backend_aggregation
-                    && active_index < state.expert_scratch.backend_aggregated.size()
-                    && state.expert_scratch.backend_aggregated[active_index] != 0)
+                device_inputs.push_back({&active.output, active.device_output, active.batch.routes});
+                has_device_output = has_device_output || static_cast<bool>(active.device_output);
+            }
+            if (fused_router_ready && has_device_output)
+            {
+                device_combined = LatentLayer_vulkan::defer_combine(device_inputs, hidden.rows(), model.descriptor.hidden_size,
+                                                                    moe.has_shared_expert ? &layer_state.shared_expert_output : nullptr,
+                                                                    layer_state.shared_expert_device_output, layer_workspace);
+            }
+            if (!device_combined)
+            {
+                for (auto& active : layer_state.active_experts())
+                    if (active.device_output && !MoeCombine_vulkan::materialize(*active.device_output, active.output))
+                        return Error{ErrorCode::InternalError, "cannot materialize resident Expert output"};
+                if (layer_state.shared_expert_device_output
+                    && !MoeCombine_vulkan::materialize(*layer_state.shared_expert_device_output, layer_state.shared_expert_output))
+                    return Error{ErrorCode::InternalError, "cannot materialize resident Shared Expert output"};
+                ActivationBuffer& moe_output = layer_state.normalized;
+                const bool has_backend_aggregation = init_moe_output(state.expert_scratch,
+                                                                     hidden.rows(),
+                                                                     model.descriptor.hidden_size,
+                                                                     moe_output);
+                for (size_t active_index = 0; active_index < layer_state.active_experts().size(); ++active_index)
                 {
-                    continue;
-                }
-                for (size_t batch_index = 0; batch_index < active.batch.routes.size(); ++batch_index)
-                {
-                    const ExpertRoute& route = active.batch.routes[batch_index];
-                    float* destination = moe_output.row(route.token_index);
-                    const float* source = active.output.row(batch_index);
-                    for (uint32_t column = 0; column < model.descriptor.hidden_size; ++column)
+                    const ExpertState& active = layer_state.active_experts()[active_index];
+                    if (has_backend_aggregation
+                        && active_index < state.expert_scratch.backend_aggregated.size()
+                        && state.expert_scratch.backend_aggregated[active_index] != 0)
                     {
-                        destination[column] += route.weight * source[column];
+                        continue;
+                    }
+                    for (size_t batch_index = 0; batch_index < active.batch.routes.size(); ++batch_index)
+                    {
+                        const ExpertRoute& route = active.batch.routes[batch_index];
+                        float* destination = moe_output.row(route.token_index);
+                        const float* source = active.output.row(batch_index);
+                        for (uint32_t column = 0; column < model.descriptor.hidden_size; ++column)
+                        {
+                            destination[column] += route.weight * source[column];
+                        }
+                    }
+                }
+                if (moe.has_shared_expert)
+                {
+                    add_batch_inplace(moe_output, layer_state.shared_expert_output);
+                }
+                if (fused_router_ready)
+                {
+                    if (!LatentLayer_vulkan::defer_combine(moe_output, layer_workspace))
+                        return Error{ErrorCode::InternalError, "cannot defer latent FFN post"};
+                    fused_router_ready = false;
+                }
+                else if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
+                {
+                    auto connected = forward_gated_residual_post(moe_output, hidden, layer_state.ffn_hyper_mix,
+                                                                 model.descriptor.hyper_connection_multiplier,
+                                                                 hidden);
+                    if (!connected)
+                        return connected.error();
+                }
+                else if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
+                {
+                    auto connected = forward_hyper_connection_post(moe_output, hidden, layer_state.ffn_hyper_mix,
+                                                                   model.descriptor.hyper_connection_multiplier,
+                                                                   state.expert_scratch.staged_output);
+                    if (!connected)
+                        return connected.error();
+                    hidden.swap(state.expert_scratch.staged_output);
+                }
+                else
+                {
+                    for (size_t token_index = 0; token_index < hidden.rows(); ++token_index)
+                    {
+                        float* hidden_row = hidden.row(token_index);
+                        const float* output_row = moe_output.row(token_index);
+                        for (uint32_t column = 0; column < model.descriptor.hidden_size; ++column)
+                            hidden_row[column] += output_row[column];
                     }
                 }
             }
-            if (moe.has_shared_expert)
-            {
-                add_batch_inplace(moe_output, layer_state.shared_expert_output);
-            }
-            if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
-            {
-                auto connected = forward_gated_residual_post(moe_output, hidden, layer_state.ffn_hyper_mix,
-                                                             model.descriptor.hyper_connection_multiplier,
-                                                             hidden);
-                if (!connected)
-                    return connected.error();
-            }
-            else if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
-            {
-                auto connected = forward_hyper_connection_post(moe_output, hidden, layer_state.ffn_hyper_mix,
-                                                               model.descriptor.hyper_connection_multiplier,
-                                                               state.expert_scratch.staged_output);
-                if (!connected)
-                    return connected.error();
-                hidden.swap(state.expert_scratch.staged_output);
-            }
-            else
-            {
-                for (size_t token_index = 0; token_index < hidden.rows(); ++token_index)
-                {
-                    float* hidden_row = hidden.row(token_index);
-                    const float* output_row = moe_output.row(token_index);
-                    for (uint32_t column = 0; column < model.descriptor.hidden_size; ++column)
-                        hidden_row[column] += output_row[column];
-                }
-            }
-            const auto combine_end = std::chrono::steady_clock::now();
-            statistics.expert_combine_time_microseconds += elapsed_microseconds(combine_start, combine_end);
+            if (device_combined) fused_router_ready = false;
 
-            statistics.expert_time_microseconds += elapsed_microseconds(layer_state.expert_start, combine_end);
             const auto target = std::find(model.speculative.target_layer_ids.begin(),
                                           model.speculative.target_layer_ids.end(),
                                           layer.layer_id);
@@ -808,6 +955,40 @@ struct ScopedBatchWorkspace
         workspace.attention.latent_caches.clear();
     }
 };
+
+static Result<void> forward_staged_shared_expert(const CompiledModel& model,
+                                                 const MoeBlockPlan& moe,
+                                                 std::span<const DecodeBatchEntry> entries,
+                                                 BatchWorkspace& workspace,
+                                                 bool retain_device_output)
+{
+    LayerState& combined = workspace.staged_state;
+    if (shared_expert_completed(combined)) return {};
+    const size_t session_count = entries.size();
+    const ActivationBuffer& shared_input = combined.normalized;
+    for (const DecodeBatchEntry& entry : entries)
+    {
+        const ActivationBuffer& normalized = entry.state->execution_state.normalized;
+        if (normalized.rows() != 1 || normalized.columns() != model.descriptor.hidden_size)
+            return Error{ErrorCode::InternalError, "Shared Expert input has an invalid shape"};
+    }
+    if (shared_input.rows() != session_count || shared_input.columns() != model.descriptor.hidden_size)
+        return Error{ErrorCode::InternalError, "Shared Expert input has an invalid shape"};
+    forward_shared_expert(model, moe, shared_input, combined.shared_expert_output,
+                          combined.shared_expert_workspace, combined.normalized_device,
+                          retain_device_output ? &combined.shared_expert_device_output : nullptr);
+    for (size_t session_index = 0; session_index < session_count; ++session_index)
+    {
+        const DecodeBatchEntry& entry = entries[session_index];
+        if (!combined.shared_expert_device_output)
+        {
+            ActivationBuffer& output = entry.state->execution_state.shared_expert_output;
+            output.reset(1, combined.shared_expert_output.columns(), false);
+            std::copy_n(combined.shared_expert_output.row(session_index), output.columns(), output.row(0));
+        }
+    }
+    return {};
+}
 
 Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel& model,
                                                              std::span<const DecodeBatchEntry> entries,
@@ -957,6 +1138,14 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
         return entry.state->use_speculative_context;
     });
     bool deferred_final_norm = false;
+    bool deferred_gpu_head = false;
+    bool fused_router_ready = false;
+    LatentLayerWorkspace_vulkan& layer_workspace = workspace.latent_layer;
+    const ScopedLatentLayerWorkspace latent_workspace_scope(layer_workspace);
+    ExpertDispatchPlan& fused_routes = workspace.latent_routes;
+    const auto& gpu_head = model.operators.at_weight(model.hyper_head_function).layer_head;
+    const bool use_layer_fusion = (!model.speculative.enabled() || !use_speculative_context)
+                                  && !has_flag(model.opt.flags, OptionRouterPrediction);
     for (const ExecutionNodeId node_id : model.schedule.node_order)
     {
         if (node_id >= model.graph.nodes.size())
@@ -968,7 +1157,6 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
         {
             if (node->weight_inputs.size() != 1)
                 return Error{ErrorCode::InternalError, "token embedding node has an invalid weight binding"};
-            const auto start = std::chrono::steady_clock::now();
             ExpertScratch& scratch = workspace.expert;
             std::vector<int32_t>& input_ids = workspace.staged_input_ids;
             input_ids.resize(session_count);
@@ -985,9 +1173,6 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             }
             if (!split_hidden_rows(scratch.staged_output))
                 return Error{ErrorCode::InternalError, "cannot split staged embedding rows"};
-            const uint64_t elapsed = elapsed_microseconds(start);
-            for (const DecodeBatchEntry& entry : entries)
-                entry.statistics->embedding_time_microseconds += elapsed;
             continue;
         }
         if (node->type == ExecutionNodeType::FinalNorm)
@@ -1005,7 +1190,25 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 deferred_final_norm = true;
                 continue;
             }
-            const auto start = std::chrono::steady_clock::now();
+            if (layer_workspace.active())
+            {
+                if (gpu_head && LatentLayer_vulkan::can_finish(layer_workspace, *gpu_head)
+                    && (all_output_logits || requested_count == 0))
+                {
+                    deferred_gpu_head = true;
+                    continue;
+                }
+                ActivationBuffer& materialized = workspace.expert.staged_output;
+                if (gpu_head && LatentLayer_vulkan::can_finish(layer_workspace, *gpu_head))
+                {
+                    if (!LatentLayer_vulkan::finish(layer_workspace, *gpu_head, false, false, materialized, workspace.staged_router_logits)
+                        || !split_hidden_rows(materialized))
+                        return Error{ErrorCode::InternalError, "cannot materialize staged latent head"};
+                    continue;
+                }
+                if (!LatentLayer_vulkan::materialize_hidden(layer_workspace, materialized) || !split_hidden_rows(materialized))
+                    return Error{ErrorCode::InternalError, "cannot materialize staged final latent state"};
+            }
             ExpertScratch& scratch = workspace.expert;
             if (hyper_multiplier > 1)
             {
@@ -1054,18 +1257,29 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                                 state.speculative_main_hidden.row(0));
                 }
             }
-            const uint64_t elapsed = elapsed_microseconds(start);
-            for (const DecodeBatchEntry& entry : entries)
-                entry.statistics->final_norm_time_microseconds += elapsed;
             continue;
         }
         if (node->type == ExecutionNodeType::LmHead)
         {
             if (node->weight_inputs.size() != 2)
                 return Error{ErrorCode::InternalError, "LM head node has an invalid weight binding"};
+            if (deferred_gpu_head)
+            {
+                ActivationBuffer& materialized = workspace.expert.staged_merged;
+                ActivationBuffer& gpu_logits = workspace.expert.staged_output;
+                if (!LatentLayer_vulkan::finish(layer_workspace, *gpu_head, requested_count != 0, false, materialized, gpu_logits)
+                    || !split_hidden_rows(materialized))
+                    return Error{ErrorCode::InternalError, "continuous staged latent LM head execution failed"};
+                for (size_t row = 0; row < session_count; ++row)
+                {
+                    if (entries[row].output_logits)
+                        logits[row].assign(gpu_logits.row(row), gpu_logits.row(row) + gpu_logits.columns());
+                }
+                deferred_gpu_head = false;
+                continue;
+            }
             if (requested_count == 0)
                 continue;
-            const auto start = std::chrono::steady_clock::now();
             ExpertScratch& scratch = workspace.expert;
             ActivationBuffer& merged = scratch.staged_merged;
             if (all_output_logits)
@@ -1141,12 +1355,6 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 logits[session_index].assign(source,
                                              source + scratch.staged_output.columns());
             }
-            const uint64_t elapsed = elapsed_microseconds(start);
-            for (size_t session_index = 0; session_index < session_count; ++session_index)
-            {
-                if (entries[session_index].output_logits)
-                    entries[session_index].statistics->lm_head_time_microseconds += elapsed;
-            }
             continue;
         }
         if (node->layer_plan_index >= model.graph.layer_plans.size())
@@ -1158,6 +1366,12 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
         const MoeBlockPlan& moe = layer.moe;
         if (node->type == ExecutionNodeType::Attention)
         {
+            if (layer_workspace.active() && layer.attention.kind != AttentionKind::MultiHeadLatent)
+            {
+                ActivationBuffer& materialized = workspace.expert.staged_merged;
+                if (!LatentLayer_vulkan::materialize_hidden(layer_workspace, materialized) || !split_hidden_rows(materialized))
+                    return Error{ErrorCode::InternalError, "cannot materialize staged latent state for the next attention input"};
+            }
             if (layer.attention.kind == AttentionKind::GatedDeltaNet)
             {
                 std::vector<GatedDeltaBatchEntry>& gated_delta_entries = workspace.gated_delta_entries;
@@ -1171,7 +1385,6 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                         &state.layers[layer.layer_id],
                         &state.gated_delta_scratch.output};
                 }
-                const auto start = std::chrono::steady_clock::now();
                 if (!forward_gated_delta_batch(model.weights,
                                                model.operators,
                                                layer.attention,
@@ -1184,18 +1397,14 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                         ErrorCode::InternalError,
                         "gated delta batch execution failed"};
                 }
-                const uint64_t elapsed = elapsed_microseconds(start);
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
                 {
                     SessionState& state = *entries[session_index].state;
                     state.hidden.swap(state.gated_delta_scratch.output);
-                    SessionStatistics& statistics = *entries[session_index].statistics;
-                    statistics.attention_time_microseconds += elapsed;
                 }
             }
             else if (layer.attention.kind == AttentionKind::MultiHeadLatent)
             {
-                const auto start = std::chrono::steady_clock::now();
                 std::vector<uint64_t>& positions = workspace.staged_attention_positions;
                 std::vector<LayerCache*>& caches = workspace.staged_attention_caches;
                 positions.resize(session_count);
@@ -1207,6 +1416,34 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                     return Error{
                         ErrorCode::InternalError,
                         "cannot merge staged attention rows"};
+                }
+                const auto& fused = model.operators.at_weight(layer.attention.query_a_weight).latent_layer;
+                if (use_layer_fusion && node->backend == ExecutionBackend::Vulkan && fused)
+                {
+                    for (size_t row = 0; row < session_count; ++row)
+                    {
+                        positions[row] = entries[row].position_offset;
+                        caches[row] = &entries[row].state->layers[layer.layer_id];
+                    }
+                    auto options = latent_router_options(model, moe, workspace.staged_input_ids, batch_scratch.explicit_expert_ids);
+                    if (fused->forward(merged_hidden, positions, caches, options, workspace.staged_state.normalized,
+                                       fused_routes, layer_workspace))
+                    {
+                        for (size_t row = 0; row < session_count; ++row)
+                        {
+                            auto& layer_state = entries[row].state->execution_state;
+                            layer_state.normalized.reset(1, model.descriptor.hidden_size, false);
+                            std::copy_n(workspace.staged_state.normalized.row(row), model.descriptor.hidden_size, layer_state.normalized.row(0));
+                            split_latent_routes(fused_routes, static_cast<uint32_t>(row), layer_state.dispatch_plan);
+                        }
+                        fused_router_ready = true;
+                        continue;
+                    }
+                }
+                if (layer_workspace.active())
+                {
+                    if (!LatentLayer_vulkan::materialize_hidden(layer_workspace, merged_hidden) || !split_hidden_rows(merged_hidden))
+                        return Error{ErrorCode::InternalError, "cannot materialize staged latent fallback state"};
                 }
                 HyperConnectionScratch& hyper_scratch = workspace.hyper_connection;
                 HyperConnectionMix& merged_mix = hyper_scratch.transient_mix;
@@ -1262,12 +1499,6 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                             hidden[column] += attention[column];
                     }
                 }
-                const uint64_t elapsed = elapsed_microseconds(start);
-                for (size_t session_index = 0; session_index < session_count; ++session_index)
-                {
-                    SessionStatistics& statistics = *entries[session_index].statistics;
-                    statistics.attention_time_microseconds += elapsed;
-                }
             }
             else
             {
@@ -1285,7 +1516,6 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                         &state.hidden,
                         &state.attention_scratch.output};
                 }
-                const auto batch_start = std::chrono::steady_clock::now();
                 auto batched = forward_attention_batch(model.operators,
                                                        layer.attention,
                                                        node->backend,
@@ -1295,15 +1525,12 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                     return batched.error();
                 if (batched.value())
                 {
-                    const uint64_t elapsed = elapsed_microseconds(batch_start);
                     for (size_t session_index = 0;
                          session_index < session_count;
                          ++session_index)
                     {
                         SessionState& state = *entries[session_index].state;
                         state.hidden.swap(state.attention_scratch.output);
-                        SessionStatistics& statistics = *entries[session_index].statistics;
-                        statistics.attention_time_microseconds += elapsed;
                     }
                 }
                 else
@@ -1326,7 +1553,6 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                          ++session_index)
                     {
                         SessionState& state = *entries[session_index].state;
-                        const auto start = std::chrono::steady_clock::now();
                         auto attention = forward_attention(model.weights,
                                                            model.operators,
                                                            layer.attention,
@@ -1358,8 +1584,6 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                             batch_vulkan_before = solo_vulkan_after;
                         }
                         state.hidden.swap(state.attention_scratch.output);
-                        SessionStatistics& statistics = *entries[session_index].statistics;
-                        statistics.attention_time_microseconds += elapsed_microseconds(start);
                     }
                 }
             }
@@ -1367,7 +1591,8 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
         }
         if (node->type == ExecutionNodeType::Router)
         {
-            const auto start = std::chrono::steady_clock::now();
+            if (fused_router_ready)
+                continue;
             ExpertScratch& scratch = workspace.expert;
             ActivationBuffer& merged_hidden = workspace.staged_state.normalized;
             ActivationBuffer& merged_hyper = scratch.staged_output;
@@ -1438,9 +1663,6 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 layer_state.router_logits.reset(1, merged_logits.columns(), false);
                 std::copy_n(merged_logits.row(session_index), merged_logits.columns(), layer_state.router_logits.row(0));
             }
-            const uint64_t elapsed = elapsed_microseconds(start);
-            for (const DecodeBatchEntry& entry : entries)
-                entry.statistics->router_time_microseconds += elapsed;
             continue;
         }
         if (node->type == ExecutionNodeType::ExpertDispatch)
@@ -1473,16 +1695,20 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                     }
                     options.explicit_expert_ids = explicit_expert_ids;
                 }
-                auto dispatched = forward_router(layer_state.router_logits.values(), 1, options, layer_state.dispatch_plan);
-                if (!dispatched)
-                    return dispatched.error();
+                if (!fused_router_ready)
+                {
+                    auto dispatched = forward_router(layer_state.router_logits.values(), 1, options, layer_state.dispatch_plan);
+                    if (!dispatched)
+                        return dispatched.error();
+                }
                 ExpertDispatchPlan& plan = layer_state.dispatch_plan;
                 resolve_router_predictions(model, layer, plan, state, statistics, false);
                 prepare_experts(moe, layer_state, statistics);
-                layer_state.expert_start = std::chrono::steady_clock::now();
             }
             LayerState& combined = workspace.staged_state;
             combined.reset();
+            if (fused_router_ready)
+                combined.normalized_device = layer_workspace.device_input();
             // Router already produced the complete normalized batch here.
             if (combined.normalized.rows() != session_count || combined.normalized.columns() != model.descriptor.hidden_size)
                 return Error{ErrorCode::InternalError, "Expert group has no staged Router input"};
@@ -1521,11 +1747,8 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             combined.resize_experts(combined_count);
             if (has_flag(node->flags, ExecutionNodeRequestExperts))
             {
-                uint64_t request_cache_time = 0;
                 auto requested = request_experts(model, moe, combined, batch_scratch,
-                                                 layer.layer_id, request_cache_time);
-                for (const DecodeBatchEntry& entry : entries)
-                    entry.statistics->expert_cache_management_time_microseconds += request_cache_time;
+                                                 layer.layer_id);
                 if (!requested)
                     return requested.error();
             }
@@ -1535,7 +1758,16 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
         {
             LayerState& combined = workspace.staged_state;
             SessionStatistics aggregate_statistics;
-            const auto engine_start = std::chrono::steady_clock::now();
+            Result<void> shared_result;
+            std::function<void()> shared_work;
+            if (moe.has_shared_expert && node->backend == ExecutionBackend::Vulkan
+                && has_flag(model.opt.optimization_flags, OptimizationVulkanSharedExpertOverlap)
+                && support_vulkan_shared_experts(model.operators, moe))
+            {
+                shared_work = [&] {
+                    shared_result = forward_staged_shared_expert(model, moe, entries, workspace, fused_router_ready);
+                };
+            }
             auto executed = forward_moe(model,
                                         moe,
                                         combined,
@@ -1543,8 +1775,8 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                                         workspace.expert,
                                         layer.layer_id,
                                         node->backend,
-                                        has_flag(node->flags, ExecutionNodeCpuPrefetch));
-            const uint64_t engine_elapsed = elapsed_microseconds(engine_start);
+                                        has_flag(node->flags, ExecutionNodeCpuPrefetch), shared_work);
+            if (!shared_result) return shared_result.error();
             if (!executed)
             {
                 combined.reset();
@@ -1561,6 +1793,9 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                         continue;
                     if (route.token_index >= session_count)
                         return Error{ErrorCode::InternalError, "combined Expert route references an invalid session"};
+                    if (!has_flag(model.opt.flags, OptionRouterPrediction)
+                        || !has_flag(model.opt.flags, OptionRankAdaptivePrefetch))
+                        continue;
                     SessionStatistics& route_statistics = *entries[route.token_index].statistics;
                     ++route_statistics.expert_route_rank_demands[route.rank];
                     route_statistics.expert_route_rank_demand_queue_time_microseconds[route.rank] += active.metrics.cache_wait_time_microseconds;
@@ -1571,39 +1806,7 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             {
                 LayerState& layer_state = entries[session_index].state->execution_state;
                 SessionStatistics& statistics = *entries[session_index].statistics;
-                statistics.expert_engine_time_microseconds += engine_elapsed;
-                statistics.expert_compute_time_microseconds += aggregate_statistics.expert_compute_time_microseconds;
-                statistics.expert_cache_wait_time_microseconds += aggregate_statistics.expert_cache_wait_time_microseconds;
-                statistics.expert_cache_management_time_microseconds += aggregate_statistics.expert_cache_management_time_microseconds;
-                statistics.expert_regroup_time_microseconds += aggregate_statistics.expert_regroup_time_microseconds;
-                if (session_index == 0)
-                {
-                    statistics.expert_parallel_tasks += aggregate_statistics.expert_parallel_tasks;
-                    statistics.expert_prefetches += aggregate_statistics.expert_prefetches;
-                    statistics.expert_prefetch_bytes += aggregate_statistics.expert_prefetch_bytes;
-                    statistics.mxfp4_reused_input_rows += aggregate_statistics.mxfp4_reused_input_rows;
-                }
                 statistics.expert_batches += layer_state.active_experts().size();
-                for (const ExpertState& active : layer_state.active_experts())
-                {
-                    const ExpertPlan& expert = moe.experts[active.batch.expert_id];
-                    ExpertExecutionMetrics logical_metrics;
-                    if (expert.gate_up_weight != invalid_tensor_handle)
-                    {
-                        const TensorData& gate_up = model.weights.at(expert.gate_up_weight);
-                        const TensorData& down = model.weights.at(expert.down_weight);
-                        record_mxfp4(gate_up, active.batch.routes.size(), logical_metrics);
-                        record_mxfp4(down, active.batch.routes.size(), logical_metrics);
-                        if (gate_up.dtype == DType::MxFp4)
-                        {
-                            logical_metrics.mxfp4_fused_gate_up_rows += static_cast<uint64_t>(active.batch.routes.size()) * gate_up.shape[0] / 2;
-                        }
-                    }
-                    statistics.mxfp4_decode_gemv_rows += logical_metrics.mxfp4_decode_gemv_rows;
-                    statistics.mxfp4_prefill_gemm_rows += logical_metrics.mxfp4_prefill_gemm_rows;
-                    statistics.mxfp4_paired_rows += logical_metrics.mxfp4_paired_rows;
-                    statistics.mxfp4_fused_gate_up_rows += logical_metrics.mxfp4_fused_gate_up_rows;
-                }
                 layer_state.experts_executed = true;
             }
             continue;
@@ -1612,39 +1815,12 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
         {
             if (!moe.has_shared_expert)
                 return Error{ErrorCode::InternalError, "Shared Expert graph node has no shared Expert plan"};
-            // Router's normalized rows stay intact through the Expert wave.
-            const ActivationBuffer& shared_input = workspace.staged_state.normalized;
-            for (size_t session_index = 0; session_index < session_count; ++session_index)
-            {
-                const ActivationBuffer& normalized = entries[session_index].state->execution_state.normalized;
-                if (normalized.rows() != 1 || normalized.columns() != model.descriptor.hidden_size)
-                    return Error{ErrorCode::InternalError, "Shared Expert input has an invalid shape"};
-            }
-            if (shared_input.rows() != session_count
-                || shared_input.columns() != model.descriptor.hidden_size)
-                return Error{ErrorCode::InternalError, "Shared Expert input has an invalid shape"};
-            const auto shared_start = std::chrono::steady_clock::now();
-            ExpertExecutionMetrics shared_metrics;
-            ActivationBuffer& shared_output = batch_scratch.staged_output;
-            forward_shared_expert(model,
-                                  moe,
-                                  shared_input,
-                                  shared_output,
-                                  workspace.staged_state.shared_expert_workspace,
-                                  shared_metrics);
-            const uint64_t shared_elapsed = elapsed_microseconds(shared_start);
-            for (size_t session_index = 0; session_index < session_count; ++session_index)
-            {
-                LayerState& layer_state = entries[session_index].state->execution_state;
-                layer_state.shared_expert_output.reset(1, shared_output.columns(), false);
-                std::copy_n(shared_output.row(session_index), shared_output.columns(), layer_state.shared_expert_output.row(0));
-                entries[session_index].statistics->expert_compute_time_microseconds += shared_elapsed;
-            }
+            auto executed = forward_staged_shared_expert(model, moe, entries, workspace, fused_router_ready);
+            if (!executed) return executed.error();
             continue;
         }
         if (node->type == ExecutionNodeType::Combine)
         {
-            const auto combine_start = std::chrono::steady_clock::now();
             LayerState& combined = workspace.staged_state;
             const std::vector<uint8_t>& combined_backend_aggregated = batch_scratch.backend_aggregated;
             const bool has_aggregate = batch_scratch.backend_aggregated_output_valid
@@ -1655,84 +1831,145 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             const ActivationBuffer& aggregate = batch_scratch.backend_aggregated_output;
             const std::vector<size_t>& combined_by_expert = workspace.combined_by_expert;
             const size_t missing = std::numeric_limits<size_t>::max();
-            for (size_t session_index = 0; session_index < session_count; ++session_index)
-            {
-                LayerState& layer_state = entries[session_index].state->execution_state;
-                if (!layer_state.experts_executed)
-                {
-                    return Error{ErrorCode::InternalError, "Combine executed before its Expert wave"};
-                }
-                if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0)
-                    return Error{ErrorCode::InternalError, "Combine executed before Shared Expert group"};
-                ActivationBuffer& moe_output = layer_state.normalized;
-                moe_output.reset(1, model.descriptor.hidden_size, !has_aggregate);
-                if (has_aggregate)
-                {
-                    std::copy_n(aggregate.row(session_index),
-                                model.descriptor.hidden_size,
-                                moe_output.row(0));
-                }
-            }
+            bool device_combined = false;
+            bool has_device_output = static_cast<bool>(combined.shared_expert_device_output);
+            std::vector<MoeCombineInput_vulkan> device_inputs;
             for (size_t expert_id = 0; expert_id < combined_by_expert.size(); ++expert_id)
             {
-                const size_t combined_index = combined_by_expert[expert_id];
-                if (combined_index == missing)
-                    continue;
-                if (combined_index >= combined.active_experts().size())
+                const size_t index = combined_by_expert[expert_id];
+                if (index == missing) continue;
+                if (index >= combined.active_experts().size())
                     return Error{ErrorCode::InternalError, "combined Expert index is out of range"};
-                const ExpertState& source = combined.active_experts()[combined_index];
-                const bool backend_aggregated = has_aggregate
-                                                && combined_index < combined_backend_aggregated.size()
-                                                && combined_backend_aggregated[combined_index] != 0;
-                if (backend_aggregated)
-                    continue;
-                for (size_t route_index = 0; route_index < source.batch.routes.size(); ++route_index)
+                const auto& active = combined.active_experts()[index];
+                device_inputs.push_back({&active.output, active.device_output, active.batch.routes});
+                has_device_output = has_device_output || static_cast<bool>(active.device_output);
+            }
+            for (const auto& entry : entries)
+                if (!entry.state->execution_state.experts_executed)
+                    return Error{ErrorCode::InternalError, "Combine executed before its Expert wave"};
+            ActivationBuffer shared_host_batch;
+            if (moe.has_shared_expert && !combined.shared_expert_device_output)
+            {
+                shared_host_batch.reset(session_count, model.descriptor.hidden_size, false);
+                for (size_t row = 0; row < session_count; ++row)
                 {
-                    const ExpertRoute& route = source.batch.routes[route_index];
-                    if (route.token_index >= session_count)
-                        return Error{ErrorCode::InternalError, "combined Expert route references an invalid session"};
-                    ActivationBuffer& moe_output = entries[route.token_index].state->execution_state.normalized;
-                    float* destination = moe_output.row(0);
-                    const float* source_row = source.output.row(route_index);
-                    for (uint32_t column = 0; column < model.descriptor.hidden_size; ++column)
+                    const auto& output = entries[row].state->execution_state.shared_expert_output;
+                    if (output.rows() != 1 || output.columns() != model.descriptor.hidden_size)
+                        return Error{ErrorCode::InternalError, "Combine executed before Shared Expert group"};
+                    std::copy_n(output.row(0), model.descriptor.hidden_size, shared_host_batch.row(row));
+                }
+            }
+            if (fused_router_ready && has_device_output)
+            {
+                device_combined = LatentLayer_vulkan::defer_combine(device_inputs, session_count, model.descriptor.hidden_size,
+                                                                    shared_host_batch.rows() ? &shared_host_batch : nullptr,
+                                                                    combined.shared_expert_device_output, layer_workspace);
+            }
+            if (!device_combined)
+            {
+                for (auto& active : combined.active_experts())
+                    if (active.device_output && !MoeCombine_vulkan::materialize(*active.device_output, active.output))
+                        return Error{ErrorCode::InternalError, "cannot materialize staged resident Expert output"};
+                if (combined.shared_expert_device_output)
+                {
+                    ActivationBuffer shared_host;
+                    if (!MoeCombine_vulkan::materialize(*combined.shared_expert_device_output, shared_host))
+                        return Error{ErrorCode::InternalError, "cannot materialize staged Shared Expert output"};
+                    for (size_t row = 0; row < session_count; ++row)
                     {
-                        destination[column] += route.weight * source_row[column];
+                        auto& output = entries[row].state->execution_state.shared_expert_output;
+                        output.reset(1, model.descriptor.hidden_size, false);
+                        std::copy_n(shared_host.row(row), model.descriptor.hidden_size, output.row(0));
                     }
                 }
-            }
-            batch_scratch.backend_aggregated_output_valid = false;
-            for (size_t session_index = 0; session_index < session_count; ++session_index)
-            {
-                LayerState& layer_state = entries[session_index].state->execution_state;
-                if (moe.has_shared_expert)
-                {
-                    add_batch_inplace(layer_state.normalized, layer_state.shared_expert_output);
-                }
-            }
-            if (hyper_multiplier > 1)
-            {
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
                 {
                     LayerState& layer_state = entries[session_index].state->execution_state;
-                    auto connected = forward_hyper_connection_post(layer_state.normalized,
-                                                                   entries[session_index].state->hidden,
-                                                                   layer_state.ffn_hyper_mix,
-                                                                   hyper_multiplier,
-                                                                   batch_scratch.staged_output);
-                    if (!connected)
-                        return connected.error();
-                    entries[session_index].state->hidden.swap(batch_scratch.staged_output);
+                    if (!layer_state.experts_executed)
+                    {
+                        return Error{ErrorCode::InternalError, "Combine executed before its Expert wave"};
+                    }
+                    if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0)
+                        return Error{ErrorCode::InternalError, "Combine executed before Shared Expert group"};
+                    ActivationBuffer& moe_output = layer_state.normalized;
+                    moe_output.reset(1, model.descriptor.hidden_size, !has_aggregate);
+                    if (has_aggregate)
+                    {
+                        std::copy_n(aggregate.row(session_index),
+                                    model.descriptor.hidden_size,
+                                    moe_output.row(0));
+                    }
                 }
-            }
-            else
-            {
+                for (size_t expert_id = 0; expert_id < combined_by_expert.size(); ++expert_id)
+                {
+                    const size_t combined_index = combined_by_expert[expert_id];
+                    if (combined_index == missing)
+                        continue;
+                    if (combined_index >= combined.active_experts().size())
+                        return Error{ErrorCode::InternalError, "combined Expert index is out of range"};
+                    const ExpertState& source = combined.active_experts()[combined_index];
+                    const bool backend_aggregated = has_aggregate
+                                                    && combined_index < combined_backend_aggregated.size()
+                                                    && combined_backend_aggregated[combined_index] != 0;
+                    if (backend_aggregated)
+                        continue;
+                    for (size_t route_index = 0; route_index < source.batch.routes.size(); ++route_index)
+                    {
+                        const ExpertRoute& route = source.batch.routes[route_index];
+                        if (route.token_index >= session_count)
+                            return Error{ErrorCode::InternalError, "combined Expert route references an invalid session"};
+                        ActivationBuffer& moe_output = entries[route.token_index].state->execution_state.normalized;
+                        float* destination = moe_output.row(0);
+                        const float* source_row = source.output.row(route_index);
+                        for (uint32_t column = 0; column < model.descriptor.hidden_size; ++column)
+                        {
+                            destination[column] += route.weight * source_row[column];
+                        }
+                    }
+                }
+                batch_scratch.backend_aggregated_output_valid = false;
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
                 {
-                    add_batch_inplace(entries[session_index].state->hidden, entries[session_index].state->execution_state.normalized);
+                    LayerState& layer_state = entries[session_index].state->execution_state;
+                    if (moe.has_shared_expert)
+                    {
+                        add_batch_inplace(layer_state.normalized, layer_state.shared_expert_output);
+                    }
+                }
+                if (fused_router_ready)
+                {
+                    ActivationBuffer& merged = batch_scratch.staged_output;
+                    merged.reset(session_count, model.descriptor.hidden_size, false);
+                    for (size_t row = 0; row < session_count; ++row)
+                        std::copy_n(entries[row].state->execution_state.normalized.row(0), model.descriptor.hidden_size, merged.row(row));
+                    if (!LatentLayer_vulkan::defer_combine(merged, layer_workspace))
+                        return Error{ErrorCode::InternalError, "cannot defer staged latent FFN post"};
+                    fused_router_ready = false;
+                }
+                else if (hyper_multiplier > 1)
+                {
+                    for (size_t session_index = 0; session_index < session_count; ++session_index)
+                    {
+                        LayerState& layer_state = entries[session_index].state->execution_state;
+                        auto connected = forward_hyper_connection_post(layer_state.normalized,
+                                                                       entries[session_index].state->hidden,
+                                                                       layer_state.ffn_hyper_mix,
+                                                                       hyper_multiplier,
+                                                                       batch_scratch.staged_output);
+                        if (!connected)
+                            return connected.error();
+                        entries[session_index].state->hidden.swap(batch_scratch.staged_output);
+                    }
+                }
+                else
+                {
+                    for (size_t session_index = 0; session_index < session_count; ++session_index)
+                    {
+                        add_batch_inplace(entries[session_index].state->hidden, entries[session_index].state->execution_state.normalized);
+                    }
                 }
             }
-            const auto combine_end = std::chrono::steady_clock::now();
-            const uint64_t combine_elapsed = elapsed_microseconds(combine_start, combine_end);
+            if (device_combined) fused_router_ready = false;
             const auto target = std::find(model.speculative.target_layer_ids.begin(),
                                           model.speculative.target_layer_ids.end(),
                                           layer.layer_id);
@@ -1748,9 +1985,7 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                                                target_index,
                                                entries[session_index].state->speculative_main_hidden);
                 }
-                SessionStatistics& statistics = *entries[session_index].statistics;
-                statistics.expert_combine_time_microseconds += combine_elapsed;
-                statistics.expert_time_microseconds += elapsed_microseconds(layer_state.expert_start, combine_end);
+
                 layer_state.reset();
             }
             combined.reset();
@@ -1974,7 +2209,6 @@ static Result<RouterPredictionOutcome> run_router_prediction(const CompiledModel
                                                              const ActivationBuffer& router_input,
                                                              uint32_t prefetch_width)
 {
-    const auto started = std::chrono::steady_clock::now();
     ActivationBuffer predicted_logits;
     forward_linear(model.weights.at(next_layer.moe.router_weight),
                    router_input,
@@ -2048,7 +2282,6 @@ static Result<RouterPredictionOutcome> run_router_prediction(const CompiledModel
         else
             ++outcome.cache_misses;
     }
-    outcome.predictor_time_microseconds = elapsed_microseconds(started);
     return outcome;
 }
 
@@ -2077,7 +2310,6 @@ static Result<void> apply_router_prediction(uint32_t target_layer_id,
     state.layers[target_layer_id].predicted_expert_ids = std::move(outcome.predicted_expert_ids);
     statistics.expert_route_prediction_cache_hits += outcome.cache_hits;
     statistics.expert_route_prediction_cache_misses += outcome.cache_misses;
-    statistics.expert_route_prediction_time_microseconds += outcome.predictor_time_microseconds;
     return {};
 }
 
@@ -2177,7 +2409,6 @@ static Result<void> complete_router_prediction(const CompiledModel& model,
             "Router prediction completed after its target layer"};
     }
 
-    const auto wait_started = std::chrono::steady_clock::now();
     Result<RouterPredictionOutcome> completed = Error{
         ErrorCode::InternalError,
         "Router prediction worker did not return a result"};
@@ -2197,7 +2428,6 @@ static Result<void> complete_router_prediction(const CompiledModel& model,
             ErrorCode::InternalError,
             "Router prediction worker failed"};
     }
-    statistics.expert_route_prediction_wait_time_microseconds += elapsed_microseconds(wait_started);
     const uint32_t target_layer_id = pending.target_layer_id;
     pending.target_layer_id = std::numeric_limits<uint32_t>::max();
     if (!completed)

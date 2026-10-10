@@ -1,0 +1,28 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer input_blob
+{ float input_data[]; };
+layout(binding = 1) readonly buffer row_blob
+{ uint input_rows[]; };
+layout(binding = 2) writeonly buffer output_blob
+{ float output_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint columns;
+    uint rows;
+    uint input_pack;
+}
+p;
+
+void main()
+{
+    const uint column = gl_GlobalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y + gl_GlobalInvocationID.z * gl_NumWorkGroups.y;
+    if (column >= p.columns || row >= p.rows)
+        return;
+    const uint input_row = input_rows[row];
+    const uint input_offset = ((input_row / p.input_pack) * p.columns + column) * p.input_pack + input_row % p.input_pack;
+    output_data[row * p.columns + column] = input_data[input_offset];
+}

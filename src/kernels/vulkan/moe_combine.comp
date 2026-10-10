@@ -1,0 +1,37 @@
+#version 450
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer source_blob
+{ float source_data[]; };
+layout(binding = 1) readonly buffer route_blob
+{ uint route_data[]; };
+layout(binding = 2) buffer output_blob
+{ float output_data[]; };
+layout(push_constant) uniform parameter
+{
+    uint columns;
+    uint rows;
+    uint route_count;
+    uint shared_source;
+    uint initialize;
+}
+p;
+void main()
+{
+    const uint column = gl_GlobalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y + gl_GlobalInvocationID.z * 65535;
+    if (column >= p.columns || row >= p.rows) return;
+    const uint index = row * p.columns + column;
+    precise float sum = p.initialize != 0 ? 0.0 : output_data[index];
+    if (p.shared_source != 0)
+        sum += source_data[index];
+    else
+    {
+        for (uint route = 0; route < p.route_count; ++route)
+        {
+            if (route_data[route * 2] != row) continue;
+            precise float product = uintBitsToFloat(route_data[route * 2 + 1]) * source_data[route * p.columns + column];
+            sum += product;
+        }
+    }
+    output_data[index] = sum;
+}

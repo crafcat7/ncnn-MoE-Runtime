@@ -1,0 +1,58 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer query_blob
+{ float query_data[]; };
+layout(binding = 1) readonly buffer rope_blob
+{ float rope_data[]; };
+layout(binding = 2) writeonly buffer output_blob
+{ float output_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint dimension;
+    uint head_count;
+    uint rope_dimension;
+    uint row;
+    float epsilon;
+}
+p;
+
+shared float reduction[128];
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint head = gl_WorkGroupID.z;
+    const uint base = (p.row * p.head_count + head) * p.dimension;
+    float partial = 0.0;
+    for (uint column = lane; column < p.dimension; column += 128)
+        partial += query_data[base + column] * query_data[base + column];
+    reduction[lane] = partial;
+    barrier();
+    for (uint stride = 64; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+            reduction[lane] += reduction[lane + stride];
+        barrier();
+    }
+    const float inverse_rms = inversesqrt(reduction[0] / float(p.dimension) + p.epsilon);
+    const uint rope_offset = p.dimension - p.rope_dimension;
+    for (uint column = lane; column < p.dimension; column += 128)
+    {
+        float value = query_data[base + column] * inverse_rms;
+        if (column >= rope_offset)
+        {
+            const uint pair = (column - rope_offset) / 2;
+            const uint first = rope_offset + pair * 2;
+            const float real = query_data[base + first] * inverse_rms;
+            const float imaginary = query_data[base + first + 1] * inverse_rms;
+            const float cosine = rope_data[pair * 2];
+            const float sine = rope_data[pair * 2 + 1];
+            value = (column - rope_offset) % 2 == 0
+                        ? real * cosine - imaginary * sine
+                        : real * sine + imaginary * cosine;
+        }
+        output_data[base + column] = value;
+    }
+}

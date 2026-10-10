@@ -1,0 +1,69 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer score_blob
+{ float scores[]; };
+layout(binding = 1) writeonly buffer index_blob
+{ uint indices[]; };
+layout(push_constant) uniform parameter
+{
+    uint count;
+    uint top_k;
+}
+p;
+
+shared float block_scores[1024];
+shared uint block_indices[1024];
+
+bool better(float left_score, uint left, float right_score, uint right)
+{
+    return left_score > right_score || (left_score == right_score && left < right);
+}
+
+void main()
+{
+    const uint block = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+    const uint block_count = max(1u, (p.count + 1023u) / 1024u);
+    if (block >= block_count)
+        return;
+    const uint lane = gl_LocalInvocationID.x;
+    for (uint item = lane; item < 1024; item += 128)
+    {
+        const uint index = block * 1024 + item;
+        block_scores[item] = index < p.count ? scores[index] : uintBitsToFloat(0xff800000u);
+        block_indices[item] = index < p.count ? index : 0xffffffffu;
+    }
+    barrier();
+    // Every pair is owned by its smaller lane index. Workgroup barriers
+    // separate disjoint compare/exchange stages of the bitonic network.
+    for (uint size = 2; size <= 1024; size <<= 1)
+    {
+        for (uint stride = size >> 1; stride > 0; stride >>= 1)
+        {
+            for (uint item = lane; item < 1024; item += 128)
+            {
+                const uint other = item ^ stride;
+                if (other > item)
+                {
+                    const float left_score = block_scores[item];
+                    const float right_score = block_scores[other];
+                    const uint left = block_indices[item];
+                    const uint right = block_indices[other];
+                    const bool descending = (item & size) == 0;
+                    const bool exchange = descending ? better(right_score, right, left_score, left)
+                                                     : better(left_score, left, right_score, right);
+                    if (exchange)
+                    {
+                        block_scores[item] = right_score;
+                        block_indices[item] = right;
+                        block_scores[other] = left_score;
+                        block_indices[other] = left;
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+    for (uint item = lane; item < p.top_k; item += 128)
+        indices[block * p.top_k + item] = block_indices[item];
+}

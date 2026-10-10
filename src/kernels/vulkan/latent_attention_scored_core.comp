@@ -1,0 +1,106 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer score_blob
+{ float candidate_scores[]; };
+layout(binding = 1) readonly buffer window_blob
+{ float window_data[]; };
+layout(binding = 2) readonly buffer compressed_blob
+{ float compressed_data[]; };
+layout(binding = 3) readonly buffer index_blob
+{ uint index_data[]; };
+layout(binding = 4) readonly buffer sink_blob
+{ float sink_data[]; };
+layout(binding = 5) readonly buffer rope_blob
+{ float rope_data[]; };
+layout(binding = 6) writeonly buffer output_blob
+{ float output_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint dimension;
+    uint head_count;
+    uint rope_dimension;
+    uint row;
+    uint window_capacity;
+    uint window_first_slot;
+    uint window_count;
+    uint compressed_count;
+    uint selected;
+    float scale;
+}
+p;
+
+shared float maximum;
+shared float denominator;
+shared float previous_scale;
+shared float current_weight;
+shared float accumulated[512];
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint head = gl_WorkGroupID.z;
+    const uint base = (p.row * p.head_count + head) * p.dimension;
+    float numerator[4];
+    for (uint part = 0; part < 4; ++part)
+        numerator[part] = 0.0;
+    if (lane == 0)
+    {
+        maximum = sink_data[head];
+        denominator = 1.0;
+    }
+    barrier();
+    for (uint candidate = 0; candidate < p.window_count + p.compressed_count; ++candidate)
+    {
+        const bool rolling = candidate < p.window_count;
+        const uint offset = rolling ? candidate : candidate - p.window_count;
+        const uint slot = rolling ? (p.window_first_slot + offset) % p.window_capacity
+                                  : (p.selected != 0 ? index_data[offset] : offset);
+        const uint key_base = slot * p.dimension;
+        if (lane == 0)
+        {
+            const float score = candidate_scores[head * (p.window_count + p.compressed_count) + candidate];
+            const float next_maximum = max(maximum, score);
+            previous_scale = exp(maximum - next_maximum);
+            current_weight = exp(score - next_maximum);
+            denominator = denominator * previous_scale + current_weight;
+            maximum = next_maximum;
+        }
+        barrier();
+        for (uint part = 0; part < 4; ++part)
+        {
+            const uint column = lane + part * 128;
+            if (column < p.dimension)
+            {
+                const float key = rolling ? window_data[key_base + column] : compressed_data[key_base + column];
+                numerator[part] = numerator[part] * previous_scale + current_weight * key;
+            }
+        }
+        barrier();
+    }
+    for (uint part = 0; part < 4; ++part)
+    {
+        const uint column = lane + part * 128;
+        if (column < p.dimension)
+            accumulated[column] = numerator[part] / denominator;
+    }
+    barrier();
+    const uint rope_offset = p.dimension - p.rope_dimension;
+    for (uint column = lane; column < p.dimension; column += 128)
+    {
+        float value = accumulated[column];
+        if (column >= rope_offset)
+        {
+            const uint pair = (column - rope_offset) / 2;
+            const float real = accumulated[rope_offset + pair * 2];
+            const float imaginary = accumulated[rope_offset + pair * 2 + 1];
+            const float cosine = rope_data[pair * 2];
+            const float sine = rope_data[pair * 2 + 1];
+            value = (column - rope_offset) % 2 == 0
+                        ? real * cosine + imaginary * sine
+                        : imaginary * cosine - real * sine;
+        }
+        output_data[base + column] = value;
+    }
+}

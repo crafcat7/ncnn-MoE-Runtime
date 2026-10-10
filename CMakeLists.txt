@@ -41,7 +41,15 @@ endif()
 set(NCNN_MOE_SOURCES
     src/backends/ncnn/attention_vulkan.cpp
     src/backends/ncnn/expertbackend_vulkan.cpp
+    src/backends/ncnn/experttransfer_vulkan.cpp
     src/backends/ncnn/gateddeltanet_vulkan.cpp
+    src/backends/ncnn/hyperconnection_vulkan.cpp
+    src/backends/ncnn/rmsnorm_vulkan.cpp
+    src/backends/ncnn/router_vulkan.cpp
+    src/backends/ncnn/layerhead_vulkan.cpp
+    src/backends/ncnn/latentlayer_vulkan.cpp
+    src/backends/ncnn/moecombine_vulkan.cpp
+    src/backends/ncnn/latentattention_vulkan.cpp
     src/backends/ncnn/linear.cpp
     src/backends/ncnn/modelpipeline.cpp
     src/backends/ncnn/vulkancontext.cpp
@@ -80,6 +88,7 @@ set(NCNN_MOE_SOURCES
     src/models/safetensors.cpp
     src/models/tokenizer.cpp
     src/storage/expertcache.cpp
+    src/storage/expertresidency.cpp
     src/storage/expertcache_victim.cpp
     src/storage/mappedfile.cpp
     src/storage/weightstore.cpp
@@ -296,7 +305,27 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/float8_rms_norm_quantize.comp
         src/kernels/vulkan/float8_swiglu_quantize.comp
         src/kernels/vulkan/gated_delta_net.comp
+        src/kernels/vulkan/activation_rms_norm.comp
+        src/kernels/vulkan/hyper_connection_project.comp
+        src/kernels/vulkan/hyper_connection_mix.comp
+        src/kernels/vulkan/hyper_connection_reduce.comp
+        src/kernels/vulkan/hyper_connection_post.comp
+        src/kernels/vulkan/router_select.comp
+        src/kernels/vulkan/latent_attention_transform.comp
+        src/kernels/vulkan/latent_attention_compress.comp
+        src/kernels/vulkan/latent_attention_index_score.comp
+        src/kernels/vulkan/latent_attention_index_topk.comp
+        src/kernels/vulkan/latent_attention_index_sort.comp
+        src/kernels/vulkan/latent_attention_index_merge.comp
+        src/kernels/vulkan/latent_attention_cache_append.comp
+        src/kernels/vulkan/latent_attention_core.comp
+        src/kernels/vulkan/latent_attention_score.comp
+        src/kernels/vulkan/latent_attention_scored_core.comp
+        src/kernels/vulkan/latent_attention_query.comp
+        src/kernels/vulkan/expert_gather.comp
+        src/kernels/vulkan/moe_combine.comp
         src/kernels/vulkan/mxfp4_gate_up.comp
+        src/kernels/vulkan/mxfp4_row_tile.comp
         src/kernels/vulkan/mxfp4_indexed.comp
         src/kernels/vulkan/mxfp4_projection.comp
         src/kernels/vulkan/mxfp4_route_aggregation.comp
@@ -353,6 +382,14 @@ endif()
 
 if(NCNN_MOE_BUILD_TESTS)
     enable_testing()
+    # This policy test does not link or initialize ncnn/Vulkan. Failure sequences
+    # exercise the same completion and queue drain policies as the GPU helper.
+    add_executable(ncnn_moe_vulkan_wait_policy_test tests/test_vulkan_wait_policy.cpp)
+    target_compile_features(ncnn_moe_vulkan_wait_policy_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_vulkan_wait_policy_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME ncnn_moe_vulkan_wait_policy COMMAND ncnn_moe_vulkan_wait_policy_test)
+
     add_executable(ncnn_moe_tests
         tests/modeladapter_fixture.cpp
         tests/test_batch_combine.cpp
@@ -368,11 +405,88 @@ if(NCNN_MOE_BUILD_TESTS)
     )
     add_test(NAME ncnn_moe_tests COMMAND ncnn_moe_tests)
 
+    add_executable(ncnn_moe_latent_vulkan_test tests/test_latent_vulkan.cpp)
+    target_link_libraries(ncnn_moe_latent_vulkan_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_latent_vulkan_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_latent_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(ncnn_moe_latent_vulkan_test PRIVATE
+        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+    )
+    add_test(NAME ncnn_moe_latent_vulkan_test COMMAND ncnn_moe_latent_vulkan_test)
+    set_tests_properties(ncnn_moe_latent_vulkan_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    foreach(NCNN_MOE_VULKAN_TEST IN ITEMS hyperconnection router latent_layer shared_expert moe_combine latent_index)
+        add_executable(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test tests/test_${NCNN_MOE_VULKAN_TEST}_vulkan.cpp)
+        target_link_libraries(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE cxx_std_20)
+        target_include_directories(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+        target_compile_definitions(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE
+            NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+            NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+        )
+        add_test(NAME ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test COMMAND ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test)
+        set_tests_properties(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PROPERTIES SKIP_RETURN_CODE 77)
+    endforeach()
+
+    add_executable(ncnn_moe_mxfp4_row_tile_test tests/test_mxfp4_row_tile.cpp)
+    target_link_libraries(ncnn_moe_mxfp4_row_tile_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_mxfp4_row_tile_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_mxfp4_row_tile_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(ncnn_moe_mxfp4_row_tile_test PRIVATE
+        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+    )
+    add_test(NAME ncnn_moe_mxfp4_row_tile_test COMMAND ncnn_moe_mxfp4_row_tile_test)
+    set_tests_properties(ncnn_moe_mxfp4_row_tile_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(ncnn_moe_expert_upload_vulkan_test tests/test_expert_upload_vulkan.cpp)
+    target_link_libraries(ncnn_moe_expert_upload_vulkan_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_expert_upload_vulkan_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_expert_upload_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(ncnn_moe_expert_upload_vulkan_test PRIVATE
+        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+    )
+    add_test(NAME ncnn_moe_expert_upload_vulkan_test COMMAND ncnn_moe_expert_upload_vulkan_test)
+    set_tests_properties(ncnn_moe_expert_upload_vulkan_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(ncnn_moe_expert_device_input_test tests/test_expert_device_input.cpp)
+    target_link_libraries(ncnn_moe_expert_device_input_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_expert_device_input_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_expert_device_input_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(ncnn_moe_expert_device_input_test PRIVATE
+        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+    )
+    add_test(NAME ncnn_moe_expert_device_input_test COMMAND ncnn_moe_expert_device_input_test)
+    set_tests_properties(ncnn_moe_expert_device_input_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(ncnn_moe_gpu_first_experts_test tests/test_gpu_first_experts.cpp)
+    target_link_libraries(ncnn_moe_gpu_first_experts_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_gpu_first_experts_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_gpu_first_experts_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(ncnn_moe_gpu_first_experts_test PRIVATE
+        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+    )
+    add_test(NAME ncnn_moe_gpu_first_experts_test COMMAND ncnn_moe_gpu_first_experts_test)
+    set_tests_properties(ncnn_moe_gpu_first_experts_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
     # This consumer must not inherit the runtime's private src include path.
     add_executable(ncnn_moe_public_api_test tests/public_api/main.cpp)
     target_link_libraries(ncnn_moe_public_api_test PRIVATE ncnn::moe)
     add_test(NAME ncnn_moe_public_api_test COMMAND ncnn_moe_public_api_test)
     set_tests_properties(ncnn_moe_public_api_test PROPERTIES TIMEOUT 60)
+
+    add_executable(ncnn_moe_expert_pipeline_test tests/test_expert_pipeline.cpp)
+    target_link_libraries(ncnn_moe_expert_pipeline_test PRIVATE ncnn::moe)
+    target_include_directories(ncnn_moe_expert_pipeline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(ncnn_moe_expert_pipeline_test PRIVATE
+        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+    )
+    add_test(NAME ncnn_moe_expert_pipeline COMMAND ncnn_moe_expert_pipeline_test)
 
     # Asset-driven tokenizer parity checks use tools/test_tokenizer.py.
     add_executable(ncnn_moe_tokenizer_test tests/test_tokenizer.cpp)

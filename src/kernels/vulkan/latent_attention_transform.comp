@@ -1,0 +1,147 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer input_blob
+{ float input_data[]; };
+layout(binding = 1) readonly buffer norm_blob
+{ float norm_data[]; };
+layout(binding = 2) readonly buffer rope_blob
+{ float rope_data[]; };
+layout(binding = 3) writeonly buffer output_blob
+{ float output_data[]; };
+layout(push_constant) uniform parameter
+{
+    uint dimension;
+    uint rope_dimension;
+    uint input_offset;
+    uint output_offset;
+    uint flags;
+    float epsilon;
+}
+p;
+
+shared float values[512];
+shared float partial[128];
+
+float fp8(float value)
+{
+    const float sign_value = value < 0.0 ? -1.0 : 1.0;
+    const float magnitude = min(abs(value), 448.0);
+    if (magnitude < 0.015625)
+        return sign_value * min(7.0, floor(magnitude * 512.0 + 0.5)) * 0.001953125;
+    float exponent = floor(log2(magnitude)) + 7.0;
+    float mantissa = floor((magnitude * exp2(7.0 - exponent) - 1.0) * 8.0 + 0.5);
+    if (mantissa >= 8.0)
+    {
+        mantissa = 0.0;
+        exponent += 1.0;
+    }
+    if (exponent >= 15.0)
+    {
+        exponent = 15.0;
+        mantissa = min(mantissa, 6.0);
+    }
+    return sign_value * (1.0 + mantissa * 0.125) * exp2(exponent - 7.0);
+}
+
+float fp4(float value)
+{
+    const float magnitudes[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    const float magnitude = min(abs(value), 6.0);
+    float selected = 0.0;
+    float distance = magnitude;
+    for (uint i = 1; i < 8; ++i)
+    {
+        const float candidate_distance = abs(magnitude - magnitudes[i]);
+        if (candidate_distance < distance)
+        {
+            distance = candidate_distance;
+            selected = magnitudes[i];
+        }
+    }
+    return value < 0.0 ? -selected : selected;
+}
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint head = gl_WorkGroupID.z;
+    const uint input_base = p.input_offset + head * p.dimension;
+    const uint output_base = p.output_offset + head * p.dimension;
+    float sum = 0.0;
+    for (uint column = lane; column < p.dimension; column += 128)
+    {
+        const float value = input_data[input_base + column];
+        values[column] = value;
+        sum += value * value;
+    }
+    partial[lane] = sum;
+    barrier();
+    if ((p.flags & 1u) != 0)
+    {
+        for (uint stride = 64; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+                partial[lane] += partial[lane + stride];
+            barrier();
+        }
+        const float inverse_rms = inversesqrt(partial[0] / float(p.dimension) + p.epsilon);
+        for (uint column = lane; column < p.dimension; column += 128)
+            values[column] *= inverse_rms * norm_data[column];
+        barrier();
+    }
+    const uint rope_offset = p.dimension - p.rope_dimension;
+    for (uint pair = lane; pair < p.rope_dimension / 2; pair += 128)
+    {
+        const uint first = rope_offset + pair * 2;
+        const float real = values[first];
+        const float imaginary = values[first + 1];
+        values[first] = real * rope_data[pair * 2] - imaginary * rope_data[pair * 2 + 1];
+        values[first + 1] = real * rope_data[pair * 2 + 1] + imaginary * rope_data[pair * 2];
+    }
+    barrier();
+    if ((p.flags & 2u) != 0)
+    {
+        for (uint stride = 1; stride < p.dimension; stride <<= 1)
+        {
+            for (uint pair = lane; pair < p.dimension / 2; pair += 128)
+            {
+                const uint first = (pair / stride) * stride * 2 + pair % stride;
+                const float left = values[first];
+                const float right = values[first + stride];
+                values[first] = left + right;
+                values[first + stride] = left - right;
+            }
+            barrier();
+        }
+        const float scale = inversesqrt(float(p.dimension));
+        for (uint column = lane; column < p.dimension; column += 128)
+            values[column] *= scale;
+        barrier();
+    }
+    if ((p.flags & 12u) != 0)
+    {
+        const bool use_fp4 = (p.flags & 8u) != 0;
+        const uint block_size = use_fp4 ? 32u : 64u;
+        const uint count = use_fp4 ? p.dimension : rope_offset;
+        for (uint begin = 0; begin < count; begin += block_size)
+        {
+            const uint column = begin + lane;
+            partial[lane] = lane < block_size && column < count ? abs(values[column]) : 0.0;
+            barrier();
+            for (uint stride = block_size / 2; stride > 0; stride >>= 1)
+            {
+                if (lane < stride)
+                    partial[lane] = max(partial[lane], partial[lane + stride]);
+                barrier();
+            }
+            const float maximum = max(partial[0], use_fp4 ? 7.0529661e-38 : 0.0001);
+            const float scale = exp2(ceil(log2(maximum / (use_fp4 ? 6.0 : 448.0))));
+            if (lane < block_size && column < count)
+                values[column] = (use_fp4 ? fp4(values[column] / scale) : fp8(values[column] / scale)) * scale;
+            barrier();
+        }
+    }
+    for (uint column = lane; column < p.dimension; column += 128)
+        output_data[output_base + column] = values[column];
+}

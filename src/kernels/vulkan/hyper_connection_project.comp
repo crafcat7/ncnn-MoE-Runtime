@@ -1,0 +1,49 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer input_blob
+{ float input_data[]; };
+layout(binding = 1) readonly buffer function_blob
+{ float function_data[]; };
+layout(binding = 2) writeonly buffer output_blob
+{ float output_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint columns;
+    uint output_columns;
+    float epsilon;
+}
+p;
+
+shared float squares[128];
+shared float projection[128];
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint output_column = gl_WorkGroupID.y;
+    const uint row = gl_WorkGroupID.z;
+    float square_sum = 0.0;
+    float dot = 0.0;
+    for (uint column = lane; column < p.columns; column += 128)
+    {
+        const float value = input_data[row * p.columns + column];
+        square_sum += value * value;
+        dot += value * function_data[output_column * p.columns + column];
+    }
+    squares[lane] = square_sum;
+    projection[lane] = dot;
+    barrier();
+    for (uint stride = 64; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+        {
+            squares[lane] += squares[lane + stride];
+            projection[lane] += projection[lane + stride];
+        }
+        barrier();
+    }
+    if (lane == 0)
+        output_data[row * p.output_columns + output_column] = projection[0] * inversesqrt(squares[0] / float(p.columns) + p.epsilon);
+}

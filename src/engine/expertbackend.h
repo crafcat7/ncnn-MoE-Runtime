@@ -23,6 +23,8 @@ namespace ncnn {
 namespace moe {
 
 class ExpertVictimCache;
+class ExpertResidencyCoordinator;
+class DeviceTensor_vulkan;
 
 struct ExpertKeyHash
 {
@@ -61,7 +63,6 @@ struct ExpertBackendStatistics
     uint64_t bytes_uploaded = 0;
     uint64_t resident_size = 0;
     uint64_t pending_size = 0;
-    uint64_t execution_time_microseconds = 0;
     uint64_t arc_recent_size = 0;
     uint64_t arc_frequent_size = 0;
     uint64_t arc_recent_target_size = 0;
@@ -97,6 +98,65 @@ struct ExpertBackendRequest
     ActivationBuffer* output = nullptr;
     uint64_t weight_size = 0;
     RouteAggregation route_aggregation;
+    // Optional completed normalized batch. Host input may be absent until
+    // the caller actually needs CPU fallback.
+    std::shared_ptr<const DeviceTensor_vulkan> device_input;
+    std::span<const ExpertRoute> device_routes;
+    // Optional completed FP32 output, published only by successful commit().
+    // Unsupported backends return a host output and publish an empty pointer.
+    std::shared_ptr<DeviceTensor_vulkan>* device_output = nullptr;
+    // Explicit logical shape permits device execution without allocating a
+    // gathered host tensor. Legacy callers can continue providing input only.
+    size_t input_rows = 0;
+    uint32_t input_columns = 0;
+
+    [[nodiscard]] size_t rows() const noexcept
+    {
+        return input_rows != 0 ? input_rows : input ? input->rows()
+                                                    : 0;
+    }
+
+    [[nodiscard]] uint32_t columns() const noexcept
+    {
+        return input_columns != 0 ? input_columns : input ? input->columns()
+                                                          : 0;
+    }
+
+    [[nodiscard]] bool has_host_input() const noexcept
+    {
+        return input && input->dtype() == DType::Float32
+               && input->rows() == rows() && input->columns() == columns()
+               && rows() != 0 && columns() != 0
+               && input->bytes().size() == input->rows() * static_cast<size_t>(input->columns()) * sizeof(float);
+    }
+};
+
+struct ExpertDemandRequest
+{
+    std::string_view key;
+    std::shared_ptr<const TensorData> gate_up;
+    const TensorData* gate_up_bias = nullptr;
+    std::shared_ptr<const TensorData> down;
+    const TensorData* down_bias = nullptr;
+    uint32_t residency_group = 0;
+    float activation_limit = 0.0f;
+    ExpertActivation activation = ExpertActivation::GptOssSwiGlu;
+};
+
+class ExpertDemandSubmission
+{
+public:
+    virtual ~ExpertDemandSubmission() = default;
+
+    // The pin span must match the submitted request count. Return a prepared
+    // contiguous prefix; every successful pin is nonempty and the tail empty.
+    // wait() is the sole publication point and is safe to repeat. Async
+    // implementations retain request weight/bias ownership until completion.
+    [[nodiscard]] virtual size_t wait(std::span<std::shared_ptr<const void>> pins) = 0;
+
+    // Idempotent cancellation prevents later pin publication. The submission
+    // must drain any in-flight upload before releasing its request ownership.
+    virtual void abort() noexcept = 0;
 };
 
 class ExpertSubmission
@@ -112,6 +172,13 @@ public:
     // wait() returns exactly one final result per reservation. A final
     // Executed result is valid only for a request reserved as Executed.
     [[nodiscard]] virtual std::vector<ExpertBackendExecutionResult> wait() = 0;
+
+    // Replace the caller's result array. Backends can preserve its capacity;
+    // the default keeps existing by-value implementations compatible.
+    virtual void wait(std::vector<ExpertBackendExecutionResult>& results)
+    {
+        results = wait();
+    }
 
     // commit() is the sole publication point. It must publish all successful
     // outputs atomically from the caller's perspective; false leaves every
@@ -138,6 +205,48 @@ public:
                        ExpertActivation activation = ExpertActivation::GptOssSwiGlu)
         = 0;
 
+    // Complete a bounded current-wave upload. On success, pin keeps the
+    // resident pair alive until submit_batch captures its selected entries.
+    // Unsupported or exhausted backends leave pin empty for CPU fallback.
+    [[nodiscard]] virtual bool prepare_demand(std::string key,
+                                              std::shared_ptr<const TensorData> gate_up,
+                                              const TensorData* gate_up_bias,
+                                              std::shared_ptr<const TensorData> down,
+                                              const TensorData* down_bias,
+                                              uint32_t residency_group,
+                                              float activation_limit,
+                                              ExpertActivation activation,
+                                              std::shared_ptr<const void>& pin)
+    {
+        (void)key;
+        (void)gate_up;
+        (void)gate_up_bias;
+        (void)down;
+        (void)down_bias;
+        (void)residency_group;
+        (void)activation_limit;
+        (void)activation;
+        pin.reset();
+        return false;
+    }
+
+    // Return a prepared contiguous prefix. Each successful request owns a
+    // nonempty pin; every unprepared pin is empty. Capacity-limited callers
+    // execute and release their current wave before retrying the remainder.
+    // A zero prefix leaves the first request eligible for CPU fallback.
+    [[nodiscard]] virtual size_t prepare_demand_batch(std::span<const ExpertDemandRequest> requests,
+                                                      std::span<std::shared_ptr<const void>> pins);
+
+    // Begin one bounded upload wave without requiring the caller to wait for
+    // it before submitting independent resident work. The default preserves
+    // synchronous backends; asynchronous backends copy the request ownership.
+    [[nodiscard]] virtual std::unique_ptr<ExpertDemandSubmission> begin_demand_batch(std::span<const ExpertDemandRequest> requests);
+
+    virtual void set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator)
+    {
+        (void)coordinator;
+    }
+
     [[nodiscard]] virtual std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) = 0;
 
     // Suspend background device-weight admission while the foreground
@@ -160,6 +269,17 @@ public:
 
     void admit(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
                float activation_limit, ExpertActivation activation) override;
+
+    bool prepare_demand(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias,
+                        std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
+                        float activation_limit, ExpertActivation activation, std::shared_ptr<const void>& pin) override;
+
+    size_t prepare_demand_batch(std::span<const ExpertDemandRequest> requests,
+                                std::span<std::shared_ptr<const void>> pins) override;
+
+    std::unique_ptr<ExpertDemandSubmission> begin_demand_batch(std::span<const ExpertDemandRequest> requests) override;
+
+    void set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator) override;
 
     std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) override;
 
@@ -188,6 +308,8 @@ private:
         std::span<const ExpertBackendExecutionResult> reservations() const noexcept override;
 
         std::vector<ExpertBackendExecutionResult> wait() override;
+
+        void wait(std::vector<ExpertBackendExecutionResult>& results) override;
 
         bool commit() override;
 

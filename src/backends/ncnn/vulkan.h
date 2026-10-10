@@ -21,20 +21,11 @@ struct VulkanStatistics
     uint64_t dispatches = 0;
     uint64_t attention_blocks = 0;
     uint64_t compute_submissions = 0;
-    uint64_t submit_wait_time_microseconds = 0;
     uint64_t batch_uploads = 0;
     uint64_t batch_downloads = 0;
-    uint64_t auxiliary_uploads = 0;
-    uint64_t auxiliary_upload_bytes = 0;
-    uint64_t staging_slot_resizes = 0;
-    uint64_t staging_slot_reuses = 0;
-    uint64_t staging_slot_acquisitions = 0;
-    uint64_t staging_slot_contentions = 0;
     uint64_t command_buffer_reuses = 0;
     uint64_t command_graph_submissions = 0;
     uint64_t command_graph_operations = 0;
-    uint64_t direct_host_input_bindings = 0;
-    uint64_t direct_host_output_bindings = 0;
     uint64_t attention_qkv_rope_fusions = 0;
     uint64_t attention_device_rope_fusions = 0;
     uint64_t attention_qkv_ring_fusions = 0;
@@ -48,17 +39,7 @@ struct VulkanStatistics
     uint64_t kv_ring_appends = 0;
     uint64_t kv_ring_resizes = 0;
     uint64_t kv_ring_wrapped_views = 0;
-    uint64_t kv_cache_promotions = 0;
-    uint64_t kv_cache_promotion_bytes = 0;
     uint64_t bfloat16_cooperative_matrix_dispatches = 0;
-    uint64_t command_dispatches = 0;
-    uint64_t command_pipeline_binds = 0;
-    uint64_t command_redundant_pipeline_binds = 0;
-    uint64_t command_descriptor_bindings = 0;
-    uint64_t command_push_constant_updates = 0;
-    uint64_t command_resource_barrier_calls = 0;
-    uint64_t command_buffer_resource_barriers = 0;
-    uint64_t command_image_resource_barriers = 0;
 };
 
 [[nodiscard]] uint32_t get_gpu_count() noexcept;

@@ -37,6 +37,10 @@ struct CompilerOption
     // persistent GPU attention state; zero means that no budget-based
     // promotion should be attempted.
     uint64_t gpu_heap_budget = 0;
+    // A fixed executable or victim Expert cache requires a smaller optional
+    // attention allowance. Automatic caches use the live heap after dense
+    // operators are allocated and do not require this extra reserve.
+    bool explicit_expert_gpu_cache = false;
     uint64_t optimization_flags = OptimizationDefaultFlags;
     VulkanRuntimePtr vulkan_runtime;
     std::vector<uint32_t> device_indices;

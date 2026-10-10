@@ -29,14 +29,16 @@ from ncnn_moe import (  # noqa: E402
     _format_bytes_gb,
     _format_runtime_metrics,
     configure_standard_streams,
+    cli_runtime_settings,
     default_worker_path,
     find_worker,
     load_adapter,
     parse_arguments,
 )
 from ncnn_moe_protocol import WorkerClient, WorkerError  # noqa: E402
-from ncnn_moe_state import runtime_args_from_settings  # noqa: E402
+from ncnn_moe_state import merge_runtime_settings, runtime_args_from_settings  # noqa: E402
 import benchmark_prompt  # noqa: E402
+import benchmark_runtime  # noqa: E402
 
 
 FAMILY_CASES = (
@@ -212,6 +214,55 @@ class FakeWorkerClient:
             },
             [piece[0] if isinstance(piece, tuple) else 300000 + index for index, piece in enumerate(pieces, start=1)],
         )
+
+
+class RuntimeOptionsTests(unittest.TestCase):
+    def test_removed_concurrent_command_flags_are_rejected(self) -> None:
+        for command in ("run", "chat", "inspect", "tune"):
+            with self.subTest(command=command):
+                settings = cli_runtime_settings(parse_arguments([command]))
+                self.assertNotIn("vulkan_expert_concurrent_commands", settings)
+                self.assertNotIn("cpu_packed_weights", settings)
+                self.assertNotIn("--cpu-packed-weights", runtime_args_from_settings(settings))
+            for flag in ("--vulkan-expert-concurrent-commands", "--disable-vulkan-expert-concurrent-commands"):
+                with self.subTest(command=command, flag=flag), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        parse_arguments([command, flag])
+                    self.assertEqual(error.exception.code, 2)
+
+    def test_saved_concurrent_command_settings_are_ignored_on_restore(self) -> None:
+        obsolete = {
+            "vulkan_expert_concurrent_commands": "on",
+            "disable_vulkan_expert_concurrent_commands": True,
+        }
+        self.assertEqual(runtime_args_from_settings(obsolete), [])
+        for source in ("user", "profile", "session", "cli"):
+            layers = {"cli": {}, "session": None, "profile": None, "user": None}
+            layers[source] = {**obsolete, "backend": "cpu", "cpu_packed_weights": "off"}
+            with self.subTest(source=source):
+                settings = merge_runtime_settings(**layers)
+                self.assertEqual(settings, {"backend": "cpu", "cpu_packed_weights": "off"})
+                self.assertEqual(runtime_args_from_settings(settings), ["--cpu", "--cpu-packed-weights", "off"])
+        with tempfile.TemporaryDirectory() as directory:
+            settings = merge_runtime_settings(
+                cli={"backend": "hybrid"},
+                session={**obsolete, "backend": "cpu"},
+                profile={"vulkan_expert_concurrent_commands": True},
+                user={"disable_vulkan_expert_concurrent_commands": True},
+            )
+            process = SimpleNamespace(
+                stdin=io.StringIO(),
+                stdout=io.StringIO('{"event":"ready"}\n'),
+                poll=lambda: 0,
+            )
+            worker = Path(sys.executable).resolve()
+            model = Path(directory).resolve()
+            with patch("ncnn_moe_protocol.subprocess.Popen", return_value=process) as popen:
+                client = WorkerClient(worker, model, runtime_args_from_settings(settings))
+            try:
+                self.assertEqual(popen.call_args.args[0], [str(worker), str(model), "--hybrid"])
+            finally:
+                client.close()
 
 
 class AdapterTests(unittest.TestCase):
@@ -471,6 +522,47 @@ class ProtocolTests(unittest.TestCase):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_benchmarks_preserve_generation_and_basic_metrics(self) -> None:
+        event = {
+            "prompt_tok_per_second": 2.0,
+            "generation_tok_per_second": 3.0,
+            "elapsed_seconds": 1.0,
+            "ttft_microseconds": 1000,
+            "tpot_microseconds": 2000,
+            "generated_tokens": 2,
+            "metrics": {
+                "expert": {"gpu_executions": 3},
+                "gpu": {"available": True, "submit_count": 7, "linear_dispatches": 4},
+                "process": {"cpu_percent": 25.0},
+                "gpu_device": {"utilization_percent": 40.0},
+            },
+        }
+        report = benchmark_prompt._summary([event, event], [[4, 5], [4, 5]])
+        self.assertEqual(report["expert_gpu_executions"], 3)
+        self.assertEqual(report["gpu_linear_dispatches"], 4)
+        self.assertEqual(report["median_generation_tokens_per_second"], 3.0)
+        self.assertEqual(report["median_ttft_seconds"], 0.001)
+        self.assertEqual(report["median_tpot_seconds"], 0.002)
+        self.assertTrue(report["generated_sequences_match"])
+        self.assertEqual(report["generated_token_ids"], [4, 5])
+        trace = _format_runtime_metrics({**event, **event["metrics"]})
+        self.assertIn("Process CPU: 25.0%", trace)
+        self.assertIn("utilization 40.0%", trace)
+        output = """loaded deepseek-v4 in 1.00 s, backend Hybrid
+generated 3 token(s) in 2.00 s
+Vulkan linear dispatches: 4
+Vulkan compute submissions: 5
+Expert route ranks: r0 2 predicted/1 matched/3 demanded;
+Expert I/O policy: buffered, io workers: 2
+generated token ids: 4 5 6
+"""
+        basic = benchmark_runtime.parse_runner_output(output)
+        self.assertEqual(basic["decode_tokens_per_second"], 1.5)
+        self.assertEqual(basic["generated_token_ids"], [4, 5, 6])
+        self.assertTrue(basic["gpu_compute_detected"])
+        self.assertEqual(basic["expert_cache_io_worker_count"], 2)
+        self.assertEqual(benchmark_runtime.median_route_ranks([basic]), [{"rank": 0, "predictions": 2, "matches": 1, "demands": 3}])
+
     def test_direct_token_benchmark_does_not_require_native_text(self) -> None:
         class Client:
             def __init__(self, stops: list[int] | None) -> None:
@@ -504,7 +596,7 @@ class BenchmarkTests(unittest.TestCase):
                         "ttft_microseconds": 1000,
                         "tpot_microseconds": 2000,
                         "generated_tokens": 1,
-                        "metrics": {"expert": {}, "gpu": {}, "cpu": {}},
+                        "metrics": {"expert": {}, "gpu": {}},
                     },
                     [4],
                 )

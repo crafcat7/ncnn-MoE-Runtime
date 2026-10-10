@@ -88,9 +88,6 @@ void record_expert_cache_delta(SessionStatistics& statistics,
     statistics.expert_cache_coalesced_read_ranges_saved += after.coalesced_read_ranges_saved - before.coalesced_read_ranges_saved;
     statistics.expert_cache_read_policy = after.adaptive_read_policy;
     statistics.expert_cache_num_io_threads = after.num_io_threads;
-    statistics.expert_cache_io_read_samples += after.io_read_samples - before.io_read_samples;
-    statistics.expert_cache_io_read_time_microseconds += after.io_read_time_microseconds
-                                                         - before.io_read_time_microseconds;
     statistics.expert_cache_resident_size = after.resident_size;
     statistics.expert_gpu_victim_cache_hits += after.victim.hits - before.victim.hits;
     statistics.expert_gpu_victim_cache_misses += after.victim.misses - before.victim.misses;
@@ -104,7 +101,6 @@ void record_expert_cache_delta(SessionStatistics& statistics,
     statistics.expert_gpu_victim_cache_restore_failures += after.victim.restore_failures - before.victim.restore_failures;
     statistics.expert_gpu_victim_cache_bytes_uploaded += after.victim.bytes_uploaded - before.victim.bytes_uploaded;
     statistics.expert_gpu_victim_cache_bytes_downloaded += after.victim.bytes_downloaded - before.victim.bytes_downloaded;
-    statistics.expert_gpu_victim_cache_restore_time_microseconds += after.victim.restore_time_microseconds - before.victim.restore_time_microseconds;
     statistics.expert_gpu_victim_cache_mapped_stores += after.victim.mapped_stores - before.victim.mapped_stores;
     statistics.expert_gpu_victim_cache_mapped_restores += after.victim.mapped_restores - before.victim.mapped_restores;
     statistics.expert_gpu_victim_cache_resident_size = after.victim.resident_size;
@@ -118,23 +114,13 @@ void record_vulkan_execution_delta(SessionStatistics& statistics,
     statistics.vulkan_linear_dispatches += after.dispatches - before.dispatches;
     statistics.vulkan_attention_blocks += after.attention_blocks - before.attention_blocks;
     statistics.vulkan_compute_submissions += after.compute_submissions - before.compute_submissions;
-    statistics.vulkan_submit_wait_time_microseconds += after.submit_wait_time_microseconds
-                                                       - before.submit_wait_time_microseconds;
     statistics.vulkan_batch_uploads += after.batch_uploads - before.batch_uploads;
     statistics.vulkan_batch_downloads += after.batch_downloads - before.batch_downloads;
-    statistics.vulkan_auxiliary_uploads += after.auxiliary_uploads - before.auxiliary_uploads;
-    statistics.vulkan_auxiliary_upload_bytes += after.auxiliary_upload_bytes - before.auxiliary_upload_bytes;
-    statistics.vulkan_staging_slot_resizes += after.staging_slot_resizes - before.staging_slot_resizes;
-    statistics.vulkan_staging_slot_reuses += after.staging_slot_reuses - before.staging_slot_reuses;
-    statistics.vulkan_staging_slot_acquisitions += after.staging_slot_acquisitions - before.staging_slot_acquisitions;
-    statistics.vulkan_staging_slot_contentions += after.staging_slot_contentions - before.staging_slot_contentions;
     statistics.vulkan_command_buffer_reuses += after.command_buffer_reuses - before.command_buffer_reuses;
     statistics.vulkan_command_graph_submissions += after.command_graph_submissions
                                                    - before.command_graph_submissions;
     statistics.vulkan_command_graph_operations += after.command_graph_operations
                                                   - before.command_graph_operations;
-    statistics.vulkan_direct_host_input_bindings += after.direct_host_input_bindings - before.direct_host_input_bindings;
-    statistics.vulkan_direct_host_output_bindings += after.direct_host_output_bindings - before.direct_host_output_bindings;
     statistics.vulkan_attention_qkv_rope_fusions += after.attention_qkv_rope_fusions - before.attention_qkv_rope_fusions;
     statistics.vulkan_attention_device_rope_fusions += after.attention_device_rope_fusions - before.attention_device_rope_fusions;
     statistics.vulkan_attention_qkv_ring_fusions += after.attention_qkv_ring_fusions - before.attention_qkv_ring_fusions;
@@ -150,25 +136,8 @@ void record_vulkan_execution_delta(SessionStatistics& statistics,
     statistics.vulkan_kv_ring_appends += after.kv_ring_appends - before.kv_ring_appends;
     statistics.vulkan_kv_ring_resizes += after.kv_ring_resizes - before.kv_ring_resizes;
     statistics.vulkan_kv_ring_wrapped_views += after.kv_ring_wrapped_views - before.kv_ring_wrapped_views;
-    statistics.vulkan_kv_cache_promotions += after.kv_cache_promotions - before.kv_cache_promotions;
-    statistics.vulkan_kv_cache_promotion_bytes += after.kv_cache_promotion_bytes - before.kv_cache_promotion_bytes;
     statistics.vulkan_bfloat16_cooperative_matrix_dispatches += after.bfloat16_cooperative_matrix_dispatches
                                                                 - before.bfloat16_cooperative_matrix_dispatches;
-    statistics.vulkan_command_dispatches += after.command_dispatches - before.command_dispatches;
-    statistics.vulkan_command_pipeline_binds += after.command_pipeline_binds
-                                                - before.command_pipeline_binds;
-    statistics.vulkan_command_redundant_pipeline_binds += after.command_redundant_pipeline_binds
-                                                          - before.command_redundant_pipeline_binds;
-    statistics.vulkan_command_descriptor_bindings += after.command_descriptor_bindings
-                                                     - before.command_descriptor_bindings;
-    statistics.vulkan_command_push_constant_updates += after.command_push_constant_updates
-                                                       - before.command_push_constant_updates;
-    statistics.vulkan_command_resource_barrier_calls += after.command_resource_barrier_calls
-                                                        - before.command_resource_barrier_calls;
-    statistics.vulkan_command_buffer_resource_barriers += after.command_buffer_resource_barriers
-                                                          - before.command_buffer_resource_barriers;
-    statistics.vulkan_command_image_resource_barriers += after.command_image_resource_barriers
-                                                         - before.command_image_resource_barriers;
 }
 
 void record_expert_backend_delta(SessionStatistics& statistics, const ExpertBackendStatistics& before, const ExpertBackendStatistics& after)
@@ -184,7 +153,6 @@ void record_expert_backend_delta(SessionStatistics& statistics, const ExpertBack
     statistics.expert_gpu_cache_pending_size = after.pending_size;
     statistics.expert_gpu_executions += after.executions - before.executions;
     statistics.expert_gpu_execution_failures += after.execution_failures - before.execution_failures;
-    statistics.expert_gpu_execution_time_microseconds += after.execution_time_microseconds - before.execution_time_microseconds;
     statistics.expert_gpu_arc_recent_size = after.arc_recent_size;
     statistics.expert_gpu_arc_frequent_size = after.arc_frequent_size;
     statistics.expert_gpu_arc_recent_target_size = after.arc_recent_target_size;
@@ -215,17 +183,8 @@ RuntimeMetricCounters runtime_metric_counters(const SessionStatistics& statistic
     result.expert_cache_hits = counter_delta(statistics.expert_cache_hits, start.expert_cache_hits);
     result.expert_cache_misses = counter_delta(statistics.expert_cache_misses, start.expert_cache_misses);
     result.expert_io_bytes = counter_delta(statistics.expert_cache_bytes_read, start.expert_io_bytes);
-    result.expert_compute_time_microseconds = counter_delta(statistics.expert_compute_time_microseconds,
-                                                            start.expert_compute_time_microseconds);
     result.gpu_submit_count = counter_delta(statistics.vulkan_compute_submissions,
                                             start.gpu_submit_count);
-    result.gpu_wait_time_microseconds = counter_delta(statistics.vulkan_submit_wait_time_microseconds,
-                                                      start.gpu_wait_time_microseconds);
-    result.gpu_kernel_time_microseconds = counter_delta(statistics.expert_gpu_execution_time_microseconds,
-                                                        start.gpu_kernel_time_microseconds);
-    result.gpu_kernel_time_available = counter_delta(statistics.expert_gpu_executions,
-                                                     start.expert_gpu_executions)
-                                       != 0;
     result.vulkan_linear_dispatches = counter_delta(statistics.vulkan_linear_dispatches,
                                                     start.vulkan_linear_dispatches);
     result.vulkan_attention_blocks = counter_delta(statistics.vulkan_attention_blocks,

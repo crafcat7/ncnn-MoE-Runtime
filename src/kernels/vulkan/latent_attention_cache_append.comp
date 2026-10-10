@@ -1,0 +1,20 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer source_blob
+{ uint source_data[]; };
+layout(binding = 1) writeonly buffer destination_blob
+{ uint destination_data[]; };
+layout(push_constant) uniform parameter
+{
+    uint count;
+    uint destination_offset;
+}
+p;
+
+void main()
+{
+    const uint column = gl_GlobalInvocationID.x;
+    if (column < p.count)
+        destination_data[p.destination_offset + column] = source_data[column];
+}

@@ -1,5 +1,8 @@
 #include "linear.h"
+#include "mxfp4_weightpacking.h"
+#include "rmsnorm_vulkan.h"
 #include "vulkancontext.h"
+#include "experttransfer_vulkan.h"
 #include "expertbackend_vulkan.h"
 
 #include "ncnn/moe/runtime.h"
@@ -14,11 +17,13 @@
 #include "kernels/vulkan/bfloat16_projection.comp.hex.h"
 #include "kernels/vulkan/bfloat16_rms_norm_projection.comp.hex.h"
 #include "kernels/vulkan/bfloat16_swiglu_down.comp.hex.h"
+#include "kernels/vulkan/expert_gather.comp.hex.h"
 #include "kernels/vulkan/float8_projection.comp.hex.h"
 #include "kernels/vulkan/float8_quantize.comp.hex.h"
 #include "kernels/vulkan/float8_rms_norm_quantize.comp.hex.h"
 #include "kernels/vulkan/float8_swiglu_quantize.comp.hex.h"
 #include "kernels/vulkan/mxfp4_gate_up.comp.hex.h"
+#include "kernels/vulkan/mxfp4_row_tile.comp.hex.h"
 #include "kernels/vulkan/mxfp4_indexed.comp.hex.h"
 #include "kernels/vulkan/mxfp4_projection.comp.hex.h"
 #include "kernels/vulkan/mxfp4_route_aggregation.comp.hex.h"
@@ -35,7 +40,6 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -118,17 +122,72 @@ public:
 #if NCNN_MOE_WITH_VULKAN
 struct CommandGraphState_vulkan
 {
+    size_t storage_variant = 0;
+    bool submitted = false;
+    bool completed = false;
+    bool failed = false;
 };
+#endif
+
+#if NCNN_MOE_WITH_VULKAN
+// Row offsets are byte offsets, while storage descriptors have a stricter
+// device alignment. Keep the normal view path and copy only misaligned reads.
+static ncnn::VkMat aligned_readonly_row_view(const ncnn::VkMat& source,
+                                             size_t first_row, size_t rows,
+                                             ncnn::VkCompute& command,
+                                             const ncnn::Option& option,
+                                             const std::shared_ptr<VulkanContext>& context,
+                                             std::vector<ncnn::VkMat>& retained)
+{
+    ncnn::VkMat view = row_view(source, first_row, rows);
+    const size_t alignment = std::max<size_t>(4, context->device()->info.buffer_offset_alignment());
+    if (view.empty() || view.buffer_offset() % alignment == 0) return view;
+    if (view.buffer_offset() % 4 != 0 || view.buffer_capacity() % 4 != 0) return {};
+    ncnn::VkMat aligned;
+    command.record_clone(view, aligned, option);
+    if (aligned.empty()) return {};
+    retained.push_back(aligned);
+    return aligned;
+}
+
+static bool record_output_row_copy(const ncnn::VkMat& source, ncnn::VkMat& destination,
+                                   ncnn::VkCompute& command, const ncnn::Option& option)
+{
+    if (source.empty() || destination.empty() || source.buffer_offset() % 4 != 0
+        || destination.buffer_offset() % 4 != 0 || destination.buffer_capacity() % 4 != 0)
+        return false;
+    // Keep create_like on the existing row view, including a staging-backed
+    // destination, instead of silently allocating a different destination.
+    ncnn::Option copy_option = option;
+    copy_option.blob_vkallocator = destination.allocator;
+    const VkBuffer buffer = destination.buffer();
+    const size_t offset = destination.buffer_offset();
+    command.record_clone(source, destination, copy_option);
+    return !destination.empty() && destination.buffer() == buffer && destination.buffer_offset() == offset;
+}
 #endif
 
 class DeviceTensor_vulkan::Implementation
 {
 public:
 #if NCNN_MOE_WITH_VULKAN
-    std::weak_ptr<CommandGraphState_vulkan> graph;
+    // Retain the allocator domain and completion record after the producer
+    // graph releases its command/staging resources.
+    std::shared_ptr<VulkanContext> context;
+    // Null marks an intrinsically completed unpacked FP32 publication.
+    // Pending graph results always retain their producer's mutable state.
+    std::shared_ptr<CommandGraphState_vulkan> graph;
     ncnn::VkMat value;
     size_t rows = 0;
     uint32_t columns = 0;
+
+    [[nodiscard]] bool readable_from(const std::shared_ptr<CommandGraphState_vulkan>& target,
+                                     size_t storage_variant) const noexcept
+    {
+        if (!graph) return storage_variant == 0;
+        return !graph->failed && graph->storage_variant == storage_variant
+               && (graph == target || (graph->submitted && graph->completed));
+    }
 #endif
 };
 
@@ -196,6 +255,67 @@ uint32_t DeviceTensor_vulkan::columns() const noexcept
 #endif
 }
 
+bool DeviceTensor_vulkan::assign_completed(const ncnn::VkMat& value,
+                                           std::shared_ptr<VulkanContext> context)
+{
+#if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
+    if (!context || value.empty() || (value.dims != 1 && value.dims != 2)
+        || value.elempack != 1 || value.elemsize != sizeof(float))
+    {
+        d.reset();
+        return false;
+    }
+    auto tensor = std::make_unique<Implementation>();
+    tensor->context = std::move(context);
+    tensor->value = value;
+    tensor->rows = value.dims == 1 ? 1 : static_cast<size_t>(value.h);
+    tensor->columns = static_cast<uint32_t>(value.w);
+    d = std::move(tensor);
+    return true;
+#else
+    (void)value;
+    (void)context;
+    return false;
+#endif
+}
+
+const ncnn::VkMat* DeviceTensor_vulkan::value() const noexcept
+{
+#if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
+    return d && (!d->graph || (d->graph->completed && !d->graph->failed)) && !d->value.empty()
+               ? &d->value
+               : nullptr;
+#else
+    return nullptr;
+#endif
+}
+
+void DeviceTensor_vulkan::prepare_read() const noexcept
+{
+#if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
+    const ncnn::VkMat* completed = value();
+    if (!completed || !completed->data)
+        return;
+
+    // ncnn changes shared buffer metadata while recording, so an abandoned
+    // consumer can leave flags for a barrier that never ran. Re-arm every
+    // completed import instead of restoring a snapshot that may overwrite a
+    // later recorder's state. The producer may have used transfer or compute.
+    completed->data->access_flags = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    completed->data->stage_flags = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+#endif
+}
+
+const std::shared_ptr<VulkanContext>& DeviceTensor_vulkan::vulkan_context() const noexcept
+{
+#if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
+    if (d)
+        return d->context;
+#endif
+    static const std::shared_ptr<VulkanContext> empty_context;
+    return empty_context;
+}
+
 CommandGraph_vulkan::CommandGraph_vulkan(std::unique_ptr<Implementation> implementation)
     : d(std::move(implementation))
 {
@@ -222,7 +342,18 @@ CommandGraph_vulkan::~CommandGraph_vulkan()
 
 CommandGraph_vulkan::CommandGraph_vulkan(CommandGraph_vulkan&&) noexcept = default;
 
-CommandGraph_vulkan& CommandGraph_vulkan::operator=(CommandGraph_vulkan&&) noexcept = default;
+CommandGraph_vulkan& CommandGraph_vulkan::operator=(CommandGraph_vulkan&& other) noexcept
+{
+    if (this != &other)
+    {
+        // Preserve the old Graph's submitted-command cleanup when replacing
+        // its implementation. A plain unique_ptr move would release owners
+        // and return the old command slot without waiting for its fence.
+        CommandGraph_vulkan retired(std::move(d));
+        d = std::move(other.d);
+    }
+    return *this;
+}
 
 std::unique_ptr<CommandGraph_vulkan> CommandGraph_vulkan::create(const Linear& seed)
 {
@@ -234,6 +365,7 @@ std::unique_ptr<CommandGraph_vulkan> CommandGraph_vulkan::create(const Linear& s
     implementation->context = seed.vulkan_context();
     implementation->option = seed.option();
     implementation->state = std::make_shared<CommandGraphState_vulkan>();
+    implementation->state->storage_variant = vulkan_activation_storage_variant(implementation->option);
     implementation->transfer_lease = std::make_unique<VulkanTransferLease>(implementation->context->acquire_transfer_slot());
 
     VulkanTransferSlot& transfer_slot = implementation->transfer_lease->slot();
@@ -257,7 +389,7 @@ bool CommandGraph_vulkan::upload(const ActivationBuffer& input,
                                  DeviceTensor_vulkan& output)
 {
 #if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
-    if (!d || d->submitted
+    if (!d || d->submitted || d->state->failed
         || !d->context || input.rows() == 0
         || input.columns() == 0
         || input.rows()
@@ -269,8 +401,7 @@ bool CommandGraph_vulkan::upload(const ActivationBuffer& input,
     ncnn::VkMat staging;
     if (!fill_staging_upload(input,
                              staging,
-                             d->transfer_lease->slot().staging_allocator,
-                             d->context->runtime_state()))
+                             d->transfer_lease->slot().staging_allocator))
     {
         return false;
     }
@@ -291,6 +422,7 @@ bool CommandGraph_vulkan::upload(const ActivationBuffer& input,
     }
 
     auto tensor = std::make_unique<DeviceTensor_vulkan::Implementation>();
+    tensor->context = d->context;
     tensor->graph = d->state;
     tensor->value = std::move(device_input);
     tensor->rows = input.rows();
@@ -311,15 +443,15 @@ bool CommandGraph_vulkan::linear(const Linear& op,
                                  DeviceTensor_vulkan& output)
 {
 #if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
-    if (!d || d->submitted
+    if (!d || d->submitted || d->state->failed
         || !input.d
         || &input == &output || input.empty())
     {
         return false;
     }
-    const std::shared_ptr<CommandGraphState_vulkan> input_graph = input.d->graph.lock();
-    if (!input_graph
-        || input_graph.get() != d->state.get())
+    const std::shared_ptr<CommandGraphState_vulkan>& input_graph = input.d->graph;
+    if (input.d->context.get() != d->context.get()
+        || !input.d->readable_from(d->state, vulkan_activation_storage_variant(d->option)))
     {
         return false;
     }
@@ -339,6 +471,8 @@ bool CommandGraph_vulkan::linear(const Linear& op,
     ncnn::VkMat device_output;
     {
         const std::lock_guard<std::mutex> lock(d->context->command_mutex());
+        if (input_graph.get() != d->state.get())
+            input.prepare_read();
         if (op.forward(input.d->value,
                        device_output,
                        *d->transfer_lease->slot().command,
@@ -362,6 +496,7 @@ bool CommandGraph_vulkan::linear(const Linear& op,
         return false;
 
     auto tensor = std::make_unique<DeviceTensor_vulkan::Implementation>();
+    tensor->context = d->context;
     tensor->graph = d->state;
     tensor->value = std::move(device_output);
     tensor->rows = input.rows();
@@ -381,14 +516,14 @@ bool CommandGraph_vulkan::download(const DeviceTensor_vulkan& input,
                                    ActivationBuffer& output)
 {
 #if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
-    if (!d || d->submitted
+    if (!d || d->submitted || d->state->failed
         || !input.d || input.empty())
     {
         return false;
     }
-    const std::shared_ptr<CommandGraphState_vulkan> input_graph = input.d->graph.lock();
-    if (!input_graph
-        || input_graph.get() != d->state.get())
+    const std::shared_ptr<CommandGraphState_vulkan>& input_graph = input.d->graph;
+    if (input.d->context.get() != d->context.get()
+        || !input.d->readable_from(d->state, vulkan_activation_storage_variant(d->option)))
     {
         return false;
     }
@@ -399,7 +534,6 @@ bool CommandGraph_vulkan::download(const DeviceTensor_vulkan& input,
                                input.rows(),
                                input.columns(),
                                d->transfer_lease->slot().staging_allocator,
-                               d->context->runtime_state(),
                                output.element_size()))
     {
         return false;
@@ -407,6 +541,8 @@ bool CommandGraph_vulkan::download(const DeviceTensor_vulkan& input,
     output.reset(input.rows(), input.columns(), false);
     {
         const std::lock_guard<std::mutex> lock(d->context->command_mutex());
+        if (input_graph.get() != d->state.get())
+            input.prepare_read();
         if (!record_prepared_activation_staging_download(input.d->value,
                                                          input.rows(),
                                                          input.columns(),
@@ -432,8 +568,8 @@ bool CommandGraph_vulkan::download(const DeviceTensor_vulkan& input,
 bool CommandGraph_vulkan::submit()
 {
 #if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
-    if (!d || d->submitted
-        || d->recorded_operations == 0
+    if (!d || d->submitted || d->state->failed
+        || (d->recorded_operations == 0 && d->pending_downloads.empty())
         || !d->context || !d->transfer_lease)
     {
         return false;
@@ -441,13 +577,15 @@ bool CommandGraph_vulkan::submit()
 
     ncnn::VkCompute& command = *d->transfer_lease->slot().command;
     const std::lock_guard<std::mutex> lock(d->context->command_mutex());
-    const ncnn::VkComputeCommandStatistics command_recording = command.command_statistics();
     VulkanRuntimeState& runtime_state = d->context->runtime_state();
     if (command.submit() != 0)
+    {
+        d->state->failed = true;
         return false;
+    }
     d->submitted = true;
+    d->state->submitted = true;
     d->completed = false;
-    runtime_state.dispatches += command_recording.dispatches;
     ++runtime_state.compute_submissions;
     runtime_state.batch_uploads += d->upload_staging.size();
     runtime_state.batch_downloads += d->pending_downloads.size();
@@ -470,15 +608,18 @@ bool CommandGraph_vulkan::wait()
     }
 
     ncnn::VkCompute& command = *d->transfer_lease->slot().command;
-    VulkanRuntimeState& runtime_state = d->context->runtime_state();
-    const auto started = std::chrono::steady_clock::now();
     {
         const std::lock_guard<std::mutex> lock(d->context->command_mutex());
-        if (command.wait() != 0)
+        const int wait_result = wait_submitted_compute(command, d->context->device());
+        // The native CB is now complete (or its device is lost). Later CPU
+        // download failure must not wait it again after ncnn cleared submitted.
+        d->completed = true;
+        if (wait_result != 0)
+        {
+            d->state->failed = true;
             return false;
+        }
     }
-    const auto submit_wait = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started);
-    runtime_state.submit_wait_time_microseconds += static_cast<uint64_t>(submit_wait.count());
 
     for (CommandGraph_vulkan::Implementation::PendingDownload& pending :
          d->pending_downloads)
@@ -486,10 +627,12 @@ bool CommandGraph_vulkan::wait()
         if (!pending.output
             || !copy_staging_to_cpu_batch(pending.staging, *pending.output))
         {
+            d->state->failed = true;
             return false;
         }
     }
     d->completed = true;
+    d->state->completed = true;
     return true;
 #else
     return false;
@@ -726,13 +869,11 @@ bool Linear::forward(const ActivationBuffer& input, ActivationBuffer& output) co
         const DType output_dtype = output.dtype();
         if (!fill_staging_upload(input,
                                  transfer_slot.upload,
-                                 transfer_slot.staging_allocator,
-                                 runtime_state)
+                                 transfer_slot.staging_allocator)
             || !prepare_staging_batch(transfer_slot.download,
                                       input.rows(),
                                       implementation.output_columns,
                                       transfer_slot.staging_allocator,
-                                      runtime_state,
                                       output.element_size()))
             return false;
 
@@ -770,7 +911,7 @@ bool Linear::forward(const ActivationBuffer& input, ActivationBuffer& output) co
                                                          implementation.option,
                                                          output_dtype))
             return false;
-        if (submit_compute_and_wait(command, runtime_state) != 0 || !copy_staging_to_cpu_batch(transfer_slot.download, output))
+        if (submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0 || !copy_staging_to_cpu_batch(transfer_slot.download, output))
             return false;
         ++runtime_state.dispatches;
         ++runtime_state.compute_submissions;
@@ -925,9 +1066,13 @@ static bool create_bfloat16_projection_pipeline(const std::shared_ptr<VulkanCont
         return false;
     }
     destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(),
-                                                  [context](ncnn::Pipeline* value) {
-                                                      const std::lock_guard<std::mutex> lock(context->command_mutex());
-                                                      delete value;
+                                                  [context = context](ncnn::Pipeline* value) mutable {
+                                                      {
+                                                          const std::lock_guard<std::mutex> lock(context->command_mutex());
+                                                          delete value;
+                                                      }
+                                                      // Weak cache entries retain the deleter control block after disposal.
+                                                      context.reset();
                                                   });
     context->cache_pipeline(bfloat16_projection_shader,
                             shader_variant,
@@ -1040,9 +1185,13 @@ static bool create_bfloat16_cooperative_projection_pipeline(const std::shared_pt
         return false;
     }
     destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(),
-                                                  [context](ncnn::Pipeline* value) {
-                                                      const std::lock_guard<std::mutex> lock(context->command_mutex());
-                                                      delete value;
+                                                  [context = context](ncnn::Pipeline* value) mutable {
+                                                      {
+                                                          const std::lock_guard<std::mutex> lock(context->command_mutex());
+                                                          delete value;
+                                                      }
+                                                      // Weak cache entries retain the deleter control block after disposal.
+                                                      context.reset();
                                                   });
     context->cache_pipeline(bfloat16_cooperative_projection_shader,
                             pipeline_key,
@@ -1092,9 +1241,13 @@ static bool create_bfloat16_rms_norm_projection_pipeline(const std::shared_ptr<V
         return false;
     }
     destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(),
-                                                  [context](ncnn::Pipeline* value) {
-                                                      const std::lock_guard<std::mutex> lock(context->command_mutex());
-                                                      delete value;
+                                                  [context = context](ncnn::Pipeline* value) mutable {
+                                                      {
+                                                          const std::lock_guard<std::mutex> lock(context->command_mutex());
+                                                          delete value;
+                                                      }
+                                                      // Weak cache entries retain the deleter control block after disposal.
+                                                      context.reset();
                                                   });
     context->cache_pipeline(bfloat16_rms_norm_projection_shader,
                             shader_variant,
@@ -1138,9 +1291,13 @@ static bool create_bfloat16_swiglu_down_pipeline(const std::shared_ptr<VulkanCon
         return false;
     }
     destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(),
-                                                  [context](ncnn::Pipeline* value) {
-                                                      const std::lock_guard<std::mutex> lock(context->command_mutex());
-                                                      delete value;
+                                                  [context = context](ncnn::Pipeline* value) mutable {
+                                                      {
+                                                          const std::lock_guard<std::mutex> lock(context->command_mutex());
+                                                          delete value;
+                                                      }
+                                                      // Weak cache entries retain the deleter control block after disposal.
+                                                      context.reset();
                                                   });
     context->cache_pipeline(bfloat16_swiglu_down_shader,
                             shader_variant,
@@ -1297,13 +1454,11 @@ bool Bfloat16Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input
                                                                                                  output.dtype());
     if (!fill_staging_upload(input,
                              transfer_slot.upload,
-                             transfer_slot.staging_allocator,
-                             runtime_state)
+                             transfer_slot.staging_allocator)
         || !prepare_staging_batch(transfer_slot.download,
                                   input.rows(),
                                   implementation.output_columns,
-                                  transfer_slot.staging_allocator,
-                                  runtime_state))
+                                  transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -1322,7 +1477,7 @@ bool Bfloat16Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;
     if (direct_host_input)
-        input_gpu = bind_direct_host_input(transfer_slot.upload, runtime_state);
+        input_gpu = bind_direct_host_input(transfer_slot.upload);
     else if (!record_mapped_activation_upload(transfer_slot.upload,
                                               input_gpu,
                                               command,
@@ -1335,7 +1490,7 @@ bool Bfloat16Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input
 
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        output_gpu = prepare_direct_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(implementation.output_columns),
                           static_cast<int>(input.rows()),
@@ -1379,7 +1534,7 @@ bool Bfloat16Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input
                                                          implementation.vulkan_context->device(),
                                                          implementation.option,
                                                          output.dtype()))
-        || submit_compute_and_wait(command, runtime_state) != 0
+        || submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
         return false;
@@ -1549,17 +1704,19 @@ Bfloat16Linear_vulkan::create_with_allocator(const TensorData& matrix,
     packed_upload_option.use_fp16_storage = false;
     packed_upload_option.use_bf16_storage = false;
     bool uploaded = false;
+    if (auto* independent_allocator = dynamic_cast<VulkanExpertWeightAllocator*>(weight_allocator))
+    {
+        VulkanIndependentWeightTransfer command(implementation.vulkan_context, implementation.weight_staging_allocator.get());
+        uploaded = command.record(packed, implementation.packed, independent_allocator)
+                   && command.record(biases, implementation.bias, independent_allocator)
+                   && command.submit_and_wait();
+    }
+    else
     {
         ncnn::VkTransfer command(device);
-        command.record_upload(packed,
-                              implementation.packed,
-                              packed_upload_option);
-        command.record_upload(biases,
-                              implementation.bias,
-                              upload_option);
-        uploaded = !implementation.packed.empty()
-                   && !implementation.bias.empty()
-                   && command.submit_and_wait() == 0;
+        command.record_upload(packed, implementation.packed, packed_upload_option);
+        command.record_upload(biases, implementation.bias, upload_option);
+        uploaded = !implementation.packed.empty() && !implementation.bias.empty() && command.submit_and_wait() == 0;
     }
     implementation.weight_staging_allocator.reset();
     if (!uploaded)
@@ -1901,13 +2058,11 @@ bool Bfloat16Linear_vulkan::forward(const ActivationBuffer& input,
                                                                                                  output.dtype());
     if (!fill_staging_upload(input,
                              transfer_slot.upload,
-                             transfer_slot.staging_allocator,
-                             runtime_state)
+                             transfer_slot.staging_allocator)
         || !prepare_staging_batch(transfer_slot.download,
                                   input.rows(),
                                   implementation.output_columns,
-                                  transfer_slot.staging_allocator,
-                                  runtime_state))
+                                  transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -1926,7 +2081,7 @@ bool Bfloat16Linear_vulkan::forward(const ActivationBuffer& input,
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;
     if (direct_host_input)
-        input_gpu = bind_direct_host_input(transfer_slot.upload, runtime_state);
+        input_gpu = bind_direct_host_input(transfer_slot.upload);
     else if (!record_mapped_activation_upload(transfer_slot.upload,
                                               input_gpu,
                                               command,
@@ -1938,7 +2093,7 @@ bool Bfloat16Linear_vulkan::forward(const ActivationBuffer& input,
     }
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        output_gpu = prepare_direct_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(implementation.output_columns),
                           static_cast<int>(input.rows()),
@@ -1960,7 +2115,7 @@ bool Bfloat16Linear_vulkan::forward(const ActivationBuffer& input,
                                                          implementation.vulkan_context->device(),
                                                          implementation.option,
                                                          output.dtype()))
-        || submit_compute_and_wait(command, runtime_state) != 0
+        || submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download,
                                       output))
     {
@@ -2024,18 +2179,15 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
                                                                                                     parallel_output.dtype());
     if (!fill_staging_upload(input,
                              transfer_slot.upload,
-                             transfer_slot.staging_allocator,
-                             runtime_state)
+                             transfer_slot.staging_allocator)
         || !prepare_staging_batch(transfer_slot.download,
                                   input.rows(),
                                   first.output_columns,
-                                  transfer_slot.staging_allocator,
-                                  runtime_state)
+                                  transfer_slot.staging_allocator)
         || !prepare_staging_batch(parallel_download,
                                   input.rows(),
                                   parallel.output_columns,
-                                  transfer_slot.staging_allocator,
-                                  runtime_state))
+                                  transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -2053,7 +2205,7 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;
     if (direct_host_input)
-        input_gpu = bind_direct_host_input(transfer_slot.upload, runtime_state);
+        input_gpu = bind_direct_host_input(transfer_slot.upload);
     else if (!record_mapped_activation_upload(transfer_slot.upload,
                                               input_gpu,
                                               command,
@@ -2066,7 +2218,7 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
 
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        output_gpu = prepare_direct_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(first.output_columns),
                           static_cast<int>(input.rows()),
@@ -2074,7 +2226,7 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
                           first.vulkan_context->blob_allocator());
     ncnn::VkMat parallel_output_gpu;
     if (parallel_direct_host_output)
-        parallel_output_gpu = prepare_direct_host_output(parallel_download, runtime_state);
+        parallel_output_gpu = prepare_direct_host_output(parallel_download);
     else
         parallel_output_gpu.create(static_cast<int>(parallel.output_columns),
                                    static_cast<int>(input.rows()),
@@ -2109,7 +2261,7 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
                                                             parallel.vulkan_context->device(),
                                                             parallel.option,
                                                             parallel_output.dtype()))
-        || submit_compute_and_wait(command, runtime_state) != 0
+        || submit_compute_and_wait(command, first.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output)
         || !copy_staging_to_cpu_batch(parallel_download, parallel_output))
     {
@@ -2180,13 +2332,11 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
                                                                                         output.dtype());
     if (!fill_staging_upload(input,
                              transfer_slot.upload,
-                             transfer_slot.staging_allocator,
-                             runtime_state)
+                             transfer_slot.staging_allocator)
         || !prepare_staging_batch(transfer_slot.download,
                                   input.rows(),
                                   down.output_columns,
-                                  transfer_slot.staging_allocator,
-                                  runtime_state))
+                                  transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -2210,7 +2360,7 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;
     if (direct_host_input)
-        input_gpu = bind_direct_host_input(transfer_slot.upload, runtime_state);
+        input_gpu = bind_direct_host_input(transfer_slot.upload);
     else if (!record_mapped_activation_upload(transfer_slot.upload,
                                               input_gpu,
                                               command,
@@ -2227,7 +2377,7 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
                      first.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        output_gpu = prepare_direct_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(down.output_columns),
                           static_cast<int>(input.rows()),
@@ -2270,7 +2420,7 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
                                                          first.vulkan_context->device(),
                                                          first.option,
                                                          output.dtype()))
-        || submit_compute_and_wait(command, runtime_state) != 0
+        || submit_compute_and_wait(command, first.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
         return false;
@@ -2568,13 +2718,11 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
                                total_rows,
                                input_columns,
                                transfer_slot.staging_allocator,
-                               runtime_state,
                                sizeof(float))
         || !prepare_staging_batch(transfer_slot.download,
                                   total_rows,
                                   output_columns,
                                   transfer_slot.staging_allocator,
-                                  runtime_state,
                                   sizeof(float)))
     {
         return false;
@@ -2635,6 +2783,12 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
     if (input_gpu.empty() || output_gpu.empty())
         return false;
 
+    const size_t descriptor_alignment = std::max<size_t>(4, first_expert.vulkan_context->device()->info.buffer_offset_alignment());
+    const bool align_output_rows = experts.size() > 1
+                                   && (static_cast<size_t>(output_columns) * output_gpu.elemsize) % descriptor_alignment != 0;
+    std::vector<ncnn::VkMat> aligned_inputs;
+    aligned_inputs.reserve(experts.size());
+    std::vector<ncnn::VkMat> aligned_outputs(align_output_rows ? experts.size() : 0);
     std::vector<ncnn::VkMat> intermediates;
     intermediates.reserve(experts.size());
     std::vector<ncnn::VkMat> swiglu_bindings(4);
@@ -2646,10 +2800,18 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
         const Bfloat16Linear_vulkan::Implementation& gate = *expert.gate_up->d;
         const Bfloat16Linear_vulkan::Implementation& down = *expert.down->d;
         const size_t rows = inputs[index]->rows();
-        ncnn::VkMat input_view = row_view(input_gpu, row_offset, rows);
+        ncnn::VkMat input_view = aligned_readonly_row_view(input_gpu, row_offset, rows, command, first_gate.option,
+                                                           first_expert.vulkan_context, aligned_inputs);
         ncnn::VkMat output_view = row_view(output_gpu, row_offset, rows);
         if (input_view.empty() || output_view.empty())
             return false;
+        if (align_output_rows)
+        {
+            aligned_outputs[index].create(output_view.w, output_view.h, output_view.elemsize,
+                                          first_expert.vulkan_context->blob_allocator());
+            output_view = aligned_outputs[index];
+            if (output_view.empty()) return false;
+        }
 
         ncnn::VkMat& fused_gpu = intermediates.emplace_back();
         fused_gpu.create(static_cast<int>(gate.output_columns),
@@ -2683,6 +2845,11 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
                                 swiglu_bindings,
                                 swiglu_constants,
                                 swiglu_dispatcher);
+        if (align_output_rows)
+        {
+            ncnn::VkMat destination = row_view(output_gpu, row_offset, rows);
+            if (!record_output_row_copy(output_view, destination, command, first_gate.option)) return false;
+        }
         row_offset += rows;
     }
 
@@ -2694,7 +2861,7 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
                                                      first_expert.vulkan_context->device(),
                                                      first_down.option,
                                                      DType::Float32)
-        || submit_compute_and_wait(command, runtime_state) != 0
+        || submit_compute_and_wait(command, first_expert.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batches(transfer_slot.download,
                                         inputs,
                                         outputs,
@@ -2731,6 +2898,8 @@ public:
     ncnn::VkMat bias;
     ncnn::VkMat rms_norm_weight;
     ncnn::VkMat input_rms_norm_weight;
+    std::shared_ptr<RmsNorm_vulkan> rms_norm;
+    std::shared_ptr<RmsNorm_vulkan> input_rms_norm;
     ncnn::Option option;
     uint64_t optimization_flags = OptimizationDefaultFlags;
 
@@ -2797,9 +2966,13 @@ static bool create_float8_projection_pipeline(const std::shared_ptr<VulkanContex
     const std::vector<ncnn::vk_specialization_type> specializations;
     if (pipeline->create(spirv->data(), spirv->size() * sizeof(uint32_t), specializations) != 0)
         return false;
-    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context](ncnn::Pipeline* value) {
-        const std::lock_guard<std::mutex> lock(context->command_mutex());
-        delete value;
+    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context = context](ncnn::Pipeline* value) mutable {
+        {
+            const std::lock_guard<std::mutex> lock(context->command_mutex());
+            delete value;
+        }
+        // Weak cache entries retain the deleter control block after disposal.
+        context.reset();
     });
     context->cache_pipeline(float8_projection_shader, 0, destination);
     return true;
@@ -2827,9 +3000,13 @@ static bool create_float8_quantize_pipeline(const std::shared_ptr<VulkanContext>
     const std::vector<ncnn::vk_specialization_type> specializations;
     if (pipeline->create(spirv->data(), spirv->size() * sizeof(uint32_t), specializations) != 0)
         return false;
-    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context](ncnn::Pipeline* value) {
-        const std::lock_guard<std::mutex> lock(context->command_mutex());
-        delete value;
+    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context = context](ncnn::Pipeline* value) mutable {
+        {
+            const std::lock_guard<std::mutex> lock(context->command_mutex());
+            delete value;
+        }
+        // Weak cache entries retain the deleter control block after disposal.
+        context.reset();
     });
     context->cache_pipeline(float8_quantize_shader, 0, destination);
     return true;
@@ -2857,9 +3034,13 @@ static bool create_float8_rms_norm_quantize_pipeline(const std::shared_ptr<Vulka
     const std::vector<ncnn::vk_specialization_type> specializations;
     if (pipeline->create(spirv->data(), spirv->size() * sizeof(uint32_t), specializations) != 0)
         return false;
-    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context](ncnn::Pipeline* value) {
-        const std::lock_guard<std::mutex> lock(context->command_mutex());
-        delete value;
+    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context = context](ncnn::Pipeline* value) mutable {
+        {
+            const std::lock_guard<std::mutex> lock(context->command_mutex());
+            delete value;
+        }
+        // Weak cache entries retain the deleter control block after disposal.
+        context.reset();
     });
     context->cache_pipeline(float8_rms_norm_quantize_shader, 0, destination);
     return true;
@@ -2887,9 +3068,13 @@ static bool create_float8_swiglu_quantize_pipeline(const std::shared_ptr<VulkanC
     const std::vector<ncnn::vk_specialization_type> specializations;
     if (pipeline->create(spirv->data(), spirv->size() * sizeof(uint32_t), specializations) != 0)
         return false;
-    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context](ncnn::Pipeline* value) {
-        const std::lock_guard<std::mutex> lock(context->command_mutex());
-        delete value;
+    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context = context](ncnn::Pipeline* value) mutable {
+        {
+            const std::lock_guard<std::mutex> lock(context->command_mutex());
+            delete value;
+        }
+        // Weak cache entries retain the deleter control block after disposal.
+        context.reset();
     });
     context->cache_pipeline(float8_swiglu_quantize_shader, 0, destination);
     return true;
@@ -3128,6 +3313,10 @@ bool Float8Linear_vulkan::prepare_rms_norm(const TensorData& weight,
                                  epsilon,
                                  implementation.rms_norm_weight))
         return false;
+    implementation.rms_norm = RmsNorm_vulkan::create(weight, epsilon, 0.0f,
+                                                     implementation.vulkan_context, implementation.option);
+    if (!implementation.rms_norm)
+        return false;
     implementation.rms_norm_epsilon = epsilon;
     return true;
 #else
@@ -3147,6 +3336,10 @@ bool Float8Linear_vulkan::prepare_input_rms_norm(const TensorData& weight,
                                  epsilon,
                                  implementation.input_rms_norm_weight))
         return false;
+    implementation.input_rms_norm = RmsNorm_vulkan::create(weight, epsilon, 0.0f,
+                                                           implementation.vulkan_context, implementation.option);
+    if (!implementation.input_rms_norm)
+        return false;
     implementation.input_rms_norm_epsilon = epsilon;
     return true;
 #else
@@ -3161,8 +3354,7 @@ static bool fill_float8_quantized_staging(const ActivationBuffer& input,
                                           uint32_t columns,
                                           uint64_t optimization_flags,
                                           ncnn::VkMat& staging,
-                                          ncnn::VkAllocator* allocator,
-                                          VulkanRuntimeState& runtime_state)
+                                          ncnn::VkAllocator* allocator)
 {
     if (input.dtype() != DType::Float32
         || input.rows() == 0
@@ -3182,7 +3374,6 @@ static bool fill_float8_quantized_staging(const ActivationBuffer& input,
                                input.rows(),
                                columns,
                                allocator,
-                               runtime_state,
                                sizeof(float)))
     {
         return false;
@@ -3215,6 +3406,122 @@ static bool fill_float8_quantized_staging(const ActivationBuffer& input,
 }
 #endif
 
+#if NCNN_MOE_WITH_VULKAN
+const std::shared_ptr<VulkanContext>& Float8Linear_vulkan::vulkan_context() const noexcept
+{
+    return d->vulkan_context;
+}
+
+const ncnn::Option& Float8Linear_vulkan::option() const noexcept
+{
+    return d->option;
+}
+
+uint32_t Float8Linear_vulkan::input_columns() const noexcept
+{
+    return d->logical_input_columns;
+}
+
+uint32_t Float8Linear_vulkan::output_columns() const noexcept
+{
+    return d->output_columns;
+}
+
+bool Float8Linear_vulkan::record_input_normalization(const ncnn::VkMat& input,
+                                                     ncnn::VkMat& output,
+                                                     ncnn::VkCompute& cmd) const
+{
+    return d->input_rms_norm && d->input_rms_norm->record(input, output, cmd);
+}
+
+bool Float8Linear_vulkan::record_rms_norm_chain_parallel(const ncnn::VkMat& input,
+                                                         const Float8Linear_vulkan& next,
+                                                         const Float8Linear_vulkan& parallel,
+                                                         ncnn::VkMat& query,
+                                                         ncnn::VkMat& kv,
+                                                         ncnn::VkMat& query_rank,
+                                                         ncnn::VkCompute& cmd,
+                                                         std::vector<ncnn::VkMat>& workspace) const
+{
+    if (!d->rms_norm || d->vulkan_context != next.d->vulkan_context
+        || d->vulkan_context != parallel.d->vulkan_context)
+        return false;
+    ncnn::VkMat intermediate;
+    if (!record_forward(input, intermediate, cmd, workspace)
+        || !d->rms_norm->record(intermediate, query_rank, cmd)
+        || !next.record_forward(query_rank, query, cmd, workspace)
+        || !parallel.record_forward(input, kv, cmd, workspace))
+        return false;
+    workspace.push_back(std::move(intermediate));
+    return true;
+}
+
+bool Float8Linear_vulkan::record_forward(const ncnn::VkMat& input,
+                                         ncnn::VkMat& output,
+                                         ncnn::VkCompute& command,
+                                         std::vector<ncnn::VkMat>& workspace) const
+{
+    if (!d->vulkan_context || !d->pipeline || !d->quantize_pipeline
+        || input.empty() || input.dims != 2 || input.elempack != 1
+        || input.elemsize != sizeof(float) || input.h <= 0
+        || input.w != static_cast<int>(d->logical_input_columns)
+        || d->logical_input_columns % 128 != 0)
+        return false;
+    ncnn::VkMat quantized;
+    command.record_clone(input, quantized, d->option);
+    output.create(static_cast<int>(d->output_columns), input.h, sizeof(float),
+                  d->vulkan_context->blob_allocator());
+    if (quantized.empty() || output.empty())
+        return false;
+    std::vector<ncnn::vk_constant_type> constants(2);
+    constants[0].u32 = d->logical_input_columns;
+    constants[1].u32 = static_cast<uint32_t>(input.h);
+    ncnn::VkMat dispatcher;
+    dispatcher.w = static_cast<int>((d->logical_input_columns / 128) * 32);
+    dispatcher.h = input.h;
+    dispatcher.c = 1;
+    command.record_pipeline(d->quantize_pipeline.get(), {quantized}, constants, dispatcher);
+    d->record_projection(quantized, output, static_cast<uint32_t>(input.h), command);
+    workspace.push_back(std::move(quantized));
+    return true;
+}
+#endif
+
+bool Float8Linear_vulkan::materialize(const DeviceTensor_vulkan& input, ActivationBuffer& output) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    const ncnn::VkMat* value = input.value();
+    if (!value || !d->vulkan_context || input.vulkan_context() != d->vulkan_context)
+        return false;
+    VulkanTransferLease lease = d->vulkan_context->acquire_transfer_slot();
+    VulkanTransferSlot& slot = lease.slot();
+    VulkanRuntimeState& state = d->vulkan_context->runtime_state();
+    if (!prepare_staging_batch(slot.download, input.rows(), input.columns(),
+                               slot.staging_allocator, output.element_size()))
+        return false;
+    const DType dtype = output.dtype();
+    output.reset(input.rows(), input.columns(), false);
+    const std::lock_guard<std::mutex> lock(d->vulkan_context->command_mutex());
+    input.prepare_read();
+    if (slot.command_used && slot.command->reset() != 0)
+        return false;
+    slot.command_used = true;
+    if (!record_prepared_activation_staging_download(*value, input.rows(), input.columns(),
+                                                     slot.download, *slot.command,
+                                                     d->vulkan_context->device(), d->option, dtype)
+        || submit_compute_and_wait(*slot.command, d->vulkan_context->device()) != 0
+        || !copy_staging_to_cpu_batch(slot.download, output))
+        return false;
+    ++state.compute_submissions;
+    ++state.batch_downloads;
+    return true;
+#else
+    (void)input;
+    (void)output;
+    return false;
+#endif
+}
+
 bool Float8Linear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& output) const
 {
 #if NCNN_MOE_WITH_VULKAN
@@ -3239,9 +3546,8 @@ bool Float8Linear_vulkan::forward(const ActivationBuffer& input, ActivationBuffe
                                        implementation.logical_input_columns,
                                        implementation.optimization_flags,
                                        transfer_slot.upload,
-                                       transfer_slot.staging_allocator,
-                                       runtime_state)
-        || !prepare_staging_batch(transfer_slot.download, input.rows(), implementation.output_columns, transfer_slot.staging_allocator, runtime_state))
+                                       transfer_slot.staging_allocator)
+        || !prepare_staging_batch(transfer_slot.download, input.rows(), implementation.output_columns, transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -3259,12 +3565,12 @@ bool Float8Linear_vulkan::forward(const ActivationBuffer& input, ActivationBuffe
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;
     if (direct_host_input)
-        input_gpu = bind_direct_host_input(transfer_slot.upload, runtime_state);
+        input_gpu = bind_direct_host_input(transfer_slot.upload);
     else if (!record_mapped_upload(transfer_slot.upload, input_gpu, command, implementation.option))
         return false;
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        output_gpu = prepare_direct_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(implementation.output_columns),
                           static_cast<int>(input.rows()),
@@ -3286,7 +3592,7 @@ bool Float8Linear_vulkan::forward(const ActivationBuffer& input, ActivationBuffe
                                                          implementation.vulkan_context->device(),
                                                          implementation.option,
                                                          output_dtype))
-        || submit_compute_and_wait(command, runtime_state) != 0
+        || submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
         return false;
@@ -3327,9 +3633,8 @@ bool Float8Linear_vulkan::forward_chain(const ActivationBuffer& input, const Flo
                                        first.logical_input_columns,
                                        first.optimization_flags,
                                        transfer_slot.upload,
-                                       transfer_slot.staging_allocator,
-                                       runtime_state)
-        || !prepare_staging_batch(transfer_slot.download, input.rows(), second.output_columns, transfer_slot.staging_allocator, runtime_state))
+                                       transfer_slot.staging_allocator)
+        || !prepare_staging_batch(transfer_slot.download, input.rows(), second.output_columns, transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -3355,7 +3660,7 @@ bool Float8Linear_vulkan::forward_chain(const ActivationBuffer& input, const Flo
                             first.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        output_gpu = prepare_direct_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(second.output_columns),
                           static_cast<int>(input.rows()),
@@ -3393,7 +3698,7 @@ bool Float8Linear_vulkan::forward_chain(const ActivationBuffer& input, const Flo
                                                          first.vulkan_context->device(),
                                                          first.option,
                                                          output_dtype))
-        || submit_compute_and_wait(command, runtime_state) != 0
+        || submit_compute_and_wait(command, first.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
         return false;
@@ -3439,9 +3744,8 @@ bool Float8Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input,
                                        first.logical_input_columns,
                                        first.optimization_flags,
                                        transfer_slot.upload,
-                                       transfer_slot.staging_allocator,
-                                       runtime_state)
-        || !prepare_staging_batch(transfer_slot.download, input.rows(), second.output_columns, transfer_slot.staging_allocator, runtime_state))
+                                       transfer_slot.staging_allocator)
+        || !prepare_staging_batch(transfer_slot.download, input.rows(), second.output_columns, transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -3467,7 +3771,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input,
                             first.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        output_gpu = prepare_direct_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(second.output_columns),
                           static_cast<int>(input.rows()),
@@ -3510,7 +3814,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input,
                                                          first.vulkan_context->device(),
                                                          first.option,
                                                          output_dtype))
-        || submit_compute_and_wait(command, runtime_state) != 0
+        || submit_compute_and_wait(command, first.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
         return false;
@@ -3533,7 +3837,8 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_impl(const ActivationB
                                                                const Float8Linear_vulkan& parallel_operator,
                                                                ActivationBuffer& output,
                                                                ActivationBuffer& parallel_output,
-                                                               bool normalize_input) const
+                                                               bool normalize_input,
+                                                               DeviceTensor_vulkan* retained_output) const
 {
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& first = *d;
@@ -3565,9 +3870,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_impl(const ActivationB
 
     VulkanTransferLease transfer_lease = first.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
-    const bool direct_host_output = first.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * second.output_columns
-                                                                                         * sizeof(float),
-                                                                                     output.dtype());
+    const bool direct_host_output = !retained_output && first.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * second.output_columns * sizeof(float), output.dtype());
     const bool parallel_direct_host_output = parallel.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * parallel.output_columns
                                                                                                      * sizeof(float),
                                                                                                  parallel_output.dtype());
@@ -3575,16 +3878,14 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_impl(const ActivationB
     if (!(normalize_input
               ? fill_staging_upload(input,
                                     transfer_slot.upload,
-                                    transfer_slot.staging_allocator,
-                                    runtime_state)
+                                    transfer_slot.staging_allocator)
               : fill_float8_quantized_staging(input,
                                               first.logical_input_columns,
                                               first.optimization_flags,
                                               transfer_slot.upload,
-                                              transfer_slot.staging_allocator,
-                                              runtime_state))
-        || !prepare_staging_batch(transfer_slot.download, input.rows(), second.output_columns, transfer_slot.staging_allocator, runtime_state)
-        || !prepare_staging_batch(parallel_download, input.rows(), parallel.output_columns, transfer_slot.staging_allocator, runtime_state))
+                                              transfer_slot.staging_allocator))
+        || (!retained_output && !prepare_staging_batch(transfer_slot.download, input.rows(), second.output_columns, transfer_slot.staging_allocator))
+        || !prepare_staging_batch(parallel_download, input.rows(), parallel.output_columns, transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -3631,7 +3932,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_impl(const ActivationB
                             first.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        output_gpu = prepare_direct_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(second.output_columns),
                           static_cast<int>(input.rows()),
@@ -3639,7 +3940,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_impl(const ActivationB
                           first.vulkan_context->blob_allocator());
     ncnn::VkMat parallel_gpu;
     if (parallel_direct_host_output)
-        parallel_gpu = prepare_direct_host_output(parallel_download, runtime_state);
+        parallel_gpu = prepare_direct_host_output(parallel_download);
     else
         parallel_gpu.create(static_cast<int>(parallel.output_columns),
                             static_cast<int>(input.rows()),
@@ -3676,7 +3977,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_impl(const ActivationB
                                parallel_gpu,
                                static_cast<uint32_t>(input.rows()),
                                command);
-    if ((!direct_host_output
+    if ((!retained_output && !direct_host_output
          && !record_prepared_activation_staging_download(output_gpu,
                                                          input.rows(),
                                                          second.output_columns,
@@ -3694,16 +3995,22 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_impl(const ActivationB
                                                             first.vulkan_context->device(),
                                                             first.option,
                                                             parallel_output_dtype))
-        || submit_compute_and_wait(command, runtime_state) != 0
-        || !copy_staging_to_cpu_batch(transfer_slot.download, output)
+        || submit_compute_and_wait(command, first.vulkan_context->device()) != 0
+        || (!retained_output && !copy_staging_to_cpu_batch(transfer_slot.download, output))
         || !copy_staging_to_cpu_batch(parallel_download, parallel_output))
     {
         return false;
     }
+    if (retained_output)
+    {
+        if (!retained_output->assign_completed(output_gpu, first.vulkan_context))
+            return false;
+        output.clear();
+    }
     runtime_state.dispatches += 3;
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
-    runtime_state.batch_downloads += 2;
+    runtime_state.batch_downloads += retained_output ? 1 : 2;
     if (normalize_input)
         ++runtime_state.rms_norm_linear_fusions;
     return true;
@@ -3713,6 +4020,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_impl(const ActivationB
     (void)parallel_operator;
     (void)output;
     (void)parallel_output;
+    (void)retained_output;
     (void)normalize_input;
     return false;
 #endif
@@ -3722,28 +4030,30 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel(const ActivationBuffer
                                                           const Float8Linear_vulkan& next,
                                                           const Float8Linear_vulkan& parallel_operator,
                                                           ActivationBuffer& output,
-                                                          ActivationBuffer& parallel_output) const
+                                                          ActivationBuffer& parallel_output,
+                                                          DeviceTensor_vulkan* retained_output) const
 {
     return forward_rms_norm_chain_parallel_impl(input,
                                                 next,
                                                 parallel_operator,
                                                 output,
                                                 parallel_output,
-                                                false);
+                                                false, retained_output);
 }
 
 bool Float8Linear_vulkan::forward_input_rms_norm_chain_parallel(const ActivationBuffer& input,
                                                                 const Float8Linear_vulkan& next,
                                                                 const Float8Linear_vulkan& parallel_operator,
                                                                 ActivationBuffer& output,
-                                                                ActivationBuffer& parallel_output) const
+                                                                ActivationBuffer& parallel_output,
+                                                                DeviceTensor_vulkan* retained_output) const
 {
     return forward_rms_norm_chain_parallel_impl(input,
                                                 next,
                                                 parallel_operator,
                                                 output,
                                                 parallel_output,
-                                                true);
+                                                true, retained_output);
 }
 
 bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const ActivationBuffer& input,
@@ -3752,7 +4062,8 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
                                                                    std::span<const Bfloat16Linear_vulkan*> extra_operators,
                                                                    std::span<ActivationBuffer*> extra_outputs,
                                                                    ActivationBuffer& output,
-                                                                   ActivationBuffer& parallel_output) const
+                                                                   ActivationBuffer& parallel_output,
+                                                                   DeviceTensor_vulkan* retained_output) const
 {
 #if NCNN_MOE_WITH_VULKAN
     if (extra_operators.empty())
@@ -3760,7 +4071,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
                                                next,
                                                parallel_operator,
                                                output,
-                                               parallel_output);
+                                               parallel_output, retained_output);
     if (extra_operators.size() != extra_outputs.size())
         return false;
 
@@ -3813,9 +4124,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
 
     VulkanTransferLease transfer_lease = first.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
-    const bool direct_host_output = first.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * second.output_columns
-                                                                                         * sizeof(float),
-                                                                                     output.dtype());
+    const bool direct_host_output = !retained_output && first.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * second.output_columns * sizeof(float), output.dtype());
     const bool parallel_direct_host_output = parallel.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * parallel.output_columns
                                                                                                      * sizeof(float),
                                                                                                  parallel_output.dtype());
@@ -3824,15 +4133,12 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
     std::vector<bool> extra_direct_host_outputs(extra_operators.size(), false);
     if (!fill_staging_upload(input,
                              transfer_slot.upload,
-                             transfer_slot.staging_allocator, runtime_state)
-        || !prepare_staging_batch(transfer_slot.download,
-                                  input.rows(),
-                                  second.output_columns,
-                                  transfer_slot.staging_allocator, runtime_state)
+                             transfer_slot.staging_allocator)
+        || (!retained_output && !prepare_staging_batch(transfer_slot.download, input.rows(), second.output_columns, transfer_slot.staging_allocator))
         || !prepare_staging_batch(parallel_download,
                                   input.rows(),
                                   parallel.output_columns,
-                                  transfer_slot.staging_allocator, runtime_state))
+                                  transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -3842,7 +4148,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
         if (!prepare_staging_batch(extra_downloads[index],
                                    input.rows(),
                                    extra.output_columns,
-                                   transfer_slot.staging_allocator, runtime_state))
+                                   transfer_slot.staging_allocator))
         {
             return false;
         }
@@ -3902,7 +4208,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
                             first.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        output_gpu = prepare_direct_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(second.output_columns),
                           static_cast<int>(input.rows()),
@@ -3910,7 +4216,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
                           first.vulkan_context->blob_allocator());
     ncnn::VkMat parallel_gpu;
     if (parallel_direct_host_output)
-        parallel_gpu = prepare_direct_host_output(parallel_download, runtime_state);
+        parallel_gpu = prepare_direct_host_output(parallel_download);
     else
         parallel_gpu.create(static_cast<int>(parallel.output_columns),
                             static_cast<int>(input.rows()),
@@ -3923,7 +4229,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
     {
         const auto& extra = *extra_operators[index]->d;
         if (extra_direct_host_outputs[index])
-            extra_gpu[index] = prepare_direct_host_output(extra_downloads[index], runtime_state);
+            extra_gpu[index] = prepare_direct_host_output(extra_downloads[index]);
         else
             extra_gpu[index].create(static_cast<int>(extra.output_columns),
                                     static_cast<int>(input.rows()),
@@ -3973,7 +4279,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
                                                                 command);
     }
 
-    if ((!direct_host_output
+    if ((!retained_output && !direct_host_output
          && !record_prepared_activation_staging_download(output_gpu,
                                                          input.rows(),
                                                          second.output_columns,
@@ -4010,8 +4316,8 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
             return false;
         }
     }
-    if (submit_compute_and_wait(command, runtime_state) != 0
-        || !copy_staging_to_cpu_batch(transfer_slot.download, output)
+    if (submit_compute_and_wait(command, first.vulkan_context->device()) != 0
+        || (!retained_output && !copy_staging_to_cpu_batch(transfer_slot.download, output))
         || !copy_staging_to_cpu_batch(parallel_download, parallel_output))
     {
         return false;
@@ -4024,10 +4330,16 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
             return false;
         }
     }
+    if (retained_output)
+    {
+        if (!retained_output->assign_completed(output_gpu, first.vulkan_context))
+            return false;
+        output.clear();
+    }
     runtime_state.dispatches += 4 + static_cast<uint64_t>(extra_operators.size());
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
-    runtime_state.batch_downloads += 2 + extra_operators.size();
+    runtime_state.batch_downloads += (retained_output ? 1 : 2) + extra_operators.size();
     for (bool used_cooperative_matrix : cooperative_dispatches)
     {
         if (used_cooperative_matrix)
@@ -4042,6 +4354,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
     (void)extra_outputs;
     (void)output;
     (void)parallel_output;
+    (void)retained_output;
     return false;
 #endif
 }
@@ -4082,9 +4395,8 @@ bool Float8Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
                                        gate.logical_input_columns,
                                        gate.optimization_flags,
                                        transfer_slot.upload,
-                                       transfer_slot.staging_allocator,
-                                       runtime_state)
-        || !prepare_staging_batch(transfer_slot.download, input.rows(), down.output_columns, transfer_slot.staging_allocator, runtime_state))
+                                       transfer_slot.staging_allocator)
+        || !prepare_staging_batch(transfer_slot.download, input.rows(), down.output_columns, transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -4115,7 +4427,7 @@ bool Float8Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
                   gate.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        output_gpu = prepare_direct_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(down.output_columns),
                           static_cast<int>(input.rows()),
@@ -4160,7 +4472,7 @@ bool Float8Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
                                                          gate.vulkan_context->device(),
                                                          gate.option,
                                                          output_dtype))
-        || submit_compute_and_wait(command, runtime_state) != 0
+        || submit_compute_and_wait(command, gate.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
         return false;
@@ -4169,6 +4481,95 @@ bool Float8Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     ++runtime_state.batch_downloads;
+    ++runtime_state.shared_expert_swiglu_fusions;
+    return true;
+#else
+    (void)input;
+    (void)up_operator;
+    (void)down_operator;
+    (void)activation;
+    (void)activation_limit;
+    (void)output;
+    return false;
+#endif
+}
+
+bool Float8Linear_vulkan::forward_swiglu_chain_device(const DeviceTensor_vulkan& input,
+                                                      const Float8Linear_vulkan& up_operator,
+                                                      const Float8Linear_vulkan& down_operator,
+                                                      ExpertActivation activation,
+                                                      float activation_limit,
+                                                      DeviceTensor_vulkan& output) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    const Implementation& gate = *d;
+    const Implementation& up = *up_operator.d;
+    const Implementation& down = *down_operator.d;
+    const ncnn::VkMat* source = input.value();
+    if (&input == &output || activation != ExpertActivation::DeepSeekSwiGlu
+        || !source || source->dims != 2 || source->elemsize / source->elempack != sizeof(float)
+        || !gate.vulkan_context || input.vulkan_context() != gate.vulkan_context
+        || gate.vulkan_context != up.vulkan_context || gate.vulkan_context != down.vulkan_context
+        || !gate.pipeline || !gate.quantize_pipeline || !up.pipeline || !down.pipeline || !gate.swiglu_quantize_pipeline
+        || gate.input_group_count != 1 || up.input_group_count != 1 || down.input_group_count != 1
+        || input.rows() == 0 || input.columns() != gate.logical_input_columns
+        || input.columns() != up.logical_input_columns || gate.output_columns != up.output_columns
+        || gate.output_columns != down.logical_input_columns || gate.output_columns % 128 != 0
+        || input.rows() > gate.vulkan_context->device()->info.max_workgroup_count_y())
+        return false;
+    // Retain the import and every temporary until the command has completed.
+    const ncnn::VkMat retained_input = *source;
+    VulkanRuntimeState& state = gate.vulkan_context->runtime_state();
+    auto lease = gate.vulkan_context->acquire_transfer_slot();
+    auto& slot = lease.slot();
+    const std::lock_guard<std::mutex> lock(gate.vulkan_context->command_mutex());
+    if (slot.command_used)
+    {
+        if (slot.command->reset() != 0)
+            return false;
+        ++state.command_buffer_reuses;
+    }
+    slot.command_used = true;
+    auto& cmd = *slot.command;
+    input.prepare_read();
+    ncnn::VkMat input_gpu = retained_input;
+    if (input_gpu.elempack != 1)
+    {
+        gate.vulkan_context->device()->convert_packing(retained_input, input_gpu, 1, 1, cmd, gate.option);
+        if (input_gpu.empty())
+            return false;
+    }
+    std::vector<ncnn::VkMat> workspace;
+    ncnn::VkMat gate_gpu;
+    if (!record_forward(input_gpu, gate_gpu, cmd, workspace))
+        return false;
+    // Gate and Up share the same FP8 activation quantization; the imported input is immutable.
+    const ncnn::VkMat& quantized = workspace.back();
+    ncnn::VkMat up_gpu;
+    ncnn::VkMat output_gpu;
+    up_gpu.create(static_cast<int>(up.output_columns), input_gpu.h, sizeof(float), gate.vulkan_context->blob_allocator());
+    output_gpu.create(static_cast<int>(down.output_columns), input_gpu.h, sizeof(float), gate.vulkan_context->blob_allocator());
+    if (up_gpu.empty() || output_gpu.empty())
+        return false;
+    up.record_projection(quantized, up_gpu, static_cast<uint32_t>(input.rows()), cmd);
+    std::vector<ncnn::vk_constant_type> constants(3);
+    constants[0].u32 = gate.output_columns;
+    constants[1].u32 = static_cast<uint32_t>(input.rows());
+    constants[2].f = activation_limit;
+    ncnn::VkMat dispatcher;
+    dispatcher.w = static_cast<int>((gate.output_columns / 128) * 32);
+    dispatcher.h = input_gpu.h;
+    dispatcher.c = 1;
+    cmd.record_pipeline(gate.swiglu_quantize_pipeline.get(), {gate_gpu, up_gpu}, constants, dispatcher);
+    down.record_projection(gate_gpu, output_gpu, static_cast<uint32_t>(input.rows()), cmd);
+    if (submit_compute_and_wait(cmd, gate.vulkan_context->device()) != 0)
+        return false;
+    DeviceTensor_vulkan completed;
+    if (!completed.assign_completed(output_gpu, gate.vulkan_context))
+        return false;
+    output = std::move(completed);
+    ++state.compute_submissions;
+    ++state.shared_expert_swiglu_fusions;
     return true;
 #else
     (void)input;
@@ -4230,9 +4631,13 @@ static bool create_mxfp4_projection_pipeline(const std::shared_ptr<VulkanContext
     {
         return false;
     }
-    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context](ncnn::Pipeline* value) {
-        const std::lock_guard<std::mutex> lock(context->command_mutex());
-        delete value;
+    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context = context](ncnn::Pipeline* value) mutable {
+        {
+            const std::lock_guard<std::mutex> lock(context->command_mutex());
+            delete value;
+        }
+        // Weak cache entries retain the deleter control block after disposal.
+        context.reset();
     });
     context->cache_pipeline(mxfp4_projection_shader, pipeline_key, destination);
     return true;
@@ -4294,6 +4699,8 @@ std::shared_ptr<Mxfp4Linear_vulkan> Mxfp4Linear_vulkan::create_with_allocator(co
     }
 
     std::shared_ptr<Mxfp4Linear_vulkan> result(new Mxfp4Linear_vulkan);
+    if (upload_batch)
+        upload_batch->retain_owner(result);
     Implementation& implementation = *result->d;
     implementation.input_columns = input_columns;
     implementation.output_columns = output_columns;
@@ -4378,25 +4785,27 @@ std::shared_ptr<Mxfp4Linear_vulkan> Mxfp4Linear_vulkan::create_with_allocator(co
     if (storage_size == 0 || storage_size > static_cast<size_t>(std::numeric_limits<int>::max()))
         return {};
 
+    const bool direct_staging = upload_batch
+                                && dynamic_cast<VulkanExpertWeightAllocator*>(weight_allocator)
+                                && has_flag(optimization_flags, OptimizationVulkanExpertDirectStaging);
     ncnn::Mat combined;
-    combined.create(static_cast<int>(storage_size), sizeof(uint8_t));
-    if (combined.empty())
+    std::span<uint8_t> packed_storage;
+    if (direct_staging)
+        packed_storage = upload_batch->prepare_storage(storage_size, weight_allocator);
+    else
+    {
+        combined = upload_batch ? upload_batch->host_storage(storage_size)
+                                : ncnn::Mat(static_cast<int>(storage_size), sizeof(uint8_t));
+        if (!combined.empty())
+            packed_storage = {static_cast<uint8_t*>(combined.data), storage_size};
+    }
+    if (packed_storage.size() != storage_size)
         return {};
-    std::memset(combined.data, 0, storage_size);
-    std::memcpy(combined.data, matrix.mxfp4_blocks.data(), matrix.mxfp4_blocks.size());
-    std::memcpy(static_cast<std::byte*>(combined.data) + scales_offset,
-                matrix.mxfp4_scales.data(),
-                matrix.mxfp4_scales.size());
-    float* bias_values = reinterpret_cast<float*>(static_cast<std::byte*>(combined.data) + bias_offset);
-    if (bias && bias->dtype == DType::Float32)
-    {
-        std::copy(float_bias_values.begin(), float_bias_values.end(), bias_values);
-    }
-    else if (bias)
-    {
-        for (uint32_t index = 0; index < output_columns; ++index)
-            bias_values[index] = bfloat16_to_float(bfloat16_bias_values[index]);
-    }
+    pack_mxfp4_weight_storage(packed_storage,
+                              packed_segment_size, scales_segment_size,
+                              {matrix.mxfp4_blocks.data(), matrix.mxfp4_blocks.size()},
+                              {matrix.mxfp4_scales.data(), matrix.mxfp4_scales.size()},
+                              float_bias_values, bfloat16_bias_values);
 
     if (upload_batch)
     {
@@ -4417,7 +4826,9 @@ std::shared_ptr<Mxfp4Linear_vulkan> Mxfp4Linear_vulkan::create_with_allocator(co
     bool uploaded = false;
     if (upload_batch)
     {
-        uploaded = upload_batch->record(combined, implementation.storage, implementation.option, weight_allocator);
+        uploaded = direct_staging
+                       ? upload_batch->record_prepared_storage(implementation.storage, implementation.option, weight_allocator)
+                       : upload_batch->record(combined, implementation.storage, implementation.option, weight_allocator);
     }
     else
     {
@@ -4496,8 +4907,8 @@ bool Mxfp4Linear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer
     const bool direct_host_output = implementation.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * implementation.output_columns
                                                                                                   * sizeof(float),
                                                                                               output.dtype());
-    if (!fill_staging_upload(input, transfer_slot.upload, transfer_slot.staging_allocator, runtime_state)
-        || !prepare_staging_batch(transfer_slot.download, input.rows(), implementation.output_columns, transfer_slot.staging_allocator, runtime_state))
+    if (!fill_staging_upload(input, transfer_slot.upload, transfer_slot.staging_allocator)
+        || !prepare_staging_batch(transfer_slot.download, input.rows(), implementation.output_columns, transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -4515,14 +4926,14 @@ bool Mxfp4Linear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;
     if (direct_host_input)
-        input_gpu = bind_direct_host_input(transfer_slot.upload, runtime_state);
+        input_gpu = bind_direct_host_input(transfer_slot.upload);
     else if (!record_mapped_upload(transfer_slot.upload, input_gpu, command, implementation.option))
     {
         return false;
     }
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        output_gpu = prepare_direct_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(implementation.output_columns), static_cast<int>(input.rows()), sizeof(float),
                           implementation.vulkan_context->blob_allocator());
@@ -4554,7 +4965,7 @@ bool Mxfp4Linear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer
                                                          implementation.vulkan_context->device(),
                                                          implementation.option,
                                                          output_dtype))
-        || submit_compute_and_wait(command, runtime_state) != 0 || !copy_staging_to_cpu_batch(transfer_slot.download, output))
+        || submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0 || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
         return false;
     }
@@ -4630,9 +5041,13 @@ static bool create_qnk_projection_pipeline(const std::shared_ptr<VulkanContext>&
         return false;
     }
     destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(),
-                                                  [context](ncnn::Pipeline* value) {
-                                                      const std::lock_guard<std::mutex> lock(context->command_mutex());
-                                                      delete value;
+                                                  [context = context](ncnn::Pipeline* value) mutable {
+                                                      {
+                                                          const std::lock_guard<std::mutex> lock(context->command_mutex());
+                                                          delete value;
+                                                      }
+                                                      // Weak cache entries retain the deleter control block after disposal.
+                                                      context.reset();
                                                   });
     context->cache_pipeline(qnk_projection_shader, pipeline_key, destination);
     return true;
@@ -4664,9 +5079,13 @@ static bool create_qnk_swiglu_pipeline(const std::shared_ptr<VulkanContext>& con
         return false;
     }
     destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(),
-                                                  [context](ncnn::Pipeline* value) {
-                                                      const std::lock_guard<std::mutex> lock(context->command_mutex());
-                                                      delete value;
+                                                  [context = context](ncnn::Pipeline* value) mutable {
+                                                      {
+                                                          const std::lock_guard<std::mutex> lock(context->command_mutex());
+                                                          delete value;
+                                                      }
+                                                      // Weak cache entries retain the deleter control block after disposal.
+                                                      context.reset();
                                                   });
     context->cache_pipeline(qnk_swiglu_shader, 0, destination);
     return true;
@@ -4843,6 +5262,12 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     upload_option.workspace_vkallocator = weight_allocator;
     upload_option.staging_vkallocator = implementation.weight_staging_allocator.get();
     bool uploaded = false;
+    if (auto* independent_allocator = dynamic_cast<VulkanExpertWeightAllocator*>(weight_allocator))
+    {
+        VulkanIndependentWeightTransfer command(implementation.vulkan_context, implementation.weight_staging_allocator.get());
+        uploaded = command.record(combined, implementation.storage, independent_allocator) && command.submit_and_wait();
+    }
+    else
     {
         const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
         ncnn::VkTransfer command(device);
@@ -4904,8 +5329,8 @@ bool QnkLinear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
                                                                                              input.dtype());
     const bool direct_host_output = implementation.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * implementation.output_columns * sizeof(float),
                                                                                               output.dtype());
-    if (!fill_staging_upload(input, transfer_slot.upload, transfer_slot.staging_allocator, runtime_state)
-        || !prepare_staging_batch(transfer_slot.download, input.rows(), implementation.output_columns, transfer_slot.staging_allocator, runtime_state))
+    if (!fill_staging_upload(input, transfer_slot.upload, transfer_slot.staging_allocator)
+        || !prepare_staging_batch(transfer_slot.download, input.rows(), implementation.output_columns, transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -4923,12 +5348,12 @@ bool QnkLinear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;
     if (direct_host_input)
-        input_gpu = bind_direct_host_input(transfer_slot.upload, runtime_state);
+        input_gpu = bind_direct_host_input(transfer_slot.upload);
     else if (!record_mapped_upload(transfer_slot.upload, input_gpu, command, implementation.option))
         return false;
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        output_gpu = prepare_direct_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(implementation.output_columns), static_cast<int>(input.rows()), sizeof(float), implementation.vulkan_context->blob_allocator());
     if (output_gpu.empty())
@@ -4960,7 +5385,7 @@ bool QnkLinear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
                                                          implementation.vulkan_context->device(),
                                                          implementation.option,
                                                          output_dtype))
-        || submit_compute_and_wait(command, runtime_state) != 0
+        || submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
         return false;
@@ -5237,13 +5662,11 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
                                total_rows,
                                input_columns,
                                transfer_slot.staging_allocator,
-                               runtime_state,
                                sizeof(float))
         || !prepare_staging_batch(transfer_slot.download,
                                   total_rows,
                                   output_columns,
                                   transfer_slot.staging_allocator,
-                                  runtime_state,
                                   sizeof(float)))
     {
         return false;
@@ -5296,6 +5719,12 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
     if (output_gpu.empty())
         return false;
 
+    const size_t descriptor_alignment = std::max<size_t>(4, first_expert.vulkan_context->device()->info.buffer_offset_alignment());
+    const bool align_output_rows = experts.size() > 1
+                                   && (static_cast<size_t>(output_columns) * output_gpu.elemsize) % descriptor_alignment != 0;
+    std::vector<ncnn::VkMat> aligned_inputs;
+    aligned_inputs.reserve(experts.size());
+    std::vector<ncnn::VkMat> aligned_outputs(align_output_rows ? experts.size() : 0);
     std::vector<ncnn::VkMat> intermediates;
     intermediates.reserve(experts.size() * 2);
     std::vector<ncnn::VkMat> bindings(4);
@@ -5307,10 +5736,18 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
         const QnkLinear_vulkan::Implementation& gate = *expert.gate_up->d;
         const QnkLinear_vulkan::Implementation& down = *expert.down->d;
         const size_t rows = inputs[index]->rows();
-        ncnn::VkMat input_view = row_view(input_gpu, row_offset, rows);
+        ncnn::VkMat input_view = aligned_readonly_row_view(input_gpu, row_offset, rows, command, first_gate.option,
+                                                           first_expert.vulkan_context, aligned_inputs);
         ncnn::VkMat output_view = row_view(output_gpu, row_offset, rows);
         if (input_view.empty() || output_view.empty())
             return false;
+        if (align_output_rows)
+        {
+            aligned_outputs[index].create(output_view.w, output_view.h, output_view.elemsize,
+                                          first_expert.vulkan_context->blob_allocator());
+            output_view = aligned_outputs[index];
+            if (output_view.empty()) return false;
+        }
 
         ncnn::VkMat gate_up_gpu;
         gate_up_gpu.create(static_cast<int>(gate.output_columns),
@@ -5378,6 +5815,11 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
         down_dispatcher.h = static_cast<int>(rows);
         down_dispatcher.c = 1;
         command.record_pipeline(down.pipeline.get(), bindings, constants, down_dispatcher);
+        if (align_output_rows)
+        {
+            ncnn::VkMat destination = row_view(output_gpu, row_offset, rows);
+            if (!record_output_row_copy(output_view, destination, command, first_gate.option)) return false;
+        }
         row_offset += rows;
     }
 
@@ -5389,7 +5831,7 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
                                                      first_expert.vulkan_context->device(),
                                                      first_down.option,
                                                      output_dtype)
-        || submit_compute_and_wait(command, runtime_state) != 0
+        || submit_compute_and_wait(command, first_expert.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batches(transfer_slot.download,
                                         inputs,
                                         outputs,
@@ -5441,12 +5883,11 @@ bool QnkExpert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
                                                                                              input.dtype());
     const bool direct_host_output = implementation.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * down.output_columns * sizeof(float),
                                                                                               output.dtype());
-    if (!fill_staging_upload(input, transfer_slot.upload, transfer_slot.staging_allocator, runtime_state)
+    if (!fill_staging_upload(input, transfer_slot.upload, transfer_slot.staging_allocator)
         || !prepare_staging_batch(transfer_slot.download,
                                   input.rows(),
                                   down.output_columns,
-                                  transfer_slot.staging_allocator,
-                                  runtime_state))
+                                  transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -5465,7 +5906,7 @@ bool QnkExpert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
 
     ncnn::VkMat input_gpu;
     if (direct_host_input)
-        input_gpu = bind_direct_host_input(transfer_slot.upload, runtime_state);
+        input_gpu = bind_direct_host_input(transfer_slot.upload);
     else if (!record_mapped_upload(transfer_slot.upload, input_gpu, command, gate.option))
         return false;
 
@@ -5482,7 +5923,7 @@ bool QnkExpert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
     ncnn::VkMat output_gpu;
     if (direct_host_output)
     {
-        output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        output_gpu = prepare_direct_host_output(transfer_slot.download);
     }
     else
     {
@@ -5560,7 +6001,7 @@ bool QnkExpert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
                                                          implementation.vulkan_context->device(),
                                                          down.option,
                                                          output_dtype))
-        || submit_compute_and_wait(command, runtime_state) != 0
+        || submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
         return false;
@@ -5582,6 +6023,7 @@ class Mxfp4Expert_vulkan::Implementation
 public:
 #if NCNN_MOE_WITH_VULKAN
     std::shared_ptr<ncnn::Pipeline> gate_up_pipeline;
+    std::shared_ptr<ncnn::Pipeline> row_tile_pipeline;
 #endif
     std::shared_ptr<Mxfp4Linear_vulkan> gate_up;
     std::shared_ptr<Mxfp4Linear_vulkan> down;
@@ -5614,11 +6056,77 @@ static bool create_mxfp4_gate_up_pipeline(const std::shared_ptr<VulkanContext>& 
     {
         return false;
     }
-    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context](ncnn::Pipeline* value) {
-        const std::lock_guard<std::mutex> lock(context->command_mutex());
-        delete value;
+    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context = context](ncnn::Pipeline* value) mutable {
+        {
+            const std::lock_guard<std::mutex> lock(context->command_mutex());
+            delete value;
+        }
+        // Weak cache entries retain the deleter control block after disposal.
+        context.reset();
     });
     context->cache_pipeline(mxfp4_gate_up_shader, pipeline_key, destination);
+    return true;
+}
+
+static bool create_mxfp4_row_tile_pipeline(const std::shared_ptr<VulkanContext>& context, const ncnn::Option& option,
+                                           std::shared_ptr<ncnn::Pipeline>& destination)
+{
+    const std::shared_ptr<const std::vector<uint32_t>> spirv = context->shader_binary(mxfp4_row_tile_shader,
+                                                                                      static_cast<int>(sizeof(mxfp4_row_tile_shader) - 1),
+                                                                                      option,
+                                                                                      0);
+    if (!spirv || spirv->empty())
+        return false;
+    ncnn::VulkanDevice* device = context->device();
+    const size_t pipeline_key = option.use_subgroup_ops ? 1u : 0u;
+    destination = context->find_pipeline(mxfp4_row_tile_shader, pipeline_key);
+    if (destination)
+    {
+        return true;
+    }
+    std::unique_ptr<ncnn::Pipeline> pipeline(new ncnn::Pipeline(device));
+    pipeline->set_optimal_local_size_xyz(32, 1, 1);
+    const std::vector<ncnn::vk_specialization_type> specializations;
+    if (pipeline->create(spirv->data(), spirv->size() * sizeof(uint32_t), specializations) != 0)
+    {
+        return false;
+    }
+    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context = context](ncnn::Pipeline* value) mutable {
+        {
+            const std::lock_guard<std::mutex> lock(context->command_mutex());
+            delete value;
+        }
+        // Weak cache entries retain the deleter control block after disposal.
+        context.reset();
+    });
+    context->cache_pipeline(mxfp4_row_tile_shader, pipeline_key, destination);
+    return true;
+}
+
+static bool create_expert_gather_pipeline(const std::shared_ptr<VulkanContext>& context,
+                                          const ncnn::Option& opt,
+                                          std::shared_ptr<ncnn::Pipeline>& destination)
+{
+    const auto spirv = context->shader_binary(expert_gather_shader, static_cast<int>(sizeof(expert_gather_shader) - 1), opt, 0);
+    if (!spirv || spirv->empty())
+        return false;
+    destination = context->find_pipeline(expert_gather_shader, 0);
+    if (destination)
+        return true;
+    std::unique_ptr<ncnn::Pipeline> pipeline(new ncnn::Pipeline(context->device()));
+    pipeline->set_local_size_xyz(128, 1, 1);
+    const std::vector<ncnn::vk_specialization_type> specializations;
+    if (pipeline->create(spirv->data(), spirv->size() * sizeof(uint32_t), specializations) != 0)
+        return false;
+    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context = context](ncnn::Pipeline* value) mutable {
+        {
+            const std::lock_guard<std::mutex> lock(context->command_mutex());
+            delete value;
+        }
+        // Weak cache entries retain the deleter control block after disposal.
+        context.reset();
+    });
+    context->cache_pipeline(expert_gather_shader, 0, destination);
     return true;
 }
 
@@ -5643,9 +6151,13 @@ static bool create_mxfp4_route_aggregation_pipeline(const std::shared_ptr<Vulkan
     const std::vector<ncnn::vk_specialization_type> specializations;
     if (pipeline->create(spirv->data(), spirv->size() * sizeof(uint32_t), specializations) != 0)
         return false;
-    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context](ncnn::Pipeline* value) {
-        const std::lock_guard<std::mutex> lock(context->command_mutex());
-        delete value;
+    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context = context](ncnn::Pipeline* value) mutable {
+        {
+            const std::lock_guard<std::mutex> lock(context->command_mutex());
+            delete value;
+        }
+        // Weak cache entries retain the deleter control block after disposal.
+        context.reset();
     });
     context->cache_pipeline(mxfp4_route_aggregation_shader, 0, destination);
     return true;
@@ -5681,9 +6193,13 @@ static bool create_mxfp4_indexed_pipeline(const std::shared_ptr<VulkanContext>& 
         return false;
     }
     destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(),
-                                                  [context](ncnn::Pipeline* value) {
-                                                      const std::lock_guard<std::mutex> lock(context->command_mutex());
-                                                      delete value;
+                                                  [context = context](ncnn::Pipeline* value) mutable {
+                                                      {
+                                                          const std::lock_guard<std::mutex> lock(context->command_mutex());
+                                                          delete value;
+                                                      }
+                                                      // Weak cache entries retain the deleter control block after disposal.
+                                                      context.reset();
                                                   });
     context->cache_pipeline(mxfp4_indexed_shader, pipeline_key, destination);
     return true;
@@ -5753,6 +6269,8 @@ std::shared_ptr<Mxfp4Expert_vulkan> Mxfp4Expert_vulkan::create_with_allocator(co
     }
 
     std::shared_ptr<Mxfp4Expert_vulkan> result(new Mxfp4Expert_vulkan);
+    if (upload_batch)
+        upload_batch->retain_owner(result);
     Implementation& implementation = *result->d;
     implementation.gate_up = std::move(gate_up_projection);
     implementation.down = std::move(down_projection);
@@ -5761,13 +6279,17 @@ std::shared_ptr<Mxfp4Expert_vulkan> Mxfp4Expert_vulkan::create_with_allocator(co
     Mxfp4Linear_vulkan::Implementation& gate_implementation = *implementation.gate_up->d;
     if (upload_batch)
     {
-        if (!create_mxfp4_gate_up_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.gate_up_pipeline))
+        if (!create_mxfp4_gate_up_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.gate_up_pipeline)
+            || (has_flag(optimization_flags, OptimizationVulkanMxfp4RowTile)
+                && !create_mxfp4_row_tile_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.row_tile_pipeline)))
             return {};
     }
     else
     {
         const std::lock_guard<std::mutex> lock(gate_implementation.vulkan_context->command_mutex());
-        if (!create_mxfp4_gate_up_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.gate_up_pipeline))
+        if (!create_mxfp4_gate_up_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.gate_up_pipeline)
+            || (has_flag(optimization_flags, OptimizationVulkanMxfp4RowTile)
+                && !create_mxfp4_row_tile_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.row_tile_pipeline)))
         {
             return {};
         }
@@ -5933,7 +6455,9 @@ std::shared_ptr<Mxfp4Expert_vulkan> Mxfp4Expert_vulkan::create_from_device_stora
     auto& gate_implementation = *implementation.gate_up->d;
     {
         const std::lock_guard<std::mutex> lock(gate_implementation.vulkan_context->command_mutex());
-        if (!create_mxfp4_gate_up_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.gate_up_pipeline))
+        if (!create_mxfp4_gate_up_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.gate_up_pipeline)
+            || (has_flag(optimization_flags, OptimizationVulkanMxfp4RowTile)
+                && !create_mxfp4_row_tile_pipeline(gate_implementation.vulkan_context, gate_implementation.option, implementation.row_tile_pipeline)))
         {
             return {};
         }
@@ -5979,8 +6503,8 @@ bool Mxfp4Expert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer
 
     VulkanTransferLease transfer_lease = gate.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
-    if (!fill_staging_upload(input, transfer_slot.upload, transfer_slot.staging_allocator, runtime_state)
-        || !prepare_staging_batch(transfer_slot.download, input.rows(), down.output_columns, transfer_slot.staging_allocator, runtime_state))
+    if (!fill_staging_upload(input, transfer_slot.upload, transfer_slot.staging_allocator)
+        || !prepare_staging_batch(transfer_slot.download, input.rows(), down.output_columns, transfer_slot.staging_allocator))
     {
         return false;
     }
@@ -6018,7 +6542,7 @@ bool Mxfp4Expert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer
                                                      gate.vulkan_context->device(),
                                                      down.option,
                                                      output_dtype)
-        || submit_compute_and_wait(command, runtime_state) != 0 || !copy_staging_to_cpu_batch(transfer_slot.download, output))
+        || submit_compute_and_wait(command, gate.vulkan_context->device()) != 0 || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
         return false;
     }
@@ -6045,6 +6569,37 @@ void Mxfp4Expert_vulkan::record(const ncnn::VkMat& input,
     const Mxfp4Linear_vulkan::Implementation& down = *implementation.down->d;
     const uint32_t intermediate_columns = gate.output_columns / 2;
     const uint32_t rows = static_cast<uint32_t>(input.h);
+
+    // Four-row register reuse amortizes its extra registers on larger
+    // prefill batches. Keep short prompts on the scalar decode pipeline.
+    if (rows >= 16 && implementation.row_tile_pipeline)
+    {
+        std::vector<ncnn::VkMat> bindings{input, gate.packed, gate.scales, gate.bias, intermediate};
+        std::vector<ncnn::vk_constant_type> constants(7);
+        constants[0].u32 = gate.input_columns;
+        constants[1].u32 = intermediate_columns;
+        constants[2].u32 = gate.block_count;
+        constants[3].u32 = rows;
+        constants[4].u32 = 0;
+        constants[5].u32 = implementation.activation == ExpertActivation::Silu
+                               ? 2
+                           : implementation.activation == ExpertActivation::DeepSeekSwiGlu ? 1
+                                                                                           : 0;
+        constants[6].f = implementation.activation_limit;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = static_cast<int>(intermediate_columns * 32);
+        dispatcher.h = static_cast<int>((rows + 3) / 4);
+        dispatcher.c = 1;
+        cmd.record_pipeline(implementation.row_tile_pipeline.get(), bindings, constants, dispatcher);
+        bindings = {intermediate, down.packed, down.scales, down.bias, output};
+        constants[0].u32 = down.input_columns;
+        constants[1].u32 = down.output_columns;
+        constants[2].u32 = down.block_count;
+        constants[4].u32 = 1;
+        dispatcher.w = static_cast<int>(down.output_columns * 32);
+        cmd.record_pipeline(implementation.row_tile_pipeline.get(), bindings, constants, dispatcher);
+        return;
+    }
 
     std::vector<ncnn::VkMat> bindings(5);
     bindings[0] = input;
@@ -6118,6 +6673,8 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
     }
 
     VulkanRuntimeState& runtime_state = first_gate.vulkan_context->runtime_state();
+    bool retain_output = false;
+    bool download_output = false;
     size_t total_rows = 0;
     size_t maximum_request_rows = 0;
     for (const Selection& selection : selected)
@@ -6134,14 +6691,12 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
             return false;
         const auto& gate = *expert.gate_up->d;
         const auto& down = *expert.down->d;
-        if (!request.input || !request.output || request.input->rows() == 0
-            || request.input->dtype() != DType::Float32 || request.input->columns() != input_columns
-            || request.input->bytes().size() != request.input->rows() * static_cast<size_t>(input_columns) * sizeof(float)
+        if (!request.output || request.rows() == 0 || request.columns() != input_columns
             || gate.vulkan_context != first_gate.vulkan_context || down.vulkan_context != first_gate.vulkan_context
             || gate.input_columns != input_columns
             || gate.output_columns % 2 != 0 || down.input_columns != gate.output_columns / 2
             || down.output_columns != output_columns
-            || request.input->rows() > static_cast<size_t>(std::numeric_limits<int>::max()) - total_rows)
+            || request.rows() > static_cast<size_t>(std::numeric_limits<int>::max()) - total_rows)
         {
             return false;
         }
@@ -6164,10 +6719,12 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
             }
             else
             {
-                maximum_request_rows = std::max(maximum_request_rows, request.input->rows());
+                maximum_request_rows = std::max(maximum_request_rows, request.rows());
             }
         }
-        total_rows += request.input->rows();
+        retain_output = retain_output || request.device_output != nullptr;
+        download_output = download_output || request.device_output == nullptr;
+        total_rows += request.rows();
     }
     bool use_tiled_indexed = false;
     size_t indexed_chunk_count = 0;
@@ -6217,12 +6774,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
 
     ActivationBuffer* aggregated_output = nullptr;
     uint32_t aggregated_token_count = 0;
-    const bool use_route_aggregation = route_aggregation_enabled(requests,
-                                                                 selected,
-                                                                 output_columns,
-                                                                 aggregated_output,
-                                                                 aggregated_token_count,
-                                                                 optimization_flags);
+    const bool use_route_aggregation = !retain_output && route_aggregation_enabled(requests, selected, output_columns, aggregated_output, aggregated_token_count, optimization_flags);
     std::vector<uint32_t> route_offsets;
     std::vector<uint32_t> route_rows;
     std::vector<float> route_weights;
@@ -6236,24 +6788,71 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
         return false;
     }
 
+    const std::shared_ptr<const DeviceTensor_vulkan> retained_input = requests[selected.front().request_index].device_input;
+    const ncnn::VkMat* retained_value = retained_input ? retained_input->value() : nullptr;
+    const uint32_t input_pack = retained_value ? static_cast<uint32_t>(retained_value->elempack) : 0;
+    const uint64_t input_rows_available = retained_value && retained_value->h > 0
+                                              ? static_cast<uint64_t>(retained_value->h) * input_pack
+                                              : 0;
+    bool use_device_input = retained_value && retained_input->vulkan_context() == first_gate.vulkan_context
+                            && retained_value->dims == 2 && retained_value->w == static_cast<int>(input_columns)
+                            && (input_pack == 1 || input_pack == 4) && retained_value->elemsize == sizeof(float) * input_pack
+                            && retained_input->columns() == input_columns && retained_input->rows() == input_rows_available;
+    std::vector<uint32_t> input_rows;
+    if (use_device_input)
+    {
+        input_rows.reserve(total_rows);
+        for (const Selection& selection : selected)
+        {
+            const ExpertBackendRequest& request = requests[selection.request_index];
+            if (request.device_input != retained_input || request.device_routes.size() != request.rows())
+            {
+                use_device_input = false;
+                break;
+            }
+            for (const ExpertRoute& route : request.device_routes)
+            {
+                if (route.token_index >= input_rows_available)
+                {
+                    use_device_input = false;
+                    break;
+                }
+                input_rows.push_back(route.token_index);
+            }
+            if (!use_device_input)
+                break;
+        }
+        if (use_device_input && !input_gather_pipeline)
+        {
+            const std::lock_guard<std::mutex> lock(first_gate.vulkan_context->command_mutex());
+            use_device_input = create_expert_gather_pipeline(first_gate.vulkan_context, first_gate.option, input_gather_pipeline);
+        }
+    }
+
+    // A foreign or malformed device tensor may still use a complete Host
+    // input. Device-only requests fail safely so the executor can gather on
+    // its actual CPU fallback path instead of every successful GPU request.
+    if (!use_device_input)
+        for (const Selection& selection : selected)
+            if (!requests[selection.request_index].has_host_input()) return false;
+
     VulkanTransferLease transfer_lease = first_gate.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
-    if (!prepare_staging_batch(transfer_slot.upload,
-                               total_rows,
-                               input_columns,
-                               transfer_slot.staging_allocator,
-                               runtime_state,
-                               sizeof(float)))
+    ncnn::VkMat input_rows_staging;
+    if (use_device_input)
+    {
+        if (!fill_staging_values(input_rows.data(), input_rows.size(), sizeof(uint32_t), input_rows_staging,
+                                 transfer_slot.staging_allocator))
+            return false;
+    }
+    if (!use_device_input && !prepare_staging_batch(transfer_slot.upload, total_rows, input_columns, transfer_slot.staging_allocator, sizeof(float)))
     {
         return false;
     }
-    ncnn::Mat mapped_input = transfer_slot.upload.mapped();
-    if (mapped_input.empty()
-        || mapped_input.dims != 2
-        || mapped_input.w != static_cast<int>(input_columns)
-        || mapped_input.h != static_cast<int>(total_rows)
-        || mapped_input.elemsize != sizeof(float)
-        || mapped_input.elempack != 1)
+    ncnn::Mat mapped_input;
+    if (!use_device_input)
+        mapped_input = transfer_slot.upload.mapped();
+    if (!use_device_input && (mapped_input.empty() || mapped_input.dims != 2 || mapped_input.w != static_cast<int>(input_columns) || mapped_input.h != static_cast<int>(total_rows) || mapped_input.elemsize != sizeof(float) || mapped_input.elempack != 1))
     {
         return false;
     }
@@ -6263,37 +6862,40 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
     for (size_t slot = 0; slot < selected.size(); ++slot)
     {
         const ExpertBackendRequest& request = requests[selected[slot].request_index];
-        const ActivationBuffer& input = *request.input;
         if (use_indexed)
             expert_row_offsets[slot] = static_cast<uint32_t>(row_offset);
-        std::memcpy(mapped_input_data + row_offset * static_cast<size_t>(input_columns) * sizeof(float),
-                    input.bytes().data(),
-                    input.bytes().size());
+        if (!use_device_input)
+        {
+            const ActivationBuffer& input = *request.input;
+            std::memcpy(mapped_input_data + row_offset * static_cast<size_t>(input_columns) * sizeof(float),
+                        input.bytes().data(), input.bytes().size());
+        }
         if (use_indexed)
         {
             std::fill(row_slots.begin() + static_cast<std::ptrdiff_t>(row_offset),
-                      row_slots.begin() + static_cast<std::ptrdiff_t>(row_offset + input.rows()),
+                      row_slots.begin() + static_cast<std::ptrdiff_t>(row_offset + request.rows()),
                       static_cast<uint32_t>(slot));
         }
-        row_offset += input.rows();
+        row_offset += request.rows();
     }
     if (use_indexed)
         expert_row_offsets[selected.size()] = static_cast<uint32_t>(row_offset);
-    transfer_slot.upload.allocator->flush(transfer_slot.upload.data);
-    transfer_slot.upload.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
-    transfer_slot.upload.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
+    if (!use_device_input)
+    {
+        transfer_slot.upload.allocator->flush(transfer_slot.upload.data);
+        transfer_slot.upload.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
+        transfer_slot.upload.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
+    }
 
-    const bool direct_host_input = first_gate.vulkan_context->support_direct_host_buffer(total_rows * input_columns * sizeof(float),
-                                                                                         DType::Float32);
-    const bool direct_host_output = !use_route_aggregation
+    const size_t descriptor_alignment = std::max<size_t>(4, first_gate.vulkan_context->device()->info.buffer_offset_alignment());
+    const bool align_output_rows = selected.size() > 1
+                                   && (static_cast<size_t>(output_columns) * sizeof(float)) % descriptor_alignment != 0;
+    const bool direct_host_input = !use_device_input && first_gate.vulkan_context->support_direct_host_buffer(total_rows * input_columns * sizeof(float), DType::Float32);
+    const bool direct_host_output = download_output && !retain_output && !use_route_aggregation && !align_output_rows
                                     && first_gate.vulkan_context->support_direct_host_buffer(total_rows * output_columns * sizeof(float),
                                                                                              DType::Float32);
     const size_t download_rows = use_route_aggregation ? aggregated_token_count : total_rows;
-    if (!prepare_staging_batch(transfer_slot.download,
-                               download_rows,
-                               output_columns,
-                               transfer_slot.staging_allocator,
-                               runtime_state))
+    if ((download_output || use_route_aggregation) && !prepare_staging_batch(transfer_slot.download, download_rows, output_columns, transfer_slot.staging_allocator))
         return false;
 
     if (use_indexed)
@@ -6302,16 +6904,14 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
                                  row_slots.size(),
                                  sizeof(uint32_t),
                                  transfer_slot.expert_slots,
-                                 transfer_slot.staging_allocator,
-                                 runtime_state))
+                                 transfer_slot.staging_allocator))
             return false;
         if (use_tiled_indexed
             && !fill_staging_values(expert_row_offsets.data(),
                                     expert_row_offsets.size(),
                                     sizeof(uint32_t),
                                     transfer_slot.expert_row_offsets,
-                                    transfer_slot.staging_allocator,
-                                    runtime_state))
+                                    transfer_slot.staging_allocator))
             return false;
     }
 
@@ -6321,28 +6921,25 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
                                  route_offsets.size(),
                                  sizeof(uint32_t),
                                  transfer_slot.route_offsets,
-                                 transfer_slot.staging_allocator,
-                                 runtime_state)
+                                 transfer_slot.staging_allocator)
             || !fill_staging_values(route_rows.data(),
                                     route_rows.size(),
                                     sizeof(uint32_t),
                                     transfer_slot.route_rows,
-                                    transfer_slot.staging_allocator,
-                                    runtime_state)
+                                    transfer_slot.staging_allocator)
             || !fill_staging_values(route_weights.data(),
                                     route_weights.size(),
                                     sizeof(float),
                                     transfer_slot.route_weights,
-                                    transfer_slot.staging_allocator,
-                                    runtime_state))
+                                    transfer_slot.staging_allocator))
             return false;
     }
 
-    const bool use_direct_output = !use_route_aggregation && selected.size() == 1;
+    const bool use_direct_output = download_output && !use_route_aggregation && selected.size() == 1;
     ActivationBuffer combined_output;
     // A single request already owns a private output until Submission::commit().
     ActivationBuffer& host_output = use_direct_output ? *requests[selected.front().request_index].output : combined_output;
-    if (!use_route_aggregation && !use_direct_output)
+    if (download_output && !use_route_aggregation && !use_direct_output)
         host_output.reset(total_rows, output_columns, false);
 
     std::unique_lock<std::mutex> lock(first_gate.vulkan_context->command_mutex());
@@ -6356,8 +6953,27 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
     transfer_slot.command_used = true;
 
     ncnn::VkMat input_gpu;
-    if (direct_host_input)
-        input_gpu = bind_direct_host_input(transfer_slot.upload, runtime_state);
+    ncnn::VkMat input_rows_gpu;
+    if (use_device_input)
+    {
+        retained_input->prepare_read();
+        if (!record_mapped_upload(input_rows_staging, input_rows_gpu, command, first_gate.option))
+            return false;
+        input_gpu.create(static_cast<int>(input_columns), static_cast<int>(total_rows), sizeof(float), first_gate.vulkan_context->blob_allocator());
+        if (input_gpu.empty())
+            return false;
+        std::vector<ncnn::vk_constant_type> constants(3);
+        constants[0].u32 = input_columns;
+        constants[1].u32 = static_cast<uint32_t>(total_rows);
+        constants[2].u32 = input_pack;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = static_cast<int>(input_columns);
+        dispatcher.h = static_cast<int>(std::min(total_rows, size_t(65535)));
+        dispatcher.c = static_cast<int>((total_rows + 65534) / 65535);
+        command.record_pipeline_readonly(input_gather_pipeline.get(), {*retained_value, input_rows_gpu, input_gpu}, {1, 1, 0}, constants, dispatcher);
+    }
+    else if (direct_host_input)
+        input_gpu = bind_direct_host_input(transfer_slot.upload);
     else if (!record_mapped_upload(transfer_slot.upload, input_gpu, command, first_gate.option))
     {
         return false;
@@ -6365,7 +6981,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
 
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download, runtime_state);
+        output_gpu = prepare_direct_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(output_columns),
                           static_cast<int>(total_rows),
@@ -6378,6 +6994,9 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
     ncnn::VkMat expert_row_offsets_gpu;
     ncnn::VkMat intermediate_gpu;
     std::vector<ncnn::VkMat> intermediates;
+    std::vector<ncnn::VkMat> aligned_inputs;
+    aligned_inputs.reserve(selected.size());
+    std::vector<ncnn::VkMat> aligned_outputs(align_output_rows ? selected.size() : 0);
     if (use_indexed)
     {
         if (!record_mapped_upload(transfer_slot.expert_slots,
@@ -6443,7 +7062,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
             {
                 const size_t request_index = selected[slot].request_index;
                 chunk_maximum_request_rows = std::max(chunk_maximum_request_rows,
-                                                      static_cast<uint32_t>(requests[request_index].input->rows()));
+                                                      static_cast<uint32_t>(requests[request_index].rows()));
             }
             const uint32_t chunk_tile_mode = use_tiled_indexed && chunk_maximum_request_rows >= 2 ? 1u : 0u;
 
@@ -6505,27 +7124,59 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
     {
         intermediates.reserve(selected.size());
         row_offset = 0;
-        for (const Selection& selection : selected)
+        for (size_t selected_slot = 0; selected_slot < selected.size(); ++selected_slot)
         {
+            const Selection& selection = selected[selected_slot];
             const ExpertBackendRequest& request = requests[selection.request_index];
             const auto& expert = *selection.entry->operation->d;
             const auto& gate = *expert.gate_up->d;
             const uint32_t intermediate_columns = gate.output_columns / 2;
-            ncnn::VkMat input_view = row_view(input_gpu, row_offset, request.input->rows());
-            ncnn::VkMat output_view = row_view(output_gpu, row_offset, request.input->rows());
+            ncnn::VkMat input_view = aligned_readonly_row_view(input_gpu, row_offset, request.rows(), command, first_gate.option,
+                                                               first_gate.vulkan_context, aligned_inputs);
+            ncnn::VkMat output_view = row_view(output_gpu, row_offset, request.rows());
             if (input_view.empty() || output_view.empty())
             {
                 return false;
             }
+            if (align_output_rows)
+            {
+                // Every output in this batch uses the same transfer-write
+                // assembly path, preserving shared buffer access tracking.
+                aligned_outputs[selected_slot].create(output_view.w, output_view.h, sizeof(float),
+                                                      first_gate.vulkan_context->blob_allocator());
+                output_view = aligned_outputs[selected_slot];
+                if (output_view.empty()) return false;
+            }
             ncnn::VkMat& intermediate = intermediates.emplace_back();
             intermediate.create(static_cast<int>(intermediate_columns),
-                                static_cast<int>(request.input->rows()),
+                                static_cast<int>(request.rows()),
                                 sizeof(float),
                                 first_gate.vulkan_context->blob_allocator());
             if (intermediate.empty())
                 return false;
             selection.entry->operation->record(input_view, intermediate, output_view, command);
-            row_offset += request.input->rows();
+            if (align_output_rows)
+            {
+                ncnn::VkMat destination = row_view(output_gpu, row_offset, request.rows());
+                if (!record_output_row_copy(output_view, destination, command, first_gate.option)) return false;
+            }
+            row_offset += request.rows();
+        }
+    }
+
+    if (align_output_rows && retain_output && use_indexed)
+    {
+        row_offset = 0;
+        for (size_t selected_slot = 0; selected_slot < selected.size(); ++selected_slot)
+        {
+            const auto& request = requests[selected[selected_slot].request_index];
+            if (request.device_output)
+            {
+                ncnn::VkMat source = row_view(output_gpu, row_offset, request.rows());
+                command.record_clone(source, aligned_outputs[selected_slot], first_gate.option);
+                if (aligned_outputs[selected_slot].empty()) return false;
+            }
+            row_offset += request.rows();
         }
     }
 
@@ -6589,7 +7240,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
                                                          first_down.vulkan_context->device(),
                                                          first_down.option,
                                                          aggregated_output->dtype())
-            || submit_compute_and_wait(command, runtime_state) != 0
+            || submit_compute_and_wait(command, first_gate.vulkan_context->device()) != 0
             || !copy_staging_to_cpu_batch(transfer_slot.download, *aggregated_output))
         {
             return false;
@@ -6597,7 +7248,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
     }
     else
     {
-        if (!direct_host_output
+        if (download_output && !direct_host_output
             && !record_prepared_activation_staging_download(output_gpu,
                                                             total_rows,
                                                             output_columns,
@@ -6609,13 +7260,41 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
         {
             return false;
         }
-        if (submit_compute_and_wait(command, runtime_state) != 0)
+        if (submit_compute_and_wait(command, first_gate.vulkan_context->device()) != 0)
             return false;
         if (use_direct_output)
             host_output.reset(total_rows, output_columns, false);
-        if (!copy_staging_to_cpu_batch(transfer_slot.download, host_output))
+        if (download_output && !copy_staging_to_cpu_batch(transfer_slot.download, host_output))
             return false;
     }
+    if (retain_output)
+    {
+        row_offset = 0;
+        for (size_t selected_slot = 0; selected_slot < selected.size(); ++selected_slot)
+        {
+            const auto& request = requests[selected[selected_slot].request_index];
+            if (request.device_output)
+            {
+                auto completed = std::make_shared<DeviceTensor_vulkan>();
+                const ncnn::VkMat value = align_output_rows ? aligned_outputs[selected_slot]
+                                                            : row_view(output_gpu, row_offset, request.rows());
+                if (!completed->assign_completed(value, first_gate.vulkan_context)) return false;
+                *request.device_output = std::move(completed);
+            }
+            row_offset += request.rows();
+        }
+    }
+    // VkBlobAllocator is shared and has no internal lock. Release every
+    // temporary GPU owner before leaving the command/allocator lock.
+    aligned_outputs.clear();
+    aligned_inputs.clear();
+    intermediates.clear();
+    intermediate_gpu.release();
+    expert_row_offsets_gpu.release();
+    expert_ids_gpu.release();
+    output_gpu.release();
+    input_rows_gpu.release();
+    input_gpu.release();
     lock.unlock();
 
     if (use_route_aggregation)
@@ -6627,29 +7306,36 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
                 *request.route_aggregation.completed = 1;
         }
     }
-    else if (!use_direct_output)
+    else if (download_output && !use_direct_output)
     {
         row_offset = 0;
         for (const Selection& selection : selected)
         {
             const ExpertBackendRequest& request = requests[selection.request_index];
-            request.output->reset(request.input->rows(), output_columns, false);
-            for (size_t row = 0; row < request.input->rows(); ++row)
+            if (request.device_output)
+            {
+                row_offset += request.rows();
+                continue;
+            }
+            request.output->reset(request.rows(), output_columns, false);
+            for (size_t row = 0; row < request.rows(); ++row)
             {
                 std::copy_n(combined_output.row(row_offset + row),
                             output_columns,
                             request.output->row(row));
             }
-            row_offset += request.input->rows();
+            row_offset += request.rows();
         }
     }
     const uint64_t projection_dispatches = use_indexed
                                                ? static_cast<uint64_t>(indexed_chunk_count) * 2
                                                : static_cast<uint64_t>(selected.size()) * 2;
-    runtime_state.dispatches += projection_dispatches + static_cast<uint64_t>(use_route_aggregation);
+    runtime_state.dispatches += projection_dispatches + static_cast<uint64_t>(use_route_aggregation) + static_cast<uint64_t>(use_device_input);
     ++runtime_state.compute_submissions;
-    ++runtime_state.batch_uploads;
-    ++runtime_state.batch_downloads;
+    if (!use_device_input)
+        ++runtime_state.batch_uploads;
+    if (download_output || use_route_aggregation)
+        ++runtime_state.batch_downloads;
     return true;
 }
 #endif

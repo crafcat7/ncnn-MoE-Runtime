@@ -1,0 +1,66 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer query_blob
+{ float query_data[]; };
+layout(binding = 1) readonly buffer window_blob
+{ float window_data[]; };
+layout(binding = 2) readonly buffer compressed_blob
+{ float compressed_data[]; };
+layout(binding = 3) readonly buffer index_blob
+{ uint index_data[]; };
+layout(binding = 4) writeonly buffer score_blob
+{ float scores[]; };
+layout(push_constant) uniform parameter
+{
+    uint dimension;
+    uint head_count;
+    uint rope_dimension;
+    uint row;
+    uint window_capacity;
+    uint window_first_slot;
+    uint window_count;
+    uint compressed_count;
+    uint selected;
+    float scale;
+}
+p;
+
+shared float reduction[128];
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint head = gl_WorkGroupID.z;
+    const uint candidate = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535;
+    const uint count = p.window_count + p.compressed_count;
+    if (candidate >= count || head >= p.head_count)
+        return;
+    const uint base = (p.row * p.head_count + head) * p.dimension;
+    const bool rolling = candidate < p.window_count;
+    const uint offset = rolling ? candidate : candidate - p.window_count;
+    const uint slot = rolling ? (p.window_first_slot + offset) % p.window_capacity
+                              : (p.selected != 0 ? index_data[offset] : offset);
+    const uint key_base = slot * p.dimension;
+    float partial = 0.0;
+    // Match the canonical per-candidate dot-product accumulation exactly.
+    for (uint part = 0; part < 4; ++part)
+    {
+        const uint column = lane + part * 128;
+        if (column < p.dimension)
+        {
+            const float key = rolling ? window_data[key_base + column] : compressed_data[key_base + column];
+            partial += query_data[base + column] * key;
+        }
+    }
+    reduction[lane] = partial;
+    barrier();
+    for (uint stride = 64; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+            reduction[lane] += reduction[lane + stride];
+        barrier();
+    }
+    if (lane == 0)
+        scores[head * count + candidate] = reduction[0] * p.scale;
+}

@@ -199,6 +199,10 @@ def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
         ("buffered_expert_io", "--buffered-expert-io"),
         ("disable_gpu_victim_execution", "--disable-gpu-victim-execution"),
         ("release_vulkan_dense_host", "--release-vulkan-dense-host"),
+        ("disable_vulkan_joint_cache_eviction", "--disable-vulkan-joint-cache-eviction"),
+        ("disable_vulkan_mxfp4_row_tile", "--disable-vulkan-mxfp4-row-tile"),
+        ("disable_vulkan_expert_direct_staging", "--disable-vulkan-expert-direct-staging"),
+        ("disable_vulkan_shared_expert_overlap", "--disable-vulkan-shared-expert-overlap"),
     ):
         if settings.get(key):
             args.append(option)
@@ -217,8 +221,13 @@ def merge_runtime_settings(
         for key, value in source.items():
             if value is not None:
                 result[key] = value
-    # Hybrid mode owns GPU Expert decode selection. Ignore the pre-release
-    # experimental setting so stale profiles do not preserve a dead option.
-    result.pop("gpu_decode_experts", None)
+    # Ignore removed experimental options in saved sessions/configs/profiles.
+    for key in (
+        "gpu_decode_experts",
+        "profiling",
+        "vulkan_expert_concurrent_commands",
+        "disable_vulkan_expert_concurrent_commands",
+    ):
+        result.pop(key, None)
     result.setdefault("backend", "auto")
     return result

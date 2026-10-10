@@ -52,6 +52,9 @@ public:
 private:
     friend class CommandGraph_vulkan;
     friend class Attention_vulkan;
+    friend class Router_vulkan;
+    friend class LatentAttention_vulkan;
+    friend class LayerHead_vulkan;
 
     // Records a device projection; the caller holds the Vulkan context lock.
     [[nodiscard]] int forward(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& cmd, const ncnn::Option& opt) const;
@@ -90,6 +93,21 @@ private:
     std::unique_ptr<Implementation> d;
 
     friend class CommandGraph_vulkan;
+    friend class VulkanExpertBackend;
+    friend class LatentLayer_vulkan;
+    friend class MoeCombine_vulkan;
+    friend class LatentLayerWorkspace_vulkan;
+    friend class Float8Linear_vulkan;
+    friend class LatentAttention_vulkan;
+    friend class LayerHead_vulkan;
+
+    // Wraps a completed unpacked FP32 device result without materializing it.
+    [[nodiscard]] bool assign_completed(const ncnn::VkMat& value,
+                                        std::shared_ptr<VulkanContext> context);
+    [[nodiscard]] const ncnn::VkMat* value() const noexcept;
+    // Re-arms a completed import; the caller holds the Vulkan context lock.
+    void prepare_read() const noexcept;
+    [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
 };
 
 class CommandGraph_vulkan
@@ -166,6 +184,8 @@ public:
 
 private:
     friend class Float8Linear_vulkan;
+    friend class LatentAttention_vulkan;
+    friend class LayerHead_vulkan;
     friend class GatedDeltaNet_vulkan;
     friend class Attention_vulkan;
     friend class Bfloat16Expert_vulkan;
@@ -261,12 +281,14 @@ public:
                                                        const Float8Linear_vulkan& next,
                                                        const Float8Linear_vulkan& parallel,
                                                        ActivationBuffer& output,
-                                                       ActivationBuffer& parallel_output) const;
+                                                       ActivationBuffer& parallel_output,
+                                                       DeviceTensor_vulkan* retained_output = nullptr) const;
     [[nodiscard]] bool forward_input_rms_norm_chain_parallel(const ActivationBuffer& input,
                                                              const Float8Linear_vulkan& next,
                                                              const Float8Linear_vulkan& parallel,
                                                              ActivationBuffer& output,
-                                                             ActivationBuffer& parallel_output) const;
+                                                             ActivationBuffer& parallel_output,
+                                                             DeviceTensor_vulkan* retained_output = nullptr) const;
     // Extends the FP8 Q/KV chain with one or more independent BF16
     // projections from the original (pre-FP8-quantized) input.  All
     // projections share one command submission; extra outputs are returned in
@@ -277,15 +299,48 @@ public:
                                                                 std::span<const Bfloat16Linear_vulkan*> extra_operators,
                                                                 std::span<ActivationBuffer*> extra_outputs,
                                                                 ActivationBuffer& output,
-                                                                ActivationBuffer& parallel_output) const;
+                                                                ActivationBuffer& parallel_output,
+                                                                DeviceTensor_vulkan* retained_output = nullptr) const;
     [[nodiscard]] bool forward_swiglu_chain(const ActivationBuffer& input,
                                             const Float8Linear_vulkan& up,
                                             const Float8Linear_vulkan& down,
                                             ExpertActivation activation,
                                             float activation_limit,
                                             ActivationBuffer& output) const;
+    // Keeps normalized input and the completed FP8 Shared Expert output on the device.
+    [[nodiscard]] bool forward_swiglu_chain_device(const DeviceTensor_vulkan& input,
+                                                   const Float8Linear_vulkan& up,
+                                                   const Float8Linear_vulkan& down,
+                                                   ExpertActivation activation,
+                                                   float activation_limit,
+                                                   DeviceTensor_vulkan& output) const;
+
+#if NCNN_MOE_WITH_VULKAN
+    // Internal recording bridge; caller owns the command and holds the context lock.
+    [[nodiscard]] bool record_input_normalization(const ncnn::VkMat& input,
+                                                  ncnn::VkMat& output,
+                                                  ncnn::VkCompute& cmd) const;
+    [[nodiscard]] bool record_rms_norm_chain_parallel(const ncnn::VkMat& input,
+                                                      const Float8Linear_vulkan& next,
+                                                      const Float8Linear_vulkan& parallel,
+                                                      ncnn::VkMat& query,
+                                                      ncnn::VkMat& kv,
+                                                      ncnn::VkMat& query_rank,
+                                                      ncnn::VkCompute& cmd,
+                                                      std::vector<ncnn::VkMat>& workspace) const;
+#endif
+
+    [[nodiscard]] bool materialize(const DeviceTensor_vulkan& input, ActivationBuffer& output) const;
 
 private:
+    friend class LatentAttention_vulkan;
+    friend class LayerHead_vulkan;
+    [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
+    [[nodiscard]] const ncnn::Option& option() const noexcept;
+    [[nodiscard]] uint32_t input_columns() const noexcept;
+    [[nodiscard]] uint32_t output_columns() const noexcept;
+    [[nodiscard]] bool record_forward(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace) const;
+
     class Implementation;
 
     [[nodiscard]] bool prepare_rms_norm_weight(const TensorData& weight,
@@ -297,7 +352,8 @@ private:
                                                             const Float8Linear_vulkan& parallel,
                                                             ActivationBuffer& output,
                                                             ActivationBuffer& parallel_output,
-                                                            bool normalize_input) const;
+                                                            bool normalize_input,
+                                                            DeviceTensor_vulkan* retained_output) const;
 
     Float8Linear_vulkan();
     std::unique_ptr<Implementation> d;

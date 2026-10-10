@@ -1,0 +1,38 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer branch_blob
+{ float branch_data[]; };
+layout(binding = 1) readonly buffer residual_blob
+{ float residual_data[]; };
+layout(binding = 2) readonly buffer post_blob
+{ float post_data[]; };
+layout(binding = 3) readonly buffer combine_blob
+{ float combine_data[]; };
+layout(binding = 4) writeonly buffer output_blob
+{ float output_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint hidden_size;
+    uint multiplier;
+}
+p;
+
+void main()
+{
+    const uint index = gl_GlobalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y;
+    if (index >= p.hidden_size * p.multiplier)
+        return;
+    const uint output_copy = index / p.hidden_size;
+    const uint column = index % p.hidden_size;
+    float value = branch_data[row * p.hidden_size + column] * post_data[row * p.multiplier + output_copy];
+    for (uint residual_copy = 0; residual_copy < p.multiplier; ++residual_copy)
+    {
+        // CPU/DeepSeek store combine[src, dst], not combine[dst, src].
+        const float coefficient = combine_data[(row * p.multiplier + residual_copy) * p.multiplier + output_copy];
+        value += residual_data[(row * p.multiplier + residual_copy) * p.hidden_size + column] * coefficient;
+    }
+    output_data[row * p.hidden_size * p.multiplier + index] = value;
+}

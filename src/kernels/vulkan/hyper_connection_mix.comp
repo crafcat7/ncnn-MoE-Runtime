@@ -1,0 +1,97 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer projection_blob
+{ float projection_data[]; };
+layout(binding = 1) readonly buffer scale_blob
+{ float scale_data[]; };
+layout(binding = 2) readonly buffer base_blob
+{ float base_data[]; };
+layout(binding = 3) writeonly buffer pre_blob
+{ float pre_data[]; };
+layout(binding = 4) writeonly buffer post_blob
+{ float post_data[]; };
+layout(binding = 5) writeonly buffer combine_blob
+{ float combine_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint multiplier;
+    uint iterations;
+    float epsilon;
+    uint head;
+}
+p;
+
+void main()
+{
+    // The at-most 8x8 Sinkhorn matrix stays in one invocation; each row of
+    // the activation batch has its own workgroup and independent coefficients.
+    if (gl_LocalInvocationID.x != 0)
+        return;
+    const uint row = gl_WorkGroupID.z;
+    const uint mix_columns = p.head != 0 ? p.multiplier : p.multiplier * (p.multiplier + 2);
+    const uint offset = row * mix_columns;
+    for (uint copy = 0; copy < p.multiplier; ++copy)
+    {
+        const float pre = projection_data[offset + copy] * scale_data[0] + base_data[copy];
+        pre_data[row * p.multiplier + copy] = 1.0 / (1.0 + exp(-pre)) + p.epsilon;
+        if (p.head == 0)
+        {
+            const float post = projection_data[offset + p.multiplier + copy] * scale_data[1] + base_data[p.multiplier + copy];
+            post_data[row * p.multiplier + copy] = 2.0 / (1.0 + exp(-post));
+        }
+    }
+    if (p.head != 0)
+        return;
+
+    float combine[64];
+    float sums[8];
+    for (uint output_copy = 0; output_copy < p.multiplier; ++output_copy)
+    {
+        float maximum = -3.402823466e+38;
+        for (uint residual_copy = 0; residual_copy < p.multiplier; ++residual_copy)
+        {
+            const uint index = output_copy * p.multiplier + residual_copy;
+            combine[index] = projection_data[offset + 2 * p.multiplier + index] * scale_data[2] + base_data[2 * p.multiplier + index];
+            maximum = max(maximum, combine[index]);
+        }
+        float sum = 0.0;
+        for (uint residual_copy = 0; residual_copy < p.multiplier; ++residual_copy)
+        {
+            const uint index = output_copy * p.multiplier + residual_copy;
+            combine[index] = exp(combine[index] - maximum);
+            sum += combine[index];
+        }
+        for (uint residual_copy = 0; residual_copy < p.multiplier; ++residual_copy)
+            combine[output_copy * p.multiplier + residual_copy] = combine[output_copy * p.multiplier + residual_copy] / sum + p.epsilon;
+    }
+    for (uint iteration = 0; iteration < p.iterations; ++iteration)
+    {
+        if (iteration != 0)
+        {
+            for (uint output_copy = 0; output_copy < p.multiplier; ++output_copy)
+            {
+                float sum = 0.0;
+                for (uint residual_copy = 0; residual_copy < p.multiplier; ++residual_copy)
+                    sum += combine[output_copy * p.multiplier + residual_copy];
+                sums[output_copy] = sum;
+            }
+            for (uint output_copy = 0; output_copy < p.multiplier; ++output_copy)
+                for (uint residual_copy = 0; residual_copy < p.multiplier; ++residual_copy)
+                    combine[output_copy * p.multiplier + residual_copy] /= sums[output_copy] + p.epsilon;
+        }
+        for (uint residual_copy = 0; residual_copy < p.multiplier; ++residual_copy)
+        {
+            float sum = 0.0;
+            for (uint output_copy = 0; output_copy < p.multiplier; ++output_copy)
+                sum += combine[output_copy * p.multiplier + residual_copy];
+            sums[residual_copy] = sum;
+        }
+        for (uint output_copy = 0; output_copy < p.multiplier; ++output_copy)
+            for (uint residual_copy = 0; residual_copy < p.multiplier; ++residual_copy)
+                combine[output_copy * p.multiplier + residual_copy] /= sums[residual_copy] + p.epsilon;
+    }
+    for (uint index = 0; index < p.multiplier * p.multiplier; ++index)
+        combine_data[row * p.multiplier * p.multiplier + index] = combine[index];
+}

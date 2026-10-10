@@ -7,12 +7,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 
 namespace ncnn {
 namespace moe {
 
+class DeviceTensor_vulkan;
 struct CompiledModel;
-struct ExpertExecutionMetrics;
 struct ExpertScratch;
 struct ExpertWorkspace;
 struct ExpertPlan;
@@ -23,15 +25,14 @@ struct SessionStatistics;
 struct TensorData;
 enum class ExecutionBackend;
 
-void record_mxfp4(const TensorData& matrix, size_t input_rows, ExpertExecutionMetrics& metrics);
-
 // Input and output must be distinct; existing output capacity is reused.
 void forward_shared_expert(const CompiledModel& model,
                            const MoeBlockPlan& moe,
                            const ActivationBuffer& input,
                            ActivationBuffer& output,
                            ExpertWorkspace& workspace,
-                           ExpertExecutionMetrics& metrics);
+                           const std::shared_ptr<const DeviceTensor_vulkan>& device_input = {},
+                           std::shared_ptr<const DeviceTensor_vulkan>* device_output = nullptr);
 
 bool support_vulkan_expert(const ExpertPlan& expert,
                            const TensorData& gate_up,
@@ -52,9 +53,10 @@ void prepare_experts(const MoeBlockPlan& moe,
                                            const MoeBlockPlan& moe,
                                            const LayerState& layer_state,
                                            ExpertScratch& scratch,
-                                           uint32_t residency_group,
-                                           uint64_t& cache_time);
+                                           uint32_t residency_group);
 
+// independent_work runs at most once, after a demand ticket begins and
+// before its wait; callers retain the normal graph-node fallback if it never runs.
 [[nodiscard]] Result<void> forward_moe(const CompiledModel& model,
                                        const MoeBlockPlan& moe,
                                        LayerState& layer_state,
@@ -62,7 +64,8 @@ void prepare_experts(const MoeBlockPlan& moe,
                                        ExpertScratch& scratch,
                                        uint32_t residency_group,
                                        ExecutionBackend backend,
-                                       bool prefetch);
+                                       bool prefetch,
+                                       const std::function<void()>& independent_work = {});
 
 // Consume a committed aggregate, or initialize a zeroed CPU accumulator.
 bool init_moe_output(ExpertScratch& scratch,

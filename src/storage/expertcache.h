@@ -25,6 +25,7 @@ namespace ncnn {
 namespace moe {
 
 struct CompiledOperator;
+class ExpertResidencyCoordinator;
 
 struct ExpertCacheLease
 {
@@ -75,8 +76,6 @@ struct ExpertCacheStatistics
     uint64_t coalesced_read_ranges_saved = 0;
     uint32_t adaptive_read_policy = 0;
     uint32_t num_io_threads = 0;
-    uint64_t io_read_samples = 0;
-    uint64_t io_read_time_microseconds = 0;
     ExpertVictimCacheStatistics victim;
 };
 
@@ -136,13 +135,21 @@ public:
                                                         ExpertVictimExecutionMetadata victim_execution = {});
     // Acquires a ready group under one cache lock.
     [[nodiscard]] Result<bool> try_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests, std::span<ExpertCacheLease> leases);
-    // Enqueues as many pairs as the current cache capacity permits, waits for
-    // one completion, and acquires all enqueued pairs ready at that point.
-    [[nodiscard]] Result<size_t> wait_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests, std::span<ExpertCacheLease> leases, bool wait_for_any = true);
+    // Enqueues a capacity-bounded prefix and acquires all ready pairs. The
+    // default target preserves any/first completion selection. A target > 1
+    // waits for min(target, admitted prefix size) ready pairs instead, failing
+    // immediately when any admitted read fails. Unadmitted pairs are not waited
+    // on; callers bound the request span to their desired read-ahead wave.
+    // wait_for_ready=false polls a bounded prefix without waiting for either
+    // capacity or I/O completion, allowing overlap with an in-flight compute.
+    [[nodiscard]] Result<size_t> wait_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests, std::span<ExpertCacheLease> leases, bool wait_for_any = true, size_t target_ready_count = 1, bool wait_for_ready = true);
     [[nodiscard]] bool is_ready(const TensorData& gate_up, const TensorData& down, std::string_view prepared_key = {}) const;
     [[nodiscard]] static std::string make_pair_key(const TensorData& gate_up, const TensorData& down);
     void resolve_predictions(uint32_t residency_group, std::span<const std::string_view> demanded_keys);
     void wait_for_background_work();
+    // Enable pressure-based host/device duplicate reclamation. CPU-only caches
+    // retain their existing ARC policy when no coordinator is attached.
+    void set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator);
     [[nodiscard]] ExpertCacheStatistics statistics() const;
     [[nodiscard]] uint64_t capacity() const noexcept
     {
@@ -245,10 +252,9 @@ private:
     std::deque<std::shared_ptr<Entry>> high_priority;
     std::deque<std::shared_ptr<Entry>> low_priority;
     std::vector<std::thread> workers;
-    uint64_t io_read_samples = 0;
-    uint64_t io_read_time_nanoseconds = 0;
     std::unique_ptr<FileRangeReader> reader;
     std::shared_ptr<ExpertVictimCache> victim_cache;
+    std::shared_ptr<ExpertResidencyCoordinator> residency_coordinator;
     ExpertIoMode io_mode = ExpertIoMode::Auto;
     uint32_t flags = 0;
     bool reserve_cpu_packed_weights = false;

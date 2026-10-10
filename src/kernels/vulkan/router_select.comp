@@ -1,0 +1,179 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer logits_blob
+{ float logits[]; };
+layout(binding = 1) readonly buffer bias_blob
+{ float selection_bias[]; };
+layout(binding = 2) readonly buffer ids_blob
+{ uint explicit_ids[]; };
+layout(binding = 3) writeonly buffer selected_blob
+{ float selected[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint expert_count;
+    uint top_k;
+    uint score_function;
+    uint normalize;
+    uint has_bias;
+    uint has_explicit_ids;
+    float scaling;
+}
+p;
+
+shared float scores[2048];
+shared float reduction[128];
+shared uint row_invalid;
+
+float approximate_exp(float value)
+{
+    if (value >= 104.0)
+        return uintBitsToFloat(0x7f800000u);
+    if (value <= -104.0)
+        return 0.0;
+    const bool negative = value < 0.0;
+    const float magnitude = abs(value);
+    const float exponent = fma(magnitude, 1.4426950408889634, 12582912.0) - 12582912.0;
+    const float remainder = fma(exponent, -0.693145751953125,
+                                fma(exponent, -0.000001428606765330187, magnitude));
+    float polynomial = 0.00137805939;
+    polynomial = fma(polynomial, remainder, 0.00837312452);
+    polynomial = fma(polynomial, remainder, 0.0416695364);
+    polynomial = fma(polynomial, remainder, 0.166664720);
+    polynomial = fma(polynomial, remainder, 0.499999851);
+    polynomial = fma(polynomial, remainder, 1.0);
+    polynomial = fma(polynomial, remainder, 1.0);
+    const int exponent_integer = int(exponent);
+    const uint exponent_bits = uint(exponent_integer) << 23;
+    const uint underflow_bias = exponent_integer > 0 ? 0u : 0x83000000u;
+    const float scale_high = uintBitsToFloat(0x7f000000u + underflow_bias);
+    const float scale_low = uintBitsToFloat(exponent_bits - underflow_bias);
+    const float result = (polynomial * scale_high) * scale_low;
+    return negative ? 1.0 / result : result;
+}
+
+float softplus(float value)
+{
+    if (value > 20.0)
+        return value;
+    const float exponential = approximate_exp(value);
+    if (value < -20.0)
+        return exponential;
+    if (value > 0.0)
+        return log(1.0 + exponential);
+    // log1p via atanh avoids losing tiny negative-logit probabilities.
+    const float ratio = exponential / (2.0 + exponential);
+    const float square = ratio * ratio;
+    float polynomial = 1.0 / 17.0;
+    for (int denominator = 15; denominator >= 3; denominator -= 2)
+        polynomial = fma(polynomial, square, 1.0 / float(denominator));
+    return 2.0 * ratio * fma(polynomial, square, 1.0);
+}
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint row = gl_WorkGroupID.y;
+    const uint input_base = row * p.expert_count;
+    const uint output_base = row * (p.top_k * 2 + 1);
+    if (lane == 0)
+        row_invalid = 0;
+    barrier();
+    float maximum = -uintBitsToFloat(0x7f800000u);
+    for (uint expert = lane; expert < p.expert_count; expert += 128)
+    {
+        const float logit = logits[input_base + expert];
+        if (isnan(logit) || isinf(logit))
+            atomicOr(row_invalid, 1u);
+        maximum = max(maximum, logit);
+    }
+    reduction[lane] = maximum;
+    barrier();
+    for (uint stride = 64; stride != 0; stride /= 2)
+    {
+        if (lane < stride)
+            reduction[lane] = max(reduction[lane], reduction[lane + stride]);
+        barrier();
+    }
+    maximum = reduction[0];
+    if (row_invalid != 0)
+    {
+        if (lane == 0)
+            selected[output_base + p.top_k * 2] = 1.0;
+        return;
+    }
+    float sum = 0.0;
+    for (uint expert = lane; expert < p.expert_count; expert += 128)
+    {
+        const float logit = logits[input_base + expert];
+        const float score = p.score_function == 0 ? approximate_exp(logit - maximum)
+                            : p.score_function == 1
+                                ? 1.0 / (1.0 + approximate_exp(-logit))
+                                : sqrt(softplus(logit));
+        scores[expert] = score;
+        sum += score;
+    }
+    reduction[lane] = sum;
+    barrier();
+    for (uint stride = 64; stride != 0; stride /= 2)
+    {
+        if (lane < stride)
+            reduction[lane] += reduction[lane + stride];
+        barrier();
+    }
+    if (p.score_function == 0)
+    {
+        for (uint expert = lane; expert < p.expert_count; expert += 128)
+            scores[expert] /= reduction[0];
+    }
+    barrier();
+    if (lane != 0)
+        return;
+    uint ids[64];
+    float candidate_scores[64];
+    uint count = 0;
+    if (p.has_explicit_ids != 0)
+    {
+        for (uint rank = 0; rank < p.top_k; ++rank)
+            ids[rank] = explicit_ids[row * p.top_k + rank];
+        count = p.top_k;
+    }
+    else
+    {
+        for (uint expert = 0; expert < p.expert_count; ++expert)
+        {
+            const float candidate = scores[expert] + (p.has_bias != 0 ? selection_bias[expert] : 0.0);
+            uint insertion = 0;
+            while (insertion < count && (candidate_scores[insertion] > candidate || (candidate_scores[insertion] == candidate && ids[insertion] < expert)))
+                ++insertion;
+            if (insertion >= p.top_k)
+                continue;
+            const uint last = min(count, p.top_k - 1);
+            for (uint index = last; index > insertion; --index)
+            {
+                ids[index] = ids[index - 1];
+                candidate_scores[index] = candidate_scores[index - 1];
+            }
+            ids[insertion] = expert;
+            candidate_scores[insertion] = candidate;
+            count = min(count + 1, p.top_k);
+        }
+    }
+    float selected_sum = 0.0;
+    for (uint rank = 0; rank < p.top_k; ++rank)
+        selected_sum += scores[ids[rank]];
+    if (p.normalize != 0 && selected_sum <= 0.0)
+    {
+        selected[output_base + p.top_k * 2] = 2.0;
+        return;
+    }
+    for (uint rank = 0; rank < p.top_k; ++rank)
+    {
+        selected[output_base + rank] = float(ids[rank]);
+        selected[output_base + p.top_k + rank] = (p.normalize != 0 ? scores[ids[rank]] / selected_sum
+                                                                   : scores[ids[rank]])
+                                                 * p.scaling;
+    }
+    selected[output_base + p.top_k * 2] = 0.0;
+}

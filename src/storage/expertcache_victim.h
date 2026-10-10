@@ -17,6 +17,8 @@
 namespace ncnn {
 namespace moe {
 
+class ExpertResidencyCoordinator;
+
 struct ExpertVictimPair
 {
     std::shared_ptr<TensorData> gate_up;
@@ -46,7 +48,6 @@ struct ExpertVictimCacheStatistics
     uint64_t restore_failures = 0;
     uint64_t bytes_uploaded = 0;
     uint64_t bytes_downloaded = 0;
-    uint64_t restore_time_microseconds = 0;
     uint64_t mapped_stores = 0;
     uint64_t mapped_restores = 0;
     uint64_t resident_size = 0;
@@ -64,6 +65,14 @@ class ExpertVictimCache
 public:
     virtual ~ExpertVictimCache() = default;
 
+    // Only concrete device caches publish successfully completed resident
+    // copies. Wrappers forward the same coordinator without fabricating
+    // readiness for queued, filtered, or failed admissions.
+    virtual void set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator)
+    {
+        (void)coordinator;
+    }
+
     // Admission is asynchronous and best effort.
     virtual void admit(std::string key, std::shared_ptr<const TensorData> gate_up, std::shared_ptr<const TensorData> down, ExpertVictimExecutionMetadata execution = {}) = 0;
     [[nodiscard]] virtual std::optional<ExpertVictimPair> restore(const std::string& key, const TensorData& gate_up_source, const TensorData& down_source) = 0;
@@ -76,6 +85,8 @@ class ReuseFilteredExpertVictimCache final : public ExpertVictimCache
 {
 public:
     ReuseFilteredExpertVictimCache(std::shared_ptr<ExpertVictimCache> _inner, uint32_t _reuse_probe_interval);
+
+    void set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator) override;
 
     void admit(std::string key,
                std::shared_ptr<const TensorData> gate_up,
@@ -115,6 +126,8 @@ class ShardedExpertVictimCache final : public ExpertVictimCache
 {
 public:
     explicit ShardedExpertVictimCache(std::vector<std::shared_ptr<ExpertVictimCache>> _shards);
+
+    void set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator) override;
 
     void admit(std::string key,
                std::shared_ptr<const TensorData> gate_up,

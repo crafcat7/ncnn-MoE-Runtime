@@ -1,4 +1,5 @@
 #include "expertcache.h"
+#include "expertresidency.h"
 #include "graph/compiledoperator.h"
 #include "kernels/mxfp4.h"
 #include "mappedfile.h"
@@ -101,6 +102,7 @@ struct ExpertCache::Entry
     ExpertVictimExecutionMetadata victim_execution;
     std::shared_ptr<TensorData> gate_up;
     std::shared_ptr<TensorData> down;
+    std::shared_ptr<const void> host_residency;
     CompiledOperator gate_up_operator;
     CompiledOperator down_operator;
 };
@@ -172,15 +174,16 @@ struct ExpertCache::FileRangeReader
                                         || (sample && adaptive_sample_ticket.fetch_add(1, std::memory_order_relaxed) % 2 == 1)));
         if (try_direct)
         {
-            const auto started = std::chrono::steady_clock::now();
+            const auto started = sample ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
             auto direct = read_direct(path, offset, size);
-            const uint64_t elapsed = std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
             if (direct)
             {
                 direct_read_ranges.fetch_add(1, std::memory_order_relaxed);
                 direct_read_bytes.fetch_add(size, std::memory_order_relaxed);
                 if (sample)
                 {
+                    const uint64_t elapsed = std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
                     record_adaptive_sample(true, size, elapsed);
                 }
                 LoadedRange loaded;
@@ -196,21 +199,20 @@ struct ExpertCache::FileRangeReader
 #endif
 
 #if defined(_WIN32)
-        const auto buffered_started = std::chrono::steady_clock::now();
+        const auto buffered_started = sample ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
 #endif
         LoadedRange loaded;
         loaded.data.resize(static_cast<size_t>(size));
         auto status = read(path, offset, loaded.data);
         if (!status)
             return status.error();
-#if defined(_WIN32)
-        const uint64_t buffered_elapsed = std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - buffered_started).count());
-#endif
         buffered_read_ranges.fetch_add(1, std::memory_order_relaxed);
         buffered_read_bytes.fetch_add(size, std::memory_order_relaxed);
 #if defined(_WIN32)
         if (sample)
         {
+            const uint64_t buffered_elapsed = std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - buffered_started).count());
             record_adaptive_sample(false, size, buffered_elapsed);
         }
 #endif
@@ -563,6 +565,26 @@ ExpertCache::ExpertCache(uint64_t _cache_size,
 ExpertCache::~ExpertCache()
 {
     stop_workers();
+    // Leases may outlive the cache, but those payloads are no longer reachable
+    // by a cache lookup and must not advertise a host fallback copy.
+    set_residency_coordinator({});
+}
+
+void ExpertCache::set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator)
+{
+    // Victim caches own a different scheduler mutex. Propagate outside the
+    // host lock; the coordinator itself never calls back into either cache.
+    if (victim_cache)
+        victim_cache->set_residency_coordinator(coordinator);
+    const std::lock_guard<std::mutex> lock(mutex);
+    residency_coordinator = std::move(coordinator);
+    for (const auto& item : entries)
+    {
+        Entry& entry = *item.second;
+        entry.host_residency.reset();
+        if (residency_coordinator && entry.state == Entry::State::Ready)
+            entry.host_residency = residency_coordinator->register_host(entry.key);
+    }
 }
 
 void ExpertCache::stop_workers()
@@ -1497,6 +1519,7 @@ void ExpertCache::remove_resident_locked(Entry& entry, bool add_ghost)
 {
     if (entry.arc_list == Entry::ArcList::None)
         return;
+    entry.host_residency.reset();
     if (add_ghost)
         add_ghost_locked(entry);
     if (entry.arc_list == Entry::ArcList::Recent)
@@ -1568,6 +1591,7 @@ ExpertCache::Entry* ExpertCache::find_victim_locked(const std::list<Entry*>& lis
 {
     Entry* selected = nullptr;
     uint32_t selected_distance = 0;
+    bool selected_gpu_duplicate = false;
     for (Entry* entry : list)
     {
         const bool speculative_requires_speculative_victim = speculative
@@ -1589,20 +1613,30 @@ ExpertCache::Entry* ExpertCache::find_victim_locked(const std::list<Entry*>& lis
         const auto existing = entries.find(entry->key);
         if (existing != entries.end() && existing->second.get() == entry && existing->second.use_count() == 1)
         {
+            const bool gpu_duplicate = residency_coordinator && residency_coordinator->device_resident(entry->key);
             if (forward_anchor == invalid_residency_group
                 || forward_anchor >= residency_group_sizes.size()
                 || entry->residency_group >= residency_group_sizes.size())
             {
-                return entry;
+                // Keep ARC's recent/frequent class and all pin/prediction
+                // eligibility unchanged. Within that class, reclaim a device
+                // duplicate before dropping the only cached copy of a key.
+                if (!residency_coordinator || gpu_duplicate)
+                    return entry;
+                if (!selected)
+                    selected = entry;
+                continue;
             }
             const uint32_t group_count = static_cast<uint32_t>(residency_group_sizes.size());
             const uint32_t distance = entry->residency_group > forward_anchor
                                           ? entry->residency_group - forward_anchor
                                           : group_count - forward_anchor + entry->residency_group;
-            if (!selected || distance > selected_distance)
+            if (!selected || distance > selected_distance
+                || (distance == selected_distance && gpu_duplicate && !selected_gpu_duplicate))
             {
                 selected = entry;
                 selected_distance = distance;
+                selected_gpu_duplicate = gpu_duplicate;
             }
         }
     }
@@ -2067,7 +2101,6 @@ void ExpertCache::worker_loop()
             active_jobs += static_cast<uint32_t>(batch.size());
         }
 
-        const auto io_started = std::chrono::steady_clock::now();
         loaded_pairs.clear();
         loaded_pairs.resize(batch.size());
         errors.clear();
@@ -2143,18 +2176,6 @@ void ExpertCache::worker_loop()
 
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (!disk_entries.empty())
-            {
-                const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - io_started);
-                const uint64_t elapsed_nanoseconds = std::max<int64_t>(1, elapsed.count());
-                ++io_read_samples;
-                io_read_time_nanoseconds += elapsed_nanoseconds;
-                // The runtime thread budget is the single ownership boundary
-                // for I/O concurrency.  Keep an explicit worker count stable;
-                // changing it from sampled read latency is a calibration loop
-                // and can starve the CPU Expert path exactly when a prompt is
-                // already waiting on cold weights.
-            }
             if (coalesced)
             {
                 ++coalesced_read_batches;
@@ -2212,6 +2233,8 @@ void ExpertCache::worker_loop()
                 entry->gate_up = std::move(pair.gate_up);
                 entry->down = std::move(pair.down);
                 entry->state = Entry::State::Ready;
+                if (residency_coordinator)
+                    entry->host_residency = residency_coordinator->register_host(entry->key);
                 if (!restored[index])
                 {
                     bytes_read += entry->stored_size;
@@ -2350,7 +2373,9 @@ Result<bool> ExpertCache::try_acquire_ready_pairs(std::span<const ExpertCachePai
 
 Result<size_t> ExpertCache::wait_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests,
                                                      std::span<ExpertCacheLease> leases,
-                                                     bool wait_for_any)
+                                                     bool wait_for_any,
+                                                     size_t target_ready_count,
+                                                     bool wait_for_ready)
 {
     if (requests.size() != leases.size())
     {
@@ -2364,6 +2389,18 @@ Result<size_t> ExpertCache::wait_acquire_ready_pairs(std::span<const ExpertCache
             ErrorCode::InvalidArgument,
             "Expert cache ready wait requires at least one pair"};
     }
+
+    if (target_ready_count == 0)
+    {
+        return Error{
+            ErrorCode::InvalidArgument,
+            "Expert cache ready target must be positive"};
+    }
+    // Release every previous output pin before trying to reserve a prefix.
+    // Capacity exhaustion can leave an unadmitted tail, which must also stay
+    // empty when callers reuse their lease storage.
+    for (ExpertCacheLease& lease : leases)
+        lease = {};
 
     static constexpr size_t inline_entry_count = 16;
     std::array<std::shared_ptr<Entry>, inline_entry_count> inline_entries;
@@ -2408,7 +2445,7 @@ Result<size_t> ExpertCache::wait_acquire_ready_pairs(std::span<const ExpertCache
             }
             if (!temporarily_exhausted)
                 return queued.error();
-            if (enqueued_count != 0)
+            if (enqueued_count != 0 || !wait_for_ready)
             {
                 capacity_exhausted = true;
                 break;
@@ -2433,25 +2470,31 @@ Result<size_t> ExpertCache::wait_acquire_ready_pairs(std::span<const ExpertCache
         }
     }
 
+    if (enqueued_count == 0)
+        return size_t{0};
+
     std::unique_lock<std::mutex> lock(mutex);
-    ready.wait(lock, [ready_entries,
-                      request_count = enqueued_count,
-                      wait_for_any] {
-        if (!wait_for_any)
-        {
-            return ready_entries[0]->state == Entry::State::Ready
-                   || ready_entries[0]->state == Entry::State::Failed;
-        }
-        for (size_t index = 0; index < request_count; ++index)
-        {
-            if (ready_entries[index]->state == Entry::State::Ready
-                || ready_entries[index]->state == Entry::State::Failed)
+    if (wait_for_ready)
+        ready.wait(lock, [ready_entries,
+                          request_count = enqueued_count,
+                          target_count = std::min(target_ready_count, enqueued_count),
+                          coalesce_ready = target_ready_count > 1,
+                          wait_for_any] {
+            if (!coalesce_ready && !wait_for_any)
             {
-                return true;
+                return ready_entries[0]->state == Entry::State::Ready
+                       || ready_entries[0]->state == Entry::State::Failed;
             }
-        }
-        return false;
-    });
+            size_t ready_count = 0;
+            for (size_t index = 0; index < request_count; ++index)
+            {
+                if (ready_entries[index]->state == Entry::State::Failed)
+                    return true;
+                if (ready_entries[index]->state == Entry::State::Ready)
+                    ++ready_count;
+            }
+            return ready_count >= target_count;
+        });
 
     for (size_t index = 0; index < enqueued_count; ++index)
     {
@@ -2530,8 +2573,6 @@ ExpertCacheStatistics ExpertCache::statistics() const
         result.mapped_ranges = mapped_ranges;
         result.mapped_bytes = mapped_bytes;
         result.num_io_threads = static_cast<uint32_t>(workers.size());
-        result.io_read_samples = io_read_samples;
-        result.io_read_time_microseconds = (io_read_time_nanoseconds + 999) / 1000;
         victim = victim_cache;
     }
     reader->populate_statistics(result);

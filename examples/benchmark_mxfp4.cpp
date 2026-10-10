@@ -173,35 +173,6 @@ static double elapsed_milliseconds(std::chrono::steady_clock::time_point start)
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
-static void print_command_statistics(const VulkanStatistics& before,
-                                     const VulkanStatistics& after)
-{
-    std::cout << "command recording: "
-              << after.command_dispatches - before.command_dispatches
-              << " dispatch(es), "
-              << after.command_pipeline_binds
-                     - before.command_pipeline_binds
-              << " pipeline bind(s), "
-              << after.command_descriptor_bindings
-                     - before.command_descriptor_bindings
-              << " descriptor binding(s), "
-              << after.command_push_constant_updates
-                     - before.command_push_constant_updates
-              << " push constant update(s), "
-              << after.command_resource_barrier_calls
-                     - before.command_resource_barrier_calls
-              << " resource barrier call(s), "
-              << after.command_buffer_resource_barriers
-                     - before.command_buffer_resource_barriers
-              << " buffer barrier(s), "
-              << after.command_image_resource_barriers
-                     - before.command_image_resource_barriers
-              << " image barrier(s), "
-              << after.command_redundant_pipeline_binds
-                     - before.command_redundant_pipeline_binds
-              << " redundant pipeline bind candidate(s)\n";
-}
-
 static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_columns, uint32_t token_count, uint32_t repeats, uint32_t device_index)
 {
     constexpr uint64_t optimization_flags = OptimizationDefaultFlags;
@@ -271,7 +242,6 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
     }
     std::vector<double> vulkan_times;
     vulkan_times.reserve(repeats);
-    const VulkanStatistics counters_before = get_vulkan_statistics(vulkan_runtime);
     for (uint32_t repeat = 0; repeat < repeats; ++repeat)
     {
         const auto started = std::chrono::steady_clock::now();
@@ -282,7 +252,6 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
         }
         vulkan_times.push_back(elapsed_milliseconds(started));
     }
-    const VulkanStatistics counters_after = get_vulkan_statistics(vulkan_runtime);
 
     float maximum_error = 0.0f;
     float maximum_normalized_error = 0.0f;
@@ -299,7 +268,6 @@ static int benchmark_expert(uint32_t input_columns, uint32_t intermediate_column
     std::cout << "Vulkan device: " << (device_index == automatic_vulkan_device_index ? -1 : static_cast<int64_t>(device_index)) << '\n';
     std::cout << "Vulkan median: " << vulkan_ms << " ms, " << bandwidth(vulkan_ms) << " effective GiB/s\n";
     std::cout << "speedup: " << cpu_ms / vulkan_ms << "x\n";
-    print_command_statistics(counters_before, counters_after);
     std::cout << "maximum absolute error: " << maximum_error << '\n';
     std::cout << "maximum normalized error: " << maximum_normalized_error << '\n';
     return maximum_normalized_error <= 1e-4f ? 0 : 1;
@@ -496,16 +464,10 @@ static int benchmark_bfloat16_projection(uint32_t input_columns,
     const double effective_bandwidth = static_cast<double>(weight_size) * token_count
                                        / (1024.0 * 1024.0 * 1024.0)
                                        / (milliseconds / 1000.0);
-    const uint64_t submit_wait_microseconds = counters_after.submit_wait_time_microseconds
-                                              - counters_before.submit_wait_time_microseconds;
     std::cout << "BF16 shape: " << token_count << " x "
               << input_columns << " -> " << output_columns << '\n';
     std::cout << "median: " << milliseconds << " ms, "
               << effective_bandwidth << " effective GiB/s\n";
-    std::cout << "average submit/wait: "
-              << static_cast<double>(submit_wait_microseconds)
-                     / repeats / 1000.0
-              << " ms\n";
     std::cout << "submissions/uploads/downloads: "
               << counters_after.compute_submissions
                      - counters_before.compute_submissions
@@ -519,7 +481,6 @@ static int benchmark_bfloat16_projection(uint32_t input_columns,
               << counters_after.bfloat16_cooperative_matrix_dispatches
                      - counters_before.bfloat16_cooperative_matrix_dispatches
               << '\n';
-    print_command_statistics(counters_before, counters_after);
     std::cout << "maximum absolute/normalized error: "
               << maximum_error << " / " << maximum_normalized_error << '\n';
     std::cout << "RMS error: " << rms_error << '\n';

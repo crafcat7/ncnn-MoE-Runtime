@@ -42,6 +42,8 @@ class VulkanContext;
 class Mxfp4Expert_vulkan;
 class QnkExpert_vulkan;
 class Bfloat16Expert_vulkan;
+class VulkanWeightUploadBatch;
+class VulkanUploadStagingAllocator;
 
 class VulkanExpertVictimCache final : public ExpertVictimCache
 {
@@ -52,6 +54,8 @@ public:
 
     void admit(std::string key, std::shared_ptr<const TensorData> gate_up, std::shared_ptr<const TensorData> down,
                ExpertVictimExecutionMetadata execution) override;
+
+    void set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator) override;
 
     struct DeviceOperationLease
     {
@@ -74,7 +78,9 @@ public:
 private:
     struct DeviceEntry
     {
+        std::shared_ptr<ncnn::VkBlobAllocator> weight_allocator;
         ncnn::VkMat data;
+        std::shared_ptr<const void> residency_token;
         std::shared_ptr<Mxfp4Expert_vulkan> operation;
         uint64_t size = 0;
         uint64_t gate_blocks_size = 0;
@@ -130,6 +136,8 @@ private:
     void worker_loop();
 
     std::shared_ptr<VulkanContext> context;
+    std::shared_ptr<ncnn::VkBlobAllocator> weight_allocator;
+    std::shared_ptr<ExpertResidencyCoordinator> residency_coordinator;
     // Bounds both resident data and queued host-weight references.
     uint64_t cache_size = 0;
     ncnn::VkAllocator* upload_staging_allocator = nullptr;
@@ -152,11 +160,9 @@ private:
     uint64_t restore_failures = 0;
     uint64_t bytes_uploaded = 0;
     uint64_t bytes_downloaded = 0;
-    uint64_t restore_time_microseconds = 0;
     uint64_t mapped_stores = 0;
     uint64_t mapped_restores = 0;
     bool stopping = false;
-    ncnn::VkMat upload_staging;
     std::array<DownloadSlot, 2> download_slots;
     std::atomic<size_t> next_download_slot{0};
     std::thread worker;
@@ -178,6 +184,16 @@ public:
     void admit(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down,
                const TensorData* down_bias, uint32_t residency_group, float activation_limit,
                ExpertActivation activation) override;
+
+    bool prepare_demand(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias,
+                        std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
+                        float activation_limit, ExpertActivation activation, std::shared_ptr<const void>& pin) override;
+
+    size_t prepare_demand_batch(std::span<const ExpertDemandRequest> requests,
+                                std::span<std::shared_ptr<const void>> pins) override;
+
+    std::unique_ptr<ExpertDemandSubmission> begin_demand_batch(std::span<const ExpertDemandRequest> requests) override;
+    void set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator) override;
 
     std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) override;
 
@@ -201,6 +217,7 @@ private:
         std::shared_ptr<QnkExpert_vulkan> qnk_operation;
         std::shared_ptr<Bfloat16Expert_vulkan> bfloat16_operation;
         std::shared_ptr<const void> device_source_pin;
+        std::shared_ptr<const void> residency_token;
         uint64_t size = 0;
         uint32_t residency_group = 0;
         ArcList list = ArcList::Recent;
@@ -218,6 +235,7 @@ private:
         std::vector<ExpertBackendRequest> client_requests;
         std::vector<ExpertBackendRequest> requests;
         std::vector<ActivationBuffer> private_outputs;
+        std::vector<std::shared_ptr<DeviceTensor_vulkan>> private_device_outputs;
         ActivationBuffer private_aggregation;
         std::vector<uint8_t> private_route_completed;
         std::vector<Selection> selected;
@@ -226,7 +244,12 @@ private:
         std::mutex mutex;
         std::condition_variable completed;
         bool done = false;
+
+        // The pool keeps Host capacity, never cache pins or device activations.
+        void clear_references() noexcept;
     };
+
+    std::shared_ptr<WorkItem> acquire_work_item();
 
     class Submission final : public ExpertSubmission
     {
@@ -238,16 +261,43 @@ private:
         std::span<const ExpertBackendExecutionResult> reservations() const noexcept override;
 
         std::vector<ExpertBackendExecutionResult> wait() override;
+        void wait(std::vector<ExpertBackendExecutionResult>& results) override;
 
         bool commit() override;
 
         void abort() noexcept override;
 
     private:
+        void wait_completion();
+
         std::shared_ptr<WorkItem> work;
         bool waited = false;
         bool committed = false;
         bool aborted = false;
+    };
+
+    struct DemandWork
+    {
+        std::vector<std::string> keys;
+        std::vector<std::shared_ptr<const TensorData>> biases;
+        std::vector<ExpertDemandRequest> requests;
+        std::vector<std::shared_ptr<const void>> pins;
+        std::mutex mutex;
+        std::condition_variable completed;
+        size_t prefix = 0;
+        bool done = false;
+        bool aborted = false;
+    };
+    class DemandSubmission final : public ExpertDemandSubmission
+    {
+    public:
+        explicit DemandSubmission(std::shared_ptr<DemandWork> work);
+        ~DemandSubmission() override;
+        size_t wait(std::span<std::shared_ptr<const void>> pins) override;
+        void abort() noexcept override;
+
+    private:
+        std::shared_ptr<DemandWork> work;
     };
 
     struct PendingAdmission
@@ -262,6 +312,12 @@ private:
         uint32_t residency_group = 0;
         uint64_t size = 0;
     };
+
+    bool make_admission(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias,
+                        std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
+                        float activation_limit, ExpertActivation activation, PendingAdmission& admission) const;
+    std::shared_ptr<Entry> create_entry(const PendingAdmission& admission, VulkanWeightUploadBatch* upload_batch);
+    bool install_entry_locked(std::shared_ptr<Entry>& entry);
 
     using GhostList = std::list<ExpertKeySize>;
     using GhostIndex = std::unordered_map<std::string, GhostList::iterator, ExpertKeyHash, std::equal_to<>>;
@@ -321,6 +377,7 @@ private:
     void finish_admission_locked();
 
     void worker_loop();
+    void demand_loop();
     void stop_workers();
 
     // Bounds both resident data and queued host-weight references.
@@ -330,17 +387,29 @@ private:
     const uint64_t optimization_flags;
     std::shared_ptr<VulkanContext> vulkan_context;
     std::shared_ptr<ncnn::VkBlobAllocator> expert_weight_allocator;
+    std::unique_ptr<VulkanUploadStagingAllocator> admission_staging_allocator;
+    ncnn::Mat admission_upload_scratch;
     std::shared_ptr<ncnn::Pipeline> indexed_pipeline;
+    std::shared_ptr<ncnn::Pipeline> input_gather_pipeline;
     std::shared_ptr<ncnn::Pipeline> route_aggregation_pipeline;
     std::shared_ptr<VulkanExpertVictimCache> device_weight_source;
+    // Always acquired before mutex and never held by command execution.
+    std::mutex admission_mutex;
     mutable std::mutex mutex;
     std::condition_variable work_available;
     std::condition_variable execution_available;
+    std::condition_variable demand_available;
     std::condition_variable admission_idle;
     bool stopping = false;
     uint32_t foreground_depth = 0;
+    uint32_t admission_drain_waiters = 0;
     std::deque<PendingAdmission> pending;
+    // Only the pool's final owner may recycle a submission's private storage.
+    std::vector<std::shared_ptr<WorkItem>> execution_scratch;
     std::deque<std::shared_ptr<WorkItem>> execution_pending;
+    std::deque<std::shared_ptr<DemandWork>> demand_pending;
+    uint32_t demand_active = 0;
+    std::shared_ptr<ExpertResidencyCoordinator> residency_coordinator;
     std::unordered_set<std::string, ExpertKeyHash, std::equal_to<>> pending_keys;
     uint64_t pending_size = 0;
     uint32_t active_admissions = 0;
@@ -368,7 +437,6 @@ private:
     uint64_t executions = 0;
     uint64_t execution_failures = 0;
     uint64_t bytes_uploaded = 0;
-    uint64_t execution_time_microseconds = 0;
     uint64_t device_source_hits = 0;
     uint64_t device_source_misses = 0;
     uint64_t device_source_executions = 0;
@@ -378,6 +446,7 @@ private:
     uint64_t route_aggregation_bytes_saved = 0;
     std::thread worker;
     std::thread execution_worker;
+    std::thread demand_worker;
 };
 
 #endif // NCNN_MOE_WITH_VULKAN

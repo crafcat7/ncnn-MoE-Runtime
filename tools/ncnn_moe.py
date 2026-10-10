@@ -141,16 +141,6 @@ def _generation_rate(metrics: dict[str, Any]) -> float | None:
     return None
 
 
-def _format_gpu_kernel_time(gpu: dict[str, Any], available: bool) -> str:
-    if not available:
-        return "N/A (CPU-only)"
-    if gpu.get("kernel_time_available", False):
-        return _format_duration_microseconds(gpu.get("kernel_time_microseconds"))
-    if gpu.get("reason") == "gpu_expert_execution_not_observed":
-        return "N/A (no GPU Expert execution)"
-    return "N/A"
-
-
 def _format_runtime_metrics(metrics: Any) -> str:
     if not isinstance(metrics, dict):
         return "metrics\n  unavailable"
@@ -163,9 +153,6 @@ def _format_runtime_metrics(metrics: Any) -> str:
         cache_miss = expert.get("cache_miss")
         if isinstance(cache_hit, (int, float)) and isinstance(cache_miss, (int, float)) and cache_hit + cache_miss:
             cache_hit_rate = cache_hit / (cache_hit + cache_miss)
-    cpu = metrics.get("cpu", {})
-    if not isinstance(cpu, dict):
-        cpu = {"expert_compute_time_microseconds": metrics.get("expert_compute_time_microseconds")}
     gpu = metrics.get("gpu", {})
     if not isinstance(gpu, dict):
         gpu = {}
@@ -209,15 +196,9 @@ def _format_runtime_metrics(metrics: Any) -> str:
             f"{_format_bytes_gb(expert.get('gpu_cache_resident_bytes'))}"
             " / dropped "
             f"{_format_metric_count(expert.get('gpu_cache_dropped_admissions'))}",
-            "  CPU: expert compute "
-            f"{_format_duration_microseconds(cpu.get('expert_compute_time_microseconds'))}"
-            f" · process {process_cpu_text}",
+            f"  Process CPU: {process_cpu_text}",
             "  GPU: submit "
             f"{_format_metric_count(gpu.get('submit_count'), available=gpu_available)}"
-            " · wait "
-            f"{_format_duration_microseconds(gpu.get('wait_time_microseconds') if gpu_available else None)}"
-            " · kernel "
-            f"{_format_gpu_kernel_time(gpu, gpu_available)}"
             " · utilization "
             f"{_format_gpu_utilization(gpu_device)}"
             " / attention "
@@ -279,6 +260,10 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
     expert_io_group.add_argument("--buffered-expert-io", action="store_true", default=None)
     parser.add_argument("--disable-gpu-victim-execution", action="store_true", default=None)
     parser.add_argument("--release-vulkan-dense-host", action="store_true", default=None)
+    parser.add_argument("--disable-vulkan-joint-cache-eviction", action="store_true", default=None)
+    parser.add_argument("--disable-vulkan-mxfp4-row-tile", action="store_true", default=None)
+    parser.add_argument("--disable-vulkan-expert-direct-staging", action="store_true", default=None)
+    parser.add_argument("--disable-vulkan-shared-expert-overlap", action="store_true", default=None)
     parser.add_argument("--verbose", action="store_true")
 
 
@@ -484,6 +469,10 @@ def cli_runtime_settings(arguments: argparse.Namespace) -> dict[str, Any]:
         "buffered_expert_io",
         "disable_gpu_victim_execution",
         "release_vulkan_dense_host",
+        "disable_vulkan_joint_cache_eviction",
+        "disable_vulkan_mxfp4_row_tile",
+        "disable_vulkan_expert_direct_staging",
+        "disable_vulkan_shared_expert_overlap",
     )
     return {key: getattr(arguments, key) for key in keys if getattr(arguments, key, None) is not None}
 
