@@ -156,6 +156,7 @@ private:
         case DType::Q5K:
         case DType::Q6K:
         case DType::Q8K:
+        case DType::Int4:
             return 0;
         }
         return 0;

@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -33,10 +34,15 @@ enum SafetensorLoadFlag : uint32_t
 class SafetensorsArchive
 {
 public:
-    [[nodiscard]] static Result<SafetensorsArchive> open(const std::filesystem::path& root);
+    [[nodiscard]] static Result<SafetensorsArchive> open(const std::filesystem::path& root, std::string_view manifest_json = {});
     [[nodiscard]] static Result<SafetensorsArchive> open_file(const std::filesystem::path& path);
     [[nodiscard]] const SafetensorInfo* find(const std::string& name) const noexcept;
+    [[nodiscard]] bool contains_tensor(const std::string& name) const noexcept;
+    [[nodiscard]] bool has_native_quantized_tensors() const noexcept;
+    [[nodiscard]] bool has_float8_tensors() const noexcept;
+    [[nodiscard]] Result<DType> tensor_dtype(const std::string& name) const;
     [[nodiscard]] Result<TensorData> load_tensor(const std::string& name) const;
+    [[nodiscard]] Result<TensorData> load_float32_tensor(const std::string& name) const;
     [[nodiscard]] Result<TensorData> load_bfloat16_slice(const std::string& name, uint32_t index, std::vector<uint32_t> shape) const;
     [[nodiscard]] Result<TensorData> load_float8_tensor(const std::string& weight_name, const std::string& scale_name) const;
     // Detect a Q2_K..Q8_K Expert bank by byte count.
@@ -56,7 +62,12 @@ public:
     [[nodiscard]] Result<TensorData> load_mxfp4_expert(const std::string& blocks_name, const std::string& scales_name, uint32_t expert_id, uint32_t rows, uint32_t columns, uint32_t flags = 0) const;
 
 private:
+    [[nodiscard]] Result<TensorData> load_source_int4_tensor(const std::string& name) const;
+
     std::unordered_map<std::string, SafetensorInfo> tensors;
+    std::string source_quantization_method;
+    int64_t source_quantization_group_size = 0;
+    bool source_quantization_desc_act = false;
 };
 
 } // namespace moe

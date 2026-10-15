@@ -317,6 +317,9 @@ bool LatentLayer_vulkan::forward(const ActivationBuffer& initial_hidden,
         return false;
     if (submit_compute_and_wait(cmd, context->device()) != 0)
         return false;
+    const uint32_t int4_ops = attention_hyper->int4_ops() + ffn_hyper->int4_ops();
+    if (int4_ops != 0)
+        state.int4_dispatches += int4_ops;
     ++state.compute_submissions;
     state.batch_downloads += 2;
     LatentLayerWorkspace_vulkan::Implementation::prepare_host(previous.normalized_host, positions.size(), normalized_gpu.w);
@@ -550,6 +553,9 @@ bool LatentLayer_vulkan::finish(LatentLayerWorkspace_vulkan& workspace,
         return false;
     ++state.compute_submissions;
     state.batch_downloads += produce_logits ? 2 : 1;
+    const uint32_t int4_ops = head.int4_ops(produce_logits);
+    if (int4_ops != 0)
+        state.int4_dispatches += int4_ops;
     LatentLayerWorkspace_vulkan::Implementation::prepare_host(impl.hidden_host, normalized.h, normalized.w);
     if (!copy_staging_to_cpu_batch(hidden_staging, impl.hidden_host))
         return false;

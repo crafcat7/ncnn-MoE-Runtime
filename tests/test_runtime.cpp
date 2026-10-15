@@ -194,6 +194,10 @@ public:
 };
 
 void test_batch_combine_backend();
+void test_dense_ffn();
+void test_int4();
+void test_quant_archive();
+void test_native_awq();
 void test_reusable_kernel_scratch();
 
 static std::filesystem::path create_unique_test_directory(const char* prefix)
@@ -2555,6 +2559,35 @@ void test_mxfp4_weight_storage_padding()
     }
 }
 
+void test_weightstore_finalize()
+{
+    WeightStore weights;
+    TensorData tensor;
+    tensor.dtype = DType::Float32;
+    tensor.shape = {1};
+    tensor.float32_data = {3.5f};
+    auto added = weights.add("weight", std::move(tensor));
+    check(static_cast<bool>(added));
+    const TensorHandle handle = added.value();
+
+    check(weights.find_handle("weight") == handle);
+    weights.finalize();
+    check(weights.find_handle("weight") == invalid_tensor_handle);
+    check(weights.size() == 1);
+    check(weights.at(handle).float32_data == std::vector<float>{3.5f});
+
+    TensorData later_tensor;
+    later_tensor.dtype = DType::Float32;
+    later_tensor.shape = {1};
+    later_tensor.float32_data = {7.0f};
+    auto later = weights.add("later", std::move(later_tensor));
+    check(static_cast<bool>(later));
+    check(weights.find_handle("weight") == invalid_tensor_handle);
+    check(weights.find_handle("later") == later.value());
+    check(weights.at(later.value()).float32_data == std::vector<float>{7.0f});
+    check(!weights.add("later", TensorData{}));
+}
+
 void test_mxfp4_cpu_kernel_and_fused_gate_up()
 {
     const VulkanRuntimePtr vulkan_runtime = create_vulkan_runtime();
@@ -4748,7 +4781,7 @@ void test_qnk_cpu_kernel()
     }
 }
 
-void test_qnk_graph_gate_up_fusion()
+void test_qnk_graph_cpu_projections()
 {
     constexpr uint32_t vocabulary_size = 256;
     constexpr uint32_t hidden_size = 256;
@@ -4829,15 +4862,46 @@ void test_qnk_graph_gate_up_fusion()
         check(model.opt.num_concurrent_sessions == compiler_opt.num_concurrent_sessions);
         check(static_cast<bool>(model.graph.layer_plans.size() == 1));
         const ExpertPlan& expert = model.graph.layer_plans.front().moe.experts.front();
-        check(static_cast<bool>(expert.gate_up_weight != invalid_tensor_handle));
-        check(static_cast<bool>(expert.gate_weight == invalid_tensor_handle));
-        check(static_cast<bool>(expert.up_weight == invalid_tensor_handle));
-        check(static_cast<bool>(expert.layout == ExpertLayout::PackedGateUpDown));
-        const TensorData& gate_up = model.weights.at(expert.gate_up_weight);
-        check(static_cast<bool>(gate_up.dtype == dtype));
-        check(static_cast<bool>(gate_up.shape == std::vector<uint32_t>{intermediate_size * 2, hidden_size}));
-        check(static_cast<bool>(!gate_up.qnk_interleave_rows));
-        check(static_cast<bool>(gate_up.qnk_values().size() == qnk_storage_bytes(dtype, intermediate_size * 2, hidden_size)));
+        check(expert.gate_up_weight == invalid_tensor_handle);
+        check(expert.gate_weight != invalid_tensor_handle);
+        check(expert.up_weight != invalid_tensor_handle);
+        check(expert.layout == ExpertLayout::GateUpDown);
+        for (TensorHandle handle : {expert.gate_weight, expert.up_weight})
+        {
+            const TensorData& weight = model.weights.at(handle);
+            check(weight.dtype == dtype);
+            check((weight.shape == std::vector<uint32_t>{intermediate_size, hidden_size}));
+            check(weight.qnk_values().size() == qnk_storage_bytes(dtype, intermediate_size, hidden_size));
+        }
+
+        WeightStore capability_weights;
+        TensorData gate_up = model.weights.at(expert.gate_weight);
+        gate_up.shape[0] *= 2;
+        gate_up.quantized_data.resize(static_cast<size_t>(qnk_storage_bytes(dtype, intermediate_size * 2, hidden_size)));
+        auto gate_up_handle = capability_weights.add("gate_up", std::move(gate_up));
+        auto down_handle = capability_weights.add("down", model.weights.at(expert.down_weight));
+        check(static_cast<bool>(gate_up_handle) && static_cast<bool>(down_handle));
+        ExpertPlan packed_expert = expert;
+        packed_expert.gate_up_weight = gate_up_handle.value();
+        packed_expert.down_weight = down_handle.value();
+        MoeBlockPlan capability_moe;
+        capability_moe.experts.push_back(packed_expert);
+        const auto eligible = [&] {
+            return support_vulkan_expert(packed_expert, capability_weights.at(gate_up_handle.value()),
+                                         capability_weights.at(down_handle.value()), compiler_opt.optimization_flags);
+        };
+        check(eligible());
+        check(support_vulkan_experts(capability_weights, capability_moe, compiler_opt.optimization_flags));
+        for (TensorHandle handle : {gate_up_handle.value(), down_handle.value()})
+        {
+            TensorData& weight = capability_weights.at_mutable(handle);
+            weight.input_column_indices.resize(weight.shape[1]);
+            for (uint32_t column = 0; column < weight.shape[1]; ++column)
+                weight.input_column_indices[column] = weight.shape[1] - column - 1;
+            check(eligible());
+            check(support_vulkan_experts(capability_weights, capability_moe, compiler_opt.optimization_flags));
+            weight.input_column_indices.clear();
+        }
     }
 }
 
@@ -5118,7 +5182,7 @@ void test_ncnn_vulkan_qnk_expert_operator()
         }
     }
     const ActivationBuffer expected = forward_linear(down, activated, 0);
-    const uint64_t qnk_pair_bytes = gate_up.quantized_data.size() + down.quantized_data.size();
+    const uint64_t qnk_pair_bytes = packed_vulkan->device_bytes();
     const uint64_t backend_flags = g_test_optimization_flags
                                    | OptimizationVulkanQnK;
     const auto backend = create_vulkan_expert_backend(qnk_pair_bytes * 2 + 4096,
@@ -8830,13 +8894,13 @@ void test_speculative_generation()
             compiled.speculative.markov_head_weight = add_float("test_dspark_markov_head", {2, 1}, {-1.0f, 1.0f});
 
             TensorData confidence;
-            confidence.dtype = DType::BFloat16;
+            confidence.dtype = DType::Int4;
             confidence.shape = {1, 3};
-            confidence.bfloat16_data = {
-                float_to_bfloat16(0.0f),
-                float_to_bfloat16(0.0f),
-                float_to_bfloat16(0.0f),
-            };
+            confidence.quantization_group_size = 3;
+            confidence.quantization_scales = {1.0f};
+            confidence.quantization_zero_points = {8};
+            confidence.quantized_data = {0x88, 0x08};
+            confidence.input_column_indices = {2, 1, 0};
             auto confidence_handle = compiled.weights.add("test_dspark_confidence", std::move(confidence));
             check(static_cast<bool>(confidence_handle));
             compiled.speculative.confidence_weight = confidence_handle.value();
@@ -8860,6 +8924,62 @@ void test_speculative_generation()
             check(dspark_session->statistics().speculative_accepted_tokens >= 2);
             for (size_t index = 0; index < dspark_result.value().tokens.size(); ++index)
                 check(dspark_result.value().tokens[index].token_id == (index % 2 == 0 ? 1 : 0));
+
+            SessionState proposal_state;
+            proposal_state.speculative_layers.resize(compiled.speculative.layer_nodes.size());
+            for (size_t layer_index = 0;
+                 layer_index < proposal_state.speculative_layers.size();
+                 ++layer_index)
+            {
+                const AttentionBlockPlan& attention = compiled.speculative.graph.layer_plans[layer_index].attention;
+                proposal_state.speculative_layers[layer_index].latent_window.assign(static_cast<size_t>(attention.sliding_window) * attention.head_dimension,
+                                                                                    0.0f);
+            }
+            SessionStatistics proposal_statistics;
+            proposal_statistics.expert_token_counts.resize(compiled.descriptor.expert_count);
+            const SpeculativeSampler fixed_sampler = [](const std::vector<float>&) -> Result<int32_t> { return 1; };
+            auto confidence_proposal = propose_speculative(compiled, 0, proposal_statistics,
+                                                           proposal_state, 0, fixed_sampler);
+            if (!confidence_proposal)
+                throw std::runtime_error("DSpark confidence proposal failed: "
+                                         + confidence_proposal.error().message);
+            check(confidence_proposal.value().confidence_logits.size() == compiled.speculative.block_size);
+            const std::array<const std::byte*, 3> confidence_storage = {
+                proposal_state.hyper_connection_scratch.auxiliary.bytes().data(),
+                proposal_state.hyper_connection_scratch.normalized.bytes().data(),
+                proposal_state.hyper_connection_scratch.projection.bytes().data(),
+            };
+            const std::array<uint64_t, 3> confidence_capacity = {
+                proposal_state.hyper_connection_scratch.auxiliary.allocated_bytes(),
+                proposal_state.hyper_connection_scratch.normalized.allocated_bytes(),
+                proposal_state.hyper_connection_scratch.projection.allocated_bytes(),
+            };
+            check(confidence_capacity[2] >= 3 * sizeof(float));
+            check(confidence_storage[0] != confidence_storage[1]);
+            check(confidence_storage[0] != confidence_storage[2]);
+            check(confidence_storage[1] != confidence_storage[2]);
+            check(proposal_state.expert_scratch.staged_output.bytes().data()
+                  != proposal_state.expert_scratch.staged_merged.bytes().data());
+            check(confidence_storage[0] != proposal_state.expert_scratch.staged_output.bytes().data());
+            check(confidence_storage[0] != proposal_state.expert_scratch.staged_merged.bytes().data());
+            check(confidence_storage[1] != proposal_state.expert_scratch.staged_output.bytes().data());
+            check(confidence_storage[1] != proposal_state.expert_scratch.staged_merged.bytes().data());
+            check(confidence_storage[2] != proposal_state.expert_scratch.staged_output.bytes().data());
+            check(confidence_storage[2] != proposal_state.expert_scratch.staged_merged.bytes().data());
+            auto repeated_confidence_proposal = propose_speculative(compiled, 0, proposal_statistics,
+                                                                    proposal_state, 0, fixed_sampler);
+            if (!repeated_confidence_proposal)
+                throw std::runtime_error("repeated DSpark confidence proposal failed: "
+                                         + repeated_confidence_proposal.error().message);
+            check(repeated_confidence_proposal.value().token_ids == confidence_proposal.value().token_ids);
+            check(repeated_confidence_proposal.value().logits == confidence_proposal.value().logits);
+            check(repeated_confidence_proposal.value().confidence_logits == confidence_proposal.value().confidence_logits);
+            check(proposal_state.hyper_connection_scratch.auxiliary.bytes().data() == confidence_storage[0]);
+            check(proposal_state.hyper_connection_scratch.normalized.bytes().data() == confidence_storage[1]);
+            check(proposal_state.hyper_connection_scratch.projection.bytes().data() == confidence_storage[2]);
+            check(proposal_state.hyper_connection_scratch.auxiliary.allocated_bytes() == confidence_capacity[0]);
+            check(proposal_state.hyper_connection_scratch.normalized.allocated_bytes() == confidence_capacity[1]);
+            check(proposal_state.hyper_connection_scratch.projection.allocated_bytes() == confidence_capacity[2]);
 
             GenerationOptions ordinary_options = dspark_options;
             ordinary_options.use_speculative = false;
@@ -9161,6 +9281,87 @@ void test_bfloat16_ring_kv_cache()
     for (uint32_t index = 0; index < 16; ++index)
         check(static_cast<bool>(bfloat16_session.value()->decode(static_cast<int32_t>(index % 2))));
     check(static_cast<bool>(bfloat16_session.value()->statistics().kv_cache_allocated_size <= bfloat16_session.value()->statistics().kv_cache_logical_size * 16));
+}
+
+void test_generic_mtp_int4_cache_key()
+{
+    AttentionPackage package(false, 0, false, false);
+    ModelPackage model_package;
+    model_package.root = package.path();
+    model_package.manifest.model_type = "test_moe";
+    std::ifstream manifest_stream(package.path() / "config.json", std::ios::binary);
+    model_package.manifest.raw_json = {std::istreambuf_iterator<char>(manifest_stream),
+                                       std::istreambuf_iterator<char>()};
+    FixtureModelAdapter adapter;
+    auto parsed = adapter.parse_model(model_package);
+    check(static_cast<bool>(parsed));
+    auto mapping = adapter.map_weights(model_package, parsed.value());
+    check(static_cast<bool>(mapping));
+
+    MoeModelDescriptor descriptor = std::move(parsed).value();
+    descriptor.speculative_kind = SpeculativeModelKind::Mtp;
+    descriptor.speculative_layer_count = 1;
+    descriptor.speculative_block_size = 2;
+    MoeDescriptor& moe = descriptor.layers.back().moe;
+    moe.activation = ExpertActivation::Silu;
+    moe.expert_weight_dtype = DType::Int4;
+
+    const auto make_int4 = [](std::vector<uint32_t> shape) {
+        TensorData tensor;
+        tensor.dtype = DType::Int4;
+        tensor.shape = std::move(shape);
+        tensor.quantization_group_size = tensor.shape[1];
+        tensor.quantization_scales.assign(tensor.shape[0], 1.0f);
+        tensor.quantization_zero_points.assign(tensor.shape[0], 8);
+        const size_t row_bytes = (tensor.shape[1] + 1) / 2;
+        tensor.quantized_data.assign(static_cast<size_t>(tensor.shape[0]) * row_bytes, 0x88);
+        return tensor;
+    };
+    const auto add_float = [&mapping](std::string name, std::vector<uint32_t> shape, float value = 0.0f) {
+        TensorData tensor;
+        tensor.dtype = DType::Float32;
+        tensor.shape = std::move(shape);
+        tensor.float32_data.assign(static_cast<size_t>(tensor.shape[0]) * tensor.shape[1], value);
+        mapping.value().emplace(std::move(name), std::move(tensor));
+    };
+    const auto add_float_vector = [&mapping](std::string name, uint32_t size, float value) {
+        TensorData tensor;
+        tensor.dtype = DType::Float32;
+        tensor.shape = {size};
+        tensor.float32_data.assign(size, value);
+        mapping.value().emplace(std::move(name), std::move(tensor));
+    };
+
+    mapping.value()["layers.0.experts.0.up.weight"] = make_int4({2, 2});
+    mapping.value()["layers.0.experts.0.down.weight"] = make_int4({2, 2});
+    add_float_vector("speculative.mtp.embedding_norm.weight", 2, 1.0f);
+    add_float_vector("speculative.mtp.hidden_norm.weight", 2, 1.0f);
+    add_float("speculative.mtp.input_projection.weight", {2, 4});
+    add_float_vector("speculative.final_norm.weight", 2, 1.0f);
+    add_float_vector("speculative.layers.0.pre_attention_norm.weight", 2, 1.0f);
+    for (const char* projection : {"query", "key", "value", "output"})
+        add_float(std::string("speculative.layers.0.attention.") + projection + ".weight", {2, 2});
+    add_float_vector("speculative.layers.0.pre_ffn_norm.weight", 2, 1.0f);
+    add_float("speculative.layers.0.router.weight", {1, 2});
+    for (const char* projection : {"gate", "up", "down"})
+        add_float(std::string("speculative.layers.0.shared_expert.") + projection + ".weight", {2, 2});
+    mapping.value()["speculative.layers.0.experts.0.gate_up.weight"] = make_int4({4, 2});
+    mapping.value()["speculative.layers.0.experts.0.down.weight"] = make_int4({2, 2});
+
+    CompiledModel compiled;
+    auto status = compile_model(std::move(descriptor), std::move(mapping).value(), compiled,
+                                HybridMode::CpuOnly);
+    if (!status)
+        throw std::runtime_error("generic INT4 MTP compilation failed: " + status.error().message);
+    const ExpertPlan& expert = compiled.speculative.graph.layer_plans.back().moe.experts.front();
+    check(expert.cache_key == "quantized:speculative.layers.0.experts.0.");
+    check(support_vulkan_expert(expert,
+                                compiled.weights.at(expert.gate_up_weight),
+                                compiled.weights.at(expert.down_weight),
+                                compiled.opt.optimization_flags));
+    check(support_vulkan_experts(compiled.weights,
+                                 compiled.speculative.graph.layer_plans.back().moe,
+                                 compiled.opt.optimization_flags));
 }
 
 void test_attention_graph_without_bias_or_sink()
@@ -9678,7 +9879,10 @@ void test_shared_expert_descriptor()
                                     {
                                         if (expert.activation == ExpertActivation::DeepSeekSwiGlu
                                             && expert.activation_limit > 0.0f)
+                                        {
                                             gate = std::min(gate, expert.activation_limit);
+                                            up = std::clamp(up, -expert.activation_limit, expert.activation_limit);
+                                        }
                                         activated.row(row)[column] = scaled_silu(gate,
                                                                                  1.0f,
                                                                                  model.opt.optimization_flags)
@@ -10685,7 +10889,7 @@ void test_expert_dispatcher_groups_routes()
     const ExpertRoute second_route = second_handoff_batch.routes.front();
     const ExpertRoute* second_dispatch_data = second_handoff_batch.routes.data();
     const size_t second_previous_active_capacity = handoff_active.batch.routes.capacity();
-    handoff_active.metrics.cache_wait_time_microseconds = 1;
+    handoff_active.cache_wait_us = 1;
     handoff_active.prepare(second_handoff_batch);
     check(handoff_active.batch.expert_id == second_expert_id);
     check(handoff_active.batch.routes.size() == 1);
@@ -10695,7 +10899,7 @@ void test_expert_dispatcher_groups_routes()
     check_near(handoff_active.batch.routes.front().weight, second_route.weight, 1e-6f);
     check(second_handoff_batch.routes.empty());
     check(second_handoff_batch.routes.capacity() == second_previous_active_capacity);
-    check(handoff_active.metrics.cache_wait_time_microseconds == 0);
+    check(handoff_active.cache_wait_us == 0);
 
     const std::vector<float> invalid_logits = {1.0f, 2.0f};
     ExpertDispatchPlan invalid_plan;
@@ -11171,6 +11375,70 @@ void test_deepseek_router_and_hyper_connection_kernels()
     check(static_cast<bool>(mixed_result));
     check_near(mixed.reduced.row(0)[0], 3.000006f, 1e-4f);
 
+    // FP8 projections force input quantization through the retained auxiliary buffer.
+    TensorData float8_function = function;
+    float8_function.dtype = DType::Float8E4M3;
+    float8_function.float32_data.clear();
+    float8_function.quantized_data.assign(16, 0);
+    float8_function.quantization_scales = {1.0f};
+    HyperConnectionMix float8_mix;
+    HyperConnectionScratch float8_scratch;
+    auto float8_pre = forward_hyper_connection_pre(hyper_input,
+                                                   float8_function,
+                                                   scale,
+                                                   base,
+                                                   2,
+                                                   2,
+                                                   1e-6f,
+                                                   1e-6f,
+                                                   float8_mix,
+                                                   float8_scratch,
+                                                   g_test_optimization_flags);
+    check(static_cast<bool>(float8_pre));
+    const std::byte* auxiliary_storage = float8_scratch.auxiliary.bytes().data();
+    const uint64_t auxiliary_capacity = float8_scratch.auxiliary.allocated_bytes();
+    check(auxiliary_capacity >= 2 * sizeof(float));
+    float8_pre = forward_hyper_connection_pre(hyper_input,
+                                              float8_function,
+                                              scale,
+                                              base,
+                                              2,
+                                              2,
+                                              1e-6f,
+                                              1e-6f,
+                                              float8_mix,
+                                              float8_scratch,
+                                              g_test_optimization_flags);
+    check(static_cast<bool>(float8_pre));
+    check(float8_scratch.auxiliary.bytes().data() == auxiliary_storage);
+    check(float8_scratch.auxiliary.allocated_bytes() == auxiliary_capacity);
+    for (size_t index = 0; index < mixed.reduced.values().size(); ++index)
+        check_near(float8_mix.reduced.values()[index], mixed.reduced.values()[index], 1e-5f);
+
+    TensorData int8_function;
+    int8_function.dtype = DType::Int8;
+    int8_function.shape = {8, 2};
+    int8_function.int8_data.assign(16, 0);
+    int8_function.quantization_scales.assign(8, 1.0f);
+    HyperConnectionMix int8_mix;
+    HyperConnectionScratch int8_scratch;
+    auto int8_pre = forward_hyper_connection_pre(hyper_input,
+                                                 int8_function,
+                                                 scale,
+                                                 base,
+                                                 2,
+                                                 2,
+                                                 1e-6f,
+                                                 1e-6f,
+                                                 int8_mix,
+                                                 int8_scratch,
+                                                 g_test_optimization_flags);
+    check(static_cast<bool>(int8_pre));
+    for (size_t index = 0; index < mixed.reduced.values().size(); ++index)
+        check_near(int8_mix.reduced.values()[index], mixed.reduced.values()[index], 1e-5f);
+    for (size_t index = 0; index < mixed.post.size(); ++index)
+        check_near(int8_mix.post[index], mixed.post[index], 1e-5f);
+
     TensorData malformed_function = function;
     malformed_function.shape.clear();
     auto invalid_function = forward_hyper_connection_pre(hyper_input, malformed_function, scale, base,
@@ -11320,6 +11588,46 @@ void test_deepseek_router_and_hyper_connection_kernels()
                                            g_test_optimization_flags);
     check(static_cast<bool>(headed));
     check_near(head_output.row(0)[0], 3.000006f, 1e-4f);
+
+    TensorData float8_head_function;
+    float8_head_function.dtype = DType::Float8E4M3;
+    float8_head_function.shape = {2, 2};
+    float8_head_function.quantized_data.assign(4, 0);
+    float8_head_function.quantization_scales = {1.0f};
+    ActivationBuffer float8_head_output;
+    auto float8_head = forward_hyper_connection_head(hyper_input,
+                                                     float8_head_function,
+                                                     head_scale,
+                                                     head_base,
+                                                     2,
+                                                     1e-6f,
+                                                     1e-6f,
+                                                     float8_head_output,
+                                                     float8_scratch,
+                                                     g_test_optimization_flags);
+    check(static_cast<bool>(float8_head));
+    check_near(float8_head_output.row(0)[0], 3.000006f, 1e-4f);
+    check(float8_scratch.auxiliary.bytes().data() == auxiliary_storage);
+    check(float8_scratch.auxiliary.allocated_bytes() == auxiliary_capacity);
+
+    TensorData int8_head_function;
+    int8_head_function.dtype = DType::Int8;
+    int8_head_function.shape = {2, 2};
+    int8_head_function.int8_data.assign(4, 0);
+    int8_head_function.quantization_scales.assign(2, 1.0f);
+    ActivationBuffer int8_head_output;
+    auto int8_head = forward_hyper_connection_head(hyper_input,
+                                                   int8_head_function,
+                                                   head_scale,
+                                                   head_base,
+                                                   2,
+                                                   1e-6f,
+                                                   1e-6f,
+                                                   int8_head_output,
+                                                   int8_scratch,
+                                                   g_test_optimization_flags);
+    check(static_cast<bool>(int8_head));
+    check_near(int8_head_output.row(0)[0], 3.000006f, 1e-4f);
 
     TensorData head4_function;
     head4_function.dtype = DType::Float32;
@@ -14703,6 +15011,84 @@ void test_gated_residual_kernels()
     check(mixed.reduced.bytes().data() == grown_reduced_data);
     check(gated_scratch.normalized.bytes().data() == grown_normalized_data);
 
+    const auto add_zero_quantized_projection = [&weights](const char* name,
+                                                          std::vector<uint32_t> shape,
+                                                          DType dtype) {
+        TensorData tensor;
+        tensor.dtype = dtype;
+        tensor.shape = std::move(shape);
+        if (dtype == DType::Int8)
+        {
+            tensor.int8_data.assign(static_cast<size_t>(tensor.shape[0]) * tensor.shape[1], 0);
+            tensor.quantization_scales.assign(tensor.shape[0], 1.0f);
+        }
+        else
+        {
+            tensor.quantized_data.assign(static_cast<size_t>(tensor.shape[0]) * tensor.shape[1], 0);
+            tensor.quantization_scales = {1.0f};
+        }
+        auto added = weights.add(name, std::move(tensor));
+        check(static_cast<bool>(added));
+        return added.value();
+    };
+    GatedResidualPlan int8_plan = plan;
+    int8_plan.mix_down_weight = add_zero_quantized_projection("gr_int8_down", {1, 4}, DType::Int8);
+    int8_plan.mix_up_weight = add_zero_quantized_projection("gr_int8_up", {4, 1}, DType::Int8);
+    int8_plan.inject_weight = add_zero_quantized_projection("gr_int8_inject", {2, 4}, DType::Int8);
+    HyperConnectionMix int8_mixed;
+    HyperConnectionScratch int8_scratch;
+    auto int8_pre = forward_gated_residual_pre(input,
+                                               weights,
+                                               operators,
+                                               int8_plan,
+                                               descriptor,
+                                               int8_mixed,
+                                               int8_scratch,
+                                               0);
+    check(static_cast<bool>(int8_pre));
+    for (size_t index = 0; index < mixed.reduced.values().size(); ++index)
+        check_near(int8_mixed.reduced.values()[index], mixed.reduced.values()[index], 1e-6f);
+    for (size_t index = 0; index < mixed.post.size(); ++index)
+        check_near(int8_mixed.post[index], mixed.post[index], 1e-6f);
+
+    GatedResidualPlan float8_plan = plan;
+    float8_plan.mix_down_weight = add_zero_quantized_projection("gr_float8_down", {1, 4}, DType::Float8E4M3);
+    float8_plan.mix_up_weight = add_zero_quantized_projection("gr_float8_up", {4, 1}, DType::Float8E4M3);
+    float8_plan.inject_weight = add_zero_quantized_projection("gr_float8_inject", {2, 4}, DType::Float8E4M3);
+    HyperConnectionMix float8_mixed;
+    HyperConnectionScratch float8_scratch;
+    auto float8_pre = forward_gated_residual_pre(input,
+                                                 weights,
+                                                 operators,
+                                                 float8_plan,
+                                                 descriptor,
+                                                 float8_mixed,
+                                                 float8_scratch,
+                                                 0);
+    check(static_cast<bool>(float8_pre));
+    const std::byte* auxiliary_storage = float8_scratch.auxiliary.bytes().data();
+    const uint64_t auxiliary_capacity = float8_scratch.auxiliary.allocated_bytes();
+    const std::byte* reduced_storage = float8_mixed.reduced.bytes().data();
+    const uint64_t reduced_capacity = float8_mixed.reduced.allocated_bytes();
+    check(reduced_capacity >= 4 * sizeof(float));
+    float8_pre = forward_gated_residual_pre(input,
+                                            weights,
+                                            operators,
+                                            float8_plan,
+                                            descriptor,
+                                            float8_mixed,
+                                            float8_scratch,
+                                            0);
+    check(static_cast<bool>(float8_pre));
+    check(float8_scratch.auxiliary.bytes().data() == auxiliary_storage);
+    check(float8_scratch.auxiliary.allocated_bytes() == auxiliary_capacity);
+    check(float8_mixed.reduced.bytes().data() == reduced_storage);
+    check(float8_mixed.reduced.allocated_bytes() == reduced_capacity);
+    for (size_t index = 0; index < mixed.reduced.values().size(); ++index)
+        check_near(float8_mixed.reduced.values()[index], mixed.reduced.values()[index], 1e-6f);
+    for (size_t index = 0; index < mixed.post.size(); ++index)
+        check_near(float8_mixed.post[index], mixed.post[index], 1e-6f);
+
     TensorData malformed_norm = weights.at(norm);
     malformed_norm.shape.clear();
     auto malformed_norm_added = weights.add("gr_malformed_norm", malformed_norm);
@@ -14843,12 +15229,25 @@ void test_ple_prefill_decode_continuation()
                                                          3.0f, 4.0f,
                                                          5.0f, 6.0f,
                                                          7.0f, 8.0f}));
-    plan.key_weight = add_bfloat16_tensor(weights, "ple_key", {4, 4}, std::vector<float>(16, 0.0f));
-    plan.value_weight = add_bfloat16_tensor(weights,
-                                            "ple_value",
-                                            {2, 4},
-                                            {1.0f, 0.0f, 0.0f, 0.0f,
-                                             0.0f, 1.0f, 0.0f, 0.0f});
+    const auto add_float8 = [&weights](const char* name,
+                                       std::vector<uint32_t> shape,
+                                       std::vector<float> values) {
+        TensorData tensor;
+        tensor.dtype = DType::Float8E4M3;
+        tensor.shape = std::move(shape);
+        tensor.quantized_data.reserve(values.size());
+        for (float value : values)
+            tensor.quantized_data.push_back(float_to_float8_e4m3(value));
+        tensor.quantization_scales = {1.0f};
+        auto added = weights.add(name, std::move(tensor));
+        check(static_cast<bool>(added));
+        return added.value();
+    };
+    plan.key_weight = add_float8("ple_key", {4, 4}, std::vector<float>(16, 0.0f));
+    plan.value_weight = add_float8("ple_value",
+                                   {2, 4},
+                                   {1.0f, 0.0f, 0.0f, 0.0f,
+                                    0.0f, 1.0f, 0.0f, 0.0f});
     plan.key_norm_weight = add_bfloat16_tensor(weights, "ple_key_norm", {4}, {0.0f, 0.0f, 0.0f, 0.0f});
     plan.query_norm_weight = add_bfloat16_tensor(weights, "ple_query_norm", {4}, {0.0f, 0.0f, 0.0f, 0.0f});
     plan.convolution_norm_weight = add_bfloat16_tensor(weights, "ple_conv_norm", {4}, {0.0f, 0.0f, 0.0f, 0.0f});
@@ -14876,7 +15275,7 @@ void test_ple_prefill_decode_continuation()
 
     ActivationBuffer decode_hidden(input_ids.size(), 4);
     LayerCache decode_cache;
-    const std::array<const std::byte*, 7> storage = {
+    const std::array<const std::byte*, 8> storage = {
         prefill_scratch.normalized.bytes().data(),
         prefill_scratch.key.bytes().data(),
         prefill_scratch.value.bytes().data(),
@@ -14884,6 +15283,7 @@ void test_ple_prefill_decode_continuation()
         prefill_scratch.gate.bytes().data(),
         prefill_scratch.attention.bytes().data(),
         prefill_scratch.projected.bytes().data(),
+        prefill_scratch.quantized_input.bytes().data(),
     };
     AttentionScratch decode_scratch = std::move(prefill_scratch);
     for (size_t row = 0; row < input_ids.size(); ++row)
@@ -14911,6 +15311,8 @@ void test_ple_prefill_decode_continuation()
     check(decode_scratch.gate.bytes().data() == storage[4]);
     check(decode_scratch.attention.bytes().data() == storage[5]);
     check(decode_scratch.projected.bytes().data() == storage[6]);
+    check(decode_scratch.quantized_input.bytes().data() == storage[7]);
+    check(decode_scratch.quantized_input.allocated_bytes() >= 4 * sizeof(float));
     constexpr float first_gate = 0.5f;
     check_near(prefill_hidden.row(0)[0], first_gate, 1e-6f);
     check_near(prefill_hidden.row(0)[1], first_gate * 2.0f, 1e-6f);
@@ -20191,9 +20593,10 @@ int main(int argc, char** argv)
         ncnn::moe::test_ncnn_vulkan_bfloat16_operator();
         ncnn::moe::test_ncnn_vulkan_float8_operator();
         ncnn::moe::test_mxfp4_weight_storage_padding();
+        ncnn::moe::test_weightstore_finalize();
         ncnn::moe::test_mxfp4_cpu_kernel_and_fused_gate_up();
         ncnn::moe::test_qnk_cpu_kernel();
-        ncnn::moe::test_qnk_graph_gate_up_fusion();
+        ncnn::moe::test_qnk_graph_cpu_projections();
         ncnn::moe::test_ncnn_vulkan_qnk_operator();
         ncnn::moe::test_ncnn_vulkan_qnk_expert_operator();
         ncnn::moe::test_adaptive_cache_wait_policy();
@@ -20223,6 +20626,7 @@ int main(int argc, char** argv)
         ncnn::moe::test_invalid_int8_scale_is_rejected();
         ncnn::moe::test_attention_kv_cache_and_reset();
         ncnn::moe::test_bfloat16_ring_kv_cache();
+        ncnn::moe::test_generic_mtp_int4_cache_key();
         ncnn::moe::test_attention_graph_without_bias_or_sink();
         ncnn::moe::test_shared_expert_descriptor();
         ncnn::moe::test_execution_graph_and_scheduler();
@@ -20244,6 +20648,10 @@ int main(int argc, char** argv)
         ncnn::moe::test_sampling_and_streaming_generation();
         ncnn::moe::test_batch_workspace_reuse();
         ncnn::moe::test_batch_combine_backend();
+        ncnn::moe::test_dense_ffn();
+        ncnn::moe::test_int4();
+        ncnn::moe::test_quant_archive();
+        ncnn::moe::test_native_awq();
         ncnn::moe::test_reusable_kernel_scratch();
         ncnn::moe::test_generation_logits_ownership();
         ncnn::moe::test_generation_callback_errors();

@@ -5,7 +5,7 @@
 >❗This software is in the early development stage
 
 ncnn MoE Runtime is a lightweight, high-performance C++20 inference engine for
-sparse Mixture-of-Experts models, built on
+dense Transformers and sparse Mixture-of-Experts models, built on
 [Tencent/ncnn](https://github.com/Tencent/ncnn). Model adapters parse external
 packages into a model-neutral `MoeModelDescriptor`; the Loader validates that
 descriptor, while the Runtime compiles its model plans into an
@@ -17,7 +17,9 @@ complete model may be larger than available RAM. The public API is independent
 of a model family, device vendor, and fixed cache size. The distributed release
 includes validated GPT-OSS, DeepSeek-V4-Flash, DeepSeek-V4-Flash-DSpark, and
 Qwen3.6-35B-A3B and Qwen3.8-Flash-Next text-backbone support for their official
-Safetensors packages.
+Safetensors packages. The Qwen3.5/Qwen3.6 dense text architecture and Qwen3.8-27B are also
+admitted, with generated-model execution and official-tokenizer parity tests.
+Full-checkpoint dense generation and performance have not yet been measured.
 
 [Runtime capabilities](#runtime-capabilities) | [Architecture](#architecture) |
 [Supported models and data](#supported-models-and-reference-data) |
@@ -39,6 +41,7 @@ matrix.
 | DeepSeek-V4-Flash-DSpark | Hybrid, DSpark enabled, 16 GiB host ARC | **1.254 token/s** | **3.594 aggregate token/s** (4 independent Sessions) | [DSpark performance](models/deepseek-v4/README.md#deepseek-v4-flash-dspark-matrix) |
 | Qwen3.6-35B-A3B | Hybrid, compiled MXFP4 Artifact, target only | **8.383 token/s** | **22.435 aggregate token/s** (4 independent Sessions) | [Qwen3.6 performance](models/qwen3.6/README.md#reference-performance) |
 | Qwen3.8-Flash-Next | Hybrid, on-demand Experts | Not yet published | Not yet published | [Qwen3.8 admission](models/qwen3.8/README.md) |
+| Qwen3.5 / Qwen3.6 dense text | CPU or mixed Attention/FFN | Not yet published | Not yet published | [Dense admission](models/qwen3.6/README.md#dense-text-models) |
 
 Model-specific prompts, kernels, quantization formats, and service policies
 differ, so these rows are reference points rather than a cross-model ranking.
@@ -73,10 +76,11 @@ requiring a resident copy of every routed weight.
 | Compiler | Descriptor validation, weight resolution, execution-graph construction, and immutable compilation |
 | Execution graph | Tensor and node dependencies, backend candidates and placement, and dependency-ordered nodes |
 | Dense path | Portable CPU with runtime-dispatched FP8 E4M3 scalar/AVX2/AVX-512 Linear, and mixed ncnn Vulkan Dense/Attention execution |
+| Dense FFN | Unconditional gated MLP with independent FP32/BF16/INT4/Qn_K gate/up/down projections, CPU/Vulkan dispatch, batching, and resident weight accounting |
 | Attention | RMSNorm, GQA, full/sliding Attention, Gated DeltaNet, latent Attention with learned compressed history, RoPE/YaRN variants, output gates, sinks, persistent KV/recurrent state, fused QKV+RoPE, and option-controlled fused Decode SDPA |
-| Experts | Stable Top-K regrouping, Softmax/Sigmoid/square-root-Softplus scoring, hash routes, gated shared Experts, float32/BF16/FP8/INT8/Q2_K-Q6_K execution, and fused-decode FP4 kernels selected at runtime for scalar, NEON, SVE2, AVX2/FMA, or AVX-512 |
+| Experts | Stable Top-K regrouping, Softmax/Sigmoid/square-root-Softplus scoring, hash routes, gated shared Experts, float32/BF16/FP8/INT8/INT4/Q2_K-Q8_K execution, and fused-decode FP4 kernels selected at runtime for scalar, NEON, SVE2, AVX2/FMA, or AVX-512 |
 | Memory and storage | Automatic eager/on-demand planning, per-Session KV/recurrent state, byte-bounded host ARC, mmap or asynchronous direct/buffered reads, optional packed Expert storage, and optional Vulkan cache tiers |
-| Heterogeneous execution | CPU Experts by default, optional resident native Vulkan MXFP4 Experts, and capability-weighted multi-Vulkan layer placement |
+| Heterogeneous execution | CPU Experts by default, resident native Vulkan MXFP4/INT4/Qn_K Experts when eligible, and capability-weighted multi-Vulkan layer placement |
 | Scheduling | Independent Session state, ragged staged Prefill, mHC/Attention/Expert Decode batching, and same-Expert and exact-input coalescing |
 | Generation | Greedy, temperature, Top-K, Top-P, Min-P, stop tokens, streaming, and model-provided speculative plans |
 
@@ -237,6 +241,11 @@ common commands. The model guides document model-specific package preparation
 and adapter options.
 
 ## Qn_K CPU weights
+
+The [model catalog](models/README.md#quantized-package-import) documents the
+native AWQ/GPTQ INT4 execution across the built-in model families and the
+GGUF, FP8, and ordinary Safetensors importer, including retained storage,
+CPU/Vulkan execution, and validation boundaries.
 
 The CPU path accepts the portable Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, and
 Q8_K blocks. Q2_K-Q6_K use the exact 256-element super-block layouts; Q8_K is
@@ -442,7 +451,7 @@ the Runtime API and its public model guides.
 | Built-in reference adapters | GPT-OSS-20B/120B, DeepSeek-V4-Flash/DSpark, and the Qwen3.6-35B-A3B and Qwen3.8-Flash-Next text backbones |
 | CPU execution | Complete portable path |
 | Heterogeneous execution | Vulkan Dense/Attention with CPU routing and Experts |
-| Native Vulkan Experts | Optional MXFP4 cache and resident execution, with CPU recovery for missing or failed work |
+| Native Vulkan Experts | MXFP4, INT4 and Qn_K cache and resident execution, with CPU recovery for missing or failed work |
 | Multiple Vulkan devices | Capability-weighted whole-layer placement |
 | Expert memory | Automatic eager or byte-bounded on-demand residency |
 | KV cache | CPU FP32/BF16 or mixed-backend FP32 ring |

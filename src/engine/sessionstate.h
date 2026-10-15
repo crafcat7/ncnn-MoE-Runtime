@@ -27,11 +27,6 @@ namespace moe {
 
 struct SessionStatistics;
 
-struct ExpertExecutionMetrics
-{
-    uint64_t cache_wait_time_microseconds = 0;
-};
-
 struct ExpertWorkspace
 {
     ActivationBuffer projection;
@@ -46,7 +41,7 @@ struct ExpertState
     ActivationBuffer output;
     std::shared_ptr<DeviceTensor_vulkan> device_output;
     ExpertCacheLease lease;
-    ExpertExecutionMetrics metrics;
+    uint64_t cache_wait_us = 0;
 
     void prepare(ExpertBatch& next_batch)
     {
@@ -56,7 +51,7 @@ struct ExpertState
         next_batch.routes.clear();
         lease = {};
         device_output.reset();
-        metrics = {};
+        cache_wait_us = 0;
     }
 };
 

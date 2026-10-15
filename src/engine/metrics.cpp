@@ -112,6 +112,7 @@ void record_vulkan_execution_delta(SessionStatistics& statistics,
                                    const VulkanStatistics& after)
 {
     statistics.vulkan_linear_dispatches += after.dispatches - before.dispatches;
+    statistics.vulkan_int4_dispatches += after.int4_dispatches - before.int4_dispatches;
     statistics.vulkan_attention_blocks += after.attention_blocks - before.attention_blocks;
     statistics.vulkan_compute_submissions += after.compute_submissions - before.compute_submissions;
     statistics.vulkan_batch_uploads += after.batch_uploads - before.batch_uploads;
@@ -187,6 +188,8 @@ RuntimeMetricCounters runtime_metric_counters(const SessionStatistics& statistic
                                             start.gpu_submit_count);
     result.vulkan_linear_dispatches = counter_delta(statistics.vulkan_linear_dispatches,
                                                     start.vulkan_linear_dispatches);
+    result.vulkan_int4_dispatches = counter_delta(statistics.vulkan_int4_dispatches,
+                                                  start.vulkan_int4_dispatches);
     result.vulkan_attention_blocks = counter_delta(statistics.vulkan_attention_blocks,
                                                    start.vulkan_attention_blocks);
     result.vulkan_batch_uploads = counter_delta(statistics.vulkan_batch_uploads,
@@ -209,12 +212,17 @@ RuntimeMetricCounters runtime_metric_counters(const SessionStatistics& statistic
                                                           start.vulkan_gated_delta_submissions);
     result.expert_gpu_cache_hits = counter_delta(statistics.expert_gpu_cache_hits,
                                                  start.expert_gpu_cache_hits);
+    result.speculative_proposals = counter_delta(statistics.speculative_proposals, start.speculative_proposals);
+    result.speculative_draft_tokens = counter_delta(statistics.speculative_draft_tokens, start.speculative_draft_tokens);
+    result.speculative_accepted_tokens = counter_delta(statistics.speculative_accepted_tokens, start.speculative_accepted_tokens);
     result.expert_gpu_cache_misses = counter_delta(statistics.expert_gpu_cache_misses,
                                                    start.expert_gpu_cache_misses);
     result.expert_gpu_cache_admissions = counter_delta(statistics.expert_gpu_cache_admissions,
                                                        start.expert_gpu_cache_admissions);
     result.expert_gpu_cache_stores = counter_delta(statistics.expert_gpu_cache_stores,
                                                    start.expert_gpu_cache_stores);
+    result.expert_gpu_cache_evictions = counter_delta(statistics.expert_gpu_cache_evictions,
+                                                      start.expert_gpu_cache_evictions);
     result.expert_gpu_cache_dropped_admissions = counter_delta(statistics.expert_gpu_cache_dropped_admissions,
                                                                start.expert_gpu_cache_dropped_admissions);
     result.expert_gpu_cache_resident_size = statistics.expert_gpu_cache_resident_size;

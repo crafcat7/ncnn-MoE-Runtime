@@ -788,7 +788,13 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
     proposal.confidence_logits.reserve(model.speculative.block_size);
     int32_t previous_token = input_id;
     const TensorData& confidence = model.weights.at(model.speculative.confidence_weight);
-    const std::span<const uint16_t> confidence_values = confidence.bfloat16_values();
+    // The head and base logits remain live in ExpertScratch until every
+    // proposal row is processed. HyperConnectionScratch is independent and
+    // its head projection is complete, so its buffers can hold this work.
+    ActivationBuffer& confidence_input = state.hyper_connection_scratch.auxiliary;
+    ActivationBuffer& confidence_output = state.hyper_connection_scratch.normalized;
+    ActivationBuffer& quantized_input = state.hyper_connection_scratch.projection;
+    const CompiledOperator* confidence_operator = model.operators.find_weight(model.speculative.confidence_weight);
     const TensorData& markov_embedding_weight = model.weights.at(model.speculative.markov_embedding_weight);
     const TensorData& markov_head_weight = model.weights.at(model.speculative.markov_head_weight);
     const CompiledOperator* markov_head_operator = model.operators.find_weight(model.speculative.markov_head_weight);
@@ -817,17 +823,14 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
         proposal.logits.push_back(std::move(row_logits));
         previous_token = selected;
 
-        float confidence_logit = 0.0f;
-        for (uint32_t column = 0; column < model.descriptor.hidden_size; ++column)
-        {
-            confidence_logit += head_hidden.row(row)[column]
-                                * bfloat16_to_float(confidence_values[column]);
-        }
-        for (uint32_t column = 0; column < model.speculative.markov_rank; ++column)
-        {
-            confidence_logit += markov_embedding.row(0)[column] * bfloat16_to_float(confidence_values[model.descriptor.hidden_size + column]);
-        }
-        proposal.confidence_logits.push_back(confidence_logit);
+        confidence_input.reset(1, model.descriptor.hidden_size + model.speculative.markov_rank, false);
+        std::copy_n(head_hidden.row(row), model.descriptor.hidden_size, confidence_input.row(0));
+        std::copy_n(markov_embedding.row(0), model.speculative.markov_rank,
+                    confidence_input.row(0) + model.descriptor.hidden_size);
+        forward_linear(confidence, confidence_input, confidence_output,
+                       model.opt.optimization_flags, confidence_operator,
+                       ExecutionBackend::Cpu, &quantized_input);
+        proposal.confidence_logits.push_back(confidence_output.row(0)[0]);
     }
 
     if (model.expert_cache)

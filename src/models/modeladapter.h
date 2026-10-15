@@ -54,6 +54,10 @@ float optional_manifest_float(const std::string& json, const std::string& key, f
                                       const std::string& target,
                                       const std::string& source);
 
+// Select logical matrix rows without expanding native quantized weights.
+[[nodiscard]] Result<TensorData> select_tensor_rows(const TensorData& source,
+                                                    const std::vector<uint32_t>& rows);
+
 [[nodiscard]] Result<void> add_bfloat16_slice(WeightMapping& mapping,
                                               const SafetensorsArchive& archive,
                                               const std::string& target_name,

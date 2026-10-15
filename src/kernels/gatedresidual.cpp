@@ -19,13 +19,18 @@ static float gated_sigmoid(float value) noexcept
     return 1.0f / (1.0f + float_approximate_exp(-value));
 }
 
-static bool valid_bfloat16_matrix(const TensorData& tensor, uint32_t rows, uint32_t columns) noexcept
+static bool valid_projection_matrix(const TensorData& tensor, uint32_t rows, uint32_t columns) noexcept
 {
-    return tensor.dtype == DType::BFloat16
-           && tensor.shape.size() == 2
-           && tensor.shape[0] == rows
-           && tensor.shape[1] == columns
-           && tensor.bfloat16_values().size() == tensor.element_count();
+    if (tensor.shape.size() != 2 || tensor.shape[0] != rows || tensor.shape[1] != columns)
+        return false;
+    if (tensor.dtype == DType::BFloat16)
+        return tensor.bfloat16_values().size() == tensor.element_count();
+    if (tensor.dtype == DType::Float32)
+        return tensor.float32_values().size() == tensor.element_count();
+    if (tensor.dtype == DType::Int8)
+        return tensor.int8_values().size() == tensor.element_count()
+               && tensor.quantization_scales.size() == rows;
+    return tensor.dtype == DType::Int4 || tensor.dtype == DType::Float8E4M3 || is_qnk_dtype(tensor.dtype);
 }
 
 static bool valid_bfloat16_vector(const TensorData& tensor, uint32_t size) noexcept
@@ -65,11 +70,8 @@ static Result<void> forward_gated_residual(const ActivationBuffer& input,
     if (plan.mix_down_weight >= weights.size())
         return Error{ErrorCode::InvalidModel, "invalid gated-residual down projection"};
     const TensorData& mix_down_weight = weights.at(plan.mix_down_weight);
-    if (mix_down_weight.dtype != DType::BFloat16
-        || mix_down_weight.shape.size() != 2
-        || mix_down_weight.shape[1] != expanded_size
-        || mix_down_weight.shape[0] == 0
-        || mix_down_weight.bfloat16_values().size() != mix_down_weight.element_count())
+    if (mix_down_weight.shape.size() != 2 || mix_down_weight.shape[0] == 0
+        || !valid_projection_matrix(mix_down_weight, mix_down_weight.shape[0], expanded_size))
     {
         return Error{ErrorCode::InvalidModel, "invalid gated-residual down projection"};
     }
@@ -77,7 +79,7 @@ static Result<void> forward_gated_residual(const ActivationBuffer& input,
     if (plan.mix_up_weight >= weights.size())
         return Error{ErrorCode::InvalidModel, "invalid gated-residual up projection"};
     const TensorData& mix_up_weight = weights.at(plan.mix_up_weight);
-    if (!valid_bfloat16_matrix(mix_up_weight, expanded_size, low_rank))
+    if (!valid_projection_matrix(mix_up_weight, expanded_size, low_rank))
         return Error{ErrorCode::InvalidModel, "invalid gated-residual up projection"};
     const TensorData* inject_weight = nullptr;
     if (post_output)
@@ -85,7 +87,7 @@ static Result<void> forward_gated_residual(const ActivationBuffer& input,
         if (plan.inject_weight >= weights.size())
             return Error{ErrorCode::InvalidModel, "invalid gated-residual block injection projection"};
         inject_weight = &weights.at(plan.inject_weight);
-        if (!valid_bfloat16_matrix(*inject_weight, multiplier, expanded_size))
+        if (!valid_projection_matrix(*inject_weight, multiplier, expanded_size))
             return Error{ErrorCode::InvalidModel, "invalid gated-residual block injection projection"};
     }
 
@@ -111,11 +113,14 @@ static Result<void> forward_gated_residual(const ActivationBuffer& input,
         }
     }
 
+    // The previous auxiliary contents are dead here; mix-up will replace them.
     forward_linear(mix_down_weight,
                    normalized,
                    scratch.projection,
                    optimization_flags,
-                   operators.find_weight(plan.mix_down_weight));
+                   operators.find_weight(plan.mix_down_weight),
+                   ExecutionBackend::Cpu,
+                   &scratch.auxiliary);
     const float inverse_multiplier = 1.0f / static_cast<float>(multiplier);
     for (size_t row_index = 0; row_index < scratch.projection.rows(); ++row_index)
     {
@@ -126,20 +131,27 @@ static Result<void> forward_gated_residual(const ActivationBuffer& input,
             row[column] = row[column] * gated_sigmoid(row[column]);
         }
     }
+    // reduced_output is not read until the final reduction, so it can stage
+    // FP8/quantized input for mix-up while the projection stays in auxiliary.
     forward_linear(mix_up_weight,
                    scratch.projection,
                    scratch.auxiliary,
                    optimization_flags,
-                   operators.find_weight(plan.mix_up_weight));
+                   operators.find_weight(plan.mix_up_weight),
+                   ExecutionBackend::Cpu,
+                   &reduced_output);
 
-    reduced_output.reset(input.rows(), hidden_size, true);
     if (inject_weight)
     {
+        // Mix-up has committed its output to auxiliary; reduced_output is free
+        // again until the final reduced result is written below.
         forward_linear(*inject_weight,
                        normalized,
                        scratch.projection,
                        optimization_flags,
-                       operators.find_weight(plan.inject_weight));
+                       operators.find_weight(plan.inject_weight),
+                       ExecutionBackend::Cpu,
+                       &reduced_output);
         post_output->resize(input.rows() * multiplier);
         for (size_t row_index = 0; row_index < input.rows(); ++row_index)
         {
@@ -149,6 +161,7 @@ static Result<void> forward_gated_residual(const ActivationBuffer& input,
                 output[copy] = 2.0f * gated_sigmoid(row[copy] * inverse_multiplier);
         }
     }
+    reduced_output.reset(input.rows(), hidden_size, true);
     for (size_t row_index = 0; row_index < input.rows(); ++row_index)
     {
         const float* normalized_row = normalized.row(row_index);

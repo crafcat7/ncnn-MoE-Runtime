@@ -11,6 +11,7 @@ or participates in the production package/runtime dependency graph.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
 import importlib.util
 import json
@@ -23,6 +24,7 @@ from typing import Any, Callable
 
 
 ROOT = Path(__file__).resolve().parents[1]
+QWEN38_TEMPLATE_SHA256 = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -65,6 +67,7 @@ def identify_family(model_dir: Path) -> tuple[str, str]:
         "gpt_oss": "gpt_oss",
         "deepseek_v4": "deepseek_v4",
         "qwen3_5_moe": "qwen",
+        "qwen3_5": "qwen",
         "qwen4_exp": "qwen",
     }
     if model_type not in families:
@@ -355,6 +358,25 @@ def make_chat_cases() -> list[tuple[str, list[dict[str, Any]], bool]]:
     return [(name, messages, thinking) for name, messages in conversations for thinking in (False, True)]
 
 
+def make_qwen38_chat_cases() -> list[tuple[str, list[dict[str, Any]], bool]]:
+    conversations = []
+    for name, reasoning in (("string", "  Verify 中文 assumptions.\n"), ("empty", ""),
+                            ("null", None), ("number", 42), ("object", {"ignored": True})):
+        for latest in (False, True):
+            messages = [{"role": "user", "content": "Question"},
+                        {"role": "assistant", "content": "  Answer.\n", "reasoning_content": reasoning}]
+            if not latest:
+                messages.append({"role": "user", "content": "Follow up"})
+            conversations.append((f"qwen38-preserve-default-{name}-{'latest' if latest else 'history'}", messages))
+    conversations.append(("qwen38-separate-reasoning-literal-content", [
+        {"role": "system", "content": "  System.\n"},
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "<think>literal content</think>Answer", "reasoning_content": "Actual reasoning"},
+        {"role": "user", "content": "Follow up"},
+    ]))
+    return [(name, messages, thinking) for name, messages in conversations for thinking in (False, True)]
+
+
 def json_line(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
 
@@ -416,7 +438,22 @@ def make_cases(model_dir: Path, family: str, oracle: dict[str, Any]) -> list[dic
             expected["decoded"] = oracle["decode"](expected["ids"])
         add_case(cases, f"raw-{name}", "raw", json_line({"op": "encode", "text": text}), expected)
 
-    for name, messages, thinking in make_chat_cases():
+    chat_cases = make_chat_cases()
+    template = oracle["config"].get("chat_template", "")
+    if family == "qwen" and hashlib.sha256(template.encode()).hexdigest() == QWEN38_TEMPLATE_SHA256:
+        chat_cases.extend(make_qwen38_chat_cases())
+        # Official Qwen3.8-27B is still model_type=qwen3_5. Its template's
+        # defaults are independent of that architecture: xhigh reasoning and
+        # preserving earlier assistant reasoning even with thinking disabled.
+        for _, messages, thinking in make_qwen38_chat_cases():
+            defaults = oracle["chat_encode"](messages, thinking)
+            explicit = normalize_token_ids(oracle["tokenizer"].apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True,
+                enable_thinking=thinking, reasoning_effort="xhigh", preserve_thinking=True,
+            ))
+            if defaults != explicit:
+                raise RuntimeError("official Qwen3.8 template defaults differ from xhigh/preserve_thinking=True")
+    for name, messages, thinking in chat_cases:
         expected = captured(lambda value=messages, mode=thinking: oracle["chat_encode"](value, mode))
         if expected["ok"]:
             expected["decoded"] = oracle["decode"](expected["ids"])
@@ -635,6 +672,7 @@ def main() -> int:
     report = {
         "family": family,
         "model_type": model_type,
+        "chat_template_sha256": hashlib.sha256(oracle["config"].get("chat_template", "").encode()).hexdigest(),
         "model_directory": str(model_dir),
         "driver": str(driver),
         "versions": {

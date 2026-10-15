@@ -1,6 +1,8 @@
 #include "modeladapter.h"
 
 #include "json.h"
+#include "kernels/int4.h"
+#include "kernels/qnk.h"
 #include "ncnn/moe/modeladapter.h"
 #include "safetensors.h"
 #include "storage/mappedfile.h"
@@ -8,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <iomanip>
@@ -797,6 +800,158 @@ Result<void> add_tensor(WeightMapping& mapping,
     return {};
 }
 
+Result<TensorData> select_tensor_rows(const TensorData& source,
+                                      const std::vector<uint32_t>& rows)
+{
+    if (source.shape.size() != 2 || source.shape[0] == 0 || source.shape[1] == 0
+        || rows.empty() || rows.size() > std::numeric_limits<uint32_t>::max())
+    {
+        return Error{ErrorCode::InvalidModel, "invalid matrix row selection"};
+    }
+    bool contiguous = true;
+    for (size_t row = 0; row < rows.size(); ++row)
+    {
+        if (rows[row] >= source.shape[0])
+            return Error{ErrorCode::InvalidModel, "matrix row selection is out of range"};
+        if (static_cast<uint64_t>(rows[row]) != static_cast<uint64_t>(rows.front()) + row)
+            contiguous = false;
+    }
+
+    const uint32_t columns = source.shape[1];
+    const uint8_t* source_data = nullptr;
+    uint64_t row_bytes = 0;
+    uint64_t source_bytes = 0;
+    TensorData result;
+    result.dtype = source.dtype;
+    result.shape = {static_cast<uint32_t>(rows.size()), columns};
+    result.qnk_interleave_rows = source.qnk_interleave_rows;
+    if (source.dtype == DType::BFloat16)
+    {
+        const auto values = source.bfloat16_values();
+        if (values.size() != source.element_count())
+            return Error{ErrorCode::InvalidModel, "invalid BF16 matrix row storage"};
+        source_data = reinterpret_cast<const uint8_t*>(values.data());
+        row_bytes = static_cast<uint64_t>(columns) * sizeof(uint16_t);
+        source_bytes = values.size_bytes();
+    }
+    else if (source.dtype == DType::Float32)
+    {
+        const auto values = source.float32_values();
+        if (values.size() != source.element_count())
+            return Error{ErrorCode::InvalidModel, "invalid F32 matrix row storage"};
+        source_data = reinterpret_cast<const uint8_t*>(values.data());
+        row_bytes = static_cast<uint64_t>(columns) * sizeof(float);
+        source_bytes = values.size_bytes();
+    }
+    else if (source.dtype == DType::Float8E4M3)
+    {
+        const auto values = source.float8_values();
+        if (values.size() != source.element_count()
+            || (!source.quantized_data.empty() && source.mapped_data)
+            || (source.float8_scale_row_size != 1 && source.float8_scale_row_size != 128))
+            return Error{ErrorCode::InvalidModel, "invalid FP8 matrix row storage"};
+        const size_t scale_columns = columns / 128 + (columns % 128 != 0);
+        const size_t scale_rows = source.shape[0] / source.float8_scale_row_size
+                                  + (source.shape[0] % source.float8_scale_row_size != 0);
+        if (scale_rows > std::numeric_limits<size_t>::max() / scale_columns
+            || source.quantization_scales.size() != scale_rows * scale_columns
+            || rows.size() > std::numeric_limits<size_t>::max() / scale_columns)
+        {
+            return Error{ErrorCode::InvalidModel, "invalid FP8 matrix row scales"};
+        }
+        for (float scale : source.quantization_scales)
+            if (!(scale > 0.f) || !std::isfinite(scale))
+                return Error{ErrorCode::InvalidModel, "invalid FP8 matrix row scale value"};
+        source_data = values.data();
+        row_bytes = columns;
+        source_bytes = values.size();
+        result.float8_scale_row_size = 1;
+        result.quantization_scales.resize(rows.size() * scale_columns);
+        for (size_t row = 0; row < rows.size(); ++row)
+        {
+            const size_t scale_row = rows[row] / source.float8_scale_row_size;
+            std::copy_n(source.quantization_scales.data() + scale_row * scale_columns,
+                        scale_columns, result.quantization_scales.data() + row * scale_columns);
+        }
+    }
+    else if (source.dtype == DType::Int4)
+    {
+        auto status = validate_int4_tensor(source);
+        if (!status)
+            return status.error();
+        const auto values = source.int4_values();
+        source_data = values.data();
+        row_bytes = columns / 2 + columns % 2;
+        source_bytes = values.size();
+        const size_t groups = columns / source.quantization_group_size
+                              + (columns % source.quantization_group_size != 0);
+        if (rows.size() > std::numeric_limits<size_t>::max() / groups)
+            return Error{ErrorCode::InvalidModel, "INT4 matrix row selection is too large"};
+        result.quantization_group_size = source.quantization_group_size;
+        result.quantization_group_indices = source.quantization_group_indices;
+        result.input_column_indices = source.input_column_indices;
+        result.quantization_scales.resize(rows.size() * groups);
+        result.quantization_zero_points.resize(rows.size() * groups);
+        for (size_t row = 0; row < rows.size(); ++row)
+        {
+            std::copy_n(source.quantization_scales.data() + static_cast<size_t>(rows[row]) * groups,
+                        groups, result.quantization_scales.data() + row * groups);
+            std::copy_n(source.quantization_zero_points.data() + static_cast<size_t>(rows[row]) * groups,
+                        groups, result.quantization_zero_points.data() + row * groups);
+        }
+    }
+    else if (is_qnk_dtype(source.dtype))
+    {
+        if (!qnk_shape_supported(source.dtype, source.shape[0], columns))
+            return Error{ErrorCode::InvalidModel, "invalid Qn_K matrix row shape"};
+        auto status = validate_input_column_indices(source);
+        if (!status)
+            return status.error();
+        result.input_column_indices = source.input_column_indices;
+        const auto values = source.qnk_values();
+        source_data = values.data();
+        source_bytes = values.size();
+        row_bytes = qnk_storage_bytes(source.dtype, 1, columns);
+    }
+    else
+    {
+        return Error{ErrorCode::UnsupportedModel, "unsupported matrix dtype for row selection"};
+    }
+    if (row_bytes == 0 || row_bytes > std::numeric_limits<size_t>::max() / rows.size()
+        || source_bytes != row_bytes * source.shape[0])
+    {
+        return Error{ErrorCode::InvalidModel, "invalid matrix row byte count"};
+    }
+    const size_t selected_bytes = static_cast<size_t>(row_bytes * rows.size());
+    const size_t stride = static_cast<size_t>(row_bytes);
+    if (contiguous && source.mapped_data && source_data == source.mapped_data.get())
+    {
+        result.mapped_data = std::shared_ptr<const uint8_t>(source.mapped_data,
+                                                            source.mapped_data.get() + static_cast<size_t>(rows.front()) * stride);
+        result.mapped_size = selected_bytes;
+        return result;
+    }
+    uint8_t* destination;
+    if (source.dtype == DType::BFloat16)
+    {
+        result.bfloat16_data.resize(selected_bytes / sizeof(uint16_t));
+        destination = reinterpret_cast<uint8_t*>(result.bfloat16_data.data());
+    }
+    else if (source.dtype == DType::Float32)
+    {
+        result.float32_data.resize(selected_bytes / sizeof(float));
+        destination = reinterpret_cast<uint8_t*>(result.float32_data.data());
+    }
+    else
+    {
+        result.quantized_data.resize(selected_bytes);
+        destination = result.quantized_data.data();
+    }
+    for (size_t row = 0; row < rows.size(); ++row)
+        std::memcpy(destination + row * stride, source_data + static_cast<size_t>(rows[row]) * stride, stride);
+    return result;
+}
+
 Result<void> add_bfloat16_slice(WeightMapping& mapping,
                                 const SafetensorsArchive& archive,
                                 const std::string& target_name,
@@ -910,36 +1065,35 @@ static Result<void> add_query_gate(WeightMapping& mapping,
     {
         return Error{ErrorCode::InvalidModel, "invalid interleaved " + std::string(description) + " query/gate tensor: " + source};
     }
-    const size_t head_elements = static_cast<size_t>(static_cast<uint64_t>(head_dimension) * hidden_size);
-    const size_t combined_head_elements = head_elements * 2;
     auto loaded = archive.load_tensor(source);
     if (!loaded)
         return loaded.error();
     const TensorData& combined = loaded.value();
-    if (combined.dtype != DType::BFloat16
-        || combined.shape != std::vector<uint32_t>{combined_rows, hidden_size}
-        || combined.bfloat16_values().size() != combined.element_count())
+    if (combined.shape != std::vector<uint32_t>{combined_rows, hidden_size})
     {
         return Error{ErrorCode::InvalidModel, "invalid interleaved " + std::string(description) + " query/gate tensor: " + source};
     }
 
-    TensorData query;
-    query.dtype = DType::BFloat16;
-    query.shape = {static_cast<uint32_t>(query_rows), hidden_size};
-    query.bfloat16_data.resize(static_cast<size_t>(query_rows * hidden_size));
-    TensorData gate;
-    gate.dtype = DType::BFloat16;
-    gate.shape = {static_cast<uint32_t>(query_rows), hidden_size};
-    gate.bfloat16_data.resize(static_cast<size_t>(query_rows * hidden_size));
-    const std::span<const uint16_t> values = combined.bfloat16_values();
+    std::vector<uint32_t> query_selection;
+    std::vector<uint32_t> gate_selection;
+    query_selection.reserve(static_cast<size_t>(query_rows));
+    gate_selection.reserve(static_cast<size_t>(query_rows));
     for (uint32_t head = 0; head < head_count; ++head)
     {
-        const uint16_t* source_head = values.data() + static_cast<size_t>(head) * combined_head_elements;
-        std::copy_n(source_head, head_elements, query.bfloat16_data.data() + static_cast<size_t>(head) * head_elements);
-        std::copy_n(source_head + head_elements, head_elements, gate.bfloat16_data.data() + static_cast<size_t>(head) * head_elements);
+        for (uint32_t row = 0; row < head_dimension; ++row)
+        {
+            query_selection.push_back(head * head_dimension * 2 + row);
+            gate_selection.push_back(head * head_dimension * 2 + head_dimension + row);
+        }
     }
-    mapping.emplace(target_prefix + "attention.query.weight", std::move(query));
-    mapping.emplace(target_prefix + "attention.output_gate.weight", std::move(gate));
+    auto query = select_tensor_rows(combined, query_selection);
+    if (!query)
+        return query.error();
+    auto gate = select_tensor_rows(combined, gate_selection);
+    if (!gate)
+        return gate.error();
+    mapping.emplace(target_prefix + "attention.query.weight", std::move(query).value());
+    mapping.emplace(target_prefix + "attention.output_gate.weight", std::move(gate).value());
     return {};
 }
 

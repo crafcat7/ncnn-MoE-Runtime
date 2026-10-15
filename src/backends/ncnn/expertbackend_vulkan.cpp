@@ -5,6 +5,7 @@
 #include "experttransfer_vulkan.h"
 #include "storage/expertresidency.h"
 #include "kernels/qnk.h"
+#include "kernels/int4.h"
 
 #if NCNN_MOE_WITH_VULKAN
 #include <allocator.h>
@@ -644,8 +645,11 @@ bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const 
                                          const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down,
                                          const TensorData* down_bias, uint32_t residency_group,
                                          float activation_limit, ExpertActivation activation,
-                                         PendingAdmission& admission) const
+                                         PendingAdmission& admission, std::shared_ptr<const TensorData> up,
+                                         const TensorData* up_bias) const
 {
+    if (!vulkan_context)
+        return false;
     const auto valid_mxfp4_matrix = [](const TensorData& matrix) {
         if (matrix.shape.size() != 2 || matrix.shape[0] == 0 || matrix.shape[1] == 0
             || matrix.shape[1] % 32 != 0
@@ -668,7 +672,7 @@ bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const 
             return bias->float32_values().size() == columns;
         return bias->dtype == DType::BFloat16 && bias->bfloat16_values().size() == columns;
     };
-    const bool bfloat16_expert = gate_up
+    const bool bfloat16_expert = !up && gate_up
                                  && down
                                  && gate_up->dtype == DType::BFloat16
                                  && down->dtype == DType::BFloat16
@@ -680,7 +684,7 @@ bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const 
                                  && down->shape[1] == gate_up->shape[0] / 2
                                  && gate_up->bfloat16_values().size() == gate_up->element_count()
                                  && down->bfloat16_values().size() == down->element_count();
-    const bool mxfp4_expert = gate_up
+    const bool mxfp4_expert = !up && gate_up
                               && down
                               && gate_up->dtype == DType::MxFp4
                               && down->dtype == DType::MxFp4
@@ -690,20 +694,31 @@ bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const 
                               && down->shape[1] == gate_up->shape[0] / 2
                               && valid_mxfp4_matrix(*gate_up)
                               && valid_mxfp4_matrix(*down);
-    const bool qnk_expert = gate_up
-                            && down
-                            && is_qnk_dtype(gate_up->dtype)
-                            && gate_up->dtype == down->dtype
-                            && gate_up->shape.size() == 2
-                            && down->shape.size() == 2
-                            && gate_up->shape[0] % 2 == 0
-                            && down->shape[1] == gate_up->shape[0] / 2
-                            && qnk_shape_supported(gate_up->dtype, gate_up->shape[0], gate_up->shape[1])
-                            && qnk_shape_supported(down->dtype, down->shape[0], down->shape[1]);
+    const auto valid_native_matrix = [](const TensorData& matrix) {
+        if (matrix.shape.size() != 2 || matrix.shape[0] == 0 || matrix.shape[1] == 0)
+            return false;
+        if (matrix.dtype == DType::Int4)
+            return static_cast<bool>(validate_int4_tensor(matrix));
+        if (matrix.dtype == DType::BFloat16)
+            return matrix.input_column_indices.empty() && matrix.bfloat16_values().size() == matrix.element_count();
+        if (matrix.dtype == DType::Float32)
+            return matrix.input_column_indices.empty() && matrix.float32_values().size() == matrix.element_count();
+        return is_qnk_dtype(matrix.dtype) && matrix.shape.size() == 2
+               && qnk_shape_supported(matrix.dtype, matrix.shape[0], matrix.shape[1])
+               && matrix.qnk_values().size() == qnk_storage_bytes(matrix.dtype, matrix.shape[0], matrix.shape[1])
+               && static_cast<bool>(validate_input_column_indices(matrix));
+    };
+    const auto quantized = [](const TensorData& matrix) { return matrix.dtype == DType::Int4 || is_qnk_dtype(matrix.dtype); };
+    const bool native_expert = gate_up && down && (quantized(*gate_up) || quantized(*down) || (up && quantized(*up)))
+                               && valid_native_matrix(*gate_up) && valid_native_matrix(*down)
+                               && (up ? valid_native_matrix(*up) && up->shape == gate_up->shape
+                                            && down->shape[1] == gate_up->shape[0]
+                                      : gate_up->shape[0] % 2 == 0 && down->shape[1] == gate_up->shape[0] / 2);
     if (key.empty()
-        || (!mxfp4_expert && !qnk_expert && !bfloat16_expert)
+        || (!mxfp4_expert && !native_expert && !bfloat16_expert)
         || !valid_bias(gate_up_bias, gate_up->shape[0])
         || !valid_bias(down_bias, down->shape[0])
+        || (up && !valid_bias(up_bias, up->shape[0]))
         || (activation != ExpertActivation::Silu
             && activation != ExpertActivation::GptOssSwiGlu
             && activation != ExpertActivation::DeepSeekSwiGlu)
@@ -712,7 +727,13 @@ bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const 
         return false;
     }
     uint64_t size = 0;
-    const std::array<uint64_t, 4> parts = {expert_matrix_bytes(*gate_up), expert_matrix_bytes(*down), tensor_bytes(gate_up_bias), tensor_bytes(down_bias)};
+    const uint64_t alignment = std::max<uint64_t>(4, vulkan_context->device()->info.buffer_offset_alignment());
+    const std::array<uint64_t, 5> parts = {
+        native_expert ? QnkLinear_vulkan::storage_bytes(*gate_up, alignment) : expert_matrix_bytes(*gate_up),
+        native_expert ? QnkLinear_vulkan::storage_bytes(*down, alignment) : expert_matrix_bytes(*down),
+        up ? QnkLinear_vulkan::storage_bytes(*up, alignment) : 0,
+        native_expert ? 0 : tensor_bytes(gate_up_bias),
+        native_expert ? 0 : tensor_bytes(down_bias)};
     for (uint64_t part : parts)
     {
         if (part > cache_size - size)
@@ -727,6 +748,7 @@ bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const 
     admission.key = std::move(key);
     admission.gate_up = std::move(gate_up);
     admission.down = std::move(down);
+    admission.up = std::move(up);
     if (gate_up_bias)
     {
         admission.gate_up_bias = std::make_shared<TensorData>(*gate_up_bias);
@@ -735,6 +757,8 @@ bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const 
     {
         admission.down_bias = std::make_shared<TensorData>(*down_bias);
     }
+    if (up_bias)
+        admission.up_bias = std::make_shared<TensorData>(*up_bias);
     admission.activation_limit = activation_limit;
     admission.activation = activation;
     admission.residency_group = residency_group;
@@ -746,10 +770,39 @@ void VulkanExpertBackend::admit(std::string key, std::shared_ptr<const TensorDat
                                 const TensorData* down_bias, uint32_t residency_group, float activation_limit,
                                 ExpertActivation activation)
 {
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (stopping || entries.contains(key) || pending_keys.contains(key))
+            return;
+    }
     PendingAdmission admission;
     if (!make_admission(std::move(key), std::move(gate_up), gate_up_bias, std::move(down), down_bias,
                         residency_group, activation_limit, activation, admission))
         return;
+    enqueue_admission(std::move(admission));
+}
+
+void VulkanExpertBackend::admit_separate(std::string key, std::shared_ptr<const TensorData> gate, const TensorData* gate_bias,
+                                         std::shared_ptr<const TensorData> up, const TensorData* up_bias,
+                                         std::shared_ptr<const TensorData> down, const TensorData* down_bias,
+                                         uint32_t residency_group, float activation_limit, ExpertActivation activation)
+{
+    if (!up)
+        return;
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (stopping || entries.contains(key) || pending_keys.contains(key))
+            return;
+    }
+    PendingAdmission admission;
+    if (!make_admission(std::move(key), std::move(gate), gate_bias, std::move(down), down_bias,
+                        residency_group, activation_limit, activation, admission, std::move(up), up_bias))
+        return;
+    enqueue_admission(std::move(admission));
+}
+
+void VulkanExpertBackend::enqueue_admission(PendingAdmission admission)
+{
     const uint64_t size = admission.size;
     const std::lock_guard<std::mutex> lock(mutex);
     if (stopping || entries.find(admission.key) != entries.end() || pending_keys.find(admission.key) != pending_keys.end())
@@ -799,6 +852,41 @@ bool VulkanExpertBackend::prepare_demand(std::string key,
     {
         return false;
     }
+    return prepare_admission(std::move(admission), pin);
+}
+
+bool VulkanExpertBackend::prepare_demand_separate(std::string key,
+                                                  std::shared_ptr<const TensorData> gate,
+                                                  const TensorData* gate_bias,
+                                                  std::shared_ptr<const TensorData> up,
+                                                  const TensorData* up_bias,
+                                                  std::shared_ptr<const TensorData> down,
+                                                  const TensorData* down_bias,
+                                                  uint32_t residency_group,
+                                                  float activation_limit,
+                                                  ExpertActivation activation,
+                                                  std::shared_ptr<const void>& pin)
+{
+    pin.reset();
+    PendingAdmission admission;
+    try
+    {
+        if (!up || !vulkan_context || !expert_weight_allocator
+            || !make_admission(std::move(key), std::move(gate), gate_bias,
+                               std::move(down), down_bias, residency_group,
+                               activation_limit, activation, admission, std::move(up), up_bias))
+            return false;
+    }
+    catch (...)
+    {
+        return false;
+    }
+    return prepare_admission(std::move(admission), pin);
+}
+
+bool VulkanExpertBackend::prepare_admission(PendingAdmission admission,
+                                            std::shared_ptr<const void>& pin)
+{
     {
         const std::lock_guard<std::mutex> lock(mutex);
         const auto existing = entries.find(admission.key);
@@ -917,7 +1005,7 @@ size_t VulkanExpertBackend::prepare_demand_batch(std::span<const ExpertDemandReq
 {
     for (auto& pin : pins) pin.reset();
     if (requests.empty() || requests.size() != pins.size()) return 0;
-    if (!requests.front().gate_up || requests.front().gate_up->dtype != DType::MxFp4)
+    if (requests.front().up || !requests.front().gate_up || requests.front().gate_up->dtype != DType::MxFp4)
         return ExpertBackend::prepare_demand_batch(requests, pins);
 
     static constexpr size_t maximum_requests = 8;
@@ -928,7 +1016,7 @@ size_t VulkanExpertBackend::prepare_demand_batch(std::span<const ExpertDemandReq
     for (size_t index = 0; index < limit; ++index)
     {
         const auto& request = requests[index];
-        if (!request.gate_up || request.gate_up->dtype != DType::MxFp4) break;
+        if (request.up || !request.gate_up || request.gate_up->dtype != DType::MxFp4) break;
         PendingAdmission admission;
         try
         {
@@ -1208,22 +1296,26 @@ std::unique_ptr<ExpertDemandSubmission> VulkanExpertBackend::begin_demand_batch(
 {
     auto work = std::make_shared<DemandWork>();
     work->keys.reserve(requests.size());
-    work->biases.reserve(requests.size() * 2);
+    work->biases.reserve(requests.size() * 3);
     work->requests.assign(requests.begin(), requests.end());
     work->pins.resize(requests.size());
     for (size_t index = 0; index < requests.size(); ++index)
     {
         work->keys.emplace_back(requests[index].key);
         work->requests[index].key = work->keys.back();
-        for (bool gate : {true, false})
+        for (size_t projection = 0; projection < 3; ++projection)
         {
-            const TensorData* source = gate ? requests[index].gate_up_bias : requests[index].down_bias;
+            const TensorData* source = projection == 0   ? requests[index].gate_up_bias
+                                       : projection == 1 ? requests[index].down_bias
+                                                         : requests[index].up_bias;
             if (!source) continue;
             work->biases.push_back(std::make_shared<const TensorData>(*source));
-            if (gate)
+            if (projection == 0)
                 work->requests[index].gate_up_bias = work->biases.back().get();
-            else
+            else if (projection == 1)
                 work->requests[index].down_bias = work->biases.back().get();
+            else
+                work->requests[index].up_bias = work->biases.back().get();
         }
     }
     {
@@ -1330,18 +1422,34 @@ std::shared_ptr<VulkanExpertBackend::Entry> VulkanExpertBackend::create_entry(co
     }
     else
     {
-        entry->qnk_operation = QnkExpert_vulkan::create_with_allocator(*admission.gate_up,
-                                                                       admission.gate_up_bias.get(),
-                                                                       *admission.down,
-                                                                       admission.down_bias.get(),
-                                                                       admission.activation_limit,
-                                                                       vulkan_device_index,
-                                                                       expert_weight_allocator.get(),
-                                                                       admission.activation,
-                                                                       vulkan_runtime,
-                                                                       optimization_flags);
+        if (admission.up)
+            entry->qnk_operation = QnkExpert_vulkan::create_separate_with_allocator(*admission.gate_up,
+                                                                                    admission.gate_up_bias.get(),
+                                                                                    *admission.up,
+                                                                                    admission.up_bias.get(),
+                                                                                    *admission.down,
+                                                                                    admission.down_bias.get(),
+                                                                                    admission.activation_limit,
+                                                                                    vulkan_device_index,
+                                                                                    expert_weight_allocator.get(),
+                                                                                    admission.activation,
+                                                                                    vulkan_runtime,
+                                                                                    optimization_flags);
+        else
+            entry->qnk_operation = QnkExpert_vulkan::create_with_allocator(*admission.gate_up,
+                                                                           admission.gate_up_bias.get(),
+                                                                           *admission.down,
+                                                                           admission.down_bias.get(),
+                                                                           admission.activation_limit,
+                                                                           vulkan_device_index,
+                                                                           expert_weight_allocator.get(),
+                                                                           admission.activation,
+                                                                           vulkan_runtime,
+                                                                           optimization_flags);
     }
     if (!entry->operation && !entry->bfloat16_operation && !entry->qnk_operation)
+        return {};
+    if (entry->qnk_operation && entry->qnk_operation->device_bytes() != admission.size)
         return {};
     entry->key = admission.key;
     entry->weight_allocator = expert_weight_allocator;
@@ -1912,6 +2020,8 @@ uint64_t VulkanExpertBackend::qnk_bytes(const TensorData& tensor)
 
 uint64_t VulkanExpertBackend::expert_matrix_bytes(const TensorData& tensor)
 {
+    if (tensor.dtype == DType::Int4)
+        return int4_storage_bytes(tensor);
     if (tensor.dtype == DType::MxFp4)
         return mxfp4_bytes(tensor);
     if (tensor.dtype == DType::BFloat16)
@@ -2145,16 +2255,50 @@ void VulkanExpertBackend::execute_work_item(const std::shared_ptr<WorkItem>& wor
     bool executed = work->selected.empty();
     if (!work->selected.empty())
     {
-        const std::shared_ptr<Entry>& entry = work->selected.front().entry;
-        if (entry && entry->operation)
-            executed = forward_batch(work->requests, work->selected);
-        else if (entry && entry->bfloat16_operation)
+        const auto operation_kind = [](const std::shared_ptr<Entry>& entry) {
+            return !entry ? 0 : entry->operation        ? 1
+                            : entry->bfloat16_operation ? 2
+                            : entry->qnk_operation      ? 3
+                                                        : 0;
+        };
+        const int kind = operation_kind(work->selected.front().entry);
+        const bool homogeneous = std::all_of(work->selected.begin(), work->selected.end(), [&](const Selection& selection) {
+            return operation_kind(selection.entry) == kind;
+        });
+        const auto forward = [&](int selected_kind, std::span<const Selection> selected) {
+            if (selected_kind == 1)
+                return forward_batch(work->requests, selected);
+            if (selected_kind == 2)
+                return forward_bfloat16_batch(work->requests, selected);
+            return selected_kind == 3 && forward_qnk_batch(work->requests, selected);
+        };
+        if (homogeneous)
         {
-            executed = forward_bfloat16_batch(work->requests, work->selected);
+            executed = forward(kind, work->selected);
         }
-        else if (entry && entry->qnk_operation)
+        else
         {
-            executed = forward_qnk_batch(work->requests, work->selected);
+            // Each family publishes its own host output. A shared aggregate
+            // cannot be overwritten by independent family submissions.
+            for (ExpertBackendRequest& request : work->requests)
+            {
+                request.route_aggregation.output = nullptr;
+                request.route_aggregation.completed = nullptr;
+            }
+            executed = std::all_of(work->selected.begin(), work->selected.end(), [&](const Selection& selection) {
+                return operation_kind(selection.entry) != 0;
+            });
+            for (int selected_kind = 1; executed && selected_kind <= 3; ++selected_kind)
+            {
+                std::vector<Selection> selected;
+                for (const Selection& selection : work->selected)
+                    if (operation_kind(selection.entry) == selected_kind) selected.push_back(selection);
+                if (!selected.empty() && !forward(selected_kind, selected))
+                {
+                    executed = false;
+                    break;
+                }
+            }
         }
     }
     uint64_t aggregated_route_count = 0;
@@ -2495,7 +2639,12 @@ bool VulkanExpertBackend::forward_qnk_batch(std::span<const ExpertBackendRequest
             outputs.push_back(request.output);
         }
         if (!QnkExpert_vulkan::forward_batch(experts, inputs, outputs))
-            return false;
+        {
+            // Packed and independent gate/up layouts can share one cache
+            // wave without sharing the kernel's batched matrix geometry.
+            for (size_t index = 0; index < experts.size(); ++index)
+                if (!experts[index]->forward(*inputs[index], *outputs[index])) return false;
+        }
     }
 
     if (use_route_aggregation)
@@ -2526,6 +2675,46 @@ bool VulkanExpertBackend::forward_qnk_batch(std::span<const ExpertBackendRequest
 }
 
 #endif // NCNN_MOE_WITH_VULKAN
+
+uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
+                                               const TensorData& down, uint32_t device_index,
+                                               const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags)
+{
+#if NCNN_MOE_WITH_VULKAN
+    auto context = VulkanContext::acquire(device_index, vulkan_runtime, optimization_flags);
+    if (!context)
+        return 0;
+    const uint64_t alignment = std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
+    uint64_t size = 0;
+    for (const TensorData* matrix : {&gate_up, up, &down})
+    {
+        if (!matrix)
+            continue;
+        const uint64_t part = QnkLinear_vulkan::storage_bytes(*matrix, alignment);
+        if (part == 0 || part > std::numeric_limits<uint64_t>::max() - size)
+            return 0;
+        size += part;
+    }
+    return size;
+#else
+    (void)gate_up;
+    (void)up;
+    (void)down;
+    (void)device_index;
+    (void)vulkan_runtime;
+    (void)optimization_flags;
+    return 0;
+#endif
+}
+
+uint64_t native_quantized_gpu_cache_size(uint64_t available_size, uint64_t total_size,
+                                         uint64_t largest_expert_size) noexcept
+{
+    if (total_size < largest_expert_size || largest_expert_size == 0)
+        return 0;
+    const uint64_t available = std::min(available_size, total_size);
+    return available < largest_expert_size ? 0 : available;
+}
 
 std::shared_ptr<ExpertBackend> create_vulkan_expert_backend(uint64_t cache_size, uint32_t device_index,
                                                             std::shared_ptr<ExpertVictimCache> device_weight_source,

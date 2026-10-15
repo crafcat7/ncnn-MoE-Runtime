@@ -574,6 +574,7 @@ VulkanStatistics VulkanRuntimeState::snapshot() const noexcept
 {
     VulkanStatistics result;
     result.dispatches = dispatches.load();
+    result.int4_dispatches = int4_dispatches.load();
     result.attention_blocks = attention_blocks.load();
     result.compute_submissions = compute_submissions.load();
     result.batch_uploads = batch_uploads.load();

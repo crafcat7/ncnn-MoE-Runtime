@@ -3,6 +3,7 @@
 #include "bfloat16.h"
 #include "fastmath.h"
 #include "float8.h"
+#include "int4.h"
 #include "mxfp4.h"
 #include "qnk.h"
 #include "vector.h"
@@ -226,21 +227,75 @@ static void apply_float8_gate_up_activation(float* output,
             up_value = std::clamp(up_value, -activation_limit,
                                   activation_limit);
         }
-        output[column] = up_value * expert_activation(gate[column], activation, activation_limit, optimization_flags);
+        if (activation == ExpertActivation::GptOssSwiGlu)
+        {
+            const float gate_value = activation_limit > 0.0f ? std::min(gate[column], activation_limit) : gate[column];
+            if (activation_limit > 0.0f)
+                up_value = std::clamp(up_value, -activation_limit, activation_limit);
+            output[column] = scaled_silu(gate_value, 1.702f, optimization_flags) * (up_value + 1.0f);
+        }
+        else
+            output[column] = up_value * expert_activation(gate[column], activation, activation_limit, optimization_flags);
+    }
+}
+
+void forward_embedding_row(const TensorData& embedding, uint32_t row_index, float* destination)
+{
+    assert(embedding.shape.size() == 2);
+    const uint32_t hidden_size = embedding.shape[1];
+    if (row_index >= embedding.shape[0])
+        throw std::runtime_error("embedding token ID is out of range");
+    if (embedding.dtype == DType::Int4)
+    {
+        if (!int4_dequantize_row(embedding, row_index, destination))
+            throw std::runtime_error("invalid INT4 embedding layout");
+        return;
+    }
+    if (is_qnk_dtype(embedding.dtype))
+    {
+        const bool remap = !embedding.input_column_indices.empty();
+        const uint64_t row_bytes = qnk_storage_bytes(embedding.dtype, 1, hidden_size);
+        if ((remap && embedding.input_column_indices.size() != hidden_size)
+            || !qnk_shape_supported(embedding.dtype, embedding.shape[0], hidden_size)
+            || embedding.qnk_values().size() != row_bytes * embedding.shape[0])
+            throw std::runtime_error("invalid quantized embedding layout");
+        const uint8_t* row = embedding.qnk_values().data() + static_cast<size_t>(row_index) * row_bytes;
+        std::array<float, qnk_block_elements> decoded;
+        for (uint32_t column = 0; column < hidden_size; column += qnk_block_elements)
+        {
+            float* block = remap ? decoded.data() : destination + column;
+            qnk_dequantize_block(embedding.dtype, row + (column / qnk_block_elements) * qnk_block_bytes(embedding.dtype), block);
+            if (remap)
+            {
+                for (uint32_t lane = 0; lane < qnk_block_elements; ++lane)
+                    destination[embedding.input_column_indices[column + lane]] = block[lane];
+            }
+        }
+        return;
+    }
+    const size_t offset = static_cast<size_t>(row_index) * hidden_size;
+    const uint32_t input_blocks = hidden_size / 128 + (hidden_size % 128 != 0);
+    for (uint32_t column = 0; column < hidden_size; ++column)
+    {
+        if (embedding.dtype == DType::Int8)
+            destination[column] = embedding.int8_values()[offset + column] * embedding.quantization_scales[row_index];
+        else if (embedding.dtype == DType::Float8E4M3)
+            destination[column] = tensor_value(embedding, offset + column)
+                                  * embedding.quantization_scales[static_cast<size_t>(row_index / embedding.float8_scale_row_size) * input_blocks + column / 128];
+        else
+            destination[column] = tensor_value(embedding, offset + column);
     }
 }
 
 void forward_embedding(const TensorData& embedding, std::span<const int32_t> input_ids, ActivationBuffer& output)
 {
     assert(embedding.shape.size() == 2);
-    const uint32_t hidden_size = embedding.shape[1];
-    output.reset(input_ids.size(), hidden_size, false);
+    output.reset(input_ids.size(), embedding.shape[1], false);
     for (size_t token_index = 0; token_index < input_ids.size(); ++token_index)
     {
-        const size_t offset = static_cast<size_t>(input_ids[token_index]) * hidden_size;
-        float* destination = output.row(token_index);
-        for (uint32_t column = 0; column < hidden_size; ++column)
-            destination[column] = tensor_value(embedding, offset + column);
+        if (input_ids[token_index] < 0)
+            throw std::runtime_error("embedding token ID is out of range");
+        forward_embedding_row(embedding, static_cast<uint32_t>(input_ids[token_index]), output.row(token_index));
     }
 }
 
@@ -273,7 +328,7 @@ static void float8_linear_group_into(const TensorData& matrix,
     const uint8_t* weights = matrix_values.data()
                              + static_cast<size_t>(first_output_column) * input_columns;
     const float* scales = matrix.quantization_scales.data()
-                          + static_cast<size_t>(first_output_column / block_size) * input_blocks;
+                          + static_cast<size_t>(first_output_column / matrix.float8_scale_row_size) * input_blocks;
     if (quantized_input.rows() > 1)
     {
         float8_e4m3_quantized_input_dot_rows_batch(weights, input_columns, scales, quantized_input.row(0),
@@ -315,7 +370,7 @@ static void float8_linear_quantized_into(const TensorData& matrix,
     assert(quantized_input.columns() == input_columns);
     constexpr uint32_t block_size = 128;
     const uint32_t input_blocks = (input_columns + block_size - 1) / block_size;
-    const uint32_t output_blocks = (output_columns + block_size - 1) / block_size;
+    const uint32_t output_blocks = (output_columns + matrix.float8_scale_row_size - 1) / matrix.float8_scale_row_size;
     assert(matrix.float8_values().size() == matrix.element_count());
     assert(matrix.quantization_scales.size()
            == static_cast<size_t>(output_blocks) * input_blocks);
@@ -623,6 +678,8 @@ static uint32_t float8_linear_row_group_size_for_shape(const TensorData& matrix,
                                                        uint64_t optimization_flags) noexcept
 {
     const uint32_t kernel_group = float8_linear_row_group_size(optimization_flags);
+    if (matrix.float8_scale_row_size == 1)
+        return 1;
     if (token_count == 1 || matrix.shape[0] < 8)
         return kernel_group;
     // Use a wider output tile when activation reuse is available.
@@ -649,7 +706,7 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
     const CompiledOperator* const* owners = ops.size() == 0 ? nullptr : ops.begin();
     for (size_t i = 0; i < matrix_count; ++i)
     {
-        if (!weights[i] || !result[i])
+        if (!weights[i] || !result[i] || !weights[i]->input_column_indices.empty())
             return false;
     }
 
@@ -742,8 +799,11 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
         for (size_t i = 0; i < matrix_count; ++i)
         {
             const TensorData& matrix = *weights[i];
-            const uint32_t output_blocks = matrix.shape[0] / block_size
-                                           + (matrix.shape[0] % block_size != 0);
+            if (matrix.float8_scale_row_size != 1 && matrix.float8_scale_row_size != 128)
+                return false;
+            row_group_size = std::min(row_group_size, matrix.float8_scale_row_size);
+            const uint32_t output_blocks = matrix.shape[0] / matrix.float8_scale_row_size
+                                           + (matrix.shape[0] % matrix.float8_scale_row_size != 0);
             const uint64_t scale_count = static_cast<uint64_t>(output_blocks) * input_blocks;
             if (matrix.float8_values().size() != matrix.element_count()
                 || matrix.quantization_scales.size() != scale_count)
@@ -975,13 +1035,45 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
 
     if (forward_linear_vulkan(op, input, output, backend))
         return;
+
+    const ActivationBuffer* linear_input = &input;
+    ActivationBuffer local_input;
+    if (!matrix.input_column_indices.empty())
+    {
+        if ((matrix.dtype != DType::Int4 && !is_qnk_dtype(matrix.dtype))
+            || matrix.input_column_indices.size() != input_columns
+            || input.dtype() != DType::Float32)
+        {
+            throw std::runtime_error("invalid quantized linear input column map");
+        }
+        ActivationBuffer& prepared = quantized_input_scratch && quantized_input_scratch->dtype() == DType::Float32
+                                         ? *quantized_input_scratch
+                                         : local_input;
+        prepared.reset(input.rows(), input_columns, false);
+        for (size_t row = 0; row < input.rows(); ++row)
+        {
+            const float* source = input.row(row);
+            float* destination = prepared.row(row);
+            for (uint32_t column = 0; column < input_columns; ++column)
+                destination[column] = source[matrix.input_column_indices[column]];
+        }
+        linear_input = &prepared;
+    }
+    if (matrix.dtype == DType::Int4)
+    {
+        if (!forward_linear_int4(matrix, *linear_input, output))
+            throw std::runtime_error("invalid INT4 linear weight or activation shape");
+        return;
+    }
     if (is_qnk_dtype(matrix.dtype)
         && forward_linear_qnk(matrix,
-                              input,
+                              *linear_input,
                               output,
                               has_flag(optimization_flags, OptimizationCpuPackedWeights),
                               op ? &op->qnk_packed : nullptr))
         return;
+    if (!matrix.input_column_indices.empty())
+        throw std::runtime_error("invalid quantized linear weight layout");
     require_dense_host_storage(matrix, "linear weight");
     output.reset(input.rows(), output_columns, false);
     const int64_t parallel_output_columns = static_cast<int64_t>(output_columns);
@@ -1231,13 +1323,17 @@ bool forward_gate_up_float8(const TensorData& gate,
     const uint32_t output_columns = gate.shape[0];
     const uint32_t input_columns = gate.shape[1];
     const uint32_t input_blocks = (input_columns + block_size - 1) / block_size;
-    const uint32_t output_blocks = (output_columns + block_size - 1) / block_size;
+    if ((gate.float8_scale_row_size != 1 && gate.float8_scale_row_size != 128)
+        || (up.float8_scale_row_size != 1 && up.float8_scale_row_size != 128))
+        return false;
+    const uint32_t gate_output_blocks = (output_columns + gate.float8_scale_row_size - 1) / gate.float8_scale_row_size;
+    const uint32_t up_output_blocks = (output_columns + up.float8_scale_row_size - 1) / up.float8_scale_row_size;
     if (gate.float8_values().size() != gate.element_count()
         || up.float8_values().size() != up.element_count()
         || gate.quantization_scales.size()
-               != static_cast<size_t>(output_blocks) * input_blocks
+               != static_cast<size_t>(gate_output_blocks) * input_blocks
         || up.quantization_scales.size()
-               != static_cast<size_t>(output_blocks) * input_blocks)
+               != static_cast<size_t>(up_output_blocks) * input_blocks)
     {
         return false;
     }
@@ -1255,7 +1351,8 @@ bool forward_gate_up_float8(const TensorData& gate,
     prepare_quantized_float8_input(quantized_input, input, optimization_flags);
 
     output.reset(input.rows(), output_columns, false);
-    const uint32_t row_group_size = float8_linear_row_group_size(optimization_flags);
+    const uint32_t row_group_size = std::min({float8_linear_row_group_size(optimization_flags),
+                                              gate.float8_scale_row_size, up.float8_scale_row_size});
     const int64_t output_group_count = (static_cast<int64_t>(output_columns) + row_group_size - 1)
                                        / row_group_size;
     const uint64_t operation_count = static_cast<uint64_t>(output_columns) * input_columns * input.rows()
@@ -1275,10 +1372,10 @@ bool forward_gate_up_float8(const TensorData& gate,
         const uint8_t* up_weights = up_values.data()
                                     + static_cast<size_t>(first_output_column) * input_columns;
         const float* gate_scales = gate.quantization_scales.data()
-                                   + static_cast<size_t>(first_output_column / block_size)
+                                   + static_cast<size_t>(first_output_column / gate.float8_scale_row_size)
                                          * input_blocks;
         const float* up_scales = up.quantization_scales.data()
-                                 + static_cast<size_t>(first_output_column / block_size)
+                                 + static_cast<size_t>(first_output_column / up.float8_scale_row_size)
                                        * input_blocks;
         for (size_t token_index = 0; token_index < input.rows();
              ++token_index)

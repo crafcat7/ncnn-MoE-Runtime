@@ -11,11 +11,14 @@
 
 namespace ncnn {
 class Option;
+class VkMat;
+class VkCompute;
 
 namespace moe {
 
 class ActivationBuffer;
 class Bfloat16Linear_vulkan;
+class QnkLinear_vulkan;
 class VulkanContext;
 struct LayerCache;
 struct TensorData;
@@ -85,6 +88,22 @@ public:
                                                                       uint32_t vulkan_device_index,
                                                                       const VulkanRuntimePtr& vulkan_runtime,
                                                                       uint64_t optimization_flags);
+    [[nodiscard]] static std::shared_ptr<GatedDeltaNet_vulkan> create_quantized(std::span<const std::shared_ptr<QnkLinear_vulkan>> inputs,
+                                                                                const TensorData& convolution_weight,
+                                                                                const TensorData& time_bias,
+                                                                                const TensorData& decay_log,
+                                                                                const TensorData& norm_weight,
+                                                                                const std::shared_ptr<QnkLinear_vulkan>& output_projection,
+                                                                                uint32_t head_count,
+                                                                                uint32_t kv_head_count,
+                                                                                uint32_t head_dimension,
+                                                                                uint32_t value_head_dimension,
+                                                                                uint32_t convolution_kernel_size,
+                                                                                float norm_epsilon,
+                                                                                bool sigmoid_gate,
+                                                                                uint32_t vulkan_device_index,
+                                                                                const VulkanRuntimePtr& vulkan_runtime,
+                                                                                uint64_t optimization_flags);
 
     [[nodiscard]] bool forward(const ActivationBuffer& normalized,
                                LayerCache& cache,
@@ -97,6 +116,29 @@ public:
 
 private:
     class Implementation;
+
+    [[nodiscard]] static std::shared_ptr<GatedDeltaNet_vulkan> create_impl(const std::shared_ptr<Bfloat16Linear_vulkan>& fused_input,
+                                                                           std::span<const std::shared_ptr<QnkLinear_vulkan>> quantized_inputs,
+                                                                           const TensorData& convolution_weight,
+                                                                           const TensorData& time_bias,
+                                                                           const TensorData& decay_log,
+                                                                           const TensorData& norm_weight,
+                                                                           const std::shared_ptr<Bfloat16Linear_vulkan>& output_projection,
+                                                                           const std::shared_ptr<QnkLinear_vulkan>& quantized_output,
+                                                                           uint32_t head_count,
+                                                                           uint32_t kv_head_count,
+                                                                           uint32_t head_dimension,
+                                                                           uint32_t value_head_dimension,
+                                                                           uint32_t convolution_kernel_size,
+                                                                           float norm_epsilon,
+                                                                           bool sigmoid_gate,
+                                                                           uint32_t vulkan_device_index,
+                                                                           const VulkanRuntimePtr& vulkan_runtime,
+                                                                           uint64_t optimization_flags);
+    void record_input_projection(const ncnn::VkMat& input, ncnn::VkMat& output,
+                                 ncnn::VkCompute& command, bool normalize) const;
+    void record_output_projection(const ncnn::VkMat& input, ncnn::VkMat& output,
+                                  ncnn::VkCompute& command) const;
 
     [[nodiscard]] bool forward_impl(const ActivationBuffer& input,
                                     LayerCache& cache,

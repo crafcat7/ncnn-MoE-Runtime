@@ -863,12 +863,12 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                                                       ? static_cast<double>(generation.tokens.size()) / generation_seconds
                                                       : 0.0;
         const ncnn::moe::SessionStatistics statistics = active_sessions.front()->statistics();
-        uint64_t speculative_proposals = 0;
-        uint64_t speculative_draft_tokens = 0;
-        uint64_t speculative_accepted_tokens = 0;
-        for (const ncnn::moe::SessionPtr& session : active_sessions)
+        uint64_t speculative_proposals = statistics.speculative_proposals;
+        uint64_t speculative_draft_tokens = statistics.speculative_draft_tokens;
+        uint64_t speculative_accepted_tokens = statistics.speculative_accepted_tokens;
+        for (size_t session_index = 1; session_index < active_sessions.size(); ++session_index)
         {
-            const ncnn::moe::SessionStatistics session_statistics = session->statistics();
+            const ncnn::moe::SessionStatistics session_statistics = active_sessions[session_index]->statistics();
             speculative_proposals += session_statistics.speculative_proposals;
             speculative_draft_tokens += session_statistics.speculative_draft_tokens;
             speculative_accepted_tokens += session_statistics.speculative_accepted_tokens;

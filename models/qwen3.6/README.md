@@ -1,4 +1,33 @@
-#Qwen3.6 - 35B - A3B
+# Qwen3.5 / Qwen3.6
+
+## Dense text models
+
+The `qwen3_5` adapter also admits the dense text architecture used by
+[`Qwen3.6-27B`](https://huggingface.co/Qwen/Qwen3.6-27B) and the
+[`Qwen3.5` dense series](https://huggingface.co/Qwen/Qwen3.5-4B).
+It reads `text_config.intermediate_size` and ordinary
+`mlp.{gate_proj,up_proj,down_proj}.weight` tensors. Tied output embeddings are
+supported. Each dense FFN executes directly, without routing, Expert cache
+allocation, or Expert statistics. Gated DeltaNet and full Attention use the
+existing CPU/mixed backends, including Vulkan dense FFNs.
+
+Use the same `run` and `chat` commands below with the dense model directory.
+The dense path is text-only and target-only; vision and MTP tensors are not
+executed. Native text accepts the validated Qwen3.5 and Qwen3.6 tokenizer and
+string-message templates. Automated tests cover generated tiny packages and
+the official tokenizer assets; full-checkpoint generation and throughput have
+not yet been measured for these dense models.
+
+Dense FFN projections may retain native affine INT4 or raw Q2_K–Q8_K blocks.
+Each gate/up/down projection has its own dtype, including mixed Q4_K/Q6_K
+layers. CPU and Vulkan paths retain packed weights without persistent expanded copies.
+AWQ/GPTQ scales, zero points and GPTQ group indices are preserved. Attention
+and the output head can also use quantized projections. Keep
+`--cpu-packed-weights off` for native imported weights; resident packed storage
+is not admitted for this path. See the [model catalog](../README.md) for the
+quantized-package import boundary.
+
+## Qwen3.6-35B-A3B
 
 The built-in `qwen3_5_moe` adapter runs the text backbone from the official
 [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

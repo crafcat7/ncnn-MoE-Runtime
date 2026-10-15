@@ -64,17 +64,20 @@ static int64_t floor_remainder(int64_t value, int64_t divisor) noexcept
     return remainder < 0 ? remainder + divisor : remainder;
 }
 
-static Result<const uint16_t*> embedding_row(const WeightStore& weights,
-                                             const PleBlockPlan& plan,
-                                             uint64_t global_row,
-                                             uint32_t head_dimension)
+static Result<void> embedding_row(const WeightStore& weights,
+                                  const PleBlockPlan& plan,
+                                  uint64_t global_row,
+                                  float* destination)
 {
     uint64_t row = global_row;
     for (TensorHandle handle : plan.embedding_shards)
     {
         const TensorData& shard = weights.at(handle);
         if (row < shard.shape[0])
-            return shard.bfloat16_values().data() + static_cast<size_t>(row) * head_dimension;
+        {
+            forward_embedding_row(shard, static_cast<uint32_t>(row), destination);
+            return {};
+        }
         row -= shard.shape[0];
     }
     return Error{ErrorCode::InvalidModel, "PLE hash index exceeds embedding shards"};
@@ -147,12 +150,10 @@ Result<void> forward_ple(const WeightStore& weights,
                 if (vocabulary_size <= 0 || offset < 0)
                     return Error{ErrorCode::InvalidModel, "invalid PLE head vocabulary metadata"};
                 const uint64_t index = static_cast<uint64_t>(floor_remainder(mixed, vocabulary_size) + offset);
-                auto source = embedding_row(weights, plan, index, head_dimension);
+                float* destination = embeddings.row(row_index) + static_cast<size_t>(head) * head_dimension;
+                auto source = embedding_row(weights, plan, index, destination);
                 if (!source)
                     return source.error();
-                float* destination = embeddings.row(row_index) + static_cast<size_t>(head) * head_dimension;
-                for (uint32_t column = 0; column < head_dimension; ++column)
-                    destination[column] = bfloat16_to_float(source.value()[column]);
             }
         }
     }
@@ -175,12 +176,16 @@ Result<void> forward_ple(const WeightStore& weights,
                    embeddings,
                    key,
                    flags,
-                   operators.find_weight(plan.key_weight));
+                   operators.find_weight(plan.key_weight),
+                   ExecutionBackend::Cpu,
+                   &scratch.quantized_input);
     forward_linear(weights.at(plan.value_weight),
                    embeddings,
                    value,
                    flags,
-                   operators.find_weight(plan.value_weight));
+                   operators.find_weight(plan.value_weight),
+                   ExecutionBackend::Cpu,
+                   &scratch.quantized_input);
     ActivationBuffer& key_normed = scratch.query;
     ActivationBuffer& query_normed = scratch.gate;
     forward_grouped_rms_norm(key, weights.at(plan.key_norm_weight), hidden_size,

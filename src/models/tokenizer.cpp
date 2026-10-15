@@ -627,7 +627,7 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
         total_vocab_size = 129280;
         split_regexes.assign(deepseek_regexes.begin(), deepseek_regexes.end());
     }
-    else if (model_type == "qwen3_5_moe")
+    else if (model_type == "qwen3_5_moe" || model_type == "qwen3_5")
     {
         new_family = Family::Qwen36;
         base_vocab_size = 248044;
@@ -649,7 +649,9 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
     if (new_family == Family::Qwen36 || new_family == Family::Qwen38)
     {
         text_config = find_manifest_member(std::string_view(model_config), "text_config");
-        const std::string expected_text_type = new_family == Family::Qwen36 ? "qwen3_5_moe_text" : "qwen4_exp_text";
+        const std::string expected_text_type = model_type == "qwen3_5"       ? "qwen3_5_text"
+                                               : model_type == "qwen3_5_moe" ? "qwen3_5_moe_text"
+                                                                             : "qwen4_exp_text";
         if (!text_config || json_integer(*text_config, "vocab_size") != std::optional<int64_t>(248320) || json_string(*text_config, "model_type") != std::optional<std::string>(expected_text_type))
             return false;
     }
@@ -664,12 +666,35 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
         const std::string template_file((std::istreambuf_iterator<char>(template_input)), std::istreambuf_iterator<char>());
         if (template_input.bad())
             return false;
-        const std::string_view pinned_template = new_family == Family::Qwen36
-                                                     ? std::string_view(qwen36_template, sizeof(qwen36_template) - 1)
-                                                     : std::string_view(qwen38_template, sizeof(qwen38_template) - 1);
         const std::optional<std::string> config_template = json_string(config, "chat_template");
-        if (template_file != pinned_template || !config_template || *config_template != pinned_template)
+        // Qwen3.8-27B retains the Qwen3.5 architecture and tokenizer assets,
+        // but uses the Qwen3.8 chat template and its thinking-history defaults.
+        const bool qwen38_chat = template_file == std::string_view(qwen38_template, sizeof(qwen38_template) - 1);
+        bool supported_template = qwen38_chat
+                                  || (new_family == Family::Qwen36
+                                      && template_file == std::string_view(qwen36_template, sizeof(qwen36_template) - 1));
+        if (!supported_template && model_type == "qwen3_5")
+        {
+            // Qwen3.5 has the same string-message behavior with the default
+            // preserve_thinking value. Tool-call objects are outside this API.
+            std::string dense_template(qwen36_template, sizeof(qwen36_template) - 1);
+            const std::pair<std::string_view, std::string_view> differences[] = {
+                {"(preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index)", "loop.index0 > ns.last_query_index"},
+                {"args_value | string if args_value is string else args_value | tojson | safe", "args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string"},
+            };
+            for (const auto& difference : differences)
+            {
+                const size_t position = dense_template.find(difference.first);
+                if (position == std::string::npos)
+                    return false;
+                dense_template.replace(position, difference.first.size(), difference.second);
+            }
+            supported_template = template_file == dense_template;
+        }
+        if (!supported_template || !config_template || *config_template != template_file)
             return false;
+        if (qwen38_chat)
+            new_family = Family::Qwen38;
     }
 
     auto take_value = [](std::string_view text, size_t& position, std::string_view& value) {
@@ -1959,6 +1984,7 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
     {
         std::string role;
         std::string content;
+        std::string reasoning;
         std::string_view text{};
     };
     std::vector<Message> messages;
@@ -1982,6 +2008,7 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
         Message message;
         bool has_role = false;
         bool has_content = false;
+        bool has_reasoning = false;
         for (;;)
         {
             position = skip_space(messages_json, position);
@@ -1999,12 +2026,16 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
             if (position >= messages_json.size() || messages_json[position++] != ':')
                 throw std::invalid_argument("invalid message member");
             position = skip_space(messages_json, position);
-            if (key != "role" && key != "content")
+            const bool reasoning_field = family == Family::Qwen38 && key == "reasoning_content";
+            if (key != "role" && key != "content" && !reasoning_field)
                 throw std::invalid_argument("message fields are limited to role and content strings");
-            if (position >= messages_json.size() || messages_json[position] != '"')
+            if (position >= messages_json.size())
+                throw std::invalid_argument("invalid message member");
+            if (!reasoning_field && messages_json[position] != '"')
                 throw std::invalid_argument("message role and content must be strings");
             std::string value;
-            if (!parse_json_string(messages_json, position, &value))
+            if (messages_json[position] == '"' ? !parse_json_string(messages_json, position, &value)
+                                               : !parse_json_value(messages_json, position))
                 throw std::invalid_argument("invalid message string");
             if (key == "role")
             {
@@ -2013,12 +2044,19 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
                 has_role = true;
                 message.role = std::move(value);
             }
-            else
+            else if (key == "content")
             {
                 if (has_content)
                     throw std::invalid_argument("duplicate message content");
                 has_content = true;
                 message.content = std::move(value);
+            }
+            else
+            {
+                if (has_reasoning)
+                    throw std::invalid_argument("duplicate message reasoning_content");
+                has_reasoning = true;
+                message.reasoning = std::move(value);
             }
             position = skip_space(messages_json, position);
             if (position >= messages_json.size())
@@ -2259,7 +2297,7 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
         }
         else if (message.role == "assistant")
         {
-            std::string_view reasoning;
+            std::string_view reasoning = trim(message.reasoning);
             std::string_view body = content;
             if (family == Family::Qwen36)
             {

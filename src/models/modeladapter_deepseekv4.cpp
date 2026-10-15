@@ -5,19 +5,95 @@
 #include "modeladapter.h"
 #include "safetensors.h"
 
+#include <optional>
 #include <utility>
 
 namespace ncnn {
 namespace moe {
 
+static Result<void> add_deepseek_projection(WeightMapping& mapping, const SafetensorsArchive& archive,
+                                            const std::string& target, const std::string& source);
+
+static Result<DType> deepseek_projection_dtype(const SafetensorsArchive& archive, const std::string& source)
+{
+    const SafetensorInfo* tensor = archive.find(source);
+    if (tensor && tensor->dtype == "F8_E4M3")
+        return DType::Float8E4M3;
+    return archive.tensor_dtype(source);
+}
+
+static bool is_deepseek_fp4_expert(const SafetensorsArchive& archive, const std::string& source)
+{
+    const SafetensorInfo* weight = archive.find(source + "w1.weight");
+    return weight && weight->dtype == "I8" && archive.find(source + "w1.scale")
+           && !archive.find(source + "w1.weight.__int4_shape")
+           && !archive.find(source + "w1.weight.__qnk_shape");
+}
+
+static Result<void> inspect_deepseek_experts(const SafetensorsArchive& archive,
+                                             const std::string& source, MoeDescriptor& moe)
+{
+    const std::string experts = source + "ffn.experts.";
+    const bool fp4 = is_deepseek_fp4_expert(archive, experts + "0.");
+    const bool fused = archive.contains_tensor(experts + "0.gate_up_proj.weight");
+    if (fp4 && fused)
+        return Error{ErrorCode::InvalidModel, "duplicate DeepSeek Expert projection encodings: " + experts};
+    moe.layout = fp4 || fused ? ExpertLayout::InterleavedGateUpDown : ExpertLayout::GateUpDown;
+    moe.expert_weight_dtype = fp4 ? DType::MxFp4 : DType::BFloat16;
+    constexpr const char* fused_projections[] = {"gate_up_proj", "w2"};
+    constexpr const char* separate_projections[] = {"w1", "w3", "w2"};
+    const char* const* projections = fused ? fused_projections : separate_projections;
+    const size_t projection_count = fused ? 2 : 3;
+    for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
+    {
+        const std::string expert = experts + std::to_string(expert_id) + ".";
+        if (is_deepseek_fp4_expert(archive, expert) != fp4
+            || archive.contains_tensor(expert + "gate_up_proj.weight") != fused
+            || (fused && (archive.contains_tensor(expert + "w1.weight") || archive.contains_tensor(expert + "w3.weight"))))
+            return Error{ErrorCode::InvalidModel, "inconsistent DeepSeek Expert projection layout: " + expert};
+        if (fp4)
+            continue;
+        for (size_t projection_index = 0; projection_index < projection_count; ++projection_index)
+        {
+            auto dtype = deepseek_projection_dtype(archive, expert + projections[projection_index] + ".weight");
+            if (!dtype)
+                return dtype.error();
+            if (expert_id == 0 && projection_index == 0)
+                moe.expert_weight_dtype = dtype.value();
+        }
+    }
+    return {};
+}
+
 static Result<void> add_experts(WeightMapping& mapping, const SafetensorsArchive& archive,
                                 const std::string& source, const std::string& target,
                                 uint32_t expert_count, uint32_t hidden_size, uint32_t intermediate_size, uint32_t flags)
 {
+    constexpr std::pair<const char*, const char*> fused_projections[] = {
+        {"gate_up", "gate_up_proj"},
+        {"down", "w2"}};
+    constexpr std::pair<const char*, const char*> separate_projections[] = {
+        {"gate", "w1"},
+        {"up", "w3"},
+        {"down", "w2"}};
     for (uint32_t expert_id = 0; expert_id < expert_count; ++expert_id)
     {
         const std::string expert_source = source + "ffn.experts." + std::to_string(expert_id) + ".";
         const std::string expert_target = target + "experts." + std::to_string(expert_id) + ".";
+        if (!is_deepseek_fp4_expert(archive, expert_source))
+        {
+            const bool fused = archive.contains_tensor(expert_source + "gate_up_proj.weight");
+            const auto* projections = fused ? fused_projections : separate_projections;
+            const size_t projection_count = fused ? 2 : 3;
+            for (size_t projection_index = 0; projection_index < projection_count; ++projection_index)
+            {
+                const auto& projection = projections[projection_index];
+                auto status = add_deepseek_projection(mapping, archive, expert_target + projection.first + ".weight", expert_source + projection.second);
+                if (!status)
+                    return status.error();
+            }
+            continue;
+        }
         auto gate_up = archive.load_interleaved_mxfp4_tensor(expert_source + "w1.weight", expert_source + "w1.scale",
                                                              expert_source + "w3.weight", expert_source + "w3.scale",
                                                              intermediate_size, hidden_size, flags);
@@ -131,9 +207,14 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
         return compress_ratios.error();
     if (compress_ratios.value().empty())
         return Error{ErrorCode::InvalidModel, "DeepSeek-V4 integer array is empty: compress_ratios"};
-    auto expert_dtype = read_manifest_string(json, "expert_dtype", "DeepSeek-V4 ");
-    if (!expert_dtype)
-        return expert_dtype.error();
+    std::string expert_dtype = "bfloat16";
+    if (find_manifest_member(json, "expert_dtype"))
+    {
+        auto parsed = read_manifest_string(json, "expert_dtype", "DeepSeek-V4 ");
+        if (!parsed)
+            return parsed.error();
+        expert_dtype = std::move(parsed).value();
+    }
     auto scoring_function = read_manifest_string(json, "scoring_func", "DeepSeek-V4 ");
     if (!scoring_function)
         return scoring_function.error();
@@ -147,20 +228,31 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
         quantization_config_json = std::move(parsed_quantization_config).value();
         quantization_json = &quantization_config_json;
     }
-    auto quantization_method = read_manifest_string(*quantization_json, "quant_method", "DeepSeek-V4 ");
-    if (!quantization_method)
-        return quantization_method.error();
-    auto quantization_format = read_manifest_string(*quantization_json, "fmt", "DeepSeek-V4 ");
-    if (!quantization_format)
-        return quantization_format.error();
-    auto scale_format = read_manifest_string(*quantization_json, "scale_fmt", "DeepSeek-V4 ");
-    if (!scale_format)
-        return scale_format.error();
-    auto weight_block_size = read_manifest_uint32_array(*quantization_json, "weight_block_size", "DeepSeek-V4 ");
-    if (!weight_block_size)
-        return weight_block_size.error();
-    if (weight_block_size.value().empty())
-        return Error{ErrorCode::InvalidModel, "DeepSeek-V4 integer array is empty: weight_block_size"};
+    std::string quantization_method;
+    if (find_manifest_member(*quantization_json, "quant_method"))
+    {
+        auto parsed = read_manifest_string(*quantization_json, "quant_method", "DeepSeek-V4 ");
+        if (!parsed)
+            return parsed.error();
+        quantization_method = std::move(parsed).value();
+        if (quantization_method != "fp8" && quantization_method != "awq" && quantization_method != "gptq")
+            return Error{ErrorCode::UnsupportedModel, "unsupported DeepSeek-V4 quantization method: " + quantization_method};
+    }
+    if (quantization_method == "fp8")
+    {
+        auto format = read_manifest_string(*quantization_json, "fmt", "DeepSeek-V4 ");
+        if (!format)
+            return format.error();
+        auto scale_format = read_manifest_string(*quantization_json, "scale_fmt", "DeepSeek-V4 ");
+        if (!scale_format)
+            return scale_format.error();
+        auto block_size = read_manifest_uint32_array(*quantization_json, "weight_block_size", "DeepSeek-V4 ");
+        if (!block_size)
+            return block_size.error();
+        if (format.value() != "e4m3" || scale_format.value() != "ue8m0"
+            || block_size.value() != std::vector<uint32_t>{128, 128})
+            return Error{ErrorCode::UnsupportedModel, "unsupported DeepSeek-V4 FP8 encoding"};
+    }
 
     std::vector<uint32_t> speculative_targets;
     uint32_t speculative_block_size = 0;
@@ -205,12 +297,7 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
         || attention_head_count.value() % output_group_count.value() != 0
         || hash_layer_count.value() > layer_count.value()
         || shared_expert_count.value() != 1
-        || expert_dtype.value() != "fp4"
-        || scoring_function.value() != "sqrtsoftplus"
-        || quantization_method.value() != "fp8"
-        || quantization_format.value() != "e4m3"
-        || scale_format.value() != "ue8m0"
-        || weight_block_size.value() != std::vector<uint32_t>{128, 128})
+        || scoring_function.value() != "sqrtsoftplus")
     {
         return Error{ErrorCode::InvalidModel, "unsupported DeepSeek-V4 architectural dimensions"};
     }
@@ -265,7 +352,7 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
     attention.rope_scaling_factor = optional_manifest_float(*rope_json, "factor", 16.0f);
     attention.rope_ntk_alpha = optional_manifest_float(*rope_json, "beta_slow", 1.0f);
     attention.rope_ntk_beta = optional_manifest_float(*rope_json, "beta_fast", 32.0f);
-    attention.projection_weight_dtype = DType::Float8E4M3;
+    attention.projection_weight_dtype = quantization_method == "fp8" ? DType::Float8E4M3 : DType::BFloat16;
     attention.flags = AttentionDescriptorSinks | AttentionDescriptorQueryKeyNorm;
 
     MoeDescriptor moe;
@@ -277,11 +364,18 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
     moe.normalization = RouterNormalization::SelectedExperts;
     moe.activation = ExpertActivation::DeepSeekSwiGlu;
     moe.layout = ExpertLayout::InterleavedGateUpDown;
-    moe.expert_weight_dtype = DType::MxFp4;
-    moe.shared_expert_weight_dtype = DType::Float8E4M3;
+    moe.expert_weight_dtype = expert_dtype == "fp4" ? DType::MxFp4 : DType::BFloat16;
+    moe.shared_expert_weight_dtype = attention.projection_weight_dtype;
     moe.activation_limit = optional_manifest_float(json, "swiglu_limit", 10.0f);
     moe.routed_scaling_factor = optional_manifest_float(json, "routed_scaling_factor", 1.5f);
 
+    std::optional<SafetensorsArchive> archive;
+    if (!package.root.empty())
+    {
+        auto opened = SafetensorsArchive::open(package.root, package.manifest.raw_json);
+        if (opened)
+            archive = std::move(opened).value();
+    }
     descriptor.layers.resize(layer_count.value());
     for (uint32_t layer_id = 0; layer_id < layer_count.value(); ++layer_id)
     {
@@ -291,10 +385,47 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
         layer.attention = attention;
         layer.attention.compression_ratio = compress_ratios.value()[layer_id];
         layer.moe = moe;
+        if (archive)
+        {
+            const std::string source = "layers." + std::to_string(layer_id) + ".";
+            auto status = inspect_deepseek_experts(*archive, source, layer.moe);
+            if (!status)
+                return status.error();
+            auto projection_dtype = deepseek_projection_dtype(*archive, source + "attn.wq_a.weight");
+            if (!projection_dtype)
+                return projection_dtype.error();
+            layer.attention.projection_weight_dtype = projection_dtype.value();
+            auto shared_dtype = deepseek_projection_dtype(*archive, source + "ffn.shared_experts.w1.weight");
+            if (!shared_dtype)
+                return shared_dtype.error();
+            layer.moe.shared_expert_weight_dtype = shared_dtype.value();
+        }
         if (layer_id >= descriptor.hash_routing_layer_count)
             layer.moe.flags |= MoeDescriptorRouterBias;
     }
     return descriptor;
+}
+
+static Result<void> add_deepseek_float32(WeightMapping& mapping, const SafetensorsArchive& archive,
+                                         const std::string& target, const std::string& source)
+{
+    auto tensor = archive.load_float32_tensor(source);
+    if (!tensor)
+        return tensor.error();
+    mapping.emplace(target, std::move(tensor).value());
+    return {};
+}
+
+static Result<void> add_deepseek_function(WeightMapping& mapping, const SafetensorsArchive& archive,
+                                          const std::string& target, const std::string& source)
+{
+    const std::string name = archive.contains_tensor(source) ? source : source + ".weight";
+    const SafetensorInfo* info = archive.find(name);
+    auto tensor = info && info->dtype == "F32" ? archive.load_float32_tensor(name) : archive.load_tensor(name);
+    if (!tensor)
+        return tensor.error();
+    mapping.emplace(target, std::move(tensor).value());
+    return {};
 }
 
 static Result<void> add_common_layer_tensors(WeightMapping& mapping, const SafetensorsArchive& archive,
@@ -316,16 +447,28 @@ static Result<void> add_common_layer_tensors(WeightMapping& mapping, const Safet
     };
     for (const auto& item : tensors)
     {
-        auto ret = add_tensor(mapping, archive, target + item.first, source + item.second);
-        if (!ret)
-            return ret.error();
+        const std::string_view name(item.first);
+        Result<void> status;
+        if (name.starts_with("hyper.") && name.ends_with(".function"))
+            status = add_deepseek_function(mapping, archive, target + item.first, source + item.second);
+        else if (name.starts_with("hyper.") || name == "attention.sinks")
+            status = add_deepseek_float32(mapping, archive, target + item.first, source + item.second);
+        else
+            status = add_tensor(mapping, archive, target + item.first, source + item.second);
+        if (!status)
+            return status.error();
     }
     return {};
 }
 
-static Result<void> add_float8(WeightMapping& mapping, const SafetensorsArchive& archive, const std::string& target, const std::string& source)
+static Result<void> add_deepseek_projection(WeightMapping& mapping, const SafetensorsArchive& archive, const std::string& target, const std::string& source)
 {
-    auto tensor = archive.load_float8_tensor(source + ".weight", source + ".scale");
+    auto dtype = deepseek_projection_dtype(archive, source + ".weight");
+    if (!dtype)
+        return dtype.error();
+    auto tensor = dtype.value() == DType::Float8E4M3
+                      ? archive.load_float8_tensor(source + ".weight", source + ".scale")
+                      : archive.load_tensor(source + ".weight");
     if (!tensor)
         return tensor.error();
     mapping.emplace(target, std::move(tensor).value());
@@ -347,7 +490,7 @@ static Result<void> add_float8_layer_tensors(WeightMapping& mapping, const Safet
     };
     for (const auto& item : tensors)
     {
-        auto ret = add_float8(mapping, archive, target + item.first, source + item.second);
+        auto ret = add_deepseek_projection(mapping, archive, target + item.first, source + item.second);
         if (!ret)
             return ret.error();
     }
@@ -361,17 +504,18 @@ static Result<void> validate_dspark(const SafetensorsArchive& archive, const Moe
     for (uint32_t layer_id = 0; layer_id < descriptor.speculative_layer_count; ++layer_id)
     {
         const std::string prefix = "mtp." + std::to_string(layer_id) + ".";
-        if (!archive.find(prefix + "attn.wq_a.weight")
-            || !archive.find(prefix + "ffn.gate.weight")
-            || !archive.find(prefix + "ffn.experts.0.w1.weight"))
+        if (!archive.contains_tensor(prefix + "attn.wq_a.weight")
+            || !archive.contains_tensor(prefix + "ffn.gate.weight")
+            || (!archive.contains_tensor(prefix + "ffn.experts.0.w1.weight")
+                && !archive.contains_tensor(prefix + "ffn.experts.0.gate_up_proj.weight")))
         {
             return Error{ErrorCode::InvalidModel, "incomplete DSpark draft layer: " + std::to_string(layer_id)};
         }
     }
     const std::string last = "mtp." + std::to_string(descriptor.speculative_layer_count - 1) + ".";
-    if (!archive.find(last + "markov_head.markov_w1.weight")
-        || !archive.find(last + "markov_head.markov_w2.weight")
-        || !archive.find(last + "confidence_head.proj.weight"))
+    if (!archive.contains_tensor(last + "markov_head.markov_w1.weight")
+        || !archive.contains_tensor(last + "markov_head.markov_w2.weight")
+        || !archive.contains_tensor(last + "confidence_head.proj.weight"))
     {
         return Error{ErrorCode::InvalidModel, "incomplete DSpark prediction heads"};
     }
@@ -383,7 +527,7 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
     if (descriptor.model_type != "deepseek_v4")
         return Error{ErrorCode::UnsupportedModel, "unsupported DeepSeek model_type: " + descriptor.model_type};
 
-    auto opened = SafetensorsArchive::open(package.root);
+    auto opened = SafetensorsArchive::open(package.root, package.manifest.raw_json);
     if (!opened)
         return opened.error();
     SafetensorsArchive archive = std::move(opened).value();
@@ -405,13 +549,13 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
     status = add_tensor(mapping, archive, "lm_head.weight", "head.weight");
     if (!status)
         return status.error();
-    status = add_tensor(mapping, archive, "hyper.head.function", "hc_head_fn");
+    status = add_deepseek_function(mapping, archive, "hyper.head.function", "hc_head_fn");
     if (!status)
         return status.error();
-    status = add_tensor(mapping, archive, "hyper.head.base", "hc_head_base");
+    status = add_deepseek_float32(mapping, archive, "hyper.head.base", "hc_head_base");
     if (!status)
         return status.error();
-    status = add_tensor(mapping, archive, "hyper.head.scale", "hc_head_scale");
+    status = add_deepseek_float32(mapping, archive, "hyper.head.scale", "hc_head_scale");
     if (!status)
         return status.error();
 
@@ -432,7 +576,7 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
         }
         else
         {
-            status = add_tensor(mapping, archive, target + "router.selection_bias", source + "ffn.gate.bias");
+            status = add_deepseek_float32(mapping, archive, target + "router.selection_bias", source + "ffn.gate.bias");
         }
         if (!status)
             return status.error();
@@ -448,7 +592,9 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
             };
             for (const auto& item : compressor_tensors)
             {
-                status = add_tensor(mapping, archive, target + item.first, source + item.second);
+                status = std::string_view(item.first).ends_with(".position")
+                             ? add_deepseek_float32(mapping, archive, target + item.first, source + item.second)
+                             : add_tensor(mapping, archive, target + item.first, source + item.second);
                 if (!status)
                     return status.error();
             }
@@ -463,11 +609,13 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
                 };
                 for (const auto& item : index_tensors)
                 {
-                    status = add_tensor(mapping, archive, target + item.first, source + item.second);
+                    status = std::string_view(item.first).ends_with(".position")
+                                 ? add_deepseek_float32(mapping, archive, target + item.first, source + item.second)
+                                 : add_tensor(mapping, archive, target + item.first, source + item.second);
                     if (!status)
                         return status.error();
                 }
-                status = add_float8(mapping, archive, target + "attention.indexer.query.weight", source + "attn.indexer.wq_b");
+                status = add_deepseek_projection(mapping, archive, target + "attention.indexer.query.weight", source + "attn.indexer.wq_b");
                 if (!status)
                     return status.error();
             }
@@ -491,7 +639,7 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
         status = add_common_layer_tensors(mapping, archive, source, target);
         if (!status)
             return status.error();
-        status = add_tensor(mapping, archive, target + "router.selection_bias", source + "ffn.gate.bias");
+        status = add_deepseek_float32(mapping, archive, target + "router.selection_bias", source + "ffn.gate.bias");
         if (!status)
             return status.error();
         status = add_float8_layer_tensors(mapping, archive, source, target);
@@ -504,7 +652,7 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
             return status.error();
     }
 
-    status = add_float8(mapping, archive, "speculative.main_projection.weight", "mtp.0.main_proj");
+    status = add_deepseek_projection(mapping, archive, "speculative.main_projection.weight", "mtp.0.main_proj");
     if (!status)
         return status.error();
     status = add_tensor(mapping, archive, "speculative.main_norm.weight", "mtp.0.main_norm.weight");
@@ -522,7 +670,13 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
     };
     for (const auto& item : final_tensors)
     {
-        status = add_tensor(mapping, archive, item.first, final_source + item.second);
+        const std::string_view name(item.first);
+        if (name.starts_with("speculative.hyper.") && name.ends_with(".function"))
+            status = add_deepseek_function(mapping, archive, item.first, final_source + item.second);
+        else if (name.starts_with("speculative.hyper."))
+            status = add_deepseek_float32(mapping, archive, item.first, final_source + item.second);
+        else
+            status = add_tensor(mapping, archive, item.first, final_source + item.second);
         if (!status)
             return status.error();
     }

@@ -4,9 +4,11 @@
 
 #include "kernels/mxfp4.h"
 #include "kernels/qnk.h"
+#include "kernels/int4.h"
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <string>
 #include <utility>
 
@@ -37,7 +39,7 @@ static Result<uint64_t> matrix_storage_size(uint64_t rows, uint64_t columns, DTy
     if (dtype == DType::Float8E4M3)
     {
         const uint64_t scale_count = ((rows + 127) / 128) * ((columns + 127) / 128);
-        return checked_add(elements.value(), scale_count, name);
+        return checked_add(elements.value(), scale_count * sizeof(float), name);
     }
     if (is_qnk_dtype(dtype))
     {
@@ -510,6 +512,21 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
         }
 
         uint64_t layer_auxiliary_size = 0;
+        if (layer.dense.enabled())
+        {
+            auto status = add_matrix_size(layer.dense.intermediate_size, descriptor.hidden_size,
+                                          layer.dense.gate_weight_dtype, "dense FFN gate", layer_auxiliary_size);
+            if (!status)
+                return status.error();
+            status = add_matrix_size(layer.dense.intermediate_size, descriptor.hidden_size,
+                                     layer.dense.up_weight_dtype, "dense FFN up", layer_auxiliary_size);
+            if (!status)
+                return status.error();
+            status = add_matrix_size(descriptor.hidden_size, layer.dense.intermediate_size,
+                                     layer.dense.down_weight_dtype, "dense FFN down", layer_auxiliary_size);
+            if (!status)
+                return status.error();
+        }
         if (layer.ple.enabled())
         {
             if (layer.ple.ngram_size < 2 || layer.ple.heads_per_ngram == 0)
@@ -559,7 +576,10 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
                                                   "PLE metadata");
             if (!metadata_size)
                 return metadata_size.error();
-            layer_auxiliary_size = metadata_size.value();
+            auto auxiliary_size = checked_add(layer_auxiliary_size, metadata_size.value(), "layer auxiliary weights");
+            if (!auxiliary_size)
+                return auxiliary_size.error();
+            layer_auxiliary_size = auxiliary_size.value();
         }
 
         if (descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
@@ -848,10 +868,83 @@ static Result<uint64_t> packed_expert_pair_size(const MoeModelDescriptor& descri
     return checked_add(gate_up.value(), down.value(), "packed expert pair");
 }
 
+static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeModelDescriptor& descriptor,
+                                        ModelMemoryPlan& plan)
+{
+    std::map<std::string, uint64_t> expert_sizes;
+    for (const auto& [name, tensor] : weights)
+    {
+        uint64_t bytes = tensor.dtype == DType::Int4
+                             ? int4_storage_bytes(tensor)
+                             : tensor.mapped_size
+                                   + tensor.float32_data.size() * sizeof(float)
+                                   + tensor.bfloat16_data.size() * sizeof(uint16_t)
+                                   + tensor.int64_data.size() * sizeof(int64_t)
+                                   + tensor.int8_data.size()
+                                   + tensor.quantized_data.size()
+                                   + tensor.quantization_scales.size() * sizeof(float)
+                                   + tensor.input_column_indices.size() * sizeof(uint32_t)
+                                   + tensor.mxfp4_blocks.size() + tensor.mxfp4_scales.size();
+        if (tensor.mxfp4_file_storage)
+        {
+            const auto& storage = *tensor.mxfp4_file_storage;
+            auto stored = checked_add(storage.blocks_size, storage.secondary_blocks_size, "mapped Expert blocks");
+            if (!stored)
+                return stored.error();
+            stored = checked_add(stored.value(), storage.scales_size, "mapped Expert scales");
+            if (!stored)
+                return stored.error();
+            stored = checked_add(stored.value(), storage.secondary_scales_size, "mapped Expert scales");
+            if (!stored)
+                return stored.error();
+            auto total = checked_add(bytes, stored.value(), "mapped Expert storage");
+            if (!total)
+                return total.error();
+            bytes = total.value();
+        }
+        const size_t marker = name.find(".experts.");
+        if (marker != std::string::npos)
+        {
+            const size_t end = name.find('.', marker + 9);
+            if (end == std::string::npos)
+                return Error{ErrorCode::InvalidModel, "invalid canonical Expert tensor name: " + name};
+            uint64_t& size = expert_sizes[name.substr(0, end)];
+            auto total = checked_add(size, bytes, "mapped Expert weights");
+            if (!total)
+                return total.error();
+            size = total.value();
+        }
+        else
+        {
+            auto total = checked_add(plan.estimated_dense_size, bytes, "mapped dense weights");
+            if (!total)
+                return total.error();
+            plan.estimated_dense_size = total.value();
+        }
+    }
+    for (const auto& [name, bytes] : expert_sizes)
+    {
+        (void)name;
+        auto total = checked_add(plan.estimated_expert_size, bytes, "mapped Expert weights");
+        if (!total)
+            return total.error();
+        plan.estimated_expert_size = total.value();
+        plan.expert_pair_size = std::max(plan.expert_pair_size, bytes);
+    }
+    plan.expert_pair_resident_size = plan.expert_pair_size;
+    plan.estimated_expert_resident_size = plan.estimated_expert_size;
+    auto active = checked_multiply(plan.expert_pair_size, descriptor.experts_per_token, "mapped active Experts");
+    if (!active)
+        return active.error();
+    plan.minimum_active_expert_size = active.value();
+    return {};
+}
+
 Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, const Option& opt, uint64_t physical_memory_size,
                                           bool release_vulkan_dense_host_storage,
                                           uint64_t available_memory_size,
-                                          bool reserve_cpu_packed_weights)
+                                          bool reserve_cpu_packed_weights,
+                                          const WeightMapping* weights)
 {
     if (opt.expert_memory_mode != ExpertMemoryMode::Auto
         && opt.expert_memory_mode != ExpertMemoryMode::Eager
@@ -894,16 +987,37 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         plan.host_memory_budget = 8 * gibibyte;
     }
 
-    auto estimated_dense = dense_size(descriptor);
-    if (!estimated_dense)
-        return estimated_dense.error();
+    if (weights)
+    {
+        if (reserve_cpu_packed_weights)
+            return Error{ErrorCode::UnsupportedModel, "native imported weights require CpuPackedWeightMode::Disabled"};
+        auto sizes = mapped_weight_sizes(*weights, descriptor, plan);
+        if (!sizes)
+            return sizes.error();
+    }
+    else
+    {
+        auto estimated_dense = dense_size(descriptor);
+        if (!estimated_dense)
+            return estimated_dense.error();
+        plan.estimated_dense_size = estimated_dense.value();
+    }
     // PLE embedding shards remain file-backed and are paged on demand.  The
     // dense estimate covers only their resident projections and state.
-    plan.estimated_dense_size = estimated_dense.value();
 
     if (descriptor.layers.empty())
         return Error{ErrorCode::InvalidModel, "memory planner requires at least one layer"};
-    const MoeDescriptor& moe = descriptor.layers.front().moe;
+    if (std::all_of(descriptor.layers.begin(), descriptor.layers.end(), [](const LayerDescriptor& layer) {
+            return layer.dense.enabled();
+        }))
+    {
+        plan.selected_mode = ExpertMemoryMode::Eager;
+        return plan;
+    }
+    const auto first_moe = std::find_if(descriptor.layers.begin(), descriptor.layers.end(), [](const LayerDescriptor& layer) {
+        return !layer.dense.enabled();
+    });
+    const MoeDescriptor& moe = first_moe->moe;
     const auto add_expert_layers = [&](const MoeDescriptor& layer_moe,
                                        uint64_t layer_count) -> Result<void> {
         auto pair_size = expert_pair_size(descriptor, layer_moe.expert_weight_dtype);
@@ -952,31 +1066,36 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         plan.estimated_cpu_packed_expert_size = total_packed_expert_size.value();
         return {};
     };
-    for (const LayerDescriptor& layer : descriptor.layers)
+    if (!weights)
     {
-        auto status = add_expert_layers(layer.moe, 1);
-        if (!status)
-            return status.error();
+        for (const LayerDescriptor& layer : descriptor.layers)
+        {
+            if (layer.dense.enabled())
+                continue;
+            auto status = add_expert_layers(layer.moe, 1);
+            if (!status)
+                return status.error();
+        }
+        if (descriptor.speculative_layer_count != 0)
+        {
+            // MTP and D-Spark bind speculative gate/up weights as one 2I x H matrix.
+            MoeDescriptor speculative_moe = descriptor.layers.back().moe;
+            speculative_moe.layout = ExpertLayout::PackedGateUpDown;
+            auto status = add_expert_layers(speculative_moe, descriptor.speculative_layer_count);
+            if (!status)
+                return status.error();
+        }
+        auto active_size = checked_multiply(plan.expert_pair_resident_size, moe.top_k, "active experts");
+        if (!active_size)
+            return active_size.error();
+        plan.minimum_active_expert_size = active_size.value();
+        auto resident_expert_size = checked_add(plan.estimated_expert_size,
+                                                plan.estimated_cpu_packed_expert_size,
+                                                "resident expert weights");
+        if (!resident_expert_size)
+            return resident_expert_size.error();
+        plan.estimated_expert_resident_size = resident_expert_size.value();
     }
-    if (descriptor.speculative_layer_count != 0)
-    {
-        // MTP and D-Spark bind speculative gate/up weights as one 2I x H matrix.
-        MoeDescriptor speculative_moe = descriptor.layers.back().moe;
-        speculative_moe.layout = ExpertLayout::PackedGateUpDown;
-        auto status = add_expert_layers(speculative_moe, descriptor.speculative_layer_count);
-        if (!status)
-            return status.error();
-    }
-    auto active_size = checked_multiply(plan.expert_pair_resident_size, moe.top_k, "active experts");
-    if (!active_size)
-        return active_size.error();
-    plan.minimum_active_expert_size = active_size.value();
-    auto resident_expert_size = checked_add(plan.estimated_expert_size,
-                                            plan.estimated_cpu_packed_expert_size,
-                                            "resident expert weights");
-    if (!resident_expert_size)
-        return resident_expert_size.error();
-    plan.estimated_expert_resident_size = resident_expert_size.value();
 
     const uint64_t safety_reserve = budget_limited_by_available_memory
                                         ? 0
@@ -1034,6 +1153,8 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
     }
     for (const LayerDescriptor& layer : descriptor.layers)
     {
+        if (layer.dense.enabled())
+            continue;
         if (!supports_file_backed_experts(layer.moe))
         {
             return Error{ErrorCode::UnsupportedModel, "on-demand mode requires a file-backed Expert encoding"};

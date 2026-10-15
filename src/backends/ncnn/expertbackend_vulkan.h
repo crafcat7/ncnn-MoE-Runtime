@@ -185,9 +185,19 @@ public:
                const TensorData* down_bias, uint32_t residency_group, float activation_limit,
                ExpertActivation activation) override;
 
+    void admit_separate(std::string key, std::shared_ptr<const TensorData> gate, const TensorData* gate_bias,
+                        std::shared_ptr<const TensorData> up, const TensorData* up_bias,
+                        std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
+                        float activation_limit, ExpertActivation activation) override;
+
     bool prepare_demand(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias,
                         std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
                         float activation_limit, ExpertActivation activation, std::shared_ptr<const void>& pin) override;
+
+    bool prepare_demand_separate(std::string key, std::shared_ptr<const TensorData> gate, const TensorData* gate_bias,
+                                 std::shared_ptr<const TensorData> up, const TensorData* up_bias,
+                                 std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
+                                 float activation_limit, ExpertActivation activation, std::shared_ptr<const void>& pin) override;
 
     size_t prepare_demand_batch(std::span<const ExpertDemandRequest> requests,
                                 std::span<std::shared_ptr<const void>> pins) override;
@@ -307,6 +317,8 @@ private:
         std::shared_ptr<const TensorData> down;
         std::shared_ptr<const TensorData> gate_up_bias;
         std::shared_ptr<const TensorData> down_bias;
+        std::shared_ptr<const TensorData> up;
+        std::shared_ptr<const TensorData> up_bias;
         float activation_limit = 0.0f;
         ExpertActivation activation = ExpertActivation::GptOssSwiGlu;
         uint32_t residency_group = 0;
@@ -315,7 +327,10 @@ private:
 
     bool make_admission(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias,
                         std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
-                        float activation_limit, ExpertActivation activation, PendingAdmission& admission) const;
+                        float activation_limit, ExpertActivation activation, PendingAdmission& admission,
+                        std::shared_ptr<const TensorData> up = {}, const TensorData* up_bias = nullptr) const;
+    void enqueue_admission(PendingAdmission admission);
+    bool prepare_admission(PendingAdmission admission, std::shared_ptr<const void>& pin);
     std::shared_ptr<Entry> create_entry(const PendingAdmission& admission, VulkanWeightUploadBatch* upload_batch);
     bool install_entry_locked(std::shared_ptr<Entry>& entry);
 
@@ -450,6 +465,13 @@ private:
 };
 
 #endif // NCNN_MOE_WITH_VULKAN
+
+[[nodiscard]] uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
+                                                             const TensorData& down, uint32_t device_index,
+                                                             const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags);
+
+[[nodiscard]] uint64_t native_quantized_gpu_cache_size(uint64_t available_size, uint64_t total_size,
+                                                       uint64_t largest_expert_size) noexcept;
 
 [[nodiscard]] std::shared_ptr<ExpertBackend> create_vulkan_expert_backend(uint64_t cache_size, uint32_t device_index,
                                                                           std::shared_ptr<ExpertVictimCache> device_weight_source,

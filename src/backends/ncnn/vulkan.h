@@ -19,6 +19,7 @@ using VulkanRuntimePtr = std::shared_ptr<VulkanRuntime>;
 struct VulkanStatistics
 {
     uint64_t dispatches = 0;
+    uint64_t int4_dispatches = 0;
     uint64_t attention_blocks = 0;
     uint64_t compute_submissions = 0;
     uint64_t batch_uploads = 0;

@@ -169,6 +169,7 @@ struct SessionStatistics
     uint64_t expert_gpu_device_source_executions = 0;
     uint64_t expert_gpu_device_source_execution_failures = 0;
     uint64_t vulkan_linear_dispatches = 0;
+    uint64_t vulkan_int4_dispatches = 0;
     uint64_t vulkan_attention_blocks = 0;
     uint64_t vulkan_compute_submissions = 0;
     uint64_t vulkan_batch_uploads = 0;
@@ -208,11 +209,15 @@ struct RuntimeMetricCounters
 {
     uint64_t prefill_tokens = 0;
     uint64_t decode_tokens = 0;
+    uint64_t speculative_proposals = 0;
+    uint64_t speculative_draft_tokens = 0;
+    uint64_t speculative_accepted_tokens = 0;
     uint64_t expert_cache_hits = 0;
     uint64_t expert_cache_misses = 0;
     uint64_t expert_io_bytes = 0;
     uint64_t gpu_submit_count = 0;
     uint64_t vulkan_linear_dispatches = 0;
+    uint64_t vulkan_int4_dispatches = 0;
     uint64_t vulkan_attention_blocks = 0;
     uint64_t vulkan_batch_uploads = 0;
     uint64_t vulkan_batch_downloads = 0;
@@ -227,6 +232,7 @@ struct RuntimeMetricCounters
     uint64_t expert_gpu_cache_misses = 0;
     uint64_t expert_gpu_cache_admissions = 0;
     uint64_t expert_gpu_cache_stores = 0;
+    uint64_t expert_gpu_cache_evictions = 0;
     uint64_t expert_gpu_cache_dropped_admissions = 0;
     uint64_t expert_gpu_cache_resident_size = 0;
     uint64_t expert_gpu_cache_pending_size = 0;

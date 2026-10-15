@@ -78,6 +78,7 @@ set(NCNN_MOE_SOURCES
     src/kernels/ops.cpp
     src/kernels/ple.cpp
     src/kernels/qnk.cpp
+    src/kernels/int4.cpp
     src/kernels/statecache.cpp
     src/kernels/vector.cpp
     src/models/modeladapter.cpp
@@ -265,12 +266,15 @@ if(NCNN_MOE_USE_NCNN)
     set(NCNN_BUILD_TOOLS OFF CACHE BOOL "Build ncnn tools")
     set(NCNN_VULKAN ${NCNN_MOE_USE_VULKAN} CACHE BOOL "Build ncnn with Vulkan support" FORCE)
     set(NCNN_BF16 ON CACHE BOOL "Build ncnn with bfloat16 support")
+    # Quantized runtime kernels do not use ncnn's INT8 operators.
+    set(NCNN_INT8 OFF CACHE BOOL "Build ncnn with int8 inference" FORCE)
 
-    # Fix the bundled Runtime conversion and backend layer closure.
+    # Build only Runtime layers and their ncnn dependencies.
     set(NCNN_MOE_REQUIRED_LAYERS
-        bias binaryop cast crop dequantize flatten gemm innerproduct interp packing padding
-        permute quantize rmsnorm requantize reshape rotaryembed sdpa scale slice softmax)
+        binaryop cast flatten gemm innerproduct packing permute rmsnorm
+        reshape rotaryembed sdpa slice softmax)
     if(NCNN_MOE_USE_VULKAN)
+        # RMSNorm reuses the LayerNorm Vulkan shaders.
         list(APPEND NCNN_MOE_REQUIRED_LAYERS layernorm)
     endif()
     file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ncnn/src/CMakeLists.txt"
@@ -419,6 +423,10 @@ if(NCNN_MOE_BUILD_TESTS)
     add_executable(ncnn_moe_tests
         tests/modeladapter_fixture.cpp
         tests/test_batch_combine.cpp
+        tests/test_dense.cpp
+        tests/test_int4.cpp
+        tests/test_quant_archive.cpp
+        tests/test_native_awq.cpp
         tests/test_scratch.cpp
         tests/test_runtime.cpp
     )
@@ -431,6 +439,30 @@ if(NCNN_MOE_BUILD_TESTS)
     )
     add_test(NAME ncnn_moe_tests COMMAND ncnn_moe_tests)
 
+    add_executable(ncnn_moe_qwen_dense_test tests/test_qwen_dense.cpp)
+    target_link_libraries(ncnn_moe_qwen_dense_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_qwen_dense_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_qwen_dense_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ncnn_moe_qwen_dense COMMAND ncnn_moe_qwen_dense_test)
+
+    add_executable(ncnn_moe_qwen_quant_banks_test tests/test_qwen_quant_banks.cpp)
+    target_link_libraries(ncnn_moe_qwen_quant_banks_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_qwen_quant_banks_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_qwen_quant_banks_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ncnn_moe_qwen_quant_banks COMMAND ncnn_moe_qwen_quant_banks_test)
+
+    add_executable(ncnn_moe_native_gpu_budget_test tests/test_native_gpu_budget.cpp)
+    target_link_libraries(ncnn_moe_native_gpu_budget_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_native_gpu_budget_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_native_gpu_budget_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ncnn_moe_native_gpu_budget COMMAND ncnn_moe_native_gpu_budget_test)
+
+    add_executable(ncnn_moe_native_family_adapters_test tests/test_native_family_adapters.cpp)
+    target_link_libraries(ncnn_moe_native_family_adapters_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_native_family_adapters_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_native_family_adapters_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ncnn_moe_native_family_adapters COMMAND ncnn_moe_native_family_adapters_test)
+
     add_executable(ncnn_moe_latent_vulkan_test tests/test_latent_vulkan.cpp)
     target_link_libraries(ncnn_moe_latent_vulkan_test PRIVATE ncnn::moe)
     target_compile_features(ncnn_moe_latent_vulkan_test PRIVATE cxx_std_20)
@@ -442,7 +474,7 @@ if(NCNN_MOE_BUILD_TESTS)
     add_test(NAME ncnn_moe_latent_vulkan_test COMMAND ncnn_moe_latent_vulkan_test)
     set_tests_properties(ncnn_moe_latent_vulkan_test PROPERTIES SKIP_RETURN_CODE 77)
 
-    foreach(NCNN_MOE_VULKAN_TEST IN ITEMS hyperconnection router latent_layer shared_expert moe_combine latent_index)
+    foreach(NCNN_MOE_VULKAN_TEST IN ITEMS hyperconnection router latent_layer shared_expert moe_combine latent_index int4 float8_row_scales)
         add_executable(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test tests/test_${NCNN_MOE_VULKAN_TEST}_vulkan.cpp)
         target_link_libraries(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE ncnn::moe)
         target_compile_features(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE cxx_std_20)
@@ -626,6 +658,21 @@ endif()
 if(NCNN_MOE_BUILD_TESTS AND NCNN_MOE_BUILD_EXAMPLES)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+            RESULT_VARIABLE NCNN_MOE_NUMPY_RESULT OUTPUT_QUIET ERROR_QUIET)
+        if(NCNN_MOE_NUMPY_RESULT EQUAL 0)
+            add_test(NAME ncnn_moe_import_quantized
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_import_quantized.py)
+            add_test(NAME ncnn_moe_native_quantized
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_native_quantized.py
+                    --worker $<TARGET_FILE:ncnn_moe_worker>)
+            if(NCNN_MOE_WITH_VULKAN)
+                add_test(NAME ncnn_moe_native_quantized_vulkan
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_native_quantized.py
+                        --worker $<TARGET_FILE:ncnn_moe_worker> --backend hybrid)
+                set_tests_properties(ncnn_moe_native_quantized_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+            endif()
+        endif()
         if(NCNN_MOE_BUILD_REFERENCE_RUNNERS)
             add_test(
                 NAME ncnn_moe_gpt_oss_fixture

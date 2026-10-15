@@ -34,11 +34,20 @@ static Result<void> validate_hyper_tensors(const ActivationBuffer& input, const 
 {
     if (multiplier == 0 || input.columns() == 0 || input.columns() % multiplier != 0)
         return Error{ErrorCode::InvalidArgument, "hyper-connection input must contain multiplier hidden-state copies"};
-    if (function.dtype != DType::Float32
-        || function.shape.size() != 2
+    const bool valid_storage = (function.dtype == DType::Float32
+                                && function.float32_values().size() == function.element_count())
+                               || (function.dtype == DType::BFloat16
+                                   && function.bfloat16_values().size() == function.element_count())
+                               || function.dtype == DType::Int4
+                               || (function.dtype == DType::Int8
+                                   && function.shape.size() == 2
+                                   && function.int8_values().size() == function.element_count()
+                                   && function.quantization_scales.size() == function.shape[0])
+                               || is_qnk_dtype(function.dtype)
+                               || function.dtype == DType::Float8E4M3;
+    if (!valid_storage || function.shape.size() != 2
         || function.shape[0] != output_count
-        || function.shape[1] != input.columns()
-        || function.float32_values().size() != function.element_count())
+        || function.shape[1] != input.columns())
         return Error{ErrorCode::InvalidModel, "invalid hyper-connection function tensor"};
     if (base.dtype != DType::Float32
         || base.shape.size() != 1
@@ -71,7 +80,8 @@ Result<void> forward_hyper_connection_pre(const ActivationBuffer& input, const T
         std::copy_n(source, input.columns(), target);
         float_rms_scale_inplace(target, norm_epsilon, input.columns());
     }
-    forward_linear(function, normalized, scratch.projection, optimization_flags);
+    forward_linear(function, normalized, scratch.projection, optimization_flags,
+                   nullptr, ExecutionBackend::Cpu, &scratch.auxiliary);
     const std::span<const float> scales = scale.float32_values();
     const std::span<const float> bases = base.float32_values();
 
@@ -238,7 +248,8 @@ Result<void> forward_hyper_connection_head(const ActivationBuffer& input, const 
         std::copy_n(source, input.columns(), target);
         float_rms_scale_inplace(target, norm_epsilon, input.columns());
     }
-    forward_linear(function, normalized, scratch.projection, optimization_flags);
+    forward_linear(function, normalized, scratch.projection, optimization_flags,
+                   nullptr, ExecutionBackend::Cpu, &scratch.auxiliary);
     // Generic multiplier paths accumulate into each destination row.
     output.reset(input.rows(), hidden_size, true);
     const float scale_value = scale.float32_values()[0];

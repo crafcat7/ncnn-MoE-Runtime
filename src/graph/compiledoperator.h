@@ -16,6 +16,7 @@ class Linear;
 class Bfloat16Linear_vulkan;
 class Float8Linear_vulkan;
 class QnkLinear_vulkan;
+class QnkExpert_vulkan;
 class Attention_vulkan;
 class LatentAttention_vulkan;
 class LatentLayer_vulkan;
@@ -32,6 +33,7 @@ struct CompiledOperator
     std::shared_ptr<Bfloat16Linear_vulkan> bfloat16;
     std::shared_ptr<Float8Linear_vulkan> float8;
     std::shared_ptr<QnkLinear_vulkan> qnk;
+    std::shared_ptr<QnkExpert_vulkan> qnk_expert;
     std::shared_ptr<Attention_vulkan> attention;
     std::shared_ptr<LatentAttention_vulkan> latent_attention;
     std::shared_ptr<LatentLayer_vulkan> latent_layer;

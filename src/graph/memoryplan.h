@@ -32,7 +32,8 @@ struct Option;
 [[nodiscard]] Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, const Option& opt, uint64_t physical_memory_size,
                                                         bool release_vulkan_dense_host_storage = false,
                                                         uint64_t available_memory_size = 0,
-                                                        bool reserve_cpu_packed_weights = false);
+                                                        bool reserve_cpu_packed_weights = false,
+                                                        const WeightMapping* weights = nullptr);
 
 } // namespace moe
 } // namespace ncnn

@@ -18,6 +18,11 @@ Result<TensorHandle> WeightStore::add(std::string name, TensorData tensor)
     return handle;
 }
 
+void WeightStore::finalize() noexcept
+{
+    std::unordered_map<std::string, TensorHandle>().swap(handles);
+}
+
 TensorHandle WeightStore::find_handle(const std::string& name) const noexcept
 {
     const auto it = handles.find(name);

@@ -25,6 +25,7 @@ class WeightStore
 {
 public:
     [[nodiscard]] Result<TensorHandle> add(std::string name, TensorData tensor);
+    void finalize() noexcept;
     [[nodiscard]] const TensorData& at(TensorHandle handle) const
     {
         assert(handle < tensors.size());
@@ -35,6 +36,7 @@ public:
         assert(handle < tensors.size());
         return tensors[handle];
     }
+    // Name lookup is retained during compilation; finalize drops this index for existing weights.
     [[nodiscard]] TensorHandle find_handle(const std::string& name) const noexcept;
     [[nodiscard]] size_t size() const noexcept
     {

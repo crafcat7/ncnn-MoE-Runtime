@@ -34,6 +34,7 @@ layout(push_constant) uniform parameter
     uint output_columns_per_group;
     uint block_count;
     uint token_count;
+    uint scale_row_size;
 }
 p;
 
@@ -69,7 +70,7 @@ void main()
     const uint input_group = output_column / p.output_columns_per_group;
     const uint input_row = token * p.logical_input_columns + input_group * p.matrix_input_columns;
     const uint weight_row = output_column * p.matrix_input_columns;
-    const uint scale_row = (output_column / 128) * p.block_count;
+    const uint scale_row = (output_column / p.scale_row_size) * p.block_count;
     float sum = 0.0;
     for (uint block = 0; block < p.block_count; ++block)
     {

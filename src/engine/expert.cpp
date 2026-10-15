@@ -7,10 +7,12 @@
 #include "kernels/fastmath.h"
 #include "kernels/ops.h"
 #include "kernels/qnk.h"
+#include "kernels/int4.h"
 #include "kernels/vector.h"
 #include "storage/expertcache.h"
 #include "storage/weightstore.h"
 #include "backends/ncnn/linear.h"
+#include "backends/ncnn/modelpipeline.h"
 #include "ncnn/moe/session.h"
 
 #include <algorithm>
@@ -134,6 +136,23 @@ static float activate(float value,
     return value;
 }
 
+static float gated_product(float gate, float up, ExpertActivation activation,
+                           float limit, uint64_t flags)
+{
+    if (activation == ExpertActivation::GptOssSwiGlu)
+    {
+        if (limit > 0.0f)
+        {
+            gate = std::min(gate, limit);
+            up = std::clamp(up, -limit, limit);
+        }
+        return scaled_silu(gate, 1.702f, flags) * (up + 1.0f);
+    }
+    if (activation == ExpertActivation::DeepSeekSwiGlu && limit > 0.0f)
+        up = std::clamp(up, -limit, limit);
+    return activate(gate, activation, limit, flags) * up;
+}
+
 static void expert_linear(const TensorData& matrix,
                           const TensorData* bias,
                           const CompiledOperator* executable,
@@ -214,11 +233,8 @@ static void forward_expert(const CompiledModel& model,
                 {
                     const float gate = source[column];
                     const float up = source[intermediate_size + column];
-                    destination[column] = activate(gate,
-                                                   expert.activation,
-                                                   expert.activation_limit,
-                                                   optimization_flags)
-                                          * up;
+                    destination[column] = gated_product(gate, up, expert.activation,
+                                                        expert.activation_limit, optimization_flags);
                 }
             }
             activated.reset(rows, intermediate_size, false);
@@ -235,14 +251,9 @@ static void forward_expert(const CompiledModel& model,
                 float* destination = activated.row(0) + token_index * intermediate_size;
                 for (uint32_t column = 0; column < intermediate_size; ++column)
                 {
-                    const float gate = expert.activation_limit > 0.0f ? std::min(source[column * 2], expert.activation_limit) : source[column * 2];
-                    const float linear = expert.activation_limit > 0.0f
-                                             ? std::clamp(source[column * 2 + 1], -expert.activation_limit, expert.activation_limit)
-                                             : source[column * 2 + 1];
-                    const float silu = scaled_silu(gate,
-                                                   1.702f,
-                                                   optimization_flags);
-                    destination[column] = silu * (linear + 1.0f);
+                    destination[column] = gated_product(source[column * 2], source[column * 2 + 1],
+                                                        expert.activation, expert.activation_limit,
+                                                        optimization_flags);
                 }
             }
             activated.reset(rows, intermediate_size, false);
@@ -276,7 +287,9 @@ static void forward_expert(const CompiledModel& model,
         const CompiledOperator* down_operator = operators.find_weight(expert.down_weight);
         if (has_flag(optimization_flags, OptimizationCpuFloat8FusedGateUp)
             && gate_weight.dtype == DType::Float8E4M3
-            && up_weight.dtype == DType::Float8E4M3)
+            && up_weight.dtype == DType::Float8E4M3
+            && expert.gate_bias == invalid_tensor_handle
+            && expert.up_bias == invalid_tensor_handle)
         {
             if (prefetch)
             {
@@ -314,6 +327,8 @@ static void forward_expert(const CompiledModel& model,
     if (prefetch && !gate_prefetched && expert.layout != ExpertLayout::UpDown)
         prefetch_weight(weights, expert.gate_weight);
     const bool paired = expert.layout != ExpertLayout::UpDown
+                        && expert.gate_bias == invalid_tensor_handle
+                        && expert.up_bias == invalid_tensor_handle
                         && forward_linear({&up_weight, &weights.at(expert.gate_weight)}, input,
                                           {&up, &workspace.gate}, optimization_flags,
                                           {operators.find_weight(expert.up_weight),
@@ -321,7 +336,7 @@ static void forward_expert(const CompiledModel& model,
                                           &workspace.quantized_input);
     if (!paired)
         expert_linear(up_weight,
-                      nullptr,
+                      expert.up_bias == invalid_tensor_handle ? nullptr : &weights.at(expert.up_bias),
                       operators.find_weight(expert.up_weight),
                       input,
                       up,
@@ -332,7 +347,7 @@ static void forward_expert(const CompiledModel& model,
         ActivationBuffer& gate = workspace.gate;
         if (!paired)
             expert_linear(weights.at(expert.gate_weight),
-                          nullptr,
+                          expert.gate_bias == invalid_tensor_handle ? nullptr : &weights.at(expert.gate_bias),
                           operators.find_weight(expert.gate_weight),
                           input,
                           gate,
@@ -359,12 +374,8 @@ static void forward_expert(const CompiledModel& model,
             }
             for (uint32_t column = 0; column < up.columns(); ++column)
             {
-                if (expert.activation == ExpertActivation::DeepSeekSwiGlu && expert.activation_limit > 0.0f)
-                    up_row[column] = std::clamp(up_row[column], -expert.activation_limit, expert.activation_limit);
-                up_row[column] *= activate(gate_row[column],
-                                           expert.activation,
-                                           expert.activation_limit,
-                                           optimization_flags);
+                up_row[column] = gated_product(gate_row[column], up_row[column], expert.activation,
+                                               expert.activation_limit, optimization_flags);
             }
         }
     }
@@ -383,12 +394,55 @@ static void forward_expert(const CompiledModel& model,
     if (prefetch)
         prefetch_weight(weights, expert.down_weight);
     expert_linear(weights.at(expert.down_weight),
-                  nullptr,
+                  expert.down_bias == invalid_tensor_handle ? nullptr : &weights.at(expert.down_bias),
                   operators.find_weight(expert.down_weight),
                   up,
                   output,
                   optimization_flags,
                   &workspace.quantized_input);
+}
+
+void forward_dense_ffn(const CompiledModel& model,
+                       const ExpertPlan& ffn,
+                       const ActivationBuffer& input,
+                       ActivationBuffer& output,
+                       ExpertWorkspace& workspace,
+                       ExecutionBackend backend)
+{
+    if (backend == ExecutionBackend::Vulkan)
+    {
+        const CompiledOperator& fused = model.operators.at(ffn.vulkan_operator);
+        if (fused.qnk_expert && fused.qnk_expert->forward(input, output))
+            return;
+        const CompiledOperator& down = model.operators.at_weight(ffn.down_weight);
+        if (fused.bfloat16 && down.bfloat16
+            && fused.bfloat16->forward_swiglu_chain(input, *down.bfloat16,
+                                                    model.weights.at(ffn.up_weight).shape[0],
+                                                    ffn.activation, ffn.activation_limit, false, output))
+        {
+            return;
+        }
+        if (ffn.gate_up_weight == invalid_tensor_handle)
+        {
+            const uint64_t flags = model.opt.optimization_flags;
+            forward_linear(model.weights.at(ffn.gate_weight), input, workspace.gate,
+                           flags, model.operators.find_weight(ffn.gate_weight), backend, &workspace.quantized_input);
+            forward_linear(model.weights.at(ffn.up_weight), input, workspace.projection,
+                           flags, model.operators.find_weight(ffn.up_weight), backend, &workspace.quantized_input);
+            for (size_t row = 0; row < input.rows(); ++row)
+            {
+                float* up = workspace.projection.row(row);
+                const float* gate = workspace.gate.row(row);
+                for (uint32_t column = 0; column < workspace.projection.columns(); ++column)
+                    up[column] = gated_product(gate[column], up[column], ffn.activation,
+                                               ffn.activation_limit, flags);
+            }
+            forward_linear(model.weights.at(ffn.down_weight), workspace.projection, output,
+                           flags, &down, backend, &workspace.quantized_input);
+            return;
+        }
+    }
+    forward_expert(model, ffn, nullptr, input, output, workspace, false);
 }
 
 void forward_shared_expert(const CompiledModel& model,
@@ -465,11 +519,11 @@ void forward_shared_expert(const CompiledModel& model,
                          column < intermediate;
                          ++column)
                     {
-                        destination[column] = activate(source[column],
-                                                       expert.activation,
-                                                       expert.activation_limit,
-                                                       optimization_flags)
-                                              * source[intermediate + column];
+                        destination[column] = gated_product(source[column],
+                                                            source[intermediate + column],
+                                                            expert.activation,
+                                                            expert.activation_limit,
+                                                            optimization_flags);
                     }
                 }
                 expert_linear(model.weights.at(expert.down_weight),
@@ -503,13 +557,8 @@ void forward_shared_expert(const CompiledModel& model,
         }
     }
 
-    forward_expert(model,
-                   moe.shared_expert,
-                   nullptr,
-                   input,
-                   output,
-                   workspace,
-                   false);
+    forward_dense_ffn(model, moe.shared_expert, input, output, workspace,
+                      support_vulkan_shared_experts(model.operators, moe) ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu);
     if (moe.shared_expert_gate_weight == invalid_tensor_handle)
         return;
     ActivationBuffer& gate = workspace.gate;
@@ -518,7 +567,7 @@ void forward_shared_expert(const CompiledModel& model,
                    gate,
                    optimization_flags,
                    model.operators.find_weight(moe.shared_expert_gate_weight),
-                   ExecutionBackend::Cpu,
+                   support_vulkan_shared_experts(model.operators, moe) ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
                    &workspace.quantized_input);
     assert(gate.columns() == 1);
     for (size_t token_index = 0; token_index < output.rows(); ++token_index)
@@ -918,32 +967,42 @@ static void forward_experts(const CompiledModel& model,
 bool support_vulkan_expert(const ExpertPlan& expert,
                            const TensorData& gate_up,
                            const TensorData& down,
-                           uint64_t optimization_flags)
+                           uint64_t optimization_flags,
+                           const TensorData* up)
 {
     if ((expert.activation != ExpertActivation::Silu
          && expert.activation != ExpertActivation::GptOssSwiGlu
          && expert.activation != ExpertActivation::DeepSeekSwiGlu)
         || gate_up.shape.size() != 2
         || down.shape.size() != 2
-        || gate_up.shape[0] % 2 != 0
-        || down.shape[1] != gate_up.shape[0] / 2)
+        || gate_up.shape[0] == 0 || gate_up.shape[1] == 0
+        || down.shape[0] == 0 || down.shape[1] == 0
+        || (up ? up->shape != gate_up.shape || down.shape[1] != gate_up.shape[0]
+               : gate_up.shape[0] % 2 != 0 || down.shape[1] != gate_up.shape[0] / 2))
     {
         return false;
     }
-    if (gate_up.dtype == DType::MxFp4 && down.dtype == DType::MxFp4)
+    if (!up && gate_up.dtype == DType::MxFp4 && down.dtype == DType::MxFp4)
         return true;
-    if (gate_up.dtype == DType::BFloat16 && down.dtype == DType::BFloat16)
+    if (!up && gate_up.dtype == DType::BFloat16 && down.dtype == DType::BFloat16)
     {
         return expert.activation == ExpertActivation::Silu
                && gate_up.shape[0] / 2 % 128 == 0
                && gate_up.bfloat16_values().size() == gate_up.element_count()
                && down.bfloat16_values().size() == down.element_count();
     }
-    return has_flag(optimization_flags, OptimizationVulkanQnK)
-           && is_qnk_dtype(gate_up.dtype)
-           && gate_up.dtype == down.dtype
-           && qnk_shape_supported(gate_up.dtype, gate_up.shape[0], gate_up.shape[1])
-           && qnk_shape_supported(down.dtype, down.shape[0], down.shape[1]);
+    const auto supported = [optimization_flags](const TensorData& weight) {
+        if (weight.dtype == DType::BFloat16 || weight.dtype == DType::Float32)
+            return true;
+        if (weight.dtype == DType::Int4)
+            return weight.shape.size() == 2 && weight.quantization_group_size != 0;
+        return has_flag(optimization_flags, OptimizationVulkanQnK)
+               && is_qnk_dtype(weight.dtype)
+               && qnk_shape_supported(weight.dtype, weight.shape[0], weight.shape[1]);
+    };
+    const auto quantized = [](DType dtype) { return dtype == DType::Int4 || is_qnk_dtype(dtype); };
+    return (quantized(gate_up.dtype) || quantized(down.dtype) || (up && quantized(up->dtype)))
+           && supported(gate_up) && supported(down) && (!up || supported(*up));
 }
 
 // Resident Qn_K weights are owned by CompiledModel::weights.  The Vulkan
@@ -952,7 +1011,7 @@ bool support_vulkan_expert(const ExpertPlan& expert,
 // the backend, so this non-owning handle avoids copying a large raw tensor.
 static std::shared_ptr<const TensorData> borrow_resident_tensor(const TensorData& tensor)
 {
-    return std::shared_ptr<const TensorData>(&tensor, [](const TensorData*) {});
+    return std::shared_ptr<const TensorData>(std::shared_ptr<const TensorData>{}, &tensor);
 }
 
 static void admit_vulkan_expert(const CompiledModel& model,
@@ -1202,23 +1261,38 @@ Result<void> forward_moe(const CompiledModel& model,
         {
             ExpertState& active = layer_state.active_experts()[active_index];
             const ExpertPlan& expert = moe.experts[active.batch.expert_id];
-            if (expert.gate_up_weight == invalid_tensor_handle
+            const TensorHandle gate_handle = expert.gate_up_weight != invalid_tensor_handle ? expert.gate_up_weight : expert.gate_weight;
+            const TensorData* up_weight = expert.gate_up_weight == invalid_tensor_handle && expert.up_weight != invalid_tensor_handle
+                                              ? &model.weights.at(expert.up_weight)
+                                              : nullptr;
+            if (gate_handle == invalid_tensor_handle
                 || expert.down_weight == invalid_tensor_handle
                 || !support_vulkan_expert(expert,
-                                          model.weights.at(expert.gate_up_weight),
+                                          model.weights.at(gate_handle),
                                           model.weights.at(expert.down_weight),
-                                          model.opt.optimization_flags))
+                                          model.opt.optimization_flags, up_weight))
             {
                 continue;
             }
-            const TensorData& gate_up_weight = model.weights.at(expert.gate_up_weight);
+            const TensorData& gate_up_weight = model.weights.at(gate_handle);
             const TensorData& down_weight = model.weights.at(expert.down_weight);
-            if (is_qnk_dtype(gate_up_weight.dtype)
-                && expert.cache_key.empty())
+            if (expert.cache_key.empty())
             {
                 continue;
             }
-            if (is_qnk_dtype(gate_up_weight.dtype))
+            if (up_weight)
+            {
+                model.expert_backend->admit_separate(expert.cache_key,
+                                                     borrow_resident_tensor(gate_up_weight),
+                                                     expert.gate_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.gate_bias),
+                                                     borrow_resident_tensor(*up_weight),
+                                                     expert.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.up_bias),
+                                                     borrow_resident_tensor(down_weight),
+                                                     expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
+                                                     residency_group, expert.activation_limit, expert.activation);
+            }
+            else if (gate_up_weight.dtype == DType::Int4 || is_qnk_dtype(gate_up_weight.dtype)
+                     || down_weight.dtype == DType::Int4 || is_qnk_dtype(down_weight.dtype))
             {
                 model.expert_backend->admit(expert.cache_key,
                                             borrow_resident_tensor(gate_up_weight),
@@ -1364,7 +1438,7 @@ Result<void> forward_moe(const CompiledModel& model,
                         const auto wait_start = expert_cache_wait_start(model);
                         auto lease = model.expert_cache->acquire_pair(gate_up, down, residency_group, expert.cache_key,
                                                                       victim_metadata(model, expert, layer_state.normalized.rows()));
-                        active.metrics.cache_wait_time_microseconds += expert_cache_wait_elapsed(wait_start);
+                        active.cache_wait_us += expert_cache_wait_elapsed(wait_start);
                         if (!lease) return lease.error();
                         active.lease = std::move(lease).value();
                         admit_vulkan_expert(model, expert, active.lease, residency_group,
@@ -1620,18 +1694,25 @@ Result<void> forward_moe(const CompiledModel& model,
             ExpertState& active = layer_state.active_experts()[active_index];
             const ExpertPlan& expert = moe.experts[active.batch.expert_id];
             bool supported = false;
+            const TensorHandle gate_handle = expert.gate_up_weight != invalid_tensor_handle ? expert.gate_up_weight : expert.gate_weight;
             if (gpu_priority && use_backend_batch && !expert.cache_key.empty()
-                && expert.gate_up_weight != invalid_tensor_handle && expert.down_weight != invalid_tensor_handle)
+                && gate_handle != invalid_tensor_handle && expert.down_weight != invalid_tensor_handle)
             {
-                const auto gate_up = active.lease.gate_up ? active.lease.gate_up : borrow_resident_tensor(model.weights.at(expert.gate_up_weight));
+                const auto gate_up = active.lease.gate_up ? active.lease.gate_up : borrow_resident_tensor(model.weights.at(gate_handle));
                 const auto down = active.lease.down ? active.lease.down : borrow_resident_tensor(model.weights.at(expert.down_weight));
-                supported = support_vulkan_expert(expert, *gate_up, *down, model.opt.optimization_flags);
+                const auto up = expert.gate_up_weight == invalid_tensor_handle && expert.up_weight != invalid_tensor_handle
+                                    ? borrow_resident_tensor(model.weights.at(expert.up_weight))
+                                    : nullptr;
+                supported = support_vulkan_expert(expert, *gate_up, *down, model.opt.optimization_flags, up.get());
                 if (supported)
                 {
                     demands.push_back({expert.cache_key, gate_up,
-                                       expert.gate_up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.gate_up_bias),
+                                       (up ? expert.gate_bias : expert.gate_up_bias) == invalid_tensor_handle
+                                           ? nullptr
+                                           : &model.weights.at(up ? expert.gate_bias : expert.gate_up_bias),
                                        down, expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
-                                       residency_group, expert.activation_limit, expert.activation});
+                                       residency_group, expert.activation_limit, expert.activation, up,
+                                       expert.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.up_bias)});
                     demand_indices.push_back(active_index);
                 }
             }
@@ -1826,7 +1907,7 @@ Result<void> forward_moe(const CompiledModel& model,
             active.lease = std::move(lease);
             if (!wait_accounted)
             {
-                active.metrics.cache_wait_time_microseconds += cache_wait_microseconds;
+                active.cache_wait_us += cache_wait_microseconds;
                 wait_accounted = true;
             }
             const ExpertPlan& expert = moe.experts[active.batch.expert_id];
@@ -1860,7 +1941,7 @@ Result<void> forward_moe(const CompiledModel& model,
                 if (route.rank >= maximum_expert_route_ranks)
                     continue;
                 ++stats.expert_route_rank_demands[route.rank];
-                stats.expert_route_rank_demand_queue_time_microseconds[route.rank] += active.metrics.cache_wait_time_microseconds;
+                stats.expert_route_rank_demand_queue_time_microseconds[route.rank] += active.cache_wait_us;
             }
         }
     }

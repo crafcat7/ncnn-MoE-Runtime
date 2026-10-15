@@ -106,6 +106,7 @@ static Result<void> validate_graph(const ExecutionGraph& graph, std::vector<Exec
             }
         }
         const bool layer_bound = node.type == ExecutionNodeType::Attention
+                                 || node.type == ExecutionNodeType::DenseFfn
                                  || node.type == ExecutionNodeType::Router
                                  || node.type == ExecutionNodeType::ExpertDispatch
                                  || node.type == ExecutionNodeType::Expert
@@ -651,8 +652,23 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
             hidden = attention_output;
         }
 
-        previous = add_moe_nodes(graph, compiled, plan_index, prefix, previous, hidden,
-                                 use_vulkan_experts);
+        if (layer.dense_ffn.down_weight != invalid_tensor_handle)
+        {
+            const bool vulkan = compiled.opt.hybrid_mode != HybridMode::CpuOnly
+                                && support_vulkan_ffn(compiled.operators, layer.dense_ffn);
+            const ExecutionTensorId output = add_tensor(graph, prefix + "ffn.hidden", compiled.descriptor.activation_dtype,
+                                                        {0, compiled.descriptor.hidden_size});
+            previous = add_node(graph, ExecutionNodeType::DenseFfn, vulkan ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
+                                vulkan ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu,
+                                prefix + "ffn", {previous}, {hidden}, {output},
+                                static_cast<uint32_t>(plan_index), invalid_execution_expert_id, 0);
+            hidden = output;
+        }
+        else
+        {
+            previous = add_moe_nodes(graph, compiled, plan_index, prefix, previous, hidden,
+                                     use_vulkan_experts);
+        }
     }
 
     const ExecutionTensorId normalized = add_tensor(graph, "final_norm.hidden", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size});

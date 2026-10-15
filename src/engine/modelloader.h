@@ -5,6 +5,8 @@
 #include "ncnn/moe/modeladapter.h"
 #include "ncnn/moe/runtime.h"
 
+#include <optional>
+
 namespace ncnn {
 namespace moe {
 
@@ -34,7 +36,7 @@ private:
                                                                                         std::vector<std::shared_ptr<ExpertVictimCache>>& victim_caches);
     [[nodiscard]] Result<void> create_expert_backend(const std::vector<uint64_t>& gpu_cache_sizes,
                                                      const std::vector<std::shared_ptr<ExpertVictimCache>>& victim_caches);
-    [[nodiscard]] Result<void> configure_resident_qnk_backend();
+    [[nodiscard]] Result<void> configure_resident_quantized_backend();
 
     [[nodiscard]] uint32_t resolve_expert_io_threads() const;
 
@@ -44,11 +46,13 @@ private:
     ModelPackage package;
     const ModelAdapter* adapter = nullptr;
     MoeModelDescriptor descriptor;
+    std::optional<WeightMapping> native_weights;
     ModelMemoryPlan plan;
     CompiledModel& model;
 
     uint64_t requested_gpu_cache_size = 0;
     bool use_auto_gpu_cache = false;
+    bool native_quantized_experts = false;
 };
 
 } // namespace moe

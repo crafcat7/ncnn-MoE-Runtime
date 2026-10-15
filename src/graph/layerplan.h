@@ -23,8 +23,11 @@ struct ExpertPlan
     TensorHandle up_weight = invalid_tensor_handle;
     TensorHandle gate_up_weight = invalid_tensor_handle;
     TensorHandle down_weight = invalid_tensor_handle;
+    TensorHandle gate_bias = invalid_tensor_handle;
+    TensorHandle up_bias = invalid_tensor_handle;
     TensorHandle gate_up_bias = invalid_tensor_handle;
     TensorHandle down_bias = invalid_tensor_handle;
+    CompiledOperatorHandle vulkan_operator = invalid_compiled_operator_handle;
     ExpertActivation activation = ExpertActivation::Silu;
     ExpertLayout layout = ExpertLayout::GateUpDown;
     float activation_limit = 0.0f;
@@ -204,6 +207,8 @@ struct CompiledLayerPlan
     GatedResidualPlan ffn_gated_residual;
     PleBlockPlan ple;
     MoeBlockPlan moe;
+    TensorHandle dense_pre_ffn_norm_weight = invalid_tensor_handle;
+    ExpertPlan dense_ffn;
 };
 
 } // namespace moe

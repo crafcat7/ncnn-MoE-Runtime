@@ -14,6 +14,7 @@ struct MoeBlockPlan;
 struct CompiledModel;
 struct AttentionBlockPlan;
 struct CompilerOption;
+struct ExpertPlan;
 
 Result<void> prepare_model_pipeline(CompiledModel& compiled,
                                     const CompilerOption& opt);
@@ -26,6 +27,9 @@ void release_vulkan_dense_host_copies(CompiledModel& compiled);
 
 [[nodiscard]] bool support_vulkan_shared_experts(const CompiledOperatorTable& operators,
                                                  const MoeBlockPlan& moe) noexcept;
+
+[[nodiscard]] bool support_vulkan_ffn(const CompiledOperatorTable& operators,
+                                      const ExpertPlan& ffn) noexcept;
 
 [[nodiscard]] bool support_vulkan_attention(const CompiledOperatorTable& operators,
                                             const AttentionBlockPlan& attention) noexcept;

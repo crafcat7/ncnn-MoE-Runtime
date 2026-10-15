@@ -6,16 +6,23 @@ The built-in `gpt_oss` adapter runs the official
 Safetensors packages directly. No GGUF conversion or private checkpoint format
 is required.
 
+AWQ/GPTQ INT4 Safetensors also load directly. GGUF Qn_K/MXFP4 checkpoints
+use the [shared importer](../README.md#quantized-package-import), including
+standard split files. These paths retain packed weights and use the existing
+CPU/Vulkan execution and Expert residency policy. Generated-model format and
+numerical tests cover these variants; full-size quantized quality and
+performance have not been measured.
+
 ## Model support
 
 | Area | Implementation |
 | --- | --- |
 | Package | Official multi-shard Hugging Face Safetensors and `config.json` |
-| Dense weights | BF16/F32 with automatic mmap and buffered fallback |
+| Dense weights | BF16/F32, native INT4 or imported Qn_K with automatic mmap and buffered fallback |
 | Attention | RMSNorm, fused QKV+RoPE, option-controlled fused Decode SDPA, GQA, learned sinks, full/sliding Attention, and YaRN RoPE |
 | KV cache | Persistent per-Session BF16 or FP32 CPU cache; FP32 mixed-backend ring |
-| Experts | Native MXFP4 blocks and scales with runtime-selected CPU SIMD kernels |
-| Mixed execution | Vulkan Dense/Attention with CPU routing and Experts |
+| Experts | Native MXFP4, INT4 and Qn_K with runtime-selected CPU kernels and eligible Vulkan execution |
+| Mixed execution | Vulkan Dense/Attention and eligible Experts, with CPU routing and fallback |
 | Expert residency | Automatic, eager, or byte-bounded on-demand |
 | Expert I/O | Asynchronous range reads, Windows aligned direct I/O, packed sidecar support, and byte-aware ARC |
 | Scheduling | Independent Sessions, explicit batch submission, and Expert coalescing |

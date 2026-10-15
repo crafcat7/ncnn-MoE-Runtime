@@ -30,6 +30,15 @@ layout(push_constant) uniform parameter
     uint token_count;
     uint block_bytes;
     uint qnk_type;
+    uint group_size;
+    uint group_count;
+    uint scales_offset;
+    uint zeros_offset;
+    uint groups_offset;
+    uint columns_offset;
+    uint output_stride;
+    uint output_column_offset;
+    uint input_group_count;
 }
 p;
 
@@ -55,6 +64,12 @@ uint qnk_u32(uint index)
 float qnk_f16(uint index)
 {
     return unpackHalf2x16(qnk_u16(index)).x;
+}
+
+float projection_input(uint row, uint column)
+{
+    const uint logical_column = p.columns_offset == 0u ? column : qnk_u32(p.columns_offset + column * 4u);
+    return input_data[row + logical_column];
 }
 
 int qnk_signed_byte(uint value)
@@ -181,23 +196,50 @@ void main()
     float sum = 0.0;
     if (valid && lane < 32u)
     {
-        const uint input_row = token * p.input_columns;
-        const uint matrix_row = output_column * p.block_count * p.block_bytes;
-        for (uint block = 0u; block < p.block_count; ++block)
+        const uint group = output_column / (p.output_columns / p.input_group_count);
+        const uint input_row = (token * p.input_group_count + group) * p.input_columns;
+        if (p.qnk_type == 6u)
         {
-            const uint block_offset = matrix_row + block * p.block_bytes;
-            const uint input_offset = input_row + block * 256u + lane * 8u;
-            for (uint offset = 0u; offset < 8u; ++offset)
+            const uint matrix_row = output_column * p.block_bytes;
+            for (uint column = lane; column < p.input_columns; column += 32u)
             {
-                sum += qnk_value(block_offset, p.qnk_type, lane * 8u + offset)
-                       * input_data[input_offset + offset];
+                const uint group = p.groups_offset == 0u ? column / p.group_size : qnk_u32(p.groups_offset + column * 4u);
+                const uint metadata = output_column * p.group_count + group;
+                const float scale = uintBitsToFloat(qnk_u32(p.scales_offset + metadata * 4u));
+                const uint zero = qnk_byte(p.zeros_offset + metadata);
+                const uint code = (qnk_byte(matrix_row + column / 2u) >> ((column & 1u) * 4u)) & 15u;
+                sum += float(int(code) - int(zero)) * scale * projection_input(input_row, column);
+            }
+        }
+        else if (p.qnk_type == 7u || p.qnk_type == 8u)
+        {
+            const uint matrix_row = output_column * p.block_bytes;
+            for (uint column = lane; column < p.input_columns; column += 32u)
+            {
+                const float weight = p.qnk_type == 7u ? uintBitsToFloat(qnk_u16(matrix_row + column * 2u) << 16u)
+                                                      : uintBitsToFloat(qnk_u32(matrix_row + column * 4u));
+                sum += weight * projection_input(input_row, column);
+            }
+        }
+        else
+        {
+            const uint matrix_row = output_column * p.block_count * p.block_bytes;
+            for (uint block = 0u; block < p.block_count; ++block)
+            {
+                const uint block_offset = matrix_row + block * p.block_bytes;
+                const uint first_column = block * 256u + lane * 8u;
+                for (uint offset = 0u; offset < 8u; ++offset)
+                {
+                    sum += qnk_value(block_offset, p.qnk_type, lane * 8u + offset)
+                           * projection_input(input_row, first_column + offset);
+                }
             }
         }
     }
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
     const float reduced_sum = subgroupAdd(sum);
     if (valid && lane == 0u)
-        output_data[token * p.output_columns + output_column] = reduced_sum + bias_data[output_column];
+        output_data[token * p.output_stride + p.output_column_offset + output_column] = reduced_sum + bias_data[output_column];
 #else
     partial_sum[lane] = sum;
     barrier();
@@ -208,6 +250,6 @@ void main()
         barrier();
     }
     if (valid && lane == 0u)
-        output_data[token * p.output_columns + output_column] = partial_sum[0] + bias_data[output_column];
+        output_data[token * p.output_stride + p.output_column_offset + output_column] = partial_sum[0] + bias_data[output_column];
 #endif
 }

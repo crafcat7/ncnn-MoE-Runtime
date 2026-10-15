@@ -1,0 +1,1137 @@
+#!/usr/bin/env python3
+"""Offline checkpoint -> native worker regression against independent BF16 models.
+
+Requires NumPy; real GGUF cases additionally require the official gguf package.
+The fixtures exercise prefill/decode, recurrent/full attention, dense/shared/routed
+FFNs, the output head, mixed BF16/INT4 weights, GPTQ act-order, and memory plans.
+No checkpoint downloads are used.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import math
+import re
+import sys
+import tempfile
+import unittest
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+import numpy as np
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+
+from tools import import_quantized as importer  # noqa: E402
+from tools.ncnn_moe_protocol import WorkerClient  # noqa: E402
+from tools.test_import_quantized import pack_columns, pack_gptq, write_safetensors  # noqa: E402
+
+try:
+    import gguf
+except ImportError:
+    gguf = None
+
+HIDDEN = 256
+INTERMEDIATE = 256
+VOCABULARY = 8
+GROUP_SIZE = 128
+PREFIX = "model.language_model."
+
+
+def bfloat16(values: np.ndarray) -> np.ndarray:
+    """Independent round-to-nearest-even reference; no importer dequantizer."""
+    bits = np.asarray(values, dtype=np.float32).view(np.uint32)
+    return ((bits + np.uint32(0x7fff) + ((bits >> 16) & 1)) >> 16).astype(np.uint16)
+
+
+def float32(values: np.ndarray) -> np.ndarray:
+    return (np.asarray(values, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
+
+
+def plain(shape: tuple[int, ...], seed: int, scale: float = 1 / 512) -> np.ndarray:
+    values = np.random.default_rng(seed).integers(-8, 9, size=shape).astype(np.float32)
+    return bfloat16(values * scale)
+
+
+def config(moe: bool = False, reordered: bool = False) -> dict:
+    model_type = "qwen3_5_moe" if moe else "qwen3_5"
+    text = {
+        "model_type": model_type + "_text", "vocab_size": VOCABULARY,
+        "hidden_size": HIDDEN, "intermediate_size": INTERMEDIATE,
+        "num_hidden_layers": 2, "num_attention_heads": 4,
+        "num_key_value_heads": 2, "head_dim": 64,
+        "linear_num_key_heads": 8, "linear_num_value_heads": 8,
+        "linear_key_head_dim": 32, "linear_value_head_dim": 32,
+        "linear_conv_kernel_dim": 2, "max_position_embeddings": 32,
+        "rms_norm_eps": 0.000001,
+        "rope_parameters": {"rope_theta": 10000.0, "partial_rotary_factor": 1.0},
+        "layer_types": ["linear_attention", "full_attention"], "hidden_act": "silu",
+        "dtype": "bfloat16", "mamba_ssm_dtype": "float32",
+        "attention_bias": False, "attn_output_gate": True, "tie_word_embeddings": False,
+    }
+    if moe:
+        text.update(moe_intermediate_size=INTERMEDIATE,
+                    shared_expert_intermediate_size=INTERMEDIATE,
+                    num_experts=2, num_experts_per_tok=1,
+                    mtp_num_hidden_layers=1, mtp_use_dedicated_embeddings=False)
+    if reordered:
+        text.update(linear_num_key_heads=2, linear_num_value_heads=6, linear_value_head_dim=128)
+    return {"model_type": model_type, "text_config": text}
+
+
+def assets(root: Path, model_config: dict) -> None:
+    root.mkdir()
+    (root / "config.json").write_text(json.dumps(model_config))
+    (root / "tokenizer.json").write_text('{"model":{"type":"BPE"}}')
+    (root / "chat_template.jinja").write_text("{{ messages }}")
+
+
+def base_tensors(moe: bool, reordered: bool = False) -> tuple[dict, list[str]]:
+    """Return BF16 weights and the Linear matrices eligible for INT4/Qn_K."""
+    result = {
+        PREFIX + "embed_tokens.weight": ("BF16", plain((VOCABULARY, HIDDEN), 1, 1 / 32)),
+        PREFIX + "norm.weight": ("BF16", bfloat16(np.zeros(HIDDEN))),
+        "lm_head.weight": ("BF16", plain((VOCABULARY, HIDDEN), 2)),
+    }
+    quantized = ["lm_head.weight"]
+    text = config(moe, reordered)["text_config"]
+    key_heads, value_heads = text["linear_num_key_heads"], text["linear_num_value_heads"]
+    key_dimension, value_dimension = text["linear_key_head_dim"], text["linear_value_head_dim"]
+    value_width = value_heads * value_dimension
+    qkv_width = 2 * key_heads * key_dimension + value_width
+    seed = 10
+    for layer in range(2):
+        prefix = PREFIX + f"layers.{layer}."
+        for role in ("input_layernorm.weight", "post_attention_layernorm.weight"):
+            result[prefix + role] = ("BF16", bfloat16(np.zeros(HIDDEN)))
+        matrices = {}
+        if layer == 0:
+            matrices.update({
+                "linear_attn.in_proj_qkv.weight": (qkv_width, HIDDEN),
+                "linear_attn.in_proj_z.weight": (value_width, HIDDEN),
+                "linear_attn.in_proj_b.weight": (value_heads, HIDDEN),
+                "linear_attn.in_proj_a.weight": (value_heads, HIDDEN),
+                "linear_attn.out_proj.weight": (HIDDEN, value_width),
+            })
+            result[prefix + "linear_attn.conv1d.weight"] = ("BF16", plain((qkv_width, 1, 2), seed, 1 / 8))
+            result[prefix + "linear_attn.dt_bias"] = ("BF16", bfloat16(np.full(value_heads, -1.0)))
+            result[prefix + "linear_attn.A_log"] = ("BF16", bfloat16(np.zeros(value_heads)))
+            result[prefix + "linear_attn.norm.weight"] = ("BF16", bfloat16(np.ones(value_dimension)))
+        else:
+            matrices.update({
+                "self_attn.q_proj.weight": (2 * HIDDEN, HIDDEN),
+                "self_attn.k_proj.weight": (HIDDEN // 2, HIDDEN),
+                "self_attn.v_proj.weight": (HIDDEN // 2, HIDDEN),
+                "self_attn.o_proj.weight": (HIDDEN, HIDDEN),
+            })
+            for role in ("q_norm.weight", "k_norm.weight"):
+                result[prefix + "self_attn." + role] = ("BF16", bfloat16(np.zeros(64)))
+        if moe:
+            # The first two prompt embeddings favor different routed Experts.
+            embedding = float32(result[PREFIX + "embed_tokens.weight"][1])
+            result[prefix + "mlp.gate.weight"] = ("BF16", bfloat16(embedding[[1, 2]]))
+            result[prefix + "mlp.shared_expert_gate.weight"] = ("BF16", plain((1, HIDDEN), seed + 2))
+            for expert in ("shared_expert", "experts.0", "experts.1"):
+                for role in ("gate", "up", "down"):
+                    matrices[f"mlp.{expert}.{role}_proj.weight"] = (INTERMEDIATE, HIDDEN)
+        else:
+            matrices.update({f"mlp.{role}_proj.weight": (INTERMEDIATE, HIDDEN) for role in ("gate", "up", "down")})
+        for role, shape in matrices.items():
+            name = prefix + role
+            result[name] = ("BF16", plain(shape, seed))
+            # Leave one routed projection in BF16 to exercise mixed Expert storage.
+            if not (moe and ".experts.1.up_proj." in name):
+                quantized.append(name)
+            seed += 1
+    return result, quantized
+
+
+@dataclass
+class Fixture:
+    baseline: Path
+    imported: Path
+    source: Path
+    expected_dense: int
+    expected_expert: int
+    bf16_dense: int
+    bf16_expert: int
+    native_matrices: int
+    moe: bool
+    int4: bool = False
+    family: str = "qwen"
+
+
+def gpt_oss_tensors() -> tuple[dict, dict, list[str]]:
+    model_config = {
+        "model_type": "gpt_oss", "vocab_size": VOCABULARY, "hidden_size": HIDDEN,
+        "intermediate_size": INTERMEDIATE, "num_hidden_layers": 2,
+        "num_local_experts": 2, "experts_per_token": 1,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 64,
+        "sliding_window": 8, "initial_context_length": 32, "max_position_embeddings": 32,
+        "rope_theta": 150000.0, "rope_scaling": {"factor": 1.0, "beta_slow": 1.0, "beta_fast": 32.0},
+        "attention_bias": True, "rms_norm_eps": 1e-5, "swiglu_limit": 0.25,
+    }
+    tensors = {"model.embed_tokens.weight": ("BF16", plain((VOCABULARY, HIDDEN), 1, 1 / 32)),
+               "model.norm.weight": ("BF16", bfloat16(np.ones(HIDDEN))),
+               "lm_head.weight": ("BF16", plain((VOCABULARY, HIDDEN), 2))}
+    native = ["lm_head.weight"]
+    for layer in range(2):
+        prefix = f"model.layers.{layer}."
+        for role in ("input_layernorm.weight", "post_attention_layernorm.weight"):
+            tensors[prefix + role] = ("BF16", bfloat16(np.ones(HIDDEN)))
+        for role, rows in (("q", HIDDEN), ("k", HIDDEN // 2), ("v", HIDDEN // 2), ("o", HIDDEN)):
+            name = prefix + f"self_attn.{role}_proj.weight"
+            tensors[name] = ("BF16", plain((rows, HIDDEN), 10 + layer))
+            native.append(name)
+            tensors[name[:-6] + "bias"] = ("BF16", plain((rows,), 20 + layer, 1 / 1024))
+        tensors[prefix + "self_attn.sinks"] = ("BF16", bfloat16(np.arange(4) / 16))
+        embedding = float32(tensors["model.embed_tokens.weight"][1])
+        tensors[prefix + "mlp.router.weight"] = ("BF16", bfloat16(embedding[[1, 2]]))
+        tensors[prefix + "mlp.router.bias"] = ("BF16", bfloat16(np.zeros(2)))
+        for expert in range(2):
+            for role in ("gate", "up", "down"):
+                name = prefix + f"mlp.experts.{expert}.{role}_proj.weight"
+                tensors[name] = ("BF16", plain((INTERMEDIATE, HIDDEN), 30 + expert))
+                if not (expert == 1 and role == "up"):
+                    native.append(name)
+                tensors[name[:-6] + "bias"] = ("BF16", plain((HIDDEN,), 40 + expert, 1 / 1024))
+    return model_config, tensors, native
+
+
+def deepseek_tensors() -> tuple[dict, dict, list[str]]:
+    model_config = {
+        "model_type": "deepseek_v4", "vocab_size": VOCABULARY, "hidden_size": HIDDEN,
+        "moe_intermediate_size": INTERMEDIATE, "num_hidden_layers": 2,
+        "n_routed_experts": 2, "num_experts_per_tok": 1, "n_shared_experts": 1,
+        "num_attention_heads": 4, "num_key_value_heads": 1, "head_dim": 128,
+        "q_lora_rank": 256, "qk_rope_head_dim": 64, "o_groups": 2, "o_lora_rank": 256,
+        "sliding_window": 8, "max_position_embeddings": 32, "original_max_position_embeddings": 32,
+        "num_hash_layers": 0, "index_n_heads": 2, "index_head_dim": 128, "index_topk": 8,
+        "hc_mult": 4, "hc_sinkhorn_iters": 4, "compress_ratios": [0, 0],
+        "expert_dtype": "bfloat16", "scoring_func": "sqrtsoftplus", "rms_norm_eps": 1e-6,
+        "hc_eps": 1e-6, "swiglu_limit": 0.25, "routed_scaling_factor": 1.5,
+    }
+    tensors = {"embed.weight": ("BF16", plain((VOCABULARY, HIDDEN), 1, 1 / 32)),
+               "norm.weight": ("BF16", bfloat16(np.ones(HIDDEN))),
+               "head.weight": ("BF16", plain((VOCABULARY, HIDDEN), 2)),
+               "hc_head_fn": ("F32", np.zeros((4, 4 * HIDDEN), np.float32)),
+               "hc_head_base": ("F32", np.zeros(4, np.float32)),
+               "hc_head_scale": ("F32", np.ones(1, np.float32))}
+    native = ["head.weight"]
+    for layer in range(2):
+        prefix = f"layers.{layer}."
+        for block in ("attn", "ffn"):
+            tensors[prefix + f"hc_{block}_fn"] = ("F32", np.zeros((24, 4 * HIDDEN), np.float32))
+            tensors[prefix + f"hc_{block}_base"] = ("F32", np.arange(24, dtype=np.float32) * np.float32(0.0001234567))
+            tensors[prefix + f"hc_{block}_scale"] = ("F32", np.asarray([0.999997, 1.000003, 0.33333334], np.float32))
+            tensors[prefix + f"{block}_norm.weight"] = ("BF16", bfloat16(np.ones(HIDDEN)))
+        tensors[prefix + "attn.q_norm.weight"] = ("BF16", bfloat16(np.ones(256)))
+        tensors[prefix + "attn.kv_norm.weight"] = ("BF16", bfloat16(np.ones(128)))
+        tensors[prefix + "attn.attn_sink"] = ("F32", np.arange(4, dtype=np.float32) * np.float32(0.12345679))
+        embedding = float32(tensors["embed.weight"][1])
+        tensors[prefix + "ffn.gate.weight"] = ("BF16", bfloat16(embedding[[1, 2]]))
+        tensors[prefix + "ffn.gate.bias"] = ("F32", np.asarray([-0.0001234567, 0.0001234567], np.float32))
+        matrices = {"attn.wq_a": (256, HIDDEN), "attn.wq_b": (512, 256),
+                    "attn.wkv": (128, HIDDEN), "attn.wo_a": (512, 256), "attn.wo_b": (HIDDEN, 512)}
+        for expert in ("shared_experts", "experts.0", "experts.1"):
+            matrices.update({f"ffn.{expert}.{role}": (INTERMEDIATE, HIDDEN) for role in ("w1", "w3", "w2")})
+        for index, (role, shape) in enumerate(matrices.items()):
+            name = prefix + role + ".weight"
+            tensors[name] = ("BF16", plain(shape, 50 + index + layer))
+            if not role.endswith("experts.1.w3"):
+                native.append(name)
+    return model_config, tensors, native
+
+
+def dspark_tensors() -> tuple[dict, dict, list[str]]:
+    model_config, tensors, native = deepseek_tensors()
+    model_config.update(dspark_target_layer_ids=[0], dspark_block_size=2, dspark_noise_token_id=0,
+                        dspark_markov_rank=256)
+    for name, tensor in list(tensors.items()):
+        if name.startswith("layers.0."):
+            target = "mtp.0." + name[len("layers.0."):]
+            tensors[target] = (tensor[0], tensor[1].copy())
+            if name in native:
+                native.append(target)
+    for role in ("norm.weight", "hc_head_fn", "hc_head_base", "hc_head_scale"):
+        tensors["mtp.0." + role] = tensors[role]
+    tensors["mtp.0.main_norm.weight"] = ("BF16", bfloat16(np.ones(HIDDEN)))
+    for role, shape in (("main_proj", (HIDDEN, HIDDEN)),
+                        ("markov_head.markov_w1", (VOCABULARY, 256)),
+                        ("markov_head.markov_w2", (VOCABULARY, 256))):
+        name = "mtp.0." + role + ".weight"
+        tensors[name] = ("BF16", plain(shape, 80))
+        native.append(name)
+    codes = np.arange(HIDDEN + 256, dtype=np.int32).reshape(1, -1) % 16
+    tensors["mtp.0.confidence_head.proj.weight"] = ("BF16", bfloat16((codes - 8).astype(np.float32) / 512))
+    return model_config, tensors, native
+
+
+def qwen38_tensors() -> tuple[dict, dict, list[str]]:
+    model_config = config(True)
+    model_config["model_type"] = "qwen4_exp"
+    text = model_config["text_config"]
+    text.update(model_type="qwen4_exp_text", hc_count=4, hc_lowrank=256, output_gate_type="sigmoid",
+                indexer_n_heads=2, indexer_head_dim=64, indexer_kv_heads=1,
+                indexer_compress_ratio=4, indexer_budget=16, ple_embed_dim=HIDDEN, ple_conv_kernel_size=2,
+                ngram_size=3, heads_per_ngram=1, ngram_vocab_size_base=2,
+                make_ngram_vocab_size_divisible_by=4, split_ngram_parts=2, ple_layer_ids=[1],
+                eos_token_id=7, mtp_num_hidden_layers=0)
+    tensors, native = base_tensors(True)
+    del tensors[PREFIX + "norm.weight"]
+    for layer in range(2):
+        for role in ("input_layernorm.weight", "post_attention_layernorm.weight"):
+            del tensors[PREFIX + f"layers.{layer}." + role]
+    for prefix in ([PREFIX + "hyper_connection_mixer."]
+                   + [PREFIX + f"layers.{layer}.{block}_hyper_connection."
+                      for layer in range(2) for block in ("attn", "mlp")]):
+        tensors[prefix + "hc_norm.weight"] = ("BF16", bfloat16(np.zeros(4 * HIDDEN)))
+        for role, shape in (("input_mix_weight_down", (256, 4 * HIDDEN)),
+                            ("input_mix_weight_up", (4 * HIDDEN, 256))):
+            name = prefix + role + ".weight"
+            tensors[name] = ("BF16", plain(shape, 70, 1 / 4096))
+            native.append(name)
+        if not prefix.endswith("hyper_connection_mixer."):
+            name = prefix + "block_inject_weight.weight"
+            tensors[name] = ("BF16", plain((4, 4 * HIDDEN), 71, 1 / 4096))
+    prefix = PREFIX + "layers.1.self_attn.indexer."
+    tensors[prefix + "index_qk_proj.weight"] = ("BF16", plain((192, HIDDEN), 72))
+    native.append(prefix + "index_qk_proj.weight")
+    for role in ("q_layernorm", "k_layernorm"):
+        tensors[prefix + role + ".weight"] = ("BF16", bfloat16(np.zeros(64)))
+    prefix = PREFIX + "layers.0.ple."
+    for role, shape in (("key_proj", (4 * HIDDEN, HIDDEN)), ("value_proj", (HIDDEN, HIDDEN))):
+        tensors[prefix + role + ".weight"] = ("BF16", plain(shape, 73))
+        native.append(prefix + role + ".weight")
+    for role in ("norm_key", "norm_query", "norm_conv"):
+        tensors[prefix + role + ".weight"] = ("BF16", bfloat16(np.zeros(4 * HIDDEN)))
+    tensors[prefix + "conv1d.weight"] = ("BF16", plain((4 * HIDDEN, 1, 2), 74, 1 / 8))
+    for role, values in (("layer_multipliers", [1, 3, 5]), ("ngram_heads_vocab_sizes", [2, 3]), ("ngram_heads_offsets", [0, 2])):
+        tensors[prefix + "ple_embedding." + role] = ("I64", np.asarray(values, np.int64))
+    for shard in range(2):
+        tensors[prefix + f"ple_embedding.ngram_embedding.shard_{shard}.weight"] = ("BF16", plain((4, 128), 75 + shard))
+    return model_config, tensors, native
+
+
+def family_tensors(family: str) -> tuple[dict, dict, list[str]]:
+    return {"gpt_oss": gpt_oss_tensors, "deepseek_v4": deepseek_tensors,
+            "deepseek_dspark": dspark_tensors, "qwen4_exp": qwen38_tensors}[family]()
+
+
+def check_preserved_auxiliary(loaded: dict, reference: dict) -> None:
+    for name, (dtype, values) in reference.items():
+        if dtype in ("F32", "I64"):
+            assert loaded[name].dtype == dtype, name
+            np.testing.assert_array_equal(loaded[name].read().view(np.uint8), values.view(np.uint8))
+
+
+def weight_sizes(tensors: dict, packed_sizes: dict[str, int]) -> tuple[int, int]:
+    dense = expert = 0
+    for name, (dtype, values) in tensors.items():
+        size = packed_sizes.get(name, values.size * {"BF16": 2, "F32": 4, "I64": 8}[dtype])
+        if ".experts." in name:
+            expert += size
+        else:
+            dense += size
+    return dense, expert
+
+
+def prepare_int4(root: Path, method: str, moe: bool, family: str = "qwen") -> Fixture:
+    if family == "qwen":
+        model_config = config(moe)
+        reference, native_names = base_tensors(moe)
+    else:
+        model_config, reference, native_names = family_tensors(family)
+    # Common HF AWQ/GPTQ assets have float16 dtype and unquantized F16 tensors.
+    source_tensors = {name: ("F16", float32(values).astype(np.float16)) if dtype == "BF16" else (dtype, values)
+                      for name, (dtype, values) in reference.items()}
+    specs, packed_sizes = {}, {}
+    for number, name in enumerate(native_names):
+        outputs, inputs = reference[name][1].shape
+        rng = np.random.default_rng(100 + number)
+        codes = rng.integers(0, 16, size=(inputs, outputs), dtype=np.int32)
+        groups = (inputs + GROUP_SIZE - 1) // GROUP_SIZE
+        zeros = rng.integers(1, 17 if method == "gptq" else 16, size=(groups, outputs), dtype=np.int32)
+        scales = rng.integers(1, 4, size=(groups, outputs)).astype(np.float32) / 512
+        # Interleaved act-order groups are deliberately different from k // group_size.
+        indices = (np.arange(inputs) % groups).astype(np.int32) if method == "gptq" else None
+        logical_groups = indices if indices is not None else np.arange(inputs) // GROUP_SIZE
+        expected = np.empty((outputs, inputs), dtype=np.float32)
+        for output in range(outputs):
+            expected[output] = (codes[:, output] - zeros[logical_groups, output]) * scales[logical_groups, output]
+        reference[name] = ("BF16", bfloat16(expected))
+        # Dyadic scales keep all reference values exactly representable in BF16.
+        np.testing.assert_array_equal(float32(reference[name][1]), expected)
+        prefix = name[:-len("weight")]
+        del source_tensors[name]
+        source_tensors[prefix + "qweight"] = ("I32", pack_columns(codes, True) if method == "awq" else pack_gptq(codes))
+        source_tensors[prefix + "qzeros"] = ("I32", pack_columns(zeros, True) if method == "awq" else pack_columns(zeros - 1))
+        source_tensors[prefix + "scales"] = ("F16", scales.astype(np.float16))
+        if indices is not None:
+            source_tensors[prefix + "g_idx"] = ("I32", indices)
+        resident = outputs * ((inputs + 1) // 2) + groups * outputs * 5
+        if indices is not None:
+            resident += inputs * 4
+            if family in ("qwen", "qwen4_exp") and name.endswith("self_attn.q_proj.weight"):
+                resident += inputs * 4  # Query/gate split each owns its group-index vector.
+        packed_sizes[name] = resident
+        specs[name] = (codes, scales, zeros, indices)
+    dense_bytes, expert_bytes = weight_sizes(reference, packed_sizes)
+    bf16_dense, bf16_expert = weight_sizes(reference, {})
+    baseline = root / "baseline"
+    assets(baseline, model_config)
+    write_safetensors(baseline / "model.safetensors", reference)
+    source = root / "source"
+    source_config = copy.deepcopy(model_config)
+    source_config.get("text_config", source_config)["dtype"] = "float16"
+    quant = {"quant_method": method, "bits": 4, "group_size": GROUP_SIZE}
+    if method == "awq":
+        quant.update(version="GEMM", zero_point=True)
+    else:
+        quant.update(desc_act=True, sym=False, checkpoint_format="gptq")
+    source_config["quantization_config"] = quant
+    assets(source, source_config)
+    write_safetensors(source / "model.safetensors", source_tensors)
+    imported = root / "imported"
+    importer.import_package(source, imported)
+    loaded = importer.scan_safetensors(imported)
+    check_preserved_auxiliary(loaded, reference)
+    for name, (codes, scales, zeros, indices) in specs.items():
+        assert loaded[name].dtype == "U8", name
+        np.testing.assert_array_equal(loaded[name + ".__int4_shape"].read(), [codes.shape[1], codes.shape[0], GROUP_SIZE])
+        packed = loaded[name].read()
+        actual_codes = np.empty((codes.shape[1], packed.shape[1] * 2), dtype=np.uint8)
+        actual_codes[:, ::2], actual_codes[:, 1::2] = packed & 15, packed >> 4
+        np.testing.assert_array_equal(actual_codes[:, :codes.shape[0]], codes.T)
+        np.testing.assert_array_equal(loaded[name + ".__int4_scales"].read(), scales.T)
+        np.testing.assert_array_equal(loaded[name + ".__int4_zeros"].read(), zeros.T)
+        if indices is not None:
+            np.testing.assert_array_equal(loaded[name + ".__int4_g_idx"].read(), indices)
+    return Fixture(baseline, imported, source, dense_bytes, expert_bytes, bf16_dense, bf16_expert, len(specs), moe, True, family)
+
+
+def quantize_tiny_confidence(fixture: Fixture) -> Fixture:
+    # HF AWQ/GPTQ pack output zero points eight at a time. This one-row
+    # auxiliary head uses the runtime's canonical INT4 schema directly.
+    name = "mtp.0.confidence_head.proj.weight"
+    loaded = importer.scan_safetensors(fixture.imported)
+    info = loaded[name]
+    values = float32(info.read())
+    codes = np.rint(values * 512 + 8).astype(np.uint8)
+    packed = codes[:, ::2] | (codes[:, 1::2] << 4)
+    columns = values.shape[1]
+    metadata = {name + ".__int4_shape": ("I64", np.asarray([1, columns, GROUP_SIZE], np.int64)),
+                name + ".__int4_scales": ("F32", np.full((1, columns // GROUP_SIZE), 1 / 512, np.float32)),
+                name + ".__int4_zeros": ("U8", np.full((1, columns // GROUP_SIZE), 8, np.uint8))}
+    write_safetensors(info.path, {name: ("U8", packed)})
+    filename = "native-confidence-metadata.safetensors"
+    write_safetensors(fixture.imported / filename, metadata)
+    index_path = fixture.imported / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["weight_map"].update({key: filename for key in metadata})
+    size = packed.nbytes + sum(array.nbytes for _, array in metadata.values())
+    index["metadata"]["total_size"] += size - info.size
+    index_path.write_text(json.dumps(index))
+    resident = packed.nbytes + (columns // GROUP_SIZE) * 5
+    return replace(fixture, expected_dense=fixture.expected_dense - info.size + resident,
+                   native_matrices=fixture.native_matrices + 1)
+
+
+def gguf_name(name: str) -> str:
+    names = {PREFIX + "embed_tokens.weight": "token_embd.weight",
+             PREFIX + "norm.weight": "output_norm.weight", "lm_head.weight": "output.weight"}
+    if name in names:
+        return names[name]
+    layer, role = name[len(PREFIX + "layers."):].split(".", 1)
+    roles = {
+        "input_layernorm.weight": "attn_norm.weight", "post_attention_layernorm.weight": "ffn_norm.weight",
+        "self_attn.q_proj.weight": "attn_q.weight", "self_attn.k_proj.weight": "attn_k.weight",
+        "self_attn.v_proj.weight": "attn_v.weight", "self_attn.o_proj.weight": "attn_output.weight",
+        "self_attn.q_norm.weight": "attn_q_norm.weight", "self_attn.k_norm.weight": "attn_k_norm.weight",
+        "linear_attn.in_proj_qkv.weight": "attn_qkv.weight", "linear_attn.in_proj_z.weight": "attn_gate.weight",
+        "linear_attn.in_proj_a.weight": "ssm_alpha.weight", "linear_attn.in_proj_b.weight": "ssm_beta.weight",
+        "linear_attn.out_proj.weight": "ssm_out.weight", "linear_attn.conv1d.weight": "ssm_conv1d.weight",
+        "linear_attn.A_log": "ssm_a", "linear_attn.dt_bias": "ssm_dt.bias", "linear_attn.norm.weight": "ssm_norm.weight",
+        "mlp.gate_proj.weight": "ffn_gate.weight", "mlp.up_proj.weight": "ffn_up.weight", "mlp.down_proj.weight": "ffn_down.weight",
+        "mlp.gate.weight": "ffn_gate_inp.weight", "mlp.shared_expert_gate.weight": "ffn_gate_inp_shexp.weight",
+        "mlp.shared_expert.gate_proj.weight": "ffn_gate_shexp.weight",
+        "mlp.shared_expert.up_proj.weight": "ffn_up_shexp.weight",
+        "mlp.shared_expert.down_proj.weight": "ffn_down_shexp.weight",
+    }
+    return f"blk.{layer}." + roles[role]
+
+
+def qnk_blocks(rows: int, bits: int, seed: int, columns: int = 256) -> np.ndarray:
+    """Construct finite, nonzero GGML blocks without an importer quantizer."""
+    rng = np.random.default_rng(seed)
+    assert columns % 256 == 0
+    block_bytes = 144 if bits == 4 else 210
+    raw = np.empty((rows, columns // 256 * block_bytes), dtype=np.uint8)
+    for block in range(columns // 256):
+        if bits == 4:
+            values = np.zeros((rows, 144), dtype=np.uint8)
+            for row in range(rows):
+                values[row, :2] = np.asarray([(row % 3 + 1) / 1024], dtype="<f2").view(np.uint8)
+                values[row, 2:4] = np.asarray([1 / 2048], dtype="<f2").view(np.uint8)
+            values[:, 4:16] = 1
+            values[:, 16:] = rng.integers(0, 256, size=(rows, 128), dtype=np.uint8)
+        else:
+            values = rng.integers(0, 256, size=(rows, 210), dtype=np.uint8)
+            values[:, 192:208] = rng.integers(1, 4, size=(rows, 16), dtype=np.uint8)
+            for row in range(rows):
+                values[row, 208:] = np.asarray([(row % 2 + 1) / 2048], dtype="<f2").view(np.uint8)
+        raw[:, block * block_bytes:(block + 1) * block_bytes] = values
+    return raw
+
+
+def logical_to_gguf_columns(keys: int, heads: int, dimension: int) -> np.ndarray:
+    """Independent explicit key-major HF -> repetition-major GGUF indexing."""
+    result = np.empty(heads * dimension, dtype=np.int64)
+    repetitions = heads // keys
+    for key in range(keys):
+        for repetition in range(repetitions):
+            for feature in range(dimension):
+                logical = (key * repetitions + repetition) * dimension + feature
+                result[logical] = (repetition * keys + key) * dimension + feature
+    return result
+
+
+def prepare_gguf(root: Path, moe: bool = False, reordered: bool = False) -> Fixture:
+    model_config = config(moe, reordered)
+    reference, native_names = base_tensors(moe, reordered)
+    native_names.append(PREFIX + "embed_tokens.weight")
+    native_names.extend(name for name in reference if ".experts." in name and name not in native_names)
+    if moe:
+        native_names.extend(name for name in reference if name.endswith(("mlp.gate.weight", "mlp.shared_expert_gate.weight")))
+    assets(root / "assets", model_config)
+    path = root / "source.gguf"
+    writer = gguf.GGUFWriter(path, "qwen35moe" if moe else "qwen35")
+    writer.add_block_count(2)
+    specs, packed_sizes, expert_banks = {}, {}, {}
+    text = model_config["text_config"]
+    keys, heads, dimension = text["linear_num_key_heads"], text["linear_num_value_heads"], text["linear_value_head_dim"]
+    value_order = logical_to_gguf_columns(keys, heads, dimension)
+    head_order = logical_to_gguf_columns(keys, heads, 1)
+    qk_width = 2 * keys * text["linear_key_head_dim"]
+    for index, (name, (_, values)) in enumerate(reference.items()):
+        if name in native_names:
+            rows, columns = values.shape
+            assert columns % 256 == 0
+            bits = 6 if any(role in name for role in ("down_proj", "out_proj", "o_proj", "lm_head")) else 4
+            dtype = gguf.GGMLQuantizationType.Q4_K if bits == 4 else gguf.GGMLQuantizationType.Q6_K
+            raw = qnk_blocks(rows, bits, index, columns)
+            decoded = gguf.dequantize(raw, dtype).reshape(rows, columns)
+            expected_raw = raw
+            column_indices = None
+            if reordered and ".linear_attn." in name:
+                if name.endswith("in_proj_qkv.weight"):
+                    selection = np.concatenate((np.arange(qk_width), qk_width + value_order))
+                    decoded, expected_raw = decoded[selection], raw[selection]
+                elif name.endswith("in_proj_z.weight"):
+                    decoded, expected_raw = decoded[value_order], raw[value_order]
+                elif name.endswith(("in_proj_a.weight", "in_proj_b.weight")):
+                    decoded, expected_raw = decoded[head_order], raw[head_order]
+                elif name.endswith("out_proj.weight"):
+                    decoded = decoded[:, value_order]
+                    column_indices = np.argsort(value_order)
+                    assert not np.array_equal(column_indices[column_indices], np.arange(columns))
+            reference[name] = ("BF16", bfloat16(decoded))
+            np.testing.assert_array_equal(float32(reference[name][1]), decoded)
+            if ".experts." in name:
+                layer = name[len(PREFIX + "layers."):].split(".", 1)[0]
+                role = name.rsplit(".", 2)[1].removesuffix("_proj")
+                expert_banks.setdefault((layer, role, dtype), []).append(raw)
+            else:
+                writer.add_tensor(gguf_name(name), raw, raw_dtype=dtype)
+            specs[name] = (expected_raw, bits, columns, column_indices)
+            packed_sizes[name] = raw.nbytes + (columns * 4 if column_indices is not None else 0)
+        else:
+            decoded = float32(values)
+            if name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"):
+                decoded = decoded + 1
+            if name.endswith("linear_attn.A_log"):
+                decoded = -np.exp(decoded)
+            if reordered and name.endswith(("linear_attn.A_log", "linear_attn.dt_bias")):
+                decoded = decoded[np.argsort(head_order)]
+            if name.endswith("linear_attn.conv1d.weight"):
+                decoded = decoded[:, 0, :]
+                if reordered:
+                    decoded = np.concatenate((decoded[:qk_width], decoded[qk_width:][np.argsort(value_order)]))
+            writer.add_tensor(gguf_name(name), decoded)
+    for (layer, role, dtype), values in expert_banks.items():
+        writer.add_tensor(f"blk.{layer}.ffn_{role}_exps.weight", np.stack(values), raw_dtype=dtype)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    baseline = root / "baseline"
+    assets(baseline, model_config)
+    write_safetensors(baseline / "model.safetensors", reference)
+    imported = root / "imported"
+    importer.import_package(path, imported, root / "assets")
+    loaded = importer.scan_safetensors(imported)
+    check_preserved_auxiliary(loaded, reference)
+    for name, (raw, bits, columns, column_indices) in specs.items():
+        assert loaded[name].dtype == "U8", name
+        np.testing.assert_array_equal(loaded[name].read().reshape(raw.shape), raw)
+        np.testing.assert_array_equal(loaded[name + ".__qnk_shape"].read(), [bits, raw.shape[0], columns])
+        if column_indices is not None:
+            np.testing.assert_array_equal(loaded[name + ".__qnk_columns"].read(), column_indices)
+    dense_bytes, expert_bytes = weight_sizes(reference, packed_sizes)
+    bf16_dense, bf16_expert = weight_sizes(reference, {})
+    return Fixture(baseline, imported, path, dense_bytes, expert_bytes, bf16_dense, bf16_expert, len(specs), moe)
+
+
+def family_gguf_name(name: str, family: str) -> str:
+    if family == "gpt_oss":
+        roots = {"model.embed_tokens.weight": "token_embd.weight", "model.norm.weight": "output_norm.weight",
+                 "lm_head.weight": "output.weight"}
+        if name in roots:
+            return roots[name]
+        layer, role = name[len("model.layers."):].split(".", 1)
+        roles = {"input_layernorm.weight": "attn_norm.weight", "post_attention_layernorm.weight": "ffn_norm.weight",
+                 "self_attn.sinks": "attn_sinks.weight", "mlp.router.weight": "ffn_gate_inp.weight",
+                 "mlp.router.bias": "ffn_gate_inp.bias"}
+        for hf, gg in (("q", "q"), ("k", "k"), ("v", "v"), ("o", "output")):
+            for suffix in ("weight", "bias"):
+                roles[f"self_attn.{hf}_proj.{suffix}"] = f"attn_{gg}.{suffix}"
+        return f"blk.{layer}." + roles[role]
+    if family == "deepseek_v4":
+        roots = {"embed.weight": "token_embd.weight", "norm.weight": "output_norm.weight", "head.weight": "output.weight",
+                 "hc_head_fn": "output_hc_fn.weight", "hc_head_base": "output_hc_base.weight", "hc_head_scale": "output_hc_scale.weight"}
+        if name in roots:
+            return roots[name]
+        layer, role = name[len("layers."):].split(".", 1)
+        roles = {"attn_norm.weight": "attn_norm.weight", "ffn_norm.weight": "ffn_norm.weight",
+                 "attn.q_norm.weight": "attn_q_a_norm.weight", "attn.kv_norm.weight": "attn_kv_norm.weight",
+                 "attn.attn_sink": "attn_sinks.weight", "ffn.gate.weight": "ffn_gate_inp.weight",
+                 "ffn.gate.bias": "exp_probs_b.bias"}
+        for block in ("attn", "ffn"):
+            for kind in ("fn", "base", "scale"):
+                roles[f"hc_{block}_{kind}"] = f"hc_{block}_{kind}.weight"
+        for hf, gg in (("wq_a", "q_a"), ("wq_b", "q_b"), ("wkv", "kv"), ("wo_a", "output_a"), ("wo_b", "output_b")):
+            roles[f"attn.{hf}.weight"] = f"attn_{gg}.weight"
+        for hf, gg in (("w1", "gate"), ("w3", "up"), ("w2", "down")):
+            roles[f"ffn.shared_experts.{hf}.weight"] = f"ffn_{gg}_shexp.weight"
+        return f"blk.{layer}." + roles[role]
+    head = PREFIX + "hyper_connection_mixer."
+    hc = {"hc_norm.weight": "norm.weight", "input_mix_weight_down.weight": "down.weight",
+          "input_mix_weight_up.weight": "up.weight", "block_inject_weight.weight": "inject.weight"}
+    if name.startswith(head):
+        return "output_hc_" + hc[name[len(head):]]
+    if "_hyper_connection." in name:
+        layer, tail = name[len(PREFIX + "layers."):].split(".", 1)
+        block, role = tail.split("_hyper_connection.")
+        return f"blk.{layer}.hc_{'attn' if block == 'attn' else 'ffn'}_" + hc[role]
+    if ".ple." in name or ".self_attn.indexer." in name:
+        layer, role = name[len(PREFIX + "layers."):].split(".", 1)
+        roles = {"ple.key_proj.weight": "ple_key.weight", "ple.value_proj.weight": "ple_value.weight",
+                 "ple.norm_key.weight": "ple_norm_key.weight", "ple.norm_query.weight": "ple_norm_query.weight",
+                 "ple.norm_conv.weight": "ple_norm_conv.weight", "ple.conv1d.weight": "ple_conv1d.weight",
+                 "self_attn.indexer.q_layernorm.weight": "indexer.q_norm.weight",
+                 "self_attn.indexer.k_layernorm.weight": "indexer.k_norm.weight"}
+        return f"blk.{layer}." + roles[role]
+    return gguf_name(name)
+
+
+def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = False) -> Fixture:
+    model_config, reference, native_names = family_tensors(family)
+    embedding = "embed.weight" if family == "deepseek_v4" else ("model." if family == "gpt_oss" else PREFIX) + "embed_tokens.weight"
+    native = set(native_names) | {embedding}
+    native.update(name for name, (_, values) in reference.items()
+                  if ".experts." in name and values.ndim == 2)
+    source_config = copy.deepcopy(model_config)
+    if canonical_dspark:
+        source_config.update(dspark_target_layer_ids=[0], dspark_block_size=2, dspark_noise_token_id=0,
+                             dspark_markov_rank=256)
+    assets(root / "assets", source_config)
+    path = root / "source.gguf"
+    writer = gguf.GGUFWriter(path, {"gpt_oss": "gpt-oss", "deepseek_v4": "deepseek4", "qwen4_exp": "qwen4exp"}[family])
+    writer.add_block_count(2)
+    if family == "qwen4_exp":
+        ple = PREFIX + "layers.0.ple.ple_embedding."
+        for key, source in (("layer_multipliers", "layer_multipliers"), ("head_offsets", "ngram_heads_offsets"),
+                            ("head_vocab_sizes", "ngram_heads_vocab_sizes")):
+            writer.add_array("qwen4exp.ple." + key, reference[ple + source][1].tolist())
+        writer.add_tensor("per_layer_token_embd.weight", np.concatenate([
+            float32(reference[ple + f"ngram_embedding.shard_{shard}.weight"][1]) for shard in range(2)]))
+    specs, packed_sizes, banks = {}, {}, {}
+    for index, (name, (source_dtype, values)) in enumerate(list(reference.items())):
+        if family == "qwen4_exp" and ".ple.ple_embedding." in name:
+            continue
+        expert = re.search(r"(?:mlp|ffn)\.experts\.(\d+)\.(.+)\.(weight|bias)$", name)
+        if expert:
+            layer = re.search(r"layers\.(\d+)\.", name)[1]
+            role = {"gate_proj": "gate", "up_proj": "up", "down_proj": "down", "w1": "gate", "w3": "up", "w2": "down"}[expert[2]]
+            bank_name = f"blk.{layer}.ffn_{role}_exps.{expert[3]}"
+        if name in native:
+            rows, columns = values.shape
+            bits = 6 if any(role in name for role in ("down_proj", ".w2.", "out_proj", "o_proj", "wo_b", "head.weight")) else 4
+            dtype = gguf.GGMLQuantizationType.Q4_K if bits == 4 else gguf.GGMLQuantizationType.Q6_K
+            raw = qnk_blocks(rows, bits, index, columns)
+            decoded = gguf.dequantize(raw, dtype).reshape(rows, columns)
+            reference[name] = ("BF16", bfloat16(decoded))
+            np.testing.assert_array_equal(float32(reference[name][1]), decoded)
+            specs[name] = (raw, bits, rows, columns)
+            packed_sizes[name] = raw.nbytes
+            if expert:
+                banks.setdefault((bank_name, dtype), []).append(raw)
+            elif name.endswith("self_attn.indexer.index_qk_proj.weight"):
+                layer = re.search(r"layers\.(\d+)\.", name)[1]
+                writer.add_tensor(f"blk.{layer}.indexer.q_proj.weight", raw[:128], raw_dtype=dtype)
+                writer.add_tensor(f"blk.{layer}.indexer.k_proj.weight", raw[128:], raw_dtype=dtype)
+            else:
+                writer.add_tensor(family_gguf_name(name, family), raw, raw_dtype=dtype)
+        else:
+            decoded = float32(values) if source_dtype == "BF16" else values
+            if family == "qwen4_exp":
+                if (name.endswith("norm.weight") or name.endswith(("ple.norm_key.weight", "ple.norm_query.weight", "ple.norm_conv.weight"))) and not name.endswith("linear_attn.norm.weight"):
+                    decoded = decoded + 1
+                if name.endswith("linear_attn.A_log"):
+                    decoded = -np.exp(decoded)
+                if name.endswith("conv1d.weight"):
+                    decoded = decoded[:, 0, :]
+            if expert:
+                banks.setdefault((bank_name, None), []).append(decoded)
+            else:
+                writer.add_tensor(family_gguf_name(name, family), decoded)
+    for (name, dtype), values in banks.items():
+        writer.add_tensor(name, np.stack(values), **({"raw_dtype": dtype} if dtype is not None else {}))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    baseline = root / "baseline"
+    assets(baseline, model_config)
+    write_safetensors(baseline / "model.safetensors", reference)
+    imported = root / "imported"
+    importer.import_package(path, imported, root / "assets")
+    loaded = importer.scan_safetensors(imported)
+    check_preserved_auxiliary(loaded, reference)
+    if canonical_dspark:
+        imported_config = json.loads((imported / "config.json").read_text())
+        assert not any(name.startswith("dspark_") for name in imported_config)
+        assert not any(name.startswith("mtp.") for name in loaded)
+    for name, (raw, bits, rows, columns) in specs.items():
+        np.testing.assert_array_equal(loaded[name].read().reshape(raw.shape), raw)
+        np.testing.assert_array_equal(loaded[name + ".__qnk_shape"].read(), [bits, rows, columns])
+    dense, expert = weight_sizes(reference, packed_sizes)
+    bf16_dense, bf16_expert = weight_sizes(reference, {})
+    return Fixture(baseline, imported, path, dense, expert, bf16_dense, bf16_expert, len(specs), True, False, family)
+
+
+
+def prepare_fp8(root: Path, family: str) -> Fixture:
+    """Use independent E4M3 arithmetic and nonuniform block scales as an oracle."""
+    if family in {"qwen_dense", "qwen_moe"}:
+        model_config = config(family == "qwen_moe")
+        reference, names = base_tensors(family == "qwen_moe")
+    else:
+        model_config, reference, names = family_tensors(family)
+    codes = np.arange(256, dtype=np.uint16)
+    exponent, mantissa = (codes >> 3) & 15, codes & 7
+    positive = np.where(exponent == 0, mantissa / 512,
+                        np.ldexp(1 + mantissa / 8, exponent.astype(np.int16) - 7))
+    values = np.where(codes & 128, -positive, positive).astype(np.float32)
+    values[(codes & 127) == 127] = np.nan
+    encoding = {float(value): int(code) for code, value in enumerate(values)
+                if np.isfinite(value)}
+    encoding[0.0] = 0
+    source_tensors = dict(reference)
+    packed_sizes = {}
+    # Qwen's interleaved query/gate row selection preserves FP8 codes and
+    # represents source block scales per selected row, with input blocks 128.
+    selection_metadata = 0
+    for name in names:
+        rows, columns = reference[name][1].shape
+        original = float32(reference[name][1])
+        packed = np.empty((rows, columns), dtype=np.uint8)
+        scales = np.empty(((rows + 127) // 128, (columns + 127) // 128), dtype=np.float32)
+        for row in range(0, rows, 128):
+            for column in range(0, columns, 128):
+                scale = np.float32(1 / (16 if (row // 128 + column // 128) % 2 else 32))
+                block = original[row:row + 128, column:column + 128]
+                encoded = np.asarray([encoding[float(value / scale)] for value in block.reshape(-1)], dtype=np.uint8).reshape(block.shape)
+                packed[row:row + 128, column:column + 128] = encoded
+                scales[row // 128, column // 128] = scale
+                np.testing.assert_array_equal(values[encoded] * scale, block)
+        source_tensors[name] = ("F8_E4M3", packed)
+        suffix = "scale" if family == "deepseek_v4" else "weight_scale_inv"
+        source_tensors[name[:-len("weight")] + suffix] = ("F32", scales)
+        packed_sizes[name] = packed.nbytes + scales.nbytes
+        if family.startswith("qwen") and name.endswith(".self_attn.q_proj.weight"):
+            selection_metadata += rows * scales.shape[1] * 4 - scales.nbytes
+    model_config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "scale_fmt": "ue8m0",
+                                           "weight_block_size": [128, 128], "activation_scheme": "dynamic"}
+    source = root / "source"
+    assets(source, model_config)
+    write_safetensors(source / "model.safetensors", source_tensors)
+    imported = root / "imported"
+    importer.import_package(source, imported)
+    loaded = importer.scan_safetensors(imported)
+    for name in names:
+        target = importer.canonical_tensor_name(name, model_config)
+        assert loaded[target].dtype == "F8_E4M3", target
+        np.testing.assert_array_equal(loaded[target].read(), source_tensors[name][1])
+        scale_name = name[:-len("weight")] + ("scale" if family == "deepseek_v4" else "weight_scale_inv")
+        imported_scale = importer.canonical_tensor_name(name[:-len("weight")] + "scale", model_config)
+        assert loaded[imported_scale].dtype == "F32", imported_scale
+        np.testing.assert_array_equal(loaded[imported_scale].read(), source_tensors[scale_name][1])
+    baseline = root / "baseline"
+    assets(baseline, importer.normalized_config(model_config))
+    write_safetensors(baseline / "model.safetensors", reference)
+    dense, expert = weight_sizes(reference, packed_sizes)
+    bf16_dense, bf16_expert = weight_sizes(reference, {})
+    moe = family != "qwen_dense"
+    return Fixture(baseline, imported, source, dense + selection_metadata, expert, bf16_dense, bf16_expert,
+                   len(names), moe, False, family)
+
+
+def add_deepseek_mxfp4_experts(fixture: Fixture) -> Path:
+    """Keep FP8 dense projections and replace routed banks with official MXFP4 pairs."""
+    source_tensors = {name: (info.dtype, info.read().copy())
+                      for name, info in importer.scan_safetensors(fixture.source).items()}
+    oracle_tensors = dict(source_tensors)
+    blocks = np.full((INTERMEDIATE, HIDDEN // 2), 0x11, dtype=np.uint8).view(np.int8)
+    scales = np.full((INTERMEDIATE, HIDDEN // 32), 127, dtype=np.uint8)
+    oracle_weight = bfloat16(np.full((INTERMEDIATE, HIDDEN), 0.5, dtype=np.float32))
+    for layer in range(2):
+        for expert in range(2):
+            for role in ("w1", "w3", "w2"):
+                name = f"layers.{layer}.ffn.experts.{expert}.{role}.weight"
+                scale_name = name[:-len("weight")] + "scale"
+                source_tensors.pop(name, None)
+                source_tensors.pop(scale_name, None)
+                source_tensors[name] = ("I8", blocks)
+                source_tensors[scale_name] = ("F8_E8M0", scales)
+                oracle_tensors.pop(scale_name, None)
+                oracle_tensors[name] = ("BF16", oracle_weight)
+    write_safetensors(fixture.source / "model.safetensors", source_tensors)
+    oracle = fixture.source.parent / "bf16_oracle"
+    assets(oracle, json.loads((fixture.source / "config.json").read_text()))
+    write_safetensors(oracle / "model.safetensors", oracle_tensors)
+    return oracle
+
+class NativeQuantizedTests(unittest.TestCase):
+    worker: Path
+    backend = "cpu"
+    verbose_worker = False
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="ncnn-native-quantized-")
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def run_worker(self, path: Path, moe: bool, expected: Fixture | None = None,
+                   *, backend: str | None = None, extra_args: tuple[str, ...] = (),
+                   speculative: bool = False) -> dict:
+        selected_backend = backend or self.backend
+        with WorkerClient(self.worker, path, ["--backend", selected_backend, "--cpu-packed-weights", "off", *extra_args],
+                          verbose=self.verbose_worker) as client:
+            ready = client.ready
+            if selected_backend != "auto":
+                self.assertEqual(ready["resources"]["backend"], selected_backend)
+            hybrid = ready["resources"]["backend"] == "hybrid"
+            if hybrid:
+                capabilities = ready["capabilities"]
+                self.assertGreater(capabilities["vulkan_device_count"], 0)
+                devices = {device["index"]: device for device in capabilities["vulkan_devices"]}
+                self.assertIn(capabilities["selected_vulkan_device_index"], devices)
+                self.assertTrue(devices[capabilities["selected_vulkan_device_index"]]["name"])
+            self.assertEqual(ready["model"]["expert_count"], 2 if moe else 0)
+            if expected is not None:
+                resources = ready["resources"]
+                self.assertEqual(resources["estimated_dense_bytes"], expected.expected_dense)
+                self.assertEqual(resources["estimated_expert_bytes"], expected.expected_expert)
+                self.assertLess(resources["estimated_dense_bytes"], expected.bf16_dense)
+                if moe:
+                    self.assertLess(resources["estimated_expert_bytes"], expected.bf16_expert)
+                else:
+                    self.assertEqual(resources["expert_cache_bytes"], 0)
+            result = {"resources": ready["resources"]}
+            sessions = [("greedy", 0.0, 0), ("sampled", 1.0, 23)]
+            if hybrid and moe and expected is not None:
+                sessions.append(("reused", 1.0, 23))
+            for label, temperature, seed in sessions:
+                client.create_session(label, seed=seed, prefill_chunk_size=8, enable_speculative_context=speculative)
+                events = []
+                new_tokens = 6 if speculative else 4
+                done, tokens = client.generate(label, [1, 1, 2, 2, 3, 3, 4, 4], max_new_tokens=new_tokens, temperature=temperature,
+                                              stop_tokens=[], enable_speculative=speculative,
+                                              speculative_confidence=0, speculative_max_draft=2,
+                                              metrics_enabled=True, on_event=events.append)
+                self.assertTrue(done["ok"], done)
+                self.assertEqual(len(tokens), new_tokens)
+                probabilities = [event["probability"] for event in events if event.get("event") == "token"]
+                self.assertEqual(len(probabilities), new_tokens)
+                self.assertTrue(all(math.isfinite(value) and 0 < value <= 1 for value in probabilities))
+                if speculative:
+                    self.assertGreater(done["stats"]["generation"]["speculative_proposals"], 0,
+                                       "DSpark model loaded but executed no draft proposal")
+                    self.assertGreater(done["stats"]["generation"]["speculative_draft_tokens"], 0)
+                if expected is not None:
+                    gpu = done["stats"]["generation_gpu"]
+                    if hybrid:
+                        self.assertTrue(gpu["available"])
+                        self.assertGreater(gpu["submit_count"], 0)
+                        self.assertGreater(gpu["linear_dispatches"], 0)
+                        if expected.family in ("qwen", "qwen4_exp"):
+                            self.assertGreater(gpu["gated_delta_submissions"], 0,
+                                               "hybrid quantized DeltaNet executed no Vulkan recurrence")
+                        if expected.int4:
+                            self.assertGreater(gpu["int4_dispatches"], 0,
+                                               "hybrid INT4 model executed no native INT4 Vulkan projection")
+                        if moe and label == "sampled":
+                            self.assertGreater(done["stats"]["cumulative"]["gpu_executions"], 0,
+                                               "hybrid MoE model executed no routed Expert on Vulkan")
+                        if moe and label == "reused":
+                            generation = done["stats"]["generation"]
+                            self.assertGreater(generation["gpu_executions"], 0,
+                                               "warm MoE session executed no routed Expert on Vulkan")
+                            self.assertEqual(generation["gpu_cache_stores"], 0,
+                                             "warm MoE session uploaded an Expert again")
+                            self.assertEqual(generation["gpu_cache_evictions"], 0,
+                                             "warm MoE session evicted an already resident Expert")
+                    else:
+                        self.assertEqual(gpu["int4_dispatches"], 0)
+                result[label] = (tokens, probabilities)
+                result[label + "_stats"] = done["stats"]
+            if "reused" in result:
+                self.assertEqual(result["reused"][0], result["sampled"][0])
+                np.testing.assert_allclose(result["reused"][1], result["sampled"][1], rtol=0, atol=3e-5)
+            return result
+
+    def compare(self, fixture: Fixture, *, direct: bool) -> None:
+        # The CPU reference avoids BF16 Vulkan activation rounding in the
+        # baseline. Native INT4 GPU projections use FP32 activations.
+        speculative = fixture.family == "deepseek_dspark"
+        baseline = self.run_worker(fixture.baseline, fixture.moe, backend="cpu", speculative=speculative)
+        paths = [("imported", fixture.imported)]
+        if direct:
+            paths.append(("direct", fixture.source))
+        for label, path in paths:
+            with self.subTest(path=label, native_matrices=fixture.native_matrices):
+                result = self.run_worker(path, fixture.moe, fixture, speculative=speculative)
+                for mode in ("greedy", "sampled"):
+                    self.assertEqual(result[mode][0], baseline[mode][0])
+                    np.testing.assert_allclose(result[mode][1], baseline[mode][1], rtol=0, atol=3e-5)
+                print(json.dumps({"family": fixture.family, "path": label,
+                                  "backend": result["resources"]["backend"], "native_matrices": fixture.native_matrices,
+                                  "greedy": result["greedy"], "sampled": result["sampled"],
+                                  "bf16_greedy": baseline["greedy"], "bf16_sampled": baseline["sampled"],
+                                  "gpu": result["sampled_stats"]["generation_gpu"],
+                                  "speculative": result["sampled_stats"]["generation"].get("speculative_proposals"),
+                                  "warm_experts": result.get("reused_stats", {}).get("generation")}), flush=True)
+
+    def test_awq_dense(self):
+        self.compare(prepare_int4(self.root, "awq", False), direct=True)
+
+    def test_gptq_dense_act_order(self):
+        self.compare(prepare_int4(self.root, "gptq", False), direct=True)
+
+    def test_awq_moe_mixed_expert_storage(self):
+        self.compare(prepare_int4(self.root, "awq", True), direct=True)
+
+    def test_gptq_moe_mixed_expert_storage(self):
+        self.compare(prepare_int4(self.root, "gptq", True), direct=True)
+
+    def test_gpt_oss_native_int4(self):
+        self.compare_native_family("gpt_oss")
+
+    def test_deepseek_v4_native_int4(self):
+        self.compare_native_family("deepseek_v4")
+
+    def test_qwen38_flash_native_int4(self):
+        self.compare_native_family("qwen4_exp")
+
+    def test_deepseek_dspark_native_proposals(self):
+        for method in ("awq", "gptq"):
+            with self.subTest(method=method):
+                root = self.root / method
+                root.mkdir()
+                fixture = prepare_int4(root, method, True, "deepseek_dspark")
+                self.compare(fixture, direct=True)
+                with self.subTest(confidence="canonical_int4_one_row"):
+                    self.compare(quantize_tiny_confidence(fixture), direct=False)
+
+    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
+    def test_deepseek_gguf_target_only(self):
+        fixture = prepare_family_gguf(self.root, "deepseek_v4", canonical_dspark=True)
+        self.compare(fixture, direct=False)
+        baseline = self.run_worker(fixture.baseline, True, backend="cpu")
+        with WorkerClient(self.worker, fixture.imported, ["--backend", self.backend, "--cpu-packed-weights", "off"]) as client:
+            client.create_session("target-only", prefill_chunk_size=8, enable_speculative_context=True)
+            events = []
+            done, tokens = client.generate("target-only", [1, 1, 2, 2, 3, 3, 4, 4], max_new_tokens=4,
+                                          stop_tokens=[], enable_speculative=True, on_event=events.append)
+            self.assertTrue(done["ok"], done)
+            self.assertEqual(done["stats"]["generation"]["speculative_proposals"], 0)
+            self.assertEqual(tokens, baseline["greedy"][0])
+            probabilities = [event["probability"] for event in events if event.get("event") == "token"]
+            np.testing.assert_allclose(probabilities, baseline["greedy"][1], rtol=0, atol=3e-5)
+
+    def compare_native_family(self, family: str):
+        for method in ("awq", "gptq"):
+            with self.subTest(family=family, method=method):
+                root = self.root / method
+                root.mkdir()
+                self.compare(prepare_int4(root, method, True, family), direct=True)
+
+    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
+    def test_real_gguf_q4k_q6k_dense(self):
+        self.compare(prepare_gguf(self.root), direct=False)
+
+    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
+    def test_real_gguf_q4k_q6k_moe(self):
+        self.compare(prepare_gguf(self.root, True), direct=False)
+
+    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
+    def test_real_gguf_recurrent_columns_and_embedding(self):
+        self.compare(prepare_gguf(self.root, reordered=True), direct=False)
+
+    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
+    def test_real_gguf_native_families(self):
+        for family in ("gpt_oss", "deepseek_v4", "qwen4_exp"):
+            with self.subTest(family=family):
+                root = self.root / family
+                root.mkdir()
+                self.compare(prepare_family_gguf(root, family), direct=False)
+
+
+    def test_native_fp8_all_families(self):
+        for family in ("qwen_dense", "qwen_moe", "qwen4_exp", "gpt_oss", "deepseek_v4"):
+            with self.subTest(family=family):
+                root = self.root / family
+                root.mkdir()
+                fixture = prepare_fp8(root, family)
+                baseline = self.run_worker(fixture.baseline, fixture.moe, backend="cpu")
+                cpu_fp8 = self.run_worker(fixture.source, fixture.moe, backend="cpu")
+                for label, path in (("direct", fixture.source), ("imported", fixture.imported)):
+                    with self.subTest(path=label):
+                        result = self.run_worker(path, fixture.moe)
+                        resources = result["resources"]
+                        self.assertEqual(resources["estimated_dense_bytes"], fixture.expected_dense)
+                        self.assertEqual(resources["estimated_expert_bytes"], fixture.expected_expert)
+                        self.assertLess(resources["estimated_dense_bytes"], fixture.bf16_dense)
+                        if fixture.moe:
+                            self.assertLess(resources["estimated_expert_bytes"], fixture.bf16_expert)
+                        for mode in ("greedy", "sampled"):
+                            # FP8 rounds activations too, so the native source
+                            # CPU execution defines the E2E arithmetic oracle.
+                            # The decoded BF16 model is observational only.
+                            self.assertEqual(result[mode][0], cpu_fp8[mode][0])
+                            np.testing.assert_allclose(result[mode][1], cpu_fp8[mode][1], rtol=0, atol=3e-5)
+                        gpu = result["sampled_stats"]["generation_gpu"]
+                        if resources["backend"] == "hybrid":
+                            self.assertTrue(gpu["available"])
+                            self.assertGreater(gpu["submit_count"], 0)
+                            self.assertGreater(gpu["linear_dispatches"] + gpu["attention_blocks"], 0,
+                                               "native FP8 model executed no Vulkan projection or attention")
+                        self.assertEqual(gpu["int4_dispatches"], 0)
+                        print(json.dumps({"family": family, "format": "native_fp8", "path": label,
+                                          "backend": resources["backend"], "gpu": gpu,
+                                          "max_bf16_probability_delta": max(abs(actual - expected)
+                                              for mode in ("greedy", "sampled")
+                                              for actual, expected in zip(result[mode][1], baseline[mode][1])),
+                                          "max_cpu_fp8_probability_delta": max(abs(actual - expected)
+                                              for mode in ("greedy", "sampled")
+                                              for actual, expected in zip(result[mode][1], cpu_fp8[mode][1])),
+                                          "dense_bytes": resources["estimated_dense_bytes"],
+                                          "expert_bytes": resources["estimated_expert_bytes"]}), flush=True)
+
+    def test_deepseek_fp8_dense_mxfp4_expert_memory_modes(self):
+        root = self.root / "deepseek-fp8-mxfp4"
+        root.mkdir()
+        fixture = prepare_fp8(root, "deepseek_v4")
+        oracle = add_deepseek_mxfp4_experts(fixture)
+
+        def execute(model_path: Path, memory_mode: str) -> tuple[list[int], list[float], dict]:
+            with WorkerClient(self.worker, model_path,
+                              ["--backend", "cpu", "--cpu-packed-weights", "off",
+                               "--expert-memory", memory_mode]) as client:
+                self.assertEqual(client.ready["resources"]["selected_expert_memory"], memory_mode)
+                client.create_session("mixed", seed=0, prefill_chunk_size=8)
+                events = []
+                done, tokens = client.generate("mixed", [1, 1, 2, 2, 3, 3, 4, 4],
+                                               max_new_tokens=4, temperature=0.0,
+                                               stop_tokens=[], enable_speculative=False,
+                                               metrics_enabled=True, on_event=events.append)
+                self.assertTrue(done["ok"], done)
+                self.assertEqual(len(tokens), 4)
+                probabilities = [event["probability"] for event in events if event.get("event") == "token"]
+                self.assertEqual(len(probabilities), 4)
+                self.assertTrue(all(math.isfinite(value) and 0 < value <= 1 for value in probabilities))
+                return tokens, probabilities, done["stats"]["generation"]
+
+        on_demand = execute(fixture.source, "on-demand")
+        eager = execute(fixture.source, "eager")
+        expected = execute(oracle, "eager")
+        self.assertGreater(on_demand[2]["cache_miss"], 0,
+                           "OnDemand FP8/MXFP4 generation did not load a routed Expert from file storage")
+        self.assertGreater(on_demand[2]["cache_hit"], 0,
+                           "OnDemand FP8/MXFP4 generation did not reuse its file-backed Expert cache entry")
+        self.assertGreater(on_demand[2]["io_bytes"], 0,
+                           "OnDemand FP8/MXFP4 generation read no routed Expert bytes")
+        self.assertEqual(on_demand[0], eager[0])
+        np.testing.assert_allclose(on_demand[1], eager[1], rtol=0, atol=3e-5)
+        self.assertEqual(eager[0], expected[0])
+        np.testing.assert_allclose(eager[1], expected[1], rtol=0, atol=3e-5)
+
+    def test_hybrid_release_dense_host(self):
+        if self.backend != "hybrid":
+            self.skipTest("dense host release regression runs with --backend hybrid")
+        methods = ["awq", "gptq"]
+        if gguf is not None:
+            methods.append("gguf")
+        for method in methods:
+            with self.subTest(method=method):
+                root = self.root / method
+                root.mkdir()
+                fixture = (prepare_gguf(root, reordered=True) if method == "gguf"
+                           else prepare_int4(root, method, False))
+                baseline = self.run_worker(fixture.baseline, False, backend="cpu")
+                # Direct HF F16 auxiliaries and imported Qn_K columns both
+                # need host projections for fresh multi-token prefill.
+                path = fixture.source if method == "awq" else fixture.imported
+                result = self.run_worker(path, False, fixture, backend="hybrid",
+                                         extra_args=("--release-vulkan-dense-host",))
+                for mode in ("greedy", "sampled"):
+                    self.assertEqual(result[mode][0], baseline[mode][0])
+                    np.testing.assert_allclose(result[mode][1], baseline[mode][1], rtol=0, atol=3e-5)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--worker", type=Path, required=True)
+    parser.add_argument("--backend", choices=("cpu", "auto", "hybrid"), default="cpu")
+    parser.add_argument("--verbose-worker", action="store_true")
+    args, test_args = parser.parse_known_args()
+    NativeQuantizedTests.worker = args.worker.resolve()
+    NativeQuantizedTests.backend = args.backend
+    NativeQuantizedTests.verbose_worker = args.verbose_worker
+    if args.backend == "hybrid":
+        # A CPU worker can report the actual device inventory without trying
+        # any optional GPU operator. Only an explicit empty inventory skips;
+        # checkpoint, operator or Vulkan execution failures still fail tests.
+        with tempfile.TemporaryDirectory(prefix="ncnn-native-gpu-probe-") as temporary:
+            probe = Path(temporary) / "model"
+            assets(probe, config())
+            weights, _ = base_tensors(False)
+            write_safetensors(probe / "model.safetensors", weights)
+            with WorkerClient(args.worker, probe, ["--backend", "cpu", "--cpu-packed-weights", "off"]) as client:
+                if client.ready["capabilities"]["vulkan_device_count"] == 0:
+                    print("SKIP: Vulkan GPU unavailable")
+                    return 77
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(NativeQuantizedTests)
+    if test_args:
+        parser.error("unrecognized arguments: " + " ".join(test_args))
+    return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

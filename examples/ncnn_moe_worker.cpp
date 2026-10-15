@@ -154,11 +154,15 @@ static std::string expert_metrics_json(const RuntimeMetricCounters& counters)
     result.add_uint("gpu_cache_miss", counters.expert_gpu_cache_misses);
     result.add_uint("gpu_cache_admissions", counters.expert_gpu_cache_admissions);
     result.add_uint("gpu_cache_stores", counters.expert_gpu_cache_stores);
+    result.add_uint("gpu_cache_evictions", counters.expert_gpu_cache_evictions);
     result.add_uint("gpu_cache_dropped_admissions", counters.expert_gpu_cache_dropped_admissions);
     result.add_uint("gpu_cache_resident_bytes", counters.expert_gpu_cache_resident_size);
     result.add_uint("gpu_cache_pending_bytes", counters.expert_gpu_cache_pending_size);
     result.add_uint("gpu_executions", counters.expert_gpu_executions);
     result.add_uint("gpu_execution_failures", counters.expert_gpu_execution_failures);
+    result.add_uint("speculative_proposals", counters.speculative_proposals);
+    result.add_uint("speculative_draft_tokens", counters.speculative_draft_tokens);
+    result.add_uint("speculative_accepted_tokens", counters.speculative_accepted_tokens);
     result.add_uint("gpu_route_aggregation_batches", counters.expert_gpu_route_aggregation_batches);
     result.add_uint("gpu_route_aggregation_routes", counters.expert_gpu_route_aggregation_routes);
     result.add_uint("gpu_route_aggregation_bytes_saved", counters.expert_gpu_route_aggregation_bytes_saved);
@@ -179,6 +183,7 @@ static std::string gpu_metrics_json(const RuntimeMetricCounters& counters, bool 
     else
         result.add_null("submit_count");
     result.add_uint("linear_dispatches", counters.vulkan_linear_dispatches);
+    result.add_uint("int4_dispatches", counters.vulkan_int4_dispatches);
     result.add_uint("attention_blocks", counters.vulkan_attention_blocks);
     result.add_uint("gated_delta_fusions", counters.vulkan_gated_delta_fusions);
     result.add_uint("gated_delta_submissions", counters.vulkan_gated_delta_submissions);

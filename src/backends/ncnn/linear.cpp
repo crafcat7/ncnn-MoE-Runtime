@@ -8,6 +8,7 @@
 #include "ncnn/moe/runtime.h"
 #include "engine/expertbackend.h"
 #include "kernels/float8.h"
+#include "kernels/int4.h"
 #include "kernels/ops.h"
 #include "kernels/qnk.h"
 
@@ -110,12 +111,15 @@ static ncnn::VkMat aligned_readonly_row_view(const ncnn::VkMat& source,
                                              ncnn::VkCompute& command,
                                              const ncnn::Option& option,
                                              const std::shared_ptr<VulkanContext>& context,
-                                             std::vector<ncnn::VkMat>& retained)
+                                             std::vector<ncnn::VkMat>& retained,
+                                             size_t reserve_size = 0)
 {
     ncnn::VkMat view = row_view(source, first_row, rows);
     const size_t alignment = std::max<size_t>(4, context->device()->info.buffer_offset_alignment());
     if (view.empty() || view.buffer_offset() % alignment == 0) return view;
     if (view.buffer_offset() % 4 != 0 || view.buffer_capacity() % 4 != 0) return {};
+    if (retained.capacity() == 0 && reserve_size != 0)
+        retained.reserve(reserve_size);
     ncnn::VkMat aligned;
     command.record_clone(view, aligned, option);
     if (aligned.empty()) return {};
@@ -2817,6 +2821,7 @@ public:
     uint32_t output_columns_per_group = 0;
     uint32_t block_count = 0;
     uint32_t input_group_count = 1;
+    uint32_t scale_row_size = 128;
     float rms_norm_epsilon = 0.0f;
     float input_rms_norm_epsilon = 0.0f;
 };
@@ -2829,13 +2834,14 @@ void Float8Linear_vulkan::Implementation::record_projection(const ncnn::VkMat& i
                                                             ncnn::VkCompute& command) const
 {
     std::vector<ncnn::VkMat> bindings = {input, packed, scales, bias, output};
-    std::vector<ncnn::vk_constant_type> constants(6);
+    std::vector<ncnn::vk_constant_type> constants(7);
     constants[0].u32 = matrix_input_columns;
     constants[1].u32 = logical_input_columns;
     constants[2].u32 = output_columns;
     constants[3].u32 = output_columns_per_group;
     constants[4].u32 = block_count;
     constants[5].u32 = token_count;
+    constants[6].u32 = scale_row_size;
     ncnn::VkMat dispatcher;
     dispatcher.w = static_cast<int>(output_columns * 32);
     dispatcher.h = static_cast<int>(token_count);
@@ -3019,6 +3025,7 @@ std::shared_ptr<Float8Linear_vulkan> Float8Linear_vulkan::create(const TensorDat
 {
 #if NCNN_MOE_WITH_VULKAN
     if (matrix.dtype != DType::Float8E4M3 || matrix.shape.size() != 2 || matrix.shape[0] == 0 || matrix.shape[1] == 0
+        || (matrix.float8_scale_row_size != 1 && matrix.float8_scale_row_size != 128)
         || matrix.shape[1] % 128 != 0 || input_group_count == 0 || matrix.shape[0] % input_group_count != 0
         || matrix.shape[0] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 32)
         || matrix.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max()))
@@ -3028,7 +3035,8 @@ std::shared_ptr<Float8Linear_vulkan> Float8Linear_vulkan::create(const TensorDat
     const uint32_t output_columns = matrix.shape[0];
     const uint32_t input_columns = matrix.shape[1];
     const uint32_t block_count = input_columns / 128;
-    const uint32_t output_block_count = (output_columns + 127) / 128;
+    const uint32_t output_block_count = output_columns / matrix.float8_scale_row_size
+                                        + (output_columns % matrix.float8_scale_row_size != 0);
     const std::span<const uint8_t> weights = matrix.float8_values();
     if (weights.size() != matrix.element_count()
         || matrix.quantization_scales.size() != static_cast<size_t>(output_block_count) * block_count)
@@ -3051,6 +3059,7 @@ std::shared_ptr<Float8Linear_vulkan> Float8Linear_vulkan::create(const TensorDat
     implementation.output_columns_per_group = output_columns / input_group_count;
     implementation.block_count = block_count;
     implementation.input_group_count = input_group_count;
+    implementation.scale_row_size = matrix.float8_scale_row_size;
     implementation.optimization_flags = optimization_flags;
     implementation.vulkan_context = VulkanContext::acquire(vulkan_device_index,
                                                            vulkan_runtime,
@@ -4910,9 +4919,17 @@ public:
 #endif
     DType dtype = DType::Q4K;
     uint32_t input_columns = 0;
+    uint32_t input_group_count = 1;
     uint32_t output_columns = 0;
     uint32_t block_count = 0;
     uint32_t block_size = 0;
+    uint32_t group_size = 0;
+    uint32_t group_count = 0;
+    uint32_t scales_offset = 0;
+    uint32_t zeros_offset = 0;
+    uint32_t groups_offset = 0;
+    uint32_t columns_offset = 0;
+    uint64_t device_size = 0;
 };
 
 #if NCNN_MOE_WITH_VULKAN
@@ -4996,6 +5013,12 @@ static bool create_qnk_swiglu_pipeline(const std::shared_ptr<VulkanContext>& con
 
 static size_t qnk_shader_type(DType dtype) noexcept
 {
+    if (dtype == DType::Int4)
+        return 6;
+    if (dtype == DType::BFloat16)
+        return 7;
+    if (dtype == DType::Float32)
+        return 8;
     return static_cast<size_t>(dtype) - static_cast<size_t>(DType::Q2K);
 }
 
@@ -5008,18 +5031,66 @@ QnkLinear_vulkan::QnkLinear_vulkan()
 
 QnkLinear_vulkan::~QnkLinear_vulkan() = default;
 
+static std::span<const uint8_t> qnk_projection_values(const TensorData& matrix) noexcept
+{
+    if (matrix.dtype == DType::Int4)
+        return matrix.int4_values();
+    if (matrix.dtype == DType::BFloat16)
+    {
+        const auto values = matrix.bfloat16_values();
+        return {reinterpret_cast<const uint8_t*>(values.data()), values.size_bytes()};
+    }
+    if (matrix.dtype == DType::Float32)
+    {
+        const auto values = matrix.float32_values();
+        return {reinterpret_cast<const uint8_t*>(values.data()), values.size_bytes()};
+    }
+    return matrix.qnk_values();
+}
+
+uint64_t QnkLinear_vulkan::storage_bytes(const TensorData& matrix, uint64_t alignment) noexcept
+{
+    if ((matrix.dtype != DType::Int4 && !is_qnk_dtype(matrix.dtype) && matrix.dtype != DType::BFloat16 && matrix.dtype != DType::Float32) || matrix.shape.size() != 2
+        || matrix.shape[0] == 0 || matrix.shape[1] == 0)
+    {
+        return 0;
+    }
+    alignment = std::max<uint64_t>(4, alignment);
+    const uint64_t raw = qnk_projection_values(matrix).size();
+    if (raw == 0)
+        return 0;
+    const uint64_t segments[] = {
+        raw,
+        static_cast<uint64_t>(matrix.shape[0]) * sizeof(float),
+        static_cast<uint64_t>(matrix.quantization_scales.size()) * sizeof(float),
+        matrix.quantization_zero_points.size(),
+        static_cast<uint64_t>(matrix.quantization_group_indices.size()) * sizeof(uint32_t),
+        static_cast<uint64_t>(matrix.input_column_indices.size()) * sizeof(uint32_t),
+    };
+    uint64_t total = 0;
+    for (uint64_t bytes : segments)
+    {
+        const uint64_t padding = bytes % alignment == 0 ? 0 : alignment - bytes % alignment;
+        if (bytes > std::numeric_limits<uint64_t>::max() - padding || total > std::numeric_limits<uint64_t>::max() - bytes - padding)
+            return 0;
+        total += bytes + padding;
+    }
+    return total;
+}
+
 std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create(const TensorData& matrix,
                                                            const TensorData* bias,
                                                            uint32_t vulkan_device_index,
                                                            const VulkanRuntimePtr& vulkan_runtime,
-                                                           uint64_t optimization_flags)
+                                                           uint64_t optimization_flags,
+                                                           uint32_t input_group_count)
 {
     return create_with_allocator(matrix,
                                  bias,
                                  vulkan_device_index,
                                  nullptr,
                                  vulkan_runtime,
-                                 optimization_flags);
+                                 optimization_flags, input_group_count);
 }
 
 std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const TensorData& matrix,
@@ -5027,21 +5098,31 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
                                                                           uint32_t vulkan_device_index,
                                                                           ncnn::VkAllocator* weight_allocator,
                                                                           const VulkanRuntimePtr& vulkan_runtime,
-                                                                          uint64_t optimization_flags)
+                                                                          uint64_t optimization_flags,
+                                                                          uint32_t input_group_count)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (!is_qnk_dtype(matrix.dtype)
+    const bool int4 = matrix.dtype == DType::Int4;
+    const bool dense = matrix.dtype == DType::BFloat16 || matrix.dtype == DType::Float32;
+    if ((!int4 && !dense && !is_qnk_dtype(matrix.dtype))
         || matrix.shape.size() != 2
+        || input_group_count == 0
+        || matrix.shape[0] % input_group_count != 0
+        || static_cast<uint64_t>(matrix.shape[1]) * input_group_count > static_cast<uint32_t>(std::numeric_limits<int>::max())
         || matrix.shape[0] == 0
         || matrix.shape[1] == 0
         || matrix.shape[0] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 32)
         || matrix.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max())
-        || !qnk_shape_supported(matrix.dtype, matrix.shape[0], matrix.shape[1]))
+        || (int4 && !validate_int4_tensor(matrix))
+        || (!int4 && !dense && !qnk_shape_supported(matrix.dtype, matrix.shape[0], matrix.shape[1]))
+        || (!int4 && !validate_input_column_indices(matrix)))
     {
         return {};
     }
-    const std::span<const uint8_t> raw_values = matrix.qnk_values();
-    const uint64_t expected_size = qnk_storage_bytes(matrix.dtype, matrix.shape[0], matrix.shape[1]);
+    const std::span<const uint8_t> raw_values = qnk_projection_values(matrix);
+    const uint64_t expected_size = int4    ? static_cast<uint64_t>(matrix.shape[0]) * (matrix.shape[1] / 2 + matrix.shape[1] % 2)
+                                   : dense ? static_cast<uint64_t>(matrix.shape[0]) * matrix.shape[1] * (matrix.dtype == DType::BFloat16 ? sizeof(uint16_t) : sizeof(float))
+                                           : qnk_storage_bytes(matrix.dtype, matrix.shape[0], matrix.shape[1]);
     if (expected_size == 0
         || expected_size != raw_values.size()
         || expected_size > static_cast<uint64_t>(std::numeric_limits<int>::max()))
@@ -5062,9 +5143,14 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     Implementation& implementation = *result->d;
     implementation.dtype = matrix.dtype;
     implementation.input_columns = input_columns;
+    implementation.input_group_count = input_group_count;
     implementation.output_columns = output_columns;
-    implementation.block_count = input_columns / qnk_block_elements;
-    implementation.block_size = static_cast<uint32_t>(qnk_block_bytes(matrix.dtype));
+    implementation.block_count = int4 || dense ? 0 : input_columns / qnk_block_elements;
+    implementation.block_size = int4    ? input_columns / 2 + input_columns % 2
+                                : dense ? input_columns * (matrix.dtype == DType::BFloat16 ? sizeof(uint16_t) : sizeof(float))
+                                        : static_cast<uint32_t>(qnk_block_bytes(matrix.dtype));
+    implementation.group_size = matrix.quantization_group_size;
+    implementation.group_count = int4 ? input_columns / matrix.quantization_group_size + (input_columns % matrix.quantization_group_size != 0) : 0;
     implementation.optimization_flags = optimization_flags;
     implementation.vulkan_context = VulkanContext::acquire(vulkan_device_index,
                                                            vulkan_runtime,
@@ -5106,21 +5192,31 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     {
         return {};
     }
-    const size_t storage_size = raw_segment_size + bias_segment_size;
+    const uint64_t total_bytes = storage_bytes(matrix, storage_alignment);
+    if (total_bytes == 0 || total_bytes > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+        return {};
+    const size_t storage_size = static_cast<size_t>(total_bytes);
     if (storage_size == 0 || storage_size > static_cast<size_t>(std::numeric_limits<int>::max()))
         return {};
+    implementation.device_size = storage_size;
+    size_t metadata_offset = raw_segment_size + bias_segment_size;
+    const auto segment_offset = [&](size_t bytes) -> uint32_t {
+        if (bytes == 0)
+            return 0;
+        const uint32_t offset = static_cast<uint32_t>(metadata_offset);
+        metadata_offset += aligned_segment(bytes);
+        return offset;
+    };
+    implementation.scales_offset = segment_offset(matrix.quantization_scales.size() * sizeof(float));
+    implementation.zeros_offset = segment_offset(matrix.quantization_zero_points.size());
+    implementation.groups_offset = segment_offset(matrix.quantization_group_indices.size() * sizeof(uint32_t));
+    implementation.columns_offset = segment_offset(matrix.input_column_indices.size() * sizeof(uint32_t));
     if (!weight_allocator)
     {
         implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(device, storage_size));
         weight_allocator = implementation.weight_allocator.get();
     }
     implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(device));
-
-    ncnn::Mat raw;
-    raw.create(static_cast<int>(raw_size), sizeof(uint8_t));
-    if (raw.empty())
-        return {};
-    std::memcpy(raw.data, raw_values.data(), raw_size);
 
     ncnn::Mat biases;
     biases.create(static_cast<int>(output_columns), sizeof(float));
@@ -5152,8 +5248,16 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     if (combined.empty())
         return {};
     std::memset(combined.data, 0, storage_size);
-    std::memcpy(combined.data, raw.data, raw_size);
+    std::memcpy(combined.data, raw_values.data(), raw_size);
     std::memcpy(static_cast<std::byte*>(combined.data) + bias_offset, biases.data, bias_size);
+    const auto copy_metadata = [&](uint32_t offset, const void* data, size_t bytes) {
+        if (bytes != 0)
+            std::memcpy(static_cast<std::byte*>(combined.data) + offset, data, bytes);
+    };
+    copy_metadata(implementation.scales_offset, matrix.quantization_scales.data(), matrix.quantization_scales.size() * sizeof(float));
+    copy_metadata(implementation.zeros_offset, matrix.quantization_zero_points.data(), matrix.quantization_zero_points.size());
+    copy_metadata(implementation.groups_offset, matrix.quantization_group_indices.data(), matrix.quantization_group_indices.size() * sizeof(uint32_t));
+    copy_metadata(implementation.columns_offset, matrix.input_column_indices.data(), matrix.input_column_indices.size() * sizeof(uint32_t));
 
     {
         const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
@@ -5198,7 +5302,7 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
         view.offset += offset;
         return view;
     };
-    implementation.quantized = storage_view(0, raw_segment_size);
+    implementation.quantized = storage_view(0, storage_size);
     implementation.bias = storage_view(bias_offset, bias_size);
     return result;
 #else
@@ -5208,9 +5312,81 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     (void)weight_allocator;
     (void)vulkan_runtime;
     (void)optimization_flags;
+    (void)input_group_count;
     return {};
 #endif
 }
+
+void QnkLinear_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& command, uint32_t output_column_offset) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    std::vector<ncnn::VkMat> bindings;
+    std::vector<ncnn::vk_constant_type> constants;
+    record(input, output, command, output_column_offset, bindings, constants);
+#else
+    (void)input;
+    (void)output;
+    (void)command;
+    (void)output_column_offset;
+#endif
+}
+
+void QnkLinear_vulkan::record(const ncnn::VkMat& input,
+                              ncnn::VkMat& output,
+                              ncnn::VkCompute& command,
+                              uint32_t output_column_offset,
+                              std::vector<ncnn::VkMat>& bindings,
+                              std::vector<ncnn::vk_constant_type>& constants) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    const Implementation& implementation = *d;
+    bindings.resize(4);
+    bindings[0] = input;
+    bindings[1] = implementation.quantized;
+    bindings[2] = implementation.bias;
+    bindings[3] = output;
+    constants.resize(15);
+    constants[0].u32 = implementation.input_columns;
+    constants[1].u32 = implementation.output_columns;
+    constants[2].u32 = implementation.block_count;
+    constants[3].u32 = input.dims == 1 ? 1u : static_cast<uint32_t>(input.h);
+    constants[4].u32 = implementation.block_size;
+    constants[5].u32 = static_cast<uint32_t>(qnk_shader_type(implementation.dtype));
+    constants[6].u32 = implementation.group_size;
+    constants[7].u32 = implementation.group_count;
+    constants[8].u32 = implementation.scales_offset;
+    constants[9].u32 = implementation.zeros_offset;
+    constants[10].u32 = implementation.groups_offset;
+    constants[11].u32 = implementation.columns_offset;
+    constants[12].u32 = static_cast<uint32_t>(output.w);
+    constants[13].u32 = output_column_offset;
+    constants[14].u32 = implementation.input_group_count;
+    ncnn::VkMat dispatcher;
+    dispatcher.w = static_cast<int>(implementation.output_columns * 32);
+    dispatcher.h = static_cast<int>(constants[3].u32);
+    dispatcher.c = 1;
+    command.record_pipeline(implementation.pipeline.get(), bindings, constants, dispatcher);
+#else
+    (void)input;
+    (void)output;
+    (void)command;
+    (void)output_column_offset;
+    (void)bindings;
+    (void)constants;
+#endif
+}
+
+#if NCNN_MOE_WITH_VULKAN
+const std::shared_ptr<VulkanContext>& QnkLinear_vulkan::vulkan_context() const noexcept
+{
+    return d->vulkan_context;
+}
+
+const ncnn::Option& QnkLinear_vulkan::option() const noexcept
+{
+    return d->option;
+}
+#endif
 
 bool QnkLinear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& output) const
 {
@@ -5220,7 +5396,7 @@ bool QnkLinear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
         || !implementation.pipeline
         || input.dtype() != DType::Float32
         || input.rows() == 0
-        || input.columns() != implementation.input_columns
+        || input.columns() != implementation.input_columns * implementation.input_group_count
         || input.rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
     {
         return false;
@@ -5228,7 +5404,7 @@ bool QnkLinear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
     VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
-    const bool direct_host_input = implementation.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * implementation.input_columns * sizeof(float),
+    const bool direct_host_input = implementation.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * input.columns() * sizeof(float),
                                                                                              input.dtype());
     const bool direct_host_output = implementation.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * implementation.output_columns * sizeof(float),
                                                                                               output.dtype());
@@ -5262,23 +5438,7 @@ bool QnkLinear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
     if (output_gpu.empty())
         return false;
 
-    std::vector<ncnn::VkMat> bindings(4);
-    bindings[0] = input_gpu;
-    bindings[1] = implementation.quantized;
-    bindings[2] = implementation.bias;
-    bindings[3] = output_gpu;
-    std::vector<ncnn::vk_constant_type> constants(6);
-    constants[0].u32 = implementation.input_columns;
-    constants[1].u32 = implementation.output_columns;
-    constants[2].u32 = implementation.block_count;
-    constants[3].u32 = static_cast<uint32_t>(input.rows());
-    constants[4].u32 = implementation.block_size;
-    constants[5].u32 = static_cast<uint32_t>(qnk_shader_type(implementation.dtype));
-    ncnn::VkMat dispatcher;
-    dispatcher.w = static_cast<int>(implementation.output_columns * 32);
-    dispatcher.h = static_cast<int>(input.rows());
-    dispatcher.c = 1;
-    command.record_pipeline(implementation.pipeline.get(), bindings, constants, dispatcher);
+    record(input_gpu, output_gpu, command);
     if ((!direct_host_output
          && !record_prepared_activation_staging_download(output_gpu,
                                                          input.rows(),
@@ -5294,6 +5454,8 @@ bool QnkLinear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
         return false;
     }
     ++runtime_state.dispatches;
+    if (implementation.dtype == DType::Int4)
+        ++runtime_state.int4_dispatches;
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     ++runtime_state.batch_downloads;
@@ -5312,7 +5474,7 @@ DType QnkLinear_vulkan::dtype() const noexcept
 
 uint32_t QnkLinear_vulkan::input_columns() const noexcept
 {
-    return d->input_columns;
+    return d->input_columns * d->input_group_count;
 }
 
 uint32_t QnkLinear_vulkan::output_columns() const noexcept
@@ -5320,11 +5482,17 @@ uint32_t QnkLinear_vulkan::output_columns() const noexcept
     return d->output_columns;
 }
 
+uint64_t QnkLinear_vulkan::device_bytes() const noexcept
+{
+    return d->device_size;
+}
+
 class QnkExpert_vulkan::Implementation
 {
 public:
 #if NCNN_MOE_WITH_VULKAN
     std::shared_ptr<QnkLinear_vulkan> gate_up;
+    std::shared_ptr<QnkLinear_vulkan> up;
     std::shared_ptr<QnkLinear_vulkan> down;
     std::shared_ptr<VulkanContext> vulkan_context;
     std::shared_ptr<ncnn::Pipeline> swiglu_pipeline;
@@ -5347,6 +5515,17 @@ QnkExpert_vulkan::~QnkExpert_vulkan() = default;
 uint32_t QnkExpert_vulkan::output_columns() const noexcept
 {
     return d->output_columns;
+}
+
+uint64_t QnkExpert_vulkan::device_bytes() const noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    return (d->gate_up ? d->gate_up->device_bytes() : 0)
+           + (d->up ? d->up->device_bytes() : 0)
+           + (d->down ? d->down->device_bytes() : 0);
+#else
+    return 0;
+#endif
 }
 
 std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create(const TensorData& gate_up,
@@ -5382,20 +5561,73 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_with_allocator(const 
                                                                           const VulkanRuntimePtr& vulkan_runtime,
                                                                           uint64_t optimization_flags)
 {
+    return create_impl(gate_up, gate_up_bias, nullptr, nullptr, down, down_bias,
+                       activation_limit, vulkan_device_index, weight_allocator, activation,
+                       vulkan_runtime, optimization_flags);
+}
+
+std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_separate(const TensorData& gate,
+                                                                    const TensorData* gate_bias,
+                                                                    const TensorData& up,
+                                                                    const TensorData* up_bias,
+                                                                    const TensorData& down,
+                                                                    const TensorData* down_bias,
+                                                                    float activation_limit,
+                                                                    uint32_t vulkan_device_index,
+                                                                    ExpertActivation activation,
+                                                                    const VulkanRuntimePtr& vulkan_runtime,
+                                                                    uint64_t optimization_flags)
+{
+    return create_separate_with_allocator(gate, gate_bias, up, up_bias, down, down_bias,
+                                          activation_limit, vulkan_device_index, nullptr, activation,
+                                          vulkan_runtime, optimization_flags);
+}
+
+std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_separate_with_allocator(const TensorData& gate,
+                                                                                   const TensorData* gate_bias,
+                                                                                   const TensorData& up,
+                                                                                   const TensorData* up_bias,
+                                                                                   const TensorData& down,
+                                                                                   const TensorData* down_bias,
+                                                                                   float activation_limit,
+                                                                                   uint32_t vulkan_device_index,
+                                                                                   ncnn::VkAllocator* weight_allocator,
+                                                                                   ExpertActivation activation,
+                                                                                   const VulkanRuntimePtr& vulkan_runtime,
+                                                                                   uint64_t optimization_flags)
+{
+    return create_impl(gate, gate_bias, &up, up_bias, down, down_bias,
+                       activation_limit, vulkan_device_index, weight_allocator, activation,
+                       vulkan_runtime, optimization_flags);
+}
+
+std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_impl(const TensorData& gate_up,
+                                                                const TensorData* gate_up_bias,
+                                                                const TensorData* up,
+                                                                const TensorData* up_bias,
+                                                                const TensorData& down,
+                                                                const TensorData* down_bias,
+                                                                float activation_limit,
+                                                                uint32_t vulkan_device_index,
+                                                                ncnn::VkAllocator* weight_allocator,
+                                                                ExpertActivation activation,
+                                                                const VulkanRuntimePtr& vulkan_runtime,
+                                                                uint64_t optimization_flags)
+{
 #if NCNN_MOE_WITH_VULKAN
     if ((activation != ExpertActivation::Silu
          && activation != ExpertActivation::GptOssSwiGlu
          && activation != ExpertActivation::DeepSeekSwiGlu)
-        || !is_qnk_dtype(gate_up.dtype)
-        || gate_up.dtype != down.dtype
+        || (gate_up.dtype != DType::Int4 && !is_qnk_dtype(gate_up.dtype) && gate_up.dtype != DType::BFloat16 && gate_up.dtype != DType::Float32)
+        || (down.dtype != DType::Int4 && !is_qnk_dtype(down.dtype) && down.dtype != DType::BFloat16 && down.dtype != DType::Float32)
         || gate_up.shape.size() != 2
         || down.shape.size() != 2
         || gate_up.shape[0] == 0
-        || gate_up.shape[0] % 2 != 0
+        || (!up && gate_up.shape[0] % 2 != 0)
         || down.shape[0] == 0
-        || down.shape[1] != gate_up.shape[0] / 2
-        || !qnk_shape_supported(gate_up.dtype, gate_up.shape[0], gate_up.shape[1])
-        || !qnk_shape_supported(down.dtype, down.shape[0], down.shape[1])
+        || down.shape[1] != (up ? gate_up.shape[0] : gate_up.shape[0] / 2)
+        || down.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 128)
+        || (up && (up->shape != gate_up.shape || (up->dtype != DType::Int4 && !is_qnk_dtype(up->dtype) && up->dtype != DType::BFloat16 && up->dtype != DType::Float32)))
         || activation_limit < 0.0f)
     {
         return {};
@@ -5429,18 +5661,26 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_with_allocator(const 
                                                                   weight_allocator,
                                                                   vulkan_runtime,
                                                                   optimization_flags);
+    if (up)
+    {
+        implementation.up = QnkLinear_vulkan::create_with_allocator(*up, up_bias, vulkan_device_index,
+                                                                    weight_allocator, vulkan_runtime, optimization_flags);
+        if (!implementation.up)
+            return {};
+    }
     if (!implementation.gate_up || !implementation.down)
         return {};
 
     const QnkLinear_vulkan::Implementation& gate = *implementation.gate_up->d;
     const QnkLinear_vulkan::Implementation& down_projection = *implementation.down->d;
-    if (!gate.vulkan_context || gate.vulkan_context != down_projection.vulkan_context)
+    if (!gate.vulkan_context || gate.vulkan_context != down_projection.vulkan_context
+        || (implementation.up && implementation.up->d->vulkan_context != gate.vulkan_context))
         return {};
     implementation.vulkan_context = gate.vulkan_context;
     implementation.option = gate.option;
-    implementation.intermediate_columns = gate.output_columns / 2;
+    implementation.intermediate_columns = up ? gate.output_columns : gate.output_columns / 2;
     implementation.output_columns = implementation.down->output_columns();
-    implementation.activation_limit = activation_limit;
+    implementation.activation_limit = activation == ExpertActivation::Silu ? 0.0f : activation_limit;
     implementation.activation = activation;
     implementation.interleave_gate_up_rows = gate_up.qnk_interleave_rows;
     {
@@ -5456,6 +5696,8 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_with_allocator(const 
 #else
     (void)gate_up;
     (void)gate_up_bias;
+    (void)up;
+    (void)up_bias;
     (void)down;
     (void)down_bias;
     (void)activation_limit;
@@ -5465,6 +5707,61 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_with_allocator(const 
     (void)vulkan_runtime;
     (void)optimization_flags;
     return {};
+#endif
+}
+
+bool QnkExpert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output,
+                              ncnn::VkCompute& command,
+                              std::vector<ncnn::VkMat>& workspace,
+                              std::vector<ncnn::VkMat>& bindings,
+                              std::vector<ncnn::vk_constant_type>& constants) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    const Implementation& implementation = *d;
+    const QnkLinear_vulkan::Implementation& gate = *implementation.gate_up->d;
+    const uint32_t rows = input.dims == 1 ? 1u : static_cast<uint32_t>(input.h);
+    ncnn::VkMat gate_gpu;
+    gate_gpu.create(static_cast<int>(gate.output_columns), static_cast<int>(rows), sizeof(float), implementation.vulkan_context->blob_allocator());
+    ncnn::VkMat up_gpu;
+    if (implementation.up)
+        up_gpu.create(static_cast<int>(implementation.intermediate_columns), static_cast<int>(rows), sizeof(float), implementation.vulkan_context->blob_allocator());
+    ncnn::VkMat intermediate_gpu;
+    intermediate_gpu.create(static_cast<int>(implementation.intermediate_columns), static_cast<int>(rows), sizeof(float), implementation.vulkan_context->blob_allocator());
+    if (gate_gpu.empty() || intermediate_gpu.empty() || (implementation.up && up_gpu.empty()))
+        return false;
+    workspace.push_back(gate_gpu);
+    workspace.push_back(intermediate_gpu);
+    if (implementation.up)
+        workspace.push_back(up_gpu);
+    implementation.gate_up->record(input, gate_gpu, command, 0, bindings, constants);
+    if (implementation.up)
+        implementation.up->record(input, up_gpu, command, 0, bindings, constants);
+    bindings.resize(3);
+    bindings[0] = gate_gpu;
+    bindings[1] = intermediate_gpu;
+    bindings[2] = implementation.up ? up_gpu : gate_gpu;
+    constants.resize(5);
+    constants[0].u32 = implementation.intermediate_columns;
+    constants[1].u32 = rows;
+    constants[2].u32 = implementation.activation == ExpertActivation::GptOssSwiGlu ? 0u : 1u;
+    constants[3].f = implementation.activation_limit;
+    constants[4].u32 = implementation.up ? 2u : implementation.interleave_gate_up_rows ? 0u
+                                                                                       : 1u;
+    ncnn::VkMat dispatcher;
+    dispatcher.w = static_cast<int>(implementation.intermediate_columns * 128);
+    dispatcher.h = static_cast<int>(rows);
+    dispatcher.c = 1;
+    command.record_pipeline(implementation.swiglu_pipeline.get(), bindings, constants, dispatcher);
+    implementation.down->record(intermediate_gpu, output, command, 0, bindings, constants);
+    return true;
+#else
+    (void)input;
+    (void)output;
+    (void)command;
+    (void)workspace;
+    (void)bindings;
+    (void)constants;
+    return false;
 #endif
 }
 
@@ -5492,7 +5789,7 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
     const QnkLinear_vulkan::Implementation& first_down = *first_expert.down->d;
     if (!first_gate.pipeline
         || !first_down.pipeline
-        || first_gate.output_columns % 2 != 0
+        || (!first_expert.up && first_gate.output_columns % 2 != 0)
         || first_down.input_columns != first_expert.intermediate_columns
         || first_down.output_columns != first_expert.output_columns)
     {
@@ -5534,6 +5831,7 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
             || expert.output_columns != output_columns
             || expert.activation != first_expert.activation
             || expert.activation_limit != first_expert.activation_limit
+            || static_cast<bool>(expert.up) != static_cast<bool>(first_expert.up)
             || expert.interleave_gate_up_rows != first_expert.interleave_gate_up_rows)
         {
             return false;
@@ -5548,6 +5846,10 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
             || gate.output_columns != first_gate.output_columns
             || down.input_columns != first_down.input_columns
             || down.output_columns != output_columns)
+        {
+            return false;
+        }
+        if (expert.up && (!expert.up->d->pipeline || expert.up->d->vulkan_context != first_expert.vulkan_context || expert.up->input_columns() != input_columns || expert.up->output_columns() != expert.intermediate_columns))
         {
             return false;
         }
@@ -5625,19 +5927,20 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
     const size_t descriptor_alignment = std::max<size_t>(4, first_expert.vulkan_context->device()->info.buffer_offset_alignment());
     const bool align_output_rows = experts.size() > 1
                                    && (static_cast<size_t>(output_columns) * output_gpu.elemsize) % descriptor_alignment != 0;
+    const size_t workspace_count = first_expert.up ? 4u : 3u;
+    std::vector<ncnn::VkMat> workspace;
+    if (experts.size() > workspace.max_size() / workspace_count)
+        return false;
+    workspace.reserve(experts.size() * workspace_count);
     std::vector<ncnn::VkMat> aligned_inputs;
     aligned_inputs.reserve(experts.size());
-    std::vector<ncnn::VkMat> aligned_outputs(align_output_rows ? experts.size() : 0);
-    std::vector<ncnn::VkMat> intermediates;
-    intermediates.reserve(experts.size() * 2);
-    std::vector<ncnn::VkMat> bindings(4);
-    std::vector<ncnn::vk_constant_type> constants(6);
+    std::vector<ncnn::VkMat> bindings;
+    bindings.reserve(4);
+    std::vector<ncnn::vk_constant_type> constants;
+    constants.reserve(15);
     row_offset = 0;
     for (size_t index = 0; index < experts.size(); ++index)
     {
-        const Implementation& expert = *experts[index]->d;
-        const QnkLinear_vulkan::Implementation& gate = *expert.gate_up->d;
-        const QnkLinear_vulkan::Implementation& down = *expert.down->d;
         const size_t rows = inputs[index]->rows();
         ncnn::VkMat input_view = aligned_readonly_row_view(input_gpu, row_offset, rows, command, first_gate.option,
                                                            first_expert.vulkan_context, aligned_inputs);
@@ -5646,78 +5949,16 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
             return false;
         if (align_output_rows)
         {
-            aligned_outputs[index].create(output_view.w, output_view.h, output_view.elemsize,
-                                          first_expert.vulkan_context->blob_allocator());
-            output_view = aligned_outputs[index];
-            if (output_view.empty()) return false;
+            ncnn::VkMat aligned_output;
+            aligned_output.create(output_view.w, output_view.h, output_view.elemsize,
+                                  first_expert.vulkan_context->blob_allocator());
+            if (aligned_output.empty()) return false;
+            output_view = aligned_output;
+            workspace.push_back(aligned_output);
         }
 
-        ncnn::VkMat gate_up_gpu;
-        gate_up_gpu.create(static_cast<int>(gate.output_columns),
-                           static_cast<int>(rows),
-                           sizeof(float),
-                           first_expert.vulkan_context->blob_allocator());
-        ncnn::VkMat intermediate_gpu;
-        intermediate_gpu.create(static_cast<int>(expert.intermediate_columns),
-                                static_cast<int>(rows),
-                                sizeof(float),
-                                first_expert.vulkan_context->blob_allocator());
-        if (gate_up_gpu.empty() || intermediate_gpu.empty())
+        if (!experts[index]->record(input_view, output_view, command, workspace, bindings, constants))
             return false;
-        intermediates.push_back(gate_up_gpu);
-        intermediates.push_back(intermediate_gpu);
-
-        bindings[0] = input_view;
-        bindings[1] = gate.quantized;
-        bindings[2] = gate.bias;
-        bindings[3] = gate_up_gpu;
-        constants[0].u32 = gate.input_columns;
-        constants[1].u32 = gate.output_columns;
-        constants[2].u32 = gate.block_count;
-        constants[3].u32 = static_cast<uint32_t>(rows);
-        constants[4].u32 = gate.block_size;
-        constants[5].u32 = static_cast<uint32_t>(qnk_shader_type(gate.dtype));
-        ncnn::VkMat gate_dispatcher;
-        gate_dispatcher.w = static_cast<int>(gate.output_columns * 32);
-        gate_dispatcher.h = static_cast<int>(rows);
-        gate_dispatcher.c = 1;
-        command.record_pipeline(gate.pipeline.get(), bindings, constants, gate_dispatcher);
-
-        bindings.resize(2);
-        constants.resize(5);
-        bindings[0] = gate_up_gpu;
-        bindings[1] = intermediate_gpu;
-        constants[0].u32 = expert.intermediate_columns;
-        constants[1].u32 = static_cast<uint32_t>(rows);
-        constants[2].u32 = expert.activation == ExpertActivation::GptOssSwiGlu ? 0u : 1u;
-        constants[3].f = expert.activation_limit;
-        constants[4].u32 = expert.interleave_gate_up_rows ? 0u : 1u;
-        ncnn::VkMat activation_dispatcher;
-        activation_dispatcher.w = static_cast<int>(expert.intermediate_columns * 128);
-        activation_dispatcher.h = static_cast<int>(rows);
-        activation_dispatcher.c = 1;
-        command.record_pipeline(expert.swiglu_pipeline.get(),
-                                bindings,
-                                constants,
-                                activation_dispatcher);
-
-        bindings.resize(4);
-        constants.resize(6);
-        bindings[0] = intermediate_gpu;
-        bindings[1] = down.quantized;
-        bindings[2] = down.bias;
-        bindings[3] = output_view;
-        constants[0].u32 = down.input_columns;
-        constants[1].u32 = down.output_columns;
-        constants[2].u32 = down.block_count;
-        constants[3].u32 = static_cast<uint32_t>(rows);
-        constants[4].u32 = down.block_size;
-        constants[5].u32 = static_cast<uint32_t>(qnk_shader_type(down.dtype));
-        ncnn::VkMat down_dispatcher;
-        down_dispatcher.w = static_cast<int>(down.output_columns * 32);
-        down_dispatcher.h = static_cast<int>(rows);
-        down_dispatcher.c = 1;
-        command.record_pipeline(down.pipeline.get(), bindings, constants, down_dispatcher);
         if (align_output_rows)
         {
             ncnn::VkMat destination = row_view(output_gpu, row_offset, rows);
@@ -5742,8 +5983,24 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
     {
         return false;
     }
+    bindings.clear();
+    constants.clear();
+    workspace.clear();
+    aligned_inputs.clear();
     lock.unlock();
-    runtime_state.dispatches += static_cast<uint64_t>(experts.size()) * 3;
+    uint64_t ops = 0;
+    uint64_t int4_ops = 0;
+    for (const QnkExpert_vulkan* expert : experts)
+    {
+        ops += expert->d->up ? 4 : 3;
+        int4_ops += expert->d->gate_up->dtype() == DType::Int4 ? 1 : 0;
+        int4_ops += expert->d->down->dtype() == DType::Int4 ? 1 : 0;
+        if (expert->d->up && expert->d->up->dtype() == DType::Int4)
+            ++int4_ops;
+    }
+    runtime_state.dispatches += ops;
+    if (int4_ops != 0)
+        runtime_state.int4_dispatches += int4_ops;
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     ++runtime_state.batch_downloads;
@@ -5772,7 +6029,7 @@ bool QnkExpert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
     }
     const QnkLinear_vulkan::Implementation& gate = *implementation.gate_up->d;
     const QnkLinear_vulkan::Implementation& down = *implementation.down->d;
-    if (gate.output_columns % 2 != 0
+    if ((!implementation.up && gate.output_columns % 2 != 0)
         || down.input_columns != implementation.intermediate_columns
         || down.output_columns != implementation.output_columns)
     {
@@ -5813,16 +6070,6 @@ bool QnkExpert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
     else if (!record_mapped_upload(transfer_slot.upload, input_gpu, command, gate.option))
         return false;
 
-    ncnn::VkMat gate_up_gpu;
-    gate_up_gpu.create(static_cast<int>(gate.output_columns),
-                       static_cast<int>(input.rows()),
-                       sizeof(float),
-                       implementation.vulkan_context->blob_allocator());
-    ncnn::VkMat intermediate_gpu;
-    intermediate_gpu.create(static_cast<int>(implementation.intermediate_columns),
-                            static_cast<int>(input.rows()),
-                            sizeof(float),
-                            implementation.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
     if (direct_host_output)
     {
@@ -5835,65 +6082,17 @@ bool QnkExpert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
                           sizeof(float),
                           implementation.vulkan_context->blob_allocator());
     }
-    if (gate_up_gpu.empty() || intermediate_gpu.empty() || output_gpu.empty())
+    if (output_gpu.empty())
         return false;
 
-    std::vector<ncnn::VkMat> gate_bindings = {
-        input_gpu,
-        gate.quantized,
-        gate.bias,
-        gate_up_gpu,
-    };
-    std::vector<ncnn::vk_constant_type> gate_constants(6);
-    gate_constants[0].u32 = gate.input_columns;
-    gate_constants[1].u32 = gate.output_columns;
-    gate_constants[2].u32 = gate.block_count;
-    gate_constants[3].u32 = static_cast<uint32_t>(input.rows());
-    gate_constants[4].u32 = gate.block_size;
-    gate_constants[5].u32 = static_cast<uint32_t>(qnk_shader_type(gate.dtype));
-    ncnn::VkMat gate_dispatcher;
-    gate_dispatcher.w = static_cast<int>(gate.output_columns * 32);
-    gate_dispatcher.h = static_cast<int>(input.rows());
-    gate_dispatcher.c = 1;
-    command.record_pipeline(gate.pipeline.get(), gate_bindings, gate_constants, gate_dispatcher);
-
-    std::vector<ncnn::VkMat> activation_bindings = {
-        gate_up_gpu,
-        intermediate_gpu,
-    };
-    std::vector<ncnn::vk_constant_type> activation_constants(5);
-    activation_constants[0].u32 = implementation.intermediate_columns;
-    activation_constants[1].u32 = static_cast<uint32_t>(input.rows());
-    activation_constants[2].u32 = implementation.activation == ExpertActivation::GptOssSwiGlu ? 0u : 1u;
-    activation_constants[3].f = implementation.activation_limit;
-    activation_constants[4].u32 = implementation.interleave_gate_up_rows ? 0u : 1u;
-    ncnn::VkMat activation_dispatcher;
-    activation_dispatcher.w = static_cast<int>(implementation.intermediate_columns * 128);
-    activation_dispatcher.h = static_cast<int>(input.rows());
-    activation_dispatcher.c = 1;
-    command.record_pipeline(implementation.swiglu_pipeline.get(),
-                            activation_bindings,
-                            activation_constants,
-                            activation_dispatcher);
-
-    std::vector<ncnn::VkMat> down_bindings = {
-        intermediate_gpu,
-        down.quantized,
-        down.bias,
-        output_gpu,
-    };
-    std::vector<ncnn::vk_constant_type> down_constants(6);
-    down_constants[0].u32 = down.input_columns;
-    down_constants[1].u32 = down.output_columns;
-    down_constants[2].u32 = down.block_count;
-    down_constants[3].u32 = static_cast<uint32_t>(input.rows());
-    down_constants[4].u32 = down.block_size;
-    down_constants[5].u32 = static_cast<uint32_t>(qnk_shader_type(down.dtype));
-    ncnn::VkMat down_dispatcher;
-    down_dispatcher.w = static_cast<int>(down.output_columns * 32);
-    down_dispatcher.h = static_cast<int>(input.rows());
-    down_dispatcher.c = 1;
-    command.record_pipeline(down.pipeline.get(), down_bindings, down_constants, down_dispatcher);
+    std::vector<ncnn::VkMat> workspace;
+    workspace.reserve(implementation.up ? 3u : 2u);
+    std::vector<ncnn::VkMat> bindings;
+    bindings.reserve(4);
+    std::vector<ncnn::vk_constant_type> constants;
+    constants.reserve(15);
+    if (!record(input_gpu, output_gpu, command, workspace, bindings, constants))
+        return false;
 
     if ((!direct_host_output
          && !record_prepared_activation_staging_download(output_gpu,
@@ -5909,7 +6108,14 @@ bool QnkExpert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
     {
         return false;
     }
-    runtime_state.dispatches += 3;
+    uint64_t int4_ops = 0;
+    int4_ops += implementation.gate_up->dtype() == DType::Int4 ? 1 : 0;
+    int4_ops += implementation.down->dtype() == DType::Int4 ? 1 : 0;
+    if (implementation.up && implementation.up->dtype() == DType::Int4)
+        ++int4_ops;
+    runtime_state.dispatches += implementation.up ? 4 : 3;
+    if (int4_ops != 0)
+        runtime_state.int4_dispatches += int4_ops;
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     ++runtime_state.batch_downloads;
@@ -6435,7 +6641,9 @@ bool Mxfp4Expert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer
     output_gpu.create(static_cast<int>(down.output_columns), static_cast<int>(input.rows()), sizeof(float), gate.vulkan_context->blob_allocator());
     if (output_gpu.empty())
         return false;
-    record(input_gpu, intermediate_gpu, output_gpu, command);
+    std::vector<ncnn::VkMat> bindings(5);
+    std::vector<ncnn::vk_constant_type> constants(7);
+    record(input_gpu, intermediate_gpu, output_gpu, command, bindings, constants);
 
     if (!record_prepared_activation_staging_download(output_gpu,
                                                      input.rows(),
@@ -6465,7 +6673,9 @@ bool Mxfp4Expert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer
 void Mxfp4Expert_vulkan::record(const ncnn::VkMat& input,
                                 ncnn::VkMat& intermediate,
                                 ncnn::VkMat& output,
-                                ncnn::VkCompute& cmd) const
+                                ncnn::VkCompute& cmd,
+                                std::vector<ncnn::VkMat>& bindings,
+                                std::vector<ncnn::vk_constant_type>& constants) const
 {
     const Implementation& implementation = *d;
     const Mxfp4Linear_vulkan::Implementation& gate = *implementation.gate_up->d;
@@ -6477,8 +6687,13 @@ void Mxfp4Expert_vulkan::record(const ncnn::VkMat& input,
     // prefill batches. Keep short prompts on the scalar decode pipeline.
     if (rows >= 16 && implementation.row_tile_pipeline)
     {
-        std::vector<ncnn::VkMat> bindings{input, gate.packed, gate.scales, gate.bias, intermediate};
-        std::vector<ncnn::vk_constant_type> constants(7);
+        bindings.resize(5);
+        bindings[0] = input;
+        bindings[1] = gate.packed;
+        bindings[2] = gate.scales;
+        bindings[3] = gate.bias;
+        bindings[4] = intermediate;
+        constants.resize(7);
         constants[0].u32 = gate.input_columns;
         constants[1].u32 = intermediate_columns;
         constants[2].u32 = gate.block_count;
@@ -6494,7 +6709,12 @@ void Mxfp4Expert_vulkan::record(const ncnn::VkMat& input,
         dispatcher.h = static_cast<int>((rows + 3) / 4);
         dispatcher.c = 1;
         cmd.record_pipeline(implementation.row_tile_pipeline.get(), bindings, constants, dispatcher);
-        bindings = {intermediate, down.packed, down.scales, down.bias, output};
+
+        bindings[0] = intermediate;
+        bindings[1] = down.packed;
+        bindings[2] = down.scales;
+        bindings[3] = down.bias;
+        bindings[4] = output;
         constants[0].u32 = down.input_columns;
         constants[1].u32 = down.output_columns;
         constants[2].u32 = down.block_count;
@@ -6504,13 +6724,13 @@ void Mxfp4Expert_vulkan::record(const ncnn::VkMat& input,
         return;
     }
 
-    std::vector<ncnn::VkMat> bindings(5);
+    bindings.resize(5);
     bindings[0] = input;
     bindings[1] = gate.packed;
     bindings[2] = gate.scales;
     bindings[3] = gate.bias;
     bindings[4] = intermediate;
-    std::vector<ncnn::vk_constant_type> constants(6);
+    constants.resize(6);
     constants[0].u32 = gate.input_columns;
     constants[1].u32 = intermediate_columns;
     constants[2].u32 = gate.block_count;
@@ -6898,7 +7118,6 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
     ncnn::VkMat intermediate_gpu;
     std::vector<ncnn::VkMat> intermediates;
     std::vector<ncnn::VkMat> aligned_inputs;
-    aligned_inputs.reserve(selected.size());
     std::vector<ncnn::VkMat> aligned_outputs(align_output_rows ? selected.size() : 0);
     if (use_indexed)
     {
@@ -7026,6 +7245,8 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
     else
     {
         intermediates.reserve(selected.size());
+        std::vector<ncnn::VkMat> bindings(5);
+        std::vector<ncnn::vk_constant_type> constants(7);
         row_offset = 0;
         for (size_t selected_slot = 0; selected_slot < selected.size(); ++selected_slot)
         {
@@ -7035,7 +7256,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
             const auto& gate = *expert.gate_up->d;
             const uint32_t intermediate_columns = gate.output_columns / 2;
             ncnn::VkMat input_view = aligned_readonly_row_view(input_gpu, row_offset, request.rows(), command, first_gate.option,
-                                                               first_gate.vulkan_context, aligned_inputs);
+                                                               first_gate.vulkan_context, aligned_inputs, selected.size());
             ncnn::VkMat output_view = row_view(output_gpu, row_offset, request.rows());
             if (input_view.empty() || output_view.empty())
             {
@@ -7057,7 +7278,8 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
                                 first_gate.vulkan_context->blob_allocator());
             if (intermediate.empty())
                 return false;
-            selection.entry->operation->record(input_view, intermediate, output_view, command);
+
+            selection.entry->operation->record(input_view, intermediate, output_view, command, bindings, constants);
             if (align_output_rows)
             {
                 ncnn::VkMat destination = row_view(output_gpu, row_offset, request.rows());

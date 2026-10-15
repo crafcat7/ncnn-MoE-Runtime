@@ -14,6 +14,7 @@ class Option;
 namespace moe {
 
 class VulkanContext;
+class LatentLayer_vulkan;
 struct TensorData;
 struct CompiledOperator;
 struct HyperConnectionWorkspace_vulkan;
@@ -39,11 +40,6 @@ public:
 
     // Caller holds the context lock and retains all tensors/workspace until
     // cmd completes. The resident LM projection is shared, never re-uploaded.
-    [[nodiscard]] bool record(const ncnn::VkMat& input,
-                              ncnn::VkMat& logits,
-                              HyperConnectionWorkspace_vulkan& hc_workspace,
-                              std::vector<ncnn::VkMat>& temporaries,
-                              ncnn::VkCompute& cmd) const;
     // Reuses an already-normalized device view without repeating HC or RMS.
     [[nodiscard]] bool record_logits(const ncnn::VkMat& normalized,
                                      ncnn::VkMat& logits,
@@ -56,6 +52,9 @@ public:
                                      ncnn::VkCompute& cmd) const;
 #endif
 private:
+    friend class LatentLayer_vulkan;
+    // Count the projections recorded by record_hidden and optional logits.
+    [[nodiscard]] uint32_t int4_ops(bool include_logits) const noexcept;
     class Implementation;
     LayerHead_vulkan();
     std::unique_ptr<Implementation> d;

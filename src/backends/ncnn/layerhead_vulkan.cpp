@@ -23,6 +23,7 @@ public:
     std::shared_ptr<Linear> linear;
     std::shared_ptr<Bfloat16Linear_vulkan> bfloat16;
     std::shared_ptr<Float8Linear_vulkan> float8;
+    std::shared_ptr<QnkLinear_vulkan> qnk;
 #endif
 };
 
@@ -32,6 +33,17 @@ LayerHead_vulkan::LayerHead_vulkan()
 }
 
 LayerHead_vulkan::~LayerHead_vulkan() = default;
+
+uint32_t LayerHead_vulkan::int4_ops(bool include_logits) const noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    return d->hyper->int4_ops()
+           + (include_logits && d->qnk && d->qnk->dtype() == DType::Int4 ? 1u : 0u);
+#else
+    (void)include_logits;
+    return 0;
+#endif
+}
 
 std::shared_ptr<LayerHead_vulkan> LayerHead_vulkan::create(const TensorData& function,
                                                            const TensorData& scale,
@@ -53,9 +65,17 @@ std::shared_ptr<LayerHead_vulkan> LayerHead_vulkan::create(const TensorData& fun
     const uint32_t hidden_size = function.shape[1] / multiplier;
     auto result = std::shared_ptr<LayerHead_vulkan>(new LayerHead_vulkan);
     Implementation& implementation = *result->d;
-    if (lm_head.float8 && lm_head.float8->vulkan_context()
-        && lm_head.float8->input_columns() == hidden_size
-        && hidden_size % 128 == 0 && vulkan_activation_storage_variant(lm_head.float8->option()) == 0)
+    if (lm_head.qnk && lm_head.qnk->vulkan_context()
+        && lm_head.qnk->input_columns() == hidden_size
+        && vulkan_activation_storage_variant(lm_head.qnk->option()) == 0)
+    {
+        implementation.qnk = lm_head.qnk;
+        implementation.context = lm_head.qnk->vulkan_context();
+        implementation.opt = lm_head.qnk->option();
+    }
+    else if (lm_head.float8 && lm_head.float8->vulkan_context()
+             && lm_head.float8->input_columns() == hidden_size
+             && hidden_size % 128 == 0 && vulkan_activation_storage_variant(lm_head.float8->option()) == 0)
     {
         implementation.float8 = lm_head.float8;
         implementation.context = lm_head.float8->vulkan_context();
@@ -130,7 +150,8 @@ bool LayerHead_vulkan::record_hidden(const ncnn::VkMat& input,
                                      std::vector<ncnn::VkMat>& temporaries,
                                      ncnn::VkCompute& cmd) const
 {
-    if (&normalized == &input || &normalized == &hc_workspace.projection || &normalized == &hc_workspace.pre)
+    if (&normalized == &input || &normalized == &hc_workspace.normalized
+        || &normalized == &hc_workspace.projection || &normalized == &hc_workspace.pre)
         return false;
     ncnn::VkMat headed;
     if (!d->hyper->record_head(input, headed, hc_workspace, cmd))
@@ -142,20 +163,6 @@ bool LayerHead_vulkan::record_hidden(const ncnn::VkMat& input,
     temporaries.push_back(next);
     normalized = std::move(next);
     return true;
-}
-
-bool LayerHead_vulkan::record(const ncnn::VkMat& input,
-                              ncnn::VkMat& logits,
-                              HyperConnectionWorkspace_vulkan& hc_workspace,
-                              std::vector<ncnn::VkMat>& temporaries,
-                              ncnn::VkCompute& cmd) const
-{
-    if (&logits == &input || &logits == &hc_workspace.projection || &logits == &hc_workspace.pre)
-        return false;
-    ncnn::VkMat normalized;
-    if (!record_hidden(input, normalized, hc_workspace, temporaries, cmd))
-        return false;
-    return record_logits(normalized, logits, temporaries, cmd);
 }
 
 bool LayerHead_vulkan::record_logits(const ncnn::VkMat& normalized,
@@ -173,7 +180,14 @@ bool LayerHead_vulkan::record_logits(const ncnn::VkMat& normalized,
     if (temporaries.empty() || temporaries.back().data != input.data || temporaries.back().offset != input.offset)
         temporaries.push_back(input);
     ncnn::VkMat next;
-    if (d->float8)
+    if (d->qnk)
+    {
+        next.create(static_cast<int>(d->qnk->output_columns()), input.h, sizeof(float), d->context->blob_allocator());
+        if (next.empty())
+            return false;
+        d->qnk->record(input, next, cmd);
+    }
+    else if (d->float8)
     {
         if (!d->float8->record_forward(input, next, cmd, temporaries))
             return false;

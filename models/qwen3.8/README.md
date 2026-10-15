@@ -4,6 +4,14 @@ The built-in `qwen4_exp` adapter runs the text backbone from an official
 Qwen3.8-Flash-Next Safetensors package. It loads the source BF16 weights
 directly, so conversion is optional.
 
+Qwen3.8-27B uses the separate dense `qwen3_5` architecture and is admitted by
+the dense adapter. Architecture recognition and chat-template selection are
+independent: its official Qwen3.8 template retains the default `xhigh` system
+instruction, historical thinking, and `reasoning_content`. Its official
+tokenizer passes 172 parity cases. See the [model catalog](../README.md#quantized-package-import)
+for native AWQ/GPTQ and GGUF support for both Qwen3.8 architectures. Full-size
+27B generation quality and performance have not been measured.
+
 ## Admitted scope
 
 | Area | Implementation |
@@ -12,8 +20,8 @@ directly, so conversion is optional.
 | Attention | Persistent Gated DeltaNet state and QSA full Attention with partial RoPE, Q/K normalization, and a sigmoid output gate |
 | Experts | 512 routed Experts, normalized Top-10 routing, one gated shared Expert per layer, and SiLU activation |
 | Input features | PLE n-gram embedding on the checkpoint-selected layer and four-stream hyper-connections |
-| Expert weights | Official file-backed BF16 or an optional checkpoint-bound MXFP4 Artifact |
-| Mixed execution | Vulkan Dense projections, Gated DeltaNet state, and resident compatible MXFP4 Experts; CPU fallback remains available |
+| Expert weights | Official file-backed BF16, native AWQ/GPTQ INT4, imported GGUF Qn_K, or an optional checkpoint-bound MXFP4 Artifact |
+| Mixed execution | Vulkan Dense projections, Gated DeltaNet state, and resident eligible MXFP4/INT4/Qn_K Experts; CPU fallback remains available |
 | Text input | Official tokenizer and text chat template in Runtime |
 
 The vision encoder and multimodal token path are not admitted. The checkpoint's

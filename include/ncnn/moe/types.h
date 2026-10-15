@@ -203,7 +203,8 @@ enum class DType
     Q4K,
     Q5K,
     Q6K,
-    Q8K
+    Q8K,
+    Int4
 };
 
 [[nodiscard]] inline constexpr bool is_qnk_dtype(DType dtype) noexcept
@@ -322,7 +323,7 @@ struct TensorData
     std::vector<uint16_t> bfloat16_data;
     std::vector<int64_t> int64_data;
     std::vector<int8_t> int8_data;
-    // Raw Qn_K data; logical shape is [output_rows, input_columns].
+    // Raw FP8/Qn_K or row-packed unsigned INT4 data; logical shape is [output_rows, input_columns].
     std::vector<uint8_t> quantized_data;
     // Qn_K gate/up Expert matrices may store gate and up rows either
     // interleaved (gate0, up0, gate1, up1, ...) or packed (all gate rows,
@@ -331,6 +332,18 @@ struct TensorData
     // PackedGateUpDown descriptors.
     bool qnk_interleave_rows = true;
     std::vector<float> quantization_scales;
+    // FP8 scales cover this many output rows and 128 input columns. Row
+    // selection retains original bytes and expands only the scale rows.
+    uint32_t float8_scale_row_size = 128;
+    // INT4 affine groups use row-major scales/zeros. Optional GPTQ g_idx
+    // selects the group for each input column; otherwise columns are grouped
+    // consecutively. Zero points may be 16 for legacy GPTQ checkpoints.
+    uint32_t quantization_group_size = 0;
+    std::vector<uint8_t> quantization_zero_points;
+    std::vector<uint32_t> quantization_group_indices;
+    // Optional logical input column for each stored quantized weight column.
+    // This is a permutation, independent of GPTQ's scale-group indices.
+    std::vector<uint32_t> input_column_indices;
     MxFp4ByteBuffer mxfp4_blocks;
     MxFp4ByteBuffer mxfp4_scales;
     std::shared_ptr<const uint8_t> mapped_data;
@@ -344,6 +357,7 @@ struct TensorData
     [[nodiscard]] std::span<const int64_t> int64_values() const noexcept;
     [[nodiscard]] std::span<const int8_t> int8_values() const noexcept;
     [[nodiscard]] std::span<const uint8_t> qnk_values() const noexcept;
+    [[nodiscard]] std::span<const uint8_t> int4_values() const noexcept;
 };
 
 using WeightMapping = std::unordered_map<std::string, TensorData>;
@@ -380,10 +394,12 @@ inline std::span<const uint16_t> TensorData::bfloat16_values() const noexcept
 
 inline std::span<const uint8_t> TensorData::float8_values() const noexcept
 {
-    if (dtype != DType::Float8E4M3 || !mapped_data)
-    {
+    if (dtype != DType::Float8E4M3)
         return {};
-    }
+    if (!quantized_data.empty())
+        return quantized_data;
+    if (!mapped_data)
+        return {};
     return {mapped_data.get(), static_cast<size_t>(mapped_size)};
 }
 
@@ -412,6 +428,17 @@ inline std::span<const int8_t> TensorData::int8_values() const noexcept
 inline std::span<const uint8_t> TensorData::qnk_values() const noexcept
 {
     if (!is_qnk_dtype(dtype))
+        return {};
+    if (!quantized_data.empty())
+        return quantized_data;
+    if (!mapped_data)
+        return {};
+    return {mapped_data.get(), static_cast<size_t>(mapped_size)};
+}
+
+inline std::span<const uint8_t> TensorData::int4_values() const noexcept
+{
+    if (dtype != DType::Int4)
         return {};
     if (!quantized_data.empty())
         return quantized_data;

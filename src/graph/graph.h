@@ -39,6 +39,7 @@ enum class ExecutionNodeType
     ExpertGroup,
     SharedExpertGroup,
     Combine,
+    DenseFfn,
     FinalNorm,
     LmHead
 };

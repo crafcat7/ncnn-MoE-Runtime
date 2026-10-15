@@ -141,6 +141,9 @@ struct ExpertDemandRequest
     uint32_t residency_group = 0;
     float activation_limit = 0.0f;
     ExpertActivation activation = ExpertActivation::GptOssSwiGlu;
+    // When present, gate_up names the independent gate projection.
+    std::shared_ptr<const TensorData> up;
+    const TensorData* up_bias = nullptr;
 };
 
 class ExpertDemandSubmission
@@ -205,6 +208,29 @@ public:
                        ExpertActivation activation = ExpertActivation::GptOssSwiGlu)
         = 0;
 
+    virtual void admit_separate(std::string key,
+                                std::shared_ptr<const TensorData> gate,
+                                const TensorData* gate_bias,
+                                std::shared_ptr<const TensorData> up,
+                                const TensorData* up_bias,
+                                std::shared_ptr<const TensorData> down,
+                                const TensorData* down_bias,
+                                uint32_t residency_group,
+                                float activation_limit,
+                                ExpertActivation activation = ExpertActivation::GptOssSwiGlu)
+    {
+        (void)key;
+        (void)gate;
+        (void)gate_bias;
+        (void)up;
+        (void)up_bias;
+        (void)down;
+        (void)down_bias;
+        (void)residency_group;
+        (void)activation_limit;
+        (void)activation;
+    }
+
     // Complete a bounded current-wave upload. On success, pin keeps the
     // resident pair alive until submit_batch captures its selected entries.
     // Unsupported or exhausted backends leave pin empty for CPU fallback.
@@ -221,6 +247,32 @@ public:
         (void)key;
         (void)gate_up;
         (void)gate_up_bias;
+        (void)down;
+        (void)down_bias;
+        (void)residency_group;
+        (void)activation_limit;
+        (void)activation;
+        pin.reset();
+        return false;
+    }
+
+    [[nodiscard]] virtual bool prepare_demand_separate(std::string key,
+                                                       std::shared_ptr<const TensorData> gate,
+                                                       const TensorData* gate_bias,
+                                                       std::shared_ptr<const TensorData> up,
+                                                       const TensorData* up_bias,
+                                                       std::shared_ptr<const TensorData> down,
+                                                       const TensorData* down_bias,
+                                                       uint32_t residency_group,
+                                                       float activation_limit,
+                                                       ExpertActivation activation,
+                                                       std::shared_ptr<const void>& pin)
+    {
+        (void)key;
+        (void)gate;
+        (void)gate_bias;
+        (void)up;
+        (void)up_bias;
         (void)down;
         (void)down_bias;
         (void)residency_group;
@@ -270,9 +322,19 @@ public:
     void admit(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
                float activation_limit, ExpertActivation activation) override;
 
+    void admit_separate(std::string key, std::shared_ptr<const TensorData> gate, const TensorData* gate_bias,
+                        std::shared_ptr<const TensorData> up, const TensorData* up_bias,
+                        std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
+                        float activation_limit, ExpertActivation activation) override;
+
     bool prepare_demand(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias,
                         std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
                         float activation_limit, ExpertActivation activation, std::shared_ptr<const void>& pin) override;
+
+    bool prepare_demand_separate(std::string key, std::shared_ptr<const TensorData> gate, const TensorData* gate_bias,
+                                 std::shared_ptr<const TensorData> up, const TensorData* up_bias,
+                                 std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
+                                 float activation_limit, ExpertActivation activation, std::shared_ptr<const void>& pin) override;
 
     size_t prepare_demand_batch(std::span<const ExpertDemandRequest> requests,
                                 std::span<std::shared_ptr<const void>> pins) override;

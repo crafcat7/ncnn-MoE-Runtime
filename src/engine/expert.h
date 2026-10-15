@@ -26,6 +26,13 @@ struct TensorData;
 enum class ExecutionBackend;
 
 // Input and output must be distinct; existing output capacity is reused.
+void forward_dense_ffn(const CompiledModel& model,
+                       const ExpertPlan& ffn,
+                       const ActivationBuffer& input,
+                       ActivationBuffer& output,
+                       ExpertWorkspace& workspace,
+                       ExecutionBackend backend);
+
 void forward_shared_expert(const CompiledModel& model,
                            const MoeBlockPlan& moe,
                            const ActivationBuffer& input,
@@ -37,7 +44,8 @@ void forward_shared_expert(const CompiledModel& model,
 bool support_vulkan_expert(const ExpertPlan& expert,
                            const TensorData& gate_up,
                            const TensorData& down,
-                           uint64_t optimization_flags);
+                           uint64_t optimization_flags,
+                           const TensorData* up = nullptr);
 
 ExpertVictimExecutionMetadata victim_metadata(const CompiledModel& model,
                                               const ExpertPlan& expert,

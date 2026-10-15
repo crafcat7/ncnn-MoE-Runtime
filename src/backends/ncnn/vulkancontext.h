@@ -108,6 +108,7 @@ struct VulkanRuntimeState
     AtomicRuntimeCounter kv_ring_wrapped_views;
     AtomicRuntimeCounter bfloat16_cooperative_matrix_dispatches;
     AtomicRuntimeCounter dispatches;
+    AtomicRuntimeCounter int4_dispatches;
     AtomicRuntimeCounter attention_blocks;
 
     [[nodiscard]] VulkanStatistics snapshot() const noexcept;
