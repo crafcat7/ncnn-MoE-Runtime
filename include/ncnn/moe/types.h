@@ -298,6 +298,12 @@ struct GpuInfo
     std::string device_name;
 };
 
+enum class MxFp4FileLayout
+{
+    Separate,
+    GgufBlockInterleaved
+};
+
 struct MxFp4FileStorage
 {
     std::string blocks_path;
@@ -313,6 +319,9 @@ struct MxFp4FileStorage
     uint64_t secondary_scales_offset = 0;
     uint64_t secondary_scales_size = 0;
     bool interleave_rows = false;
+    // GGUF stores [E8M0, 16 code bytes] per 32 values in blocks ranges;
+    // scales ranges remain empty. ExpertCache converts only admitted ranges.
+    MxFp4FileLayout layout = MxFp4FileLayout::Separate;
 };
 
 struct TensorData

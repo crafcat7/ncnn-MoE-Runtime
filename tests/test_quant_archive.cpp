@@ -261,8 +261,11 @@ static void test_qnk_archive()
         QuantArchiveTestFile file;
         file.add_qnk("model.self_attn.q_proj.weight", dtypes[index], bits[index], true);
         file.add_attention_tail("model.self_attn.");
-        file.write(directory.path / "model.safetensors");
-        auto archive = SafetensorsArchive::open_file(directory.path / "model.safetensors");
+        // Retained rows keep the preceding fixture mapped until the next row
+        // selection. Windows does not permit truncating that mapped file.
+        const auto path = directory.path / ("qnk-" + std::to_string(bits[index]) + ".safetensors");
+        file.write(path);
+        auto archive = SafetensorsArchive::open_file(path);
         quant_archive_check(static_cast<bool>(archive), "open tagged Qn_K archive");
         auto dtype = archive.value().tensor_dtype("model.self_attn.q_proj.weight");
         quant_archive_check(dtype && dtype.value() == dtypes[index], "inspect tagged Qn_K dtype");

@@ -1134,7 +1134,7 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create(const TensorData& nor
     if (!create_vulkan_layer(ncnn::LayerType::BinaryOp, add_parameters, vkdev, implementation.option, implementation.layers, implementation.add))
         return {};
 
-    implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(vkdev));
+    implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(vkdev, static_cast<size_t>(vulkan_weight_block_size)));
     implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(vkdev));
     const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
     if (!create_attention_pipeline(implementation.vulkan_context, implementation.kv_option, attention_qkv_rope_shader, static_cast<int>(sizeof(attention_qkv_rope_shader) - 1),
@@ -1381,7 +1381,7 @@ Attention_vulkan::create(const TensorData& norm_weight,
         return {};
     }
 
-    implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(vkdev));
+    implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(vkdev, static_cast<size_t>(vulkan_weight_block_size)));
     implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(vkdev));
     const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
     if (!create_attention_pipeline(implementation.vulkan_context,
@@ -1632,7 +1632,6 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
         {
             return false;
         }
-        ++runtime_state.command_buffer_reuses;
     }
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;
@@ -2202,7 +2201,6 @@ bool Attention_vulkan::materialize_device_cache(LayerCache& cache) const
     {
         if (command.reset() != 0)
             return false;
-        ++runtime_state.command_buffer_reuses;
     }
     transfer_slot.command_used = true;
 
@@ -2610,7 +2608,6 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
     {
         if (command.reset() != 0)
             return AttentionBatchResult_vulkan::NotExecuted;
-        ++runtime_state.command_buffer_reuses;
     }
     transfer_slot.command_used = true;
 

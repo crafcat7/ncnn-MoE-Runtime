@@ -136,6 +136,8 @@ class Bfloat16Linear_vulkan
 public:
     ~Bfloat16Linear_vulkan();
 
+    // Owned BF16 weights, FP32 bias, optional input RMSNorm and allocator slack.
+    [[nodiscard]] static uint64_t storage_bytes(const TensorData& matrix, uint64_t alignment = 256) noexcept;
     [[nodiscard]] static std::shared_ptr<Bfloat16Linear_vulkan> create(const TensorData& matrix,
                                                                        const TensorData* bias,
                                                                        uint32_t vulkan_device_index,

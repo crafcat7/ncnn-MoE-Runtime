@@ -236,13 +236,12 @@ std::shared_ptr<LatentLayer_vulkan> LatentLayer_vulkan::create(std::shared_ptr<L
 }
 
 #if NCNN_MOE_WITH_VULKAN
-static bool reset_layer_command(VulkanTransferSlot& slot, VulkanRuntimeState& state)
+static bool reset_layer_command(VulkanTransferSlot& slot)
 {
     if (slot.command_used)
     {
         if (slot.command->reset() != 0)
             return false;
-        ++state.command_buffer_reuses;
     }
     slot.command_used = true;
     return true;
@@ -273,7 +272,7 @@ bool LatentLayer_vulkan::forward(const ActivationBuffer& initial_hidden,
     const std::lock_guard<std::mutex> lock(context->command_mutex());
     std::vector<ncnn::VkMat> combine_storage;
     uint64_t combine_uploads = 0;
-    if (!reset_layer_command(slot, state))
+    if (!reset_layer_command(slot))
         return false;
     auto& cmd = *slot.command;
     ncnn::VkMat input;
@@ -460,7 +459,7 @@ bool LatentLayer_vulkan::materialize_hidden(LatentLayerWorkspace_vulkan& workspa
     std::unique_lock<std::mutex> lock(impl.context->command_mutex());
     std::vector<ncnn::VkMat> combine_storage;
     uint64_t combine_uploads = 0;
-    if (!reset_layer_command(slot, state))
+    if (!reset_layer_command(slot))
         return false;
     auto& cmd = *slot.command;
     ncnn::VkMat result;
@@ -525,7 +524,7 @@ bool LatentLayer_vulkan::finish(LatentLayerWorkspace_vulkan& workspace,
     std::unique_lock<std::mutex> lock(impl.context->command_mutex());
     std::vector<ncnn::VkMat> combine_storage;
     uint64_t combine_uploads = 0;
-    if (!reset_layer_command(slot, state))
+    if (!reset_layer_command(slot))
         return false;
     auto& cmd = *slot.command;
     ncnn::VkMat expanded;

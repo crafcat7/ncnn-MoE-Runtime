@@ -463,9 +463,15 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
         }
 
         std::vector<ActivationBuffer> logits;
+        std::vector<int32_t> verify_input_ids;
+        std::vector<float> accepted_probabilities;
+        std::vector<SampledToken> output_tokens;
         bool speculative_active = true;
         while (result.tokens.size() < opt.max_new_tokens)
         {
+            verify_input_ids.clear();
+            accepted_probabilities.clear();
+            output_tokens.clear();
             const int32_t anchor = result.tokens.back().token_id;
             const size_t remaining = opt.max_new_tokens - result.tokens.size();
             if (remaining == 1 || !speculative_active)
@@ -552,7 +558,6 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
                 speculative_active = false;
                 continue;
             }
-            std::vector<int32_t> verify_input_ids;
             verify_input_ids.reserve(draft_count + 1);
             verify_input_ids.push_back(anchor);
             verify_input_ids.insert(verify_input_ids.end(),
@@ -633,10 +638,7 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
             }
             // Verification rows are consumed before callbacks can reuse state.logits.
             size_t accepted = 0;
-            std::vector<float> accepted_probabilities;
             accepted_probabilities.reserve(draft_count);
-            std::vector<SampledToken> rejected_target_distribution;
-            std::vector<SampledToken> rejected_draft_distribution;
             while (accepted < draft_count)
             {
                 if (opt.sampling.temperature == 0.0f)
@@ -707,10 +709,6 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
                     if (distribution(random_generator)
                         >= acceptance_probability)
                     {
-                        rejected_target_distribution.assign(sampling_candidates[0].begin(),
-                                                            sampling_candidates[0].end());
-                        rejected_draft_distribution.assign(sampling_candidates[1].begin(),
-                                                           sampling_candidates[1].end());
                         break;
                     }
                     accepted_probabilities.push_back(target_probability);
@@ -731,8 +729,8 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
                 if (accepted < draft_count
                     && opt.sampling.temperature > 0.0f)
                 {
-                    return sample_residual_distribution(rejected_target_distribution,
-                                                        rejected_draft_distribution,
+                    return sample_residual_distribution(sampling_candidates[0],
+                                                        sampling_candidates[1],
                                                         compiled.descriptor.vocabulary_size,
                                                         sampling_residual,
                                                         random_generator);
@@ -754,7 +752,6 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
                 return next.error();
             }
 
-            std::vector<SampledToken> output_tokens;
             output_tokens.reserve(accepted + 1);
             for (size_t index = 0; index < accepted; ++index)
             {

@@ -861,8 +861,17 @@ int main()
         ncnn::moe::latent_test_end_to_end(4);
         ncnn::moe::latent_test_end_to_end(128);
         ncnn::moe::latent_test_end_to_end(0, true);
-        ncnn::moe::latent_test_end_to_end(4, true);
-        ncnn::moe::latent_test_end_to_end(128, true);
+        const auto context = ncnn::moe::VulkanContext::acquire(ncnn::moe::get_default_gpu_index(),
+                                                               ncnn::moe::create_vulkan_runtime(),
+                                                               ncnn::moe::OptimizationDefaultFlags);
+        ncnn::moe::latent_check(static_cast<bool>(context), "create recorded compressor capability context");
+        if (context->device()->info.subgroup_size() == 32)
+        {
+            ncnn::moe::latent_test_end_to_end(4, true);
+            ncnn::moe::latent_test_end_to_end(128, true);
+        }
+        else
+            std::cout << "SKIP: recorded BF16 MLA compressor tests require Vulkan subgroup size 32\n";
         std::cout << "Vulkan MLA tests passed\n";
         return 0;
     }

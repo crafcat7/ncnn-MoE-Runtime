@@ -25,6 +25,8 @@
 namespace ncnn {
 namespace moe {
 
+inline constexpr uint64_t vulkan_weight_block_size = 64 * 1024;
+
 #if NCNN_MOE_WITH_VULKAN
 class ActivationBuffer;
 struct TensorData;
@@ -90,7 +92,6 @@ struct VulkanRuntimeState
     AtomicRuntimeCounter compute_submissions;
     AtomicRuntimeCounter batch_uploads;
     AtomicRuntimeCounter batch_downloads;
-    AtomicRuntimeCounter command_buffer_reuses;
     AtomicRuntimeCounter command_graph_submissions;
     AtomicRuntimeCounter command_graph_operations;
     AtomicRuntimeCounter attention_qkv_rope_fusions;

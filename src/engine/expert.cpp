@@ -16,6 +16,7 @@
 #include "ncnn/moe/session.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -402,6 +403,108 @@ static void forward_expert(const CompiledModel& model,
                   &workspace.quantized_input);
 }
 
+// The model owns these tensors until its backend has drained all uploads.
+// Borrowing avoids a host copy while the asynchronous demand retains them.
+static std::shared_ptr<const TensorData> borrow_resident_tensor(const TensorData& tensor)
+{
+    return std::shared_ptr<const TensorData>(std::shared_ptr<const TensorData>{}, &tensor);
+}
+
+static bool forward_cached_dense_ffn(const CompiledModel& model,
+                                     const ExpertPlan& ffn,
+                                     const ActivationBuffer& input,
+                                     ActivationBuffer& output)
+{
+    if (!model.expert_backend || ffn.cache_key.empty()
+        || model.opt.hybrid_mode != HybridMode::HybridExperts
+        || has_flag(model.opt.flags, OptionDisableGpuExpertExecution))
+        return false;
+
+    ExpertBackendRequest request;
+    request.key = ffn.cache_key;
+    request.input = &input;
+    request.output = &output;
+    request.weight_size = ffn.weight_size;
+    const auto execute = [&]() {
+        auto submission = model.expert_backend->submit_batch({&request, 1});
+        if (!submission)
+            return ExpertBackendExecutionResult::Failed;
+        const auto reservations = submission->reservations();
+        if (reservations.size() != 1)
+        {
+            submission->abort();
+            return ExpertBackendExecutionResult::Failed;
+        }
+        if (reservations.front() != ExpertBackendExecutionResult::Executed)
+        {
+            const auto result = reservations.front();
+            submission->abort();
+            return result;
+        }
+        std::vector<ExpertBackendExecutionResult> results;
+        submission->wait(results);
+        if (results.size() != 1 || results.front() != ExpertBackendExecutionResult::Executed
+            || !submission->commit())
+        {
+            submission->abort();
+            return ExpertBackendExecutionResult::Failed;
+        }
+        return output.rows() == input.rows()
+                       && output.columns() == model.weights.at(ffn.down_weight).shape[0]
+                   ? ExpertBackendExecutionResult::Executed
+                   : ExpertBackendExecutionResult::Failed;
+    };
+    const ExpertBackendExecutionResult resident = execute();
+    if (resident == ExpertBackendExecutionResult::Executed)
+        return true;
+    if (resident != ExpertBackendExecutionResult::NotResident)
+        return false;
+
+    const TensorHandle gate = ffn.gate_up_weight == invalid_tensor_handle ? ffn.gate_weight : ffn.gate_up_weight;
+    const TensorHandle gate_bias = ffn.gate_up_weight == invalid_tensor_handle ? ffn.gate_bias : ffn.gate_up_bias;
+    ExpertDemandRequest demand;
+    demand.key = ffn.cache_key;
+    demand.gate_up = borrow_resident_tensor(model.weights.at(gate));
+    demand.gate_up_bias = gate_bias == invalid_tensor_handle ? nullptr : &model.weights.at(gate_bias);
+    demand.down = borrow_resident_tensor(model.weights.at(ffn.down_weight));
+    demand.down_bias = ffn.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(ffn.down_bias);
+    demand.residency_group = ffn.residency_group;
+    demand.activation_limit = ffn.activation_limit;
+    demand.activation = ffn.activation;
+    if (ffn.gate_up_weight == invalid_tensor_handle)
+    {
+        demand.up = borrow_resident_tensor(model.weights.at(ffn.up_weight));
+        demand.up_bias = ffn.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(ffn.up_bias);
+    }
+    if (!has_flag(model.opt.optimization_flags, OptimizationVulkanExpertGpuPriority))
+    {
+        if (input.rows() < vulkan_expert_gpu_admission_min_rows)
+            return false;
+        if (demand.up)
+            model.expert_backend->admit_separate(std::string(demand.key), demand.gate_up, demand.gate_up_bias,
+                                                 demand.up, demand.up_bias, demand.down, demand.down_bias,
+                                                 demand.residency_group, demand.activation_limit, demand.activation);
+        else
+            model.expert_backend->admit(std::string(demand.key), demand.gate_up, demand.gate_up_bias,
+                                        demand.down, demand.down_bias, demand.residency_group,
+                                        demand.activation_limit, demand.activation);
+        return false;
+    }
+    auto upload = model.expert_backend->begin_demand_batch({&demand, 1});
+    if (!upload)
+        return false;
+    std::array<std::shared_ptr<const void>, 1> pins;
+    if (upload->wait(pins) != 1 || !pins.front())
+    {
+        upload->abort();
+        return false;
+    }
+    upload.reset();
+    // Keep the demand pin until the execution submission has captured and
+    // completed its entry. Both use the same eviction and publication rules.
+    return execute() == ExpertBackendExecutionResult::Executed;
+}
+
 void forward_dense_ffn(const CompiledModel& model,
                        const ExpertPlan& ffn,
                        const ActivationBuffer& input,
@@ -409,6 +512,14 @@ void forward_dense_ffn(const CompiledModel& model,
                        ExpertWorkspace& workspace,
                        ExecutionBackend backend)
 {
+    if (ffn.use_gpu_cache)
+    {
+        if (backend == ExecutionBackend::Vulkan
+            && forward_cached_dense_ffn(model, ffn, input, output))
+            return;
+        forward_expert(model, ffn, nullptr, input, output, workspace, false);
+        return;
+    }
     if (backend == ExecutionBackend::Vulkan)
     {
         const CompiledOperator& fused = model.operators.at(ffn.vulkan_operator);
@@ -1001,17 +1112,12 @@ bool support_vulkan_expert(const ExpertPlan& expert,
                && qnk_shape_supported(weight.dtype, weight.shape[0], weight.shape[1]);
     };
     const auto quantized = [](DType dtype) { return dtype == DType::Int4 || is_qnk_dtype(dtype); };
-    return (quantized(gate_up.dtype) || quantized(down.dtype) || (up && quantized(up->dtype)))
+    const bool separate_floating = up
+                                   && (gate_up.dtype == DType::BFloat16 || gate_up.dtype == DType::Float32)
+                                   && (up->dtype == DType::BFloat16 || up->dtype == DType::Float32)
+                                   && (down.dtype == DType::BFloat16 || down.dtype == DType::Float32);
+    return (separate_floating || quantized(gate_up.dtype) || quantized(down.dtype) || (up && quantized(up->dtype)))
            && supported(gate_up) && supported(down) && (!up || supported(*up));
-}
-
-// Resident Qn_K weights are owned by CompiledModel::weights.  The Vulkan
-// backend only needs a temporary shared handle while its asynchronous
-// admission worker copies the bytes to device storage; the model outlives
-// the backend, so this non-owning handle avoids copying a large raw tensor.
-static std::shared_ptr<const TensorData> borrow_resident_tensor(const TensorData& tensor)
-{
-    return std::shared_ptr<const TensorData>(std::shared_ptr<const TensorData>{}, &tensor);
 }
 
 static void admit_vulkan_expert(const CompiledModel& model,

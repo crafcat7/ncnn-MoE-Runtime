@@ -174,9 +174,6 @@ struct SessionStatistics
     uint64_t vulkan_compute_submissions = 0;
     uint64_t vulkan_batch_uploads = 0;
     uint64_t vulkan_batch_downloads = 0;
-    uint64_t vulkan_command_buffer_reuses = 0;
-    uint64_t vulkan_command_graph_submissions = 0;
-    uint64_t vulkan_command_graph_operations = 0;
     uint64_t vulkan_attention_qkv_rope_fusions = 0;
     uint64_t vulkan_attention_device_rope_fusions = 0;
     uint64_t vulkan_attention_qkv_ring_fusions = 0;

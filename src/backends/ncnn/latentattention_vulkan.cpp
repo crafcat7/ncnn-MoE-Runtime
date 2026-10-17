@@ -409,7 +409,6 @@ bool LatentAttention_vulkan::forward_batch(std::span<const uint64_t> positions,
     {
         if (cmd.reset() != 0)
             return false;
-        ++runtime_state.command_buffer_reuses;
     }
     transfer_slot.command_used = true;
     uint64_t uploads = 0;

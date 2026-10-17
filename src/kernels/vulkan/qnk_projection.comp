@@ -241,7 +241,8 @@ void main()
     if (valid && lane == 0u)
         output_data[token * p.output_stride + p.output_column_offset + output_column] = reduced_sum + bias_data[output_column];
 #else
-    partial_sum[lane] = sum;
+    if (lane < 32u)
+        partial_sum[lane] = sum;
     barrier();
     for (uint stride = 16u; stride > 0u; stride >>= 1u)
     {

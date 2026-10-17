@@ -142,7 +142,7 @@ static void row_scale_single(uint32_t scale_rows, uint32_t matrix_rows, uint32_t
     const auto input = row_scale_input(tokens, 256 * input_groups);
     const auto expected = row_scale_reference(matrix, input, input_groups, &bias);
     const auto runtime = create_vulkan_runtime();
-    const auto op = Float8Linear_vulkan::create(matrix, &bias, input_groups, 0, runtime, OptimizationDefaultFlags);
+    const auto op = Float8Linear_vulkan::create(matrix, &bias, input_groups, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     row_scale_check(static_cast<bool>(op), "create FP8 row-scale GPU projection");
     const auto before = get_vulkan_statistics(runtime);
     ActivationBuffer actual;
@@ -165,9 +165,9 @@ static void row_scale_chains(uint32_t tokens)
     const auto first_expected = row_scale_reference(first, input);
     const auto chain_expected = row_scale_reference(second, first_expected);
     const auto runtime = create_vulkan_runtime();
-    const auto gate = Float8Linear_vulkan::create(first, nullptr, 1, 0, runtime, OptimizationDefaultFlags);
-    const auto down = Float8Linear_vulkan::create(second, nullptr, 1, 0, runtime, OptimizationDefaultFlags);
-    const auto up = Float8Linear_vulkan::create(up_weight, nullptr, 1, 0, runtime, OptimizationDefaultFlags);
+    const auto gate = Float8Linear_vulkan::create(first, nullptr, 1, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
+    const auto down = Float8Linear_vulkan::create(second, nullptr, 1, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
+    const auto up = Float8Linear_vulkan::create(up_weight, nullptr, 1, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     row_scale_check(gate && down && up, "create per-row-scale FP8 chain");
     ActivationBuffer actual;
     auto before = get_vulkan_statistics(runtime);
@@ -216,10 +216,10 @@ static void row_scale_invalid()
     const auto runtime = create_vulkan_runtime();
     TensorData matrix = row_scale_matrix(129, 256, 1, 1);
     matrix.float8_scale_row_size = 0;
-    row_scale_check(!Float8Linear_vulkan::create(matrix, nullptr, 1, 0, runtime, OptimizationDefaultFlags), "reject zero FP8 scale-row size");
+    row_scale_check(!Float8Linear_vulkan::create(matrix, nullptr, 1, get_default_gpu_index(), runtime, OptimizationDefaultFlags), "reject zero FP8 scale-row size");
     matrix.float8_scale_row_size = 1;
     matrix.quantization_scales.pop_back();
-    row_scale_check(!Float8Linear_vulkan::create(matrix, nullptr, 1, 0, runtime, OptimizationDefaultFlags), "reject incomplete per-row FP8 scales");
+    row_scale_check(!Float8Linear_vulkan::create(matrix, nullptr, 1, get_default_gpu_index(), runtime, OptimizationDefaultFlags), "reject incomplete per-row FP8 scales");
 }
 #endif
 

@@ -50,6 +50,8 @@ inline constexpr size_t vulkan_expert_gpu_admission_min_rows = 2;
 
 inline constexpr size_t vulkan_expert_gpu_victim_min_rows = 32;
 
+// Physical residency and execution counters for the shared FFN cache.
+// Dense FFNs contribute here without creating Expert routes or assignments.
 struct ExpertBackendStatistics
 {
     uint64_t hits = 0;

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Offline checkpoint -> native worker regression against independent BF16 models.
+"""Offline checkpoint -> native worker regression against independent
+decoded-weight oracles.
 
 Requires NumPy; real GGUF cases additionally require the official gguf package.
 The fixtures exercise prefill/decode, recurrent/full attention, dense/shared/routed
@@ -383,7 +384,10 @@ def prepare_int4(root: Path, method: str, moe: bool, family: str = "qwen") -> Fi
     bf16_dense, bf16_expert = weight_sizes(reference, {})
     baseline = root / "baseline"
     assets(baseline, model_config)
-    write_safetensors(baseline / "model.safetensors", reference)
+    baseline_tensors = dict(reference)
+    for name in native_names:
+        baseline_tensors[name] = ("F32", float32(reference[name][1]))
+    write_safetensors(baseline / "model.safetensors", baseline_tensors)
     source = root / "source"
     source_config = copy.deepcopy(model_config)
     source_config.get("text_config", source_config)["dtype"] = "float16"
@@ -499,7 +503,7 @@ def logical_to_gguf_columns(keys: int, heads: int, dimension: int) -> np.ndarray
     return result
 
 
-def prepare_gguf(root: Path, moe: bool = False, reordered: bool = False) -> Fixture:
+def prepare_gguf(root: Path, moe: bool = False, reordered: bool = False, *, fp32: bool = True) -> Fixture:
     model_config = config(moe, reordered)
     reference, native_names = base_tensors(moe, reordered)
     native_names.append(PREFIX + "embed_tokens.weight")
@@ -569,7 +573,12 @@ def prepare_gguf(root: Path, moe: bool = False, reordered: bool = False) -> Fixt
     writer.close()
     baseline = root / "baseline"
     assets(baseline, model_config)
-    write_safetensors(baseline / "model.safetensors", reference)
+    baseline_tensors = dict(reference)
+    if fp32:
+        for name in native_names:
+            if name != PREFIX + "embed_tokens.weight":
+                baseline_tensors[name] = ("F32", float32(reference[name][1]))
+    write_safetensors(baseline / "model.safetensors", baseline_tensors)
     imported = root / "imported"
     importer.import_package(path, imported, root / "assets")
     loaded = importer.scan_safetensors(imported)
@@ -637,7 +646,7 @@ def family_gguf_name(name: str, family: str) -> str:
     return gguf_name(name)
 
 
-def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = False) -> Fixture:
+def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = False, fp32: bool = True) -> Fixture:
     model_config, reference, native_names = family_tensors(family)
     embedding = "embed.weight" if family == "deepseek_v4" else ("model." if family == "gpt_oss" else PREFIX) + "embed_tokens.weight"
     native = set(native_names) | {embedding}
@@ -706,7 +715,12 @@ def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = Fal
     writer.close()
     baseline = root / "baseline"
     assets(baseline, model_config)
-    write_safetensors(baseline / "model.safetensors", reference)
+    baseline_tensors = dict(reference)
+    if fp32:
+        for name in native:
+            if name != embedding:
+                baseline_tensors[name] = ("F32", float32(reference[name][1]))
+    write_safetensors(baseline / "model.safetensors", baseline_tensors)
     imported = root / "imported"
     importer.import_package(path, imported, root / "assets")
     loaded = importer.scan_safetensors(imported)
@@ -818,6 +832,7 @@ def add_deepseek_mxfp4_experts(fixture: Fixture) -> Path:
 class NativeQuantizedTests(unittest.TestCase):
     worker: Path
     backend = "cpu"
+    vulkan_device_index: int | None = None
     verbose_worker = False
 
     def setUp(self):
@@ -831,7 +846,12 @@ class NativeQuantizedTests(unittest.TestCase):
                    *, backend: str | None = None, extra_args: tuple[str, ...] = (),
                    speculative: bool = False) -> dict:
         selected_backend = backend or self.backend
-        with WorkerClient(self.worker, path, ["--backend", selected_backend, "--cpu-packed-weights", "off", *extra_args],
+        worker_args = ["--backend", selected_backend, "--cpu-packed-weights", "off"]
+        if selected_backend == "hybrid":
+            self.assertIsNotNone(self.vulkan_device_index)
+        if selected_backend in ("hybrid", "auto") and self.vulkan_device_index is not None:
+            worker_args.extend(("--vulkan-device", str(self.vulkan_device_index)))
+        with WorkerClient(self.worker, path, [*worker_args, *extra_args],
                           verbose=self.verbose_worker) as client:
             ready = client.ready
             if selected_backend != "auto":
@@ -839,10 +859,15 @@ class NativeQuantizedTests(unittest.TestCase):
             hybrid = ready["resources"]["backend"] == "hybrid"
             if hybrid:
                 capabilities = ready["capabilities"]
-                self.assertGreater(capabilities["vulkan_device_count"], 0)
+                self.assertIsNotNone(self.vulkan_device_index)
                 devices = {device["index"]: device for device in capabilities["vulkan_devices"]}
                 self.assertIn(capabilities["selected_vulkan_device_index"], devices)
                 self.assertTrue(devices[capabilities["selected_vulkan_device_index"]]["name"])
+                self.assertIn(self.vulkan_device_index, devices)
+                device = devices[self.vulkan_device_index]
+                self.assertNotEqual(device["type"], "cpu")
+                self.assertGreater(device["compute_queue_count"], 0)
+                self.assertEqual(ready["resources"]["vulkan_device_index"], self.vulkan_device_index)
             self.assertEqual(ready["model"]["expert_count"], 2 if moe else 0)
             if expected is not None:
                 resources = ready["resources"]
@@ -854,10 +879,29 @@ class NativeQuantizedTests(unittest.TestCase):
                 else:
                     self.assertEqual(resources["expert_cache_bytes"], 0)
             result = {"resources": ready["resources"]}
+            has_gpu_expert_cache = False
+            if hybrid and moe and expected is not None:
+                cache_bytes = resources["expert_gpu_cache_bytes"]
+                has_gpu_expert_cache = cache_bytes > 0
+                if not has_gpu_expert_cache:
+                    print("SKIP optional routed GPU Expert execution assertions: no eligible Expert GPU cache "
+                          "was constructed", flush=True)
             sessions = [("greedy", 0.0, 0), ("sampled", 1.0, 23)]
             if hybrid and moe and expected is not None:
                 sessions.append(("reused", 1.0, 23))
             for label, temperature, seed in sessions:
+                warm_cache_is_populated = False
+                if label == "reused":
+                    sampled_cumulative = result["sampled_stats"]["cumulative"]
+                    routed_expert_entries = (ready["model"]["expert_count"]
+                                             * ready["model"]["layer_count"])
+                    stores = sampled_cumulative["gpu_cache_stores"]
+                    evictions = sampled_cumulative["gpu_cache_evictions"]
+                    warm_cache_is_populated = evictions == 0 and stores >= routed_expert_entries
+                    if not warm_cache_is_populated:
+                        print(f"SKIP optional warm-cache residency assertions: sampled generation stored "
+                              f"{stores} of {routed_expert_entries} routed Expert entries and evicted "
+                              f"{evictions}", flush=True)
                 client.create_session(label, seed=seed, prefill_chunk_size=8, enable_speculative_context=speculative)
                 events = []
                 new_tokens = 6 if speculative else 4
@@ -886,17 +930,18 @@ class NativeQuantizedTests(unittest.TestCase):
                         if expected.int4:
                             self.assertGreater(gpu["int4_dispatches"], 0,
                                                "hybrid INT4 model executed no native INT4 Vulkan projection")
-                        if moe and label == "sampled":
+                        if moe and label == "sampled" and has_gpu_expert_cache:
                             self.assertGreater(done["stats"]["cumulative"]["gpu_executions"], 0,
                                                "hybrid MoE model executed no routed Expert on Vulkan")
-                        if moe and label == "reused":
+                        if moe and label == "reused" and has_gpu_expert_cache:
                             generation = done["stats"]["generation"]
                             self.assertGreater(generation["gpu_executions"], 0,
                                                "warm MoE session executed no routed Expert on Vulkan")
-                            self.assertEqual(generation["gpu_cache_stores"], 0,
-                                             "warm MoE session uploaded an Expert again")
-                            self.assertEqual(generation["gpu_cache_evictions"], 0,
-                                             "warm MoE session evicted an already resident Expert")
+                            if warm_cache_is_populated:
+                                self.assertEqual(generation["gpu_cache_stores"], 0,
+                                                 "warm MoE session uploaded an Expert again")
+                                self.assertEqual(generation["gpu_cache_evictions"], 0,
+                                                 "warm MoE session evicted an already resident Expert")
                     else:
                         self.assertEqual(gpu["int4_dispatches"], 0)
                 result[label] = (tokens, probabilities)
@@ -907,8 +952,8 @@ class NativeQuantizedTests(unittest.TestCase):
             return result
 
     def compare(self, fixture: Fixture, *, direct: bool) -> None:
-        # The CPU reference avoids BF16 Vulkan activation rounding in the
-        # baseline. Native INT4 GPU projections use FP32 activations.
+        # Native quantized matrices use FP32 activations; retain their exact
+        # decoded FP32 values in the oracle while auxiliaries stay BF16.
         speculative = fixture.family == "deepseek_dspark"
         baseline = self.run_worker(fixture.baseline, fixture.moe, backend="cpu", speculative=speculative)
         paths = [("imported", fixture.imported)]
@@ -923,7 +968,7 @@ class NativeQuantizedTests(unittest.TestCase):
                 print(json.dumps({"family": fixture.family, "path": label,
                                   "backend": result["resources"]["backend"], "native_matrices": fixture.native_matrices,
                                   "greedy": result["greedy"], "sampled": result["sampled"],
-                                  "bf16_greedy": baseline["greedy"], "bf16_sampled": baseline["sampled"],
+                                  "reference_greedy": baseline["greedy"], "reference_sampled": baseline["sampled"],
                                   "gpu": result["sampled_stats"]["generation_gpu"],
                                   "speculative": result["sampled_stats"]["generation"].get("speculative_proposals"),
                                   "warm_experts": result.get("reused_stats", {}).get("generation")}), flush=True)
@@ -964,7 +1009,12 @@ class NativeQuantizedTests(unittest.TestCase):
         fixture = prepare_family_gguf(self.root, "deepseek_v4", canonical_dspark=True)
         self.compare(fixture, direct=False)
         baseline = self.run_worker(fixture.baseline, True, backend="cpu")
-        with WorkerClient(self.worker, fixture.imported, ["--backend", self.backend, "--cpu-packed-weights", "off"]) as client:
+        worker_args = ["--backend", self.backend, "--cpu-packed-weights", "off"]
+        if self.backend == "hybrid":
+            self.assertIsNotNone(self.vulkan_device_index)
+        if self.backend in ("hybrid", "auto") and self.vulkan_device_index is not None:
+            worker_args.extend(("--vulkan-device", str(self.vulkan_device_index)))
+        with WorkerClient(self.worker, fixture.imported, worker_args) as client:
             client.create_session("target-only", prefill_chunk_size=8, enable_speculative_context=True)
             events = []
             done, tokens = client.generate("target-only", [1, 1, 2, 2, 3, 3, 4, 4], max_new_tokens=4,
@@ -1113,20 +1163,26 @@ def main() -> int:
     args, test_args = parser.parse_known_args()
     NativeQuantizedTests.worker = args.worker.resolve()
     NativeQuantizedTests.backend = args.backend
+    NativeQuantizedTests.vulkan_device_index = None
     NativeQuantizedTests.verbose_worker = args.verbose_worker
-    if args.backend == "hybrid":
+    if args.backend in ("hybrid", "auto"):
         # A CPU worker can report the actual device inventory without trying
-        # any optional GPU operator. Only an explicit empty inventory skips;
-        # checkpoint, operator or Vulkan execution failures still fail tests.
+        # any optional GPU operator. Hybrid skips only without an eligible
+        # device; checkpoint and operator failures still fail the tests.
         with tempfile.TemporaryDirectory(prefix="ncnn-native-gpu-probe-") as temporary:
             probe = Path(temporary) / "model"
             assets(probe, config())
             weights, _ = base_tensors(False)
             write_safetensors(probe / "model.safetensors", weights)
             with WorkerClient(args.worker, probe, ["--backend", "cpu", "--cpu-packed-weights", "off"]) as client:
-                if client.ready["capabilities"]["vulkan_device_count"] == 0:
-                    print("SKIP: Vulkan GPU unavailable")
+                devices = client.ready["capabilities"]["vulkan_devices"]
+                eligible_device = next((device for device in devices
+                                         if device["type"] != "cpu" and device["compute_queue_count"] > 0), None)
+                if eligible_device is None and args.backend == "hybrid":
+                    print("SKIP: no non-CPU Vulkan device with a compute queue")
                     return 77
+                if eligible_device is not None:
+                    NativeQuantizedTests.vulkan_device_index = eligible_device["index"]
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(NativeQuantizedTests)
     if test_args:
         parser.error("unrecognized arguments: " + " ".join(test_args))

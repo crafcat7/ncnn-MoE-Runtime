@@ -466,6 +466,9 @@ private:
 
 #endif // NCNN_MOE_WITH_VULKAN
 
+// Original matrix bytes plus aligned bias/metadata for the shared residency
+// allocator. Separate BF16/FP32 dense FFNs use the same native projection path.
+// Returns zero when any matrix cannot be admitted or dispatched on this device.
 [[nodiscard]] uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
                                                              const TensorData& down, uint32_t device_index,
                                                              const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags);

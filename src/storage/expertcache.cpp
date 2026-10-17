@@ -681,6 +681,37 @@ static bool is_supported_file_backed_pair(const TensorData& gate_up,
                && is_file_backed_bfloat16_tensor(down));
 }
 
+static Result<uint64_t> gguf_mxfp4_stored_size(const TensorData& tensor)
+{
+    const MxFp4FileStorage& file = *tensor.mxfp4_file_storage;
+    if (tensor.shape.size() != 2 || tensor.shape[0] == 0 || tensor.shape[1] == 0
+        || tensor.shape[1] % 32 != 0 || (file.interleave_rows && tensor.shape[0] % 2 != 0))
+        return Error{ErrorCode::InvalidModel, "invalid file-backed GGUF MXFP4 matrix shape"};
+    const uint64_t rows = tensor.shape[0] / (file.interleave_rows ? 2 : 1);
+    const uint64_t blocks = rows * (tensor.shape[1] / 32);
+    if (blocks > std::numeric_limits<uint64_t>::max() / 17)
+        return Error{ErrorCode::InvalidModel, "GGUF MXFP4 range byte count overflows"};
+    const uint64_t size = blocks * 17;
+    if (file.blocks_path.empty() || file.blocks_size != size
+        || file.blocks_offset > std::numeric_limits<uint64_t>::max() - size
+        || !file.scales_path.empty() || file.scales_size != 0 || file.scales_offset != 0
+        || !file.secondary_scales_path.empty() || file.secondary_scales_size != 0 || file.secondary_scales_offset != 0)
+        return Error{ErrorCode::InvalidModel, "invalid file-backed GGUF MXFP4 range"};
+    if (file.interleave_rows)
+    {
+        if (file.secondary_blocks_path.empty() || file.secondary_blocks_size != size
+            || file.secondary_blocks_offset > std::numeric_limits<uint64_t>::max() - size
+            || size > std::numeric_limits<uint64_t>::max() / 2)
+            return Error{ErrorCode::InvalidModel, "invalid GGUF MXFP4 Gate/Up range"};
+    }
+    else if (!file.secondary_blocks_path.empty() || file.secondary_blocks_size != 0 || file.secondary_blocks_offset != 0)
+        return Error{ErrorCode::InvalidModel, "non-interleaved GGUF MXFP4 matrix has secondary ranges"};
+    const uint64_t total = size * (file.interleave_rows ? 2 : 1);
+    if (total > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+        return Error{ErrorCode::InvalidModel, "file-backed GGUF MXFP4 matrix is too large"};
+    return total;
+}
+
 Result<uint64_t> ExpertCache::stored_size(const TensorData& tensor)
 {
     if (is_file_backed_bfloat16_tensor(tensor))
@@ -688,6 +719,10 @@ Result<uint64_t> ExpertCache::stored_size(const TensorData& tensor)
     if (tensor.dtype != DType::MxFp4 || !tensor.mxfp4_file_storage)
         return Error{ErrorCode::InvalidArgument, "expert cache requires file-backed MXFP4 or BF16 tensors"};
     const MxFp4FileStorage& source = *tensor.mxfp4_file_storage;
+    if (source.layout == MxFp4FileLayout::GgufBlockInterleaved)
+        return gguf_mxfp4_stored_size(tensor);
+    if (source.layout != MxFp4FileLayout::Separate)
+        return Error{ErrorCode::InvalidModel, "unknown file-backed MXFP4 layout"};
     if (source.scales_size > std::numeric_limits<uint64_t>::max() - source.blocks_size)
         return Error{ErrorCode::InvalidModel, "file-backed MXFP4 tensor byte count overflows"};
     uint64_t size = source.blocks_size + source.scales_size;
@@ -755,18 +790,22 @@ std::string ExpertCache::make_pair_key(const TensorData& gate_up, const TensorDa
     }
     const MxFp4FileStorage& gate = *gate_up.mxfp4_file_storage;
     const MxFp4FileStorage& projection = *down.mxfp4_file_storage;
-    return gate.blocks_path + ":" + std::to_string(gate.blocks_offset)
-           + ":" + std::to_string(gate.blocks_size)
-           + ":" + gate.scales_path + ":" + std::to_string(gate.scales_offset)
-           + ":" + std::to_string(gate.scales_size)
-           + ":" + gate.secondary_blocks_path + ":" + std::to_string(gate.secondary_blocks_offset)
-           + ":" + std::to_string(gate.secondary_blocks_size)
-           + ":" + gate.secondary_scales_path + ":" + std::to_string(gate.secondary_scales_offset)
-           + ":" + std::to_string(gate.secondary_scales_size)
-           + "|" + projection.blocks_path + ":" + std::to_string(projection.blocks_offset)
-           + ":" + std::to_string(projection.blocks_size)
-           + ":" + projection.scales_path + ":" + std::to_string(projection.scales_offset)
-           + ":" + std::to_string(projection.scales_size);
+    std::string key = gate.blocks_path + ":" + std::to_string(gate.blocks_offset)
+                      + ":" + std::to_string(gate.blocks_size)
+                      + ":" + gate.scales_path + ":" + std::to_string(gate.scales_offset)
+                      + ":" + std::to_string(gate.scales_size)
+                      + ":" + gate.secondary_blocks_path + ":" + std::to_string(gate.secondary_blocks_offset)
+                      + ":" + std::to_string(gate.secondary_blocks_size)
+                      + ":" + gate.secondary_scales_path + ":" + std::to_string(gate.secondary_scales_offset)
+                      + ":" + std::to_string(gate.secondary_scales_size)
+                      + "|" + projection.blocks_path + ":" + std::to_string(projection.blocks_offset)
+                      + ":" + std::to_string(projection.blocks_size)
+                      + ":" + projection.scales_path + ":" + std::to_string(projection.scales_offset)
+                      + ":" + std::to_string(projection.scales_size);
+    if (gate.layout != MxFp4FileLayout::Separate || projection.layout != MxFp4FileLayout::Separate)
+        key += "|layout:" + std::to_string(static_cast<uint32_t>(gate.layout))
+               + ":" + std::to_string(static_cast<uint32_t>(projection.layout));
+    return key;
 }
 
 static Result<void> copy_interleaved_mxfp4_rows(const TensorData& source,
@@ -813,6 +852,57 @@ static Result<void> copy_interleaved_mxfp4_rows(const TensorData& source,
     return {};
 }
 
+Result<std::shared_ptr<TensorData>> ExpertCache::load_gguf_tensor(const TensorData& source,
+                                                                  uint64_t& mapped_range_count, uint64_t& mapped_size)
+{
+    auto size = gguf_mxfp4_stored_size(source);
+    if (!size)
+        return size.error();
+    const MxFp4FileStorage& file = *source.mxfp4_file_storage;
+    auto first = reader->load(file.blocks_path, file.blocks_offset, file.blocks_size, io_mode);
+    if (!first)
+        return first.error();
+    if (first.value().mapped)
+    {
+        ++mapped_range_count;
+        mapped_size += file.blocks_size;
+    }
+    auto loaded = std::make_shared<TensorData>();
+    loaded->dtype = DType::MxFp4;
+    loaded->shape = source.shape;
+    const size_t scale_count = static_cast<size_t>(source.element_count() / 32);
+    loaded->mxfp4_blocks.resize(scale_count * 16);
+    loaded->mxfp4_scales.resize(scale_count);
+    const auto convert = [&](const MxFp4ByteBuffer& raw, size_t raw_offset, size_t scale_offset, size_t count) {
+        return unpack_gguf_mxfp4({raw.data() + raw_offset, count * 17},
+                                 {loaded->mxfp4_blocks.data() + scale_offset * 16, count * 16},
+                                 {loaded->mxfp4_scales.data() + scale_offset, count});
+    };
+    if (!file.interleave_rows)
+    {
+        if (!convert(first.value().data, 0, 0, scale_count))
+            return Error{ErrorCode::InvalidModel, "cannot unpack file-backed GGUF MXFP4 matrix"};
+        return loaded;
+    }
+    auto second = reader->load(file.secondary_blocks_path, file.secondary_blocks_offset, file.secondary_blocks_size, io_mode);
+    if (!second)
+        return second.error();
+    if (second.value().mapped)
+    {
+        ++mapped_range_count;
+        mapped_size += file.secondary_blocks_size;
+    }
+    const size_t row_scales = source.shape[1] / 32;
+    for (size_t row = 0; row < source.shape[0] / 2; ++row)
+    {
+        const size_t raw_offset = row * row_scales * 17;
+        if (!convert(first.value().data, raw_offset, row * 2 * row_scales, row_scales)
+            || !convert(second.value().data, raw_offset, (row * 2 + 1) * row_scales, row_scales))
+            return Error{ErrorCode::InvalidModel, "cannot unpack file-backed GGUF MXFP4 Gate/Up matrix"};
+    }
+    return loaded;
+}
+
 Result<std::shared_ptr<TensorData>> ExpertCache::load_tensor(const TensorData& source, uint64_t& mapped_range_count, uint64_t& mapped_size)
 {
     if (is_file_backed_bfloat16_tensor(source))
@@ -842,6 +932,8 @@ Result<std::shared_ptr<TensorData>> ExpertCache::load_tensor(const TensorData& s
     if (!source.mxfp4_file_storage)
         return Error{ErrorCode::InvalidArgument, "Expert tensor is not file-backed"};
     const MxFp4FileStorage& file = *source.mxfp4_file_storage;
+    if (file.layout == MxFp4FileLayout::GgufBlockInterleaved)
+        return load_gguf_tensor(source, mapped_range_count, mapped_size);
     if (file.blocks_size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
         || file.scales_size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
         || file.secondary_blocks_size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
@@ -1092,6 +1184,9 @@ Result<ExpertVictimPair> ExpertCache::load_pair(const TensorData& gate_up, const
     }
     const MxFp4FileStorage& gate = *gate_up.mxfp4_file_storage;
     const MxFp4FileStorage& projection = *down.mxfp4_file_storage;
+    if (gate.layout == MxFp4FileLayout::GgufBlockInterleaved
+        || projection.layout == MxFp4FileLayout::GgufBlockInterleaved)
+        return load_independent_pair(gate_up, down, mapped_range_count, mapped_size);
     if (gate.interleave_rows)
         return load_interleaved_pair(gate_up, down, mapped_range_count, mapped_size);
     struct Range
@@ -1212,7 +1307,11 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(std::spa
     for (const std::shared_ptr<Entry>& entry : batch)
     {
         if (is_file_backed_bfloat16_tensor(entry->gate_up_source)
-            || is_file_backed_bfloat16_tensor(entry->down_source))
+            || is_file_backed_bfloat16_tensor(entry->down_source)
+            || (entry->gate_up_source.mxfp4_file_storage
+                && entry->gate_up_source.mxfp4_file_storage->layout != MxFp4FileLayout::Separate)
+            || (entry->down_source.mxfp4_file_storage
+                && entry->down_source.mxfp4_file_storage->layout != MxFp4FileLayout::Separate))
         {
             return std::vector<ExpertVictimPair>();
         }
@@ -2323,9 +2422,9 @@ Result<bool> ExpertCache::try_acquire_ready_pairs(std::span<const ExpertCachePai
     }
 
     static constexpr size_t inline_entry_count = 16;
-    std::array<std::shared_ptr<Entry>, inline_entry_count> inline_entries;
-    std::vector<std::shared_ptr<Entry>> overflow_entries;
-    std::shared_ptr<Entry>* ready_entries = inline_entries.data();
+    std::array<const std::shared_ptr<Entry>*, inline_entry_count> inline_entries;
+    std::vector<const std::shared_ptr<Entry>*> overflow_entries;
+    const std::shared_ptr<Entry>** ready_entries = inline_entries.data();
     if (requests.size() > inline_entry_count)
     {
         overflow_entries.resize(requests.size());
@@ -2341,12 +2440,12 @@ Result<bool> ExpertCache::try_acquire_ready_pairs(std::span<const ExpertCachePai
         {
             return false;
         }
-        ready_entries[index] = existing->second;
+        ready_entries[index] = &existing->second;
     }
 
     for (size_t index = 0; index < requests.size(); ++index)
     {
-        const std::shared_ptr<Entry>& entry = ready_entries[index];
+        const std::shared_ptr<Entry>& entry = *ready_entries[index];
         if (requests[index].victim_execution.enabled)
         {
             entry->victim_execution = requests[index].victim_execution;

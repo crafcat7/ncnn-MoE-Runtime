@@ -32,6 +32,8 @@ struct ExpertPlan
     ExpertLayout layout = ExpertLayout::GateUpDown;
     float activation_limit = 0.0f;
     uint64_t weight_size = 0;
+    uint32_t residency_group = 0;
+    bool use_gpu_cache = false;
 };
 
 #define NCNN_MOE_ATTN_PLAN_SINK_BIT     0

@@ -5,7 +5,9 @@
 #include "kernels/int4.h"
 #include "models/tensornames.h"
 #include "backends/ncnn/modelpipeline.h"
+#include "backends/ncnn/expertbackend_vulkan.h"
 #include "storage/expertcache.h"
+#include "engine/expert.h"
 
 #include <algorithm>
 #include <cassert>
@@ -286,14 +288,17 @@ static Result<TensorHandle> require_tensor(const WeightStore& weights, const std
             return Error{ErrorCode::InvalidModel, "MXFP4 tensor must be a matrix with 32-aligned columns: " + name};
         if (tensor.mxfp4_file_storage)
         {
-            const uint64_t stored_blocks = tensor.mxfp4_file_storage->blocks_size + tensor.mxfp4_file_storage->secondary_blocks_size;
-            const uint64_t stored_scales = tensor.mxfp4_file_storage->scales_size + tensor.mxfp4_file_storage->secondary_scales_size;
+            const auto& storage = *tensor.mxfp4_file_storage;
+            const uint64_t stored_blocks = storage.blocks_size + storage.secondary_blocks_size;
+            const uint64_t stored_scales = storage.scales_size + storage.secondary_scales_size;
+            const bool gguf = storage.layout == MxFp4FileLayout::GgufBlockInterleaved;
             if (!tensor.mxfp4_blocks.empty()
                 || !tensor.mxfp4_scales.empty()
-                || tensor.mxfp4_file_storage->blocks_path.empty()
-                || tensor.mxfp4_file_storage->scales_path.empty()
-                || stored_blocks != tensor.element_count() / 2
-                || stored_scales != tensor.element_count() / 32)
+                || storage.blocks_path.empty()
+                || (gguf ? !storage.scales_path.empty() || !storage.secondary_scales_path.empty()
+                               || stored_blocks != tensor.element_count() / 32 * 17 || stored_scales != 0
+                         : storage.scales_path.empty() || stored_blocks != tensor.element_count() / 2
+                               || stored_scales != tensor.element_count() / 32))
             {
                 return Error{ErrorCode::InvalidModel, "invalid file-backed MXFP4 storage: " + name};
             }
@@ -1674,7 +1679,8 @@ static Result<void> compile_moe_layer(CompiledModel& compiled, const std::string
 }
 
 static Result<void> compile_dense_layer(CompiledModel& compiled, const std::string& layer_name,
-                                        const LayerDescriptor& layer, CompiledLayerPlan& layer_plan)
+                                        const LayerDescriptor& layer, CompiledLayerPlan& layer_plan,
+                                        bool use_vulkan_experts)
 {
     const uint32_t hidden_size = compiled.descriptor.hidden_size;
     auto status = assign_required_tensor(compiled.weights, layer_name + "pre_ffn_norm.weight",
@@ -1700,6 +1706,23 @@ static Result<void> compile_dense_layer(CompiledModel& compiled, const std::stri
     if (!status)
         return status.error();
     ffn.weight_size = expert_weight_size(compiled.weights, ffn);
+    if (use_vulkan_experts && compiled.opt.hybrid_mode != HybridMode::CpuOnly
+        && support_vulkan_expert(ffn, compiled.weights.at(ffn.gate_weight), compiled.weights.at(ffn.down_weight),
+                                 compiled.opt.optimization_flags, &compiled.weights.at(ffn.up_weight)))
+    {
+        const uint64_t device_size = native_quantized_expert_storage_bytes(compiled.weights.at(ffn.gate_weight),
+                                                                           &compiled.weights.at(ffn.up_weight),
+                                                                           compiled.weights.at(ffn.down_weight),
+                                                                           layer_plan.vulkan_device_index, compiled.vulkan_runtime,
+                                                                           compiled.opt.optimization_flags);
+        if (device_size != 0)
+        {
+            ffn.cache_key = "dense:" + layer_name + "ffn";
+            ffn.residency_group = layer_plan.layer_id;
+            ffn.use_gpu_cache = true;
+            ffn.weight_size = device_size;
+        }
+    }
     return {};
 }
 
@@ -1978,7 +2001,8 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
             return ple_status.error();
 
         auto ret = layer.dense.enabled()
-                       ? compile_dense_layer(compiled, layer_name, layer, layer_plan)
+                       ? compile_dense_layer(compiled, layer_name, layer, layer_plan,
+                                             has_flag(opt.flags, BackendVulkanExperts))
                        : compile_moe_layer(compiled, layer_name, layer, layer_plan, use_file_backed_experts,
                                            has_flag(opt.flags, BackendVulkanExperts));
         if (!ret)

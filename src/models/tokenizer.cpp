@@ -1,6 +1,7 @@
 #include "tokenizer.h"
 
 #include "json.h"
+#include "gguf.h"
 #include "modeladapter.h"
 #include "storage/mappedfile.h"
 #include "unicodedata.h"
@@ -549,7 +550,11 @@ bool Tokenizer::load(const std::string& model_directory, size_t vocabulary_size)
     Tokenizer loaded;
     try
     {
-        if (!loaded.load_impl(model_directory, vocabulary_size))
+        const std::filesystem::path path(model_directory);
+        const bool gguf = std::filesystem::is_regular_file(path)
+                          || !std::filesystem::is_regular_file(path / "tokenizer.json");
+        if (!(gguf ? loaded.load_gguf_impl(model_directory, vocabulary_size)
+                   : loaded.load_impl(model_directory, vocabulary_size)))
             return false;
     }
     catch (...)
@@ -557,6 +562,293 @@ bool Tokenizer::load(const std::string& model_directory, size_t vocabulary_size)
         return false;
     }
     *this = std::move(loaded);
+    return true;
+}
+
+bool Tokenizer::load_gguf_impl(const std::string& model_path, size_t vocabulary_size)
+{
+    auto opened = GgufArchive::open(model_path);
+    if (!opened)
+        return false;
+    const GgufArchive& archive = opened.value();
+    const auto string_value = [&](const char* key) -> const std::string* {
+        const auto* item = archive.find_metadata(key);
+        return item ? item->string() : nullptr;
+    };
+    const auto array_value = [&](const char* key) -> const GgufMetadataValue::Array* {
+        const auto* item = archive.find_metadata(key);
+        return item ? item->array() : nullptr;
+    };
+    const auto integer_value = [&](const char* key) -> std::optional<uint64_t> {
+        const auto* item = archive.find_metadata(key);
+        return item ? item->unsigned_integer() : std::nullopt;
+    };
+    const auto optional_id = [&](const char* key, uint64_t expected) {
+        return !archive.find_metadata(key) || integer_value(key) == expected;
+    };
+    const auto* architecture = string_value("general.architecture");
+    const auto* model = string_value("tokenizer.ggml.model");
+    const auto* pre = string_value("tokenizer.ggml.pre");
+    const auto* tokens = array_value("tokenizer.ggml.tokens");
+    const auto* types = array_value("tokenizer.ggml.token_type");
+    const auto* merge_list = array_value("tokenizer.ggml.merges");
+    if (!architecture || !model || *model != "gpt2" || !pre || !tokens || !types
+        || types->size() != tokens->size() || !merge_list || merge_list->empty())
+        return false;
+
+    Family new_family = Family::None;
+    size_t base_vocabulary = 0;
+    size_t total_vocabulary = 0;
+    if (*architecture == "deepseek4" && *pre == "joyai-llm")
+    {
+        new_family = Family::DeepSeekV4;
+        base_vocabulary = 128000;
+        total_vocabulary = 129280;
+        if (integer_value("tokenizer.ggml.bos_token_id") != 0
+            || integer_value("tokenizer.ggml.eos_token_id") != 1)
+            return false;
+    }
+    else if (*architecture == "gpt-oss" && *pre == "gpt-4o")
+    {
+        new_family = Family::GptOss;
+        base_vocabulary = 199998;
+        total_vocabulary = 201088;
+        if (integer_value("tokenizer.ggml.bos_token_id") != 199998
+            || integer_value("tokenizer.ggml.eos_token_id") != 200002
+            || !optional_id("tokenizer.ggml.padding_token_id", 199999))
+            return false;
+    }
+    else if ((*architecture == "qwen35" || *architecture == "qwen35moe" || *architecture == "qwen4exp")
+             && *pre == "qwen35")
+    {
+        base_vocabulary = 248044;
+        total_vocabulary = 248320;
+        if (integer_value("tokenizer.ggml.eos_token_id") != 248046
+            || !optional_id("tokenizer.ggml.bos_token_id", 248044)
+            || !optional_id("tokenizer.ggml.padding_token_id", 248044))
+            return false;
+        const auto* chat = string_value("tokenizer.chat_template");
+        if (!chat)
+            return false;
+        if (*chat == std::string_view(qwen38_template, sizeof(qwen38_template) - 1))
+            new_family = Family::Qwen38;
+        else if (*architecture != "qwen4exp")
+        {
+            bool supported = *chat == std::string_view(qwen36_template, sizeof(qwen36_template) - 1);
+            if (!supported && *architecture == "qwen35")
+            {
+                std::string dense_template(qwen36_template, sizeof(qwen36_template) - 1);
+                const std::pair<std::string_view, std::string_view> differences[] = {
+                    {"(preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index)", "loop.index0 > ns.last_query_index"},
+                    {"args_value | string if args_value is string else args_value | tojson | safe", "args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string"},
+                };
+                for (const auto& difference : differences)
+                {
+                    const size_t position = dense_template.find(difference.first);
+                    if (position == std::string::npos)
+                        return false;
+                    dense_template.replace(position, difference.first.size(), difference.second);
+                }
+                supported = *chat == dense_template;
+            }
+            if (supported)
+                new_family = Family::Qwen36;
+        }
+        // Architecture and the BPE profile do not identify a chat revision.
+        // Accept only templates whose string-message behavior is implemented.
+        if (new_family == Family::None)
+            return false;
+    }
+    else
+        return false;
+    if (tokens->size() != total_vocabulary || (vocabulary_size != 0 && vocabulary_size != total_vocabulary))
+        return false;
+    for (const char* key : {"tokenizer.ggml.add_bos_token", "tokenizer.ggml.add_eos_token", "tokenizer.ggml.add_space_prefix"})
+    {
+        const auto* item = archive.find_metadata(key);
+        if (item && item->boolean() != std::optional<bool>(false))
+            return false;
+    }
+    const bool qwen = new_family == Family::Qwen36 || new_family == Family::Qwen38;
+    const bool gpt = new_family == Family::GptOss;
+    const bool deepseek = new_family == Family::DeepSeekV4;
+    static const std::array<std::string_view, 21> gpt_tokens = {
+        "<|startoftext|>", "<|endoftext|>", "<|reserved_200000|>", "<|reserved_200001|>", "<|return|>",
+        "<|constrain|>", "<|reserved_200004|>", "<|channel|>", "<|start|>", "<|end|>", "<|message|>",
+        "<|reserved_200009|>", "<|reserved_200010|>", "<|reserved_200011|>", "<|call|>",
+        "<|reserved_200013|>", "<|reserved_200014|>", "<|reserved_200015|>", "<|reserved_200016|>",
+        "<|reserved_200017|>", "<|endofprompt|>"};
+    static const std::array<std::string_view, 33> qwen_tokens = {
+        "<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|object_ref_start|>", "<|object_ref_end|>",
+        "<|box_start|>", "<|box_end|>", "<|quad_start|>", "<|quad_end|>", "<|vision_start|>", "<|vision_end|>",
+        "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>", "<tool_call>", "</tool_call>", "<|fim_prefix|>",
+        "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>", "<tool_response>",
+        "</tool_response>", "<think>", "</think>", "<|audio_start|>", "<|audio_end|>", "<tts_pad>", "<tts_text_bos>",
+        "<tts_text_eod>", "<tts_text_bos_single>", "<|audio_pad|>"};
+    if (gpt || qwen)
+    {
+        const std::span<const std::string_view> expected = gpt ? std::span<const std::string_view>(gpt_tokens)
+                                                               : std::span<const std::string_view>(qwen_tokens);
+        for (size_t i = 0; i < expected.size(); ++i)
+        {
+            const auto* token = (*tokens)[base_vocabulary + i].string();
+            if (!token || (*token != expected[i] && !(gpt && i == 20 && *token == "<|reserved_200018|>")))
+                return false;
+        }
+    }
+    else
+    {
+        static const std::array<std::pair<uint32_t, std::string_view>, 10> required = {{{0, "<｜begin▁of▁sentence｜>"}, {1, "<｜end▁of▁sentence｜>"}, {2, "<｜▁pad▁｜>"}, {128803, "<｜User｜>"}, {128804, "<｜Assistant｜>"}, {128821, "<think>"}, {128822, "</think>"}, {128825, "｜DSML｜"}, {128828, "<｜latest_reminder｜>"}, {129279, "<｜image｜>"}}};
+        for (const auto& item : required)
+        {
+            const auto* token = (*tokens)[item.first].string();
+            if (!token || *token != item.second)
+                return false;
+        }
+    }
+
+    constexpr size_t max_bytes = 64 * 1024 * 1024;
+    std::array<int16_t, 512> byte_for_symbol;
+    byte_for_symbol.fill(-1);
+    std::array<uint32_t, 256> symbol_for_byte{};
+    uint32_t next_symbol = 256;
+    for (uint32_t byte = 0; byte < 256; ++byte)
+    {
+        const bool visible = (byte >= 33 && byte <= 126) || (byte >= 161 && byte <= 172)
+                             || (byte >= 174 && byte <= 255);
+        const uint32_t symbol = visible ? byte : next_symbol++;
+        symbol_for_byte[byte] = symbol;
+        byte_for_symbol[symbol] = static_cast<int16_t>(byte);
+    }
+    index.resize(total_vocabulary);
+    std::unordered_map<std::string, uint32_t> vocab;
+    vocab.reserve(total_vocabulary);
+    added_token_trie.emplace_back();
+    const auto add_token = [&](uint32_t id, std::string_view token) {
+        uint32_t node = 0;
+        for (const unsigned char byte : token)
+        {
+            const auto& edges = added_token_trie[node].edges;
+            const auto edge = std::lower_bound(edges.begin(), edges.end(), byte,
+                                               [](const auto& item, uint8_t value) { return item.first < value; });
+            if (edge == edges.end() || edge->first != byte)
+            {
+                const uint32_t child = static_cast<uint32_t>(added_token_trie.size());
+                added_token_trie.emplace_back();
+                auto& parent = added_token_trie[node].edges;
+                const auto at = std::lower_bound(parent.begin(), parent.end(), byte,
+                                                 [](const auto& item, uint8_t value) { return item.first < value; });
+                parent.insert(at, {byte, child});
+                node = child;
+            }
+            else
+                node = edge->second;
+        }
+        added_token_trie[node].token_id = id;
+        added_token_trie[node].terminal = true;
+    };
+    const auto store = [&](uint32_t id, std::string_view token, bool added, bool special) {
+        Entry& entry = index[id];
+        entry.offset = static_cast<uint32_t>(bytes.size());
+        for (size_t offset = 0; offset < token.size();)
+        {
+            if (bytes.size() >= max_bytes)
+                return false;
+            if (added)
+                bytes.push_back(static_cast<uint8_t>(token[offset++]));
+            else
+            {
+                const uint32_t cp = read_utf8(token, offset);
+                if (cp >= byte_for_symbol.size() || byte_for_symbol[cp] < 0)
+                    return false;
+                bytes.push_back(static_cast<uint8_t>(byte_for_symbol[cp]));
+            }
+        }
+        entry.length = static_cast<uint32_t>(bytes.size() - entry.offset);
+        entry.flags = static_cast<uint8_t>(Present | (special ? Special : 0));
+        return true;
+    };
+    for (uint32_t id = 0; id < tokens->size(); ++id)
+    {
+        const auto* token = (*tokens)[id].string();
+        const auto type = (*types)[id].integer();
+        const bool added = (deepseek && id < 3) || id >= base_vocabulary;
+        const size_t added_count = gpt ? gpt_tokens.size() : qwen ? qwen_tokens.size()
+                                                                  : total_vocabulary - base_vocabulary;
+        const bool unused = !deepseek && id >= base_vocabulary + added_count;
+        if (!token || token->empty() || !type || !vocab.emplace(*token, id).second)
+            return false;
+        if (unused)
+        {
+            // Standard GGUF exporters pad the logits vocabulary with UNUSED
+            // pieces. GPT-OSS replaces these with Harmony reserved spellings.
+            if (*type != 5 && !(gpt && (*type == 3 || *type == 4) && *token == "<|reserved_" + std::to_string(id) + "|>"))
+                return false;
+            continue;
+        }
+        if (added ? *type != 3 && *type != 4 : *type != 1)
+            return false;
+        // GGUF exporters may promote user-defined <|fim_*|> pieces to CONTROL.
+        // The supported Qwen profile still exposes them, as its HF tokenizer does.
+        const size_t relative = added && id >= base_vocabulary ? id - base_vocabulary : 0;
+        const bool special = qwen  ? added && (relative < 14 || relative >= 26)
+                             : gpt ? added
+                                   : id < 3 || *type == 3;
+        if (!store(id, *token, added, special))
+            return false;
+        if (added && !(gpt && id == 200018))
+            add_token(id, *token);
+        else if (gpt && !added)
+        {
+            const Entry& entry = index[id];
+            if (!raw_piece_ids.emplace(std::string(reinterpret_cast<const char*>(bytes.data() + entry.offset), entry.length), id).second)
+                return false;
+        }
+    }
+    for (uint32_t byte = 0; byte < 256; ++byte)
+    {
+        std::string symbol;
+        append_utf8(symbol_for_byte[byte], symbol);
+        const auto found = vocab.find(symbol);
+        if (found == vocab.end() || found->second >= base_vocabulary || (deepseek && found->second < 3))
+            return false;
+        byte_ids[byte] = static_cast<int32_t>(found->second);
+    }
+    merges.reserve(merge_list->size());
+    for (size_t rank = 0; rank < merge_list->size(); ++rank)
+    {
+        const auto* text = (*merge_list)[rank].string();
+        if (!text || rank >= std::numeric_limits<uint32_t>::max())
+            return false;
+        const size_t separator = text->find(' ');
+        if (separator == std::string::npos || separator == 0 || separator + 1 == text->size())
+            return false;
+        const auto left = vocab.find(text->substr(0, separator));
+        const auto right = vocab.find(text->substr(separator + 1));
+        const auto merged = vocab.find(text->substr(0, separator) + text->substr(separator + 1));
+        if (left == vocab.end() || right == vocab.end() || merged == vocab.end()
+            || left->second >= base_vocabulary || right->second >= base_vocabulary || merged->second >= base_vocabulary
+            || (deepseek && (left->second < 3 || right->second < 3 || merged->second < 3))
+            || !merges.emplace(merge_key(left->second, right->second), Merge{static_cast<uint32_t>(rank), merged->second}).second)
+            return false;
+    }
+    if (gpt)
+    {
+        // Match Harmony's reserved overlay, including one non-logits sentinel.
+        index.resize(total_vocabulary + 1);
+        for (uint32_t id = 200018; id <= total_vocabulary; ++id)
+        {
+            const std::string token = "<|reserved_" + std::to_string(id) + "|>";
+            if (!store(id, token, true, true))
+                return false;
+            add_token(id, token);
+        }
+        stops = {200002, 200012};
+    }
+    else
+        stops = qwen ? std::vector<int32_t>{248046, 248044} : std::vector<int32_t>{1};
+    family = new_family;
+    ignore_merges = gpt;
     return true;
 }
 
@@ -2124,66 +2416,83 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
 
     if (family == Family::DeepSeekV4)
     {
-        std::vector<Message> normalized;
-        for (const Message& message : messages)
+        size_t count = 0;
+        for (size_t i = 0; i < messages.size(); ++i)
         {
+            Message& message = messages[i];
             if (message.role != "system" && message.role != "developer" && message.role != "user" && message.role != "assistant" && message.role != "tool")
                 throw std::invalid_argument("Unknown DeepSeek-V4 role");
             if (message.role == "tool")
             {
-                const std::string tool_result = "<tool_result>" + message.content + "</tool_result>";
-                if (!normalized.empty() && normalized.back().role == "user")
-                    normalized.back().content += "\n\n" + tool_result;
-                else
-                    normalized.push_back({"user", tool_result});
+                if (count != 0 && messages[count - 1].role == "user")
+                {
+                    std::string& content = messages[count - 1].content;
+                    content.append("\n\n<tool_result>");
+                    content.append(message.content);
+                    content.append("</tool_result>");
+                    continue;
+                }
+                message.role = "user";
+                message.content.insert(0, "<tool_result>");
+                message.content.append("</tool_result>");
             }
-            else if (message.role == "user" && !normalized.empty() && normalized.back().role == "user")
+            else if (message.role == "user" && count != 0 && messages[count - 1].role == "user")
             {
-                normalized.back().content += "\n\n" + message.content;
+                std::string& content = messages[count - 1].content;
+                content.append("\n\n");
+                content.append(message.content);
+                continue;
             }
-            else
-                normalized.push_back({message.role, message.content});
+            if (count != i)
+                messages[count] = std::move(message);
+            ++count;
         }
+        messages.resize(count);
         int32_t last_user_index = -1;
-        for (size_t i = 0; i < normalized.size(); ++i)
+        for (size_t i = 0; i < messages.size(); ++i)
         {
-            if (normalized[i].role == "user")
+            if (messages[i].role == "user")
                 last_user_index = static_cast<int32_t>(i);
         }
         const bool thinking = enable_thinking;
         if (thinking && last_user_index >= 0)
         {
-            std::vector<Message> kept;
-            kept.reserve(normalized.size());
-            for (size_t i = 0; i < normalized.size(); ++i)
+            count = 0;
+            for (size_t i = 0; i < messages.size(); ++i)
             {
-                if (normalized[i].role == "developer" && static_cast<int32_t>(i) < last_user_index)
+                if (messages[i].role == "developer" && static_cast<int32_t>(i) < last_user_index)
                     continue;
-                kept.push_back(std::move(normalized[i]));
+                if (count != i)
+                    messages[count] = std::move(messages[i]);
+                ++count;
             }
-            normalized.swap(kept);
+            messages.resize(count);
             last_user_index = -1;
-            for (size_t i = 0; i < normalized.size(); ++i)
+            for (size_t i = 0; i < messages.size(); ++i)
             {
-                if (normalized[i].role == "user")
+                if (messages[i].role == "user")
                     last_user_index = static_cast<int32_t>(i);
             }
         }
 
         std::string prompt = "<｜begin▁of▁sentence｜>";
-        for (size_t i = 0; i < normalized.size(); ++i)
+        for (size_t i = 0; i < messages.size(); ++i)
         {
-            const Message& message = normalized[i];
+            const Message& message = messages[i];
             if (message.role == "system")
                 prompt += message.content;
             else if (message.role == "developer")
             {
                 if (message.content.empty())
                     throw std::invalid_argument("Invalid message for role developer");
-                prompt += "<｜User｜>" + message.content;
+                prompt += "<｜User｜>";
+                prompt += message.content;
             }
             else if (message.role == "user")
-                prompt += "<｜User｜>" + message.content;
+            {
+                prompt += "<｜User｜>";
+                prompt += message.content;
+            }
             else if (message.role == "assistant")
             {
                 if (thinking && static_cast<int32_t>(i) > last_user_index)
@@ -2191,8 +2500,8 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
                 prompt += message.content;
                 prompt += "<｜end▁of▁sentence｜>";
             }
-            const bool next_is_assistant = i + 1 < normalized.size() && normalized[i + 1].role == "assistant";
-            if (i + 1 < normalized.size() && !next_is_assistant)
+            const bool next_is_assistant = i + 1 < messages.size() && messages[i + 1].role == "assistant";
+            if (i + 1 < messages.size() && !next_is_assistant)
                 continue;
             if (message.role == "user" || message.role == "developer")
             {

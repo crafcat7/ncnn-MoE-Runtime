@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free tests for the native-text worker client and chat flow."""
+"""Dependency-free unit tests, or a worker smoke test with --worker and --model."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import copy
 import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -34,6 +35,8 @@ from ncnn_moe import (  # noqa: E402
     find_worker,
     load_adapter,
     parse_arguments,
+    resolve_model,
+    lightweight_model_fingerprint,
 )
 from ncnn_moe_protocol import WorkerClient, WorkerError  # noqa: E402
 from ncnn_moe_state import merge_runtime_settings, runtime_args_from_settings  # noqa: E402
@@ -62,6 +65,17 @@ def _model(root: Path, model_type: str, *, context: int = 2048) -> Path:
     )
     (root / "tokenizer.json").write_text("{}", encoding="utf-8")
     return root
+
+
+def _gguf(path: Path, text: str = "tokenizer metadata") -> Path:
+    def string(value: str) -> bytes:
+        data = value.encode("utf-8")
+        return struct.pack("<Q", len(data)) + data
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(struct.pack("<4sIQQ", b"GGUF", 3, 0, 1)
+                     + string("tokenizer.stub") + struct.pack("<I", 8) + string(text))
+    return path
 
 
 def _ready(stop_tokens: list[int] | None = None, *, supported: bool = True) -> dict[str, object]:
@@ -266,6 +280,75 @@ class RuntimeOptionsTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_all_gguf_families_use_authoritative_worker_profile(self) -> None:
+        cases = (*FAMILY_CASES, ("qwen3_5", "qwen3.6", [248046, 248044]),
+                 ("qwen35", "qwen3.6", [248046, 248044]),
+                 ("qwen35moe", "qwen3.6", [248046, 248044]),
+                 ("qwen4exp", "qwen3.8", [248046, 248044]),
+                 ("deepseek4", "deepseek-v4", [1]))
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-gguf-families-") as directory:
+            root = Path(directory)
+            for model_type, name, stops in cases:
+                with self.subTest(model_type=model_type):
+                    source = _gguf(root / model_type / "model.gguf")
+                    ready = _ready(stops)
+                    ready["model"].update(model_type=model_type)
+                    self.assertEqual(load_adapter(_arguments(), source, ready).name, name)
+                    # A stale config must not override the archive's selected
+                    # family after the native loader identified it.
+                    (source.parent / "config.json").write_text(
+                        json.dumps({"model_type": "unrelated_architecture", "max_position_embeddings": 2048}), encoding="utf-8")
+                    adapter = load_adapter(_arguments(), source, ready)
+                    self.assertEqual(adapter.name, name)
+                    self.assertEqual(adapter.stop_tokens, stops)
+                    self.assertEqual(adapter.context_limit, 4096)
+
+    def test_gguf_directory_and_split_file_use_worker_model_metadata(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-gguf-") as directory:
+            root = Path(directory)
+            first = _gguf(root / "weights" / "model-00001-of-00002.gguf", "first")
+            second = _gguf(first.with_name("model-00002-of-00002.gguf"), "second")
+            ready = _ready([1])
+            ready["model"].update(model_type="deepseek_v4", max_context_tokens=1048576)
+            for source in (root, second):
+                with self.subTest(source=source):
+                    adapter = load_adapter(_arguments(), source, ready)
+                    self.assertEqual(adapter.model_type, "deepseek_v4")
+                    self.assertEqual(adapter.context_limit, 1048576)
+                    self.assertEqual(adapter.stop_tokens, [1])
+                    self.assertEqual(adapter.legacy_model_fingerprints, ())
+                    self.assertEqual(resolve_model(SimpleNamespace(model_opt=str(source))), source.resolve())
+                    self.assertEqual(len(lightweight_model_fingerprint(source)), 20)
+            before = load_adapter(_arguments(), second, ready).model_fingerprint
+            self.assertEqual(load_adapter(_arguments(), root, ready).model_fingerprint, before)
+            _gguf(first, "FIRST")
+            self.assertNotEqual(load_adapter(_arguments(), second, ready).model_fingerprint, before)
+            first.unlink()
+            with self.assertRaisesRegex(AdapterError, "incomplete"):
+                load_adapter(_arguments(), second, ready)
+
+    def test_gguf_fingerprint_includes_metadata_between_weight_samples(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-gguf-metadata-") as directory:
+            path = _gguf(Path(directory) / "model.gguf", "a" * 16000)
+            ready = _ready([1])
+            ready["model"].update(model_type="deepseek_v4")
+            before = load_adapter(_arguments(), path, ready).model_fingerprint
+            data = bytearray(path.read_bytes())
+            data[8000] = ord("b")
+            path.write_bytes(data)
+            self.assertNotEqual(load_adapter(_arguments(), path, ready).model_fingerprint, before)
+            path.write_bytes(b"GGUF")
+            with self.assertRaisesRegex(AdapterError, "truncated"):
+                load_adapter(_arguments(), path, ready)
+
+    def test_hf_directory_keeps_safetensors_precedence_over_gguf(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-hf-gguf-") as directory:
+            model = _model(Path(directory), "deepseek_v4")
+            (model / "model.safetensors").write_bytes(b"existing HF weights")
+            original = create_adapter(model).model_fingerprint
+            (model / "unrelated.gguf").write_bytes(b"not a loaded GGUF package")
+            self.assertEqual(create_adapter(model).model_fingerprint, original)
+
     def test_four_model_families_need_no_python_tokenizer_packages(self) -> None:
         original_import = __import__
 
@@ -373,6 +456,17 @@ class AdapterTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_worker_accepts_a_gguf_file_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-gguf-client-") as directory:
+            model = _gguf(Path(directory) / "model.gguf")
+            process = SimpleNamespace(stdin=io.StringIO(), stdout=io.StringIO('{"event":"ready"}\n'), poll=lambda: 0)
+            with patch("ncnn_moe_protocol.subprocess.Popen", return_value=process) as popen:
+                client = WorkerClient(Path(sys.executable), model)
+            try:
+                self.assertEqual(popen.call_args.args[0][:2], [str(Path(sys.executable).resolve()), str(model.resolve())])
+            finally:
+                client.close()
+
     class QueuedClient(WorkerClient):
         def __init__(self, events: list[dict[str, object]], *, interrupt: bool = False) -> None:
             self.events = list(events)
@@ -1051,12 +1145,10 @@ def main() -> int:
     parser.add_argument("--auto", action="store_true")
     arguments = parser.parse_args()
 
-    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
-    if not result.wasSuccessful():
-        return 1
     if arguments.worker is None and arguments.model is None:
-        return 0
+        suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        return 0 if result.wasSuccessful() else 1
     if arguments.worker is None or arguments.model is None:
         parser.error("--worker and --model must be provided together")
     _runtime_smoke(arguments.worker, arguments.model, auto=arguments.auto)

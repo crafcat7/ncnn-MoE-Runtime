@@ -52,7 +52,7 @@ static void verify_payload(const std::shared_ptr<VulkanContext>& context, const 
 static void direct_upload_pool()
 {
     auto runtime = create_vulkan_runtime();
-    auto context = VulkanContext::acquire(0, runtime, OptimizationDefaultFlags);
+    auto context = VulkanContext::acquire(get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     upload_check(static_cast<bool>(context), "upload context");
     VulkanExpertWeightAllocator weights(context->device(), 16384);
     VulkanUploadStagingAllocator first_staging(context->device(), 8192);
@@ -201,7 +201,7 @@ static void factory_direct_staging_ab()
         for (bool direct : {false, true})
         {
             const auto selected_flags = direct ? flags | OptimizationVulkanExpertDirectStaging : flags & ~OptimizationVulkanExpertDirectStaging;
-            auto backend = create_vulkan_expert_backend(8192, 0, {}, runtime, selected_flags);
+            auto backend = create_vulkan_expert_backend(8192, get_default_gpu_index(), {}, runtime, selected_flags);
             ScopedExpertBackendForeground foreground(backend);
             std::shared_ptr<const void> pin;
             upload_check(backend && backend->prepare_demand("packing-ab", gate, &gate_bias, down, &down_bias, 0, 4.0f, ExpertActivation::DeepSeekSwiGlu, pin), "MXFP4 factory packs gate/down and both bias types");
@@ -280,13 +280,13 @@ static void expert_submission_pool()
     const uint64_t flags = OptimizationDefaultFlags & ~OptimizationCpuMxfp4Q8 & ~OptimizationCpuFastSilu
                            & ~OptimizationVulkanRouteAggregation;
     const auto runtime = create_vulkan_runtime();
-    auto backend = create_vulkan_expert_backend(8192, 0, {}, runtime, flags);
+    auto backend = create_vulkan_expert_backend(8192, get_default_gpu_index(), {}, runtime, flags);
     upload_check(static_cast<bool>(backend), "submission pool backend");
     std::shared_ptr<const void> pin;
     upload_check(backend->prepare_demand("submission-pool", gate, nullptr, down, nullptr, 0, 4.0f,
                                          ExpertActivation::DeepSeekSwiGlu, pin),
                  "submission pool resident Expert");
-    const auto context = VulkanContext::acquire(0, runtime, flags);
+    const auto context = VulkanContext::acquire(get_default_gpu_index(), runtime, flags);
     upload_check(static_cast<bool>(context), "submission pool context");
 
     std::array<ActivationBuffer, 3> held_inputs;
@@ -385,7 +385,7 @@ static void expert_submission_pool()
     identity.float32_data.assign(32 * 32, 0.0f);
     for (uint32_t column = 0; column < 32; ++column)
         identity.float32_data[column * 32 + column] = 1.0f;
-    const auto graph_seed = Linear::create(identity, nullptr, 0, runtime, flags);
+    const auto graph_seed = Linear::create(identity, nullptr, get_default_gpu_index(), runtime, flags);
     upload_check(static_cast<bool>(graph_seed), "device-only pool graph seed");
     const ActivationBuffer normalized = submission_pool_input(4, 83);
     const ActivationBuffer resident_expected = submission_pool_oracle(*gate, *down, normalized, flags);
@@ -455,7 +455,7 @@ static void expert_submission_pool()
     // Submission owns completion resources independently of the backend.
     // Backend destruction drains pending GPU work, then an external handle
     // still controls whether the completed result reaches its client.
-    auto detached_backend = create_vulkan_expert_backend(8192, 0, {}, runtime, flags);
+    auto detached_backend = create_vulkan_expert_backend(8192, get_default_gpu_index(), {}, runtime, flags);
     upload_check(detached_backend && detached_backend->prepare_demand("detached-pool", gate, nullptr, down, nullptr, 0, 4.0f, ExpertActivation::DeepSeekSwiGlu, pin),
                  "detached submission resident Expert");
     const ActivationBuffer detached_input = submission_pool_input(3, 97);

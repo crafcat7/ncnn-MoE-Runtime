@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace ncnn {
@@ -20,6 +21,12 @@ enum class MxFp4KernelKind
 [[nodiscard]] MxFp4KernelKind mxfp4_kernel_kind() noexcept;
 [[nodiscard]] const char* mxfp4_kernel_name() noexcept;
 [[nodiscard]] uint32_t mxfp4_decode_row_pair_group_size() noexcept;
+
+// Split GGUF's 17-byte blocks and reorder their low/high half-block nibbles
+// into the adjacent-value packing used by the CPU and Vulkan MXFP4 kernels.
+[[nodiscard]] bool unpack_gguf_mxfp4(std::span<const uint8_t> source,
+                                     std::span<uint8_t> blocks,
+                                     std::span<uint8_t> scales) noexcept;
 
 [[nodiscard]] float mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input) noexcept;
 

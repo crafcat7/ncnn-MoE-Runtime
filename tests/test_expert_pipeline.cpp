@@ -2,6 +2,7 @@
 #include "engine/executor.h"
 #include "backends/ncnn/modelpipeline.h"
 #include "backends/ncnn/vulkan.h"
+#include "backends/ncnn/vulkancontext.h"
 #include "graph/compiler.h"
 #include "kernels/bfloat16.h"
 #include "engine/expertbackend.h"
@@ -935,7 +936,7 @@ static CompiledModel pipeline_host_shared_model(bool enabled, bool gpu_shared, b
     if (!enabled) option.optimization_flags &= ~OptimizationVulkanSharedExpertOverlap;
     // Keep routed GPU eligibility independent of optional Shared capability.
     if (!cpu_only) option.flags |= BackendVulkanExperts | BackendVulkanDense;
-    option.device_index = 0;
+    option.device_index = get_default_gpu_index();
     option.vulkan_runtime = create_vulkan_runtime();
     CompiledModel model;
     const auto compiled = compile_model(std::move(descriptor), std::move(weights), model,
@@ -1035,15 +1036,24 @@ static std::vector<float> pipeline_host_shared_case(bool staged, bool enabled, b
 
 static void pipeline_host_shared_tests()
 {
+    const auto context = VulkanContext::acquire(get_default_gpu_index(), create_vulkan_runtime(), OptimizationDefaultFlags);
+    pipeline_check(static_cast<bool>(context), "create Shared Expert capability context");
+    const bool bf16_gpu_shared_supported = context->device()->info.subgroup_size() == 32;
+    if (!bf16_gpu_shared_supported)
+        std::cout << "SKIP: BF16 GPU Shared Expert cases require Vulkan subgroup size 32; float32/CPU Shared cases still run\n";
     for (bool staged : {false, true})
     {
-        const auto expected = pipeline_host_shared_case(staged, false, false);
-        for (const auto& actual : {
-                 pipeline_host_shared_case(staged, true, false),
-                 pipeline_host_shared_case(staged, true, true),
-                 pipeline_host_shared_case(staged, true, false, false),
-                 pipeline_host_shared_case(staged, true, false, false, true),
-             })
+        const auto expected = pipeline_host_shared_case(staged, false, false, bf16_gpu_shared_supported);
+        std::vector<std::vector<float>> actuals;
+        actuals.reserve(bf16_gpu_shared_supported ? 4 : 2);
+        if (bf16_gpu_shared_supported)
+        {
+            actuals.push_back(pipeline_host_shared_case(staged, true, false));
+            actuals.push_back(pipeline_host_shared_case(staged, true, true));
+        }
+        actuals.push_back(pipeline_host_shared_case(staged, true, false, false));
+        actuals.push_back(pipeline_host_shared_case(staged, true, false, false, true));
+        for (const auto& actual : actuals)
         {
             pipeline_check(actual.size() == expected.size(), "host Shared executor logits shape");
             for (size_t index = 0; index < expected.size(); ++index)

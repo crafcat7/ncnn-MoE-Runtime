@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import gc
 import contextlib
 import io
 import struct
@@ -96,6 +97,8 @@ class ImportTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
 
     def tearDown(self):
+        # Mock call histories can retain GGUF mmap views in reference cycles.
+        gc.collect()
         self.temporary.cleanup()
 
     def assets(self, quant=None, model_type="qwen3_5") -> Path:

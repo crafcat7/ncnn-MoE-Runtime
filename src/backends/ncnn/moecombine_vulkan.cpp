@@ -29,12 +29,11 @@ static ncnn::Option combine_option(const std::shared_ptr<VulkanContext>& context
     return opt;
 }
 
-static bool reset_combine_command(VulkanTransferSlot& slot, VulkanRuntimeState& state)
+static bool reset_combine_command(VulkanTransferSlot& slot)
 {
     if (slot.command_used)
     {
         if (slot.command->reset() != 0) return false;
-        ++state.command_buffer_reuses;
     }
     slot.command_used = true;
     return true;
@@ -356,7 +355,7 @@ bool MoeCombine_vulkan::combine(std::span<const MoeCombineInput_vulkan> inputs,
     auto& slot = lease.slot();
     auto& state = d->context->runtime_state();
     const std::lock_guard<std::mutex> lock(d->context->command_mutex());
-    if (!reset_combine_command(slot, state)) return false;
+    if (!reset_combine_command(slot)) return false;
     auto& cmd = *slot.command;
     ncnn::VkMat combined;
     std::vector<ncnn::VkMat> storage;
@@ -391,7 +390,7 @@ bool MoeCombine_vulkan::materialize(const DeviceTensor_vulkan& input, Activation
     auto& state = context->runtime_state();
     const auto opt = combine_option(context);
     const std::lock_guard<std::mutex> lock(context->command_mutex());
-    if (!reset_combine_command(slot, state)) return false;
+    if (!reset_combine_command(slot)) return false;
     input.prepare_read();
     auto& cmd = *slot.command;
     if (!prepare_staging_batch(slot.download, input.rows(), input.columns(), slot.staging_allocator)

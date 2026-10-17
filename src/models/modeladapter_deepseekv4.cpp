@@ -25,6 +25,8 @@ static Result<DType> deepseek_projection_dtype(const SafetensorsArchive& archive
 static bool is_deepseek_fp4_expert(const SafetensorsArchive& archive, const std::string& source)
 {
     const SafetensorInfo* weight = archive.find(source + "w1.weight");
+    if (weight && weight->dtype == "MXFP4")
+        return true;
     return weight && weight->dtype == "I8" && archive.find(source + "w1.scale")
            && !archive.find(source + "w1.weight.__int4_shape")
            && !archive.find(source + "w1.weight.__qnk_shape");
@@ -372,7 +374,7 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
     std::optional<SafetensorsArchive> archive;
     if (!package.root.empty())
     {
-        auto opened = SafetensorsArchive::open(package.root, package.manifest.raw_json);
+        auto opened = SafetensorsArchive::open(package.weights_path.empty() ? package.root : package.weights_path, package.manifest.raw_json);
         if (opened)
             archive = std::move(opened).value();
     }
@@ -527,7 +529,7 @@ Result<WeightMapping> DeepSeekV4ModelAdapter::map_weights(const ModelPackage& pa
     if (descriptor.model_type != "deepseek_v4")
         return Error{ErrorCode::UnsupportedModel, "unsupported DeepSeek model_type: " + descriptor.model_type};
 
-    auto opened = SafetensorsArchive::open(package.root, package.manifest.raw_json);
+    auto opened = SafetensorsArchive::open(package.weights_path.empty() ? package.root : package.weights_path, package.manifest.raw_json);
     if (!opened)
         return opened.error();
     SafetensorsArchive archive = std::move(opened).value();

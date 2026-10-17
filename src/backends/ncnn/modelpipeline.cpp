@@ -39,7 +39,8 @@ static Result<void> prepare_vulkan_linear_operator(WeightStore& weights,
                                                    const VulkanRuntimePtr& vulkan_runtime,
                                                    uint64_t optimization_flags,
                                                    uint32_t input_group_count = 1,
-                                                   bool prefer_bfloat16_vulkan = true)
+                                                   bool prefer_bfloat16_vulkan = true,
+                                                   bool allow_float32_fallback = true)
 {
     TensorData& matrix = weights.at_mutable(matrix_handle);
     CompiledOperator& compiled_operator = operators.at_weight_mutable(matrix_handle);
@@ -84,6 +85,8 @@ static Result<void> prepare_vulkan_linear_operator(WeightStore& weights,
                                                                    optimization_flags);
         if (compiled_operator.bfloat16)
             return {};
+        if (!allow_float32_fallback)
+            return Error{ErrorCode::InternalError, "failed to create Vulkan BF16 Linear operator"};
     }
     compiled_operator.linear = Linear::create(matrix,
                                               bias,
@@ -95,11 +98,12 @@ static Result<void> prepare_vulkan_linear_operator(WeightStore& weights,
     return {};
 }
 
-static Result<void> prepare_lm_head_operator(CompiledModel& compiled)
+static Result<void> prepare_lm_head_operator(CompiledModel& compiled, bool allow_float32_fallback = true,
+                                             bool prefer_bfloat16_vulkan = true)
 {
     auto prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, compiled.lm_head_weight, invalid_tensor_handle,
                                                    compiled.opt.vulkan_device_index, compiled.vulkan_runtime,
-                                                   compiled.opt.optimization_flags);
+                                                   compiled.opt.optimization_flags, 1, prefer_bfloat16_vulkan, allow_float32_fallback);
     if (!prepared)
         return prepared.error();
     const CompiledOperator& lm_head_operator = compiled.operators.at_weight(compiled.lm_head_weight);
@@ -144,6 +148,19 @@ bool support_vulkan_ffn(const CompiledOperatorTable& operators, const ExpertPlan
            && prepared(operators.at_weight(ffn.gate_weight))
            && prepared(operators.at_weight(ffn.up_weight))
            && prepared(operators.at_weight(ffn.down_weight));
+}
+
+bool support_vulkan_dense_ffn(const CompiledOperatorTable& operators, const ExpertPlan& ffn) noexcept
+{
+    if (support_vulkan_ffn(operators, ffn))
+        return true;
+    for (TensorHandle handle : {ffn.gate_weight, ffn.up_weight, ffn.down_weight})
+    {
+        const CompiledOperator& op = operators.at_weight(handle);
+        if (op.bfloat16 || op.float8 || op.qnk || op.linear)
+            return true;
+    }
+    return false;
 }
 
 bool support_vulkan_shared_experts(const CompiledOperatorTable& operators,
@@ -274,12 +291,16 @@ bool support_vulkan_attention(const CompiledOperatorTable& operators,
     {
         return true;
     }
+    if (uses_vulkan_dense_operator(operators.at(attention.fused_qkv_operator))
+        || uses_vulkan_dense_operator(operators.at(attention.fused_qkv_gate_bfloat16_operator)))
+        return true;
 
     const TensorHandle dense_handles[] = {
         attention.query_weight,
         attention.key_weight,
         attention.value_weight,
         attention.output_weight,
+        attention.output_gate_weight,
         attention.query_a_weight,
         attention.query_b_weight,
         attention.key_value_weight,
@@ -419,7 +440,8 @@ static Result<void> prepare_ffn_operators(WeightStore& weights,
                                           ExpertPlan& ffn,
                                           uint32_t vulkan_device_index,
                                           const VulkanRuntimePtr& vulkan_runtime,
-                                          uint64_t optimization_flags)
+                                          uint64_t optimization_flags,
+                                          bool allow_float32_fallback = true)
 {
     const TensorData& gate = weights.at(ffn.gate_weight);
     const TensorData& up = weights.at(ffn.up_weight);
@@ -446,13 +468,15 @@ static Result<void> prepare_ffn_operators(WeightStore& weights,
             ffn.vulkan_operator = operators.allocate();
             operators.at_mutable(ffn.vulkan_operator).bfloat16 = std::move(fused);
             return prepare_vulkan_linear_operator(weights, operators, ffn.down_weight, invalid_tensor_handle,
-                                                  vulkan_device_index, vulkan_runtime, optimization_flags);
+                                                  vulkan_device_index, vulkan_runtime, optimization_flags, 1, true, allow_float32_fallback);
         }
     }
+    if (!allow_float32_fallback)
+        return Error{ErrorCode::InternalError, "failed to create fused Vulkan BF16 FFN operator"};
     for (TensorHandle handle : {ffn.gate_weight, ffn.up_weight, ffn.down_weight})
     {
         auto prepared = prepare_vulkan_linear_operator(weights, operators, handle, invalid_tensor_handle,
-                                                       vulkan_device_index, vulkan_runtime, optimization_flags);
+                                                       vulkan_device_index, vulkan_runtime, optimization_flags, 1, true, allow_float32_fallback);
         if (!prepared)
             return prepared.error();
     }
@@ -542,7 +566,8 @@ static Result<void> prepare_shared_expert_operators(WeightStore& weights,
 static Result<void> prepare_vulkan_qkv_operator(CompiledModel& compiled,
                                                 CompiledLayerPlan& layer_plan,
                                                 bool use_bfloat16_fusion,
-                                                const char* failure_message)
+                                                const char* failure_message,
+                                                bool allow_float32_fallback = true)
 {
     AttentionBlockPlan& plan = layer_plan.attention;
     const TensorData* query_bias_data = plan.query_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.query_bias);
@@ -597,6 +622,8 @@ static Result<void> prepare_vulkan_qkv_operator(CompiledModel& compiled,
             plan.fused_qkv_gate_bfloat16_operator = fused_handle;
             return {};
         }
+        if (!allow_float32_fallback)
+            return Error{ErrorCode::InternalError, failure_message};
     }
     if (use_bfloat16_fusion
         && qkv_matrices.front()->dtype
@@ -615,6 +642,8 @@ static Result<void> prepare_vulkan_qkv_operator(CompiledModel& compiled,
             return {};
         }
     }
+    if (!allow_float32_fallback)
+        return Error{ErrorCode::InternalError, failure_message};
     auto fused_operator = Linear::create_fused(qkv_matrices,
                                                qkv_biases,
                                                layer_plan.vulkan_device_index,
@@ -875,7 +904,8 @@ static void prepare_gated_delta_attention_operators(CompiledModel& compiled,
 }
 
 static Result<void> prepare_standard_attention_operators(CompiledModel& compiled,
-                                                         CompiledLayerPlan& layer_plan)
+                                                         CompiledLayerPlan& layer_plan,
+                                                         bool allow_float32_fallback = true)
 {
     AttentionBlockPlan& plan = layer_plan.attention;
     // QSA selection and external residual mixing remain on the CPU.  Their
@@ -897,7 +927,7 @@ static Result<void> prepare_standard_attention_operators(CompiledModel& compiled
                                                  && plan.norm_weight_offset == 0.0f;
     Result<void> prepared;
     prepared = prepare_vulkan_qkv_operator(compiled, layer_plan, !fused_vulkan_attention_eligible,
-                                           "failed to create fused Vulkan QKV operator");
+                                           "failed to create fused Vulkan QKV operator", allow_float32_fallback);
     if (!prepared)
         return prepared.error();
     prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, plan.output_weight,
@@ -906,7 +936,8 @@ static Result<void> prepare_standard_attention_operators(CompiledModel& compiled
                                               compiled.vulkan_runtime,
                                               compiled.opt.optimization_flags,
                                               1,
-                                              !fused_vulkan_attention_eligible);
+                                              !fused_vulkan_attention_eligible,
+                                              allow_float32_fallback);
     if (!prepared)
         return prepared.error();
     if (plan.output_gate_weight != invalid_tensor_handle)
@@ -917,7 +948,7 @@ static Result<void> prepare_standard_attention_operators(CompiledModel& compiled
                                                       invalid_tensor_handle,
                                                       layer_plan.vulkan_device_index,
                                                       compiled.vulkan_runtime,
-                                                      compiled.opt.optimization_flags);
+                                                      compiled.opt.optimization_flags, 1, true, allow_float32_fallback);
             if (!prepared)
                 return prepared.error();
         }
@@ -1057,6 +1088,551 @@ static Result<void> prepare_dspark_operators(CompiledModel& compiled)
     return {};
 }
 
+static std::vector<TensorHandle> dense_qwen_layer_weights(const CompiledLayerPlan& layer)
+{
+    const AttentionBlockPlan& attention = layer.attention;
+    return {attention.pre_attention_norm_weight, attention.query_weight, attention.query_bias,
+            attention.key_weight, attention.key_bias, attention.value_weight, attention.value_bias,
+            attention.output_weight, attention.output_bias, attention.output_gate_weight,
+            attention.query_norm_weight, attention.key_norm_weight, attention.sinks,
+            attention.delta_qkv_weight, attention.delta_z_weight, attention.delta_beta_weight,
+            attention.delta_alpha_weight, attention.delta_convolution_weight, attention.delta_time_bias,
+            attention.delta_decay_log, attention.delta_norm_weight, layer.dense_pre_ffn_norm_weight,
+            layer.dense_ffn.gate_weight, layer.dense_ffn.up_weight, layer.dense_ffn.down_weight};
+}
+
+static bool use_bounded_dense_qwen_pipeline(const CompiledModel& compiled)
+{
+    if (compiled.descriptor.model_type != "qwen3_5"
+        || compiled.descriptor.expert_count != 0
+        || compiled.weights.at(compiled.lm_head_weight).dtype != DType::BFloat16)
+        return false;
+    for (const CompiledLayerPlan& layer : compiled.graph.layer_plans)
+    {
+        if (layer.dense_ffn.down_weight == invalid_tensor_handle
+            || (layer.attention.kind != AttentionKind::Standard
+                && layer.attention.kind != AttentionKind::GatedDeltaNet))
+            return false;
+        for (TensorHandle handle : dense_qwen_layer_weights(layer))
+        {
+            if (handle == invalid_tensor_handle)
+                continue;
+            const TensorData& tensor = compiled.weights.at(handle);
+            if (tensor.shape.size() == 2 && tensor.dtype != DType::BFloat16)
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool dense_qwen_bfloat16_projection_supported(const CompiledModel& compiled,
+                                                     const TensorData& matrix,
+                                                     uint64_t alignment,
+                                                     uint32_t device_index)
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (Bfloat16Linear_vulkan::storage_bytes(matrix, alignment) == 0)
+        return false;
+    auto context = VulkanContext::acquire(device_index, compiled.vulkan_runtime, compiled.opt.optimization_flags);
+    if (!context || context->device()->info.subgroup_size() != 32)
+        return false;
+    const uint64_t bytes = (matrix.element_count() + 1) / 2 * sizeof(uint32_t);
+    return bytes <= context->device()->info.physicalDeviceProperties().limits.maxStorageBufferRange;
+#else
+    (void)compiled;
+    (void)matrix;
+    (void)alignment;
+    (void)device_index;
+    return false;
+#endif
+}
+
+uint64_t dense_vulkan_weight_storage_size(const CompiledModel& compiled,
+                                          const TensorData& matrix,
+                                          uint64_t alignment,
+                                          uint32_t device_index,
+                                          bool has_bias) noexcept
+{
+    if (dense_qwen_bfloat16_projection_supported(compiled, matrix, alignment, device_index))
+        return Bfloat16Linear_vulkan::storage_bytes(matrix, alignment);
+#if NCNN_MOE_WITH_VULKAN
+    if (matrix.shape.size() != 2 || matrix.shape[0] == 0 || matrix.shape[1] == 0
+        || (matrix.dtype != DType::BFloat16 && matrix.dtype != DType::Float32)
+        || matrix.element_count() > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+        return 0;
+    auto context = VulkanContext::acquire(device_index, compiled.vulkan_runtime, compiled.opt.optimization_flags);
+    const uint64_t bytes = matrix.element_count() * sizeof(float);
+    const uint64_t bias_bytes = has_bias ? static_cast<uint64_t>(matrix.shape[0]) * sizeof(float) : 0;
+    if (!context || bytes > context->device()->info.physicalDeviceProperties().limits.maxStorageBufferRange
+        || bias_bytes > context->device()->info.physicalDeviceProperties().limits.maxStorageBufferRange)
+        return 0;
+    alignment = std::max<uint64_t>(4, alignment);
+    const uint64_t padding = bytes % alignment == 0 ? 0 : alignment - bytes % alignment;
+    // Generic InnerProduct stores FP32 and owns the default 8 MiB allocator.
+    uint64_t size = std::max<uint64_t>(UINT64_C(8) * 1024 * 1024, saturating_add_u64(bytes, padding));
+    if (has_bias)
+    {
+        const uint64_t bias_padding = bias_bytes % alignment == 0 ? 0 : alignment - bias_bytes % alignment;
+        size = saturating_add_u64(size, std::max<uint64_t>(UINT64_C(8) * 1024 * 1024, saturating_add_u64(bias_bytes, bias_padding)));
+    }
+    return size;
+#else
+    (void)has_bias;
+    return 0;
+#endif
+}
+
+static uint64_t dense_qwen_fused_storage_size(const CompiledModel& compiled,
+                                              std::initializer_list<TensorHandle> handles,
+                                              uint64_t alignment,
+                                              uint32_t device_index) noexcept
+{
+    uint64_t rows = 0;
+    uint32_t columns = 0;
+    for (TensorHandle handle : handles)
+    {
+        if (handle == invalid_tensor_handle)
+            continue;
+        const TensorData& tensor = compiled.weights.at(handle);
+        if (tensor.dtype != DType::BFloat16 || tensor.shape.size() != 2
+            || (columns != 0 && columns != tensor.shape[1]))
+            return 0;
+        columns = tensor.shape[1];
+        rows += tensor.shape[0];
+    }
+    if (rows > std::numeric_limits<uint32_t>::max())
+        return 0;
+    TensorData fused;
+    fused.dtype = DType::BFloat16;
+    fused.shape = {static_cast<uint32_t>(rows), columns};
+    if (!dense_qwen_bfloat16_projection_supported(compiled, fused, alignment, device_index))
+        return 0;
+    return Bfloat16Linear_vulkan::storage_bytes(fused, alignment);
+}
+
+static uint64_t dense_qwen_constant_storage_size(std::initializer_list<uint64_t> buffers,
+                                                 uint64_t alignment) noexcept
+{
+    alignment = std::max<uint64_t>(4, alignment);
+    uint64_t size = 0;
+    uint64_t remaining = 0;
+    for (uint64_t bytes : buffers)
+    {
+        const uint64_t padding = bytes % alignment == 0 ? 0 : alignment - bytes % alignment;
+        bytes = saturating_add_u64(bytes, padding);
+        if (bytes > remaining)
+        {
+            remaining = std::max<uint64_t>(vulkan_weight_block_size, bytes);
+            const uint64_t block_padding = remaining % alignment == 0 ? 0 : alignment - remaining % alignment;
+            remaining = saturating_add_u64(remaining, block_padding);
+            size = saturating_add_u64(size, remaining);
+        }
+        remaining -= bytes;
+    }
+    return size;
+}
+
+static uint64_t dense_qwen_gated_delta_state_size(const CompiledModel& compiled,
+                                                  const AttentionBlockPlan& attention) noexcept
+{
+    const uint64_t convolution_columns = saturating_add_u64(saturating_multiply_u64(saturating_multiply_u64(attention.kv_head_count, attention.head_dimension), 2),
+                                                            saturating_multiply_u64(attention.head_count, attention.value_head_dimension));
+    const uint64_t convolution = saturating_multiply_u64(saturating_multiply_u64(convolution_columns, attention.convolution_kernel_size), sizeof(float));
+    const uint64_t recurrent = saturating_multiply_u64(saturating_multiply_u64(attention.head_count, attention.head_dimension),
+                                                       static_cast<uint64_t>(attention.value_head_dimension) * sizeof(float));
+    // Cached decode keeps the live state and an initial transaction copy.
+    return saturating_multiply_u64(saturating_add_u64(convolution, recurrent),
+                                   static_cast<uint64_t>(std::max(1u, compiled.opt.num_concurrent_sessions)) * 2);
+}
+
+uint64_t dense_vulkan_attention_storage_size(const CompiledModel& compiled,
+                                             const CompiledLayerPlan& layer,
+                                             uint64_t alignment,
+                                             uint32_t device_index) noexcept
+{
+    const AttentionBlockPlan& attention = layer.attention;
+    uint64_t input = 0;
+    uint64_t constants = 0;
+    uint64_t state = 0;
+    if (attention.kind == AttentionKind::Standard)
+    {
+        input = dense_qwen_fused_storage_size(compiled,
+                                              {attention.query_weight, attention.key_weight, attention.value_weight, attention.output_gate_weight}, alignment, device_index);
+        // QKV biases prevent the combined query/key/value/gate projection.
+        // Account its separate projections instead of charging one fusion.
+        if (attention.query_bias != invalid_tensor_handle || attention.key_bias != invalid_tensor_handle
+            || attention.value_bias != invalid_tensor_handle)
+            input = 0;
+        constants = dense_qwen_constant_storage_size({static_cast<uint64_t>(compiled.descriptor.hidden_size) * sizeof(float),
+                                                      static_cast<uint64_t>(attention.head_dimension) * sizeof(float),
+                                                      static_cast<uint64_t>(attention.head_dimension) * sizeof(float),
+                                                      static_cast<uint64_t>(attention.rope_head_dimension / 2) * sizeof(float),
+                                                      static_cast<uint64_t>(attention.head_count) * sizeof(float)},
+                                                     alignment);
+    }
+    else if (attention.kind == AttentionKind::GatedDeltaNet)
+    {
+        input = dense_qwen_fused_storage_size(compiled,
+                                              {attention.delta_qkv_weight, attention.delta_z_weight, attention.delta_beta_weight, attention.delta_alpha_weight}, alignment, device_index);
+        const uint64_t convolution = compiled.weights.at(attention.delta_convolution_weight).element_count() * sizeof(float);
+        constants = dense_qwen_constant_storage_size({convolution,
+                                                      static_cast<uint64_t>(attention.head_count) * sizeof(float),
+                                                      static_cast<uint64_t>(attention.head_count) * sizeof(float),
+                                                      static_cast<uint64_t>(attention.value_head_dimension) * sizeof(float)},
+                                                     alignment);
+        state = dense_qwen_gated_delta_state_size(compiled, attention);
+    }
+    else
+        return 0;
+    const TensorData& output_weight = compiled.weights.at(attention.output_weight);
+    const uint64_t output = dense_qwen_bfloat16_projection_supported(compiled, output_weight, alignment, device_index)
+                                ? Bfloat16Linear_vulkan::storage_bytes(output_weight, alignment)
+                                : 0;
+    if (input == 0 || output == 0)
+    {
+        if (attention.kind != AttentionKind::Standard)
+            return 0;
+        uint64_t projections = 0;
+        const TensorHandle weights[] = {attention.query_weight, attention.key_weight, attention.value_weight,
+                                        attention.output_weight, attention.output_gate_weight};
+        const TensorHandle biases[] = {attention.query_bias, attention.key_bias, attention.value_bias,
+                                       attention.output_bias, invalid_tensor_handle};
+        for (size_t i = 0; i < 5; ++i)
+        {
+            if (weights[i] == invalid_tensor_handle)
+                continue;
+            const uint64_t size = dense_vulkan_weight_storage_size(compiled, compiled.weights.at(weights[i]), alignment, device_index,
+                                                                   biases[i] != invalid_tensor_handle);
+            if (size == 0)
+                return 0;
+            projections = saturating_add_u64(projections, size);
+        }
+        return projections;
+    }
+    return saturating_add_u64(saturating_add_u64(input, output), saturating_add_u64(constants, state));
+}
+
+uint64_t dense_vulkan_pending_state_size(const CompiledModel& compiled,
+                                         uint32_t device_index) noexcept
+{
+    uint64_t size = 0;
+    for (const CompiledLayerPlan& layer : compiled.graph.layer_plans)
+    {
+        const AttentionBlockPlan& attention = layer.attention;
+        if (layer.vulkan_device_index == device_index && attention.kind == AttentionKind::GatedDeltaNet
+            && compiled.operators.at(attention.gated_delta_vulkan_operator).gated_delta)
+            size = saturating_add_u64(size, dense_qwen_gated_delta_state_size(compiled, attention));
+    }
+    return size;
+}
+
+uint64_t dense_vulkan_workspace_reserve(uint64_t heap_budget) noexcept
+{
+    return std::min(heap_budget / 4, std::max<uint64_t>(UINT64_C(256) * 1024 * 1024, heap_budget / 16));
+}
+
+static uint64_t dense_qwen_dynamic_cache_reserve(const CompiledModel& compiled,
+                                                 const CompilerOption& opt) noexcept
+{
+    uint64_t largest = 0;
+    for (const CompiledLayerPlan& layer : compiled.graph.layer_plans)
+    {
+        if (layer.dense_ffn.use_gpu_cache)
+            largest = std::max(largest, layer.dense_ffn.weight_size);
+    }
+    if (largest == 0)
+        return 0;
+    if (opt.gpu_expert_cache_reserve != 0)
+        return std::max(largest, opt.gpu_expert_cache_reserve);
+    // Automatic caches retain at least 85% of the remaining heap. Preserve
+    // enough free space for one complete FFN after applying that policy.
+    return saturating_add_u64(saturating_multiply_u64(largest / 85, 100),
+                              (largest % 85 * 100 + 84) / 85);
+}
+
+static uint64_t dense_qwen_gpu_alignment(const CompiledModel& compiled,
+                                         uint32_t device_index)
+{
+#if NCNN_MOE_WITH_VULKAN
+    auto context = VulkanContext::acquire(device_index, compiled.vulkan_runtime, compiled.opt.optimization_flags);
+    if (context)
+        return std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
+#else
+    (void)compiled;
+    (void)device_index;
+#endif
+    return 0;
+}
+
+static bool dense_qwen_can_admit(const CompiledModel& compiled, const CompilerOption& opt,
+                                 uint32_t device_index, uint64_t size, uint64_t planned)
+{
+    const uint64_t reserve = saturating_add_u64(dense_vulkan_workspace_reserve(opt.gpu_heap_budget),
+                                                dense_qwen_dynamic_cache_reserve(compiled, opt));
+    if (reserve >= opt.gpu_heap_budget)
+        return false;
+    const uint64_t capacity = opt.gpu_heap_budget - reserve;
+    if (size == 0 || size > capacity || planned > capacity - size)
+        return false;
+#if NCNN_MOE_WITH_VULKAN
+    auto context = VulkanContext::acquire(device_index, compiled.vulkan_runtime, compiled.opt.optimization_flags);
+    if (!context)
+        return false;
+    const uint64_t budget = static_cast<uint64_t>(context->device()->get_heap_budget()) * 1024 * 1024;
+    const uint64_t usage = static_cast<uint64_t>(context->device()->get_heap_usage()) * 1024 * 1024;
+    // State is allocated on the first forward, so the live heap does not yet
+    // include it. The candidate's own state is already part of size.
+    const uint64_t live_reserve = saturating_add_u64(saturating_add_u64(dense_vulkan_workspace_reserve(budget), dense_qwen_dynamic_cache_reserve(compiled, opt)),
+                                                     dense_vulkan_pending_state_size(compiled, device_index));
+    return usage < budget && live_reserve < budget - usage && size <= budget - usage - live_reserve;
+#else
+    (void)compiled;
+    (void)device_index;
+    return false;
+#endif
+}
+
+static void clear_dense_qwen_group_operators(CompiledModel& compiled,
+                                             std::initializer_list<TensorHandle> weights,
+                                             size_t first_operator)
+{
+    for (TensorHandle handle : weights)
+    {
+        if (handle != invalid_tensor_handle)
+            compiled.operators.at_weight_mutable(handle) = {};
+    }
+    for (size_t handle = first_operator; handle < compiled.operators.size(); ++handle)
+        compiled.operators.at_mutable(static_cast<CompiledOperatorHandle>(handle)) = {};
+}
+
+static void clear_dense_qwen_attention_operators(CompiledModel& compiled,
+                                                 AttentionBlockPlan& attention)
+{
+    for (TensorHandle handle : {attention.query_weight, attention.key_weight, attention.value_weight, attention.output_weight,
+                                attention.output_gate_weight, attention.delta_qkv_weight, attention.delta_z_weight,
+                                attention.delta_beta_weight, attention.delta_alpha_weight})
+    {
+        if (handle != invalid_tensor_handle)
+            compiled.operators.at_weight_mutable(handle) = {};
+    }
+    for (CompiledOperatorHandle handle : {attention.vulkan_attention_operator, attention.fused_qkv_operator,
+                                          attention.fused_qkv_gate_bfloat16_operator, attention.fused_delta_input_operator,
+                                          attention.gated_delta_vulkan_operator})
+    {
+        if (handle != invalid_compiled_operator_handle)
+            compiled.operators.at_mutable(handle) = {};
+    }
+    attention.vulkan_attention_operator = invalid_compiled_operator_handle;
+    attention.fused_qkv_operator = invalid_compiled_operator_handle;
+    attention.fused_qkv_gate_bfloat16_operator = invalid_compiled_operator_handle;
+    attention.fused_delta_input_operator = invalid_compiled_operator_handle;
+    attention.gated_delta_vulkan_operator = invalid_compiled_operator_handle;
+}
+
+static bool dense_qwen_dynamic_cache_fits(const CompiledModel& compiled,
+                                          const CompilerOption& opt,
+                                          uint32_t device_index)
+{
+#if NCNN_MOE_WITH_VULKAN
+    const uint64_t cache_reserve = dense_qwen_dynamic_cache_reserve(compiled, opt);
+    if (cache_reserve == 0)
+        return true;
+    auto context = VulkanContext::acquire(device_index, compiled.vulkan_runtime, compiled.opt.optimization_flags);
+    if (!context)
+        return true;
+    const uint64_t budget = static_cast<uint64_t>(context->device()->get_heap_budget()) * 1024 * 1024;
+    const uint64_t reserve = saturating_add_u64(dense_vulkan_workspace_reserve(budget), cache_reserve);
+    // An entry that cannot fit even on an empty heap must not evict every
+    // useful small projection in pursuit of an impossible cache.
+    if (reserve >= std::min(budget, opt.gpu_heap_budget))
+        return true;
+    const uint64_t usage = static_cast<uint64_t>(context->device()->get_heap_usage()) * 1024 * 1024;
+    const uint64_t required = saturating_add_u64(reserve, dense_vulkan_pending_state_size(compiled, device_index));
+    return usage < budget && required <= budget - usage;
+#else
+    (void)compiled;
+    (void)opt;
+    (void)device_index;
+    return true;
+#endif
+}
+
+static void preserve_dense_qwen_dynamic_cache(CompiledModel& compiled,
+                                              const CompilerOption& opt)
+{
+    std::vector<uint32_t> devices;
+    for (const CompiledLayerPlan& layer : compiled.graph.layer_plans)
+    {
+        if (layer.dense_ffn.use_gpu_cache
+            && std::find(devices.begin(), devices.end(), layer.vulkan_device_index) == devices.end())
+            devices.push_back(layer.vulkan_device_index);
+    }
+    for (uint32_t device_index : devices)
+    {
+        if (dense_qwen_dynamic_cache_fits(compiled, opt, device_index))
+            continue;
+        // Driver allocations and heap-budget changes can exceed the planned
+        // storage estimate. Recheck actual usage after releasing each group.
+        for (auto layer = compiled.graph.layer_plans.rbegin(); layer != compiled.graph.layer_plans.rend(); ++layer)
+        {
+            if (layer->vulkan_device_index != device_index
+                || !support_vulkan_attention(compiled.operators, layer->attention))
+                continue;
+            clear_dense_qwen_attention_operators(compiled, layer->attention);
+            if (dense_qwen_dynamic_cache_fits(compiled, opt, device_index))
+                break;
+        }
+        if (!dense_qwen_dynamic_cache_fits(compiled, opt, device_index)
+            && compiled.opt.vulkan_device_index == device_index)
+            compiled.operators.at_weight_mutable(compiled.lm_head_weight) = {};
+    }
+}
+
+static Result<void> prepare_dense_qwen_projection(CompiledModel& compiled,
+                                                  const CompilerOption& opt,
+                                                  TensorHandle weight, TensorHandle bias,
+                                                  uint32_t device_index, uint64_t alignment,
+                                                  uint64_t& planned)
+{
+    const TensorData& matrix = compiled.weights.at(weight);
+    const uint64_t size = dense_vulkan_weight_storage_size(compiled, matrix, alignment, device_index, bias != invalid_tensor_handle);
+    if (!dense_qwen_can_admit(compiled, opt, device_index, size, planned))
+        return {};
+    auto ret = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, weight, bias,
+                                              device_index, compiled.vulkan_runtime, compiled.opt.optimization_flags, 1,
+                                              dense_qwen_bfloat16_projection_supported(compiled, matrix, alignment, device_index), false);
+    if (!ret)
+    {
+        compiled.operators.at_weight_mutable(weight) = {};
+        if (ret.error().code != ErrorCode::InternalError)
+            return ret.error();
+        return {};
+    }
+    planned = saturating_add_u64(planned, size);
+    return {};
+}
+
+static Result<void> prepare_bounded_dense_qwen_pipeline(CompiledModel& compiled,
+                                                        const CompilerOption& opt)
+{
+    if (opt.gpu_heap_budget == 0)
+        return {};
+    uint64_t planned = 0;
+    const uint64_t head_alignment = dense_qwen_gpu_alignment(compiled, compiled.opt.vulkan_device_index);
+    const TensorData& head = compiled.weights.at(compiled.lm_head_weight);
+    const uint64_t head_size = dense_vulkan_weight_storage_size(compiled, head, head_alignment, compiled.opt.vulkan_device_index);
+    if (head_alignment != 0 && dense_qwen_can_admit(compiled, opt, compiled.opt.vulkan_device_index, head_size, planned))
+    {
+        auto ret = prepare_lm_head_operator(compiled, false,
+                                            dense_qwen_bfloat16_projection_supported(compiled, head, head_alignment, compiled.opt.vulkan_device_index));
+        if (!ret)
+        {
+            compiled.operators.at_weight_mutable(compiled.lm_head_weight) = {};
+            if (ret.error().code != ErrorCode::InternalError)
+                return ret.error();
+        }
+        else
+            planned += head_size;
+    }
+
+    // Reserve attention groups across the model before admitting large FFNs.
+    if (has_flag(opt.flags, BackendVulkanAttention)
+        && has_flag(compiled.opt.optimization_flags, OptimizationVulkanAttention))
+    {
+        for (CompiledLayerPlan& layer : compiled.graph.layer_plans)
+        {
+            AttentionBlockPlan& attention = layer.attention;
+            const uint64_t alignment = dense_qwen_gpu_alignment(compiled, layer.vulkan_device_index);
+            if (alignment == 0)
+                continue;
+            const uint64_t size = dense_vulkan_attention_storage_size(compiled, layer, alignment, layer.vulkan_device_index);
+            const bool bfloat16_group = attention.kind == AttentionKind::GatedDeltaNet
+                                            ? size != 0
+                                            : dense_qwen_fused_storage_size(compiled,
+                                                                            {attention.query_weight, attention.key_weight, attention.value_weight, attention.output_gate_weight},
+                                                                            alignment, layer.vulkan_device_index)
+                                                      != 0
+                                                  && dense_qwen_bfloat16_projection_supported(compiled, compiled.weights.at(attention.output_weight), alignment, layer.vulkan_device_index);
+            if (bfloat16_group && dense_qwen_can_admit(compiled, opt, layer.vulkan_device_index, size, planned))
+            {
+                Result<void> ret;
+                if (attention.kind == AttentionKind::Standard)
+                    ret = prepare_standard_attention_operators(compiled, layer, false);
+                else
+                {
+                    prepare_gated_delta_attention_operators(compiled, layer);
+                    if (!support_vulkan_attention(compiled.operators, attention))
+                        ret = Error{ErrorCode::InternalError, "failed to create Vulkan dense DeltaNet operator"};
+                }
+                if (ret)
+                {
+                    planned = saturating_add_u64(planned, size);
+                    continue;
+                }
+                clear_dense_qwen_attention_operators(compiled, attention);
+                if (ret.error().code != ErrorCode::InternalError)
+                    return ret.error();
+            }
+            // Standard attention executes individual resident projections when
+            // its full group does not fit. DeltaNet recurrence remains atomic.
+            if (attention.kind != AttentionKind::Standard)
+                continue;
+            const TensorHandle weights[] = {attention.key_weight, attention.value_weight, attention.query_weight,
+                                            attention.output_weight, attention.output_gate_weight};
+            const TensorHandle biases[] = {attention.key_bias, attention.value_bias, attention.query_bias,
+                                           attention.output_bias, invalid_tensor_handle};
+            for (size_t i = 0; i < 5; ++i)
+            {
+                if (weights[i] == invalid_tensor_handle)
+                    continue;
+                auto ret = prepare_dense_qwen_projection(compiled, opt, weights[i], biases[i], layer.vulkan_device_index, alignment, planned);
+                if (!ret)
+                    return ret.error();
+            }
+        }
+    }
+
+    for (CompiledLayerPlan& layer : compiled.graph.layer_plans)
+    {
+        if (layer.dense_ffn.use_gpu_cache)
+            continue;
+        const uint64_t alignment = dense_qwen_gpu_alignment(compiled, layer.vulkan_device_index);
+        if (alignment == 0)
+            continue;
+        ExpertPlan& ffn = layer.dense_ffn;
+        const uint64_t input_size = dense_qwen_fused_storage_size(compiled, {ffn.gate_weight, ffn.up_weight}, alignment, layer.vulkan_device_index);
+        const TensorData& down = compiled.weights.at(ffn.down_weight);
+        const uint64_t down_size = dense_qwen_bfloat16_projection_supported(compiled, down, alignment, layer.vulkan_device_index)
+                                       ? Bfloat16Linear_vulkan::storage_bytes(down, alignment)
+                                       : 0;
+        const uint64_t size = input_size == 0 || down_size == 0 ? 0 : saturating_add_u64(input_size, down_size);
+        if (dense_qwen_can_admit(compiled, opt, layer.vulkan_device_index, size, planned))
+        {
+            const size_t first_operator = compiled.operators.size();
+            auto ret = prepare_ffn_operators(compiled.weights, compiled.operators, ffn,
+                                             layer.vulkan_device_index, compiled.vulkan_runtime, compiled.opt.optimization_flags, false);
+            if (ret)
+            {
+                planned = saturating_add_u64(planned, size);
+                continue;
+            }
+            clear_dense_qwen_group_operators(compiled, {ffn.gate_weight, ffn.up_weight, ffn.down_weight}, first_operator);
+            ffn.vulkan_operator = invalid_compiled_operator_handle;
+            if (ret.error().code != ErrorCode::InternalError)
+                return ret.error();
+        }
+        for (TensorHandle handle : {ffn.gate_weight, ffn.up_weight, ffn.down_weight})
+        {
+            auto ret = prepare_dense_qwen_projection(compiled, opt, handle, invalid_tensor_handle,
+                                                     layer.vulkan_device_index, alignment, planned);
+            if (!ret)
+                return ret.error();
+        }
+    }
+    preserve_dense_qwen_dynamic_cache(compiled, opt);
+    return {};
+}
+
 Result<void> prepare_model_pipeline(CompiledModel& compiled,
                                     const CompilerOption& opt)
 {
@@ -1065,6 +1641,8 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled,
     compiled.operators.bind_weight_count(compiled.weights.size());
     if (compiled.opt.hybrid_mode == HybridMode::CpuOnly)
         return {};
+    if (use_bounded_dense_qwen_pipeline(compiled))
+        return prepare_bounded_dense_qwen_pipeline(compiled, opt);
 
     Result<void> ret = prepare_lm_head_operator(compiled);
     if (!ret)
@@ -1136,7 +1714,8 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled,
                 return ret.error();
             prepare_latent_layer_operators(compiled, layer_plan);
         }
-        if (layer_plan.dense_ffn.down_weight != invalid_tensor_handle)
+        if (layer_plan.dense_ffn.down_weight != invalid_tensor_handle
+            && !layer_plan.dense_ffn.use_gpu_cache)
         {
             ret = prepare_ffn_operators(compiled.weights, compiled.operators, layer_plan.dense_ffn,
                                         layer_plan.vulkan_device_index, compiled.vulkan_runtime,

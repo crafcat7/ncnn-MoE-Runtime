@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any, TextIO
 
 try:
-    from ncnn_moe_adapters import AdapterError, Completion, ModelAdapter, NATIVE_TEXT_VERSION, create_adapter
+    from ncnn_moe_adapters import (
+        AdapterError, Completion, ModelAdapter, NATIVE_TEXT_VERSION, create_adapter,
+        model_asset_root, model_config_path, model_weight_files, weight_fingerprint_samples,
+    )
     from ncnn_moe_protocol import WorkerClient, WorkerError
     from ncnn_moe_state import (
         SessionStore,
@@ -25,7 +28,10 @@ try:
         runtime_args_from_settings,
     )
 except ModuleNotFoundError:  # Installed entry point: tools is a package.
-    from .ncnn_moe_adapters import AdapterError, Completion, ModelAdapter, NATIVE_TEXT_VERSION, create_adapter
+    from .ncnn_moe_adapters import (
+        AdapterError, Completion, ModelAdapter, NATIVE_TEXT_VERSION, create_adapter,
+        model_asset_root, model_config_path, model_weight_files, weight_fingerprint_samples,
+    )
     from .ncnn_moe_protocol import WorkerClient, WorkerError
     from .ncnn_moe_state import (
         SessionStore,
@@ -227,7 +233,7 @@ def _format_runtime_metrics(metrics: Any) -> str:
 
 def _add_model_position(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("model_pos", nargs="?", help="Model directory")
-    parser.add_argument("--model", dest="model_opt", help="Model directory")
+    parser.add_argument("--model", dest="model_opt", help="Model directory or GGUF file")
 
 
 def _add_worker_options(parser: argparse.ArgumentParser) -> None:
@@ -383,11 +389,11 @@ def resolve_model(arguments: argparse.Namespace, *, required: bool = True) -> Pa
     value = getattr(arguments, "model_opt", None) or getattr(arguments, "model_pos", None)
     if not value:
         if required:
-            raise ValueError("a model directory is required; pass --model PATH or a positional model")
+            raise ValueError("a model path is required; pass --model PATH or a positional model")
         return None
     model = Path(value).expanduser().resolve()
-    if not model.is_dir():
-        raise ValueError(f"model directory does not exist: {model}")
+    if not model.is_dir() and not (model.is_file() and model.suffix.lower() == ".gguf"):
+        raise ValueError(f"model directory or GGUF file does not exist: {model}")
     return model
 
 
@@ -439,15 +445,18 @@ def find_worker(explicit: str | None, root: Path) -> Path:
 
 def lightweight_model_fingerprint(model: Path) -> str:
     digest = hashlib.sha256()
-    digest.update((model / "config.json").read_bytes())
-    for path in sorted(model.rglob("*.safetensors")):
-        digest.update(path.relative_to(model).as_posix().encode("utf-8"))
+    config = model_config_path(model)
+    if config.is_file():
+        digest.update(config.read_bytes())
+    root = model_asset_root(model)
+    for path in model_weight_files(model):
+        relative = path.name if path.suffix.lower() == ".gguf" else path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
         digest.update(str(path.stat().st_size).encode("ascii"))
-        with path.open("rb") as stream:
-            digest.update(stream.read(4096))
-            if path.stat().st_size > 4096:
-                stream.seek(-4096, 2)
-                digest.update(stream.read(4096))
+        head, tail = weight_fingerprint_samples(path)
+        digest.update(head)
+        if tail:
+            digest.update(tail)
     return digest.hexdigest()[:20]
 
 
@@ -1450,6 +1459,7 @@ def load_adapter(arguments: argparse.Namespace, model: Path, ready: dict[str, An
         model,
         thinking=thinking,
         native_stop_tokens=stop_tokens,
+        native_model_info=model_info,
     )
 
 

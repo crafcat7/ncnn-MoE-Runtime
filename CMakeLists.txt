@@ -87,6 +87,10 @@ set(NCNN_MOE_SOURCES
     src/models/modeladapter_qwen3_5.cpp
     src/models/modeladapter_qwen4exp.cpp
     src/models/safetensors.cpp
+    src/models/gguf.cpp
+    src/models/ggufmodel.cpp
+    src/models/ggufmodel_gptoss.cpp
+    src/models/ggufmodel_qwen.cpp
     src/models/tokenizer.cpp
     src/storage/expertcache.cpp
     src/storage/expertresidency.cpp
@@ -308,6 +312,8 @@ if(NCNN_MOE_USE_NCNN)
         endif()
         if(NCNN_MOE_USE_VULKAN AND NCNN_VULKAN)
             target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_WITH_VULKAN=1)
+            target_include_directories(ncnn_moe PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ncnn/src/layer)
             set(NCNN_MOE_WITH_VULKAN ON)
             if(APPLE)
                 target_compile_definitions(ncnn_moe PRIVATE
@@ -420,6 +426,16 @@ if(NCNN_MOE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME ncnn_moe_vulkan_wait_policy COMMAND ncnn_moe_vulkan_wait_policy_test)
 
+    if(NCNN_MOE_WITH_VULKAN)
+        add_executable(ncnn_moe_linear_allocation_vulkan_test tests/test_linear_allocation_vulkan.cpp)
+        target_link_libraries(ncnn_moe_linear_allocation_vulkan_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_linear_allocation_vulkan_test PRIVATE cxx_std_20)
+        target_compile_definitions(ncnn_moe_linear_allocation_vulkan_test PRIVATE NCNN_MOE_WITH_VULKAN=1)
+        target_include_directories(ncnn_moe_linear_allocation_vulkan_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ncnn/src/layer)
+        add_test(NAME ncnn_moe_linear_allocation_vulkan COMMAND ncnn_moe_linear_allocation_vulkan_test)
+    endif()
+
     add_executable(ncnn_moe_tests
         tests/modeladapter_fixture.cpp
         tests/test_batch_combine.cpp
@@ -444,6 +460,33 @@ if(NCNN_MOE_BUILD_TESTS)
     target_compile_features(ncnn_moe_qwen_dense_test PRIVATE cxx_std_20)
     target_include_directories(ncnn_moe_qwen_dense_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME ncnn_moe_qwen_dense COMMAND ncnn_moe_qwen_dense_test)
+
+    add_executable(ncnn_moe_gguf_test tests/test_gguf.cpp)
+    target_link_libraries(ncnn_moe_gguf_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_gguf_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_gguf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ncnn_moe_gguf COMMAND ncnn_moe_gguf_test)
+
+    add_executable(ncnn_moe_gguf_mxfp4_cache_test tests/test_gguf_mxfp4_cache.cpp)
+    target_link_libraries(ncnn_moe_gguf_mxfp4_cache_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_gguf_mxfp4_cache_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_gguf_mxfp4_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ncnn_moe_gguf_mxfp4_cache COMMAND ncnn_moe_gguf_mxfp4_cache_test)
+
+    add_executable(ncnn_moe_gguf_tokenizer_test tests/test_gguf_tokenizer.cpp)
+    target_link_libraries(ncnn_moe_gguf_tokenizer_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_gguf_tokenizer_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_gguf_tokenizer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(MSVC)
+        target_compile_options(ncnn_moe_gguf_tokenizer_test PRIVATE /utf-8)
+    endif()
+    add_test(NAME ncnn_moe_gguf_tokenizer COMMAND ncnn_moe_gguf_tokenizer_test)
+
+    add_executable(ncnn_moe_gguf_graph_test tests/test_gguf_graph.cpp)
+    target_link_libraries(ncnn_moe_gguf_graph_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_gguf_graph_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_gguf_graph_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 
     add_executable(ncnn_moe_qwen_quant_banks_test tests/test_qwen_quant_banks.cpp)
     target_link_libraries(ncnn_moe_qwen_quant_banks_test PRIVATE ncnn::moe)
@@ -655,25 +698,39 @@ if(NCNN_MOE_BUILD_EXAMPLES)
     endif()
 endif()
 
-if(NCNN_MOE_BUILD_TESTS AND NCNN_MOE_BUILD_EXAMPLES)
+if(NCNN_MOE_BUILD_TESTS)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME ncnn_moe_python_unit
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ncnn_moe.py)
         execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
             RESULT_VARIABLE NCNN_MOE_NUMPY_RESULT OUTPUT_QUIET ERROR_QUIET)
         if(NCNN_MOE_NUMPY_RESULT EQUAL 0)
+            add_test(NAME ncnn_moe_direct_gguf
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_direct_gguf.py
+                    --runner $<TARGET_FILE:ncnn_moe_gguf_graph_test>)
+            set_tests_properties(ncnn_moe_direct_gguf PROPERTIES SKIP_RETURN_CODE 77)
+            if(NCNN_MOE_WITH_VULKAN)
+                add_test(NAME ncnn_moe_direct_gguf_vulkan
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_direct_gguf.py
+                        --runner $<TARGET_FILE:ncnn_moe_gguf_graph_test> --hybrid)
+                set_tests_properties(ncnn_moe_direct_gguf_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+            endif()
             add_test(NAME ncnn_moe_import_quantized
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_import_quantized.py)
-            add_test(NAME ncnn_moe_native_quantized
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_native_quantized.py
-                    --worker $<TARGET_FILE:ncnn_moe_worker>)
-            if(NCNN_MOE_WITH_VULKAN)
-                add_test(NAME ncnn_moe_native_quantized_vulkan
+            if(NCNN_MOE_BUILD_EXAMPLES)
+                add_test(NAME ncnn_moe_native_quantized
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_native_quantized.py
-                        --worker $<TARGET_FILE:ncnn_moe_worker> --backend hybrid)
-                set_tests_properties(ncnn_moe_native_quantized_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+                        --worker $<TARGET_FILE:ncnn_moe_worker>)
+                if(NCNN_MOE_WITH_VULKAN)
+                    add_test(NAME ncnn_moe_native_quantized_vulkan
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_native_quantized.py
+                            --worker $<TARGET_FILE:ncnn_moe_worker> --backend hybrid)
+                    set_tests_properties(ncnn_moe_native_quantized_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+                endif()
             endif()
         endif()
-        if(NCNN_MOE_BUILD_REFERENCE_RUNNERS)
+        if(NCNN_MOE_BUILD_EXAMPLES AND NCNN_MOE_BUILD_REFERENCE_RUNNERS)
             add_test(
                 NAME ncnn_moe_gpt_oss_fixture
                 COMMAND ${Python3_EXECUTABLE}
@@ -681,7 +738,7 @@ if(NCNN_MOE_BUILD_TESTS AND NCNN_MOE_BUILD_EXAMPLES)
                     ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
                     --verify-runner $<TARGET_FILE:ncnn_moe_gpt_oss>
             )
-        else()
+        elseif(NCNN_MOE_BUILD_EXAMPLES)
             add_test(
                 NAME ncnn_moe_gpt_oss_fixture
                 COMMAND ${Python3_EXECUTABLE}
@@ -689,34 +746,42 @@ if(NCNN_MOE_BUILD_TESTS AND NCNN_MOE_BUILD_EXAMPLES)
                     ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
             )
         endif()
-        add_test(
-            NAME ncnn_moe_python_fixture
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ncnn_moe.py
-                --worker $<TARGET_FILE:ncnn_moe_worker>
-                --model ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
-        )
-        set_tests_properties(
-            ncnn_moe_python_fixture
-            PROPERTIES
-                DEPENDS ncnn_moe_gpt_oss_fixture
-                SKIP_RETURN_CODE 77
-        )
-        add_test(
-            NAME ncnn_moe_python_auto_fixture
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ncnn_moe.py
-                --auto
-                --worker $<TARGET_FILE:ncnn_moe_worker>
-                --model ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
-        )
-        set_tests_properties(
-            ncnn_moe_python_auto_fixture
-            PROPERTIES
-                DEPENDS ncnn_moe_gpt_oss_fixture
-                SKIP_RETURN_CODE 77
-        )
+        if(NCNN_MOE_BUILD_EXAMPLES)
+            add_test(
+                NAME ncnn_moe_python_fixture
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ncnn_moe.py
+                    --worker $<TARGET_FILE:ncnn_moe_worker>
+                    --model ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
+            )
+            set_tests_properties(
+                ncnn_moe_python_fixture
+                PROPERTIES
+                    DEPENDS ncnn_moe_gpt_oss_fixture
+                    SKIP_RETURN_CODE 77
+            )
+            add_test(
+                NAME ncnn_moe_python_auto_fixture
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ncnn_moe.py
+                    --auto
+                    --worker $<TARGET_FILE:ncnn_moe_worker>
+                    --model ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
+            )
+            set_tests_properties(
+                ncnn_moe_python_auto_fixture
+                PROPERTIES
+                    DEPENDS ncnn_moe_gpt_oss_fixture
+                    SKIP_RETURN_CODE 77
+            )
+        endif()
     endif()
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-tmp")
+    get_property(NCNN_MOE_TESTS DIRECTORY PROPERTY TESTS)
+    set_property(TEST ${NCNN_MOE_TESTS} APPEND PROPERTY ENVIRONMENT
+        "TEMP=${CMAKE_CURRENT_BINARY_DIR}/test-tmp"
+        "TMP=${CMAKE_CURRENT_BINARY_DIR}/test-tmp"
+        "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}/test-tmp")
 endif()
 
 include(CMakePackageConfigHelpers)

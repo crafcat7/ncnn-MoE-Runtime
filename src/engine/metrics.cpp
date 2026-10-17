@@ -14,50 +14,9 @@
 namespace ncnn {
 namespace moe {
 
-void record_model_resource_delta(const CompiledModel& model,
-                                 SessionStatistics& statistics,
-                                 const ExpertCacheStatistics& execution_cache_before,
-                                 const ExpertBackendStatistics& expert_backend_before)
-{
-    if (model.expert_cache)
-    {
-        const ExpertCacheStatistics after = model.expert_cache->statistics();
-        record_expert_cache_delta(statistics, execution_cache_before, after);
-    }
-    if (model.expert_backend)
-    {
-        record_expert_backend_delta(statistics, expert_backend_before, model.expert_backend->statistics());
-    }
-}
-
-void record_batch_resource_delta(const CompiledModel& model,
-                                 std::span<const DecodeBatchEntry> entries,
-                                 const ExpertCacheStatistics& cache_before,
-                                 const ExpertBackendStatistics& backend_before)
-{
-    // Each participating Session retains the logical batch resource delta.
-    if (model.expert_cache)
-    {
-        const ExpertCacheStatistics cache_after = model.expert_cache->statistics();
-        for (const DecodeBatchEntry& entry : entries)
-        {
-            SessionStatistics& statistics = *entry.statistics;
-            record_expert_cache_delta(statistics, cache_before, cache_after);
-        }
-    }
-    if (model.expert_backend)
-    {
-        const ExpertBackendStatistics backend_after = model.expert_backend->statistics();
-        for (const DecodeBatchEntry& entry : entries)
-        {
-            record_expert_backend_delta(*entry.statistics, backend_before, backend_after);
-        }
-    }
-}
-
-void record_expert_cache_delta(SessionStatistics& statistics,
-                               const ExpertCacheStatistics& before,
-                               const ExpertCacheStatistics& after)
+static void add_cache_delta(SessionStatistics& statistics,
+                            const ExpertCacheStatistics& before,
+                            const ExpertCacheStatistics& after)
 {
     statistics.expert_cache_hits += after.hits - before.hits;
     statistics.expert_cache_misses += after.misses - before.misses;
@@ -107,9 +66,9 @@ void record_expert_cache_delta(SessionStatistics& statistics,
     statistics.expert_gpu_victim_cache_pending_size = after.victim.pending_size;
 }
 
-void record_vulkan_execution_delta(SessionStatistics& statistics,
-                                   const VulkanStatistics& before,
-                                   const VulkanStatistics& after)
+void record_vulkan_delta(SessionStatistics& statistics,
+                         const VulkanStatistics& before,
+                         const VulkanStatistics& after)
 {
     statistics.vulkan_linear_dispatches += after.dispatches - before.dispatches;
     statistics.vulkan_int4_dispatches += after.int4_dispatches - before.int4_dispatches;
@@ -117,11 +76,6 @@ void record_vulkan_execution_delta(SessionStatistics& statistics,
     statistics.vulkan_compute_submissions += after.compute_submissions - before.compute_submissions;
     statistics.vulkan_batch_uploads += after.batch_uploads - before.batch_uploads;
     statistics.vulkan_batch_downloads += after.batch_downloads - before.batch_downloads;
-    statistics.vulkan_command_buffer_reuses += after.command_buffer_reuses - before.command_buffer_reuses;
-    statistics.vulkan_command_graph_submissions += after.command_graph_submissions
-                                                   - before.command_graph_submissions;
-    statistics.vulkan_command_graph_operations += after.command_graph_operations
-                                                  - before.command_graph_operations;
     statistics.vulkan_attention_qkv_rope_fusions += after.attention_qkv_rope_fusions - before.attention_qkv_rope_fusions;
     statistics.vulkan_attention_device_rope_fusions += after.attention_device_rope_fusions - before.attention_device_rope_fusions;
     statistics.vulkan_attention_qkv_ring_fusions += after.attention_qkv_ring_fusions - before.attention_qkv_ring_fusions;
@@ -141,7 +95,9 @@ void record_vulkan_execution_delta(SessionStatistics& statistics,
                                                                 - before.bfloat16_cooperative_matrix_dispatches;
 }
 
-void record_expert_backend_delta(SessionStatistics& statistics, const ExpertBackendStatistics& before, const ExpertBackendStatistics& after)
+static void add_backend_delta(SessionStatistics& statistics,
+                              const ExpertBackendStatistics& before,
+                              const ExpertBackendStatistics& after)
 {
     statistics.expert_gpu_cache_hits += after.hits - before.hits;
     statistics.expert_gpu_cache_misses += after.misses - before.misses;
@@ -166,6 +122,47 @@ void record_expert_backend_delta(SessionStatistics& statistics, const ExpertBack
     statistics.expert_gpu_route_aggregation_batches += after.route_aggregation_batches - before.route_aggregation_batches;
     statistics.expert_gpu_route_aggregation_routes += after.route_aggregation_routes - before.route_aggregation_routes;
     statistics.expert_gpu_route_aggregation_bytes_saved += after.route_aggregation_bytes_saved - before.route_aggregation_bytes_saved;
+}
+
+void record_resource_delta(const CompiledModel& model,
+                           SessionStatistics& statistics,
+                           const ExpertCacheStatistics& cache_before,
+                           const ExpertBackendStatistics& backend_before)
+{
+    if (model.expert_cache)
+    {
+        const ExpertCacheStatistics cache_after = model.expert_cache->statistics();
+        add_cache_delta(statistics, cache_before, cache_after);
+    }
+    if (model.expert_backend)
+    {
+        add_backend_delta(statistics, backend_before, model.expert_backend->statistics());
+    }
+}
+
+void record_resource_delta(const CompiledModel& model,
+                           std::span<const DecodeBatchEntry> entries,
+                           const ExpertCacheStatistics& cache_before,
+                           const ExpertBackendStatistics& backend_before)
+{
+    // Each participating Session retains the logical batch resource delta.
+    if (model.expert_cache)
+    {
+        const ExpertCacheStatistics cache_after = model.expert_cache->statistics();
+        for (const DecodeBatchEntry& entry : entries)
+        {
+            SessionStatistics& statistics = *entry.statistics;
+            add_cache_delta(statistics, cache_before, cache_after);
+        }
+    }
+    if (model.expert_backend)
+    {
+        const ExpertBackendStatistics backend_after = model.expert_backend->statistics();
+        for (const DecodeBatchEntry& entry : entries)
+        {
+            add_backend_delta(*entry.statistics, backend_before, backend_after);
+        }
+    }
 }
 
 static uint64_t counter_delta(uint64_t current, uint64_t baseline) noexcept

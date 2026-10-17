@@ -10,13 +10,13 @@ directories in `models/` and are not version-controlled.
 
 | Model family | Package | Weights | Execution and performance |
 | --- | --- | --- | --- |
-| GPT-OSS-20B | Hugging Face Safetensors / imported GGUF | BF16, native MXFP4, INT4 or Qn_K | [GPT-OSS](gpt-oss/README.md#reference-performance) |
-| GPT-OSS-120B | Hugging Face Safetensors / imported GGUF | BF16, native MXFP4, INT4 or Qn_K | [GPT-OSS](gpt-oss/README.md#reference-performance) |
-| DeepSeek-V4-Flash | Hugging Face Safetensors / imported target GGUF | FP8/FP4, native INT4 or Qn_K | [DeepSeek V4 Flash](deepseek-v4/README.md#deepseek-v4-flash-matrix) |
-| DeepSeek-V4-Flash-DSpark | Hugging Face Safetensors / imported target GGUF | FP8/FP4, native INT4 or Qn_K | [DeepSeek V4 Flash DSpark](deepseek-v4/README.md#deepseek-v4-flash-dspark-matrix) |
-| Qwen3.6-35B-A3B text backbone | Hugging Face Safetensors / imported GGUF | BF16, native INT4/Qn_K, or optional compiled MXFP4 Artifact | [Execution and performance](qwen3.6/README.md) |
-| Qwen3.5 / Qwen3.6 / Qwen3.8-27B dense text architecture | Hugging Face Safetensors (`qwen3_5`) | BF16, native AWQ/GPTQ INT4, or imported GGUF Qn_K | [Dense admission and validation boundary](qwen3.6/README.md#dense-text-models) |
-| Qwen3.8-Flash-Next text backbone | Hugging Face Safetensors / imported GGUF | BF16, native INT4/Qn_K, or optional compiled MXFP4 Artifact | [Admission and execution](qwen3.8/README.md) |
+| GPT-OSS-20B | Hugging Face Safetensors / native GGUF | BF16, native MXFP4, INT4 or Qn_K | [GPT-OSS](gpt-oss/README.md#reference-performance) |
+| GPT-OSS-120B | Hugging Face Safetensors / native GGUF | BF16, native MXFP4, INT4 or Qn_K | [GPT-OSS](gpt-oss/README.md#reference-performance) |
+| DeepSeek-V4-Flash | Hugging Face Safetensors / native target GGUF | FP8/FP4, native INT4 or Qn_K | [DeepSeek V4 Flash](deepseek-v4/README.md#deepseek-v4-flash-matrix) |
+| DeepSeek-V4-Flash-DSpark | Hugging Face Safetensors; GGUF target-only | FP8/FP4, native INT4 or Qn_K | [DeepSeek V4 Flash DSpark](deepseek-v4/README.md#deepseek-v4-flash-dspark-matrix) |
+| Qwen3.6-35B-A3B text backbone | Hugging Face Safetensors / native GGUF | BF16, native INT4/Qn_K, or optional compiled MXFP4 Artifact | [Execution and performance](qwen3.6/README.md) |
+| Qwen3.5 / Qwen3.6 / Qwen3.8-27B dense text architecture | Hugging Face Safetensors / native GGUF (`qwen3_5`) | BF16, native AWQ/GPTQ INT4, or GGUF Qn_K | [Dense admission and validation boundary](qwen3.6/README.md#dense-text-models) |
+| Qwen3.8-Flash-Next text backbone | Hugging Face Safetensors / native GGUF | BF16, native INT4/Qn_K, or optional compiled MXFP4 Artifact | [Admission and execution](qwen3.8/README.md) |
 
 ## Execution capability
 
@@ -73,7 +73,29 @@ compressor positions retain FP32.
 `tools/import_quantized.py` produces a new Safetensors model directory with
 its tokenizer assets, leaving the source unchanged. The same adapters load
 the result. Matching canonical HF configuration and tokenizer assets are
-required for GGUF import.
+required for offline GGUF import.
+
+All built-in model families accept native GGUF through the existing
+`--model` option, using a GGUF file, a standard split directory, or its parent
+containing one package. GGUF architecture names `deepseek4`, `gpt-oss`,
+`qwen35`, `qwen35moe`, and `qwen4exp` select the existing model adapters.
+Model configuration, vocabulary, merges, and supported tokenizer profiles
+come from GGUF metadata. BF16/F32 projections and native Qn_K blocks use their
+existing kernels; MXFP4 routed Experts are read from the original GGUF ranges
+through the existing on-demand host cache and Hybrid GPU Expert cache. Only
+selected Expert cache entries unpack the GGUF block layout in memory; no
+converted weight files or tokenizer sidecars are written. Qwen normalization,
+recurrent-head ordering, PLE, and indexer layouts are restored at the tensor
+boundary. Packed recurrent output weights retain their codes and carry an
+activation column map. Unknown tokenizer profiles or chat templates fail
+explicitly. Target packages containing MTP tensors run their target layers;
+draft-only packages and missing DSpark draft weights do not enable speculation.
+
+```powershell
+python tools/ncnn_moe.py run --model "./models/DeepSeek-GGUF" `
+  --backend hybrid --expert-memory on-demand --cpu-packed-weights off `
+  --prompt "Reply OK" --max-new-tokens 32 --no-speculative
+```
 
 | Source | Imported storage and current boundary |
 | --- | --- |
@@ -119,7 +141,7 @@ python tools/import_quantized.py /models/Qwen-Q4_K_M.gguf /models/Qwen-imported 
 python tools/ncnn_moe.py run --model /models/Qwen-imported --prompt 'Reply OK'
 ```
 
-Choose a fresh output directory for each import. GGUF requires matching
+Choose a fresh output directory for each import. Offline GGUF import requires matching
 original `config.json`, `tokenizer.json`, `tokenizer_config.json`, and chat
 template assets. Imported target GGUF files skip MTP tensors for target-only
 execution. For DeepSeek target GGUF, the output configuration omits DSpark

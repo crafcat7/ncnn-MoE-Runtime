@@ -641,6 +641,71 @@ void VulkanExpertBackend::set_foreground_active(bool active) noexcept
     }
 }
 
+static uint64_t native_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
+                                            const TensorData& down, const VulkanContext& context,
+                                            uint64_t optimization_flags)
+{
+    const auto quantized = [](DType dtype) { return dtype == DType::Int4 || is_qnk_dtype(dtype); };
+    if (gate_up.shape.size() != 2 || down.shape.size() != 2
+        || (!up && !quantized(gate_up.dtype) && !quantized(down.dtype))
+        || (up ? up->shape != gate_up.shape || down.shape[1] != gate_up.shape[0]
+               : gate_up.shape[0] % 2 != 0 || down.shape[1] != gate_up.shape[0] / 2)
+        || down.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 128))
+    {
+        return 0;
+    }
+    const uint64_t alignment = std::max<uint64_t>(4, context.device()->info.buffer_offset_alignment());
+    const uint64_t maximum_range = context.device()->info.physicalDeviceProperties().limits.maxStorageBufferRange;
+    const uint32_t projection_lanes = std::max<uint32_t>(32, context.device()->info.subgroup_size());
+    uint64_t size = 0;
+    for (const TensorData* matrix : {&gate_up, up, &down})
+    {
+        if (!matrix)
+            continue;
+        if (matrix->shape.size() != 2 || matrix->shape[0] == 0 || matrix->shape[1] == 0
+            || matrix->shape[0] > static_cast<uint32_t>(std::numeric_limits<int>::max()) / projection_lanes
+            || matrix->shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max()))
+        {
+            return 0;
+        }
+        const uint64_t elements = static_cast<uint64_t>(matrix->shape[0]) * matrix->shape[1];
+        if (matrix->dtype == DType::BFloat16 || matrix->dtype == DType::Float32)
+        {
+            const uint64_t element_size = matrix->dtype == DType::BFloat16 ? sizeof(uint16_t) : sizeof(float);
+            const uint64_t count = matrix->dtype == DType::BFloat16 ? matrix->bfloat16_values().size()
+                                                                    : matrix->float32_values().size();
+            if (!matrix->input_column_indices.empty() || count != elements
+                || elements > static_cast<uint64_t>(std::numeric_limits<int>::max()) / element_size)
+            {
+                return 0;
+            }
+        }
+        else if (matrix->dtype == DType::Int4)
+        {
+            if (!validate_int4_tensor(*matrix))
+                return 0;
+        }
+        else if (!has_flag(optimization_flags, OptimizationVulkanQnK)
+                 || !is_qnk_dtype(matrix->dtype)
+                 || !qnk_shape_supported(matrix->dtype, matrix->shape[0], matrix->shape[1])
+                 || matrix->qnk_values().size() != qnk_storage_bytes(matrix->dtype, matrix->shape[0], matrix->shape[1])
+                 || !validate_input_column_indices(*matrix))
+        {
+            return 0;
+        }
+        // Each projection owns one packed allocation containing the original
+        // matrix, an aligned FP32 bias (also when absent), and its metadata.
+        const uint64_t part = QnkLinear_vulkan::storage_bytes(*matrix, alignment);
+        if (part == 0 || part > static_cast<uint64_t>(std::numeric_limits<int>::max())
+            || part > maximum_range || part > std::numeric_limits<uint64_t>::max() - size)
+        {
+            return 0;
+        }
+        size += part;
+    }
+    return size;
+}
+
 bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const TensorData> gate_up,
                                          const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down,
                                          const TensorData* down_bias, uint32_t residency_group,
@@ -694,26 +759,11 @@ bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const 
                               && down->shape[1] == gate_up->shape[0] / 2
                               && valid_mxfp4_matrix(*gate_up)
                               && valid_mxfp4_matrix(*down);
-    const auto valid_native_matrix = [](const TensorData& matrix) {
-        if (matrix.shape.size() != 2 || matrix.shape[0] == 0 || matrix.shape[1] == 0)
-            return false;
-        if (matrix.dtype == DType::Int4)
-            return static_cast<bool>(validate_int4_tensor(matrix));
-        if (matrix.dtype == DType::BFloat16)
-            return matrix.input_column_indices.empty() && matrix.bfloat16_values().size() == matrix.element_count();
-        if (matrix.dtype == DType::Float32)
-            return matrix.input_column_indices.empty() && matrix.float32_values().size() == matrix.element_count();
-        return is_qnk_dtype(matrix.dtype) && matrix.shape.size() == 2
-               && qnk_shape_supported(matrix.dtype, matrix.shape[0], matrix.shape[1])
-               && matrix.qnk_values().size() == qnk_storage_bytes(matrix.dtype, matrix.shape[0], matrix.shape[1])
-               && static_cast<bool>(validate_input_column_indices(matrix));
-    };
     const auto quantized = [](const TensorData& matrix) { return matrix.dtype == DType::Int4 || is_qnk_dtype(matrix.dtype); };
-    const bool native_expert = gate_up && down && (quantized(*gate_up) || quantized(*down) || (up && quantized(*up)))
-                               && valid_native_matrix(*gate_up) && valid_native_matrix(*down)
-                               && (up ? valid_native_matrix(*up) && up->shape == gate_up->shape
-                                            && down->shape[1] == gate_up->shape[0]
-                                      : gate_up->shape[0] % 2 == 0 && down->shape[1] == gate_up->shape[0] / 2);
+    const uint64_t native_size = gate_up && down && (up || quantized(*gate_up) || quantized(*down))
+                                     ? native_expert_storage_bytes(*gate_up, up.get(), *down, *vulkan_context, optimization_flags)
+                                     : 0;
+    const bool native_expert = native_size != 0;
     if (key.empty()
         || (!mxfp4_expert && !native_expert && !bfloat16_expert)
         || !valid_bias(gate_up_bias, gate_up->shape[0])
@@ -727,11 +777,9 @@ bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const 
         return false;
     }
     uint64_t size = 0;
-    const uint64_t alignment = std::max<uint64_t>(4, vulkan_context->device()->info.buffer_offset_alignment());
-    const std::array<uint64_t, 5> parts = {
-        native_expert ? QnkLinear_vulkan::storage_bytes(*gate_up, alignment) : expert_matrix_bytes(*gate_up),
-        native_expert ? QnkLinear_vulkan::storage_bytes(*down, alignment) : expert_matrix_bytes(*down),
-        up ? QnkLinear_vulkan::storage_bytes(*up, alignment) : 0,
+    const std::array<uint64_t, 4> parts = {
+        native_expert ? native_size : expert_matrix_bytes(*gate_up),
+        native_expert ? 0 : expert_matrix_bytes(*down),
         native_expert ? 0 : tensor_bytes(gate_up_bias),
         native_expert ? 0 : tensor_bytes(down_bias)};
     for (uint64_t part : parts)
@@ -1407,7 +1455,8 @@ std::shared_ptr<VulkanExpertBackend::Entry> VulkanExpertBackend::create_entry(co
                                                                      optimization_flags,
                                                                      upload_batch);
     }
-    else if (admission.gate_up->dtype == DType::BFloat16)
+    else if (!admission.up && admission.gate_up->dtype == DType::BFloat16
+             && admission.down->dtype == DType::BFloat16)
     {
         entry->bfloat16_operation = Bfloat16Expert_vulkan::create_with_allocator(*admission.gate_up,
                                                                                  admission.gate_up_bias.get(),
@@ -2684,18 +2733,7 @@ uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const 
     auto context = VulkanContext::acquire(device_index, vulkan_runtime, optimization_flags);
     if (!context)
         return 0;
-    const uint64_t alignment = std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
-    uint64_t size = 0;
-    for (const TensorData* matrix : {&gate_up, up, &down})
-    {
-        if (!matrix)
-            continue;
-        const uint64_t part = QnkLinear_vulkan::storage_bytes(*matrix, alignment);
-        if (part == 0 || part > std::numeric_limits<uint64_t>::max() - size)
-            return 0;
-        size += part;
-    }
-    return size;
+    return native_expert_storage_bytes(gate_up, up, down, *context, optimization_flags);
 #else
     (void)gate_up;
     (void)up;

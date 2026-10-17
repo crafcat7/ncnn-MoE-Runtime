@@ -2015,10 +2015,23 @@ void test_ncnn_vulkan_float8_operator()
 
 void test_ncnn_vulkan_bfloat16_operator()
 {
-#if NCNN_MOE_WITH_NCNN
+#if NCNN_MOE_WITH_NCNN && NCNN_MOE_WITH_VULKAN
     const VulkanRuntimePtr vulkan_runtime = create_vulkan_runtime();
     if (get_gpu_count() == 0)
+    {
+        std::cout << "SKIP BF16 Vulkan operator: no Vulkan device is available\n";
         return;
+    }
+    const uint32_t device_index = get_default_gpu_index();
+    const auto context = VulkanContext::acquire(device_index, vulkan_runtime, g_test_optimization_flags);
+    check(static_cast<bool>(context));
+    const uint32_t subgroup_size = context->device()->info.subgroup_size();
+    if (subgroup_size != 32)
+    {
+        std::cout << "SKIP BF16 Vulkan operator: device subgroup size " << subgroup_size
+                  << " is not 32\n";
+        return;
+    }
     TensorData first;
     first.dtype = DType::BFloat16;
     first.shape = {192, 128};
@@ -2071,7 +2084,7 @@ void test_ncnn_vulkan_bfloat16_operator()
     const ActivationBuffer first_cpu = forward_linear(first, first_bias, input, g_test_optimization_flags);
     const auto first_vulkan = Bfloat16Linear_vulkan::create(first,
                                                             &first_bias,
-                                                            automatic_vulkan_device_index,
+                                                            device_index,
                                                             vulkan_runtime,
                                                             g_test_optimization_flags);
     check(static_cast<bool>(first_vulkan));
@@ -2141,7 +2154,7 @@ void test_ncnn_vulkan_bfloat16_operator()
         const uint64_t cooperative_flags = g_test_optimization_flags | OptimizationVulkanBfloat16CoopMatrix;
         const auto cooperative_operator = Bfloat16Linear_vulkan::create(first,
                                                                         &first_bias,
-                                                                        automatic_vulkan_device_index,
+                                                                        device_index,
                                                                         vulkan_runtime,
                                                                         cooperative_flags);
         check(static_cast<bool>(cooperative_operator));
@@ -2201,7 +2214,7 @@ void test_ncnn_vulkan_bfloat16_operator()
                                                                g_test_optimization_flags);
         const auto tail_operator = Bfloat16Linear_vulkan::create(tail_matrix,
                                                                  nullptr,
-                                                                 automatic_vulkan_device_index,
+                                                                 device_index,
                                                                  vulkan_runtime,
                                                                  g_test_optimization_flags);
         check(static_cast<bool>(tail_operator));
@@ -2223,7 +2236,7 @@ void test_ncnn_vulkan_bfloat16_operator()
 
     const auto fused = Bfloat16Linear_vulkan::create_fused({&first, &second},
                                                            {&first_bias, &second_bias},
-                                                           automatic_vulkan_device_index,
+                                                           device_index,
                                                            vulkan_runtime,
                                                            g_test_optimization_flags);
     check(static_cast<bool>(fused));
@@ -2280,12 +2293,12 @@ void test_ncnn_vulkan_bfloat16_operator()
     }
     const auto fused_swiglu = Bfloat16Linear_vulkan::create_fused({&gate, &up, &router_gate},
                                                                   {nullptr, nullptr, nullptr},
-                                                                  automatic_vulkan_device_index,
+                                                                  device_index,
                                                                   vulkan_runtime,
                                                                   g_test_optimization_flags);
     const auto down_vulkan = Bfloat16Linear_vulkan::create(down,
                                                            nullptr,
-                                                           automatic_vulkan_device_index,
+                                                           device_index,
                                                            vulkan_runtime,
                                                            g_test_optimization_flags);
     check(static_cast<bool>(fused_swiglu));
@@ -2369,7 +2382,7 @@ void test_ncnn_vulkan_bfloat16_operator()
         };
 
         const auto bfloat_backend = create_vulkan_expert_backend(1024 * 1024,
-                                                                 automatic_vulkan_device_index,
+                                                                 device_index,
                                                                  nullptr,
                                                                  vulkan_runtime,
                                                                  g_test_optimization_flags);
@@ -2438,7 +2451,7 @@ void test_ncnn_vulkan_bfloat16_operator()
 
 #if NCNN_MOE_WITH_VULKAN
     {
-        const auto context = VulkanContext::acquire(automatic_vulkan_device_index,
+        const auto context = VulkanContext::acquire(device_index,
                                                     vulkan_runtime,
                                                     g_test_optimization_flags);
         check(static_cast<bool>(context));
@@ -2519,6 +2532,8 @@ void test_ncnn_vulkan_bfloat16_operator()
         check(std::memcmp(self_first_input.bytes().data(), staged_values.data(), 4 * sizeof(uint16_t)) == 0);
     }
 #endif
+#else
+    std::cout << "SKIP BF16 Vulkan operator: NCNN/Vulkan backend is unavailable\n";
 #endif
 }
 
@@ -8782,6 +8797,45 @@ void test_speculative_generation()
     {
         if (speculative_kind == 0)
         {
+            const std::vector<float> original_lm_head = compiled.weights.at(compiled.lm_head_weight).float32_data;
+            const auto original_mtp_final_norm = compiled.speculative.final_norm_weight;
+            // This fixture's target hidden has positive sum, so this head selects token 1; zeroing only the MTP final norm ties draft logits and selects token 0.
+            // temperature > 0 with top_k=1 makes these disjoint one-hot distributions exercise rejection and residual sampling deterministically.
+            TensorData zero_mtp_final_norm;
+            zero_mtp_final_norm.dtype = DType::Float32;
+            zero_mtp_final_norm.shape = {2};
+            zero_mtp_final_norm.float32_data = {0.0f, 0.0f};
+            auto zero_mtp_final_norm_handle = compiled.weights.add("test_mtp_zero_final_norm", std::move(zero_mtp_final_norm));
+            check(static_cast<bool>(zero_mtp_final_norm_handle));
+            compiled.speculative.final_norm_weight = zero_mtp_final_norm_handle.value();
+            compiled.weights.at_mutable(compiled.lm_head_weight).float32_data = {-1.0f, -1.0f, 1.0f, 1.0f};
+            compiled.operators.bind_weight_count(compiled.weights.size());
+            check(static_cast<bool>(build_graph(compiled, false)));
+
+            GenerationOptions residual_options = options;
+            residual_options.max_new_tokens = 3;
+            residual_options.sampling.temperature = 1.0f;
+            residual_options.sampling.top_k = 1;
+            residual_options.speculative_confidence_threshold = 0.0f;
+            SessionOptions residual_session_options;
+            residual_session_options.sampling_seed = 1234;
+            auto residual_session = runtime.create_session(model.value(), residual_session_options).value();
+            auto residual_result = residual_session->generate(input, residual_options);
+            check(static_cast<bool>(residual_result));
+            check(residual_result.value().tokens.size() == residual_options.max_new_tokens);
+            check(residual_session->statistics().speculative_proposals == 1);
+            check(residual_session->statistics().speculative_accepted_tokens == 0);
+            for (const StreamToken& token : residual_result.value().tokens)
+            {
+                check(token.token_id == 1);
+                check(token.probability == 1.0f);
+            }
+
+            compiled.weights.at_mutable(compiled.lm_head_weight).float32_data = original_lm_head;
+            compiled.speculative.final_norm_weight = original_mtp_final_norm;
+            compiled.operators.bind_weight_count(compiled.weights.size());
+            check(static_cast<bool>(build_graph(compiled, false)));
+
             GenerationOptions mtp_options = options;
             mtp_options.max_new_tokens = 12;
             for (uint32_t block_size : {2u, 4u, 8u})
@@ -10130,6 +10184,39 @@ void test_shared_expert_descriptor()
         mtp_states[index].mtp_pending_target_hidden.row(0)[1] = 0.25f;
         mtp_statistics[index].expert_token_counts.resize(shared_descriptor.expert_count);
     }
+    const auto pending_bytes = mtp_states[0].mtp_pending_target_hidden.bytes();
+    const std::byte* pending_data = pending_bytes.data();
+    const std::vector<std::byte> pending_snapshot(pending_bytes.begin(), pending_bytes.end());
+    SessionStatistics failure_statistics = mtp_statistics[0];
+    check(static_cast<bool>(begin_state_cache_transaction(mtp_states[0].speculative_layers,
+                                                          mtp.block_size)));
+    size_t sampler_calls = 0;
+    const SpeculativeSampler failing_sampler = [&sampler_calls](const std::vector<float>&) -> Result<int32_t> {
+        if (sampler_calls++ == 0)
+            return 0;
+        return Error{ErrorCode::InternalError, "test sampler failure"};
+    };
+    auto failed_mtp = propose_speculative(mtp_shared_model,
+                                          1,
+                                          failure_statistics,
+                                          mtp_states[0],
+                                          1,
+                                          failing_sampler);
+    auto rolled_back_mtp_cache = finish_state_cache_transaction(mtp_states[0].speculative_layers,
+                                                                0);
+    check(static_cast<bool>(rolled_back_mtp_cache));
+    check(!failed_mtp);
+    check(failed_mtp.error().code == ErrorCode::InternalError);
+    check(failed_mtp.error().message == "test sampler failure");
+    check(sampler_calls == 2);
+    check(mtp_states[0].mtp_pending_target_hidden.rows() == 1);
+    check(mtp_states[0].mtp_pending_target_hidden.columns() == 2);
+    check(mtp_states[0].mtp_pending_target_hidden.bytes().data() == pending_data);
+    check(mtp_states[0].mtp_pending_target_hidden.bytes().size() == pending_snapshot.size());
+    check(std::equal(mtp_states[0].mtp_pending_target_hidden.bytes().begin(),
+                     mtp_states[0].mtp_pending_target_hidden.bytes().end(),
+                     pending_snapshot.begin(),
+                     pending_snapshot.end()));
     const SpeculativeSampler first_token = [](const std::vector<float>&) -> Result<int32_t> { return 0; };
     auto mtp_actual = propose_speculative(mtp_shared_model, 1, mtp_statistics[0], mtp_states[0], 1, first_token);
     auto mtp_expected = propose_speculative(serial_mtp_model, 1, mtp_statistics[1], mtp_states[1], 1, first_token);
@@ -14677,6 +14764,16 @@ void test_gated_delta_vulkan_budget_admission()
     if (get_gpu_count() == 0)
         return;
 
+    bool bf16_supported = false;
+#if NCNN_MOE_WITH_NCNN && NCNN_MOE_WITH_VULKAN
+    const auto context = VulkanContext::acquire(get_default_gpu_index(), create_vulkan_runtime(), g_test_optimization_flags);
+    check(static_cast<bool>(context));
+    bf16_supported = context->device()->info.subgroup_size() == 32;
+    if (!bf16_supported)
+        std::cout << "SKIP BF16 GDN GPU admission: device subgroup size " << context->device()->info.subgroup_size()
+                  << " is not 32; CPU fallback parity remains enabled\n";
+#endif
+
     Qwen4ExpModelAdapter adapter;
     auto parsed = adapter.parse_model(qwen4_exp_package());
     check(static_cast<bool>(parsed));
@@ -14808,7 +14905,7 @@ void test_gated_delta_vulkan_budget_admission()
             for (const ExpertPlan& expert : layer.moe.experts)
                 check(static_cast<bool>(model.weights.at(expert.gate_up_weight).mxfp4_file_storage));
         }
-        if (admitted_layers != test_case.expected_layers)
+        if (admitted_layers != (bf16_supported ? test_case.expected_layers : 0))
             throw std::runtime_error(std::string("unexpected GDN budget admission (") + test_case.name + "): " + std::to_string(admitted_layers));
         uint32_t gpu_expert_nodes = 0;
         for (const ExecutionNode& node : model.graph.nodes)
@@ -17700,20 +17797,29 @@ void test_backend_capabilities_and_hybrid_execution()
         check(static_cast<bool>(selected_device_model));
         check(static_cast<bool>(selected_device_model.value()->vulkan_device_index() == selected_device_options.vulkan_device_index));
 
-        if (runtime.info().gpu_infos.size() >= 2 && runtime.info().gpu_infos[0].type != VulkanDeviceType::Cpu && runtime.info().gpu_infos[1].type != VulkanDeviceType::Cpu)
+        std::vector<uint32_t> usable_device_indices;
+        for (const GpuInfo& gpu : runtime.info().gpu_infos)
+        {
+            if (gpu.type != VulkanDeviceType::Cpu && gpu.compute_queue_count > 0)
+                usable_device_indices.push_back(gpu.device_index);
+        }
+        if (usable_device_indices.size() >= 2)
         {
             Option multi_device_options;
             multi_device_options.hybrid_mode = HybridMode::HybridExperts;
-            multi_device_options.vulkan_device_indices = {
-                0,
-                1,
-            };
+            multi_device_options.vulkan_device_indices = {usable_device_indices[0], usable_device_indices[1]};
             auto multi_device_model = runtime.load_model(package.path(), multi_device_options);
             check(static_cast<bool>(multi_device_model));
-            check(static_cast<bool>(multi_device_model.value()->vulkan_device_indices() == std::vector<uint32_t>({0})));
+            check(multi_device_model.value()->vulkan_device_index() == usable_device_indices[0]);
+            const std::vector<uint32_t>& selected_devices = multi_device_model.value()->vulkan_device_indices();
+            check(!selected_devices.empty());
+            check(std::find(selected_devices.begin(), selected_devices.end(), usable_device_indices[0]) != selected_devices.end());
+            for (uint32_t device_index : selected_devices)
+                check(device_index == usable_device_indices[0] || device_index == usable_device_indices[1]);
             const CompiledModel& compiled = model_compiled(*multi_device_model.value());
-            check(static_cast<bool>(compiled.graph.layer_plans.front().vulkan_device_index
-                                    < runtime.info().gpu_infos.size()));
+            check(std::find(selected_devices.begin(), selected_devices.end(),
+                            compiled.graph.layer_plans.front().vulkan_device_index)
+                  != selected_devices.end());
         }
 
         const SessionStatistics& statistics = automatic_session.value()->statistics();

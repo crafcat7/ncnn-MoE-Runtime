@@ -2,6 +2,7 @@
 #define NCNN_MOE_MODELPIPELINE_H
 
 #include "ncnn/moe/result.h"
+#include "ncnn/moe/types.h"
 
 #include <cstdint>
 
@@ -15,6 +16,7 @@ struct CompiledModel;
 struct AttentionBlockPlan;
 struct CompilerOption;
 struct ExpertPlan;
+struct CompiledLayerPlan;
 
 Result<void> prepare_model_pipeline(CompiledModel& compiled,
                                     const CompilerOption& opt);
@@ -30,6 +32,25 @@ void release_vulkan_dense_host_copies(CompiledModel& compiled);
 
 [[nodiscard]] bool support_vulkan_ffn(const CompiledOperatorTable& operators,
                                       const ExpertPlan& ffn) noexcept;
+
+[[nodiscard]] bool support_vulkan_dense_ffn(const CompiledOperatorTable& operators,
+                                            const ExpertPlan& ffn) noexcept;
+
+[[nodiscard]] uint64_t dense_vulkan_attention_storage_size(const CompiledModel& compiled,
+                                                           const CompiledLayerPlan& layer,
+                                                           uint64_t alignment,
+                                                           uint32_t device_index = automatic_vulkan_device_index) noexcept;
+
+[[nodiscard]] uint64_t dense_vulkan_weight_storage_size(const CompiledModel& compiled,
+                                                        const TensorData& matrix,
+                                                        uint64_t alignment,
+                                                        uint32_t device_index = automatic_vulkan_device_index,
+                                                        bool has_bias = false) noexcept;
+
+[[nodiscard]] uint64_t dense_vulkan_workspace_reserve(uint64_t heap_budget) noexcept;
+
+[[nodiscard]] uint64_t dense_vulkan_pending_state_size(const CompiledModel& compiled,
+                                                       uint32_t device_index) noexcept;
 
 [[nodiscard]] bool support_vulkan_attention(const CompiledOperatorTable& operators,
                                             const AttentionBlockPlan& attention) noexcept;

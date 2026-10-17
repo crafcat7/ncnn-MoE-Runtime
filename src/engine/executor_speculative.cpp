@@ -247,7 +247,8 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
 
 static Result<ActivationBuffer> forward_mtp_input(const CompiledModel& model,
                                                   std::span<const int32_t> input_ids,
-                                                  const ActivationBuffer& target_hidden)
+                                                  const ActivationBuffer& target_hidden,
+                                                  AttentionScratch& scratch)
 {
     if (input_ids.empty()
         || input_ids.size() != target_hidden.rows()
@@ -258,27 +259,31 @@ static Result<ActivationBuffer> forward_mtp_input(const CompiledModel& model,
             "invalid Qwen MTP input batch"};
     }
 
-    ActivationBuffer embeddings;
+    ActivationBuffer& emb = scratch.normalized;
     forward_embedding(model.weights.at(model.token_embedding),
                       input_ids,
-                      embeddings);
-    forward_rms_norm(embeddings,
+                      emb);
+    forward_rms_norm(emb,
                      model.weights.at(model.speculative.mtp_embedding_norm_weight),
                      model.descriptor.norm_epsilon,
-                     embeddings,
+                     emb,
                      model.descriptor.norm_weight_offset);
-    ActivationBuffer normalized_hidden = forward_rms_norm(target_hidden,
-                                                          model.weights.at(model.speculative.mtp_hidden_norm_weight),
-                                                          model.descriptor.norm_epsilon,
-                                                          model.descriptor.norm_weight_offset);
-    ActivationBuffer packed(target_hidden.rows(),
-                            model.descriptor.hidden_size * 2);
+    ActivationBuffer& norm = scratch.query;
+    forward_rms_norm(target_hidden,
+                     model.weights.at(model.speculative.mtp_hidden_norm_weight),
+                     model.descriptor.norm_epsilon,
+                     norm,
+                     model.descriptor.norm_weight_offset);
+    ActivationBuffer& packed = scratch.fused_qkv;
+    packed.reset(target_hidden.rows(),
+                 model.descriptor.hidden_size * 2,
+                 false);
     for (size_t row = 0; row < target_hidden.rows(); ++row)
     {
-        std::copy_n(embeddings.row(row),
+        std::copy_n(emb.row(row),
                     model.descriptor.hidden_size,
                     packed.row(row));
-        std::copy_n(normalized_hidden.row(row),
+        std::copy_n(norm.row(row),
                     model.descriptor.hidden_size,
                     packed.row(row) + model.descriptor.hidden_size);
     }
@@ -302,7 +307,8 @@ static Result<ActivationBuffer> forward_mtp(const CompiledModel& model,
     }
     auto prepared = forward_mtp_input(model,
                                       input_ids,
-                                      target_hidden);
+                                      target_hidden,
+                                      state.attention_scratch);
     if (!prepared)
         return prepared.error();
     ActivationBuffer hidden = std::move(prepared).value();
@@ -351,7 +357,8 @@ static Result<void> append_mtp_context(const CompiledModel& model,
     }
     auto prepared = forward_mtp_input(model,
                                       input_ids,
-                                      target_hidden);
+                                      target_hidden,
+                                      state.attention_scratch);
     if (!prepared)
         return prepared.error();
     const SpeculativeModelPlan::LayerNodes& execution = layer_nodes.front();
@@ -486,7 +493,7 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
         if (model.vulkan_runtime)
         {
             const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
-            record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
+            record_vulkan_delta(statistics, vulkan_before, vulkan_after);
         }
         statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
         return {};
@@ -549,7 +556,7 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
     if (model.vulkan_runtime)
     {
         const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
-        record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
+        record_vulkan_delta(statistics, vulkan_before, vulkan_after);
     }
     statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
     return {};
@@ -613,17 +620,20 @@ static Result<SpeculativeProposal> propose_mtp(const CompiledModel& model,
     proposal.logits.reserve(model.speculative.block_size);
     proposal.confidence_logits.reserve(model.speculative.block_size);
     proposal.committed_context_rows = 1;
-    ActivationBuffer previous_hidden = state.mtp_pending_target_hidden;
+    ActivationBuffer previous_hidden;
     ActivationBuffer logits;
     int32_t previous_token = input_id;
     for (uint32_t row = 0;
          row < model.speculative.block_size;
          ++row)
     {
+        const ActivationBuffer& input_hidden = row == 0
+                                                   ? state.mtp_pending_target_hidden
+                                                   : previous_hidden;
         const std::span<const int32_t> token(&previous_token,
                                              1);
         auto mtp_hidden = forward_mtp(model, execution,
-                                      token, previous_hidden,
+                                      token, input_hidden,
                                       state.mtp_pending_target_position + row, statistics, state);
         if (!mtp_hidden)
             return mtp_hidden.error();
@@ -645,21 +655,11 @@ static Result<SpeculativeProposal> propose_mtp(const CompiledModel& model,
     }
     state.mtp_pending_target_hidden.clear();
 
-    if (model.expert_cache)
-    {
-        const ExpertCacheStatistics cache_after = model.expert_cache->statistics();
-        record_expert_cache_delta(statistics, cache_before, cache_after);
-    }
-    if (model.expert_backend)
-    {
-        record_expert_backend_delta(statistics,
-                                    backend_before,
-                                    model.expert_backend->statistics());
-    }
+    record_resource_delta(model, statistics, cache_before, backend_before);
     if (model.vulkan_runtime)
     {
         const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
-        record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
+        record_vulkan_delta(statistics, vulkan_before, vulkan_after);
     }
     ++statistics.speculative_proposals;
     statistics.speculative_draft_tokens += proposal.token_ids.size();
@@ -833,19 +833,11 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
         proposal.confidence_logits.push_back(confidence_output.row(0)[0]);
     }
 
-    if (model.expert_cache)
-    {
-        const ExpertCacheStatistics cache_after = model.expert_cache->statistics();
-        record_expert_cache_delta(statistics, cache_before, cache_after);
-    }
-    if (model.expert_backend)
-    {
-        record_expert_backend_delta(statistics, backend_before, model.expert_backend->statistics());
-    }
+    record_resource_delta(model, statistics, cache_before, backend_before);
     if (model.vulkan_runtime)
     {
         const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
-        record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
+        record_vulkan_delta(statistics, vulkan_before, vulkan_after);
     }
     statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
     ++statistics.speculative_proposals;

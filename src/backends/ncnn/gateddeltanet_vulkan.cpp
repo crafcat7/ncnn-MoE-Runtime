@@ -858,7 +858,7 @@ GatedDeltaNet_vulkan::create_impl(const std::shared_ptr<Bfloat16Linear_vulkan>& 
         }
     }
 
-    implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(implementation.vulkan_context->device()));
+    implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(implementation.vulkan_context->device(), static_cast<size_t>(vulkan_weight_block_size)));
     implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(implementation.vulkan_context->device()));
     ncnn::Mat convolution_model;
     ncnn::Mat time_model;
@@ -1064,7 +1064,6 @@ bool GatedDeltaNet_vulkan::forward_impl(const ActivationBuffer& input,
     {
         if (cmd.reset() != 0)
             return false;
-        ++runtime_state.command_buffer_reuses;
     }
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;
@@ -1398,7 +1397,6 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
     {
         if (cmd.reset() != 0)
             return GatedDeltaBatchResult_vulkan::NotExecuted;
-        ++runtime_state.command_buffer_reuses;
     }
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;

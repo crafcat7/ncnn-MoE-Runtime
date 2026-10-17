@@ -10,6 +10,8 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #endif
 
+layout(constant_id = 0) const uint workgroup_size = 32;
+
 layout(binding = 0) readonly buffer input_blob
 {
     float input_data[];
@@ -74,18 +76,16 @@ float mxfp4_product(float value, float input_value, float scale)
 #endif
 }
 
-#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
-shared float partial_sum[32];
-#endif
+shared float partial_sum[workgroup_size];
 
 void main()
 {
     const uint output_column = gl_WorkGroupID.x;
     const uint token = gl_WorkGroupID.y;
-    const uint lane = gl_LocalInvocationID.x;
+    const uint lane = gl_LocalInvocationIndex;
     const bool valid = output_column < p.output_columns && token < p.token_count;
     float sum = 0.0;
-    if (valid && lane < 32)
+    for (uint logical_lane = lane; valid && logical_lane < 32; logical_lane += workgroup_size)
     {
         const uint packed_row = output_column * p.block_count * 16;
         const uint scale_row = output_column * p.block_count;
@@ -93,29 +93,32 @@ void main()
         for (uint block = 0; block < p.block_count; ++block)
         {
             const float scale = decode_scale(scale_byte(scale_row + block));
-            const uint value = packed_byte(packed_row + block * 16 + lane / 2);
-            const uint nibble = (lane & 1) == 0 ? value & 15 : value >> 4;
+            const uint value = packed_byte(packed_row + block * 16 + logical_lane / 2);
+            const uint nibble = (logical_lane & 1) == 0 ? value & 15 : value >> 4;
             sum += mxfp4_product(decode_mxfp4(nibble),
-                                 input_data[input_row + block * 32 + lane],
+                                 input_data[input_row + block * 32 + logical_lane],
                                  scale);
         }
     }
+    float reduced_sum = 0.0;
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
-    const float reduced_sum = subgroupAdd(sum);
-    if (valid && lane == 0)
+    if (gl_NumSubgroups == 1)
     {
-        output_data[token * p.output_columns + output_column] = reduced_sum + bias_data[output_column];
+        reduced_sum = subgroupAdd(sum);
     }
-#else
-    partial_sum[lane] = sum;
-    barrier();
-    for (uint stride = 16; stride > 0; stride >>= 1)
-    {
-        if (lane < stride)
-            partial_sum[lane] += partial_sum[lane + stride];
-        barrier();
-    }
-    if (valid && lane == 0)
-        output_data[token * p.output_columns + output_column] = partial_sum[0] + bias_data[output_column];
+    else
 #endif
+    {
+        partial_sum[lane] = sum;
+        barrier();
+        for (uint stride = workgroup_size >> 1; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+                partial_sum[lane] += partial_sum[lane + stride];
+            barrier();
+        }
+        reduced_sum = partial_sum[0];
+    }
+    if (valid && lane == 0)
+        output_data[token * p.output_columns + output_column] = reduced_sum + bias_data[output_column];
 }

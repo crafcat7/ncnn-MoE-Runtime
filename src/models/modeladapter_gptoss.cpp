@@ -14,6 +14,25 @@ namespace moe {
 static Result<void> inspect_gpt_oss_experts(const SafetensorsArchive& archive,
                                             const std::string& source, MoeDescriptor& moe)
 {
+    const auto* gguf_gate = archive.find(source + "0.gate_proj.weight");
+    if (gguf_gate && gguf_gate->ggml_type == 39)
+    {
+        for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
+        {
+            const std::string expert = source + std::to_string(expert_id) + ".";
+            for (const char* role : {"gate_proj.weight", "up_proj.weight", "down_proj.weight"})
+            {
+                const auto* info = archive.find(expert + role);
+                if (!info || info->ggml_type != 39)
+                    return Error{ErrorCode::InvalidModel, "inconsistent GPT-OSS GGUF MXFP4 projections: " + expert};
+            }
+            if (archive.contains_tensor(expert + "gate_up_proj.weight") || archive.find(expert + "gate_up_proj_blocks"))
+                return Error{ErrorCode::InvalidModel, "duplicate GPT-OSS GGUF Expert projections: " + expert};
+        }
+        moe.layout = ExpertLayout::InterleavedGateUpDown;
+        moe.expert_weight_dtype = DType::MxFp4;
+        return {};
+    }
     const bool official = archive.find(source + "gate_up_proj_blocks") != nullptr
                           || archive.find(source + "0.gate_up_proj_blocks") != nullptr;
     if (official)
@@ -64,7 +83,29 @@ static Result<void> add_gpt_oss_expert_bias(WeightMapping& mapping, const Safete
 {
     const std::string expert = source + std::to_string(expert_id) + ".";
     const bool separate = layout == ExpertLayout::GateUpDown;
-    if (separate && (archive.contains_tensor(expert + "gate_proj.bias") || archive.contains_tensor(expert + "up_proj.bias")))
+    if (!separate && archive.contains_tensor(expert + "gate_proj.bias") && archive.contains_tensor(expert + "up_proj.bias"))
+    {
+        auto gate = archive.load_tensor(expert + "gate_proj.bias");
+        auto up = archive.load_tensor(expert + "up_proj.bias");
+        if (!gate)
+            return gate.error();
+        if (!up)
+            return up.error();
+        if (gate.value().dtype != DType::BFloat16 || up.value().dtype != DType::BFloat16
+            || gate.value().shape != std::vector<uint32_t>{intermediate_size} || up.value().shape != gate.value().shape)
+            return Error{ErrorCode::InvalidModel, "invalid GPT-OSS GGUF Expert bias shape: " + expert};
+        TensorData fused;
+        fused.dtype = DType::BFloat16;
+        fused.shape = {intermediate_size * 2};
+        fused.bfloat16_data.resize(static_cast<size_t>(intermediate_size) * 2);
+        for (size_t i = 0; i < intermediate_size; ++i)
+        {
+            fused.bfloat16_data[i * 2] = gate.value().bfloat16_values()[i];
+            fused.bfloat16_data[i * 2 + 1] = up.value().bfloat16_values()[i];
+        }
+        mapping.emplace(target + "gate_up.bias", std::move(fused));
+    }
+    else if (separate && (archive.contains_tensor(expert + "gate_proj.bias") || archive.contains_tensor(expert + "up_proj.bias")))
     {
         auto status = add_tensor(mapping, archive, target + "gate.bias", expert + "gate_proj.bias");
         if (!status)
@@ -211,7 +252,7 @@ Result<MoeModelDescriptor> GptOssModelAdapter::parse_model(const ModelPackage& p
     std::optional<SafetensorsArchive> archive;
     if (!package.root.empty())
     {
-        auto opened = SafetensorsArchive::open(package.root, package.manifest.raw_json);
+        auto opened = SafetensorsArchive::open(package.weights_path.empty() ? package.root : package.weights_path, package.manifest.raw_json);
         if (opened)
             archive = std::move(opened).value();
     }
@@ -239,7 +280,7 @@ Result<WeightMapping> GptOssModelAdapter::map_weights(const ModelPackage& packag
 {
     if (descriptor.model_type != "gpt_oss")
         return Error{ErrorCode::UnsupportedModel, "unsupported built-in model_type: " + descriptor.model_type};
-    auto opened = SafetensorsArchive::open(package.root, package.manifest.raw_json);
+    auto opened = SafetensorsArchive::open(package.weights_path.empty() ? package.root : package.weights_path, package.manifest.raw_json);
     if (!opened)
         return opened.error();
     SafetensorsArchive archive = std::move(opened).value();
@@ -349,6 +390,21 @@ Result<WeightMapping> GptOssModelAdapter::map_weights(const ModelPackage& packag
                 continue;
             }
             const std::string native_expert = experts_source + std::to_string(expert_id) + ".";
+            if (const auto* info = archive.find(native_expert + "gate_proj.weight"); info && info->ggml_type == 39)
+            {
+                auto gate_up = archive.load_interleaved_mxfp4_tensor(native_expert + "gate_proj.weight", {},
+                                                                     native_expert + "up_proj.weight", {},
+                                                                     descriptor.intermediate_size, descriptor.hidden_size, expert_load_flags);
+                if (!gate_up)
+                    return gate_up.error();
+                mapping.emplace(expert + "gate_up.weight", std::move(gate_up).value());
+                auto down = archive.load_mxfp4_tensor(native_expert + "down_proj.weight", {},
+                                                      descriptor.hidden_size, descriptor.intermediate_size, expert_load_flags);
+                if (!down)
+                    return down.error();
+                mapping.emplace(expert + "down.weight", std::move(down).value());
+                continue;
+            }
             if (archive.find(native_expert + "gate_up_proj_blocks"))
             {
                 auto gate_up = archive.load_mxfp4_tensor(native_expert + "gate_up_proj_blocks", native_expert + "gate_up_proj_scales",

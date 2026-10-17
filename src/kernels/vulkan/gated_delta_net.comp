@@ -91,6 +91,7 @@ void main()
                        * convolution_weight[state_base + tap];
             fused_input[input_row + channel] = sum * sigmoid(sum);
         }
+        memoryBarrierBuffer();
         barrier();
 
         for (uint key_head = lane; key_head < p.kv_head_count; key_head += 128)
@@ -114,6 +115,7 @@ void main()
                 fused_input[key_base + column] *= key_inverse_norm;
             }
         }
+        memoryBarrierBuffer();
         barrier();
 
         for (uint value_head = 0; value_head < p.head_count; ++value_head)

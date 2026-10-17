@@ -36,6 +36,30 @@
 namespace ncnn {
 namespace moe {
 
+bool unpack_gguf_mxfp4(std::span<const uint8_t> source,
+                       std::span<uint8_t> blocks,
+                       std::span<uint8_t> scales) noexcept
+{
+    if (source.empty() || source.size() % 17 != 0
+        || scales.size() != source.size() / 17
+        || blocks.size() != scales.size() * 16)
+        return false;
+    for (size_t block = 0; block < scales.size(); ++block)
+    {
+        const uint8_t* codes = source.data() + block * 17 + 1;
+        uint8_t* output = blocks.data() + block * 16;
+        scales[block] = source[block * 17];
+        for (size_t pair = 0; pair < 8; ++pair)
+        {
+            const uint8_t first = codes[pair * 2];
+            const uint8_t second = codes[pair * 2 + 1];
+            output[pair] = static_cast<uint8_t>((first & 15u) | (second & 15u) << 4);
+            output[pair + 8] = static_cast<uint8_t>((first >> 4) | (second & 240u));
+        }
+    }
+    return true;
+}
+
 static std::array<float, 256> make_scale_table()
 {
     std::array<float, 256> table = {};

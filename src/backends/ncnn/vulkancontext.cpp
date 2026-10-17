@@ -591,7 +591,6 @@ VulkanStatistics VulkanRuntimeState::snapshot() const noexcept
     result.rms_norm_linear_fusions = rms_norm_linear_fusions.load();
     result.kv_ring_appends = kv_ring_appends.load();
     result.bfloat16_cooperative_matrix_dispatches = bfloat16_cooperative_matrix_dispatches.load();
-    result.command_buffer_reuses = command_buffer_reuses.load();
     result.command_graph_submissions = command_graph_submissions.load();
     result.command_graph_operations = command_graph_operations.load();
     result.kv_ring_resizes = kv_ring_resizes.load();

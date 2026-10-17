@@ -15,6 +15,8 @@
 namespace ncnn {
 namespace moe {
 
+struct GgufTensorTransform;
+
 struct SafetensorInfo
 {
     std::filesystem::path path;
@@ -22,6 +24,29 @@ struct SafetensorInfo
     std::vector<uint32_t> shape;
     uint64_t offset = 0;
     uint64_t size = 0;
+    // Original GGML encoding for directly indexed GGUF ranges; UINT32_MAX for Safetensors.
+    uint32_t ggml_type = UINT32_MAX;
+    std::shared_ptr<const GgufTensorTransform> transform;
+};
+
+enum class GgufValueTransform
+{
+    None,
+    SubtractOne,
+    LogNegative
+};
+
+struct GgufTensorTransform
+{
+    // Raw ranges, with transform unset. Multiple matrices concatenate rows.
+    std::vector<SafetensorInfo> sources;
+    // Destination row/column -> stored row/column for floating-point tensors.
+    std::vector<uint32_t> row_indices;
+    std::vector<uint32_t> column_indices;
+    // Stored quantized input column -> logical input column; blocks stay raw.
+    std::vector<uint32_t> input_column_indices;
+    GgufValueTransform value_transform = GgufValueTransform::None;
+    std::vector<int64_t> generated_i64;
 };
 
 #define NCNN_MOE_SAFETENSOR_DEFER_MXFP4_BIT 0
@@ -62,12 +87,20 @@ public:
     [[nodiscard]] Result<TensorData> load_mxfp4_expert(const std::string& blocks_name, const std::string& scales_name, uint32_t expert_id, uint32_t rows, uint32_t columns, uint32_t flags = 0) const;
 
 private:
+    [[nodiscard]] static Result<TensorData> load_gguf_source(SafetensorInfo info,
+                                                             std::optional<uint32_t> slice,
+                                                             bool preserve_float32);
+    [[nodiscard]] Result<TensorData> load_gguf_tensor(const SafetensorInfo& info,
+                                                      std::optional<uint32_t> slice = std::nullopt,
+                                                      std::vector<uint32_t> shape = {},
+                                                      bool preserve_float32 = false) const;
     [[nodiscard]] Result<TensorData> load_source_int4_tensor(const std::string& name) const;
 
     std::unordered_map<std::string, SafetensorInfo> tensors;
     std::string source_quantization_method;
     int64_t source_quantization_group_size = 0;
     bool source_quantization_desc_act = false;
+    bool gguf_source = false;
 };
 
 } // namespace moe

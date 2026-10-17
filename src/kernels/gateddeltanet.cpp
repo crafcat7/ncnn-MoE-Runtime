@@ -516,7 +516,8 @@ Result<void> forward_gated_delta(const WeightStore& weights,
                    scratch.recurrent_output,
                    projected,
                    optimization_flags,
-                   operators.find_weight(plan.output_weight));
+                   operators.find_weight(plan.output_weight),
+                   backend);
     if (!has_flag(plan.flags, AttentionBlockExternalResidual))
         add_batch_inplace(projected, hidden);
     if (&projected != &output)

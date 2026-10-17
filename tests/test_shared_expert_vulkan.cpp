@@ -72,7 +72,7 @@ static void shared_model(CompiledModel& model, uint32_t hidden, uint32_t interme
     model.graph.layer_plans.resize(1);
     auto& plan = model.graph.layer_plans[0];
     plan.attention.kind = AttentionKind::None;
-    plan.vulkan_device_index = 0;
+    plan.vulkan_device_index = get_default_gpu_index();
     plan.moe.has_shared_expert = true;
     plan.moe.shared_expert.activation = ExpertActivation::DeepSeekSwiGlu;
     plan.moe.shared_expert.activation_limit = limit;
@@ -87,14 +87,14 @@ static void shared_model(CompiledModel& model, uint32_t hidden, uint32_t interme
     shared.up_weight = add("shared.up.weight", shared_fp8(intermediate, hidden, 2));
     shared.down_weight = add("shared.down.weight", shared_fp8(hidden, intermediate, 3));
     model.opt.optimization_flags = OptimizationDefaultFlags;
-    model.opt.vulkan_device_index = 0;
+    model.opt.vulkan_device_index = get_default_gpu_index();
     model.opt.hybrid_mode = gpu ? HybridMode::HybridExperts : HybridMode::CpuOnly;
     model.vulkan_runtime = runtime;
     if (gpu)
     {
         CompilerOption option;
         option.flags |= BackendVulkanDense;
-        option.device_index = 0;
+        option.device_index = get_default_gpu_index();
         option.vulkan_runtime = runtime;
         auto result = prepare_model_pipeline(model, option);
         shared_check(static_cast<bool>(result), "FP8 Shared Expert preparation");
@@ -148,7 +148,7 @@ static std::shared_ptr<DeviceTensor_vulkan> shared_upload(const ActivationBuffer
     identity.float32_data.assign(static_cast<size_t>(input.columns()) * input.columns(), 0.0f);
     for (uint32_t column = 0; column < input.columns(); ++column)
         identity.float32_data[static_cast<size_t>(column) * input.columns() + column] = 1.0f;
-    auto seed = Linear::create(identity, nullptr, 0, runtime, OptimizationDefaultFlags);
+    auto seed = Linear::create(identity, nullptr, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     shared_check(static_cast<bool>(seed), "resident Shared input producer");
     auto graph = CommandGraph_vulkan::create(*seed);
     auto result = std::make_shared<DeviceTensor_vulkan>();

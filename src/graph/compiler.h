@@ -33,10 +33,13 @@ struct CompilerOption
     uint32_t device_index = automatic_vulkan_device_index;
     uint32_t num_concurrent_sessions = 1;
     // Total heap budget available to the selected Vulkan placement.  The
-    // compiler uses this as a conservative admission limit for optional
-    // persistent GPU attention state; zero means that no budget-based
-    // promotion should be attempted.
+    // compiler uses this as a conservative admission limit for optional GPU
+    // attention state and BF16 Qwen dense weights; zero disables these
+    // budget-based promotions.
     uint64_t gpu_heap_budget = 0;
+    // Preserve explicitly requested executable/victim cache capacity while
+    // placing persistent attention and output projections.
+    uint64_t gpu_expert_cache_reserve = 0;
     // A fixed executable or victim Expert cache requires a smaller optional
     // attention allowance. Automatic caches use the live heap after dense
     // operators are allocated and do not require this extra reserve.

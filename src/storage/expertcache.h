@@ -173,6 +173,7 @@ private:
     using GhostIndex = std::unordered_map<std::string, GhostList::iterator, TransparentStringHash, std::equal_to<>>;
 
     [[nodiscard]] Result<std::shared_ptr<TensorData>> load_tensor(const TensorData& source, uint64_t& mapped_range_count, uint64_t& mapped_size);
+    [[nodiscard]] Result<std::shared_ptr<TensorData>> load_gguf_tensor(const TensorData& source, uint64_t& mapped_range_count, uint64_t& mapped_size);
     [[nodiscard]] Result<ExpertVictimPair> load_independent_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_range_count, uint64_t& mapped_size);
     [[nodiscard]] Result<ExpertVictimPair> load_interleaved_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_range_count, uint64_t& mapped_size);
     [[nodiscard]] Result<ExpertVictimPair> load_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_range_count, uint64_t& mapped_size);

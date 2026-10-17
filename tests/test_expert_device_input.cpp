@@ -64,7 +64,7 @@ static std::shared_ptr<const DeviceTensor_vulkan> expert_device_upload(const Act
     seed_weight.float32_data.assign(static_cast<size_t>(input.columns()) * input.columns(), 0.0f);
     for (uint32_t column = 0; column < input.columns(); ++column)
         seed_weight.float32_data[static_cast<size_t>(column) * input.columns() + column] = 1.0f;
-    auto seed = Linear::create(seed_weight, nullptr, 0, runtime, flags);
+    auto seed = Linear::create(seed_weight, nullptr, get_default_gpu_index(), runtime, flags);
     expert_device_check(static_cast<bool>(seed), "device input graph seed");
     auto graph = CommandGraph_vulkan::create(*seed);
     auto tensor = std::make_shared<DeviceTensor_vulkan>();
@@ -92,7 +92,7 @@ static void expert_device_test()
 {
     const uint64_t flags = OptimizationDefaultFlags & ~OptimizationVulkanRouteAggregation;
     const auto runtime = create_vulkan_runtime();
-    auto backend = create_vulkan_expert_backend(1024 * 1024, 0, nullptr, runtime, flags);
+    auto backend = create_vulkan_expert_backend(1024 * 1024, get_default_gpu_index(), nullptr, runtime, flags);
     expert_device_check(static_cast<bool>(backend), "device expert backend");
     auto gate = std::make_shared<TensorData>(expert_device_mxfp4(64, 32, 1));
     auto down = std::make_shared<TensorData>(expert_device_mxfp4(32, 32, 2));

@@ -2,6 +2,7 @@
 #define NCNN_MOE_SESSIONSTATE_H
 
 #include "backends/ncnn/latentlayer_vulkan.h"
+#include "backends/ncnn/moecombine_vulkan.h"
 #include "kernels/attention.h"
 #include "kernels/gateddeltanet.h"
 #include "kernels/hyperconnection.h"
@@ -138,6 +139,7 @@ struct ExpertScratch
     std::vector<ExpertDemandRequest> wave_demands;
     std::vector<size_t> wave_demand_indices;
     std::vector<std::shared_ptr<const void>> prepared_pins;
+    std::vector<MoeCombineInput_vulkan> combine_inputs;
     bool backend_aggregated_output_valid = false;
     ActivationBuffer backend_aggregated_output;
     ActivationBuffer staged_merged;

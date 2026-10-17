@@ -226,9 +226,9 @@ static void test_int4_gpu_grouped_projection()
     {
         const TensorData matrix = packed ? int4_gpu_weight(outputs, columns, 64, 7, true, true)
                                          : int4_gpu_bfloat16(outputs, columns);
-        auto op = QnkLinear_vulkan::create(matrix, &bias, 0, runtime, OptimizationDefaultFlags, groups);
+        auto op = QnkLinear_vulkan::create(matrix, &bias, get_default_gpu_index(), runtime, OptimizationDefaultFlags, groups);
         int4_gpu_check(op && op->input_columns() == columns * groups, "create grouped native projection");
-        int4_gpu_check(!QnkLinear_vulkan::create(matrix, &bias, 0, runtime, OptimizationDefaultFlags, 4),
+        int4_gpu_check(!QnkLinear_vulkan::create(matrix, &bias, get_default_gpu_index(), runtime, OptimizationDefaultFlags, 4),
                        "reject nondivisible output groups");
         ActivationBuffer input = int4_gpu_input(4, columns * groups);
         ActivationBuffer expected(input.rows(), outputs);
@@ -251,7 +251,7 @@ static void test_int4_gpu_grouped_projection()
 static void test_int4_gpu_projections()
 {
     const auto runtime = create_vulkan_runtime();
-    const auto context = VulkanContext::acquire(0, runtime, OptimizationDefaultFlags);
+    const auto context = VulkanContext::acquire(get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     int4_gpu_check(static_cast<bool>(context), "INT4 Vulkan context");
     const uint64_t alignment = std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
     for (bool indexed : {false, true})
@@ -262,7 +262,7 @@ static void test_int4_gpu_projections()
             {
                 TensorData matrix = int4_gpu_weight(odd_shape ? 17 : 32, odd_shape ? 33 : 256, odd_shape ? 7 : 128, 3, indexed, permuted);
                 TensorData bias = int4_gpu_bias(matrix.shape[0]);
-                auto projection = QnkLinear_vulkan::create(matrix, &bias, 0, runtime, OptimizationDefaultFlags);
+                auto projection = QnkLinear_vulkan::create(matrix, &bias, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
                 int4_gpu_check(static_cast<bool>(projection), "create native INT4 Vulkan projection");
                 int4_gpu_check(projection->dtype() == DType::Int4 && projection->input_columns() == matrix.shape[1]
                                    && projection->output_columns() == matrix.shape[0],
@@ -284,7 +284,7 @@ static void test_int4_gpu_projections()
                 }
                 auto invalid = matrix;
                 invalid.quantization_scales[0] = -1.f;
-                int4_gpu_check(!QnkLinear_vulkan::create(invalid, nullptr, 0, runtime, OptimizationDefaultFlags), "reject malformed native INT4 GPU metadata");
+                int4_gpu_check(!QnkLinear_vulkan::create(invalid, nullptr, get_default_gpu_index(), runtime, OptimizationDefaultFlags), "reject malformed native INT4 GPU metadata");
             }
         }
     }
@@ -293,7 +293,7 @@ static void test_int4_gpu_projections()
 static void test_int4_gpu_experts()
 {
     const auto runtime = create_vulkan_runtime();
-    const auto context = VulkanContext::acquire(0, runtime, OptimizationDefaultFlags);
+    const auto context = VulkanContext::acquire(get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     int4_gpu_check(static_cast<bool>(context), "INT4 Expert Vulkan context");
     const uint64_t alignment = std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
     constexpr uint32_t hidden = 256;
@@ -311,7 +311,7 @@ static void test_int4_gpu_experts()
     for (bool interleaved : {false, true})
     {
         gate_up->qnk_interleave_rows = interleaved;
-        auto expert = QnkExpert_vulkan::create(*gate_up, &gate_up_bias, *down, &down_bias, 0.f, 0,
+        auto expert = QnkExpert_vulkan::create(*gate_up, &gate_up_bias, *down, &down_bias, 0.f, get_default_gpu_index(),
                                                ExpertActivation::Silu, runtime, OptimizationDefaultFlags);
         int4_gpu_check(expert && expert->device_bytes() == packed_bytes, "packed INT4 Expert device residency");
         for (size_t rows : {size_t(1), size_t(4), size_t(5)})
@@ -327,7 +327,7 @@ static void test_int4_gpu_experts()
             int4_gpu_check_output(actual, expected, "packed INT4 Vulkan Expert");
         }
     }
-    auto separate = QnkExpert_vulkan::create_separate(*gate, &gate_bias, *up, &up_bias, *down, &down_bias, 0.f, 0,
+    auto separate = QnkExpert_vulkan::create_separate(*gate, &gate_bias, *up, &up_bias, *down, &down_bias, 0.f, get_default_gpu_index(),
                                                       ExpertActivation::Silu, runtime, OptimizationDefaultFlags);
     int4_gpu_check(separate && separate->device_bytes() == separate_bytes, "separate INT4 Expert device residency");
     const ActivationBuffer input = int4_gpu_input(4, hidden);
@@ -346,7 +346,7 @@ static void test_int4_gpu_experts()
     for (ExpertActivation activation : {ExpertActivation::Silu, ExpertActivation::DeepSeekSwiGlu, ExpertActivation::GptOssSwiGlu})
     {
         constexpr float limit = 0.0625f;
-        auto limited = QnkExpert_vulkan::create_separate(*gate, &gate_bias, *up, &up_bias, *down, &down_bias, limit, 0,
+        auto limited = QnkExpert_vulkan::create_separate(*gate, &gate_bias, *up, &up_bias, *down, &down_bias, limit, get_default_gpu_index(),
                                                          activation, runtime, OptimizationDefaultFlags);
         int4_gpu_check(static_cast<bool>(limited), "create limited INT4 Expert activation");
         const auto limited_expected = int4_gpu_expert_oracle(*gate, &gate_bias, up.get(), &up_bias, *down, &down_bias, input, activation, limit);
@@ -364,7 +364,7 @@ static void test_int4_gpu_experts()
 
     const TensorData bfloat_up = int4_gpu_bfloat16(intermediate, hidden);
     const uint64_t mixed_bytes = int4_gpu_payload(*gate, alignment) + int4_gpu_payload(bfloat_up, alignment) + int4_gpu_payload(*down, alignment);
-    auto mixed = QnkExpert_vulkan::create_separate(*gate, &gate_bias, bfloat_up, &up_bias, *down, &down_bias, 0.f, 0,
+    auto mixed = QnkExpert_vulkan::create_separate(*gate, &gate_bias, bfloat_up, &up_bias, *down, &down_bias, 0.f, get_default_gpu_index(),
                                                    ExpertActivation::Silu, runtime, OptimizationDefaultFlags);
     int4_gpu_check(mixed && mixed->device_bytes() == mixed_bytes,
                    "mixed INT4/BF16 Expert retains each original device storage type");
@@ -375,7 +375,7 @@ static void test_int4_gpu_experts()
     int4_gpu_check_output(actual, int4_gpu_expert_oracle(*gate, &gate_bias, &bfloat_up, &up_bias, *down, &down_bias, input), "mixed INT4/BF16 Vulkan Expert");
 
     gate_up->qnk_interleave_rows = false;
-    auto backend = create_vulkan_expert_backend(packed_bytes + separate_bytes + mixed_bytes, 0, nullptr, runtime, OptimizationDefaultFlags);
+    auto backend = create_vulkan_expert_backend(packed_bytes + separate_bytes + mixed_bytes, get_default_gpu_index(), nullptr, runtime, OptimizationDefaultFlags);
     int4_gpu_check(static_cast<bool>(backend), "INT4 resident Expert backend");
     std::shared_ptr<const void> packed_pin;
     std::shared_ptr<const void> separate_pin;
@@ -434,7 +434,7 @@ static void test_int4_gpu_experts()
     int4_gpu_check_output(outputs[0], expected, "batched INT4 Expert");
     int4_gpu_check_output(outputs[1], int4_gpu_expert_oracle(*gate, &gate_bias, &bfloat_up, &up_bias, *down, &down_bias, input), "batched mixed Expert");
 
-    auto insufficient = create_vulkan_expert_backend(packed_bytes - 1, 0, nullptr, runtime, OptimizationDefaultFlags);
+    auto insufficient = create_vulkan_expert_backend(packed_bytes - 1, get_default_gpu_index(), nullptr, runtime, OptimizationDefaultFlags);
     std::shared_ptr<const void> rejected;
     int4_gpu_check(!insufficient->prepare_demand("too-large", gate_up, &gate_up_bias, down, &down_bias, 0, 0.f,
                                                  ExpertActivation::Silu, rejected)
@@ -500,13 +500,13 @@ static void test_int4_gpu_gated_delta()
     std::array<std::shared_ptr<QnkLinear_vulkan>, 4> projections;
     for (size_t index = 0; index < inputs.size(); ++index)
     {
-        projections[index] = QnkLinear_vulkan::create(inputs[index], nullptr, 0, runtime, OptimizationDefaultFlags);
+        projections[index] = QnkLinear_vulkan::create(inputs[index], nullptr, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
         int4_gpu_check(static_cast<bool>(projections[index]), "native DeltaNet input projection");
     }
-    auto output_projection = QnkLinear_vulkan::create(output, nullptr, 0, runtime, OptimizationDefaultFlags);
+    auto output_projection = QnkLinear_vulkan::create(output, nullptr, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     auto operation = GatedDeltaNet_vulkan::create_quantized(projections, convolution, time_bias, decay_log, norm,
                                                             output_projection, heads, keys, key_dimension, value_dimension,
-                                                            2, 1e-6f, false, 0, runtime, OptimizationDefaultFlags);
+                                                            2, 1e-6f, false, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     int4_gpu_check(static_cast<bool>(operation), "create native INT4 DeltaNet recurrence");
 
     WeightStore weights;

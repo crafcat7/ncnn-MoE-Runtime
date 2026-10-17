@@ -1,7 +1,9 @@
 #include "safetensors.h"
+#include "ggufmodel.h"
 #include "json.h"
 #include "kernels/int4.h"
 #include "kernels/qnk.h"
+#include "kernels/mxfp4.h"
 #include "storage/mappedfile.h"
 
 #include <algorithm>
@@ -438,6 +440,18 @@ static Result<SourceInt4TensorInfo> source_int4_tensor_info(const SafetensorsArc
 Result<SafetensorsArchive> SafetensorsArchive::open(const std::filesystem::path& root, std::string_view manifest_json)
 {
     SafetensorsArchive archive;
+    if (has_gguf_source(root))
+    {
+        auto source = GgufArchive::open(root);
+        if (!source)
+            return source.error();
+        auto tensors = gguf_model_tensors(source.value());
+        if (!tensors)
+            return tensors.error();
+        archive.tensors = std::move(tensors).value();
+        archive.gguf_source = true;
+        return archive;
+    }
     std::error_code filesystem_error;
     for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(root, filesystem_error))
     {
@@ -514,6 +528,8 @@ bool SafetensorsArchive::contains_tensor(const std::string& name) const noexcept
 
 bool SafetensorsArchive::has_native_quantized_tensors() const noexcept
 {
+    if (gguf_source)
+        return true;
     for (const auto& item : tensors)
     {
         if (item.first.ends_with(".__int4_shape") || item.first.ends_with(".__qnk_shape"))
@@ -567,6 +583,15 @@ static Result<QuantizedTensorInfo> tensor_encoding(const SafetensorsArchive& arc
     const SafetensorInfo* source = archive.find(name);
     if (!source)
         return Error{ErrorCode::InvalidModel, "missing safetensors tensor: " + name};
+    if (source->ggml_type >= 10 && source->ggml_type <= 15)
+    {
+        static constexpr DType types[] = {DType::Q2K, DType::Q3K, DType::Q4K, DType::Q5K, DType::Q6K, DType::Q8K};
+        if (source->shape.size() != 2)
+            return Error{ErrorCode::InvalidModel, "GGUF Qn_K tensor must be a matrix: " + name};
+        return QuantizedTensorInfo{types[source->ggml_type - 10], source->shape[0], source->shape[1], 0};
+    }
+    if (source->dtype == "MXFP4")
+        return QuantizedTensorInfo{DType::MxFp4};
     const bool int4 = archive.find(name + ".__int4_shape")
                       || archive.find(name + ".__int4_scales")
                       || archive.find(name + ".__int4_zeros")
@@ -639,7 +664,7 @@ static Result<QuantizedTensorInfo> tensor_encoding(const SafetensorsArchive& arc
         return QuantizedTensorInfo{DType::BFloat16};
     if (source->dtype == "F32")
         return QuantizedTensorInfo{DType::Float32};
-    if (source->dtype == "I64")
+    if (source->dtype == "I64" || source->dtype == "I32")
         return QuantizedTensorInfo{DType::Int64};
     if (source->dtype == "F8_E4M3")
         return QuantizedTensorInfo{DType::Float8E4M3};
@@ -659,7 +684,7 @@ Result<DType> SafetensorsArchive::tensor_dtype(const std::string& name) const
     auto encoding = tensor_encoding(*this, name);
     if (!encoding)
         return encoding.error();
-    if (!source_quantization_method.empty() && encoding.value().dtype == DType::Float32)
+    if ((!source_quantization_method.empty() || gguf_source) && encoding.value().dtype == DType::Float32)
         return DType::BFloat16;
     return encoding.value().dtype;
 }
@@ -847,6 +872,8 @@ Result<TensorData> SafetensorsArchive::load_source_int4_tensor(const std::string
 Result<TensorData> SafetensorsArchive::load_float32_tensor(const std::string& name) const
 {
     const SafetensorInfo* info = find(name);
+    if (info && info->transform)
+        return load_gguf_tensor(*info, std::nullopt, {}, true);
     if (!info || info->dtype != "F32")
         return Error{ErrorCode::InvalidModel, "expected F32 tensor: " + name};
     TensorData tensor;
@@ -872,6 +899,8 @@ Result<TensorData> SafetensorsArchive::load_float32_tensor(const std::string& na
 
 Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) const
 {
+    if (const auto* info = find(name); info && info->transform)
+        return load_gguf_tensor(*info);
     const std::string prefix = source_quantized_prefix(name);
     if (!prefix.empty() && find(prefix + "qweight"))
         return load_source_int4_tensor(name);
@@ -895,6 +924,29 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) cons
 
     TensorData tensor;
     tensor.shape = info->shape;
+    if (info->dtype == "MXFP4")
+    {
+        if (info->shape.size() != 2)
+            return Error{ErrorCode::InvalidModel, "GGUF MXFP4 tensor must be a matrix: " + name};
+        return load_mxfp4_tensor(name, {}, info->shape[0], info->shape[1]);
+    }
+    if (info->dtype == "I32")
+    {
+        if (info->size != tensor.element_count() * sizeof(int32_t))
+            return Error{ErrorCode::InvalidModel, "invalid GGUF I32 tensor: " + name};
+        auto bytes = read_range(info->path, info->offset, info->size);
+        if (!bytes)
+            return bytes.error();
+        tensor.dtype = DType::Int64;
+        tensor.int64_data.resize(static_cast<size_t>(tensor.element_count()));
+        for (size_t i = 0; i < tensor.int64_data.size(); ++i)
+        {
+            int32_t value;
+            std::memcpy(&value, bytes.value().data() + i * sizeof(value), sizeof(value));
+            tensor.int64_data[i] = value;
+        }
+        return tensor;
+    }
     if (encoding.value().dtype == DType::Int4)
     {
         tensor.dtype = DType::Int4;
@@ -950,7 +1002,7 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) cons
         if (!status)
             return Error{ErrorCode::InvalidModel, status.error().message + ": " + name};
     }
-    else if (info->dtype == "F16" || (info->dtype == "F32" && !source_quantization_method.empty()))
+    else if (info->dtype == "F16" || (info->dtype == "F32" && (!source_quantization_method.empty() || gguf_source)))
     {
         const size_t element_size = info->dtype == "F16" ? sizeof(uint16_t) : sizeof(float);
         if (tensor.element_count() > std::numeric_limits<uint64_t>::max() / element_size
@@ -1036,11 +1088,231 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) cons
     return tensor;
 }
 
+static float gguf_float_value(const TensorData& tensor, size_t index)
+{
+    if (tensor.dtype == DType::Float32)
+        return tensor.float32_values()[index];
+    return std::bit_cast<float>(static_cast<uint32_t>(tensor.bfloat16_values()[index]) << 16);
+}
+
+Result<TensorData> SafetensorsArchive::load_gguf_tensor(const SafetensorInfo& info,
+                                                        std::optional<uint32_t> slice,
+                                                        std::vector<uint32_t> shape,
+                                                        bool preserve_float32) const
+{
+    if (!info.transform)
+        return Error{ErrorCode::InvalidArgument, "GGUF tensor has no transformation"};
+    const GgufTensorTransform& transform = *info.transform;
+    if (shape.empty())
+    {
+        shape = info.shape;
+        if (slice)
+        {
+            if (shape.empty() || *slice >= shape.front())
+                return Error{ErrorCode::InvalidModel, "GGUF tensor slice exceeds its shape"};
+            shape.erase(shape.begin());
+        }
+    }
+    TensorData result;
+    result.shape = std::move(shape);
+    if (!transform.generated_i64.empty())
+    {
+        if (slice || result.element_count() != transform.generated_i64.size())
+            return Error{ErrorCode::InvalidModel, "invalid GGUF generated integer tensor shape"};
+        result.dtype = DType::Int64;
+        result.int64_data = transform.generated_i64;
+        return result;
+    }
+    if (transform.sources.empty())
+        return Error{ErrorCode::InvalidModel, "GGUF transformation has no source ranges"};
+    std::vector<TensorData> sources;
+    sources.reserve(transform.sources.size());
+    uint64_t total_elements = 0;
+    for (const SafetensorInfo& source : transform.sources)
+    {
+        auto loaded = load_gguf_source(source, slice,
+                                       preserve_float32 || transform.value_transform != GgufValueTransform::None);
+        if (!loaded)
+            return loaded.error();
+        if (total_elements > std::numeric_limits<uint64_t>::max() - loaded.value().element_count())
+            return Error{ErrorCode::InvalidModel, "GGUF transformed tensor element count overflows"};
+        total_elements += loaded.value().element_count();
+        sources.push_back(std::move(loaded).value());
+    }
+    if (result.element_count() != total_elements || total_elements > std::numeric_limits<size_t>::max())
+        return Error{ErrorCode::InvalidModel, "GGUF transformation disagrees with its logical shape"};
+    const uint32_t columns = result.shape.size() >= 2 ? result.shape.back() : 1;
+    if (columns == 0)
+        return Error{ErrorCode::InvalidModel, "GGUF transformed tensor has an empty column dimension"};
+    const uint64_t rows = total_elements / columns;
+    if ((!transform.row_indices.empty() && transform.row_indices.size() != rows)
+        || (!transform.column_indices.empty() && transform.column_indices.size() != columns))
+        return Error{ErrorCode::InvalidModel, "GGUF transformation permutation shape mismatch"};
+    for (uint32_t row : transform.row_indices)
+    {
+        if (row >= rows)
+            return Error{ErrorCode::InvalidModel, "GGUF transformed row index is out of range"};
+    }
+    for (uint32_t column : transform.column_indices)
+    {
+        if (column >= columns)
+            return Error{ErrorCode::InvalidModel, "GGUF transformed column index is out of range"};
+    }
+    const DType source_dtype = sources.front().dtype;
+    if (is_qnk_dtype(source_dtype))
+    {
+        if (transform.value_transform != GgufValueTransform::None || !transform.column_indices.empty()
+            || result.shape.size() != 2)
+            return Error{ErrorCode::UnsupportedModel, "GGUF quantized transforms require row moves or input column metadata"};
+        result.dtype = source_dtype;
+        if (sources.size() == 1 && transform.row_indices.empty())
+        {
+            auto target_shape = std::move(result.shape);
+            result = std::move(sources.front());
+            result.shape = std::move(target_shape);
+        }
+        else
+        {
+            const uint64_t row_size = qnk_storage_bytes(source_dtype, 1, columns);
+            if (row_size == 0 || rows > std::numeric_limits<size_t>::max() / row_size)
+                return Error{ErrorCode::InvalidModel, "GGUF quantized transformation size overflows"};
+            std::vector<uint8_t> joined;
+            joined.reserve(static_cast<size_t>(rows * row_size));
+            for (const TensorData& source : sources)
+            {
+                if (source.dtype != source_dtype || source.shape.size() != 2 || source.shape[1] != columns)
+                    return Error{ErrorCode::InvalidModel, "GGUF concatenated quantized tensors have different encodings"};
+                const auto values = source.qnk_values();
+                joined.insert(joined.end(), values.begin(), values.end());
+            }
+            if (joined.size() != rows * row_size)
+                return Error{ErrorCode::InvalidModel, "GGUF quantized source byte count mismatch"};
+            if (transform.row_indices.empty())
+                result.quantized_data = std::move(joined);
+            else
+            {
+                result.quantized_data.resize(joined.size());
+                for (size_t row = 0; row < static_cast<size_t>(rows); ++row)
+                    std::memcpy(result.quantized_data.data() + row * row_size,
+                                joined.data() + static_cast<uint64_t>(transform.row_indices[row]) * row_size,
+                                static_cast<size_t>(row_size));
+            }
+        }
+        result.input_column_indices = transform.input_column_indices;
+        return result;
+    }
+    for (const TensorData& source : sources)
+    {
+        if ((source.dtype != DType::Float32 && source.dtype != DType::BFloat16)
+            || (source.dtype == DType::Float32 && source.float32_values().size() != source.element_count())
+            || (source.dtype == DType::BFloat16 && source.bfloat16_values().size() != source.element_count()))
+            return Error{ErrorCode::UnsupportedModel, "unsupported GGUF floating-point transformation source"};
+    }
+    if (!transform.input_column_indices.empty())
+        return Error{ErrorCode::UnsupportedModel, "GGUF input column metadata requires a quantized matrix"};
+    if (sources.size() == 1 && transform.row_indices.empty() && transform.column_indices.empty()
+        && transform.value_transform == GgufValueTransform::None)
+    {
+        auto target_shape = std::move(result.shape);
+        result = std::move(sources.front());
+        result.shape = std::move(target_shape);
+        return result;
+    }
+    std::vector<float> joined;
+    if (sources.size() > 1)
+    {
+        joined.reserve(static_cast<size_t>(total_elements));
+        for (const TensorData& source : sources)
+        {
+            for (size_t i = 0; i < source.element_count(); ++i)
+                joined.push_back(gguf_float_value(source, i));
+        }
+    }
+    result.dtype = preserve_float32 ? DType::Float32 : DType::BFloat16;
+    if (preserve_float32)
+        result.float32_data.resize(static_cast<size_t>(total_elements));
+    else
+        result.bfloat16_data.resize(static_cast<size_t>(total_elements));
+    for (size_t row = 0; row < static_cast<size_t>(rows); ++row)
+    {
+        const uint64_t source_row = transform.row_indices.empty() ? row : transform.row_indices[row];
+        for (uint32_t column = 0; column < columns; ++column)
+        {
+            const uint32_t source_column = transform.column_indices.empty() ? column : transform.column_indices[column];
+            const size_t source_index = static_cast<size_t>(source_row * columns + source_column);
+            float value = sources.size() == 1 ? gguf_float_value(sources.front(), source_index) : joined[source_index];
+            if (transform.value_transform == GgufValueTransform::SubtractOne)
+                value -= 1.0f;
+            else if (transform.value_transform == GgufValueTransform::LogNegative)
+            {
+                if (!(value < 0.0f))
+                    return Error{ErrorCode::InvalidModel, "GGUF SSM A must be negative"};
+                value = std::log(-value);
+            }
+            if (!std::isfinite(value))
+                return Error{ErrorCode::InvalidModel, "GGUF transformation produced a non-finite value"};
+            const size_t destination = row * columns + column;
+            if (preserve_float32)
+                result.float32_data[destination] = value;
+            else
+            {
+                const uint32_t bits = std::bit_cast<uint32_t>(value);
+                result.bfloat16_data[destination] = static_cast<uint16_t>((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+            }
+        }
+    }
+    return result;
+}
+
+Result<TensorData> SafetensorsArchive::load_gguf_source(SafetensorInfo info,
+                                                        std::optional<uint32_t> slice,
+                                                        bool preserve_float32)
+{
+    info.transform.reset();
+    if (slice)
+    {
+        if (info.shape.size() < 2 || *slice >= info.shape[0] || info.size % info.shape[0] != 0)
+            return Error{ErrorCode::InvalidModel, "invalid GGUF transformed tensor slice"};
+        info.size /= info.shape[0];
+        info.offset += static_cast<uint64_t>(*slice) * info.size;
+        info.shape.erase(info.shape.begin());
+    }
+    if (preserve_float32 && info.dtype == "F16")
+    {
+        auto bytes = read_range(info.path, info.offset, info.size);
+        if (!bytes)
+            return bytes.error();
+        TensorData tensor;
+        tensor.dtype = DType::Float32;
+        tensor.shape = info.shape;
+        if (tensor.element_count() > SIZE_MAX / sizeof(float) || info.size != tensor.element_count() * 2)
+            return Error{ErrorCode::InvalidModel, "invalid GGUF F16 source tensor"};
+        tensor.float32_data.resize(static_cast<size_t>(tensor.element_count()));
+        for (size_t i = 0; i < tensor.float32_data.size(); ++i)
+            tensor.float32_data[i] = read_safetensor_float(bytes.value().data(), i, "F16");
+        return tensor;
+    }
+    const bool load_float32 = preserve_float32 && info.dtype == "F32";
+    SafetensorsArchive archive;
+    archive.gguf_source = true;
+    archive.tensors.emplace("source", std::move(info));
+    return load_float32 ? archive.load_float32_tensor("source") : archive.load_tensor("source");
+}
+
 Result<TensorData> SafetensorsArchive::load_qnk_tensor(const std::string& name,
                                                        DType dtype,
                                                        uint32_t rows,
                                                        uint32_t columns) const
 {
+    if (const auto* info = find(name); info && info->transform)
+    {
+        auto tensor = load_gguf_tensor(*info);
+        if (!tensor)
+            return tensor.error();
+        if (tensor.value().dtype != dtype || tensor.value().shape != std::vector<uint32_t>{rows, columns})
+            return Error{ErrorCode::InvalidModel, "transformed GGUF Qn_K shape mismatch: " + name};
+        return tensor;
+    }
     if (!qnk_shape_supported(dtype, rows, columns))
         return Error{ErrorCode::InvalidArgument, "invalid Qn_K tensor shape: " + name};
     if (find(name + ".__qnk_shape") || find(name + ".__qnk_columns"))
@@ -1087,7 +1359,8 @@ Result<TensorData> SafetensorsArchive::load_qnk_tensor(const std::string& name,
     auto mapped = MappedFileRange::open(source->path, source->offset, source->size);
     if (mapped)
     {
-        mapped.value()->prefault();
+        if (source->ggml_type == UINT32_MAX)
+            mapped.value()->prefault();
         tensor.mapped_data = mapped.value()->share_data();
         tensor.mapped_size = source->size;
         return tensor;
@@ -1106,6 +1379,16 @@ Result<TensorData> SafetensorsArchive::load_qnk_expert(const std::string& name,
                                                        uint32_t rows,
                                                        uint32_t columns) const
 {
+    if (const auto* info = find(name); info && info->transform)
+    {
+        auto tensor = load_gguf_tensor(*info, expert_id, {rows, columns});
+        if (!tensor)
+            return tensor.error();
+        if (tensor.value().dtype != dtype || tensor.value().shape != std::vector<uint32_t>{rows, columns}
+            || info->shape.empty() || info->shape[0] != expert_count)
+            return Error{ErrorCode::InvalidModel, "transformed GGUF Qn_K Expert mismatch: " + name};
+        return tensor;
+    }
     if (expert_count == 0 || expert_id >= expert_count || !qnk_shape_supported(dtype, rows, columns))
         return Error{ErrorCode::InvalidArgument, "invalid Qn_K Expert shape: " + name};
     const uint64_t expert_size = qnk_storage_bytes(dtype, rows, columns);
@@ -1188,6 +1471,36 @@ Result<TensorData> SafetensorsArchive::load_float8_tensor(const std::string& wei
 Result<TensorData> SafetensorsArchive::load_mxfp4_tensor(const std::string& blocks_name, const std::string& scales_name, uint32_t rows, uint32_t columns, uint32_t flags) const
 {
     const SafetensorInfo* blocks = find(blocks_name);
+    if (blocks && blocks->ggml_type == 39)
+    {
+        if (rows == 0 || columns == 0 || columns % 32 != 0
+            || blocks->shape != std::vector<uint32_t>{rows, columns}
+            || blocks->size != static_cast<uint64_t>(rows) * (columns / 32) * 17)
+            return Error{ErrorCode::InvalidModel, "invalid GGUF MXFP4 matrix: " + blocks_name};
+        TensorData tensor;
+        tensor.dtype = DType::MxFp4;
+        tensor.shape = {rows, columns};
+        if (has_flag(flags, SafetensorLoadDeferMxfp4Data))
+        {
+            auto storage = std::make_shared<MxFp4FileStorage>();
+            storage->layout = MxFp4FileLayout::GgufBlockInterleaved;
+            storage->blocks_path = blocks->path.string();
+            storage->blocks_offset = blocks->offset;
+            storage->blocks_size = blocks->size;
+            tensor.mxfp4_file_storage = std::move(storage);
+            return tensor;
+        }
+        auto raw = MappedFileRange::open(blocks->path, blocks->offset, blocks->size);
+        if (!raw)
+            return raw.error();
+        tensor.mxfp4_blocks.resize(static_cast<size_t>(rows) * columns / 2);
+        tensor.mxfp4_scales.resize(static_cast<size_t>(rows) * columns / 32);
+        if (!unpack_gguf_mxfp4({raw.value()->data(), raw.value()->size()},
+                               {tensor.mxfp4_blocks.data(), tensor.mxfp4_blocks.size()},
+                               {tensor.mxfp4_scales.data(), tensor.mxfp4_scales.size()}))
+            return Error{ErrorCode::InvalidModel, "invalid GGUF MXFP4 blocks: " + blocks_name};
+        return tensor;
+    }
     const SafetensorInfo* scales = find(scales_name);
     const SafetensorInfo* packed_blocks = find(packed_tensor_name(blocks_name));
     const SafetensorInfo* packed_scales = find(packed_tensor_name(scales_name));
@@ -1258,6 +1571,28 @@ Result<TensorData> SafetensorsArchive::load_interleaved_mxfp4_tensor(const std::
     }
     const uint64_t block_size = static_cast<uint64_t>(rows) * columns / 2;
     const uint64_t scale_size = static_cast<uint64_t>(rows) * columns / 32;
+    const SafetensorInfo* gguf_gate = find(gate_blocks_name);
+    const SafetensorInfo* gguf_up = find(up_blocks_name);
+    if (gguf_gate && gguf_gate->ggml_type == 39 && has_flag(flags, SafetensorLoadDeferMxfp4Data))
+    {
+        if (!gguf_up || gguf_up->ggml_type != 39 || gguf_gate->shape != std::vector<uint32_t>{rows, columns}
+            || gguf_up->shape != gguf_gate->shape || gguf_gate->size != scale_size * 17 || gguf_up->size != gguf_gate->size)
+            return Error{ErrorCode::InvalidModel, "invalid GGUF interleaved MXFP4 projections: " + gate_blocks_name};
+        TensorData tensor;
+        tensor.dtype = DType::MxFp4;
+        tensor.shape = {rows * 2, columns};
+        auto storage = std::make_shared<MxFp4FileStorage>();
+        storage->layout = MxFp4FileLayout::GgufBlockInterleaved;
+        storage->blocks_path = gguf_gate->path.string();
+        storage->blocks_offset = gguf_gate->offset;
+        storage->blocks_size = gguf_gate->size;
+        storage->secondary_blocks_path = gguf_up->path.string();
+        storage->secondary_blocks_offset = gguf_up->offset;
+        storage->secondary_blocks_size = gguf_up->size;
+        storage->interleave_rows = true;
+        tensor.mxfp4_file_storage = std::move(storage);
+        return tensor;
+    }
     if (has_flag(flags, SafetensorLoadDeferMxfp4Data))
     {
         const SafetensorInfo* gate_blocks = find(gate_blocks_name);
@@ -1345,6 +1680,8 @@ Result<TensorData> SafetensorsArchive::load_interleaved_mxfp4_tensor(const std::
 Result<TensorData> SafetensorsArchive::load_bfloat16_slice(const std::string& name, uint32_t index, std::vector<uint32_t> shape) const
 {
     const SafetensorInfo* info = find(name);
+    if (info && info->transform)
+        return load_gguf_tensor(*info, index, std::move(shape));
     if (!info || info->dtype != "BF16" || info->shape.empty() || index >= info->shape[0])
         return Error{ErrorCode::InvalidModel, "invalid BF16 tensor slice: " + name};
     uint64_t element_count = 1;

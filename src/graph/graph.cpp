@@ -655,7 +655,8 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
         if (layer.dense_ffn.down_weight != invalid_tensor_handle)
         {
             const bool vulkan = compiled.opt.hybrid_mode != HybridMode::CpuOnly
-                                && support_vulkan_ffn(compiled.operators, layer.dense_ffn);
+                                && ((use_vulkan_experts && layer.dense_ffn.use_gpu_cache)
+                                    || support_vulkan_dense_ffn(compiled.operators, layer.dense_ffn));
             const ExecutionTensorId output = add_tensor(graph, prefix + "ffn.hidden", compiled.descriptor.activation_dtype,
                                                         {0, compiled.descriptor.hidden_size});
             previous = add_node(graph, ExecutionNodeType::DenseFfn, vulkan ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
@@ -680,7 +681,11 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
                                               : std::vector<TensorHandle>{compiled.final_norm_weight,
                                                                           compiled.lm_head_weight};
 
-    const ExecutionBackend lm_head_backend = compiled.opt.hybrid_mode == HybridMode::CpuOnly ? ExecutionBackend::Cpu : ExecutionBackend::Vulkan;
+    const CompiledOperator& lm_head_operator = compiled.operators.at_weight(compiled.lm_head_weight);
+    const bool vulkan_lm_head = compiled.opt.hybrid_mode != HybridMode::CpuOnly
+                                && (lm_head_operator.linear || lm_head_operator.bfloat16
+                                    || lm_head_operator.float8 || lm_head_operator.qnk);
+    const ExecutionBackend lm_head_backend = vulkan_lm_head ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
     const ExecutionTensorId logits = add_tensor(graph, "logits", DType::Float32, {0, compiled.descriptor.vocabulary_size});
     const ExecutionNodeId lm_head_node = add_node(graph, ExecutionNodeType::LmHead, lm_head_backend, lm_head_backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, "lm_head",
                                                   {previous}, {normalized}, {logits},
