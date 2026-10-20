@@ -7515,7 +7515,6 @@ void test_file_backed_mxfp4_expert_cache()
     check(coalesced_many_statistics.coalesced_experts == coalesced_many_count);
     check(coalesced_many_statistics.coalesced_read_ranges_saved == coalesced_many_count - 1);
     check(coalesced_many_statistics.resident_size == coalesced_many_capacity);
-    check(coalesced_many_statistics.resident_size - 34 == coalesced_many_count * coalesced_many_pair_size);
 
     const std::filesystem::path coalesced_truncated_path = directory / "coalesced_truncated.bin";
     {

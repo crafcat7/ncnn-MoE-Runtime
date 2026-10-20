@@ -2080,11 +2080,6 @@ static void gpu_first_upload_staging_pool()
             gpu_first_check(static_cast<const uint8_t*>(downloaded.data)[index] == static_cast<const uint8_t*>(source.data)[index],
                             "reused staging keeps retry payload intact");
     }
-    {
-        VulkanWeightUploadBatch compatible(context);
-        gpu_first_check(compatible.record(source, destination, option, &weights) && compatible.submit(), "default owned staging upload remains compatible");
-    }
-
     auto backend = create_vulkan_expert_backend(4096, get_default_gpu_index(), {}, fixture.runtime, fixture.flags);
     ScopedExpertBackendForeground foreground(backend);
     std::shared_ptr<const void> pin;

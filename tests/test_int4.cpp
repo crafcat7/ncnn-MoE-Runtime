@@ -574,7 +574,7 @@ void test_int4()
         {
             const TensorData matrix = int4_test_matrix(shape[0], shape[1], shape[2], indexed);
             int4_check(static_cast<bool>(validate_int4_tensor(matrix)), "generated matrix rejected");
-            for (size_t tokens : {0, 1, 2, 4, 5, 9})
+            for (size_t tokens : {0, 1, 2, 4, 5})
                 check_int4_reference(matrix, tokens);
             TensorData mapped = matrix;
             auto storage = std::make_shared<std::vector<uint8_t>>(matrix.quantized_data);

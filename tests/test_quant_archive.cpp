@@ -446,14 +446,17 @@ static void test_native_float_scales()
                                                         : (index + 1) * 0.125f;
             quant_archive_check(tensor.value().quantization_scales[index] == expected, "retain exact native FP8 scales");
         }
-        auto retained = archive.value().load_float32_tensor("retained");
-        auto normalized = archive.value().load_tensor("retained");
-        quant_archive_check(retained && retained.value().dtype == DType::Float32
-                                && retained.value().float32_values()[0] == scales[0],
-                            "preserve explicit F32 auxiliary values");
-        quant_archive_check(normalized && normalized.value().dtype == DType::BFloat16,
-                            "default source floating-point normalization");
-        quant_archive_check(!archive.value().load_float32_tensor("projection.weight"), "reject non-F32 exact loader");
+        if (dtype == "F32")
+        {
+            auto retained = archive.value().load_float32_tensor("retained");
+            auto normalized = archive.value().load_tensor("retained");
+            quant_archive_check(retained && retained.value().dtype == DType::Float32
+                                    && retained.value().float32_values()[0] == scales[0],
+                                "preserve explicit F32 auxiliary values");
+            quant_archive_check(normalized && normalized.value().dtype == DType::BFloat16,
+                                "default source floating-point normalization");
+            quant_archive_check(!archive.value().load_float32_tensor("projection.weight"), "reject non-F32 exact loader");
+        }
     }
 }
 

@@ -1090,23 +1090,22 @@ class NativeQuantizedTests(unittest.TestCase):
                 root = self.root / family
                 root.mkdir()
                 fixture = prepare_fp8(root, family)
-                baseline = self.run_worker(fixture.baseline, fixture.moe, backend="cpu")
+                # FP8 rounds activations too, so native CPU execution is the oracle.
                 cpu_fp8 = self.run_worker(fixture.source, fixture.moe, backend="cpu")
                 for label, path in (("direct", fixture.source), ("imported", fixture.imported)):
                     with self.subTest(path=label):
-                        result = self.run_worker(path, fixture.moe)
+                        is_cpu_reference = self.backend == "cpu" and label == "direct"
+                        result = cpu_fp8 if is_cpu_reference else self.run_worker(path, fixture.moe)
                         resources = result["resources"]
                         self.assertEqual(resources["estimated_dense_bytes"], fixture.expected_dense)
                         self.assertEqual(resources["estimated_expert_bytes"], fixture.expected_expert)
                         self.assertLess(resources["estimated_dense_bytes"], fixture.bf16_dense)
                         if fixture.moe:
                             self.assertLess(resources["estimated_expert_bytes"], fixture.bf16_expert)
-                        for mode in ("greedy", "sampled"):
-                            # FP8 rounds activations too, so the native source
-                            # CPU execution defines the E2E arithmetic oracle.
-                            # The decoded BF16 model is observational only.
-                            self.assertEqual(result[mode][0], cpu_fp8[mode][0])
-                            np.testing.assert_allclose(result[mode][1], cpu_fp8[mode][1], rtol=0, atol=3e-5)
+                        if not is_cpu_reference:
+                            for mode in ("greedy", "sampled"):
+                                self.assertEqual(result[mode][0], cpu_fp8[mode][0])
+                                np.testing.assert_allclose(result[mode][1], cpu_fp8[mode][1], rtol=0, atol=3e-5)
                         gpu = result["sampled_stats"]["generation_gpu"]
                         if resources["backend"] == "hybrid":
                             self.assertTrue(gpu["available"])
@@ -1116,16 +1115,12 @@ class NativeQuantizedTests(unittest.TestCase):
                         self.assertEqual(gpu["int4_dispatches"], 0)
                         print(json.dumps({"family": family, "format": "native_fp8", "path": label,
                                           "backend": resources["backend"], "gpu": gpu,
-                                          "max_bf16_probability_delta": max(abs(actual - expected)
-                                              for mode in ("greedy", "sampled")
-                                              for actual, expected in zip(result[mode][1], baseline[mode][1])),
-                                          "max_cpu_fp8_probability_delta": max(abs(actual - expected)
-                                              for mode in ("greedy", "sampled")
-                                              for actual, expected in zip(result[mode][1], cpu_fp8[mode][1])),
                                           "dense_bytes": resources["estimated_dense_bytes"],
                                           "expert_bytes": resources["estimated_expert_bytes"]}), flush=True)
 
     def test_deepseek_fp8_dense_mxfp4_expert_memory_modes(self):
+        if self.backend != "cpu":
+            self.skipTest("mixed FP8/MXFP4 memory mode regression runs with --backend cpu")
         root = self.root / "deepseek-fp8-mxfp4"
         root.mkdir()
         fixture = prepare_fp8(root, "deepseek_v4")

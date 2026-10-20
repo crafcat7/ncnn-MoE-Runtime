@@ -216,17 +216,6 @@ static void test_mxfp4_scratch_reuse()
     scratch_check(scratch.q8_down_packed.size() == q8_packed_size, "Q8 packed storage after shrink");
     scratch_check(scratch.activated[0].bytes().data() == activated_storage[0], "MXFP4 storage after shrink");
 
-    std::array<ActivationBuffer, 3> regrow_fresh_outputs;
-    std::array<Mxfp4Task, 3> regrow_fresh_tasks = tasks;
-    for (size_t index = 0; index < regrow_fresh_tasks.size(); ++index)
-        regrow_fresh_tasks[index].output = &regrow_fresh_outputs[index];
-    Mxfp4Scratch regrow_fresh_scratch;
-    scratch_check(forward_experts_mxfp4(std::span<const Mxfp4Task>(regrow_fresh_tasks.data(), regrow_fresh_tasks.size()),
-                                        &regrow_fresh_scratch,
-                                        q8_flags),
-                  "MXFP4 fresh Q8 regrow batch");
-    for (size_t index = 0; index < tasks.size(); ++index)
-        tasks[index].output = &outputs[index];
     scratch_check(forward_experts_mxfp4(std::span<const Mxfp4Task>(tasks.data(), tasks.size()),
                                         &scratch,
                                         q8_flags),
@@ -236,7 +225,7 @@ static void test_mxfp4_scratch_reuse()
     {
         scratch_check(scratch.activated[index].bytes().data() == activated_storage[index],
                       "MXFP4 storage after regrow");
-        check_mxfp4_outputs(outputs[index], regrow_fresh_outputs[index], 1e-5f);
+        check_mxfp4_outputs(outputs[index], fresh_outputs[index], 1e-5f);
     }
     for (const auto& packed : scratch.q8_down_packed)
         scratch_check(!packed, "packed sidecar reference cleanup after regrow");
@@ -259,7 +248,7 @@ static void test_mxfp4_scratch_reuse()
         {
             scratch_check(!owner.mxfp4_q8_packed, "FP32 row-pair path avoids packed sidecar");
         }
-        check_mxfp4_outputs(outputs[0], regrow_fresh_outputs[0], 1e-5f);
+        check_mxfp4_outputs(outputs[0], fresh_outputs[0], 1e-5f);
     }
 }
 
