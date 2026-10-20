@@ -701,6 +701,22 @@ if(NCNN_MOE_BUILD_EXAMPLES)
     endif()
 endif()
 
+if(APPLE)
+    foreach(NCNN_MOE_EXECUTABLE IN ITEMS
+        ncnn_moe_worker
+        ncnn_moe_gpt_oss
+        ncnn_moe_deepseek_v4
+        ncnn_moe_qwen3_6
+        ncnn_moe_qwen3_8
+        ncnn_moe_mxfp4_bench
+    )
+        if(TARGET ${NCNN_MOE_EXECUTABLE})
+            target_link_options(${NCNN_MOE_EXECUTABLE} PRIVATE
+                "$<$<CONFIG:Release>:LINKER:-dead_strip>")
+        endif()
+    endforeach()
+endif()
+
 if(NCNN_MOE_BUILD_TESTS)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
