@@ -1,9 +1,13 @@
+# ==============================================================================
+# OpenMP dependency discovery
+# ==============================================================================
+
 include_guard(GLOBAL)
 
-# AppleClang does not discover Homebrew's libomp without explicit flags. Define
-# the imported target before ncnn's package configuration requests it.
 find_package(OpenMP QUIET COMPONENTS CXX)
 
+# --- AppleClang fallback ------------------------------------------------------
+# AppleClang may need explicit Homebrew libomp paths and OpenMP flags.
 if(APPLE AND NOT TARGET OpenMP::OpenMP_CXX)
     set(_ncnn_moe_libomp_prefixes)
     if(DEFINED ENV{HOMEBREW_PREFIX})

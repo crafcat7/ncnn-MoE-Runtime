@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.21)
 
 project(ncnn_moe_runtime VERSION 0.1.0 LANGUAGES CXX)
 
+# ==============================================================================
+# Build options
+# ==============================================================================
+# NCNN_MOE_USE_* requests backends; NCNN_MOE_WITH_* records capabilities.
 option(NCNN_BUILD_MOE_RUNTIME "Build the ncnn MoE transformer runtime" ON)
 option(NCNN_MOE_BUILD_TESTS "Build ncnn_moe tests" ON)
 option(NCNN_MOE_BUILD_EXAMPLES "Build ncnn_moe examples" ON)
@@ -24,9 +28,11 @@ set(NCNN_MOE_USE_NCNN_DEFAULT ON)
 option(NCNN_MOE_USE_NCNN "Use ncnn optimized CPU operators when available" ${NCNN_MOE_USE_NCNN_DEFAULT})
 set(NCNN_MOE_USE_VULKAN_DEFAULT ON)
 option(NCNN_MOE_USE_VULKAN "Build ncnn with Vulkan support" ${NCNN_MOE_USE_VULKAN_DEFAULT})
+
 include(GNUInstallDirs)
 
 if(MSVC)
+    # Set CRT and link policy before creating runtime/ncnn targets.
     include(third_party/Mile.Windows.UniCrt/Mile.Windows.UniCrt.cmake)
 endif()
 
@@ -38,7 +44,12 @@ if(NOT NCNN_BUILD_MOE_RUNTIME)
     return()
 endif()
 
+# ==============================================================================
+# Runtime library
+# ==============================================================================
+# Backend files also provide CPU-only stubs.
 set(NCNN_MOE_SOURCES
+    # ncnn backends
     src/backends/ncnn/attention_vulkan.cpp
     src/backends/ncnn/expertbackend_vulkan.cpp
     src/backends/ncnn/experttransfer_vulkan.cpp
@@ -53,6 +64,7 @@ set(NCNN_MOE_SOURCES
     src/backends/ncnn/linear.cpp
     src/backends/ncnn/modelpipeline.cpp
     src/backends/ncnn/vulkancontext.cpp
+    # Execution
     src/engine/cpu.cpp
     src/engine/executor.cpp
     src/engine/executor_speculative.cpp
@@ -63,10 +75,12 @@ set(NCNN_MOE_SOURCES
     src/engine/runtime.cpp
     src/engine/scheduler.cpp
     src/engine/session.cpp
+    # Graph
     src/graph/compiler.cpp
     src/graph/graph.cpp
     src/graph/memoryplan.cpp
     src/graph/router.cpp
+    # Kernels
     src/kernels/attention.cpp
     src/kernels/bfloat16.cpp
     src/kernels/float8.cpp
@@ -81,6 +95,7 @@ set(NCNN_MOE_SOURCES
     src/kernels/int4.cpp
     src/kernels/statecache.cpp
     src/kernels/vector.cpp
+    # Models and package I/O
     src/models/modeladapter.cpp
     src/models/modeladapter_gptoss.cpp
     src/models/modeladapter_deepseekv4.cpp
@@ -92,6 +107,7 @@ set(NCNN_MOE_SOURCES
     src/models/ggufmodel_gptoss.cpp
     src/models/ggufmodel_qwen.cpp
     src/models/tokenizer.cpp
+    # Storage
     src/storage/expertcache.cpp
     src/storage/expertresidency.cpp
     src/storage/expertcache_victim.cpp
@@ -102,16 +118,21 @@ add_library(ncnn_moe STATIC ${NCNN_MOE_SOURCES})
 source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_SOURCES})
 
 if(MSVC)
-    # Tokenizer literals, templates, and parity fixtures must retain UTF-8 bytes.
+    # Preserve UTF-8 tokenizer literals.
     set_property(SOURCE src/models/tokenizer.cpp tests/test_tokenizer.cpp APPEND PROPERTY COMPILE_OPTIONS /utf-8)
 endif()
 install(FILES src/models/unicode.LICENSE
     DESTINATION ${CMAKE_INSTALL_DATADIR}/ncnn-moe-runtime/licenses)
 
 if(APPLE)
+    # Static SDK consumers also need the Accelerate link dependency.
     target_link_libraries(ncnn_moe PRIVATE "-framework Accelerate")
 endif()
 
+# ==============================================================================
+# Architecture-specific compilation
+# ==============================================================================
+# Keep ISA flags local so baseline code remains portable.
 if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
     set(NCNN_MOE_MSVC_SIMD_SOURCES
         src/kernels/float8_msvc_avx2.cpp
@@ -143,6 +164,7 @@ if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set(NCNN_MOE_TARGET_HAS_X86 OFF)
     if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+        # Universal builds may include x86 on ARM hosts.
         foreach(NCNN_MOE_ARCH IN LISTS CMAKE_OSX_ARCHITECTURES)
             if(NCNN_MOE_ARCH MATCHES "^(x86_64|AMD64|amd64|X86|x86|x64|i[3-6]86)$")
                 set(NCNN_MOE_TARGET_HAS_X86 ON)
@@ -165,7 +187,7 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_X86_SIMD=1)
     endif()
 endif()
-
+# Compiler support does not imply runtime CPU support.
 if(
     CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$"
     AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"
@@ -191,6 +213,10 @@ if(
     endif()
 endif()
 
+# ==============================================================================
+# Public target interface
+# ==============================================================================
+# Expose only public headers through ncnn::moe.
 add_library(ncnn::moe ALIAS ncnn_moe)
 set_target_properties(ncnn_moe PROPERTIES EXPORT_NAME moe)
 
@@ -203,6 +229,8 @@ target_include_directories(ncnn_moe
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+# --- OpenMP dependency --------------------------------------------------------
+# Discover OpenMP before ncnn so both share the imported target.
 include(cmake/ncnn_moe_openmp.cmake)
 set(NCNN_MOE_WITH_OPENMP OFF)
 if(TARGET OpenMP::OpenMP_CXX)
@@ -212,6 +240,10 @@ if(TARGET OpenMP::OpenMP_CXX)
 else()
     message(STATUS "ncnn_moe OpenMP unavailable; expert groups use one CPU thread")
 endif()
+
+# ==============================================================================
+# Bundled ncnn and Vulkan configuration
+# ==============================================================================
 
 set(NCNN_MOE_WITH_NCNN OFF)
 set(NCNN_MOE_WITH_VULKAN OFF)
@@ -254,7 +286,7 @@ if(NCNN_MOE_USE_NCNN)
                 "-DNCNN_MOE_MOLTENVK_LIBRARY=/absolute/path/to/libMoltenVK.dylib.")
         endif()
 
-        # ncnn simplevk uses this path for its static-link fallback on Apple platforms.
+        # ncnn simplevk uses this path for its Apple loader fallback.
         set(Vulkan_LIBRARY "${NCNN_MOE_MOLTENVK_LIBRARY}" CACHE FILEPATH
             "Vulkan loader library used by bundled ncnn" FORCE)
     endif()
@@ -264,6 +296,7 @@ if(NCNN_MOE_USE_NCNN)
             "'git submodule update --init --recursive'.")
     endif()
 
+    # Force runtime-owned options when reconfiguring an existing cache.
     set(NCNN_BUILD_BENCHMARK OFF CACHE BOOL "Build ncnn benchmark")
     set(NCNN_BUILD_TESTS OFF CACHE BOOL "Build ncnn tests")
     set(NCNN_BUILD_EXAMPLES OFF CACHE BOOL "Build ncnn examples")
@@ -273,7 +306,7 @@ if(NCNN_MOE_USE_NCNN)
     # Quantized runtime kernels do not use ncnn's INT8 operators.
     set(NCNN_INT8 OFF CACHE BOOL "Build ncnn with int8 inference" FORCE)
 
-    # Build only Runtime layers and their ncnn dependencies.
+    # Disable unneeded upstream layers to keep the dependency small.
     set(NCNN_MOE_REQUIRED_LAYERS
         binaryop cast flatten gemm innerproduct packing permute rmsnorm
         reshape rotaryembed sdpa slice softmax)
@@ -299,6 +332,7 @@ if(NCNN_MOE_USE_NCNN)
     if(TARGET ncnn)
         if(NCNN_OPENMP AND NOT NCNN_SIMPLEOMP AND TARGET OpenMP::OpenMP_CXX
             AND NOT OpenMP_CXX_FOUND AND NOT OPENMP_FOUND)
+            # Apple fallback targets may exist even when FindOpenMP reports failure.
             target_link_libraries(ncnn PUBLIC OpenMP::OpenMP_CXX)
         endif()
         target_link_libraries(ncnn_moe PUBLIC ncnn)
@@ -324,6 +358,10 @@ if(NCNN_MOE_USE_NCNN)
     endif()
 endif()
 
+# ==============================================================================
+# Runtime Vulkan shaders
+# ==============================================================================
+# Embed GLSL for runtime compilation.
 if(NCNN_MOE_WITH_VULKAN)
     set(NCNN_MOE_VULKAN_SHADER_SOURCES
         src/kernels/vulkan/attention_decode_sdpa.comp
@@ -395,6 +433,7 @@ if(NCNN_MOE_WITH_VULKAN)
     set_source_files_properties(
         ${NCNN_MOE_VULKAN_SHADER_SOURCES}
         PROPERTIES HEADER_FILE_ONLY TRUE)
+
     target_sources(
         ncnn_moe
         PRIVATE
@@ -416,10 +455,13 @@ else()
     target_compile_options(ncnn_moe PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# ==============================================================================
+# C++ tests and fixture runners
+# ==============================================================================
+# GPU cases return 77 when their backend is unavailable.
 if(NCNN_MOE_BUILD_TESTS)
     enable_testing()
-    # This policy test does not link or initialize ncnn/Vulkan. Failure sequences
-    # exercise the same completion and queue drain policies as the GPU helper.
+    # Exercise failure handling without initializing Vulkan.
     add_executable(ncnn_moe_vulkan_wait_policy_test tests/test_vulkan_wait_policy.cpp)
     target_compile_features(ncnn_moe_vulkan_wait_policy_test PRIVATE cxx_std_20)
     target_include_directories(ncnn_moe_vulkan_wait_policy_test PRIVATE
@@ -435,6 +477,8 @@ if(NCNN_MOE_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ncnn/src/layer)
         add_test(NAME ncnn_moe_linear_allocation_vulkan COMMAND ncnn_moe_linear_allocation_vulkan_test)
     endif()
+
+    # --- Core regression suite ------------------------------------------------
 
     add_executable(ncnn_moe_tests
         tests/modeladapter_fixture.cpp
@@ -455,8 +499,11 @@ if(NCNN_MOE_BUILD_TESTS)
     )
     add_test(NAME ncnn_moe_tests COMMAND ncnn_moe_tests)
     if(UNIX)
+        # Isolate the low-FD regression in its own process.
         add_test(NAME ncnn_moe_mapped_file_low_fd COMMAND ncnn_moe_tests --mapped-file)
     endif()
+
+    # --- Model and package fixtures -------------------------------------------
 
     add_executable(ncnn_moe_qwen_dense_test tests/test_qwen_dense.cpp)
     target_link_libraries(ncnn_moe_qwen_dense_test PRIVATE ncnn::moe)
@@ -485,11 +532,11 @@ if(NCNN_MOE_BUILD_TESTS)
     endif()
     add_test(NAME ncnn_moe_gguf_tokenizer COMMAND ncnn_moe_gguf_tokenizer_test)
 
+    # Python supplies fixtures and invokes this runner below.
     add_executable(ncnn_moe_gguf_graph_test tests/test_gguf_graph.cpp)
     target_link_libraries(ncnn_moe_gguf_graph_test PRIVATE ncnn::moe)
     target_compile_features(ncnn_moe_gguf_graph_test PRIVATE cxx_std_20)
     target_include_directories(ncnn_moe_gguf_graph_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-
 
     add_executable(ncnn_moe_qwen_quant_banks_test tests/test_qwen_quant_banks.cpp)
     target_link_libraries(ncnn_moe_qwen_quant_banks_test PRIVATE ncnn::moe)
@@ -508,6 +555,8 @@ if(NCNN_MOE_BUILD_TESTS)
     target_compile_features(ncnn_moe_native_family_adapters_test PRIVATE cxx_std_20)
     target_include_directories(ncnn_moe_native_family_adapters_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME ncnn_moe_native_family_adapters COMMAND ncnn_moe_native_family_adapters_test)
+
+    # --- Vulkan operators -----------------------------------------------------
 
     add_executable(ncnn_moe_latent_vulkan_test tests/test_latent_vulkan.cpp)
     target_link_libraries(ncnn_moe_latent_vulkan_test PRIVATE ncnn::moe)
@@ -532,6 +581,8 @@ if(NCNN_MOE_BUILD_TESTS)
         add_test(NAME ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test COMMAND ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test)
         set_tests_properties(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
+
+    # --- Expert execution and transfers ---------------------------------------
 
     add_executable(ncnn_moe_mxfp4_row_tile_test tests/test_mxfp4_row_tile.cpp)
     target_link_libraries(ncnn_moe_mxfp4_row_tile_test PRIVATE ncnn::moe)
@@ -576,13 +627,11 @@ if(NCNN_MOE_BUILD_TESTS)
     )
     add_test(NAME ncnn_moe_gpu_first_experts_test COMMAND ncnn_moe_gpu_first_experts_test)
     set_tests_properties(ncnn_moe_gpu_first_experts_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
-
-    # This consumer must not inherit the runtime's private src include path.
+    # Do not add private src headers to this consumer.
     add_executable(ncnn_moe_public_api_test tests/public_api/main.cpp)
     target_link_libraries(ncnn_moe_public_api_test PRIVATE ncnn::moe)
     add_test(NAME ncnn_moe_public_api_test COMMAND ncnn_moe_public_api_test)
     set_tests_properties(ncnn_moe_public_api_test PROPERTIES TIMEOUT 60)
-
     add_executable(ncnn_moe_expert_pipeline_test tests/test_expert_pipeline.cpp)
     target_link_libraries(ncnn_moe_expert_pipeline_test PRIVATE ncnn::moe)
     target_include_directories(ncnn_moe_expert_pipeline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -591,7 +640,6 @@ if(NCNN_MOE_BUILD_TESTS)
         NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
     )
     add_test(NAME ncnn_moe_expert_pipeline COMMAND ncnn_moe_expert_pipeline_test)
-
     # Asset-driven tokenizer parity checks use tools/test_tokenizer.py.
     add_executable(ncnn_moe_tokenizer_test tests/test_tokenizer.cpp)
     target_link_libraries(ncnn_moe_tokenizer_test PRIVATE ncnn::moe)
@@ -604,6 +652,10 @@ if(NCNN_MOE_BUILD_TESTS)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_style.cmake
     )
 endif()
+
+# ==============================================================================
+# Tools and optional reference runners
+# ==============================================================================
 
 if(NCNN_MOE_BUILD_EXAMPLES)
     if(NCNN_MOE_BUILD_REFERENCE_RUNNERS)
@@ -661,7 +713,6 @@ if(NCNN_MOE_BUILD_EXAMPLES)
             ncnn_moe_qwen3_8
             PRIVATE cxx_std_20)
     endif()
-
     add_executable(
         ncnn_moe_worker
         examples/ncnn_moe_worker.cpp
@@ -677,6 +728,7 @@ if(NCNN_MOE_BUILD_EXAMPLES)
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
     if(WIN32)
+        # Worker telemetry uses Windows process APIs.
         target_link_libraries(ncnn_moe_worker PRIVATE psapi)
     endif()
     if(CMAKE_DL_LIBS)
@@ -684,7 +736,6 @@ if(NCNN_MOE_BUILD_EXAMPLES)
     endif()
     install(TARGETS ncnn_moe_worker
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-
     if(NCNN_MOE_BUILD_MXFP4_BENCHMARK)
         add_executable(
             ncnn_moe_mxfp4_bench
@@ -717,11 +768,16 @@ if(APPLE)
     endforeach()
 endif()
 
+# ==============================================================================
+# Python integration tests
+# ==============================================================================
+# Register worker tests after the executable targets.
 if(NCNN_MOE_BUILD_TESTS)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME ncnn_moe_python_unit
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ncnn_moe.py)
+
         execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
             RESULT_VARIABLE NCNN_MOE_NUMPY_RESULT OUTPUT_QUIET ERROR_QUIET)
         if(NCNN_MOE_NUMPY_RESULT EQUAL 0)
@@ -749,6 +805,7 @@ if(NCNN_MOE_BUILD_TESTS)
                 endif()
             endif()
         endif()
+        # Reuse one generated package for worker smoke tests.
         if(NCNN_MOE_BUILD_EXAMPLES AND NCNN_MOE_BUILD_REFERENCE_RUNNERS)
             add_test(
                 NAME ncnn_moe_gpt_oss_fixture
@@ -766,6 +823,7 @@ if(NCNN_MOE_BUILD_TESTS)
             )
         endif()
         if(NCNN_MOE_BUILD_EXAMPLES)
+            # DEPENDS orders selected tests; it does not select the generator.
             add_test(
                 NAME ncnn_moe_python_fixture
                 COMMAND ${Python3_EXECUTABLE}
@@ -795,6 +853,7 @@ if(NCNN_MOE_BUILD_TESTS)
             )
         endif()
     endif()
+    # Keep temporary fixtures in the build tree.
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-tmp")
     get_property(NCNN_MOE_TESTS DIRECTORY PROPERTY TESTS)
     set_property(TEST ${NCNN_MOE_TESTS} APPEND PROPERTY ENVIRONMENT
@@ -803,6 +862,10 @@ if(NCNN_MOE_BUILD_TESTS)
         "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}/test-tmp")
 endif()
 
+# ==============================================================================
+# Installed SDK
+# ==============================================================================
+# Export public SDK headers and transitive link dependencies.
 include(CMakePackageConfigHelpers)
 set(NCNN_MOE_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/ncnn_moe")
 
@@ -816,7 +879,6 @@ write_basic_package_version_file(
     VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion
 )
-
 install(TARGETS ncnn_moe
     EXPORT ncnn_moeTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}

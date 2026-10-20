@@ -1,3 +1,7 @@
+# ==============================================================================
+# Vulkan shader header generation
+# ==============================================================================
+
 if(NOT DEFINED SHADER_SRC
     OR NOT DEFINED SHADER_COMP_HEADER
     OR NOT DEFINED SHADER_VARIABLE)
@@ -12,6 +16,7 @@ if(NOT version_start EQUAL -1)
     string(SUBSTRING "${comp_data}" ${version_start} -1 comp_data)
 endif()
 
+# Preserve newlines so GLSL preprocessor directives remain separate.
 string(REGEX REPLACE "\n +" "\n" comp_data "${comp_data}")
 string(REGEX REPLACE "//[^\n]*" "" comp_data "${comp_data}")
 string(REGEX REPLACE "[ \t]+" " " comp_data "${comp_data}")
@@ -30,6 +35,8 @@ if(tail_comma GREATER -1)
     string(SUBSTRING "${comp_data_hex}" 0 ${tail_comma} comp_data_hex)
 endif()
 
+# Keep C-string termination; callers exclude the NUL with sizeof(array) - 1.
+# Scope MSVC's C4309 suppression for high-bit byte values to this char array.
 file(WRITE "${SHADER_COMP_HEADER}"
     "#if defined(_MSC_VER)\n"
     "#pragma warning(push)\n"

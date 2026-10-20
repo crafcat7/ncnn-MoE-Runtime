@@ -1,3 +1,7 @@
+# ==============================================================================
+# Source style checks
+# ==============================================================================
+
 if(NOT DEFINED NCNN_MOE_SOURCE_DIR)
     message(FATAL_ERROR "NCNN_MOE_SOURCE_DIR is required")
 endif()
@@ -25,12 +29,14 @@ endif()
 
 set(NCNN_MOE_STYLE_ERRORS "")
 
+# --- Source policy ------------------------------------------------------------
+# These regex checks do not parse C++ or resolve transitive includes.
 foreach(SOURCE_FILE IN LISTS NCNN_MOE_STYLE_FILES)
     file(READ "${SOURCE_FILE}" SOURCE_TEXT)
+    # Normalize CRLF for line-anchored checks without rewriting source files.
     string(REPLACE "\r\n" "\n" SOURCE_TEXT "${SOURCE_TEXT}")
     file(RELATIVE_PATH RELATIVE_FILE "${NCNN_MOE_SOURCE_DIR}" "${SOURCE_FILE}")
 
-    # Check direct includes at the public API and layer boundaries.
     string(REGEX MATCHALL "(^|\n)[ \t]*#[ \t]*include[ \t]*[<\"][^>\"]+[>\"]" INCLUDE_DIRECTIVES "${SOURCE_TEXT}")
     foreach(INCLUDE_DIRECTIVE IN LISTS INCLUDE_DIRECTIVES)
         if(RELATIVE_FILE MATCHES "^include/" AND INCLUDE_DIRECTIVE MATCHES "[<\"]((src/)?(engine|graph|kernels|models|storage|backends)/|\\.\\./)")
@@ -67,6 +73,7 @@ foreach(SOURCE_FILE IN LISTS NCNN_MOE_STYLE_FILES)
                 "${RELATIVE_FILE}: project symbols must use the explicit ncnn/moe namespace nesting\n")
         endif()
     endforeach()
+
     if(SOURCE_TEXT MATCHES "#pragma[ \t]+once")
         string(APPEND NCNN_MOE_STYLE_ERRORS "${RELATIVE_FILE}: use an include guard instead of pragma once\n")
     endif()
@@ -77,7 +84,8 @@ foreach(SOURCE_FILE IN LISTS NCNN_MOE_STYLE_FILES)
         string(APPEND NCNN_MOE_STYLE_ERRORS
             "${RELATIVE_FILE}: name bitmap positions with NCNN_MOE_*_BIT macros\n")
     endif()
-    # Newer clang-format may place a pure virtual '= 0;' on its own line.
+
+    # Allow clang-format to place a pure virtual '= 0;' on its own line.
     string(REGEX REPLACE "\n[ \t]+= 0;" "" ASSIGNMENT_CHECK_TEXT "${SOURCE_TEXT}")
     if(ASSIGNMENT_CHECK_TEXT MATCHES "\n[ \t]+(=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=)[ \t]+")
         string(APPEND NCNN_MOE_STYLE_ERRORS
@@ -90,6 +98,7 @@ foreach(SOURCE_FILE IN LISTS NCNN_MOE_STYLE_FILES)
     if(SOURCE_TEXT MATCHES "\\}[ \t]+(else|catch)([ \t]|\\()")
         string(APPEND NCNN_MOE_STYLE_ERRORS "${RELATIVE_FILE}: text after a closing brace must start on a new line\n")
     endif()
+
     set(TEMPLATE_CHECK_TEXT "${SOURCE_TEXT}")
     if(RELATIVE_FILE STREQUAL "src/kernels/qnk.cpp")
         # Isolate scalar OpenMP captures while keeping one QnK math implementation.
@@ -101,12 +110,12 @@ foreach(SOURCE_FILE IN LISTS NCNN_MOE_STYLE_FILES)
     endif()
 endforeach()
 
+# --- Formatting ---------------------------------------------------------------
 if(NCNN_MOE_STYLE_ERRORS)
     message(FATAL_ERROR "ncnn_moe style violations:\n${NCNN_MOE_STYLE_ERRORS}")
 endif()
 
-# ColumnLimit: 0 preserves existing newlines, so clang-format alone does not
-# reject a first argument placed below the opening parenthesis.
+# ColumnLimit: 0 cannot enforce keeping the first argument on the opening line.
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
 execute_process(
     COMMAND "${Python3_EXECUTABLE}" "${NCNN_MOE_SOURCE_DIR}/cmake/check_format.py"
