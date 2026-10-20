@@ -562,12 +562,13 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
     return {};
 }
 
-static Result<SpeculativeProposal> propose_mtp(const CompiledModel& model,
-                                               int32_t input_id,
-                                               SessionStatistics& statistics,
-                                               SessionState& state,
-                                               uint64_t position_offset,
-                                               const SpeculativeSampler& sampler)
+static Result<void> propose_mtp(const CompiledModel& model,
+                                int32_t input_id,
+                                SessionStatistics& statistics,
+                                SessionState& state,
+                                uint64_t position_offset,
+                                SpeculativeProposal& proposal,
+                                const SpeculativeSampler& sampler)
 {
     if (!sampler)
     {
@@ -615,13 +616,12 @@ static Result<SpeculativeProposal> propose_mtp(const CompiledModel& model,
     }
     const SpeculativeModelPlan::LayerNodes& execution = layer_nodes.front();
 
-    SpeculativeProposal proposal;
     proposal.token_ids.reserve(model.speculative.block_size);
-    proposal.logits.reserve(model.speculative.block_size);
+    proposal.logits.resize(model.speculative.block_size);
     proposal.confidence_logits.reserve(model.speculative.block_size);
     proposal.committed_context_rows = 1;
     ActivationBuffer previous_hidden;
-    ActivationBuffer logits;
+    const CompiledOperator* lm_head_operator = model.operators.find_weight(model.lm_head_weight);
     int32_t previous_token = input_id;
     for (uint32_t row = 0;
          row < model.speculative.block_size;
@@ -639,17 +639,14 @@ static Result<SpeculativeProposal> propose_mtp(const CompiledModel& model,
             return mtp_hidden.error();
         forward_linear(model.weights.at(model.lm_head_weight),
                        mtp_hidden.value(),
-                       logits,
+                       proposal.logits[row],
                        model.opt.optimization_flags,
-                       model.operators.find_weight(model.lm_head_weight));
-        std::vector<float> row_logits(logits.row(0),
-                                      logits.row(0) + logits.columns());
-        auto sampled = sampler(row_logits);
+                       lm_head_operator);
+        auto sampled = sampler(proposal.logits[row].values());
         if (!sampled)
             return sampled.error();
         previous_token = sampled.value();
         proposal.token_ids.push_back(previous_token);
-        proposal.logits.push_back(std::move(row_logits));
         proposal.confidence_logits.push_back(std::numeric_limits<float>::infinity());
         previous_hidden = std::move(mtp_hidden).value();
     }
@@ -663,12 +660,15 @@ static Result<SpeculativeProposal> propose_mtp(const CompiledModel& model,
     }
     ++statistics.speculative_proposals;
     statistics.speculative_draft_tokens += proposal.token_ids.size();
-    return proposal;
+    return {};
 }
 
-Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int32_t input_id, SessionStatistics& statistics, SessionState& state, uint64_t position_offset,
-                                                const SpeculativeSampler& sampler)
+Result<void> propose_speculative(const CompiledModel& model, int32_t input_id, SessionStatistics& statistics, SessionState& state, uint64_t position_offset,
+                                 SpeculativeProposal& proposal, const SpeculativeSampler& sampler)
 {
+    proposal.token_ids.clear();
+    proposal.confidence_logits.clear();
+    proposal.committed_context_rows = 0;
     if (!model.speculative.enabled())
     {
         return Error{
@@ -679,17 +679,18 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
     const Bf16Scope bf16_scope(&bf16);
     if (model.speculative.kind == SpeculativeModelKind::Mtp)
     {
-        auto proposal = propose_mtp(model,
+        auto proposed = propose_mtp(model,
                                     input_id,
                                     statistics,
                                     state,
                                     position_offset,
+                                    proposal,
                                     sampler);
-        if (proposal)
+        if (proposed)
         {
             statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
         }
-        return proposal;
+        return proposed;
     }
     if (!sampler)
     {
@@ -782,9 +783,8 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
     const ActivationBuffer& head_hidden = state.expert_scratch.staged_output;
     const ActivationBuffer& base_logits = state.expert_scratch.staged_merged;
 
-    SpeculativeProposal proposal;
     proposal.token_ids.reserve(model.speculative.block_size);
-    proposal.logits.reserve(model.speculative.block_size);
+    proposal.logits.resize(model.speculative.block_size);
     proposal.confidence_logits.reserve(model.speculative.block_size);
     int32_t previous_token = input_id;
     const TensorData& confidence = model.weights.at(model.speculative.confidence_weight);
@@ -799,28 +799,25 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
     const TensorData& markov_head_weight = model.weights.at(model.speculative.markov_head_weight);
     const CompiledOperator* markov_head_operator = model.operators.find_weight(model.speculative.markov_head_weight);
     ActivationBuffer markov_embedding;
-    ActivationBuffer markov_logits;
     for (uint32_t row = 0; row < model.speculative.block_size; ++row)
     {
         const std::span<const int32_t> previous(&previous_token, 1);
         forward_embedding(markov_embedding_weight, previous, markov_embedding);
         forward_linear(markov_head_weight,
                        markov_embedding,
-                       markov_logits,
+                       proposal.logits[row],
                        model.opt.optimization_flags,
                        markov_head_operator);
-        std::vector<float> row_logits(model.descriptor.vocabulary_size);
+        float* row_logits = proposal.logits[row].row(0);
         for (uint32_t token_id = 0; token_id < model.descriptor.vocabulary_size; ++token_id)
         {
-            row_logits[token_id] = base_logits.row(row)[token_id]
-                                   + markov_logits.row(0)[token_id];
+            row_logits[token_id] += base_logits.row(row)[token_id];
         }
-        auto sampled = sampler(row_logits);
+        auto sampled = sampler(proposal.logits[row].values());
         if (!sampled)
             return sampled.error();
         const int32_t selected = sampled.value();
         proposal.token_ids.push_back(selected);
-        proposal.logits.push_back(std::move(row_logits));
         previous_token = selected;
 
         confidence_input.reset(1, model.descriptor.hidden_size + model.speculative.markov_rank, false);
@@ -842,7 +839,7 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
     statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
     ++statistics.speculative_proposals;
     statistics.speculative_draft_tokens += proposal.token_ids.size();
-    return proposal;
+    return {};
 }
 
 } // namespace moe

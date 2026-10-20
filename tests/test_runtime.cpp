@@ -15,6 +15,7 @@
 #include "kernels/ops.h"
 #include "kernels/statecache.h"
 #include "kernels/float8.h"
+#include "kernels/int4.h"
 #include "kernels/vector.h"
 #include "kernels/hyperconnection.h"
 #include "engine/executor.h"
@@ -8991,13 +8992,26 @@ void test_speculative_generation()
             }
             SessionStatistics proposal_statistics;
             proposal_statistics.expert_token_counts.resize(compiled.descriptor.expert_count);
-            const SpeculativeSampler fixed_sampler = [](const std::vector<float>&) -> Result<int32_t> { return 1; };
-            auto confidence_proposal = propose_speculative(compiled, 0, proposal_statistics,
-                                                           proposal_state, 0, fixed_sampler);
-            if (!confidence_proposal)
+            std::vector<std::span<const float>> sampled_logits;
+            const SpeculativeSampler fixed_sampler = [&sampled_logits](std::span<const float> logits) -> Result<int32_t> {
+                sampled_logits.push_back(logits);
+                return 1;
+            };
+            SpeculativeProposal confidence_proposal;
+            auto confidence_status = propose_speculative(compiled, 0, proposal_statistics,
+                                                         proposal_state, 0, confidence_proposal, fixed_sampler);
+            if (!confidence_status)
                 throw std::runtime_error("DSpark confidence proposal failed: "
-                                         + confidence_proposal.error().message);
-            check(confidence_proposal.value().confidence_logits.size() == compiled.speculative.block_size);
+                                         + confidence_status.error().message);
+            check(confidence_proposal.confidence_logits.size() == compiled.speculative.block_size);
+            check(sampled_logits.size() == confidence_proposal.logits.size());
+            for (size_t row = 0; row < sampled_logits.size(); ++row)
+            {
+                const std::span<const float> retained = confidence_proposal.logits[row].values();
+                check(sampled_logits[row].data() == retained.data());
+                check(sampled_logits[row].size() == retained.size());
+                check(std::equal(sampled_logits[row].begin(), sampled_logits[row].end(), retained.begin()));
+            }
             const std::array<const std::byte*, 3> confidence_storage = {
                 proposal_state.hyper_connection_scratch.auxiliary.bytes().data(),
                 proposal_state.hyper_connection_scratch.normalized.bytes().data(),
@@ -9020,20 +9034,53 @@ void test_speculative_generation()
             check(confidence_storage[1] != proposal_state.expert_scratch.staged_merged.bytes().data());
             check(confidence_storage[2] != proposal_state.expert_scratch.staged_output.bytes().data());
             check(confidence_storage[2] != proposal_state.expert_scratch.staged_merged.bytes().data());
+            const SpeculativeProposal expected_confidence = confidence_proposal;
+            const auto proposal_storage = sampled_logits;
+            const auto* token_storage = confidence_proposal.token_ids.data();
+            const auto* logits_storage = confidence_proposal.logits.data();
+            const auto* confidence_data = confidence_proposal.confidence_logits.data();
+            sampled_logits.clear();
             auto repeated_confidence_proposal = propose_speculative(compiled, 0, proposal_statistics,
-                                                                    proposal_state, 0, fixed_sampler);
+                                                                    proposal_state, 0, confidence_proposal, fixed_sampler);
             if (!repeated_confidence_proposal)
                 throw std::runtime_error("repeated DSpark confidence proposal failed: "
                                          + repeated_confidence_proposal.error().message);
-            check(repeated_confidence_proposal.value().token_ids == confidence_proposal.value().token_ids);
-            check(repeated_confidence_proposal.value().logits == confidence_proposal.value().logits);
-            check(repeated_confidence_proposal.value().confidence_logits == confidence_proposal.value().confidence_logits);
+            check(confidence_proposal.token_ids == expected_confidence.token_ids);
+            check(sampled_logits.size() == confidence_proposal.logits.size());
+            check(confidence_proposal.logits.size() == expected_confidence.logits.size());
+            check(confidence_proposal.token_ids.data() == token_storage);
+            check(confidence_proposal.logits.data() == logits_storage);
+            check(confidence_proposal.confidence_logits.data() == confidence_data);
+            for (size_t row = 0; row < sampled_logits.size(); ++row)
+            {
+                const std::span<const float> retained = confidence_proposal.logits[row].values();
+                const std::span<const float> previous = expected_confidence.logits[row].values();
+                check(retained.data() == proposal_storage[row].data());
+                check(sampled_logits[row].data() == retained.data());
+                check(sampled_logits[row].size() == retained.size());
+                check(std::equal(sampled_logits[row].begin(), sampled_logits[row].end(), retained.begin()));
+                check(retained.size() == previous.size());
+                check(std::equal(retained.begin(), retained.end(), previous.begin()));
+            }
+            check(confidence_proposal.confidence_logits == expected_confidence.confidence_logits);
             check(proposal_state.hyper_connection_scratch.auxiliary.bytes().data() == confidence_storage[0]);
             check(proposal_state.hyper_connection_scratch.normalized.bytes().data() == confidence_storage[1]);
             check(proposal_state.hyper_connection_scratch.projection.bytes().data() == confidence_storage[2]);
             check(proposal_state.hyper_connection_scratch.auxiliary.allocated_bytes() == confidence_capacity[0]);
             check(proposal_state.hyper_connection_scratch.normalized.allocated_bytes() == confidence_capacity[1]);
             check(proposal_state.hyper_connection_scratch.projection.allocated_bytes() == confidence_capacity[2]);
+
+            const auto saved_kind = compiled.speculative.kind;
+            compiled.speculative.kind = SpeculativeModelKind::None;
+            auto disabled_proposal = propose_speculative(compiled, 0, proposal_statistics,
+                                                         proposal_state, 0, confidence_proposal, fixed_sampler);
+            compiled.speculative.kind = saved_kind;
+            check(!disabled_proposal && disabled_proposal.error().code == ErrorCode::UnsupportedModel);
+            check(confidence_proposal.token_ids.empty() && confidence_proposal.confidence_logits.empty());
+            check(confidence_proposal.committed_context_rows == 0);
+            check(confidence_proposal.logits.data() == logits_storage);
+            for (size_t row = 0; row < proposal_storage.size(); ++row)
+                check(confidence_proposal.logits[row].values().data() == proposal_storage[row].data());
 
             GenerationOptions ordinary_options = dspark_options;
             ordinary_options.use_speculative = false;
@@ -9043,6 +9090,17 @@ void test_speculative_generation()
             check(ordinary_result.value().tokens.size() == dspark_result.value().tokens.size());
             for (size_t index = 0; index < dspark_result.value().tokens.size(); ++index)
                 check(dspark_result.value().tokens[index].token_id == ordinary_result.value().tokens[index].token_id);
+
+            GenerationOptions empty_options = dspark_options;
+            empty_options.speculative_confidence_threshold = 1.0f;
+            auto empty_session = runtime.create_session(model.value()).value();
+            auto empty_result = empty_session->generate(input, empty_options);
+            check(static_cast<bool>(empty_result));
+            check(empty_session->statistics().speculative_proposals == 1);
+            check(empty_session->statistics().speculative_accepted_tokens == 0);
+            check(empty_result.value().tokens.size() == ordinary_result.value().tokens.size());
+            for (size_t index = 0; index < empty_result.value().tokens.size(); ++index)
+                check(empty_result.value().tokens[index].token_id == ordinary_result.value().tokens[index].token_id);
 
             compiled.weights.at_mutable(latent.output_b_weight).float32_data = {1.0f, -0.25f};
             compiled.weights.at_mutable(compiled.speculative.markov_head_weight).float32_data = {0.0f, 0.0f};
@@ -10191,16 +10249,18 @@ void test_shared_expert_descriptor()
     check(static_cast<bool>(begin_state_cache_transaction(mtp_states[0].speculative_layers,
                                                           mtp.block_size)));
     size_t sampler_calls = 0;
-    const SpeculativeSampler failing_sampler = [&sampler_calls](const std::vector<float>&) -> Result<int32_t> {
+    const SpeculativeSampler failing_sampler = [&sampler_calls](std::span<const float>) -> Result<int32_t> {
         if (sampler_calls++ == 0)
             return 0;
         return Error{ErrorCode::InternalError, "test sampler failure"};
     };
+    SpeculativeProposal mtp_actual;
     auto failed_mtp = propose_speculative(mtp_shared_model,
                                           1,
                                           failure_statistics,
                                           mtp_states[0],
                                           1,
+                                          mtp_actual,
                                           failing_sampler);
     auto rolled_back_mtp_cache = finish_state_cache_transaction(mtp_states[0].speculative_layers,
                                                                 0);
@@ -10209,6 +10269,8 @@ void test_shared_expert_descriptor()
     check(failed_mtp.error().code == ErrorCode::InternalError);
     check(failed_mtp.error().message == "test sampler failure");
     check(sampler_calls == 2);
+    check(mtp_actual.token_ids.size() == 1 && mtp_actual.confidence_logits.size() == 1);
+    check(mtp_actual.logits.size() == mtp.block_size);
     check(mtp_states[0].mtp_pending_target_hidden.rows() == 1);
     check(mtp_states[0].mtp_pending_target_hidden.columns() == 2);
     check(mtp_states[0].mtp_pending_target_hidden.bytes().data() == pending_data);
@@ -10217,13 +10279,67 @@ void test_shared_expert_descriptor()
                      mtp_states[0].mtp_pending_target_hidden.bytes().end(),
                      pending_snapshot.begin(),
                      pending_snapshot.end()));
-    const SpeculativeSampler first_token = [](const std::vector<float>&) -> Result<int32_t> { return 0; };
-    auto mtp_actual = propose_speculative(mtp_shared_model, 1, mtp_statistics[0], mtp_states[0], 1, first_token);
-    auto mtp_expected = propose_speculative(serial_mtp_model, 1, mtp_statistics[1], mtp_states[1], 1, first_token);
-    check(static_cast<bool>(mtp_actual) && static_cast<bool>(mtp_expected));
-    check(mtp_actual.value().logits == mtp_expected.value().logits);
-    check(mtp_actual.value().token_ids == mtp_expected.value().token_ids);
+    std::vector<std::span<const float>> sampled_mtp_logits;
+    const SpeculativeSampler first_token = [&sampled_mtp_logits](std::span<const float> logits) -> Result<int32_t> {
+        sampled_mtp_logits.push_back(logits);
+        return 0;
+    };
+    auto mtp_status = propose_speculative(mtp_shared_model, 1, mtp_statistics[0], mtp_states[0], 1, mtp_actual, first_token);
+    check(static_cast<bool>(mtp_status));
+    check(sampled_mtp_logits.size() == mtp_actual.logits.size());
+    for (size_t row = 0; row < sampled_mtp_logits.size(); ++row)
+    {
+        const std::span<const float> retained = mtp_actual.logits[row].values();
+        check(sampled_mtp_logits[row].data() == retained.data());
+        check(sampled_mtp_logits[row].size() == retained.size());
+        check(std::equal(sampled_mtp_logits[row].begin(), sampled_mtp_logits[row].end(), retained.begin()));
+    }
+    sampled_mtp_logits.clear();
+    SpeculativeProposal mtp_expected;
+    auto expected_status = propose_speculative(serial_mtp_model, 1, mtp_statistics[1], mtp_states[1], 1, mtp_expected, first_token);
+    check(static_cast<bool>(expected_status));
+    check(sampled_mtp_logits.size() == mtp_expected.logits.size());
+    check(mtp_actual.logits.size() == mtp_expected.logits.size());
+    for (size_t row = 0; row < sampled_mtp_logits.size(); ++row)
+    {
+        const std::span<const float> retained = mtp_expected.logits[row].values();
+        const std::span<const float> actual = mtp_actual.logits[row].values();
+        check(sampled_mtp_logits[row].data() == retained.data());
+        check(sampled_mtp_logits[row].size() == retained.size());
+        check(std::equal(sampled_mtp_logits[row].begin(), sampled_mtp_logits[row].end(), retained.begin()));
+        check(retained.size() == actual.size());
+        check(std::equal(retained.begin(), retained.end(), actual.begin()));
+    }
+    check(mtp_actual.token_ids == mtp_expected.token_ids);
     check(mtp_statistics[0].expert_assignments == mtp_statistics[1].expert_assignments);
+
+    SessionState repeated_mtp_state;
+    repeated_mtp_state.speculative_layers.resize(1);
+    repeated_mtp_state.mtp_pending_target_hidden.reset(1, 2, false);
+    repeated_mtp_state.mtp_pending_target_hidden.row(0)[0] = 1.0f;
+    repeated_mtp_state.mtp_pending_target_hidden.row(0)[1] = 0.25f;
+    SessionStatistics repeated_mtp_statistics;
+    repeated_mtp_statistics.expert_token_counts.resize(shared_descriptor.expert_count);
+    const std::array<const float*, 2> mtp_storage = {
+        mtp_actual.logits[0].values().data(), mtp_actual.logits[1].values().data()};
+    const auto* mtp_tokens = mtp_actual.token_ids.data();
+    const auto* mtp_confidence = mtp_actual.confidence_logits.data();
+    sampled_mtp_logits.clear();
+    auto repeated_mtp = propose_speculative(mtp_shared_model, 1, repeated_mtp_statistics,
+                                            repeated_mtp_state, 1, mtp_actual, first_token);
+    check(static_cast<bool>(repeated_mtp));
+    check(mtp_actual.token_ids == mtp_expected.token_ids);
+    check(mtp_actual.confidence_logits == mtp_expected.confidence_logits);
+    check(mtp_actual.token_ids.data() == mtp_tokens);
+    check(mtp_actual.confidence_logits.data() == mtp_confidence);
+    check(sampled_mtp_logits.size() == mtp_actual.logits.size());
+    for (size_t row = 0; row < mtp_storage.size(); ++row)
+    {
+        check(mtp_actual.logits[row].values().data() == mtp_storage[row]);
+        check(sampled_mtp_logits[row].data() == mtp_storage[row]);
+        check(std::equal(mtp_actual.logits[row].values().begin(), mtp_actual.logits[row].values().end(),
+                         mtp_expected.logits[row].values().begin(), mtp_expected.logits[row].values().end()));
+    }
 
     const MoeBlockPlan& nonzero_shared_plan = nonzero_shared_model.graph.layer_plans.front().moe;
     ActivationBuffer nonzero_shared_input(2, shared_descriptor.hidden_size);
@@ -11430,6 +11546,35 @@ void test_deepseek_router_and_hyper_connection_kernels()
     check(static_cast<bool>(routed_reuse));
     check(reusable.batches[0].expert_id == 2);
     check(reusable.batches[1].expert_id == 3);
+
+    // Reuse the same plan across full-score and explicit-score paths.
+    for (RouterScoreFunction score_function : {RouterScoreFunction::Softmax, RouterScoreFunction::Sigmoid, RouterScoreFunction::SqrtSoftplus})
+    {
+        for (RouterNormalization normalization : {RouterNormalization::None, RouterNormalization::SelectedExperts})
+        {
+            options.score_function = score_function;
+            options.normalization = normalization;
+            general_explicit_options.score_function = score_function;
+            general_explicit_options.normalization = normalization;
+            check(static_cast<bool>(forward_router(logits, 1, options, routed)));
+            check(static_cast<bool>(forward_router(repeated_logits, 2, general_explicit_options, general_explicit)));
+            check(general_explicit.assignment_count == 4);
+            check(general_explicit.batches.size() == routed.batches.size());
+            for (size_t batch_index = 0; batch_index < routed.batches.size(); ++batch_index)
+            {
+                const ExpertRoute& expected_route = routed.batches[batch_index].routes[0];
+                check(general_explicit.batches[batch_index].expert_id == routed.batches[batch_index].expert_id);
+                check(general_explicit.batches[batch_index].routes.size() == 2);
+                for (uint32_t token_index = 0; token_index < 2; ++token_index)
+                {
+                    const ExpertRoute& actual_route = general_explicit.batches[batch_index].routes[token_index];
+                    check(actual_route.token_index == token_index);
+                    check(actual_route.rank == expected_route.rank);
+                    check(actual_route.weight == expected_route.weight);
+                }
+            }
+        }
+    }
 
     ActivationBuffer hyper_input(1, 2);
     hyper_input.row(0)[0] = 2.0f;
@@ -15565,6 +15710,250 @@ void test_ple_prefill_decode_continuation()
             for (size_t column = 0; column < expected_hash_outputs[row].size(); ++column)
                 check_near(hash_hidden.row(row)[column], expected_hash_outputs[row][column], 1e-6f);
     }
+}
+
+void test_quantized_attention_scratch_reuse()
+{
+    constexpr uint32_t input_columns = 256;
+    const uint64_t flags = g_test_optimization_flags & ~OptimizationCpuFloat8FusedProjections
+                           & ~OptimizationCpuPackedWeights;
+    for (DType dtype : {DType::Float8E4M3, DType::Int4, DType::Q8K})
+        for (bool delta : {false, true})
+        {
+            WeightStore weights;
+            CompiledOperatorTable operators;
+            const auto add_projection = [&](uint32_t rows, uint32_t seed) {
+                TensorData matrix;
+                matrix.dtype = dtype;
+                matrix.shape = {rows, input_columns};
+                std::vector<float> decoded(static_cast<size_t>(rows) * input_columns);
+                std::vector<uint8_t> raw;
+                if (dtype == DType::Float8E4M3)
+                {
+                    raw.resize(decoded.size());
+                    matrix.float8_scale_row_size = 1;
+                    matrix.quantization_scales.assign(static_cast<size_t>(rows) * 2, 1.0f);
+                    for (size_t index = 0; index < raw.size(); ++index)
+                    {
+                        raw[index] = float_to_float8_e4m3(static_cast<float>(static_cast<int>((index * 3 + seed) % 16) - 8) / 64.0f);
+                        decoded[index] = float8_e4m3_to_float(raw[index]);
+                    }
+                }
+                else
+                {
+                    matrix.input_column_indices.resize(input_columns);
+                    for (uint32_t column = 0; column < input_columns; ++column)
+                        matrix.input_column_indices[column] = input_columns - column - 1;
+                    if (dtype == DType::Int4)
+                    {
+                        matrix.quantization_group_size = 32;
+                        matrix.quantization_scales.assign(static_cast<size_t>(rows) * 8, 1.0f / 64.0f);
+                        matrix.quantization_zero_points.assign(matrix.quantization_scales.size(), 8);
+                        raw.resize(static_cast<size_t>(rows) * input_columns / 2);
+                        for (size_t index = 0; index < raw.size(); ++index)
+                            raw[index] = static_cast<uint8_t>(((index * 3 + seed) % 16)
+                                                              | (((index * 5 + seed + 1) % 16) << 4));
+                    }
+                    else
+                    {
+                        raw.resize(static_cast<size_t>(qnk_storage_bytes(dtype, rows, input_columns)));
+                        std::array<float, input_columns> source;
+                        std::array<float, input_columns> block;
+                        for (uint32_t row = 0; row < rows; ++row)
+                        {
+                            for (uint32_t column = 0; column < input_columns; ++column)
+                                source[column] = static_cast<float>(static_cast<int>((column * 3 + row + seed) % 16) - 8) / 64.0f;
+                            uint8_t* encoded = raw.data() + row * qnk_block_bytes(dtype);
+                            qnk_q8k_quantize(source.data(), encoded, input_columns);
+                            qnk_dequantize_block(dtype, encoded, block.data());
+                            for (uint32_t column = 0; column < input_columns; ++column)
+                                decoded[static_cast<size_t>(row) * input_columns + matrix.input_column_indices[column]] = block[column];
+                        }
+                    }
+                }
+                std::shared_ptr<uint8_t[]> storage(new uint8_t[raw.size()], std::default_delete<uint8_t[]>());
+                std::copy(raw.begin(), raw.end(), storage.get());
+                matrix.mapped_data = std::shared_ptr<const uint8_t>(storage, storage.get());
+                matrix.mapped_size = raw.size();
+                if (dtype == DType::Int4)
+                    for (uint32_t row = 0; row < rows; ++row)
+                        check(int4_dequantize_row(matrix, row, decoded.data() + static_cast<size_t>(row) * input_columns));
+                const std::string name = "scratch_projection_" + std::to_string(weights.size());
+                const auto added = weights.add(name, std::move(matrix));
+                check(static_cast<bool>(added));
+                const TensorHandle reference = add_float_tensor(weights, name + "_reference", {rows, input_columns}, std::move(decoded));
+                return std::pair<TensorHandle, TensorHandle>{added.value(), reference};
+            };
+
+            AttentionBlockPlan plan;
+            plan.kind = delta ? AttentionKind::GatedDeltaNet : AttentionKind::Standard;
+            plan.flags = AttentionBlockExternalResidual;
+            plan.head_count = 1;
+            plan.kv_head_count = 1;
+            plan.head_dimension = 2;
+            plan.value_head_dimension = 2;
+            plan.rope_head_dimension = 2;
+            plan.norm_epsilon = 1e-6f;
+            std::vector<float> output_weights(input_columns * 2);
+            for (size_t index = 0; index < output_weights.size(); ++index)
+                output_weights[index] = static_cast<float>(static_cast<int>(index % 7) - 3) / 16.0f;
+            plan.output_weight = add_float_tensor(weights, "scratch_output", {input_columns, 2}, std::move(output_weights));
+            if (delta)
+            {
+                plan.convolution_kernel_size = 2;
+                plan.delta_convolution_weight = add_float_tensor(weights, "scratch_conv", {6, 1, 2},
+                                                                 {0.2f, 0.8f, -0.1f, 0.7f, 0.3f, 0.6f,
+                                                                  0.15f, 0.9f, -0.25f, 0.5f, 0.4f, 0.65f});
+                plan.delta_time_bias = add_float_tensor(weights, "scratch_time", {1}, {0.1f});
+                plan.delta_decay_log = add_float_tensor(weights, "scratch_decay", {1}, {-0.2f});
+                plan.delta_norm_weight = add_float_tensor(weights, "scratch_norm", {2}, {1.1f, 0.9f});
+            }
+            else
+            {
+                // Biases force the scalar projection path even when fusion is enabled elsewhere.
+                plan.query_bias = add_float_tensor(weights, "scratch_q_bias", {2}, {0.02f, -0.03f});
+                plan.key_bias = add_float_tensor(weights, "scratch_k_bias", {2}, {-0.01f, 0.04f});
+                plan.value_bias = add_float_tensor(weights, "scratch_v_bias", {2}, {0.05f, -0.02f});
+            }
+            AttentionBlockPlan reference_plan = plan;
+            const auto bind_projection = [&](TensorHandle& actual, TensorHandle& reference, uint32_t rows, uint32_t seed) {
+                const auto pair = add_projection(rows, seed);
+                actual = pair.first;
+                reference = pair.second;
+            };
+            if (delta)
+            {
+                bind_projection(plan.delta_qkv_weight, reference_plan.delta_qkv_weight, 6, 1);
+                bind_projection(plan.delta_z_weight, reference_plan.delta_z_weight, 2, 2);
+                bind_projection(plan.delta_beta_weight, reference_plan.delta_beta_weight, 1, 3);
+                bind_projection(plan.delta_alpha_weight, reference_plan.delta_alpha_weight, 1, 4);
+            }
+            else
+            {
+                bind_projection(plan.query_weight, reference_plan.query_weight, 2, 1);
+                bind_projection(plan.key_weight, reference_plan.key_weight, 2, 2);
+                bind_projection(plan.value_weight, reference_plan.value_weight, 2, 3);
+            }
+
+            for (uint32_t alias = 0; alias < 4; ++alias)
+            {
+                LayerCache cache;
+                LayerCache reference_cache;
+                AttentionScratch scratch;
+                AttentionScratch reference_scratch;
+                GatedDeltaScratch delta_scratch;
+                GatedDeltaScratch delta_reference_scratch;
+                ActivationBuffer& reused = delta ? delta_scratch.fused_input : scratch.quantized_input;
+                if (alias == 3)
+                    reused = ActivationBuffer(4, input_columns, DType::BFloat16);
+                const std::byte* storage = nullptr;
+                uint64_t capacity = 0;
+                uint64_t position = 0;
+                for (size_t rows : {4u, 1u, 3u, 1u, 4u})
+                {
+                    ActivationBuffer input(rows, input_columns);
+                    for (size_t row = 0; row < rows; ++row)
+                        for (uint32_t column = 0; column < input_columns; ++column)
+                            input.row(row)[column] = static_cast<float>(static_cast<int>((column * 7 + position + row * 3) % 29) - 14) / 128.0f;
+                    ActivationBuffer reference_input = input;
+                    if (dtype == DType::Float8E4M3)
+                        for (size_t row = 0; row < rows; ++row)
+                            quantize_float8_e4m3(input.row(row), reference_input.row(row), input_columns, 128, true, flags);
+                    ActivationBuffer expected;
+                    ActivationBuffer separate_output;
+                    ActivationBuffer& actual = alias == 1   ? input
+                                               : alias == 2 ? (delta ? delta_scratch.recurrent_output : scratch.quantized_input)
+                                                            : separate_output;
+                    std::fill(reused.mutable_bytes().begin(), reused.mutable_bytes().end(), std::byte{0xff});
+                    if (delta)
+                    {
+                        check(static_cast<bool>(forward_gated_delta(weights, operators, reference_plan, ExecutionBackend::Cpu,
+                                                                    reference_cache, delta_reference_scratch, reference_input, expected, flags)));
+                        check(static_cast<bool>(forward_gated_delta(weights, operators, plan, ExecutionBackend::Cpu,
+                                                                    cache, delta_scratch, input, actual, flags)));
+                    }
+                    else
+                    {
+                        check(static_cast<bool>(forward_attention(weights, operators, reference_plan, ExecutionBackend::Cpu, position,
+                                                                  reference_cache, reference_scratch, reference_input, expected, flags)));
+                        check(static_cast<bool>(forward_attention(weights, operators, plan, ExecutionBackend::Cpu, position,
+                                                                  cache, scratch, input, actual, flags)));
+                    }
+                    check(actual.rows() == expected.rows() && actual.columns() == expected.columns());
+                    for (size_t index = 0; index < expected.values().size(); ++index)
+                    {
+                        check(std::isfinite(actual.values()[index]));
+                        check_near(actual.values()[index], expected.values()[index], 2e-5f);
+                    }
+                    check(reused.dtype() == (alias == 3 ? DType::BFloat16 : DType::Float32));
+                    if (dtype != DType::Float8E4M3 || &actual == &reused)
+                    {
+                        check(reused.rows() == (alias == 3 ? 4u : rows) && reused.columns() == input_columns);
+                        if (!storage)
+                        {
+                            storage = reused.bytes().data();
+                            capacity = reused.allocated_bytes();
+                            check(capacity >= 4 * input_columns * reused.element_size());
+                        }
+                        else
+                        {
+                            check(reused.bytes().data() == storage);
+                            check(reused.allocated_bytes() == capacity);
+                        }
+                    }
+                    position += rows;
+                }
+            }
+
+            plan.flags = 0;
+            plan.pre_attention_norm_weight = add_float_tensor(weights, "scratch_input_norm", {input_columns},
+                                                              std::vector<float>(input_columns, 1.0f));
+            LayerCache cache;
+            LayerCache reference_cache;
+            AttentionScratch scratch;
+            GatedDeltaScratch delta_scratch;
+            ActivationBuffer& reused = delta ? delta_scratch.fused_input : scratch.quantized_input;
+            uint64_t position = 0;
+            for (size_t rows : {4u, 1u, 3u})
+            {
+                ActivationBuffer input(rows, input_columns);
+                for (size_t row = 0; row < rows; ++row)
+                    for (uint32_t column = 0; column < input_columns; ++column)
+                        input.row(row)[column] = static_cast<float>(static_cast<int>((column * 7 + position + row * 3) % 29) - 14) / 128.0f;
+                reused = input;
+                ActivationBuffer expected;
+                ActivationBuffer actual;
+                AttentionScratch reference_scratch;
+                GatedDeltaScratch delta_reference_scratch;
+                if (delta)
+                {
+                    check(static_cast<bool>(forward_gated_delta(weights, operators, plan, ExecutionBackend::Cpu,
+                                                                reference_cache, delta_reference_scratch, input, expected, flags)));
+                    check(static_cast<bool>(forward_gated_delta(weights, operators, plan, ExecutionBackend::Cpu,
+                                                                cache, delta_scratch, reused, actual, flags)));
+                    check(cache.gated_delta_convolution == reference_cache.gated_delta_convolution);
+                    check(cache.gated_delta_recurrent == reference_cache.gated_delta_recurrent);
+                }
+                else
+                {
+                    check(static_cast<bool>(forward_attention(weights, operators, plan, ExecutionBackend::Cpu, position,
+                                                              reference_cache, reference_scratch, input, expected, flags)));
+                    check(static_cast<bool>(forward_attention(weights, operators, plan, ExecutionBackend::Cpu, position,
+                                                              cache, scratch, reused, actual, flags)));
+                    check(cache.keys == reference_cache.keys && cache.values == reference_cache.values);
+                    check(cache.bfloat16_keys == reference_cache.bfloat16_keys && cache.bfloat16_values == reference_cache.bfloat16_values);
+                }
+                check(actual.rows() == expected.rows() && actual.columns() == expected.columns());
+                for (size_t index = 0; index < expected.values().size(); ++index)
+                {
+                    check(std::isfinite(actual.values()[index]));
+                    check_near(actual.values()[index], expected.values()[index], 2e-5f);
+                }
+                check(reused.rows() == input.rows() && reused.columns() == input.columns());
+                check(std::equal(reused.values().begin(), reused.values().end(), input.values().begin()));
+                position += rows;
+            }
+        }
 }
 
 void test_attention_output_aliases()
@@ -20747,6 +21136,7 @@ int main(int argc, char** argv)
         ncnn::moe::test_gated_delta_vulkan_budget_admission();
         ncnn::moe::test_gated_residual_kernels();
         ncnn::moe::test_ple_prefill_decode_continuation();
+        ncnn::moe::test_quantized_attention_scratch_reuse();
         ncnn::moe::test_attention_output_aliases();
         ncnn::moe::test_qsa_prefill_decode_continuation();
         ncnn::moe::test_gated_delta_net_continuation();

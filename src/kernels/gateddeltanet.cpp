@@ -453,18 +453,27 @@ Result<void> forward_gated_delta(const WeightStore& weights,
     }
     if (!fused_input)
     {
+        ActivationBuffer* quantized_input = scratch.fused_input.dtype() == DType::Float32
+                                                    && &scratch.fused_input != normalized
+                                                    && &scratch.fused_input != &hidden
+                                                ? &scratch.fused_input
+                                                : nullptr;
         if (backend != ExecutionBackend::Cpu
             || !forward_linear({&weights.at(plan.delta_qkv_weight),
                                 &weights.at(plan.delta_z_weight)},
                                *normalized, {&scratch.qkv, &scratch.z}, optimization_flags,
                                {operators.find_weight(plan.delta_qkv_weight),
                                 operators.find_weight(plan.delta_z_weight)},
-                               &scratch.fused_input))
+                               quantized_input))
         {
-            forward_linear(weights.at(plan.delta_qkv_weight), *normalized, scratch.qkv, optimization_flags,
-                           operators.find_weight(plan.delta_qkv_weight));
-            forward_linear(weights.at(plan.delta_z_weight), *normalized, scratch.z, optimization_flags,
-                           operators.find_weight(plan.delta_z_weight));
+            const TensorData& qkv = weights.at(plan.delta_qkv_weight);
+            const TensorData& z = weights.at(plan.delta_z_weight);
+            forward_linear(qkv, *normalized, scratch.qkv, optimization_flags,
+                           operators.find_weight(plan.delta_qkv_weight), ExecutionBackend::Cpu,
+                           qkv.input_column_indices.empty() ? nullptr : quantized_input);
+            forward_linear(z, *normalized, scratch.z, optimization_flags,
+                           operators.find_weight(plan.delta_z_weight), ExecutionBackend::Cpu,
+                           z.input_column_indices.empty() ? nullptr : quantized_input);
         }
         if (backend != ExecutionBackend::Cpu
             || !forward_linear({&weights.at(plan.delta_beta_weight),
@@ -472,12 +481,16 @@ Result<void> forward_gated_delta(const WeightStore& weights,
                                *normalized, {&scratch.beta, &scratch.alpha}, optimization_flags,
                                {operators.find_weight(plan.delta_beta_weight),
                                 operators.find_weight(plan.delta_alpha_weight)},
-                               &scratch.fused_input))
+                               quantized_input))
         {
-            forward_linear(weights.at(plan.delta_beta_weight), *normalized, scratch.beta, optimization_flags,
-                           operators.find_weight(plan.delta_beta_weight));
-            forward_linear(weights.at(plan.delta_alpha_weight), *normalized, scratch.alpha, optimization_flags,
-                           operators.find_weight(plan.delta_alpha_weight));
+            const TensorData& beta = weights.at(plan.delta_beta_weight);
+            const TensorData& alpha = weights.at(plan.delta_alpha_weight);
+            forward_linear(beta, *normalized, scratch.beta, optimization_flags,
+                           operators.find_weight(plan.delta_beta_weight), ExecutionBackend::Cpu,
+                           beta.input_column_indices.empty() ? nullptr : quantized_input);
+            forward_linear(alpha, *normalized, scratch.alpha, optimization_flags,
+                           operators.find_weight(plan.delta_alpha_weight), ExecutionBackend::Cpu,
+                           alpha.input_column_indices.empty() ? nullptr : quantized_input);
         }
     }
     scratch.recurrent_output.reset(hidden.rows(),

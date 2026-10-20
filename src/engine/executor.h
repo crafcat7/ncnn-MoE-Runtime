@@ -1,6 +1,7 @@
 #ifndef NCNN_MOE_EXECUTOR_H
 #define NCNN_MOE_EXECUTOR_H
 
+#include "kernels/activationbuffer.h"
 #include "ncnn/moe/result.h"
 
 #include <cstddef>
@@ -38,12 +39,12 @@ struct DecodeBatchEntry
 struct SpeculativeProposal
 {
     std::vector<int32_t> token_ids;
-    std::vector<std::vector<float>> logits;
+    std::vector<ActivationBuffer> logits;
     std::vector<float> confidence_logits;
     size_t committed_context_rows = 0;
 };
 
-using SpeculativeSampler = std::function<Result<int32_t>(const std::vector<float>& logits)>;
+using SpeculativeSampler = std::function<Result<int32_t>(std::span<const float> logits)>;
 
 // Execute the model into the session's reusable logits buffer.  Callers must
 // consume state.logits before another execution on the same session.
@@ -62,12 +63,14 @@ using SpeculativeSampler = std::function<Result<int32_t>(const std::vector<float
                                                       SessionStatistics& statistics,
                                                       SessionState& state);
 
-[[nodiscard]] Result<SpeculativeProposal> propose_speculative(const CompiledModel& model,
-                                                              int32_t input_id,
-                                                              SessionStatistics& statistics,
-                                                              SessionState& state,
-                                                              uint64_t position_offset,
-                                                              const SpeculativeSampler& sampler);
+// Reuses logits storage; the proposal is consumed only after a successful result.
+[[nodiscard]] Result<void> propose_speculative(const CompiledModel& model,
+                                               int32_t input_id,
+                                               SessionStatistics& statistics,
+                                               SessionState& state,
+                                               uint64_t position_offset,
+                                               SpeculativeProposal& proposal,
+                                               const SpeculativeSampler& sampler);
 
 } // namespace moe
 } // namespace ncnn

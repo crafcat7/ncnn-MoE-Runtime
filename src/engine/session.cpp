@@ -466,6 +466,7 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
         std::vector<int32_t> verify_input_ids;
         std::vector<float> accepted_probabilities;
         std::vector<SampledToken> output_tokens;
+        SpeculativeProposal proposal;
         bool speculative_active = true;
         while (result.tokens.size() < opt.max_new_tokens)
         {
@@ -476,6 +477,7 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
             const size_t remaining = opt.max_new_tokens - result.tokens.size();
             if (remaining == 1 || !speculative_active)
             {
+                proposal = {};
                 auto decoded = decode_unlocked(anchor);
                 if (!decoded)
                     return decoded.error();
@@ -512,7 +514,8 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
                                                 stats,
                                                 *state,
                                                 token_count,
-                                                [this, &opt](const std::vector<float>& draft_logits)
+                                                proposal,
+                                                [this, &opt](std::span<const float> draft_logits)
                                                     -> Result<int32_t> {
                                                     auto sampled = sample_unlocked(draft_logits,
                                                                                    opt.sampling);
@@ -522,13 +525,13 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
                                                 });
             auto discarded_draft_cache = finish_cache(state->speculative_layers,
                                                       proposed
-                                                          ? proposed.value().committed_context_rows
+                                                          ? proposal.committed_context_rows
                                                           : 0);
             if (!discarded_draft_cache)
                 return discarded_draft_cache.error();
             if (!proposed)
                 return proposed.error();
-            size_t draft_count = std::min(proposed.value().token_ids.size(),
+            size_t draft_count = std::min(proposal.token_ids.size(),
                                           remaining - 1);
             if (opt.speculative_max_draft_tokens != 0)
             {
@@ -536,15 +539,15 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
                                        static_cast<size_t>(opt.speculative_max_draft_tokens));
             }
             if (opt.speculative_confidence_threshold > 0.0f
-                && !proposed.value().confidence_logits.empty())
+                && !proposal.confidence_logits.empty())
             {
                 draft_count = std::min(draft_count,
-                                       proposed.value().confidence_logits.size());
+                                       proposal.confidence_logits.size());
                 for (size_t index = 0; index < draft_count; ++index)
                 {
                     const float confidence = 1.0f
                                              / (1.0f
-                                                + float_approximate_exp(-proposed.value().confidence_logits[index]));
+                                                + float_approximate_exp(-proposal.confidence_logits[index]));
                     if (confidence
                         < opt.speculative_confidence_threshold)
                     {
@@ -561,8 +564,8 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
             verify_input_ids.reserve(draft_count + 1);
             verify_input_ids.push_back(anchor);
             verify_input_ids.insert(verify_input_ids.end(),
-                                    proposed.value().token_ids.begin(),
-                                    proposed.value().token_ids.begin() + draft_count);
+                                    proposal.token_ids.begin(),
+                                    proposal.token_ids.begin() + draft_count);
 
             stats_scratch = stats;
             auto target_transaction = begin_cache(state->layers,
@@ -657,7 +660,7 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
                         return target_token.error();
                     }
                     if (target_token.value().token_id
-                        != proposed.value().token_ids[accepted])
+                        != proposal.token_ids[accepted])
                     {
                         break;
                     }
@@ -673,7 +676,7 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
                                                                           opt.sampling,
                                                                           sampling_candidates[0],
                                                                           sampling_token_ids);
-                    auto draft_distribution = sampling_distribution_into(proposed.value().logits[accepted],
+                    auto draft_distribution = sampling_distribution_into(proposal.logits[accepted].values(),
                                                                          opt.sampling,
                                                                          sampling_candidates[1],
                                                                          sampling_token_ids);
@@ -687,7 +690,7 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
                                    ? target_distribution.error()
                                    : draft_distribution.error();
                     }
-                    const int32_t token_id = proposed.value().token_ids[accepted];
+                    const int32_t token_id = proposal.token_ids[accepted];
                     const float target_probability = candidate_probability(sampling_candidates[0],
                                                                            token_id);
                     const float draft_probability = candidate_probability(sampling_candidates[1],
@@ -755,7 +758,7 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
             output_tokens.reserve(accepted + 1);
             for (size_t index = 0; index < accepted; ++index)
             {
-                output_tokens.push_back({proposed.value().token_ids[index],
+                output_tokens.push_back({proposal.token_ids[index],
                                          accepted_probabilities[index]});
             }
             output_tokens.push_back(next.value());

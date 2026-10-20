@@ -383,6 +383,7 @@ static void dequantize_q8(const uint8_t* block, QnKOutput& output) noexcept
 #endif
 }
 
+template<bool paired>
 static void qnk_gemm(const uint8_t* raw,
                      const QnKPack* packed,
                      DType dtype,
@@ -392,109 +393,174 @@ static void qnk_gemm(const uint8_t* raw,
                      size_t input_stride,
                      size_t token_count,
                      float* output,
-                     size_t output_stride) noexcept
+                     size_t output_stride,
+                     const TensorData* matrix2 = nullptr,
+                     const QnKPack* packed2 = nullptr,
+                     ActivationBuffer* output2 = nullptr) noexcept
 {
     const uint32_t block_count = columns / qnk_block_elements;
     const size_t block_bytes = qnk_block_bytes(dtype);
+    size_t rows2 = 0;
+    const uint8_t* raw2 = nullptr;
+    float* output2_data = nullptr;
+    size_t output_stride2 = 0;
+    if constexpr (paired)
+    {
+        rows2 = matrix2->shape[0];
+        raw2 = matrix2->qnk_values().data();
+        output2_data = output2->row(0);
+        output_stride2 = output2->columns();
+    }
+
+    const auto dot = [&](const uint8_t* data, const QnKPack* pack, float* result, size_t stride, size_t row)
+#if defined(__GNUC__) || defined(__clang__)
+                         __attribute__((always_inline))
+#endif
+    {
 #if defined(__aarch64__) || defined(_M_ARM64)
-#if defined(_OPENMP)
-    const uint64_t operation_count = static_cast<uint64_t>(rows) * columns * token_count;
-    const size_t task_count = token_count > 1 ? (rows + 7) / 8 : rows;
-    const int team_size = static_cast<int>(std::min<size_t>(task_count,
-                                                            static_cast<size_t>(cpu_linear_team_size(operation_count, dtype))));
-#endif
-    if (token_count == 1)
-    {
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
-#endif
-        for (int64_t row = 0; row < static_cast<int64_t>(rows); ++row)
+        static_cast<void>(stride);
+        float sum = 0.0f;
+        for (uint32_t block = 0; block < block_count; ++block)
         {
-            float sum = 0.0f;
-            for (uint32_t block = 0; block < block_count; ++block)
-            {
-                const uint8_t* encoded = packed
-                                             ? qnk_packed_block(*packed, static_cast<size_t>(row), block)
-                                             : raw + ((static_cast<size_t>(row) * block_count + block) * block_bytes);
-                sum += qnk_dot_block(dtype,
-                                     encoded,
-                                     input + static_cast<size_t>(block) * qnk_block_elements);
-            }
-            output[row] = sum;
+            const uint8_t* encoded = pack
+                                         ? qnk_packed_block(*pack, row, block)
+                                         : data + ((row * static_cast<size_t>(block_count) + block) * block_bytes);
+            sum += qnk_dot_block(dtype,
+                                 encoded,
+                                 input + static_cast<size_t>(block) * qnk_block_elements);
         }
-        return;
-    }
-    if (token_count > 1)
-    {
-        const size_t tile_count = (rows + 7) / 8;
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
-#endif
-        for (int64_t tile = 0; tile < static_cast<int64_t>(tile_count); ++tile)
-        {
-            const size_t first_row = static_cast<size_t>(tile) * 8;
-            const uint32_t output_count = static_cast<uint32_t>(std::min<size_t>(8, rows - first_row));
-            alignas(16) float decoded[8 * qnk_block_elements];
-            for (uint32_t block = 0; block < block_count; ++block)
-            {
-                for (uint32_t row = 0; row < output_count; ++row)
-                {
-                    const size_t weight_row = first_row + row;
-                    const uint8_t* encoded = packed
-                                                 ? qnk_packed_block(*packed, weight_row, block)
-                                                 : raw + ((weight_row * block_count + block) * block_bytes);
-                    qnk_dequantize_block(dtype, encoded, decoded + static_cast<size_t>(row) * qnk_block_elements);
-                }
-                for (size_t first_token = 0; first_token < token_count; first_token += 4)
-                {
-                    const uint32_t input_count = static_cast<uint32_t>(std::min<size_t>(4, token_count - first_token));
-                    const float* input_tile = input + first_token * input_stride
-                                              + static_cast<size_t>(block) * qnk_block_elements;
-                    float* destination = output + first_token * output_stride + first_row;
-                    float partial[4 * 8];
-                    float_gemm_4x8(decoded,
-                                   qnk_block_elements,
-                                   input_tile,
-                                   input_stride,
-                                   qnk_block_elements,
-                                   output_count,
-                                   input_count,
-                                   block == 0 ? destination : partial,
-                                   block == 0 ? output_stride : 8);
-                    if (block != 0)
-                    {
-                        for (uint32_t token = 0; token < input_count; ++token)
-                        {
-                            float* token_output = output + (first_token + token) * output_stride + first_row;
-                            const float* values = partial + token * 8;
-                            for (uint32_t row = 0; row < output_count; ++row)
-                                token_output[row] += values[row];
-                        }
-                    }
-                }
-            }
-        }
-        return;
-    }
-#endif
-    for (size_t row = 0; row < rows; ++row)
-    {
+        result[row] = sum;
+#else
         for (size_t token = 0; token < token_count; ++token)
         {
             const float* token_input = input + token * input_stride;
             float sum = 0.0f;
             for (uint32_t block = 0; block < block_count; ++block)
             {
-                const uint8_t* encoded = packed
-                                             ? qnk_packed_block(*packed, row, block)
-                                             : raw + ((row * static_cast<size_t>(block_count) + block) * block_bytes);
+                const uint8_t* encoded = pack
+                                             ? qnk_packed_block(*pack, row, block)
+                                             : data + ((row * static_cast<size_t>(block_count) + block) * block_bytes);
                 sum += qnk_dot_block(dtype,
                                      encoded,
                                      token_input + static_cast<size_t>(block) * qnk_block_elements);
             }
-            output[token * output_stride + row] = sum;
+            result[token * stride + row] = sum;
+        }
+#endif
+    };
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (token_count == 1)
+    {
+#if defined(_OPENMP)
+        const size_t task_count = rows + rows2;
+        const uint64_t operation_count = static_cast<uint64_t>(task_count) * columns;
+        const int team_size = static_cast<int>(std::min<size_t>(task_count,
+                                                                static_cast<size_t>(cpu_linear_team_size(operation_count, dtype))));
+        if (team_size > 1)
+        {
+            if constexpr (paired)
+            {
+#pragma omp parallel num_threads(team_size)
+                {
+#pragma omp for schedule(static) nowait
+                    for (int64_t row = 0; row < static_cast<int64_t>(rows); ++row)
+                        dot(raw, packed, output, output_stride, static_cast<size_t>(row));
+#pragma omp for schedule(static) nowait
+                    for (int64_t row = 0; row < static_cast<int64_t>(rows2); ++row)
+                        dot(raw2, packed2, output2_data, output_stride2, static_cast<size_t>(row));
+                }
+            }
+            else
+            {
+#pragma omp parallel for schedule(static) num_threads(team_size)
+                for (int64_t row = 0; row < static_cast<int64_t>(rows); ++row)
+                    dot(raw, packed, output, output_stride, static_cast<size_t>(row));
+            }
+            return;
+        }
+#endif
+        for (size_t row = 0; row < rows; ++row)
+            dot(raw, packed, output, output_stride, row);
+        if constexpr (paired)
+            for (size_t row = 0; row < rows2; ++row)
+                dot(raw2, packed2, output2_data, output_stride2, row);
+        return;
+    }
+    const size_t first_tiles = (rows + 7) / 8;
+    const size_t tile_count = first_tiles + (rows2 + 7) / 8;
+#if defined(_OPENMP)
+    const uint64_t operation_count = static_cast<uint64_t>(rows + rows2) * columns * token_count;
+    const int team_size = static_cast<int>(std::min<size_t>(tile_count, static_cast<size_t>(cpu_linear_team_size(operation_count, dtype))));
+#pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
+#endif
+    for (int64_t tile = 0; tile < static_cast<int64_t>(tile_count); ++tile)
+    {
+        size_t first_row = static_cast<size_t>(tile) * 8;
+        size_t tile_rows = rows;
+        const uint8_t* tile_raw = raw;
+        const QnKPack* tile_packed = packed;
+        float* tile_output = output;
+        size_t tile_stride = output_stride;
+        if constexpr (paired)
+        {
+            if (static_cast<size_t>(tile) >= first_tiles)
+            {
+                first_row = (static_cast<size_t>(tile) - first_tiles) * 8;
+                tile_rows = rows2;
+                tile_raw = raw2;
+                tile_packed = packed2;
+                tile_output = output2_data;
+                tile_stride = output_stride2;
+            }
+        }
+        const uint32_t output_count = static_cast<uint32_t>(std::min<size_t>(8, tile_rows - first_row));
+        alignas(16) float decoded[8 * qnk_block_elements];
+        for (uint32_t block = 0; block < block_count; ++block)
+        {
+            for (uint32_t row = 0; row < output_count; ++row)
+            {
+                const size_t weight_row = first_row + row;
+                const uint8_t* encoded = tile_packed
+                                             ? qnk_packed_block(*tile_packed, weight_row, block)
+                                             : tile_raw + ((weight_row * block_count + block) * block_bytes);
+                qnk_dequantize_block(dtype, encoded, decoded + static_cast<size_t>(row) * qnk_block_elements);
+            }
+            for (size_t first_token = 0; first_token < token_count; first_token += 4)
+            {
+                const uint32_t input_count = static_cast<uint32_t>(std::min<size_t>(4, token_count - first_token));
+                const float* input_tile = input + first_token * input_stride
+                                          + static_cast<size_t>(block) * qnk_block_elements;
+                float* destination = tile_output + first_token * tile_stride + first_row;
+                float partial[4 * 8];
+                float_gemm_4x8(decoded,
+                               qnk_block_elements,
+                               input_tile,
+                               input_stride,
+                               qnk_block_elements,
+                               output_count,
+                               input_count,
+                               block == 0 ? destination : partial,
+                               block == 0 ? tile_stride : 8);
+                if (block != 0)
+                {
+                    for (uint32_t token = 0; token < input_count; ++token)
+                    {
+                        float* token_output = tile_output + (first_token + token) * tile_stride + first_row;
+                        const float* values = partial + token * 8;
+                        for (uint32_t row = 0; row < output_count; ++row)
+                            token_output[row] += values[row];
+                    }
+                }
+            }
         }
     }
+#else
+    for (size_t row = 0; row < rows; ++row)
+        dot(raw, packed, output, output_stride, row);
+    if constexpr (paired)
+        for (size_t row = 0; row < rows2; ++row)
+            dot(raw2, packed2, output2_data, output_stride2, row);
+#endif
 }
 
 static std::shared_ptr<const QnKPack> get_qnk_packed_weights(const TensorData& matrix,
@@ -763,7 +829,6 @@ bool qnk_pack_weights(const uint8_t* raw,
     packed.rows = rows;
     packed.columns = columns;
     packed.block_count = block_count;
-    packed.tile_rows = 8;
     packed.storage.resize(static_cast<size_t>(packed_bytes), 0);
     for (size_t tile = 0; tile < tile_count; ++tile)
     {
@@ -787,48 +852,116 @@ bool qnk_pack_weights(const uint8_t* raw,
     return true;
 }
 
-bool forward_linear_qnk(const TensorData& matrix,
+bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
                         const ActivationBuffer& input,
-                        ActivationBuffer& output,
+                        std::initializer_list<ActivationBuffer*> outputs,
                         bool use_packed_weights,
-                        std::shared_ptr<const QnKPack>* sidecar) noexcept
+                        std::span<std::shared_ptr<const QnKPack>* const> sidecars) noexcept
 {
-    if (!is_qnk_dtype(matrix.dtype) || matrix.shape.size() != 2)
-        return false;
-    const size_t rows = matrix.shape[0];
-    const uint32_t columns = matrix.shape[1];
-    if (!qnk_shape_supported(matrix.dtype, rows, columns) || input.columns() != columns)
-        return false;
-    const std::span<const uint8_t> raw = matrix.qnk_values();
-    if (raw.size() != qnk_storage_bytes(matrix.dtype, rows, columns))
-        return false;
-    output.reset(input.rows(), static_cast<uint32_t>(rows), false);
-    if (input.rows() == 0)
-        return true;
-    if (!use_packed_weights)
-    {
-        qnk_gemm(raw.data(), nullptr, matrix.dtype, rows, columns,
-                 input.row(0), columns, input.rows(), output.row(0), output.columns());
-        return true;
-    }
-    const std::shared_ptr<const QnKPack> packed = get_qnk_packed_weights(matrix, sidecar, rows, columns);
-    if (!packed)
+    const size_t matrix_count = matrices.size();
+    if ((matrix_count != 1 && matrix_count != 2)
+        || outputs.size() != matrix_count
+        || (sidecars.size() != 0 && sidecars.size() != matrix_count))
         return false;
 
+    const TensorData* const* weights = matrices.begin();
+    ActivationBuffer* const* results = outputs.begin();
+    if (matrix_count == 1)
+    {
+        if (!weights[0] || !results[0] || results[0] == &input
+            || input.dtype() != DType::Float32 || results[0]->dtype() != DType::Float32)
+            return false;
+        const TensorData& matrix = *weights[0];
+        if (!is_qnk_dtype(matrix.dtype) || matrix.shape.size() != 2)
+            return false;
+        const size_t rows = matrix.shape[0];
+        const uint32_t columns = matrix.shape[1];
+        if (!qnk_shape_supported(matrix.dtype, rows, columns) || input.columns() != columns)
+            return false;
+        const std::span<const uint8_t> raw = matrix.qnk_values();
+        if (raw.size() != qnk_storage_bytes(matrix.dtype, rows, columns))
+            return false;
+        results[0]->reset(input.rows(), static_cast<uint32_t>(rows), false);
+        if (input.rows() == 0)
+            return true;
+        if (!use_packed_weights)
+        {
+            qnk_gemm<false>(raw.data(), nullptr, matrix.dtype, rows, columns,
+                            input.row(0), columns, input.rows(), results[0]->row(0), results[0]->columns());
+            return true;
+        }
+        const std::shared_ptr<const QnKPack> packed = get_qnk_packed_weights(matrix,
+                                                                             sidecars.empty() ? nullptr : sidecars[0], rows, columns);
+        if (!packed)
+            return false;
+
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
-    {
-        msvc_avx512_qnk_gemm(*packed, input.row(0), columns, input.rows(), output.row(0), output.columns());
-        return true;
-    }
-    if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
-    {
-        msvc_avx2_qnk_gemm(*packed, input.row(0), columns, input.rows(), output.row(0), output.columns());
-        return true;
-    }
+        if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
+        {
+            msvc_avx512_qnk_gemm(*packed, input.row(0), columns, input.rows(),
+                                 results[0]->row(0), results[0]->columns());
+            return true;
+        }
+        if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
+        {
+            msvc_avx2_qnk_gemm(*packed, input.row(0), columns, input.rows(),
+                               results[0]->row(0), results[0]->columns());
+            return true;
+        }
 #endif
-    qnk_gemm(nullptr, packed.get(), matrix.dtype, rows, columns,
-             input.row(0), columns, input.rows(), output.row(0), output.columns());
+        qnk_gemm<false>(nullptr, packed.get(), matrix.dtype, rows, columns,
+                        input.row(0), columns, input.rows(), results[0]->row(0), results[0]->columns());
+        return true;
+    }
+
+    if (!weights[0] || !weights[1] || !results[0] || !results[1]
+        || input.dtype() != DType::Float32 || results[0]->dtype() != DType::Float32
+        || results[1]->dtype() != DType::Float32 || results[0] == &input || results[1] == &input
+        || results[0] == results[1])
+        return false;
+    const TensorData& matrix0 = *weights[0];
+    const TensorData& matrix1 = *weights[1];
+    if (!is_qnk_dtype(matrix0.dtype) || matrix0.dtype != matrix1.dtype
+        || matrix0.shape.size() != 2 || matrix1.shape.size() != 2
+        || !matrix0.input_column_indices.empty() || !matrix1.input_column_indices.empty())
+        return false;
+    const size_t rows0 = matrix0.shape[0];
+    const size_t rows1 = matrix1.shape[0];
+    const uint32_t columns = matrix0.shape[1];
+    if (matrix1.shape[1] != columns || input.columns() != columns
+        || rows0 > std::numeric_limits<size_t>::max() - rows1
+        || !qnk_shape_supported(matrix0.dtype, rows0, columns)
+        || !qnk_shape_supported(matrix1.dtype, rows1, columns))
+        return false;
+    const std::span<const uint8_t> raw0 = matrix0.qnk_values();
+    const std::span<const uint8_t> raw1 = matrix1.qnk_values();
+    if (raw0.size() != qnk_storage_bytes(matrix0.dtype, rows0, columns)
+        || raw1.size() != qnk_storage_bytes(matrix1.dtype, rows1, columns))
+        return false;
+
+    if (input.rows() == 0)
+    {
+        results[0]->reset(0, static_cast<uint32_t>(rows0), false);
+        results[1]->reset(0, static_cast<uint32_t>(rows1), false);
+        return true;
+    }
+
+    std::shared_ptr<const QnKPack> packed0;
+    std::shared_ptr<const QnKPack> packed1;
+    if (use_packed_weights)
+    {
+        packed0 = get_qnk_packed_weights(matrix0, sidecars.empty() ? nullptr : sidecars[0], rows0, columns);
+        if (!packed0)
+            return false;
+        packed1 = get_qnk_packed_weights(matrix1, sidecars.empty() ? nullptr : sidecars[1], rows1, columns);
+        if (!packed1)
+            return false;
+    }
+    results[0]->reset(input.rows(), static_cast<uint32_t>(rows0), false);
+    results[1]->reset(input.rows(), static_cast<uint32_t>(rows1), false);
+    qnk_gemm<true>(raw0.data(), packed0.get(), matrix0.dtype, rows0, columns,
+                   input.row(0), columns, input.rows(), results[0]->row(0), results[0]->columns(),
+                   &matrix1, packed1.get(), results[1]);
     return true;
 }
 

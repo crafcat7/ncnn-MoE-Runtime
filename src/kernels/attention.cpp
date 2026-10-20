@@ -1333,15 +1333,21 @@ static void trim_sliding_cache(LayerCache& cache, const AttentionBlockPlan& plan
         compact_cache(cache, target_capacity);
 }
 
-static void attention_linear_into(const WeightStore& weights, const CompiledOperatorTable& operators, TensorHandle matrix, TensorHandle bias, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, ExecutionBackend backend)
+static void attention_linear_into(const WeightStore& weights, const CompiledOperatorTable& operators, TensorHandle matrix, TensorHandle bias, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, ExecutionBackend backend, ActivationBuffer* quantized_input)
 {
+    const TensorData& weight = weights.at(matrix);
+    ActivationBuffer* scratch = !weight.input_column_indices.empty()
+                                        && quantized_input && quantized_input->dtype() == DType::Float32
+                                        && quantized_input != &input && quantized_input != &output
+                                    ? quantized_input
+                                    : nullptr;
     if (bias == invalid_tensor_handle)
     {
-        forward_linear(weights.at(matrix), input, output, optimization_flags, operators.find_weight(matrix), backend);
+        forward_linear(weight, input, output, optimization_flags, operators.find_weight(matrix), backend, scratch);
     }
     else
     {
-        forward_linear(weights.at(matrix), weights.at(bias), input, output, optimization_flags, operators.find_weight(matrix), backend);
+        forward_linear(weight, weights.at(bias), input, output, optimization_flags, operators.find_weight(matrix), backend, scratch);
     }
 }
 
@@ -1400,6 +1406,7 @@ static Result<void> project_and_append_qsa_keys(const WeightStore& weights,
                                                 const ActivationBuffer& normalized,
                                                 LayerCache& cache,
                                                 AttentionScratch& scratch,
+                                                ActivationBuffer* quantized_input,
                                                 uint64_t optimization_flags)
 {
     if (!has_flag(plan.flags, AttentionBlockQsa))
@@ -1447,7 +1454,7 @@ static Result<void> project_and_append_qsa_keys(const WeightStore& weights,
     }
     attention_linear_into(weights, operators, plan.qsa_query_key_weight,
                           invalid_tensor_handle, normalized, scratch.qsa_query_key,
-                          optimization_flags, ExecutionBackend::Cpu);
+                          optimization_flags, ExecutionBackend::Cpu, quantized_input);
     const uint32_t query_columns = plan.index_head_count * plan.index_head_dimension;
     const uint32_t expected_columns = query_columns + plan.index_head_dimension;
     if (scratch.qsa_query_key.columns() != expected_columns)
@@ -1663,6 +1670,10 @@ Result<void> append_attention_context(const WeightStore& weights,
 
     configure_cache(cache, plan.kv_head_count * plan.head_dimension,
                     plan.kv_cache_dtype);
+    ActivationBuffer* quantized_input = scratch.quantized_input.dtype() == DType::Float32
+                                                && &scratch.quantized_input != &hidden
+                                            ? &scratch.quantized_input
+                                            : nullptr;
     const ActivationBuffer* normalized = &hidden;
     if (plan.pre_attention_norm_weight != invalid_tensor_handle)
     {
@@ -1674,7 +1685,7 @@ Result<void> append_attention_context(const WeightStore& weights,
         normalized = &scratch.normalized;
     }
     auto qsa_status = project_and_append_qsa_keys(weights, operators, plan, position_offset,
-                                                  *normalized, cache, scratch,
+                                                  *normalized, cache, scratch, quantized_input,
                                                   optimization_flags);
     if (!qsa_status)
         return qsa_status.error();
@@ -1716,10 +1727,10 @@ Result<void> append_attention_context(const WeightStore& weights,
                                 optimization_flags,
                                 {operators.find_weight(plan.key_weight),
                                  operators.find_weight(plan.value_weight)},
-                                &scratch.quantized_input))
+                                quantized_input))
     {
-        attention_linear_into(weights, operators, plan.key_weight, plan.key_bias, *normalized, key, optimization_flags, backend);
-        attention_linear_into(weights, operators, plan.value_weight, plan.value_bias, *normalized, value, optimization_flags, backend);
+        attention_linear_into(weights, operators, plan.key_weight, plan.key_bias, *normalized, key, optimization_flags, backend, quantized_input);
+        attention_linear_into(weights, operators, plan.value_weight, plan.value_bias, *normalized, value, optimization_flags, backend, quantized_input);
     }
 
     if (has_flag(plan.flags, AttentionBlockQueryKeyNorm))
@@ -1853,6 +1864,10 @@ Result<void> forward_attention(const WeightStore& weights,
 
     configure_cache(cache, plan.kv_head_count * plan.head_dimension,
                     plan.kv_cache_dtype);
+    ActivationBuffer* quantized_input = scratch.quantized_input.dtype() == DType::Float32
+                                                && &scratch.quantized_input != &hidden
+                                            ? &scratch.quantized_input
+                                            : nullptr;
     const ActivationBuffer* normalized = &hidden;
     if (plan.pre_attention_norm_weight != invalid_tensor_handle)
     {
@@ -1864,7 +1879,7 @@ Result<void> forward_attention(const WeightStore& weights,
         normalized = &scratch.normalized;
     }
     auto qsa_status = project_and_append_qsa_keys(weights, operators, plan, position_offset,
-                                                  *normalized, cache, scratch,
+                                                  *normalized, cache, scratch, quantized_input,
                                                   optimization_flags);
     if (!qsa_status)
         return qsa_status.error();
@@ -1931,7 +1946,7 @@ Result<void> forward_attention(const WeightStore& weights,
                                         operators.find_weight(plan.key_weight),
                                         operators.find_weight(plan.value_weight),
                                         operators.find_weight(plan.output_gate_weight)},
-                                       &scratch.quantized_input);
+                                       quantized_input);
         if (!gate_ready)
         {
             gate_ready = backend == ExecutionBackend::Cpu
@@ -1943,9 +1958,9 @@ Result<void> forward_attention(const WeightStore& weights,
                                            {&query, &scratch.gate}, optimization_flags,
                                            {operators.find_weight(plan.query_weight),
                                             operators.find_weight(plan.output_gate_weight)},
-                                           &scratch.quantized_input);
+                                           quantized_input);
             if (!gate_ready)
-                attention_linear_into(weights, operators, plan.query_weight, plan.query_bias, *normalized, query, optimization_flags, backend);
+                attention_linear_into(weights, operators, plan.query_weight, plan.query_bias, *normalized, query, optimization_flags, backend, quantized_input);
             if (backend != ExecutionBackend::Cpu
                 || plan.key_bias != invalid_tensor_handle
                 || plan.value_bias != invalid_tensor_handle
@@ -1956,10 +1971,10 @@ Result<void> forward_attention(const WeightStore& weights,
                                    optimization_flags,
                                    {operators.find_weight(plan.key_weight),
                                     operators.find_weight(plan.value_weight)},
-                                   &scratch.quantized_input))
+                                   quantized_input))
             {
-                attention_linear_into(weights, operators, plan.key_weight, plan.key_bias, *normalized, key, optimization_flags, backend);
-                attention_linear_into(weights, operators, plan.value_weight, plan.value_bias, *normalized, value, optimization_flags, backend);
+                attention_linear_into(weights, operators, plan.key_weight, plan.key_bias, *normalized, key, optimization_flags, backend, quantized_input);
+                attention_linear_into(weights, operators, plan.value_weight, plan.value_bias, *normalized, value, optimization_flags, backend, quantized_input);
             }
         }
     }
@@ -2032,7 +2047,7 @@ Result<void> forward_attention(const WeightStore& weights,
                                   *normalized,
                                   scratch.gate,
                                   optimization_flags,
-                                  backend);
+                                  backend, quantized_input);
         }
         for (size_t token_index = 0; token_index < scratch.attention.rows(); ++token_index)
         {
@@ -2062,7 +2077,7 @@ Result<void> forward_attention(const WeightStore& weights,
                           scratch.attention,
                           projected,
                           optimization_flags,
-                          backend);
+                          backend, quantized_input);
     if (!has_flag(plan.flags, AttentionBlockExternalResidual))
         add_batch_inplace(projected, hidden);
     if (&projected != &output)

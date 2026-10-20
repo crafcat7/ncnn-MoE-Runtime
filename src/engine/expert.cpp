@@ -330,6 +330,11 @@ static void forward_expert(const CompiledModel& model,
     const bool paired = expert.layout != ExpertLayout::UpDown
                         && expert.gate_bias == invalid_tensor_handle
                         && expert.up_bias == invalid_tensor_handle
+                        && (up_weight.dtype == DType::BFloat16 || up_weight.dtype == DType::Float8E4M3
+#if defined(__aarch64__) || defined(_M_ARM64)
+                            || is_qnk_dtype(up_weight.dtype)
+#endif
+                                )
                         && forward_linear({&up_weight, &weights.at(expert.gate_weight)}, input,
                                           {&up, &workspace.gate}, optimization_flags,
                                           {operators.find_weight(expert.up_weight),

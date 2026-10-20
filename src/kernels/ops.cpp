@@ -730,6 +730,34 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
         return false;
 
     const DType dtype = weights[0]->dtype;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (is_qnk_dtype(dtype))
+    {
+        if (matrix_count != 2)
+            return false;
+        for (size_t i = 0; i < matrix_count; ++i)
+        {
+            const CompiledOperator* op = owners ? owners[i] : nullptr;
+            if (op && (op->linear || op->bfloat16 || op->float8))
+                return false;
+        }
+        std::array<std::shared_ptr<const QnKPack>*, 2> sidecars{};
+        if (owners)
+        {
+            for (size_t i = 0; i < matrix_count; ++i)
+                sidecars[i] = owners[i] ? &owners[i]->qnk_packed : nullptr;
+        }
+        const auto sidecar_span = std::span<std::shared_ptr<const QnKPack>* const>(sidecars.data(), matrix_count);
+        return forward_linear_qnk(matrices,
+                                  input,
+                                  outputs,
+                                  has_flag(optimization_flags, OptimizationCpuPackedWeights),
+                                  sidecar_span);
+    }
+#else
+    if (is_qnk_dtype(dtype))
+        return false;
+#endif
     bool use_bfloat16 = false;
 #if defined(__aarch64__) || defined(_M_ARM64)
     use_bfloat16 = dtype == DType::BFloat16;
@@ -1065,13 +1093,17 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
             throw std::runtime_error("invalid INT4 linear weight or activation shape");
         return;
     }
-    if (is_qnk_dtype(matrix.dtype)
-        && forward_linear_qnk(matrix,
-                              *linear_input,
-                              output,
-                              has_flag(optimization_flags, OptimizationCpuPackedWeights),
-                              op ? &op->qnk_packed : nullptr))
-        return;
+    if (is_qnk_dtype(matrix.dtype))
+    {
+        std::array<std::shared_ptr<const QnKPack>*, 1> sidecars = {op ? &op->qnk_packed : nullptr};
+        const auto sidecar_span = std::span<std::shared_ptr<const QnKPack>* const>(sidecars.data(), sidecars.size());
+        if (forward_linear_qnk({&matrix},
+                               *linear_input,
+                               {&output},
+                               has_flag(optimization_flags, OptimizationCpuPackedWeights),
+                               sidecar_span))
+            return;
+    }
     if (!matrix.input_column_indices.empty())
         throw std::runtime_error("invalid quantized linear weight layout");
     require_dense_host_storage(matrix, "linear weight");

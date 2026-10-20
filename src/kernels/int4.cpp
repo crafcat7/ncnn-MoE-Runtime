@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
@@ -24,7 +25,18 @@ Result<void> validate_input_column_indices(const TensorData& tensor)
     {
         return Error{ErrorCode::InvalidModel, "quantized input column map must match the input dimension"};
     }
-    std::vector<uint8_t> seen(tensor.shape[1], 0);
+    std::array<uint8_t, 8192> small_seen;
+    std::vector<uint8_t> large_seen;
+    uint8_t* seen = small_seen.data();
+    if (tensor.shape[1] <= small_seen.size())
+    {
+        std::fill_n(seen, tensor.shape[1], uint8_t{0});
+    }
+    else
+    {
+        large_seen.assign(tensor.shape[1], 0);
+        seen = large_seen.data();
+    }
     for (uint32_t column : tensor.input_column_indices)
     {
         if (column >= tensor.shape[1] || seen[column] != 0)

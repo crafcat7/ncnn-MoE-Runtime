@@ -1,6 +1,7 @@
 #include "kernels/int4.h"
 #include "kernels/ops.h"
 #include "kernels/qnk.h"
+#include "graph/compiledoperator.h"
 #include "ncnn/moe/option.h"
 
 #include <algorithm>
@@ -238,6 +239,147 @@ static TensorData qnk_test_matrix(DType dtype, uint32_t rows, uint32_t columns)
     return matrix;
 }
 
+static void test_qnk_paired_linear()
+{
+#if defined(__aarch64__) || defined(_M_ARM64)
+    for (DType dtype : {DType::Q2K, DType::Q3K, DType::Q4K, DType::Q5K, DType::Q6K, DType::Q8K})
+    {
+        for (uint32_t columns : {256u, 512u})
+        {
+            for (size_t tokens : {size_t{1}, size_t{5}, size_t{9}})
+            {
+                const bool has_parallel_decode = dtype == DType::Q4K && columns == 512 && tokens == 1;
+                for (size_t row_case = 0; row_case < (has_parallel_decode ? 2u : 1u); ++row_case)
+                {
+                    const bool parallel_decode = row_case != 0;
+                    for (bool packed : {false, true})
+                    {
+                        TensorData first = qnk_test_matrix(dtype, parallel_decode ? 257 : 9, columns);
+                        TensorData second = qnk_test_matrix(dtype, parallel_decode ? 129 : 17, columns);
+                        ActivationBuffer input(tokens, columns);
+                        for (size_t row = 0; row < input.rows(); ++row)
+                        {
+                            for (uint32_t column = 0; column < columns; ++column)
+                            {
+                                input.row(row)[column] = static_cast<float>(static_cast<int>((row * 7 + column * 3) % 29) - 14) / 32.0f;
+                            }
+                        }
+
+                        const uint64_t flags = packed ? OptimizationCpuPackedWeights : 0;
+                        CompiledOperator first_owner;
+                        CompiledOperator second_owner;
+                        ActivationBuffer first_scalar;
+                        ActivationBuffer second_scalar;
+                        forward_linear(first, input, first_scalar, flags, &first_owner);
+                        forward_linear(second, input, second_scalar, flags, &second_owner);
+                        const auto first_pack = first_owner.qnk_packed;
+                        const auto second_pack = second_owner.qnk_packed;
+                        int4_check(!packed || (first_pack && second_pack), "packed scalar Qn_K owner did not retain its sidecar");
+
+                        ActivationBuffer first_paired;
+                        ActivationBuffer second_paired;
+                        const auto forward_pair = [&] {
+                            return forward_linear({&first, &second}, input,
+                                                  {&first_paired, &second_paired}, flags,
+                                                  {&first_owner, &second_owner});
+                        };
+                        int4_check(forward_pair(), "paired Qn_K forward rejected valid matrices");
+                        int4_check(first_paired.rows() == input.rows() && first_paired.columns() == first.shape[0]
+                                       && second_paired.rows() == input.rows() && second_paired.columns() == second.shape[0],
+                                   "paired Qn_K output shape mismatch");
+                        for (size_t index = 0; index < first_scalar.values().size(); ++index)
+                            int4_near(first_paired.values()[index], first_scalar.values()[index]);
+                        for (size_t index = 0; index < second_scalar.values().size(); ++index)
+                            int4_near(second_paired.values()[index], second_scalar.values()[index]);
+
+                        int4_check(forward_pair(), "repeated paired Qn_K forward rejected valid matrices");
+                        int4_check(first_owner.qnk_packed == first_pack && second_owner.qnk_packed == second_pack,
+                                   "paired Qn_K forward did not reuse weight sidecars");
+                        for (size_t index = 0; index < first_scalar.values().size(); ++index)
+                            int4_near(first_paired.values()[index], first_scalar.values()[index]);
+                        for (size_t index = 0; index < second_scalar.values().size(); ++index)
+                            int4_near(second_paired.values()[index], second_scalar.values()[index]);
+                    }
+                }
+            }
+        }
+    }
+#else
+    {
+        TensorData first = qnk_test_matrix(DType::Q8K, 9, 256);
+        TensorData second = qnk_test_matrix(DType::Q8K, 17, 256);
+        ActivationBuffer input(1, 256);
+        ActivationBuffer first_output(1, 1);
+        ActivationBuffer second_output(1, 2);
+        first_output.row(0)[0] = 17.0f;
+        second_output.row(0)[0] = 23.0f;
+        second_output.row(0)[1] = 29.0f;
+        int4_check(!forward_linear({&first, &second}, input, {&first_output, &second_output}, 0),
+                   "paired Qn_K forward unexpectedly ran outside ARM");
+        int4_check(first_output.rows() == 1 && first_output.columns() == 1 && first_output.row(0)[0] == 17.0f
+                       && second_output.rows() == 1 && second_output.columns() == 2
+                       && second_output.row(0)[0] == 23.0f && second_output.row(0)[1] == 29.0f,
+                   "unsupported paired Qn_K forward changed outputs");
+    }
+#endif
+
+    TensorData first = qnk_test_matrix(DType::Q8K, 9, 256);
+    TensorData second = qnk_test_matrix(DType::Q8K, 17, 256);
+    ActivationBuffer input(1, 256);
+    ActivationBuffer first_output;
+    ActivationBuffer second_output;
+    const auto reset_outputs = [&] {
+        first_output.reset(1, 2, false);
+        second_output.reset(1, 2, false);
+        first_output.row(0)[0] = 17.0f;
+        first_output.row(0)[1] = 19.0f;
+        second_output.row(0)[0] = 23.0f;
+        second_output.row(0)[1] = 29.0f;
+    };
+    const auto outputs_unchanged = [&] {
+        int4_check(first_output.rows() == 1 && first_output.columns() == 2
+                       && first_output.row(0)[0] == 17.0f && first_output.row(0)[1] == 19.0f
+                       && second_output.rows() == 1 && second_output.columns() == 2
+                       && second_output.row(0)[0] == 23.0f && second_output.row(0)[1] == 29.0f,
+                   "rejected paired Qn_K forward changed outputs");
+    };
+    const auto check_rejected = [&](const TensorData& gate, const TensorData& up,
+                                    const ActivationBuffer& activation, const char* message) {
+        reset_outputs();
+        int4_check(!forward_linear({&gate, &up}, activation,
+                                   {&first_output, &second_output}, 0),
+                   message);
+        outputs_unchanged();
+    };
+    ActivationBuffer wrong_width(1, 128);
+    check_rejected(first, second, wrong_width, "paired Qn_K forward accepted a mismatched input shape");
+    TensorData wrong_dtype = second;
+    wrong_dtype.dtype = DType::Q4K;
+    check_rejected(first, wrong_dtype, input, "paired Qn_K forward accepted mixed dtypes");
+    TensorData wrong_raw = second;
+    wrong_raw.quantized_data.pop_back();
+    check_rejected(first, wrong_raw, input, "paired Qn_K forward accepted truncated raw bytes");
+    TensorData wrong_columns = second;
+    wrong_columns.input_column_indices.push_back(0);
+    check_rejected(first, wrong_columns, input, "paired Qn_K forward accepted a column map");
+
+    reset_outputs();
+    int4_check(!forward_linear({&first, &second}, input, {&first_output, &first_output}, 0),
+               "paired Qn_K forward accepted aliased outputs");
+    outputs_unchanged();
+    ActivationBuffer alias_input(1, 256);
+    std::fill_n(alias_input.row(0), alias_input.columns(), 31.0f);
+    reset_outputs();
+    int4_check(!forward_linear({&first, &second}, alias_input, {&alias_input, &second_output}, 0),
+               "paired Qn_K forward accepted input/output aliasing");
+    int4_check(alias_input.rows() == 1 && alias_input.columns() == 256
+                   && std::all_of(alias_input.values().begin(), alias_input.values().end(), [](float value) { return value == 31.0f; }),
+               "rejected paired Qn_K alias changed its input");
+    int4_check(second_output.rows() == 1 && second_output.columns() == 2
+                   && second_output.row(0)[0] == 23.0f && second_output.row(0)[1] == 29.0f,
+               "rejected paired Qn_K alias changed the other output");
+}
+
 static void test_quantized_column_map()
 {
     for (bool int4 : {false, true})
@@ -305,6 +447,52 @@ static void test_quantized_column_map()
         invalid.dtype = DType::BFloat16;
         int4_check(!validate_input_column_indices(invalid), "column map accepted on dense weights");
     }
+}
+
+static void test_input_column_map_boundaries()
+{
+    for (uint32_t columns : {63u, 64u, 65u, 8192u, 8193u})
+    {
+        TensorData matrix;
+        matrix.dtype = DType::Q8K;
+        matrix.shape = {1, columns};
+        matrix.input_column_indices.resize(columns);
+        for (uint32_t column = 0; column < columns; ++column)
+            matrix.input_column_indices[column] = column;
+        int4_check(static_cast<bool>(validate_input_column_indices(matrix)), "valid column map at boundary rejected");
+
+        TensorData invalid = matrix;
+        invalid.input_column_indices.back() = invalid.input_column_indices.front();
+        int4_check(!validate_input_column_indices(invalid), "duplicate final column accepted");
+
+        invalid = matrix;
+        invalid.input_column_indices.back() = columns;
+        int4_check(!validate_input_column_indices(invalid), "out-of-range final column accepted");
+
+        invalid = matrix;
+        invalid.input_column_indices.pop_back();
+        int4_check(!validate_input_column_indices(invalid), "short column map accepted");
+
+        invalid = matrix;
+        invalid.shape = {columns};
+        int4_check(!validate_input_column_indices(invalid), "non-matrix column map accepted");
+
+        invalid = matrix;
+        invalid.dtype = DType::Float32;
+        int4_check(!validate_input_column_indices(invalid), "dense column map accepted");
+
+        if (columns > 64)
+        {
+            invalid = matrix;
+            invalid.input_column_indices[64] = invalid.input_column_indices[63];
+            int4_check(!validate_input_column_indices(invalid), "duplicate across columns 63 and 64 accepted");
+        }
+    }
+
+    TensorData empty_map;
+    empty_map.dtype = DType::Float32;
+    empty_map.shape = {1};
+    int4_check(static_cast<bool>(validate_input_column_indices(empty_map)), "empty column map did not bypass validation");
 }
 
 static void test_quantized_embeddings()
@@ -375,7 +563,9 @@ void test_int4()
 {
     test_int4_known_values();
     test_int4_invalid_tensors();
+    test_qnk_paired_linear();
     test_quantized_column_map();
+    test_input_column_map_boundaries();
     test_quantized_embeddings();
     const std::array<std::array<uint32_t, 3>, 6> shapes = {{{1, 1, 1}, {3, 5, 2}, {5, 39, 17}, {7, 64, 16}, {9, 97, 32}, {5, 7, 128}}};
     for (const auto& shape : shapes)
