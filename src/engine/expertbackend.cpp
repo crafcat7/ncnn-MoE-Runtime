@@ -205,6 +205,7 @@ void MultiDeviceExpertBackend::admit(std::string key, std::shared_ptr<const Tens
     if (backends.empty() || key.empty())
         return;
     const size_t backend_index = key_sharded ? fallback_backend(key) : backend_for_group(residency_group);
+    if (!key_sharded)
     {
         const std::lock_guard<std::mutex> lock(placement_mutex);
         key_placements.insert_or_assign(key, backend_index);
@@ -230,6 +231,7 @@ void MultiDeviceExpertBackend::admit_separate(std::string key, std::shared_ptr<c
     if (backends.empty() || key.empty())
         return;
     const size_t backend_index = key_sharded ? fallback_backend(key) : backend_for_group(residency_group);
+    if (!key_sharded)
     {
         const std::lock_guard<std::mutex> lock(placement_mutex);
         key_placements.insert_or_assign(key, backend_index);
@@ -250,6 +252,7 @@ bool MultiDeviceExpertBackend::prepare_demand(std::string key, std::shared_ptr<c
     if (backends.empty() || key.empty())
         return false;
     const size_t backend_index = key_sharded ? fallback_backend(key) : backend_for_group(residency_group);
+    if (!key_sharded)
     {
         const std::lock_guard<std::mutex> lock(placement_mutex);
         key_placements.insert_or_assign(key, backend_index);
@@ -272,6 +275,7 @@ bool MultiDeviceExpertBackend::prepare_demand_separate(std::string key, std::sha
     if (backends.empty() || key.empty())
         return false;
     const size_t backend_index = key_sharded ? fallback_backend(key) : backend_for_group(residency_group);
+    if (!key_sharded)
     {
         const std::lock_guard<std::mutex> lock(placement_mutex);
         key_placements.insert_or_assign(key, backend_index);
@@ -300,6 +304,7 @@ size_t MultiDeviceExpertBackend::prepare_demand_batch(std::span<const ExpertDema
         size_t count = 1;
         while (prepared + count < requests.size() && !requests[prepared + count].key.empty()
                && select(requests[prepared + count]) == backend_index) ++count;
+        if (!key_sharded)
         {
             const std::lock_guard<std::mutex> lock(placement_mutex);
             for (size_t index = 0; index < count; ++index)
@@ -333,6 +338,7 @@ std::unique_ptr<ExpertDemandSubmission> MultiDeviceExpertBackend::begin_demand_b
         size_t count = 1;
         while (cursor + count < requests.size() && !requests[cursor + count].key.empty()
                && select(requests[cursor + count]) == backend_index) ++count;
+        if (!key_sharded)
         {
             const std::lock_guard<std::mutex> lock(placement_mutex);
             for (size_t index = 0; index < count; ++index)
@@ -354,6 +360,16 @@ void MultiDeviceExpertBackend::set_residency_coordinator(std::shared_ptr<ExpertR
 std::unique_ptr<ExpertSubmission> MultiDeviceExpertBackend::submit_batch(std::span<const ExpertBackendRequest> requests)
 {
     std::vector<std::vector<size_t>> request_indices(backends.size());
+    if (key_sharded)
+    {
+        for (size_t request_index = 0; request_index < requests.size(); ++request_index)
+        {
+            const size_t backend_index = fallback_backend(requests[request_index].key);
+            if (backend_index < backends.size())
+                request_indices[backend_index].push_back(request_index);
+        }
+    }
+    else
     {
         const std::lock_guard<std::mutex> lock(placement_mutex);
         for (size_t request_index = 0; request_index < requests.size(); ++request_index)

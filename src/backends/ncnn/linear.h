@@ -421,7 +421,8 @@ private:
                                                                                  ncnn::VkAllocator* weight_allocator,
                                                                                  const VulkanRuntimePtr& vulkan_runtime,
                                                                                  uint64_t optimization_flags,
-                                                                                 uint32_t input_group_count = 1);
+                                                                                 uint32_t input_group_count = 1,
+                                                                                 const TensorData* extra = nullptr);
     class Implementation;
 
     QnkLinear_vulkan();

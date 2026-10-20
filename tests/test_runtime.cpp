@@ -4867,6 +4867,61 @@ void test_qnk_graph_cpu_projections()
         compiler_opt.flags |= BackendVulkanDense;
         compiler_opt.optimization_flags = OptimizationDefaultFlags;
         compiler_opt.num_concurrent_sessions = 3;
+        const bool test_hybrid_plan = dtype == DType::Q4K && get_gpu_count() != 0;
+        std::unique_ptr<ScopedTestDirectory> hybrid_directory;
+        MoeModelDescriptor hybrid_descriptor;
+        WeightMapping hybrid_mapping;
+        struct MappedQnkTensor
+        {
+            uint32_t expert_id = 0;
+            uint32_t projection = 0;
+            std::string name;
+            size_t size = 0;
+            std::shared_ptr<const uint8_t> data;
+        };
+        std::vector<MappedQnkTensor> mapped_qnk;
+        const std::array<const char*, 3> projections = {"gate", "up", "down"};
+        if (test_hybrid_plan)
+        {
+            hybrid_descriptor = descriptor;
+            hybrid_mapping = mapping;
+            hybrid_directory = std::make_unique<ScopedTestDirectory>("ncnn_moe_qnk_hybrid_mapping_test_");
+            const std::filesystem::path bank_path = hybrid_directory->path() / "experts.bin";
+            {
+                std::ofstream bank(bank_path, std::ios::binary);
+                for (uint32_t expert_id = 0; expert_id < expert_count; ++expert_id)
+                {
+                    const std::string prefix = "layers.0.experts." + std::to_string(expert_id) + ".";
+                    for (uint32_t projection = 0; projection < projections.size(); ++projection)
+                    {
+                        const std::string name = prefix + projections[projection] + ".weight";
+                        TensorData& weight = hybrid_mapping.at(name);
+                        const std::span<const uint8_t> values = weight.qnk_values();
+                        check(!values.empty());
+                        bank.write(reinterpret_cast<const char*>(values.data()),
+                                   static_cast<std::streamsize>(values.size()));
+                        check(static_cast<bool>(bank));
+                        mapped_qnk.push_back({expert_id, projection, name, values.size(), {}});
+                    }
+                }
+                bank.close();
+                check(static_cast<bool>(bank));
+            }
+
+            size_t offset = 0;
+            for (MappedQnkTensor& source : mapped_qnk)
+            {
+                TensorData& weight = hybrid_mapping.at(source.name);
+                auto range = MappedFileRange::open(bank_path, offset, source.size);
+                check(static_cast<bool>(range));
+                source.data = range.value()->share_data();
+                check(static_cast<bool>(source.data));
+                weight.mapped_size = source.size;
+                weight.mapped_data = source.data;
+                std::vector<uint8_t>().swap(weight.quantized_data);
+                offset += source.size;
+            }
+        }
         CompiledModel model;
         auto ret = compile_model(std::move(descriptor), std::move(mapping), model, HybridMode::CpuOnly, compiler_opt);
         check(static_cast<bool>(ret));
@@ -4888,6 +4943,56 @@ void test_qnk_graph_cpu_projections()
             check(weight.dtype == dtype);
             check((weight.shape == std::vector<uint32_t>{intermediate_size, hidden_size}));
             check(weight.qnk_values().size() == qnk_storage_bytes(dtype, intermediate_size, hidden_size));
+        }
+
+        if (test_hybrid_plan)
+        {
+            CompilerOption hybrid_opt = compiler_opt;
+            hybrid_opt.flags |= BackendVulkanExperts;
+            hybrid_opt.device_index = get_default_gpu_index();
+            hybrid_opt.vulkan_runtime = create_vulkan_runtime();
+            CompiledModel hybrid_model;
+            auto hybrid_ret = compile_model(std::move(hybrid_descriptor),
+                                            std::move(hybrid_mapping),
+                                            hybrid_model,
+                                            HybridMode::HybridExperts,
+                                            hybrid_opt);
+            if (!hybrid_ret)
+                throw std::runtime_error("Qn_K hybrid graph compilation failed: " + hybrid_ret.error().message);
+            const ExpertPlan& hybrid_expert = hybrid_model.graph.layer_plans.front().moe.experts.front();
+            check(hybrid_expert.layout == ExpertLayout::GateUpDown);
+            check(hybrid_expert.gate_up_weight == invalid_tensor_handle);
+            check(hybrid_expert.gate_weight != invalid_tensor_handle);
+            check(hybrid_expert.up_weight != invalid_tensor_handle);
+            for (const MappedQnkTensor& source : mapped_qnk)
+            {
+                const ExpertPlan& hybrid_plan = hybrid_model.graph.layer_plans.front().moe.experts[source.expert_id];
+                const ExpertPlan& cpu_plan = model.graph.layer_plans.front().moe.experts[source.expert_id];
+                const std::array<TensorHandle, 3> hybrid_handles = {
+                    hybrid_plan.gate_weight,
+                    hybrid_plan.up_weight,
+                    hybrid_plan.down_weight,
+                };
+                const std::array<TensorHandle, 3> cpu_handles = {
+                    cpu_plan.gate_weight,
+                    cpu_plan.up_weight,
+                    cpu_plan.down_weight,
+                };
+                const TensorData& hybrid_weight = hybrid_model.weights.at(hybrid_handles[source.projection]);
+                const TensorData& cpu_weight = model.weights.at(cpu_handles[source.projection]);
+                const auto hybrid_values = hybrid_weight.qnk_values();
+                const auto cpu_values = cpu_weight.qnk_values();
+                check(hybrid_weight.mapped_data.get() == source.data.get());
+                check(hybrid_weight.mapped_size == source.size);
+                check(hybrid_weight.quantized_data.empty());
+                check(hybrid_values.data() == source.data.get());
+                check(hybrid_values.size() == source.size);
+                check(hybrid_values.size() == cpu_values.size());
+                check(std::equal(hybrid_values.begin(), hybrid_values.end(), cpu_values.begin()));
+            }
+            hybrid_model = {};
+            hybrid_mapping.clear();
+            mapped_qnk.clear();
         }
 
         WeightStore capability_weights;
@@ -5185,6 +5290,231 @@ void test_ncnn_vulkan_qnk_expert_operator()
 
     if (get_gpu_count() == 0)
         return;
+
+#if NCNN_MOE_WITH_VULKAN
+    TensorData separate_gate;
+    separate_gate.dtype = dtype;
+    separate_gate.shape = {intermediate_columns, qnk_columns};
+    separate_gate.quantized_data = make_q4k(intermediate_columns, qnk_columns, 29);
+    TensorData separate_up;
+    separate_up.dtype = dtype;
+    separate_up.shape = {intermediate_columns, qnk_columns};
+    separate_up.quantized_data = make_q4k(intermediate_columns, qnk_columns, 41);
+    const ActivationBuffer separate_gate_output = forward_linear(separate_gate, input, 0);
+    const ActivationBuffer separate_up_output = forward_linear(separate_up, input, 0);
+    ActivationBuffer separate_activated(input_rows, intermediate_columns);
+    for (size_t row = 0; row < input_rows; ++row)
+    {
+        for (uint32_t column = 0; column < intermediate_columns; ++column)
+        {
+            const float gate = separate_gate_output.row(row)[column];
+            const float silu = gate / (1.0f + std::exp(-gate));
+            separate_activated.row(row)[column] = silu * separate_up_output.row(row)[column];
+        }
+    }
+    const ActivationBuffer separate_expected = forward_linear(down, separate_activated, 0);
+    const auto check_batch = [&vulkan_runtime](const TensorData& gate, const TensorData* up, const TensorData& down,
+                                               const ActivationBuffer& batch_input, const ActivationBuffer& expected, uint64_t flags,
+                                               uint64_t dispatches, uint64_t int4_dispatches, float tolerance) {
+        const uint64_t size = native_quantized_expert_storage_bytes(gate, up, down, automatic_vulkan_device_index, vulkan_runtime, flags);
+        check(size != 0);
+        auto backend = create_vulkan_expert_backend(size + 4096, automatic_vulkan_device_index, nullptr, vulkan_runtime, flags);
+        check(static_cast<bool>(backend));
+        if (up)
+            backend->admit_separate("batch", std::make_shared<TensorData>(gate), nullptr, std::make_shared<TensorData>(*up), nullptr,
+                                    std::make_shared<TensorData>(down), nullptr, 0, 0.0f, ExpertActivation::Silu);
+        else
+            backend->admit("batch", std::make_shared<TensorData>(gate), nullptr, std::make_shared<TensorData>(down), nullptr,
+                           0, 0.0f, ExpertActivation::Silu);
+        backend->wait_for_background_work();
+        check(backend->statistics().stores == 1);
+        ActivationBuffer first_input(1, batch_input.columns());
+        std::copy_n(batch_input.row(0), batch_input.columns(), first_input.row(0));
+        std::array<ActivationBuffer, 2> actual;
+        std::array<ExpertBackendRequest, 2> requests = {{{"batch", &first_input, &actual[0]}, {"batch", &batch_input, &actual[1]}}};
+        for (uint32_t input_case = 0; input_case < 3; ++input_case)
+        {
+            requests[0].input = input_case == 2 ? &batch_input : &first_input;
+            requests[1].input = input_case == 1 ? &first_input : &batch_input;
+            const VulkanStatistics before = get_vulkan_statistics(vulkan_runtime);
+            const auto results = submit_backend_batch(*backend, requests);
+            check(results.size() == 2 && results[0] == ExpertBackendExecutionResult::Executed && results[1] == ExpertBackendExecutionResult::Executed);
+            const VulkanStatistics after = get_vulkan_statistics(vulkan_runtime);
+            check(after.dispatches - before.dispatches == dispatches);
+            check(after.int4_dispatches - before.int4_dispatches == int4_dispatches);
+            check(after.compute_submissions - before.compute_submissions == 1);
+            check(after.batch_uploads - before.batch_uploads == 1);
+            check(after.batch_downloads - before.batch_downloads == 1);
+            for (size_t index = 0; index < actual.size(); ++index)
+            {
+                check(actual[index].rows() == requests[index].input->rows() && actual[index].columns() == expected.columns());
+                for (size_t row = 0; row < actual[index].rows(); ++row)
+                    for (uint32_t column = 0; column < actual[index].columns(); ++column)
+                        check_near(actual[index].row(row)[column], expected.row(row)[column], tolerance);
+            }
+        }
+        const VulkanStatistics after = get_vulkan_statistics(vulkan_runtime);
+        for (auto& request : requests) request.output = nullptr;
+        const auto invalid = submit_backend_batch(*backend, requests);
+        check(invalid.size() == 2 && invalid[0] != ExpertBackendExecutionResult::Executed && invalid[1] != ExpertBackendExecutionResult::Executed);
+        const VulkanStatistics failed = get_vulkan_statistics(vulkan_runtime);
+        check(failed.dispatches == after.dispatches && failed.int4_dispatches == after.int4_dispatches);
+        check(failed.compute_submissions == after.compute_submissions);
+        check(failed.batch_uploads == after.batch_uploads && failed.batch_downloads == after.batch_downloads);
+    };
+    for (const bool enable_fusion : {true, false})
+    {
+        uint64_t optimization_flags = g_test_optimization_flags;
+        if (enable_fusion)
+            optimization_flags |= OptimizationVulkanQnK;
+        else
+            optimization_flags &= ~OptimizationVulkanQnK;
+        const auto context = VulkanContext::acquire(automatic_vulkan_device_index,
+                                                    vulkan_runtime,
+                                                    optimization_flags);
+        check(static_cast<bool>(context));
+        const uint64_t alignment = std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
+        const uint64_t expected_storage = QnkLinear_vulkan::storage_bytes(separate_gate, alignment)
+                                          + QnkLinear_vulkan::storage_bytes(separate_up, alignment)
+                                          + QnkLinear_vulkan::storage_bytes(down, alignment);
+        auto separate_vulkan = QnkExpert_vulkan::create_separate(separate_gate,
+                                                                 nullptr,
+                                                                 separate_up,
+                                                                 nullptr,
+                                                                 down,
+                                                                 nullptr,
+                                                                 0.0f,
+                                                                 automatic_vulkan_device_index,
+                                                                 ExpertActivation::Silu,
+                                                                 vulkan_runtime,
+                                                                 optimization_flags);
+        check(static_cast<bool>(separate_vulkan));
+        check(separate_vulkan->device_bytes() == expected_storage);
+        const VulkanStatistics before = get_vulkan_statistics(vulkan_runtime);
+        ActivationBuffer separate_actual;
+        check(static_cast<bool>(separate_vulkan->forward(input, separate_actual)));
+        const VulkanStatistics after = get_vulkan_statistics(vulkan_runtime);
+        check(after.dispatches - before.dispatches == (enable_fusion ? 3u : 4u));
+        check(separate_actual.rows() == separate_expected.rows());
+        check(separate_actual.columns() == separate_expected.columns());
+        for (size_t row = 0; row < separate_actual.rows(); ++row)
+        {
+            for (uint32_t column = 0; column < separate_actual.columns(); ++column)
+                check_near(separate_actual.row(row)[column], separate_expected.row(row)[column], 0.2f);
+        }
+        if (enable_fusion)
+            check_batch(separate_gate, &separate_up, down, input, separate_expected, optimization_flags, 6, 0, 0.2f);
+    }
+
+    const auto file_backed_qnk = [](const TensorData& matrix, const char* path) {
+        TensorData result = matrix;
+        result.quantized_data.clear();
+        result.mapped_data.reset();
+        result.mapped_size = 0;
+        auto storage = std::make_shared<MxFp4FileStorage>();
+        storage->blocks_path = path;
+        storage->blocks_size = qnk_storage_bytes(matrix.dtype, matrix.shape[0], matrix.shape[1]);
+        result.mxfp4_file_storage = std::move(storage);
+        return result;
+    };
+    const TensorData metadata_gate_up = file_backed_qnk(gate_up, "unused-qnk-gate-up");
+    const TensorData metadata_down = file_backed_qnk(down, "unused-qnk-down");
+    const auto context = VulkanContext::acquire(automatic_vulkan_device_index,
+                                                vulkan_runtime,
+                                                g_test_optimization_flags | OptimizationVulkanQnK);
+    check(static_cast<bool>(context));
+    const uint64_t alignment = std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
+    const auto make_int4 = [](uint32_t rows, uint32_t columns) {
+        TensorData result;
+        result.dtype = DType::Int4;
+        result.shape = {rows, columns};
+        result.quantized_data.assign(static_cast<size_t>(rows) * ((columns + 1) / 2), 0x99);
+        result.quantization_group_size = 3;
+        result.quantization_scales.assign(static_cast<size_t>(rows) * ((columns + 2) / 3), 1.0f / 16.0f);
+        result.quantization_zero_points.assign(result.quantization_scales.size(), 8);
+        return result;
+    };
+    const TensorData int4_gate = make_int4(3, 5);
+    const TensorData int4_gate_up = make_int4(6, 5);
+    const TensorData int4_down = make_int4(5, 3);
+    ActivationBuffer int4_input(3, 5);
+    for (size_t row = 0; row < int4_input.rows(); ++row)
+        for (uint32_t column = 0; column < int4_input.columns(); ++column)
+            int4_input.row(row)[column] = static_cast<float>(row * 5 + column + 1) * 0.125f;
+    ActivationBuffer int4_activated = forward_linear(int4_gate, int4_input, 0);
+    for (size_t row = 0; row < int4_activated.rows(); ++row)
+        for (uint32_t column = 0; column < int4_activated.columns(); ++column)
+        {
+            float& value = int4_activated.row(row)[column];
+            value = value * value / (1.0f + std::exp(-value));
+        }
+    const ActivationBuffer int4_expected = forward_linear(int4_down, int4_activated, 0);
+    const uint64_t int4_flags = g_test_optimization_flags | OptimizationVulkanQnK;
+    check_batch(int4_gate_up, nullptr, int4_down, int4_input, int4_expected, int4_flags, 6, 4, 1e-5f);
+    check_batch(int4_gate, &int4_gate, int4_down, int4_input, int4_expected, int4_flags, 8, 6, 1e-5f);
+    if (alignment <= 4)
+        std::cout << "INT4 batch row offsets are aligned on this device; misaligned-input branch is not exercised\n";
+    check(QnkLinear_vulkan::storage_bytes(metadata_gate_up, alignment)
+          == QnkLinear_vulkan::storage_bytes(gate_up, alignment));
+    check(QnkLinear_vulkan::storage_bytes(metadata_down, alignment)
+          == QnkLinear_vulkan::storage_bytes(down, alignment));
+    const uint64_t metadata_size = native_quantized_expert_storage_bytes(metadata_gate_up,
+                                                                         nullptr,
+                                                                         metadata_down,
+                                                                         automatic_vulkan_device_index,
+                                                                         vulkan_runtime,
+                                                                         g_test_optimization_flags | OptimizationVulkanQnK);
+    check(metadata_size == native_quantized_expert_storage_bytes(gate_up, nullptr, down, automatic_vulkan_device_index, vulkan_runtime, g_test_optimization_flags | OptimizationVulkanQnK));
+    check(static_cast<bool>(!QnkExpert_vulkan::create(metadata_gate_up,
+                                                      nullptr,
+                                                      metadata_down,
+                                                      nullptr,
+                                                      0.0f,
+                                                      automatic_vulkan_device_index,
+                                                      ExpertActivation::GptOssSwiGlu,
+                                                      vulkan_runtime,
+                                                      g_test_optimization_flags | OptimizationVulkanQnK)));
+    TensorData invalid_metadata = metadata_gate_up;
+    auto invalid_storage = std::make_shared<MxFp4FileStorage>(*metadata_gate_up.mxfp4_file_storage);
+    --invalid_storage->blocks_size;
+    invalid_metadata.mxfp4_file_storage = std::move(invalid_storage);
+    check(QnkLinear_vulkan::storage_bytes(invalid_metadata, alignment) == 0);
+    check(native_quantized_expert_storage_bytes(invalid_metadata,
+                                                nullptr,
+                                                metadata_down,
+                                                automatic_vulkan_device_index,
+                                                vulkan_runtime,
+                                                g_test_optimization_flags | OptimizationVulkanQnK)
+          == 0);
+
+    const auto metadata_backend = create_vulkan_expert_backend(metadata_size + 4096,
+                                                               automatic_vulkan_device_index,
+                                                               nullptr,
+                                                               vulkan_runtime,
+                                                               g_test_optimization_flags | OptimizationVulkanQnK);
+    check(static_cast<bool>(metadata_backend));
+    const ExpertBackendStatistics before_metadata_admission = metadata_backend->statistics();
+    metadata_backend->admit("qnk-file-metadata",
+                            std::make_shared<TensorData>(metadata_gate_up),
+                            nullptr,
+                            std::make_shared<TensorData>(metadata_down),
+                            nullptr,
+                            0,
+                            0.0f,
+                            ExpertActivation::GptOssSwiGlu);
+    const ExpertBackendStatistics after_metadata_admission = metadata_backend->statistics();
+    check(after_metadata_admission.admissions == before_metadata_admission.admissions);
+    check(after_metadata_admission.stores == before_metadata_admission.stores);
+    check(after_metadata_admission.pending_size == before_metadata_admission.pending_size);
+    check(after_metadata_admission.bytes_uploaded == before_metadata_admission.bytes_uploaded);
+    metadata_backend->wait_for_background_work();
+    const ExpertBackendStatistics after_metadata_wait = metadata_backend->statistics();
+    check(after_metadata_wait.admissions == before_metadata_admission.admissions);
+    check(after_metadata_wait.stores == before_metadata_admission.stores);
+    check(after_metadata_wait.pending_size == before_metadata_admission.pending_size);
+    check(after_metadata_wait.bytes_uploaded == before_metadata_admission.bytes_uploaded);
+#endif
+
     ActivationBuffer gate_up_output = forward_linear(gate_up, input, 0);
     ActivationBuffer activated(input_rows, intermediate_columns);
     for (size_t row = 0; row < input_rows; ++row)
@@ -5234,6 +5564,8 @@ void test_ncnn_vulkan_qnk_expert_operator()
 
     auto backend_gate_up_second = std::make_shared<TensorData>(gate_up);
     auto backend_down_second = std::make_shared<TensorData>(down);
+    backend_gate_up_second->quantized_data = make_q4k(gate_up.shape[0], qnk_columns, 8);
+    backend_down_second->quantized_data = make_q4k(down.shape[0], intermediate_columns, 20);
     const ActivationBuffer second_gate_up_output = forward_linear(*backend_gate_up_second, input, 0);
     ActivationBuffer second_activated(input_rows, intermediate_columns);
     for (size_t row = 0; row < input_rows; ++row)

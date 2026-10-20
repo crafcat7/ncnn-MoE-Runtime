@@ -4,6 +4,7 @@
 #include "backends/ncnn/vulkan.h"
 #include "backends/ncnn/vulkancontext.h"
 #include "backends/ncnn/experttransfer_vulkan.h"
+#include "storage/expertcache.h"
 #include "storage/expertresidency.h"
 #include "engine/expertbackend.h"
 #include "engine/expert.h"
@@ -18,6 +19,8 @@
 #include <chrono>
 #include <future>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -289,6 +292,243 @@ static void gpu_first_dense_separate_residency(uint32_t device_index)
         gpu_first_check(native_quantized_expert_storage_bytes(*gate, malformed.get(), *down, device_index, runtime, flags) == 0,
                         "dense planning rejects incomplete source before eviction");
     }
+}
+
+static void gpu_first_bfloat16_work_item_lifecycle(uint32_t device_index)
+{
+    constexpr uint32_t input_columns = 256;
+    constexpr uint32_t intermediate_columns = 128;
+    constexpr uint32_t output_columns = 64;
+    const uint64_t flags = OptimizationDefaultFlags & ~static_cast<uint64_t>(OptimizationCpuBfloat16Batched);
+    const VulkanRuntimePtr runtime = create_vulkan_runtime();
+    gpu_first_check(static_cast<bool>(VulkanContext::acquire(device_index, runtime, flags)),
+                    "BF16 WorkItem lifecycle Vulkan context");
+
+    const auto weight = [](uint32_t rows, uint32_t columns, uint32_t seed) {
+        auto result = std::make_shared<TensorData>();
+        result->dtype = DType::BFloat16;
+        result->shape = {rows, columns};
+        result->bfloat16_data.assign(static_cast<size_t>(rows) * columns, 0);
+        const float diagonal = 0.625f + static_cast<float>(seed % 4) * 0.125f;
+        for (uint32_t row = 0; row < std::min(rows, columns); ++row)
+            result->bfloat16_data[static_cast<size_t>(row) * columns + row] = float_to_bfloat16(diagonal);
+        return result;
+    };
+    struct ExpertWeights
+    {
+        std::shared_ptr<const TensorData> gate_up;
+        std::shared_ptr<const TensorData> down;
+        uint64_t size = 0;
+    };
+    const auto expert_weights = [&](uint32_t seed) {
+        const auto gate = weight(intermediate_columns, input_columns, seed);
+        const auto up = weight(intermediate_columns, input_columns, seed + 1);
+        auto gate_up = std::make_shared<TensorData>();
+        gate_up->dtype = DType::BFloat16;
+        gate_up->shape = {intermediate_columns * 2, input_columns};
+        gate_up->bfloat16_data = gate->bfloat16_data;
+        gate_up->bfloat16_data.insert(gate_up->bfloat16_data.end(), up->bfloat16_data.begin(), up->bfloat16_data.end());
+        ExpertWeights result;
+        result.gate_up = std::move(gate_up);
+        result.down = weight(output_columns, intermediate_columns, seed + 2);
+        result.size = (result.gate_up->bfloat16_data.size() + result.down->bfloat16_data.size()) * sizeof(uint16_t);
+        gpu_first_check(result.size != 0, "valid fused BF16 Expert storage estimate");
+        return result;
+    };
+    const std::array<ExpertWeights, 2> experts = {expert_weights(1), expert_weights(7)};
+    const uint64_t cache_size = experts[0].size + experts[1].size;
+    auto backend = create_vulkan_expert_backend(cache_size, device_index, {}, runtime, flags);
+    gpu_first_check(static_cast<bool>(backend), "fused BF16 WorkItem backend");
+    const std::array<ExpertDemandRequest, 2> demands = {{
+        {"bf16-work-A", experts[0].gate_up, nullptr, experts[0].down, nullptr, 0, 4.f, ExpertActivation::Silu},
+        {"bf16-work-B", experts[1].gate_up, nullptr, experts[1].down, nullptr, 0, 4.f, ExpertActivation::Silu},
+    }};
+    std::array<std::shared_ptr<const void>, 2> pins;
+    gpu_first_check(backend->prepare_demand_batch(demands, pins) == demands.size() && pins[0] && pins[1],
+                    "fused BF16 Experts become resident for WorkItem lifecycle checks");
+    pins = {};
+
+    const auto input = [](size_t rows, uint32_t seed) {
+        ActivationBuffer result(rows, input_columns);
+        for (size_t row = 0; row < rows; ++row)
+            for (uint32_t column = 0; column < input_columns; ++column)
+                result.row(row)[column] = 0.5f + static_cast<float>((row * 5 + column * 3 + seed) % 7) * 0.125f;
+        return result;
+    };
+    const auto cpu_output = [&](const ExpertWeights& source, const ActivationBuffer& activations) {
+        TensorData gate;
+        gate.dtype = DType::BFloat16;
+        gate.shape = {intermediate_columns, input_columns};
+        gate.bfloat16_data.assign(source.gate_up->bfloat16_data.begin(),
+                                  source.gate_up->bfloat16_data.begin() + gate.element_count());
+        TensorData up;
+        up.dtype = DType::BFloat16;
+        up.shape = gate.shape;
+        up.bfloat16_data.assign(source.gate_up->bfloat16_data.begin() + gate.element_count(),
+                                source.gate_up->bfloat16_data.end());
+        ActivationBuffer activated = forward_linear(gate, activations, flags);
+        const ActivationBuffer up_output = forward_linear(up, activations, flags);
+        for (size_t row = 0; row < activations.rows(); ++row)
+        {
+            for (uint32_t column = 0; column < intermediate_columns; ++column)
+            {
+                const float value = activated.row(row)[column];
+                activated.row(row)[column] = value / (1.f + std::exp(-value)) * up_output.row(row)[column];
+            }
+        }
+        return forward_linear(*source.down, activated, flags);
+    };
+    const auto check_output = [](const ActivationBuffer& actual, const ActivationBuffer& expected) {
+        gpu_first_check(actual.rows() == expected.rows() && actual.columns() == expected.columns(),
+                        "fused BF16 Expert output shape");
+        float maximum = 0.f;
+        for (size_t index = 0; index < expected.values().size(); ++index)
+            maximum = std::max(maximum, std::abs(expected.values()[index]));
+        gpu_first_check(maximum > 0.01f, "fused BF16 CPU oracle is nonzero");
+        for (size_t index = 0; index < expected.values().size(); ++index)
+            gpu_first_check(std::isfinite(actual.values()[index])
+                                && std::abs(actual.values()[index] - expected.values()[index])
+                                       <= 0.000001f + 0.02f * std::abs(expected.values()[index]),
+                            "fused BF16 GPU output matches the CPU gate/up/down oracle");
+    };
+    const auto check_sentinel = [](const ActivationBuffer& output, float sentinel) {
+        gpu_first_check(std::all_of(output.values().begin(), output.values().end(),
+                                    [sentinel](float value) { return value == sentinel; }),
+                        "BF16 output remains private until commit");
+    };
+
+    std::array<ActivationBuffer, 2> batch_inputs = {input(1, 2), input(3, 5)};
+    std::array<ActivationBuffer, 2> batch_outputs;
+    for (size_t index = 0; index < batch_outputs.size(); ++index)
+    {
+        batch_outputs[index].reset(batch_inputs[index].rows(), output_columns, false);
+        std::fill_n(batch_outputs[index].row(0), batch_outputs[index].values().size(), -123.f);
+    }
+    const std::array<ExpertBackendRequest, 2> batch_requests = {{
+        {"bf16-work-A", &batch_inputs[0], &batch_outputs[0], experts[0].size},
+        {"bf16-work-B", &batch_inputs[1], &batch_outputs[1], experts[1].size},
+    }};
+    auto batch = backend->submit_batch(batch_requests);
+    gpu_first_check(batch && batch->reservations().size() == 2
+                        && batch->reservations()[0] == ExpertBackendExecutionResult::Executed
+                        && batch->reservations()[1] == ExpertBackendExecutionResult::Executed,
+                    "two fused BF16 Experts reserve one batched WorkItem");
+    const auto batch_results = batch->wait();
+    gpu_first_check(batch_results.size() == 2
+                        && batch_results[0] == ExpertBackendExecutionResult::Executed
+                        && batch_results[1] == ExpertBackendExecutionResult::Executed,
+                    "two fused BF16 Experts execute together");
+    check_sentinel(batch_outputs[0], -123.f);
+    check_sentinel(batch_outputs[1], -123.f);
+    gpu_first_check(batch->commit(), "two fused BF16 outputs commit together");
+    check_output(batch_outputs[0], cpu_output(experts[0], batch_inputs[0]));
+    check_output(batch_outputs[1], cpu_output(experts[1], batch_inputs[1]));
+    batch.reset();
+
+    for (size_t rows : {size_t(1), size_t(3)})
+    {
+        ActivationBuffer shared_input = input(rows, 7);
+        std::array<ActivationBuffer, 2> shared_outputs;
+        for (ActivationBuffer& output : shared_outputs)
+        {
+            output.reset(rows, output_columns, false);
+            std::fill_n(output.row(0), output.values().size(), -123.f);
+        }
+        const std::array<ExpertBackendRequest, 2> requests = {{
+            {"bf16-work-A", &shared_input, &shared_outputs[0], experts[0].size},
+            {"bf16-work-B", &shared_input, &shared_outputs[1], experts[1].size},
+        }};
+        const VulkanStatistics before = get_vulkan_statistics(runtime);
+        auto submission = backend->submit_batch(requests);
+        gpu_first_check(submission && submission->reservations().size() == 2
+                            && submission->reservations()[0] == ExpertBackendExecutionResult::Executed
+                            && submission->reservations()[1] == ExpertBackendExecutionResult::Executed,
+                        "shared BF16 input reserves both experts");
+        const auto results = submission->wait();
+        gpu_first_check(results.size() == 2
+                            && results[0] == ExpertBackendExecutionResult::Executed
+                            && results[1] == ExpertBackendExecutionResult::Executed,
+                        "shared BF16 input executes both experts");
+        const VulkanStatistics after = get_vulkan_statistics(runtime);
+        gpu_first_check(after.dispatches - before.dispatches == 4
+                            && after.compute_submissions - before.compute_submissions == 1
+                            && after.batch_uploads - before.batch_uploads == 1
+                            && after.batch_downloads - before.batch_downloads == 1,
+                        "shared BF16 input retains one transfer batch and both expert dispatches");
+        for (const ActivationBuffer& output : shared_outputs)
+            check_sentinel(output, -123.f);
+        gpu_first_check(submission->commit(), "shared BF16 outputs commit independently");
+        for (size_t index = 0; index < experts.size(); ++index)
+            check_output(shared_outputs[index], cpu_output(experts[index], shared_input));
+    }
+
+    ActivationBuffer reused_input = input(2, 9);
+    ActivationBuffer reused_output(2, output_columns);
+    std::fill_n(reused_output.row(0), reused_output.values().size(), -123.f);
+    const ExpertBackendRequest reused_request{"bf16-work-B", &reused_input, &reused_output, experts[1].size};
+    auto reused = backend->submit_batch(std::span<const ExpertBackendRequest>(&reused_request, 1));
+    gpu_first_check(reused && reused->reservations()[0] == ExpertBackendExecutionResult::Executed,
+                    "single fused BF16 request reuses the released two-entry WorkItem");
+    const auto reused_results = reused->wait();
+    gpu_first_check(reused_results.size() == 1 && reused_results[0] == ExpertBackendExecutionResult::Executed
+                        && reused->commit(),
+                    "single fused BF16 request completes after batch resize");
+    check_output(reused_output, cpu_output(experts[1], reused_input));
+    reused.reset();
+
+    ActivationBuffer held_input = input(1, 11);
+    ActivationBuffer next_input = input(3, 13);
+    ActivationBuffer held_output(1, output_columns);
+    ActivationBuffer next_output(3, output_columns);
+    std::fill_n(held_output.row(0), held_output.values().size(), -91.f);
+    std::fill_n(next_output.row(0), next_output.values().size(), -91.f);
+    const ExpertBackendRequest held_request{"bf16-work-A", &held_input, &held_output, experts[0].size};
+    const ExpertBackendRequest next_request{"bf16-work-B", &next_input, &next_output, experts[1].size};
+    auto held = backend->submit_batch(std::span<const ExpertBackendRequest>(&held_request, 1));
+    auto next = backend->submit_batch(std::span<const ExpertBackendRequest>(&next_request, 1));
+    gpu_first_check(held && next && held->reservations()[0] == ExpertBackendExecutionResult::Executed
+                        && next->reservations()[0] == ExpertBackendExecutionResult::Executed,
+                    "a retained BF16 ticket keeps its WorkItem unavailable to another submission");
+    const auto next_results = next->wait();
+    gpu_first_check(next_results.size() == 1 && next_results[0] == ExpertBackendExecutionResult::Executed,
+                    "second BF16 ticket completes while first remains retained");
+    const auto held_results = held->wait();
+    gpu_first_check(held_results.size() == 1 && held_results[0] == ExpertBackendExecutionResult::Executed,
+                    "retained first BF16 ticket preserves its result");
+    check_sentinel(held_output, -91.f);
+    held->abort();
+    gpu_first_check(!held->commit(), "aborted BF16 ticket cannot publish its private output");
+    check_sentinel(held_output, -91.f);
+    gpu_first_check(next->commit(), "second BF16 ticket commits independently");
+    check_output(next_output, cpu_output(experts[1], next_input));
+    held.reset();
+    next.reset();
+
+    ActivationBuffer invalid_input(1, input_columns - 1);
+    ActivationBuffer invalid_output(1, output_columns);
+    std::fill_n(invalid_output.row(0), invalid_output.values().size(), -77.f);
+    const ExpertBackendRequest invalid_request{"bf16-work-A", &invalid_input, &invalid_output, experts[0].size};
+    auto invalid = backend->submit_batch(std::span<const ExpertBackendRequest>(&invalid_request, 1));
+    gpu_first_check(invalid && invalid->reservations()[0] == ExpertBackendExecutionResult::Executed,
+                    "resident BF16 request with a bad column count reaches execution validation");
+    const auto invalid_results = invalid->wait();
+    gpu_first_check(invalid_results.size() == 1 && invalid_results[0] == ExpertBackendExecutionResult::Failed,
+                    "BF16 batch rejects an invalid input column count");
+    check_sentinel(invalid_output, -77.f);
+    invalid.reset();
+
+    ActivationBuffer retry_input = input(2, 19);
+    ActivationBuffer retry_output(2, output_columns);
+    std::fill_n(retry_output.row(0), retry_output.values().size(), -55.f);
+    const ExpertBackendRequest retry_request{"bf16-work-A", &retry_input, &retry_output, experts[0].size};
+    auto retry = backend->submit_batch(std::span<const ExpertBackendRequest>(&retry_request, 1));
+    gpu_first_check(retry && retry->reservations()[0] == ExpertBackendExecutionResult::Executed,
+                    "valid BF16 request remains available after invalid execution");
+    const auto retry_results = retry->wait();
+    gpu_first_check(retry_results.size() == 1 && retry_results[0] == ExpertBackendExecutionResult::Executed
+                        && retry->commit(),
+                    "BF16 WorkItem recovers for a valid request after failure");
+    check_output(retry_output, cpu_output(experts[0], retry_input));
 }
 
 static void gpu_first_duplicate_and_shard()
@@ -785,6 +1025,91 @@ static void gpu_first_async_transfer_and_joint_eviction()
     }
 }
 
+struct GpuFirstHostCacheFixture
+{
+    std::filesystem::path path = std::filesystem::temp_directory_path()
+                                 / ("ncnn_moe_gpu_first_host_"
+                                    + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())
+                                    + ".bin");
+    std::array<std::shared_ptr<TensorData>, 4> tensors;
+
+    explicit GpuFirstHostCacheFixture(const GpuFirstFixture& fixture)
+    {
+        const auto other_gate = gpu_first_weight(64, 32, 17);
+        const auto other_down = gpu_first_weight(32, 32, 19);
+        const std::array<std::shared_ptr<const TensorData>, 4> sources = {
+            fixture.gate, fixture.down, other_gate, other_down};
+        std::ofstream stream(path, std::ios::binary);
+        gpu_first_check(static_cast<bool>(stream), "create GPU-first host cache source file");
+        uint64_t offset = 0;
+        for (size_t index = 0; index < sources.size(); ++index)
+        {
+            tensors[index] = std::make_shared<TensorData>(*sources[index]);
+            auto storage = std::make_shared<MxFp4FileStorage>();
+            storage->blocks_path = path.string();
+            storage->blocks_offset = offset;
+            storage->blocks_size = tensors[index]->mxfp4_blocks.size();
+            stream.write(reinterpret_cast<const char*>(tensors[index]->mxfp4_blocks.data()),
+                         static_cast<std::streamsize>(storage->blocks_size));
+            offset += storage->blocks_size;
+            storage->scales_path = path.string();
+            storage->scales_offset = offset;
+            storage->scales_size = tensors[index]->mxfp4_scales.size();
+            stream.write(reinterpret_cast<const char*>(tensors[index]->mxfp4_scales.data()),
+                         static_cast<std::streamsize>(storage->scales_size));
+            offset += storage->scales_size;
+            tensors[index]->mxfp4_file_storage = std::move(storage);
+            tensors[index]->mxfp4_blocks.resize(0);
+            tensors[index]->mxfp4_scales.resize(0);
+        }
+        stream.close();
+        gpu_first_check(static_cast<bool>(stream), "write GPU-first host cache source file");
+    }
+
+    ~GpuFirstHostCacheFixture()
+    {
+        std::error_code error;
+        std::filesystem::remove(path, error);
+    }
+};
+
+static void gpu_first_completed_demand_releases_host_cache()
+{
+    GpuFirstFixture fixture;
+    GpuFirstHostCacheFixture host(fixture);
+    ExpertCache cache(fixture.size, 1, {}, ExpertIoMode::Buffered);
+    auto backend = create_vulkan_expert_backend(fixture.size, get_default_gpu_index(), {}, fixture.runtime, fixture.flags);
+    gpu_first_check(static_cast<bool>(backend), "host-backed async demand backend");
+
+    auto acquired = cache.acquire_pair(*host.tensors[0], *host.tensors[1], 0, "host-pair-0");
+    gpu_first_check(static_cast<bool>(acquired), "acquire first host cache pair");
+    ExpertCacheLease lease = std::move(acquired).value();
+    const std::weak_ptr<const TensorData> gate_owner = lease.gate_up;
+    const std::weak_ptr<const TensorData> down_owner = lease.down;
+    ExpertDemandRequest request{"host-pair-0", lease.gate_up, nullptr, lease.down, nullptr,
+                                0, 4.0f, ExpertActivation::DeepSeekSwiGlu};
+    auto upload = backend->begin_demand_batch(std::span<const ExpertDemandRequest>(&request, 1));
+    gpu_first_check(static_cast<bool>(upload), "queue host-backed async demand");
+    request = {};
+    lease = {};
+
+    std::array<std::shared_ptr<const void>, 1> pins;
+    const size_t completed = upload->wait(pins);
+    gpu_first_check(completed == 1 && pins[0], "host-backed async demand completes");
+    backend->wait_for_background_work();
+    const auto retained_pin = pins[0];
+    gpu_first_check(upload->wait(pins) == completed && pins[0] == retained_pin,
+                    "completed host-backed demand wait is repeatable");
+
+    auto next_request = cache.request_pair(*host.tensors[2], *host.tensors[3], 0, "host-pair-1");
+    gpu_first_check(static_cast<bool>(next_request) && cache.statistics().evictions == 1,
+                    "completed demand handle releases host cache capacity");
+    gpu_first_check(gate_owner.expired() && down_owner.expired(),
+                    "completed demand handle drops evicted host cache aliases");
+    auto next = cache.acquire_pair(*host.tensors[2], *host.tensors[3], 0, "host-pair-1");
+    gpu_first_check(static_cast<bool>(next), "next host cache pair becomes ready");
+}
+
 static void gpu_first_context_lifetime()
 {
     GpuFirstFixture fixture;
@@ -928,6 +1253,82 @@ static void gpu_first_aligned_batch_outputs()
                                     && std::abs(output.row(0)[column] - expected.row(0)[column]) < 0.0002f,
                                 "aligned row output preserves CPU oracle values");
         }
+    }
+}
+
+static void gpu_first_quantized_upload()
+{
+    const auto weight = [](uint32_t rows, uint32_t columns) {
+        auto result = std::make_shared<TensorData>();
+        result->dtype = DType::Int4;
+        result->shape = {rows, columns};
+        result->quantization_group_size = 3;
+        const size_t groups = (columns + 2) / 3;
+        result->quantized_data.assign(static_cast<size_t>(rows) * ((columns + 1) / 2), 0x9a);
+        result->quantization_scales.resize(rows * groups);
+        result->quantization_zero_points.assign(rows * groups, 8);
+        for (size_t index = 0; index < result->quantization_scales.size(); ++index)
+            result->quantization_scales[index] = static_cast<float>(index % 3 + 1) * 0.03125f;
+        for (uint32_t column = 0; column < columns; ++column)
+        {
+            result->quantization_group_indices.push_back((column + 1) % groups);
+            result->input_column_indices.push_back(columns - column - 1);
+        }
+        return result;
+    };
+    const auto gate_up = weight(6, 5);
+    const auto down = weight(5, 3);
+    TensorData gate_bias;
+    gate_bias.dtype = DType::Float32;
+    gate_bias.shape = {6};
+    gate_bias.float32_data = {0.03125f, -0.0625f, 0.09375f, 0.125f, -0.15625f, 0.1875f};
+    TensorData down_bias;
+    down_bias.dtype = DType::BFloat16;
+    down_bias.shape = {5};
+    down_bias.bfloat16_data.assign(5, float_to_bfloat16(0.0625f));
+    const auto runtime = create_vulkan_runtime();
+    const uint64_t flags = OptimizationDefaultFlags;
+    const uint32_t device = get_default_gpu_index();
+    const uint64_t size = native_quantized_expert_storage_bytes(*gate_up, nullptr, *down, device, runtime, flags);
+    auto backend = create_vulkan_expert_backend(size, device, {}, runtime, flags);
+    std::shared_ptr<const void> pin;
+    gpu_first_check(size != 0 && backend
+                        && backend->prepare_demand("quantized-upload", gate_up, &gate_bias, down, &down_bias, 0, 0.f, ExpertActivation::Silu, pin)
+                        && pin && backend->statistics().resident_size == size,
+                    "odd INT4 matrices and metadata upload through the independent allocator");
+    auto legacy = QnkExpert_vulkan::create(*gate_up, &gate_bias, *down, &down_bias, 0.f, device, ExpertActivation::Silu, runtime, flags);
+    gpu_first_check(static_cast<bool>(legacy), "legacy INT4 upload remains available");
+    for (size_t rows : {size_t(1), size_t(3)})
+    {
+        ActivationBuffer input(rows, 5);
+        for (size_t index = 0; index < input.values().size(); ++index)
+            input.row(0)[index] = static_cast<float>(index + 1) * 0.0625f;
+        const ActivationBuffer projected = forward_linear(*gate_up, gate_bias, input, flags);
+        ActivationBuffer activated(rows, 3);
+        for (size_t row = 0; row < rows; ++row)
+            for (uint32_t column = 0; column < 3; ++column)
+            {
+                const float gate = projected.row(row)[column * 2];
+                activated.row(row)[column] = gate / (1.f + std::exp(-gate)) * projected.row(row)[column * 2 + 1];
+            }
+        const ActivationBuffer expected = forward_linear(*down, down_bias, activated, flags);
+        ActivationBuffer actual;
+        ActivationBuffer legacy_output;
+        const ExpertBackendRequest request{"quantized-upload", &input, &actual, size};
+        auto submission = backend->submit_batch(std::span<const ExpertBackendRequest>(&request, 1));
+        gpu_first_check(submission && submission->reservations()[0] == ExpertBackendExecutionResult::Executed,
+                        "uploaded INT4 expert reserves GPU execution");
+        const auto results = submission->wait();
+        gpu_first_check(results.size() == 1 && results[0] == ExpertBackendExecutionResult::Executed && submission->commit()
+                            && legacy->forward(input, legacy_output),
+                        "direct staging and legacy INT4 uploads execute");
+        gpu_first_check(actual.values().size() == expected.values().size() && legacy_output.values().size() == expected.values().size(),
+                        "quantized upload output shape");
+        for (size_t index = 0; index < expected.values().size(); ++index)
+            gpu_first_check(std::isfinite(actual.values()[index]) && std::isfinite(legacy_output.values()[index])
+                                && std::abs(actual.values()[index] - expected.values()[index]) < 0.00002f
+                                && std::abs(legacy_output.values()[index] - expected.values()[index]) < 0.00002f,
+                            "raw weights, padding, both bias types and quantization metadata preserve the CPU oracle");
     }
 }
 
@@ -1697,6 +2098,32 @@ static void gpu_first_upload_staging_pool()
     const auto reused = backend->statistics();
     gpu_first_check(reused.executions == 3 && reused.evictions == 1 && reused.resident_size <= 4096,
                     "pooled cold uploads execute and evict within bounds");
+
+    const auto descriptor = [](const TensorData& source) {
+        TensorData result;
+        result.dtype = DType::MxFp4;
+        result.shape = source.shape;
+        auto file = std::make_shared<MxFp4FileStorage>();
+        file->blocks_size = source.mxfp4_blocks.size();
+        file->scales_size = source.mxfp4_scales.size();
+        result.mxfp4_file_storage = std::move(file);
+        return result;
+    };
+    auto victim = create_vulkan_victim_cache(1024 * 1024, get_default_gpu_index(), fixture.runtime, fixture.flags);
+    gpu_first_check(static_cast<bool>(victim), "direct staging victim cache");
+    const auto victim_down = gpu_first_weight(1, 32, 9);
+    victim->admit("victim-upload", fixture.gate, victim_down, {});
+    victim->wait_for_background_work();
+    auto restored = victim->restore("victim-upload", descriptor(*fixture.gate), descriptor(*victim_down));
+    gpu_first_check(victim->statistics().stores == 1 && restored, "direct staging victim upload and readback");
+    const auto check_bytes = [](const MxFp4ByteBuffer& actual, const MxFp4ByteBuffer& expected) {
+        gpu_first_check(actual.size() == expected.size() && std::equal(actual.data(), actual.data() + actual.size(), expected.data()),
+                        "victim staging upload preserves every restored payload byte");
+    };
+    check_bytes(restored->gate_up->mxfp4_blocks, fixture.gate->mxfp4_blocks);
+    check_bytes(restored->gate_up->mxfp4_scales, fixture.gate->mxfp4_scales);
+    check_bytes(restored->down->mxfp4_blocks, victim_down->mxfp4_blocks);
+    check_bytes(restored->down->mxfp4_scales, victim_down->mxfp4_scales);
 }
 
 #endif
@@ -1722,14 +2149,19 @@ int main(int argc, char** argv)
         }
         ncnn::moe::gpu_first_cold_and_capacity();
         for (uint32_t device = 0; device < ncnn::moe::get_gpu_count(); ++device)
+        {
             ncnn::moe::gpu_first_dense_separate_residency(device);
+            ncnn::moe::gpu_first_bfloat16_work_item_lifecycle(device);
+        }
         ncnn::moe::gpu_first_duplicate_and_shard();
         ncnn::moe::gpu_first_gptoss_prefill();
         ncnn::moe::gpu_first_lazy_host_input();
         ncnn::moe::gpu_first_upload_staging_pool();
         ncnn::moe::gpu_first_foreground_batch();
         ncnn::moe::gpu_first_upload_host_scratch();
+        ncnn::moe::gpu_first_quantized_upload();
         ncnn::moe::gpu_first_async_transfer_and_joint_eviction();
+        ncnn::moe::gpu_first_completed_demand_releases_host_cache();
         ncnn::moe::gpu_first_joint_eviction_window();
         ncnn::moe::gpu_first_aligned_batch_outputs();
         ncnn::moe::gpu_first_context_lifetime();

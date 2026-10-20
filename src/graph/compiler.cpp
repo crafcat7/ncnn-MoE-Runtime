@@ -985,55 +985,6 @@ static bool is_cache_file_backed_expert_pair(const TensorData& gate_up,
            && is_cache_file_backed_expert_tensor(down, allow_bfloat16);
 }
 
-static Result<void> combine_qnk_gate_up_weights(WeightStore& weights,
-                                                TensorHandle gate_handle,
-                                                TensorHandle up_handle,
-                                                uint32_t rows,
-                                                uint32_t columns)
-{
-    if (gate_handle == invalid_tensor_handle || up_handle == invalid_tensor_handle)
-        return Error{ErrorCode::InvalidArgument, "Qn_K gate/up handles cannot be invalid"};
-
-    const TensorData& gate = weights.at(gate_handle);
-    const TensorData& up = weights.at(up_handle);
-    if (!is_qnk_dtype(gate.dtype)
-        || gate.dtype != up.dtype
-        || gate.shape != std::vector<uint32_t>{rows, columns}
-        || up.shape != std::vector<uint32_t>{rows, columns}
-        || !qnk_shape_supported(gate.dtype, rows, columns))
-    {
-        return Error{ErrorCode::InvalidModel, "Qn_K gate/up tensors cannot be packed"};
-    }
-
-    const uint64_t row_size = qnk_storage_bytes(gate.dtype, 1, columns);
-    if (row_size == 0
-        || rows > std::numeric_limits<uint32_t>::max() / 2
-        || row_size > std::numeric_limits<size_t>::max() / rows
-        || row_size * rows > std::numeric_limits<size_t>::max() / 2)
-    {
-        return Error{ErrorCode::InvalidModel, "Qn_K gate/up tensor size overflows"};
-    }
-
-    const size_t source_size = static_cast<size_t>(row_size * rows);
-    const std::span<const uint8_t> gate_data = gate.qnk_values();
-    const std::span<const uint8_t> up_data = up.qnk_values();
-    if (gate_data.size() != source_size || up_data.size() != source_size)
-    {
-        return Error{ErrorCode::InvalidModel, "Qn_K gate/up tensor byte count does not match its shape"};
-    }
-
-    TensorData combined;
-    combined.dtype = gate.dtype;
-    combined.shape = {rows * 2, columns};
-    combined.qnk_interleave_rows = false;
-    combined.quantized_data.reserve(source_size * 2);
-    combined.quantized_data.insert(combined.quantized_data.end(), gate_data.begin(), gate_data.end());
-    combined.quantized_data.insert(combined.quantized_data.end(), up_data.begin(), up_data.end());
-    weights.at_mutable(gate_handle) = std::move(combined);
-    weights.at_mutable(up_handle) = TensorData{};
-    return {};
-}
-
 static double placement_cost(const std::vector<uint32_t>& counts, const std::vector<uint32_t>& scores, uint32_t concurrency, size_t added_device)
 {
     double latency = 0.0;
@@ -1499,7 +1450,7 @@ static Result<void> compile_speculative_model(CompiledModel& compiled,
 
 static Result<void> compile_moe_layer(CompiledModel& compiled, const std::string& layer_name,
                                       const LayerDescriptor& layer, CompiledLayerPlan& layer_plan,
-                                      bool use_file_backed_experts, bool use_vulkan_experts)
+                                      bool use_file_backed_experts)
 {
     const MoeDescriptor& moe = layer.moe;
     if (layer.pre_ffn_norm == NormType::RmsNorm)
@@ -1549,10 +1500,6 @@ static Result<void> compile_moe_layer(CompiledModel& compiled, const std::string
     }
 
     layer_plan.moe.experts.reserve(moe.expert_count);
-    const bool fuse_qnk_gate_up = use_vulkan_experts
-                                  && compiled.opt.hybrid_mode != HybridMode::CpuOnly
-                                  && has_flag(compiled.opt.optimization_flags,
-                                              OptimizationVulkanQnK);
     for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
     {
         ExpertPlan expert;
@@ -1588,36 +1535,6 @@ static Result<void> compile_moe_layer(CompiledModel& compiled, const std::string
         ret = assign_required_linear_tensor(compiled.weights, prefix + "down.weight", {compiled.descriptor.hidden_size, moe.intermediate_size}, moe.expert_weight_dtype, expert.down_weight);
         if (!ret)
             return ret.error();
-
-        if (fuse_qnk_gate_up
-            && expert.layout == ExpertLayout::GateUpDown
-            && !has_flag(moe.flags, MoeDescriptorProjectionBias)
-            && expert.gate_weight != invalid_tensor_handle
-            && expert.up_weight != invalid_tensor_handle
-            && compiled.weights.at(expert.gate_weight).dtype == compiled.weights.at(expert.up_weight).dtype
-            && compiled.weights.at(expert.gate_weight).dtype == compiled.weights.at(expert.down_weight).dtype
-            && compiled.weights.at(expert.gate_weight).input_column_indices.empty()
-            && compiled.weights.at(expert.up_weight).input_column_indices.empty()
-            && compiled.weights.at(expert.down_weight).input_column_indices.empty())
-        {
-            auto fused = combine_qnk_gate_up_weights(compiled.weights,
-                                                     expert.gate_weight,
-                                                     expert.up_weight,
-                                                     moe.intermediate_size,
-                                                     compiled.descriptor.hidden_size);
-            if (fused)
-            {
-                expert.gate_up_weight = expert.gate_weight;
-                expert.gate_weight = invalid_tensor_handle;
-                expert.up_weight = invalid_tensor_handle;
-                expert.layout = ExpertLayout::PackedGateUpDown;
-            }
-            else if (is_qnk_dtype(compiled.weights.at(expert.gate_weight).dtype)
-                     && is_qnk_dtype(compiled.weights.at(expert.up_weight).dtype))
-            {
-                return fused.error();
-            }
-        }
 
         if (has_flag(moe.flags, MoeDescriptorProjectionBias))
         {
@@ -2003,8 +1920,7 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
         auto ret = layer.dense.enabled()
                        ? compile_dense_layer(compiled, layer_name, layer, layer_plan,
                                              has_flag(opt.flags, BackendVulkanExperts))
-                       : compile_moe_layer(compiled, layer_name, layer, layer_plan, use_file_backed_experts,
-                                           has_flag(opt.flags, BackendVulkanExperts));
+                       : compile_moe_layer(compiled, layer_name, layer, layer_plan, use_file_backed_experts);
         if (!ret)
             return ret.error();
     }

@@ -249,6 +249,11 @@ private:
         ActivationBuffer private_aggregation;
         std::vector<uint8_t> private_route_completed;
         std::vector<Selection> selected;
+        std::vector<Selection> dispatch;
+        std::vector<const Bfloat16Expert_vulkan*> bfloat16_experts;
+        std::vector<const QnkExpert_vulkan*> qnk_experts;
+        std::vector<const ActivationBuffer*> inputs;
+        std::vector<ActivationBuffer*> outputs;
         std::vector<ExpertBackendExecutionResult> planned;
         std::vector<ExpertBackendExecutionResult> final;
         std::mutex mutex;
@@ -380,10 +385,11 @@ private:
 
     bool forward_batch(std::span<const ExpertBackendRequest> requests, std::span<const Selection> selected);
 
-    bool forward_bfloat16_batch(std::span<const ExpertBackendRequest> requests,
+    bool forward_bfloat16_batch(WorkItem& work, std::span<const ExpertBackendRequest> requests,
                                 std::span<const Selection> selected);
 
-    bool forward_qnk_batch(std::span<const ExpertBackendRequest> requests, std::span<const Selection> selected);
+    bool forward_qnk_batch(WorkItem& work, std::span<const ExpertBackendRequest> requests,
+                           std::span<const Selection> selected);
 
     void execute_work_item(const std::shared_ptr<WorkItem>& work);
 
