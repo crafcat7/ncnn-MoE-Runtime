@@ -60,6 +60,10 @@
 #include <sys/sysctl.h>
 #endif
 
+#if !defined(_WIN32)
+#include <sys/resource.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -3541,7 +3545,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             const auto mixed_status = forward_moe(mixed_model,
                                                   mixed_moe,
                                                   mixed_state,
-                                                  mixed_statistics,
+                                                  &mixed_statistics,
                                                   mixed_scratch,
                                                   0,
                                                   ExecutionBackend::Cpu,
@@ -3852,7 +3856,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 ActivationBuffer expected_aggregated(state.normalized.rows(), expert_down.shape[0]);
                 const uint64_t executions_before = block_backend->statistics().executions;
                 const uint64_t aggregations_before = block_backend->statistics().route_aggregation_batches;
-                auto ret = forward_moe(model, moe, state, statistics, scratch, 0, ExecutionBackend::Vulkan, false);
+                auto ret = forward_moe(model, moe, state, &statistics, scratch, 0, ExecutionBackend::Vulkan, false);
                 check(static_cast<bool>(ret));
                 const bool expect_aggregated = aggregate_routes && pass == 2;
                 check(block_backend->statistics().route_aggregation_batches
@@ -6052,7 +6056,7 @@ void test_adaptive_cache_wait_policy()
         state.active_experts().front().batch.routes = {{0, 2, 1.0f}};
         ExpertScratch scratch;
         SessionStatistics statistics;
-        check(static_cast<bool>(forward_moe(model, moe, state, statistics, scratch, 0, ExecutionBackend::Cpu, false)));
+        check(static_cast<bool>(forward_moe(model, moe, state, &statistics, scratch, 0, ExecutionBackend::Cpu, false)));
         check(state.experts_executed);
         check(state.active_experts().front().output.rows() == 1);
         check(state.active_experts().front().output.columns() == 32);
@@ -6145,7 +6149,7 @@ void test_sharded_expert_victim_cache()
     check(static_cast<bool>(!filtered->restore("weak.3", *gate_up, *down)));
 }
 
-void test_mapped_file_range_and_shared_buffer()
+void test_mapped_file_range_and_shared_buffer(bool low_fd = false)
 {
     MxFp4ByteBuffer bytes = {1, 2, 3};
     check(bytes.size() == 3);
@@ -6225,6 +6229,33 @@ void test_mapped_file_range_and_shared_buffer()
         auto missing = MappedFileRange::open(directory / "missing.bin", 0, 1);
         check(!missing);
         check(missing.error().code == ErrorCode::IoError);
+    }
+
+    if (low_fd)
+    {
+        for (size_t index = 0; index < 24; ++index)
+        {
+            auto truncated = MappedFileRange::open(path, file_size - 8, 16);
+            check(!truncated && truncated.error().code == ErrorCode::InvalidModel);
+        }
+
+        std::array<size_t, 32> offsets{};
+        std::vector<std::shared_ptr<const uint8_t>> ranges;
+        ranges.reserve(offsets.size());
+        for (size_t index = 0; index < offsets.size(); ++index)
+        {
+            offsets[index] = 123 + index * 31;
+            auto mapped = MappedFileRange::open(path, offsets[index], 128);
+            check(static_cast<bool>(mapped));
+            auto data = mapped.value()->share_data();
+            mapped.value().reset();
+            ranges.push_back(std::move(data));
+        }
+        for (size_t index = 0; index < ranges.size(); ++index)
+        {
+            check(ranges[index].get()[0] == expected[offsets[index]]);
+            check(ranges[index].get()[127] == expected[offsets[index] + 127]);
+        }
     }
 
     std::error_code ignored;
@@ -6778,6 +6809,332 @@ void test_expert_residency_coordinator()
     check(!coordinator->host_resident("concurrent") && !coordinator->device_resident("concurrent"));
 }
 
+void test_file_backed_qnk_expert_cache()
+{
+    constexpr uint32_t columns = 256;
+    const std::array<DType, 6> dtypes = {
+        DType::Q2K, DType::Q3K, DType::Q4K, DType::Q5K, DType::Q6K, DType::Q8K};
+    const std::filesystem::path directory = create_unique_test_directory("ncnn_moe_qnk_expert_cache_test_");
+    const auto write_file = [](const std::filesystem::path& path, const std::vector<uint8_t>& bytes) {
+        std::ofstream stream(path, std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    const auto append_range = [](std::vector<uint8_t>& bank, size_t size, uint8_t seed) {
+        const uint64_t offset = bank.size();
+        for (size_t index = 0; index < size; ++index)
+            bank.push_back(static_cast<uint8_t>(seed + index * 13));
+        return std::pair<uint64_t, std::vector<uint8_t>>{
+            offset,
+            std::vector<uint8_t>(bank.begin() + static_cast<std::ptrdiff_t>(offset), bank.end())};
+    };
+    const auto file_backed = [columns](DType dtype,
+                                       uint32_t rows,
+                                       const std::filesystem::path& path,
+                                       uint64_t offset,
+                                       uint64_t size,
+                                       uint64_t secondary_offset = 0,
+                                       uint64_t secondary_size = 0) {
+        TensorData tensor;
+        tensor.dtype = dtype;
+        tensor.shape = {rows, columns};
+        tensor.qnk_interleave_rows = false;
+        auto storage = std::make_shared<MxFp4FileStorage>();
+        storage->blocks_path = path.string();
+        storage->blocks_offset = offset;
+        storage->blocks_size = size;
+        if (secondary_size != 0)
+        {
+            storage->secondary_blocks_path = path.string();
+            storage->secondary_blocks_offset = secondary_offset;
+            storage->secondary_blocks_size = secondary_size;
+        }
+        tensor.mxfp4_file_storage = std::move(storage);
+        return tensor;
+    };
+
+    TensorData pinned_gate;
+    TensorData pinned_down;
+    TensorData reload_gate;
+    TensorData reload_down;
+    uint64_t pinned_capacity = 0;
+    uint64_t pinned_raw_size = 0;
+    for (size_t index = 0; index < dtypes.size(); ++index)
+    {
+        const DType gate_dtype = dtypes[index];
+        const DType down_dtype = dtypes[(index + 1) % dtypes.size()];
+        const std::filesystem::path path = directory / ("qnk_" + std::to_string(index) + ".bin");
+        std::vector<uint8_t> bank;
+        const uint64_t gate_half_size = qnk_storage_bytes(gate_dtype, 4, columns);
+        const uint64_t gate_size = qnk_storage_bytes(gate_dtype, 8, columns);
+        const uint64_t down_size = qnk_storage_bytes(down_dtype, 4, columns);
+        auto gate_first = append_range(bank, static_cast<size_t>(gate_half_size), static_cast<uint8_t>(11 + index));
+        auto gate_second = append_range(bank, static_cast<size_t>(gate_half_size), static_cast<uint8_t>(31 + index));
+        auto down_first = append_range(bank, static_cast<size_t>(down_size), static_cast<uint8_t>(51 + index));
+        auto gate_reload = append_range(bank, static_cast<size_t>(gate_size), static_cast<uint8_t>(71 + index));
+        auto down_reload = append_range(bank, static_cast<size_t>(down_size), static_cast<uint8_t>(91 + index));
+        write_file(path, bank);
+
+        TensorData gate = file_backed(gate_dtype, 8, path, gate_first.first, gate_half_size,
+                                      gate_second.first, gate_half_size);
+        TensorData down = file_backed(down_dtype, 4, path, down_first.first, down_size);
+        TensorData gate_next = file_backed(gate_dtype, 8, path, gate_reload.first, gate_size);
+        TensorData down_next = file_backed(down_dtype, 4, path, down_reload.first, down_size);
+        for (uint32_t column = 0; column < columns; ++column)
+            gate.input_column_indices.push_back(columns - column - 1);
+        gate_next.input_column_indices = gate.input_column_indices;
+        down.qnk_interleave_rows = true;
+        down_next.qnk_interleave_rows = true;
+
+        check(gate.quantized_data.empty() && !gate.mapped_data);
+        check(down.quantized_data.empty() && !down.mapped_data);
+        check(ExpertCache::make_pair_key(gate, down) != ExpertCache::make_pair_key(gate_next, down_next));
+        TensorData changed_map = gate;
+        std::swap(changed_map.input_column_indices[0], changed_map.input_column_indices[1]);
+        check(ExpertCache::make_pair_key(gate, down) != ExpertCache::make_pair_key(changed_map, down));
+        const std::string map_bytes(reinterpret_cast<const char*>(gate.input_column_indices.data()),
+                                    gate.input_column_indices.size() * sizeof(uint32_t));
+        check(ExpertCache::make_pair_key(gate, down).find(map_bytes) != std::string::npos);
+        TensorData changed_dtype = gate;
+        changed_dtype.dtype = down_dtype;
+        check(ExpertCache::make_pair_key(gate, down) != ExpertCache::make_pair_key(changed_dtype, down));
+        TensorData changed_secondary = gate;
+        auto changed_storage = std::make_shared<MxFp4FileStorage>(*gate.mxfp4_file_storage);
+        ++changed_storage->secondary_blocks_offset;
+        changed_secondary.mxfp4_file_storage = std::move(changed_storage);
+        check(ExpertCache::make_pair_key(gate, down) != ExpertCache::make_pair_key(changed_secondary, down));
+
+        const uint64_t raw_pair_size = gate_size + down_size;
+        const uint64_t metadata_size = static_cast<uint64_t>(gate.input_column_indices.size()) * sizeof(uint32_t);
+        const uint64_t resident_pair_size = raw_pair_size + metadata_size * 2;
+        for (const ExpertIoMode mode : {ExpertIoMode::Buffered, ExpertIoMode::Mmap, ExpertIoMode::Direct})
+        {
+            ExpertCache cache(resident_pair_size, 1, {}, mode);
+            auto pair = cache.acquire_pair(gate, down);
+            check(static_cast<bool>(pair));
+            const auto gate_values = pair.value().gate_up->qnk_values();
+            const auto down_values = pair.value().down->qnk_values();
+            check(gate_values.size() == gate_size);
+            check(down_values.size() == down_size);
+            check(std::equal(gate_first.second.begin(), gate_first.second.end(), gate_values.begin()));
+            check(std::equal(gate_second.second.begin(), gate_second.second.end(), gate_values.begin() + gate_first.second.size()));
+            check(std::equal(down_first.second.begin(), down_first.second.end(), down_values.begin()));
+            check(pair.value().gate_up->dtype == gate_dtype && pair.value().down->dtype == down_dtype);
+            check(pair.value().gate_up->qnk_interleave_rows == gate.qnk_interleave_rows);
+            check(pair.value().down->qnk_interleave_rows == down.qnk_interleave_rows);
+            check(pair.value().gate_up->input_column_indices == gate.input_column_indices);
+            check(pair.value().gate_up->quantized_data.empty() && pair.value().gate_up->mapped_data);
+            check(pair.value().down->quantized_data.empty() && pair.value().down->mapped_data);
+            const ExpertCacheStatistics stats = cache.statistics();
+            check(stats.bytes_read == raw_pair_size);
+            check(stats.resident_size == resident_pair_size);
+            check(stats.mapped_ranges <= 1);
+            check(stats.mapped_bytes + stats.buffered_read_bytes + stats.direct_read_bytes == raw_pair_size);
+        }
+
+        if (gate_dtype == DType::Q4K)
+        {
+            TensorData mxfp4_gate = gate;
+            mxfp4_gate.dtype = DType::MxFp4;
+            ExpertCache mixed_gate_cache(1024 * 1024, 1, {}, ExpertIoMode::Buffered);
+            auto rejected_mixed_gate = mixed_gate_cache.request_pair(mxfp4_gate, down);
+            check(!rejected_mixed_gate && rejected_mixed_gate.error().code == ErrorCode::InvalidArgument);
+            check(mixed_gate_cache.statistics().bytes_read == 0);
+
+            TensorData mxfp4_down = down;
+            mxfp4_down.dtype = DType::MxFp4;
+            ExpertCache mixed_down_cache(1024 * 1024, 1, {}, ExpertIoMode::Buffered);
+            auto rejected_mixed_down = mixed_down_cache.request_pair(gate, mxfp4_down);
+            check(!rejected_mixed_down && rejected_mixed_down.error().code == ErrorCode::InvalidArgument);
+            check(mixed_down_cache.statistics().bytes_read == 0);
+
+            pinned_gate = gate;
+            pinned_down = down;
+            reload_gate = gate_next;
+            reload_down = down_next;
+            pinned_capacity = resident_pair_size;
+            pinned_raw_size = raw_pair_size;
+
+            ExpertCache coalescing_cache(resident_pair_size * 2,
+                                         1,
+                                         {},
+                                         ExpertIoMode::Buffered,
+                                         ExpertCacheCrossExpertReadCoalescing);
+            const std::string gate_key = ExpertCache::make_pair_key(gate, down);
+            const std::string reload_key = ExpertCache::make_pair_key(gate_next, down_next);
+            const std::array<ExpertCachePairRequest, 2> batch = {{
+                {&gate, &down, 0, gate_key},
+                {&gate_next, &down_next, 0, reload_key},
+            }};
+            auto queued = coalescing_cache.request_pairs(batch);
+            check(queued && queued.value() == batch.size());
+            coalescing_cache.wait_for_background_work();
+            auto first_loaded = coalescing_cache.acquire_pair(gate, down);
+            auto second_loaded = coalescing_cache.acquire_pair(gate_next, down_next);
+            check(first_loaded && second_loaded);
+            check(first_loaded.value().gate_up->qnk_values().front() == gate_first.second.front());
+            check(second_loaded.value().gate_up->qnk_values().front() == gate_reload.second.front());
+            check(coalescing_cache.statistics().bytes_read == raw_pair_size * 2);
+            check(coalescing_cache.statistics().coalesced_read_batches == 0);
+        }
+    }
+
+    {
+        ExpertCache pin_cache(pinned_capacity, 1, {}, ExpertIoMode::Buffered);
+        auto first = pin_cache.acquire_pair(pinned_gate, pinned_down);
+        check(static_cast<bool>(first));
+        std::shared_ptr<const TensorData> retained = first.value().gate_up;
+        first.value() = {};
+        const std::string reload_key = ExpertCache::make_pair_key(reload_gate, reload_down);
+        const std::array<ExpertCachePairRequest, 1> reload_request = {{
+            {&reload_gate, &reload_down, 0, reload_key},
+        }};
+        std::array<ExpertCacheLease, 1> reload_lease;
+        auto blocked = pin_cache.wait_acquire_ready_pairs(reload_request, reload_lease, true, 1, true, false);
+        check(blocked && blocked.value() == 0);
+        check(retained && retained->qnk_values().size() == qnk_storage_bytes(DType::Q4K, 8, columns));
+        retained.reset();
+        auto reloaded = pin_cache.wait_acquire_ready_pairs(reload_request, reload_lease);
+        check(reloaded && reloaded.value() == 1);
+        check(reload_lease[0].gate_up->qnk_values().front() == 71 + 2);
+        reload_lease[0] = {};
+        auto restored = pin_cache.acquire_pair(pinned_gate, pinned_down);
+        check(static_cast<bool>(restored));
+        check(restored.value().gate_up->qnk_values().front() == 11 + 2);
+        const ExpertCacheStatistics pin_stats = pin_cache.statistics();
+        check(pin_stats.bytes_read == pinned_raw_size * 3);
+        check(pin_stats.resident_size == pinned_capacity);
+        check(pin_stats.evictions == 2);
+
+        const uint64_t raw_size = qnk_storage_bytes(DType::Q4K, 8, columns)
+                                  + qnk_storage_bytes(DType::Q5K, 4, columns);
+        const uint64_t metadata_size = static_cast<uint64_t>(pinned_gate.input_column_indices.size()) * sizeof(uint32_t);
+        const uint64_t packed_size = qnk_packed_storage_bytes(DType::Q4K, 8, columns)
+                                     + qnk_packed_storage_bytes(DType::Q5K, 4, columns);
+        const uint64_t reserved_size = raw_size + metadata_size * 2 + packed_size;
+        ExpertCache packed_too_small(reserved_size - 1, 1, {}, ExpertIoMode::Buffered, 0, 1, true);
+        auto rejected_packed = packed_too_small.acquire_pair(pinned_gate, pinned_down);
+        check(!rejected_packed && rejected_packed.error().code == ErrorCode::InvalidArgument);
+        check(packed_too_small.statistics().bytes_read == 0);
+        ExpertCache packed_exact(reserved_size, 1, {}, ExpertIoMode::Buffered, 0, 1, true);
+        auto packed = packed_exact.acquire_pair(pinned_gate, pinned_down);
+        check(static_cast<bool>(packed));
+        check(packed_exact.statistics().resident_size == reserved_size);
+        check(packed_exact.statistics().bytes_read == raw_size);
+
+        const auto expect_invalid = [&](const TensorData& gate) {
+            ExpertCache cache(1024 * 1024, 1, {}, ExpertIoMode::Buffered);
+            auto request = cache.request_pair(gate, pinned_down);
+            check(!request && request.error().code == ErrorCode::InvalidModel);
+            check(cache.statistics().bytes_read == 0);
+        };
+        TensorData invalid = pinned_gate;
+        invalid.quantized_data.push_back(1);
+        expect_invalid(invalid);
+        invalid = pinned_gate;
+        auto invalid_storage = std::make_shared<MxFp4FileStorage>(*pinned_gate.mxfp4_file_storage);
+        invalid_storage->scales_path = "unexpected-scale-range";
+        invalid_storage->scales_size = 1;
+        invalid.mxfp4_file_storage = std::move(invalid_storage);
+        expect_invalid(invalid);
+        invalid = pinned_gate;
+        invalid_storage = std::make_shared<MxFp4FileStorage>(*pinned_gate.mxfp4_file_storage);
+        invalid_storage->blocks_offset = std::numeric_limits<uint64_t>::max() - invalid_storage->blocks_size + 1;
+        invalid.mxfp4_file_storage = std::move(invalid_storage);
+        expect_invalid(invalid);
+        invalid = pinned_gate;
+        invalid_storage = std::make_shared<MxFp4FileStorage>(*pinned_gate.mxfp4_file_storage);
+        --invalid_storage->secondary_blocks_size;
+        invalid.mxfp4_file_storage = std::move(invalid_storage);
+        expect_invalid(invalid);
+        invalid = pinned_gate;
+        invalid.input_column_indices[1] = invalid.input_column_indices[0];
+        expect_invalid(invalid);
+        invalid = pinned_gate;
+        invalid.quantization_scales.push_back(1.0f);
+        expect_invalid(invalid);
+
+        const std::filesystem::path missing_path = directory / "missing.bin";
+        invalid = pinned_gate;
+        invalid_storage = std::make_shared<MxFp4FileStorage>(*pinned_gate.mxfp4_file_storage);
+        invalid_storage->blocks_path = missing_path.string();
+        invalid.mxfp4_file_storage = std::move(invalid_storage);
+        ExpertCache missing_cache(1024 * 1024, 1, {}, ExpertIoMode::Buffered);
+        auto missing = missing_cache.acquire_pair(invalid, pinned_down);
+        check(!missing && missing.error().code == ErrorCode::IoError);
+
+        const std::filesystem::path truncated_path = directory / "truncated.bin";
+        write_file(truncated_path, {1});
+        invalid = pinned_gate;
+        invalid_storage = std::make_shared<MxFp4FileStorage>(*pinned_gate.mxfp4_file_storage);
+        invalid_storage->blocks_path = truncated_path.string();
+        invalid.mxfp4_file_storage = std::move(invalid_storage);
+        ExpertCache truncated_cache(1024 * 1024, 1, {}, ExpertIoMode::Buffered);
+        auto truncated = truncated_cache.acquire_pair(invalid, pinned_down);
+        check(!truncated && truncated.error().code == ErrorCode::IoError);
+    }
+
+    {
+        constexpr size_t entry_count = 96;
+        ExpertCache rehash_cache(pinned_capacity * entry_count, 1, {}, ExpertIoMode::Buffered);
+        for (size_t index = 0; index < entry_count; ++index)
+        {
+            std::string prepared_key = "qnk-rehash-" + std::to_string(index) + std::string(64, 'k');
+            auto queued = rehash_cache.request_pair(pinned_gate, pinned_down, 0, prepared_key);
+            check(queued && !queued.value());
+            prepared_key.assign(prepared_key.size(), 'x');
+        }
+        rehash_cache.wait_for_background_work();
+        for (size_t index = 0; index < entry_count; ++index)
+        {
+            const std::string prepared_key = "qnk-rehash-" + std::to_string(index) + std::string(64, 'k');
+            auto hit = rehash_cache.acquire_pair(pinned_gate, pinned_down, 0, prepared_key);
+            check(hit && hit.value().gate_up->qnk_values().front() == 11 + 2);
+        }
+        const ExpertCacheStatistics rehash_stats = rehash_cache.statistics();
+        check(rehash_stats.misses == entry_count);
+        check(rehash_stats.bytes_read == pinned_raw_size * entry_count);
+        check(rehash_stats.resident_size == pinned_capacity * entry_count);
+        check(rehash_stats.evictions == 0);
+    }
+
+    {
+        ExpertCache reinsert_cache(pinned_capacity, 1, {}, ExpertIoMode::Buffered);
+        const std::string reused_key = "qnk-reinsert";
+        auto original = reinsert_cache.acquire_pair(pinned_gate, pinned_down, 0, reused_key);
+        check(original && original.value().gate_up->qnk_values().front() == 11 + 2);
+        original.value() = {};
+
+        const std::string other_key = "qnk-evict";
+        auto other = reinsert_cache.acquire_pair(reload_gate, reload_down, 0, other_key);
+        check(other && other.value().gate_up->qnk_values().front() == 71 + 2);
+        other.value() = {};
+
+        const std::string reinserted_key = "qnk-reinsert";
+        auto reinserted = reinsert_cache.acquire_pair(pinned_gate, pinned_down, 0, reinserted_key);
+        check(reinserted && reinserted.value().gate_up->qnk_values().front() == 11 + 2);
+        check(reinsert_cache.statistics().evictions == 2);
+    }
+
+    {
+        ExpertCacheLease retained;
+        {
+            ExpertCache temporary_cache(pinned_capacity, 1, {}, ExpertIoMode::Buffered);
+            std::string prepared_key = "qnk-cache-owner-gone";
+            auto acquired = temporary_cache.acquire_pair(pinned_gate, pinned_down, 0, prepared_key);
+            check(static_cast<bool>(acquired));
+            retained = std::move(acquired).value();
+            prepared_key.assign(prepared_key.size(), 'x');
+        }
+        check(retained.gate_up && retained.down);
+        check(retained.gate_up->qnk_values().front() == 11 + 2);
+        check(retained.down->qnk_values().front() == 51 + 2);
+        check(retained.gate_up_operator && retained.down_operator);
+    }
+
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
 void test_file_backed_mxfp4_expert_cache()
 {
     const VulkanRuntimePtr vulkan_runtime = create_vulkan_runtime();
@@ -6871,6 +7228,80 @@ void test_file_backed_mxfp4_expert_cache()
     check(static_cast<bool>(statistics.mapped_bytes == statistics.bytes_read));
     check(static_cast<bool>(statistics.num_io_threads > 0));
 
+    enum class LeaseAcquirePath
+    {
+        Acquire,
+        TryReady,
+        WaitReady
+    };
+    const auto check_single_payload_pin = [&](LeaseAcquirePath path, bool keep_gate_up) {
+        ExpertCache pin_cache(34, 1, {}, ExpertIoMode::Buffered);
+        const std::array<ExpertCachePairRequest, 1> first_request = {{
+            {&gate_zero, &down_zero, 0, "lease-pin-zero"},
+        }};
+        const std::array<ExpertCachePairRequest, 1> second_request = {{
+            {&gate_one, &down_one, 0, "lease-pin-one"},
+        }};
+        ExpertCacheLease lease;
+        if (path == LeaseAcquirePath::Acquire)
+        {
+            auto acquired = pin_cache.acquire_pair(gate_zero, down_zero, 0, first_request[0].prepared_key);
+            check(static_cast<bool>(acquired));
+            lease = std::move(acquired).value();
+        }
+        else if (path == LeaseAcquirePath::TryReady)
+        {
+            {
+                auto warmed = pin_cache.acquire_pair(gate_zero, down_zero, 0, first_request[0].prepared_key);
+                check(static_cast<bool>(warmed));
+            }
+            auto acquired = pin_cache.try_acquire_ready_pairs(first_request, std::span<ExpertCacheLease>(&lease, 1));
+            check(acquired && acquired.value());
+        }
+        else
+        {
+            auto acquired = pin_cache.wait_acquire_ready_pairs(first_request, std::span<ExpertCacheLease>(&lease, 1));
+            check(acquired && acquired.value() == 1);
+        }
+
+        check(lease.gate_up && lease.down);
+        check(lease.gate_up->mxfp4_blocks.front() == 0);
+        check(lease.gate_up->mxfp4_scales.front() == 101);
+        check(lease.down->mxfp4_blocks.front() == 16);
+        check(lease.down->mxfp4_scales.front() == 102);
+        check(lease.gate_up_operator && lease.down_operator);
+        std::shared_ptr<const TensorData> retained = keep_gate_up ? lease.gate_up : lease.down;
+        lease = {};
+        check(static_cast<bool>(retained));
+        check(retained->mxfp4_blocks.front() == (keep_gate_up ? 0 : 16));
+        check(retained->mxfp4_scales.front() == (keep_gate_up ? 101 : 102));
+
+        std::array<ExpertCacheLease, 1> next_lease;
+        auto blocked = pin_cache.wait_acquire_ready_pairs(second_request, next_lease, true, 1, true, false);
+        check(blocked && blocked.value() == 0);
+        check(!next_lease[0].gate_up && !next_lease[0].down);
+        check(pin_cache.statistics().queued_reads == 1);
+        retained.reset();
+
+        auto admitted = pin_cache.wait_acquire_ready_pairs(second_request, next_lease);
+        check(admitted && admitted.value() == 1);
+        check(next_lease[0].gate_up->mxfp4_blocks.front() == 32);
+        check(next_lease[0].gate_up->mxfp4_scales.front() == 103);
+        check(next_lease[0].down->mxfp4_blocks.front() == 48);
+        check(next_lease[0].down->mxfp4_scales.front() == 104);
+        const ExpertCacheStatistics pin_statistics = pin_cache.statistics();
+        check(pin_statistics.bytes_read == 68);
+        check(pin_statistics.resident_size == 34);
+        check(pin_statistics.evictions == 1);
+    };
+    for (const LeaseAcquirePath path : {LeaseAcquirePath::Acquire,
+                                        LeaseAcquirePath::TryReady,
+                                        LeaseAcquirePath::WaitReady})
+    {
+        check_single_payload_pin(path, true);
+        check_single_payload_pin(path, false);
+    }
+
     ExpertCacheLease retained_lease;
     {
         ExpertCache pin_cache(34, 1, {}, ExpertIoMode::Buffered);
@@ -6936,24 +7367,24 @@ void test_file_backed_mxfp4_expert_cache()
         std::ofstream stream(coalesced_path, std::ios::binary);
         stream.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     }
-    auto coalesced_tensor = [&](uint64_t block_offset, uint64_t scale_offset) {
+    auto coalesced_tensor = [](const std::filesystem::path& path, uint64_t block_offset, uint64_t scale_offset) {
         TensorData tensor;
         tensor.dtype = DType::MxFp4;
         tensor.shape = {1, 32};
         auto storage = std::make_shared<MxFp4FileStorage>();
-        storage->blocks_path = coalesced_path.string();
+        storage->blocks_path = path.string();
         storage->blocks_offset = block_offset;
         storage->blocks_size = 16;
-        storage->scales_path = coalesced_path.string();
+        storage->scales_path = path.string();
         storage->scales_offset = scale_offset;
         storage->scales_size = 1;
         tensor.mxfp4_file_storage = std::move(storage);
         return tensor;
     };
-    const TensorData coalesced_gate_zero = coalesced_tensor(0, 16);
-    const TensorData coalesced_down_zero = coalesced_tensor(17, 33);
-    const TensorData coalesced_gate_one = coalesced_tensor(34, 50);
-    const TensorData coalesced_down_one = coalesced_tensor(51, 67);
+    const TensorData coalesced_gate_zero = coalesced_tensor(coalesced_path, 0, 16);
+    const TensorData coalesced_down_zero = coalesced_tensor(coalesced_path, 17, 33);
+    const TensorData coalesced_gate_one = coalesced_tensor(coalesced_path, 34, 50);
+    const TensorData coalesced_down_one = coalesced_tensor(coalesced_path, 51, 67);
     auto coalescing_victim = std::make_shared<TestExpertVictimCache>(34);
     coalescing_victim->admit("coalescing-dummy",
                              dummy_gate,
@@ -7004,6 +7435,153 @@ void test_file_backed_mxfp4_expert_cache()
           == coalesced_zero.value().down->mxfp4_scales.data());
     check(coalesced_zero.value().gate_up->mxfp4_blocks.data()
           != coalesced_one.value().gate_up->mxfp4_blocks.data());
+
+    constexpr size_t coalesced_many_count = 8;
+    constexpr size_t coalesced_many_pair_size = 34;
+    const std::filesystem::path coalesced_many_path = directory / "coalesced_many.bin";
+    {
+        std::vector<uint8_t> bytes(coalesced_many_count * coalesced_many_pair_size);
+        for (size_t index = 0; index < bytes.size(); ++index)
+            bytes[index] = static_cast<uint8_t>(index);
+        std::ofstream stream(coalesced_many_path, std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    std::array<TensorData, coalesced_many_count> coalesced_many_gates;
+    std::array<TensorData, coalesced_many_count> coalesced_many_downs;
+    std::array<std::string, coalesced_many_count> coalesced_many_keys;
+    std::array<ExpertCachePairRequest, coalesced_many_count> coalesced_many_requests{};
+    for (size_t index = 0; index < coalesced_many_count; ++index)
+    {
+        const uint64_t offset = index * coalesced_many_pair_size;
+        coalesced_many_gates[index] = coalesced_tensor(coalesced_many_path, offset, offset + 16);
+        coalesced_many_downs[index] = coalesced_tensor(coalesced_many_path, offset + 17, offset + 33);
+        coalesced_many_keys[index] = "coalesced-many-" + std::to_string(index);
+        coalesced_many_requests[index] = {&coalesced_many_gates[index],
+                                          &coalesced_many_downs[index],
+                                          0,
+                                          coalesced_many_keys[index],
+                                          {}};
+    }
+    auto coalesced_many_victim = std::make_shared<TestExpertVictimCache>(34);
+    coalesced_many_victim->admit("coalesced-many-dummy", dummy_gate, dummy_down, {});
+    coalesced_many_victim->block_restore("coalesced-many-dummy");
+    constexpr uint64_t coalesced_many_capacity = coalesced_many_count * coalesced_many_pair_size + 34;
+    ExpertCache coalesced_many_cache(coalesced_many_capacity,
+                                     1,
+                                     coalesced_many_victim,
+                                     ExpertIoMode::Buffered,
+                                     ExpertCacheCrossExpertReadCoalescing);
+    auto coalesced_many_dummy = coalesced_many_cache.request_pair(coalesced_many_gates[0],
+                                                                  coalesced_many_downs[0],
+                                                                  0,
+                                                                  "coalesced-many-dummy");
+    const bool coalesced_many_dummy_queued = static_cast<bool>(coalesced_many_dummy && !coalesced_many_dummy.value());
+    const bool coalesced_many_restore_entered = coalesced_many_dummy_queued
+                                                    ? coalesced_many_victim->wait_for_blocked_restore()
+                                                    : false;
+    auto coalesced_many_queued = coalesced_many_cache.request_pairs(coalesced_many_requests);
+    coalesced_many_victim->release_blocked_restore();
+    check(coalesced_many_dummy_queued);
+    check(coalesced_many_restore_entered);
+    check(static_cast<bool>(coalesced_many_queued && coalesced_many_queued.value() == coalesced_many_count));
+    coalesced_many_cache.wait_for_background_work();
+    std::array<ExpertCacheLease, coalesced_many_count> coalesced_many_leases;
+    std::array<const uint8_t*, coalesced_many_count> coalesced_many_buffers{};
+    for (size_t index = 0; index < coalesced_many_count; ++index)
+    {
+        auto acquired = coalesced_many_cache.acquire_pair(coalesced_many_gates[index],
+                                                          coalesced_many_downs[index],
+                                                          0,
+                                                          coalesced_many_keys[index]);
+        check(static_cast<bool>(acquired));
+        coalesced_many_leases[index] = std::move(acquired).value();
+        const ExpertCacheLease& lease = coalesced_many_leases[index];
+        const size_t offset = index * coalesced_many_pair_size;
+        check(lease.gate_up->mxfp4_blocks.front() == static_cast<uint8_t>(offset));
+        check(lease.gate_up->mxfp4_scales.front() == static_cast<uint8_t>(offset + 16));
+        check(lease.down->mxfp4_blocks.front() == static_cast<uint8_t>(offset + 17));
+        check(lease.down->mxfp4_scales.front() == static_cast<uint8_t>(offset + 33));
+        check(lease.gate_up->mxfp4_blocks.data() + 16 == lease.gate_up->mxfp4_scales.data());
+        check(lease.gate_up->mxfp4_scales.data() + 1 == lease.down->mxfp4_blocks.data());
+        check(lease.down->mxfp4_blocks.data() + 16 == lease.down->mxfp4_scales.data());
+        coalesced_many_buffers[index] = lease.gate_up->mxfp4_blocks.data();
+        for (size_t previous = 0; previous < index; ++previous)
+            check(coalesced_many_buffers[previous] != coalesced_many_buffers[index]);
+    }
+    const ExpertCacheStatistics coalesced_many_statistics = coalesced_many_cache.statistics();
+    check(coalesced_many_statistics.buffered_read_ranges == 1);
+    check(coalesced_many_statistics.buffered_read_bytes == coalesced_many_count * coalesced_many_pair_size);
+    check(coalesced_many_statistics.coalesced_read_batches == 1);
+    check(coalesced_many_statistics.coalesced_experts == coalesced_many_count);
+    check(coalesced_many_statistics.coalesced_read_ranges_saved == coalesced_many_count - 1);
+    check(coalesced_many_statistics.resident_size == coalesced_many_capacity);
+    check(coalesced_many_statistics.resident_size - 34 == coalesced_many_count * coalesced_many_pair_size);
+
+    const std::filesystem::path coalesced_truncated_path = directory / "coalesced_truncated.bin";
+    {
+        std::vector<uint8_t> bytes(17, 0x5a);
+        std::ofstream stream(coalesced_truncated_path, std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    std::array<TensorData, coalesced_many_count> coalesced_truncated_gates;
+    std::array<TensorData, coalesced_many_count> coalesced_truncated_downs;
+    std::array<std::string, coalesced_many_count> coalesced_truncated_keys;
+    std::array<ExpertCachePairRequest, coalesced_many_count> coalesced_truncated_requests{};
+    for (size_t index = 0; index < coalesced_many_count; ++index)
+    {
+        const uint64_t offset = index * coalesced_many_pair_size;
+        coalesced_truncated_gates[index] = coalesced_tensor(coalesced_truncated_path, offset, offset + 16);
+        coalesced_truncated_downs[index] = coalesced_tensor(coalesced_truncated_path, offset + 17, offset + 33);
+        coalesced_truncated_keys[index] = "coalesced-truncated-" + std::to_string(index);
+        coalesced_truncated_requests[index] = {&coalesced_truncated_gates[index],
+                                               &coalesced_truncated_downs[index],
+                                               0,
+                                               coalesced_truncated_keys[index],
+                                               {}};
+    }
+    auto coalesced_truncated_victim = std::make_shared<TestExpertVictimCache>(34);
+    coalesced_truncated_victim->admit("coalesced-truncated-dummy", dummy_gate, dummy_down, {});
+    coalesced_truncated_victim->block_restore("coalesced-truncated-dummy");
+    ExpertCache coalesced_truncated_cache(coalesced_many_capacity,
+                                          1,
+                                          coalesced_truncated_victim,
+                                          ExpertIoMode::Buffered,
+                                          ExpertCacheCrossExpertReadCoalescing);
+    auto coalesced_truncated_dummy = coalesced_truncated_cache.request_pair(coalesced_truncated_gates[0],
+                                                                            coalesced_truncated_downs[0],
+                                                                            0,
+                                                                            "coalesced-truncated-dummy");
+    const bool coalesced_truncated_dummy_queued = static_cast<bool>(coalesced_truncated_dummy
+                                                                    && !coalesced_truncated_dummy.value());
+    const bool coalesced_truncated_restore_entered = coalesced_truncated_dummy_queued
+                                                         ? coalesced_truncated_victim->wait_for_blocked_restore()
+                                                         : false;
+    // The restored sentinel remains resident when the following disk batch fails.
+    const uint64_t coalesced_truncated_baseline_size = 34;
+    auto coalesced_truncated_queued = coalesced_truncated_cache.request_pairs(coalesced_truncated_requests);
+    coalesced_truncated_victim->release_blocked_restore();
+    check(coalesced_truncated_dummy_queued);
+    check(coalesced_truncated_restore_entered);
+    check(static_cast<bool>(coalesced_truncated_queued
+                            && coalesced_truncated_queued.value() == coalesced_many_count));
+    coalesced_truncated_cache.wait_for_background_work();
+    const ExpertCacheStatistics coalesced_truncated_statistics = coalesced_truncated_cache.statistics();
+    check(coalesced_truncated_statistics.resident_size == coalesced_truncated_baseline_size);
+    check(coalesced_truncated_statistics.buffered_read_ranges == 0);
+    check(coalesced_truncated_statistics.buffered_read_bytes == 0);
+    check(coalesced_truncated_statistics.bytes_read == 0);
+    check(coalesced_truncated_statistics.coalesced_read_batches == 1);
+    for (size_t index = 0; index < coalesced_many_count; ++index)
+        check(!coalesced_truncated_cache.is_ready(coalesced_truncated_gates[index],
+                                                  coalesced_truncated_downs[index],
+                                                  coalesced_truncated_keys[index]));
+    auto coalesced_truncated_failure = coalesced_truncated_cache.acquire_pair(coalesced_truncated_gates[0],
+                                                                              coalesced_truncated_downs[0],
+                                                                              0,
+                                                                              coalesced_truncated_keys[0]);
+    check(!coalesced_truncated_failure);
+    check(coalesced_truncated_failure.error().code == ErrorCode::IoError);
+    check(coalesced_truncated_cache.statistics().resident_size == coalesced_truncated_baseline_size);
 
     const std::filesystem::path interleaved_coalesced_path = directory / "interleaved_coalesced.bin";
     {
@@ -10696,7 +11274,18 @@ void test_shared_expert_descriptor()
     std::array<SessionStatistics, 3> staged_statistics;
     std::array<std::vector<float>, 3> staged_logits;
     BatchWorkspace shared_batch_workspace;
+    check(!has_flag(nonzero_shared_model.opt.flags, OptionRankAdaptivePrefetch));
     auto check_staged_batch = [&](std::span<const DecodeBatchEntry> entries) {
+        std::array<uint64_t, 3> expert_batches_before{};
+        std::array<std::array<uint64_t, maximum_expert_route_ranks>, 3> rank_demands_before{};
+        std::array<std::array<uint64_t, maximum_expert_route_ranks>, 3> queue_times_before{};
+        for (size_t session_index = 0; session_index < entries.size(); ++session_index)
+        {
+            const SessionStatistics& statistics = *entries[session_index].statistics;
+            expert_batches_before[session_index] = statistics.expert_batches;
+            rank_demands_before[session_index] = statistics.expert_route_rank_demands;
+            queue_times_before[session_index] = statistics.expert_route_rank_demand_queue_time_microseconds;
+        }
         auto staged_status = forward_decode_batch(nonzero_shared_model, entries, shared_batch_workspace);
         check(static_cast<bool>(staged_status));
         for (size_t session_index = 0; session_index < entries.size(); ++session_index)
@@ -10712,6 +11301,17 @@ void test_shared_expert_descriptor()
             check(entries[session_index].logits->size() == reference_state.logits.columns());
             for (size_t column = 0; column < reference_state.logits.columns(); ++column)
                 check_near((*entries[session_index].logits)[column], reference_state.logits.row(0)[column], 1e-5f);
+            const SessionStatistics& actual_statistics = *entries[session_index].statistics;
+            check(actual_statistics.expert_batches - expert_batches_before[session_index]
+                  == reference_statistics.expert_batches);
+            for (size_t rank = 0; rank < maximum_expert_route_ranks; ++rank)
+            {
+                check(actual_statistics.expert_route_rank_demands[rank]
+                          - rank_demands_before[session_index][rank]
+                      == reference_statistics.expert_route_rank_demands[rank]);
+                check(actual_statistics.expert_route_rank_demand_queue_time_microseconds[rank]
+                      == queue_times_before[session_index][rank]);
+            }
             check(entries[session_index].state->execution_state.shared_expert_output.rows() == 0);
         }
     };
@@ -17662,6 +18262,94 @@ void test_automatic_expert_memory_planning()
     invalid = plan_model_memory(large, oversized_cache, physical_memory);
     check(static_cast<bool>(!invalid));
     check(static_cast<bool>(invalid.error().code == ErrorCode::InvalidArgument));
+
+    MoeModelDescriptor native = gpt_oss_memory_descriptor(1, 2);
+    native.hidden_size = 256;
+    native.intermediate_size = 256;
+    native.experts_per_token = 1;
+    native.layers.front().moe.intermediate_size = 256;
+    native.layers.front().moe.top_k = 1;
+    native.layers.front().moe.layout = ExpertLayout::GateUpDown;
+    native.layers.front().moe.expert_weight_dtype = DType::Q4K;
+    const uint64_t gate_size = qnk_storage_bytes(DType::Q4K, 256, 256);
+    const uint64_t down_size = qnk_storage_bytes(DType::Q6K, 256, 256);
+    const uint64_t raw_pair_size = gate_size * 2 + down_size;
+    const uint64_t map_pair_size = uint64_t{3} * 256 * sizeof(uint32_t);
+    const uint64_t bias_pair_size = uint64_t{3} * 256 * sizeof(uint16_t);
+    const uint64_t resident_pair_size = raw_pair_size + map_pair_size * 2;
+    const uint64_t fixed_size = 8 * sizeof(float) + 2 * (map_pair_size + bias_pair_size);
+    WeightMapping native_weights;
+    TensorData dense;
+    dense.dtype = DType::Float32;
+    dense.shape = {8};
+    dense.float32_data.assign(8, 1.0f);
+    native_weights.emplace("embedding.weight", std::move(dense));
+    uint64_t offset = 0;
+    for (uint32_t expert_id = 0; expert_id < 2; ++expert_id)
+    {
+        const std::string prefix = "layers.0.experts." + std::to_string(expert_id) + ".";
+        for (const char* projection : {"gate", "up", "down"})
+        {
+            TensorData weight;
+            weight.dtype = std::string_view(projection) == "down" ? DType::Q6K : DType::Q4K;
+            weight.shape = {256, 256};
+            weight.input_column_indices.resize(256);
+            for (uint32_t column = 0; column < 256; ++column)
+                weight.input_column_indices[column] = 255 - column;
+            auto storage = std::make_shared<MxFp4FileStorage>();
+            storage->blocks_path = "memory-plan-qnk.bin";
+            storage->blocks_offset = offset;
+            storage->blocks_size = qnk_storage_bytes(weight.dtype, 256, 256);
+            offset += storage->blocks_size;
+            weight.mxfp4_file_storage = std::move(storage);
+            native_weights.emplace(prefix + projection + ".weight", std::move(weight));
+            TensorData bias;
+            bias.dtype = DType::BFloat16;
+            bias.shape = {256};
+            bias.bfloat16_data.assign(256, 0);
+            native_weights.emplace(prefix + projection + ".bias", std::move(bias));
+        }
+    }
+
+    Option native_options;
+    native_options.expert_memory_mode = ExpertMemoryMode::OnDemand;
+    native_options.expert_cache_size = resident_pair_size;
+    native_options.host_memory_budget = 2 * gibibyte + fixed_size + resident_pair_size;
+    auto native_plan = plan_model_memory(native, native_options, 4 * gibibyte, false, 0, false, &native_weights);
+    check(static_cast<bool>(native_plan));
+    check(native_plan.value().selected_mode == ExpertMemoryMode::OnDemand);
+    check(native_plan.value().estimated_dense_size == fixed_size);
+    check(native_plan.value().expert_pair_resident_size == resident_pair_size);
+    check(native_plan.value().minimum_active_expert_size == resident_pair_size);
+    check(native_plan.value().expert_cache_size == resident_pair_size);
+
+    Option short_cache = native_options;
+    --short_cache.expert_cache_size;
+    auto short_cache_plan = plan_model_memory(native, short_cache, 4 * gibibyte, false, 0, false, &native_weights);
+    check(!short_cache_plan && short_cache_plan.error().code == ErrorCode::InvalidArgument);
+    Option short_budget = native_options;
+    --short_budget.host_memory_budget;
+    auto short_budget_plan = plan_model_memory(native, short_budget, 4 * gibibyte, false, 0, false, &native_weights);
+    check(!short_budget_plan && short_budget_plan.error().code == ErrorCode::InvalidArgument);
+
+    native.layers.front().moe.expert_weight_dtype = DType::BFloat16;
+    auto representative_plan = plan_model_memory(native, native_options, 4 * gibibyte, false, 0, false, &native_weights);
+    check(static_cast<bool>(representative_plan));
+    check(representative_plan.value().selected_mode == ExpertMemoryMode::OnDemand);
+    check(representative_plan.value().estimated_dense_size == fixed_size);
+    check(representative_plan.value().expert_pair_resident_size == resident_pair_size);
+
+    TensorData& resident_gate = native_weights.at("layers.0.experts.0.gate.weight");
+    resident_gate.mxfp4_file_storage.reset();
+    resident_gate.quantized_data.resize(static_cast<size_t>(gate_size));
+    auto incomplete_plan = plan_model_memory(native, native_options, 4 * gibibyte, false, 0, false, &native_weights);
+    check(!incomplete_plan && incomplete_plan.error().code == ErrorCode::UnsupportedModel);
+    native_options.expert_memory_mode = ExpertMemoryMode::Auto;
+    native_options.expert_cache_size = 0;
+    native_options.host_memory_budget = 3 * gibibyte;
+    auto native_eager_plan = plan_model_memory(native, native_options, 4 * gibibyte, false, 0, false, &native_weights);
+    check(static_cast<bool>(native_eager_plan));
+    check(native_eager_plan.value().selected_mode == ExpertMemoryMode::Eager);
 }
 
 void test_sampling_and_streaming_generation()
@@ -20216,7 +20904,7 @@ void test_dense_expert_thread_budget()
                     const bool prefetch = !grouped_bfloat16_case
                                           && threads == 1
                                           && token_count == 1;
-                    check(static_cast<bool>(forward_moe(model, moe, state, statistics, scratch, 0, ExecutionBackend::Cpu, prefetch)));
+                    check(static_cast<bool>(forward_moe(model, moe, state, &statistics, scratch, 0, ExecutionBackend::Cpu, prefetch)));
                     check(state.experts_executed);
                     check(scratch.decode_tasks.empty());
                     check(scratch.backend_executed.empty());
@@ -20286,7 +20974,7 @@ void test_dense_expert_thread_budget()
                     const auto status = forward_moe(model,
                                                     moe,
                                                     state,
-                                                    statistics,
+                                                    &statistics,
                                                     scratch,
                                                     0,
                                                     ExecutionBackend::Cpu,
@@ -21364,6 +22052,28 @@ int main(int argc, char** argv)
             return 2;
         }
         const std::string argument = argc > 1 ? std::string(argv[1]) : std::string{};
+        if (argument == "--mapped-file")
+        {
+#if !defined(_WIN32)
+            struct rlimit limits{};
+            if (getrlimit(RLIMIT_NOFILE, &limits) != 0 || limits.rlim_max < 16)
+            {
+                std::cerr << "cannot set mapped-file test descriptor limit\n";
+                return 3;
+            }
+            limits.rlim_cur = 16;
+            if (setrlimit(RLIMIT_NOFILE, &limits) != 0)
+            {
+                std::cerr << "cannot set mapped-file test descriptor limit\n";
+                return 3;
+            }
+            ncnn::moe::test_mapped_file_range_and_shared_buffer(true);
+            return 0;
+#else
+            std::cerr << "mapped-file descriptor test requires POSIX\n";
+            return 3;
+#endif
+        }
         if (argument == "--benchmark-bfloat16-attention")
         {
             ncnn::moe::benchmark_bfloat16_attention_kernels();
@@ -21434,6 +22144,7 @@ int main(int argc, char** argv)
         ncnn::moe::test_safetensors_qnk_source_binding();
         ncnn::moe::test_expert_residency_coordinator();
         ncnn::moe::test_file_backed_bfloat16_expert_cache();
+        ncnn::moe::test_file_backed_qnk_expert_cache();
         ncnn::moe::test_file_backed_mxfp4_expert_cache();
         ncnn::moe::test_cross_session_batch_scheduler();
         ncnn::moe::test_batch_scheduler_submission_contract();

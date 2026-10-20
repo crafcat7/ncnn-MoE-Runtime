@@ -1052,6 +1052,37 @@ class NativeQuantizedTests(unittest.TestCase):
                 root.mkdir()
                 self.compare(prepare_family_gguf(root, family), direct=False)
 
+    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
+    def test_qnk_expert_memory_modes(self):
+        for family in ("qwen", "gpt_oss", "deepseek_v4", "qwen4_exp"):
+            with self.subTest(family=family):
+                root = self.root / family
+                root.mkdir()
+                fixture = (prepare_gguf(root, True) if family == "qwen"
+                           else prepare_family_gguf(root, family))
+                cache_args = ("--expert-gpu-cache-mb", "16") if self.backend == "hybrid" else ()
+                eager = self.run_worker(fixture.imported, True, fixture,
+                                        extra_args=(*cache_args, "--expert-memory", "eager"))
+                # Biases and uint32 column maps stay resident outside the cache.
+                fixed_bytes = sum(info.size // 2 if name.endswith(".__qnk_columns") else info.size
+                                  for name, info in importer.scan_safetensors(fixture.imported).items()
+                                  if ".experts." in name
+                                  and (name.endswith(".bias") or name.endswith(".__qnk_columns")))
+                deferred_fixture = replace(fixture, expected_dense=fixture.expected_dense + fixed_bytes)
+                deferred = self.run_worker(fixture.imported, True, deferred_fixture,
+                                           extra_args=(*cache_args, "--expert-memory", "on-demand",
+                                                       "--expert-cache-mb", "1"))
+                resources = deferred["resources"]
+                self.assertEqual(resources["selected_expert_memory"], "on-demand")
+                self.assertTrue(resources["file_backed_experts"])
+                self.assertEqual(resources["expert_cache_bytes"], 1024 * 1024)
+                for mode in ("greedy", "sampled"):
+                    self.assertEqual(deferred[mode][0], eager[mode][0])
+                    np.testing.assert_allclose(deferred[mode][1], eager[mode][1], rtol=0, atol=3e-5)
+                    generation = deferred[mode + "_stats"]["generation"]
+                    self.assertLessEqual(generation["cache_resident_bytes"], resources["expert_cache_bytes"])
+                self.assertGreater(deferred["greedy_stats"]["generation"]["io_bytes"], 0)
+
 
     def test_native_fp8_all_families(self):
         for family in ("qwen_dense", "qwen_moe", "qwen4_exp", "gpt_oss", "deepseek_v4"):

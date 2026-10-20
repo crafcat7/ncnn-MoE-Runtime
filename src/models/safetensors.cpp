@@ -10,11 +10,11 @@
 #include <array>
 #include <bit>
 #include <cctype>
+#include <charconv>
 #include <cstring>
 #include <fstream>
 #include <cmath>
 #include <limits>
-#include <regex>
 #include <sstream>
 #include <utility>
 
@@ -187,78 +187,7 @@ static std::string packed_tensor_name(const std::string& name)
     return "__ncnn_moe_packed__." + name;
 }
 
-static bool parse_json_string(const std::string& json, size_t& position, std::string& value)
-{
-    while (position < json.size() && std::isspace(static_cast<unsigned char>(json[position])))
-        ++position;
-    if (position >= json.size() || json[position] != '"')
-        return false;
-    ++position;
-    value.clear();
-    while (position < json.size())
-    {
-        const char character = json[position++];
-        if (character == '"')
-            return true;
-        if (character == '\\' && position < json.size())
-        {
-            value.push_back(json[position++]);
-        }
-        else
-        {
-            value.push_back(character);
-        }
-    }
-    return false;
-}
-
-static bool find_object_end(const std::string& json, size_t begin, size_t& end)
-{
-    if (begin >= json.size() || json[begin] != '{')
-        return false;
-    uint32_t depth = 0;
-    bool in_string = false;
-    bool escaped = false;
-    for (size_t position = begin; position < json.size(); ++position)
-    {
-        const char character = json[position];
-        if (in_string)
-        {
-            if (escaped)
-            {
-                escaped = false;
-            }
-            else if (character == '\\')
-            {
-                escaped = true;
-            }
-            else if (character == '"')
-            {
-                in_string = false;
-            }
-            continue;
-        }
-        if (character == '"')
-        {
-            in_string = true;
-        }
-        else if (character == '{')
-        {
-            ++depth;
-        }
-        else if (character == '}')
-        {
-            if (--depth == 0)
-            {
-                end = position + 1;
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-static Result<std::vector<uint32_t>> parse_shape(const std::string& object)
+static Result<std::vector<uint32_t>> parse_shape(std::string_view object)
 {
     const auto dimensions = json_integer_array(object, "shape");
     if (!dimensions)
@@ -275,61 +204,69 @@ static Result<std::vector<uint32_t>> parse_shape(const std::string& object)
 }
 
 static Result<void> parse_header(const std::filesystem::path& path,
-                                 const std::string& json,
+                                 std::string_view json,
                                  uint64_t data_start,
                                  uint64_t file_size,
                                  std::unordered_map<std::string, SafetensorInfo>& tensors)
 {
-    const std::regex dtype_expression("\"dtype\"\\s*:\\s*\"([^\"]+)\"");
-    const std::regex offsets_expression("\"data_offsets\"\\s*:\\s*\\[\\s*([0-9]+)\\s*,\\s*([0-9]+)\\s*\\]");
-    size_t position = 1;
-    while (position < json.size())
+    size_t position = skip_space(json, 0);
+    size_t end_position = position;
+    if (position >= json.size() || json[position] != '{'
+        || !parse_json_value(json, end_position) || skip_space(json, end_position) != json.size())
+        return Error{ErrorCode::InvalidModel, "invalid safetensors header: " + path.string()};
+    ++position;
+    for (;;)
     {
-        while (position < json.size() && (std::isspace(static_cast<unsigned char>(json[position])) || json[position] == ','))
-            ++position;
-        if (position >= json.size() || json[position] == '}')
+        position = skip_space(json, position);
+        if (json[position] == '}')
             break;
-
         std::string name;
-        if (!parse_json_string(json, position, name))
+        if (!parse_json_string(json, position, &name))
             return Error{ErrorCode::InvalidModel, "invalid safetensors header key: " + path.string()};
-        while (position < json.size() && (std::isspace(static_cast<unsigned char>(json[position])) || json[position] == ':'))
-            ++position;
-        size_t object_end = 0;
-        if (!find_object_end(json, position, object_end))
+        position = skip_space(json, position);
+        if (json[position++] != ':')
             return Error{ErrorCode::InvalidModel, "invalid safetensors tensor object: " + path.string()};
-        const std::string object = json.substr(position, object_end - position);
-        position = object_end;
+        position = skip_space(json, position);
+        const size_t object_start = position;
+        if (json[position] != '{' || !parse_json_value(json, position))
+            return Error{ErrorCode::InvalidModel, "invalid safetensors tensor object: " + path.string()};
+        const std::string_view object = json.substr(object_start, position - object_start);
+        position = skip_space(json, position);
+        if (json[position] == ',')
+            ++position;
         if (name == "__metadata__")
             continue;
 
-        std::smatch dtype_match;
-        std::smatch offsets_match;
-        if (!std::regex_search(object, dtype_match, dtype_expression)
-            || !std::regex_search(object, offsets_match, offsets_expression))
+        auto dtype = json_string(object, "dtype");
+        const auto offsets = find_manifest_member(object, "data_offsets");
+        if (!dtype || dtype->empty() || !offsets || offsets->empty() || offsets->front() != '[')
             return Error{ErrorCode::InvalidModel, "incomplete safetensors tensor metadata: " + name};
-
         auto shape = parse_shape(object);
         if (!shape)
             return shape.error();
-        uint64_t begin = 0;
-        uint64_t end = 0;
-        try
+        uint64_t range[2] = {};
+        size_t offset_position = skip_space(*offsets, 1);
+        for (size_t index = 0; index < 2; ++index)
         {
-            begin = std::stoull(offsets_match[1].str());
-            end = std::stoull(offsets_match[2].str());
+            const auto parsed = std::from_chars(offsets->data() + offset_position, offsets->data() + offsets->size(), range[index]);
+            if (parsed.ec != std::errc())
+                return Error{ErrorCode::InvalidModel, "invalid safetensors data offsets: " + name};
+            offset_position = skip_space(*offsets, static_cast<size_t>(parsed.ptr - offsets->data()));
+            if (offset_position >= offsets->size() || (*offsets)[offset_position++] != (index == 0 ? ',' : ']'))
+                return Error{ErrorCode::InvalidModel, "invalid safetensors data offsets: " + name};
+            offset_position = skip_space(*offsets, offset_position);
         }
-        catch (const std::exception&)
-        {
+        if (offset_position != offsets->size())
             return Error{ErrorCode::InvalidModel, "invalid safetensors data offsets: " + name};
-        }
+        const uint64_t begin = range[0];
+        const uint64_t end = range[1];
         if (end < begin
             || data_start > std::numeric_limits<uint64_t>::max() - end
             || data_start + end > file_size)
             return Error{ErrorCode::InvalidModel, "invalid safetensors data range: " + name};
         if (tensors.contains(name))
             return Error{ErrorCode::InvalidModel, "duplicate safetensors tensor: " + name};
-        tensors.emplace(std::move(name), SafetensorInfo{path, dtype_match[1].str(), std::move(shape).value(), data_start + begin, end - begin});
+        tensors.emplace(std::move(name), SafetensorInfo{path, std::move(*dtype), std::move(shape).value(), data_start + begin, end - begin});
     }
     return {};
 }
@@ -897,10 +834,21 @@ Result<TensorData> SafetensorsArchive::load_float32_tensor(const std::string& na
     return tensor;
 }
 
-Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) const
+Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name, uint32_t flags) const
 {
     if (const auto* info = find(name); info && info->transform)
+    {
+        if (has_flag(flags, SafetensorLoadDeferMxfp4Data)
+            && info->ggml_type >= 10 && info->ggml_type <= 15)
+        {
+            auto encoding = tensor_encoding(*this, name);
+            if (!encoding)
+                return encoding.error();
+            if (is_qnk_dtype(encoding.value().dtype))
+                return load_qnk_tensor(name, encoding.value().dtype, encoding.value().rows, encoding.value().columns, flags);
+        }
         return load_gguf_tensor(*info);
+    }
     const std::string prefix = source_quantized_prefix(name);
     if (!prefix.empty() && find(prefix + "qweight"))
         return load_source_int4_tensor(name);
@@ -919,7 +867,7 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) cons
     if (!encoding)
         return encoding.error();
     if (is_qnk_dtype(encoding.value().dtype))
-        return load_qnk_tensor(name, encoding.value().dtype, encoding.value().rows, encoding.value().columns);
+        return load_qnk_tensor(name, encoding.value().dtype, encoding.value().rows, encoding.value().columns, flags);
     const SafetensorInfo* info = find(name);
 
     TensorData tensor;
@@ -928,7 +876,7 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) cons
     {
         if (info->shape.size() != 2)
             return Error{ErrorCode::InvalidModel, "GGUF MXFP4 tensor must be a matrix: " + name};
-        return load_mxfp4_tensor(name, {}, info->shape[0], info->shape[1]);
+        return load_mxfp4_tensor(name, {}, info->shape[0], info->shape[1], flags);
     }
     if (info->dtype == "I32")
     {
@@ -1176,26 +1124,52 @@ Result<TensorData> SafetensorsArchive::load_gguf_tensor(const SafetensorInfo& in
             const uint64_t row_size = qnk_storage_bytes(source_dtype, 1, columns);
             if (row_size == 0 || rows > std::numeric_limits<size_t>::max() / row_size)
                 return Error{ErrorCode::InvalidModel, "GGUF quantized transformation size overflows"};
-            std::vector<uint8_t> joined;
-            joined.reserve(static_cast<size_t>(rows * row_size));
+            uint64_t source_rows = 0;
             for (const TensorData& source : sources)
             {
                 if (source.dtype != source_dtype || source.shape.size() != 2 || source.shape[1] != columns)
                     return Error{ErrorCode::InvalidModel, "GGUF concatenated quantized tensors have different encodings"};
                 const auto values = source.qnk_values();
-                joined.insert(joined.end(), values.begin(), values.end());
+                const uint64_t expected_size = qnk_storage_bytes(source_dtype, source.shape[0], columns);
+                if (expected_size == 0 || values.size() != expected_size
+                    || source_rows > rows || source.shape[0] > rows - source_rows)
+                    return Error{ErrorCode::InvalidModel, "GGUF quantized source byte count mismatch"};
+                source_rows += source.shape[0];
             }
-            if (joined.size() != rows * row_size)
+            if (source_rows != rows)
                 return Error{ErrorCode::InvalidModel, "GGUF quantized source byte count mismatch"};
             if (transform.row_indices.empty())
-                result.quantized_data = std::move(joined);
+            {
+                const size_t total_size = static_cast<size_t>(rows * row_size);
+                result.quantized_data.reserve(total_size);
+                for (const TensorData& source : sources)
+                {
+                    const auto values = source.qnk_values();
+                    result.quantized_data.insert(result.quantized_data.end(), values.begin(), values.end());
+                }
+            }
             else
             {
-                result.quantized_data.resize(joined.size());
+                result.quantized_data.resize(static_cast<size_t>(rows * row_size));
                 for (size_t row = 0; row < static_cast<size_t>(rows); ++row)
-                    std::memcpy(result.quantized_data.data() + row * row_size,
-                                joined.data() + static_cast<uint64_t>(transform.row_indices[row]) * row_size,
-                                static_cast<size_t>(row_size));
+                {
+                    const uint64_t source_row = transform.row_indices[row];
+                    uint64_t source_row_begin = 0;
+                    for (const TensorData& source : sources)
+                    {
+                        const uint64_t source_row_end = source_row_begin + source.shape[0];
+                        if (source_row < source_row_end)
+                        {
+                            const uint64_t row_in_source = source_row - source_row_begin;
+                            const auto values = source.qnk_values();
+                            std::memcpy(result.quantized_data.data() + row * row_size,
+                                        values.data() + row_in_source * row_size,
+                                        static_cast<size_t>(row_size));
+                            break;
+                        }
+                        source_row_begin = source_row_end;
+                    }
+                }
             }
         }
         result.input_column_indices = transform.input_column_indices;
@@ -1299,13 +1273,130 @@ Result<TensorData> SafetensorsArchive::load_gguf_source(SafetensorInfo info,
     return load_float32 ? archive.load_float32_tensor("source") : archive.load_tensor("source");
 }
 
+static bool qnk_ggml_type_matches(uint32_t type, DType dtype) noexcept
+{
+    static constexpr DType types[] = {DType::Q2K, DType::Q3K, DType::Q4K, DType::Q5K, DType::Q6K, DType::Q8K};
+    return type >= 10 && type <= 15 && types[type - 10] == dtype;
+}
+
+static Result<void> set_qnk_file_range(MxFp4FileStorage& storage,
+                                       const SafetensorInfo& source,
+                                       uint64_t offset,
+                                       uint64_t size,
+                                       size_t index)
+{
+    if (source.path.empty() || size == 0 || offset > std::numeric_limits<uint64_t>::max() - size)
+        return Error{ErrorCode::InvalidModel, "invalid file-backed Qn_K range"};
+    if (index == 0)
+    {
+        storage.blocks_path = source.path.string();
+        storage.blocks_offset = offset;
+        storage.blocks_size = size;
+    }
+    else if (index == 1)
+    {
+        storage.secondary_blocks_path = source.path.string();
+        storage.secondary_blocks_offset = offset;
+        storage.secondary_blocks_size = size;
+    }
+    else
+        return Error{ErrorCode::UnsupportedModel, "file-backed Qn_K transforms support at most two ranges"};
+    return {};
+}
+
+static Result<TensorData> defer_gguf_qnk(const SafetensorInfo& info,
+                                         DType dtype,
+                                         uint32_t rows,
+                                         uint32_t columns,
+                                         std::optional<uint32_t> slice = std::nullopt,
+                                         uint32_t expert_count = 0)
+{
+    if (!info.transform)
+        return Error{ErrorCode::InvalidArgument, "GGUF Qn_K tensor has no transformation"};
+    if ((!slice && info.shape != std::vector<uint32_t>{rows, columns})
+        || (slice && (info.shape.size() != 3 || info.shape[0] != expert_count || info.shape[1] != rows || info.shape[2] != columns)))
+        return Error{ErrorCode::InvalidModel, "GGUF Qn_K transform shape mismatch"};
+    if (!qnk_shape_supported(dtype, rows, columns))
+        return Error{ErrorCode::InvalidArgument, "invalid deferred Qn_K tensor shape"};
+    const GgufTensorTransform& transform = *info.transform;
+    if (!transform.row_indices.empty() || !transform.column_indices.empty()
+        || transform.value_transform != GgufValueTransform::None || !transform.generated_i64.empty())
+        return Error{ErrorCode::UnsupportedModel, "deferred GGUF Qn_K transform requires raw row ranges"};
+    if (transform.sources.empty() || transform.sources.size() > 2)
+        return Error{ErrorCode::UnsupportedModel, "deferred GGUF Qn_K transform supports one or two source ranges"};
+
+    TensorData tensor;
+    tensor.dtype = dtype;
+    tensor.shape = {rows, columns};
+    tensor.input_column_indices = transform.input_column_indices;
+    auto valid_columns = validate_input_column_indices(tensor);
+    if (!valid_columns)
+        return Error{ErrorCode::InvalidModel, valid_columns.error().message};
+
+    auto storage = std::make_shared<MxFp4FileStorage>();
+    uint64_t total_rows = 0;
+    for (size_t index = 0; index < transform.sources.size(); ++index)
+    {
+        const SafetensorInfo& source = transform.sources[index];
+        if (source.dtype != "U8" || !qnk_ggml_type_matches(source.ggml_type, dtype))
+            return Error{ErrorCode::InvalidModel, "GGUF Qn_K transform source encoding mismatch"};
+
+        uint32_t source_rows = 0;
+        uint64_t offset = source.offset;
+        uint64_t size = source.size;
+        if (slice)
+        {
+            if (expert_count == 0 || source.shape.size() != 3 || source.shape[0] != expert_count
+                || *slice >= expert_count || source.shape[2] != columns || source.size % expert_count != 0)
+                return Error{ErrorCode::InvalidModel, "invalid GGUF Qn_K Expert bank slice"};
+            source_rows = source.shape[1];
+            size /= expert_count;
+            const uint64_t relative = static_cast<uint64_t>(*slice) * size;
+            if (*slice != 0 && relative / *slice != size)
+                return Error{ErrorCode::InvalidModel, "GGUF Qn_K Expert slice offset overflows"};
+            if (source.offset > std::numeric_limits<uint64_t>::max() - source.size
+                || source.offset > std::numeric_limits<uint64_t>::max() - relative)
+                return Error{ErrorCode::InvalidModel, "GGUF Qn_K Expert bank range overflows"};
+            offset += relative;
+            const uint64_t bank_end = source.offset + source.size;
+            if (offset > bank_end || size > bank_end - offset)
+                return Error{ErrorCode::InvalidModel, "GGUF Qn_K Expert slice exceeds its source range"};
+        }
+        else
+        {
+            if (source.shape.size() != 2 || source.shape[1] != columns)
+                return Error{ErrorCode::InvalidModel, "invalid GGUF Qn_K source matrix shape"};
+            source_rows = source.shape[0];
+        }
+
+        if (source_rows == 0 || size != qnk_storage_bytes(dtype, source_rows, columns)
+            || total_rows > std::numeric_limits<uint64_t>::max() - source_rows)
+            return Error{ErrorCode::InvalidModel, "invalid GGUF Qn_K source byte count"};
+        auto range = set_qnk_file_range(*storage, source, offset, size, index);
+        if (!range)
+            return range.error();
+        total_rows += source_rows;
+    }
+    if (total_rows != rows)
+        return Error{ErrorCode::InvalidModel, "GGUF Qn_K ranges disagree with the requested row count"};
+    tensor.mxfp4_file_storage = std::move(storage);
+    return tensor;
+}
+
 Result<TensorData> SafetensorsArchive::load_qnk_tensor(const std::string& name,
                                                        DType dtype,
                                                        uint32_t rows,
-                                                       uint32_t columns) const
+                                                       uint32_t columns,
+                                                       uint32_t flags) const
 {
     if (const auto* info = find(name); info && info->transform)
     {
+        if (has_flag(flags, SafetensorLoadDeferMxfp4Data))
+        {
+            auto deferred = defer_gguf_qnk(*info, dtype, rows, columns);
+            if (deferred || deferred.error().code != ErrorCode::UnsupportedModel)
+                return deferred;
+        }
         auto tensor = load_gguf_tensor(*info);
         if (!tensor)
             return tensor.error();
@@ -1327,6 +1418,8 @@ Result<TensorData> SafetensorsArchive::load_qnk_tensor(const std::string& name,
     const SafetensorInfo* source = find(name);
     if (!source || source->dtype != "U8" || source->size != expected_size)
         return Error{ErrorCode::InvalidModel, "invalid Qn_K safetensors tensor: " + name};
+    if (source->ggml_type != UINT32_MAX && !qnk_ggml_type_matches(source->ggml_type, dtype))
+        return Error{ErrorCode::InvalidModel, "Qn_K tensor GGUF type disagrees with its dtype: " + name};
 
     TensorData tensor;
     tensor.dtype = dtype;
@@ -1356,6 +1449,15 @@ Result<TensorData> SafetensorsArchive::load_qnk_tensor(const std::string& name,
         if (!status)
             return Error{ErrorCode::InvalidModel, status.error().message + ": " + name};
     }
+    if (has_flag(flags, SafetensorLoadDeferMxfp4Data))
+    {
+        auto storage = std::make_shared<MxFp4FileStorage>();
+        auto range = set_qnk_file_range(*storage, *source, source->offset, source->size, 0);
+        if (!range)
+            return range.error();
+        tensor.mxfp4_file_storage = std::move(storage);
+        return tensor;
+    }
     auto mapped = MappedFileRange::open(source->path, source->offset, source->size);
     if (mapped)
     {
@@ -1377,10 +1479,19 @@ Result<TensorData> SafetensorsArchive::load_qnk_expert(const std::string& name,
                                                        uint32_t expert_id,
                                                        uint32_t expert_count,
                                                        uint32_t rows,
-                                                       uint32_t columns) const
+                                                       uint32_t columns,
+                                                       uint32_t flags) const
 {
     if (const auto* info = find(name); info && info->transform)
     {
+        if (has_flag(flags, SafetensorLoadDeferMxfp4Data))
+        {
+            if (info->shape.empty() || info->shape[0] != expert_count)
+                return Error{ErrorCode::InvalidModel, "transformed GGUF Qn_K Expert mismatch: " + name};
+            auto deferred = defer_gguf_qnk(*info, dtype, rows, columns, expert_id, expert_count);
+            if (deferred || deferred.error().code != ErrorCode::UnsupportedModel)
+                return deferred;
+        }
         auto tensor = load_gguf_tensor(*info, expert_id, {rows, columns});
         if (!tensor)
             return tensor.error();
@@ -1399,11 +1510,32 @@ Result<TensorData> SafetensorsArchive::load_qnk_expert(const std::string& name,
     {
         return Error{ErrorCode::InvalidModel, "invalid Qn_K Expert tensor: " + name};
     }
-    const uint64_t offset = source->offset + expert_id * expert_size;
+    if (source->ggml_type != UINT32_MAX && !qnk_ggml_type_matches(source->ggml_type, dtype))
+        return Error{ErrorCode::InvalidModel, "Qn_K Expert GGUF type disagrees with its dtype: " + name};
+    if (source->offset > std::numeric_limits<uint64_t>::max() - source->size)
+        return Error{ErrorCode::InvalidModel, "Qn_K Expert source range overflows: " + name};
+    const uint64_t relative = static_cast<uint64_t>(expert_id) * expert_size;
+    if (expert_id != 0 && relative / expert_id != expert_size)
+        return Error{ErrorCode::InvalidModel, "Qn_K Expert slice offset overflows: " + name};
+    if (source->offset > std::numeric_limits<uint64_t>::max() - relative)
+        return Error{ErrorCode::InvalidModel, "Qn_K Expert slice offset overflows: " + name};
+    const uint64_t offset = source->offset + relative;
+    const uint64_t source_end = source->offset + source->size;
+    if (offset > source_end || expert_size > source_end - offset)
+        return Error{ErrorCode::InvalidModel, "Qn_K Expert slice exceeds its source range: " + name};
 
     TensorData tensor;
     tensor.dtype = dtype;
     tensor.shape = {rows, columns};
+    if (has_flag(flags, SafetensorLoadDeferMxfp4Data))
+    {
+        auto storage = std::make_shared<MxFp4FileStorage>();
+        auto range = set_qnk_file_range(*storage, *source, offset, expert_size, 0);
+        if (!range)
+            return range.error();
+        tensor.mxfp4_file_storage = std::move(storage);
+        return tensor;
+    }
     auto mapped = MappedFileRange::open(source->path, offset, expert_size);
     if (mapped)
     {

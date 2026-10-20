@@ -22,6 +22,7 @@
 #include <cmath>
 #include <limits>
 #include <span>
+#include <thread>
 #include <utility>
 
 #if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
@@ -1241,7 +1242,7 @@ Result<void> request_experts(const CompiledModel& model,
 Result<void> forward_moe(const CompiledModel& model,
                          const MoeBlockPlan& moe,
                          LayerState& layer_state,
-                         SessionStatistics& stats,
+                         SessionStatistics* stats,
                          ExpertScratch& scratch,
                          uint32_t residency_group,
                          ExecutionBackend backend,
@@ -1253,8 +1254,13 @@ Result<void> forward_moe(const CompiledModel& model,
     struct WaveCleanup
     {
         ExpertScratch& scratch;
+        LayerState& state;
+        bool completed = false;
         ~WaveCleanup()
         {
+            if (!completed)
+                for (ExpertState& active : state.active_experts())
+                    active.lease = {};
             scratch.backend_requests.clear();
             scratch.cache_leases.clear();
             scratch.prestaged_demands.clear();
@@ -1265,7 +1271,7 @@ Result<void> forward_moe(const CompiledModel& model,
             scratch.wave_demands.clear();
             scratch.prepared_pins.clear();
         }
-    } wave_cleanup{scratch};
+    } wave_cleanup{scratch, layer_state};
     bool independent_work_started = false;
     const auto run_independent_work = [&] {
         if (!independent_work || independent_work_started) return;
@@ -1391,7 +1397,7 @@ Result<void> forward_moe(const CompiledModel& model,
             {
                 continue;
             }
-            if (up_weight)
+            if (up_weight && !gate_up_weight.mxfp4_file_storage && !up_weight->mxfp4_file_storage && !down_weight.mxfp4_file_storage)
             {
                 model.expert_backend->admit_separate(expert.cache_key,
                                                      borrow_resident_tensor(gate_up_weight),
@@ -1402,8 +1408,9 @@ Result<void> forward_moe(const CompiledModel& model,
                                                      expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
                                                      residency_group, expert.activation_limit, expert.activation);
             }
-            else if (gate_up_weight.dtype == DType::Int4 || is_qnk_dtype(gate_up_weight.dtype)
-                     || down_weight.dtype == DType::Int4 || is_qnk_dtype(down_weight.dtype))
+            else if (!up_weight && !gate_up_weight.mxfp4_file_storage && !down_weight.mxfp4_file_storage
+                     && (gate_up_weight.dtype == DType::Int4 || is_qnk_dtype(gate_up_weight.dtype)
+                         || down_weight.dtype == DType::Int4 || is_qnk_dtype(down_weight.dtype)))
             {
                 model.expert_backend->admit(expert.cache_key,
                                             borrow_resident_tensor(gate_up_weight),
@@ -1547,11 +1554,30 @@ Result<void> forward_moe(const CompiledModel& model,
                         const TensorData& gate_up = model.weights.at(expert.gate_up_weight);
                         const TensorData& down = model.weights.at(expert.down_weight);
                         const auto wait_start = expert_cache_wait_start(model);
-                        auto lease = model.expert_cache->acquire_pair(gate_up, down, residency_group, expert.cache_key,
-                                                                      victim_metadata(model, expert, layer_state.normalized.rows()));
+                        const std::array<ExpertCachePairRequest, 1> requests{{{
+                            &gate_up,
+                            &down,
+                            residency_group,
+                            expert.cache_key,
+                            victim_metadata(model, expert, layer_state.normalized.rows()),
+                        }}};
+                        std::array<ExpertCacheLease, 1> leases;
+                        auto lease_count = model.expert_cache->wait_acquire_ready_pairs(requests, leases, true, 1, true, false);
+                        if (!lease_count) return lease_count.error();
+                        bool drained = false;
+                        while (lease_count.value() == 0)
+                        {
+                            if (drained)
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            model.expert_backend->wait_for_background_work();
+                            lease_count = model.expert_cache->wait_acquire_ready_pairs(requests, leases, true, 1, true, false);
+                            if (!lease_count) return lease_count.error();
+                            drained = true;
+                        }
                         active.cache_wait_us += expert_cache_wait_elapsed(wait_start);
-                        if (!lease) return lease.error();
-                        active.lease = std::move(lease).value();
+                        if (!leases[0].gate_up)
+                            return Error{ErrorCode::InternalError, "Expert cache ready wait acquired no pair"};
+                        active.lease = std::move(leases[0]);
                         admit_vulkan_expert(model, expert, active.lease, residency_group,
                                             static_cast<uint32_t>(layer_state.normalized.rows()), backend);
                         forward_experts(model, moe, layer_state, std::span<const size_t>(&active_index, 1), scratch, prefetch);
@@ -1974,21 +2000,29 @@ Result<void> forward_moe(const CompiledModel& model,
         }
 
         const auto cache_wait_start = expert_cache_wait_start(model);
-        // Poll next host-ready work while current compute owns its leases.
-        // A small cache may be entirely pinned by that wave; release it before
-        // entering a blocking host wait so capacity pressure cannot deadlock.
-        auto acquired = model.expert_cache->wait_acquire_ready_pairs(requests, leases, true, 1,
-                                                                     current_wave_requests.empty());
-        if (acquired && acquired.value() == 0 && !current_wave_requests.empty())
+        // Wait for admitted reads while current compute remains in flight. If
+        // capacity blocked admission, release its pins before draining/retry.
+        auto acquired = model.expert_cache->wait_acquire_ready_pairs(requests, leases, true, 1, true, false);
+        if (!acquired) return acquired.error();
+        bool drained = false;
+        while (acquired.value() == 0)
         {
-            auto queued = model.expert_cache->request_pairs(requests);
-            if (!queued) return queued.error();
-            if (queued.value() == 0)
+            if (!current_wave_requests.empty())
+            {
                 finish_current_wave();
-            // A nonzero admitted prefix has a loading/ready pair independent
-            // of the current leases. Its first read can complete alongside
-            // current GPU work without waiting for the rest of the wave.
-            acquired = model.expert_cache->wait_acquire_ready_pairs(requests, leases, true);
+                drained = false;
+            }
+            if (!model.expert_backend)
+            {
+                acquired = model.expert_cache->wait_acquire_ready_pairs(requests, leases, true);
+                break;
+            }
+            if (drained)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            model.expert_backend->wait_for_background_work();
+            acquired = model.expert_cache->wait_acquire_ready_pairs(requests, leases, true, 1, true, false);
+            if (!acquired) return acquired.error();
+            drained = true;
         }
         const uint64_t cache_wait_microseconds = expert_cache_wait_elapsed(cache_wait_start);
         if (!acquired)
@@ -2042,21 +2076,25 @@ Result<void> forward_moe(const CompiledModel& model,
         if (!finalized) return finalized.error();
     }
 
-    stats.expert_batches += active_expert_count;
-    if (expert_cache_wait_timing_enabled(model))
+    if (stats)
     {
-        for (const ExpertState& active : layer_state.active_experts())
+        stats->expert_batches += active_expert_count;
+        if (expert_cache_wait_timing_enabled(model))
         {
-            for (const ExpertRoute& route : active.batch.routes)
+            for (const ExpertState& active : layer_state.active_experts())
             {
-                if (route.rank >= maximum_expert_route_ranks)
-                    continue;
-                ++stats.expert_route_rank_demands[route.rank];
-                stats.expert_route_rank_demand_queue_time_microseconds[route.rank] += active.cache_wait_us;
+                for (const ExpertRoute& route : active.batch.routes)
+                {
+                    if (route.rank >= maximum_expert_route_ranks)
+                        continue;
+                    ++stats->expert_route_rank_demands[route.rank];
+                    stats->expert_route_rank_demand_queue_time_microseconds[route.rank] += active.cache_wait_us;
+                }
             }
         }
     }
     layer_state.experts_executed = true;
+    wave_cleanup.completed = true;
     return {};
 }
 

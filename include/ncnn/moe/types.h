@@ -320,7 +320,9 @@ struct MxFp4FileStorage
     uint64_t secondary_scales_size = 0;
     bool interleave_rows = false;
     // GGUF stores [E8M0, 16 code bytes] per 32 values in blocks ranges;
-    // scales ranges remain empty. ExpertCache converts only admitted ranges.
+    // scales ranges remain empty. Separate Qn_K storage also reuses these as
+    // raw blocks ranges, with an optional secondary range and no scales.
+    // ExpertCache converts only admitted ranges.
     MxFp4FileLayout layout = MxFp4FileLayout::Separate;
 };
 

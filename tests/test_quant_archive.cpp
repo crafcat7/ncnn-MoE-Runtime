@@ -339,10 +339,11 @@ static void test_qnk_archive()
 
 static void write_shape_test_archive(const std::filesystem::path& path,
                                      const std::string& shape,
-                                     size_t data_size)
+                                     size_t data_size,
+                                     const std::string& offsets = {})
 {
     std::string header = "{\"weight\":{\"dtype\":\"BF16\",\"shape\":" + shape
-                         + ",\"data_offsets\":[0," + std::to_string(data_size) + "]}}";
+                         + ",\"data_offsets\":" + (offsets.empty() ? "[0," + std::to_string(data_size) + "]" : offsets) + "}}";
     header.append((8 - header.size() % 8) % 8, ' ');
     const uint64_t header_size = header.size();
     const std::vector<uint8_t> payload(data_size, 0);
@@ -374,6 +375,25 @@ static void test_safetensor_shape_metadata()
     write_shape_test_archive(path, "[ 2 ]", 4);
     auto normal = SafetensorsArchive::open_file(path);
     quant_archive_check(normal && normal.value().find("weight")->shape == std::vector<uint32_t>{2}, "preserve valid integer shape metadata");
+    write_shape_test_archive(path, "[2]", 4, "[ 0 , 4 ]");
+    auto spaced = SafetensorsArchive::open_file(path);
+    quant_archive_check(spaced && spaced.value().find("weight")->size == 4,
+                        "preserve whitespace in data offsets");
+    for (const char* offsets : {"[4,0]", "[-1,4]", "[0,4.0]", "[0,4e0]", "[0,18446744073709551615]", "[0,18446744073709551616]", "[0,4],", "[0,4]}junk"})
+    {
+        write_shape_test_archive(path, "[2]", 4, offsets);
+        auto invalid = SafetensorsArchive::open_file(path);
+        quant_archive_check(!invalid && invalid.error().code == ErrorCode::InvalidModel,
+                            "reject reversed, noninteger, overflowing or out-of-file data offsets");
+    }
+    QuantArchiveTestFile escaped;
+    const std::array<uint16_t, 2> values = {0x3f80, 0x4000};
+    escaped.add("wei\\u0067ht", "BF16", {2}, values.data(), sizeof(values));
+    escaped.write(path);
+    auto unicode = SafetensorsArchive::open_file(path);
+    quant_archive_check(unicode && unicode.value().find("weight"), "decode escaped tensor names with the shared JSON parser");
+    auto tensor = unicode.value().load_tensor("weight");
+    quant_archive_check(tensor && tensor.value().bfloat16_values()[1] == values[1], "preserve escaped-name tensor payload");
 }
 
 static void test_native_float_scales()

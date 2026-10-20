@@ -319,15 +319,61 @@ static Result<TensorHandle> require_tensor(const WeightStore& weights, const std
     }
     else if (is_qnk_dtype(dtype))
     {
-        if (tensor.shape.size() != 2 || !qnk_shape_supported(dtype, tensor.shape[0], tensor.shape[1])
-            || tensor.qnk_values().size() != qnk_storage_bytes(dtype, tensor.shape[0], tensor.shape[1]))
+        if (tensor.shape.size() != 2 || !qnk_shape_supported(dtype, tensor.shape[0], tensor.shape[1]))
+        {
+            return Error{ErrorCode::InvalidModel, "invalid Qn_K tensor storage: " + name};
+        }
+        const uint64_t expected_size = qnk_storage_bytes(dtype, tensor.shape[0], tensor.shape[1]);
+        if (tensor.mxfp4_file_storage)
+        {
+            const MxFp4FileStorage& storage = *tensor.mxfp4_file_storage;
+            const auto valid_range = [](const std::string& path, uint64_t offset, uint64_t size, bool optional) {
+                return optional && path.empty() ? offset == 0 && size == 0
+                                                : !path.empty() && size != 0
+                                                      && offset <= std::numeric_limits<uint64_t>::max() - size;
+            };
+            const bool scales_empty = storage.scales_path.empty()
+                                      && storage.scales_offset == 0
+                                      && storage.scales_size == 0
+                                      && storage.secondary_scales_path.empty()
+                                      && storage.secondary_scales_offset == 0
+                                      && storage.secondary_scales_size == 0;
+            const bool has_secondary = !storage.secondary_blocks_path.empty();
+            const bool size_overflow = storage.secondary_blocks_size
+                                       > std::numeric_limits<uint64_t>::max() - storage.blocks_size;
+            const uint64_t stored_size = size_overflow ? 0 : storage.blocks_size + storage.secondary_blocks_size;
+            if (storage.layout != MxFp4FileLayout::Separate
+                || storage.interleave_rows
+                || !scales_empty
+                || !valid_range(storage.blocks_path, storage.blocks_offset, storage.blocks_size, false)
+                || !valid_range(storage.secondary_blocks_path, storage.secondary_blocks_offset,
+                                storage.secondary_blocks_size, true)
+                || size_overflow
+                || (has_secondary
+                    && (tensor.shape[0] % 2 != 0
+                        || storage.blocks_size != storage.secondary_blocks_size
+                        || expected_size % 2 != 0
+                        || storage.blocks_size != expected_size / 2))
+                || stored_size != expected_size
+                || !tensor.quantized_data.empty()
+                || tensor.mapped_data || tensor.mapped_size != 0)
+            {
+                return Error{ErrorCode::InvalidModel, "invalid file-backed Qn_K storage: " + name};
+            }
+        }
+        else if (tensor.qnk_values().size() != expected_size
+                 || (!tensor.quantized_data.empty() && tensor.mapped_data))
         {
             return Error{ErrorCode::InvalidModel, "invalid Qn_K tensor storage: " + name};
         }
         if (!tensor.float32_data.empty()
             || !tensor.bfloat16_data.empty()
             || !tensor.int8_data.empty()
+            || !tensor.int64_data.empty()
             || !tensor.quantization_scales.empty()
+            || tensor.quantization_group_size != 0
+            || !tensor.quantization_zero_points.empty()
+            || !tensor.quantization_group_indices.empty()
             || !tensor.mxfp4_blocks.empty()
             || !tensor.mxfp4_scales.empty())
         {
@@ -985,6 +1031,212 @@ static bool is_cache_file_backed_expert_pair(const TensorData& gate_up,
            && is_cache_file_backed_expert_tensor(down, allow_bfloat16);
 }
 
+static Result<void> finalize_expert(WeightStore& weights,
+                                    ExpertPlan& expert,
+                                    const std::string& prefix,
+                                    const MoeDescriptor& moe,
+                                    bool use_file_backed_experts)
+{
+    const DType declared_dtype = moe.expert_weight_dtype;
+    const bool allow_file_backed_bfloat16 = declared_dtype == DType::BFloat16
+                                            && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
+    const bool separate_gate_up = expert.gate_up_weight == invalid_tensor_handle
+                                  && expert.gate_weight != invalid_tensor_handle
+                                  && expert.up_weight != invalid_tensor_handle;
+    if (use_file_backed_experts && separate_gate_up)
+    {
+        const TensorData& gate = weights.at(expert.gate_weight);
+        const TensorData& up = weights.at(expert.up_weight);
+        const bool has_qnk = is_qnk_dtype(gate.dtype)
+                             || is_qnk_dtype(up.dtype)
+                             || (expert.down_weight != invalid_tensor_handle
+                                 && is_qnk_dtype(weights.at(expert.down_weight).dtype));
+        if (has_qnk)
+        {
+            if (!is_qnk_dtype(gate.dtype) || gate.dtype != up.dtype
+                || gate.shape.size() != 2 || gate.shape != up.shape
+                || gate.input_column_indices != up.input_column_indices)
+            {
+                return Error{ErrorCode::UnsupportedModel,
+                             "on-demand Qn_K gate/up Experts require matching dtype, shape, and input columns"};
+            }
+            if (!gate.mxfp4_file_storage || !up.mxfp4_file_storage
+                || expert.down_weight == invalid_tensor_handle
+                || !is_qnk_dtype(weights.at(expert.down_weight).dtype)
+                || !weights.at(expert.down_weight).mxfp4_file_storage)
+            {
+                return Error{ErrorCode::UnsupportedModel,
+                             "on-demand Qn_K Experts require file-backed gate, up, and down matrices"};
+            }
+
+            const uint32_t rows = gate.shape[0];
+            const uint32_t columns = gate.shape[1];
+            if (rows > std::numeric_limits<uint32_t>::max() / 2)
+                return Error{ErrorCode::InvalidModel, "Qn_K gate/up Expert row count overflows"};
+            const uint32_t packed_rows = rows * 2;
+            const uint64_t expected_size = qnk_storage_bytes(gate.dtype, packed_rows, columns);
+            if (expected_size == 0)
+                return Error{ErrorCode::InvalidModel, "Qn_K packed gate/up Expert dimensions are invalid"};
+
+            const MxFp4FileStorage& gate_storage = *gate.mxfp4_file_storage;
+            const MxFp4FileStorage& up_storage = *up.mxfp4_file_storage;
+            if (!gate_storage.secondary_blocks_path.empty()
+                || !up_storage.secondary_blocks_path.empty())
+            {
+                return Error{ErrorCode::UnsupportedModel,
+                             "Qn_K gate/up projections must each use one raw file range"};
+            }
+            if (gate_storage.blocks_size != up_storage.blocks_size
+                || gate_storage.blocks_size > std::numeric_limits<uint64_t>::max() / 2
+                || gate_storage.blocks_size * 2 != expected_size)
+            {
+                return Error{ErrorCode::InvalidModel,
+                             "Qn_K gate/up file ranges do not match their matrix shapes"};
+            }
+
+            TensorData combined_bias;
+            const bool has_gate_bias = expert.gate_bias != invalid_tensor_handle;
+            const bool has_up_bias = expert.up_bias != invalid_tensor_handle;
+            if (has_gate_bias != has_up_bias)
+                return Error{ErrorCode::InvalidModel, "Qn_K gate/up Expert biases must be paired"};
+            if (has_gate_bias)
+            {
+                const TensorData& gate_bias = weights.at(expert.gate_bias);
+                const TensorData& up_bias = weights.at(expert.up_bias);
+                if (gate_bias.dtype != up_bias.dtype
+                    || (gate_bias.dtype != DType::Float32 && gate_bias.dtype != DType::BFloat16)
+                    || gate_bias.shape != std::vector<uint32_t>{rows}
+                    || up_bias.shape != gate_bias.shape)
+                {
+                    return Error{ErrorCode::InvalidModel,
+                                 "Qn_K gate/up Expert biases must have matching BF16 or F32 shapes"};
+                }
+                combined_bias.dtype = gate_bias.dtype;
+                combined_bias.shape = {packed_rows};
+                if (gate_bias.dtype == DType::Float32)
+                {
+                    const std::span<const float> gate_values = gate_bias.float32_values();
+                    const std::span<const float> up_values = up_bias.float32_values();
+                    if (gate_values.size() != rows || up_values.size() != rows)
+                        return Error{ErrorCode::InvalidModel, "invalid Qn_K gate/up F32 Expert bias data"};
+                    combined_bias.float32_data.reserve(static_cast<size_t>(rows) * 2);
+                    combined_bias.float32_data.insert(combined_bias.float32_data.end(), gate_values.begin(), gate_values.end());
+                    combined_bias.float32_data.insert(combined_bias.float32_data.end(), up_values.begin(), up_values.end());
+                }
+                else
+                {
+                    const std::span<const uint16_t> gate_values = gate_bias.bfloat16_values();
+                    const std::span<const uint16_t> up_values = up_bias.bfloat16_values();
+                    if (gate_values.size() != rows || up_values.size() != rows)
+                        return Error{ErrorCode::InvalidModel, "invalid Qn_K gate/up BF16 Expert bias data"};
+                    combined_bias.bfloat16_data.reserve(static_cast<size_t>(rows) * 2);
+                    combined_bias.bfloat16_data.insert(combined_bias.bfloat16_data.end(), gate_values.begin(), gate_values.end());
+                    combined_bias.bfloat16_data.insert(combined_bias.bfloat16_data.end(), up_values.begin(), up_values.end());
+                }
+            }
+
+            auto combined_storage = std::make_shared<MxFp4FileStorage>();
+            combined_storage->layout = MxFp4FileLayout::Separate;
+            combined_storage->interleave_rows = false;
+            combined_storage->blocks_path = gate_storage.blocks_path;
+            combined_storage->blocks_offset = gate_storage.blocks_offset;
+            combined_storage->blocks_size = gate_storage.blocks_size;
+            combined_storage->secondary_blocks_path = up_storage.blocks_path;
+            combined_storage->secondary_blocks_offset = up_storage.blocks_offset;
+            combined_storage->secondary_blocks_size = up_storage.blocks_size;
+
+            TensorData& packed_gate_up = weights.at_mutable(expert.gate_weight);
+            packed_gate_up.shape[0] = packed_rows;
+            packed_gate_up.qnk_interleave_rows = false;
+            packed_gate_up.mxfp4_file_storage = std::move(combined_storage);
+            const TensorHandle gate_handle = expert.gate_weight;
+            const TensorHandle up_handle = expert.up_weight;
+            weights.at_mutable(up_handle) = TensorData{};
+            expert.gate_up_weight = gate_handle;
+            expert.gate_weight = invalid_tensor_handle;
+            expert.up_weight = invalid_tensor_handle;
+            expert.layout = ExpertLayout::PackedGateUpDown;
+            if (has_gate_bias)
+            {
+                const TensorHandle gate_bias_handle = expert.gate_bias;
+                const TensorHandle up_bias_handle = expert.up_bias;
+                weights.at_mutable(gate_bias_handle) = std::move(combined_bias);
+                weights.at_mutable(up_bias_handle) = TensorData{};
+                expert.gate_up_bias = gate_bias_handle;
+                expert.gate_bias = invalid_tensor_handle;
+                expert.up_bias = invalid_tensor_handle;
+            }
+        }
+    }
+
+    const TensorData* gate_up_weight = expert.gate_up_weight != invalid_tensor_handle
+                                           ? &weights.at(expert.gate_up_weight)
+                                       : expert.gate_weight != invalid_tensor_handle
+                                           ? &weights.at(expert.gate_weight)
+                                       : expert.up_weight != invalid_tensor_handle
+                                           ? &weights.at(expert.up_weight)
+                                           : nullptr;
+    const TensorData* down_weight = expert.down_weight != invalid_tensor_handle
+                                        ? &weights.at(expert.down_weight)
+                                        : nullptr;
+    const bool has_qnk_weight = (gate_up_weight && is_qnk_dtype(gate_up_weight->dtype))
+                                || (expert.up_weight != invalid_tensor_handle
+                                    && is_qnk_dtype(weights.at(expert.up_weight).dtype))
+                                || (down_weight && is_qnk_dtype(down_weight->dtype));
+    if (use_file_backed_experts && has_qnk_weight)
+    {
+        if (expert.gate_up_weight == invalid_tensor_handle
+            || !gate_up_weight || !is_qnk_dtype(gate_up_weight->dtype)
+            || !down_weight || !is_qnk_dtype(down_weight->dtype)
+            || !is_cache_file_backed_expert_pair(*gate_up_weight, *down_weight, false))
+        {
+            return Error{ErrorCode::UnsupportedModel,
+                         "on-demand Qn_K Experts require file-backed Qn_K gate/up and down matrices"};
+        }
+    }
+    if (use_file_backed_experts && is_qnk_dtype(declared_dtype) && !has_qnk_weight)
+    {
+        return Error{ErrorCode::UnsupportedModel,
+                     "on-demand Qn_K Experts require file-backed Qn_K gate/up and down matrices"};
+    }
+    if (use_file_backed_experts && declared_dtype == DType::MxFp4
+        && (!gate_up_weight || !down_weight
+            || gate_up_weight->dtype != DType::MxFp4 || down_weight->dtype != DType::MxFp4
+            || !is_cache_file_backed_expert_pair(*gate_up_weight, *down_weight, false)))
+    {
+        return Error{ErrorCode::InvalidModel,
+                     "on-demand MXFP4 Expert weights must remain file-backed"};
+    }
+    if (use_file_backed_experts && allow_file_backed_bfloat16 && !has_qnk_weight
+        && (!gate_up_weight || !down_weight
+            || gate_up_weight->dtype != DType::BFloat16 || down_weight->dtype != DType::BFloat16
+            || !is_cache_file_backed_expert_pair(*gate_up_weight, *down_weight, true)))
+    {
+        return Error{ErrorCode::InvalidModel,
+                     "file-backed BF16 Expert weights must remain memory-mapped"};
+    }
+
+    expert.weight_size = expert_weight_size(weights, expert);
+    if (expert.gate_up_weight != invalid_tensor_handle && down_weight
+        && is_cache_file_backed_expert_pair(*gate_up_weight, *down_weight,
+                                            allow_file_backed_bfloat16))
+    {
+        expert.cache_key = ExpertCache::make_pair_key(*gate_up_weight, *down_weight);
+    }
+    if (expert.cache_key.empty())
+    {
+        const auto quantized = [](DType dtype) { return dtype == DType::Int4 || is_qnk_dtype(dtype); };
+        if ((gate_up_weight && quantized(gate_up_weight->dtype))
+            || (down_weight && quantized(down_weight->dtype))
+            || (expert.up_weight != invalid_tensor_handle
+                && quantized(weights.at(expert.up_weight).dtype)))
+        {
+            expert.cache_key = "quantized:" + prefix;
+        }
+    }
+    return {};
+}
+
 static double placement_cost(const std::vector<uint32_t>& counts, const std::vector<uint32_t>& scores, uint32_t concurrency, size_t added_device)
 {
     double latency = 0.0;
@@ -1197,19 +1449,9 @@ static Result<void> compile_mtp_speculative_model(CompiledModel& compiled,
                                                expert.down_weight);
         if (!status)
             return status.error();
-        expert.weight_size = expert_weight_size(compiled.weights, expert);
-        const TensorData& gate_up_weight = compiled.weights.at(expert.gate_up_weight);
-        const TensorData& down_weight = compiled.weights.at(expert.down_weight);
-        const bool use_file_backed_bfloat16 = use_file_backed_experts
-                                              && moe.expert_weight_dtype == DType::BFloat16
-                                              && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
-        if (is_cache_file_backed_expert_pair(gate_up_weight, down_weight, use_file_backed_bfloat16))
-            expert.cache_key = ExpertCache::make_pair_key(gate_up_weight, down_weight);
-        else if (is_qnk_dtype(gate_up_weight.dtype) && gate_up_weight.dtype == down_weight.dtype)
-            expert.cache_key = "qnk:" + prefix;
-        else if (gate_up_weight.dtype == DType::Int4 || is_qnk_dtype(gate_up_weight.dtype)
-                 || down_weight.dtype == DType::Int4 || is_qnk_dtype(down_weight.dtype))
-            expert.cache_key = "quantized:" + prefix;
+        status = finalize_expert(compiled.weights, expert, prefix, moe, use_file_backed_experts);
+        if (!status)
+            return status.error();
         compiled_moe.experts.push_back(std::move(expert));
     }
     return {};
@@ -1425,23 +1667,18 @@ static Result<void> compile_speculative_model(CompiledModel& compiled,
             }
             if (!status)
                 return status.error();
+            if (fused && is_qnk_dtype(compiled.weights.at(expert.gate_up_weight).dtype))
+            {
+                compiled.weights.at_mutable(expert.gate_up_weight).qnk_interleave_rows = expert.layout == ExpertLayout::InterleavedGateUpDown;
+            }
             status = assign_required_linear_tensor(compiled.weights, prefix + "down.weight",
                                                    {hidden_size, moe.intermediate_size},
                                                    moe.expert_weight_dtype, expert.down_weight);
             if (!status)
                 return status.error();
-            expert.weight_size = expert_weight_size(compiled.weights, expert);
-            const TensorData& gate_up_weight = compiled.weights.at(fused ? expert.gate_up_weight : expert.gate_weight);
-            const TensorData& down_weight = compiled.weights.at(expert.down_weight);
-            const bool use_file_backed_bfloat16 = use_file_backed_experts
-                                                  && moe.expert_weight_dtype == DType::BFloat16
-                                                  && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
-            if (fused && is_cache_file_backed_expert_pair(gate_up_weight, down_weight, use_file_backed_bfloat16))
-                expert.cache_key = ExpertCache::make_pair_key(gate_up_weight, down_weight);
-            if (gate_up_weight.dtype == DType::Int4 || is_qnk_dtype(gate_up_weight.dtype)
-                || down_weight.dtype == DType::Int4 || is_qnk_dtype(down_weight.dtype)
-                || (!fused && (compiled.weights.at(expert.up_weight).dtype == DType::Int4 || is_qnk_dtype(compiled.weights.at(expert.up_weight).dtype))))
-                expert.cache_key = "quantized:" + prefix;
+            status = finalize_expert(compiled.weights, expert, prefix, moe, use_file_backed_experts);
+            if (!status)
+                return status.error();
             layer_plan.moe.experts.push_back(std::move(expert));
         }
     }
@@ -1553,43 +1790,9 @@ static Result<void> compile_moe_layer(CompiledModel& compiled, const std::string
             if (!ret)
                 return ret.error();
         }
-        expert.weight_size = expert_weight_size(compiled.weights, expert);
-        const TensorData& down_weight = compiled.weights.at(expert.down_weight);
-        const bool use_file_backed_bfloat16 = use_file_backed_experts
-                                              && moe.expert_weight_dtype == DType::BFloat16
-                                              && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
-        if (expert.gate_up_weight != invalid_tensor_handle)
-        {
-            const TensorData& gate_up_weight = compiled.weights.at(expert.gate_up_weight);
-            if (use_file_backed_bfloat16
-                && !is_cache_file_backed_expert_pair(gate_up_weight, down_weight, true))
-            {
-                return Error{
-                    ErrorCode::InvalidModel,
-                    "file-backed BF16 Expert weights must remain memory-mapped"};
-            }
-            if (is_cache_file_backed_expert_pair(gate_up_weight, down_weight, use_file_backed_bfloat16))
-            {
-                expert.cache_key = ExpertCache::make_pair_key(gate_up_weight, down_weight);
-            }
-            else if (is_qnk_dtype(gate_up_weight.dtype) && gate_up_weight.dtype == down_weight.dtype)
-            {
-                expert.cache_key = "qnk:" + prefix;
-            }
-        }
-        if (expert.cache_key.empty())
-        {
-            const TensorHandle gate_handle = expert.gate_up_weight != invalid_tensor_handle ? expert.gate_up_weight
-                                             : expert.gate_weight != invalid_tensor_handle  ? expert.gate_weight
-                                                                                            : expert.up_weight;
-            const TensorData& gate = compiled.weights.at(gate_handle);
-            const TensorData* up = expert.gate_up_weight == invalid_tensor_handle && expert.up_weight != invalid_tensor_handle
-                                       ? &compiled.weights.at(expert.up_weight)
-                                       : nullptr;
-            const auto quantized = [](DType dtype) { return dtype == DType::Int4 || is_qnk_dtype(dtype); };
-            if (quantized(gate.dtype) || quantized(down_weight.dtype) || (up && quantized(up->dtype)))
-                expert.cache_key = "quantized:" + prefix;
-        }
+        ret = finalize_expert(compiled.weights, expert, prefix, moe, use_file_backed_experts);
+        if (!ret)
+            return ret.error();
         layer_plan.moe.experts.push_back(expert);
     }
     return {};

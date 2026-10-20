@@ -12,6 +12,7 @@
 #include "storage/expertcache.h"
 #include "storage/expertresidency.h"
 #include "storage/expertcache_victim.h"
+#include "storage/mappedfile.h"
 #include "graph/memoryplan.h"
 #include "backends/ncnn/vulkan.h"
 #include "backends/ncnn/modelpipeline.h"
@@ -370,12 +371,64 @@ Result<void> ModelLoader::plan_memory()
                                                           return layer.dense.enabled()
                                                                  || layer.moe.expert_weight_dtype == DType::MxFp4;
                                                       });
+    const bool native_file_backed_qnk_experts = native_weights
+                                                && std::any_of(native_weights->begin(),
+                                                               native_weights->end(),
+                                                               [](const auto& item) {
+                                                                   return item.first.find(".experts.") != std::string::npos
+                                                                          && is_qnk_dtype(item.second.dtype)
+                                                                          && static_cast<bool>(item.second.mxfp4_file_storage);
+                                                               });
+    const bool use_file_backed_qnk = use_file_backed_experts && native_file_backed_qnk_experts;
     if (plan.selected_mode == ExpertMemoryMode::Eager && native_weights
         && std::any_of(native_weights->begin(), native_weights->end(), [](const auto& item) {
                return static_cast<bool>(item.second.mxfp4_file_storage);
            }))
     {
-        native_weights.reset();
+        bool ready = std::all_of(native_weights->begin(), native_weights->end(), [](const auto& item) {
+            return !item.second.mxfp4_file_storage || is_qnk_dtype(item.second.dtype);
+        });
+        if (ready)
+        {
+            for (auto& [name, tensor] : *native_weights)
+            {
+                const auto storage = tensor.mxfp4_file_storage;
+                if (!storage)
+                    continue;
+                auto primary = MappedFileRange::open(storage->blocks_path, storage->blocks_offset, storage->blocks_size);
+                if (!primary)
+                {
+                    ready = false;
+                    break;
+                }
+                if (storage->secondary_blocks_path.empty())
+                {
+                    if (package.weights_path.empty())
+                        primary.value()->prefault();
+                    tensor.mapped_data = primary.value()->share_data();
+                    tensor.mapped_size = storage->blocks_size;
+                }
+                else
+                {
+                    auto secondary = MappedFileRange::open(storage->secondary_blocks_path, storage->secondary_blocks_offset,
+                                                           storage->secondary_blocks_size);
+                    if (!secondary
+                        || storage->secondary_blocks_size > std::numeric_limits<size_t>::max()
+                        || storage->blocks_size > std::numeric_limits<size_t>::max() - storage->secondary_blocks_size)
+                    {
+                        ready = false;
+                        break;
+                    }
+                    tensor.quantized_data.resize(static_cast<size_t>(storage->blocks_size + storage->secondary_blocks_size));
+                    std::copy_n(primary.value()->data(), static_cast<size_t>(storage->blocks_size), tensor.quantized_data.data());
+                    std::copy_n(secondary.value()->data(), static_cast<size_t>(storage->secondary_blocks_size),
+                                tensor.quantized_data.data() + static_cast<size_t>(storage->blocks_size));
+                }
+                tensor.mxfp4_file_storage.reset();
+            }
+        }
+        if (!ready)
+            native_weights.reset();
     }
     const bool support_gpu_cache = use_file_backed_experts
                                    && std::all_of(descriptor.layers.begin(),
@@ -388,7 +441,7 @@ Result<void> ModelLoader::plan_memory()
                                                              || (moe.expert_weight_dtype == DType::BFloat16
                                                                  && has_flag(moe.flags, MoeDescriptorFileBackedExperts));
                                                   });
-    if (use_file_backed_mxfp4)
+    if (use_file_backed_mxfp4 || use_file_backed_qnk)
         package.flags |= ModelPackageDeferMxfp4Experts;
 
     if (opt.expert_gpu_cache_size > std::numeric_limits<uint64_t>::max() - opt.expert_gpu_victim_cache_size)

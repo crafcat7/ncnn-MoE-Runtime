@@ -790,9 +790,10 @@ Result<void> validate_mxfp4_artifact_expert_bank(const SafetensorsArchive& archi
 Result<void> add_tensor(WeightMapping& mapping,
                         const SafetensorsArchive& archive,
                         const std::string& target,
-                        const std::string& source)
+                        const std::string& source,
+                        uint32_t flags)
 {
-    auto tensor = archive.load_tensor(source);
+    auto tensor = archive.load_tensor(source, flags);
     if (!tensor)
         return tensor.error();
 

@@ -186,9 +186,11 @@ public:
     {
     }
 
-    void admit(std::string key, std::shared_ptr<const TensorData>, const TensorData*,
-               std::shared_ptr<const TensorData>, const TensorData*, uint32_t, float, ExpertActivation) override
+    void admit(std::string key, std::shared_ptr<const TensorData> gate, const TensorData*,
+               std::shared_ptr<const TensorData> down, const TensorData*, uint32_t, float, ExpertActivation) override
     {
+        if (pause_admission_aliases && gate && down)
+            pending_admissions.emplace_back(std::move(gate), std::move(down));
         if (admit_observer) admit_observer(key);
     }
 
@@ -219,8 +221,8 @@ public:
                     break;
                 }
                 auto entry = std::make_shared<Entry>();
-                entry->gate = request.gate_up;
-                entry->down = request.down;
+                entry->gate = request.gate_up ? std::make_shared<const TensorData>(*request.gate_up) : nullptr;
+                entry->down = request.down ? std::make_shared<const TensorData>(*request.down) : nullptr;
                 entry->activation = request.activation;
                 entry->activation_limit = request.activation_limit;
                 found = resident.emplace(std::string(request.key), std::move(entry)).first;
@@ -247,6 +249,21 @@ public:
 
     void wait_for_background_work() override
     {
+        ++background_waits;
+        if (foreground_depth == 0)
+            drain_outside_foreground = true;
+        pending_admissions.clear();
+        pause_admission_aliases = false;
+    }
+
+    void set_foreground_active(bool active) noexcept override
+    {
+        if (active)
+            ++foreground_depth;
+        else if (foreground_depth != 0)
+            --foreground_depth;
+        else
+            drain_outside_foreground = true;
     }
 
     ExpertBackendStatistics statistics() const override
@@ -267,9 +284,14 @@ public:
     size_t maximum_wave = 0;
     size_t demands_in_flight = 0;
     size_t demand_waits = 0;
+    size_t background_waits = 0;
+    size_t foreground_depth = 0;
     size_t abort_count = 0;
     size_t rejected_requests = 0;
     uint64_t executed = 0;
+    bool pause_admission_aliases = false;
+    bool drain_outside_foreground = false;
+    std::vector<std::pair<std::shared_ptr<const TensorData>, std::shared_ptr<const TensorData>>> pending_admissions;
     std::string failed_key;
     bool fail_commit = false;
     bool fail_initial_commit = false;
@@ -379,7 +401,7 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
     bool threw = false;
     try
     {
-        auto result = forward_moe(model, moe, state, statistics, scratch, 0, ExecutionBackend::Vulkan, false, shared_work);
+        auto result = forward_moe(model, moe, state, &statistics, scratch, 0, ExecutionBackend::Vulkan, false, shared_work);
         pipeline_check(static_cast<bool>(result) && state.experts_executed, "pipeline forward completed");
     }
     catch (const std::runtime_error& exception)
@@ -531,7 +553,7 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
                 const auto prefill_result = forward_moe(prefill_model,
                                                         prefill_moe,
                                                         prefill_state,
-                                                        prefill_statistics,
+                                                        &prefill_statistics,
                                                         prefill_scratch,
                                                         0,
                                                         ExecutionBackend::Vulkan,
@@ -733,7 +755,7 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
             const auto result = forward_moe(file_model,
                                             file_moe,
                                             file_state,
-                                            file_statistics,
+                                            &file_statistics,
                                             file_scratch,
                                             0,
                                             ExecutionBackend::Vulkan,
@@ -789,6 +811,234 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
         pipeline_check(file_statistics.expert_route_rank_demands[0] == 450,
                        "hybrid fallback preserves per-route cache queue feedback");
 
+        const auto run_alias_capacity_case = [&](size_t pair_capacity, bool gpu_priority, bool fail_commit) {
+            const size_t resident_id = fail_commit ? 1 : 0;
+            auto backend = std::make_shared<PipelineTestBackend>(2);
+            backend->fail_commit = fail_commit;
+            backend->pause_admission_aliases = true;
+            file_model.expert_backend = backend;
+            file_model.opt.optimization_flags = OptimizationDefaultFlags;
+            if (gpu_priority)
+                file_model.opt.optimization_flags |= OptimizationVulkanExpertGpuPriority;
+            else
+                file_model.opt.optimization_flags &= ~OptimizationVulkanExpertGpuPriority;
+            file_model.expert_cache = std::make_shared<ExpertCache>(file_pair_size * pair_capacity,
+                                                                    1,
+                                                                    nullptr,
+                                                                    ExpertIoMode::Buffered);
+
+            const auto resident_gate = std::make_shared<const TensorData>(gate_sources[resident_id]);
+            const auto resident_down = std::make_shared<const TensorData>(down_sources[resident_id]);
+            const ExpertDemandRequest resident_request{file_moe.experts[resident_id].cache_key,
+                                                       resident_gate,
+                                                       nullptr,
+                                                       resident_down,
+                                                       nullptr,
+                                                       0,
+                                                       4.0f,
+                                                       ExpertActivation::DeepSeekSwiGlu};
+            std::array<std::shared_ptr<const void>, 1> resident_pins;
+            pipeline_check(backend->prepare_demand_batch(std::span<const ExpertDemandRequest>(&resident_request, 1), resident_pins) == 1,
+                           "alias-pinning fixture seeds an independent resident GPU pair");
+            resident_pins[0].reset();
+
+            auto cached = file_model.expert_cache->acquire_pair(file_model.weights.at(file_gates[0]),
+                                                                file_model.weights.at(file_downs[0]),
+                                                                0,
+                                                                file_moe.experts[0].cache_key);
+            pipeline_check(static_cast<bool>(cached), "alias-pinning fixture loads the host pair");
+            ExpertCacheLease cache_lease = std::move(cached).value();
+            backend->admit(file_moe.experts[0].cache_key,
+                           cache_lease.gate_up,
+                           nullptr,
+                           cache_lease.down,
+                           nullptr,
+                           0,
+                           4.0f,
+                           ExpertActivation::DeepSeekSwiGlu);
+            cache_lease = {};
+            pipeline_check(backend->pending_admissions.size() == 1,
+                           "pending backend aliases alone retain the host cache Entry");
+
+            LayerState alias_state;
+            const size_t active_count = 1;
+            alias_state.normalized.reset(96, 32, false);
+            alias_state.resize_experts(active_count);
+            for (size_t row = 0; row < alias_state.normalized.rows(); ++row)
+                for (uint32_t column = 0; column < alias_state.normalized.columns(); ++column)
+                    alias_state.normalized.row(row)[column] = static_cast<float>(static_cast<int>((row * 7 + column * 3 + pair_capacity * 5 + gpu_priority) % 19) - 9) * 0.015625f;
+            alias_state.reset();
+            for (size_t index = 0; index < active_count; ++index)
+            {
+                ExpertState& active = alias_state.active_experts()[index];
+                active.batch.expert_id = 1;
+                active.batch.routes = {{static_cast<uint32_t>(index * 7 + 3), 0, 1.0f}};
+                active.output.reset(1, 32, false);
+                std::fill_n(active.output.row(0), active.output.columns(), -37.0f);
+            }
+
+            ExpertScratch alias_scratch;
+            SessionStatistics alias_statistics;
+            Result<void> result;
+            {
+                ScopedExpertBackendForeground foreground(backend);
+                result = forward_moe(file_model,
+                                     file_moe,
+                                     alias_state,
+                                     &alias_statistics,
+                                     alias_scratch,
+                                     0,
+                                     ExecutionBackend::Vulkan,
+                                     false);
+            }
+            pipeline_check(static_cast<bool>(result) && alias_state.experts_executed,
+                           "host cache recovers from aliases retained by backend admission");
+            pipeline_check(backend->foreground_depth == 0 && !backend->drain_outside_foreground,
+                           "cache pressure drains backend aliases only during foreground work");
+            if (pair_capacity == 1)
+                pipeline_check(backend->background_waits != 0 && backend->pending_admissions.empty(),
+                               "one-pair cache drains the held aliases before admitting the cold Expert");
+            else
+            {
+                pipeline_check(backend->background_waits == 0,
+                               "two-pair cache admits both Experts without draining background work");
+                backend->pending_admissions.clear();
+            }
+            pipeline_check(alias_scratch.cache_leases.empty(),
+                           "alias-pinning fallback leaves no scratch cache leases");
+            for (const ExpertState& active : alias_state.active_experts())
+                pipeline_check(!active.lease.gate_up && !active.lease.down,
+                               "alias-pinning fallback releases every active cache lease");
+            pipeline_check(file_model.expert_cache->statistics().resident_size <= file_pair_size * pair_capacity,
+                           "alias-pinning admission respects the configured cache capacity");
+
+            for (const ExpertState& active : alias_state.active_experts())
+            {
+                const size_t expert_id = active.batch.expert_id;
+                ActivationBuffer gathered(1, 32);
+                std::copy_n(alias_state.normalized.row(active.batch.routes.front().token_index), 32, gathered.row(0));
+                ActivationBuffer activated;
+                forward_gate_up_mxfp4(gate_sources[expert_id],
+                                      nullptr,
+                                      gathered,
+                                      ExpertActivation::DeepSeekSwiGlu,
+                                      4.0f,
+                                      activated,
+                                      file_model.opt.optimization_flags);
+                const ActivationBuffer expected = forward_linear(down_sources[expert_id],
+                                                                 activated,
+                                                                 file_model.opt.optimization_flags);
+                pipeline_check(active.output.rows() == expected.rows()
+                                   && active.output.columns() == expected.columns(),
+                               "alias-pinning fallback preserves the CPU oracle shape");
+                for (size_t index = 0; index < expected.values().size(); ++index)
+                    pipeline_check(std::isfinite(active.output.values()[index])
+                                       && std::abs(active.output.values()[index] - expected.values()[index]) < 0.000001f,
+                                   "alias-pinning fallback matches the independent CPU oracle");
+            }
+        };
+        run_alias_capacity_case(1, true, false);
+        run_alias_capacity_case(1, false, false);
+        run_alias_capacity_case(2, true, false);
+        run_alias_capacity_case(1, false, true);
+
+        {
+            auto throwing_backend = std::make_shared<PipelineTestBackend>(2);
+            file_model.expert_backend = throwing_backend;
+            file_model.opt.optimization_flags = OptimizationDefaultFlags | OptimizationVulkanExpertGpuPriority;
+            file_model.expert_cache = std::make_shared<ExpertCache>(file_pair_size,
+                                                                    1,
+                                                                    nullptr,
+                                                                    ExpertIoMode::Buffered);
+            const auto resident_gate = std::make_shared<const TensorData>(gate_sources[1]);
+            const auto resident_down = std::make_shared<const TensorData>(down_sources[1]);
+            const ExpertDemandRequest resident_request{file_moe.experts[1].cache_key,
+                                                       resident_gate,
+                                                       nullptr,
+                                                       resident_down,
+                                                       nullptr,
+                                                       0,
+                                                       4.0f,
+                                                       ExpertActivation::DeepSeekSwiGlu};
+            std::array<std::shared_ptr<const void>, 1> resident_pins;
+            pipeline_check(throwing_backend->prepare_demand_batch(std::span<const ExpertDemandRequest>(&resident_request, 1), resident_pins) == 1,
+                           "exception cleanup fixture seeds an independent resident GPU pair");
+            resident_pins[0].reset();
+            {
+                auto warmed = file_model.expert_cache->acquire_pair(file_model.weights.at(file_gates[0]),
+                                                                    file_model.weights.at(file_downs[0]),
+                                                                    0,
+                                                                    file_moe.experts[0].cache_key);
+                pipeline_check(static_cast<bool>(warmed), "exception cleanup fixture warms the cold host pair");
+            }
+
+            LayerState throwing_state;
+            throwing_state.normalized.reset(96, 32, false);
+            throwing_state.resize_experts(2);
+            for (size_t row = 0; row < throwing_state.normalized.rows(); ++row)
+                for (uint32_t column = 0; column < throwing_state.normalized.columns(); ++column)
+                    throwing_state.normalized.row(row)[column] = static_cast<float>(static_cast<int>((row * 5 + column * 11) % 23) - 11) * 0.0078125f;
+            throwing_state.reset();
+            for (size_t index = 0; index < 2; ++index)
+            {
+                ExpertState& active = throwing_state.active_experts()[index];
+                active.batch.expert_id = static_cast<uint32_t>(index);
+                active.batch.routes = {{static_cast<uint32_t>(index + 4), 0, 1.0f}};
+                active.output.reset(1, 32, false);
+            }
+
+            ExpertScratch throwing_scratch;
+            SessionStatistics throwing_statistics;
+            bool hook_called_with_pinned_wave = false;
+            bool caught_hook_exception = false;
+            try
+            {
+                ScopedExpertBackendForeground foreground(throwing_backend);
+                (void)forward_moe(file_model,
+                                  file_moe,
+                                  throwing_state,
+                                  &throwing_statistics,
+                                  throwing_scratch,
+                                  0,
+                                  ExecutionBackend::Vulkan,
+                                  false,
+                                  [&] {
+                                      hook_called_with_pinned_wave = true;
+                                      pipeline_check(throwing_state.active_experts()[0].lease.gate_up
+                                                         && throwing_backend->in_flight == 1,
+                                                     "exception hook runs with a host lease and resident GPU work in flight");
+                                      throw std::runtime_error("injected pinned-wave exception");
+                                  });
+            }
+            catch (const std::runtime_error& exception)
+            {
+                if (std::string(exception.what()) != "injected pinned-wave exception") throw;
+                caught_hook_exception = true;
+            }
+            pipeline_check(hook_called_with_pinned_wave && caught_hook_exception,
+                           "pinned-wave exception propagates from the existing independent-work hook");
+            pipeline_check(throwing_backend->in_flight == 0
+                               && throwing_backend->demands_in_flight == 0
+                               && throwing_scratch.cache_leases.empty(),
+                           "exception cleanup drains compute and demand owners");
+            for (const ExpertState& active : throwing_state.active_experts())
+                pipeline_check(!active.lease.gate_up && !active.lease.down,
+                               "exception cleanup releases every active host cache lease");
+            auto recovered = file_model.expert_cache->acquire_pair(file_model.weights.at(file_gates[1]),
+                                                                   file_model.weights.at(file_downs[1]),
+                                                                   0,
+                                                                   file_moe.experts[1].cache_key);
+            pipeline_check(static_cast<bool>(recovered),
+                           "a later host pair is admitted after pinned-wave exception cleanup");
+            ExpertCacheLease recovered_lease = std::move(recovered).value();
+            pipeline_check(recovered_lease.gate_up->mxfp4_blocks.front() == gate_sources[1].mxfp4_blocks.front()
+                               && recovered_lease.down->mxfp4_blocks.front() == down_sources[1].mxfp4_blocks.front(),
+                           "recovered cache pair contains its original quantized payload");
+            recovered_lease = {};
+        }
+        file_model.opt.optimization_flags = OptimizationDefaultFlags & ~OptimizationVulkanExpertGpuPriority;
+        file_model.expert_cache = std::make_shared<ExpertCache>(file_pair_size, 1, nullptr, ExpertIoMode::Buffered);
+
         auto error_backend = std::make_shared<PipelineTestBackend>(1);
         error_backend->reject_second_request = true;
         error_backend->fail_commit = true;
@@ -836,7 +1086,7 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
         const auto error_result = forward_moe(file_model,
                                               file_moe,
                                               file_state,
-                                              file_statistics,
+                                              &file_statistics,
                                               file_scratch,
                                               0,
                                               ExecutionBackend::Vulkan,

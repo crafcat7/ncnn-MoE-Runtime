@@ -868,10 +868,49 @@ static Result<uint64_t> packed_expert_pair_size(const MoeModelDescriptor& descri
     return checked_add(gate_up.value(), down.value(), "packed expert pair");
 }
 
-static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeModelDescriptor& descriptor,
-                                        ModelMemoryPlan& plan)
+enum class QnkExpertEncoding
 {
-    std::map<std::string, uint64_t> expert_sizes;
+    None,
+    FileBacked,
+    Unsupported
+};
+
+static QnkExpertEncoding qnk_expert_encoding(const WeightMapping& weights) noexcept
+{
+    bool found = false;
+    bool qnk_only = true;
+    bool file_backed = true;
+    for (const auto& [name, tensor] : weights)
+    {
+        if (name.find(".experts.") == std::string::npos || !name.ends_with(".weight"))
+            continue;
+        if (is_qnk_dtype(tensor.dtype))
+        {
+            found = true;
+            file_backed = file_backed && static_cast<bool>(tensor.mxfp4_file_storage);
+        }
+        else
+        {
+            qnk_only = false;
+        }
+    }
+    if (!found)
+        return QnkExpertEncoding::None;
+    return qnk_only && file_backed ? QnkExpertEncoding::FileBacked
+                                   : QnkExpertEncoding::Unsupported;
+}
+
+static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeModelDescriptor& descriptor,
+                                        ModelMemoryPlan& plan, uint64_t& expert_fixed_size,
+                                        uint64_t& max_qnk_cache_pair_size)
+{
+    struct MappedExpertSize
+    {
+        uint64_t total = 0;
+        uint64_t raw = 0;
+        uint64_t metadata = 0;
+    };
+    std::map<std::string, MappedExpertSize> expert_sizes;
     for (const auto& [name, tensor] : weights)
     {
         uint64_t bytes = tensor.dtype == DType::Int4
@@ -908,11 +947,53 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
             const size_t end = name.find('.', marker + 9);
             if (end == std::string::npos)
                 return Error{ErrorCode::InvalidModel, "invalid canonical Expert tensor name: " + name};
-            uint64_t& size = expert_sizes[name.substr(0, end)];
-            auto total = checked_add(size, bytes, "mapped Expert weights");
+            MappedExpertSize& expert_size = expert_sizes[name.substr(0, end)];
+            auto total = checked_add(expert_size.total, bytes, "mapped Expert weights");
             if (!total)
                 return total.error();
-            size = total.value();
+            expert_size.total = total.value();
+            if (!is_qnk_dtype(tensor.dtype))
+            {
+                auto resident = checked_add(expert_fixed_size, bytes,
+                                            "resident non-Qn_K Expert weights");
+                if (!resident)
+                    return resident.error();
+                expert_fixed_size = resident.value();
+            }
+            if (is_qnk_dtype(tensor.dtype))
+            {
+                if (tensor.input_column_indices.size()
+                    > std::numeric_limits<uint64_t>::max() / sizeof(uint32_t))
+                {
+                    return Error{ErrorCode::InvalidModel, "Qn_K column-map byte count overflows"};
+                }
+                const uint64_t metadata = static_cast<uint64_t>(tensor.input_column_indices.size())
+                                          * sizeof(uint32_t);
+                auto fixed_metadata = checked_add(expert_fixed_size, metadata,
+                                                  "fixed Qn_K Expert metadata");
+                if (!fixed_metadata)
+                    return fixed_metadata.error();
+                expert_fixed_size = fixed_metadata.value();
+                auto expert_total = checked_add(expert_size.metadata, metadata,
+                                                "Qn_K Expert metadata");
+                if (!expert_total)
+                    return expert_total.error();
+                expert_size.metadata = expert_total.value();
+
+                if (tensor.mxfp4_file_storage)
+                {
+                    const MxFp4FileStorage& storage = *tensor.mxfp4_file_storage;
+                    auto raw_size = checked_add(storage.blocks_size,
+                                                storage.secondary_blocks_size,
+                                                "Qn_K Expert blocks");
+                    if (!raw_size)
+                        return raw_size.error();
+                    auto expert_raw_size = checked_add(expert_size.raw, raw_size.value(), "Qn_K Expert blocks");
+                    if (!expert_raw_size)
+                        return expert_raw_size.error();
+                    expert_size.raw = expert_raw_size.value();
+                }
+            }
         }
         else
         {
@@ -922,14 +1003,24 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
             plan.estimated_dense_size = total.value();
         }
     }
-    for (const auto& [name, bytes] : expert_sizes)
+    for (const auto& [name, expert_size] : expert_sizes)
     {
         (void)name;
-        auto total = checked_add(plan.estimated_expert_size, bytes, "mapped Expert weights");
+        auto total = checked_add(plan.estimated_expert_size, expert_size.total, "mapped Expert weights");
         if (!total)
             return total.error();
         plan.estimated_expert_size = total.value();
-        plan.expert_pair_size = std::max(plan.expert_pair_size, bytes);
+        plan.expert_pair_size = std::max(plan.expert_pair_size, expert_size.total);
+
+        auto resident_metadata = checked_multiply(expert_size.metadata, 2,
+                                                  "resident Qn_K Expert metadata");
+        if (!resident_metadata)
+            return resident_metadata.error();
+        auto resident_pair = checked_add(expert_size.raw, resident_metadata.value(),
+                                         "resident Qn_K Expert pair");
+        if (!resident_pair)
+            return resident_pair.error();
+        max_qnk_cache_pair_size = std::max(max_qnk_cache_pair_size, resident_pair.value());
     }
     plan.expert_pair_resident_size = plan.expert_pair_size;
     plan.estimated_expert_resident_size = plan.estimated_expert_size;
@@ -955,6 +1046,8 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
 
     ModelMemoryPlan plan;
     bool budget_limited_by_available_memory = false;
+    uint64_t expert_fixed_size = 0;
+    uint64_t max_qnk_cache_pair_size = 0;
     plan.requested_mode = opt.expert_memory_mode;
     plan.physical_memory_size = physical_memory_size;
     plan.available_memory_size = available_memory_size;
@@ -991,7 +1084,9 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
     {
         if (reserve_cpu_packed_weights)
             return Error{ErrorCode::UnsupportedModel, "native imported weights require CpuPackedWeightMode::Disabled"};
-        auto sizes = mapped_weight_sizes(*weights, descriptor, plan);
+        auto sizes = mapped_weight_sizes(*weights, descriptor, plan,
+                                         expert_fixed_size,
+                                         max_qnk_cache_pair_size);
         if (!sizes)
             return sizes.error();
     }
@@ -1018,6 +1113,10 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         return !layer.dense.enabled();
     });
     const MoeDescriptor& moe = first_moe->moe;
+    const QnkExpertEncoding qnk_encoding = weights ? qnk_expert_encoding(*weights)
+                                                   : QnkExpertEncoding::None;
+    const bool has_qnk_experts = qnk_encoding != QnkExpertEncoding::None;
+    const bool file_backed_qnk_experts = qnk_encoding == QnkExpertEncoding::FileBacked;
     const auto add_expert_layers = [&](const MoeDescriptor& layer_moe,
                                        uint64_t layer_count) -> Result<void> {
         auto pair_size = expert_pair_size(descriptor, layer_moe.expert_weight_dtype);
@@ -1105,7 +1204,9 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
     {
         eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - safety_reserve;
     }
-    const auto supports_file_backed_experts = [](const MoeDescriptor& descriptor) {
+    const auto supports_file_backed_experts = [has_qnk_experts, file_backed_qnk_experts](const MoeDescriptor& descriptor) {
+        if (has_qnk_experts)
+            return file_backed_qnk_experts;
         return descriptor.expert_weight_dtype == DType::MxFp4
                || (descriptor.expert_weight_dtype == DType::BFloat16
                    && has_flag(descriptor.flags, MoeDescriptorFileBackedExperts));
@@ -1169,6 +1270,29 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         plan.estimated_dense_size = releasable.value() >= plan.estimated_dense_size
                                         ? 0
                                         : plan.estimated_dense_size - releasable.value();
+        eager_capacity = 0;
+        if (plan.host_memory_budget > plan.estimated_dense_size
+            && plan.host_memory_budget - plan.estimated_dense_size > safety_reserve)
+        {
+            eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - safety_reserve;
+        }
+    }
+    if (plan.selected_mode == ExpertMemoryMode::OnDemand && file_backed_qnk_experts)
+    {
+        auto fixed_resident = checked_add(plan.estimated_dense_size, expert_fixed_size,
+                                          "fixed Qn_K Expert weights");
+        if (!fixed_resident)
+            return fixed_resident.error();
+        plan.estimated_dense_size = fixed_resident.value();
+
+        plan.expert_pair_resident_size = max_qnk_cache_pair_size;
+        auto active = checked_multiply(plan.expert_pair_resident_size,
+                                       descriptor.experts_per_token,
+                                       "mapped active Experts");
+        if (!active)
+            return active.error();
+        plan.minimum_active_expert_size = active.value();
+
         eager_capacity = 0;
         if (plan.host_memory_budget > plan.estimated_dense_size
             && plan.host_memory_budget - plan.estimated_dense_size > safety_reserve)

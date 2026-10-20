@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -84,9 +85,10 @@ public:
         return true;
     }
 
-    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest>) override
+    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) override
     {
         ++submissions;
+        if (!requests.empty()) last_key = requests.front().key;
         return {};
     }
 
@@ -99,7 +101,65 @@ public:
     uint32_t admissions = 0;
     uint32_t demands = 0;
     uint32_t submissions = 0;
+    std::string last_key;
 };
+
+static void test_key_sharded_routing()
+{
+    const std::array<std::shared_ptr<CountingBudgetBackend>, 2> children = {
+        std::make_shared<CountingBudgetBackend>(), std::make_shared<CountingBudgetBackend>()};
+    auto backend = create_key_sharded_expert_backend({children[0], children[1]}, {2, 7});
+    std::array<std::string, 2> keys = {"first", "second"};
+    for (size_t index = 0; index < keys.size(); ++index)
+    {
+        while (std::hash<std::string_view>{}(keys[index]) % children.size() != index)
+            keys[index] += 'x';
+    }
+    auto weight = std::make_shared<TensorData>();
+    for (size_t index = 0; index < keys.size(); ++index)
+    {
+        // A conflicting group must not override deterministic key placement.
+        const uint32_t group = static_cast<uint32_t>(1 - index);
+        backend->admit(keys[index], weight, nullptr, weight, nullptr, group, 0.f, ExpertActivation::Silu);
+        backend->admit_separate(keys[index], weight, nullptr, weight, nullptr, weight, nullptr,
+                                group, 0.f, ExpertActivation::Silu);
+        std::shared_ptr<const void> pin;
+        budget_check(backend->prepare_demand(keys[index], weight, nullptr, weight, nullptr,
+                                             group, 0.f, ExpertActivation::Silu, pin)
+                         && pin,
+                     "key-sharded demand prepares its hash-selected child");
+        budget_check(backend->prepare_demand_separate(keys[index], weight, nullptr, weight, nullptr, weight, nullptr,
+                                                      group, 0.f, ExpertActivation::Silu, pin)
+                         && pin,
+                     "key-sharded separate demand prepares its hash-selected child");
+        budget_check(children[index]->admissions == 2 && children[index]->demands == 2,
+                     "key-sharded single requests ignore conflicting residency groups");
+    }
+    const std::array<ExpertDemandRequest, 2> demands = {
+        ExpertDemandRequest{keys[0], weight, nullptr, weight, nullptr, 1, 0.f, ExpertActivation::Silu},
+        ExpertDemandRequest{keys[1], weight, nullptr, weight, nullptr, 0, 0.f, ExpertActivation::Silu},
+    };
+    std::array<std::shared_ptr<const void>, 2> pins;
+    budget_check(backend->prepare_demand_batch(demands, pins) == 2 && pins[0] && pins[1],
+                 "key-sharded batch demand preserves the prepared prefix");
+    auto upload = backend->begin_demand_batch(demands);
+    budget_check(upload && upload->wait(pins) == 2 && pins[0] && pins[1],
+                 "key-sharded asynchronous demand preserves the prepared prefix");
+    ActivationBuffer input(1, 1);
+    std::array<ActivationBuffer, 2> outputs;
+    const std::array<ExpertBackendRequest, 2> requests = {
+        ExpertBackendRequest{keys[0], &input, &outputs[0]},
+        ExpertBackendRequest{keys[1], &input, &outputs[1]},
+    };
+    auto submission = backend->submit_batch(requests);
+    budget_check(static_cast<bool>(submission), "key-sharded batch submission exists");
+    for (size_t index = 0; index < children.size(); ++index)
+    {
+        budget_check(children[index]->demands == 4 && children[index]->submissions == 1
+                         && children[index]->last_key == keys[index],
+                     "key-sharded admission and execution select the same child");
+    }
+}
 
 static void test_unbudgeted_device_fallback()
 {
@@ -155,6 +215,7 @@ int main()
     {
         ncnn::moe::test_live_budget();
         ncnn::moe::test_unbudgeted_device_fallback();
+        ncnn::moe::test_key_sharded_routing();
         std::cout << "Native quantized GPU budget tests passed\n";
         return 0;
     }

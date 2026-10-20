@@ -3,6 +3,7 @@
 #include "engine/executor.h"
 #include "engine/sessionstate.h"
 #include "backends/ncnn/vulkan.h"
+#include "kernels/qnk.h"
 
 #include <algorithm>
 #include <array>
@@ -192,17 +193,46 @@ int main(int argc, char** argv)
         ncnn::moe::check(static_cast<bool>(actual), actual ? "" : actual.error().message);
         const auto& reference = ncnn::moe::model_compiled(*expected.value());
         const auto& candidate = ncnn::moe::model_compiled(*actual.value());
+        bool qnk_experts = false;
         if (on_demand)
+        {
             ncnn::moe::check(candidate.memory_plan.selected_mode == ncnn::moe::ExpertMemoryMode::OnDemand
                                  && candidate.expert_cache,
                              "on-demand graph comparison did not construct the host Expert cache");
+            ncnn::moe::check(candidate.expert_cache->statistics().bytes_read == 0,
+                             "on-demand model read Expert payload before execution");
+            for (const auto& layer : candidate.graph.layer_plans)
+            {
+                for (const auto& expert : layer.moe.experts)
+                {
+                    for (auto handle : {expert.gate_up_weight, expert.down_weight})
+                    {
+                        ncnn::moe::check(handle != ncnn::moe::invalid_tensor_handle,
+                                         "on-demand Expert is missing its cached projection");
+                        const auto& tensor = candidate.weights.at(handle);
+                        if (!ncnn::moe::is_qnk_dtype(tensor.dtype))
+                            continue;
+                        qnk_experts = true;
+                        ncnn::moe::check(tensor.mxfp4_file_storage && !tensor.mapped_data
+                                             && tensor.quantized_data.empty() && tensor.qnk_values().empty(),
+                                         "on-demand Qn_K projection retained resident payload");
+                    }
+                }
+            }
+        }
         ncnn::moe::check(reference.descriptor.model_type == candidate.descriptor.model_type
                              && reference.descriptor.layers.size() == candidate.descriptor.layers.size(),
                          "HF/GGUF graph descriptor mismatch");
         ncnn::moe::compare_graphs(reference, candidate, hybrid);
         if (on_demand)
-            ncnn::moe::check(candidate.expert_cache->statistics().bytes_read > 0,
-                             "on-demand graph comparison did not read any Expert ranges");
+        {
+            const auto cache = candidate.expert_cache->statistics();
+            ncnn::moe::check(cache.resident_size <= candidate.expert_cache->capacity(),
+                             "on-demand graph exceeded the Expert cache payload budget");
+            ncnn::moe::check(cache.bytes_read > 0,
+                             qnk_experts ? "on-demand Qn_K comparison did not read any Expert ranges"
+                                         : "on-demand graph comparison did not read any Expert ranges");
+        }
         return 0;
     }
     catch (const std::exception& error)

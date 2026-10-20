@@ -6,7 +6,6 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -15,8 +14,6 @@
 
 namespace ncnn {
 namespace moe {
-
-class MappedFileRange;
 
 enum class GgufMetadataType : uint32_t
 {
@@ -63,15 +60,6 @@ struct GgufTensorInfo
     uint64_t size = 0;
 };
 
-struct GgufTensorView
-{
-    GgufTensorInfo info;
-    std::shared_ptr<MappedFileRange> mapping;
-
-    [[nodiscard]] const uint8_t* data() const noexcept;
-    [[nodiscard]] size_t size() const noexcept;
-};
-
 class GgufArchive
 {
 public:
@@ -82,7 +70,6 @@ public:
     [[nodiscard]] const GgufMetadataValue* find_metadata(const std::string& key) const noexcept;
     [[nodiscard]] const std::unordered_map<std::string, GgufTensorInfo>& tensor_infos() const noexcept;
     [[nodiscard]] const std::unordered_map<std::string, GgufMetadataValue>& metadata_values() const noexcept;
-    [[nodiscard]] Result<GgufTensorView> map_tensor(const std::string& name) const;
     [[nodiscard]] const std::filesystem::path& source_path() const noexcept;
     [[nodiscard]] const std::filesystem::path& root_path() const noexcept;
 

@@ -454,6 +454,9 @@ if(NCNN_MOE_BUILD_TESTS)
         NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
     )
     add_test(NAME ncnn_moe_tests COMMAND ncnn_moe_tests)
+    if(UNIX)
+        add_test(NAME ncnn_moe_mapped_file_low_fd COMMAND ncnn_moe_tests --mapped-file)
+    endif()
 
     add_executable(ncnn_moe_qwen_dense_test tests/test_qwen_dense.cpp)
     target_link_libraries(ncnn_moe_qwen_dense_test PRIVATE ncnn::moe)

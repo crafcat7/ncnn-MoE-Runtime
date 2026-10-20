@@ -383,7 +383,8 @@ Result<WeightMapping> GptOssModelAdapter::map_weights(const ModelPackage& packag
                 for (size_t projection_index = 0; projection_index < projection_count; ++projection_index)
                 {
                     const auto& projection = projections[projection_index];
-                    status = add_tensor(mapping, archive, expert + projection.first + ".weight", expert_source + projection.second + ".weight");
+                    status = add_tensor(mapping, archive, expert + projection.first + ".weight",
+                                        expert_source + projection.second + ".weight", expert_load_flags);
                     if (!status)
                         return status.error();
                 }

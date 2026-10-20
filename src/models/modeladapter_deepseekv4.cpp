@@ -12,7 +12,8 @@ namespace ncnn {
 namespace moe {
 
 static Result<void> add_deepseek_projection(WeightMapping& mapping, const SafetensorsArchive& archive,
-                                            const std::string& target, const std::string& source);
+                                            const std::string& target, const std::string& source,
+                                            uint32_t flags = 0);
 
 static Result<DType> deepseek_projection_dtype(const SafetensorsArchive& archive, const std::string& source)
 {
@@ -90,7 +91,8 @@ static Result<void> add_experts(WeightMapping& mapping, const SafetensorsArchive
             for (size_t projection_index = 0; projection_index < projection_count; ++projection_index)
             {
                 const auto& projection = projections[projection_index];
-                auto status = add_deepseek_projection(mapping, archive, expert_target + projection.first + ".weight", expert_source + projection.second);
+                auto status = add_deepseek_projection(mapping, archive, expert_target + projection.first + ".weight",
+                                                      expert_source + projection.second, flags);
                 if (!status)
                     return status.error();
             }
@@ -463,14 +465,15 @@ static Result<void> add_common_layer_tensors(WeightMapping& mapping, const Safet
     return {};
 }
 
-static Result<void> add_deepseek_projection(WeightMapping& mapping, const SafetensorsArchive& archive, const std::string& target, const std::string& source)
+static Result<void> add_deepseek_projection(WeightMapping& mapping, const SafetensorsArchive& archive,
+                                            const std::string& target, const std::string& source, uint32_t flags)
 {
     auto dtype = deepseek_projection_dtype(archive, source + ".weight");
     if (!dtype)
         return dtype.error();
     auto tensor = dtype.value() == DType::Float8E4M3
                       ? archive.load_float8_tensor(source + ".weight", source + ".scale")
-                      : archive.load_tensor(source + ".weight");
+                      : archive.load_tensor(source + ".weight", flags);
     if (!tensor)
         return tensor.error();
     mapping.emplace(target, std::move(tensor).value());

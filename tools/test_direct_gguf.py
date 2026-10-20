@@ -210,15 +210,17 @@ def main() -> int:
                     return 77
                 completed.check_returncode()
             if moe:
-                baseline, source = mxfp4_copy(fixture, directory)
-                command = [str(args.runner.resolve()), str(baseline), str(source), "--on-demand"]
-                if args.hybrid:
-                    command.append("--hybrid")
-                print(f"Checking {label}: MXFP4 with on-demand Expert cache", flush=True)
-                completed = subprocess.run(command)
-                if completed.returncode == 77:
-                    return 77
-                completed.check_returncode()
+                deferred = [(fixture.baseline, fixture.source, "QnK"),
+                            (*mxfp4_copy(fixture, directory), "MXFP4")]
+                for baseline, source, encoding in deferred:
+                    command = [str(args.runner.resolve()), str(baseline), str(source), "--on-demand"]
+                    if args.hybrid:
+                        command.append("--hybrid")
+                    print(f"Checking {label}: {encoding} with on-demand Expert cache", flush=True)
+                    completed = subprocess.run(command)
+                    if completed.returncode == 77:
+                        return 77
+                    completed.check_returncode()
     return 0
 
 

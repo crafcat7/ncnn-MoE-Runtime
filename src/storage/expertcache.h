@@ -31,15 +31,9 @@ struct ExpertCacheLease
 {
     std::shared_ptr<const TensorData> gate_up;
     std::shared_ptr<const TensorData> down;
-    // These pointers refer to the matching Entry fields and are valid while
-    // this lease's private pin keeps that Entry alive.
+    // Either tensor alias keeps the Entry fields and these operators alive.
     const CompiledOperator* gate_up_operator = nullptr;
     const CompiledOperator* down_operator = nullptr;
-
-private:
-    std::shared_ptr<const void> pin;
-
-    friend class ExpertCache;
 };
 
 struct ExpertCacheStatistics
@@ -138,9 +132,10 @@ public:
     // waits for min(target, admitted prefix size) ready pairs instead, failing
     // immediately when any admitted read fails. Unadmitted pairs are not waited
     // on; callers bound the request span to their desired read-ahead wave.
-    // wait_for_ready=false polls a bounded prefix without waiting for either
-    // capacity or I/O completion, allowing overlap with an in-flight compute.
-    [[nodiscard]] Result<size_t> wait_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests, std::span<ExpertCacheLease> leases, bool wait_for_any = true, size_t target_ready_count = 1, bool wait_for_ready = true);
+    // wait_for_ready=false polls a bounded prefix without waiting for capacity
+    // or I/O completion. Set wait_for_capacity=false to return a short prefix
+    // when capacity is unavailable while still waiting for admitted reads.
+    [[nodiscard]] Result<size_t> wait_acquire_ready_pairs(std::span<const ExpertCachePairRequest> requests, std::span<ExpertCacheLease> leases, bool wait_for_any = true, size_t target_ready_count = 1, bool wait_for_ready = true, bool wait_for_capacity = true);
     [[nodiscard]] bool is_ready(const TensorData& gate_up, const TensorData& down, std::string_view prepared_key = {}) const;
     [[nodiscard]] static std::string make_pair_key(const TensorData& gate_up, const TensorData& down);
     void resolve_predictions(uint32_t residency_group, std::span<const std::string_view> demanded_keys);
@@ -169,7 +164,8 @@ private:
             return std::hash<std::string_view>{}(value);
         }
     };
-    using EntryMap = std::unordered_map<std::string, std::shared_ptr<Entry>, TransparentStringHash, std::equal_to<>>;
+    // Entry keys are immutable after insertion; mapped shared_ptrs own each view's backing.
+    using EntryMap = std::unordered_map<std::string_view, std::shared_ptr<Entry>, TransparentStringHash, std::equal_to<>>;
     using GhostIndex = std::unordered_map<std::string, GhostList::iterator, TransparentStringHash, std::equal_to<>>;
 
     [[nodiscard]] Result<std::shared_ptr<TensorData>> load_tensor(const TensorData& source, uint64_t& mapped_range_count, uint64_t& mapped_size);

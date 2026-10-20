@@ -437,14 +437,16 @@ static Result<void> add_qnk_expert(WeightMapping& mapping,
                                    uint32_t expert_id,
                                    uint32_t expert_count,
                                    uint32_t rows,
-                                   uint32_t columns)
+                                   uint32_t columns,
+                                   uint32_t flags)
 {
     auto tensor = archive.load_qnk_expert(source,
                                           dtype,
                                           expert_id,
                                           expert_count,
                                           rows,
-                                          columns);
+                                          columns,
+                                          flags);
     if (!tensor)
         return tensor.error();
     mapping.emplace(target, std::move(tensor).value());
@@ -565,7 +567,7 @@ Result<WeightMapping> Qwen3_5MoeModelAdapter::map_weights(const ModelPackage& pa
                     for (const auto& projection : {std::pair{"gate", "gate_proj"}, std::pair{"up", "up_proj"}, std::pair{"down", "down_proj"}})
                     {
                         status = add_tensor(mapping, archive, expert_target + projection.first + ".weight",
-                                            expert_source + projection.second + ".weight");
+                                            expert_source + projection.second + ".weight", expert_load_flags);
                         if (!status)
                             return status.error();
                     }
@@ -621,7 +623,8 @@ Result<WeightMapping> Qwen3_5MoeModelAdapter::map_weights(const ModelPackage& pa
                                                 expert_id,
                                                 moe.expert_count,
                                                 moe.intermediate_size * 2,
-                                                descriptor.hidden_size);
+                                                descriptor.hidden_size,
+                                                expert_load_flags);
                     }
                     else
                     {
@@ -647,7 +650,8 @@ Result<WeightMapping> Qwen3_5MoeModelAdapter::map_weights(const ModelPackage& pa
                                                 expert_id,
                                                 moe.expert_count,
                                                 descriptor.hidden_size,
-                                                moe.intermediate_size);
+                                                moe.intermediate_size,
+                                                expert_load_flags);
                     }
                     else
                     {

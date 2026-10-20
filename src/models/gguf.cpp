@@ -1,5 +1,4 @@
 #include "gguf.h"
-#include "storage/mappedfile.h"
 
 #include <algorithm>
 #include <array>
@@ -57,16 +56,6 @@ const std::string* GgufMetadataValue::string() const noexcept
 const GgufMetadataValue::Array* GgufMetadataValue::array() const noexcept
 {
     return std::get_if<Array>(&value);
-}
-
-const uint8_t* GgufTensorView::data() const noexcept
-{
-    return mapping ? mapping->data() : nullptr;
-}
-
-size_t GgufTensorView::size() const noexcept
-{
-    return mapping ? mapping->size() : 0;
 }
 
 constexpr uint64_t maximum_header_size = UINT64_C(256) * 1024 * 1024;
@@ -522,17 +511,6 @@ const std::unordered_map<std::string, GgufTensorInfo>& GgufArchive::tensor_infos
 const std::unordered_map<std::string, GgufMetadataValue>& GgufArchive::metadata_values() const noexcept
 {
     return metadata;
-}
-
-Result<GgufTensorView> GgufArchive::map_tensor(const std::string& name) const
-{
-    const GgufTensorInfo* info = find(name);
-    if (!info)
-        return Error{ErrorCode::InvalidModel, "missing GGUF tensor: " + name};
-    auto mapping = MappedFileRange::open(info->path, info->offset, info->size);
-    if (!mapping)
-        return mapping.error();
-    return GgufTensorView{*info, std::move(mapping).value()};
 }
 
 const std::filesystem::path& GgufArchive::source_path() const noexcept

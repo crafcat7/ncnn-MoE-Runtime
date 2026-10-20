@@ -795,7 +795,7 @@ Result<void> forward_model(const CompiledModel& model,
             auto executed = forward_moe(model,
                                         moe,
                                         layer_state,
-                                        statistics,
+                                        &statistics,
                                         state.expert_scratch,
                                         layer.layer_id,
                                         node->backend,
@@ -1806,7 +1806,6 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         if (node->type == ExecutionNodeType::Expert || node->type == ExecutionNodeType::ExpertGroup)
         {
             LayerState& combined = workspace.staged_state;
-            SessionStatistics aggregate_statistics;
             Result<void> shared_result;
             std::function<void()> shared_work;
             if (moe.has_shared_expert && node->backend == ExecutionBackend::Vulkan
@@ -1820,7 +1819,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             auto executed = forward_moe(model,
                                         moe,
                                         combined,
-                                        aggregate_statistics,
+                                        nullptr,
                                         workspace.expert,
                                         layer.layer_id,
                                         node->backend,

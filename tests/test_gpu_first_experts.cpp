@@ -1498,7 +1498,7 @@ static void gpu_first_gptoss_prefill()
             for (size_t row = 0; row < count; ++row)
                 active.batch.routes[row] = {static_cast<uint32_t>(index == 0 ? row : row * (pass == 1 ? 3 : 5)), 0, 1.0f};
         }
-        gpu_first_check(static_cast<bool>(forward_moe(model, moe, state, statistics, scratch, 0, ExecutionBackend::Vulkan, false)), "GptOss cold-prefill forward");
+        gpu_first_check(static_cast<bool>(forward_moe(model, moe, state, &statistics, scratch, 0, ExecutionBackend::Vulkan, false)), "GptOss cold-prefill forward");
         for (const auto& active : state.active_experts())
         {
             ActivationBuffer activated;
@@ -1638,7 +1638,7 @@ static void gpu_first_lazy_host_input()
                 active.input.reset(active.batch.routes.size(), 32, false);
                 std::fill_n(active.input.row(0), active.input.values().size(), 123.0f);
             }
-        gpu_first_check(static_cast<bool>(forward_moe(model, moe, state, statistics, scratch, 0, ExecutionBackend::Vulkan, false)),
+        gpu_first_check(static_cast<bool>(forward_moe(model, moe, state, &statistics, scratch, 0, ExecutionBackend::Vulkan, false)),
                         "lazy Host mixed GPU/CPU forward completed");
         for (size_t index = 0; index < expert_count; ++index)
         {
@@ -1773,7 +1773,7 @@ static void gpu_first_lazy_host_input()
             }
 
             const ExpertBackendStatistics before = priority_off_backend->statistics();
-            const auto result = forward_moe(model, moe, state, statistics, scratch, 0,
+            const auto result = forward_moe(model, moe, state, &statistics, scratch, 0,
                                             ExecutionBackend::Vulkan, false);
             const ExpertBackendStatistics after = priority_off_backend->statistics();
             gpu_first_check(static_cast<bool>(result), "priority-off high-row mixed Expert forward completed");
@@ -1870,7 +1870,7 @@ static void gpu_first_lazy_host_input()
         gpu_first_check(total_routes >= 32, "disabled-execution prefill exceeds the routed-row admission boundary");
         model.opt.flags = OptionDisableGpuExpertExecution;
         const ExpertBackendStatistics before = model.expert_backend->statistics();
-        const auto result = forward_moe(model, moe, state, statistics, scratch, 0, ExecutionBackend::Vulkan, false);
+        const auto result = forward_moe(model, moe, state, &statistics, scratch, 0, ExecutionBackend::Vulkan, false);
         const ExpertBackendStatistics after = model.expert_backend->statistics();
         gpu_first_check(after.executions == before.executions && after.admissions == before.admissions,
                         "GPU Expert execution disable prevents using resident GPU weights");

@@ -563,7 +563,8 @@ Result<WeightMapping> Qwen4ExpModelAdapter::map_weights(const ModelPackage& pack
                 const std::string expert_source = source + "mlp.experts." + std::to_string(expert_id) + ".";
                 for (const auto& projection : projections)
                 {
-                    status = add_tensor(mapping, archive, expert + projection.first, expert_source + projection.second);
+                    status = add_tensor(mapping, archive, expert + projection.first,
+                                        expert_source + projection.second, expert_load_flags);
                     if (!status)
                         return status.error();
                 }
@@ -628,7 +629,8 @@ Result<WeightMapping> Qwen4ExpModelAdapter::map_weights(const ModelPackage& pack
                                                        expert_id,
                                                        moe.expert_count,
                                                        moe.intermediate_size * 2,
-                                                       descriptor.hidden_size);
+                                                       descriptor.hidden_size,
+                                                       expert_load_flags);
                 if (!gate_up)
                     return gate_up.error();
                 mapping.emplace(expert + "gate_up.weight", std::move(gate_up).value());
@@ -637,7 +639,8 @@ Result<WeightMapping> Qwen4ExpModelAdapter::map_weights(const ModelPackage& pack
                                                     expert_id,
                                                     moe.expert_count,
                                                     descriptor.hidden_size,
-                                                    moe.intermediate_size);
+                                                    moe.intermediate_size,
+                                                    expert_load_flags);
                 if (!down)
                     return down.error();
                 mapping.emplace(expert + "down.weight", std::move(down).value());
