@@ -108,7 +108,6 @@ and chat usage should use `ncnn_moe.py`.
 | `--top-p P` | Nucleus sampling probability threshold |
 | `--min-p P` | Remove tokens below a fraction of the highest probability |
 | `--seed N` | Sampling seed |
-| `--no-speculative` | Disable DSpark speculative decoding when the package provides it |
 | `--speculative-confidence P` | Override the DSpark confidence threshold |
 | `--speculative-max-draft N` | Bound the number of draft tokens per proposal |
 
@@ -162,11 +161,11 @@ and Session mix before assigning memory to Vulkan Expert tiers.
 DeepSeek-V4-Flash-DSpark uses its draft layers, Markov/confidence heads, and
 transactional latent-cache rollback. It is enabled by default when the package
 contains the complete DSpark metadata and tensor set. DeepSeek-V4-Flash has no
-DSpark plan and always executes the target model directly. `--no-speculative`
-provides a deterministic DSpark baseline for correctness or performance
-comparisons. Acceptance rate and net speedup remain workload- and
-cache-dependent, so deployment decisions require end-to-end measurement on
-the target machine.
+DSpark plan and always executes the target model directly. The reference
+benchmark's `--no-speculative` control provides a target-only baseline for
+correctness or performance comparisons. Acceptance rate and net speedup remain
+workload- and cache-dependent, so deployment decisions require end-to-end
+measurement on the target machine.
 
 For throughput tests with multiple DSpark Sessions, add
 `--parallel-speculative` together with `--parallel-sessions N`. Each Session

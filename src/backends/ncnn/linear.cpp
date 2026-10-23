@@ -922,6 +922,8 @@ public:
     ncnn::VkMat packed;
     ncnn::VkMat bias;
     ncnn::VkMat rms_norm_weight;
+    std::shared_ptr<RmsNorm_vulkan> input_rms_norm;
+    std::shared_ptr<RmsNorm_vulkan> output_rms_norm;
     ncnn::Option option;
     float rms_norm_epsilon = 0.0f;
     uint32_t rms_norm_output_subgroups = 0;
@@ -1375,6 +1377,66 @@ bool Bfloat16Linear_vulkan::has_rms_norm_chain() const noexcept
     return false;
 #endif
 }
+
+bool Bfloat16Linear_vulkan::prepare_input_rms_norm(const TensorData& weight, float epsilon)
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (!d->vulkan_context || weight.shape.size() != 1 || weight.shape[0] != d->input_columns || d->input_rms_norm)
+        return false;
+    d->input_rms_norm = RmsNorm_vulkan::create(weight, epsilon, 0.0f, d->vulkan_context, d->option);
+    return static_cast<bool>(d->input_rms_norm);
+#else
+    (void)weight;
+    (void)epsilon;
+    return false;
+#endif
+}
+
+bool Bfloat16Linear_vulkan::prepare_output_rms_norm(const TensorData& weight, float epsilon)
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (!d->vulkan_context || weight.shape.size() != 1 || weight.shape[0] != d->output_columns || d->output_rms_norm)
+        return false;
+    d->output_rms_norm = RmsNorm_vulkan::create(weight, epsilon, 0.0f, d->vulkan_context, d->option);
+    return static_cast<bool>(d->output_rms_norm);
+#else
+    (void)weight;
+    (void)epsilon;
+    return false;
+#endif
+}
+
+#if NCNN_MOE_WITH_VULKAN
+bool Bfloat16Linear_vulkan::record_input_normalization(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& cmd) const
+{
+    return d->input_rms_norm && d->input_rms_norm->record(input, output, cmd);
+}
+
+bool Bfloat16Linear_vulkan::record_rms_norm_chain_parallel(const ncnn::VkMat& input,
+                                                           const Bfloat16Linear_vulkan& next,
+                                                           const Bfloat16Linear_vulkan& parallel,
+                                                           ncnn::VkMat& query,
+                                                           ncnn::VkMat& kv,
+                                                           ncnn::VkMat& query_rank,
+                                                           ncnn::VkCompute& cmd,
+                                                           std::vector<ncnn::VkMat>& workspace) const
+{
+    if (!d->output_rms_norm || d->vulkan_context != next.d->vulkan_context
+        || d->vulkan_context != parallel.d->vulkan_context
+        || vulkan_activation_storage_variant(d->option) != 0
+        || vulkan_activation_storage_variant(next.d->option) != 0
+        || vulkan_activation_storage_variant(parallel.d->option) != 0)
+        return false;
+    ncnn::VkMat intermediate;
+    if (forward(input, intermediate, cmd, d->option) != 0
+        || !d->output_rms_norm->record(intermediate, query_rank, cmd)
+        || next.forward(query_rank, query, cmd, next.d->option) != 0
+        || parallel.forward(input, kv, cmd, parallel.d->option) != 0)
+        return false;
+    workspace.push_back(std::move(intermediate));
+    return true;
+}
+#endif
 
 bool Bfloat16Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input,
                                                    ActivationBuffer& output) const
@@ -2256,8 +2318,7 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
     const Implementation& down = *down_operator.d;
     const uint64_t expected_fused_columns = static_cast<uint64_t>(intermediate_columns) * 2
                                             + (apply_router_gate ? 1u : 0u);
-    (void)activation_limit;
-    if (activation != ExpertActivation::Silu
+    if ((activation != ExpertActivation::Silu && activation != ExpertActivation::DeepSeekSwiGlu)
         || !first.vulkan_context
         || !down.vulkan_context
         || first.vulkan_context.get() != down.vulkan_context.get()
@@ -2357,12 +2418,13 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
         down.packed,
         down.bias,
         output_gpu};
-    constants.resize(5);
+    constants.resize(6);
     constants[0].u32 = intermediate_columns;
     constants[1].u32 = first.output_columns;
     constants[2].u32 = down.output_columns;
     constants[3].u32 = static_cast<uint32_t>(input.rows());
     constants[4].u32 = apply_router_gate ? 1u : 0u;
+    constants[5].f = activation == ExpertActivation::DeepSeekSwiGlu ? activation_limit : 0.0f;
     ncnn::VkMat swiglu_dispatcher;
     swiglu_dispatcher.w = static_cast<int>(down.output_columns * 32);
     swiglu_dispatcher.h = static_cast<int>(input.rows());
@@ -2403,6 +2465,128 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
     (void)activation;
     (void)activation_limit;
     (void)apply_router_gate;
+    (void)output;
+    return false;
+#endif
+}
+
+bool Bfloat16Linear_vulkan::forward_swiglu_chain_device(const DeviceTensor_vulkan& input,
+                                                        const Bfloat16Linear_vulkan& down_operator,
+                                                        uint32_t intermediate_columns,
+                                                        ExpertActivation activation,
+                                                        float activation_limit,
+                                                        bool apply_router_gate,
+                                                        DeviceTensor_vulkan& output) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    const Implementation& first = *d;
+    const Implementation& down = *down_operator.d;
+    const ncnn::VkMat* source = input.value();
+    const uint64_t fused_columns = static_cast<uint64_t>(intermediate_columns) * 2 + (apply_router_gate ? 1u : 0u);
+    if (&input == &output || (activation != ExpertActivation::Silu && activation != ExpertActivation::DeepSeekSwiGlu)
+        || !source || source->dims != 2 || source->elemsize / source->elempack != sizeof(float)
+        || !first.vulkan_context || input.vulkan_context() != first.vulkan_context
+        || first.vulkan_context != down.vulkan_context || !first.pipeline
+        || vulkan_activation_storage_variant(first.option) != 0 || vulkan_activation_storage_variant(down.option) != 0
+        || first.output_columns != fused_columns || down.input_columns != intermediate_columns
+        || intermediate_columns == 0 || intermediate_columns % 128 != 0
+        || input.rows() == 0 || input.columns() != first.input_columns
+        || input.rows() > first.vulkan_context->device()->info.max_workgroup_count_y()
+        || down.packed.empty() || down.bias.empty())
+        return false;
+    const ncnn::VkMat retained_input = *source;
+    auto lease = first.vulkan_context->acquire_transfer_slot();
+    auto& slot = lease.slot();
+    const std::lock_guard<std::mutex> lock(first.vulkan_context->command_mutex());
+    if (!first.swiglu_down_pipeline
+        && !create_bfloat16_swiglu_down_pipeline(first.vulkan_context, first.option, first.swiglu_down_pipeline))
+        return false;
+    if (slot.command_used && slot.command->reset() != 0)
+        return false;
+    slot.command_used = true;
+    auto& cmd = *slot.command;
+    input.prepare_read();
+    ncnn::VkMat input_gpu = retained_input;
+    if (input_gpu.elempack != 1)
+    {
+        first.vulkan_context->device()->convert_packing(retained_input, input_gpu, 1, 1, cmd, first.option);
+        if (input_gpu.empty())
+            return false;
+    }
+    ncnn::VkMat fused_gpu;
+    ncnn::VkMat output_gpu;
+    fused_gpu.create(static_cast<int>(first.output_columns), input_gpu.h, sizeof(float), first.vulkan_context->blob_allocator());
+    output_gpu.create(static_cast<int>(down.output_columns), input_gpu.h, sizeof(float), first.vulkan_context->blob_allocator());
+    if (fused_gpu.empty() || output_gpu.empty())
+        return false;
+    std::vector<ncnn::VkMat> bindings;
+    std::vector<ncnn::vk_constant_type> constants;
+    const bool used_cooperative_matrix = first.record_projection(input_gpu, fused_gpu, static_cast<uint32_t>(input.rows()), cmd, bindings, constants);
+    bindings = {fused_gpu, down.packed, down.bias, output_gpu};
+    constants.resize(6);
+    constants[0].u32 = intermediate_columns;
+    constants[1].u32 = first.output_columns;
+    constants[2].u32 = down.output_columns;
+    constants[3].u32 = static_cast<uint32_t>(input.rows());
+    constants[4].u32 = apply_router_gate ? 1u : 0u;
+    constants[5].f = activation == ExpertActivation::DeepSeekSwiGlu ? activation_limit : 0.0f;
+    ncnn::VkMat dispatcher;
+    dispatcher.w = static_cast<int>(down.output_columns * 32);
+    dispatcher.h = input_gpu.h;
+    dispatcher.c = 1;
+    cmd.record_pipeline(first.swiglu_down_pipeline.get(), bindings, constants, dispatcher);
+    if (submit_compute_and_wait(cmd, first.vulkan_context->device()) != 0)
+        return false;
+    DeviceTensor_vulkan completed;
+    if (!completed.assign_completed(output_gpu, first.vulkan_context))
+        return false;
+    output = std::move(completed);
+    VulkanRuntimeState& state = first.vulkan_context->runtime_state();
+    state.dispatches += 2;
+    ++state.compute_submissions;
+    ++state.shared_expert_swiglu_fusions;
+    if (used_cooperative_matrix)
+        ++state.bfloat16_cooperative_matrix_dispatches;
+    return true;
+#else
+    (void)input;
+    (void)down_operator;
+    (void)intermediate_columns;
+    (void)activation;
+    (void)activation_limit;
+    (void)apply_router_gate;
+    (void)output;
+    return false;
+#endif
+}
+
+bool Bfloat16Linear_vulkan::materialize(const DeviceTensor_vulkan& input, ActivationBuffer& output) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    const ncnn::VkMat* value = input.value();
+    if (!value || !d->vulkan_context || input.vulkan_context() != d->vulkan_context)
+        return false;
+    auto lease = d->vulkan_context->acquire_transfer_slot();
+    auto& slot = lease.slot();
+    if (!prepare_staging_batch(slot.download, input.rows(), input.columns(), slot.staging_allocator, output.element_size()))
+        return false;
+    const DType dtype = output.dtype();
+    output.reset(input.rows(), input.columns(), false);
+    const std::lock_guard<std::mutex> lock(d->vulkan_context->command_mutex());
+    input.prepare_read();
+    if (slot.command_used && slot.command->reset() != 0)
+        return false;
+    slot.command_used = true;
+    if (!record_prepared_activation_staging_download(*value, input.rows(), input.columns(), slot.download,
+                                                     *slot.command, d->vulkan_context->device(), d->option, dtype)
+        || submit_compute_and_wait(*slot.command, d->vulkan_context->device()) != 0
+        || !copy_staging_to_cpu_batch(slot.download, output))
+        return false;
+    ++d->vulkan_context->runtime_state().compute_submissions;
+    ++d->vulkan_context->runtime_state().batch_downloads;
+    return true;
+#else
+    (void)input;
     (void)output;
     return false;
 #endif
@@ -2797,12 +2981,13 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
         bindings[1] = down.packed;
         bindings[2] = down.bias;
         bindings[3] = output_view;
-        constants.resize(5);
+        constants.resize(6);
         constants[0].u32 = expert.intermediate_columns;
         constants[1].u32 = gate.output_columns;
         constants[2].u32 = down.output_columns;
         constants[3].u32 = static_cast<uint32_t>(rows);
         constants[4].u32 = 0;
+        constants[5].f = expert.activation == ExpertActivation::DeepSeekSwiGlu ? expert.activation_limit : 0.0f;
         ncnn::VkMat swiglu_dispatcher;
         swiglu_dispatcher.w = static_cast<int>(down.output_columns * 32);
         swiglu_dispatcher.h = static_cast<int>(rows);
@@ -5479,6 +5664,29 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     (void)input_group_count;
     (void)extra;
     return {};
+#endif
+}
+
+bool QnkLinear_vulkan::record_forward(const ncnn::VkMat& input, ncnn::VkMat& output,
+                                      ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    (void)workspace;
+    if (!d->vulkan_context || !d->pipeline || input.empty() || input.dims != 2
+        || input.elempack != 1 || input.elemsize != sizeof(float) || input.h <= 0
+        || input.w != static_cast<int>(d->input_columns * d->input_group_count) || vulkan_activation_storage_variant(d->option) != 0)
+        return false;
+    output.create(static_cast<int>(d->output_columns), input.h, sizeof(float), d->vulkan_context->blob_allocator());
+    if (output.empty())
+        return false;
+    record(input, output, command);
+    return true;
+#else
+    (void)input;
+    (void)output;
+    (void)command;
+    (void)workspace;
+    return false;
 #endif
 }
 

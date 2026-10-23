@@ -99,7 +99,6 @@ normal text and chat usage should use `ncnn_moe.py`.
 | `--top-p P` | Nucleus sampling probability threshold |
 | `--min-p P` | Remove tokens below a fraction of the highest probability |
 | `--seed N` | Sampling seed |
-| `--no-speculative` | Disable model-provided speculative decoding |
 
 The native runner also accepts repeated `--stop-token ID` options.
 

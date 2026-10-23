@@ -166,7 +166,6 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                                                                     " [--disable-forward-aware-cache]"
                                                                     " [--disable-rank-adaptive-prefetch]"
                                                                     " [--disable-cross-expert-read-coalescing]"
-                                                                    " [--release-vulkan-dense-host]"
                                                                     " [--router-prediction] [--async-router-prediction]"
                                                                     " [--forward-aware-cache]"
                                                                     " [--rank-adaptive-prefetch] [--cross-expert-read-coalescing]"
@@ -352,10 +351,6 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             else if (argument == "--disable-cross-expert-read-coalescing")
             {
                 opt.flags &= ~ncnn::moe::OptionCrossExpertReadCoalescing;
-            }
-            else if (argument == "--release-vulkan-dense-host")
-            {
-                opt.flags |= ncnn::moe::OptionReleaseVulkanDenseHostStorage;
             }
             else if (argument == "--router-prediction")
             {

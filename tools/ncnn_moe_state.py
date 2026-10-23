@@ -198,7 +198,6 @@ def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
         ("direct_expert_io", "--direct-expert-io"),
         ("buffered_expert_io", "--buffered-expert-io"),
         ("disable_gpu_victim_execution", "--disable-gpu-victim-execution"),
-        ("release_vulkan_dense_host", "--release-vulkan-dense-host"),
         ("disable_vulkan_joint_cache_eviction", "--disable-vulkan-joint-cache-eviction"),
         ("disable_vulkan_mxfp4_row_tile", "--disable-vulkan-mxfp4-row-tile"),
         ("disable_vulkan_expert_direct_staging", "--disable-vulkan-expert-direct-staging"),
@@ -223,6 +222,8 @@ def merge_runtime_settings(
                 result[key] = value
     # Ignore removed experimental options in saved sessions/configs/profiles.
     for key in (
+        "release_vulkan_dense_host",
+        "no_speculative",
         "gpu_decode_experts",
         "profiling",
         "vulkan_expert_concurrent_commands",

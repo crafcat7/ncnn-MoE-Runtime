@@ -1,5 +1,6 @@
 #include "latentattention_vulkan.h"
 #include "linear.h"
+#include "rmsnorm_vulkan.h"
 #include "vulkancontext.h"
 
 #include "kernels/attention.h"
@@ -201,8 +202,8 @@ class LatentAttention_vulkan::Implementation
 {
 public:
     AttentionBlockPlan plan;
-    std::shared_ptr<Float8Linear_vulkan> output_a;
-    std::shared_ptr<Float8Linear_vulkan> output_b;
+    CompiledOperator output_a;
+    CompiledOperator output_b;
 #if NCNN_MOE_WITH_VULKAN
     std::shared_ptr<VulkanContext> context;
     ncnn::Option opt;
@@ -219,15 +220,17 @@ public:
     std::shared_ptr<ncnn::Pipeline> index_topk_pipeline;
     std::shared_ptr<ncnn::Pipeline> index_sort_pipeline;
     std::shared_ptr<ncnn::Pipeline> index_merge_pipeline;
-    std::shared_ptr<Float8Linear_vulkan> query_a;
-    std::shared_ptr<Float8Linear_vulkan> query_b;
-    std::shared_ptr<Float8Linear_vulkan> key_value;
+    CompiledOperator query_a;
+    CompiledOperator query_b;
+    CompiledOperator key_value;
     CompiledOperator index_query;
     CompiledOperator index_weights;
-    std::shared_ptr<Bfloat16Linear_vulkan> compressor_value;
-    std::shared_ptr<Bfloat16Linear_vulkan> compressor_gate;
-    std::shared_ptr<Bfloat16Linear_vulkan> index_compressor_value;
-    std::shared_ptr<Bfloat16Linear_vulkan> index_compressor_gate;
+    CompiledOperator compressor_value;
+    CompiledOperator compressor_gate;
+    CompiledOperator index_compressor_value;
+    CompiledOperator index_compressor_gate;
+    std::shared_ptr<RmsNorm_vulkan> input_norm;
+    std::shared_ptr<RmsNorm_vulkan> query_rank_norm;
     ncnn::VkMat key_norm;
     ncnn::VkMat compressor_norm;
     ncnn::VkMat compressor_position;
@@ -257,10 +260,95 @@ LatentAttention_vulkan::LatentAttention_vulkan()
 
 LatentAttention_vulkan::~LatentAttention_vulkan() = default;
 
+#if NCNN_MOE_WITH_VULKAN
+static CompiledOperator latent_projection(const CompiledOperator& op)
+{
+    // A query entry can already own this MLA operator. Retain only projection
+    // resources so preparing it cannot introduce a shared ownership cycle.
+    CompiledOperator result;
+    result.float8 = op.float8;
+    result.bfloat16 = op.bfloat16;
+    result.qnk = op.qnk;
+    result.linear = op.linear;
+    return result;
+}
+
+std::shared_ptr<VulkanContext> LatentAttention_vulkan::projection_context(const CompiledOperator& op) noexcept
+{
+    if (op.float8)
+        return op.float8->vulkan_context();
+    if (op.bfloat16)
+        return op.bfloat16->vulkan_context();
+    if (op.qnk)
+        return op.qnk->vulkan_context();
+    return op.linear ? op.linear->vulkan_context() : nullptr;
+}
+
+const ncnn::Option* LatentAttention_vulkan::projection_option(const CompiledOperator& op) noexcept
+{
+    if (op.float8)
+        return &op.float8->option();
+    if (op.bfloat16)
+        return &op.bfloat16->option();
+    if (op.qnk)
+        return &op.qnk->option();
+    return op.linear ? &op.linear->option() : nullptr;
+}
+
+uint32_t LatentAttention_vulkan::projection_input_columns(const CompiledOperator& op) noexcept
+{
+    if (op.float8)
+        return op.float8->input_columns();
+    if (op.bfloat16)
+        return op.bfloat16->input_columns();
+    if (op.qnk)
+        return op.qnk->input_columns();
+    return op.linear ? op.linear->input_columns() : 0;
+}
+
+uint32_t LatentAttention_vulkan::projection_output_columns(const CompiledOperator& op) noexcept
+{
+    if (op.float8)
+        return op.float8->output_columns();
+    if (op.bfloat16)
+        return op.bfloat16->output_columns();
+    if (op.qnk)
+        return op.qnk->output_columns();
+    return op.linear ? op.linear->output_columns() : 0;
+}
+
+bool LatentAttention_vulkan::record_projection(const CompiledOperator& op,
+                                               const ncnn::VkMat& input,
+                                               ncnn::VkMat& output,
+                                               ncnn::VkCompute& cmd,
+                                               std::vector<ncnn::VkMat>& storage) const
+{
+    if (op.float8)
+        return op.float8->record_forward(input, output, cmd, storage);
+    if (op.bfloat16)
+        return op.bfloat16->forward(input, output, cmd, d->opt) == 0;
+    if (op.qnk)
+        return op.qnk->record_forward(input, output, cmd, storage);
+    return op.linear && op.linear->forward(input, output, cmd, d->opt) == 0;
+}
+#endif
+
 std::shared_ptr<LatentAttention_vulkan> LatentAttention_vulkan::create(const AttentionBlockPlan& plan,
                                                                        const TensorData& sinks,
                                                                        std::shared_ptr<Float8Linear_vulkan> output_a,
                                                                        std::shared_ptr<Float8Linear_vulkan> output_b)
+{
+    CompiledOperator projection_a;
+    CompiledOperator projection_b;
+    projection_a.float8 = std::move(output_a);
+    projection_b.float8 = std::move(output_b);
+    return create(plan, sinks, projection_a, projection_b);
+}
+
+std::shared_ptr<LatentAttention_vulkan> LatentAttention_vulkan::create(const AttentionBlockPlan& plan,
+                                                                       const TensorData& sinks,
+                                                                       const CompiledOperator& output_a,
+                                                                       const CompiledOperator& output_b)
 {
 #if NCNN_MOE_WITH_VULKAN
     const uint64_t query_columns = static_cast<uint64_t>(plan.head_count) * plan.head_dimension;
@@ -269,18 +357,18 @@ std::shared_ptr<LatentAttention_vulkan> LatentAttention_vulkan::create(const Att
         || plan.rope_head_dimension > plan.head_dimension || plan.rope_head_dimension % 2 != 0
         || query_columns > static_cast<uint64_t>(std::numeric_limits<int>::max())
         || sinks.dtype != DType::Float32 || sinks.float32_values().size() != plan.head_count
-        || !output_a || !output_b || !output_a->vulkan_context()
-        || output_a->vulkan_context() != output_b->vulkan_context()
-        || output_a->input_columns() != query_columns
-        || output_a->output_columns() != output_b->input_columns())
+        || !projection_context(output_a) || !projection_option(output_a)
+        || projection_context(output_a) != projection_context(output_b)
+        || projection_input_columns(output_a) != query_columns
+        || projection_output_columns(output_a) != projection_input_columns(output_b))
         return {};
     auto result = std::shared_ptr<LatentAttention_vulkan>(new LatentAttention_vulkan);
     Implementation& implementation = *result->d;
     implementation.plan = plan;
-    implementation.output_a = std::move(output_a);
-    implementation.output_b = std::move(output_b);
-    implementation.context = implementation.output_a->vulkan_context();
-    implementation.opt = implementation.output_a->option();
+    implementation.output_a = latent_projection(output_a);
+    implementation.output_b = latent_projection(output_b);
+    implementation.context = projection_context(output_a);
+    implementation.opt = *projection_option(output_a);
     implementation.opt.use_packing_layout = false;
     implementation.opt.use_fp16_packed = false;
     implementation.opt.use_fp16_storage = false;
@@ -552,10 +640,10 @@ bool LatentAttention_vulkan::forward_batch(std::span<const uint64_t> positions,
     ncnn::VkMat output_rank;
     ncnn::VkMat final_output;
     std::vector<ncnn::VkMat> projection_storage;
-    const uint32_t output_columns = implementation.output_b->output_columns();
+    const uint32_t output_columns = projection_output_columns(implementation.output_b);
     const DType output_dtype = output.dtype();
-    if (!implementation.output_a->record_forward(attention, output_rank, cmd, projection_storage)
-        || !implementation.output_b->record_forward(output_rank, final_output, cmd, projection_storage)
+    if (!record_projection(implementation.output_a, attention, output_rank, cmd, projection_storage)
+        || !record_projection(implementation.output_b, output_rank, final_output, cmd, projection_storage)
         || !prepare_staging_batch(transfer_slot.download, rows, output_columns, transfer_slot.staging_allocator, output.element_size())
         || !record_prepared_activation_staging_download(final_output, rows, output_columns, transfer_slot.download, cmd,
                                                         implementation.context->device(), implementation.opt, output_dtype))
@@ -902,53 +990,60 @@ bool LatentAttention_vulkan::prepare(const WeightStore& weights, const CompiledO
                 || (plan.index_head_dimension & (plan.index_head_dimension - 1)) != 0
                 || plan.rope_head_dimension > plan.index_head_dimension || plan.index_head_count == 0)))
         return false;
-    const auto& query_a = operators.at_weight(plan.query_a_weight).float8;
-    const auto& query_b = operators.at_weight(plan.query_b_weight).float8;
-    const auto& key_value = operators.at_weight(plan.key_value_weight).float8;
-    if (!query_a || !query_b || !key_value || query_a->vulkan_context() != implementation.context
-        || query_b->vulkan_context() != implementation.context || key_value->vulkan_context() != implementation.context
-        || query_a->input_columns() != key_value->input_columns()
-        || query_a->output_columns() != query_b->input_columns()
-        || query_b->output_columns() != plan.head_count * plan.head_dimension
-        || key_value->output_columns() != plan.head_dimension)
+    const CompiledOperator& query_a = operators.at_weight(plan.query_a_weight);
+    const CompiledOperator& query_b = operators.at_weight(plan.query_b_weight);
+    const CompiledOperator& key_value = operators.at_weight(plan.key_value_weight);
+    if (!(query_a.float8 && query_b.float8 && key_value.float8)
+        && !(query_a.bfloat16 && query_b.bfloat16 && key_value.bfloat16)
+        && !(query_a.qnk && query_b.qnk && key_value.qnk))
         return false;
-    implementation.query_a = query_a;
-    implementation.query_b = query_b;
-    implementation.key_value = key_value;
+    if (projection_context(query_a) != implementation.context
+        || projection_context(query_b) != implementation.context || projection_context(key_value) != implementation.context
+        || projection_input_columns(query_a) != projection_input_columns(key_value)
+        || projection_output_columns(query_a) != projection_input_columns(query_b)
+        || projection_output_columns(query_b) != plan.head_count * plan.head_dimension
+        || projection_output_columns(key_value) != plan.head_dimension)
+        return false;
+    implementation.query_a = latent_projection(query_a);
+    implementation.query_b = latent_projection(query_b);
+    implementation.key_value = latent_projection(key_value);
+    if (query_a.qnk)
+    {
+        implementation.input_norm = RmsNorm_vulkan::create(weights.at(plan.pre_attention_norm_weight), plan.norm_epsilon,
+                                                           0.0f, implementation.context, implementation.opt);
+        implementation.query_rank_norm = RmsNorm_vulkan::create(weights.at(plan.query_norm_weight), plan.norm_epsilon,
+                                                                0.0f, implementation.context, implementation.opt);
+        if (!implementation.input_norm || !implementation.query_rank_norm)
+            return false;
+    }
     if (plan.compression_ratio != 0)
     {
-        implementation.compressor_value = operators.at_weight(plan.compressor_key_value_weight).bfloat16;
-        implementation.compressor_gate = operators.at_weight(plan.compressor_gate_weight).bfloat16;
+        implementation.compressor_value = latent_projection(operators.at_weight(plan.compressor_key_value_weight));
+        implementation.compressor_gate = latent_projection(operators.at_weight(plan.compressor_gate_weight));
         const uint32_t multiplier = plan.compression_ratio == 4 ? 2 : 1;
-        const auto valid_projection = [&](const std::shared_ptr<Bfloat16Linear_vulkan>& value, uint32_t columns) {
-            return value && value->vulkan_context() == implementation.context
-                   && value->input_columns() == query_a->input_columns()
-                   && value->output_columns() == columns;
+        const auto valid_projection = [&](const CompiledOperator& value, uint32_t columns) {
+            return projection_context(value) == implementation.context
+                   && projection_input_columns(value) == projection_input_columns(query_a)
+                   && projection_output_columns(value) == columns;
         };
         if (!valid_projection(implementation.compressor_value, multiplier * plan.head_dimension)
             || !valid_projection(implementation.compressor_gate, multiplier * plan.head_dimension))
             return false;
         if (plan.compression_ratio == 4)
         {
-            implementation.index_compressor_value = operators.at_weight(plan.indexer_compressor_key_value_weight).bfloat16;
-            implementation.index_compressor_gate = operators.at_weight(plan.indexer_compressor_gate_weight).bfloat16;
+            implementation.index_compressor_value = latent_projection(operators.at_weight(plan.indexer_compressor_key_value_weight));
+            implementation.index_compressor_gate = latent_projection(operators.at_weight(plan.indexer_compressor_gate_weight));
             if (!valid_projection(implementation.index_compressor_value, 2 * plan.index_head_dimension)
                 || !valid_projection(implementation.index_compressor_gate, 2 * plan.index_head_dimension))
                 return false;
-            implementation.index_query = operators.at_weight(plan.indexer_query_weight);
-            implementation.index_weights = operators.at_weight(plan.indexer_weights_weight);
+            implementation.index_query = latent_projection(operators.at_weight(plan.indexer_query_weight));
+            implementation.index_weights = latent_projection(operators.at_weight(plan.indexer_weights_weight));
             const auto valid_index = [&](const CompiledOperator& value, uint32_t input_columns, uint32_t output_columns) {
-                if (value.bfloat16)
-                    return value.bfloat16->vulkan_context() == implementation.context
-                           && value.bfloat16->input_columns() == input_columns && value.bfloat16->output_columns() == output_columns;
-                if (value.float8)
-                    return value.float8->vulkan_context() == implementation.context
-                           && value.float8->input_columns() == input_columns && value.float8->output_columns() == output_columns;
-                return value.linear && value.linear->vulkan_context() == implementation.context
-                       && value.linear->input_columns() == input_columns && value.linear->output_columns() == output_columns;
+                return projection_context(value) == implementation.context
+                       && projection_input_columns(value) == input_columns && projection_output_columns(value) == output_columns;
             };
-            if (!valid_index(implementation.index_query, query_a->output_columns(), plan.index_head_count * plan.index_head_dimension)
-                || !valid_index(implementation.index_weights, query_a->input_columns(), plan.index_head_count))
+            if (!valid_index(implementation.index_query, projection_output_columns(query_a), plan.index_head_count * plan.index_head_dimension)
+                || !valid_index(implementation.index_weights, projection_input_columns(query_a), plan.index_head_count))
                 return false;
         }
     }
@@ -1039,7 +1134,7 @@ bool LatentAttention_vulkan::record_batch(const ncnn::VkMat& input,
     const size_t rows = positions.size();
     if (!implementation.prepared || recording.context || input.empty() || input.dims != 2
         || input.elemsize != sizeof(float) || input.elempack != 1
-        || input.w != static_cast<int>(implementation.query_a->input_columns())
+        || input.w != static_cast<int>(projection_input_columns(implementation.query_a))
         || rows == 0 || rows != caches.size() || rows != static_cast<size_t>(input.h))
         return false;
     std::vector<std::pair<LayerCache*, uint64_t>> next_positions;
@@ -1084,19 +1179,32 @@ bool LatentAttention_vulkan::record_batch(const ncnn::VkMat& input,
         return allocate_latent_buffer(destination, count, implementation.context);
     };
     const auto record_index_projection = [&](const CompiledOperator& op, const ncnn::VkMat& source, ncnn::VkMat& destination) {
-        if (op.bfloat16)
-            return op.bfloat16->forward(source, destination, cmd, implementation.opt) == 0;
-        if (op.float8)
-            return op.float8->record_forward(source, destination, cmd, recording.storage);
-        return op.linear && op.linear->forward(source, destination, cmd, implementation.opt) == 0;
+        return record_projection(op, source, destination, cmd, recording.storage);
     };
     ncnn::VkMat normalized;
     ncnn::VkMat query;
     ncnn::VkMat key_value;
     ncnn::VkMat query_rank;
-    if (!implementation.query_a->record_input_normalization(input, normalized, cmd)
-        || !implementation.query_a->record_rms_norm_chain_parallel(normalized, *implementation.query_b, *implementation.key_value,
-                                                                   query, key_value, query_rank, cmd, recording.storage))
+    bool projected = false;
+    if (implementation.query_a.qnk)
+    {
+        ncnn::VkMat unnormalized_rank;
+        projected = implementation.input_norm->record(input, normalized, cmd)
+                    && record_projection(implementation.query_a, normalized, unnormalized_rank, cmd, recording.storage)
+                    && implementation.query_rank_norm->record(unnormalized_rank, query_rank, cmd)
+                    && record_projection(implementation.query_b, query_rank, query, cmd, recording.storage)
+                    && record_projection(implementation.key_value, normalized, key_value, cmd, recording.storage);
+        recording.storage.push_back(std::move(unnormalized_rank));
+    }
+    else
+        projected = implementation.query_a.float8
+                        ? implementation.query_a.float8->record_input_normalization(input, normalized, cmd)
+                              && implementation.query_a.float8->record_rms_norm_chain_parallel(normalized, *implementation.query_b.float8, *implementation.key_value.float8,
+                                                                                               query, key_value, query_rank, cmd, recording.storage)
+                        : implementation.query_a.bfloat16->record_input_normalization(input, normalized, cmd)
+                              && implementation.query_a.bfloat16->record_rms_norm_chain_parallel(normalized, *implementation.query_b.bfloat16, *implementation.key_value.bfloat16,
+                                                                                                 query, key_value, query_rank, cmd, recording.storage);
+    if (!projected)
         return false;
     recording.storage.push_back(normalized);
     recording.storage.push_back(query);
@@ -1111,15 +1219,15 @@ bool LatentAttention_vulkan::record_batch(const ncnn::VkMat& input,
     bool index_projection_ready = false;
     if (plan.compression_ratio != 0)
     {
-        if (implementation.compressor_value->forward(normalized, compressor_values, cmd, implementation.opt) != 0
-            || implementation.compressor_gate->forward(normalized, compressor_scores, cmd, implementation.opt) != 0)
+        if (!record_projection(implementation.compressor_value, normalized, compressor_values, cmd, recording.storage)
+            || !record_projection(implementation.compressor_gate, normalized, compressor_scores, cmd, recording.storage))
             return false;
         recording.storage.push_back(compressor_values);
         recording.storage.push_back(compressor_scores);
         if (plan.compression_ratio == 4)
         {
-            if (implementation.index_compressor_value->forward(normalized, index_compressor_values, cmd, implementation.opt) != 0
-                || implementation.index_compressor_gate->forward(normalized, index_compressor_scores, cmd, implementation.opt) != 0)
+            if (!record_projection(implementation.index_compressor_value, normalized, index_compressor_values, cmd, recording.storage)
+                || !record_projection(implementation.index_compressor_gate, normalized, index_compressor_scores, cmd, recording.storage))
                 return false;
             recording.storage.push_back(index_compressor_values);
             recording.storage.push_back(index_compressor_scores);
@@ -1479,8 +1587,8 @@ bool LatentAttention_vulkan::record_batch(const ncnn::VkMat& input,
         state->compressed_count = next_count;
     }
     ncnn::VkMat output_rank;
-    if (!implementation.output_a->record_forward(attention, output_rank, cmd, recording.storage)
-        || !implementation.output_b->record_forward(output_rank, output, cmd, recording.storage))
+    if (!record_projection(implementation.output_a, attention, output_rank, cmd, recording.storage)
+        || !record_projection(implementation.output_b, output_rank, output, cmd, recording.storage))
         return false;
     recording.storage.push_back(output_rank);
     recording.storage.push_back(output);

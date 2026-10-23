@@ -602,6 +602,22 @@ void forward_shared_expert(const CompiledModel& model,
         if (down_operator.bfloat16)
         {
             const uint32_t intermediate = model.weights.at(expert.up_weight).shape[0];
+            if (device_output && device_input && !device_input->empty())
+            {
+                auto completed = std::make_shared<DeviceTensor_vulkan>();
+                if (fused_shared_operator.bfloat16->forward_swiglu_chain_device(*device_input,
+                                                                                *down_operator.bfloat16,
+                                                                                intermediate,
+                                                                                expert.activation,
+                                                                                expert.activation_limit,
+                                                                                has_router_gate,
+                                                                                *completed))
+                {
+                    output.clear();
+                    *device_output = std::move(completed);
+                    return;
+                }
+            }
             if (fused_shared_operator.bfloat16->forward_swiglu_chain(input,
                                                                      *down_operator.bfloat16,
                                                                      intermediate,

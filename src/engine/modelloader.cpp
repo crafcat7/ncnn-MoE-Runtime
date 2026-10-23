@@ -326,7 +326,7 @@ Result<void> ModelLoader::plan_memory()
         });
     }
     const bool use_vulkan_compute = opt.hybrid_mode == HybridMode::HybridExperts;
-    const bool use_vulkan_dense_host_release = use_vulkan_compute && has_flag(opt.flags, OptionReleaseVulkanDenseHostStorage);
+    const bool use_vulkan_dense_host_release = use_vulkan_compute && has_flag(info.flags, RuntimeVulkan);
 
     if (reserve_cpu_packed_weights
         && std::any_of(descriptor.layers.begin(), descriptor.layers.end(), [](const LayerDescriptor& layer) {
@@ -488,7 +488,6 @@ Result<void> ModelLoader::plan_memory()
 Result<void> ModelLoader::compile_model()
 {
     const bool use_vulkan_compute = opt.hybrid_mode == HybridMode::HybridExperts;
-    const bool use_vulkan_dense_host_release = use_vulkan_compute && has_flag(opt.flags, OptionReleaseVulkanDenseHostStorage);
     auto weights = native_weights ? Result<WeightMapping>(std::move(*native_weights)) : adapter->map_weights(package, descriptor);
     native_weights.reset();
     if (!weights)
@@ -558,8 +557,6 @@ Result<void> ModelLoader::compile_model()
         compiler_opt.flags |= BackendMxfp4CpuKernel;
     if (use_file_backed_experts)
         compiler_opt.flags |= BackendFileBackedExperts;
-    if (use_vulkan_dense_host_release && use_file_backed_experts)
-        compiler_opt.flags |= BackendReleaseVulkanDenseHostStorage;
 
     auto ret = ncnn::moe::compile_model(std::move(descriptor),
                                         std::move(weights).value(),
@@ -569,6 +566,9 @@ Result<void> ModelLoader::compile_model()
     if (!ret)
         return ret.error();
 
+    auto finalized_plan = finalize_model_memory_plan(plan, opt, model.released_dense_host_size);
+    if (!finalized_plan)
+        return finalized_plan.error();
     model.memory_plan = plan;
     return {};
 }

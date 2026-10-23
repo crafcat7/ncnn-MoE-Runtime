@@ -205,13 +205,6 @@ def parse_arguments(argv=None):
     )
     parser.add_argument("--disable-router-prediction", action="store_true")
     parser.add_argument(
-        "--release-vulkan-dense-host",
-        action="store_true",
-        help=(
-            "Drop host copies of dense tensors after Vulkan operators take ownership."
-        ),
-    )
-    parser.add_argument(
         "--disable-async-router-prediction", action="store_true"
     )
     parser.add_argument("--disable-forward-aware-cache", action="store_true")
@@ -507,8 +500,6 @@ def runner_command(arguments):
         )
     if arguments.disable_router_prediction:
         command.append("--disable-router-prediction")
-    if arguments.release_vulkan_dense_host:
-        command.append("--release-vulkan-dense-host")
     if arguments.disable_async_router_prediction:
         command.append("--disable-async-router-prediction")
     if arguments.disable_forward_aware_cache:

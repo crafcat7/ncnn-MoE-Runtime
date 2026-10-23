@@ -2137,7 +2137,7 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
     auto graph = build_graph(compiled, has_flag(opt.flags, BackendVulkanExperts));
     if (!graph)
         return graph.error();
-    if (has_flag(opt.flags, BackendReleaseVulkanDenseHostStorage))
+    if (use_vulkan_dense)
         release_vulkan_dense_host_copies(compiled);
     compiled.weights.finalize();
     return {};

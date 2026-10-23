@@ -79,7 +79,7 @@ static Result<void> add_vector_size(uint64_t count, uint64_t element_size, const
     return {};
 }
 
-static Result<uint64_t> latent_fp8_dense_size(const MoeModelDescriptor& descriptor)
+static Result<uint64_t> latent_dense_size(const MoeModelDescriptor& descriptor)
 {
     uint64_t total = 0;
     const uint64_t element_size = descriptor.activation_dtype == DType::BFloat16 ? 2 : 4;
@@ -160,7 +160,8 @@ static Result<uint64_t> latent_fp8_dense_size(const MoeModelDescriptor& descript
         const AttentionDescriptor& attention = layer.attention;
         const MoeDescriptor& moe = layer.moe;
         if (attention.kind != AttentionKind::MultiHeadLatent
-            || attention.projection_weight_dtype != DType::Float8E4M3
+            || (attention.projection_weight_dtype != DType::Float8E4M3
+                && attention.projection_weight_dtype != DType::BFloat16)
             || attention.output_group_count == 0
             || attention.head_count % attention.output_group_count != 0)
         {
@@ -290,7 +291,8 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
     if (descriptor.layers.empty()
         || descriptor.hyper_connection_multiplier <= 1
         || descriptor.layers.front().attention.kind != AttentionKind::MultiHeadLatent
-        || descriptor.layers.front().attention.projection_weight_dtype != DType::Float8E4M3)
+        || (descriptor.layers.front().attention.projection_weight_dtype != DType::Float8E4M3
+            && descriptor.layers.front().attention.projection_weight_dtype != DType::BFloat16))
     {
         return uint64_t{0};
     }
@@ -298,7 +300,7 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
     uint64_t total = 0;
     Result<void> status = add_matrix_size(descriptor.vocabulary_size,
                                           descriptor.hidden_size,
-                                          DType::BFloat16,
+                                          descriptor.activation_dtype,
                                           "Vulkan LM head",
                                           total);
     if (!status)
@@ -308,7 +310,8 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
     {
         const AttentionDescriptor& attention = layer.attention;
         if (attention.kind != AttentionKind::MultiHeadLatent
-            || attention.projection_weight_dtype != DType::Float8E4M3
+            || (attention.projection_weight_dtype != DType::Float8E4M3
+                && attention.projection_weight_dtype != DType::BFloat16)
             || attention.output_group_count == 0
             || attention.head_count % attention.output_group_count != 0)
         {
@@ -326,7 +329,7 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
         {
             status = add_matrix_size(matrix.first,
                                      matrix.second,
-                                     DType::Float8E4M3,
+                                     attention.projection_weight_dtype,
                                      "Vulkan latent projection",
                                      total);
             if (!status)
@@ -336,14 +339,16 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
         {
             status = add_matrix_size(static_cast<uint64_t>(attention.index_head_count) * attention.index_head_dimension,
                                      attention.query_lora_rank,
-                                     DType::Float8E4M3,
+                                     attention.projection_weight_dtype,
                                      "Vulkan index query",
                                      total);
             if (!status)
                 return status.error();
         }
 
-        if (layer.moe.shared_expert_count != 0)
+        // FP8 shared projections retain their CPU fallback host weights.
+        if (layer.moe.shared_expert_count != 0
+            && layer.moe.shared_expert_weight_dtype != DType::Float8E4M3)
         {
             status = add_matrix_size(layer.moe.intermediate_size,
                                      descriptor.hidden_size,
@@ -373,12 +378,13 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
 
 static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
 {
-    const bool latent_fp8 = !descriptor.layers.empty()
-                            && descriptor.hyper_connection_multiplier > 1
-                            && descriptor.layers.front().attention.kind == AttentionKind::MultiHeadLatent
-                            && descriptor.layers.front().attention.projection_weight_dtype == DType::Float8E4M3;
-    if (latent_fp8)
-        return latent_fp8_dense_size(descriptor);
+    const bool latent = !descriptor.layers.empty()
+                        && descriptor.hyper_connection_multiplier > 1
+                        && descriptor.layers.front().attention.kind == AttentionKind::MultiHeadLatent
+                        && (descriptor.layers.front().attention.projection_weight_dtype == DType::Float8E4M3
+                            || descriptor.layers.front().attention.projection_weight_dtype == DType::BFloat16);
+    if (latent)
+        return latent_dense_size(descriptor);
 
     const uint64_t element_size = descriptor.activation_dtype == DType::BFloat16 ? 2 : 4;
     auto embedding_elements = checked_multiply(descriptor.vocabulary_size, descriptor.hidden_size, "embedding");
@@ -1032,7 +1038,7 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
 }
 
 Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, const Option& opt, uint64_t physical_memory_size,
-                                          bool release_vulkan_dense_host_storage,
+                                          bool use_vulkan_dense,
                                           uint64_t available_memory_size,
                                           bool reserve_cpu_packed_weights,
                                           const WeightMapping* weights)
@@ -1262,14 +1268,13 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         }
     }
 
-    if (release_vulkan_dense_host_storage)
+    if (use_vulkan_dense)
     {
         auto releasable = latent_vulkan_releasable_dense_size(descriptor);
         if (!releasable)
             return releasable.error();
-        plan.estimated_dense_size = releasable.value() >= plan.estimated_dense_size
-                                        ? 0
-                                        : plan.estimated_dense_size - releasable.value();
+        plan.estimated_vulkan_dense_host_release_size = std::min(releasable.value(), plan.estimated_dense_size);
+        plan.estimated_dense_size -= plan.estimated_vulkan_dense_host_release_size;
         eager_capacity = 0;
         if (plan.host_memory_budget > plan.estimated_dense_size
             && plan.host_memory_budget - plan.estimated_dense_size > safety_reserve)
@@ -1316,6 +1321,43 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         return Error{ErrorCode::InvalidArgument, "expert cache is smaller than one layer's active Expert set"};
     }
     return plan;
+}
+
+Result<void> finalize_model_memory_plan(ModelMemoryPlan& plan, const Option& opt,
+                                        uint64_t released_dense_host_size)
+{
+    auto retained_size = checked_add(plan.estimated_dense_size, plan.estimated_vulkan_dense_host_release_size,
+                                     "dense host storage before Vulkan reclamation");
+    if (!retained_size)
+        return retained_size.error();
+    plan.estimated_dense_size = retained_size.value() - std::min(retained_size.value(), released_dense_host_size);
+    plan.estimated_vulkan_dense_host_release_size = std::min(retained_size.value(), released_dense_host_size);
+    if (plan.selected_mode != ExpertMemoryMode::OnDemand)
+        return {};
+
+    const bool budget_limited_by_available_memory = opt.host_memory_budget == 0
+                                                    && plan.physical_memory_size != 0
+                                                    && plan.available_memory_size != 0
+                                                    && plan.host_memory_budget < plan.physical_memory_size / 4 * 3;
+    const uint64_t safety_reserve = budget_limited_by_available_memory
+                                        ? 0
+                                        : std::max(2 * gibibyte, plan.physical_memory_size == 0 ? 2 * gibibyte : plan.physical_memory_size / 8);
+    const uint64_t host_capacity = plan.host_memory_budget > plan.estimated_dense_size
+                                       ? plan.host_memory_budget - plan.estimated_dense_size
+                                       : 0;
+    const uint64_t cache_capacity = host_capacity > safety_reserve ? host_capacity - safety_reserve : 0;
+    if (cache_capacity < plan.minimum_active_expert_size)
+        return Error{ErrorCode::InvalidArgument, "host memory budget cannot hold one layer's active Expert set"};
+    if (opt.expert_cache_size == 0)
+    {
+        const uint64_t automatic_target = plan.physical_memory_size == 0 ? 2 * gibibyte : cache_capacity;
+        plan.expert_cache_size = std::min(automatic_target, cache_capacity);
+    }
+    if (plan.expert_cache_size > host_capacity)
+        return Error{ErrorCode::InvalidArgument, "expert cache and dense weights exceed the host memory budget"};
+    if (plan.expert_cache_size < plan.minimum_active_expert_size)
+        return Error{ErrorCode::InvalidArgument, "expert cache is smaller than one layer's active Expert set"};
+    return {};
 }
 
 } // namespace moe

@@ -301,8 +301,13 @@ static void gpu_first_bfloat16_work_item_lifecycle(uint32_t device_index)
     constexpr uint32_t output_columns = 64;
     const uint64_t flags = OptimizationDefaultFlags & ~static_cast<uint64_t>(OptimizationCpuBfloat16Batched);
     const VulkanRuntimePtr runtime = create_vulkan_runtime();
-    gpu_first_check(static_cast<bool>(VulkanContext::acquire(device_index, runtime, flags)),
-                    "BF16 WorkItem lifecycle Vulkan context");
+    const auto context = VulkanContext::acquire(device_index, runtime, flags);
+    gpu_first_check(static_cast<bool>(context), "BF16 WorkItem lifecycle Vulkan context");
+    if (context->device()->info.subgroup_size() != 32)
+    {
+        std::cout << "SKIP: fused BF16 WorkItem kernel requires subgroup size 32 on device " << device_index << '\n';
+        return;
+    }
 
     const auto weight = [](uint32_t rows, uint32_t columns, uint32_t seed) {
         auto result = std::make_shared<TensorData>();

@@ -265,7 +265,6 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
     expert_io_group.add_argument("--direct-expert-io", action="store_true", default=None)
     expert_io_group.add_argument("--buffered-expert-io", action="store_true", default=None)
     parser.add_argument("--disable-gpu-victim-execution", action="store_true", default=None)
-    parser.add_argument("--release-vulkan-dense-host", action="store_true", default=None)
     parser.add_argument("--disable-vulkan-joint-cache-eviction", action="store_true", default=None)
     parser.add_argument("--disable-vulkan-mxfp4-row-tile", action="store_true", default=None)
     parser.add_argument("--disable-vulkan-expert-direct-staging", action="store_true", default=None)
@@ -303,7 +302,6 @@ def _add_generation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--top-p", type=float)
     parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--no-speculative", action="store_true")
     parser.add_argument("--speculative-confidence", type=float, default=0.5)
     parser.add_argument("--speculative-max-draft", type=int, default=0)
     _add_metrics_options(parser)
@@ -477,7 +475,6 @@ def cli_runtime_settings(arguments: argparse.Namespace) -> dict[str, Any]:
         "direct_expert_io",
         "buffered_expert_io",
         "disable_gpu_victim_execution",
-        "release_vulkan_dense_host",
         "disable_vulkan_joint_cache_eviction",
         "disable_vulkan_mxfp4_row_tile",
         "disable_vulkan_expert_direct_staging",
@@ -700,7 +697,6 @@ class ConversationApp:
             self.native_session_id,
             seed=arguments.seed,
             prefill_chunk_size=arguments.prefill_chunk_size,
-            enable_speculative_context=not arguments.no_speculative,
         )
         replay_succeeded = False
         if record and self.messages:
@@ -1188,7 +1184,6 @@ class ConversationApp:
             "top_k": top_k,
             "top_p": top_p,
             "min_p": self.arguments.min_p,
-            "enable_speculative": not self.arguments.no_speculative,
             "speculative_confidence": self.arguments.speculative_confidence,
             "speculative_max_draft": self.arguments.speculative_max_draft,
             "metrics_enabled": metrics_trace_enabled(self.arguments),

@@ -703,7 +703,11 @@ void test_prefill_decode_and_reset()
     check(static_cast<bool>(runtime.info().float8_linear_row_group_size == 1 || runtime.info().float8_linear_row_group_size == 2
                             || runtime.info().float8_linear_row_group_size == 4
                             || runtime.info().float8_linear_row_group_size == 8));
-    auto model = runtime.load_model(package.path());
+    // This test clones and reschedules the model for CPU workspace checks;
+    // load CPU storage rather than converting a device-only Hybrid copy.
+    Option cpu_options;
+    cpu_options.hybrid_mode = HybridMode::CpuOnly;
+    auto model = runtime.load_model(package.path(), cpu_options);
     check(static_cast<bool>(model));
     check(static_cast<bool>(model.value()->descriptor().model_type == "test_moe"));
     check(static_cast<bool>(model.value()->descriptor().layers.size() == 1));
@@ -1771,6 +1775,38 @@ void test_ncnn_vulkan_float8_operator()
                                                     vulkan_runtime,
                                                     g_test_optimization_flags);
     check(static_cast<bool>(vulkan));
+    {
+        CompiledModel accounting_model;
+        auto embedding = accounting_model.weights.add("token_embedding.weight", matrix);
+        auto head = accounting_model.weights.add("lm_head.weight", matrix);
+        check(static_cast<bool>(embedding) && static_cast<bool>(head));
+        accounting_model.operators.bind_weight_count(accounting_model.weights.size());
+        accounting_model.operators.at_weight_mutable(head.value()).float8 = vulkan;
+        release_vulkan_dense_host_copies(accounting_model);
+        check(accounting_model.released_dense_host_size == matrix.quantization_scales.size() * sizeof(float));
+        check(accounting_model.weights.at(head.value()).float8_values().empty());
+        check(!accounting_model.weights.at(embedding.value()).float8_values().empty());
+        accounting_model.operators.at_weight_mutable(embedding.value()).float8 = vulkan;
+        release_vulkan_dense_host_copies(accounting_model);
+        check(accounting_model.released_dense_host_size == matrix.mapped_size + matrix.quantization_scales.size() * sizeof(float) * 2);
+        const uint64_t released_size = accounting_model.released_dense_host_size;
+        release_vulkan_dense_host_copies(accounting_model);
+        check(accounting_model.released_dense_host_size == released_size);
+    }
+    {
+        TensorData owned_matrix = matrix;
+        owned_matrix.quantized_data.assign(matrix.float8_values().begin(), matrix.float8_values().end());
+        owned_matrix.mapped_data.reset();
+        owned_matrix.mapped_size = 0;
+        CompiledModel accounting_model;
+        auto head = accounting_model.weights.add("lm_head.weight", std::move(owned_matrix));
+        check(static_cast<bool>(head));
+        accounting_model.operators.bind_weight_count(accounting_model.weights.size());
+        accounting_model.operators.at_weight_mutable(head.value()).float8 = vulkan;
+        release_vulkan_dense_host_copies(accounting_model);
+        check(accounting_model.weights.at(head.value()).quantized_data.empty());
+        check(accounting_model.released_dense_host_size == matrix.mapped_size + matrix.quantization_scales.size() * sizeof(float));
+    }
     ActivationBuffer vulkan_output;
     check(static_cast<bool>(vulkan->forward(input, vulkan_output)));
     const std::byte* output_storage = vulkan_output.bytes().data();
@@ -14088,6 +14124,70 @@ void test_deepseek_v4_descriptors()
     check(memory.value().selected_mode == ExpertMemoryMode::OnDemand);
     check(memory.value().estimated_dense_size < UINT64_C(10) * 1024 * 1024 * 1024);
 
+    Option release_options;
+    release_options.hybrid_mode = HybridMode::HybridExperts;
+    release_options.expert_memory_mode = ExpertMemoryMode::OnDemand;
+    const uint64_t physical_memory = UINT64_C(32) * 1024 * 1024 * 1024;
+    for (DType projection_dtype : {DType::Float8E4M3, DType::BFloat16})
+    {
+        MoeModelDescriptor resident = flash.value();
+        uint64_t reclaimed = static_cast<uint64_t>(resident.vocabulary_size) * resident.hidden_size * 2;
+        for (LayerDescriptor& layer : resident.layers)
+        {
+            layer.attention.projection_weight_dtype = projection_dtype;
+            layer.moe.shared_expert_weight_dtype = projection_dtype;
+            const AttentionDescriptor& attention = layer.attention;
+            const uint64_t grouped_columns = static_cast<uint64_t>(attention.head_count) * attention.head_dimension / attention.output_group_count;
+            const std::array<std::pair<uint64_t, uint64_t>, 5> projections = {{{attention.query_lora_rank, resident.hidden_size},
+                                                                               {static_cast<uint64_t>(attention.head_count) * attention.head_dimension, attention.query_lora_rank},
+                                                                               {attention.head_dimension, resident.hidden_size},
+                                                                               {static_cast<uint64_t>(attention.output_group_count) * attention.output_lora_rank, grouped_columns},
+                                                                               {resident.hidden_size, static_cast<uint64_t>(attention.output_group_count) * attention.output_lora_rank}}};
+            const auto add_projection = [&](uint64_t rows, uint64_t columns) {
+                reclaimed += rows * columns * (projection_dtype == DType::BFloat16 ? 2 : 1);
+                if (projection_dtype == DType::Float8E4M3)
+                    reclaimed += ((rows + 127) / 128) * ((columns + 127) / 128) * sizeof(float);
+            };
+            for (const auto& projection : projections)
+                add_projection(projection.first, projection.second);
+            if (attention.compression_ratio == 4)
+                add_projection(static_cast<uint64_t>(attention.index_head_count) * attention.index_head_dimension, attention.query_lora_rank);
+            if (projection_dtype == DType::BFloat16 && layer.moe.shared_expert_count != 0)
+                reclaimed += static_cast<uint64_t>(resident.hidden_size) * layer.moe.intermediate_size * 3 * 2;
+        }
+        Option cpu_options = release_options;
+        cpu_options.hybrid_mode = HybridMode::CpuOnly;
+        auto retained = plan_model_memory(resident, cpu_options, physical_memory);
+        auto released = plan_model_memory(resident, release_options, physical_memory, true);
+        check(static_cast<bool>(retained) && static_cast<bool>(released));
+        check(retained.value().estimated_dense_size > reclaimed);
+        check(released.value().estimated_dense_size == retained.value().estimated_dense_size - reclaimed);
+        check(released.value().expert_cache_size == retained.value().expert_cache_size + reclaimed);
+        check(released.value().expert_cache_size + released.value().estimated_dense_size
+              == retained.value().expert_cache_size + retained.value().estimated_dense_size);
+        ModelMemoryPlan fallback_plan = released.value();
+        check(static_cast<bool>(finalize_model_memory_plan(fallback_plan, release_options, 0)));
+        check(fallback_plan.estimated_dense_size == retained.value().estimated_dense_size);
+        check(fallback_plan.expert_cache_size == retained.value().expert_cache_size);
+        ModelMemoryPlan resident_plan = released.value();
+        check(static_cast<bool>(finalize_model_memory_plan(resident_plan, release_options, reclaimed)));
+        check(resident_plan.estimated_dense_size == released.value().estimated_dense_size);
+        check(resident_plan.expert_cache_size == released.value().expert_cache_size);
+        check(static_cast<bool>(finalize_model_memory_plan(resident_plan, release_options, reclaimed)));
+        check(resident_plan.estimated_dense_size == released.value().estimated_dense_size);
+        ModelMemoryPlan partial_plan = released.value();
+        check(static_cast<bool>(finalize_model_memory_plan(partial_plan, release_options, reclaimed / 2)));
+        check(partial_plan.estimated_dense_size == retained.value().estimated_dense_size - reclaimed / 2);
+        check(partial_plan.expert_cache_size == retained.value().expert_cache_size + reclaimed / 2);
+        Option explicit_cache = release_options;
+        explicit_cache.expert_cache_size = retained.value().host_memory_budget - retained.value().estimated_dense_size + 1;
+        ModelMemoryPlan explicit_plan = released.value();
+        explicit_plan.expert_cache_size = explicit_cache.expert_cache_size;
+        auto rejected_cache = finalize_model_memory_plan(explicit_plan, explicit_cache, 0);
+        check(!rejected_cache && rejected_cache.error().code == ErrorCode::InvalidArgument);
+        check(explicit_plan.expert_cache_size == explicit_cache.expert_cache_size);
+    }
+
     auto partial_dspark = adapter.parse_model(deepseek_v4_package(R"(
         "dspark_block_size": 5,
 )"));
@@ -15805,14 +15905,12 @@ void test_qwen4_exp_vulkan_projections()
             for (uint32_t column = 0; column < input.columns(); ++column)
                 input.row(row)[column] = static_cast<float>(static_cast<int>((row * 5 + column * 3) % 19) - 9) / 8.0f;
 
-        for (bool release_host_storage : {false, true})
+        // Vulkan-resident projections reclaim their host storage by default.
         {
             CompilerOption opt;
             opt.flags |= BackendVulkanDense | BackendVulkanAttention;
             opt.device_index = get_default_gpu_index();
             opt.vulkan_runtime = create_vulkan_runtime();
-            if (release_host_storage)
-                opt.flags |= BackendReleaseVulkanDenseHostStorage;
             CompiledModel hybrid_model;
             auto compiled = compile_model(descriptor, mapping, hybrid_model, HybridMode::HybridExperts, opt);
             if (!compiled)
@@ -15845,7 +15943,6 @@ void test_qwen4_exp_vulkan_projections()
                 }
             }
             check(found_attention);
-            if (release_host_storage)
             {
                 for (TensorHandle handle : {hybrid_plan.query_weight, hybrid_plan.key_weight,
                                             hybrid_plan.value_weight, hybrid_plan.output_weight})

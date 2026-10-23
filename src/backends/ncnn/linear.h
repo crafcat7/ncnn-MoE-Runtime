@@ -88,6 +88,7 @@ private:
     friend class MoeCombine_vulkan;
     friend class LatentLayerWorkspace_vulkan;
     friend class Float8Linear_vulkan;
+    friend class Bfloat16Linear_vulkan;
     friend class LatentAttention_vulkan;
     friend class LayerHead_vulkan;
 
@@ -152,6 +153,8 @@ public:
                                         float epsilon,
                                         float weight_offset = 0.0f);
     [[nodiscard]] bool has_rms_norm_chain() const noexcept;
+    [[nodiscard]] bool prepare_input_rms_norm(const TensorData& weight, float epsilon);
+    [[nodiscard]] bool prepare_output_rms_norm(const TensorData& weight, float epsilon);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
     // Executes two independent BF16 projections from one input batch in a
     // single command buffer.  The outputs are downloaded separately, while
@@ -173,6 +176,27 @@ public:
                                             float activation_limit,
                                             bool apply_router_gate,
                                             ActivationBuffer& output) const;
+    [[nodiscard]] bool forward_swiglu_chain_device(const DeviceTensor_vulkan& input,
+                                                   const Bfloat16Linear_vulkan& down_operator,
+                                                   uint32_t intermediate_columns,
+                                                   ExpertActivation activation,
+                                                   float activation_limit,
+                                                   bool apply_router_gate,
+                                                   DeviceTensor_vulkan& output) const;
+    [[nodiscard]] bool materialize(const DeviceTensor_vulkan& input, ActivationBuffer& output) const;
+
+#if NCNN_MOE_WITH_VULKAN
+    // Caller owns the command, holds the context lock and retains workspace until submission.
+    [[nodiscard]] bool record_input_normalization(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& cmd) const;
+    [[nodiscard]] bool record_rms_norm_chain_parallel(const ncnn::VkMat& input,
+                                                      const Bfloat16Linear_vulkan& next,
+                                                      const Bfloat16Linear_vulkan& parallel,
+                                                      ncnn::VkMat& query,
+                                                      ncnn::VkMat& kv,
+                                                      ncnn::VkMat& query_rank,
+                                                      ncnn::VkCompute& cmd,
+                                                      std::vector<ncnn::VkMat>& workspace) const;
+#endif
 
 private:
     friend class Float8Linear_vulkan;
@@ -405,6 +429,9 @@ private:
     friend class HyperConnection_vulkan;
     friend class LayerHead_vulkan;
 
+    friend class LatentAttention_vulkan;
+    [[nodiscard]] bool record_forward(const ncnn::VkMat& input, ncnn::VkMat& output,
+                                      ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace) const;
     void record(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& command, uint32_t output_column_offset = 0) const;
     void record(const ncnn::VkMat& input,
                 ncnn::VkMat& output,

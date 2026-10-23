@@ -9,14 +9,14 @@
 namespace ncnn {
 namespace moe {
 
-// Model loading option flags are kept in this public header.
+// Model loading option flags are kept in this public header. Retired bit 6
+// stays unused; resident Vulkan dense host storage is reclaimed automatically.
 #define NCNN_MOE_OPTION_DISABLE_VICTIM_EXEC_BIT 0
 #define NCNN_MOE_OPTION_ROUTER_PRED_BIT         1
 #define NCNN_MOE_OPTION_FORWARD_ARC_BIT         2
 #define NCNN_MOE_OPTION_RANK_ADAPT_BIT          3
 #define NCNN_MOE_OPTION_READ_MERGE_BIT          4
 #define NCNN_MOE_OPTION_ASYNC_ROUTER_PRED_BIT   5
-#define NCNN_MOE_OPTION_RELEASE_DENSE_BIT       6
 #define NCNN_MOE_OPTION_DISABLE_GPU_EXPERT_BIT  7
 
 enum OptionFlag : uint32_t
@@ -27,7 +27,6 @@ enum OptionFlag : uint32_t
     OptionRankAdaptivePrefetch = UINT32_C(1) << NCNN_MOE_OPTION_RANK_ADAPT_BIT,
     OptionCrossExpertReadCoalescing = UINT32_C(1) << NCNN_MOE_OPTION_READ_MERGE_BIT,
     OptionAsyncRouterPrediction = UINT32_C(1) << NCNN_MOE_OPTION_ASYNC_ROUTER_PRED_BIT,
-    OptionReleaseVulkanDenseHostStorage = UINT32_C(1) << NCNN_MOE_OPTION_RELEASE_DENSE_BIT,
     OptionDisableGpuExpertExecution = UINT32_C(1) << NCNN_MOE_OPTION_DISABLE_GPU_EXPERT_BIT
 };
 

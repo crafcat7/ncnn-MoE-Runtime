@@ -8,11 +8,11 @@ namespace moe {
 
 [[nodiscard]] Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor);
 
+// Retired bit 4 stays unused; resident dense host copies are reclaimed automatically.
 #define NCNN_MOE_COMPILER_BACKEND_CPU_BIT           0
 #define NCNN_MOE_COMPILER_BACKEND_VULKAN_DENSE_BIT  1
 #define NCNN_MOE_COMPILER_BACKEND_VULKAN_ATTN_BIT   2
 #define NCNN_MOE_COMPILER_BACKEND_MXFP4_CPU_BIT     3
-#define NCNN_MOE_COMPILER_BACKEND_RELEASE_DENSE_BIT 4
 #define NCNN_MOE_COMPILER_BACKEND_VULKAN_EXPERT_BIT 5
 #define NCNN_MOE_COMPILER_BACKEND_FILE_EXPERT_BIT   6
 
@@ -22,7 +22,6 @@ enum BackendFlag : uint32_t
     BackendVulkanDense = UINT32_C(1) << NCNN_MOE_COMPILER_BACKEND_VULKAN_DENSE_BIT,
     BackendVulkanAttention = UINT32_C(1) << NCNN_MOE_COMPILER_BACKEND_VULKAN_ATTN_BIT,
     BackendMxfp4CpuKernel = UINT32_C(1) << NCNN_MOE_COMPILER_BACKEND_MXFP4_CPU_BIT,
-    BackendReleaseVulkanDenseHostStorage = UINT32_C(1) << NCNN_MOE_COMPILER_BACKEND_RELEASE_DENSE_BIT,
     BackendVulkanExperts = UINT32_C(1) << NCNN_MOE_COMPILER_BACKEND_VULKAN_EXPERT_BIT,
     BackendFileBackedExperts = UINT32_C(1) << NCNN_MOE_COMPILER_BACKEND_FILE_EXPERT_BIT
 };

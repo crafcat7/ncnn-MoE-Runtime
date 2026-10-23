@@ -94,7 +94,6 @@ def _arguments(**overrides: object) -> SimpleNamespace:
         "title": "",
         "seed": 7,
         "prefill_chunk_size": 8,
-        "no_speculative": False,
         "max_new_tokens": 8,
         "temperature": None,
         "top_k": None,
@@ -231,6 +230,34 @@ class FakeWorkerClient:
 
 
 class RuntimeOptionsTests(unittest.TestCase):
+    def test_automatic_host_release_and_speculation_have_no_cli_switch(self) -> None:
+        for command in ("run", "chat", "inspect", "tune"):
+            arguments = parse_arguments([command])
+            self.assertFalse(hasattr(arguments, "release_vulkan_dense_host"))
+            self.assertFalse(hasattr(arguments, "no_speculative"))
+            for flag in ("--release-vulkan-dense-host", "--no-speculative"):
+                with self.subTest(command=command, flag=flag), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        parse_arguments([command, flag])
+                    self.assertEqual(error.exception.code, 2)
+
+    def test_removed_policy_settings_are_ignored_on_restore(self) -> None:
+        for enabled in (True, False):
+            obsolete = {"release_vulkan_dense_host": enabled, "no_speculative": enabled}
+            self.assertEqual(runtime_args_from_settings(obsolete), [])
+            for source in ("user", "profile", "session", "cli"):
+                layers = {"cli": {}, "session": None, "profile": None, "user": None}
+                layers[source] = {**obsolete, "backend": "hybrid"}
+                with self.subTest(enabled=enabled, source=source):
+                    settings = merge_runtime_settings(**layers)
+                    self.assertEqual(settings, {"backend": "hybrid"})
+                    self.assertEqual(runtime_args_from_settings(settings), ["--hybrid"])
+                    client = ProtocolTests.QueuedClient([{"event": "session_created"}, {"event": "done"}])
+                    client.create_session("restored")
+                    client.generate("restored", [0])
+                    self.assertTrue(client.sent[0]["enable_speculative_context"])
+                    self.assertTrue(client.sent[1]["enable_speculative"])
+
     def test_removed_concurrent_command_flags_are_rejected(self) -> None:
         for command in ("run", "chat", "inspect", "tune"):
             with self.subTest(command=command):
@@ -486,6 +513,15 @@ class ProtocolTests(unittest.TestCase):
     def _failing_callback(_: dict[str, object]) -> None:
         raise RuntimeError("callback failed")
 
+    def test_protocol_defaults_to_speculation_and_retains_internal_control(self) -> None:
+        for overrides, enabled in (({}, True), ({"enable_speculative": False}, False)):
+            client = self.QueuedClient([{"event": "session_created"}, {"event": "done"}])
+            session_options = {} if enabled else {"enable_speculative_context": False}
+            client.create_session("auto", **session_options)
+            client.generate("auto", [0], **overrides)
+            self.assertEqual(client.sent[0]["enable_speculative_context"], enabled)
+            self.assertEqual(client.sent[1]["enable_speculative"], enabled)
+
     def test_console_codec_and_redirected_input_are_frontend_owned(self) -> None:
         text = "中文 café 😀"
         for tty, explicit_codec in ((True, False), (False, False), (False, True)):
@@ -616,6 +652,14 @@ class ProtocolTests(unittest.TestCase):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_reference_benchmark_retains_target_control_without_host_release_flag(self) -> None:
+        arguments = benchmark_runtime.parse_arguments(["runner", "model", "--no-speculative"])
+        self.assertFalse(hasattr(arguments, "release_vulkan_dense_host"))
+        self.assertIn("--no-speculative", benchmark_runtime.runner_command(arguments))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            benchmark_runtime.parse_arguments(["runner", "model", "--release-vulkan-dense-host"])
+        self.assertEqual(error.exception.code, 2)
+
     def test_benchmarks_preserve_generation_and_basic_metrics(self) -> None:
         event = {
             "prompt_tok_per_second": 2.0,

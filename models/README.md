@@ -94,7 +94,7 @@ draft-only packages and missing DSpark draft weights do not enable speculation.
 ```powershell
 python tools/ncnn_moe.py run --model "./models/DeepSeek-GGUF" `
   --backend hybrid --expert-memory on-demand --cpu-packed-weights off `
-  --prompt "Reply OK" --max-new-tokens 32 --no-speculative
+  --prompt "Reply OK" --max-new-tokens 32
 ```
 
 | Source | Imported storage and current boundary |

@@ -29,6 +29,7 @@ layout(push_constant) uniform parameter
     uint output_columns;
     uint token_count;
     uint apply_router_gate;
+    float activation_limit;
 }
 p;
 
@@ -40,6 +41,16 @@ float decode_bfloat16(uint value)
 float sigmoid(float value)
 {
     return 1.0 / (1.0 + exp(-value));
+}
+
+float gated_product(float gate, float up)
+{
+    if (p.activation_limit > 0.0)
+    {
+        gate = min(gate, p.activation_limit);
+        up = clamp(up, -p.activation_limit, p.activation_limit);
+    }
+    return gate * sigmoid(gate) * up;
 }
 
 #if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
@@ -66,16 +77,16 @@ void main()
             const float first_up = buffer_ld1(input_data, input_row + p.intermediate_columns + column);
             const float second_gate = buffer_ld1(input_data, input_row + column + 2);
             const float second_up = buffer_ld1(input_data, input_row + p.intermediate_columns + column + 2);
-            const float first_value = first_gate * sigmoid(first_gate) * first_up;
-            const float second_value = second_gate * sigmoid(second_gate) * second_up;
+            const float first_value = gated_product(first_gate, first_up);
+            const float second_value = gated_product(second_gate, second_up);
             const float third_gate = buffer_ld1(input_data, input_row + column + 1);
             const float third_up = buffer_ld1(input_data, input_row + p.intermediate_columns + column + 1);
             const float fourth_gate = buffer_ld1(input_data, input_row + column + 3);
             const float fourth_up = buffer_ld1(input_data, input_row + p.intermediate_columns + column + 3);
             sum += decode_bfloat16(first & 65535) * first_value;
-            sum += decode_bfloat16(first >> 16) * (third_gate * sigmoid(third_gate) * third_up);
+            sum += decode_bfloat16(first >> 16) * gated_product(third_gate, third_up);
             sum += decode_bfloat16(second & 65535) * second_value;
-            sum += decode_bfloat16(second >> 16) * (fourth_gate * sigmoid(fourth_gate) * fourth_up);
+            sum += decode_bfloat16(second >> 16) * gated_product(fourth_gate, fourth_up);
         }
     }
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic

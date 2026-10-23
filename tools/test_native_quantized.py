@@ -163,6 +163,7 @@ class Fixture:
     moe: bool
     int4: bool = False
     family: str = "qwen"
+    hybrid_dense_release: int = 0
 
 
 def gpt_oss_tensors() -> tuple[dict, dict, list[str]]:
@@ -340,6 +341,36 @@ def weight_sizes(tensors: dict, packed_sizes: dict[str, int]) -> tuple[int, int]
     return dense, expert
 
 
+def hybrid_dense_host_release(tensors: dict, packed_sizes: dict[str, int], *,
+                              fp8: bool = False, query_selection_bytes: int = 0) -> int:
+    """Independently count the fixture weights owned by resident Vulkan ops.
+
+    INT4/Qn_K storage remains resident on host. Their unquantized Shared Expert
+    router gates are separate BF16 projections and can be reclaimed. FP8
+    reclaims codes and scales of the output head, standard/latent Attention,
+    and dense FFN projections. GatedDeltaNet's five projections retain their
+    CPU prefill fallback, and FP8 Shared Experts retain their CPU chain. The
+    Qwen4 HC/PLE/indexer projections also stay on their existing CPU paths.
+    All norms, biases, routing weights and other auxiliaries remain in the
+    exact retained-byte expectation.
+    """
+    released = query_selection_bytes if fp8 else 0
+    for name, (dtype, values) in tensors.items():
+        if not fp8:
+            if name.endswith("mlp.shared_expert_gate.weight") and name not in packed_sizes:
+                released += values.size * {"BF16": 2, "F32": 4}[dtype]
+            continue
+        if name not in packed_sizes:
+            continue
+        output_head = name in ("lm_head.weight", "head.weight")
+        standard_attention = bool(re.search(r"\.self_attn\.[qkvo]_proj\.weight$", name))
+        latent_attention = bool(re.search(r"\.attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b)\.weight$", name))
+        dense_ffn = bool(re.search(r"\.mlp\.(?:gate|up|down)_proj\.weight$", name))
+        if output_head or standard_attention or latent_attention or dense_ffn:
+            released += packed_sizes[name]
+    return released
+
+
 def prepare_int4(root: Path, method: str, moe: bool, family: str = "qwen") -> Fixture:
     if family == "qwen":
         model_config = config(moe)
@@ -414,7 +445,8 @@ def prepare_int4(root: Path, method: str, moe: bool, family: str = "qwen") -> Fi
         np.testing.assert_array_equal(loaded[name + ".__int4_zeros"].read(), zeros.T)
         if indices is not None:
             np.testing.assert_array_equal(loaded[name + ".__int4_g_idx"].read(), indices)
-    return Fixture(baseline, imported, source, dense_bytes, expert_bytes, bf16_dense, bf16_expert, len(specs), moe, True, family)
+    return Fixture(baseline, imported, source, dense_bytes, expert_bytes, bf16_dense, bf16_expert, len(specs), moe, True, family,
+                   hybrid_dense_host_release(reference, packed_sizes))
 
 
 def quantize_tiny_confidence(fixture: Fixture) -> Fixture:
@@ -591,7 +623,8 @@ def prepare_gguf(root: Path, moe: bool = False, reordered: bool = False, *, fp32
             np.testing.assert_array_equal(loaded[name + ".__qnk_columns"].read(), column_indices)
     dense_bytes, expert_bytes = weight_sizes(reference, packed_sizes)
     bf16_dense, bf16_expert = weight_sizes(reference, {})
-    return Fixture(baseline, imported, path, dense_bytes, expert_bytes, bf16_dense, bf16_expert, len(specs), moe)
+    return Fixture(baseline, imported, path, dense_bytes, expert_bytes, bf16_dense, bf16_expert, len(specs), moe,
+                   hybrid_dense_release=hybrid_dense_host_release(reference, packed_sizes))
 
 
 def family_gguf_name(name: str, family: str) -> str:
@@ -734,7 +767,8 @@ def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = Fal
         np.testing.assert_array_equal(loaded[name + ".__qnk_shape"].read(), [bits, rows, columns])
     dense, expert = weight_sizes(reference, packed_sizes)
     bf16_dense, bf16_expert = weight_sizes(reference, {})
-    return Fixture(baseline, imported, path, dense, expert, bf16_dense, bf16_expert, len(specs), True, False, family)
+    return Fixture(baseline, imported, path, dense, expert, bf16_dense, bf16_expert, len(specs), True, False, family,
+                   hybrid_dense_host_release(reference, packed_sizes))
 
 
 
@@ -801,7 +835,8 @@ def prepare_fp8(root: Path, family: str) -> Fixture:
     bf16_dense, bf16_expert = weight_sizes(reference, {})
     moe = family != "qwen_dense"
     return Fixture(baseline, imported, source, dense + selection_metadata, expert, bf16_dense, bf16_expert,
-                   len(names), moe, False, family)
+                   len(names), moe, False, family,
+                   hybrid_dense_host_release(reference, packed_sizes, fp8=True, query_selection_bytes=selection_metadata))
 
 
 def add_deepseek_mxfp4_experts(fixture: Fixture) -> Path:
@@ -871,7 +906,8 @@ class NativeQuantizedTests(unittest.TestCase):
             self.assertEqual(ready["model"]["expert_count"], 2 if moe else 0)
             if expected is not None:
                 resources = ready["resources"]
-                self.assertEqual(resources["estimated_dense_bytes"], expected.expected_dense)
+                dense_bytes = expected.expected_dense - (expected.hybrid_dense_release if hybrid else 0)
+                self.assertEqual(resources["estimated_dense_bytes"], dense_bytes)
                 self.assertEqual(resources["estimated_expert_bytes"], expected.expected_expert)
                 self.assertLess(resources["estimated_dense_bytes"], expected.bf16_dense)
                 if moe:
@@ -1097,7 +1133,9 @@ class NativeQuantizedTests(unittest.TestCase):
                         is_cpu_reference = self.backend == "cpu" and label == "direct"
                         result = cpu_fp8 if is_cpu_reference else self.run_worker(path, fixture.moe)
                         resources = result["resources"]
-                        self.assertEqual(resources["estimated_dense_bytes"], fixture.expected_dense)
+                        dense_bytes = fixture.expected_dense - (fixture.hybrid_dense_release
+                                                                 if resources["backend"] == "hybrid" else 0)
+                        self.assertEqual(resources["estimated_dense_bytes"], dense_bytes)
                         self.assertEqual(resources["estimated_expert_bytes"], fixture.expected_expert)
                         self.assertLess(resources["estimated_dense_bytes"], fixture.bf16_dense)
                         if fixture.moe:
@@ -1174,8 +1212,7 @@ class NativeQuantizedTests(unittest.TestCase):
                 # Direct HF F16 auxiliaries and imported Qn_K columns both
                 # need host projections for fresh multi-token prefill.
                 path = fixture.source if method == "awq" else fixture.imported
-                result = self.run_worker(path, False, fixture, backend="hybrid",
-                                         extra_args=("--release-vulkan-dense-host",))
+                result = self.run_worker(path, False, fixture, backend="hybrid")
                 for mode in ("greedy", "sampled"):
                     self.assertEqual(result[mode][0], baseline[mode][0])
                     np.testing.assert_allclose(result[mode][1], baseline[mode][1], rtol=0, atol=3e-5)

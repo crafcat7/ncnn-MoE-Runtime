@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -318,38 +319,57 @@ bool support_vulkan_attention(const CompiledOperatorTable& operators,
     return false;
 }
 
-static void release_tensor_host_storage(TensorData& tensor)
+static uint64_t release_tensor_host_storage(TensorData& tensor)
 {
+    uint64_t released_size = 0;
     if (tensor.dtype == DType::Float32)
     {
+        released_size = tensor.float32_data.size() * sizeof(float);
         std::vector<float>().swap(tensor.float32_data);
     }
     else if (tensor.dtype == DType::BFloat16)
     {
+        released_size = tensor.bfloat16_data.size() * sizeof(uint16_t);
         std::vector<uint16_t>().swap(tensor.bfloat16_data);
     }
     else if (tensor.dtype == DType::Float8E4M3)
     {
+        released_size = tensor.quantized_data.size() + tensor.quantization_scales.size() * sizeof(float);
+        std::vector<uint8_t>().swap(tensor.quantized_data);
         std::vector<float>().swap(tensor.quantization_scales);
     }
     else
     {
-        return;
+        return 0;
     }
     tensor.mapped_data.reset();
     tensor.mapped_size = 0;
+    return released_size;
 }
 
 static void release_vulkan_dense_handle(CompiledModel& compiled, TensorHandle handle)
 {
     if (handle == invalid_tensor_handle)
         return;
-    release_tensor_host_storage(compiled.weights.at_mutable(handle));
+    compiled.released_dense_host_size = saturating_add_u64(compiled.released_dense_host_size,
+                                                           release_tensor_host_storage(compiled.weights.at_mutable(handle)));
 }
 
 void release_vulkan_dense_host_copies(CompiledModel& compiled)
 {
-    // FP8 Shared Experts keep their CPU fallback even when optional dense host release is requested.
+    using MappedOwners = std::map<std::shared_ptr<const uint8_t>, uint64_t, std::owner_less<std::shared_ptr<const uint8_t>>>;
+    const auto mapped_owners = [&compiled] {
+        MappedOwners owners;
+        for (TensorHandle handle = 0; handle < compiled.weights.size(); ++handle)
+        {
+            const TensorData& tensor = compiled.weights.at(handle);
+            if (tensor.mapped_data)
+                owners[tensor.mapped_data] = std::max(owners[tensor.mapped_data], tensor.mapped_size);
+        }
+        return owners;
+    };
+    const MappedOwners previous_owners = mapped_owners();
+    // FP8 Shared Experts keep their CPU fallback despite resident Vulkan projections.
     std::vector<TensorHandle> shared_fallback_handles;
     const auto retain_shared = [&](const CompiledLayerPlan& layer) {
         const AttentionBlockPlan& attention = layer.attention;
@@ -383,7 +403,8 @@ void release_vulkan_dense_host_copies(CompiledModel& compiled)
         TensorData& tensor = compiled.weights.at_mutable(handle);
         if (uses_vulkan_dense_operator(compiled.operators.at_weight(handle))
             && std::find(shared_fallback_handles.begin(), shared_fallback_handles.end(), handle) == shared_fallback_handles.end())
-            release_tensor_host_storage(tensor);
+            compiled.released_dense_host_size = saturating_add_u64(compiled.released_dense_host_size,
+                                                                   release_tensor_host_storage(tensor));
     }
 
     const auto release_fused_layer_handles = [&compiled](CompiledLayerPlan& layer) {
@@ -433,6 +454,15 @@ void release_vulkan_dense_host_copies(CompiledModel& compiled)
         release_fused_layer_handles(layer);
     for (CompiledLayerPlan& layer : compiled.speculative.graph.layer_plans)
         release_fused_layer_handles(layer);
+
+    const MappedOwners retained_owners = mapped_owners();
+    for (const auto& [owner, bytes] : previous_owners)
+    {
+        // Tied embeddings and aliased ranges keep their mapping resident until
+        // the last model reference is gone. Partial owner release grants no credit.
+        if (!retained_owners.contains(owner))
+            compiled.released_dense_host_size = saturating_add_u64(compiled.released_dense_host_size, bytes);
+    }
 }
 
 static Result<void> prepare_ffn_operators(WeightStore& weights,
@@ -727,14 +757,22 @@ static Result<void> prepare_latent_attention_operators(CompiledModel& compiled,
                                                     plan.norm_epsilon))
             return Error{ErrorCode::InternalError, "failed to prepare " + std::string(diagnostic_prefix) + "Vulkan FP8 latent input RMSNorm chain"};
     }
+    if (query_a.bfloat16 && query_b.bfloat16)
+    {
+        if (!query_a.bfloat16->prepare_output_rms_norm(compiled.weights.at(plan.query_norm_weight),
+                                                       plan.norm_epsilon))
+            return Error{ErrorCode::InternalError, "failed to prepare " + std::string(diagnostic_prefix) + "Vulkan BF16 query RMSNorm chain"};
+        if (!query_a.bfloat16->prepare_input_rms_norm(compiled.weights.at(plan.pre_attention_norm_weight),
+                                                      plan.norm_epsilon))
+            return Error{ErrorCode::InternalError, "failed to prepare " + std::string(diagnostic_prefix) + "Vulkan BF16 latent input RMSNorm chain"};
+    }
     const CompiledOperator& output_a = compiled.operators.at_weight(plan.output_a_weight);
     const CompiledOperator& output_b = compiled.operators.at_weight(plan.output_b_weight);
     if (attention_core_enabled
-        && has_flag(compiled.opt.optimization_flags, OptimizationVulkanAttention)
-        && output_a.float8 && output_b.float8)
+        && has_flag(compiled.opt.optimization_flags, OptimizationVulkanAttention))
     {
         compiled.operators.at_weight_mutable(plan.query_a_weight).latent_attention = LatentAttention_vulkan::create(plan, compiled.weights.at(plan.sinks),
-                                                                                                                    output_a.float8, output_b.float8);
+                                                                                                                    output_a, output_b);
         const auto& latent = compiled.operators.at_weight(plan.query_a_weight).latent_attention;
         if (latent)
             (void)latent->prepare(compiled.weights, compiled.operators, compiled.opt.optimization_flags);

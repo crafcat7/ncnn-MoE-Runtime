@@ -126,7 +126,7 @@ python -m pip install -e .
 python tools\ncnn_moe.py run `
   --model .\models\qwen3.6\Qwen3.6-35B-A3B `
   --prompt "Briefly explain mixture-of-experts models." `
-  --max-new-tokens 1024 --stream --backend hybrid --no-speculative
+  --max-new-tokens 1024 --stream --backend hybrid
 python tools\ncnn_moe.py chat `
   --model .\models\qwen3.6\Qwen3.6-35B-A3B
 ```
@@ -134,8 +134,8 @@ python tools\ncnn_moe.py chat `
 Thinking mode uses the checkpoint defaults: temperature 1.0, Top-P 0.95,
 Top-K 20, and Min-P 0.0. `--no-thinking` requests the official template's
 direct-answer mode. `--show-reasoning` or `/reasoning` expands the hidden
-reasoning channel. `--no-speculative` selects the target-only path, and
-`--speculative-max-draft N` caps the model-provided draft window when the
+reasoning channel. The runtime automatically uses the model-provided speculative
+plan when supported. `--speculative-max-draft N` caps the draft window when the
 checkpoint exposes one. The CLI locates `ncnn_moe_worker` automatically or
 accepts `--worker PATH`. Scripted runs can add `--no-metrics` to suppress
 periodic metrics events while retaining final statistics.
@@ -347,13 +347,13 @@ does not establish quality parity between BF16 and MXFP4 routed weights.
 
 ### Speculative-decoding status
 
-MTP remains experimental and opt-in. The runner and Python wrapper default to
-target-only generation. Batched verification with the packed-BF16 target path
+MTP remains experimental. The reference runner defaults to target-only
+generation. Batched verification with the packed-BF16 target path
 does not currently preserve the complete greedy sequence. Sequential target
 verification preserves the required token and transactional-state behavior,
-but it is not the recommended performance profile. Use `--speculative` only
-for focused validation and `--no-speculative` for the documented target-only
-path.
+but it is not the recommended performance profile. The reference runner and
+benchmark retain `--speculative` for focused validation and `--no-speculative`
+for the documented target-only measurements.
 
 ### Reproduce the current profile
 

@@ -524,8 +524,6 @@ static Option parse_options(int argc, char** argv, int first_argument)
             result.optimization_flags &= ~OptimizationVulkanExpertDirectStaging;
         else if (argument == "--disable-vulkan-shared-expert-overlap")
             result.optimization_flags &= ~OptimizationVulkanSharedExpertOverlap;
-        else if (argument == "--release-vulkan-dense-host")
-            result.flags |= OptionReleaseVulkanDenseHostStorage;
         else
             throw std::invalid_argument("unknown worker option: " + argument);
     }
@@ -1436,7 +1434,7 @@ static void print_usage(const char* executable)
               << "           --expert-memory auto|eager|on-demand, --cpu-packed-weights on|off,\n"
               << "           --vulkan-device N, --vulkan-devices N[,N...]\n"
               << "  io/cache: --mmap-experts, --direct-expert-io, --buffered-expert-io,\n"
-              << "            --release-vulkan-dense-host, --disable-gpu-expert-execution,\n"
+              << "            --disable-gpu-expert-execution,\n"
               << "            --expected-concurrency N\n"
               << "  debug: --disable-vulkan-joint-cache-eviction\n"
               << "  debug: --disable-vulkan-mxfp4-row-tile\n"

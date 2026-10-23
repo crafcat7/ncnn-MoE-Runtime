@@ -86,7 +86,7 @@ static void check_budget_fallback(const MoeModelDescriptor& descriptor, const We
     for (uint64_t budget : {UINT64_C(0), UINT64_C(1)})
     {
         CompilerOption opt;
-        opt.flags = BackendCpuExecution | BackendVulkanDense | BackendVulkanAttention | BackendReleaseVulkanDenseHostStorage;
+        opt.flags = BackendCpuExecution | BackendVulkanDense | BackendVulkanAttention;
         opt.device_index = device_index;
         opt.gpu_heap_budget = budget;
         opt.vulkan_runtime = create_vulkan_runtime();
@@ -95,6 +95,7 @@ static void check_budget_fallback(const MoeModelDescriptor& descriptor, const We
         check(static_cast<bool>(compiled), compiled ? "" : compiled.error().message);
         for (const ExecutionNode& node : model.graph.nodes)
             check(node.backend == ExecutionBackend::Cpu, "unbudgeted dense node must execute on CPU");
+        check(model.released_dense_host_size == 0, "CPU fallback received resident Vulkan host-release credit");
         check(!model.weights.at(model.lm_head_weight).bfloat16_values().empty(), "fallback LM head host weights were released");
         SessionState state;
         SessionStatistics statistics;
@@ -358,13 +359,11 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
     check(bias_free_storage > 0
               && dense_vulkan_weight_storage_size(cpu, biased_projection, alignment, device_index, true) > bias_free_storage,
           "generic FP32 projection budget omitted its bias allocation");
-    const auto compile_budget = [&](CompiledModel& model, uint64_t budget, bool attention, bool release_host) {
+    const auto compile_budget = [&](CompiledModel& model, uint64_t budget, bool attention) {
         CompilerOption opt;
         opt.flags = BackendCpuExecution | BackendVulkanDense;
         if (attention)
             opt.flags |= BackendVulkanAttention;
-        if (release_host)
-            opt.flags |= BackendReleaseVulkanDenseHostStorage;
         opt.device_index = device_index;
         opt.gpu_heap_budget = budget;
         opt.vulkan_runtime = create_vulkan_runtime();
@@ -405,10 +404,10 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
     {
         check(attention_storage > 0 && (head_storage == 0 || head_storage > attention_budget),
               "budget fixture head does not exceed the attention budget");
-        for (bool release_host : {false, true})
+        // Successful resident projections release host copies without a caller flag.
         {
             CompiledModel model;
-            compile_budget(model, attention_budget, true, release_host);
+            compile_budget(model, attention_budget, true);
             size_t attention_count = 0;
             for (const CompiledLayerPlan& layer : model.graph.layer_plans)
             {
@@ -427,7 +426,7 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
             check(actual.gated_delta_state_bytes > 0
                       && dense_vulkan_pending_state_size(model, device_index) >= actual.gated_delta_state_bytes,
                   "pending DeltaNet reservation does not cover the real decode state allocation");
-            std::cout << "Dense budget attention " << device << ": groups=" << attention_count << "/2 FFN projections=0/6 head_gpu=0 release_host=" << release_host
+            std::cout << "Dense budget attention " << device << ": groups=" << attention_count << "/2 FFN projections=0/6 head_gpu=0 automatic_host_release=1"
                       << " attention=" << actual.counters.attention_blocks
                       << " DeltaNet=" << actual.counters.gated_delta_fusions << '\n';
         }
@@ -447,12 +446,13 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
         return tested_attention;
     }
 
-    for (bool release_host : {false, true})
+    // Partial residency retains only the CPU fallback projections on the host.
     {
         CompiledModel model;
-        compile_budget(model, partial_budget, false, release_host);
+        compile_budget(model, partial_budget, false);
         check(resident_ffn_projections(model) == 1,
               "partial FFN budget did not retain exactly one projection");
+        check(model.released_dense_host_size > 0, "resident FFN projection did not reclaim host storage automatically");
         size_t gpu_ffn_nodes = 0;
         for (const ExecutionNode& node : model.graph.nodes)
             if (node.type == ExecutionNodeType::DenseFfn && node.backend == ExecutionBackend::Vulkan)
@@ -467,12 +467,12 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
                 const CompiledOperator& projection = model.operators.at_weight(handle);
                 const bool resident = projection.bfloat16 || projection.linear;
                 const bool host_present = !model.weights.at(handle).bfloat16_values().empty();
-                check(host_present == (!release_host || !resident),
+                check(host_present == !resident,
                       "partial host release removed a fallback or retained resident-only FFN weights");
             }
         }
         const DenseBudgetTrace actual = execute_budget_model(model);
-        check_budget_trace(actual, expected, device + (release_host ? " released partial FFN budget" : " partial FFN budget"));
+        check_budget_trace(actual, expected, device + " automatically released partial FFN budget");
         // Head and attention are CPU-only here, so these dispatches can only
         // come from the one admitted FFN projection, across prefill and decode.
         check(actual.counters.dispatches >= 2 && actual.counters.compute_submissions >= 2,
@@ -485,7 +485,7 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
         check(projection.bfloat16 || projection.linear, "first admitted FFN projection has no Vulkan operator");
         std::cout << "Dense budget partial FFN " << device
                   << ": path=" << (projection.bfloat16 ? "BF16" : "FP32")
-                  << " projections=1/6 head_gpu=0 release_host=" << release_host
+                  << " projections=1/6 head_gpu=0 automatic_host_release=1"
                   << " dispatches=" << actual.counters.dispatches
                   << " submissions=" << actual.counters.compute_submissions << '\n';
     }
@@ -713,7 +713,6 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
     opt.vulkan_device_index = gpu.device_index;
     opt.vulkan_device_indices = {gpu.device_index};
     opt.num_concurrent_sessions = 2;
-    opt.flags = OptionReleaseVulkanDenseHostStorage;
     opt.optimization_flags &= ~OptimizationVulkanAttention;
     opt.expert_gpu_cache_size = entry_size;
     {
@@ -780,10 +779,10 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
         }
     }
     {
-        // The direct compiler flag exercises host release independently of
-        // Runtime's existing Eager/OnDemand policy for a pure dense model.
+        // Direct compilation and Runtime use the same automatic host policy,
+        // including Eager models without file-backed routed Experts.
         CompilerOption release_opt;
-        release_opt.flags = BackendCpuExecution | BackendVulkanDense | BackendVulkanExperts | BackendReleaseVulkanDenseHostStorage;
+        release_opt.flags = BackendCpuExecution | BackendVulkanDense | BackendVulkanExperts;
         release_opt.device_index = gpu.device_index;
         release_opt.gpu_heap_budget = gpu.heap_available;
         release_opt.vulkan_runtime = create_vulkan_runtime();
@@ -798,7 +797,7 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
     for (DenseCacheFault fault : {DenseCacheFault::Demand, DenseCacheFault::Execution, DenseCacheFault::Commit})
     {
         CompilerOption failing_opt;
-        failing_opt.flags = BackendCpuExecution | BackendVulkanDense | BackendVulkanExperts | BackendReleaseVulkanDenseHostStorage;
+        failing_opt.flags = BackendCpuExecution | BackendVulkanDense | BackendVulkanExperts;
         failing_opt.device_index = gpu.device_index;
         failing_opt.vulkan_runtime = create_vulkan_runtime();
         CompiledModel model;

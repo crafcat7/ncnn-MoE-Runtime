@@ -97,6 +97,7 @@ struct CompiledModel
     ExecutionGraph graph;
     ExecutionSchedule schedule;
     ModelMemoryPlan memory_plan;
+    uint64_t released_dense_host_size = 0;
     WeightStore weights;
     CompiledOperatorTable operators;
     TensorHandle token_embedding = invalid_tensor_handle;
