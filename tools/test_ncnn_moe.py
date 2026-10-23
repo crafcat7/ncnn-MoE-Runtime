@@ -24,6 +24,7 @@ from ncnn_moe_adapters import (  # noqa: E402
     Completion,
     NATIVE_TEXT_VERSION,
     create_adapter,
+    model_weight_files,
 )
 from ncnn_moe import (  # noqa: E402
     ConversationApp,
@@ -335,9 +336,13 @@ class AdapterTests(unittest.TestCase):
             root = Path(directory)
             first = _gguf(root / "weights" / "model-00001-of-00002.gguf", "first")
             second = _gguf(first.with_name("model-00002-of-00002.gguf"), "second")
+            package = first.parent
+            # Selecting a shard must use the same package identity as its
+            # directory, without inheriting an unrelated parent configuration.
+            (root / "config.json").write_text(json.dumps({"model_type": "unrelated_architecture"}), encoding="utf-8")
             ready = _ready([1])
             ready["model"].update(model_type="deepseek_v4", max_context_tokens=1048576)
-            for source in (root, second):
+            for source in (package, first, second):
                 with self.subTest(source=source):
                     adapter = load_adapter(_arguments(), source, ready)
                     self.assertEqual(adapter.model_type, "deepseek_v4")
@@ -347,12 +352,52 @@ class AdapterTests(unittest.TestCase):
                     self.assertEqual(resolve_model(SimpleNamespace(model_opt=str(source))), source.resolve())
                     self.assertEqual(len(lightweight_model_fingerprint(source)), 20)
             before = load_adapter(_arguments(), second, ready).model_fingerprint
-            self.assertEqual(load_adapter(_arguments(), root, ready).model_fingerprint, before)
+            self.assertEqual(load_adapter(_arguments(), package, ready).model_fingerprint, before)
+            self.assertEqual(lightweight_model_fingerprint(package), lightweight_model_fingerprint(second))
             _gguf(first, "FIRST")
             self.assertNotEqual(load_adapter(_arguments(), second, ready).model_fingerprint, before)
             first.unlink()
             with self.assertRaisesRegex(AdapterError, "incomplete"):
                 load_adapter(_arguments(), second, ready)
+
+    def test_model_directory_does_not_discover_child_packages(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-current-directory-") as directory:
+            root = Path(directory)
+            _gguf(root / "gguf-child" / "model.gguf")
+            child = _model(root / "hf-child", "deepseek_v4")
+            (child / "model.safetensors").write_bytes(b"child HF weights")
+            self.assertEqual(model_weight_files(root), [])
+            with self.assertRaisesRegex(ValueError, "no model files found directly.*Subdirectories are not searched"):
+                resolve_model(SimpleNamespace(model_opt=str(root)))
+            self.assertEqual(resolve_model(SimpleNamespace(model_opt=str(child))), child.resolve())
+            self.assertEqual(resolve_model(SimpleNamespace(model_opt=str(root / "gguf-child"))),
+                             (root / "gguf-child").resolve())
+            with self.assertRaisesRegex(AdapterError, "config.json is missing"):
+                create_adapter(root)
+            # Python must not fingerprint a different model merely because
+            # a native worker profile or an empty parent directory was passed.
+            ready = _ready([1])
+            ready["model"].update(model_type="deepseek_v4")
+            with self.assertRaisesRegex(AdapterError, "config.json is missing"):
+                load_adapter(_arguments(), root, ready)
+
+    def test_gguf_directory_fingerprint_ignores_child_packages(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-gguf-current-directory-") as directory:
+            root = Path(directory)
+            selected = _gguf(root / "model.gguf", "selected")
+            ready = _ready([1])
+            ready["model"].update(model_type="deepseek_v4")
+            before = load_adapter(_arguments(), root, ready).model_fingerprint
+            lightweight = lightweight_model_fingerprint(root)
+            unrelated = _gguf(root / "nested" / "model.gguf", "unrelated")
+            (unrelated.parent / "model.safetensors").write_bytes(b"unrelated HF weights")
+            self.assertEqual(model_weight_files(root), [selected])
+            self.assertEqual(load_adapter(_arguments(), root, ready).model_fingerprint, before)
+            self.assertEqual(load_adapter(_arguments(), selected, ready).model_fingerprint, before)
+            self.assertEqual(lightweight_model_fingerprint(root), lightweight)
+            _gguf(unrelated, "different child metadata")
+            self.assertEqual(load_adapter(_arguments(), root, ready).model_fingerprint, before)
+            self.assertEqual(lightweight_model_fingerprint(root), lightweight)
 
     def test_gguf_fingerprint_includes_metadata_between_weight_samples(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ncnn-moe-gguf-metadata-") as directory:
@@ -373,8 +418,13 @@ class AdapterTests(unittest.TestCase):
             model = _model(Path(directory), "deepseek_v4")
             (model / "model.safetensors").write_bytes(b"existing HF weights")
             original = create_adapter(model).model_fingerprint
+            lightweight = lightweight_model_fingerprint(model)
             (model / "unrelated.gguf").write_bytes(b"not a loaded GGUF package")
+            child = _gguf(model / "nested" / "model.gguf")
+            (child.parent / "model.safetensors").write_bytes(b"unrelated child HF weights")
+            self.assertEqual(model_weight_files(model), [model / "model.safetensors"])
             self.assertEqual(create_adapter(model).model_fingerprint, original)
+            self.assertEqual(lightweight_model_fingerprint(model), lightweight)
 
     def test_four_model_families_need_no_python_tokenizer_packages(self) -> None:
         original_import = __import__

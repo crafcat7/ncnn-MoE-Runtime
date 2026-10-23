@@ -23,11 +23,7 @@ def model_asset_root(model: Path) -> Path:
 
 
 def model_config_path(model: Path) -> Path:
-    root = model_asset_root(model)
-    if model.is_file() and model.suffix.lower() == ".gguf" and not (root / "config.json").is_file():
-        if (root.parent / "config.json").is_file():
-            return root.parent / "config.json"
-    return root / "config.json"
+    return model_asset_root(model) / "config.json"
 
 
 def model_weight_files(model: Path) -> list[Path]:
@@ -42,11 +38,11 @@ def model_weight_files(model: Path) -> list[Path]:
         if not shards or any(not path.is_file() for path in shards):
             raise AdapterError(f"GGUF split package is incomplete: {model}")
         return shards
-    safetensors = sorted(model.rglob("*.safetensors"))
-    if any(path.parent == model for path in safetensors):
+    files = [path for path in model.iterdir() if path.is_file()]
+    safetensors = sorted(path for path in files if path.suffix == ".safetensors")
+    if safetensors:
         return safetensors
-    gguf_files = sorted(path for path in model.rglob("*") if path.is_file() and path.suffix.lower() == ".gguf")
-    return gguf_files or safetensors
+    return sorted(path for path in files if path.suffix.lower() == ".gguf")
 
 
 def _gguf_prefix_size(path: Path) -> int:

@@ -392,6 +392,12 @@ def resolve_model(arguments: argparse.Namespace, *, required: bool = True) -> Pa
     model = Path(value).expanduser().resolve()
     if not model.is_dir() and not (model.is_file() and model.suffix.lower() == ".gguf"):
         raise ValueError(f"model directory or GGUF file does not exist: {model}")
+    if model.is_dir() and not model_config_path(model).is_file() and not model_weight_files(model):
+        raise ValueError(
+            f"no model files found directly in directory: {model}; "
+            "expected config.json or .gguf files. Subdirectories are not searched; "
+            "pass the directory containing the model files or a GGUF file"
+        )
     return model
 
 

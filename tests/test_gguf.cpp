@@ -154,7 +154,9 @@ static void check_split(const std::filesystem::path& root)
     check(!GgufArchive::open(first), "GGUF accepted a missing split shard");
     metadata[2] = integer_metadata("split.no", 1);
     write_bytes(second, fixture_bytes(metadata, {{"weight", 39, {32}, std::vector<uint8_t>(17, 0x52)}}));
-    for (const auto& source : {root / "split", first, second})
+    check(!has_gguf_source(root / "split") && !GgufArchive::open(root / "split"),
+          "GGUF split selection searched a child directory");
+    for (const auto& source : {directory, first, second})
     {
         auto archive = GgufArchive::open(source);
         check(static_cast<bool>(archive), archive ? "" : archive.error().message);
@@ -305,6 +307,42 @@ static void check_qnk_defer_fallback(const std::filesystem::path& root, DType dt
           "invalid deferred Qn_K request was hidden by eager fallback");
 }
 
+static void check_directory_selection(const std::filesystem::path& root)
+{
+    const auto directory = root / "discovery";
+    const auto nested = directory / "package" / "nested" / "model.gguf";
+    const auto bytes = fixture_bytes({}, {{"weight", 8, {32}, std::vector<uint8_t>(34)}});
+    write_bytes(nested, bytes);
+    check(!has_gguf_source(directory) && !GgufArchive::open(directory),
+          "GGUF selection searched a nested directory");
+    auto direct = GgufArchive::open(nested);
+    check(static_cast<bool>(direct), "GGUF direct nested file could not be selected");
+    const auto child = directory / "package" / "model.gguf";
+    write_bytes(child, bytes);
+    auto missing = GgufArchive::open(directory);
+    check(!has_gguf_source(directory) && !missing
+              && missing.error().message.find("model directory contains no GGUF files") != std::string::npos,
+          "GGUF selection searched its only child package");
+    check(!SafetensorsArchive::open(directory), "checkpoint selection searched a child GGUF package");
+    auto explicit_child = GgufArchive::open(child.parent_path());
+    check(explicit_child && has_gguf_source(child.parent_path())
+              && explicit_child.value().source_path() == std::filesystem::absolute(child),
+          "GGUF could not open an explicitly selected package directory");
+    write_bytes(directory / "other" / "model.gguf", bytes);
+    check(!has_gguf_source(directory) && !GgufArchive::open(directory),
+          "GGUF selection searched multiple child packages");
+    const auto top = directory / "model.gguf";
+    write_bytes(top, bytes);
+    auto selected = GgufArchive::open(directory);
+    check(selected && has_gguf_source(directory)
+              && selected.value().source_path() == std::filesystem::absolute(top),
+          "GGUF did not match files in the selected directory");
+    write_bytes(directory / "other.gguf", bytes);
+    auto ambiguous = GgufArchive::open(directory);
+    check(!ambiguous && ambiguous.error().message.find("select a .gguf file or package directory explicitly") != std::string::npos,
+          "GGUF silently chose one of multiple packages in the selected directory");
+}
+
 static void check_real_model(const std::filesystem::path& source)
 {
     auto archive = GgufArchive::open(source);
@@ -353,6 +391,7 @@ int main(int argc, char** argv)
         ncnn::moe::check_invalid_files(root);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q4K, 12);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q8_0, 8);
+        ncnn::moe::check_directory_selection(root);
         std::filesystem::remove_all(root);
         std::cout << "GGUF parser tests passed\n";
         return 0;

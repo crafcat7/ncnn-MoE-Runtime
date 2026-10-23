@@ -353,25 +353,12 @@ static Result<std::filesystem::path> discover_gguf(const std::filesystem::path& 
     if (error || !std::filesystem::is_directory(path, error))
         return Error{ErrorCode::IoError, "cannot inspect GGUF source: " + path.string()};
     std::vector<std::filesystem::path> candidates;
-    const auto collect = [&](const std::filesystem::path& directory) {
-        for (const auto& entry : std::filesystem::directory_iterator(directory, error))
-        {
-            if (entry.is_regular_file(error) && gguf_extension(entry.path()))
-                candidates.push_back(entry.path());
-            if (error)
-                break;
-        }
-    };
-    collect(path);
-    if (candidates.empty() && !error)
+    for (const auto& entry : std::filesystem::directory_iterator(path, error))
     {
-        for (const auto& entry : std::filesystem::directory_iterator(path, error))
-        {
-            if (entry.is_directory(error))
-                collect(entry.path());
-            if (error)
-                break;
-        }
+        if (entry.is_regular_file(error) && gguf_extension(entry.path()))
+            candidates.push_back(entry.path());
+        if (error)
+            break;
     }
     if (error)
         return Error{ErrorCode::IoError, "cannot enumerate GGUF source: " + path.string()};
@@ -389,7 +376,7 @@ static Result<std::filesystem::path> discover_gguf(const std::filesystem::path& 
         if (!split || !std::regex_match(name, current, split_pattern)
             || candidates[i].parent_path() != candidates.front().parent_path()
             || current[1].str() != first[1].str() || current[3].str() != first[3].str())
-            return Error{ErrorCode::InvalidArgument, "multiple GGUF packages found; select a .gguf file explicitly: " + path.string()};
+            return Error{ErrorCode::InvalidArgument, "multiple GGUF packages found; select a .gguf file or package directory explicitly: " + path.string()};
     }
     return candidates.front();
 }

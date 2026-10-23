@@ -38,16 +38,6 @@ bool has_gguf_source(const std::filesystem::path& path)
             return false;
         if (entry.is_regular_file(ec) && gguf_extension(entry.path()))
             found = true;
-        if (!entry.is_directory(ec))
-            continue;
-        for (const auto& child : std::filesystem::directory_iterator(entry.path(), ec))
-        {
-            if (ec)
-                break;
-            if (child.is_regular_file(ec) && gguf_extension(child.path()))
-                found = true;
-        }
-        ec.clear();
     }
     return found;
 }

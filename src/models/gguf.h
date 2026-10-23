@@ -63,8 +63,8 @@ struct GgufTensorInfo
 class GgufArchive
 {
 public:
-    // Accept one file (including any standard split shard), a GGUF directory,
-    // or its parent containing one GGUF package in an immediate subdirectory.
+    // Accept one file (including any standard split shard) or a directory
+    // containing one GGUF package. Subdirectories are not searched.
     [[nodiscard]] static Result<GgufArchive> open(const std::filesystem::path& root_or_file);
     [[nodiscard]] const GgufTensorInfo* find(const std::string& name) const noexcept;
     [[nodiscard]] const GgufMetadataValue* find_metadata(const std::string& key) const noexcept;

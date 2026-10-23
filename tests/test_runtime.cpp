@@ -19201,6 +19201,38 @@ void test_model_adapter_scopes()
 void test_loader_reports_adapter_and_weight_errors()
 {
     {
+        ScopedTestDirectory directory("ncnn_moe_model_directory_test_");
+        TestRuntime runtime;
+        const std::string expected = "no config.json or GGUF model files found directly in model directory: "
+                                     + std::filesystem::absolute(directory.path()).string()
+                                     + "; subdirectories are not searched; select the directory containing model files or a GGUF file";
+        const auto reject_directory = [&]() {
+            auto loaded = runtime.load_model(directory.path());
+            check(!loaded && loaded.error().code == ErrorCode::InvalidArgument);
+            check(loaded.error().message == expected);
+        };
+        reject_directory();
+
+        const auto child = directory.path() / "package";
+        std::filesystem::create_directory(child);
+        {
+            // Neither a child manifest nor a child GGUF file makes the parent
+            // a model directory. Its contents must never be opened here.
+            std::ofstream manifest(child / "config.json", std::ios::binary);
+            manifest << R"({"model_type":"test_moe"})";
+            std::ofstream gguf(child / "model.gguf", std::ios::binary);
+            gguf << "not opened";
+        }
+        reject_directory();
+        std::filesystem::create_directory(directory.path() / "config.json");
+        reject_directory();
+
+        const auto explicit_manifest = directory.path() / "missing.json";
+        auto missing_manifest = runtime.load_model(explicit_manifest);
+        check(!missing_manifest && missing_manifest.error().code == ErrorCode::IoError);
+        check(missing_manifest.error().message == "cannot open manifest: " + std::filesystem::absolute(explicit_manifest).string());
+    }
+    {
         TemporaryModelPackage package;
         TestRuntime runtime;
         auto empty_path = runtime.load_model(std::filesystem::path{});

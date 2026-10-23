@@ -76,8 +76,11 @@ the result. Matching canonical HF configuration and tokenizer assets are
 required for offline GGUF import.
 
 All built-in model families accept native GGUF through the existing
-`--model` option, using a GGUF file, a standard split directory, or its parent
-containing one package. GGUF architecture names `deepseek4`, `gpt-oss`,
+`--model` option, using a GGUF file or a directory containing a single package.
+Directory selection matches only files directly in that directory; it does
+not search subdirectories. Standard split shards are resolved in the same
+directory. Multiple packages require an explicit file or package directory.
+GGUF architecture names `deepseek4`, `gpt-oss`,
 `qwen35`, `qwen35moe`, and `qwen4exp` select the existing model adapters.
 Model configuration, vocabulary, merges, and supported tokenizer profiles
 come from GGUF metadata. BF16/F32 projections and native Qn_K blocks use their

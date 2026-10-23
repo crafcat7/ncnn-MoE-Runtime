@@ -248,7 +248,8 @@ Result<void> ModelLoader::load_package(const std::filesystem::path& model_path)
     std::filesystem::path root = resolved_model_path;
     std::filesystem::path manifest_path;
     std::error_code ec;
-    if (std::filesystem::is_directory(resolved_model_path, ec))
+    const bool model_directory = std::filesystem::is_directory(resolved_model_path, ec);
+    if (model_directory)
         manifest_path = resolved_model_path / "config.json";
     else
     {
@@ -257,6 +258,12 @@ Result<void> ModelLoader::load_package(const std::filesystem::path& model_path)
     }
 
     const bool gguf = has_gguf_source(resolved_model_path);
+    if (model_directory && !gguf && !std::filesystem::is_regular_file(manifest_path, ec))
+    {
+        return Error{ErrorCode::InvalidArgument,
+                     "no config.json or GGUF model files found directly in model directory: " + resolved_model_path.string()
+                         + "; subdirectories are not searched; select the directory containing model files or a GGUF file"};
+    }
     auto manifest_json = [&]() -> Result<std::string> {
         if (!gguf)
             return read_text_file(manifest_path);
