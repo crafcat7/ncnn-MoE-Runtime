@@ -9703,6 +9703,102 @@ void test_speculative_generation()
     options.sampling.temperature = 0.0f;
     options.speculative_confidence_threshold = 0.0f;
     const std::array<int32_t, 1> input = {0};
+    const auto check_shared_head_host_release = [&] {
+#if NCNN_MOE_WITH_VULKAN
+        if (get_gpu_count() == 0)
+            return;
+        const TensorData original_head = compiled.weights.at(compiled.lm_head_weight);
+        const CompiledOperator original_operator = compiled.operators.at_weight(compiled.lm_head_weight);
+        const HybridMode original_mode = compiled.opt.hybrid_mode;
+        const VulkanRuntimePtr original_runtime = compiled.vulkan_runtime;
+        const VulkanRuntimePtr vulkan_runtime = create_vulkan_runtime();
+        for (DType dtype : {DType::Float32, DType::BFloat16})
+        {
+            TensorData head = original_head;
+            if (dtype == DType::BFloat16)
+            {
+                head.dtype = dtype;
+                head.bfloat16_data.reserve(head.float32_data.size());
+                for (float value : head.float32_data)
+                    head.bfloat16_data.push_back(float_to_bfloat16(value));
+                head.float32_data.clear();
+            }
+            compiled.weights.at_mutable(compiled.lm_head_weight) = std::move(head);
+            CompiledOperator& head_operator = compiled.operators.at_weight_mutable(compiled.lm_head_weight);
+            head_operator = {};
+            // The small fixture uses the generic Vulkan Linear implementation
+            // for both dtypes; native BF16 projections require wider inputs.
+            head_operator.linear = Linear::create(compiled.weights.at(compiled.lm_head_weight),
+                                                  nullptr,
+                                                  automatic_vulkan_device_index,
+                                                  vulkan_runtime,
+                                                  compiled.opt.optimization_flags);
+            check(static_cast<bool>(head_operator.linear));
+            compiled.vulkan_runtime = vulkan_runtime;
+            compiled.opt.hybrid_mode = HybridMode::CpuOnly;
+            check(static_cast<bool>(build_graph(compiled, false)));
+            const auto check_head_backend = [&](ExecutionBackend backend) {
+                bool found = false;
+                for (const ExecutionNode& node : compiled.graph.nodes)
+                {
+                    if (node.type == ExecutionNodeType::LmHead)
+                    {
+                        check(node.backend == backend);
+                        found = true;
+                    }
+                }
+                check(found);
+            };
+            check_head_backend(ExecutionBackend::Cpu);
+
+            // An available Vulkan operator must not override a CPU graph's
+            // placement, including when the speculative head is shared.
+            auto reference = runtime.create_session(model.value()).value();
+            auto expected = reference->generate(input, options);
+            check(static_cast<bool>(expected));
+            check(reference->statistics().speculative_proposals > 0);
+            check(reference->statistics().vulkan_linear_dispatches == 0);
+            auto expected_decode = reference->decode(0);
+            check(static_cast<bool>(expected_decode));
+
+            compiled.opt.hybrid_mode = HybridMode::HybridExperts;
+            check(static_cast<bool>(build_graph(compiled, false)));
+            check_head_backend(ExecutionBackend::Vulkan);
+            release_vulkan_dense_host_copies(compiled);
+            check(compiled.weights.at(compiled.lm_head_weight).float32_values().empty());
+            check(compiled.weights.at(compiled.lm_head_weight).bfloat16_values().empty());
+
+            // Execute proposals after the real host allocation is gone, from
+            // independent Sessions sharing the same device-only head.
+            for (size_t session_index = 0; session_index < 2; ++session_index)
+            {
+                auto session = runtime.create_session(model.value()).value();
+                auto actual = session->generate(input, options);
+                check(static_cast<bool>(actual));
+                check(session->statistics().speculative_proposals > 0);
+                check(session->statistics().vulkan_linear_dispatches > 0);
+                check(actual.value().tokens.size() == expected.value().tokens.size());
+                for (size_t index = 0; index < expected.value().tokens.size(); ++index)
+                {
+                    check(actual.value().tokens[index].token_id == expected.value().tokens[index].token_id);
+                    check_near(actual.value().tokens[index].probability,
+                               expected.value().tokens[index].probability,
+                               1e-5f);
+                }
+                auto actual_decode = session->decode(0);
+                check(static_cast<bool>(actual_decode));
+                check(actual_decode.value().logits.size() == expected_decode.value().logits.size());
+                for (size_t index = 0; index < expected_decode.value().logits.size(); ++index)
+                    check_near(actual_decode.value().logits[index], expected_decode.value().logits[index], 1e-5f);
+            }
+        }
+        compiled.weights.at_mutable(compiled.lm_head_weight) = original_head;
+        compiled.operators.at_weight_mutable(compiled.lm_head_weight) = original_operator;
+        compiled.opt.hybrid_mode = original_mode;
+        compiled.vulkan_runtime = original_runtime;
+        check(static_cast<bool>(build_graph(compiled, false)));
+#endif
+    };
     for (int speculative_kind = 0; speculative_kind < 2; ++speculative_kind)
     {
         if (speculative_kind == 0)
@@ -10063,6 +10159,8 @@ void test_speculative_generation()
             compiled.weights.at_mutable(compiled.lm_head_weight).float32_data = dspark_lm_head;
             compiled.weights.at_mutable(compiled.speculative.markov_head_weight).float32_data = {-1.0f, 1.0f};
         }
+
+        check_shared_head_host_release();
 
         for (int failure = 0; failure < 3; ++failure)
         {

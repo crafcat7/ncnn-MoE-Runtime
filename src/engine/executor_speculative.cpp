@@ -22,6 +22,21 @@
 namespace ncnn {
 namespace moe {
 
+static ExecutionBackend shared_lm_head_backend(const CompiledModel& model)
+{
+    // The draft shares the target head, including its selected backend and
+    // device-only weight lifetime. Other draft projections keep their own
+    // placement; Hybrid mode alone does not imply that the head uses Vulkan.
+    for (const ExecutionNode& node : model.graph.nodes)
+    {
+        if (node.type == ExecutionNodeType::LmHead
+            && !node.weight_inputs.empty()
+            && node.weight_inputs.front() == model.lm_head_weight)
+            return node.backend;
+    }
+    return ExecutionBackend::Cpu;
+}
+
 static Result<void> forward_speculative_layer(const CompiledModel& model,
                                               const SpeculativeModelPlan::LayerNodes& execution,
                                               size_t layer_plan_index,
@@ -622,6 +637,7 @@ static Result<void> propose_mtp(const CompiledModel& model,
     proposal.committed_context_rows = 1;
     ActivationBuffer previous_hidden;
     const CompiledOperator* lm_head_operator = model.operators.find_weight(model.lm_head_weight);
+    const ExecutionBackend lm_head_backend = shared_lm_head_backend(model);
     int32_t previous_token = input_id;
     for (uint32_t row = 0;
          row < model.speculative.block_size;
@@ -641,7 +657,8 @@ static Result<void> propose_mtp(const CompiledModel& model,
                        mtp_hidden.value(),
                        proposal.logits[row],
                        model.opt.optimization_flags,
-                       lm_head_operator);
+                       lm_head_operator,
+                       lm_head_backend);
         auto sampled = sampler(proposal.logits[row].values());
         if (!sampled)
             return sampled.error();
@@ -779,7 +796,8 @@ Result<void> propose_speculative(const CompiledModel& model, int32_t input_id, S
                    state.final_norm,
                    state.expert_scratch.staged_merged,
                    model.opt.optimization_flags,
-                   model.operators.find_weight(model.lm_head_weight));
+                   model.operators.find_weight(model.lm_head_weight),
+                   shared_lm_head_backend(model));
     const ActivationBuffer& head_hidden = state.expert_scratch.staged_output;
     const ActivationBuffer& base_logits = state.expert_scratch.staged_merged;
 
