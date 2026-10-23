@@ -43,6 +43,7 @@ from ncnn_moe_protocol import WorkerClient, WorkerError  # noqa: E402
 from ncnn_moe_state import merge_runtime_settings, runtime_args_from_settings  # noqa: E402
 import benchmark_prompt  # noqa: E402
 import benchmark_runtime  # noqa: E402
+import benchmark_reference_matrix  # noqa: E402
 
 
 FAMILY_CASES = (
@@ -231,6 +232,99 @@ class FakeWorkerClient:
 
 
 class RuntimeOptionsTests(unittest.TestCase):
+    def test_io_defaults_to_auto_and_only_exposes_mmap_or_buffered(self) -> None:
+        io_flags = ("--mmap-experts", "--buffered-expert-io")
+        for command in ("run", "chat", "inspect", "tune"):
+            with self.subTest(command=command):
+                arguments = parse_arguments([command])
+                self.assertFalse(hasattr(arguments, "direct_expert_io"))
+                settings = merge_runtime_settings(
+                    cli=cli_runtime_settings(arguments), session=None, profile=None, user=None
+                )
+                self.assertEqual(runtime_args_from_settings(settings), [])
+                for flag in io_flags:
+                    selected = cli_runtime_settings(parse_arguments([command, flag]))
+                    self.assertEqual(runtime_args_from_settings(selected), [flag])
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    parse_arguments([command, "--direct-expert-io"])
+                self.assertEqual(error.exception.code, 2)
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    parse_arguments([command, *io_flags])
+                self.assertEqual(error.exception.code, 2)
+
+    def test_removed_direct_setting_is_ignored_in_every_saved_layer(self) -> None:
+        for enabled in (True, False):
+            obsolete = {"direct_expert_io": enabled}
+            self.assertEqual(runtime_args_from_settings(obsolete), [])
+            for source in ("user", "profile", "session", "cli"):
+                layers = {"cli": {}, "session": None, "profile": None, "user": None}
+                layers[source] = obsolete
+                with self.subTest(enabled=enabled, source=source):
+                    settings = merge_runtime_settings(**layers)
+                    self.assertEqual(settings, {"backend": "auto"})
+                    self.assertEqual(runtime_args_from_settings(settings), [])
+        settings = merge_runtime_settings(
+            cli={"buffered_expert_io": True}, session={"direct_expert_io": True},
+            profile=None, user={"mmap_experts": True}
+        )
+        self.assertEqual(settings, {"backend": "auto", "buffered_expert_io": True})
+        self.assertEqual(runtime_args_from_settings(settings), ["--buffered-expert-io"])
+
+    def test_io_modes_obey_whole_group_layer_priority(self) -> None:
+        order = ("user", "profile", "session", "cli")
+        for low_index, lower in enumerate(order):
+            for higher in order[low_index + 1:]:
+                for low_key, high_key, flag in (
+                    ("buffered_expert_io", "mmap_experts", "--mmap-experts"),
+                    ("mmap_experts", "buffered_expert_io", "--buffered-expert-io"),
+                ):
+                    layers = {"cli": {}, "session": None, "profile": None, "user": None}
+                    layers[lower] = {low_key: True}
+                    layers[higher] = {high_key: True}
+                    with self.subTest(lower=lower, higher=higher, selected=high_key):
+                        settings = merge_runtime_settings(**layers)
+                        self.assertEqual(settings, {"backend": "auto", high_key: True})
+                        self.assertEqual(runtime_args_from_settings(settings), [flag])
+
+    def test_io_conflicts_are_rejected_within_each_layer(self) -> None:
+        conflicting = {"mmap_experts": True, "buffered_expert_io": True}
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            runtime_args_from_settings(conflicting)
+        for source in ("user", "profile", "session", "cli"):
+            layers = {"cli": {}, "session": None, "profile": None, "user": None}
+            layers[source] = conflicting
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                merge_runtime_settings(**layers)
+
+    def test_explicit_false_io_preference_selects_auto_and_none_inherits(self) -> None:
+        for key in ("mmap_experts", "buffered_expert_io"):
+            inherited = merge_runtime_settings(
+                cli={key: None}, session=None, profile=None, user={key: True}
+            )
+            self.assertEqual(inherited[key], True)
+            automatic = merge_runtime_settings(
+                cli={key: False}, session=None, profile=None, user={key: True}
+            )
+            self.assertEqual(automatic, {"backend": "auto", key: False})
+            self.assertEqual(runtime_args_from_settings(automatic), [])
+
+    def test_restored_io_choice_reaches_worker_as_one_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = merge_runtime_settings(
+                cli={"mmap_experts": True}, session=None, profile=None,
+                user={"buffered_expert_io": True, "direct_expert_io": True}
+            )
+            process = SimpleNamespace(
+                stdin=io.StringIO(), stdout=io.StringIO('{"event":"ready"}\n'), poll=lambda: 0
+            )
+            worker, model = Path(sys.executable).resolve(), Path(directory).resolve()
+            with patch("ncnn_moe_protocol.subprocess.Popen", return_value=process) as popen:
+                client = WorkerClient(worker, model, runtime_args_from_settings(settings))
+            try:
+                self.assertEqual(popen.call_args.args[0], [str(worker), str(model), "--mmap-experts"])
+            finally:
+                client.close()
+
     def test_automatic_host_release_and_speculation_have_no_cli_switch(self) -> None:
         for command in ("run", "chat", "inspect", "tune"):
             arguments = parse_arguments([command])
@@ -702,6 +796,37 @@ class ProtocolTests(unittest.TestCase):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_reference_io_defaults_and_retained_modes_match_runner_contract(self) -> None:
+        automatic = benchmark_runtime.parse_arguments(["runner", "model"])
+        self.assertFalse(hasattr(automatic, "direct_expert_io"))
+        command = benchmark_runtime.runner_command(automatic)
+        for flag in ("--direct-expert-io", "--mmap-experts", "--buffered-expert-io"):
+            self.assertNotIn(flag, command)
+        for flag in ("--mmap-experts", "--buffered-expert-io"):
+            selected = benchmark_runtime.parse_arguments(["runner", "model", flag])
+            benchmark_runtime.validate_arguments(selected)
+            self.assertIn(flag, benchmark_runtime.runner_command(selected))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            benchmark_runtime.parse_arguments(["runner", "model", "--direct-expert-io"])
+        self.assertEqual(error.exception.code, 2)
+        conflicting = benchmark_runtime.parse_arguments(
+            ["runner", "model", "--mmap-experts", "--buffered-expert-io"]
+        )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            benchmark_runtime.validate_arguments(conflicting)
+
+    def test_reference_matrix_uses_default_auto_without_removed_direct_flag(self) -> None:
+        for family in ("gpt-oss", *benchmark_reference_matrix.DEEPSEEK_FAMILIES):
+            argv = ["benchmark_reference_matrix", family, "--runner", "runner", "--output-dir", "out"]
+            argv += ["--model-20b", "20b", "--model-120b", "120b"] if family == "gpt-oss" else ["--model", "model"]
+            with self.subTest(family=family), patch.object(sys, "argv", argv):
+                arguments = benchmark_reference_matrix.parse_arguments()
+                cases = benchmark_reference_matrix.gpt_oss_cases(arguments) if family == "gpt-oss" else benchmark_reference_matrix.deepseek_cases(arguments)
+                self.assertTrue(cases)
+                for case in cases:
+                    for flag in ("--direct-expert-io", "--mmap-experts", "--buffered-expert-io"):
+                        self.assertNotIn(flag, case["extra"])
+
     def test_reference_benchmark_retains_target_control_without_host_release_flag(self) -> None:
         arguments = benchmark_runtime.parse_arguments(["runner", "model", "--no-speculative"])
         self.assertFalse(hasattr(arguments, "release_vulkan_dense_host"))

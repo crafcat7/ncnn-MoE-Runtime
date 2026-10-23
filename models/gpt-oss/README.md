@@ -129,7 +129,6 @@ uses a byte-bounded cache backed by exact ranges in the original shards.
 | `--expert-cache-mb N` | Bound resident Expert pairs in RAM |
 | `--expert-io-workers N` | Set asynchronous read concurrency; `0` derives it from Top-K and physical cores |
 | `--mmap-experts` | Map on-demand Expert ranges |
-| `--direct-expert-io` | Force aligned direct reads when supported |
 | `--buffered-expert-io` | Force conventional buffered reads |
 | `--expert-gpu-cache-mb N` | Add an executable Vulkan MXFP4 Expert cache |
 | `--expert-gpu-victim-cache-mb N` | Add a compressed-weight Vulkan cache behind the host ARC |

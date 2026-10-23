@@ -247,11 +247,6 @@ def parse_arguments(argv=None):
         help="Use memory-mapped on-demand MXFP4 ranges.",
     )
     parser.add_argument(
-        "--direct-expert-io",
-        action="store_true",
-        help="Use aligned direct reads for on-demand MXFP4 ranges.",
-    )
-    parser.add_argument(
         "--buffered-expert-io",
         action="store_true",
         help="Force buffered reads instead of adaptive Expert I/O.",
@@ -416,13 +411,12 @@ def validate_arguments(arguments):
     selected_io_modes = sum(
         (
             arguments.mmap_experts,
-            arguments.direct_expert_io,
             arguments.buffered_expert_io,
         )
     )
     if selected_io_modes > 1:
         raise ValueError(
-            "Expert mmap, direct I/O, and buffered I/O are mutually exclusive"
+            "Expert mmap and buffered I/O modes are mutually exclusive"
         )
 
 
@@ -530,8 +524,6 @@ def runner_command(arguments):
         )
     if arguments.mmap_experts:
         command.append("--mmap-experts")
-    if arguments.direct_expert_io:
-        command.append("--direct-expert-io")
     if arguments.buffered_expert_io:
         command.append("--buffered-expert-io")
     return command

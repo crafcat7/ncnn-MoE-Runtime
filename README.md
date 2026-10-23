@@ -321,8 +321,11 @@ Expert I/O is selected with `opt.expert_io_mode`: `ExpertIoMode::Auto` (the
 default), `Mmap`, `Direct`, or `Buffered`. This replaces the three mutually
 exclusive I/O flags. The remaining `OptionFlag` bit positions are compacted;
 C++ callers must use the current named constants rather than old numeric masks.
-The CLI options `--mmap-experts`, `--direct-expert-io`, and
-`--buffered-expert-io` are unchanged.
+The CLI uses Auto when no I/O option is supplied. On Windows, Auto tries Direct
+first and switches to Buffered after a failed Direct read; other platforms
+start with Buffered. Use `--mmap-experts` or `--buffered-expert-io` to select an
+explicit alternative. Direct remains available through the C++ enum for
+diagnostics and reference execution.
 
 CPU normalization kernels, GatedDelta kernels, MXFP4 single-token row pairing,
 and latent-attention output-group threading are selected automatically using

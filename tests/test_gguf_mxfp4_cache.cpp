@@ -344,15 +344,15 @@ struct GgufDirectFixture
     };
 
     std::filesystem::path directory;
-    std::array<Bank, 4> banks;
+    std::array<Bank, 6> banks;
 
     GgufDirectFixture()
     {
         directory = std::filesystem::temp_directory_path()
                     / ("ncnn_moe_gguf_direct_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(directory);
-        const std::array<uint32_t, 4> hidden = {64, 64, 64, 96};
-        const std::array<uint32_t, 4> intermediate = {32, 2048, 4096, 64};
+        const std::array<uint32_t, 6> hidden = {64, 64, 64, 96, 64, 64};
+        const std::array<uint32_t, 6> intermediate = {32, 2048, 4096, 64, 4096, 4096};
         for (size_t index = 0; index < banks.size(); ++index)
         {
             Bank& bank = banks[index];
@@ -618,10 +618,10 @@ static void gguf_auto_direct_scratch_and_failures()
     GgufDirectFixture fixture;
     [[maybe_unused]] const bool direct_supported = gguf_direct_supported(fixture.banks[2].path);
     const auto& pinned_bank = fixture.banks[0];
-    const uint64_t capacity = pinned_bank.pair_size() + fixture.banks[2].pair_size();
-    // This budget retains 64/128/192/256 KiB aligned requests on one worker;
-    // the held small Expert must survive every scratch growth and bank switch.
-    gguf_cache_check(capacity >= 4 * 64 * 1024, "Direct reuse test budget covers its largest aligned request");
+    const uint64_t capacity = fixture.banks[2].pair_size() * 2;
+    // The largest three aligned requests occupy 640 KiB. This budget allows
+    // all three slots, but its held small pin prevents caching two large pairs.
+    gguf_cache_check(capacity >= 10 * 64 * 1024, "Direct pipeline budget covers three aligned requests");
     for (ExpertIoMode mode : {ExpertIoMode::Auto, ExpertIoMode::Direct, ExpertIoMode::Mmap})
     {
         // The default constructor argument, rather than only an explicit Auto,
@@ -633,7 +633,7 @@ static void gguf_auto_direct_scratch_and_failures()
         pinned_bank.check_output(pinned.value());
         uint64_t expected_bytes = pinned_bank.pair_size();
         size_t requests = 1;
-        for (size_t bank_index : {size_t{3}, size_t{1}, size_t{2}, size_t{1}, size_t{2}, size_t{3}, size_t{2}})
+        for (size_t bank_index : {size_t{3}, size_t{1}, size_t{2}, size_t{4}, size_t{5}, size_t{2}, size_t{4}, size_t{5}})
         {
             const auto& bank = fixture.banks[bank_index];
             const auto before = cache->statistics();
@@ -641,8 +641,8 @@ static void gguf_auto_direct_scratch_and_failures()
             gguf_cache_check(static_cast<bool>(loaded), "variable Direct bank sizes admit after scratch reuse and growth");
             bank.check_output(loaded.value());
             pinned_bank.check_output(pinned.value());
-            // Banks 3 and 1 can coexist before the first large request. Every
-            // selected bank is nevertheless new or was evicted by bank 2.
+            // The held pin makes two large pairs exceed capacity; cycling
+            // independent banks therefore exercises new reads rather than hits.
             gguf_cache_check(cache->statistics().misses == before.misses + 1, "Direct fixture sequence requires an actual read each time");
             expected_bytes += bank.pair_size();
             ++requests;
@@ -653,7 +653,8 @@ static void gguf_auto_direct_scratch_and_failures()
         if (mode == ExpertIoMode::Mmap)
         {
             gguf_cache_check(statistics.mapped_ranges == requests * 3 && statistics.mapped_bytes == expected_bytes
-                                 && statistics.direct_read_ranges == 0 && statistics.buffered_read_ranges == 0,
+                                 && statistics.direct_read_ranges == 0 && statistics.buffered_read_ranges == 0
+                                 && statistics.direct_pipeline_batches == 0 && statistics.direct_arena_allocations == 0,
                              "Mmap keeps its mapping and prefault contract after unified final-pair allocation");
         }
 #if defined(_WIN32)
@@ -662,6 +663,12 @@ static void gguf_auto_direct_scratch_and_failures()
             gguf_cache_check(statistics.direct_read_ranges == requests * 3 && statistics.direct_read_bytes == expected_bytes
                                  && statistics.direct_read_fallbacks == 0 && statistics.buffered_read_ranges == 0,
                              "Direct-capable Windows must execute true Direct I/O, including complete logical ranges at a short aligned EOF tail");
+            gguf_cache_check(statistics.direct_pipeline_batches == requests
+                                 && statistics.direct_pipeline_completed_ranges == requests * 3
+                                 && statistics.direct_arena_allocations > 1
+                                 && statistics.direct_arena_allocated_bytes >= 10 * 64 * 1024
+                                 && statistics.direct_pipeline_peak_pending <= 3,
+                             "three accepted Direct submissions precede each wave wait while the bounded arena grows across banks");
         }
 #endif
         else
@@ -672,29 +679,51 @@ static void gguf_auto_direct_scratch_and_failures()
         }
     }
 
-    // A smaller cache cannot retain even one aligned page. Preserve transient
-    // Direct execution instead of turning the scratch cap into Buffered mode.
+    // Smaller caps retain two or one slots, or cannot retain even one aligned
+    // page. Every case must preserve Direct rather than silently use Buffered.
     for (ExpertIoMode mode : {ExpertIoMode::Auto, ExpertIoMode::Direct})
     {
-        ExpertCache cache(pinned_bank.pair_size(), 1, {}, mode);
-        auto loaded = cache.acquire_pair(pinned_bank.tensor(true), pinned_bank.tensor(false));
-        gguf_cache_check(static_cast<bool>(loaded), "over-cap Direct request uses a transient raw allocation");
-        pinned_bank.check_output(loaded.value());
-        const auto statistics = cache.statistics();
-        gguf_cache_check(statistics.bytes_read == pinned_bank.pair_size() && statistics.resident_size == pinned_bank.pair_size(),
-                         "transient aligned raw memory does not enlarge the ARC resident payload");
-        gguf_cache_check(statistics.direct_read_ranges + statistics.buffered_read_ranges == 3
-                             && statistics.direct_read_bytes + statistics.buffered_read_bytes == pinned_bank.pair_size(),
-                         "transient Direct or its portable fallback reads exactly three logical ranges");
+        for (uint64_t raw_cap : {uint64_t{3 * 64 * 1024}, uint64_t{2 * 64 * 1024}, uint64_t{64 * 1024}, pinned_bank.pair_size()})
+        {
+            ExpertCache cache(raw_cap, 1, {}, mode);
+            auto loaded = cache.acquire_pair(pinned_bank.tensor(true), pinned_bank.tensor(false));
+            gguf_cache_check(static_cast<bool>(loaded), "bounded Direct waves and over-cap transient reads admit a complete Expert");
+            pinned_bank.check_output(loaded.value());
+            const auto statistics = cache.statistics();
+            gguf_cache_check(statistics.bytes_read == pinned_bank.pair_size() && statistics.resident_size == pinned_bank.pair_size(),
+                             "transient aligned raw memory does not enlarge the ARC resident payload");
+            gguf_cache_check(statistics.direct_read_ranges + statistics.buffered_read_ranges == 3
+                                 && statistics.direct_read_bytes + statistics.buffered_read_bytes == pinned_bank.pair_size(),
+                             "transient Direct or its portable fallback reads exactly three logical ranges");
 #if defined(_WIN32)
-        if (direct_supported)
-            gguf_cache_check(statistics.direct_read_ranges == 3 && statistics.direct_read_bytes == pinned_bank.pair_size()
-                                 && statistics.buffered_read_ranges == 0 && statistics.direct_read_fallbacks == 0,
-                             "over-cap requests preserve true Direct rather than silently using Buffered");
+            if (direct_supported)
+            {
+                gguf_cache_check(statistics.direct_read_ranges == 3 && statistics.direct_read_bytes == pinned_bank.pair_size()
+                                     && statistics.buffered_read_ranges == 0 && statistics.direct_read_fallbacks == 0,
+                                 "over-cap requests preserve true Direct rather than silently using Buffered");
+                const uint64_t batched_ranges = raw_cap >= 3 * 64 * 1024 ? 3 : raw_cap >= 2 * 64 * 1024 ? 2
+                                                                                                        : 0;
+                gguf_cache_check(statistics.direct_pipeline_batches == (batched_ranges != 0 ? 1u : 0u)
+                                     && statistics.direct_pipeline_completed_ranges == batched_ranges
+                                     && statistics.direct_arena_allocated_bytes <= raw_cap,
+                                 "raw budget selects three, two or one slots without hiding extra retained allocations");
+                if (raw_cap < 64 * 1024)
+                    gguf_cache_check(statistics.direct_arena_allocations == 0 && statistics.direct_arena_allocated_bytes == 0,
+                                     "a raw range above the arena cap keeps only a transient Direct allocation");
+                else
+                    gguf_cache_check(statistics.direct_arena_allocations > 0,
+                                     "eligible Direct raw waves retain their bounded aligned arena");
+                // Small uncached reads can complete synchronously. The batch
+                // counter proves submission ordering without requiring a
+                // positive sample of physical ERROR_IO_PENDING operations.
+                gguf_cache_check(statistics.direct_pipeline_peak_pending <= 3,
+                                 "sampled real pending I/O never exceeds the fixed three-slot bound");
+            }
 #endif
+        }
     }
 
-    const auto& bank = fixture.banks[1];
+    const auto& bank = fixture.banks[2];
     for (ExpertIoMode mode : {ExpertIoMode::Auto, ExpertIoMode::Direct})
     {
         for (uint32_t failed_projection : {1u, 2u})
@@ -705,27 +734,60 @@ static void gguf_auto_direct_scratch_and_failures()
                 stream.write(reinterpret_cast<const char*>(bank.bytes.data()), static_cast<std::streamsize>(bank.offsets[failed_projection] + bank.matrix_size - 1));
                 gguf_cache_check(static_cast<bool>(stream), "write one-byte-short Up or Down Direct range");
             }
-            ExpertCache cache(bank.pair_size(), 1, {}, mode);
-            gguf_cache_check(!cache.acquire_pair(bank.tensor(true, truncated), bank.tensor(false, truncated)),
+            ExpertCache cache(capacity, 1, {}, mode);
+            auto pinned = cache.acquire_pair(pinned_bank.tensor(true), pinned_bank.tensor(false));
+            gguf_cache_check(static_cast<bool>(pinned), "hold a healthy lease across a failed Direct pipeline");
+            const auto before = cache.statistics();
+            TensorData failing_gate = bank.tensor(true);
+            TensorData failing_down = bank.tensor(false);
+            if (failed_projection == 1)
+            {
+                auto storage = std::make_shared<MxFp4FileStorage>(*failing_gate.mxfp4_file_storage);
+                storage->secondary_blocks_path = truncated.string();
+                failing_gate.mxfp4_file_storage = std::move(storage);
+            }
+            else
+            {
+                auto storage = std::make_shared<MxFp4FileStorage>(*failing_down.mxfp4_file_storage);
+                storage->blocks_path = truncated.string();
+                failing_down.mxfp4_file_storage = std::move(storage);
+            }
+            gguf_cache_check(!cache.acquire_pair(failing_gate, failing_down),
                              "Direct and Buffered fallback both reject a one-byte-short logical range");
             const auto failed = cache.statistics();
-            gguf_cache_check(failed.resident_size == 0 && failed.bytes_read == 0
-                                 && failed.direct_read_ranges + failed.buffered_read_ranges == failed_projection,
-                             "partial Direct read releases the reservation and publishes no partial Expert pair");
+            const uint64_t completed_ranges = failed.direct_read_ranges + failed.buffered_read_ranges
+                                              - before.direct_read_ranges - before.buffered_read_ranges;
+            const uint64_t completed_bytes = failed.direct_read_bytes + failed.buffered_read_bytes
+                                             - before.direct_read_bytes - before.buffered_read_bytes;
+            gguf_cache_check(failed.resident_size == before.resident_size && failed.bytes_read == before.bytes_read
+                                 && completed_ranges <= 2 && completed_bytes == completed_ranges * bank.matrix_size,
+                             "failed Direct pipeline counts every completed healthy range independently of order and releases only its own reservation");
+            pinned_bank.check_output(pinned.value());
 #if defined(_WIN32)
-            gguf_cache_check(failed.direct_read_fallbacks > 0, "failed Direct attempt is counted before the exact Buffered retry");
+            if (direct_supported)
+            {
+                gguf_cache_check(failed.direct_read_fallbacks > before.direct_read_fallbacks,
+                                 "failed Direct attempt is counted before the exact Buffered retry");
+                gguf_cache_check(failed.direct_pipeline_completed_ranges - before.direct_pipeline_completed_ranges <= completed_ranges
+                                     && failed.direct_pipeline_peak_pending <= 3,
+                                 "error cleanup accounts successful Direct completions without inventing a completion order");
+            }
 #endif
             auto recovered = cache.acquire_pair(bank.tensor(true), bank.tensor(false));
             gguf_cache_check(static_cast<bool>(recovered), "the same worker recovers after partial Direct read failure");
             bank.check_output(recovered.value());
+            pinned_bank.check_output(pinned.value());
             const auto after = cache.statistics();
-            gguf_cache_check(after.resident_size == bank.pair_size() && after.bytes_read == bank.pair_size(),
+            gguf_cache_check(after.resident_size == before.resident_size + bank.pair_size()
+                                 && after.bytes_read == before.bytes_read + bank.pair_size(),
                              "failed admission cannot leak capacity into the next complete pair");
             if (mode == ExpertIoMode::Auto)
             {
                 gguf_cache_check(after.adaptive_read_policy == 1
                                      && after.direct_read_ranges == failed.direct_read_ranges
                                      && after.direct_read_fallbacks == failed.direct_read_fallbacks
+                                     && after.direct_pipeline_batches == failed.direct_pipeline_batches
+                                     && after.direct_pipeline_completed_ranges == failed.direct_pipeline_completed_ranges
                                      && after.buffered_read_ranges == failed.buffered_read_ranges + 3
                                      && after.buffered_read_bytes == failed.buffered_read_bytes + bank.pair_size(),
                                  "Auto fallback persists for later GGUF ranges and preserves Buffered statistics");
@@ -735,10 +797,32 @@ static void gguf_auto_direct_scratch_and_failures()
             {
                 gguf_cache_check(after.direct_read_ranges == failed.direct_read_ranges + 3
                                      && after.direct_read_bytes == failed.direct_read_bytes + bank.pair_size()
-                                     && after.direct_read_fallbacks == failed.direct_read_fallbacks,
+                                     && after.direct_read_fallbacks == failed.direct_read_fallbacks
+                                     && after.direct_pipeline_batches == failed.direct_pipeline_batches + 1
+                                     && after.direct_pipeline_completed_ranges == failed.direct_pipeline_completed_ranges + 3,
                                  "explicit Direct retries true Direct on the next healthy bank after failure");
             }
 #endif
+
+            // Hold the worker in a public victim-cache callback until shutdown
+            // is about to begin. The read already owns an ARC reservation;
+            // after release the destructor must join its successful/error
+            // cleanup before freeing events or the raw arena. Completion of
+            // the actual filesystem I/O may still be synchronous.
+            for (bool fail_during_shutdown : {false, true})
+            {
+                auto barrier = std::make_shared<GgufReadBarrier>();
+                auto stopping = std::make_unique<ExpertCache>(capacity, 1, barrier, mode);
+                auto survivor = stopping->acquire_pair(pinned_bank.tensor(true), pinned_bank.tensor(false));
+                gguf_cache_check(static_cast<bool>(survivor), "hold a final resident lease beyond Direct worker shutdown");
+                auto queued = stopping->request_pair(fail_during_shutdown ? failing_gate : bank.tensor(true),
+                                                     fail_during_shutdown ? failing_down : bank.tensor(false), 0, "barrier");
+                const bool entered = queued && barrier->wait_until_entered();
+                barrier->release();
+                gguf_cache_check(entered, "Direct shutdown test has a reserved read already executing on the worker");
+                stopping.reset();
+                pinned_bank.check_output(survivor.value());
+            }
         }
     }
 }

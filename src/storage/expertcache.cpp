@@ -64,6 +64,12 @@ static ThreadReadEvent& thread_read_event() noexcept
     return event;
 }
 
+static std::array<ThreadReadEvent, 3>& thread_direct_batch_events() noexcept
+{
+    static thread_local std::array<ThreadReadEvent, 3> events;
+    return events;
+}
+
 #endif
 
 #define NCNN_MOE_CACHE_ENTRY_SPECULATIVE_BIT 0
@@ -280,20 +286,26 @@ struct ExpertCache::FileRangeReader
         result.buffered_read_ranges = buffered_read_ranges.load(std::memory_order_relaxed);
         result.buffered_read_bytes = buffered_read_bytes.load(std::memory_order_relaxed);
         result.adaptive_read_policy = selected_read_policy();
+        result.direct_pipeline_batches = direct_pipeline_batches.load(std::memory_order_relaxed);
+        result.direct_pipeline_completed_ranges = direct_pipeline_completed_ranges.load(std::memory_order_relaxed);
+        result.direct_pipeline_peak_pending = direct_pipeline_peak_pending.load(std::memory_order_relaxed);
+        result.direct_arena_allocations = direct_arena_allocations.load(std::memory_order_relaxed);
+        result.direct_arena_allocated_bytes = direct_arena_allocated_bytes.load(std::memory_order_relaxed);
+        result.direct_wait_nanoseconds = direct_wait_nanoseconds.load(std::memory_order_relaxed);
     }
 
 #if defined(_WIN32)
-    Result<MxFp4ByteBuffer> read_direct(const std::string& path, uint64_t offset, uint64_t size,
-                                        MxFp4ByteBuffer* scratch, uint64_t scratch_limit)
+    static constexpr uint64_t direct_alignment = 64 * 1024;
+    struct DirectPlan
     {
-        const HANDLE read_event = thread_read_event().handle;
-        if (read_event == nullptr)
-        {
-            return Error{
-                ErrorCode::IoError,
-                "cannot create direct Expert read event: " + path};
-        }
-        static constexpr uint64_t direct_alignment = 64 * 1024;
+        uint64_t aligned_offset = 0;
+        uint64_t prefix = 0;
+        uint64_t logical_size = 0;
+        uint64_t request_size = 0;
+    };
+
+    static Result<DirectPlan> plan_direct_read(const std::string& path, uint64_t offset, uint64_t size)
+    {
         const uint64_t aligned_offset = offset - offset % direct_alignment;
         const uint64_t prefix = offset - aligned_offset;
         if (size > std::numeric_limits<uint64_t>::max() - prefix)
@@ -316,11 +328,11 @@ struct ExpertCache::FileRangeReader
                 ErrorCode::InvalidArgument,
                 "direct Expert range is outside the supported size"};
         }
+        return DirectPlan{aligned_offset, prefix, logical_size, request_size};
+    }
 
-        auto handle_result = direct_handle_for(path);
-        if (!handle_result)
-            return handle_result.error();
-        const Handle handle = handle_result.value();
+    Result<MxFp4ByteBuffer> direct_buffer(uint64_t request_size, MxFp4ByteBuffer* scratch, uint64_t scratch_limit)
+    {
         const bool retain = scratch && request_size <= scratch_limit;
         const bool reuse = retain && scratch->size() >= request_size
                            && reinterpret_cast<uintptr_t>(scratch->data()) % direct_alignment == 0;
@@ -345,12 +357,44 @@ struct ExpertCache::FileRangeReader
                                                      VirtualFree(pointer, 0, MEM_RELEASE);
                                              });
             if (retain)
+            {
                 *scratch = MxFp4ByteBuffer(owner, static_cast<size_t>(request_size));
+                direct_arena_allocations.fetch_add(1, std::memory_order_relaxed);
+                direct_arena_allocated_bytes.fetch_add(request_size, std::memory_order_relaxed);
+            }
         }
+        return MxFp4ByteBuffer(std::move(owner), static_cast<size_t>(request_size));
+    }
+
+    void add_direct_wait(std::chrono::steady_clock::time_point started) noexcept
+    {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
+        if (elapsed > 0)
+            direct_wait_nanoseconds.fetch_add(static_cast<uint64_t>(elapsed), std::memory_order_relaxed);
+    }
+
+    Result<MxFp4ByteBuffer> read_direct(const std::string& path, uint64_t offset, uint64_t size,
+                                        MxFp4ByteBuffer* scratch, uint64_t scratch_limit)
+    {
+        const HANDLE read_event = thread_read_event().handle;
+        if (read_event == nullptr)
+            return Error{ErrorCode::IoError, "cannot create direct Expert read event: " + path};
+        auto planned = plan_direct_read(path, offset, size);
+        if (!planned)
+            return planned.error();
+        const DirectPlan plan = planned.value();
+        auto handle_result = direct_handle_for(path);
+        if (!handle_result)
+            return handle_result.error();
+        const Handle handle = handle_result.value();
+        auto buffer = direct_buffer(plan.request_size, scratch, scratch_limit);
+        if (!buffer)
+            return buffer.error();
+        uint8_t* allocation = buffer.value().data();
 
         OVERLAPPED operation{};
-        operation.Offset = static_cast<DWORD>(aligned_offset);
-        operation.OffsetHigh = static_cast<DWORD>(aligned_offset >> 32);
+        operation.Offset = static_cast<DWORD>(plan.aligned_offset);
+        operation.OffsetHigh = static_cast<DWORD>(plan.aligned_offset >> 32);
         operation.hEvent = read_event;
         if (operation.hEvent == nullptr || !ResetEvent(operation.hEvent))
         {
@@ -359,7 +403,7 @@ struct ExpertCache::FileRangeReader
                 "cannot prepare direct Expert read event: " + path};
         }
         DWORD read_bytes = 0;
-        const BOOL started = ReadFile(handle, allocation, static_cast<DWORD>(request_size), nullptr, &operation);
+        const BOOL started = ReadFile(handle, allocation, static_cast<DWORD>(plan.request_size), nullptr, &operation);
         const DWORD start_error = started ? ERROR_SUCCESS : GetLastError();
         if (!started && start_error != ERROR_IO_PENDING)
         {
@@ -367,15 +411,256 @@ struct ExpertCache::FileRangeReader
                 ErrorCode::IoError,
                 "cannot start direct Expert read: " + path};
         }
-        if (!GetOverlappedResult(handle, &operation, &read_bytes, TRUE) || static_cast<uint64_t>(read_bytes) < logical_size)
+        const auto wait_started = std::chrono::steady_clock::now();
+        const BOOL completed = GetOverlappedResult(handle, &operation, &read_bytes, TRUE);
+        add_direct_wait(wait_started);
+        if (!completed || static_cast<uint64_t>(read_bytes) < plan.logical_size)
         {
             return Error{
                 ErrorCode::IoError,
                 "cannot complete direct Expert read: " + path};
         }
 
-        std::shared_ptr<uint8_t> view(owner, allocation + static_cast<size_t>(prefix));
+        std::shared_ptr<uint8_t> view(buffer.value().storage, allocation + static_cast<size_t>(plan.prefix));
         return MxFp4ByteBuffer(std::move(view), static_cast<size_t>(size));
+    }
+
+    struct DirectRange
+    {
+        const std::string* path = nullptr;
+        uint64_t offset = 0;
+        uint64_t size = 0;
+    };
+
+    struct DirectSlot
+    {
+        DirectPlan plan;
+        const DirectRange* range = nullptr;
+        HANDLE handle = INVALID_HANDLE_VALUE;
+        OVERLAPPED operation{};
+        uint8_t* base = nullptr;
+        bool active = false;
+        bool returned_pending = false;
+        bool fallback = false;
+        bool processed = false;
+    };
+
+    void completed_direct_slot(const DirectSlot& slot) noexcept
+    {
+        direct_read_ranges.fetch_add(1, std::memory_order_relaxed);
+        direct_read_bytes.fetch_add(slot.range->size, std::memory_order_relaxed);
+        direct_pipeline_completed_ranges.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Owns every submitted OVERLAPPED until completion, including exceptions
+    // from a converter or a Buffered retry. Never cancel another worker's I/O.
+    struct DirectBatchDrain
+    {
+        FileRangeReader& reader;
+        std::span<DirectSlot> slots;
+
+        ~DirectBatchDrain() noexcept
+        {
+            for (DirectSlot& slot : slots)
+                if (slot.active)
+                    CancelIoEx(slot.handle, &slot.operation);
+            for (DirectSlot& slot : slots)
+            {
+                if (!slot.active)
+                    continue;
+                DWORD bytes = 0;
+                const auto started = std::chrono::steady_clock::now();
+                const BOOL completed = GetOverlappedResult(slot.handle, &slot.operation, &bytes, TRUE);
+                reader.add_direct_wait(started);
+                slot.active = false;
+                if (completed && static_cast<uint64_t>(bytes) >= slot.plan.logical_size)
+                    reader.completed_direct_slot(slot);
+                // An intentional cancellation is not a failed Direct-policy
+                // probe and must not force Auto to Buffered or request retry.
+            }
+        }
+    };
+
+    using DirectConverter = Result<void> (*)(const void*, size_t, std::span<const uint8_t>);
+
+    Result<void> load_direct_ranges(std::span<const DirectRange> ranges, ExpertIoMode io_mode,
+                                    MxFp4ByteBuffer& scratch, uint64_t scratch_limit,
+                                    const void* conversion_context, DirectConverter convert)
+    {
+        auto& events = thread_direct_batch_events();
+        size_t cursor = 0;
+        while (cursor < ranges.size())
+        {
+            std::array<DirectPlan, 3> plans{};
+            size_t count = 0;
+            uint64_t arena_size = 0;
+            const bool direct = io_mode == ExpertIoMode::Direct
+                                || (io_mode == ExpertIoMode::Auto && selected_read_policy() == ReadPolicyDirect);
+            if (direct)
+            {
+                while (count < plans.size() && cursor + count < ranges.size())
+                {
+                    const DirectRange& range = ranges[cursor + count];
+                    auto plan = plan_direct_read(*range.path, range.offset, range.size);
+                    if (!plan || plan.value().request_size > scratch_limit - arena_size)
+                        break;
+                    plans[count] = plan.value();
+                    arena_size += plan.value().request_size;
+                    ++count;
+                }
+            }
+            // Preserve the complete scalar policy (including over-cap Direct
+            // allocation, adaptive sampling, and fallback) for one large bank.
+            if (count < 2)
+            {
+                const DirectRange& range = ranges[cursor];
+                auto raw = load(*range.path, range.offset, range.size, io_mode, &scratch, scratch_limit);
+                if (!raw)
+                    return raw.error();
+                auto converted = convert(conversion_context, cursor, std::span<const uint8_t>(raw.value().data.data(), raw.value().data.size()));
+                if (!converted)
+                    return converted.error();
+                ++cursor;
+                continue;
+            }
+
+            // All slots are planned and the arena is grown before the first
+            // submission. No pending operation can observe resize or reuse.
+            auto arena = direct_buffer(arena_size, &scratch, scratch_limit);
+            if (!arena)
+            {
+                // Allocation pressure preserves the existing scalar fallback
+                // instead of making pipelining a new model-admission limit.
+                const DirectRange& range = ranges[cursor];
+                auto raw = load(*range.path, range.offset, range.size, io_mode, &scratch, scratch_limit);
+                if (!raw)
+                    return raw.error();
+                auto converted = convert(conversion_context, cursor, std::span<const uint8_t>(raw.value().data.data(), raw.value().data.size()));
+                if (!converted)
+                    return converted.error();
+                ++cursor;
+                continue;
+            }
+            std::array<DirectSlot, 3> slots{};
+            DirectBatchDrain drain{*this, {slots.data(), count}};
+            const auto fail_direct = [&](DirectSlot& slot) {
+                slot.fallback = true;
+                direct_read_fallbacks.fetch_add(1, std::memory_order_relaxed);
+                if (io_mode == ExpertIoMode::Auto)
+                    adaptive_read_policy.store(ReadPolicyBuffered, std::memory_order_relaxed);
+            };
+            uint64_t arena_offset = 0;
+            size_t submitted = 0;
+            for (size_t index = 0; index < count; ++index)
+            {
+                DirectSlot& slot = slots[index];
+                slot.range = &ranges[cursor + index];
+                slot.plan = plans[index];
+                slot.base = arena.value().data() + static_cast<size_t>(arena_offset);
+                arena_offset += slot.plan.request_size;
+                // A failure in an earlier submission only changes work which
+                // has not yet been submitted; already active slots complete.
+                if (io_mode == ExpertIoMode::Auto && selected_read_policy() != ReadPolicyDirect)
+                {
+                    slot.fallback = true;
+                    continue;
+                }
+                auto handle = direct_handle_for(*slot.range->path);
+                slot.operation.Offset = static_cast<DWORD>(slot.plan.aligned_offset);
+                slot.operation.OffsetHigh = static_cast<DWORD>(slot.plan.aligned_offset >> 32);
+                slot.operation.hEvent = events[index].handle;
+                if (!handle || !slot.operation.hEvent || !ResetEvent(slot.operation.hEvent))
+                {
+                    fail_direct(slot);
+                    continue;
+                }
+                slot.handle = handle.value();
+                const BOOL started = ReadFile(slot.handle, slot.base, static_cast<DWORD>(slot.plan.request_size), nullptr, &slot.operation);
+                const DWORD error = started ? ERROR_SUCCESS : GetLastError();
+                if (!started && error != ERROR_IO_PENDING)
+                {
+                    fail_direct(slot);
+                    continue;
+                }
+                slot.active = true;
+                slot.returned_pending = !started;
+                ++submitted;
+                uint64_t pending = 0;
+                for (const DirectSlot& candidate : slots)
+                    if (candidate.active && candidate.returned_pending && !HasOverlappedIoCompleted(&candidate.operation))
+                        ++pending;
+                uint64_t peak = direct_pipeline_peak_pending.load(std::memory_order_relaxed);
+                while (peak < pending && !direct_pipeline_peak_pending.compare_exchange_weak(peak, pending, std::memory_order_relaxed)) {}
+            }
+            if (submitted >= 2)
+                direct_pipeline_batches.fetch_add(1, std::memory_order_relaxed);
+
+            size_t remaining = count;
+            while (remaining != 0)
+            {
+                size_t selected = count;
+                std::array<HANDLE, 3> waiting{};
+                std::array<size_t, 3> waiting_slots{};
+                DWORD waiting_count = 0;
+                for (size_t index = 0; index < count; ++index)
+                {
+                    if (slots[index].processed)
+                        continue;
+                    if (slots[index].fallback)
+                    {
+                        selected = index;
+                        break;
+                    }
+                    waiting[waiting_count] = slots[index].operation.hEvent;
+                    waiting_slots[waiting_count++] = index;
+                }
+                if (selected == count)
+                {
+                    const auto started = std::chrono::steady_clock::now();
+                    const DWORD completed = WaitForMultipleObjects(waiting_count, waiting.data(), FALSE, INFINITE);
+                    add_direct_wait(started);
+                    if (completed - WAIT_OBJECT_0 >= waiting_count)
+                        return Error{ErrorCode::IoError, "cannot wait for pipelined Direct Expert reads"};
+                    selected = waiting_slots[completed - WAIT_OBJECT_0];
+                }
+                DirectSlot& slot = slots[selected];
+                bool direct_complete = false;
+                if (slot.active)
+                {
+                    DWORD bytes = 0;
+                    const BOOL completed = GetOverlappedResult(slot.handle, &slot.operation, &bytes, FALSE);
+                    if (!completed && GetLastError() == ERROR_IO_INCOMPLETE)
+                        continue;
+                    slot.active = false;
+                    if (completed && static_cast<uint64_t>(bytes) >= slot.plan.logical_size)
+                    {
+                        completed_direct_slot(slot);
+                        direct_complete = true;
+                    }
+                    else
+                    {
+                        fail_direct(slot);
+                    }
+                }
+                if (slot.fallback)
+                {
+                    // This slot is disjoint from every still-pending Direct
+                    // destination. Never retry through the arena base owner.
+                    auto read_status = read(*slot.range->path, slot.range->offset,
+                                            std::span<uint8_t>(slot.base, static_cast<size_t>(slot.range->size)));
+                    if (!read_status)
+                        return read_status.error();
+                }
+                const uint8_t* payload = slot.base + (direct_complete ? static_cast<size_t>(slot.plan.prefix) : 0);
+                auto converted = convert(conversion_context, cursor + selected, std::span<const uint8_t>(payload, static_cast<size_t>(slot.range->size)));
+                if (!converted)
+                    return converted.error();
+                slot.processed = true;
+                --remaining;
+            }
+            cursor += count;
+        }
+        return {};
     }
 #endif
 
@@ -672,6 +957,12 @@ private:
     std::atomic<uint64_t> direct_read_fallbacks{0};
     std::atomic<uint64_t> buffered_read_ranges{0};
     std::atomic<uint64_t> buffered_read_bytes{0};
+    std::atomic<uint64_t> direct_pipeline_batches{0};
+    std::atomic<uint64_t> direct_pipeline_completed_ranges{0};
+    std::atomic<uint64_t> direct_pipeline_peak_pending{0};
+    std::atomic<uint64_t> direct_arena_allocations{0};
+    std::atomic<uint64_t> direct_arena_allocated_bytes{0};
+    std::atomic<uint64_t> direct_wait_nanoseconds{0};
 };
 
 ExpertCache::ExpertCache(uint64_t _cache_size,
@@ -1160,24 +1451,71 @@ Result<ExpertVictimPair> ExpertCache::load_gguf_pair(const TensorData& gate_up, 
     static thread_local MxFp4ByteBuffer scratch;
     const uint64_t scratch_limit = std::min<uint64_t>(16 * 1024 * 1024,
                                                       cache_size / std::max<size_t>(1, workers.size()));
+    const auto convert_rows = [](const TensorData& source, TensorData& destination, size_t range,
+                                 std::span<const uint8_t> raw) -> Result<void> {
+        const size_t row_scales = source.shape[1] / 32;
+        const size_t row_step = source.mxfp4_file_storage->interleave_rows ? 2 : 1;
+        const size_t block_offset = range * row_scales * 16;
+        const size_t scale_offset = range * row_scales;
+        if (!unpack_gguf_mxfp4_rows(raw, row_scales,
+                                    row_step * row_scales * 16, row_step * row_scales,
+                                    {destination.mxfp4_blocks.data() + block_offset, destination.mxfp4_blocks.size() - block_offset},
+                                    {destination.mxfp4_scales.data() + scale_offset, destination.mxfp4_scales.size() - scale_offset}))
+            return Error{ErrorCode::InvalidModel, "cannot unpack GGUF Expert rows"};
+        return {};
+    };
+#if defined(_WIN32)
+    if (io_mode == ExpertIoMode::Direct
+        || (io_mode == ExpertIoMode::Auto && reader->selected_read_policy() == FileRangeReader::ReadPolicyDirect))
+    {
+        struct RowTarget
+        {
+            const TensorData* source = nullptr;
+            TensorData* destination = nullptr;
+            size_t range = 0;
+        };
+        std::array<FileRangeReader::DirectRange, 4> ranges{};
+        std::array<RowTarget, 4> targets{};
+        size_t count = 0;
+        const auto append = [&](const TensorData& source, TensorData& destination) {
+            const auto& file = *source.mxfp4_file_storage;
+            ranges[count] = {&file.blocks_path, file.blocks_offset, file.blocks_size};
+            targets[count++] = {&source, &destination, 0};
+            if (file.interleave_rows)
+            {
+                ranges[count] = {&file.secondary_blocks_path, file.secondary_blocks_offset, file.secondary_blocks_size};
+                targets[count++] = {&source, &destination, 1};
+            }
+        };
+        append(gate_up, *pair.gate_up);
+        append(down, *pair.down);
+        using RowConverter = Result<void> (*)(const TensorData&, TensorData&, size_t, std::span<const uint8_t>);
+        struct ConversionContext
+        {
+            const RowTarget* targets;
+            RowConverter convert;
+        };
+        const ConversionContext conversion{targets.data(), convert_rows};
+        auto read = reader->load_direct_ranges({ranges.data(), count}, io_mode, scratch, scratch_limit,
+                                               &conversion,
+                                               [](const void* context, size_t index, std::span<const uint8_t> raw) {
+                                                   const auto& conversion = *static_cast<const ConversionContext*>(context);
+                                                   const RowTarget& target = conversion.targets[index];
+                                                   return conversion.convert(*target.source, *target.destination, target.range, raw);
+                                               });
+        if (!read)
+            return read.error();
+        return pair;
+    }
+#endif
     const auto load_tensor_rows = [&](const TensorData& source, TensorData& destination) -> Result<void> {
         const auto& file = *source.mxfp4_file_storage;
-        const size_t row_scales = source.shape[1] / 32;
-        const size_t row_step = file.interleave_rows ? 2 : 1;
         const size_t range_count = file.interleave_rows ? 2 : 1;
         for (size_t range = 0; range < range_count; ++range)
         {
             const std::string& path = range == 0 ? file.blocks_path : file.secondary_blocks_path;
             const uint64_t offset = range == 0 ? file.blocks_offset : file.secondary_blocks_offset;
             const uint64_t size = range == 0 ? file.blocks_size : file.secondary_blocks_size;
-            const auto convert = [&](std::span<const uint8_t> raw) {
-                const size_t block_offset = range * row_scales * 16;
-                const size_t scale_offset = range * row_scales;
-                return unpack_gguf_mxfp4_rows(raw, row_scales,
-                                              row_step * row_scales * 16, row_step * row_scales,
-                                              {destination.mxfp4_blocks.data() + block_offset, destination.mxfp4_blocks.size() - block_offset},
-                                              {destination.mxfp4_scales.data() + scale_offset, destination.mxfp4_scales.size() - scale_offset});
-            };
             auto raw = reader->load(path, offset, size, io_mode, &scratch, scratch_limit);
             if (!raw)
                 return raw.error();
@@ -1186,8 +1524,9 @@ Result<ExpertVictimPair> ExpertCache::load_gguf_pair(const TensorData& gate_up, 
                 ++mapped_range_count;
                 mapped_size += size;
             }
-            if (!convert({raw.value().data.data(), raw.value().data.size()}))
-                return Error{ErrorCode::InvalidModel, "cannot unpack GGUF Expert rows"};
+            auto converted = convert_rows(source, destination, range, {raw.value().data.data(), raw.value().data.size()});
+            if (!converted)
+                return converted.error();
         }
         return {};
     };

@@ -147,7 +147,6 @@ python tools\ncnn_moe.py run `
 | `--expert-cache-mb N` | Bound resident Expert pairs in RAM |
 | `--expert-io-workers N` | Set asynchronous read concurrency |
 | `--mmap-experts` | Map on-demand Expert ranges |
-| `--direct-expert-io` | Force aligned direct reads when supported |
 | `--buffered-expert-io` | Force conventional buffered reads |
 | `--expert-gpu-cache-mb N` | Add an executable Vulkan Expert cache |
 | `--expert-gpu-victim-cache-mb N` | Add a compressed-weight Vulkan cache behind the host ARC |
@@ -229,7 +228,7 @@ python tools\benchmark_runtime.py `
   --no-speculative --warmup 1 --cache-warmup-runs 1 --repeats 3 `
   --backend hybrid --expert-memory on-demand `
   --host-memory-mb 28672 --expert-cache-mb 16384 `
-  --expert-io-workers 4 --direct-expert-io --vulkan-device-index 0
+  --expert-io-workers 4 --vulkan-device-index 0
 ```
 
 This checkpoint has no DSpark plan, so these are target-model results.

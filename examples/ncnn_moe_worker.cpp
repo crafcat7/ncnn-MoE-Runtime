@@ -507,11 +507,17 @@ static Option parse_options(int argc, char** argv, int first_argument)
         else if (argument == "--expected-concurrency")
             result.num_concurrent_sessions = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expected-concurrency")));
         else if (argument == "--mmap-experts")
+        {
+            if (result.expert_io_mode != ExpertIoMode::Auto && result.expert_io_mode != ExpertIoMode::Mmap)
+                throw std::invalid_argument("Expert mmap and buffered I/O modes are mutually exclusive");
             result.expert_io_mode = ExpertIoMode::Mmap;
-        else if (argument == "--direct-expert-io")
-            result.expert_io_mode = ExpertIoMode::Direct;
+        }
         else if (argument == "--buffered-expert-io")
+        {
+            if (result.expert_io_mode != ExpertIoMode::Auto && result.expert_io_mode != ExpertIoMode::Buffered)
+                throw std::invalid_argument("Expert mmap and buffered I/O modes are mutually exclusive");
             result.expert_io_mode = ExpertIoMode::Buffered;
+        }
         else if (argument == "--disable-gpu-victim-execution")
             result.flags |= OptionDisableGpuVictimExecution;
         else if (argument == "--disable-gpu-expert-execution")
@@ -1433,7 +1439,7 @@ static void print_usage(const char* executable)
               << "           --expert-cache-mb N, --expert-gpu-cache-mb N, --expert-io-workers N,\n"
               << "           --expert-memory auto|eager|on-demand, --cpu-packed-weights on|off,\n"
               << "           --vulkan-device N, --vulkan-devices N[,N...]\n"
-              << "  io/cache: --mmap-experts, --direct-expert-io, --buffered-expert-io,\n"
+              << "  io/cache: --mmap-experts, --buffered-expert-io,\n"
               << "            --disable-gpu-expert-execution,\n"
               << "            --expected-concurrency N\n"
               << "  debug: --disable-vulkan-joint-cache-eviction\n"

@@ -173,7 +173,6 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                                                                     " [--vulkan-device N]"
                                                                     " [--vulkan-devices N[,N...]]"
                                                                     " [--mmap-experts]"
-                                                                    " [--direct-expert-io]"
                                                                     " [--buffered-expert-io]"
                                                                     " [--cache-warmup-runs N]"
                                                                     " [--parallel-sessions N]"
@@ -443,14 +442,14 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             }
             else if (argument == "--mmap-experts")
             {
+                if (opt.expert_io_mode != ncnn::moe::ExpertIoMode::Auto && opt.expert_io_mode != ncnn::moe::ExpertIoMode::Mmap)
+                    throw std::invalid_argument("Expert mmap and buffered I/O modes are mutually exclusive");
                 opt.expert_io_mode = ncnn::moe::ExpertIoMode::Mmap;
-            }
-            else if (argument == "--direct-expert-io")
-            {
-                opt.expert_io_mode = ncnn::moe::ExpertIoMode::Direct;
             }
             else if (argument == "--buffered-expert-io")
             {
+                if (opt.expert_io_mode != ncnn::moe::ExpertIoMode::Auto && opt.expert_io_mode != ncnn::moe::ExpertIoMode::Buffered)
+                    throw std::invalid_argument("Expert mmap and buffered I/O modes are mutually exclusive");
                 opt.expert_io_mode = ncnn::moe::ExpertIoMode::Buffered;
             }
             else if (argument == "--cache-warmup-runs")

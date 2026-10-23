@@ -262,7 +262,6 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expected-concurrency", type=int)
     expert_io_group = parser.add_mutually_exclusive_group()
     expert_io_group.add_argument("--mmap-experts", action="store_true", default=None)
-    expert_io_group.add_argument("--direct-expert-io", action="store_true", default=None)
     expert_io_group.add_argument("--buffered-expert-io", action="store_true", default=None)
     parser.add_argument("--disable-gpu-victim-execution", action="store_true", default=None)
     parser.add_argument("--disable-vulkan-joint-cache-eviction", action="store_true", default=None)
@@ -478,7 +477,6 @@ def cli_runtime_settings(arguments: argparse.Namespace) -> dict[str, Any]:
         "vulkan_devices",
         "expected_concurrency",
         "mmap_experts",
-        "direct_expert_io",
         "buffered_expert_io",
         "disable_gpu_victim_execution",
         "disable_vulkan_joint_cache_eviction",
