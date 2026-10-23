@@ -89,6 +89,7 @@ private:
     friend class LatentLayerWorkspace_vulkan;
     friend class Float8Linear_vulkan;
     friend class Bfloat16Linear_vulkan;
+    friend class QnkExpert_vulkan;
     friend class LatentAttention_vulkan;
     friend class LayerHead_vulkan;
 
@@ -403,7 +404,7 @@ private:
     std::unique_ptr<Implementation> d;
 };
 
-// Vulkan Qn_K projection with CPU fallback.
+// Vulkan native block-quantized projection with CPU fallback.
 class QnkLinear_vulkan
 {
 public:
@@ -456,7 +457,7 @@ private:
     std::unique_ptr<Implementation> d;
 };
 
-// Vulkan Qn_K/affine INT4 Expert chain.
+// Vulkan native block-quantized/affine INT4 Expert chain.
 class QnkExpert_vulkan
 {
 public:
@@ -483,6 +484,8 @@ public:
                                                                            const VulkanRuntimePtr& vulkan_runtime,
                                                                            uint64_t optimization_flags);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
+    [[nodiscard]] bool forward_device(const DeviceTensor_vulkan& input, DeviceTensor_vulkan& output) const;
+    [[nodiscard]] bool materialize(const DeviceTensor_vulkan& input, ActivationBuffer& output) const;
     [[nodiscard]] uint64_t device_bytes() const noexcept;
 
 private:

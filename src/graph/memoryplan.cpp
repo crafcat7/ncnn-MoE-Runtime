@@ -161,7 +161,8 @@ static Result<uint64_t> latent_dense_size(const MoeModelDescriptor& descriptor)
         const MoeDescriptor& moe = layer.moe;
         if (attention.kind != AttentionKind::MultiHeadLatent
             || (attention.projection_weight_dtype != DType::Float8E4M3
-                && attention.projection_weight_dtype != DType::BFloat16)
+                && attention.projection_weight_dtype != DType::BFloat16
+                && attention.projection_weight_dtype != DType::Q8_0)
             || attention.output_group_count == 0
             || attention.head_count % attention.output_group_count != 0)
         {
@@ -292,7 +293,8 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
         || descriptor.hyper_connection_multiplier <= 1
         || descriptor.layers.front().attention.kind != AttentionKind::MultiHeadLatent
         || (descriptor.layers.front().attention.projection_weight_dtype != DType::Float8E4M3
-            && descriptor.layers.front().attention.projection_weight_dtype != DType::BFloat16))
+            && descriptor.layers.front().attention.projection_weight_dtype != DType::BFloat16
+            && descriptor.layers.front().attention.projection_weight_dtype != DType::Q8_0))
     {
         return uint64_t{0};
     }
@@ -311,7 +313,8 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
         const AttentionDescriptor& attention = layer.attention;
         if (attention.kind != AttentionKind::MultiHeadLatent
             || (attention.projection_weight_dtype != DType::Float8E4M3
-                && attention.projection_weight_dtype != DType::BFloat16)
+                && attention.projection_weight_dtype != DType::BFloat16
+                && attention.projection_weight_dtype != DType::Q8_0)
             || attention.output_group_count == 0
             || attention.head_count % attention.output_group_count != 0)
         {
@@ -382,7 +385,8 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
                         && descriptor.hyper_connection_multiplier > 1
                         && descriptor.layers.front().attention.kind == AttentionKind::MultiHeadLatent
                         && (descriptor.layers.front().attention.projection_weight_dtype == DType::Float8E4M3
-                            || descriptor.layers.front().attention.projection_weight_dtype == DType::BFloat16);
+                            || descriptor.layers.front().attention.projection_weight_dtype == DType::BFloat16
+                            || descriptor.layers.front().attention.projection_weight_dtype == DType::Q8_0);
     if (latent)
         return latent_dense_size(descriptor);
 

@@ -163,6 +163,76 @@ def mxfp4_copy(fixture, directory: Path) -> tuple[Path, Path]:
     return baseline, destination
 
 
+def q8_0_copy(baseline: Path, source: Path, directory: Path, label: str) -> tuple[Path, Path]:
+    """Native 34-byte blocks and an independently decoded DeepSeek HF oracle."""
+    gguf = fixtures.gguf
+    reader = gguf.GGUFReader(source)
+    architecture = reader.fields["general.architecture"].contents()
+    assert architecture == "deepseek4"
+    destination = directory / f"{label}.gguf"
+    writer = gguf.GGUFWriter(destination, architecture)
+    for name, field in reader.fields.items():
+        if not name.startswith("GGUF.") and name != "general.architecture":
+            writer.add_key_value(name, field.contents(), field.types[0], field.types[-1] if len(field.types) > 1 else None)
+    reference = {name: (info.dtype, info.read().copy())
+                 for name, info in fixtures.importer.scan_safetensors(baseline).items()}
+    dense_names = {fixtures.family_gguf_name(name, "deepseek_v4"): name
+                   for name in reference if ".ffn.experts." not in name}
+    converted = set()
+    for index, tensor in enumerate(reader.tensors):
+        # Preserve the independent MXFP4 oracle, F32 auxiliary weights and
+        # layout metadata. Existing native Qn_K matrices cover embedding,
+        # LM Head, every MLA projection, Shared FFN and routed Expert banks.
+        if tensor.tensor_type not in (gguf.GGMLQuantizationType.Q4_K, gguf.GGMLQuantizationType.Q6_K):
+            writer.add_tensor(tensor.name, np.array(tensor.data), raw_dtype=tensor.tensor_type)
+            continue
+        shape = tuple(int(value) for value in tensor.shape[::-1])
+        assert len(shape) in (2, 3) and shape[-1] % 32 == 0
+        values = gguf.dequantize(tensor.data, tensor.tensor_type).reshape(shape)
+        blocks = values.reshape(*shape[:-1], shape[-1] // 32, 32)
+        maximum = np.max(np.abs(blocks), axis=-1)
+        # Powers of two keep the independently decoded oracle exactly BF16
+        # representable. Negative scales exercise the actual signed Q8_0 ABI.
+        exponents = np.ceil(np.log2(np.where(maximum > 0, maximum / 127, 1 / 1024)))
+        scales = np.exp2(exponents).astype(np.float32)
+        signs = np.arange(scales.size).reshape(scales.shape) + index
+        scales = np.where(signs % 3 == 1, -scales, scales).astype("<f2")
+        codes = np.clip(np.rint(blocks / scales[..., None]), -128, 127).astype(np.int8)
+        raw = np.empty((*blocks.shape[:-1], 34), np.uint8)
+        raw[..., :2] = scales.view(np.uint8).reshape(*scales.shape, 2)
+        raw[..., 2:] = codes.view(np.uint8)
+        packed = raw.reshape(*shape[:-1], -1)
+        writer.add_tensor(tensor.name, packed, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+        # Decode bytes directly rather than sharing the runtime/importer or
+        # the official decoder that generated the original Qn_K fixture.
+        decoded_scales = raw[..., :2].copy().view("<f2").reshape(scales.shape).astype(np.float32)
+        decoded_codes = raw[..., 2:].copy().view(np.int8).astype(np.float32)
+        decoded = (decoded_scales[..., None] * decoded_codes).reshape(shape)
+        np.testing.assert_array_equal(decoded, gguf.dequantize(packed, gguf.GGMLQuantizationType.Q8_0).reshape(shape))
+        rounded = fixtures.bfloat16(decoded)
+        np.testing.assert_array_equal(fixtures.float32(rounded), decoded)
+        match = re.fullmatch(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight", tensor.name)
+        if match:
+            role = {"gate": "w1", "up": "w3", "down": "w2"}[match[2]]
+            for expert in range(shape[0]):
+                reference[f"layers.{match[1]}.ffn.experts.{expert}.{role}.weight"] = ("BF16", rounded[expert])
+        else:
+            reference[dense_names[tensor.name]] = ("BF16", rounded)
+        converted.add(tensor.name)
+    assert {"token_embd.weight", "output.weight", "blk.0.attn_q_a.weight", "blk.0.attn_output_a.weight",
+            "blk.0.ffn_gate_shexp.weight", "blk.0.ffn_up_shexp.weight", "blk.0.ffn_down_shexp.weight"} <= converted
+    if "mxfp4" not in label:
+        assert "blk.0.ffn_gate_exps.weight" in converted
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    decoded_baseline = directory / f"{label}-baseline"
+    fixtures.assets(decoded_baseline, json.loads((baseline / "config.json").read_text()))
+    fixtures.write_safetensors(decoded_baseline / "model.safetensors", reference)
+    return decoded_baseline, destination
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runner", type=Path, required=True)
@@ -210,8 +280,8 @@ def main() -> int:
                     return 77
                 completed.check_returncode()
             if moe:
-                deferred = [(fixture.baseline, fixture.source, "QnK"),
-                            (*mxfp4_copy(fixture, directory), "MXFP4")]
+                mxfp4 = mxfp4_copy(fixture, directory)
+                deferred = [(fixture.baseline, fixture.source, "QnK"), (*mxfp4, "MXFP4")]
                 for baseline, source, encoding in deferred:
                     command = [str(args.runner.resolve()), str(baseline), str(source), "--on-demand"]
                     if args.hybrid:
@@ -221,6 +291,21 @@ def main() -> int:
                     if completed.returncode == 77:
                         return 77
                     completed.check_returncode()
+                if family == "deepseek_v4":
+                    for baseline, source in (q8_0_copy(fixture.baseline, fixture.source, directory, "q8_0"),
+                                             q8_0_copy(*mxfp4, directory, "q8_0-mxfp4")):
+                        for on_demand in (False, True):
+                            command = [str(args.runner.resolve()), str(baseline), str(source)]
+                            if on_demand:
+                                command.append("--on-demand")
+                            if args.hybrid:
+                                command.append("--hybrid")
+                            mode = "on-demand" if on_demand else "eager"
+                            print(f"Checking {label}: {source.name} with {mode} Expert memory", flush=True)
+                            completed = subprocess.run(command)
+                            if completed.returncode == 77:
+                                return 77
+                            completed.check_returncode()
     return 0
 
 

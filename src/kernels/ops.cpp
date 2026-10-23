@@ -67,6 +67,10 @@ static bool dense_host_storage_available(const TensorData& tensor) noexcept
     if (tensor.dtype == DType::Float8E4M3)
         return tensor.float8_values().size() == tensor.element_count()
                && !tensor.quantization_scales.empty();
+    if (is_qnk_dtype(tensor.dtype))
+        return tensor.shape.size() == 2
+               && qnk_storage_bytes(tensor.dtype, tensor.shape[0], tensor.shape[1]) != 0
+               && tensor.qnk_values().size() == qnk_storage_bytes(tensor.dtype, tensor.shape[0], tensor.shape[1]);
     return true;
 }
 
@@ -261,13 +265,13 @@ void forward_embedding_row(const TensorData& embedding, uint32_t row_index, floa
             throw std::runtime_error("invalid quantized embedding layout");
         const uint8_t* row = embedding.qnk_values().data() + static_cast<size_t>(row_index) * row_bytes;
         std::array<float, qnk_block_elements> decoded;
-        for (uint32_t column = 0; column < hidden_size; column += qnk_block_elements)
+        for (uint32_t column = 0; column < hidden_size; column += qnk_block_size(embedding.dtype))
         {
             float* block = remap ? decoded.data() : destination + column;
-            qnk_dequantize_block(embedding.dtype, row + (column / qnk_block_elements) * qnk_block_bytes(embedding.dtype), block);
+            qnk_dequantize_block(embedding.dtype, row + (column / qnk_block_size(embedding.dtype)) * qnk_block_bytes(embedding.dtype), block);
             if (remap)
             {
-                for (uint32_t lane = 0; lane < qnk_block_elements; ++lane)
+                for (uint32_t lane = 0; lane < qnk_block_size(embedding.dtype); ++lane)
                     destination[embedding.input_column_indices[column + lane]] = block[lane];
             }
         }
@@ -730,15 +734,18 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
         return false;
 
     const DType dtype = weights[0]->dtype;
+    if (dtype == DType::Q8_0
 #if defined(__aarch64__) || defined(_M_ARM64)
-    if (is_qnk_dtype(dtype))
+        || is_qnk_dtype(dtype)
+#endif
+    )
     {
         if (matrix_count != 2)
             return false;
         for (size_t i = 0; i < matrix_count; ++i)
         {
             const CompiledOperator* op = owners ? owners[i] : nullptr;
-            if (op && (op->linear || op->bfloat16 || op->float8))
+            if (op && (op->linear || op->bfloat16 || op->float8 || op->qnk))
                 return false;
         }
         std::array<std::shared_ptr<const QnKPack>*, 2> sidecars{};
@@ -754,10 +761,8 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
                                   has_flag(optimization_flags, OptimizationCpuPackedWeights),
                                   sidecar_span);
     }
-#else
     if (is_qnk_dtype(dtype))
         return false;
-#endif
     bool use_bfloat16 = false;
 #if defined(__aarch64__) || defined(_M_ARM64)
     use_bfloat16 = dtype == DType::BFloat16;
@@ -1095,6 +1100,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
     }
     if (is_qnk_dtype(matrix.dtype))
     {
+        require_dense_host_storage(matrix, "linear weight");
         std::array<std::shared_ptr<const QnKPack>*, 1> sidecars = {op ? &op->qnk_packed : nullptr};
         const auto sidecar_span = std::span<std::shared_ptr<const QnKPack>* const>(sidecars.data(), sidecars.size());
         if (forward_linear_qnk({&matrix},
@@ -1103,6 +1109,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                                has_flag(optimization_flags, OptimizationCpuPackedWeights),
                                sidecar_span))
             return;
+        throw std::runtime_error("invalid native GGML linear weight or activation shape");
     }
     if (!matrix.input_column_indices.empty())
         throw std::runtime_error("invalid quantized linear weight layout");

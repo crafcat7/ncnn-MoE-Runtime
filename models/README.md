@@ -107,15 +107,17 @@ python tools/ncnn_moe.py run --model "./models/DeepSeek-GGUF" `
 | GGUF | Little-endian `qwen35`, `qwen35moe`, `qwen4exp`, `gpt-oss`, and `deepseek4`; single or standard split files |
 
 GGUF Embedding, Attention, output-head, FFN, shared-Expert and routed-Expert
-Q2_K–Q8_K blocks remain lossless and reuse the existing Qn_K kernels. GPT-OSS
+Q8_0 and Q2_K–Q8_K blocks remain lossless and use native CPU/Vulkan kernels. GPT-OSS
 and DeepSeek MXFP4 Expert blocks are also retained. Mixed projection formats
 are supported. Embedding and PLE decode only selected rows; recurrent output
 projections permute activations while retaining packed weights. Flash-Next
 PLE, QSA, and gated-residual matrices, and DeepSeek hyper-connection and DSpark
 matrices use their actual supported encoding. No complete quantized matrix is
 silently expanded to BF16. Small floating-point normalization and convolution
-tensors keep the existing representation. Non-Qn_K/MXFP4 GGUF quantized
-matrices, including Q8_0, are explicitly rejected.
+tensors keep the existing representation. Q8_0 retains its FP16 scale and
+32 signed values in each 34-byte block, including DeepSeek MLA, continuous
+device execution, and Shared/routed Expert caching. Other unsupported GGUF
+quantized encodings are explicitly rejected.
 
 CPU/GPU placement uses the existing device and residency policy. INT4/Qn_K
 Experts, grouped latent output projections, and eligible dense projections use

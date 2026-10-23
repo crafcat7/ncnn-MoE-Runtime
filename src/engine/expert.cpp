@@ -576,6 +576,22 @@ void forward_shared_expert(const CompiledModel& model,
     const ExpertPlan& expert = moe.shared_expert;
     const uint64_t optimization_flags = model.opt.optimization_flags;
     const bool has_router_gate = moe.shared_expert_gate_weight != invalid_tensor_handle;
+    const auto& qnk_shared = model.operators.at(expert.vulkan_operator).qnk_expert;
+    if (!has_router_gate && qnk_shared)
+    {
+        if (device_output && device_input && !device_input->empty())
+        {
+            auto completed = std::make_shared<DeviceTensor_vulkan>();
+            if (qnk_shared->forward_device(*device_input, *completed))
+            {
+                output.clear();
+                *device_output = std::move(completed);
+                return;
+            }
+        }
+        if (qnk_shared->forward(input, output))
+            return;
+    }
     const auto& float8_gate = model.operators.at_weight(expert.gate_weight).float8;
     const auto& float8_up = model.operators.at_weight(expert.up_weight).float8;
     const auto& float8_down = model.operators.at_weight(expert.down_weight).float8;

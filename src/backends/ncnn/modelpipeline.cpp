@@ -338,6 +338,11 @@ static uint64_t release_tensor_host_storage(TensorData& tensor)
         std::vector<uint8_t>().swap(tensor.quantized_data);
         std::vector<float>().swap(tensor.quantization_scales);
     }
+    else if (tensor.dtype == DType::Q8_0)
+    {
+        released_size = tensor.quantized_data.size();
+        std::vector<uint8_t>().swap(tensor.quantized_data);
+    }
     else
     {
         return 0;
@@ -447,6 +452,17 @@ void release_vulkan_dense_host_copies(CompiledModel& compiled)
             release_vulkan_dense_handle(compiled, layer.moe.shared_expert.gate_weight);
             release_vulkan_dense_handle(compiled, layer.moe.shared_expert.up_weight);
             release_vulkan_dense_handle(compiled, layer.moe.shared_expert_gate_weight);
+        }
+        const ExpertPlan& shared = layer.moe.shared_expert;
+        if (layer.moe.has_shared_expert && shared.vulkan_operator != invalid_compiled_operator_handle
+            && compiled.operators.at(shared.vulkan_operator).qnk_expert
+            && compiled.weights.at(shared.gate_weight).dtype == DType::Q8_0
+            && compiled.weights.at(shared.up_weight).dtype == DType::Q8_0
+            && compiled.weights.at(shared.down_weight).dtype == DType::Q8_0)
+        {
+            release_vulkan_dense_handle(compiled, shared.gate_weight);
+            release_vulkan_dense_handle(compiled, shared.up_weight);
+            release_vulkan_dense_handle(compiled, shared.down_weight);
         }
     };
 

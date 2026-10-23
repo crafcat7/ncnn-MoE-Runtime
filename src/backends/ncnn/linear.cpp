@@ -5292,6 +5292,8 @@ static size_t qnk_shader_type(DType dtype) noexcept
         return 7;
     if (dtype == DType::Float32)
         return 8;
+    if (dtype == DType::Q8_0)
+        return 9;
     return static_cast<size_t>(dtype) - static_cast<size_t>(DType::Q2K);
 }
 
@@ -5471,7 +5473,7 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     implementation.input_columns = input_columns;
     implementation.input_group_count = input_group_count;
     implementation.output_columns = output_columns;
-    implementation.block_count = int4 || dense ? 0 : input_columns / qnk_block_elements;
+    implementation.block_count = int4 || dense ? 0 : input_columns / qnk_block_size(matrix.dtype);
     implementation.block_size = int4    ? input_columns / 2 + input_columns % 2
                                 : dense ? input_columns * (matrix.dtype == DType::BFloat16 ? sizeof(uint16_t) : sizeof(float))
                                         : static_cast<uint32_t>(qnk_block_bytes(matrix.dtype));
@@ -5737,9 +5739,16 @@ void QnkLinear_vulkan::record(const ncnn::VkMat& input,
     ncnn::VkMat dispatcher;
     // ncnn may round the requested 32 lanes up to the device subgroup size.
     // One complete workgroup computes one output column on every device.
-    dispatcher.w = static_cast<int>(implementation.output_columns * implementation.pipeline->local_size_x());
+    uint32_t column_groups = implementation.output_columns;
+    if (implementation.dtype == DType::Q8_0)
+    {
+        // A vocabulary-sized Q8_0 LM Head can exceed the guaranteed 65535
+        // workgroups along X. Retain one row per workgroup and tile over Z.
+        column_groups = std::min(column_groups, std::min(65535u, implementation.vulkan_context->device()->info.max_workgroup_count_x()));
+    }
+    dispatcher.w = static_cast<int>(column_groups * implementation.pipeline->local_size_x());
     dispatcher.h = static_cast<int>(constants[3].u32);
-    dispatcher.c = 1;
+    dispatcher.c = static_cast<int>(implementation.output_columns / column_groups + (implementation.output_columns % column_groups != 0));
     command.record_pipeline(implementation.pipeline.get(), bindings, constants, dispatcher);
 #else
     (void)input;
@@ -6514,6 +6523,95 @@ bool QnkExpert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     ++runtime_state.batch_downloads;
+    return true;
+#else
+    (void)input;
+    (void)output;
+    return false;
+#endif
+}
+
+bool QnkExpert_vulkan::forward_device(const DeviceTensor_vulkan& input, DeviceTensor_vulkan& output) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    const Implementation& implementation = *d;
+    const ncnn::VkMat* source = input.value();
+    if (&input == &output || !implementation.gate_up || !implementation.down
+        || !implementation.vulkan_context || !implementation.swiglu_pipeline
+        || !source || source->dims != 2 || source->elemsize / source->elempack != sizeof(float)
+        || input.vulkan_context() != implementation.vulkan_context
+        || input.rows() == 0 || input.columns() != implementation.gate_up->input_columns()
+        || input.rows() > implementation.vulkan_context->device()->info.max_workgroup_count_y()
+        || vulkan_activation_storage_variant(implementation.option) != 0)
+        return false;
+    const ncnn::VkMat retained_input = *source;
+    auto lease = implementation.vulkan_context->acquire_transfer_slot();
+    auto& slot = lease.slot();
+    const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
+    if (slot.command_used && slot.command->reset() != 0)
+        return false;
+    slot.command_used = true;
+    auto& command = *slot.command;
+    input.prepare_read();
+    ncnn::VkMat input_gpu = retained_input;
+    if (input_gpu.elempack != 1)
+    {
+        implementation.vulkan_context->device()->convert_packing(retained_input, input_gpu, 1, 1, command, implementation.option);
+        if (input_gpu.empty())
+            return false;
+    }
+    ncnn::VkMat output_gpu;
+    output_gpu.create(static_cast<int>(implementation.output_columns), input_gpu.h, sizeof(float), implementation.vulkan_context->blob_allocator());
+    if (output_gpu.empty())
+        return false;
+    std::vector<ncnn::VkMat> workspace;
+    std::vector<ncnn::VkMat> bindings;
+    std::vector<ncnn::vk_constant_type> constants;
+    if (!record(input_gpu, output_gpu, command, workspace, bindings, constants)
+        || submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0)
+        return false;
+    DeviceTensor_vulkan completed;
+    if (!completed.assign_completed(output_gpu, implementation.vulkan_context))
+        return false;
+    output = std::move(completed);
+    auto& state = implementation.vulkan_context->runtime_state();
+    state.dispatches += implementation.up ? 4 : 3;
+    state.int4_dispatches += implementation.gate_up->dtype() == DType::Int4 ? 1 : 0;
+    state.int4_dispatches += implementation.down->dtype() == DType::Int4 ? 1 : 0;
+    state.int4_dispatches += implementation.up && implementation.up->dtype() == DType::Int4 ? 1 : 0;
+    ++state.compute_submissions;
+    return true;
+#else
+    (void)input;
+    (void)output;
+    return false;
+#endif
+}
+
+bool QnkExpert_vulkan::materialize(const DeviceTensor_vulkan& input, ActivationBuffer& output) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    const ncnn::VkMat* value = input.value();
+    if (!value || !d->vulkan_context || input.vulkan_context() != d->vulkan_context)
+        return false;
+    auto lease = d->vulkan_context->acquire_transfer_slot();
+    auto& slot = lease.slot();
+    if (!prepare_staging_batch(slot.download, input.rows(), input.columns(), slot.staging_allocator, output.element_size()))
+        return false;
+    const DType dtype = output.dtype();
+    output.reset(input.rows(), input.columns(), false);
+    const std::lock_guard<std::mutex> lock(d->vulkan_context->command_mutex());
+    input.prepare_read();
+    if (slot.command_used && slot.command->reset() != 0)
+        return false;
+    slot.command_used = true;
+    if (!record_prepared_activation_staging_download(*value, input.rows(), input.columns(), slot.download,
+                                                     *slot.command, d->vulkan_context->device(), d->option, dtype)
+        || submit_compute_and_wait(*slot.command, d->vulkan_context->device()) != 0
+        || !copy_staging_to_cpu_batch(slot.download, output))
+        return false;
+    ++d->vulkan_context->runtime_state().compute_submissions;
+    ++d->vulkan_context->runtime_state().batch_downloads;
     return true;
 #else
     (void)input;

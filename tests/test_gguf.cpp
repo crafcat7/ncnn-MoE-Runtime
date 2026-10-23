@@ -173,9 +173,9 @@ static void check_split(const std::filesystem::path& root)
 
 static void check_encodings(const std::filesystem::path& root)
 {
-    const std::array<uint32_t, 10> types = {0, 1, 10, 11, 12, 13, 14, 15, 26, 30};
-    const std::array<size_t, 10> sizes = {1024, 512, 84, 110, 144, 176, 210, 292, 1024, 512};
-    const std::array<DType, 10> dtypes = {DType::Float32, DType::Float16, DType::Q2K, DType::Q3K, DType::Q4K,
+    const std::array<uint32_t, 11> types = {0, 1, 8, 10, 11, 12, 13, 14, 15, 26, 30};
+    const std::array<size_t, 11> sizes = {1024, 512, 272, 84, 110, 144, 176, 210, 292, 1024, 512};
+    const std::array<DType, 11> dtypes = {DType::Float32, DType::Float16, DType::Q8_0, DType::Q2K, DType::Q3K, DType::Q4K,
                                           DType::Q5K, DType::Q6K, DType::Q8K, DType::Int32, DType::BFloat16};
     for (size_t i = 0; i < types.size(); ++i)
     {
@@ -211,7 +211,8 @@ static void check_invalid_files(const std::filesystem::path& root)
     bytes = fixture_bytes({}, {valid});
     bytes.resize(bytes.size() - 20);
     reject(bytes, "GGUF accepted a truncated tensor payload");
-    reject(fixture_bytes({}, {{"weight", 8, {32}, std::vector<uint8_t>(34)}}), "GGUF silently accepted unsupported Q8_0");
+    reject(fixture_bytes({}, {{"weight", 2, {32}, std::vector<uint8_t>(18)}}), "GGUF silently accepted unsupported Q4_0");
+    reject(fixture_bytes({}, {{"weight", 8, {48}, std::vector<uint8_t>(51)}}), "GGUF accepted a Q8_0 row crossing quantization blocks");
     reject(fixture_bytes({}, {{"weight", 12, {128, 2}, std::vector<uint8_t>(144)}}), "GGUF accepted a row crossing quantization blocks");
     reject(fixture_bytes({}, {{"weight", 0, {UINT64_C(1) + UINT32_MAX}, {}}}), "GGUF narrowed an oversized tensor dimension");
     reject(fixture_bytes({}, {valid, valid}), "GGUF accepted duplicate tensor names");
@@ -227,19 +228,19 @@ static void check_invalid_files(const std::filesystem::path& root)
     reject(fixture_bytes({oversized}, {}), "GGUF accepted an oversized array length");
 }
 
-static void check_qnk_defer_fallback(const std::filesystem::path& root)
+static void check_qnk_defer_fallback(const std::filesystem::path& root, DType dtype, uint32_t ggml_type)
 {
     constexpr uint32_t rows = 8;
-    constexpr uint32_t columns = 256;
+    const uint32_t columns = dtype == DType::Q8_0 ? 32u : 256u;
     const std::string name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
-    const auto path = root / "qwen-qnk" / "model.gguf";
+    const auto path = root / ("qwen-qnk-" + std::to_string(ggml_type)) / "model.gguf";
     FixtureMetadata tokens{"tokenizer.ggml.tokens", 9, {}};
     append_unsigned(tokens.payload, 8, 4);
     append_unsigned(tokens.payload, 1, 8);
     append_string(tokens.payload, "x");
 
-    std::vector<uint8_t> qkv(static_cast<size_t>(qnk_storage_bytes(DType::Q4K, rows, columns)));
-    constexpr size_t row_bytes = 144;
+    std::vector<uint8_t> qkv(static_cast<size_t>(qnk_storage_bytes(dtype, rows, columns)));
+    const size_t row_bytes = static_cast<size_t>(qnk_storage_bytes(dtype, 1, columns));
     for (uint32_t row = 0; row < rows; ++row)
         std::fill_n(qkv.begin() + static_cast<size_t>(row) * row_bytes, row_bytes, static_cast<uint8_t>(row + 1));
 
@@ -260,9 +261,11 @@ static void check_qnk_defer_fallback(const std::filesystem::path& root)
         integer_metadata("qwen35.feed_forward_length", 4),
         std::move(tokens)};
     const std::vector<uint8_t> hidden(4 * columns * sizeof(uint16_t));
+    const bool q8_0 = dtype == DType::Q8_0;
+    const std::vector<uint8_t> embedding(q8_0 ? row_bytes : columns * sizeof(float), 0x35);
     write_bytes(path, fixture_bytes(metadata,
-                                    {{"token_embd.weight", 0, {columns, 1}, std::vector<uint8_t>(columns * sizeof(float))},
-                                     {"blk.0.attn_qkv.weight", 12, {columns, rows}, std::move(qkv)},
+                                    {{"token_embd.weight", q8_0 ? 8u : 0u, {columns, 1}, embedding},
+                                     {"blk.0.attn_qkv.weight", ggml_type, {columns, rows}, std::move(qkv)},
                                      {"blk.0.attn_gate.weight", 30, {columns, 4}, hidden},
                                      {"blk.0.ssm_alpha.weight", 30, {columns, 4}, hidden},
                                      {"blk.0.ssm_beta.weight", 30, {columns, 4}, hidden},
@@ -273,7 +276,7 @@ static void check_qnk_defer_fallback(const std::filesystem::path& root)
     check(static_cast<bool>(archive), archive ? "" : archive.error().message);
     auto loaded = archive.value().load_tensor(name, SafetensorLoadDeferMxfp4Data);
     check(static_cast<bool>(loaded), loaded ? "" : loaded.error().message);
-    check(loaded.value().dtype == DType::Q4K && loaded.value().shape == std::vector<uint32_t>{rows, columns}
+    check(loaded.value().dtype == dtype && loaded.value().shape == std::vector<uint32_t>{rows, columns}
               && !loaded.value().quantized_data.empty() && !loaded.value().mxfp4_file_storage,
           "unsupported deferred Qn_K row transform did not fall back to eager loading");
     constexpr std::array<uint32_t, rows> source_rows = {0, 1, 2, 3, 4, 6, 5, 7};
@@ -282,7 +285,21 @@ static void check_qnk_defer_fallback(const std::filesystem::path& root)
         check(values[static_cast<size_t>(row) * row_bytes] == source_rows[row] + 1,
               "eager Qn_K fallback did not preserve transformed row order");
 
-    auto invalid = archive.value().load_qnk_tensor(name, DType::Q4K, rows - 1, columns, SafetensorLoadDeferMxfp4Data);
+    if (q8_0)
+    {
+        auto raw = archive.value().load_tensor("model.language_model.embed_tokens.weight");
+        check(raw && raw.value().dtype == DType::Q8_0
+                  && raw.value().shape == std::vector<uint32_t>{1, columns}
+                  && raw.value().mapped_data && raw.value().quantized_data.empty()
+                  && raw.value().float32_data.empty() && raw.value().bfloat16_data.empty()
+                  && raw.value().qnk_values().size() == embedding.size()
+                  && std::equal(embedding.begin(), embedding.end(), raw.value().qnk_values().begin()),
+              "Q8_0 loading expanded or changed compact mapped storage");
+        check(archive.value().find_qnk_expert_dtype("model.language_model.embed_tokens.weight", 1, 1, columns) == DType::Q8_0,
+              "Q8_0 expert bank detection required 256-column K blocks");
+    }
+
+    auto invalid = archive.value().load_qnk_tensor(name, dtype, rows - 1, columns, SafetensorLoadDeferMxfp4Data);
     check(!invalid && invalid.error().code == ErrorCode::InvalidModel
               && invalid.error().message == "GGUF Qn_K transform shape mismatch",
           "invalid deferred Qn_K request was hidden by eager fallback");
@@ -311,7 +328,7 @@ static void check_real_model(const std::filesystem::path& source)
               << " aliases=" << aliases.value().size()
               << " layers=" << descriptor.value().layers.size()
               << " F32=" << types[0] << " BF16=" << types[30]
-              << " I32=" << types[26] << " MXFP4=" << types[39] << '\n';
+              << " Q8_0=" << types[8] << " I32=" << types[26] << " MXFP4=" << types[39] << '\n';
 }
 
 } // namespace moe
@@ -334,7 +351,8 @@ int main(int argc, char** argv)
         ncnn::moe::check_split(root);
         ncnn::moe::check_encodings(root);
         ncnn::moe::check_invalid_files(root);
-        ncnn::moe::check_qnk_defer_fallback(root);
+        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q4K, 12);
+        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q8_0, 8);
         std::filesystem::remove_all(root);
         std::cout << "GGUF parser tests passed\n";
         return 0;

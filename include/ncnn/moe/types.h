@@ -204,13 +204,17 @@ enum class DType
     Q5K,
     Q6K,
     Q8K,
-    Int4
+    Int4,
+    Q8_0
 };
 
+// Historical name for the native GGML block-quantized family. Q8_0 keeps its
+// 32-value blocks; it is not encoded as a 256-value Q8_K tensor.
 [[nodiscard]] inline constexpr bool is_qnk_dtype(DType dtype) noexcept
 {
     return dtype == DType::Q2K || dtype == DType::Q3K || dtype == DType::Q4K
-           || dtype == DType::Q5K || dtype == DType::Q6K || dtype == DType::Q8K;
+           || dtype == DType::Q5K || dtype == DType::Q6K || dtype == DType::Q8K
+           || dtype == DType::Q8_0;
 }
 
 enum class NormType

@@ -258,6 +258,10 @@ handles all formats, while AVX-512 uses 16-lane Q4_K/Q5_K/Q6_K kernels and the
 validated AVX2 kernels for the remaining formats. The scalar decoder remains
 the portability and correctness fallback.
 
+Native GGUF Q8_0 weights use a separate 32-value, 34-byte block format and
+retain their original bytes for CPU and Vulkan execution. They do not use
+Q8_K's 256-value activation-quantization kernels or expand into BF16 at load.
+
 `--cpu-packed-weights on` explicitly enables lazy in-memory repacking for
 supported Qn_K and MXFP4-Q8 CPU Expert weights. Canonical BF16 weights use the
 runtime's BF16 GEMM and dot-product kernels. The default is `off`; there is no

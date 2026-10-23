@@ -590,16 +590,16 @@ static void matrix_rows_dot(const TensorData& matrix,
             if (is_qnk_dtype(matrix.dtype))
             {
                 const uint8_t* weights = matrix.qnk_values().data() + row * qnk_storage_bytes(matrix.dtype, 1, columns);
-                for (uint32_t column = 0; column < columns; column += qnk_block_elements)
+                for (uint32_t column = 0; column < columns; column += qnk_block_size(matrix.dtype))
                 {
                     const float* block_input = input + column;
                     if (!matrix.input_column_indices.empty())
                     {
-                        for (uint32_t lane = 0; lane < qnk_block_elements; ++lane)
+                        for (uint32_t lane = 0; lane < qnk_block_size(matrix.dtype); ++lane)
                             gathered[lane] = input[matrix.input_column_indices[column + lane]];
                         block_input = gathered.data();
                     }
-                    sum += qnk_dot_block(matrix.dtype, weights + (column / qnk_block_elements) * qnk_block_bytes(matrix.dtype), block_input);
+                    sum += qnk_dot_block(matrix.dtype, weights + (column / qnk_block_size(matrix.dtype)) * qnk_block_bytes(matrix.dtype), block_input);
                 }
             }
             else

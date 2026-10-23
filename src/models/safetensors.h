@@ -71,12 +71,13 @@ public:
     [[nodiscard]] Result<TensorData> load_float32_tensor(const std::string& name) const;
     [[nodiscard]] Result<TensorData> load_bfloat16_slice(const std::string& name, uint32_t index, std::vector<uint32_t> shape) const;
     [[nodiscard]] Result<TensorData> load_float8_tensor(const std::string& weight_name, const std::string& scale_name) const;
-    // Detect a Q2_K..Q8_K Expert bank by byte count.
+    // Detect a native Q2_K..Q8_K or Q8_0 Expert bank by byte count and, for GGUF,
+    // its original encoding. Q8_0 retains 32-value blocks.
     [[nodiscard]] std::optional<DType> find_qnk_expert_dtype(const std::string& name,
                                                              uint32_t expert_count,
                                                              uint32_t rows,
                                                              uint32_t columns) const noexcept;
-    // Load a raw Qn_K matrix from the source checkpoint.
+    // Load a raw native GGML block-quantized matrix from the source checkpoint.
     [[nodiscard]] Result<TensorData> load_qnk_tensor(const std::string& name, DType dtype, uint32_t rows, uint32_t columns, uint32_t flags = 0) const;
     // Load one Expert slice from a bank tensor.
     [[nodiscard]] Result<TensorData> load_qnk_expert(const std::string& name, DType dtype, uint32_t expert_id, uint32_t expert_count,

@@ -189,7 +189,7 @@ shared float partial_sum[32];
 
 void main()
 {
-    const uint output_column = gl_WorkGroupID.x;
+    const uint output_column = gl_WorkGroupID.x + gl_WorkGroupID.z * gl_NumWorkGroups.x;
     const uint token = gl_WorkGroupID.y;
     const uint lane = gl_LocalInvocationID.x;
     const bool valid = output_column < p.output_columns && token < p.token_count;
@@ -219,6 +219,20 @@ void main()
                 const float weight = p.qnk_type == 7u ? uintBitsToFloat(qnk_u16(matrix_row + column * 2u) << 16u)
                                                       : uintBitsToFloat(qnk_u32(matrix_row + column * 4u));
                 sum += weight * projection_input(input_row, column);
+            }
+        }
+        else if (p.qnk_type == 9u)
+        {
+            // Q8_0 stores an FP16 scale and 32 signed bytes in every 34-byte
+            // block. Byte addressing also handles blocks and rows that are
+            // not aligned to uint or half boundaries.
+            const uint matrix_row = output_column * p.block_count * p.block_bytes;
+            for (uint block = 0u; block < p.block_count; ++block)
+            {
+                const uint block_offset = matrix_row + block * p.block_bytes;
+                const float weight = qnk_f16(block_offset)
+                                     * float(qnk_signed_byte(qnk_byte(block_offset + 2u + lane)));
+                sum += weight * projection_input(input_row, block * 32u + lane);
             }
         }
         else
