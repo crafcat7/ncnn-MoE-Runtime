@@ -2578,6 +2578,112 @@ void test_ncnn_vulkan_bfloat16_operator()
 #endif
 }
 
+void test_gguf_mxfp4_row_unpack()
+{
+    // Decode individual nibbles to keep the oracle independent of SIMD packing.
+    const auto reference = [](std::span<const uint8_t> source, size_t blocks_per_row,
+                              size_t block_stride, size_t scale_stride,
+                              std::span<uint8_t> blocks, std::span<uint8_t> scales) {
+        const size_t rows = source.size() / 17 / blocks_per_row;
+        for (size_t row = 0; row < rows; ++row)
+        {
+            for (size_t block = 0; block < blocks_per_row; ++block)
+            {
+                const size_t source_offset = (row * blocks_per_row + block) * 17;
+                scales[row * scale_stride + block] = source[source_offset];
+                for (size_t value = 0; value < 32; ++value)
+                {
+                    const uint8_t code = static_cast<uint8_t>((source[source_offset + 1 + value % 16] >> (value / 16 * 4)) & 15u);
+                    uint8_t& output = blocks[row * block_stride + block * 16 + value / 2];
+                    const uint8_t mask = static_cast<uint8_t>(15u << (value % 2 * 4));
+                    output = static_cast<uint8_t>((output & ~mask) | (code << (value % 2 * 4)));
+                }
+            }
+        }
+    };
+    for (size_t blocks_per_row : {size_t{1}, size_t{2}, size_t{3}, size_t{5}, size_t{31}, size_t{32}, size_t{33}, size_t{127}, size_t{128}, size_t{129}})
+    {
+        constexpr size_t rows = 9;
+        const size_t source_size = rows * blocks_per_row * 17;
+        std::vector<uint8_t> source_storage(source_size + 3, 0x5a);
+        std::span<uint8_t> source(source_storage.data() + 1, source_size);
+        for (size_t index = 0; index < source.size(); ++index)
+            source[index] = static_cast<uint8_t>(index * 73 + index / 17 * 19);
+        // All exponent bytes, including 255, are raw values rather than floats.
+        for (size_t block = 0; block < rows * blocks_per_row; ++block)
+            source[block * 17] = static_cast<uint8_t>(255 - block);
+        const size_t block_stride = blocks_per_row * 32 + 7;
+        const size_t scale_stride = blocks_per_row * 2 + 3;
+        const size_t block_size = (rows - 1) * block_stride + blocks_per_row * 16;
+        const size_t scale_size = (rows - 1) * scale_stride + blocks_per_row;
+        std::vector<uint8_t> actual_blocks(block_size + 11, 0xa5);
+        std::vector<uint8_t> actual_scales(scale_size + 13, 0x3c);
+        std::vector<uint8_t> expected_blocks = actual_blocks;
+        std::vector<uint8_t> expected_scales = actual_scales;
+        reference(source, blocks_per_row, block_stride, scale_stride,
+                  std::span<uint8_t>(expected_blocks).subspan(3, block_size), std::span<uint8_t>(expected_scales).subspan(5, scale_size));
+        check(unpack_gguf_mxfp4_rows(source, blocks_per_row, block_stride, scale_stride,
+                                     std::span<uint8_t>(actual_blocks).subspan(3, block_size), std::span<uint8_t>(actual_scales).subspan(5, scale_size)));
+        check(actual_blocks == expected_blocks && actual_scales == expected_scales);
+
+        // Sequential single-source calls populate even and odd rows directly.
+        std::vector<uint8_t> interleaved_blocks(rows * blocks_per_row * 32, 0xa5);
+        std::vector<uint8_t> interleaved_scales(rows * blocks_per_row * 2, 0x3c);
+        std::vector<uint8_t> expected_interleaved_blocks = interleaved_blocks;
+        std::vector<uint8_t> expected_interleaved_scales = interleaved_scales;
+        for (size_t parity = 0; parity < 2; ++parity)
+        {
+            for (uint8_t& value : source) value ^= 0xf3;
+            reference(source, blocks_per_row, blocks_per_row * 32, blocks_per_row * 2,
+                      std::span<uint8_t>(expected_interleaved_blocks).subspan(parity * blocks_per_row * 16),
+                      std::span<uint8_t>(expected_interleaved_scales).subspan(parity * blocks_per_row));
+            check(unpack_gguf_mxfp4_rows(source, blocks_per_row, blocks_per_row * 32, blocks_per_row * 2,
+                                         std::span<uint8_t>(interleaved_blocks).subspan(parity * blocks_per_row * 16),
+                                         std::span<uint8_t>(interleaved_scales).subspan(parity * blocks_per_row)));
+        }
+        check(interleaved_blocks == expected_interleaved_blocks && interleaved_scales == expected_interleaved_scales);
+
+        std::vector<uint8_t> contiguous_blocks(rows * blocks_per_row * 16, 0xa5);
+        std::vector<uint8_t> contiguous_scales(rows * blocks_per_row, 0x3c);
+        std::vector<uint8_t> expected_contiguous_blocks = contiguous_blocks;
+        std::vector<uint8_t> expected_contiguous_scales = contiguous_scales;
+        reference(source, rows * blocks_per_row, contiguous_blocks.size(), contiguous_scales.size(), expected_contiguous_blocks, expected_contiguous_scales);
+        check(unpack_gguf_mxfp4(source, contiguous_blocks, contiguous_scales));
+        check(contiguous_blocks == expected_contiguous_blocks && contiguous_scales == expected_contiguous_scales);
+    }
+
+    std::array<uint8_t, 256> storage;
+    std::array<uint8_t, 64> blocks;
+    std::array<uint8_t, 8> scales;
+    storage.fill(0x39);
+    blocks.fill(0xa5);
+    scales.fill(0x3c);
+    const auto source = std::span<const uint8_t>(storage).subspan(1, 68);
+    const auto reject = [&](std::span<const uint8_t> input, size_t blocks_per_row, size_t block_stride, size_t scale_stride,
+                            std::span<uint8_t> output_blocks, std::span<uint8_t> output_scales) {
+        const auto before_storage = storage;
+        const auto before_blocks = blocks;
+        const auto before_scales = scales;
+        check(!unpack_gguf_mxfp4_rows(input, blocks_per_row, block_stride, scale_stride, output_blocks, output_scales));
+        check(storage == before_storage && blocks == before_blocks && scales == before_scales);
+    };
+    reject({}, 2, 32, 2, blocks, scales);
+    reject(source.first(67), 2, 32, 2, blocks, scales);
+    reject(source, 0, 32, 2, blocks, scales);
+    reject(source, 3, 48, 3, blocks, scales);
+    reject(source, 2, 31, 2, blocks, scales);
+    reject(source, 2, 32, 1, blocks, scales);
+    reject(source, 2, 32, 2, std::span<uint8_t>(blocks).first(63), scales);
+    reject(source, 2, 32, 2, blocks, std::span<uint8_t>(scales).first(3));
+    reject(source, 2, std::numeric_limits<size_t>::max(), 2, blocks, scales);
+    reject(source, 2, 32, std::numeric_limits<size_t>::max(), blocks, scales);
+    reject(source, 2, 32, 2, std::span<uint8_t>(storage).subspan(10, 64), scales);
+    reject(source, 2, 32, 2, blocks, std::span<uint8_t>(storage).subspan(66, 4));
+    reject(source, 2, 32, 2, std::span<uint8_t>(storage).subspan(80, 64), std::span<uint8_t>(storage).subspan(140, 4));
+    reject(std::span<const uint8_t>(storage).subspan(63, 68), 2, 32, 2, std::span<uint8_t>(storage).first(64), scales);
+    reject(source, 2, 32, 2, std::span<uint8_t>(storage).subspan(84, 64), std::span<uint8_t>(storage).subspan(83, 4));
+}
+
 void test_mxfp4_weight_storage_padding()
 {
     // Three 32-column rows exercise uint32 scale padding and segment alignment.
@@ -22355,6 +22461,7 @@ int main(int argc, char** argv)
         ncnn::moe::test_released_dense_host_storage_guard();
         ncnn::moe::test_ncnn_vulkan_bfloat16_operator();
         ncnn::moe::test_ncnn_vulkan_float8_operator();
+        ncnn::moe::test_gguf_mxfp4_row_unpack();
         ncnn::moe::test_mxfp4_weight_storage_padding();
         ncnn::moe::test_weightstore_finalize();
         ncnn::moe::test_mxfp4_cpu_kernel_and_fused_gate_up();

@@ -8,6 +8,10 @@
 namespace ncnn {
 namespace moe {
 
+void msvc_avx2_unpack_gguf_mxfp4_rows(const uint8_t* source, uint8_t* blocks, uint8_t* scales,
+                                      size_t rows, size_t blocks_per_row,
+                                      size_t block_row_stride, size_t scale_row_stride) noexcept;
+
 [[nodiscard]] float msvc_avx2_bfloat16_dot(const uint16_t* weights, const float* input, uint32_t count) noexcept;
 
 void msvc_avx2_float_to_bfloat16_array(uint16_t* output,

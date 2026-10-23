@@ -9,6 +9,45 @@
 namespace ncnn {
 namespace moe {
 
+void msvc_avx2_unpack_gguf_mxfp4_rows(const uint8_t* source, uint8_t* blocks, uint8_t* scales,
+                                      size_t rows, size_t blocks_per_row,
+                                      size_t block_row_stride, size_t scale_row_stride) noexcept
+{
+    const __m256i low_mask = _mm256_set1_epi16(0x000f);
+    const __m256i high_mask = _mm256_set1_epi16(0x00f0);
+    for (size_t row = 0; row < rows; ++row)
+    {
+        const uint8_t* input = source + row * blocks_per_row * 17;
+        uint8_t* output = blocks + row * block_row_stride;
+        uint8_t* scale = scales + row * scale_row_stride;
+        size_t block = 0;
+        for (; block + 1 < blocks_per_row; block += 2)
+        {
+            // The two exact 16-byte loads omit the scale bytes. Packing stays
+            // within each 128-bit half, producing two contiguous output blocks.
+            const __m256i packed = _mm256_loadu2_m128i(reinterpret_cast<const __m128i*>(input + block * 17 + 18),
+                                                       reinterpret_cast<const __m128i*>(input + block * 17 + 1));
+            const __m256i low = _mm256_or_si256(_mm256_and_si256(packed, low_mask),
+                                                _mm256_and_si256(_mm256_srli_epi16(packed, 4), high_mask));
+            const __m256i high = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask),
+                                                 _mm256_and_si256(_mm256_srli_epi16(packed, 8), high_mask));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(output + block * 16), _mm256_packus_epi16(low, high));
+            scale[block] = input[block * 17];
+            scale[block + 1] = input[(block + 1) * 17];
+        }
+        if (block < blocks_per_row)
+        {
+            const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(input + block * 17 + 1));
+            const __m128i low = _mm_or_si128(_mm_and_si128(packed, _mm256_castsi256_si128(low_mask)),
+                                             _mm_and_si128(_mm_srli_epi16(packed, 4), _mm256_castsi256_si128(high_mask)));
+            const __m128i high = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(packed, 4), _mm256_castsi256_si128(low_mask)),
+                                              _mm_and_si128(_mm_srli_epi16(packed, 8), _mm256_castsi256_si128(high_mask)));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(output + block * 16), _mm_packus_epi16(low, high));
+            scale[block] = input[block * 17];
+        }
+    }
+}
+
 static std::array<float, 256> make_avx2_scale_table()
 {
     std::array<float, 256> table = {};

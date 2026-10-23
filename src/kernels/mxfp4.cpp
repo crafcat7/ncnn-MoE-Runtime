@@ -36,28 +36,136 @@
 namespace ncnn {
 namespace moe {
 
+static bool gguf_mxfp4_overlap(const uint8_t* first, size_t first_size, const uint8_t* second, size_t second_size) noexcept
+{
+    const uintptr_t first_address = reinterpret_cast<uintptr_t>(first);
+    const uintptr_t second_address = reinterpret_cast<uintptr_t>(second);
+    return first_address <= second_address ? second_address - first_address < first_size
+                                           : first_address - second_address < second_size;
+}
+
+static void unpack_gguf_mxfp4_rows_baseline(const uint8_t* source, uint8_t* blocks, uint8_t* scales,
+                                            size_t rows, size_t blocks_per_row,
+                                            size_t block_row_stride, size_t scale_row_stride) noexcept
+{
+#if defined(__x86_64__) || defined(_M_X64) || defined(__SSE2__)
+    const __m128i low_mask = _mm_set1_epi16(0x000f);
+    const __m128i high_mask = _mm_set1_epi16(0x00f0);
+#endif
+    for (size_t row = 0; row < rows; ++row)
+    {
+        const uint8_t* input = source + row * blocks_per_row * 17;
+        uint8_t* packed_row = blocks + row * block_row_stride;
+        uint8_t* scale_row = scales + row * scale_row_stride;
+        for (size_t block = 0; block < blocks_per_row; ++block)
+        {
+            const uint8_t* codes = input + block * 17 + 1;
+            uint8_t* output = packed_row + block * 16;
+            scale_row[block] = input[block * 17];
+#if defined(__x86_64__) || defined(_M_X64) || defined(__SSE2__)
+            // Each 16-bit lane holds consecutive GGUF codes. Join their low
+            // nibbles, then their high nibbles, without expanding to 32 values.
+            const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(codes));
+            const __m128i low = _mm_or_si128(_mm_and_si128(packed, low_mask),
+                                             _mm_and_si128(_mm_srli_epi16(packed, 4), high_mask));
+            const __m128i high = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(packed, 4), low_mask),
+                                              _mm_and_si128(_mm_srli_epi16(packed, 8), high_mask));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(output), _mm_packus_epi16(low, high));
+#else
+            for (size_t pair = 0; pair < 8; ++pair)
+            {
+                const uint8_t first = codes[pair * 2];
+                const uint8_t second = codes[pair * 2 + 1];
+                output[pair] = static_cast<uint8_t>((first & 15u) | (second & 15u) << 4);
+                output[pair + 8] = static_cast<uint8_t>((first >> 4) | (second & 240u));
+            }
+#endif
+        }
+    }
+}
+
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx2"))) static void avx2_unpack_gguf_mxfp4_rows(const uint8_t* source, uint8_t* blocks, uint8_t* scales,
+                                                                        size_t rows, size_t blocks_per_row,
+                                                                        size_t block_row_stride, size_t scale_row_stride) noexcept
+{
+    const __m256i low_mask = _mm256_set1_epi16(0x000f);
+    const __m256i high_mask = _mm256_set1_epi16(0x00f0);
+    for (size_t row = 0; row < rows; ++row)
+    {
+        const uint8_t* input = source + row * blocks_per_row * 17;
+        uint8_t* output = blocks + row * block_row_stride;
+        uint8_t* scale = scales + row * scale_row_stride;
+        size_t block = 0;
+        for (; block + 1 < blocks_per_row; block += 2)
+        {
+            // Both 16-byte loads stay within their own 17-byte GGUF block.
+            const __m256i packed = _mm256_loadu2_m128i(reinterpret_cast<const __m128i*>(input + block * 17 + 18),
+                                                       reinterpret_cast<const __m128i*>(input + block * 17 + 1));
+            const __m256i low = _mm256_or_si256(_mm256_and_si256(packed, low_mask),
+                                                _mm256_and_si256(_mm256_srli_epi16(packed, 4), high_mask));
+            const __m256i high = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask),
+                                                 _mm256_and_si256(_mm256_srli_epi16(packed, 8), high_mask));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(output + block * 16), _mm256_packus_epi16(low, high));
+            scale[block] = input[block * 17];
+            scale[block + 1] = input[(block + 1) * 17];
+        }
+        if (block < blocks_per_row)
+            unpack_gguf_mxfp4_rows_baseline(input + block * 17, output + block * 16, scale + block,
+                                            1, 1, 16, 1);
+    }
+}
+#endif
+
+using GgufMxFp4RowsKernel = void (*)(const uint8_t*, uint8_t*, uint8_t*, size_t, size_t, size_t, size_t) noexcept;
+
+static GgufMxFp4RowsKernel gguf_mxfp4_rows_kernel() noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    if ((cpu_isa_flags() & CpuIsaX86Avx2Fma) != 0)
+        return msvc_avx2_unpack_gguf_mxfp4_rows;
+#elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+    if ((cpu_isa_flags() & CpuIsaX86Avx2Fma) != 0)
+        return avx2_unpack_gguf_mxfp4_rows;
+#endif
+    return unpack_gguf_mxfp4_rows_baseline;
+}
+
+bool unpack_gguf_mxfp4_rows(std::span<const uint8_t> source,
+                            size_t blocks_per_row,
+                            size_t block_row_stride,
+                            size_t scale_row_stride,
+                            std::span<uint8_t> blocks,
+                            std::span<uint8_t> scales) noexcept
+{
+    if (source.empty() || source.size() % 17 != 0 || blocks_per_row == 0
+        || source.size() / 17 % blocks_per_row != 0)
+        return false;
+    const size_t rows = source.size() / 17 / blocks_per_row;
+    // blocks_per_row <= source.size()/17, so this product cannot overflow.
+    const size_t block_row_bytes = blocks_per_row * 16;
+    if (block_row_stride < block_row_bytes || scale_row_stride < blocks_per_row
+        || blocks.size() < block_row_bytes || scales.size() < blocks_per_row
+        || rows - 1 > (blocks.size() - block_row_bytes) / block_row_stride
+        || rows - 1 > (scales.size() - blocks_per_row) / scale_row_stride
+        || gguf_mxfp4_overlap(source.data(), source.size(), blocks.data(), blocks.size())
+        || gguf_mxfp4_overlap(source.data(), source.size(), scales.data(), scales.size())
+        || gguf_mxfp4_overlap(blocks.data(), blocks.size(), scales.data(), scales.size()))
+        return false;
+    static const GgufMxFp4RowsKernel kernel = gguf_mxfp4_rows_kernel();
+    const GgufMxFp4RowsKernel selected = blocks_per_row > 1 ? kernel : unpack_gguf_mxfp4_rows_baseline;
+    selected(source.data(), blocks.data(), scales.data(), rows, blocks_per_row, block_row_stride, scale_row_stride);
+    return true;
+}
+
 bool unpack_gguf_mxfp4(std::span<const uint8_t> source,
                        std::span<uint8_t> blocks,
                        std::span<uint8_t> scales) noexcept
 {
     if (source.empty() || source.size() % 17 != 0
-        || scales.size() != source.size() / 17
-        || blocks.size() != scales.size() * 16)
+        || scales.size() != source.size() / 17 || blocks.size() != scales.size() * 16)
         return false;
-    for (size_t block = 0; block < scales.size(); ++block)
-    {
-        const uint8_t* codes = source.data() + block * 17 + 1;
-        uint8_t* output = blocks.data() + block * 16;
-        scales[block] = source[block * 17];
-        for (size_t pair = 0; pair < 8; ++pair)
-        {
-            const uint8_t first = codes[pair * 2];
-            const uint8_t second = codes[pair * 2 + 1];
-            output[pair] = static_cast<uint8_t>((first & 15u) | (second & 15u) << 4);
-            output[pair + 8] = static_cast<uint8_t>((first >> 4) | (second & 240u));
-        }
-    }
-    return true;
+    return unpack_gguf_mxfp4_rows(source, scales.size(), blocks.size(), scales.size(), blocks, scales);
 }
 
 static std::array<float, 256> make_scale_table()

@@ -112,8 +112,9 @@ static void test_key_sharded_routing()
     std::array<std::string, 2> keys = {"first", "second"};
     for (size_t index = 0; index < keys.size(); ++index)
     {
+        // An odd suffix changes the low FNV hash bit on MSVC too.
         while (std::hash<std::string_view>{}(keys[index]) % children.size() != index)
-            keys[index] += 'x';
+            keys[index] += 'a';
     }
     auto weight = std::make_shared<TensorData>();
     for (size_t index = 0; index < keys.size(); ++index)
