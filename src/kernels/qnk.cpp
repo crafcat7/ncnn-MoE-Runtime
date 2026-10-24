@@ -69,6 +69,13 @@ static float load_f16(const uint8_t* source) noexcept
     return half_to_float(load_u16(source));
 }
 
+static uint32_t load_u32(const uint8_t* source) noexcept
+{
+    uint32_t value = 0;
+    std::memcpy(&value, source, sizeof(value));
+    return value;
+}
+
 struct QnKOutput
 {
     float* output;
@@ -400,6 +407,54 @@ static void dequantize_q8_0(const uint8_t* block, QnKOutput& output) noexcept
 #endif
 }
 
+static constexpr std::array<int8_t, 16> iq4_nl_values = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+static void dequantize_iq4_nl(const uint8_t* block, QnKOutput& output) noexcept
+{
+    const float scale = load_f16(block);
+    const uint8_t* values = block + 2;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const int8x16_t table = vld1q_s8(iq4_nl_values.data());
+    const uint8x16_t packed = vld1q_u8(values);
+    const int8x16_t low = vqtbl1q_s8(table, vandq_u8(packed, vdupq_n_u8(15)));
+    const int8x16_t high = vqtbl1q_s8(table, vshrq_n_u8(packed, 4));
+    qnk_i8_to_f32(vget_low_s8(low), scale, 0.0f, false, output, 0);
+    qnk_i8_to_f32(vget_high_s8(low), scale, 0.0f, false, output, 8);
+    qnk_i8_to_f32(vget_low_s8(high), scale, 0.0f, false, output, 16);
+    qnk_i8_to_f32(vget_high_s8(high), scale, 0.0f, false, output, 24);
+#else
+    for (uint32_t index = 0; index < 16; ++index)
+    {
+        output.output[index] = scale * static_cast<float>(iq4_nl_values[values[index] & 15u]);
+        output.output[index + 16] = scale * static_cast<float>(iq4_nl_values[values[index] >> 4]);
+    }
+#endif
+}
+
+static void dequantize_q5_1(const uint8_t* block, QnKOutput& output) noexcept
+{
+    const float scale = load_f16(block);
+    const float minimum = load_f16(block + 2);
+    const uint32_t high = load_u32(block + 4);
+    const uint8_t* values = block + 8;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    std::array<int8_t, 32> decoded;
+    for (uint32_t index = 0; index < 32; ++index)
+        decoded[index] = static_cast<int8_t>(((values[index % 16] >> (index / 16 * 4)) & 15u)
+                                             | (((high >> index) & 1u) << 4));
+    for (uint32_t index = 0; index < 32; index += 8)
+        qnk_i8_to_f32(vld1_s8(decoded.data() + index), scale, -minimum, true, output, index);
+#else
+    for (uint32_t index = 0; index < 32; ++index)
+    {
+        const uint32_t value = ((values[index % 16] >> (index / 16 * 4)) & 15u)
+                               | (((high >> index) & 1u) << 4);
+        output.output[index] = scale * static_cast<float>(value) + minimum;
+    }
+#endif
+}
+
 template<bool paired>
 static void qnk_gemm(const uint8_t* raw,
                      const QnKPack* packed,
@@ -575,7 +630,7 @@ static void qnk_gemm(const uint8_t* raw,
 #else
 #if defined(_OPENMP)
     const uint64_t operation_count = static_cast<uint64_t>(rows + rows2) * columns * token_count;
-    const int team_size = dtype == DType::Q8_0
+    const int team_size = qnk_block_size(dtype) == 32
                               ? static_cast<int>(std::min<size_t>(rows + rows2, static_cast<size_t>(cpu_linear_team_size(operation_count, dtype))))
                               : 1;
 #pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
@@ -616,7 +671,9 @@ static std::shared_ptr<const QnKPack> get_qnk_packed_weights(const TensorData& m
 
 uint32_t qnk_block_size(DType dtype) noexcept
 {
-    return dtype == DType::Q8_0 ? 32 : (is_qnk_dtype(dtype) ? qnk_block_elements : 0);
+    return dtype == DType::Q8_0 || dtype == DType::IQ4NL || dtype == DType::Q5_1
+               ? 32
+               : (is_qnk_dtype(dtype) ? qnk_block_elements : 0);
 }
 
 size_t qnk_block_bytes(DType dtype) noexcept
@@ -630,6 +687,8 @@ size_t qnk_block_bytes(DType dtype) noexcept
     case DType::Q6K: return 210;
     case DType::Q8K: return 292;
     case DType::Q8_0: return 34;
+    case DType::IQ4NL: return 18;
+    case DType::Q5_1: return 24;
     default: return 0;
     }
 }
@@ -698,6 +757,8 @@ static inline float forward_qnk(DType dtype,
     case DType::Q6K: dequantize_q6(block, local); break;
     case DType::Q8K: dequantize_q8(block, local); break;
     case DType::Q8_0: dequantize_q8_0(block, local); break;
+    case DType::IQ4NL: dequantize_iq4_nl(block, local); break;
+    case DType::Q5_1: dequantize_q5_1(block, local); break;
     default:
         if (output)
             std::fill_n(output, qnk_block_elements, 0.0f);
@@ -733,23 +794,39 @@ float qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexc
 {
     if (!block || !input)
         return 0.0f;
-    if (dtype == DType::Q8_0)
+    if (qnk_block_size(dtype) == 32)
     {
-        // Consume the original FP16 scale and signed bytes directly. Q8_K's
-        // integer-dot kernels and activation quantization use a different ABI.
+        // Consume the native FP16 scale and codes directly. K-series integer
+        // kernels and activation quantization use a different block ABI.
 #if defined(__aarch64__) || defined(_M_ARM64)
         return forward_qnk(dtype, block, input, nullptr);
 #else
         const float scale = load_f16(block);
-        const int8_t* values = reinterpret_cast<const int8_t*>(block + 2);
         float sum = 0.0f;
+        if (dtype == DType::Q5_1)
+        {
+            const float minimum = load_f16(block + 2);
+            const uint32_t high = load_u32(block + 4);
+            for (uint32_t index = 0; index < 32; ++index)
+            {
+                const uint32_t value = ((block[8 + index % 16] >> (index / 16 * 4)) & 15u)
+                                       | (((high >> index) & 1u) << 4);
+                sum += (scale * static_cast<float>(value) + minimum) * input[index];
+            }
+            return sum;
+        }
         for (uint32_t index = 0; index < 32; ++index)
-            sum += (scale * static_cast<float>(values[index])) * input[index];
+        {
+            const int8_t value = dtype == DType::IQ4NL
+                                     ? iq4_nl_values[(block[2 + index % 16] >> (index / 16 * 4)) & 15u]
+                                     : reinterpret_cast<const int8_t*>(block + 2)[index];
+            sum += (scale * static_cast<float>(value)) * input[index];
+        }
         return sum;
 #endif
     }
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    if (is_qnk_dtype(dtype) && dtype != DType::Q8_0)
+    if (qnk_block_size(dtype) == qnk_block_elements)
     {
         if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
             return msvc_avx512_qnk_dot_block(dtype, block, input);
@@ -934,11 +1011,11 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
         if (input.dtype() != DType::Float32 && input.dtype() != DType::BFloat16)
             return false;
         for (size_t index = 0; index < matrix_count; ++index)
-            if (weights[index]->dtype != DType::Q8_0
+            if (qnk_block_size(weights[index]->dtype) != 32
                 || (results[index]->dtype() != DType::Float32 && results[index]->dtype() != DType::BFloat16))
                 return false;
-        // Only activations are widened. The immutable Q8_0 weight storage and
-        // optional packed sidecar retain their original 34-byte blocks.
+        // Only activations are widened. Immutable short-block weights and
+        // optional packed sidecars retain their original native bytes.
         ActivationBuffer prepared;
         const ActivationBuffer* float_input = &input;
         if (input.dtype() == DType::BFloat16)
@@ -1014,13 +1091,13 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
             return false;
 
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-        if (matrix.dtype != DType::Q8_0 && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
+        if (qnk_block_size(matrix.dtype) == qnk_block_elements && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
         {
             msvc_avx512_qnk_gemm(*packed, input.row(0), columns, input.rows(),
                                  results[0]->row(0), results[0]->columns());
             return true;
         }
-        if (matrix.dtype != DType::Q8_0 && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
+        if (qnk_block_size(matrix.dtype) == qnk_block_elements && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
         {
             msvc_avx2_qnk_gemm(*packed, input.row(0), columns, input.rows(),
                                results[0]->row(0), results[0]->columns());

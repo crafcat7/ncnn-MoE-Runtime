@@ -520,12 +520,16 @@ static Result<QuantizedTensorInfo> tensor_encoding(const SafetensorsArchive& arc
     const SafetensorInfo* source = archive.find(name);
     if (!source)
         return Error{ErrorCode::InvalidModel, "missing safetensors tensor: " + name};
-    if (source->ggml_type == 8 || (source->ggml_type >= 10 && source->ggml_type <= 15))
+    if (source->ggml_type == 7 || source->ggml_type == 8 || source->ggml_type == 20
+        || (source->ggml_type >= 10 && source->ggml_type <= 15))
     {
         static constexpr DType types[] = {DType::Q2K, DType::Q3K, DType::Q4K, DType::Q5K, DType::Q6K, DType::Q8K};
         if (source->shape.size() != 2)
             return Error{ErrorCode::InvalidModel, "GGUF block-quantized tensor must be a matrix: " + name};
-        const DType dtype = source->ggml_type == 8 ? DType::Q8_0 : types[source->ggml_type - 10];
+        const DType dtype = source->ggml_type == 7    ? DType::Q5_1
+                            : source->ggml_type == 8  ? DType::Q8_0
+                            : source->ggml_type == 20 ? DType::IQ4NL
+                                                      : types[source->ggml_type - 10];
         return QuantizedTensorInfo{dtype, source->shape[0], source->shape[1], 0};
     }
     if (source->dtype == "MXFP4")
@@ -636,7 +640,7 @@ std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(const std::string
         return {};
 
     const SafetensorInfo* source = find(name);
-    const std::array<DType, 7> dtypes = {
+    const std::array<DType, 9> dtypes = {
         DType::Q2K,
         DType::Q3K,
         DType::Q4K,
@@ -644,6 +648,8 @@ std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(const std::string
         DType::Q6K,
         DType::Q8K,
         DType::Q8_0,
+        DType::Q5_1,
+        DType::IQ4NL,
     };
     for (const DType dtype : dtypes)
     {
@@ -657,8 +663,10 @@ std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(const std::string
         if (source
             && source->dtype == "U8"
             && source->size == bank_size
-            && (source->ggml_type == UINT32_MAX
+            && ((source->ggml_type == UINT32_MAX && dtype != DType::Q5_1 && dtype != DType::IQ4NL)
+                || (source->ggml_type == 7 && dtype == DType::Q5_1)
                 || (source->ggml_type == 8 && dtype == DType::Q8_0)
+                || (source->ggml_type == 20 && dtype == DType::IQ4NL)
                 || (source->ggml_type >= 10 && source->ggml_type <= 15 && dtypes[source->ggml_type - 10] == dtype)))
         {
             return dtype;
@@ -844,7 +852,8 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name, uint
     if (const auto* info = find(name); info && info->transform)
     {
         if (has_flag(flags, SafetensorLoadDeferMxfp4Data)
-            && (info->ggml_type == 8 || (info->ggml_type >= 10 && info->ggml_type <= 15)))
+            && (info->ggml_type == 7 || info->ggml_type == 8 || info->ggml_type == 20
+                || (info->ggml_type >= 10 && info->ggml_type <= 15)))
         {
             auto encoding = tensor_encoding(*this, name);
             if (!encoding)
@@ -1281,8 +1290,12 @@ Result<TensorData> SafetensorsArchive::load_gguf_source(SafetensorInfo info,
 static bool qnk_ggml_type_matches(uint32_t type, DType dtype) noexcept
 {
     static constexpr DType types[] = {DType::Q2K, DType::Q3K, DType::Q4K, DType::Q5K, DType::Q6K, DType::Q8K};
+    if (type == 7)
+        return dtype == DType::Q5_1;
     if (type == 8)
         return dtype == DType::Q8_0;
+    if (type == 20)
+        return dtype == DType::IQ4NL;
     return type >= 10 && type <= 15 && types[type - 10] == dtype;
 }
 

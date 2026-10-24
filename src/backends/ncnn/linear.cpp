@@ -5294,6 +5294,10 @@ static size_t qnk_shader_type(DType dtype) noexcept
         return 8;
     if (dtype == DType::Q8_0)
         return 9;
+    if (dtype == DType::IQ4NL)
+        return 10;
+    if (dtype == DType::Q5_1)
+        return 11;
     return static_cast<size_t>(dtype) - static_cast<size_t>(DType::Q2K);
 }
 
@@ -5740,7 +5744,8 @@ void QnkLinear_vulkan::record(const ncnn::VkMat& input,
     // ncnn may round the requested 32 lanes up to the device subgroup size.
     // One complete workgroup computes one output column on every device.
     uint32_t column_groups = implementation.output_columns;
-    if (implementation.dtype == DType::Q8_0)
+    if (implementation.dtype == DType::Q8_0 || implementation.dtype == DType::IQ4NL
+        || implementation.dtype == DType::Q5_1)
     {
         // A vocabulary-sized Q8_0 LM Head can exceed the guaranteed 65535
         // workgroups along X. Retain one row per workgroup and tile over Z.

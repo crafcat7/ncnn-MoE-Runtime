@@ -175,10 +175,10 @@ static void check_split(const std::filesystem::path& root)
 
 static void check_encodings(const std::filesystem::path& root)
 {
-    const std::array<uint32_t, 11> types = {0, 1, 8, 10, 11, 12, 13, 14, 15, 26, 30};
-    const std::array<size_t, 11> sizes = {1024, 512, 272, 84, 110, 144, 176, 210, 292, 1024, 512};
-    const std::array<DType, 11> dtypes = {DType::Float32, DType::Float16, DType::Q8_0, DType::Q2K, DType::Q3K, DType::Q4K,
-                                          DType::Q5K, DType::Q6K, DType::Q8K, DType::Int32, DType::BFloat16};
+    const std::array<uint32_t, 13> types = {0, 1, 7, 8, 10, 11, 12, 13, 14, 15, 20, 26, 30};
+    const std::array<size_t, 13> sizes = {1024, 512, 192, 272, 84, 110, 144, 176, 210, 292, 144, 1024, 512};
+    const std::array<DType, 13> dtypes = {DType::Float32, DType::Float16, DType::Q5_1, DType::Q8_0, DType::Q2K, DType::Q3K, DType::Q4K,
+                                          DType::Q5K, DType::Q6K, DType::Q8K, DType::IQ4NL, DType::Int32, DType::BFloat16};
     for (size_t i = 0; i < types.size(); ++i)
     {
         const auto path = root / "encodings" / (std::to_string(types[i]) + ".gguf");
@@ -230,12 +230,14 @@ static void check_invalid_files(const std::filesystem::path& root)
     reject(fixture_bytes({oversized}, {}), "GGUF accepted an oversized array length");
 }
 
-static void check_qnk_defer_fallback(const std::filesystem::path& root, DType dtype, uint32_t ggml_type)
+static void check_qnk_defer_fallback(const std::filesystem::path& root, DType dtype, uint32_t ggml_type, uint32_t columns = 0,
+                                     bool vector_shared_gate = false)
 {
     constexpr uint32_t rows = 8;
-    const uint32_t columns = dtype == DType::Q8_0 ? 32u : 256u;
+    if (columns == 0)
+        columns = qnk_block_size(dtype);
     const std::string name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
-    const auto path = root / ("qwen-qnk-" + std::to_string(ggml_type)) / "model.gguf";
+    const auto path = root / ("qwen-qnk-" + std::to_string(ggml_type) + "-" + std::to_string(columns) + (vector_shared_gate ? "-vector-gate" : "-matrix-gate")) / "model.gguf";
     FixtureMetadata tokens{"tokenizer.ggml.tokens", 9, {}};
     append_unsigned(tokens.payload, 8, 4);
     append_unsigned(tokens.payload, 1, 8);
@@ -263,19 +265,40 @@ static void check_qnk_defer_fallback(const std::filesystem::path& root, DType dt
         integer_metadata("qwen35.feed_forward_length", 4),
         std::move(tokens)};
     const std::vector<uint8_t> hidden(4 * columns * sizeof(uint16_t));
-    const bool q8_0 = dtype == DType::Q8_0;
-    const std::vector<uint8_t> embedding(q8_0 ? row_bytes : columns * sizeof(float), 0x35);
-    write_bytes(path, fixture_bytes(metadata,
-                                    {{"token_embd.weight", q8_0 ? 8u : 0u, {columns, 1}, embedding},
-                                     {"blk.0.attn_qkv.weight", ggml_type, {columns, rows}, std::move(qkv)},
-                                     {"blk.0.attn_gate.weight", 30, {columns, 4}, hidden},
-                                     {"blk.0.ssm_alpha.weight", 30, {columns, 4}, hidden},
-                                     {"blk.0.ssm_beta.weight", 30, {columns, 4}, hidden},
-                                     {"blk.0.ssm_out.weight", 30, {4, columns}, hidden},
-                                     {"blk.0.ssm_conv1d.weight", 30, {1, rows}, std::vector<uint8_t>(rows * sizeof(uint16_t))}}));
+    const bool native_small_block = qnk_block_size(dtype) == 32;
+    const std::vector<uint8_t> embedding(native_small_block ? row_bytes : columns * sizeof(float), 0x35);
+    std::vector<uint8_t> shared_gate;
+    for (uint32_t column = 0; column < columns; ++column)
+        append_unsigned(shared_gate, 0x3f000000u, sizeof(float)); // Nonzero 0.5f.
+    std::vector<FixtureTensor> tensors = {{"token_embd.weight", native_small_block ? ggml_type : 0u, {columns, 1}, embedding},
+                                          {"blk.0.attn_qkv.weight", ggml_type, {columns, rows}, std::move(qkv)},
+                                          {"blk.0.attn_gate.weight", 30, {columns, 4}, hidden},
+                                          {"blk.0.ssm_alpha.weight", 30, {columns, 4}, hidden},
+                                          {"blk.0.ssm_beta.weight", 30, {columns, 4}, hidden},
+                                          {"blk.0.ssm_out.weight", 30, {4, columns}, hidden},
+                                          {"blk.0.ssm_conv1d.weight", 30, {1, rows}, std::vector<uint8_t>(rows * sizeof(uint16_t))},
+                                          {"blk.0.ffn_gate_inp_shexp.weight", 0,
+                                           vector_shared_gate ? std::vector<uint64_t>{columns} : std::vector<uint64_t>{columns, 1}, shared_gate}};
+    write_bytes(path, fixture_bytes(metadata, tensors));
 
     auto archive = SafetensorsArchive::open(path);
     check(static_cast<bool>(archive), archive ? "" : archive.error().message);
+    const std::string shared_name = "model.language_model.layers.0.mlp.shared_expert_gate.weight";
+    auto original = GgufArchive::open(path);
+    check(static_cast<bool>(original), "cannot reopen shared gate fixture metadata");
+    const GgufTensorInfo* source_gate = original.value().find("blk.0.ffn_gate_inp_shexp.weight");
+    const SafetensorInfo* mapped_gate = archive.value().find(shared_name);
+    check(source_gate && mapped_gate && mapped_gate->shape == std::vector<uint32_t>{1, columns}
+              && !mapped_gate->transform && mapped_gate->path == source_gate->path
+              && mapped_gate->offset == source_gate->offset && mapped_gate->size == source_gate->size
+              && mapped_gate->ggml_type == source_gate->ggml_type,
+          "Qwen singleton shared gate did not preserve its file range and logical Linear shape");
+    auto gate = archive.value().load_tensor(shared_name);
+    check(gate && gate.value().shape == std::vector<uint32_t>{1, columns}
+              && gate.value().bfloat16_values().size() == columns
+              && std::all_of(gate.value().bfloat16_values().begin(), gate.value().bfloat16_values().end(),
+                             [](uint16_t value) { return value == 0x3f00; }),
+          "Qwen vector shared gate lost its nonzero payload");
     auto loaded = archive.value().load_tensor(name, SafetensorLoadDeferMxfp4Data);
     check(static_cast<bool>(loaded), loaded ? "" : loaded.error().message);
     check(loaded.value().dtype == dtype && loaded.value().shape == std::vector<uint32_t>{rows, columns}
@@ -287,24 +310,35 @@ static void check_qnk_defer_fallback(const std::filesystem::path& root, DType dt
         check(values[static_cast<size_t>(row) * row_bytes] == source_rows[row] + 1,
               "eager Qn_K fallback did not preserve transformed row order");
 
-    if (q8_0)
+    if (native_small_block)
     {
         auto raw = archive.value().load_tensor("model.language_model.embed_tokens.weight");
-        check(raw && raw.value().dtype == DType::Q8_0
+        check(raw && raw.value().dtype == dtype
                   && raw.value().shape == std::vector<uint32_t>{1, columns}
                   && raw.value().mapped_data && raw.value().quantized_data.empty()
                   && raw.value().float32_data.empty() && raw.value().bfloat16_data.empty()
                   && raw.value().qnk_values().size() == embedding.size()
                   && std::equal(embedding.begin(), embedding.end(), raw.value().qnk_values().begin()),
-              "Q8_0 loading expanded or changed compact mapped storage");
-        check(archive.value().find_qnk_expert_dtype("model.language_model.embed_tokens.weight", 1, 1, columns) == DType::Q8_0,
-              "Q8_0 expert bank detection required 256-column K blocks");
+              "native GGML loading expanded or changed compact mapped storage");
+        check(archive.value().find_qnk_expert_dtype("model.language_model.embed_tokens.weight", 1, 1, columns) == dtype,
+              "native Expert bank detection confused equal byte sizes or required K blocks");
     }
 
     auto invalid = archive.value().load_qnk_tensor(name, dtype, rows - 1, columns, SafetensorLoadDeferMxfp4Data);
     check(!invalid && invalid.error().code == ErrorCode::InvalidModel
               && invalid.error().message == "GGUF Qn_K transform shape mismatch",
           "invalid deferred Qn_K request was hidden by eager fallback");
+    if (vector_shared_gate)
+    {
+        tensors.back().shape = {static_cast<uint64_t>(columns) + 1};
+        append_unsigned(tensors.back().payload, 0x3f000000u, sizeof(float));
+        const auto invalid_path = path.parent_path() / "wrong-gate-width.gguf";
+        write_bytes(invalid_path, fixture_bytes(metadata, tensors));
+        auto bad_gate = SafetensorsArchive::open(invalid_path);
+        check(!bad_gate && bad_gate.error().code == ErrorCode::InvalidModel
+                  && bad_gate.error().message.find("shared Expert gate shape") != std::string::npos,
+              "Qwen GGUF accepted a singleton shared gate with the wrong hidden width");
+    }
 }
 
 static void check_directory_selection(const std::filesystem::path& root)
@@ -391,6 +425,12 @@ int main(int argc, char** argv)
         ncnn::moe::check_invalid_files(root);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q4K, 12);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q8_0, 8);
+        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q5_1, 7);
+        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::IQ4NL, 20);
+        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::IQ4NL, 20, 160);
+        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::IQ4NL, 20, 256);
+        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q8_0, 8, 2560, true);
+        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q8_0, 8, 2560, false);
         ncnn::moe::check_directory_selection(root);
         std::filesystem::remove_all(root);
         std::cout << "GGUF parser tests passed\n";

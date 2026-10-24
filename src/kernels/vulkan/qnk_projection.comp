@@ -66,6 +66,10 @@ float qnk_f16(uint index)
     return unpackHalf2x16(qnk_u16(index)).x;
 }
 
+// GGML IQ4_NL stores codebook indices rather than signed/affine INT4 codes.
+const int iq4_nl_values[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10,
+                                      1, 13, 25, 38, 53, 69, 89, 113);
+
 float projection_input(uint row, uint column)
 {
     const uint logical_column = p.columns_offset == 0u ? column : qnk_u32(p.columns_offset + column * 4u);
@@ -232,6 +236,35 @@ void main()
                 const uint block_offset = matrix_row + block * p.block_bytes;
                 const float weight = qnk_f16(block_offset)
                                      * float(qnk_signed_byte(qnk_byte(block_offset + 2u + lane)));
+                sum += weight * projection_input(input_row, block * 32u + lane);
+            }
+        }
+        else if (p.qnk_type == 10u)
+        {
+            // Native IQ4_NL: FP16 scale followed by 16 bytes. Low nibbles
+            // encode lanes 0..15, high nibbles encode lanes 16..31. The
+            // 18-byte stride is deliberately read through byte addressing.
+            const uint matrix_row = output_column * p.block_count * p.block_bytes;
+            for (uint block = 0u; block < p.block_count; ++block)
+            {
+                const uint block_offset = matrix_row + block * p.block_bytes;
+                const uint packed = qnk_byte(block_offset + 2u + (lane & 15u));
+                const uint code = (packed >> (lane < 16u ? 0u : 4u)) & 15u;
+                const float weight = qnk_f16(block_offset) * float(iq4_nl_values[code]);
+                sum += weight * projection_input(input_row, block * 32u + lane);
+            }
+        }
+        else if (p.qnk_type == 11u)
+        {
+            // Native Q5_1: FP16 d/m, four high-bit bytes, then 16 nibbles.
+            const uint matrix_row = output_column * p.block_count * p.block_bytes;
+            for (uint block = 0u; block < p.block_count; ++block)
+            {
+                const uint block_offset = matrix_row + block * p.block_bytes;
+                const uint packed = qnk_byte(block_offset + 8u + (lane & 15u));
+                const uint low = (packed >> (lane < 16u ? 0u : 4u)) & 15u;
+                const uint high = (qnk_byte(block_offset + 4u + (lane >> 3u)) >> (lane & 7u)) & 1u;
+                const float weight = qnk_f16(block_offset) * float(low | (high << 4u)) + qnk_f16(block_offset + 2u);
                 sum += weight * projection_input(input_row, block * 32u + lane);
             }
         }

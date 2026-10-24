@@ -518,6 +518,15 @@ Result<std::unordered_map<std::string, SafetensorInfo>> gguf_qwen_tensors(const 
         SafetensorInfo info = qwen_gguf_info(tensor);
         GgufTensorTransform transform;
         const std::string& canonical = target.value();
+        if (canonical.ends_with(".mlp.shared_expert_gate.weight"))
+        {
+            // GGML writes this one-output Linear as an n_embd vector. Restore
+            // its logical row without transforming or copying the file range.
+            if (info.shape == std::vector<uint32_t>{config.hidden})
+                info.shape.insert(info.shape.begin(), 1);
+            else if (info.shape != std::vector<uint32_t>{1, config.hidden})
+                return Error{ErrorCode::InvalidModel, "invalid Qwen GGUF shared Expert gate shape: " + name};
+        }
         if ((canonical.ends_with("norm.weight") || canonical.ends_with(".ple.norm_key.weight")
              || canonical.ends_with(".ple.norm_query.weight") || canonical.ends_with(".ple.norm_conv.weight"))
             && !canonical.ends_with("linear_attn.norm.weight"))

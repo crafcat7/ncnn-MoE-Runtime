@@ -15,7 +15,7 @@ namespace ncnn {
 namespace moe {
 
 // Qn_K uses 256-value blocks; Q8_K is the activation format for its dot products.
-// This is also the maximum scratch size. Q8_0 row strides use qnk_block_size.
+// This is also the maximum scratch size. Native row strides use qnk_block_size.
 inline constexpr uint32_t qnk_block_elements = 256;
 
 [[nodiscard]] uint32_t qnk_block_size(DType dtype) noexcept;

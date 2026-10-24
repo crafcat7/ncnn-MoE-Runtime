@@ -110,7 +110,7 @@ python tools/ncnn_moe.py run --model "./models/DeepSeek-GGUF" `
 | GGUF | Little-endian `qwen35`, `qwen35moe`, `qwen4exp`, `gpt-oss`, and `deepseek4`; single or standard split files |
 
 GGUF Embedding, Attention, output-head, FFN, shared-Expert and routed-Expert
-Q8_0 and Q2_K–Q8_K blocks remain lossless and use native CPU/Vulkan kernels. GPT-OSS
+Q5_1, Q8_0, IQ4_NL and Q2_K–Q8_K blocks remain lossless and use native CPU/Vulkan kernels. GPT-OSS
 and DeepSeek MXFP4 Expert blocks are also retained. Mixed projection formats
 are supported. Embedding and PLE decode only selected rows; recurrent output
 projections permute activations while retaining packed weights. Flash-Next

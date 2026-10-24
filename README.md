@@ -261,6 +261,9 @@ the portability and correctness fallback.
 Native GGUF Q8_0 weights use a separate 32-value, 34-byte block format and
 retain their original bytes for CPU and Vulkan execution. They do not use
 Q8_K's 256-value activation-quantization kernels or expand into BF16 at load.
+Native Q5_1 and IQ4_NL also keep their original 32-value blocks, using 24 and
+18 bytes respectively. Mixed Expert projections retain each matrix's encoding;
+large IQ4_NL PLE embeddings decode only the selected rows.
 
 `--cpu-packed-weights on` explicitly enables lazy in-memory repacking for
 supported Qn_K and MXFP4-Q8 CPU Expert weights. Canonical BF16 weights use the

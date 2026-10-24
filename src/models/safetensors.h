@@ -71,8 +71,8 @@ public:
     [[nodiscard]] Result<TensorData> load_float32_tensor(const std::string& name) const;
     [[nodiscard]] Result<TensorData> load_bfloat16_slice(const std::string& name, uint32_t index, std::vector<uint32_t> shape) const;
     [[nodiscard]] Result<TensorData> load_float8_tensor(const std::string& weight_name, const std::string& scale_name) const;
-    // Detect a native Q2_K..Q8_K or Q8_0 Expert bank by byte count and, for GGUF,
-    // its original encoding. Q8_0 retains 32-value blocks.
+    // Detect native GGML Expert banks by byte count and, for GGUF, the original
+    // encoding. Equal byte counts do not make IQ4_NL and Q4_K interchangeable.
     [[nodiscard]] std::optional<DType> find_qnk_expert_dtype(const std::string& name,
                                                              uint32_t expert_count,
                                                              uint32_t rows,
