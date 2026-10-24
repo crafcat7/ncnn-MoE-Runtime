@@ -349,6 +349,192 @@ static const char qwen38_template[] = R"QWEN38({%- set image_count = namespace(v
     {%- endif %}
 {%- endif %})QWEN38";
 
+// Exact Unsloth Qwen3.8 revision exported by the supported GGUF package.
+static const char qwen38_unsloth_template[] = R"QWEN38U({%- set image_count = namespace(value=0) %}
+{%- set video_count = namespace(value=0) %}
+{%- macro render_content(content, do_vision_count, is_system_content=false) %}
+    {%- if content is string %}
+        {{- content }}
+    {%- elif content is iterable and content is not mapping %}
+        {%- for item in content %}
+            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}
+                {%- if is_system_content %}
+                    {{- raise_exception('System message cannot contain images.') }}
+                {%- endif %}
+                {%- if do_vision_count %}
+                    {%- set image_count.value = image_count.value + 1 %}
+                {%- endif %}
+                {%- if add_vision_id %}
+                    {{- 'Picture ' ~ image_count.value ~ ': ' }}
+                {%- endif %}
+                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
+            {%- elif 'video' in item or item.type == 'video' %}
+                {%- if is_system_content %}
+                    {{- raise_exception('System message cannot contain videos.') }}
+                {%- endif %}
+                {%- if do_vision_count %}
+                    {%- set video_count.value = video_count.value + 1 %}
+                {%- endif %}
+                {%- if add_vision_id %}
+                    {{- 'Video ' ~ video_count.value ~ ': ' }}
+                {%- endif %}
+                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}
+            {%- elif 'text' in item %}
+                {{- item.text }}
+            {%- else %}
+                {{- raise_exception('Unexpected item type in content.') }}
+            {%- endif %}
+        {%- endfor %}
+    {%- elif content is none or content is undefined %}
+        {{- '' }}
+    {%- else %}
+        {{- raise_exception('Unexpected content type.') }}
+    {%- endif %}
+{%- endmacro %}
+{%- if not messages %}
+    {{- raise_exception('No messages provided.') }}
+{%- endif %}
+{%- set sysns = namespace(count=0, text='') %}
+{%- for message in messages %}
+    {%- if sysns.count == loop.index0 and (message.role == 'system' or message.role == 'developer') %}
+        {%- set sys_content = render_content(message.content, false, true)|trim %}
+        {%- if sys_content %}
+            {%- set sysns.text = sysns.text + ('\n' if sysns.text else '') + sys_content %}
+        {%- endif %}
+        {%- set sysns.count = sysns.count + 1 %}
+    {%- endif %}
+{%- endfor %}
+{%- set num_sys = sysns.count %}
+{%- set merged_system = sysns.text %}
+{%- set reasoning_instructions = '' %}
+{%- if enable_thinking is undefined or enable_thinking is true %}
+    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+    {%- if resolved_reasoning_effort == 'high' %}
+        {%- set resolved_reasoning_effort = 'xhigh' %}
+    {%- endif %}
+    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
+        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}
+    {%- endif %}
+    {%- if resolved_reasoning_effort == 'xhigh' %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
+    {%- elif resolved_reasoning_effort == 'low' %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
+    {%- endif %}
+{%- endif %}
+{%- if tools and tools is iterable and tools is not mapping %}
+    {{- '<|im_start|>system\n' }}
+    {%- if reasoning_instructions %}
+        {{- reasoning_instructions + '\n\n' }}
+    {%- endif %}
+    {{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>" }}
+    {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
+    {%- if merged_system %}
+        {{- '\n\n' + merged_system }}
+    {%- endif %}
+    {{- '<|im_end|>\n' }}
+{%- else %}
+    {%- if merged_system %}
+        {{- '<|im_start|>system\n' + (reasoning_instructions + '\n\n' if reasoning_instructions else '')  + merged_system + '<|im_end|>\n' }}
+    {%- elif reasoning_instructions %}
+        {{- '<|im_start|>system\n' + reasoning_instructions + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" %}
+        {%- set content = render_content(message.content, false)|trim %}
+        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}
+            {%- set ns.multi_step_tool = false %}
+            {%- set ns.last_query_index = index %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- if loop.index0 >= num_sys %}
+    {%- set content = render_content(message.content, true)|trim %}
+    {%- if message.role == "system" or message.role == "developer" %}
+        {{- raise_exception('System message must be at the beginning.') }}
+    {%- elif message.role == "user" %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- endif %}
+        {%- set reasoning_content = reasoning_content|trim %}
+        {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}
+            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if tool_call.function is defined %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {%- if tool_call.name is not defined or tool_call.name is none %}
+                    {{- raise_exception('Tool call is missing a function name.') }}
+                {%- endif %}
+                {%- if loop.first %}
+                    {%- if content|trim %}
+                        {{- '\n\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                    {%- else %}
+                        {{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                    {%- endif %}
+                {%- else %}
+                    {{- '\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                {%- endif %}
+                {%- if tool_call.arguments is mapping %}
+                    {%- for args_name, args_value in tool_call.arguments|items %}
+                        {{- '<parameter=' + args_name + '>\n' }}
+                        {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}
+                        {{- args_value }}
+                        {{- '\n</parameter>\n' }}
+                    {%- endfor %}
+                {%- elif tool_call.arguments is string %}
+                    {%- if tool_call.arguments|trim %}
+                        {{- raise_exception('Tool call arguments for function "' + (tool_call.name | string) + '" were passed as a JSON string. Parse them into an object before calling apply_chat_template.') }}
+                    {%- endif %}
+                {%- elif tool_call.arguments is defined and tool_call.arguments is not none %}
+                    {{- raise_exception('Tool call arguments for function "' + (tool_call.name | string) + '" must be an object/mapping or a JSON string.') }}
+                {%- endif %}
+                {{- '</function>\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.previtem and loop.previtem.role != "tool" %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- content }}
+        {{- '\n</tool_response>' }}
+        {%- if not loop.last and loop.nextitem.role != "tool" %}
+            {{- '<|im_end|>\n' }}
+        {%- elif loop.last %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- else %}
+        {{- raise_exception('Unexpected message role.') }}
+    {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- else %}
+        {{- '<think>\n' }}
+    {%- endif %}
+{%- endif %}
+{#- Unsloth fixes - developer role, merged system messages, tool calling #})QWEN38U";
+
 static void append_unsigned(std::vector<uint8_t>& bytes, uint64_t value, size_t width)
 {
     for (size_t index = 0; index < width; ++index)
@@ -649,6 +835,726 @@ static void check_profile(const std::filesystem::path& root, Fixture value, bool
     check(tokenizer.encode("foo") == std::vector<int32_t>{static_cast<int32_t>(value.word_id() + 1)}, "failed reload changed active tokenizer");
 }
 
+// Golden strings were independently rendered from the pinned Jinja revisions.
+// This compares chat formatting with the fixture BPE encoder; it does not rely
+// on an external tokenizer, model package, or a runtime Jinja interpreter.
+static void check_unsloth_profile(const std::filesystem::path& root)
+{
+    auto value = fixture("qwen4exp", true);
+    value.chat = qwen38_unsloth_template;
+    check_profile(root, value, true);
+    const auto path = root / "qwen38-unsloth.gguf";
+    write_fixture(path, value);
+    Tokenizer tokenizer;
+    check(tokenizer.load(path.string()), "known Unsloth GGUF profile was rejected");
+    struct ChatGolden
+    {
+        const char* name;
+        const char* messages;
+        bool thinking;
+        const char* unsloth;
+        const char* canonical;
+    };
+    const ChatGolden cases[] = {
+        {"single-user", R"CHAT([{"role":"user","content":" U "}])CHAT", false, R"CHAT(<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         R"CHAT(<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT"},
+        {"single-user", R"CHAT([{"role":"user","content":" U "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT"},
+        {"empty-user", R"CHAT([{"role":"user","content":" \n\t "}])CHAT", false, R"CHAT(<|im_start|>user
+<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         R"CHAT(<|im_start|>user
+<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT"},
+        {"empty-user", R"CHAT([{"role":"user","content":" \n\t "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT"},
+        {"leading-developer", R"CHAT([{"role":"developer","content":" D "},{"role":"user","content":" U "}])CHAT", false, R"CHAT(<|im_start|>system
+D<|im_end|>
+<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         nullptr},
+        {"leading-developer", R"CHAT([{"role":"developer","content":" D "},{"role":"user","content":" U "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+
+D<|im_end|>
+<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         nullptr},
+        {"two-leading", R"CHAT([{"role":"system","content":" A "},{"role":"developer","content":" B "},{"role":"user","content":" U "}])CHAT", false, R"CHAT(<|im_start|>system
+A
+B<|im_end|>
+<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         nullptr},
+        {"two-leading", R"CHAT([{"role":"system","content":" A "},{"role":"developer","content":" B "},{"role":"user","content":" U "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+
+A
+B<|im_end|>
+<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         nullptr},
+        {"repeated-system", R"CHAT([{"role":"system","content":" A "},{"role":"system","content":" B "},{"role":"user","content":" U "}])CHAT", false, R"CHAT(<|im_start|>system
+A
+B<|im_end|>
+<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         nullptr},
+        {"repeated-system", R"CHAT([{"role":"system","content":" A "},{"role":"system","content":" B "},{"role":"user","content":" U "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+
+A
+B<|im_end|>
+<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         nullptr},
+        {"empty-leading", R"CHAT([{"role":"developer","content":"   "},{"role":"system","content":" A "},{"role":"system","content":"\n\t"},{"role":"developer","content":" B "},{"role":"user","content":" U "}])CHAT", false, R"CHAT(<|im_start|>system
+A
+B<|im_end|>
+<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         nullptr},
+        {"empty-leading", R"CHAT([{"role":"developer","content":"   "},{"role":"system","content":" A "},{"role":"system","content":"\n\t"},{"role":"developer","content":" B "},{"role":"user","content":" U "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+
+A
+B<|im_end|>
+<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         nullptr},
+        {"unicode-trim", R"CHAT([{"role":"system","content":"\u00a0A\u3000"},{"role":"developer","content":"\u2003B\u00a0"},{"role":"user","content":"\u3000U\u3000"}])CHAT", false, R"CHAT(<|im_start|>system
+A
+B<|im_end|>
+<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         nullptr},
+        {"unicode-trim", R"CHAT([{"role":"system","content":"\u00a0A\u3000"},{"role":"developer","content":"\u2003B\u00a0"},{"role":"user","content":"\u3000U\u3000"}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+
+A
+B<|im_end|>
+<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         nullptr},
+        {"blank-leading-user", R"CHAT([{"role":"developer","content":" "},{"role":"system","content":"\n"},{"role":"user","content":" U "}])CHAT", false, R"CHAT(<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         nullptr},
+        {"blank-leading-user", R"CHAT([{"role":"developer","content":" "},{"role":"system","content":"\n"},{"role":"user","content":" U "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+U<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         nullptr},
+        {"empty-leading-only", R"CHAT([{"role":"system","content":" "},{"role":"developer","content":"\n"}])CHAT", false, R"CHAT(<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         nullptr},
+        {"empty-leading-only", R"CHAT([{"role":"system","content":" "},{"role":"developer","content":"\n"}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         nullptr},
+        {"system-only", R"CHAT([{"role":"system","content":" A "}])CHAT", false, R"CHAT(<|im_start|>system
+A<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         nullptr},
+        {"system-only", R"CHAT([{"role":"system","content":" A "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+
+A<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         nullptr},
+        {"developer-only", R"CHAT([{"role":"developer","content":" B "}])CHAT", false, R"CHAT(<|im_start|>system
+B<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         nullptr},
+        {"developer-only", R"CHAT([{"role":"developer","content":" B "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+
+B<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         nullptr},
+        {"assistant-only", R"CHAT([{"role":"assistant","content":" X ","reasoning_content":" R "}])CHAT", false, R"CHAT(<|im_start|>assistant
+<think>
+R
+</think>
+
+X<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         nullptr},
+        {"assistant-only", R"CHAT([{"role":"assistant","content":" X ","reasoning_content":" R "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>assistant
+<think>
+R
+</think>
+
+X<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         nullptr},
+        {"tool-only", R"CHAT([{"role":"tool","content":" T "}])CHAT", false, R"CHAT(
+<tool_response>
+T
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         nullptr},
+        {"tool-only", R"CHAT([{"role":"tool","content":" T "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+
+<tool_response>
+T
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         nullptr},
+        {"user-tool-response-only", R"CHAT([{"role":"user","content":" <tool_response>T</tool_response> "}])CHAT", false, R"CHAT(<|im_start|>user
+<tool_response>T</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         nullptr},
+        {"user-tool-response-only", R"CHAT([{"role":"user","content":" <tool_response>T</tool_response> "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+<tool_response>T</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         nullptr},
+        {"nonleading-system", R"CHAT([{"role":"user","content":" U "},{"role":"system","content":""}])CHAT", false, nullptr, nullptr},
+        {"nonleading-system", R"CHAT([{"role":"user","content":" U "},{"role":"system","content":""}])CHAT", true, nullptr, nullptr},
+        {"nonleading-developer", R"CHAT([{"role":"user","content":" U "},{"role":"developer","content":" "}])CHAT", false, nullptr, nullptr},
+        {"nonleading-developer", R"CHAT([{"role":"user","content":" U "},{"role":"developer","content":" "}])CHAT", true, nullptr, nullptr},
+        {"nonleading-after-assistant", R"CHAT([{"role":"assistant","content":" A "},{"role":"developer","content":" D "},{"role":"user","content":" U "}])CHAT", false, nullptr, nullptr},
+        {"nonleading-after-assistant", R"CHAT([{"role":"assistant","content":" A "},{"role":"developer","content":" D "},{"role":"user","content":" U "}])CHAT", true, nullptr, nullptr},
+        {"prior-reasoning", R"CHAT([{"role":"user","content":" U1 "},{"role":"assistant","content":" A ","reasoning_content":" R "},{"role":"user","content":" U2 "}])CHAT", false, R"CHAT(<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+R
+</think>
+
+A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         R"CHAT(<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+R
+</think>
+
+A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT"},
+        {"prior-reasoning", R"CHAT([{"role":"user","content":" U1 "},{"role":"assistant","content":" A ","reasoning_content":" R "},{"role":"user","content":" U2 "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+R
+</think>
+
+A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+R
+</think>
+
+A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT"},
+        {"embedded-think", R"CHAT([{"role":"user","content":" U1 "},{"role":"assistant","content":"<think>R</think>A"},{"role":"user","content":" U2 "}])CHAT", false, R"CHAT(<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<think>R</think>A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         R"CHAT(<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<think>R</think>A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT"},
+        {"embedded-think", R"CHAT([{"role":"user","content":" U1 "},{"role":"assistant","content":"<think>R</think>A"},{"role":"user","content":" U2 "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<think>R</think>A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<think>R</think>A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT"},
+        {"no-reasoning-field", R"CHAT([{"role":"user","content":" U1 "},{"role":"assistant","content":" A "},{"role":"user","content":" U2 "}])CHAT", false, R"CHAT(<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         R"CHAT(<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT"},
+        {"no-reasoning-field", R"CHAT([{"role":"user","content":" U1 "},{"role":"assistant","content":" A "},{"role":"user","content":" U2 "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT"},
+        {"null-reasoning", R"CHAT([{"role":"user","content":" U1 "},{"role":"assistant","content":" A ","reasoning_content":null},{"role":"user","content":" U2 "}])CHAT", false, R"CHAT(<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         R"CHAT(<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT"},
+        {"null-reasoning", R"CHAT([{"role":"user","content":" U1 "},{"role":"assistant","content":" A ","reasoning_content":null},{"role":"user","content":" U2 "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+U1<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+A<|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT"},
+        {"grouped-tools", R"CHAT([{"role":"user","content":" U1 "},{"role":"tool","content":" T1 "},{"role":"tool","content":" T2 "},{"role":"user","content":" U2 "}])CHAT", false, R"CHAT(<|im_start|>user
+U1<|im_end|>
+<|im_start|>user
+<tool_response>
+T1
+</tool_response>
+<tool_response>
+T2
+</tool_response><|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         R"CHAT(<|im_start|>user
+U1<|im_end|>
+<|im_start|>user
+<tool_response>
+T1
+</tool_response>
+<tool_response>
+T2
+</tool_response><|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT"},
+        {"grouped-tools", R"CHAT([{"role":"user","content":" U1 "},{"role":"tool","content":" T1 "},{"role":"tool","content":" T2 "},{"role":"user","content":" U2 "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+U1<|im_end|>
+<|im_start|>user
+<tool_response>
+T1
+</tool_response>
+<tool_response>
+T2
+</tool_response><|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+U1<|im_end|>
+<|im_start|>user
+<tool_response>
+T1
+</tool_response>
+<tool_response>
+T2
+</tool_response><|im_end|>
+<|im_start|>user
+U2<|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT"},
+        {"leading-system-tool", R"CHAT([{"role":"system","content":" S "},{"role":"tool","content":" T "}])CHAT", false, R"CHAT(<|im_start|>system
+S<|im_end|>
+<|im_start|>user
+<tool_response>
+T
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)CHAT",
+         nullptr},
+        {"leading-system-tool", R"CHAT([{"role":"system","content":" S "},{"role":"tool","content":" T "}])CHAT", true, R"CHAT(<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+
+S<|im_end|>
+<|im_start|>user
+<tool_response>
+T
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+)CHAT",
+         nullptr},
+        {"unknown-role", R"CHAT([{"role":"user","content":" U "},{"role":"unknown","content":" X "}])CHAT", false, nullptr, nullptr},
+        {"unknown-role", R"CHAT([{"role":"user","content":" U "},{"role":"unknown","content":" X "}])CHAT", true, nullptr, nullptr},
+        {"no-messages", R"CHAT([])CHAT", false, nullptr, nullptr},
+        {"no-messages", R"CHAT([])CHAT", true, nullptr, nullptr},
+    };
+    const auto compare = [&](bool unsloth) {
+        for (const ChatGolden& item : cases)
+        {
+            const char* expected = unsloth ? item.unsloth : item.canonical;
+            const std::string label = std::string(unsloth ? "Unsloth " : "canonical ") + item.name
+                                      + (item.thinking ? " thinking" : " non-thinking");
+            bool rejected = false;
+            std::vector<int32_t> ids;
+            try
+            {
+                ids = tokenizer.encode_chat(item.messages, item.thinking);
+            }
+            catch (const std::invalid_argument&)
+            {
+                rejected = true;
+            }
+            check(rejected == (expected == nullptr), label + ": chat acceptance differs from Jinja golden");
+            if (expected)
+                check(ids == tokenizer.encode(expected), label + ": chat IDs differ from Jinja golden");
+        }
+    };
+    compare(true);
+    const std::string developer_messages = R"([{"role":"developer","content":" D "},{"role":"user","content":" U "}])";
+    const auto developer_ids = tokenizer.encode_chat(developer_messages, true);
+    const std::string canonical = qwen38_template;
+    for (const auto& mutation : std::array<std::pair<std::string_view, std::string_view>, 3>{
+             std::pair<std::string_view, std::string_view>{"Reasoning effort is set to ", "Reasoning effort has been set to "},
+             {"('\\n' if sysns.text else '')", "('\\\\n' if sysns.text else '')"},
+             {"merged system messages", "merged developer messages"}})
+    {
+        value.chat = qwen38_unsloth_template;
+        const size_t position = value.chat.find(mutation.first);
+        check(position != std::string::npos, "unknown-revision mutation target is absent");
+        value.chat.replace(position, mutation.first.size(), mutation.second);
+        write_fixture(path, value);
+        check(!tokenizer.load(path.string()), "unknown Unsloth template revision was accepted");
+        check(tokenizer.encode_chat(developer_messages, true) == developer_ids,
+              "failed revision validation changed active merge policy");
+    }
+    value.chat = canonical;
+    write_fixture(path, value);
+    check(tokenizer.load(path.string()), "canonical profile reload failed");
+    compare(false);
+    value.chat = qwen38_unsloth_template;
+    write_fixture(path, value);
+    check(tokenizer.load(path.string()), "Unsloth profile reload failed");
+    compare(true);
+}
+
 static void check_invalid_profiles(const std::filesystem::path& root)
 {
     auto value = fixture("qwen35");
@@ -711,6 +1617,7 @@ int main()
         ncnn::moe::check_profile(root, ncnn::moe::fixture("qwen35moe"));
         ncnn::moe::check_profile(root, ncnn::moe::fixture("qwen35", true), true);
         ncnn::moe::check_profile(root, ncnn::moe::fixture("qwen4exp", true), true);
+        ncnn::moe::check_unsloth_profile(root);
         ncnn::moe::check_invalid_profiles(root);
         std::filesystem::remove_all(root);
         std::cout << "GGUF tokenizer profiles passed\n";

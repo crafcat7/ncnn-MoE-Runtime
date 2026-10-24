@@ -89,6 +89,7 @@ private:
     std::array<int32_t, 256> byte_ids{};
     Family family = Family::None;
     bool ignore_merges = false;
+    bool merge_leading_system_messages = false;
 };
 
 } // namespace moe
