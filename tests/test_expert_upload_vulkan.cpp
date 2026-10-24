@@ -161,7 +161,9 @@ static void demand_physical_recovery(bool mxfp4)
     std::shared_ptr<const void> pin;
     for (const char* key : {"physical-old-a", "physical-old-b"})
     {
-        upload_check(backend->prepare_demand(key, old_gate, nullptr, old_down, nullptr, 0, 0.f, ExpertActivation::Silu, pin),
+        upload_check(backend->prepare_demand(ExpertDemandRequest{key, old_gate, nullptr, old_down, nullptr,
+                                                                 0, 0.f, ExpertActivation::Silu},
+                                             pin),
                      "populate one physical block with two resident Experts");
         if (std::string_view(key) == "physical-old-a") pin.reset();
     }
@@ -169,7 +171,9 @@ static void demand_physical_recovery(bool mxfp4)
                  "both initial Experts fit the original physical allocation");
     const auto prepare = [&] {
         if (!mxfp4)
-            return backend->prepare_demand("physical-new", new_gate, nullptr, new_down, nullptr, 0, 0.f, ExpertActivation::Silu, pin);
+            return backend->prepare_demand(ExpertDemandRequest{"physical-new", new_gate, nullptr, new_down, nullptr,
+                                                               0, 0.f, ExpertActivation::Silu},
+                                           pin);
         const ExpertDemandRequest demand{"physical-new", new_gate, nullptr, new_down, nullptr, 0, 0.f, ExpertActivation::Silu};
         auto upload = backend->begin_demand_batch({&demand, 1});
         std::array<std::shared_ptr<const void>, 1> pins;
@@ -192,7 +196,9 @@ static void demand_physical_recovery(bool mxfp4)
     auto malformed = std::make_shared<TensorData>(*new_down);
     ++malformed->shape[1];
     std::shared_ptr<const void> invalid_pin;
-    upload_check(!backend->prepare_demand("physical-invalid", new_gate, nullptr, malformed, nullptr, 0, 0.f, ExpertActivation::Silu, invalid_pin)
+    upload_check(!backend->prepare_demand(ExpertDemandRequest{"physical-invalid", new_gate, nullptr, malformed, nullptr,
+                                                              0, 0.f, ExpertActivation::Silu},
+                                          invalid_pin)
                      && !invalid_pin && backend->statistics().evictions == recovered.evictions
                      && backend->physical_limit_rejections() == rejections,
                  "invalid format does not cause a physical recovery eviction");
@@ -213,7 +219,7 @@ static void demand_physical_recovery(bool mxfp4)
     ActivationBuffer actual;
     std::shared_ptr<DeviceTensor_vulkan> device_output;
     const std::array<ExpertRoute, 1> routes = {{{0, 0, 1.f}}};
-    ExpertBackendRequest request;
+    ExpertRequest request;
     request.key = "physical-new";
     request.output = &actual;
     request.device_input = device_input;
@@ -225,7 +231,7 @@ static void demand_physical_recovery(bool mxfp4)
     auto submission = backend->submit_batch({&request, 1});
     upload_check(static_cast<bool>(submission), "recovered Expert device-only submission");
     const auto results = submission->wait();
-    upload_check(results.size() == 1 && results.front() == ExpertBackendExecutionResult::Executed && submission->commit(),
+    upload_check(results.size() == 1 && results.front() == ExpertStatus::Executed && submission->commit(),
                  "recovered demand executes on GPU without fallback");
     const auto after = get_vulkan_statistics(runtime);
     upload_check(device_output && actual.rows() == 0 && before.batch_uploads == after.batch_uploads
@@ -405,15 +411,16 @@ static void factory_direct_staging_ab()
             auto backend = create_vulkan_expert_backend(8192, get_default_gpu_index(), {}, runtime, selected_flags);
             ScopedExpertBackendForeground foreground(backend);
             std::shared_ptr<const void> pin;
-            upload_check(backend && backend->prepare_demand("packing-ab", gate, &gate_bias, down, &down_bias, 0, 4.0f, ExpertActivation::DeepSeekSwiGlu, pin), "MXFP4 factory packs gate/down and both bias types");
+            upload_check(backend && backend->prepare_demand(ExpertDemandRequest{"packing-ab", gate, &gate_bias, down, &down_bias, 0, 4.0f, ExpertActivation::DeepSeekSwiGlu}, pin),
+                         "MXFP4 factory packs gate/down and both bias types");
             ActivationBuffer actual(1, 32);
-            ExpertBackendRequest request{"packing-ab", &input, &actual, 0, {}};
-            auto submission = backend->submit_batch(std::span<const ExpertBackendRequest>(&request, 1));
+            ExpertRequest request{"packing-ab", &input, &actual, 0, {}};
+            auto submission = backend->submit_batch(std::span<const ExpertRequest>(&request, 1));
             upload_check(submission && submission->reservations().size() == 1
-                             && submission->reservations()[0] == ExpertBackendExecutionResult::Executed,
+                             && submission->reservations()[0] == ExpertStatus::Executed,
                          "factory A/B retains GPU execution");
             const auto results = submission->wait();
-            upload_check(results.size() == 1 && results[0] == ExpertBackendExecutionResult::Executed && submission->commit(), "factory A/B GPU submission completes");
+            upload_check(results.size() == 1 && results[0] == ExpertStatus::Executed && submission->commit(), "factory A/B GPU submission completes");
             for (size_t index = 0; index < actual.values().size(); ++index)
                 upload_check(std::isfinite(actual.values()[index]) && std::abs(actual.values()[index] - expected.values()[index]) < 0.0002f,
                              "direct and copied factory layouts match exact CPU oracle");
@@ -470,7 +477,7 @@ static void submission_pool_compare(const ActivationBuffer& actual, const Activa
 static void submission_pool_wait(ExpertSubmission& submission)
 {
     const auto results = submission.wait();
-    upload_check(results.size() == 1 && results[0] == ExpertBackendExecutionResult::Executed,
+    upload_check(results.size() == 1 && results[0] == ExpertStatus::Executed,
                  "submission pool completed GPU Expert result");
 }
 
@@ -484,8 +491,9 @@ static void expert_submission_pool()
     auto backend = create_vulkan_expert_backend(8192, get_default_gpu_index(), {}, runtime, flags);
     upload_check(static_cast<bool>(backend), "submission pool backend");
     std::shared_ptr<const void> pin;
-    upload_check(backend->prepare_demand("submission-pool", gate, nullptr, down, nullptr, 0, 4.0f,
-                                         ExpertActivation::DeepSeekSwiGlu, pin),
+    upload_check(backend->prepare_demand(ExpertDemandRequest{"submission-pool", gate, nullptr, down, nullptr,
+                                                             0, 4.0f, ExpertActivation::DeepSeekSwiGlu},
+                                         pin),
                  "submission pool resident Expert");
     const auto context = VulkanContext::acquire(get_default_gpu_index(), runtime, flags);
     upload_check(static_cast<bool>(context), "submission pool context");
@@ -494,7 +502,7 @@ static void expert_submission_pool()
     std::array<ActivationBuffer, 3> held_outputs;
     std::array<ActivationBuffer, 3> held_expected;
     std::array<ActivationBuffer, 3> held_preserved;
-    std::array<ExpertBackendRequest, 3> held_requests;
+    std::array<ExpertRequest, 3> held_requests;
     std::array<std::unique_ptr<ExpertSubmission>, 3> held_submissions;
     for (size_t index = 0; index < held_requests.size(); ++index)
     {
@@ -511,9 +519,9 @@ static void expert_submission_pool()
         const std::lock_guard<std::mutex> lock(context->command_mutex());
         for (size_t index = 0; index < held_requests.size(); ++index)
         {
-            held_submissions[index] = backend->submit_batch(std::span<const ExpertBackendRequest>(&held_requests[index], 1));
+            held_submissions[index] = backend->submit_batch(std::span<const ExpertRequest>(&held_requests[index], 1));
             upload_check(held_submissions[index] && held_submissions[index]->reservations().size() == 1
-                             && held_submissions[index]->reservations()[0] == ExpertBackendExecutionResult::Executed,
+                             && held_submissions[index]->reservations()[0] == ExpertStatus::Executed,
                          "distinct in-flight submission reservations");
             submission_pool_compare(held_outputs[index], held_preserved[index], "in-flight output stays private", 0.0f);
         }
@@ -540,10 +548,10 @@ static void expert_submission_pool()
         const ActivationBuffer input = submission_pool_input(row_counts[iteration], static_cast<uint32_t>(iteration + 17));
         const ActivationBuffer expected = submission_pool_oracle(*gate, *down, input, flags);
         const ActivationBuffer preserved = output;
-        ExpertBackendRequest request{"submission-pool", &input, &output, 0, {}};
-        auto submission = backend->submit_batch(std::span<const ExpertBackendRequest>(&request, 1));
+        ExpertRequest request{"submission-pool", &input, &output, 0, {}};
+        auto submission = backend->submit_batch(std::span<const ExpertRequest>(&request, 1));
         upload_check(submission && submission->reservations().size() == 1
-                         && submission->reservations()[0] == ExpertBackendExecutionResult::Executed,
+                         && submission->reservations()[0] == ExpertStatus::Executed,
                      "pooled resident execution reservation");
         submission_pool_wait(*submission);
         submission_pool_compare(output, preserved, "pooled completion remains private before commit", 0.0f);
@@ -566,8 +574,8 @@ static void expert_submission_pool()
         // before releasing the fourth handle. All four pool slots are still
         // owned, so this fifth handle must use temporary, unretained storage.
         ActivationBuffer barrier_output;
-        ExpertBackendRequest barrier_request{"submission-pool", &barrier_input, &barrier_output, 0, {}};
-        auto barrier = backend->submit_batch(std::span<const ExpertBackendRequest>(&barrier_request, 1));
+        ExpertRequest barrier_request{"submission-pool", &barrier_input, &barrier_output, 0, {}};
+        auto barrier = backend->submit_batch(std::span<const ExpertRequest>(&barrier_request, 1));
         upload_check(static_cast<bool>(barrier), "temporary overflow submission");
         submission_pool_wait(*barrier);
         upload_check(barrier->commit(), "temporary overflow publication");
@@ -600,14 +608,14 @@ static void expert_submission_pool()
     for (uint32_t row = 0; row < device_routes.size(); ++row)
         device_routes[row] = {row, 0, 1.0f};
     std::shared_ptr<DeviceTensor_vulkan> device_output;
-    ExpertBackendRequest resident_request{"submission-pool", nullptr, &output, 0, {}};
+    ExpertRequest resident_request{"submission-pool", nullptr, &output, 0, {}};
     resident_request.device_input = device_input;
     resident_request.device_routes = device_routes;
     resident_request.device_output = &device_output;
     resident_request.input_rows = normalized.rows();
     resident_request.input_columns = normalized.columns();
     const ActivationBuffer host_before_resident = output;
-    auto resident_submission = backend->submit_batch(std::span<const ExpertBackendRequest>(&resident_request, 1));
+    auto resident_submission = backend->submit_batch(std::span<const ExpertRequest>(&resident_request, 1));
     upload_check(static_cast<bool>(resident_submission), "device-only pooled submission");
     submission_pool_wait(*resident_submission);
     submission_pool_compare(output, host_before_resident, "device-only completion waits for publication", 0.0f);
@@ -629,8 +637,8 @@ static void expert_submission_pool()
     // destructor reference cleanup is checked.
     {
         ActivationBuffer barrier_output;
-        ExpertBackendRequest barrier_request{"submission-pool", &barrier_input, &barrier_output, 0, {}};
-        auto barrier = backend->submit_batch(std::span<const ExpertBackendRequest>(&barrier_request, 1));
+        ExpertRequest barrier_request{"submission-pool", &barrier_input, &barrier_output, 0, {}};
+        auto barrier = backend->submit_batch(std::span<const ExpertRequest>(&barrier_request, 1));
         upload_check(static_cast<bool>(barrier), "device-only lifetime barrier");
         submission_pool_wait(*barrier);
         upload_check(barrier->commit(), "device-only lifetime barrier commit");
@@ -657,17 +665,17 @@ static void expert_submission_pool()
     // Backend destruction drains pending GPU work, then an external handle
     // still controls whether the completed result reaches its client.
     auto detached_backend = create_vulkan_expert_backend(8192, get_default_gpu_index(), {}, runtime, flags);
-    upload_check(detached_backend && detached_backend->prepare_demand("detached-pool", gate, nullptr, down, nullptr, 0, 4.0f, ExpertActivation::DeepSeekSwiGlu, pin),
+    upload_check(detached_backend && detached_backend->prepare_demand(ExpertDemandRequest{"detached-pool", gate, nullptr, down, nullptr, 0, 4.0f, ExpertActivation::DeepSeekSwiGlu}, pin),
                  "detached submission resident Expert");
     const ActivationBuffer detached_input = submission_pool_input(3, 97);
     const ActivationBuffer detached_expected = submission_pool_oracle(*gate, *down, detached_input, flags);
     ActivationBuffer detached_output(1, 32);
     std::fill_n(detached_output.row(0), detached_output.values().size(), -19.0f);
     const ActivationBuffer detached_preserved = detached_output;
-    ExpertBackendRequest detached_request{"detached-pool", &detached_input, &detached_output, 0, {}};
-    auto detached = detached_backend->submit_batch(std::span<const ExpertBackendRequest>(&detached_request, 1));
+    ExpertRequest detached_request{"detached-pool", &detached_input, &detached_output, 0, {}};
+    auto detached = detached_backend->submit_batch(std::span<const ExpertRequest>(&detached_request, 1));
     upload_check(detached && detached->reservations().size() == 1
-                     && detached->reservations()[0] == ExpertBackendExecutionResult::Executed,
+                     && detached->reservations()[0] == ExpertStatus::Executed,
                  "external submission before backend destruction");
     const std::weak_ptr<ExpertBackend> weak_backend = detached_backend;
     pin.reset();

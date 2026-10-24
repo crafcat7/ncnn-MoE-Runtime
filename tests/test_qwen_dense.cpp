@@ -507,62 +507,49 @@ public:
     {
     }
 
-    void admit(std::string, std::shared_ptr<const TensorData>, const TensorData*,
-               std::shared_ptr<const TensorData>, const TensorData*, uint32_t, float, ExpertActivation) override
+    void admit(const ExpertDemandRequest&) override
     {
     }
 
-    bool prepare_demand(std::string key, std::shared_ptr<const TensorData>, const TensorData*,
-                        std::shared_ptr<const TensorData>, const TensorData*, uint32_t, float,
-                        ExpertActivation, std::shared_ptr<const void>& pin) override
+    bool prepare_demand(const ExpertDemandRequest& request, std::shared_ptr<const void>& pin) override
     {
         ++demands;
         pin.reset();
         if (fault == DenseCacheFault::Demand)
             return false;
-        prepared.insert(std::move(key));
+        prepared.insert(std::string(request.key));
         pin = std::make_shared<int>(1);
         return true;
-    }
-
-    bool prepare_demand_separate(std::string key, std::shared_ptr<const TensorData> gate, const TensorData* gate_bias,
-                                 std::shared_ptr<const TensorData>, const TensorData*,
-                                 std::shared_ptr<const TensorData> down, const TensorData* down_bias,
-                                 uint32_t group, float limit, ExpertActivation activation,
-                                 std::shared_ptr<const void>& pin) override
-    {
-        return prepare_demand(std::move(key), std::move(gate), gate_bias, std::move(down), down_bias,
-                              group, limit, activation, pin);
     }
 
     class Submission final : public ExpertSubmission
     {
     public:
-        Submission(FailingDenseBackend& owner, std::span<const ExpertBackendRequest> requests)
+        Submission(FailingDenseBackend& owner, std::span<const ExpertRequest> requests)
             : owner(owner)
         {
             for (const auto& request : requests)
             {
                 const bool resident = owner.prepared.contains(std::string(request.key));
-                reserved.push_back(resident ? ExpertBackendExecutionResult::Executed : ExpertBackendExecutionResult::NotResident);
+                reserved.push_back(resident ? ExpertStatus::Executed : ExpertStatus::NotResident);
                 if (resident)
                     ++owner.resident_reservations;
             }
         }
 
-        std::span<const ExpertBackendExecutionResult> reservations() const noexcept override
+        std::span<const ExpertStatus> reservations() const noexcept override
         {
             return reserved;
         }
 
-        std::vector<ExpertBackendExecutionResult> wait() override
+        std::vector<ExpertStatus> wait() override
         {
             ++owner.waits;
             auto result = reserved;
             if (owner.fault == DenseCacheFault::Execution)
                 for (auto& item : result)
-                    if (item == ExpertBackendExecutionResult::Executed)
-                        item = ExpertBackendExecutionResult::Failed;
+                    if (item == ExpertStatus::Executed)
+                        item = ExpertStatus::Failed;
             return result;
         }
 
@@ -583,11 +570,11 @@ public:
 
     private:
         FailingDenseBackend& owner;
-        std::vector<ExpertBackendExecutionResult> reserved;
+        std::vector<ExpertStatus> reserved;
         bool aborted = false;
     };
 
-    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) override
+    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertRequest> requests) override
     {
         ++submissions;
         return std::make_unique<Submission>(*this, requests);

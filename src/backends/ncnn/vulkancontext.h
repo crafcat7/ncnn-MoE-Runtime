@@ -132,13 +132,6 @@ bool prepare_staging_batch(ncnn::VkMat& buffer,
                            ncnn::VkAllocator* allocator,
                            size_t element_size = sizeof(float));
 
-bool prepare_staging_tensor(ncnn::VkMat& buffer,
-                            int width,
-                            int height,
-                            int channels,
-                            size_t element_size,
-                            ncnn::VkAllocator* allocator);
-
 bool record_mapped_upload(ncnn::VkMat& staging,
                           ncnn::VkMat& destination,
                           ncnn::VkCompute& command,
@@ -190,8 +183,6 @@ bool record_mapped_activation_upload(ncnn::VkMat& staging,
 }
 
 ncnn::VkMat bind_direct_host_input(ncnn::VkMat& staging);
-
-ncnn::VkMat prepare_direct_host_output(ncnn::VkMat& staging);
 
 bool fill_staging_upload(const ActivationBuffer& input,
                          ncnn::VkMat& staging,

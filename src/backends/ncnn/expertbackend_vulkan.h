@@ -184,23 +184,10 @@ public:
 
     void set_foreground_active(bool active) noexcept override;
 
-    void admit(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down,
-               const TensorData* down_bias, uint32_t residency_group, float activation_limit,
-               ExpertActivation activation) override;
+    void admit(const ExpertDemandRequest& request) override;
 
-    void admit_separate(std::string key, std::shared_ptr<const TensorData> gate, const TensorData* gate_bias,
-                        std::shared_ptr<const TensorData> up, const TensorData* up_bias,
-                        std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
-                        float activation_limit, ExpertActivation activation) override;
-
-    bool prepare_demand(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias,
-                        std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
-                        float activation_limit, ExpertActivation activation, std::shared_ptr<const void>& pin) override;
-
-    bool prepare_demand_separate(std::string key, std::shared_ptr<const TensorData> gate, const TensorData* gate_bias,
-                                 std::shared_ptr<const TensorData> up, const TensorData* up_bias,
-                                 std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
-                                 float activation_limit, ExpertActivation activation, std::shared_ptr<const void>& pin) override;
+    bool prepare_demand(const ExpertDemandRequest& request,
+                        std::shared_ptr<const void>& pin) override;
 
     size_t prepare_demand_batch(std::span<const ExpertDemandRequest> requests,
                                 std::span<std::shared_ptr<const void>> pins) override;
@@ -208,7 +195,7 @@ public:
     std::unique_ptr<ExpertDemandSubmission> begin_demand_batch(std::span<const ExpertDemandRequest> requests) override;
     void set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator) override;
 
-    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) override;
+    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertRequest> requests) override;
 
     void wait_for_background_work() override;
 
@@ -247,8 +234,8 @@ private:
 
     struct WorkItem
     {
-        std::vector<ExpertBackendRequest> client_requests;
-        std::vector<ExpertBackendRequest> requests;
+        std::vector<ExpertRequest> client_requests;
+        std::vector<ExpertRequest> requests;
         std::vector<ActivationBuffer> private_outputs;
         std::vector<std::shared_ptr<DeviceTensor_vulkan>> private_device_outputs;
         ActivationBuffer private_aggregation;
@@ -259,8 +246,8 @@ private:
         std::vector<const QnkExpert_vulkan*> qnk_experts;
         std::vector<const ActivationBuffer*> inputs;
         std::vector<ActivationBuffer*> outputs;
-        std::vector<ExpertBackendExecutionResult> planned;
-        std::vector<ExpertBackendExecutionResult> final;
+        std::vector<ExpertStatus> planned;
+        std::vector<ExpertStatus> final;
         std::mutex mutex;
         std::condition_variable completed;
         bool done = false;
@@ -278,10 +265,10 @@ private:
 
         ~Submission() override;
 
-        std::span<const ExpertBackendExecutionResult> reservations() const noexcept override;
+        std::span<const ExpertStatus> reservations() const noexcept override;
 
-        std::vector<ExpertBackendExecutionResult> wait() override;
-        void wait(std::vector<ExpertBackendExecutionResult>& results) override;
+        std::vector<ExpertStatus> wait() override;
+        void wait(std::vector<ExpertStatus>& results) override;
 
         bool commit() override;
 
@@ -335,10 +322,7 @@ private:
         uint64_t size = 0;
     };
 
-    bool make_admission(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias,
-                        std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
-                        float activation_limit, ExpertActivation activation, PendingAdmission& admission,
-                        std::shared_ptr<const TensorData> up = {}, const TensorData* up_bias = nullptr) const;
+    bool make_admission(const ExpertDemandRequest& request, PendingAdmission& admission) const;
     void enqueue_admission(PendingAdmission admission);
     bool prepare_admission(PendingAdmission admission, std::shared_ptr<const void>& pin);
     std::shared_ptr<Entry> create_entry(const PendingAdmission& admission, VulkanWeightUploadBatch* upload_batch);
@@ -347,14 +331,14 @@ private:
     using GhostList = std::list<ExpertKeySize>;
     using GhostIndex = std::unordered_map<std::string, GhostList::iterator, ExpertKeyHash, std::equal_to<>>;
 
-    static bool route_aggregation_enabled(std::span<const ExpertBackendRequest> requests,
+    static bool route_aggregation_enabled(std::span<const ExpertRequest> requests,
                                           std::span<const Selection> selected,
                                           uint32_t output_columns,
                                           ActivationBuffer*& output,
                                           uint32_t& token_count,
                                           uint64_t optimization_flags);
 
-    static bool build_route_aggregation_metadata(std::span<const ExpertBackendRequest> requests,
+    static bool build_route_aggregation_metadata(std::span<const ExpertRequest> requests,
                                                  std::span<const Selection> selected,
                                                  std::vector<uint32_t>& offsets,
                                                  std::vector<uint32_t>& rows,
@@ -388,14 +372,14 @@ private:
 
     bool evict_one_locked(bool incoming_from_frequent, uint32_t incoming_group, uint64_t required);
 
-    bool forward_batch(std::span<const ExpertBackendRequest> requests, std::span<const Selection> selected);
+    bool forward_batch(std::span<const ExpertRequest> requests, std::span<const Selection> selected);
 
-    bool forward_bfloat16_batch(WorkItem& work, std::span<const ExpertBackendRequest> requests,
+    bool forward_bfloat16_batch(WorkItem& work, std::span<const ExpertRequest> requests,
                                 std::span<const Selection> selected);
 
-    bool forward_qnk_batch(WorkItem& work, std::span<const ExpertBackendRequest> requests,
+    bool forward_qnk_batch(WorkItem& work, std::span<const ExpertRequest> requests,
                            std::span<const Selection> selected);
-    bool forward_device_batch(std::span<const ExpertBackendRequest> requests,
+    bool forward_device_batch(std::span<const ExpertRequest> requests,
                               std::span<const Selection> selected);
 
     void execute_work_item(const std::shared_ptr<WorkItem>& work);

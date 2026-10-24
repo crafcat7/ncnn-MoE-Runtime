@@ -75,16 +75,16 @@ static std::shared_ptr<const DeviceTensor_vulkan> expert_device_upload(const Act
     return tensor;
 }
 
-static void expert_device_execute(ExpertBackend& backend, std::span<const ExpertBackendRequest> requests)
+static void expert_device_execute(ExpertBackend& backend, std::span<const ExpertRequest> requests)
 {
     auto submission = backend.submit_batch(requests);
     expert_device_check(static_cast<bool>(submission), "device expert submission");
     for (auto reservation : submission->reservations())
-        expert_device_check(reservation == ExpertBackendExecutionResult::Executed, "device expert resident reservation");
+        expert_device_check(reservation == ExpertStatus::Executed, "device expert resident reservation");
     const auto results = submission->wait();
     expert_device_check(results.size() == requests.size(), "device expert results");
     for (auto result : results)
-        expert_device_check(result == ExpertBackendExecutionResult::Executed, "device expert execution");
+        expert_device_check(result == ExpertStatus::Executed, "device expert execution");
     expert_device_check(submission->commit(), "device expert commit");
 }
 
@@ -96,8 +96,10 @@ static void expert_device_test()
     expert_device_check(static_cast<bool>(backend), "device expert backend");
     auto gate = std::make_shared<TensorData>(expert_device_mxfp4(64, 32, 1));
     auto down = std::make_shared<TensorData>(expert_device_mxfp4(32, 32, 2));
-    backend->admit("device-expert-a", gate, nullptr, down, nullptr, 0, 0.0f, ExpertActivation::Silu);
-    backend->admit("device-expert-b", gate, nullptr, down, nullptr, 0, 0.0f, ExpertActivation::Silu);
+    backend->admit(ExpertDemandRequest{"device-expert-a", gate, nullptr, down, nullptr,
+                                       0, 0.0f, ExpertActivation::Silu});
+    backend->admit(ExpertDemandRequest{"device-expert-b", gate, nullptr, down, nullptr,
+                                       0, 0.0f, ExpertActivation::Silu});
     backend->wait_for_background_work();
     expert_device_check(backend->statistics().stores == 2, "device experts admitted");
     ActivationBuffer normalized(4, 32);
@@ -110,7 +112,7 @@ static void expert_device_test()
     std::array<ActivationBuffer, 2> inputs;
     std::array<ActivationBuffer, 2> expected;
     std::array<ActivationBuffer, 2> actual;
-    std::array<ExpertBackendRequest, 2> requests;
+    std::array<ExpertRequest, 2> requests;
     for (size_t expert = 0; expert < 2; ++expert)
     {
         inputs[expert].reset(routes[expert].size(), 32, false);
@@ -167,7 +169,7 @@ static void expert_device_test()
         const auto results = rejected->wait();
         expert_device_check(results.size() == requests.size(), "device-only rejection result shape");
         for (auto result : results)
-            expert_device_check(result == ExpertBackendExecutionResult::Failed, message);
+            expert_device_check(result == ExpertStatus::Failed, message);
         rejected->abort();
         expert_device_check(!rejected->commit(), "rejected batch cannot publish");
         for (size_t expert = 0; expert < 2; ++expert)
@@ -220,7 +222,7 @@ static void expert_device_test()
         constexpr size_t rows_per_expert = 40000;
         std::array<std::vector<ExpertRoute>, 2> large_routes;
         std::array<ActivationBuffer, 2> large_outputs;
-        std::array<ExpertBackendRequest, 2> large_requests = requests;
+        std::array<ExpertRequest, 2> large_requests = requests;
         for (size_t expert = 0; expert < 2; ++expert)
         {
             const uint32_t input_row = expert == 0 ? 3u : 0u;
@@ -254,7 +256,7 @@ static void expert_device_test()
         request.device_input.reset();
     expert_device_check(!weak_device.expired(), "submission pins resident input");
     const auto results = submission->wait();
-    expert_device_check(results.size() == 2 && results[0] == ExpertBackendExecutionResult::Executed && results[1] == ExpertBackendExecutionResult::Executed, "pinned device expert completed");
+    expert_device_check(results.size() == 2 && results[0] == ExpertStatus::Executed && results[1] == ExpertStatus::Executed, "pinned device expert completed");
     expert_device_check(!weak_device.expired(), "input pin survives until commit");
     expert_device_check(submission->commit(), "pinned device commit");
     for (size_t expert = 0; expert < 2; ++expert)

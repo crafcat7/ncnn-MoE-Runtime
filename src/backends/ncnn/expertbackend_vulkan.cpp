@@ -788,78 +788,53 @@ static uint64_t executable_expert_storage_bytes(const TensorData& gate_up, const
     return size;
 }
 
-bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const TensorData> gate_up,
-                                         const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down,
-                                         const TensorData* down_bias, uint32_t residency_group,
-                                         float activation_limit, ExpertActivation activation,
-                                         PendingAdmission& admission, std::shared_ptr<const TensorData> up,
-                                         const TensorData* up_bias) const
+bool VulkanExpertBackend::make_admission(const ExpertDemandRequest& request,
+                                         PendingAdmission& admission) const
 {
     if (!vulkan_context
-        || (gate_up && gate_up->mxfp4_file_storage)
-        || (down && down->mxfp4_file_storage)
-        || (up && up->mxfp4_file_storage))
+        || (request.gate_up && request.gate_up->mxfp4_file_storage)
+        || (request.down && request.down->mxfp4_file_storage)
+        || (request.up && request.up->mxfp4_file_storage))
         return false;
-    if (key.empty() || !gate_up || !down)
+    if (request.key.empty() || !request.gate_up || !request.down)
         return false;
-    const uint64_t size = executable_expert_storage_bytes(*gate_up, up.get(), *down, *vulkan_context,
-                                                          optimization_flags, gate_up_bias, up_bias, down_bias,
-                                                          activation, activation_limit);
+    const TensorData* up_bias = request.up ? request.up_bias : nullptr;
+    const uint64_t size = executable_expert_storage_bytes(*request.gate_up, request.up.get(), *request.down, *vulkan_context,
+                                                          optimization_flags, request.gate_up_bias, up_bias, request.down_bias,
+                                                          request.activation, request.activation_limit);
     if (size == 0 || size > cache_size)
         return false;
 
-    admission.key = std::move(key);
-    admission.gate_up = std::move(gate_up);
-    admission.down = std::move(down);
-    admission.up = std::move(up);
-    if (gate_up_bias)
+    admission.key = request.key;
+    admission.gate_up = request.gate_up;
+    admission.down = request.down;
+    admission.up = request.up;
+    if (request.gate_up_bias)
     {
-        admission.gate_up_bias = std::make_shared<TensorData>(*gate_up_bias);
+        admission.gate_up_bias = std::make_shared<TensorData>(*request.gate_up_bias);
     }
-    if (down_bias)
+    if (request.down_bias)
     {
-        admission.down_bias = std::make_shared<TensorData>(*down_bias);
+        admission.down_bias = std::make_shared<TensorData>(*request.down_bias);
     }
     if (up_bias)
         admission.up_bias = std::make_shared<TensorData>(*up_bias);
-    admission.activation_limit = activation_limit;
-    admission.activation = activation;
-    admission.residency_group = residency_group;
+    admission.activation_limit = request.activation_limit;
+    admission.activation = request.activation;
+    admission.residency_group = request.residency_group;
     admission.size = size;
     return true;
 }
 
-void VulkanExpertBackend::admit(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down,
-                                const TensorData* down_bias, uint32_t residency_group, float activation_limit,
-                                ExpertActivation activation)
+void VulkanExpertBackend::admit(const ExpertDemandRequest& request)
 {
     {
         const std::lock_guard<std::mutex> lock(mutex);
-        if (stopping || entries.contains(key) || pending_keys.contains(key))
+        if (stopping || entries.contains(request.key) || pending_keys.contains(request.key))
             return;
     }
     PendingAdmission admission;
-    if (!make_admission(std::move(key), std::move(gate_up), gate_up_bias, std::move(down), down_bias,
-                        residency_group, activation_limit, activation, admission))
-        return;
-    enqueue_admission(std::move(admission));
-}
-
-void VulkanExpertBackend::admit_separate(std::string key, std::shared_ptr<const TensorData> gate, const TensorData* gate_bias,
-                                         std::shared_ptr<const TensorData> up, const TensorData* up_bias,
-                                         std::shared_ptr<const TensorData> down, const TensorData* down_bias,
-                                         uint32_t residency_group, float activation_limit, ExpertActivation activation)
-{
-    if (!up)
-        return;
-    {
-        const std::lock_guard<std::mutex> lock(mutex);
-        if (stopping || entries.contains(key) || pending_keys.contains(key))
-            return;
-    }
-    PendingAdmission admission;
-    if (!make_admission(std::move(key), std::move(gate), gate_bias, std::move(down), down_bias,
-                        residency_group, activation_limit, activation, admission, std::move(up), up_bias))
+    if (!make_admission(request, admission))
         return;
     enqueue_admission(std::move(admission));
 }
@@ -891,14 +866,7 @@ void VulkanExpertBackend::enqueue_admission(PendingAdmission admission)
     work_available.notify_one();
 }
 
-bool VulkanExpertBackend::prepare_demand(std::string key,
-                                         std::shared_ptr<const TensorData> gate_up,
-                                         const TensorData* gate_up_bias,
-                                         std::shared_ptr<const TensorData> down,
-                                         const TensorData* down_bias,
-                                         uint32_t residency_group,
-                                         float activation_limit,
-                                         ExpertActivation activation,
+bool VulkanExpertBackend::prepare_demand(const ExpertDemandRequest& request,
                                          std::shared_ptr<const void>& pin)
 {
     pin.reset();
@@ -906,38 +874,7 @@ bool VulkanExpertBackend::prepare_demand(std::string key,
     try
     {
         if (!vulkan_context || !expert_weight_allocator
-            || !make_admission(std::move(key), std::move(gate_up), gate_up_bias,
-                               std::move(down), down_bias, residency_group,
-                               activation_limit, activation, admission))
-            return false;
-    }
-    catch (...)
-    {
-        return false;
-    }
-    return prepare_admission(std::move(admission), pin);
-}
-
-bool VulkanExpertBackend::prepare_demand_separate(std::string key,
-                                                  std::shared_ptr<const TensorData> gate,
-                                                  const TensorData* gate_bias,
-                                                  std::shared_ptr<const TensorData> up,
-                                                  const TensorData* up_bias,
-                                                  std::shared_ptr<const TensorData> down,
-                                                  const TensorData* down_bias,
-                                                  uint32_t residency_group,
-                                                  float activation_limit,
-                                                  ExpertActivation activation,
-                                                  std::shared_ptr<const void>& pin)
-{
-    pin.reset();
-    PendingAdmission admission;
-    try
-    {
-        if (!up || !vulkan_context || !expert_weight_allocator
-            || !make_admission(std::move(key), std::move(gate), gate_bias,
-                               std::move(down), down_bias, residency_group,
-                               activation_limit, activation, admission, std::move(up), up_bias))
+            || !make_admission(request, admission))
             return false;
     }
     catch (...)
@@ -1102,9 +1039,7 @@ size_t VulkanExpertBackend::prepare_demand_batch(std::span<const ExpertDemandReq
         try
         {
             if (!vulkan_context || !expert_weight_allocator
-                || !make_admission(std::string(request.key), request.gate_up, request.gate_up_bias,
-                                   request.down, request.down_bias, request.residency_group,
-                                   request.activation_limit, request.activation, admission))
+                || !make_admission(request, admission))
             {
                 break;
             }
@@ -1636,8 +1571,8 @@ void VulkanExpertBackend::WorkItem::clear_references() noexcept
     for (auto& output : private_device_outputs)
         output.reset();
     uint64_t size = private_aggregation.allocated_bytes()
-                    + client_requests.capacity() * sizeof(ExpertBackendRequest)
-                    + requests.capacity() * sizeof(ExpertBackendRequest)
+                    + client_requests.capacity() * sizeof(ExpertRequest)
+                    + requests.capacity() * sizeof(ExpertRequest)
                     + private_outputs.capacity() * sizeof(ActivationBuffer)
                     + private_device_outputs.capacity() * sizeof(std::shared_ptr<DeviceTensor_vulkan>)
                     + private_route_completed.capacity() * sizeof(uint8_t)
@@ -1647,8 +1582,8 @@ void VulkanExpertBackend::WorkItem::clear_references() noexcept
                     + qnk_experts.capacity() * sizeof(const QnkExpert_vulkan*)
                     + inputs.capacity() * sizeof(const ActivationBuffer*)
                     + outputs.capacity() * sizeof(ActivationBuffer*)
-                    + planned.capacity() * sizeof(ExpertBackendExecutionResult)
-                    + final.capacity() * sizeof(ExpertBackendExecutionResult);
+                    + planned.capacity() * sizeof(ExpertStatus)
+                    + final.capacity() * sizeof(ExpertStatus);
     for (const auto& output : private_outputs)
         size += output.allocated_bytes();
     // Large prefill storage is reclaimed once its submission is released.
@@ -1687,7 +1622,7 @@ std::shared_ptr<VulkanExpertBackend::WorkItem> VulkanExpertBackend::acquire_work
     return work;
 }
 
-std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<const ExpertBackendRequest> requests)
+std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<const ExpertRequest> requests)
 {
     auto work = acquire_work_item();
     std::unique_ptr<ExpertSubmission> submission;
@@ -1705,7 +1640,7 @@ std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<co
         work->private_route_completed.assign(requests.size(), 0);
         for (size_t request_index = 0; request_index < requests.size(); ++request_index)
         {
-            ExpertBackendRequest& private_request = work->requests[request_index];
+            ExpertRequest& private_request = work->requests[request_index];
             private_request.output = &work->private_outputs[request_index];
             if (private_request.device_output)
                 private_request.device_output = &work->private_device_outputs[request_index];
@@ -1724,7 +1659,7 @@ std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<co
                 private_request.route_aggregation.completed = &work->private_route_completed[request_index];
             }
         }
-        work->planned.assign(requests.size(), ExpertBackendExecutionResult::NotResident);
+        work->planned.assign(requests.size(), ExpertStatus::NotResident);
         work->selected.reserve(requests.size());
         {
             std::unique_lock<std::mutex> lock(mutex);
@@ -1732,11 +1667,11 @@ std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<co
             std::vector<Selection>& candidates = work->selected;
             for (size_t request_index = 0; request_index < requests.size(); ++request_index)
             {
-                const ExpertBackendRequest& request = requests[request_index];
+                const ExpertRequest& request = requests[request_index];
                 if (!request.output || request.rows() == 0 || request.columns() == 0
                     || (!request.has_host_input() && !request.device_input))
                 {
-                    work->planned[request_index] = ExpertBackendExecutionResult::Failed;
+                    work->planned[request_index] = ExpertStatus::Failed;
                     continue;
                 }
                 auto existing = entries.find(request.key);
@@ -1797,7 +1732,7 @@ std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<co
             // non-resident or failed requests.
             for (const Selection& selection : candidates)
             {
-                work->planned[selection.request_index] = ExpertBackendExecutionResult::Executed;
+                work->planned[selection.request_index] = ExpertStatus::Executed;
             }
             // Prepare the public handle before borrowed inputs become visible
             // to the worker. A failed queue allocation completes the private item
@@ -1901,7 +1836,7 @@ VulkanExpertBackend::Submission::~Submission()
         work->clear_references();
 }
 
-std::span<const ExpertBackendExecutionResult> VulkanExpertBackend::Submission::reservations() const noexcept
+std::span<const ExpertStatus> VulkanExpertBackend::Submission::reservations() const noexcept
 {
     return work->planned;
 }
@@ -1913,14 +1848,14 @@ void VulkanExpertBackend::Submission::wait_completion()
     waited = true;
 }
 
-std::vector<ExpertBackendExecutionResult> VulkanExpertBackend::Submission::wait()
+std::vector<ExpertStatus> VulkanExpertBackend::Submission::wait()
 {
-    std::vector<ExpertBackendExecutionResult> results;
+    std::vector<ExpertStatus> results;
     wait(results);
     return results;
 }
 
-void VulkanExpertBackend::Submission::wait(std::vector<ExpertBackendExecutionResult>& results)
+void VulkanExpertBackend::Submission::wait(std::vector<ExpertStatus>& results)
 {
     wait_completion();
     results.assign(work->final.begin(), work->final.end());
@@ -1942,8 +1877,8 @@ bool VulkanExpertBackend::Submission::commit()
     bool require_all_route_requests = false;
     for (size_t index = 0; index < work->final.size(); ++index)
     {
-        ExpertBackendRequest& client = work->client_requests[index];
-        const bool executed = work->final[index] == ExpertBackendExecutionResult::Executed;
+        ExpertRequest& client = work->client_requests[index];
+        const bool executed = work->final[index] == ExpertStatus::Executed;
         if (executed && !client.output)
         {
             aborted = true;
@@ -1997,9 +1932,9 @@ bool VulkanExpertBackend::Submission::commit()
     bool route_published = false;
     for (size_t index = 0; index < work->final.size(); ++index)
     {
-        if (work->final[index] != ExpertBackendExecutionResult::Executed)
+        if (work->final[index] != ExpertStatus::Executed)
             continue;
-        ExpertBackendRequest& client = work->client_requests[index];
+        ExpertRequest& client = work->client_requests[index];
         client.output->swap(work->private_outputs[index]);
         if (client.device_output)
             client.device_output->swap(work->private_device_outputs[index]);
@@ -2025,7 +1960,7 @@ void VulkanExpertBackend::Submission::abort() noexcept
     aborted = true;
 }
 
-bool VulkanExpertBackend::route_aggregation_enabled(std::span<const ExpertBackendRequest> requests,
+bool VulkanExpertBackend::route_aggregation_enabled(std::span<const ExpertRequest> requests,
                                                     std::span<const Selection> selected,
                                                     uint32_t output_columns,
                                                     ActivationBuffer*& output,
@@ -2044,7 +1979,7 @@ bool VulkanExpertBackend::route_aggregation_enabled(std::span<const ExpertBacken
         return false;
 
     bool require_all_requests = false;
-    for (const ExpertBackendRequest& request : requests)
+    for (const ExpertRequest& request : requests)
     {
         require_all_requests = require_all_requests
                                || request.route_aggregation.require_all_requests;
@@ -2053,10 +1988,10 @@ bool VulkanExpertBackend::route_aggregation_enabled(std::span<const ExpertBacken
     {
         if (selection.request_index >= requests.size())
             return false;
-        const ExpertBackendRequest& request = requests[selection.request_index];
+        const ExpertRequest& request = requests[selection.request_index];
         if (request.device_output)
             return false;
-        const ExpertBackendRequest::RouteAggregation& aggregation = request.route_aggregation;
+        const ExpertRequest::RouteAggregation& aggregation = request.route_aggregation;
         if (request.rows() == 0 || !aggregation.output || !aggregation.completed || aggregation.token_count == 0
             || aggregation.routes.size() != request.rows()
             || aggregation.output->rows() != aggregation.token_count
@@ -2090,7 +2025,7 @@ bool VulkanExpertBackend::route_aggregation_enabled(std::span<const ExpertBacken
     return true;
 }
 
-bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const ExpertBackendRequest> requests,
+bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const ExpertRequest> requests,
                                                            std::span<const Selection> selected,
                                                            std::vector<uint32_t>& offsets,
                                                            std::vector<uint32_t>& rows,
@@ -2098,13 +2033,13 @@ bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const Exper
 {
     if (selected.empty())
         return false;
-    const ExpertBackendRequest::RouteAggregation& first = requests[selected.front().request_index].route_aggregation;
+    const ExpertRequest::RouteAggregation& first = requests[selected.front().request_index].route_aggregation;
     const uint32_t token_count = first.token_count;
     offsets.assign(static_cast<size_t>(token_count) + 1, 0);
     size_t total_rows = 0;
     for (const Selection& selection : selected)
     {
-        const ExpertBackendRequest& request = requests[selection.request_index];
+        const ExpertRequest& request = requests[selection.request_index];
         const auto& aggregation = request.route_aggregation;
         if (aggregation.token_count != token_count || aggregation.routes.size() != request.rows())
             return false;
@@ -2130,7 +2065,7 @@ bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const Exper
     size_t row_offset = 0;
     for (const Selection& selection : selected)
     {
-        const ExpertBackendRequest& request = requests[selection.request_index];
+        const ExpertRequest& request = requests[selection.request_index];
         for (size_t batch_index = 0; batch_index < request.route_aggregation.routes.size(); ++batch_index)
         {
             const ExpertRoute& route = request.route_aggregation.routes[batch_index];
@@ -2417,7 +2352,7 @@ void VulkanExpertBackend::execute_work_item(const std::shared_ptr<WorkItem>& wor
         {
             // Each family publishes its own host output. A shared aggregate
             // cannot be overwritten by independent family submissions.
-            for (ExpertBackendRequest& request : work->requests)
+            for (ExpertRequest& request : work->requests)
             {
                 request.route_aggregation.output = nullptr;
                 request.route_aggregation.completed = nullptr;
@@ -2453,7 +2388,7 @@ void VulkanExpertBackend::execute_work_item(const std::shared_ptr<WorkItem>& wor
                 ++device_source_count;
             if (selection.request_index >= work->requests.size())
                 continue;
-            const ExpertBackendRequest& request = work->requests[selection.request_index];
+            const ExpertRequest& request = work->requests[selection.request_index];
             if (!request.route_aggregation.completed || *request.route_aggregation.completed == 0)
                 continue;
             if (!route_aggregated)
@@ -2489,7 +2424,7 @@ void VulkanExpertBackend::execute_work_item(const std::shared_ptr<WorkItem>& wor
                 {
                     ++device_source_execution_failures;
                 }
-                final[selection.request_index] = ExpertBackendExecutionResult::Failed;
+                final[selection.request_index] = ExpertStatus::Failed;
             }
         }
         else
@@ -2645,7 +2580,7 @@ void VulkanExpertBackend::worker_loop()
 }
 
 bool VulkanExpertBackend::forward_bfloat16_batch(WorkItem& work,
-                                                 std::span<const ExpertBackendRequest> requests,
+                                                 std::span<const ExpertRequest> requests,
                                                  std::span<const Selection> selected)
 {
     if (std::any_of(selected.begin(), selected.end(), [&](const Selection& selection) {
@@ -2675,7 +2610,7 @@ bool VulkanExpertBackend::forward_bfloat16_batch(WorkItem& work,
         {
             return false;
         }
-        const ExpertBackendRequest& request = requests[selection.request_index];
+        const ExpertRequest& request = requests[selection.request_index];
         if (!request.has_host_input() || !request.output)
             return false;
         experts[index] = selection.entry->bfloat16_operation.get();
@@ -2707,7 +2642,7 @@ bool VulkanExpertBackend::forward_bfloat16_batch(WorkItem& work,
         aggregated_output->reset(aggregated_token_count, output_columns, true);
         for (const Selection& selection : selected)
         {
-            const ExpertBackendRequest& request = requests[selection.request_index];
+            const ExpertRequest& request = requests[selection.request_index];
             if (request.route_aggregation.routes.size()
                 != request.rows())
             {
@@ -2731,7 +2666,7 @@ bool VulkanExpertBackend::forward_bfloat16_batch(WorkItem& work,
 }
 
 bool VulkanExpertBackend::forward_qnk_batch(WorkItem& work,
-                                            std::span<const ExpertBackendRequest> requests,
+                                            std::span<const ExpertRequest> requests,
                                             std::span<const Selection> selected)
 {
     if (selected.empty())
@@ -2755,7 +2690,7 @@ bool VulkanExpertBackend::forward_qnk_batch(WorkItem& work,
         {
             return false;
         }
-        const ExpertBackendRequest& request = requests[selection.request_index];
+        const ExpertRequest& request = requests[selection.request_index];
         if (!request.has_host_input() || !request.output)
         {
             return false;
@@ -2773,7 +2708,7 @@ bool VulkanExpertBackend::forward_qnk_batch(WorkItem& work,
     if (selected.size() == 1)
     {
         const Selection& selection = selected.front();
-        const ExpertBackendRequest& request = requests[selection.request_index];
+        const ExpertRequest& request = requests[selection.request_index];
         if (!selection.entry->qnk_operation->forward(*request.input, *request.output))
             return false;
     }
@@ -2788,7 +2723,7 @@ bool VulkanExpertBackend::forward_qnk_batch(WorkItem& work,
         for (size_t index = 0; index < selected.size(); ++index)
         {
             const Selection& selection = selected[index];
-            const ExpertBackendRequest& request = requests[selection.request_index];
+            const ExpertRequest& request = requests[selection.request_index];
             experts[index] = selection.entry->qnk_operation.get();
             inputs[index] = request.input;
             outputs[index] = request.output;
@@ -2807,7 +2742,7 @@ bool VulkanExpertBackend::forward_qnk_batch(WorkItem& work,
         aggregated_output->reset(aggregated_token_count, output_columns, true);
         for (const Selection& selection : selected)
         {
-            const ExpertBackendRequest& request = requests[selection.request_index];
+            const ExpertRequest& request = requests[selection.request_index];
             for (size_t row = 0; row < request.rows(); ++row)
             {
                 const ExpertRoute& route = request.route_aggregation.routes[row];

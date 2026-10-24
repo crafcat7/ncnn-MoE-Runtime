@@ -233,16 +233,16 @@ static void q8_experts(uint32_t device)
     }
     auto backend = create_vulkan_expert_backend(storage + 4096, device, nullptr, runtime, OptimizationDefaultFlags);
     std::shared_ptr<const void> pin;
-    q8_check(backend && backend->prepare_demand_separate("q8-0", gate, nullptr, up, nullptr, down, nullptr, 0, limit, ExpertActivation::DeepSeekSwiGlu, pin),
+    q8_check(backend && backend->prepare_demand(ExpertDemandRequest{"q8-0", gate, nullptr, down, nullptr, 0, limit, ExpertActivation::DeepSeekSwiGlu, up}, pin),
              "Q8_0 native Expert cache admission");
     q8_check(pin && backend->statistics().resident_size == storage, "Q8_0 Expert cache accounts compact native storage");
     const auto input = q8_input(4, hidden);
     ActivationBuffer actual;
-    const std::array<ExpertBackendRequest, 1> requests = {ExpertBackendRequest{"q8-0", &input, &actual}};
+    const std::array<ExpertRequest, 1> requests = {ExpertRequest{"q8-0", &input, &actual}};
     auto submission = backend->submit_batch(requests);
     q8_check(static_cast<bool>(submission), "Q8_0 native Expert cache submission");
     const auto results = submission->wait();
-    q8_check(results.size() == 1 && results[0] == ExpertBackendExecutionResult::Executed && submission->commit(),
+    q8_check(results.size() == 1 && results[0] == ExpertStatus::Executed && submission->commit(),
              "Q8_0 cached Expert executes on Vulkan");
     q8_compare(actual, q8_expert_reference(*gate, up.get(), *down, input, false, limit), "Q8_0 cached Expert reference");
 
@@ -333,7 +333,7 @@ static void float32_device_expert(uint32_t device, bool separate, bool interleav
              "FP32 cache admission matches exact native storage without BF16 conversion");
     ActivationBuffer actual;
     std::shared_ptr<DeviceTensor_vulkan> output;
-    ExpertBackendRequest request;
+    ExpertRequest request;
     request.key = demand.key;
     request.output = &actual;
     request.device_input = resident;
@@ -346,7 +346,7 @@ static void float32_device_expert(uint32_t device, bool separate, bool interleav
     pins = {};
     q8_check(static_cast<bool>(submission), "FP32 device-only Expert request");
     const auto results = submission->wait();
-    q8_check(results.size() == 1 && results.front() == ExpertBackendExecutionResult::Executed && submission->commit(),
+    q8_check(results.size() == 1 && results.front() == ExpertStatus::Executed && submission->commit(),
              "FP32 routed device Expert commits without host input");
     const auto after = get_vulkan_statistics(runtime);
     q8_check(output && actual.rows() == 0 && after.compute_submissions == before.compute_submissions + 1
@@ -415,7 +415,7 @@ static void bfloat16_device_expert(uint32_t device)
              "BF16 eager cache planning and admission share the same payload charge");
     ActivationBuffer actual;
     std::shared_ptr<DeviceTensor_vulkan> output;
-    ExpertBackendRequest request;
+    ExpertRequest request;
     request.key = demand.key;
     request.output = &actual;
     request.device_input = resident;
@@ -428,7 +428,7 @@ static void bfloat16_device_expert(uint32_t device)
     pins = {};
     q8_check(static_cast<bool>(submission), "BF16 device-only Expert request");
     const auto results = submission->wait();
-    q8_check(results.size() == 1 && results.front() == ExpertBackendExecutionResult::Executed && submission->commit(),
+    q8_check(results.size() == 1 && results.front() == ExpertStatus::Executed && submission->commit(),
              "BF16 routed device Expert commits without host input");
     const auto after = get_vulkan_statistics(runtime);
     q8_check(output && actual.rows() == 0 && after.compute_submissions == before.compute_submissions + 1
@@ -483,7 +483,7 @@ static void mxfp4_storage_billing(uint32_t device)
              "MXFP4 storage planning includes explicit biases");
     auto backend = create_vulkan_expert_backend(1024 * 1024, device, nullptr, runtime, OptimizationDefaultFlags);
     std::shared_ptr<const void> pin;
-    q8_check(backend && backend->prepare_demand("mxfp4-billing", gate, &gate_bias, down, &down_bias, 0, 0.f, ExpertActivation::Silu, pin)
+    q8_check(backend && backend->prepare_demand(ExpertDemandRequest{"mxfp4-billing", gate, &gate_bias, down, &down_bias, 0, 0.f, ExpertActivation::Silu}, pin)
                  && pin && backend->statistics().resident_size == expected_charge,
              "MXFP4 eager cache admission and size helper use identical accounting");
 }

@@ -159,11 +159,8 @@ static bool has_unknown_vulkan_attention_state(const SessionState& state) noexce
 }
 
 static void prepare_execution_state(const CompiledModel& model,
-                                    SessionStatistics& statistics,
                                     SessionState& state)
 {
-    if (statistics.expert_token_counts.size() < model.descriptor.expert_count)
-        statistics.expert_token_counts.resize(model.descriptor.expert_count, 0);
     if (state.layers.size() != model.graph.layer_plans.size())
         state.layers.resize(model.graph.layer_plans.size());
     state.execution_state.reset();
@@ -279,7 +276,7 @@ Result<void> forward_model(const CompiledModel& model,
             return Error{ErrorCode::InvalidArgument, "token id is outside the model vocabulary"};
     }
 
-    prepare_execution_state(model, statistics, state);
+    prepare_execution_state(model, state);
 
     ExpertCacheStatistics execution_cache_before;
     if (model.expert_cache)
@@ -1150,7 +1147,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         {
             return Error{ErrorCode::InvalidArgument, "token id is outside the model vocabulary"};
         }
-        prepare_execution_state(model, *entry.statistics, *entry.state);
+        prepare_execution_state(model, *entry.state);
     }
     ExpertScratch& batch_scratch = workspace.expert;
     ExpertCacheStatistics cache_before;
@@ -2488,18 +2485,20 @@ static void admit_ready_router_prediction(const CompiledModel& model,
         if (token_count >= vulkan_expert_gpu_admission_min_rows
             || model.opt.hybrid_mode == HybridMode::HybridExperts)
         {
-            model.expert_backend->admit(expert.cache_key,
-                                        std::move(lease.gate_up),
-                                        expert.gate_up_bias == invalid_tensor_handle
-                                            ? nullptr
-                                            : &model.weights.at(expert.gate_up_bias),
-                                        std::move(lease.down),
-                                        expert.down_bias == invalid_tensor_handle
-                                            ? nullptr
-                                            : &model.weights.at(expert.down_bias),
-                                        layer.layer_id,
-                                        expert.activation_limit,
-                                        expert.activation);
+            ExpertDemandRequest demand;
+            demand.key = expert.cache_key;
+            demand.gate_up = std::move(lease.gate_up);
+            demand.gate_up_bias = expert.gate_up_bias == invalid_tensor_handle
+                                      ? nullptr
+                                      : &model.weights.at(expert.gate_up_bias);
+            demand.down = std::move(lease.down);
+            demand.down_bias = expert.down_bias == invalid_tensor_handle
+                                   ? nullptr
+                                   : &model.weights.at(expert.down_bias);
+            demand.residency_group = layer.layer_id;
+            demand.activation_limit = expert.activation_limit;
+            demand.activation = expert.activation;
+            model.expert_backend->admit(demand);
         }
         admitted_ids[admitted_count++] = expert_id;
     }

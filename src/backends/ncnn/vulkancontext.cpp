@@ -44,19 +44,6 @@ bool prepare_staging_batch(ncnn::VkMat& buffer,
     return true;
 }
 
-bool prepare_staging_tensor(ncnn::VkMat& buffer,
-                            int width,
-                            int height,
-                            int channels,
-                            size_t element_size,
-                            ncnn::VkAllocator* allocator)
-{
-    buffer.create(width, height, channels, element_size, allocator);
-    if (buffer.empty() || !buffer.mapped_ptr())
-        return false;
-    return true;
-}
-
 bool record_mapped_upload(ncnn::VkMat& staging,
                           ncnn::VkMat& destination,
                           ncnn::VkCompute& command,
@@ -137,13 +124,6 @@ ncnn::VkMat bind_direct_host_input(ncnn::VkMat& staging)
 {
     staging.allocator->flush(staging.data);
     staging.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
-    staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
-    return staging;
-}
-
-ncnn::VkMat prepare_direct_host_output(ncnn::VkMat& staging)
-{
-    staging.data->access_flags = VK_ACCESS_HOST_READ_BIT;
     staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
     return staging;
 }

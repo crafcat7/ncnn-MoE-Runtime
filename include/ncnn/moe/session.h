@@ -196,7 +196,6 @@ struct SessionStatistics
     uint64_t speculative_accepted_tokens = 0;
     uint64_t kv_cache_logical_size = 0;
     uint64_t kv_cache_allocated_size = 0;
-    std::vector<uint64_t> expert_token_counts;
     uint32_t expert_cache_num_io_threads = 0;
     uint64_t expert_gpu_route_aggregation_batches = 0;
     uint64_t expert_gpu_route_aggregation_routes = 0;
@@ -340,7 +339,8 @@ private:
     std::mt19937_64 random_generator;
     uint32_t prefill_chunk_size = 512;
     bool use_speculative_context = true;
-    RuntimeMetricCounters generation_start_counters;
+    RuntimeMetricCounters metrics_base;
+    bool metrics_valid = false;
     bool generation_active = false;
     uint64_t generation_input_tokens = 0;
     uint64_t generation_output_tokens = 0;

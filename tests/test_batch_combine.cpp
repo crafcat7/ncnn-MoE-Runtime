@@ -160,14 +160,14 @@ class FakeSubmission final : public ExpertSubmission
 {
 public:
     FakeSubmission(std::shared_ptr<FakeBackendState> state,
-                   std::span<const ExpertBackendRequest> requests,
+                   std::span<const ExpertRequest> requests,
                    const std::unordered_map<std::string, ExpertMatrices>& experts,
                    uint64_t optimization_flags,
                    bool commit_success,
                    size_t aggregate_count)
         : state_(std::move(state)),
           requests_(requests.begin(), requests.end()),
-          planned_(requests_.size(), ExpertBackendExecutionResult::Executed),
+          planned_(requests_.size(), ExpertStatus::Executed),
           final_(planned_),
           private_outputs_(requests_.size()),
           experts_(experts),
@@ -177,16 +177,16 @@ public:
     {
         for (size_t index = 0; index < requests_.size(); ++index)
         {
-            const ExpertBackendRequest& request = requests_[index];
+            const ExpertRequest& request = requests_[index];
             if (!request.input || !request.output)
             {
-                final_[index] = ExpertBackendExecutionResult::Failed;
+                final_[index] = ExpertStatus::Failed;
                 continue;
             }
             const auto expert = experts_.find(std::string(request.key));
             if (expert == experts_.end())
             {
-                final_[index] = ExpertBackendExecutionResult::Failed;
+                final_[index] = ExpertStatus::Failed;
                 continue;
             }
             private_outputs_[index] = expert_output(expert->second, *request.input, optimization_flags_);
@@ -199,12 +199,12 @@ public:
             abort();
     }
 
-    std::span<const ExpertBackendExecutionResult> reservations() const noexcept override
+    std::span<const ExpertStatus> reservations() const noexcept override
     {
         return planned_;
     }
 
-    std::vector<ExpertBackendExecutionResult> wait() override
+    std::vector<ExpertStatus> wait() override
     {
         if (!waited_)
         {
@@ -220,8 +220,8 @@ public:
             (void)wait();
         ++state_->commit_count;
         if (!commit_success_
-            || std::any_of(final_.begin(), final_.end(), [](ExpertBackendExecutionResult result) {
-                   return result != ExpertBackendExecutionResult::Executed;
+            || std::any_of(final_.begin(), final_.end(), [](ExpertStatus result) {
+                   return result != ExpertStatus::Executed;
                }))
         {
             return false;
@@ -229,7 +229,7 @@ public:
 
         for (size_t index = 0; index < aggregate_count_; ++index)
         {
-            const ExpertBackendRequest& request = requests_[index];
+            const ExpertRequest& request = requests_[index];
             require(request.route_aggregation.output != nullptr, "fake aggregate output is missing");
             require(request.route_aggregation.completed != nullptr, "fake aggregate completion is missing");
             for (size_t row = 0; row < request.route_aggregation.routes.size(); ++row)
@@ -262,9 +262,9 @@ public:
 
 private:
     std::shared_ptr<FakeBackendState> state_;
-    std::vector<ExpertBackendRequest> requests_;
-    std::vector<ExpertBackendExecutionResult> planned_;
-    std::vector<ExpertBackendExecutionResult> final_;
+    std::vector<ExpertRequest> requests_;
+    std::vector<ExpertStatus> planned_;
+    std::vector<ExpertStatus> final_;
     std::vector<ActivationBuffer> private_outputs_;
     const std::unordered_map<std::string, ExpertMatrices>& experts_;
     uint64_t optimization_flags_ = 0;
@@ -291,22 +291,15 @@ public:
     {
     }
 
-    void admit(std::string,
-               std::shared_ptr<const TensorData>,
-               const TensorData*,
-               std::shared_ptr<const TensorData>,
-               const TensorData*,
-               uint32_t,
-               float,
-               ExpertActivation) override
+    void admit(const ExpertDemandRequest&) override
     {
     }
 
-    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) override
+    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertRequest> requests) override
     {
         ++state_->submit_count;
         state_->request_count = requests.size();
-        for (const ExpertBackendRequest& request : requests)
+        for (const ExpertRequest& request : requests)
         {
             state_->saw_route_aggregation = state_->saw_route_aggregation || request.route_aggregation.output != nullptr;
             state_->saw_require_all_requests = state_->saw_require_all_requests

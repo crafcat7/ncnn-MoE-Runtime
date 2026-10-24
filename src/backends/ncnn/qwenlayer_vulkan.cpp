@@ -16,6 +16,7 @@
 #include <limits>
 #include <mutex>
 #include <utility>
+#include <vector>
 #if NCNN_MOE_WITH_VULKAN
 #include <command.h>
 #include <gpu.h>
@@ -67,6 +68,9 @@ public:
     std::shared_ptr<MoeCombine_vulkan> combiner;
     std::shared_ptr<MoeCombinePending_vulkan> pending;
     uint64_t pending_dispatches = 0;
+    std::vector<ncnn::VkMat> buffers;
+    ActivationBuffer packed;
+    std::vector<int32_t> history;
     ncnn::VkMat residual, injection;
     bool record_hidden(ncnn::VkMat& result, ncnn::VkCompute& cmd, std::vector<ncnn::VkMat>& storage, uint64_t& uploads)
     {
@@ -79,13 +83,16 @@ public:
         storage.push_back(combined);
         return true;
     }
-    void clear_buffers()
+    void clear()
     {
         pending_dispatches = 0;
         normalized.reset();
         pending.reset();
         residual.release();
         injection.release();
+        buffers.clear();
+        packed.clear();
+        history.clear();
     }
 #endif
 };
@@ -103,8 +110,10 @@ void QwenLayerWorkspace_vulkan::reset()
     if (context)
     {
         const std::lock_guard<std::mutex> lock(context->command_mutex());
-        d->clear_buffers();
+        d->clear();
     }
+    else
+        d->clear();
     d->post.reset();
     d->combiner.reset();
     d->context.reset();
@@ -119,7 +128,15 @@ bool QwenLayerWorkspace_vulkan::active() const noexcept
 #endif
 }
 uint64_t QwenLayerWorkspace_vulkan::allocated_bytes() const noexcept
-{ return d->selected.allocated_bytes(); }
+{
+    uint64_t bytes = d->selected.allocated_bytes();
+#if NCNN_MOE_WITH_VULKAN
+    bytes += static_cast<uint64_t>(d->buffers.capacity()) * sizeof(ncnn::VkMat);
+    bytes += d->packed.allocated_bytes();
+    bytes += static_cast<uint64_t>(d->history.capacity()) * sizeof(int32_t);
+#endif
+    return bytes;
+}
 const std::shared_ptr<const DeviceTensor_vulkan>& QwenLayerWorkspace_vulkan::device_input() const noexcept
 { return d->normalized; }
 
@@ -377,33 +394,39 @@ bool QwenLayer_vulkan::forward(const ActivationBuffer& initial_hidden, std::span
     const auto fail = [&](const char* stage) { error = stage; return false; };
     const auto& impl = *d;
     auto& previous = *workspace.d;
+    const bool has_previous = static_cast<bool>(previous.context);
     if (tokens.empty() || tokens.size() > static_cast<size_t>(std::numeric_limits<int>::max())
         || cache.transaction.active || cache.vulkan_attention_state_unknown
-        || (previous.context && (previous.context != impl.context || !previous.pending || previous.pending->rows() != tokens.size()))) return fail("invalid cache, token shape or device transition");
-    ActivationBuffer packed;
+        || (has_previous && (previous.context != impl.context || !previous.pending || previous.pending->rows() != tokens.size()))) return fail("invalid cache, token shape or device transition");
     uint32_t encoding = 0, stride = 0;
-    std::vector<int32_t> next_history;
-    if (impl.ple.enabled() && ((!cache.ple_device_state && !cache.ple_convolution_state.empty()) || !qwen_ple_rows(*impl.weights, impl.ple, tokens, cache, packed, encoding, stride, next_history))) return fail("PLE row selection or incompatible prefix");
+    auto& packed = previous.packed;
+    auto& history = previous.history;
+    if (impl.ple.enabled() && ((!cache.ple_device_state && !cache.ple_convolution_state.empty()) || !qwen_ple_rows(*impl.weights, impl.ple, tokens, cache, packed, encoding, stride, history))) return fail("PLE row selection or incompatible prefix");
     auto transfer = impl.context->acquire_transfer_slot();
     auto& slot = transfer.slot();
     const auto previous_post = previous.post;
     const auto previous_combiner = previous.combiner;
-    const uint64_t previous_dispatches = previous.context ? previous.pending_dispatches + 1 : 0;
+    const uint64_t previous_dispatches = has_previous ? previous.pending_dispatches + 1 : 0;
     auto ple_state = cache.ple_device_state;
     const std::lock_guard<std::mutex> lock(impl.context->command_mutex());
     if (slot.command_used && slot.command->reset() != 0) return fail("command buffer reset");
     slot.command_used = true;
     auto& cmd = *slot.command;
-    std::vector<ncnn::VkMat> storage;
+    auto& buffers = previous.buffers;
+    // The old recording is reset (or unused), so its retained buffers can be dropped.
+    buffers.clear();
+    buffers.reserve(16);
+    // Keep the owner available for workspace.reset() if recording fails before publication.
+    previous.context = impl.context;
     GatedDeltaWork_vulkan delta_work;
     QsaAttentionWork_vulkan qsa_work;
     RouterWorkspace_vulkan router_work;
     uint64_t uploads = 0;
     ncnn::VkMat input, residual, attention_input, attention_inject, attention_output, normalized, ffn_inject;
     ncnn::VkMat packed_gpu, packed_staging, ple_norm, ple_key, ple_query, ple_value, gated, conv_input;
-    if (previous.context)
+    if (has_previous)
     {
-        if (!previous.record_hidden(input, cmd, storage, uploads)) return fail("previous FFN combine and residual");
+        if (!previous.record_hidden(input, cmd, buffers, uploads)) return fail("previous FFN combine and residual");
     }
     else
     {
@@ -435,8 +458,8 @@ bool QwenLayer_vulkan::forward(const ActivationBuffer& initial_hidden, std::span
         qwen_record(impl.pipeline.get(), 7, impl.ple.embedding_dimension, heads, input.h, impl.ple.embedding_dimension,
                     0, 0, {packed_gpu, packed_gpu, packed_gpu, packed_gpu, packed_gpu, ple_norm}, cmd,
                     encoding, impl.ple.embedding_dimension / heads, stride);
-        if (!impl.ple_key->record_forward(ple_norm, ple_key, cmd, storage)
-            || !impl.ple_value->record_forward(ple_norm, ple_value, cmd, storage)) return fail("PLE key/value projection");
+        if (!impl.ple_key->record_forward(ple_norm, ple_key, cmd, buffers)
+            || !impl.ple_value->record_forward(ple_norm, ple_value, cmd, buffers)) return fail("PLE key/value projection");
         ncnn::VkMat key_normalized, query_normalized;
         if (!qwen_allocate(key_normalized, expanded, input.h, impl.context)
             || !qwen_allocate(query_normalized, expanded, input.h, impl.context)
@@ -460,10 +483,10 @@ bool QwenLayer_vulkan::forward(const ActivationBuffer& initial_hidden, std::span
                     {conv_input, gated, impl.convolution_weight, input, ple_state->d->convolution, ple_query}, cmd,
                     impl.ple.convolution_kernel_size, impl.ple.ngram_size, length, ple_state->d->slot);
         next_slot = length == 0 ? 0 : static_cast<uint32_t>((ple_state->d->slot + tokens.size()) % length);
-        storage.insert(storage.end(), {input, key_normalized, query_normalized});
+        buffers.insert(buffers.end(), {input, key_normalized, query_normalized});
         input = ple_query;
     }
-    if (impl.qsa && previous.context)
+    if (impl.qsa && has_previous)
     {
         // Keep the combined residual on the device while crossing an explicit
         // compute-to-transfer-to-compute dependency boundary before QSA.
@@ -471,10 +494,10 @@ bool QwenLayer_vulkan::forward(const ActivationBuffer& initial_hidden, std::span
         ncnn::VkMat independent_input;
         cmd.record_clone(input, independent_input, impl.opt);
         if (independent_input.empty()) return fail("QSA device input copy");
-        storage.push_back(input);
+        buffers.push_back(input);
         input = std::move(independent_input);
     }
-    if (!impl.attention_hyper->record_pre(input, attention_input, attention_inject, cmd, storage)) return fail("attention gated residual pre");
+    if (!impl.attention_hyper->record_pre(input, attention_input, attention_inject, cmd, buffers)) return fail("attention gated residual pre");
     if (impl.delta)
     {
         if (!impl.delta->record_forward(attention_input, cache, tokens.size(), attention_output, cmd, delta_work)) return fail("Gated DeltaNet recording");
@@ -482,7 +505,7 @@ bool QwenLayer_vulkan::forward(const ActivationBuffer& initial_hidden, std::span
     else if (!impl.qsa->record_forward(attention_input, cache, position, attention_output, cmd, qsa_work))
         return fail("QSA recording");
     if (!impl.attention_hyper->record_post(attention_output, input, attention_inject, residual, cmd)
-        || !impl.ffn_hyper->record_pre(residual, normalized, ffn_inject, cmd, storage)
+        || !impl.ffn_hyper->record_pre(residual, normalized, ffn_inject, cmd, buffers)
         || !impl.router->record(normalized, options, router_work, cmd)) return fail("attention post, FFN pre or GPU router");
     const uint32_t selected_columns = Router_vulkan::selected_columns(options.top_k);
     if (!prepare_staging_batch(slot.download, tokens.size(), selected_columns, slot.staging_allocator)
@@ -524,11 +547,12 @@ bool QwenLayer_vulkan::forward(const ActivationBuffer& initial_hidden, std::span
     {
         ple_state->d->slot = next_slot;
         cache.ple_device_state = ple_state;
-        cache.ple_token_history = std::move(next_history);
+        cache.ple_token_history.swap(history);
         cache.ple_first_slot = next_slot;
         cache.device_allocated_size += ple_state->allocated_bytes() - old_ple_bytes;
     }
-    previous.clear_buffers();
+    // The fence completed; clear recorded buffers before publishing the next workspace state.
+    previous.clear();
     previous.context = impl.context;
     previous.post = impl.ffn_hyper;
     previous.combiner = impl.combiner;
@@ -593,20 +617,22 @@ bool QwenLayer_vulkan::finish(const CompiledModel& model, bool produce_logits, b
     if (slot.command_used && slot.command->reset() != 0) return false;
     slot.command_used = true;
     auto& cmd = *slot.command;
-    std::vector<ncnn::VkMat> storage;
+    auto& buffers = workspace.d->buffers;
+    // Any previous recording on this slot has been reset above.
+    buffers.clear();
     ncnn::VkMat hidden, reduced, unused_injection, normalized, output;
     uint64_t uploads = 0;
-    if (!workspace.d->record_hidden(hidden, cmd, storage, uploads)) return false;
-    storage.push_back(hidden);
+    if (!workspace.d->record_hidden(hidden, cmd, buffers, uploads)) return false;
+    buffers.push_back(hidden);
     if (last_only) hidden = row_view(hidden, static_cast<size_t>(hidden.h - 1), 1);
-    if (!head.attention_hyper->record_pre(hidden, reduced, unused_injection, cmd, storage)) return false;
+    if (!head.attention_hyper->record_pre(hidden, reduced, unused_injection, cmd, buffers)) return false;
     if (head.final_norm)
     {
         if (!head.final_norm->record(reduced, normalized, cmd)) return false;
     }
     else
         normalized = reduced;
-    if (!head.lm_head->record_forward(normalized, output, cmd, storage)) return false;
+    if (!head.lm_head->record_forward(normalized, output, cmd, buffers)) return false;
     if (!prepare_staging_batch(slot.download, output.h, output.w, slot.staging_allocator)
         || !record_prepared_activation_staging_download(output, output.h, output.w, slot.download, cmd, head.context->device(), head.opt)
         || submit_compute_and_wait(cmd, head.context->device()) != 0) return false;
@@ -617,6 +643,8 @@ bool QwenLayer_vulkan::finish(const CompiledModel& model, bool produce_logits, b
     counters.batch_uploads += uploads;
     ++counters.batch_downloads;
     counters.dispatches += workspace.d->pending_dispatches + 1 + 6 + (head.final_norm ? 1 : 0);
+    // Logits have been copied out after the command fence.
+    buffers.clear();
     return true;
 #else
     (void)model;

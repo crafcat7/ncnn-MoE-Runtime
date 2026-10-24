@@ -332,16 +332,16 @@ static void iq4_experts(uint32_t device, DType dtype, DType down_dtype)
     }
     auto backend = create_vulkan_expert_backend(storage + 4096, device, nullptr, runtime, OptimizationDefaultFlags);
     std::shared_ptr<const void> pin;
-    iq4_check(backend && backend->prepare_demand_separate("gguf-blocks", gate, nullptr, up, nullptr, down, nullptr, 0, 0.0f, ExpertActivation::Silu, pin),
+    iq4_check(backend && backend->prepare_demand(ExpertDemandRequest{"gguf-blocks", gate, nullptr, down, nullptr, 0, 0.0f, ExpertActivation::Silu, up}, pin),
               "IQ4_NL/Q5_1 native Expert cache admission");
     iq4_check(pin && backend->statistics().resident_size == storage, "IQ4_NL/Q5_1 cache accounts compact native bytes");
     const auto input = iq4_input(4, hidden);
     ActivationBuffer actual;
-    const std::array<ExpertBackendRequest, 1> requests = {ExpertBackendRequest{"gguf-blocks", &input, &actual}};
+    const std::array<ExpertRequest, 1> requests = {ExpertRequest{"gguf-blocks", &input, &actual}};
     auto submission = backend->submit_batch(requests);
     iq4_check(static_cast<bool>(submission), "IQ4_NL/Q5_1 native Expert cache submission");
     const auto results = submission->wait();
-    iq4_check(results.size() == 1 && results[0] == ExpertBackendExecutionResult::Executed && submission->commit(),
+    iq4_check(results.size() == 1 && results[0] == ExpertStatus::Executed && submission->commit(),
               "IQ4_NL/Q5_1 cached Expert executes on Vulkan");
     iq4_compare(actual, iq4_expert_reference(*gate, up.get(), *down, input, false, 0.0f), "IQ4_NL/Q5_1 cached Expert reference");
 
@@ -355,7 +355,7 @@ static void iq4_experts(uint32_t device, DType dtype, DType down_dtype)
     ActivationBuffer second_host;
     std::shared_ptr<DeviceTensor_vulkan> first_device;
     std::shared_ptr<DeviceTensor_vulkan> second_device;
-    std::array<ExpertBackendRequest, 2> device_requests;
+    std::array<ExpertRequest, 2> device_requests;
     device_requests[0].key = "native-device-first";
     device_requests[0].output = &first_host;
     device_requests[0].device_input = resident;
@@ -372,8 +372,8 @@ static void iq4_experts(uint32_t device, DType dtype, DType down_dtype)
     auto cold = wave_backend->submit_batch(device_requests);
     iq4_check(static_cast<bool>(cold), "device-only cold cache lookup");
     const auto cold_results = cold->wait();
-    iq4_check(cold_results.size() == 2 && cold_results[0] == ExpertBackendExecutionResult::NotResident
-                  && cold_results[1] == ExpertBackendExecutionResult::NotResident && !first_device && !second_device,
+    iq4_check(cold_results.size() == 2 && cold_results[0] == ExpertStatus::NotResident
+                  && cold_results[1] == ExpertStatus::NotResident && !first_device && !second_device,
               "native cold miss publishes no host or device result");
     cold.reset();
     std::array<ExpertDemandRequest, 2> demands;
@@ -394,8 +394,8 @@ static void iq4_experts(uint32_t device, DType dtype, DType down_dtype)
     iq4_check(static_cast<bool>(device_submission), "device-only routed native Expert submission");
     pins = {};
     const auto device_results = device_submission->wait();
-    iq4_check(device_results.size() == 2 && device_results[0] == ExpertBackendExecutionResult::Executed
-                  && device_results[1] == ExpertBackendExecutionResult::Executed && device_submission->commit(),
+    iq4_check(device_results.size() == 2 && device_results[0] == ExpertStatus::Executed
+                  && device_results[1] == ExpertStatus::Executed && device_submission->commit(),
               "native Expert device batch commits after upload pins release");
     device_submission.reset();
     const auto after_device = get_vulkan_statistics(runtime);
@@ -428,14 +428,15 @@ static void iq4_experts(uint32_t device, DType dtype, DType down_dtype)
             combined_expected.row(second_routes[row].token_index)[column] += second_routes[row].weight * second_expected.row(row)[column];
     iq4_compare(actual, combined_expected, "native GPU weighted route reduction reference");
     std::shared_ptr<const void> replacement_pin;
-    iq4_check(wave_backend->prepare_demand_separate("native-device-replacement", gate, nullptr, up, nullptr, down, nullptr,
-                                                    0, 0.0f, ExpertActivation::Silu, replacement_pin)
+    iq4_check(wave_backend->prepare_demand(ExpertDemandRequest{"native-device-replacement", gate, nullptr, down, nullptr,
+                                                               0, 0.0f, ExpertActivation::Silu, up},
+                                           replacement_pin)
                   && wave_backend->statistics().evictions != 0,
               "native cold demand evicts a completed entry");
     iq4_check(MoeCombine_vulkan::materialize(*first_device, actual), "completed native activation survives weight cache eviction");
     iq4_compare(actual, first_expected, "native output lifetime is independent of cache Entry pins");
     const std::array<ExpertRoute, 1> invalid_routes = {{{5, 0, 1.f}}};
-    ExpertBackendRequest invalid_request = device_requests[0];
+    ExpertRequest invalid_request = device_requests[0];
     invalid_request.key = "native-device-replacement";
     invalid_request.device_routes = invalid_routes;
     invalid_request.input_rows = invalid_routes.size();
@@ -444,7 +445,7 @@ static void iq4_experts(uint32_t device, DType dtype, DType down_dtype)
     iq4_check(static_cast<bool>(invalid_submission), "malformed device route submission is contained");
     const auto invalid_results = invalid_submission->wait();
     invalid_submission->abort();
-    iq4_check(invalid_results.size() == 1 && invalid_results[0] == ExpertBackendExecutionResult::Failed
+    iq4_check(invalid_results.size() == 1 && invalid_results[0] == ExpertStatus::Failed
                   && first_device == preserved_output,
               "invalid native gather fails without publishing or modifying prior output");
 }

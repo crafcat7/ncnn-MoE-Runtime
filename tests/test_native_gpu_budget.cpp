@@ -51,41 +51,19 @@ static void test_live_budget()
 class CountingBudgetBackend final : public ExpertBackend
 {
 public:
-    void admit(std::string, std::shared_ptr<const TensorData>, const TensorData*,
-               std::shared_ptr<const TensorData>, const TensorData*, uint32_t,
-               float, ExpertActivation) override
+    void admit(const ExpertDemandRequest&) override
     {
         ++admissions;
     }
 
-    void admit_separate(std::string, std::shared_ptr<const TensorData>, const TensorData*,
-                        std::shared_ptr<const TensorData>, const TensorData*,
-                        std::shared_ptr<const TensorData>, const TensorData*, uint32_t,
-                        float, ExpertActivation) override
-    {
-        ++admissions;
-    }
-
-    bool prepare_demand(std::string, std::shared_ptr<const TensorData>, const TensorData*,
-                        std::shared_ptr<const TensorData>, const TensorData*, uint32_t,
-                        float, ExpertActivation, std::shared_ptr<const void>& pin) override
+    bool prepare_demand(const ExpertDemandRequest&, std::shared_ptr<const void>& pin) override
     {
         ++demands;
         pin = std::make_shared<int>(1);
         return true;
     }
 
-    bool prepare_demand_separate(std::string, std::shared_ptr<const TensorData>, const TensorData*,
-                                 std::shared_ptr<const TensorData>, const TensorData*,
-                                 std::shared_ptr<const TensorData>, const TensorData*, uint32_t,
-                                 float, ExpertActivation, std::shared_ptr<const void>& pin) override
-    {
-        ++demands;
-        pin = std::make_shared<int>(1);
-        return true;
-    }
-
-    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) override
+    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertRequest> requests) override
     {
         ++submissions;
         if (!requests.empty()) last_key = requests.front().key;
@@ -121,16 +99,17 @@ static void test_key_sharded_routing()
     {
         // A conflicting group must not override deterministic key placement.
         const uint32_t group = static_cast<uint32_t>(1 - index);
-        backend->admit(keys[index], weight, nullptr, weight, nullptr, group, 0.f, ExpertActivation::Silu);
-        backend->admit_separate(keys[index], weight, nullptr, weight, nullptr, weight, nullptr,
-                                group, 0.f, ExpertActivation::Silu);
+        const ExpertDemandRequest packed{keys[index], weight, nullptr, weight, nullptr,
+                                         group, 0.f, ExpertActivation::Silu};
+        const ExpertDemandRequest separate{keys[index], weight, nullptr, weight, nullptr,
+                                           group, 0.f, ExpertActivation::Silu, weight};
+        backend->admit(packed);
+        backend->admit(separate);
         std::shared_ptr<const void> pin;
-        budget_check(backend->prepare_demand(keys[index], weight, nullptr, weight, nullptr,
-                                             group, 0.f, ExpertActivation::Silu, pin)
+        budget_check(backend->prepare_demand(packed, pin)
                          && pin,
                      "key-sharded demand prepares its hash-selected child");
-        budget_check(backend->prepare_demand_separate(keys[index], weight, nullptr, weight, nullptr, weight, nullptr,
-                                                      group, 0.f, ExpertActivation::Silu, pin)
+        budget_check(backend->prepare_demand(separate, pin)
                          && pin,
                      "key-sharded separate demand prepares its hash-selected child");
         budget_check(children[index]->admissions == 2 && children[index]->demands == 2,
@@ -148,9 +127,9 @@ static void test_key_sharded_routing()
                  "key-sharded asynchronous demand preserves the prepared prefix");
     ActivationBuffer input(1, 1);
     std::array<ActivationBuffer, 2> outputs;
-    const std::array<ExpertBackendRequest, 2> requests = {
-        ExpertBackendRequest{keys[0], &input, &outputs[0]},
-        ExpertBackendRequest{keys[1], &input, &outputs[1]},
+    const std::array<ExpertRequest, 2> requests = {
+        ExpertRequest{keys[0], &input, &outputs[0]},
+        ExpertRequest{keys[1], &input, &outputs[1]},
     };
     auto submission = backend->submit_batch(requests);
     budget_check(static_cast<bool>(submission), "key-sharded batch submission exists");
@@ -169,15 +148,20 @@ static void test_unbudgeted_device_fallback()
     // device 2 merely because device 2 is the only remaining backend.
     auto backend = create_multi_device_expert_backend({child}, {2}, {2, 7});
     auto weight = std::make_shared<TensorData>();
-    backend->admit("missing", weight, nullptr, weight, nullptr, 1, 0.f, ExpertActivation::Silu);
-    backend->admit_separate("missing-separate", weight, nullptr, weight, nullptr, weight, nullptr, 1, 0.f, ExpertActivation::Silu);
+    const ExpertDemandRequest missing{"missing", weight, nullptr, weight, nullptr, 1, 0.f, ExpertActivation::Silu};
+    const ExpertDemandRequest missing_separate{"missing-separate", weight, nullptr, weight, nullptr,
+                                               1, 0.f, ExpertActivation::Silu, weight};
+    backend->admit(missing);
+    backend->admit(missing_separate);
     budget_check(child->admissions == 0, "unbudgeted device must not upload to a different device");
-    backend->admit("resident", weight, nullptr, weight, nullptr, 0, 0.f, ExpertActivation::Silu);
+    const ExpertDemandRequest resident{"resident", weight, nullptr, weight, nullptr, 0, 0.f, ExpertActivation::Silu};
+    backend->admit(resident);
     budget_check(child->admissions == 1, "budgeted device keeps normal admission");
 
     std::shared_ptr<const void> pin;
-    budget_check(!backend->prepare_demand_separate("missing", weight, nullptr, weight, nullptr, weight, nullptr,
-                                                   1, 0.f, ExpertActivation::Silu, pin)
+    const ExpertDemandRequest missing_demand{"missing", weight, nullptr, weight, nullptr,
+                                             1, 0.f, ExpertActivation::Silu, weight};
+    budget_check(!backend->prepare_demand(missing_demand, pin)
                      && !pin && child->demands == 0,
                  "unbudgeted demand stays available for CPU fallback");
     const std::array<ExpertDemandRequest, 2> demands = {
@@ -196,13 +180,13 @@ static void test_unbudgeted_device_fallback()
     ActivationBuffer input(1, 1);
     ActivationBuffer output(1, 1);
     output.row(0)[0] = 123.f;
-    const std::array<ExpertBackendRequest, 1> requests = {ExpertBackendRequest{"missing", &input, &output}};
+    const std::array<ExpertRequest, 1> requests = {ExpertRequest{"missing", &input, &output}};
     auto submission = backend->submit_batch(requests);
     budget_check(submission && submission->reservations().size() == 1
-                     && submission->reservations()[0] == ExpertBackendExecutionResult::NotResident,
+                     && submission->reservations()[0] == ExpertStatus::NotResident,
                  "unbudgeted submission reserves CPU fallback");
     const auto results = submission->wait();
-    budget_check(results.size() == 1 && results[0] == ExpertBackendExecutionResult::NotResident
+    budget_check(results.size() == 1 && results[0] == ExpertStatus::NotResident
                      && output.row(0)[0] == 123.f && child->submissions == 0,
                  "unbudgeted submission neither executes nor publishes output");
 }

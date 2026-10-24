@@ -40,6 +40,19 @@
 namespace ncnn {
 namespace moe {
 
+#if NCNN_MOE_WITH_VULKAN
+static bool create_staging(ncnn::VkMat& m,
+                           int w,
+                           int h,
+                           int c,
+                           size_t elemsize,
+                           ncnn::VkAllocator* allocator)
+{
+    m.create(w, h, c, elemsize, allocator);
+    return !m.empty() && m.mapped_ptr();
+}
+#endif
+
 class Attention_vulkan::Implementation
 {
 public:
@@ -191,8 +204,8 @@ static bool fill_attention_mask_staging(ncnn::VkMat& staging, size_t token_count
                                         bool bfloat16_storage, ncnn::VkAllocator* allocator)
 {
     if (destination_count > static_cast<uint64_t>(std::numeric_limits<int>::max()) || token_count > static_cast<size_t>(std::numeric_limits<int>::max())
-        || !prepare_staging_tensor(staging, static_cast<int>(destination_count), static_cast<int>(token_count), static_cast<int>(config.head_count),
-                                   bfloat16_storage ? sizeof(uint16_t) : sizeof(float), allocator))
+        || !create_staging(staging, static_cast<int>(destination_count), static_cast<int>(token_count), static_cast<int>(config.head_count),
+                           bfloat16_storage ? sizeof(uint16_t) : sizeof(float), allocator))
         return false;
 
     // The finite sentinel avoids BF16 NaNs and still underflows after softmax.
@@ -295,18 +308,18 @@ static bool fill_attention_cache_promotion_staging(ncnn::VkMat& key_staging,
         || (!bfloat16
             && (cache.keys.size() < capacity_elements
                 || cache.values.size() < capacity_elements))
-        || !prepare_staging_tensor(key_staging,
-                                   static_cast<int>(config.head_dimension),
-                                   static_cast<int>(cache.token_count),
-                                   static_cast<int>(config.kv_head_count),
-                                   sizeof(float),
-                                   allocator)
-        || !prepare_staging_tensor(value_staging,
-                                   static_cast<int>(config.head_dimension),
-                                   static_cast<int>(cache.token_count),
-                                   static_cast<int>(config.kv_head_count),
-                                   sizeof(float),
-                                   allocator))
+        || !create_staging(key_staging,
+                           static_cast<int>(config.head_dimension),
+                           static_cast<int>(cache.token_count),
+                           static_cast<int>(config.kv_head_count),
+                           sizeof(float),
+                           allocator)
+        || !create_staging(value_staging,
+                           static_cast<int>(config.head_dimension),
+                           static_cast<int>(cache.token_count),
+                           static_cast<int>(config.kv_head_count),
+                           sizeof(float),
+                           allocator))
     {
         return false;
     }
@@ -2179,18 +2192,18 @@ bool Attention_vulkan::materialize_device_cache(LayerCache& cache) const
     VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
-    if (!prepare_staging_tensor(transfer_slot.attention_cache_key,
-                                static_cast<int>(config.head_dimension),
-                                static_cast<int>(cache.token_count),
-                                static_cast<int>(config.kv_head_count),
-                                element_size,
-                                transfer_slot.staging_allocator)
-        || !prepare_staging_tensor(transfer_slot.attention_cache_value,
-                                   static_cast<int>(config.head_dimension),
-                                   static_cast<int>(cache.token_count),
-                                   static_cast<int>(config.kv_head_count),
-                                   element_size,
-                                   transfer_slot.staging_allocator))
+    if (!create_staging(transfer_slot.attention_cache_key,
+                        static_cast<int>(config.head_dimension),
+                        static_cast<int>(cache.token_count),
+                        static_cast<int>(config.kv_head_count),
+                        element_size,
+                        transfer_slot.staging_allocator)
+        || !create_staging(transfer_slot.attention_cache_value,
+                           static_cast<int>(config.head_dimension),
+                           static_cast<int>(cache.token_count),
+                           static_cast<int>(config.kv_head_count),
+                           element_size,
+                           transfer_slot.staging_allocator))
     {
         return false;
     }

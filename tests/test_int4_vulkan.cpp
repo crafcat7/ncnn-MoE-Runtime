@@ -380,12 +380,18 @@ static void test_int4_gpu_experts()
     std::shared_ptr<const void> packed_pin;
     std::shared_ptr<const void> separate_pin;
     std::shared_ptr<const void> mixed_pin;
-    int4_gpu_check(backend->prepare_demand("int4-packed", gate_up, &gate_up_bias, down, &down_bias, 0, 0.f, ExpertActivation::Silu, packed_pin), "admit packed INT4 Expert on GPU");
-    int4_gpu_check(backend->prepare_demand_separate("int4-separate", gate, &gate_bias, up, &up_bias, down, &down_bias,
-                                                    0, 0.f, ExpertActivation::Silu, separate_pin),
+    int4_gpu_check(backend->prepare_demand(ExpertDemandRequest{"int4-packed", gate_up, &gate_up_bias, down, &down_bias,
+                                                               0, 0.f, ExpertActivation::Silu},
+                                           packed_pin),
+                   "admit packed INT4 Expert on GPU");
+    int4_gpu_check(backend->prepare_demand(ExpertDemandRequest{"int4-separate", gate, &gate_bias, down, &down_bias,
+                                                               0, 0.f, ExpertActivation::Silu, up, &up_bias},
+                                           separate_pin),
                    "admit separate INT4 Expert on GPU");
-    int4_gpu_check(backend->prepare_demand_separate("int4-mixed", gate, &gate_bias, std::make_shared<TensorData>(bfloat_up), &up_bias, down, &down_bias,
-                                                    0, 0.f, ExpertActivation::Silu, mixed_pin),
+    int4_gpu_check(backend->prepare_demand(ExpertDemandRequest{"int4-mixed", gate, &gate_bias, down, &down_bias,
+                                                               0, 0.f, ExpertActivation::Silu,
+                                                               std::make_shared<TensorData>(bfloat_up), &up_bias},
+                                           mixed_pin),
                    "admit mixed INT4/BF16 Expert on GPU");
     const auto admitted = backend->statistics();
     int4_gpu_check(packed_pin && separate_pin && mixed_pin && admitted.stores == 3 && admitted.resident_size == packed_bytes + separate_bytes + mixed_bytes,
@@ -393,19 +399,19 @@ static void test_int4_gpu_experts()
     std::array<ActivationBuffer, 2> outputs = {ActivationBuffer(1, 1), ActivationBuffer(1, 1)};
     for (auto& output : outputs)
         output.row(0)[0] = 123.f;
-    const std::array<ExpertBackendRequest, 2> requests = {
-        ExpertBackendRequest{"int4-packed", &input, &outputs[0]},
-        ExpertBackendRequest{"int4-separate", &input, &outputs[1]},
+    const std::array<ExpertRequest, 2> requests = {
+        ExpertRequest{"int4-packed", &input, &outputs[0]},
+        ExpertRequest{"int4-separate", &input, &outputs[1]},
     };
     const auto before = get_vulkan_statistics(runtime);
     auto submission = backend->submit_batch(requests);
     int4_gpu_check(static_cast<bool>(submission), "submit native INT4 Expert batch");
     for (const auto reservation : submission->reservations())
-        int4_gpu_check(reservation == ExpertBackendExecutionResult::Executed, "INT4 Expert GPU reservation");
+        int4_gpu_check(reservation == ExpertStatus::Executed, "INT4 Expert GPU reservation");
     const auto results = submission->wait();
     int4_gpu_check(results.size() == 2, "INT4 Expert GPU result count");
     for (const auto result : results)
-        int4_gpu_check(result == ExpertBackendExecutionResult::Executed, "INT4 Expert actually executed on GPU");
+        int4_gpu_check(result == ExpertStatus::Executed, "INT4 Expert actually executed on GPU");
     for (const auto& output : outputs)
         int4_gpu_check(output.rows() == 1 && output.columns() == 1 && output.row(0)[0] == 123.f, "Expert result stays private before commit");
     int4_gpu_check(submission->commit(), "commit native INT4 Expert GPU batch");
@@ -415,15 +421,15 @@ static void test_int4_gpu_experts()
                    "native INT4 batch publishes GPU execution counters");
     int4_gpu_check_output(outputs[0], int4_gpu_expert_oracle(*gate_up, &gate_up_bias, nullptr, nullptr, *down, &down_bias, input), "resident packed INT4 Expert");
     int4_gpu_check_output(outputs[1], expected, "resident separate INT4 Expert");
-    const std::array<ExpertBackendRequest, 2> mixed_requests = {
-        ExpertBackendRequest{"int4-separate", &input, &outputs[0]},
-        ExpertBackendRequest{"int4-mixed", &input, &outputs[1]},
+    const std::array<ExpertRequest, 2> mixed_requests = {
+        ExpertRequest{"int4-separate", &input, &outputs[0]},
+        ExpertRequest{"int4-mixed", &input, &outputs[1]},
     };
     const auto batch_before = get_vulkan_statistics(runtime);
     auto batch = backend->submit_batch(mixed_requests);
     int4_gpu_check(static_cast<bool>(batch), "submit mixed INT4/BF16 Expert batch");
     const auto batch_results = batch->wait();
-    int4_gpu_check(batch_results.size() == 2 && std::all_of(batch_results.begin(), batch_results.end(), [](auto result) { return result == ExpertBackendExecutionResult::Executed; }),
+    int4_gpu_check(batch_results.size() == 2 && std::all_of(batch_results.begin(), batch_results.end(), [](auto result) { return result == ExpertStatus::Executed; }),
                    "mixed batch executes both Experts on GPU");
     int4_gpu_check(batch->commit(), "commit mixed INT4/BF16 Expert batch");
     const auto batch_after = get_vulkan_statistics(runtime);
@@ -436,8 +442,9 @@ static void test_int4_gpu_experts()
 
     auto insufficient = create_vulkan_expert_backend(packed_bytes - 1, get_default_gpu_index(), nullptr, runtime, OptimizationDefaultFlags);
     std::shared_ptr<const void> rejected;
-    int4_gpu_check(!insufficient->prepare_demand("too-large", gate_up, &gate_up_bias, down, &down_bias, 0, 0.f,
-                                                 ExpertActivation::Silu, rejected)
+    int4_gpu_check(!insufficient->prepare_demand(ExpertDemandRequest{"too-large", gate_up, &gate_up_bias, down, &down_bias,
+                                                                     0, 0.f, ExpertActivation::Silu},
+                                                 rejected)
                        && !rejected,
                    "GPU admission budget includes packed metadata and alignment");
 }

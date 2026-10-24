@@ -135,8 +135,8 @@ static std::vector<float> dense_reference(const CompiledModel& model, int32_t to
 static void dense_no_routes(const SessionStatistics& statistics)
 {
     dense_check(statistics.expert_assignments == 0 && statistics.expert_batches == 0, "dense FFN recorded routes");
+    dense_check(statistics.expert_cpu_routes == 0 && statistics.expert_gpu_routes == 0, "dense FFN recorded expert routes");
     dense_check(statistics.expert_cache_hits == 0 && statistics.expert_cache_misses == 0, "dense FFN accessed expert cache");
-    dense_check(statistics.expert_token_counts.empty(), "dense FFN allocated expert counts");
 }
 
 static TensorData native_matrix(uint32_t rows, uint32_t columns, bool packed, uint32_t seed)

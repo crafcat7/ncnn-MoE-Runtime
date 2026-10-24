@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <functional>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 
 namespace ncnn {
@@ -28,13 +30,7 @@ size_t ExpertBackend::prepare_demand_batch(std::span<const ExpertDemandRequest> 
     size_t prepared = 0;
     for (const auto& request : requests)
     {
-        const bool ready = request.up
-                               ? prepare_demand_separate(std::string(request.key), request.gate_up, request.gate_up_bias,
-                                                         request.up, request.up_bias, request.down, request.down_bias,
-                                                         request.residency_group, request.activation_limit, request.activation, pins[prepared])
-                               : prepare_demand(std::string(request.key), request.gate_up, request.gate_up_bias,
-                                                request.down, request.down_bias, request.residency_group,
-                                                request.activation_limit, request.activation, pins[prepared]);
+        const bool ready = prepare_demand(request, pins[prepared]);
         if (!ready)
             break;
         ++prepared;
@@ -188,6 +184,85 @@ static void add_statistics(ExpertBackendStatistics& destination, const ExpertBac
     destination.route_aggregation_bytes_saved += source.route_aggregation_bytes_saved;
 }
 
+class MultiDeviceExpertBackend final : public ExpertBackend
+{
+public:
+    MultiDeviceExpertBackend(std::vector<std::shared_ptr<ExpertBackend>> _backends,
+                             std::vector<uint32_t> device_indices,
+                             std::vector<uint32_t> _residency_group_devices,
+                             bool _key_sharded);
+
+    void admit(const ExpertDemandRequest& request) override;
+
+    bool prepare_demand(const ExpertDemandRequest& request,
+                        std::shared_ptr<const void>& pin) override;
+
+    size_t prepare_demand_batch(std::span<const ExpertDemandRequest> requests,
+                                std::span<std::shared_ptr<const void>> pins) override;
+
+    std::unique_ptr<ExpertDemandSubmission> begin_demand_batch(std::span<const ExpertDemandRequest> requests) override;
+
+    void set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator) override;
+
+    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertRequest> requests) override;
+
+    void set_foreground_active(bool active) noexcept override;
+
+    void wait_for_background_work() override;
+
+    ExpertBackendStatistics statistics() const override;
+
+private:
+    struct ChildSubmission
+    {
+        std::vector<size_t> request_indices;
+        std::vector<ExpertRequest> requests;
+        std::unique_ptr<ExpertSubmission> submission;
+        bool reservation_shape_valid = true;
+    };
+
+    class Submission final : public ExpertSubmission
+    {
+    public:
+        Submission(MultiDeviceExpertBackend* owner,
+                   std::span<const ExpertRequest> requests,
+                   std::vector<std::vector<size_t>> request_indices);
+
+        ~Submission() override;
+
+        std::span<const ExpertStatus> reservations() const noexcept override;
+
+        std::vector<ExpertStatus> wait() override;
+
+        void wait(std::vector<ExpertStatus>& results) override;
+
+        bool commit() override;
+
+        void abort() noexcept override;
+
+    private:
+        std::vector<ExpertRequest> client_requests;
+        std::vector<ActivationBuffer> private_outputs;
+        std::vector<ChildSubmission> children;
+        std::vector<ExpertStatus> planned;
+        std::vector<ExpertStatus> final;
+        bool waited = false;
+        bool committed = false;
+        bool aborted = false;
+    };
+
+    size_t backend_for_group(uint32_t residency_group) const;
+
+    size_t fallback_backend(std::string_view key) const;
+
+    std::vector<std::shared_ptr<ExpertBackend>> backends;
+    std::vector<uint32_t> residency_group_devices;
+    std::unordered_map<uint32_t, size_t> device_to_backend;
+    mutable std::mutex placement_mutex;
+    std::unordered_map<std::string, size_t, ExpertKeyHash, std::equal_to<>> key_placements;
+    bool key_sharded = false;
+};
+
 MultiDeviceExpertBackend::MultiDeviceExpertBackend(std::vector<std::shared_ptr<ExpertBackend>> _backends, std::vector<uint32_t> device_indices, std::vector<uint32_t> _residency_group_devices, bool _key_sharded)
     : backends(std::move(_backends)),
       residency_group_devices(std::move(_residency_group_devices)),
@@ -199,92 +274,36 @@ MultiDeviceExpertBackend::MultiDeviceExpertBackend(std::vector<std::shared_ptr<E
     }
 }
 
-void MultiDeviceExpertBackend::admit(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
-                                     float activation_limit, ExpertActivation activation)
+void MultiDeviceExpertBackend::admit(const ExpertDemandRequest& request)
 {
-    if (backends.empty() || key.empty())
+    if (backends.empty() || request.key.empty())
         return;
-    const size_t backend_index = key_sharded ? fallback_backend(key) : backend_for_group(residency_group);
+    const size_t backend_index = key_sharded ? fallback_backend(request.key) : backend_for_group(request.residency_group);
     if (!key_sharded)
     {
         const std::lock_guard<std::mutex> lock(placement_mutex);
-        key_placements.insert_or_assign(key, backend_index);
+        key_placements.insert_or_assign(std::string(request.key), backend_index);
     }
     if (backend_index >= backends.size())
         return;
-    backends[backend_index]->admit(std::move(key),
-                                   std::move(gate_up),
-                                   gate_up_bias,
-                                   std::move(down),
-                                   down_bias,
-                                   residency_group,
-                                   activation_limit,
-                                   activation);
+    backends[backend_index]->admit(request);
 }
 
-void MultiDeviceExpertBackend::admit_separate(std::string key, std::shared_ptr<const TensorData> gate,
-                                              const TensorData* gate_bias, std::shared_ptr<const TensorData> up,
-                                              const TensorData* up_bias, std::shared_ptr<const TensorData> down,
-                                              const TensorData* down_bias, uint32_t residency_group,
-                                              float activation_limit, ExpertActivation activation)
-{
-    if (backends.empty() || key.empty())
-        return;
-    const size_t backend_index = key_sharded ? fallback_backend(key) : backend_for_group(residency_group);
-    if (!key_sharded)
-    {
-        const std::lock_guard<std::mutex> lock(placement_mutex);
-        key_placements.insert_or_assign(key, backend_index);
-    }
-    if (backend_index >= backends.size())
-        return;
-    backends[backend_index]->admit_separate(std::move(key), std::move(gate), gate_bias, std::move(up), up_bias,
-                                            std::move(down), down_bias, residency_group, activation_limit, activation);
-}
-
-bool MultiDeviceExpertBackend::prepare_demand(std::string key, std::shared_ptr<const TensorData> gate_up,
-                                              const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down,
-                                              const TensorData* down_bias, uint32_t residency_group,
-                                              float activation_limit, ExpertActivation activation,
+bool MultiDeviceExpertBackend::prepare_demand(const ExpertDemandRequest& request,
                                               std::shared_ptr<const void>& pin)
 {
     pin.reset();
-    if (backends.empty() || key.empty())
+    if (backends.empty() || request.key.empty())
         return false;
-    const size_t backend_index = key_sharded ? fallback_backend(key) : backend_for_group(residency_group);
+    const size_t backend_index = key_sharded ? fallback_backend(request.key) : backend_for_group(request.residency_group);
     if (!key_sharded)
     {
         const std::lock_guard<std::mutex> lock(placement_mutex);
-        key_placements.insert_or_assign(key, backend_index);
+        key_placements.insert_or_assign(std::string(request.key), backend_index);
     }
     if (backend_index >= backends.size())
         return false;
-    return backends[backend_index]->prepare_demand(std::move(key), std::move(gate_up), gate_up_bias,
-                                                   std::move(down), down_bias, residency_group,
-                                                   activation_limit, activation, pin);
-}
-
-bool MultiDeviceExpertBackend::prepare_demand_separate(std::string key, std::shared_ptr<const TensorData> gate,
-                                                       const TensorData* gate_bias, std::shared_ptr<const TensorData> up,
-                                                       const TensorData* up_bias, std::shared_ptr<const TensorData> down,
-                                                       const TensorData* down_bias, uint32_t residency_group,
-                                                       float activation_limit, ExpertActivation activation,
-                                                       std::shared_ptr<const void>& pin)
-{
-    pin.reset();
-    if (backends.empty() || key.empty())
-        return false;
-    const size_t backend_index = key_sharded ? fallback_backend(key) : backend_for_group(residency_group);
-    if (!key_sharded)
-    {
-        const std::lock_guard<std::mutex> lock(placement_mutex);
-        key_placements.insert_or_assign(key, backend_index);
-    }
-    if (backend_index >= backends.size())
-        return false;
-    return backends[backend_index]->prepare_demand_separate(std::move(key), std::move(gate), gate_bias,
-                                                            std::move(up), up_bias, std::move(down), down_bias,
-                                                            residency_group, activation_limit, activation, pin);
+    return backends[backend_index]->prepare_demand(request, pin);
 }
 
 size_t MultiDeviceExpertBackend::prepare_demand_batch(std::span<const ExpertDemandRequest> requests,
@@ -357,7 +376,7 @@ void MultiDeviceExpertBackend::set_residency_coordinator(std::shared_ptr<ExpertR
         backend->set_residency_coordinator(coordinator);
 }
 
-std::unique_ptr<ExpertSubmission> MultiDeviceExpertBackend::submit_batch(std::span<const ExpertBackendRequest> requests)
+std::unique_ptr<ExpertSubmission> MultiDeviceExpertBackend::submit_batch(std::span<const ExpertRequest> requests)
 {
     std::vector<std::vector<size_t>> request_indices(backends.size());
     if (key_sharded)
@@ -403,10 +422,10 @@ ExpertBackendStatistics MultiDeviceExpertBackend::statistics() const
     return aggregate;
 }
 
-MultiDeviceExpertBackend::Submission::Submission(MultiDeviceExpertBackend* owner, std::span<const ExpertBackendRequest> requests, std::vector<std::vector<size_t>> request_indices)
+MultiDeviceExpertBackend::Submission::Submission(MultiDeviceExpertBackend* owner, std::span<const ExpertRequest> requests, std::vector<std::vector<size_t>> request_indices)
     : client_requests(requests.begin(), requests.end()),
       private_outputs(requests.size()),
-      planned(requests.size(), ExpertBackendExecutionResult::NotResident),
+      planned(requests.size(), ExpertStatus::NotResident),
       final(planned)
 {
     children.reserve(owner->backends.size());
@@ -421,7 +440,7 @@ MultiDeviceExpertBackend::Submission::Submission(MultiDeviceExpertBackend* owner
         child.requests.reserve(child.request_indices.size());
         for (size_t request_index : child.request_indices)
         {
-            ExpertBackendRequest child_request = requests[request_index];
+            ExpertRequest child_request = requests[request_index];
             child_request.output = &private_outputs[request_index];
             // Let the framework combine multi-device outputs on CPU.
             child_request.route_aggregation = {};
@@ -438,7 +457,7 @@ MultiDeviceExpertBackend::Submission::Submission(MultiDeviceExpertBackend* owner
             {
                 child.submission->abort();
                 for (const size_t request_index : child.request_indices)
-                    planned[request_index] = ExpertBackendExecutionResult::Failed;
+                    planned[request_index] = ExpertStatus::Failed;
             }
             else
             {
@@ -461,19 +480,19 @@ MultiDeviceExpertBackend::Submission::~Submission()
         abort();
 }
 
-std::span<const ExpertBackendExecutionResult> MultiDeviceExpertBackend::Submission::reservations() const noexcept
+std::span<const ExpertStatus> MultiDeviceExpertBackend::Submission::reservations() const noexcept
 {
     return planned;
 }
 
-std::vector<ExpertBackendExecutionResult> MultiDeviceExpertBackend::Submission::wait()
+std::vector<ExpertStatus> MultiDeviceExpertBackend::Submission::wait()
 {
-    std::vector<ExpertBackendExecutionResult> results;
+    std::vector<ExpertStatus> results;
     wait(results);
     return results;
 }
 
-void MultiDeviceExpertBackend::Submission::wait(std::vector<ExpertBackendExecutionResult>& results)
+void MultiDeviceExpertBackend::Submission::wait(std::vector<ExpertStatus>& results)
 {
     if (waited)
     {
@@ -486,15 +505,15 @@ void MultiDeviceExpertBackend::Submission::wait(std::vector<ExpertBackendExecuti
             continue;
         results.clear();
         child.submission->wait(results);
-        const std::vector<ExpertBackendExecutionResult>& child_final = results;
+        const std::vector<ExpertStatus>& child_final = results;
         bool result_shape_valid = child.reservation_shape_valid && child_final.size() == child.request_indices.size();
         if (result_shape_valid)
         {
             for (size_t index = 0; index < child_final.size(); ++index)
             {
                 const size_t request_index = child.request_indices[index];
-                if (child_final[index] == ExpertBackendExecutionResult::Executed
-                    && planned[request_index] != ExpertBackendExecutionResult::Executed)
+                if (child_final[index] == ExpertStatus::Executed
+                    && planned[request_index] != ExpertStatus::Executed)
                 {
                     result_shape_valid = false;
                     break;
@@ -505,7 +524,7 @@ void MultiDeviceExpertBackend::Submission::wait(std::vector<ExpertBackendExecuti
         {
             child.submission->abort();
             for (const size_t request_index : child.request_indices)
-                final[request_index] = ExpertBackendExecutionResult::Failed;
+                final[request_index] = ExpertStatus::Failed;
             continue;
         }
         for (size_t index = 0; index < child_final.size(); ++index)
@@ -526,7 +545,7 @@ bool MultiDeviceExpertBackend::Submission::commit()
         return committed;
     for (size_t index = 0; index < final.size(); ++index)
     {
-        if (final[index] != ExpertBackendExecutionResult::Executed)
+        if (final[index] != ExpertStatus::Executed)
             continue;
         if (!client_requests[index].output)
         {
@@ -541,7 +560,7 @@ bool MultiDeviceExpertBackend::Submission::commit()
             bool child_has_executed = false;
             for (const size_t request_index : child.request_indices)
             {
-                child_has_executed = child_has_executed || final[request_index] == ExpertBackendExecutionResult::Executed;
+                child_has_executed = child_has_executed || final[request_index] == ExpertStatus::Executed;
             }
             if (child_has_executed && !child.submission->commit())
             {
@@ -554,7 +573,7 @@ bool MultiDeviceExpertBackend::Submission::commit()
     }
     for (size_t index = 0; index < final.size(); ++index)
     {
-        if (final[index] == ExpertBackendExecutionResult::Executed)
+        if (final[index] == ExpertStatus::Executed)
             client_requests[index].output->swap(private_outputs[index]);
         if (client_requests[index].device_output)
             client_requests[index].device_output->reset();

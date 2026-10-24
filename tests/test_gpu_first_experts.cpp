@@ -79,10 +79,12 @@ struct GpuFirstFixture
         expected = forward_linear(*down, activated, flags);
     }
 
-    bool demand(ExpertBackend& backend, const std::string& key, std::shared_ptr<const void>& pin) const
+    bool demand(ExpertBackend& backend, const std::string& key, std::shared_ptr<const void>& pin,
+                uint32_t residency_group = 0) const
     {
-        return backend.prepare_demand(key, gate, nullptr, down, nullptr, 0, 4.0f,
-                                      ExpertActivation::DeepSeekSwiGlu, pin);
+        return backend.prepare_demand(ExpertDemandRequest{key, gate, nullptr, down, nullptr,
+                                                          residency_group, 4.0f, ExpertActivation::DeepSeekSwiGlu},
+                                      pin);
     }
 
     void check_output(const ActivationBuffer& actual) const
@@ -105,15 +107,15 @@ static void gpu_first_execute(const GpuFirstFixture& fixture, ExpertBackend& bac
 {
     ActivationBuffer output(1, 32);
     std::fill_n(output.row(0), output.columns(), -123.0f);
-    ExpertBackendRequest request{key, &fixture.input, &output, fixture.size, {}};
-    auto submission = backend.submit_batch(std::span<const ExpertBackendRequest>(&request, 1));
+    ExpertRequest request{key, &fixture.input, &output, fixture.size, {}};
+    auto submission = backend.submit_batch(std::span<const ExpertRequest>(&request, 1));
     gpu_first_check(submission && submission->reservations().size() == 1
-                        && submission->reservations()[0] == ExpertBackendExecutionResult::Executed,
+                        && submission->reservations()[0] == ExpertStatus::Executed,
                     "cold current-wave request must reserve GPU after demand upload");
     pin.reset();
     gpu_first_check(output.values()[0] == -123.0f, "GPU output is private before commit");
     const auto results = submission->wait();
-    gpu_first_check(results.size() == 1 && results[0] == ExpertBackendExecutionResult::Executed,
+    gpu_first_check(results.size() == 1 && results[0] == ExpertStatus::Executed,
                     "cold current-wave request must execute on GPU");
     gpu_first_check(output.values()[0] == -123.0f, "wait cannot publish GPU output");
     gpu_first_check(submission->commit(), "GPU demand commit");
@@ -163,8 +165,9 @@ static void gpu_first_cold_and_capacity()
     unsupported->dtype = DType::Float32;
     unsupported->shape = {64, 32};
     unsupported->float32_data.assign(64 * 32, 1.0f);
-    gpu_first_check(!backend->prepare_demand("unsupported", unsupported, nullptr, fixture.down, nullptr,
-                                             0, 4.0f, ExpertActivation::DeepSeekSwiGlu, pin)
+    gpu_first_check(!backend->prepare_demand(ExpertDemandRequest{"unsupported", unsupported, nullptr, fixture.down, nullptr,
+                                                                 0, 4.0f, ExpertActivation::DeepSeekSwiGlu},
+                                             pin)
                         && !pin,
                     "unsupported demand must permit CPU fallback");
 
@@ -174,16 +177,18 @@ static void gpu_first_cold_and_capacity()
     malformed->shape = {64, 32};
     malformed->mxfp4_blocks.resize(64 * 16);
     malformed->mxfp4_scales.resize(63); // A valid gate needs 64 scales.
-    gpu_first_check(!backend->prepare_demand("invalid-payload", malformed, nullptr, fixture.down, nullptr,
-                                             0, 4.0f, ExpertActivation::DeepSeekSwiGlu, pin)
+    gpu_first_check(!backend->prepare_demand(ExpertDemandRequest{"invalid-payload", malformed, nullptr, fixture.down, nullptr,
+                                                                 0, 4.0f, ExpertActivation::DeepSeekSwiGlu},
+                                             pin)
                         && !pin,
                     "malformed payload is rejected before demand eviction");
     TensorData malformed_bias;
     malformed_bias.dtype = DType::Float32;
     malformed_bias.shape = {64};
     malformed_bias.float32_data.assign(63, 0.0f);
-    gpu_first_check(!backend->prepare_demand("invalid-bias", fixture.gate, &malformed_bias, fixture.down, nullptr,
-                                             0, 4.0f, ExpertActivation::DeepSeekSwiGlu, pin)
+    gpu_first_check(!backend->prepare_demand(ExpertDemandRequest{"invalid-bias", fixture.gate, &malformed_bias, fixture.down, nullptr,
+                                                                 0, 4.0f, ExpertActivation::DeepSeekSwiGlu},
+                                             pin)
                         && !pin,
                     "malformed bias is rejected before demand eviction");
     const auto after_invalid = backend->statistics();
@@ -238,13 +243,13 @@ static void gpu_first_dense_separate_residency(uint32_t device_index)
         gpu_first_check(backend->statistics().resident_size == size && backend->statistics().bytes_uploaded == size,
                         "dense admission uses the storage estimate exactly");
         std::shared_ptr<const void> blocked_pin;
-        gpu_first_check(!backend->prepare_demand_separate("dense-B", gate, nullptr, up, nullptr, down, nullptr,
-                                                          1, 0.f, ExpertActivation::Silu, blocked_pin)
+        const ExpertDemandRequest dense_b{"dense-B", gate, nullptr, down, nullptr,
+                                          1, 0.f, ExpertActivation::Silu, up};
+        gpu_first_check(!backend->prepare_demand(dense_b, blocked_pin)
                             && !blocked_pin && backend->statistics().evictions == 0,
                         "dense admission cannot evict pinned cache entry");
         pins[0].reset();
-        gpu_first_check(backend->prepare_demand_separate("dense-B", gate, nullptr, up, nullptr, down, nullptr,
-                                                         1, 0.f, ExpertActivation::Silu, blocked_pin)
+        gpu_first_check(backend->prepare_demand(dense_b, blocked_pin)
                             && blocked_pin && backend->statistics().evictions == 1,
                         "dense demand reuses existing ARC eviction after pins release");
         for (uint32_t rows : {1u, 3u})
@@ -262,12 +267,12 @@ static void gpu_first_dense_separate_residency(uint32_t device_index)
             const ActivationBuffer expected = forward_linear(*down, activated, flags);
             ActivationBuffer output(rows, 37);
             std::fill_n(output.row(0), output.values().size(), -123.f);
-            ExpertBackendRequest request{"dense-B", &input, &output, size};
-            auto submission = backend->submit_batch(std::span<const ExpertBackendRequest>(&request, 1));
-            gpu_first_check(submission && submission->reservations()[0] == ExpertBackendExecutionResult::Executed,
+            ExpertRequest request{"dense-B", &input, &output, size};
+            auto submission = backend->submit_batch(std::span<const ExpertRequest>(&request, 1));
+            gpu_first_check(submission && submission->reservations()[0] == ExpertStatus::Executed,
                             "resident dense decode and prefill reserve GPU execution");
             const auto results = submission->wait();
-            gpu_first_check(results.size() == 1 && results[0] == ExpertBackendExecutionResult::Executed
+            gpu_first_check(results.size() == 1 && results[0] == ExpertStatus::Executed
                                 && output.values()[0] == -123.f && submission->commit(),
                             "dense output remains private until successful shared backend commit");
             for (size_t index = 0; index < expected.values().size(); ++index)
@@ -280,8 +285,9 @@ static void gpu_first_dense_separate_residency(uint32_t device_index)
                             && backend->statistics().pending_size == 0,
                         "dense execution shares bounded backend accounting");
         auto too_small = create_vulkan_expert_backend(size - 1, device_index, {}, runtime, flags);
-        gpu_first_check(!too_small->prepare_demand_separate("dense-oversize", gate, nullptr, up, nullptr, down, nullptr,
-                                                            0, 0.f, ExpertActivation::Silu, blocked_pin)
+        gpu_first_check(!too_small->prepare_demand(ExpertDemandRequest{"dense-oversize", gate, nullptr, down, nullptr,
+                                                                       0, 0.f, ExpertActivation::Silu, up},
+                                                   blocked_pin)
                             && !blocked_pin && too_small->statistics().bytes_uploaded == 0,
                         "oversize dense FFN leaves complete CPU fallback without partial upload");
         auto malformed = std::make_shared<TensorData>(*up);
@@ -409,19 +415,19 @@ static void gpu_first_bfloat16_work_item_lifecycle(uint32_t device_index)
         batch_outputs[index].reset(batch_inputs[index].rows(), output_columns, false);
         std::fill_n(batch_outputs[index].row(0), batch_outputs[index].values().size(), -123.f);
     }
-    const std::array<ExpertBackendRequest, 2> batch_requests = {{
+    const std::array<ExpertRequest, 2> batch_requests = {{
         {"bf16-work-A", &batch_inputs[0], &batch_outputs[0], experts[0].size},
         {"bf16-work-B", &batch_inputs[1], &batch_outputs[1], experts[1].size},
     }};
     auto batch = backend->submit_batch(batch_requests);
     gpu_first_check(batch && batch->reservations().size() == 2
-                        && batch->reservations()[0] == ExpertBackendExecutionResult::Executed
-                        && batch->reservations()[1] == ExpertBackendExecutionResult::Executed,
+                        && batch->reservations()[0] == ExpertStatus::Executed
+                        && batch->reservations()[1] == ExpertStatus::Executed,
                     "two fused BF16 Experts reserve one batched WorkItem");
     const auto batch_results = batch->wait();
     gpu_first_check(batch_results.size() == 2
-                        && batch_results[0] == ExpertBackendExecutionResult::Executed
-                        && batch_results[1] == ExpertBackendExecutionResult::Executed,
+                        && batch_results[0] == ExpertStatus::Executed
+                        && batch_results[1] == ExpertStatus::Executed,
                     "two fused BF16 Experts execute together");
     check_sentinel(batch_outputs[0], -123.f);
     check_sentinel(batch_outputs[1], -123.f);
@@ -439,20 +445,20 @@ static void gpu_first_bfloat16_work_item_lifecycle(uint32_t device_index)
             output.reset(rows, output_columns, false);
             std::fill_n(output.row(0), output.values().size(), -123.f);
         }
-        const std::array<ExpertBackendRequest, 2> requests = {{
+        const std::array<ExpertRequest, 2> requests = {{
             {"bf16-work-A", &shared_input, &shared_outputs[0], experts[0].size},
             {"bf16-work-B", &shared_input, &shared_outputs[1], experts[1].size},
         }};
         const VulkanStatistics before = get_vulkan_statistics(runtime);
         auto submission = backend->submit_batch(requests);
         gpu_first_check(submission && submission->reservations().size() == 2
-                            && submission->reservations()[0] == ExpertBackendExecutionResult::Executed
-                            && submission->reservations()[1] == ExpertBackendExecutionResult::Executed,
+                            && submission->reservations()[0] == ExpertStatus::Executed
+                            && submission->reservations()[1] == ExpertStatus::Executed,
                         "shared BF16 input reserves both experts");
         const auto results = submission->wait();
         gpu_first_check(results.size() == 2
-                            && results[0] == ExpertBackendExecutionResult::Executed
-                            && results[1] == ExpertBackendExecutionResult::Executed,
+                            && results[0] == ExpertStatus::Executed
+                            && results[1] == ExpertStatus::Executed,
                         "shared BF16 input executes both experts");
         const VulkanStatistics after = get_vulkan_statistics(runtime);
         gpu_first_check(after.dispatches - before.dispatches == 4
@@ -470,12 +476,12 @@ static void gpu_first_bfloat16_work_item_lifecycle(uint32_t device_index)
     ActivationBuffer reused_input = input(2, 9);
     ActivationBuffer reused_output(2, output_columns);
     std::fill_n(reused_output.row(0), reused_output.values().size(), -123.f);
-    const ExpertBackendRequest reused_request{"bf16-work-B", &reused_input, &reused_output, experts[1].size};
-    auto reused = backend->submit_batch(std::span<const ExpertBackendRequest>(&reused_request, 1));
-    gpu_first_check(reused && reused->reservations()[0] == ExpertBackendExecutionResult::Executed,
+    const ExpertRequest reused_request{"bf16-work-B", &reused_input, &reused_output, experts[1].size};
+    auto reused = backend->submit_batch(std::span<const ExpertRequest>(&reused_request, 1));
+    gpu_first_check(reused && reused->reservations()[0] == ExpertStatus::Executed,
                     "single fused BF16 request reuses the released two-entry WorkItem");
     const auto reused_results = reused->wait();
-    gpu_first_check(reused_results.size() == 1 && reused_results[0] == ExpertBackendExecutionResult::Executed
+    gpu_first_check(reused_results.size() == 1 && reused_results[0] == ExpertStatus::Executed
                         && reused->commit(),
                     "single fused BF16 request completes after batch resize");
     check_output(reused_output, cpu_output(experts[1], reused_input));
@@ -487,18 +493,18 @@ static void gpu_first_bfloat16_work_item_lifecycle(uint32_t device_index)
     ActivationBuffer next_output(3, output_columns);
     std::fill_n(held_output.row(0), held_output.values().size(), -91.f);
     std::fill_n(next_output.row(0), next_output.values().size(), -91.f);
-    const ExpertBackendRequest held_request{"bf16-work-A", &held_input, &held_output, experts[0].size};
-    const ExpertBackendRequest next_request{"bf16-work-B", &next_input, &next_output, experts[1].size};
-    auto held = backend->submit_batch(std::span<const ExpertBackendRequest>(&held_request, 1));
-    auto next = backend->submit_batch(std::span<const ExpertBackendRequest>(&next_request, 1));
-    gpu_first_check(held && next && held->reservations()[0] == ExpertBackendExecutionResult::Executed
-                        && next->reservations()[0] == ExpertBackendExecutionResult::Executed,
+    const ExpertRequest held_request{"bf16-work-A", &held_input, &held_output, experts[0].size};
+    const ExpertRequest next_request{"bf16-work-B", &next_input, &next_output, experts[1].size};
+    auto held = backend->submit_batch(std::span<const ExpertRequest>(&held_request, 1));
+    auto next = backend->submit_batch(std::span<const ExpertRequest>(&next_request, 1));
+    gpu_first_check(held && next && held->reservations()[0] == ExpertStatus::Executed
+                        && next->reservations()[0] == ExpertStatus::Executed,
                     "a retained BF16 ticket keeps its WorkItem unavailable to another submission");
     const auto next_results = next->wait();
-    gpu_first_check(next_results.size() == 1 && next_results[0] == ExpertBackendExecutionResult::Executed,
+    gpu_first_check(next_results.size() == 1 && next_results[0] == ExpertStatus::Executed,
                     "second BF16 ticket completes while first remains retained");
     const auto held_results = held->wait();
-    gpu_first_check(held_results.size() == 1 && held_results[0] == ExpertBackendExecutionResult::Executed,
+    gpu_first_check(held_results.size() == 1 && held_results[0] == ExpertStatus::Executed,
                     "retained first BF16 ticket preserves its result");
     check_sentinel(held_output, -91.f);
     held->abort();
@@ -512,12 +518,12 @@ static void gpu_first_bfloat16_work_item_lifecycle(uint32_t device_index)
     ActivationBuffer invalid_input(1, input_columns - 1);
     ActivationBuffer invalid_output(1, output_columns);
     std::fill_n(invalid_output.row(0), invalid_output.values().size(), -77.f);
-    const ExpertBackendRequest invalid_request{"bf16-work-A", &invalid_input, &invalid_output, experts[0].size};
-    auto invalid = backend->submit_batch(std::span<const ExpertBackendRequest>(&invalid_request, 1));
-    gpu_first_check(invalid && invalid->reservations()[0] == ExpertBackendExecutionResult::Executed,
+    const ExpertRequest invalid_request{"bf16-work-A", &invalid_input, &invalid_output, experts[0].size};
+    auto invalid = backend->submit_batch(std::span<const ExpertRequest>(&invalid_request, 1));
+    gpu_first_check(invalid && invalid->reservations()[0] == ExpertStatus::Executed,
                     "resident BF16 request with a bad column count reaches execution validation");
     const auto invalid_results = invalid->wait();
-    gpu_first_check(invalid_results.size() == 1 && invalid_results[0] == ExpertBackendExecutionResult::Failed,
+    gpu_first_check(invalid_results.size() == 1 && invalid_results[0] == ExpertStatus::Failed,
                     "BF16 batch rejects an invalid input column count");
     check_sentinel(invalid_output, -77.f);
     invalid.reset();
@@ -525,12 +531,12 @@ static void gpu_first_bfloat16_work_item_lifecycle(uint32_t device_index)
     ActivationBuffer retry_input = input(2, 19);
     ActivationBuffer retry_output(2, output_columns);
     std::fill_n(retry_output.row(0), retry_output.values().size(), -55.f);
-    const ExpertBackendRequest retry_request{"bf16-work-A", &retry_input, &retry_output, experts[0].size};
-    auto retry = backend->submit_batch(std::span<const ExpertBackendRequest>(&retry_request, 1));
-    gpu_first_check(retry && retry->reservations()[0] == ExpertBackendExecutionResult::Executed,
+    const ExpertRequest retry_request{"bf16-work-A", &retry_input, &retry_output, experts[0].size};
+    auto retry = backend->submit_batch(std::span<const ExpertRequest>(&retry_request, 1));
+    gpu_first_check(retry && retry->reservations()[0] == ExpertStatus::Executed,
                     "valid BF16 request remains available after invalid execution");
     const auto retry_results = retry->wait();
-    gpu_first_check(retry_results.size() == 1 && retry_results[0] == ExpertBackendExecutionResult::Executed
+    gpu_first_check(retry_results.size() == 1 && retry_results[0] == ExpertStatus::Executed
                         && retry->commit(),
                     "BF16 WorkItem recovers for a valid request after failure");
     check_output(retry_output, cpu_output(experts[0], retry_input));
@@ -554,7 +560,8 @@ static void gpu_first_duplicate_and_shard()
                         && stats.pending_size == 0,
                     "concurrent demand uploads exactly once");
     pins = {};
-    backend->admit("queued", fixture.gate, nullptr, fixture.down, nullptr, 0, 4.0f, ExpertActivation::DeepSeekSwiGlu);
+    backend->admit(ExpertDemandRequest{"queued", fixture.gate, nullptr, fixture.down, nullptr,
+                                       0, 4.0f, ExpertActivation::DeepSeekSwiGlu});
     std::shared_ptr<const void> pin;
     {
         ScopedExpertBackendForeground foreground(backend);
@@ -568,29 +575,69 @@ static void gpu_first_duplicate_and_shard()
     gpu_first_execute(fixture, *backend, "queued", pin);
     {
         ScopedExpertBackendForeground foreground(backend);
-        backend->admit("explicit-drain", fixture.gate, nullptr, fixture.down, nullptr,
-                       0, 4.0f, ExpertActivation::DeepSeekSwiGlu);
+        backend->admit(ExpertDemandRequest{"explicit-drain", fixture.gate, nullptr, fixture.down, nullptr,
+                                           0, 4.0f, ExpertActivation::DeepSeekSwiGlu});
         backend->wait_for_background_work();
         gpu_first_check(backend->statistics().pending_size == 0,
                         "explicit background drain must complete inside foreground scope");
     }
 
-    const uint32_t device_index = get_default_gpu_index();
-    auto child = create_vulkan_expert_backend(fixture.size, device_index, {}, fixture.runtime, fixture.flags);
-    auto shard = std::make_shared<MultiDeviceExpertBackend>(std::vector<std::shared_ptr<ExpertBackend>>{child},
-                                                            std::vector<uint32_t>{device_index}, std::vector<uint32_t>{device_index}, false);
-    gpu_first_check(shard && fixture.demand(*shard, "shard", pin) && pin, "multi-device demand routes to owning shard");
-    gpu_first_execute(fixture, *shard, "shard", pin);
-    stats = shard->statistics();
-    gpu_first_check(stats.bytes_uploaded == fixture.size && stats.executions == 1,
-                    "multi-device demand uploads one resident pair and executes it");
+    const uint32_t first_device = get_default_gpu_index();
+    auto first_child = create_vulkan_expert_backend(fixture.size, first_device, {}, fixture.runtime, fixture.flags);
+    gpu_first_check(static_cast<bool>(first_child), "first multi-device child backend creation");
+    uint32_t second_device = first_device;
+    for (uint32_t device = 0; device < get_gpu_count(); ++device)
+    {
+        if (device != first_device)
+        {
+            second_device = device;
+            break;
+        }
+    }
+    if (second_device != first_device)
+    {
+        auto second_child = create_vulkan_expert_backend(fixture.size, second_device, {}, fixture.runtime, fixture.flags);
+        gpu_first_check(static_cast<bool>(second_child), "second multi-device child backend creation");
+        auto shard = create_multi_device_expert_backend({first_child, second_child},
+                                                        {first_device, second_device},
+                                                        {first_device, second_device});
+        gpu_first_check(shard && shard != first_child && shard != second_child,
+                        "two physical Vulkan children retain the multi-device wrapper");
+        std::array<std::shared_ptr<const void>, 2> shard_pins;
+        gpu_first_check(fixture.demand(*shard, "shard-device-0", shard_pins[0], 0) && shard_pins[0],
+                        "multi-device demand reaches the first physical GPU child");
+        gpu_first_check(fixture.demand(*shard, "shard-device-1", shard_pins[1], 1) && shard_pins[1],
+                        "multi-device demand reaches the second physical GPU child");
+        gpu_first_execute(fixture, *shard, "shard-device-0", shard_pins[0]);
+        gpu_first_execute(fixture, *shard, "shard-device-1", shard_pins[1]);
+        stats = shard->statistics();
+        gpu_first_check(stats.bytes_uploaded == fixture.size * 2 && stats.executions == 2
+                            && first_child->statistics().bytes_uploaded == fixture.size
+                            && first_child->statistics().executions == 1
+                            && second_child->statistics().bytes_uploaded == fixture.size
+                            && second_child->statistics().executions == 1,
+                        "multi-device wrapper aggregates one executed upload from each physical child");
+    }
+    else
+    {
+        std::cout << "SKIP: two-device Vulkan wrapper routing requires a second physical GPU; checking the single-child factory fast path only\n";
+        auto shard = create_multi_device_expert_backend({first_child}, {first_device}, {first_device});
+        gpu_first_check(shard == first_child,
+                        "single-device multi-device factory returns its child fast path");
+        gpu_first_check(fixture.demand(*shard, "shard", pin) && pin,
+                        "single-child factory fast path prepares its resident pair");
+        gpu_first_execute(fixture, *shard, "shard", pin);
+        stats = shard->statistics();
+        gpu_first_check(stats.bytes_uploaded == fixture.size && stats.executions == 1,
+                        "single-child factory fast path executes the prepared GPU pair");
+    }
 }
 static void gpu_first_execute_batch(const GpuFirstFixture& fixture, ExpertBackend& backend,
                                     std::span<const std::string> keys,
                                     std::span<std::shared_ptr<const void>> pins)
 {
     std::vector<ActivationBuffer> outputs(keys.size());
-    std::vector<ExpertBackendRequest> requests;
+    std::vector<ExpertRequest> requests;
     requests.reserve(keys.size());
     for (size_t index = 0; index < keys.size(); ++index)
     {
@@ -601,13 +648,13 @@ static void gpu_first_execute_batch(const GpuFirstFixture& fixture, ExpertBacken
     auto submission = backend.submit_batch(requests);
     gpu_first_check(submission && submission->reservations().size() == keys.size(), "prepared batch reserves GPU requests");
     for (auto result : submission->reservations())
-        gpu_first_check(result == ExpertBackendExecutionResult::Executed, "every demand prefix request is resident");
+        gpu_first_check(result == ExpertStatus::Executed, "every demand prefix request is resident");
     for (auto& pin : pins) pin.reset();
     const auto results = submission->wait();
     gpu_first_check(results.size() == keys.size(), "prepared batch execution result count");
     for (size_t index = 0; index < keys.size(); ++index)
     {
-        gpu_first_check(results[index] == ExpertBackendExecutionResult::Executed, "prepared batch actually executes on GPU");
+        gpu_first_check(results[index] == ExpertStatus::Executed, "prepared batch actually executes on GPU");
         gpu_first_check(outputs[index].values()[0] == -123.0f, "demand batch output remains private before commit");
     }
     gpu_first_check(submission->commit(), "demand batch output commit");
@@ -667,8 +714,9 @@ static void gpu_first_foreground_batch()
     auto big_gate = gpu_first_weight(128, 32, 17);
     auto big_down = gpu_first_weight(32, 64, 19);
     std::shared_ptr<const void> varied_pin;
-    gpu_first_check(varied->prepare_demand("varied-large", big_gate, nullptr, big_down, nullptr, 0, 4.0f,
-                                           ExpertActivation::DeepSeekSwiGlu, varied_pin),
+    gpu_first_check(varied->prepare_demand(ExpertDemandRequest{"varied-large", big_gate, nullptr, big_down, nullptr,
+                                                               0, 4.0f, ExpertActivation::DeepSeekSwiGlu},
+                                           varied_pin),
                     "unequal-size cache fixture large pair");
     varied_pin.reset();
     gpu_first_check(fixture.demand(*varied, keys[1], varied_pin), "unequal-size cache fixture small hit");
@@ -712,7 +760,8 @@ static void gpu_first_foreground_batch()
     auto queued = create_vulkan_expert_backend(fixture.size * 2, get_default_gpu_index(), {}, fixture.runtime, fixture.flags);
     ScopedExpertBackendForeground queued_foreground(queued);
     for (size_t index = 0; index < 2; ++index)
-        queued->admit(keys[index], fixture.gate, nullptr, fixture.down, nullptr, 0, 4.0f, ExpertActivation::DeepSeekSwiGlu);
+        queued->admit(ExpertDemandRequest{keys[index], fixture.gate, nullptr, fixture.down, nullptr,
+                                          0, 4.0f, ExpertActivation::DeepSeekSwiGlu});
     gpu_first_check(queued->prepare_demand_batch(std::span(requests).first(2), std::span(pins).first(2)) == 2,
                     "foreground batch takes over same-key suspended background admissions");
     stats = queued->statistics();
@@ -736,15 +785,61 @@ static void gpu_first_foreground_batch()
     pins = {};
     gpu_first_check(validated->prepare_demand_batch(invalid_requests, std::span(pins).first(1)) == 0 && !pins[0],
                     "mismatched descriptor and pin spans are rejected safely");
-    const uint32_t device_index = get_default_gpu_index();
-    auto child = create_vulkan_expert_backend(fixture.size * 2, device_index, {}, fixture.runtime, fixture.flags);
-    MultiDeviceExpertBackend shard({child}, {device_index}, {device_index}, false);
-    gpu_first_check(shard.prepare_demand_batch(std::span(requests).first(2), std::span(pins).first(2)) == 2,
-                    "multi-device wrapper preserves contiguous same-device upload batches");
-    gpu_first_execute_batch(fixture, shard, std::span(keys).first(2), std::span(pins).first(2));
-    stats = shard.statistics();
-    gpu_first_check(stats.executions == 2,
-                    "multi-device batch executes both prepared experts");
+    const uint32_t first_device = get_default_gpu_index();
+    auto first_child = create_vulkan_expert_backend(fixture.size * 2, first_device, {}, fixture.runtime, fixture.flags);
+    gpu_first_check(static_cast<bool>(first_child), "first batch wrapper child backend creation");
+    uint32_t second_device = first_device;
+    for (uint32_t device = 0; device < get_gpu_count(); ++device)
+    {
+        if (device != first_device)
+        {
+            second_device = device;
+            break;
+        }
+    }
+    if (second_device != first_device)
+    {
+        auto second_child = create_vulkan_expert_backend(fixture.size * 2, second_device, {}, fixture.runtime, fixture.flags);
+        gpu_first_check(static_cast<bool>(second_child), "second batch wrapper child backend creation");
+        auto shard = create_multi_device_expert_backend({first_child, second_child},
+                                                        {first_device, second_device},
+                                                        {first_device, second_device});
+        gpu_first_check(shard && shard != first_child && shard != second_child,
+                        "two physical Vulkan children retain the batch wrapper");
+        const std::array<std::string, 3> shard_keys = {"multi-device-batch-0", "multi-device-batch-1", "multi-device-batch-2"};
+        const std::array<ExpertDemandRequest, 3> shard_requests = {{
+            {shard_keys[0], fixture.gate, nullptr, fixture.down, nullptr, 0, 4.0f, ExpertActivation::DeepSeekSwiGlu},
+            {shard_keys[1], fixture.gate, nullptr, fixture.down, nullptr, 0, 4.0f, ExpertActivation::DeepSeekSwiGlu},
+            {shard_keys[2], fixture.gate, nullptr, fixture.down, nullptr, 1, 4.0f, ExpertActivation::DeepSeekSwiGlu},
+        }};
+        std::array<std::shared_ptr<const void>, 3> shard_pins;
+        ScopedExpertBackendForeground shard_foreground(shard);
+        gpu_first_check(shard->prepare_demand_batch(shard_requests, shard_pins) == shard_requests.size(),
+                        "multi-device wrapper prepares a contiguous same-device run followed by a second GPU request");
+        gpu_first_execute_batch(fixture, *shard, shard_keys, shard_pins);
+        stats = shard->statistics();
+        gpu_first_check(stats.bytes_uploaded == fixture.size * 3 && stats.executions == 3
+                            && first_child->statistics().bytes_uploaded == fixture.size * 2
+                            && first_child->statistics().executions == 2
+                            && second_child->statistics().bytes_uploaded == fixture.size
+                            && second_child->statistics().executions == 1,
+                        "multi-device prefix executes the same-device run and second GPU request on their physical children");
+    }
+    else
+    {
+        std::cout << "SKIP: two-device Vulkan wrapper batch requires a second physical GPU; checking the single-child factory fast path only\n";
+        auto shard = create_multi_device_expert_backend({first_child},
+                                                        {first_device},
+                                                        {first_device, first_device});
+        gpu_first_check(shard == first_child,
+                        "single-device multi-device factory returns its child fast path");
+        gpu_first_check(shard->prepare_demand_batch(std::span(requests).first(2), std::span(pins).first(2)) == 2,
+                        "single-child factory fast path prepares a contiguous same-device batch");
+        gpu_first_execute_batch(fixture, *shard, std::span(keys).first(2), std::span(pins).first(2));
+        stats = shard->statistics();
+        gpu_first_check(stats.executions == 2,
+                        "single-child factory fast path executes both prepared experts");
+    }
 
     // This layout is about 12.75 MiB per pair. An eight-pair payload budget
     // fits the requests but the complete aligned staging layouts exceed 64 MiB.
@@ -883,8 +978,9 @@ static void gpu_first_joint_eviction_window()
     auto other_group_host = coordinator->register_host("joint-group-other");
     auto incoming_group_host = coordinator->register_host("joint-group-nearby");
     const auto demand_group = [&](const std::string& key, uint32_t group) {
-        const bool ready = grouped->prepare_demand(key, fixture.gate, nullptr, fixture.down, nullptr, group,
-                                                   4.0f, ExpertActivation::DeepSeekSwiGlu, pin);
+        const bool ready = grouped->prepare_demand(ExpertDemandRequest{key, fixture.gate, nullptr, fixture.down, nullptr,
+                                                                       group, 4.0f, ExpertActivation::DeepSeekSwiGlu},
+                                                   pin);
         gpu_first_check(ready && pin, "joint fair-share fixture admission");
         pin.reset();
     };
@@ -1211,7 +1307,7 @@ static void gpu_first_aligned_batch_outputs()
     {
         std::array<ActivationBuffer, 2> outputs;
         std::array<std::shared_ptr<DeviceTensor_vulkan>, 2> device_outputs;
-        std::array<ExpertBackendRequest, 2> requests;
+        std::array<ExpertRequest, 2> requests;
         for (size_t index = 0; index < 2; ++index)
         {
             requests[index].key = keys[index];
@@ -1223,7 +1319,7 @@ static void gpu_first_aligned_batch_outputs()
         auto submission = backend->submit_batch(requests);
         gpu_first_check(submission && submission->reservations().size() == 2, "odd-width output GPU reservations");
         for (auto result : submission->wait())
-            gpu_first_check(result == ExpertBackendExecutionResult::Executed, "odd-width outputs execute on GPU");
+            gpu_first_check(result == ExpertStatus::Executed, "odd-width outputs execute on GPU");
         gpu_first_check(submission->commit(), "odd-width output commit");
         submission.reset();
         if (retain)
@@ -1298,7 +1394,9 @@ static void gpu_first_quantized_upload()
     auto backend = create_vulkan_expert_backend(size, device, {}, runtime, flags);
     std::shared_ptr<const void> pin;
     gpu_first_check(size != 0 && backend
-                        && backend->prepare_demand("quantized-upload", gate_up, &gate_bias, down, &down_bias, 0, 0.f, ExpertActivation::Silu, pin)
+                        && backend->prepare_demand(ExpertDemandRequest{"quantized-upload", gate_up, &gate_bias, down, &down_bias,
+                                                                       0, 0.f, ExpertActivation::Silu},
+                                                   pin)
                         && pin && backend->statistics().resident_size == size,
                     "odd INT4 matrices and metadata upload through the independent allocator");
     auto legacy = QnkExpert_vulkan::create(*gate_up, &gate_bias, *down, &down_bias, 0.f, device, ExpertActivation::Silu, runtime, flags);
@@ -1319,12 +1417,12 @@ static void gpu_first_quantized_upload()
         const ActivationBuffer expected = forward_linear(*down, down_bias, activated, flags);
         ActivationBuffer actual;
         ActivationBuffer legacy_output;
-        const ExpertBackendRequest request{"quantized-upload", &input, &actual, size};
-        auto submission = backend->submit_batch(std::span<const ExpertBackendRequest>(&request, 1));
-        gpu_first_check(submission && submission->reservations()[0] == ExpertBackendExecutionResult::Executed,
+        const ExpertRequest request{"quantized-upload", &input, &actual, size};
+        auto submission = backend->submit_batch(std::span<const ExpertRequest>(&request, 1));
+        gpu_first_check(submission && submission->reservations()[0] == ExpertStatus::Executed,
                         "uploaded INT4 expert reserves GPU execution");
         const auto results = submission->wait();
-        gpu_first_check(results.size() == 1 && results[0] == ExpertBackendExecutionResult::Executed && submission->commit()
+        gpu_first_check(results.size() == 1 && results[0] == ExpertStatus::Executed && submission->commit()
                             && legacy->forward(input, legacy_output),
                         "direct staging and legacy INT4 uploads execute");
         gpu_first_check(actual.values().size() == expected.values().size() && legacy_output.values().size() == expected.values().size(),

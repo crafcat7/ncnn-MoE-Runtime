@@ -294,7 +294,7 @@ static void combine_test_expert_publication()
     auto seed = combine_seed(runtime, columns);
     VulkanExpertBackend backend(65536, get_default_gpu_index(), {}, runtime, combine_flags);
     auto gate = combine_mxfp4(64, columns), down = combine_mxfp4(columns, columns);
-    backend.admit("retained", gate, nullptr, down, nullptr, 0, 0.0f, ExpertActivation::DeepSeekSwiGlu);
+    backend.admit({"retained", gate, nullptr, down, nullptr, 0, 0.0f, ExpertActivation::DeepSeekSwiGlu});
     backend.wait_for_background_work();
     ActivationBuffer normalized(4, columns);
     for (size_t row = 0; row < normalized.rows(); ++row)
@@ -304,7 +304,7 @@ static void combine_test_expert_publication()
     routes[0] = {{2, 0, 0.5f}};
     routes[1] = {{3, 0, 0.25f}, {0, 0, 0.75f}, {1, 0, 0.5f}};
     std::array<ActivationBuffer, 2> input, host_output;
-    std::array<ExpertBackendRequest, 2> requests;
+    std::array<ExpertRequest, 2> requests;
     for (size_t i = 0; i < requests.size(); ++i)
     {
         input[i].reset(routes[i].size(), columns, false);
@@ -312,7 +312,7 @@ static void combine_test_expert_publication()
         requests[i] = {"retained", &input[i], &host_output[i], 0, {}};
     }
     auto baseline = backend.submit_batch(requests);
-    combine_check(baseline && baseline->wait() == std::vector<ExpertBackendExecutionResult>(2, ExpertBackendExecutionResult::Executed)
+    combine_check(baseline && baseline->wait() == std::vector<ExpertStatus>(2, ExpertStatus::Executed)
                       && baseline->commit(),
                   "GPU host baseline expert output");
     baseline.reset();
@@ -325,7 +325,7 @@ static void combine_test_expert_publication()
         requests[i].device_output = &resident_output[i];
     }
     auto canceled = backend.submit_batch(requests);
-    combine_check(canceled && canceled->wait() == std::vector<ExpertBackendExecutionResult>(2, ExpertBackendExecutionResult::Executed), "resident expert private execution");
+    combine_check(canceled && canceled->wait() == std::vector<ExpertStatus>(2, ExpertStatus::Executed), "resident expert private execution");
     canceled->abort();
     combine_check(!canceled->commit() && resident_output[0] == normalized_gpu && resident_output[1] == normalized_gpu, "abort publishes no resident output");
     combine_exact(host_output[0], reference[0], "abort preserves first host output");
@@ -333,7 +333,7 @@ static void combine_test_expert_publication()
     canceled.reset();
     const auto before = get_vulkan_statistics(runtime);
     auto completed = backend.submit_batch(requests);
-    combine_check(completed && completed->wait() == std::vector<ExpertBackendExecutionResult>(2, ExpertBackendExecutionResult::Executed), "resident expert completion");
+    combine_check(completed && completed->wait() == std::vector<ExpertStatus>(2, ExpertStatus::Executed), "resident expert completion");
     combine_check(resident_output[0] == normalized_gpu && resident_output[1] == normalized_gpu, "wait does not publish private output");
     combine_check(completed->commit(), "resident expert atomic commit");
     completed.reset();

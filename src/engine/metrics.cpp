@@ -258,7 +258,8 @@ void Session::begin_generation(uint64_t input_tokens)
     generation_elapsed_microseconds = 0;
     generation_start_time = std::chrono::steady_clock::now();
     generation_first_token_time = {};
-    generation_start_counters = runtime_metric_counters(stats, nullptr);
+    metrics_base = runtime_metric_counters(stats, nullptr);
+    metrics_valid = true;
 }
 
 void Session::finish_generation() noexcept
@@ -274,8 +275,9 @@ SessionMetrics Session::metrics() const
 {
     const std::lock_guard<std::mutex> lock(mutex);
     SessionMetrics result;
-    result.generation = runtime_metric_counters(stats, &generation_start_counters);
     result.cumulative = runtime_metric_counters(stats, nullptr);
+    const RuntimeMetricCounters& baseline = metrics_valid ? metrics_base : result.cumulative;
+    result.generation = runtime_metric_counters(stats, &baseline);
     result.gpu_available = model->hybrid_mode() != HybridMode::CpuOnly;
     result.timing.active = generation_active;
     result.timing.input_tokens = generation_input_tokens;

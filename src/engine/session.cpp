@@ -1,7 +1,6 @@
 #include "ncnn/moe/session.h"
 
 #include "executor.h"
-#include "metrics.h"
 #include "sessionstate.h"
 #include "expertbackend.h"
 #include "graph/compiledmodel.h"
@@ -79,16 +78,13 @@ Session::Session(ModelPtr _model, const SessionOptions& opt)
       use_speculative_context(opt.use_speculative_context)
 {
     state->use_speculative_context = use_speculative_context;
-    stats.expert_token_counts.resize(model->descriptor().expert_count, 0);
 }
 
 Session::~Session() = default;
 
 void Session::commit_execution(uint64_t prefill_tokens, uint64_t decode_tokens)
 {
-    std::vector<uint64_t> counts = std::move(stats.expert_token_counts);
-    stats = std::move(stats_scratch);
-    stats_scratch.expert_token_counts = std::move(counts);
+    stats = stats_scratch;
     stats.prefill_tokens += prefill_tokens;
     stats.decode_tokens += decode_tokens;
     token_count += prefill_tokens + decode_tokens;
@@ -176,7 +172,7 @@ Result<PrefillResult> Session::prefill(std::span<const int32_t> input_ids)
     const std::span<const float> logits = state->logits.values();
     result.logits.assign(logits.begin(), logits.end());
     result.processed_tokens = static_cast<uint32_t>(input_ids.size());
-    generation_start_counters = runtime_metric_counters(stats, nullptr);
+    metrics_valid = false;
     return result;
 }
 
@@ -227,7 +223,7 @@ Result<DecodeResult> Session::decode(int32_t input_id)
     const std::span<const float> logits = state->logits.values();
     result.logits.assign(logits.begin(), logits.end());
     result.sequence_length = token_count;
-    generation_start_counters = runtime_metric_counters(stats, nullptr);
+    metrics_valid = false;
     return result;
 }
 
@@ -235,16 +231,8 @@ Result<void> Session::reset()
 {
     const std::lock_guard<std::mutex> lock(mutex);
     token_count = 0;
-    std::vector<uint64_t> counts = std::move(stats.expert_token_counts);
-    std::vector<uint64_t> scratch_counts = std::move(stats_scratch.expert_token_counts);
     stats = {};
-    stats.expert_token_counts = std::move(counts);
-    stats.expert_token_counts.resize(model->descriptor().expert_count, 0);
-    std::fill(stats.expert_token_counts.begin(), stats.expert_token_counts.end(), 0);
     stats_scratch = {};
-    stats_scratch.expert_token_counts = std::move(scratch_counts);
-    stats_scratch.expert_token_counts.resize(model->descriptor().expert_count, 0);
-    std::fill(stats_scratch.expert_token_counts.begin(), stats_scratch.expert_token_counts.end(), 0);
     std::unique_ptr<SessionState> next(new SessionState);
     if (!generation_active)
     {
@@ -264,7 +252,8 @@ Result<void> Session::reset()
     }
     state = std::move(next);
     state->use_speculative_context = use_speculative_context;
-    generation_start_counters = {};
+    metrics_base = {};
+    metrics_valid = false;
     generation_active = false;
     generation_input_tokens = 0;
     generation_output_tokens = 0;

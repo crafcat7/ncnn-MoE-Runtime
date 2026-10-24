@@ -427,7 +427,7 @@ static bool forward_cached_dense_ffn(const CompiledModel& model,
         || has_flag(model.opt.flags, OptionDisableGpuExpertExecution))
         return false;
 
-    ExpertBackendRequest request;
+    ExpertRequest request;
     request.key = ffn.cache_key;
     request.input = &input;
     request.output = &output;
@@ -435,36 +435,36 @@ static bool forward_cached_dense_ffn(const CompiledModel& model,
     const auto execute = [&]() {
         auto submission = model.expert_backend->submit_batch({&request, 1});
         if (!submission)
-            return ExpertBackendExecutionResult::Failed;
+            return ExpertStatus::Failed;
         const auto reservations = submission->reservations();
         if (reservations.size() != 1)
         {
             submission->abort();
-            return ExpertBackendExecutionResult::Failed;
+            return ExpertStatus::Failed;
         }
-        if (reservations.front() != ExpertBackendExecutionResult::Executed)
+        if (reservations.front() != ExpertStatus::Executed)
         {
             const auto result = reservations.front();
             submission->abort();
             return result;
         }
-        std::vector<ExpertBackendExecutionResult> results;
+        std::vector<ExpertStatus> results;
         submission->wait(results);
-        if (results.size() != 1 || results.front() != ExpertBackendExecutionResult::Executed
+        if (results.size() != 1 || results.front() != ExpertStatus::Executed
             || !submission->commit())
         {
             submission->abort();
-            return ExpertBackendExecutionResult::Failed;
+            return ExpertStatus::Failed;
         }
         return output.rows() == input.rows()
                        && output.columns() == model.weights.at(ffn.down_weight).shape[0]
-                   ? ExpertBackendExecutionResult::Executed
-                   : ExpertBackendExecutionResult::Failed;
+                   ? ExpertStatus::Executed
+                   : ExpertStatus::Failed;
     };
-    const ExpertBackendExecutionResult resident = execute();
-    if (resident == ExpertBackendExecutionResult::Executed)
+    const ExpertStatus resident = execute();
+    if (resident == ExpertStatus::Executed)
         return true;
-    if (resident != ExpertBackendExecutionResult::NotResident)
+    if (resident != ExpertStatus::NotResident)
         return false;
 
     const TensorHandle gate = ffn.gate_up_weight == invalid_tensor_handle ? ffn.gate_weight : ffn.gate_up_weight;
@@ -487,14 +487,7 @@ static bool forward_cached_dense_ffn(const CompiledModel& model,
     {
         if (input.rows() < vulkan_expert_gpu_admission_min_rows)
             return false;
-        if (demand.up)
-            model.expert_backend->admit_separate(std::string(demand.key), demand.gate_up, demand.gate_up_bias,
-                                                 demand.up, demand.up_bias, demand.down, demand.down_bias,
-                                                 demand.residency_group, demand.activation_limit, demand.activation);
-        else
-            model.expert_backend->admit(std::string(demand.key), demand.gate_up, demand.gate_up_bias,
-                                        demand.down, demand.down_bias, demand.residency_group,
-                                        demand.activation_limit, demand.activation);
+        model.expert_backend->admit(demand);
         return false;
     }
     auto upload = model.expert_backend->begin_demand_batch({&demand, 1});
@@ -509,7 +502,7 @@ static bool forward_cached_dense_ffn(const CompiledModel& model,
     upload.reset();
     // Keep the demand pin until the execution submission has captured and
     // completed its entry. Both use the same eviction and publication rules.
-    return execute() == ExpertBackendExecutionResult::Executed;
+    return execute() == ExpertStatus::Executed;
 }
 
 void forward_dense_ffn(const CompiledModel& model,
@@ -1183,9 +1176,16 @@ static void admit_vulkan_expert(const CompiledModel& model,
                               ? vulkan_expert_gpu_admission_min_rows
                               : vulkan_expert_gpu_victim_min_rows))
         return;
-    model.expert_backend->admit(expert.cache_key, lease.gate_up, expert.gate_up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.gate_up_bias), lease.down,
-                                expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias), residency_group,
-                                expert.activation_limit, expert.activation);
+    ExpertDemandRequest demand;
+    demand.key = expert.cache_key;
+    demand.gate_up = lease.gate_up;
+    demand.gate_up_bias = expert.gate_up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.gate_up_bias);
+    demand.down = lease.down;
+    demand.down_bias = expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias);
+    demand.residency_group = residency_group;
+    demand.activation_limit = expert.activation_limit;
+    demand.activation = expert.activation;
+    model.expert_backend->admit(demand);
 }
 
 ExpertVictimExecutionMetadata victim_metadata(const CompiledModel& model,
@@ -1225,7 +1225,6 @@ void prepare_experts(const MoeBlockPlan& moe,
     for (size_t batch_index = 0; batch_index < plan.batches.size(); ++batch_index)
     {
         ExpertBatch& batch = plan.batches[batch_index];
-        stats.expert_token_counts[batch.expert_id] += batch.routes.size();
         const uint64_t weight_size = moe.experts[batch.expert_id].weight_size;
         if (stats.expert_batch_weight_bytes > std::numeric_limits<uint64_t>::max() - weight_size)
             stats.expert_batch_weight_bytes = std::numeric_limits<uint64_t>::max();
@@ -1427,7 +1426,7 @@ Result<void> forward_moe(const CompiledModel& model,
     std::vector<uint8_t>& backend_executed = scratch.backend_executed;
     std::vector<uint8_t>& backend_aggregated = scratch.backend_aggregated;
     std::vector<size_t>& backend_indices = scratch.backend_indices;
-    std::vector<ExpertBackendRequest>& backend_requests = scratch.backend_requests;
+    std::vector<ExpertRequest>& backend_requests = scratch.backend_requests;
     backend_executed.clear();
     backend_aggregated.clear();
     backend_indices.clear();
@@ -1465,41 +1464,38 @@ Result<void> forward_moe(const CompiledModel& model,
             {
                 continue;
             }
+            ExpertDemandRequest demand;
+            demand.key = expert.cache_key;
+            demand.gate_up = borrow_resident_tensor(gate_up_weight);
+            demand.down = borrow_resident_tensor(down_weight);
+            demand.down_bias = expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias);
+            demand.residency_group = residency_group;
+            demand.activation_limit = expert.activation_limit;
+            demand.activation = expert.activation;
+            bool can_admit = false;
             if (up_weight && !gate_up_weight.mxfp4_file_storage && !up_weight->mxfp4_file_storage && !down_weight.mxfp4_file_storage)
             {
-                model.expert_backend->admit_separate(expert.cache_key,
-                                                     borrow_resident_tensor(gate_up_weight),
-                                                     expert.gate_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.gate_bias),
-                                                     borrow_resident_tensor(*up_weight),
-                                                     expert.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.up_bias),
-                                                     borrow_resident_tensor(down_weight),
-                                                     expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
-                                                     residency_group, expert.activation_limit, expert.activation);
+                demand.gate_up_bias = expert.gate_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.gate_bias);
+                demand.up = borrow_resident_tensor(*up_weight);
+                demand.up_bias = expert.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.up_bias);
+                can_admit = true;
             }
             else if (!up_weight && !gate_up_weight.mxfp4_file_storage && !down_weight.mxfp4_file_storage
                      && (gate_up_weight.dtype == DType::Int4 || is_qnk_dtype(gate_up_weight.dtype)
                          || down_weight.dtype == DType::Int4 || is_qnk_dtype(down_weight.dtype)))
             {
-                model.expert_backend->admit(expert.cache_key,
-                                            borrow_resident_tensor(gate_up_weight),
-                                            expert.gate_up_bias == invalid_tensor_handle
-                                                ? nullptr
-                                                : &model.weights.at(expert.gate_up_bias),
-                                            borrow_resident_tensor(down_weight),
-                                            expert.down_bias == invalid_tensor_handle
-                                                ? nullptr
-                                                : &model.weights.at(expert.down_bias),
-                                            residency_group,
-                                            expert.activation_limit,
-                                            expert.activation);
+                demand.gate_up_bias = expert.gate_up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.gate_up_bias);
+                can_admit = true;
             }
+            if (can_admit)
+                model.expert_backend->admit(demand);
             backend_indices.push_back(active_index);
             const ActivationBuffer* input = nullptr;
             if (direct_input)
                 input = &layer_state.normalized;
             else if (active.input.rows() != 0)
                 input = &active.input;
-            ExpertBackendRequest request{expert.cache_key, input, &active.output, expert.weight_size, {}};
+            ExpertRequest request{expert.cache_key, input, &active.output, expert.weight_size, {}};
             request.input_rows = active.batch.routes.size();
             request.input_columns = layer_state.normalized.columns();
             request.route_aggregation.output = &scratch.backend_aggregated_output;
@@ -1517,11 +1513,11 @@ Result<void> forward_moe(const CompiledModel& model,
         }
         const bool complete_backend_coverage = backend_requests.size() == active_expert_count;
         if (complete_backend_coverage
-            && std::any_of(backend_requests.begin(), backend_requests.end(), [](const ExpertBackendRequest& request) {
+            && std::any_of(backend_requests.begin(), backend_requests.end(), [](const ExpertRequest& request) {
                    return request.route_aggregation.output != nullptr;
                }))
             scratch.backend_aggregated_output.reset(layer_state.normalized.rows(), model.descriptor.hidden_size, true);
-        for (ExpertBackendRequest& request : backend_requests)
+        for (ExpertRequest& request : backend_requests)
         {
             if (complete_backend_coverage)
                 request.route_aggregation.require_all_requests = true;
@@ -1531,7 +1527,7 @@ Result<void> forward_moe(const CompiledModel& model,
         backend_submission = model.expert_backend->submit_batch(backend_requests);
         if (backend_submission)
         {
-            const std::span<const ExpertBackendExecutionResult> planned = backend_submission->reservations();
+            const std::span<const ExpertStatus> planned = backend_submission->reservations();
             backend_reservation_shape_valid = planned.size() == backend_indices.size();
             if (!backend_reservation_shape_valid)
             {
@@ -1542,7 +1538,7 @@ Result<void> forward_moe(const CompiledModel& model,
             {
                 for (size_t result_index = 0; result_index < planned.size(); ++result_index)
                 {
-                    if (planned[result_index] != ExpertBackendExecutionResult::Executed)
+                    if (planned[result_index] != ExpertStatus::Executed)
                         continue;
                     backend_executed[backend_indices[result_index]] = 1;
                     backend_reserved_work = true;
@@ -1554,17 +1550,17 @@ Result<void> forward_moe(const CompiledModel& model,
     const auto finalize_backend = [&]() -> Result<void> {
         if (backend_submission)
         {
-            std::vector<ExpertBackendExecutionResult>& backend_results = scratch.backend_results;
+            std::vector<ExpertStatus>& backend_results = scratch.backend_results;
             backend_results.clear();
             backend_submission->wait(backend_results);
             bool backend_result_contract_valid = backend_reservation_shape_valid && backend_results.size() == backend_indices.size();
             if (backend_result_contract_valid)
             {
-                const std::span<const ExpertBackendExecutionResult> planned = backend_submission->reservations();
+                const std::span<const ExpertStatus> planned = backend_submission->reservations();
                 for (size_t result_index = 0; result_index < backend_results.size(); ++result_index)
                 {
-                    if (backend_results[result_index] == ExpertBackendExecutionResult::Executed
-                        && planned[result_index] != ExpertBackendExecutionResult::Executed)
+                    if (backend_results[result_index] == ExpertStatus::Executed
+                        && planned[result_index] != ExpertStatus::Executed)
                     {
                         backend_result_contract_valid = false;
                         break;
@@ -1574,8 +1570,8 @@ Result<void> forward_moe(const CompiledModel& model,
             bool backend_has_executed = false;
             if (backend_result_contract_valid)
             {
-                for (ExpertBackendExecutionResult result : backend_results)
-                    backend_has_executed = backend_has_executed || result == ExpertBackendExecutionResult::Executed;
+                for (ExpertStatus result : backend_results)
+                    backend_has_executed = backend_has_executed || result == ExpertStatus::Executed;
             }
             bool backend_commit_succeeded = backend_result_contract_valid && !backend_has_executed;
             if (backend_has_executed)
@@ -1601,11 +1597,11 @@ Result<void> forward_moe(const CompiledModel& model,
                 const size_t active_index = backend_indices[result_index];
                 if (!backend_executed[active_index])
                     continue;
-                const ExpertBackendExecutionResult backend_result = result_index < backend_results.size()
-                                                                        ? backend_results[result_index]
-                                                                        : ExpertBackendExecutionResult::Failed;
+                const ExpertStatus backend_result = result_index < backend_results.size()
+                                                        ? backend_results[result_index]
+                                                        : ExpertStatus::Failed;
                 if (!backend_commit_succeeded
-                    || backend_result != ExpertBackendExecutionResult::Executed)
+                    || backend_result != ExpertStatus::Executed)
                 {
                     backend_executed[active_index] = 0;
                     failed_indices.push_back(active_index);
@@ -1829,13 +1825,13 @@ Result<void> forward_moe(const CompiledModel& model,
     // a single ready Expert does not force a compute fence before the next
     // read or upload can begin.
     std::vector<size_t>& current_wave_indices = scratch.current_wave_indices;
-    std::vector<ExpertBackendRequest>& current_wave_requests = scratch.current_wave_requests;
+    std::vector<ExpertRequest>& current_wave_requests = scratch.current_wave_requests;
     current_wave_indices.clear();
     current_wave_requests.clear();
     std::unique_ptr<ExpertSubmission> current_wave_submission;
     const auto finish_current_wave = [&] {
         if (current_wave_requests.empty()) return;
-        std::vector<ExpertBackendExecutionResult>& results = scratch.backend_results;
+        std::vector<ExpertStatus>& results = scratch.backend_results;
         results.clear();
         bool valid = false;
         if (current_wave_submission)
@@ -1847,8 +1843,8 @@ Result<void> forward_moe(const CompiledModel& model,
             if (valid)
             {
                 for (size_t index = 0; index < results.size(); ++index)
-                    if (results[index] == ExpertBackendExecutionResult::Executed
-                        && planned[index] != ExpertBackendExecutionResult::Executed) valid = false;
+                    if (results[index] == ExpertStatus::Executed
+                        && planned[index] != ExpertStatus::Executed) valid = false;
             }
             valid = valid && current_wave_submission->commit();
             if (!valid) current_wave_submission->abort();
@@ -1860,7 +1856,7 @@ Result<void> forward_moe(const CompiledModel& model,
         {
             const size_t active_index = current_wave_indices[index];
             auto& active = layer_state.active_experts()[active_index];
-            if (valid && results[index] == ExpertBackendExecutionResult::Executed)
+            if (valid && results[index] == ExpertStatus::Executed)
             {
                 backend_executed[active_index] = 1;
             }
@@ -1997,7 +1993,7 @@ Result<void> forward_moe(const CompiledModel& model,
                 continue;
             }
             std::vector<size_t>& next_indices = scratch.next_wave_indices;
-            std::vector<ExpertBackendRequest>& next_requests = scratch.next_wave_requests;
+            std::vector<ExpertRequest>& next_requests = scratch.next_wave_requests;
             next_indices.clear();
             next_requests.clear();
             next_indices.reserve(prepared);
@@ -2007,13 +2003,12 @@ Result<void> forward_moe(const CompiledModel& model,
                 const size_t active_index = demand_indices[cursor + index];
                 ExpertState& active = layer_state.active_experts()[active_index];
                 const ExpertPlan& expert = moe.experts[active.batch.expert_id];
-                const auto& demand = demands[cursor + index];
                 const ActivationBuffer* input = nullptr;
                 if (direct_input)
                     input = &layer_state.normalized;
                 else if (active.input.rows() != 0)
                     input = &active.input;
-                ExpertBackendRequest request{expert.cache_key, input, &active.output, expert.weight_size, {}};
+                ExpertRequest request{expert.cache_key, input, &active.output, expert.weight_size, {}};
                 request.input_rows = active.batch.routes.size();
                 request.input_columns = layer_state.normalized.columns();
                 request.device_input = layer_state.normalized_device;

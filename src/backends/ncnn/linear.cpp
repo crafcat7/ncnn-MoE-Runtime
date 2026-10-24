@@ -144,6 +144,13 @@ static bool record_output_row_copy(const ncnn::VkMat& source, ncnn::VkMat& desti
     command.record_clone(source, destination, copy_option);
     return !destination.empty() && destination.buffer() == buffer && destination.buffer_offset() == offset;
 }
+
+static ncnn::VkMat bind_host_output(ncnn::VkMat& staging)
+{
+    staging.data->access_flags = VK_ACCESS_HOST_READ_BIT;
+    staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
+    return staging;
+}
 #endif
 
 class DeviceTensor_vulkan::Implementation
@@ -1504,7 +1511,7 @@ bool Bfloat16Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input
 
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download);
+        output_gpu = bind_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(implementation.output_columns),
                           static_cast<int>(input.rows()),
@@ -2104,7 +2111,7 @@ bool Bfloat16Linear_vulkan::forward(const ActivationBuffer& input,
     }
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download);
+        output_gpu = bind_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(implementation.output_columns),
                           static_cast<int>(input.rows()),
@@ -2232,7 +2239,7 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
 
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download);
+        output_gpu = bind_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(first.output_columns),
                           static_cast<int>(input.rows()),
@@ -2240,7 +2247,7 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
                           first.vulkan_context->blob_allocator());
     ncnn::VkMat parallel_output_gpu;
     if (parallel_direct_host_output)
-        parallel_output_gpu = prepare_direct_host_output(parallel_download);
+        parallel_output_gpu = bind_host_output(parallel_download);
     else
         parallel_output_gpu.create(static_cast<int>(parallel.output_columns),
                                    static_cast<int>(input.rows()),
@@ -2395,7 +2402,7 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
                      first.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download);
+        output_gpu = bind_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(down.output_columns),
                           static_cast<int>(input.rows()),
@@ -3792,7 +3799,7 @@ bool Float8Linear_vulkan::forward(const ActivationBuffer& input, ActivationBuffe
         return false;
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download);
+        output_gpu = bind_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(implementation.output_columns),
                           static_cast<int>(input.rows()),
@@ -3881,7 +3888,7 @@ bool Float8Linear_vulkan::forward_chain(const ActivationBuffer& input, const Flo
                             first.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download);
+        output_gpu = bind_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(second.output_columns),
                           static_cast<int>(input.rows()),
@@ -3992,7 +3999,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input,
                             first.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download);
+        output_gpu = bind_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(second.output_columns),
                           static_cast<int>(input.rows()),
@@ -4152,7 +4159,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_impl(const ActivationB
                             first.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download);
+        output_gpu = bind_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(second.output_columns),
                           static_cast<int>(input.rows()),
@@ -4160,7 +4167,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_impl(const ActivationB
                           first.vulkan_context->blob_allocator());
     ncnn::VkMat parallel_gpu;
     if (parallel_direct_host_output)
-        parallel_gpu = prepare_direct_host_output(parallel_download);
+        parallel_gpu = bind_host_output(parallel_download);
     else
         parallel_gpu.create(static_cast<int>(parallel.output_columns),
                             static_cast<int>(input.rows()),
@@ -4428,7 +4435,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
                             first.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download);
+        output_gpu = bind_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(second.output_columns),
                           static_cast<int>(input.rows()),
@@ -4436,7 +4443,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
                           first.vulkan_context->blob_allocator());
     ncnn::VkMat parallel_gpu;
     if (parallel_direct_host_output)
-        parallel_gpu = prepare_direct_host_output(parallel_download);
+        parallel_gpu = bind_host_output(parallel_download);
     else
         parallel_gpu.create(static_cast<int>(parallel.output_columns),
                             static_cast<int>(input.rows()),
@@ -4449,7 +4456,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
     {
         const auto& extra = *extra_operators[index]->d;
         if (extra_direct_host_outputs[index])
-            extra_gpu[index] = prepare_direct_host_output(extra_downloads[index]);
+            extra_gpu[index] = bind_host_output(extra_downloads[index]);
         else
             extra_gpu[index].create(static_cast<int>(extra.output_columns),
                                     static_cast<int>(input.rows()),
@@ -4650,7 +4657,7 @@ bool Float8Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
                   gate.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download);
+        output_gpu = bind_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(down.output_columns),
                           static_cast<int>(input.rows()),
@@ -5165,7 +5172,7 @@ bool Mxfp4Linear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer
     }
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download);
+        output_gpu = bind_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(implementation.output_columns), static_cast<int>(input.rows()), sizeof(float),
                           implementation.vulkan_context->blob_allocator());
@@ -5868,7 +5875,7 @@ bool QnkLinear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
         return false;
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download);
+        output_gpu = bind_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(implementation.output_columns), static_cast<int>(input.rows()), sizeof(float), implementation.vulkan_context->blob_allocator());
     if (output_gpu.empty())
@@ -6585,7 +6592,7 @@ bool QnkExpert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
     ncnn::VkMat output_gpu;
     if (direct_host_output)
     {
-        output_gpu = prepare_direct_host_output(transfer_slot.download);
+        output_gpu = bind_host_output(transfer_slot.download);
     }
     else
     {
@@ -6842,7 +6849,7 @@ static bool create_expert_gather_pipeline(const std::shared_ptr<VulkanContext>& 
     return true;
 }
 
-bool VulkanExpertBackend::forward_device_batch(std::span<const ExpertBackendRequest> requests,
+bool VulkanExpertBackend::forward_device_batch(std::span<const ExpertRequest> requests,
                                                std::span<const Selection> selected)
 {
     if (selected.empty())
@@ -7562,7 +7569,7 @@ void Mxfp4Expert_vulkan::record(const ncnn::VkMat& input,
     cmd.record_pipeline(down.pipeline.get(), bindings, constants, down_dispatcher);
 }
 
-bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> requests,
+bool VulkanExpertBackend::forward_batch(std::span<const ExpertRequest> requests,
                                         std::span<const Selection> selected)
 {
     if (selected.empty())
@@ -7607,7 +7614,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
         {
             return false;
         }
-        const ExpertBackendRequest& request = requests[selection.request_index];
+        const ExpertRequest& request = requests[selection.request_index];
         const auto& expert = *selection.entry->operation->d;
         if (!expert.gate_up || !expert.down)
             return false;
@@ -7742,7 +7749,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
         input_rows.reserve(total_rows);
         for (const Selection& selection : selected)
         {
-            const ExpertBackendRequest& request = requests[selection.request_index];
+            const ExpertRequest& request = requests[selection.request_index];
             if (request.device_input != retained_input || request.device_routes.size() != request.rows())
             {
                 use_device_input = false;
@@ -7799,7 +7806,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
     auto* mapped_input_data = static_cast<std::byte*>(mapped_input.data);
     for (size_t slot = 0; slot < selected.size(); ++slot)
     {
-        const ExpertBackendRequest& request = requests[selected[slot].request_index];
+        const ExpertRequest& request = requests[selected[slot].request_index];
         if (use_indexed)
             expert_row_offsets[slot] = static_cast<uint32_t>(row_offset);
         if (!use_device_input)
@@ -7918,7 +7925,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
 
     ncnn::VkMat output_gpu;
     if (direct_host_output)
-        output_gpu = prepare_direct_host_output(transfer_slot.download);
+        output_gpu = bind_host_output(transfer_slot.download);
     else
         output_gpu.create(static_cast<int>(output_columns),
                           static_cast<int>(total_rows),
@@ -8067,7 +8074,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
         for (size_t selected_slot = 0; selected_slot < selected.size(); ++selected_slot)
         {
             const Selection& selection = selected[selected_slot];
-            const ExpertBackendRequest& request = requests[selection.request_index];
+            const ExpertRequest& request = requests[selection.request_index];
             const auto& expert = *selection.entry->operation->d;
             const auto& gate = *expert.gate_up->d;
             const uint32_t intermediate_columns = gate.output_columns / 2;
@@ -8242,7 +8249,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
     {
         for (const Selection& selection : selected)
         {
-            const ExpertBackendRequest& request = requests[selection.request_index];
+            const ExpertRequest& request = requests[selection.request_index];
             if (request.route_aggregation.completed)
                 *request.route_aggregation.completed = 1;
         }
@@ -8252,7 +8259,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertBackendRequest> re
         row_offset = 0;
         for (const Selection& selection : selected)
         {
-            const ExpertBackendRequest& request = requests[selection.request_index];
+            const ExpertRequest& request = requests[selection.request_index];
             if (request.device_output)
             {
                 row_offset += request.rows();

@@ -87,8 +87,8 @@ public:
     class Compute final : public ExpertSubmission
     {
     public:
-        Compute(PipelineTestBackend& _owner, std::span<const ExpertBackendRequest> _requests)
-            : owner(_owner), requests(_requests.begin(), _requests.end()), entries(requests.size()), outputs(requests.size()), planned(requests.size(), ExpertBackendExecutionResult::NotResident)
+        Compute(PipelineTestBackend& _owner, std::span<const ExpertRequest> _requests)
+            : owner(_owner), requests(_requests.begin(), _requests.end()), entries(requests.size()), outputs(requests.size()), planned(requests.size(), ExpertStatus::NotResident)
         {
             for (size_t index = 0; index < requests.size(); ++index)
             {
@@ -100,7 +100,7 @@ public:
                 const auto found = owner.resident.find(std::string(requests[index].key));
                 if (found == owner.resident.end()) continue;
                 entries[index] = found->second;
-                planned[index] = ExpertBackendExecutionResult::Executed;
+                planned[index] = ExpertStatus::Executed;
                 live = true;
             }
             initial = owner.submission_count++ == 0;
@@ -117,12 +117,12 @@ public:
             if (!committed) abort();
         }
 
-        std::span<const ExpertBackendExecutionResult> reservations() const noexcept override
+        std::span<const ExpertStatus> reservations() const noexcept override
         {
             return planned;
         }
 
-        std::vector<ExpertBackendExecutionResult> wait() override
+        std::vector<ExpertStatus> wait() override
         {
             if (waited) return planned;
             if (live && owner.compute_wait_observer) owner.compute_wait_observer();
@@ -170,10 +170,10 @@ public:
 
     private:
         PipelineTestBackend& owner;
-        std::vector<ExpertBackendRequest> requests;
+        std::vector<ExpertRequest> requests;
         std::vector<std::shared_ptr<Entry>> entries;
         std::vector<ActivationBuffer> outputs;
-        std::vector<ExpertBackendExecutionResult> planned;
+        std::vector<ExpertStatus> planned;
         bool initial = false;
         bool live = false;
         bool waited = false;
@@ -186,12 +186,11 @@ public:
     {
     }
 
-    void admit(std::string key, std::shared_ptr<const TensorData> gate, const TensorData*,
-               std::shared_ptr<const TensorData> down, const TensorData*, uint32_t, float, ExpertActivation) override
+    void admit(const ExpertDemandRequest& request) override
     {
-        if (pause_admission_aliases && gate && down)
-            pending_admissions.emplace_back(std::move(gate), std::move(down));
-        if (admit_observer) admit_observer(key);
+        if (pause_admission_aliases && request.gate_up && request.down)
+            pending_admissions.emplace_back(request.gate_up, request.down);
+        if (admit_observer) admit_observer(std::string(request.key));
     }
 
     size_t prepare_demand_batch(std::span<const ExpertDemandRequest> requests,
@@ -242,7 +241,7 @@ public:
         return std::make_unique<Demand>(*this, std::move(pins), prepared, invalid_demand);
     }
 
-    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) override
+    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertRequest> requests) override
     {
         return std::make_unique<Compute>(*this, requests);
     }
@@ -848,14 +847,14 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
                                                                 file_moe.experts[0].cache_key);
             pipeline_check(static_cast<bool>(cached), "alias-pinning fixture loads the host pair");
             ExpertCacheLease cache_lease = std::move(cached).value();
-            backend->admit(file_moe.experts[0].cache_key,
-                           cache_lease.gate_up,
-                           nullptr,
-                           cache_lease.down,
-                           nullptr,
-                           0,
-                           4.0f,
-                           ExpertActivation::DeepSeekSwiGlu);
+            backend->admit(ExpertDemandRequest{file_moe.experts[0].cache_key,
+                                               cache_lease.gate_up,
+                                               nullptr,
+                                               cache_lease.down,
+                                               nullptr,
+                                               0,
+                                               4.0f,
+                                               ExpertActivation::DeepSeekSwiGlu});
             cache_lease = {};
             pipeline_check(backend->pending_admissions.size() == 1,
                            "pending backend aliases alone retain the host cache Entry");
@@ -1318,8 +1317,7 @@ static void pipeline_multidevice_prefix()
 {
     auto first = std::make_shared<PipelineTestBackend>(1);
     auto second = std::make_shared<PipelineTestBackend>(2);
-    auto backend = std::make_shared<MultiDeviceExpertBackend>(std::vector<std::shared_ptr<ExpertBackend>>{first, second},
-                                                              std::vector<uint32_t>{0, 1}, std::vector<uint32_t>{0, 1}, false);
+    auto backend = create_multi_device_expert_backend({first, second}, {0, 1}, {0, 1});
     auto gate = std::make_shared<TensorData>(pipeline_weight(64, 32, 1));
     auto down = std::make_shared<TensorData>(pipeline_weight(32, 32, 3));
     const std::array<ExpertDemandRequest, 4> requests = {{

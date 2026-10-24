@@ -118,40 +118,40 @@ static void check_near(float actual,
     }
 }
 
-static std::vector<ExpertBackendExecutionResult> submit_backend_batch(ExpertBackend& backend,
-                                                                      std::span<const ExpertBackendRequest> requests)
+static std::vector<ExpertStatus> submit_backend_batch(ExpertBackend& backend,
+                                                      std::span<const ExpertRequest> requests)
 {
     auto submission = backend.submit_batch(requests);
     if (!submission)
-        return std::vector<ExpertBackendExecutionResult>(requests.size(), ExpertBackendExecutionResult::Failed);
+        return std::vector<ExpertStatus>(requests.size(), ExpertStatus::Failed);
 
-    const std::span<const ExpertBackendExecutionResult> reservation_span = submission->reservations();
+    const std::span<const ExpertStatus> reservation_span = submission->reservations();
     if (reservation_span.size() != requests.size())
     {
         submission->abort();
-        return std::vector<ExpertBackendExecutionResult>(requests.size(), ExpertBackendExecutionResult::Failed);
+        return std::vector<ExpertStatus>(requests.size(), ExpertStatus::Failed);
     }
-    const std::vector<ExpertBackendExecutionResult> planned(reservation_span.begin(), reservation_span.end());
+    const std::vector<ExpertStatus> planned(reservation_span.begin(), reservation_span.end());
 
-    std::vector<ExpertBackendExecutionResult> results = submission->wait();
+    std::vector<ExpertStatus> results = submission->wait();
     if (results.size() != requests.size())
     {
         submission->abort();
-        return std::vector<ExpertBackendExecutionResult>(requests.size(), ExpertBackendExecutionResult::Failed);
+        return std::vector<ExpertStatus>(requests.size(), ExpertStatus::Failed);
     }
     for (size_t index = 0; index < results.size(); ++index)
     {
-        if (results[index] == ExpertBackendExecutionResult::Executed
-            && planned[index] != ExpertBackendExecutionResult::Executed)
+        if (results[index] == ExpertStatus::Executed
+            && planned[index] != ExpertStatus::Executed)
         {
             submission->abort();
-            return std::vector<ExpertBackendExecutionResult>(requests.size(), ExpertBackendExecutionResult::Failed);
+            return std::vector<ExpertStatus>(requests.size(), ExpertStatus::Failed);
         }
     }
 
     bool has_executed = false;
-    for (ExpertBackendExecutionResult result : results)
-        has_executed = has_executed || result == ExpertBackendExecutionResult::Executed;
+    for (ExpertStatus result : results)
+        has_executed = has_executed || result == ExpertStatus::Executed;
     if (!has_executed)
     {
         submission->abort();
@@ -160,10 +160,10 @@ static std::vector<ExpertBackendExecutionResult> submit_backend_batch(ExpertBack
 
     if (!submission->commit())
     {
-        for (ExpertBackendExecutionResult& result : results)
+        for (ExpertStatus& result : results)
         {
-            if (result == ExpertBackendExecutionResult::Executed)
-                result = ExpertBackendExecutionResult::Failed;
+            if (result == ExpertStatus::Executed)
+                result = ExpertStatus::Failed;
         }
         submission->abort();
     }
@@ -334,7 +334,7 @@ private:
             2.0f,
             0.0f,
             0.0f,
-            2.0f,
+            use_token_experts ? 3.0f : 2.0f,
             1.0f,
             1.0f,
             1.0f,
@@ -958,7 +958,12 @@ void test_prefill_decode_and_reset()
     check(static_cast<bool>(session.value()->statistics().decode_tokens == 0));
     check(static_cast<bool>(session.value()->statistics().expert_assignments == 3));
     check(static_cast<bool>(session.value()->statistics().expert_batches == 2));
-    check(static_cast<bool>(session.value()->statistics().expert_token_counts == std::vector<uint64_t>({2, 1})));
+    check(static_cast<bool>(model.value()->descriptor().experts_per_token == 1));
+    const SessionMetrics prefill_metrics = session.value()->metrics();
+    check(prefill_metrics.generation.expert_assignments == 0);
+    check(prefill_metrics.cumulative.expert_assignments == 3);
+    check(prefill_metrics.generation.kv_cache_logical_size
+          == prefill_metrics.cumulative.kv_cache_logical_size);
 
     auto decode = session.value()->decode(1);
     check(static_cast<bool>(decode));
@@ -966,7 +971,15 @@ void test_prefill_decode_and_reset()
     check(static_cast<bool>(session.value()->statistics().decode_tokens == 1));
     check(static_cast<bool>(session.value()->statistics().expert_assignments == 4));
     check(static_cast<bool>(session.value()->statistics().expert_batches == 3));
-    check(static_cast<bool>(session.value()->statistics().expert_token_counts == std::vector<uint64_t>({2, 2})));
+    const SessionMetrics direct_metrics = session.value()->metrics();
+    check(direct_metrics.generation.expert_assignments == 0);
+    check(direct_metrics.cumulative.expert_assignments == 4);
+    check(direct_metrics.generation.expert_cache_resident_size
+          == direct_metrics.cumulative.expert_cache_resident_size);
+    check(direct_metrics.generation.kv_cache_logical_size
+          == direct_metrics.cumulative.kv_cache_logical_size);
+    check(direct_metrics.generation.kv_cache_allocated_size
+          == direct_metrics.cumulative.kv_cache_allocated_size);
 
     const float pre_norm = 1.0f / std::sqrt(0.5f + 1e-5f);
     const float expert_one_value = 1.0f + 2.0f * pre_norm;
@@ -980,7 +993,6 @@ void test_prefill_decode_and_reset()
     check(static_cast<bool>(session.value()->sequence_length() == 0));
     check(static_cast<bool>(session.value()->statistics().expert_assignments == 0));
     check(static_cast<bool>(session.value()->statistics().expert_batches == 0));
-    check(static_cast<bool>(session.value()->statistics().expert_token_counts == std::vector<uint64_t>({0, 0})));
 
     TemporaryModelPackage token_experts_package(true);
     Option token_experts_options;
@@ -991,25 +1003,54 @@ void test_prefill_decode_and_reset()
     auto token_experts_session = runtime.create_session(token_experts_model.value());
     check(static_cast<bool>(token_experts_session));
 
+    const float route_epsilon = 1e-5f;
     const std::array<int32_t, 3> explicit_prompt = {0, 1, 2};
     auto explicit_prefill = token_experts_session.value()->prefill(explicit_prompt);
     check(static_cast<bool>(explicit_prefill));
     check(static_cast<bool>(token_experts_session.value()->statistics().expert_assignments == 3));
-    check(static_cast<bool>(token_experts_session.value()->statistics().expert_token_counts == std::vector<uint64_t>({1, 2})));
+    // The table routes the final prompt token to Expert 1, whose down
+    // projection scales the normalized coordinates by 2 and 3.
+    const float two_axis_norm = 1.0f / std::sqrt(1.0f + route_epsilon);
+    const float explicit_prefill_x = 1.0f + 2.0f * two_axis_norm;
+    const float explicit_prefill_y = 1.0f + 3.0f * two_axis_norm;
+    const float explicit_prefill_rms = std::sqrt((explicit_prefill_x * explicit_prefill_x
+                                                  + explicit_prefill_y * explicit_prefill_y)
+                                                     / 2.0f
+                                                 + route_epsilon);
+    const float explicit_prefill_x_norm = explicit_prefill_x / explicit_prefill_rms;
+    const float explicit_prefill_y_norm = explicit_prefill_y / explicit_prefill_rms;
+    check_near(explicit_prefill.value().logits[0], explicit_prefill_x_norm, 2e-5f);
+    check_near(explicit_prefill.value().logits[1], explicit_prefill_y_norm, 2e-5f);
+    check_near(explicit_prefill.value().logits[2], explicit_prefill_x_norm + explicit_prefill_y_norm, 2e-5f);
+    check_near(explicit_prefill.value().logits[3], -explicit_prefill_x_norm, 2e-5f);
 
     auto explicit_decode = token_experts_session.value()->decode(1);
     check(static_cast<bool>(explicit_decode));
     check(static_cast<bool>(token_experts_session.value()->statistics().expert_assignments == 4));
-    check(static_cast<bool>(token_experts_session.value()->statistics().expert_token_counts == std::vector<uint64_t>({2, 2})));
+    // Token 1 maps to Expert 0, whose down projection is the identity.
+    const float one_axis_norm = 1.0f / std::sqrt(0.5f + route_epsilon);
+    const float explicit_decode_value = 1.0f + one_axis_norm;
+    const float explicit_decode_final = explicit_decode_value
+                                        / std::sqrt(explicit_decode_value * explicit_decode_value / 2.0f + route_epsilon);
+    check_near(explicit_decode.value().logits[0], 0.0f, 1e-5f);
+    check_near(explicit_decode.value().logits[1], explicit_decode_final, 2e-5f);
+    check_near(explicit_decode.value().logits[2], explicit_decode_final, 2e-5f);
+    check_near(explicit_decode.value().logits[3], 0.0f, 1e-5f);
 
     check(static_cast<bool>(token_experts_session.value()->reset()));
     check(static_cast<bool>(token_experts_session.value()->statistics().expert_assignments == 0));
-    check(static_cast<bool>(token_experts_session.value()->statistics().expert_token_counts == std::vector<uint64_t>({0, 0})));
     const std::array<int32_t, 2> reused_explicit_prompt = {3, 0};
     auto reused_explicit_prefill = token_experts_session.value()->prefill(reused_explicit_prompt);
     check(static_cast<bool>(reused_explicit_prefill));
     check(static_cast<bool>(token_experts_session.value()->statistics().expert_assignments == 2));
-    check(static_cast<bool>(token_experts_session.value()->statistics().expert_token_counts == std::vector<uint64_t>({1, 1})));
+    // After reset, the final token 0 maps to Expert 1 again.
+    const float explicit_reuse_value = 1.0f + 2.0f * one_axis_norm;
+    const float explicit_reuse_final = explicit_reuse_value
+                                       / std::sqrt(explicit_reuse_value * explicit_reuse_value / 2.0f + route_epsilon);
+    check_near(reused_explicit_prefill.value().logits[0], explicit_reuse_final, 2e-5f);
+    check_near(reused_explicit_prefill.value().logits[1], 0.0f, 1e-5f);
+    check_near(reused_explicit_prefill.value().logits[2], explicit_reuse_final, 2e-5f);
+    check_near(reused_explicit_prefill.value().logits[3], -explicit_reuse_final, 2e-5f);
 }
 
 void test_linear_operator()
@@ -2430,22 +2471,10 @@ void test_ncnn_vulkan_bfloat16_operator()
         check(static_cast<bool>(bfloat_backend));
         const auto backend_gate_up = std::make_shared<TensorData>(expert_gate_up);
         const auto backend_down = std::make_shared<TensorData>(down);
-        bfloat_backend->admit("bfloat16-batch-first",
-                              backend_gate_up,
-                              nullptr,
-                              backend_down,
-                              nullptr,
-                              0,
-                              0.0f,
-                              ExpertActivation::Silu);
-        bfloat_backend->admit("bfloat16-batch-second",
-                              backend_gate_up,
-                              nullptr,
-                              backend_down,
-                              nullptr,
-                              0,
-                              0.0f,
-                              ExpertActivation::Silu);
+        bfloat_backend->admit(ExpertDemandRequest{"bfloat16-batch-first", backend_gate_up, nullptr,
+                                                  backend_down, nullptr, 0, 0.0f, ExpertActivation::Silu});
+        bfloat_backend->admit(ExpertDemandRequest{"bfloat16-batch-second", backend_gate_up, nullptr,
+                                                  backend_down, nullptr, 0, 0.0f, ExpertActivation::Silu});
         bfloat_backend->wait_for_background_work();
         check(bfloat_backend->statistics().stores == 2);
 
@@ -2468,14 +2497,14 @@ void test_ncnn_vulkan_bfloat16_operator()
         std::fill_n(second_batch_output.row(0),
                     second_batch_output.rows() * second_batch_output.columns(),
                     74.0f);
-        const std::array<ExpertBackendRequest, 2> bfloat_batch_requests = {{
+        const std::array<ExpertRequest, 2> bfloat_batch_requests = {{
             {"bfloat16-batch-first", &first_batch_input, &first_batch_output},
             {"bfloat16-batch-second", &second_batch_input, &second_batch_output},
         }};
         const auto bfloat_batch_results = submit_backend_batch(*bfloat_backend, bfloat_batch_requests);
         check(bfloat_batch_results.size() == 2);
-        check(bfloat_batch_results[0] == ExpertBackendExecutionResult::Executed);
-        check(bfloat_batch_results[1] == ExpertBackendExecutionResult::Executed);
+        check(bfloat_batch_results[0] == ExpertStatus::Executed);
+        check(bfloat_batch_results[1] == ExpertStatus::Executed);
         check(first_batch_output.rows() == first_batch_expected.rows());
         check(second_batch_output.rows() == second_batch_expected.rows());
         for (size_t row = 0; row < first_batch_expected.rows(); ++row)
@@ -4073,34 +4102,32 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 {
                     const size_t admitted_experts = aggregate_routes ? 1 : moe.experts.size();
                     for (size_t index = 0; index < admitted_experts; ++index)
-                        block_backend->admit("nonresident-block-" + std::to_string(index),
-                                             block_gate_owner,
-                                             &expert_gate_up_bias,
-                                             block_down_owner,
-                                             &expert_down_bias,
-                                             0,
-                                             expert_activation_limit,
-                                             ExpertActivation::GptOssSwiGlu);
+                        block_backend->admit(ExpertDemandRequest{"nonresident-block-" + std::to_string(index),
+                                                                 block_gate_owner,
+                                                                 &expert_gate_up_bias,
+                                                                 block_down_owner,
+                                                                 &expert_down_bias,
+                                                                 0,
+                                                                 expert_activation_limit,
+                                                                 ExpertActivation::GptOssSwiGlu});
                     block_backend->wait_for_background_work();
                 }
                 else if (aggregate_routes && pass == 1)
                 {
-                    block_backend->admit("nonresident-block-1",
-                                         block_gate_owner,
-                                         &expert_gate_up_bias,
-                                         block_down_owner,
-                                         &expert_down_bias,
-                                         0,
-                                         expert_activation_limit,
-                                         ExpertActivation::GptOssSwiGlu);
+                    block_backend->admit(ExpertDemandRequest{"nonresident-block-1", block_gate_owner,
+                                                             &expert_gate_up_bias, block_down_owner,
+                                                             &expert_down_bias, 0, expert_activation_limit,
+                                                             ExpertActivation::GptOssSwiGlu});
                     block_backend->wait_for_background_work();
                 }
             }
         }
         const auto backend_gate_up = std::make_shared<TensorData>(expert_gate_up);
         const auto backend_down = std::make_shared<TensorData>(expert_down);
-        expert_backend->admit("test-expert", backend_gate_up, &expert_gate_up_bias, backend_down, &expert_down_bias, 0, expert_activation_limit);
-        expert_backend->admit("test-expert", backend_gate_up, &expert_gate_up_bias, backend_down, &expert_down_bias, 0, expert_activation_limit);
+        const ExpertDemandRequest expert_admission{"test-expert", backend_gate_up, &expert_gate_up_bias,
+                                                   backend_down, &expert_down_bias, 0, expert_activation_limit};
+        expert_backend->admit(expert_admission);
+        expert_backend->admit(expert_admission);
         const auto admission_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (expert_backend->statistics().stores == 0 && std::chrono::steady_clock::now() < admission_deadline)
         {
@@ -4127,10 +4154,10 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         for (uint32_t sample = 0; sample < 3; ++sample)
         {
             ActivationBuffer backend_output;
-            const ExpertBackendRequest request{"test-expert", &backend_input, &backend_output};
-            const auto results = submit_backend_batch(*expert_backend, std::span<const ExpertBackendRequest>(&request, 1));
+            const ExpertRequest request{"test-expert", &backend_input, &backend_output};
+            const auto results = submit_backend_batch(*expert_backend, std::span<const ExpertRequest>(&request, 1));
             check(results.size() == 1);
-            check(results.front() == ExpertBackendExecutionResult::Executed);
+            check(results.front() == ExpertStatus::Executed);
             for (uint32_t column = 0; column < backend_expected.columns(); ++column)
             {
                 check_near(backend_output.row(0)[column], backend_expected.row(0)[column], 1e-3f);
@@ -4140,8 +4167,11 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         auto backend_down_second = std::make_shared<TensorData>(expert_down);
         backend_gate_up_second->mxfp4_blocks[0] ^= 1;
         backend_down_second->mxfp4_blocks[0] ^= 1;
-        expert_backend->admit("test-expert-second", backend_gate_up_second, &expert_gate_up_bias, backend_down_second, &expert_down_bias, 0, expert_activation_limit);
-        expert_backend->admit("test-expert-second", backend_gate_up_second, &expert_gate_up_bias, backend_down_second, &expert_down_bias, 0, expert_activation_limit);
+        const ExpertDemandRequest second_expert_admission{"test-expert-second", backend_gate_up_second,
+                                                          &expert_gate_up_bias, backend_down_second,
+                                                          &expert_down_bias, 0, expert_activation_limit};
+        expert_backend->admit(second_expert_admission);
+        expert_backend->admit(second_expert_admission);
         const auto second_admission_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (expert_backend->statistics().stores < 2 && std::chrono::steady_clock::now() < second_admission_deadline)
         {
@@ -4162,7 +4192,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                                                                         g_test_optimization_flags & ~OptimizationCpuMxfp4Q8);
         ActivationBuffer backend_batch_output_first;
         ActivationBuffer backend_batch_output_second;
-        const std::array<ExpertBackendRequest, 2> backend_requests = {{
+        const std::array<ExpertRequest, 2> backend_requests = {{
             {
                 "test-expert",
                 &backend_input,
@@ -4176,9 +4206,9 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         }};
         const auto backend_batch_results = submit_backend_batch(*expert_backend, backend_requests);
         check(static_cast<bool>(backend_batch_results.size() == 2));
-        for (ExpertBackendExecutionResult result : backend_batch_results)
+        for (ExpertStatus result : backend_batch_results)
         {
-            check(static_cast<bool>(result == ExpertBackendExecutionResult::Executed));
+            check(static_cast<bool>(result == ExpertStatus::Executed));
         }
         for (uint32_t column = 0; column < backend_expected.columns(); ++column)
         {
@@ -4208,13 +4238,9 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                                                             backend_optimization_flags);
             check(static_cast<bool>(arc_backend));
             const auto admit_arc_expert = [&](const char* key, uint32_t group) {
-                arc_backend->admit(key,
-                                   backend_gate_up,
-                                   &expert_gate_up_bias,
-                                   backend_down,
-                                   &expert_down_bias,
-                                   group,
-                                   expert_activation_limit);
+                arc_backend->admit(ExpertDemandRequest{key, backend_gate_up, &expert_gate_up_bias,
+                                                       backend_down, &expert_down_bias, group,
+                                                       expert_activation_limit});
                 arc_backend->wait_for_background_work();
             };
             admit_arc_expert("arc-hot-0", 0);
@@ -4222,14 +4248,14 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             admit_arc_expert("arc-cold-0", 1);
             {
                 std::array<ActivationBuffer, 2> hot_outputs;
-                const std::array<ExpertBackendRequest, 2> hot_requests = {{
+                const std::array<ExpertRequest, 2> hot_requests = {{
                     {"arc-hot-0", &backend_input, &hot_outputs[0]},
                     {"arc-hot-1", &backend_input, &hot_outputs[1]},
                 }};
                 const auto results = submit_backend_batch(*arc_backend, hot_requests);
                 check(results.size() == 2);
-                check(std::all_of(results.begin(), results.end(), [](ExpertBackendExecutionResult result) {
-                    return result == ExpertBackendExecutionResult::Executed;
+                check(std::all_of(results.begin(), results.end(), [](ExpertStatus result) {
+                    return result == ExpertStatus::Executed;
                 }));
             }
             const auto hot_statistics = arc_backend->statistics();
@@ -4245,7 +4271,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             check(admitted_statistics.arc_recent_size == pair_size);
             {
                 std::array<ActivationBuffer, 4> outputs;
-                const std::array<ExpertBackendRequest, 4> requests = {{
+                const std::array<ExpertRequest, 4> requests = {{
                     {"arc-hot-0", &backend_input, &outputs[0]},
                     {"arc-hot-1", &backend_input, &outputs[1]},
                     {"arc-cold-0", &backend_input, &outputs[2]},
@@ -4253,10 +4279,10 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 }};
                 const auto results = submit_backend_batch(*arc_backend, requests);
                 check(results.size() == requests.size());
-                check(results[0] == ExpertBackendExecutionResult::Executed);
-                check(results[1] == ExpertBackendExecutionResult::Executed);
-                check(results[2] == ExpertBackendExecutionResult::NotResident);
-                check(results[3] == ExpertBackendExecutionResult::Executed);
+                check(results[0] == ExpertStatus::Executed);
+                check(results[1] == ExpertStatus::Executed);
+                check(results[2] == ExpertStatus::NotResident);
+                check(results[3] == ExpertStatus::Executed);
                 for (size_t index : {size_t{0}, size_t{1}, size_t{3}})
                 {
                     check(outputs[index].rows() == backend_expected.rows());
@@ -4280,17 +4306,17 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                                   guarded_output.values().end(),
                                   [sentinel](float value) { return value == sentinel; }));
             };
-            const ExpertBackendRequest single_request{
+            const ExpertRequest single_request{
                 "test-expert",
                 &backend_input,
                 &guarded_output,
             };
             const uint64_t executions_before = expert_backend->statistics().executions;
-            auto single_submission = expert_backend->submit_batch(std::span<const ExpertBackendRequest>(&single_request, 1));
+            auto single_submission = expert_backend->submit_batch(std::span<const ExpertRequest>(&single_request, 1));
             check(static_cast<bool>(single_submission));
-            const std::span<const ExpertBackendExecutionResult> reservations = single_submission->reservations();
+            const std::span<const ExpertStatus> reservations = single_submission->reservations();
             check(reservations.size() == 1);
-            check(reservations.front() == ExpertBackendExecutionResult::Executed);
+            check(reservations.front() == ExpertStatus::Executed);
             check_guarded_output();
 
             if (scenario == 0)
@@ -4299,7 +4325,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 check_guarded_output();
                 const auto results = single_submission->wait();
                 check(results.size() == 1);
-                check(results.front() == ExpertBackendExecutionResult::Executed);
+                check(results.front() == ExpertStatus::Executed);
                 check(expert_backend->statistics().executions == executions_before + 1);
                 check_guarded_output();
                 check(!single_submission->commit());
@@ -4311,7 +4337,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             {
                 const auto results = single_submission->wait();
                 check(results.size() == 1);
-                check(results.front() == ExpertBackendExecutionResult::Executed);
+                check(results.front() == ExpertStatus::Executed);
                 check(expert_backend->statistics().executions == executions_before + 1);
                 check_guarded_output();
                 single_submission->abort();
@@ -4324,7 +4350,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             {
                 const auto results = single_submission->wait();
                 check(results.size() == 1);
-                check(results.front() == ExpertBackendExecutionResult::Executed);
+                check(results.front() == ExpertStatus::Executed);
                 check(expert_backend->statistics().executions == executions_before + 1);
                 check_guarded_output();
                 check(single_submission->commit());
@@ -4359,10 +4385,10 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                                                            backend_optimization_flags);
         check(static_cast<bool>(source_backend));
         ActivationBuffer source_output;
-        const ExpertBackendRequest source_request{"victim-expert", &backend_input, &source_output};
-        const auto source_results = submit_backend_batch(*source_backend, std::span<const ExpertBackendRequest>(&source_request, 1));
+        const ExpertRequest source_request{"victim-expert", &backend_input, &source_output};
+        const auto source_results = submit_backend_batch(*source_backend, std::span<const ExpertRequest>(&source_request, 1));
         check(source_results.size() == 1);
-        check(source_results.front() == ExpertBackendExecutionResult::Executed);
+        check(source_results.front() == ExpertStatus::Executed);
         for (uint32_t column = 0; column < backend_expected.columns(); ++column)
         {
             check_near(source_output.row(0)[column], backend_expected.row(0)[column], 1e-3f);
@@ -5466,25 +5492,25 @@ void test_ncnn_vulkan_qnk_expert_operator()
         check(size != 0);
         auto backend = create_vulkan_expert_backend(size + 4096, automatic_vulkan_device_index, nullptr, vulkan_runtime, flags);
         check(static_cast<bool>(backend));
+        ExpertDemandRequest admission{"batch", std::make_shared<TensorData>(gate), nullptr,
+                                      std::make_shared<TensorData>(down), nullptr, 0, 0.0f,
+                                      ExpertActivation::Silu};
         if (up)
-            backend->admit_separate("batch", std::make_shared<TensorData>(gate), nullptr, std::make_shared<TensorData>(*up), nullptr,
-                                    std::make_shared<TensorData>(down), nullptr, 0, 0.0f, ExpertActivation::Silu);
-        else
-            backend->admit("batch", std::make_shared<TensorData>(gate), nullptr, std::make_shared<TensorData>(down), nullptr,
-                           0, 0.0f, ExpertActivation::Silu);
+            admission.up = std::make_shared<TensorData>(*up);
+        backend->admit(admission);
         backend->wait_for_background_work();
         check(backend->statistics().stores == 1);
         ActivationBuffer first_input(1, batch_input.columns());
         std::copy_n(batch_input.row(0), batch_input.columns(), first_input.row(0));
         std::array<ActivationBuffer, 2> actual;
-        std::array<ExpertBackendRequest, 2> requests = {{{"batch", &first_input, &actual[0]}, {"batch", &batch_input, &actual[1]}}};
+        std::array<ExpertRequest, 2> requests = {{{"batch", &first_input, &actual[0]}, {"batch", &batch_input, &actual[1]}}};
         for (uint32_t input_case = 0; input_case < 3; ++input_case)
         {
             requests[0].input = input_case == 2 ? &batch_input : &first_input;
             requests[1].input = input_case == 1 ? &first_input : &batch_input;
             const VulkanStatistics before = get_vulkan_statistics(vulkan_runtime);
             const auto results = submit_backend_batch(*backend, requests);
-            check(results.size() == 2 && results[0] == ExpertBackendExecutionResult::Executed && results[1] == ExpertBackendExecutionResult::Executed);
+            check(results.size() == 2 && results[0] == ExpertStatus::Executed && results[1] == ExpertStatus::Executed);
             const VulkanStatistics after = get_vulkan_statistics(vulkan_runtime);
             check(after.dispatches - before.dispatches == dispatches);
             check(after.int4_dispatches - before.int4_dispatches == int4_dispatches);
@@ -5502,7 +5528,7 @@ void test_ncnn_vulkan_qnk_expert_operator()
         const VulkanStatistics after = get_vulkan_statistics(vulkan_runtime);
         for (auto& request : requests) request.output = nullptr;
         const auto invalid = submit_backend_batch(*backend, requests);
-        check(invalid.size() == 2 && invalid[0] != ExpertBackendExecutionResult::Executed && invalid[1] != ExpertBackendExecutionResult::Executed);
+        check(invalid.size() == 2 && invalid[0] != ExpertStatus::Executed && invalid[1] != ExpertStatus::Executed);
         const VulkanStatistics failed = get_vulkan_statistics(vulkan_runtime);
         check(failed.dispatches == after.dispatches && failed.int4_dispatches == after.int4_dispatches);
         check(failed.compute_submissions == after.compute_submissions);
@@ -5640,14 +5666,10 @@ void test_ncnn_vulkan_qnk_expert_operator()
                                                                g_test_optimization_flags | OptimizationVulkanQnK);
     check(static_cast<bool>(metadata_backend));
     const ExpertBackendStatistics before_metadata_admission = metadata_backend->statistics();
-    metadata_backend->admit("qnk-file-metadata",
-                            std::make_shared<TensorData>(metadata_gate_up),
-                            nullptr,
-                            std::make_shared<TensorData>(metadata_down),
-                            nullptr,
-                            0,
-                            0.0f,
-                            ExpertActivation::GptOssSwiGlu);
+    metadata_backend->admit(ExpertDemandRequest{"qnk-file-metadata",
+                                                std::make_shared<TensorData>(metadata_gate_up), nullptr,
+                                                std::make_shared<TensorData>(metadata_down), nullptr,
+                                                0, 0.0f, ExpertActivation::GptOssSwiGlu});
     const ExpertBackendStatistics after_metadata_admission = metadata_backend->statistics();
     check(after_metadata_admission.admissions == before_metadata_admission.admissions);
     check(after_metadata_admission.stores == before_metadata_admission.stores);
@@ -5685,21 +5707,15 @@ void test_ncnn_vulkan_qnk_expert_operator()
     check(static_cast<bool>(backend));
     const auto backend_gate_up = std::make_shared<TensorData>(gate_up);
     const auto backend_down = std::make_shared<TensorData>(down);
-    backend->admit("qnk-expert",
-                   backend_gate_up,
-                   nullptr,
-                   backend_down,
-                   nullptr,
-                   0,
-                   0.0f,
-                   ExpertActivation::GptOssSwiGlu);
+    backend->admit(ExpertDemandRequest{"qnk-expert", backend_gate_up, nullptr, backend_down, nullptr,
+                                       0, 0.0f, ExpertActivation::GptOssSwiGlu});
     backend->wait_for_background_work();
     check(backend->statistics().stores == 1);
     ActivationBuffer actual;
-    const ExpertBackendRequest request{"qnk-expert", &input, &actual};
-    const auto results = submit_backend_batch(*backend, std::span<const ExpertBackendRequest>(&request, 1));
+    const ExpertRequest request{"qnk-expert", &input, &actual};
+    const auto results = submit_backend_batch(*backend, std::span<const ExpertRequest>(&request, 1));
     check(results.size() == 1);
-    check(results.front() == ExpertBackendExecutionResult::Executed);
+    check(results.front() == ExpertStatus::Executed);
     check(actual.rows() == expected.rows());
     check(actual.columns() == expected.columns());
     for (size_t row = 0; row < actual.rows(); ++row)
@@ -5737,22 +5753,17 @@ void test_ncnn_vulkan_qnk_expert_operator()
     ActivationBuffer direct_second_output;
     check(static_cast<bool>(direct_second));
     check(static_cast<bool>(direct_second->forward(input, direct_second_output)));
-    backend->admit("qnk-expert-second",
-                   backend_gate_up_second,
-                   nullptr,
-                   backend_down_second,
-                   nullptr,
-                   0,
-                   0.0f,
-                   ExpertActivation::GptOssSwiGlu);
+    backend->admit(ExpertDemandRequest{"qnk-expert-second", backend_gate_up_second, nullptr,
+                                       backend_down_second, nullptr, 0, 0.0f,
+                                       ExpertActivation::GptOssSwiGlu});
     backend->wait_for_background_work();
     check(backend->statistics().stores == 2);
 
     ActivationBuffer second_single_output;
-    const ExpertBackendRequest second_request{"qnk-expert-second", &input, &second_single_output};
-    const auto second_results = submit_backend_batch(*backend, std::span<const ExpertBackendRequest>(&second_request, 1));
+    const ExpertRequest second_request{"qnk-expert-second", &input, &second_single_output};
+    const auto second_results = submit_backend_batch(*backend, std::span<const ExpertRequest>(&second_request, 1));
     check(second_results.size() == 1);
-    check(second_results.front() == ExpertBackendExecutionResult::Executed);
+    check(second_results.front() == ExpertStatus::Executed);
     for (size_t row = 0; row < input.rows(); ++row)
     {
         for (uint32_t column = 0; column < expected.columns(); ++column)
@@ -5763,14 +5774,14 @@ void test_ncnn_vulkan_qnk_expert_operator()
 
     ActivationBuffer batch_output_first;
     ActivationBuffer batch_output_second;
-    const std::array<ExpertBackendRequest, 2> batch_requests = {{
+    const std::array<ExpertRequest, 2> batch_requests = {{
         {"qnk-expert", &input, &batch_output_first},
         {"qnk-expert-second", &input, &batch_output_second},
     }};
     const auto batch_results = submit_backend_batch(*backend, batch_requests);
     check(batch_results.size() == batch_requests.size());
-    check(batch_results[0] == ExpertBackendExecutionResult::Executed);
-    check(batch_results[1] == ExpertBackendExecutionResult::Executed);
+    check(batch_results[0] == ExpertStatus::Executed);
+    check(batch_results[1] == ExpertStatus::Executed);
     for (size_t row = 0; row < input.rows(); ++row)
     {
         for (uint32_t column = 0; column < expected.columns(); ++column)
@@ -5798,14 +5809,14 @@ void test_ncnn_vulkan_qnk_expert_operator()
         std::fill_n(uneven_output_second.row(0),
                     uneven_output_second.rows() * uneven_output_second.columns(),
                     82.0f);
-        const std::array<ExpertBackendRequest, 2> uneven_requests = {{
+        const std::array<ExpertRequest, 2> uneven_requests = {{
             {"qnk-expert", &uneven_input_first, &uneven_output_first},
             {"qnk-expert-second", &uneven_input_second, &uneven_output_second},
         }};
         const auto uneven_results = submit_backend_batch(*backend, uneven_requests);
         check(uneven_results.size() == uneven_requests.size());
-        check(uneven_results[0] == ExpertBackendExecutionResult::Executed);
-        check(uneven_results[1] == ExpertBackendExecutionResult::Executed);
+        check(uneven_results[0] == ExpertStatus::Executed);
+        check(uneven_results[1] == ExpertStatus::Executed);
         check(uneven_output_first.rows() == 1);
         check(uneven_output_second.rows() == 2);
         for (uint32_t column = 0; column < expected.columns(); ++column)
@@ -5839,7 +5850,7 @@ void test_ncnn_vulkan_qnk_expert_operator()
     std::fill_n(aggregated_output.row(0), aggregated_output.rows() * aggregated_output.columns(), 123.0f);
     uint8_t first_completed = 0;
     uint8_t second_completed = 0;
-    std::array<ExpertBackendRequest, 2> aggregation_requests = {{
+    std::array<ExpertRequest, 2> aggregation_requests = {{
         {"qnk-expert", &input, &aggregation_output_first},
         {"qnk-expert-second", &input, &aggregation_output_second},
     }};
@@ -5877,8 +5888,8 @@ void test_ncnn_vulkan_qnk_expert_operator()
             submission->abort();
         const auto results = submission->wait();
         check(results.size() == aggregation_requests.size());
-        check(results[0] == ExpertBackendExecutionResult::Executed);
-        check(results[1] == ExpertBackendExecutionResult::Executed);
+        check(results[0] == ExpertStatus::Executed);
+        check(results[1] == ExpertStatus::Executed);
         check_unpublished();
         submission->abort();
         submission->abort();
@@ -5896,8 +5907,8 @@ void test_ncnn_vulkan_qnk_expert_operator()
         check(static_cast<bool>(submission));
         const auto results = submission->wait();
         check(results.size() == invalid_requests.size());
-        check(results[0] == ExpertBackendExecutionResult::Executed);
-        check(results[1] == ExpertBackendExecutionResult::Executed);
+        check(results[0] == ExpertStatus::Executed);
+        check(results[1] == ExpertStatus::Executed);
         check_unpublished();
         check(!submission->commit());
         check_unpublished();
@@ -5915,8 +5926,8 @@ void test_ncnn_vulkan_qnk_expert_operator()
     check_unpublished();
     check(aggregation_submission->commit());
     check(aggregation_results.size() == aggregation_requests.size());
-    check(aggregation_results[0] == ExpertBackendExecutionResult::Executed);
-    check(aggregation_results[1] == ExpertBackendExecutionResult::Executed);
+    check(aggregation_results[0] == ExpertStatus::Executed);
+    check(aggregation_results[1] == ExpertStatus::Executed);
     check(first_completed == 1);
     check(second_completed == 1);
     for (size_t token = 0; token < aggregated_output.rows(); ++token)
@@ -5949,7 +5960,7 @@ void test_ncnn_vulkan_qnk_expert_operator()
     uint8_t partial_first_completed = 0;
     uint8_t partial_second_completed = 0;
     uint8_t missing_completed = 0;
-    std::array<ExpertBackendRequest, 3> partial_requests = {{
+    std::array<ExpertRequest, 3> partial_requests = {{
         {"qnk-expert", &input, &partial_output_first},
         {"qnk-expert-second", &input, &partial_output_second},
         {"qnk-expert-missing", &input, &missing_output},
@@ -5980,9 +5991,9 @@ void test_ncnn_vulkan_qnk_expert_operator()
     const auto partial_results = partial_submission->wait();
     check(partial_submission->commit());
     check(partial_results.size() == partial_requests.size());
-    check(partial_results[0] == ExpertBackendExecutionResult::Executed);
-    check(partial_results[1] == ExpertBackendExecutionResult::Executed);
-    check(partial_results[2] == ExpertBackendExecutionResult::NotResident);
+    check(partial_results[0] == ExpertStatus::Executed);
+    check(partial_results[1] == ExpertStatus::Executed);
+    check(partial_results[2] == ExpertStatus::NotResident);
     check(partial_first_completed == 0);
     check(partial_second_completed == 0);
     check(missing_completed == 0);
@@ -9056,7 +9067,9 @@ void test_batch_scheduler_submission_contract()
         check(after.prefill_tokens == before.prefill_tokens);
         check(after.decode_tokens == before.decode_tokens);
         check(after.expert_assignments == before.expert_assignments);
-        check(after.expert_token_counts == before.expert_token_counts);
+        check(after.expert_batches == before.expert_batches);
+        check(after.expert_cpu_routes == before.expert_cpu_routes);
+        check(after.expert_gpu_routes == before.expert_gpu_routes);
         check(after.kv_cache_logical_size == before.kv_cache_logical_size);
         check(after.kv_cache_allocated_size == before.kv_cache_allocated_size);
     };
@@ -9373,7 +9386,8 @@ void test_chunked_prefill_statistics_commit_on_success()
     check(after.decode_tokens == before.decode_tokens);
     check(after.expert_assignments == before.expert_assignments);
     check(after.expert_batches == before.expert_batches);
-    check(after.expert_token_counts == before.expert_token_counts);
+    check(after.expert_cpu_routes == before.expert_cpu_routes);
+    check(after.expert_gpu_routes == before.expert_gpu_routes);
     check(after.cpu_bfloat16_batched_linear_dispatches == before.cpu_bfloat16_batched_linear_dispatches);
 
     check(static_cast<bool>(session.value()->reset()));
@@ -10138,7 +10152,6 @@ void test_speculative_generation()
                                                                                     0.0f);
             }
             SessionStatistics proposal_statistics;
-            proposal_statistics.expert_token_counts.resize(compiled.descriptor.expert_count);
             std::vector<std::span<const float>> sampled_logits;
             const SpeculativeSampler fixed_sampler = [&sampled_logits](std::span<const float> logits) -> Result<int32_t> {
                 sampled_logits.push_back(logits);
@@ -10438,7 +10451,8 @@ void test_topk_selected_weight_normalization_and_combine()
     check_near(result.value().logits[1], hidden_y / final_scale, 1e-5f);
     check(static_cast<bool>(session.value()->statistics().expert_assignments == 2));
     check(static_cast<bool>(session.value()->statistics().expert_batches == 2));
-    check(static_cast<bool>(session.value()->statistics().expert_token_counts == std::vector<uint64_t>({1, 1, 0})));
+    check(model.value()->descriptor().expert_count == 3);
+    check(model.value()->descriptor().layers.front().moe.top_k == 2);
 }
 
 void test_int8_expert_linear()
@@ -11345,7 +11359,7 @@ void test_shared_expert_descriptor()
         const auto expected = batch_to_vectors(serial_state.logits);
         check(actual == expected);
         check(reordered_statistics.expert_assignments == serial_statistics.expert_assignments);
-        check(reordered_statistics.expert_token_counts == serial_statistics.expert_token_counts);
+        check(reordered_statistics.expert_batches == serial_statistics.expert_batches);
     }
 
     // The speculative executor uses compiled node bindings rather than the
@@ -11389,7 +11403,6 @@ void test_shared_expert_descriptor()
         mtp_states[index].mtp_pending_target_hidden.reset(1, 2, false);
         mtp_states[index].mtp_pending_target_hidden.row(0)[0] = 1.0f;
         mtp_states[index].mtp_pending_target_hidden.row(0)[1] = 0.25f;
-        mtp_statistics[index].expert_token_counts.resize(shared_descriptor.expert_count);
     }
     const auto pending_bytes = mtp_states[0].mtp_pending_target_hidden.bytes();
     const std::byte* pending_data = pending_bytes.data();
@@ -11468,7 +11481,6 @@ void test_shared_expert_descriptor()
     repeated_mtp_state.mtp_pending_target_hidden.row(0)[0] = 1.0f;
     repeated_mtp_state.mtp_pending_target_hidden.row(0)[1] = 0.25f;
     SessionStatistics repeated_mtp_statistics;
-    repeated_mtp_statistics.expert_token_counts.resize(shared_descriptor.expert_count);
     const std::array<const float*, 2> mtp_storage = {
         mtp_actual.logits[0].values().data(), mtp_actual.logits[1].values().data()};
     const auto* mtp_tokens = mtp_actual.token_ids.data();
@@ -19317,13 +19329,33 @@ void test_generation_callback_errors()
     }
 
     check(static_cast<bool>(session.value()->reset()));
+    SessionMetrics callback_metrics;
     auto modified = session.value()->generate(std::vector<int32_t>{0}, opt, [&](const StreamToken& token) {
         check(static_cast<bool>(session.value()->decode(token.token_id)));
+        callback_metrics = session.value()->metrics();
+        check(callback_metrics.timing.active);
+        check(callback_metrics.generation.prefill_tokens == 0);
+        check(callback_metrics.cumulative.prefill_tokens == 1);
+        check(callback_metrics.generation.decode_tokens == 0);
+        check(callback_metrics.cumulative.decode_tokens == 1);
+        check(callback_metrics.generation.expert_gpu_cache_resident_size
+              == callback_metrics.cumulative.expert_gpu_cache_resident_size);
+        check(callback_metrics.generation.expert_gpu_cache_pending_size
+              == callback_metrics.cumulative.expert_gpu_cache_pending_size);
+        check(callback_metrics.generation.expert_cache_resident_size
+              == callback_metrics.cumulative.expert_cache_resident_size);
+        check(callback_metrics.generation.kv_cache_logical_size
+              == callback_metrics.cumulative.kv_cache_logical_size);
+        check(callback_metrics.generation.kv_cache_allocated_size
+              == callback_metrics.cumulative.kv_cache_allocated_size);
         return true;
     });
     check(!modified);
     check(modified.error().message == "generation callback modified the Session");
-    check(!session.value()->metrics().timing.active);
+    const SessionMetrics modified_metrics = session.value()->metrics();
+    check(!modified_metrics.timing.active);
+    check(modified_metrics.generation.decode_tokens == 0);
+    check(modified_metrics.cumulative.decode_tokens == 1);
 
     check(static_cast<bool>(session.value()->reset()));
     auto invalid = session.value()->generate(std::vector<int32_t>{-1}, opt);
