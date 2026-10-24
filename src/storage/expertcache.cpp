@@ -286,12 +286,6 @@ struct ExpertCache::FileRangeReader
         result.buffered_read_ranges = buffered_read_ranges.load(std::memory_order_relaxed);
         result.buffered_read_bytes = buffered_read_bytes.load(std::memory_order_relaxed);
         result.adaptive_read_policy = selected_read_policy();
-        result.direct_pipeline_batches = direct_pipeline_batches.load(std::memory_order_relaxed);
-        result.direct_pipeline_completed_ranges = direct_pipeline_completed_ranges.load(std::memory_order_relaxed);
-        result.direct_pipeline_peak_pending = direct_pipeline_peak_pending.load(std::memory_order_relaxed);
-        result.direct_arena_allocations = direct_arena_allocations.load(std::memory_order_relaxed);
-        result.direct_arena_allocated_bytes = direct_arena_allocated_bytes.load(std::memory_order_relaxed);
-        result.direct_wait_nanoseconds = direct_wait_nanoseconds.load(std::memory_order_relaxed);
     }
 
 #if defined(_WIN32)
@@ -359,18 +353,9 @@ struct ExpertCache::FileRangeReader
             if (retain)
             {
                 *scratch = MxFp4ByteBuffer(owner, static_cast<size_t>(request_size));
-                direct_arena_allocations.fetch_add(1, std::memory_order_relaxed);
-                direct_arena_allocated_bytes.fetch_add(request_size, std::memory_order_relaxed);
             }
         }
         return MxFp4ByteBuffer(std::move(owner), static_cast<size_t>(request_size));
-    }
-
-    void add_direct_wait(std::chrono::steady_clock::time_point started) noexcept
-    {
-        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
-        if (elapsed > 0)
-            direct_wait_nanoseconds.fetch_add(static_cast<uint64_t>(elapsed), std::memory_order_relaxed);
     }
 
     Result<MxFp4ByteBuffer> read_direct(const std::string& path, uint64_t offset, uint64_t size,
@@ -411,9 +396,7 @@ struct ExpertCache::FileRangeReader
                 ErrorCode::IoError,
                 "cannot start direct Expert read: " + path};
         }
-        const auto wait_started = std::chrono::steady_clock::now();
         const BOOL completed = GetOverlappedResult(handle, &operation, &read_bytes, TRUE);
-        add_direct_wait(wait_started);
         if (!completed || static_cast<uint64_t>(read_bytes) < plan.logical_size)
         {
             return Error{
@@ -440,7 +423,6 @@ struct ExpertCache::FileRangeReader
         OVERLAPPED operation{};
         uint8_t* base = nullptr;
         bool active = false;
-        bool returned_pending = false;
         bool fallback = false;
         bool processed = false;
     };
@@ -449,7 +431,6 @@ struct ExpertCache::FileRangeReader
     {
         direct_read_ranges.fetch_add(1, std::memory_order_relaxed);
         direct_read_bytes.fetch_add(slot.range->size, std::memory_order_relaxed);
-        direct_pipeline_completed_ranges.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Owns every submitted OVERLAPPED until completion, including exceptions
@@ -469,9 +450,7 @@ struct ExpertCache::FileRangeReader
                 if (!slot.active)
                     continue;
                 DWORD bytes = 0;
-                const auto started = std::chrono::steady_clock::now();
                 const BOOL completed = GetOverlappedResult(slot.handle, &slot.operation, &bytes, TRUE);
-                reader.add_direct_wait(started);
                 slot.active = false;
                 if (completed && static_cast<uint64_t>(bytes) >= slot.plan.logical_size)
                     reader.completed_direct_slot(slot);
@@ -550,7 +529,6 @@ struct ExpertCache::FileRangeReader
                     adaptive_read_policy.store(ReadPolicyBuffered, std::memory_order_relaxed);
             };
             uint64_t arena_offset = 0;
-            size_t submitted = 0;
             for (size_t index = 0; index < count; ++index)
             {
                 DirectSlot& slot = slots[index];
@@ -583,17 +561,7 @@ struct ExpertCache::FileRangeReader
                     continue;
                 }
                 slot.active = true;
-                slot.returned_pending = !started;
-                ++submitted;
-                uint64_t pending = 0;
-                for (const DirectSlot& candidate : slots)
-                    if (candidate.active && candidate.returned_pending && !HasOverlappedIoCompleted(&candidate.operation))
-                        ++pending;
-                uint64_t peak = direct_pipeline_peak_pending.load(std::memory_order_relaxed);
-                while (peak < pending && !direct_pipeline_peak_pending.compare_exchange_weak(peak, pending, std::memory_order_relaxed)) {}
             }
-            if (submitted >= 2)
-                direct_pipeline_batches.fetch_add(1, std::memory_order_relaxed);
 
             size_t remaining = count;
             while (remaining != 0)
@@ -616,9 +584,7 @@ struct ExpertCache::FileRangeReader
                 }
                 if (selected == count)
                 {
-                    const auto started = std::chrono::steady_clock::now();
                     const DWORD completed = WaitForMultipleObjects(waiting_count, waiting.data(), FALSE, INFINITE);
-                    add_direct_wait(started);
                     if (completed - WAIT_OBJECT_0 >= waiting_count)
                         return Error{ErrorCode::IoError, "cannot wait for pipelined Direct Expert reads"};
                     selected = waiting_slots[completed - WAIT_OBJECT_0];
@@ -957,12 +923,6 @@ private:
     std::atomic<uint64_t> direct_read_fallbacks{0};
     std::atomic<uint64_t> buffered_read_ranges{0};
     std::atomic<uint64_t> buffered_read_bytes{0};
-    std::atomic<uint64_t> direct_pipeline_batches{0};
-    std::atomic<uint64_t> direct_pipeline_completed_ranges{0};
-    std::atomic<uint64_t> direct_pipeline_peak_pending{0};
-    std::atomic<uint64_t> direct_arena_allocations{0};
-    std::atomic<uint64_t> direct_arena_allocated_bytes{0};
-    std::atomic<uint64_t> direct_wait_nanoseconds{0};
 };
 
 ExpertCache::ExpertCache(uint64_t _cache_size,

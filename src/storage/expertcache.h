@@ -69,19 +69,6 @@ struct ExpertCacheStatistics
     uint32_t adaptive_read_policy = 0;
     uint32_t num_io_threads = 0;
     ExpertVictimCacheStatistics victim;
-    // Waves accepting at least two Direct submissions before the first wait.
-    uint64_t direct_pipeline_batches = 0;
-    // Successful Direct completions in multi-range waves, including drain of
-    // an ultimately failed pair. Scalar completions remain in direct_read_*.
-    uint64_t direct_pipeline_completed_ranges = 0;
-    // Per-worker maximum sampled at submission boundaries; ERROR_IO_PENDING
-    // which have not completed count. Synchronous completions do not count.
-    uint64_t direct_pipeline_peak_pending = 0;
-    // Cumulative retained arena growth, not live capacity or transient reads.
-    uint64_t direct_arena_allocations = 0;
-    uint64_t direct_arena_allocated_bytes = 0;
-    // Summed worker wait wall time; waits in different workers can overlap.
-    uint64_t direct_wait_nanoseconds = 0;
 };
 
 struct ExpertCachePairRequest

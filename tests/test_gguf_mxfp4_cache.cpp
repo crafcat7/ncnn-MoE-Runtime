@@ -653,8 +653,7 @@ static void gguf_auto_direct_scratch_and_failures()
         if (mode == ExpertIoMode::Mmap)
         {
             gguf_cache_check(statistics.mapped_ranges == requests * 3 && statistics.mapped_bytes == expected_bytes
-                                 && statistics.direct_read_ranges == 0 && statistics.buffered_read_ranges == 0
-                                 && statistics.direct_pipeline_batches == 0 && statistics.direct_arena_allocations == 0,
+                                 && statistics.direct_read_ranges == 0 && statistics.buffered_read_ranges == 0,
                              "Mmap keeps its mapping and prefault contract after unified final-pair allocation");
         }
 #if defined(_WIN32)
@@ -663,12 +662,6 @@ static void gguf_auto_direct_scratch_and_failures()
             gguf_cache_check(statistics.direct_read_ranges == requests * 3 && statistics.direct_read_bytes == expected_bytes
                                  && statistics.direct_read_fallbacks == 0 && statistics.buffered_read_ranges == 0,
                              "Direct-capable Windows must execute true Direct I/O, including complete logical ranges at a short aligned EOF tail");
-            gguf_cache_check(statistics.direct_pipeline_batches == requests
-                                 && statistics.direct_pipeline_completed_ranges == requests * 3
-                                 && statistics.direct_arena_allocations > 1
-                                 && statistics.direct_arena_allocated_bytes >= 10 * 64 * 1024
-                                 && statistics.direct_pipeline_peak_pending <= 3,
-                             "three accepted Direct submissions precede each wave wait while the bounded arena grows across banks");
         }
 #endif
         else
@@ -701,23 +694,6 @@ static void gguf_auto_direct_scratch_and_failures()
                 gguf_cache_check(statistics.direct_read_ranges == 3 && statistics.direct_read_bytes == pinned_bank.pair_size()
                                      && statistics.buffered_read_ranges == 0 && statistics.direct_read_fallbacks == 0,
                                  "over-cap requests preserve true Direct rather than silently using Buffered");
-                const uint64_t batched_ranges = raw_cap >= 3 * 64 * 1024 ? 3 : raw_cap >= 2 * 64 * 1024 ? 2
-                                                                                                        : 0;
-                gguf_cache_check(statistics.direct_pipeline_batches == (batched_ranges != 0 ? 1u : 0u)
-                                     && statistics.direct_pipeline_completed_ranges == batched_ranges
-                                     && statistics.direct_arena_allocated_bytes <= raw_cap,
-                                 "raw budget selects three, two or one slots without hiding extra retained allocations");
-                if (raw_cap < 64 * 1024)
-                    gguf_cache_check(statistics.direct_arena_allocations == 0 && statistics.direct_arena_allocated_bytes == 0,
-                                     "a raw range above the arena cap keeps only a transient Direct allocation");
-                else
-                    gguf_cache_check(statistics.direct_arena_allocations > 0,
-                                     "eligible Direct raw waves retain their bounded aligned arena");
-                // Small uncached reads can complete synchronously. The batch
-                // counter proves submission ordering without requiring a
-                // positive sample of physical ERROR_IO_PENDING operations.
-                gguf_cache_check(statistics.direct_pipeline_peak_pending <= 3,
-                                 "sampled real pending I/O never exceeds the fixed three-slot bound");
             }
 #endif
         }
@@ -768,9 +744,6 @@ static void gguf_auto_direct_scratch_and_failures()
             {
                 gguf_cache_check(failed.direct_read_fallbacks > before.direct_read_fallbacks,
                                  "failed Direct attempt is counted before the exact Buffered retry");
-                gguf_cache_check(failed.direct_pipeline_completed_ranges - before.direct_pipeline_completed_ranges <= completed_ranges
-                                     && failed.direct_pipeline_peak_pending <= 3,
-                                 "error cleanup accounts successful Direct completions without inventing a completion order");
             }
 #endif
             auto recovered = cache.acquire_pair(bank.tensor(true), bank.tensor(false));
@@ -786,8 +759,6 @@ static void gguf_auto_direct_scratch_and_failures()
                 gguf_cache_check(after.adaptive_read_policy == 1
                                      && after.direct_read_ranges == failed.direct_read_ranges
                                      && after.direct_read_fallbacks == failed.direct_read_fallbacks
-                                     && after.direct_pipeline_batches == failed.direct_pipeline_batches
-                                     && after.direct_pipeline_completed_ranges == failed.direct_pipeline_completed_ranges
                                      && after.buffered_read_ranges == failed.buffered_read_ranges + 3
                                      && after.buffered_read_bytes == failed.buffered_read_bytes + bank.pair_size(),
                                  "Auto fallback persists for later GGUF ranges and preserves Buffered statistics");
@@ -797,9 +768,7 @@ static void gguf_auto_direct_scratch_and_failures()
             {
                 gguf_cache_check(after.direct_read_ranges == failed.direct_read_ranges + 3
                                      && after.direct_read_bytes == failed.direct_read_bytes + bank.pair_size()
-                                     && after.direct_read_fallbacks == failed.direct_read_fallbacks
-                                     && after.direct_pipeline_batches == failed.direct_pipeline_batches + 1
-                                     && after.direct_pipeline_completed_ranges == failed.direct_pipeline_completed_ranges + 3,
+                                     && after.direct_read_fallbacks == failed.direct_read_fallbacks,
                                  "explicit Direct retries true Direct on the next healthy bank after failure");
             }
 #endif
