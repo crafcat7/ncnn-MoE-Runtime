@@ -47,6 +47,7 @@ public:
     {
         ActivationBuffer host;
         std::shared_ptr<const DeviceTensor_vulkan> device;
+        ExpertRoute single_route;
         std::vector<ExpertRoute> routes;
     };
     std::shared_ptr<VulkanContext> context;
@@ -219,19 +220,24 @@ bool MoeCombine_vulkan::record_inputs(std::span<const MoeCombineInput_vulkan> in
     combined.create(static_cast<int>(columns), static_cast<int>(rows), sizeof(float), context->blob_allocator());
     if (combined.empty()) return false;
     temporaries.reserve(temporaries.size() + inputs.size() * 4 + 2);
+    std::vector<ncnn::vk_constant_type> constants(5);
+    std::vector<ncnn::VkMat> bindings(3);
+    const std::vector<unsigned char> readonly_bindings = {1, 1, 0};
+    constants[0].u32 = columns;
+    constants[1].u32 = static_cast<uint32_t>(rows);
     bool initialize = true;
     auto record = [&](const ncnn::VkMat& source, const ncnn::VkMat& routes, uint32_t count, bool shared) {
-        std::vector<ncnn::vk_constant_type> constants(5);
-        constants[0].u32 = columns;
-        constants[1].u32 = static_cast<uint32_t>(rows);
         constants[2].u32 = count;
         constants[3].u32 = static_cast<uint32_t>(shared);
         constants[4].u32 = static_cast<uint32_t>(initialize);
+        bindings[0] = source;
+        bindings[1] = routes;
+        bindings[2] = combined;
         ncnn::VkMat dispatcher;
         dispatcher.w = static_cast<int>(columns);
         dispatcher.h = static_cast<int>(std::min(rows, size_t(65535)));
         dispatcher.c = static_cast<int>((rows + 65534) / 65535);
-        cmd.record_pipeline_readonly(pipeline.get(), {source, routes, combined}, {1, 1, 0}, constants, dispatcher);
+        cmd.record_pipeline_readonly(pipeline.get(), bindings, readonly_bindings, constants, dispatcher);
         initialize = false;
     };
     for (const auto& input : inputs)
@@ -250,17 +256,19 @@ bool MoeCombine_vulkan::record_inputs(std::span<const MoeCombineInput_vulkan> in
             temporaries.push_back(source);
             ++uploads;
         }
-        std::vector<uint32_t> route_data;
-        route_data.reserve(input.routes.size() * 2);
-        for (const auto& route : input.routes)
-        {
-            route_data.push_back(route.token_index);
-            route_data.push_back(std::bit_cast<uint32_t>(route.weight));
-        }
         auto& staging = temporaries.emplace_back();
+        const uint32_t route_value_count = static_cast<uint32_t>(input.routes.size() * 2);
+        staging.create(static_cast<int>(route_value_count), sizeof(uint32_t), context->staging_allocator());
+        if (staging.empty() || !staging.mapped_ptr())
+            return false;
+        auto* route_data = static_cast<uint32_t*>(staging.mapped_ptr());
+        for (size_t route_index = 0; route_index < input.routes.size(); ++route_index)
+        {
+            route_data[route_index * 2] = input.routes[route_index].token_index;
+            route_data[route_index * 2 + 1] = std::bit_cast<uint32_t>(input.routes[route_index].weight);
+        }
         ncnn::VkMat routes;
-        if (!fill_staging_values(route_data.data(), route_data.size(), sizeof(uint32_t), staging, context->staging_allocator())
-            || !record_mapped_upload(staging, routes, cmd, opt)) return false;
+        if (!record_mapped_upload(staging, routes, cmd, opt)) return false;
         temporaries.push_back(routes);
         record(source, routes, static_cast<uint32_t>(input.routes.size()), false);
     }
@@ -294,7 +302,12 @@ bool MoeCombine_vulkan::record(const MoeCombinePending_vulkan& pending, ncnn::Vk
     std::vector<MoeCombineInput_vulkan> views;
     views.reserve(pending.d->inputs.size());
     for (const auto& input : pending.d->inputs)
-        views.push_back({&input.host, input.device, input.routes});
+    {
+        const std::span<const ExpertRoute> routes = input.routes.empty()
+                                                        ? std::span<const ExpertRoute>(&input.single_route, 1)
+                                                        : std::span<const ExpertRoute>(input.routes);
+        views.push_back({&input.host, input.device, routes});
+    }
     return record_inputs(views, pending.rows(), pending.columns(), &pending.d->shared_host,
                          pending.d->shared_device, output, command, storage, uploads);
 }
@@ -317,7 +330,10 @@ std::shared_ptr<MoeCombinePending_vulkan> MoeCombine_vulkan::prepare(std::span<c
         for (const auto& input : inputs)
         {
             auto& owned = pending->d->inputs.emplace_back();
-            owned.routes.assign(input.routes.begin(), input.routes.end());
+            if (input.routes.size() == 1)
+                owned.single_route = input.routes.front();
+            else
+                owned.routes.assign(input.routes.begin(), input.routes.end());
             if (input.device && !input.device->empty())
                 owned.device = input.device;
             else

@@ -457,6 +457,7 @@ private:
                                                                                  const TensorData* bias,
                                                                                  uint32_t vulkan_device_index,
                                                                                  ncnn::VkAllocator* weight_allocator,
+                                                                                 ncnn::VkAllocator* staging_allocator,
                                                                                  const VulkanRuntimePtr& vulkan_runtime,
                                                                                  uint64_t optimization_flags,
                                                                                  uint32_t input_group_count = 1,
@@ -503,28 +504,6 @@ public:
 private:
     friend class VulkanExpertBackend;
 
-    [[nodiscard]] static std::shared_ptr<QnkExpert_vulkan> create_with_allocator(const TensorData& gate_up,
-                                                                                 const TensorData* gate_up_bias,
-                                                                                 const TensorData& down,
-                                                                                 const TensorData* down_bias,
-                                                                                 float activation_limit,
-                                                                                 uint32_t vulkan_device_index,
-                                                                                 ncnn::VkAllocator* weight_allocator,
-                                                                                 ExpertActivation activation,
-                                                                                 const VulkanRuntimePtr& vulkan_runtime,
-                                                                                 uint64_t optimization_flags);
-    [[nodiscard]] static std::shared_ptr<QnkExpert_vulkan> create_separate_with_allocator(const TensorData& gate,
-                                                                                          const TensorData* gate_bias,
-                                                                                          const TensorData& up,
-                                                                                          const TensorData* up_bias,
-                                                                                          const TensorData& down,
-                                                                                          const TensorData* down_bias,
-                                                                                          float activation_limit,
-                                                                                          uint32_t vulkan_device_index,
-                                                                                          ncnn::VkAllocator* weight_allocator,
-                                                                                          ExpertActivation activation,
-                                                                                          const VulkanRuntimePtr& vulkan_runtime,
-                                                                                          uint64_t optimization_flags);
     [[nodiscard]] static std::shared_ptr<QnkExpert_vulkan> create_impl(const TensorData& gate,
                                                                        const TensorData* gate_bias,
                                                                        const TensorData* up,
@@ -534,6 +513,7 @@ private:
                                                                        float activation_limit,
                                                                        uint32_t vulkan_device_index,
                                                                        ncnn::VkAllocator* weight_allocator,
+                                                                       ncnn::VkAllocator* staging_allocator,
                                                                        ExpertActivation activation,
                                                                        const VulkanRuntimePtr& vulkan_runtime,
                                                                        uint64_t optimization_flags);

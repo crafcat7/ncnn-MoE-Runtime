@@ -426,7 +426,8 @@ CpuOpenMpThreadLimitScope::CpuOpenMpThreadLimitScope() noexcept
     : previous(cpu_openmp_thread_limit_override)
 #endif
 {
-#if defined(_OPENMP) && defined(NCNN_MOE_USE_NCNN) && NCNN_MOE_USE_NCNN
+#if defined(_OPENMP) && defined(NCNN_MOE_USE_NCNN) && NCNN_MOE_USE_NCNN \
+    && (defined(__clang__) || defined(_OPENMP_LLVM_RUNTIME))
     if (cpu_openmp_thread_limit() <= 1
         || std::getenv("KMP_BLOCKTIME")
         || std::getenv("OMP_WAIT_POLICY")
@@ -446,7 +447,8 @@ CpuOpenMpThreadLimitScope::CpuOpenMpThreadLimitScope() noexcept
 
 CpuOpenMpThreadLimitScope::~CpuOpenMpThreadLimitScope() noexcept
 {
-#if defined(_OPENMP) && defined(NCNN_MOE_USE_NCNN) && NCNN_MOE_USE_NCNN
+#if defined(_OPENMP) && defined(NCNN_MOE_USE_NCNN) && NCNN_MOE_USE_NCNN \
+    && (defined(__clang__) || defined(_OPENMP_LLVM_RUNTIME))
     if (restore_blocktime)
         ncnn::set_kmp_blocktime(previous_blocktime);
 #endif

@@ -969,17 +969,19 @@ Result<void> forward_model(const CompiledModel& model,
             }
             if (device_combined) fused_router_ready = false;
 
-            const auto target = std::find(model.speculative.target_layer_ids.begin(),
-                                          model.speculative.target_layer_ids.end(),
-                                          layer.layer_id);
-            if (target != model.speculative.target_layer_ids.end()
-                && use_speculative_context)
+            if (use_speculative_context)
             {
-                capture_speculative_hidden(hidden,
-                                           model.descriptor.hidden_size,
-                                           model.descriptor.hyper_connection_multiplier,
-                                           static_cast<size_t>(std::distance(model.speculative.target_layer_ids.begin(), target)),
-                                           state.speculative_main_hidden);
+                const auto target = std::find(model.speculative.target_layer_ids.begin(),
+                                              model.speculative.target_layer_ids.end(),
+                                              layer.layer_id);
+                if (target != model.speculative.target_layer_ids.end())
+                {
+                    capture_speculative_hidden(hidden,
+                                               model.descriptor.hidden_size,
+                                               model.descriptor.hyper_connection_multiplier,
+                                               static_cast<size_t>(std::distance(model.speculative.target_layer_ids.begin(), target)),
+                                               state.speculative_main_hidden);
+                }
             }
             layer_state.reset();
             continue;
@@ -2084,11 +2086,16 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 }
             }
             if (device_combined) fused_router_ready = false;
-            const auto target = std::find(model.speculative.target_layer_ids.begin(),
-                                          model.speculative.target_layer_ids.end(),
-                                          layer.layer_id);
-            const size_t target_index = static_cast<size_t>(std::distance(model.speculative.target_layer_ids.begin(),
-                                                                          target));
+            const bool capture_speculative_context = model.speculative.enabled() && use_speculative_context;
+            const auto target = capture_speculative_context
+                                    ? std::find(model.speculative.target_layer_ids.begin(),
+                                                model.speculative.target_layer_ids.end(),
+                                                layer.layer_id)
+                                    : model.speculative.target_layer_ids.end();
+            const size_t target_index = capture_speculative_context
+                                            ? static_cast<size_t>(std::distance(model.speculative.target_layer_ids.begin(),
+                                                                                target))
+                                            : 0;
             for (size_t session_index = 0; session_index < session_count; ++session_index)
             {
                 LayerState& layer_state = entries[session_index].state->execution_state;

@@ -873,6 +873,7 @@ static Result<void> sampling_distribution_into(std::span<const float> logits,
 
     const bool has_top_k = opt.top_k > 0 && opt.top_k < logits.size();
     const bool needs_order = opt.top_p < 1.0f;
+    const bool direct_ids = !has_top_k && !needs_order;
     if (has_top_k)
     {
         token_ids.resize(opt.top_k);
@@ -891,19 +892,21 @@ static Result<void> sampling_distribution_into(std::span<const float> logits,
         if (needs_order)
             std::sort(token_ids.begin(), token_ids.end(), logit_order);
     }
-    else
+    else if (needs_order)
     {
         token_ids.resize(logits.size());
         std::iota(token_ids.begin(), token_ids.end(), 0);
-        if (needs_order)
-            std::sort(token_ids.begin(), token_ids.end(), logit_order);
+        std::sort(token_ids.begin(), token_ids.end(), logit_order);
     }
 
-    candidates.reserve(token_ids.size());
+    const size_t token_count = direct_ids ? logits.size() : token_ids.size();
+    candidates.reserve(token_count);
     const float maximum = maximum_logit / opt.temperature;
     float normalizer = 0.0f;
-    for (int32_t token_id : token_ids)
+    for (size_t token_index = 0; token_index < token_count; ++token_index)
     {
+        const int32_t token_id = direct_ids ? static_cast<int32_t>(token_index)
+                                            : token_ids[token_index];
         const float logit = logits[token_id];
         if (!std::isfinite(logit))
             continue;

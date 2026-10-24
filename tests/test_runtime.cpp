@@ -18611,6 +18611,121 @@ void test_automatic_expert_memory_planning()
     check(static_cast<bool>(available_limited_plan.value().expert_cache_size
                             == 10 * gibibyte - available_limited_plan.value().estimated_dense_size));
 
+    constexpr uint64_t staging_per_device = 64 * 1024 * 1024;
+    Option hybrid_options = options;
+    hybrid_options.hybrid_mode = HybridMode::HybridExperts;
+    auto hybrid_limited_plan = plan_model_memory(large,
+                                                 hybrid_options,
+                                                 physical_memory,
+                                                 false,
+                                                 12 * gibibyte);
+    check(static_cast<bool>(hybrid_limited_plan));
+    const uint64_t limited_dense_size = hybrid_limited_plan.value().estimated_dense_size;
+    check(static_cast<bool>(hybrid_limited_plan.value().expert_cache_size
+                            == 10 * gibibyte - limited_dense_size - staging_per_device));
+    ModelMemoryPlan finalized_hybrid_plan = hybrid_limited_plan.value();
+    check(static_cast<bool>(finalize_model_memory_plan(finalized_hybrid_plan, hybrid_options, 0)));
+    const uint64_t finalized_cache_size = finalized_hybrid_plan.expert_cache_size;
+    check(static_cast<bool>(finalize_model_memory_plan(finalized_hybrid_plan, hybrid_options, 0)));
+    check(static_cast<bool>(finalized_hybrid_plan.expert_cache_size == finalized_cache_size));
+
+    Option small_gpu_cache = hybrid_options;
+    small_gpu_cache.expert_gpu_cache_size = 32 * 1024 * 1024;
+    auto small_gpu_cache_plan = plan_model_memory(large,
+                                                  small_gpu_cache,
+                                                  physical_memory,
+                                                  false,
+                                                  12 * gibibyte);
+    check(static_cast<bool>(small_gpu_cache_plan));
+    check(static_cast<bool>(small_gpu_cache_plan.value().expert_cache_size
+                            == 10 * gibibyte - limited_dense_size - small_gpu_cache.expert_gpu_cache_size));
+
+    Option capped_gpu_cache = hybrid_options;
+    capped_gpu_cache.expert_gpu_cache_size = 128 * 1024 * 1024;
+    auto capped_gpu_cache_plan = plan_model_memory(large,
+                                                   capped_gpu_cache,
+                                                   physical_memory,
+                                                   false,
+                                                   12 * gibibyte);
+    check(static_cast<bool>(capped_gpu_cache_plan));
+    check(static_cast<bool>(capped_gpu_cache_plan.value().expert_cache_size
+                            == 10 * gibibyte - limited_dense_size - staging_per_device));
+    capped_gpu_cache.vulkan_device_indices = {0, 1};
+    capped_gpu_cache.expert_gpu_cache_size = 256 * 1024 * 1024;
+    auto multi_gpu_cache_plan = plan_model_memory(large,
+                                                  capped_gpu_cache,
+                                                  physical_memory,
+                                                  false,
+                                                  12 * gibibyte);
+    check(static_cast<bool>(multi_gpu_cache_plan));
+    check(static_cast<bool>(multi_gpu_cache_plan.value().expert_cache_size
+                            == 10 * gibibyte - limited_dense_size - 2 * staging_per_device));
+
+    Option cpu_only_cache = hybrid_options;
+    cpu_only_cache.hybrid_mode = HybridMode::CpuOnly;
+    auto cpu_only_plan = plan_model_memory(large,
+                                           cpu_only_cache,
+                                           physical_memory,
+                                           false,
+                                           12 * gibibyte);
+    check(static_cast<bool>(cpu_only_plan));
+    check(static_cast<bool>(cpu_only_plan.value().expert_cache_size
+                            == 10 * gibibyte - limited_dense_size));
+    Option disabled_gpu_cache = hybrid_options;
+    disabled_gpu_cache.flags |= OptionDisableGpuExpertExecution;
+    auto disabled_gpu_plan = plan_model_memory(large,
+                                               disabled_gpu_cache,
+                                               physical_memory,
+                                               false,
+                                               12 * gibibyte);
+    check(static_cast<bool>(disabled_gpu_plan));
+    check(static_cast<bool>(disabled_gpu_plan.value().expert_cache_size
+                            == 10 * gibibyte - limited_dense_size));
+
+    const uint64_t active_expert_size = hybrid_limited_plan.value().minimum_active_expert_size;
+    Option cpu_tight_cache = cpu_only_cache;
+    cpu_tight_cache.expert_memory_mode = ExpertMemoryMode::OnDemand;
+    cpu_tight_cache.expert_cache_size = active_expert_size;
+    cpu_tight_cache.host_memory_budget = limited_dense_size + 4 * gibibyte + active_expert_size - 1;
+    auto cpu_tight_plan = plan_model_memory(large, cpu_tight_cache, physical_memory);
+    check(static_cast<bool>(!cpu_tight_plan));
+    check(static_cast<bool>(cpu_tight_plan.error().code == ErrorCode::InvalidArgument));
+
+    Option explicit_cpu_cache = cpu_tight_cache;
+    explicit_cpu_cache.expert_cache_size = 4 * gibibyte + active_expert_size;
+    explicit_cpu_cache.host_memory_budget = limited_dense_size + explicit_cpu_cache.expert_cache_size;
+    auto explicit_cpu_plan = plan_model_memory(large, explicit_cpu_cache, physical_memory);
+    check(static_cast<bool>(explicit_cpu_plan));
+    check(static_cast<bool>(explicit_cpu_plan.value().expert_cache_size == explicit_cpu_cache.expert_cache_size));
+    ModelMemoryPlan finalized_explicit_cpu_plan = explicit_cpu_plan.value();
+    check(static_cast<bool>(finalize_model_memory_plan(finalized_explicit_cpu_plan, explicit_cpu_cache, 0)));
+    check(static_cast<bool>(finalized_explicit_cpu_plan.expert_cache_size == explicit_cpu_cache.expert_cache_size));
+
+    Option exact_staging_budget = hybrid_options;
+    exact_staging_budget.expert_memory_mode = ExpertMemoryMode::OnDemand;
+    exact_staging_budget.expert_cache_size = active_expert_size;
+    const uint64_t exact_host_budget = limited_dense_size + staging_per_device + active_expert_size;
+    uint64_t exact_available_memory = 2 * gibibyte + exact_host_budget;
+    auto exact_staging_plan = plan_model_memory(large,
+                                                exact_staging_budget,
+                                                physical_memory,
+                                                false,
+                                                exact_available_memory);
+    check(static_cast<bool>(exact_staging_plan));
+    check(static_cast<bool>(exact_staging_plan.value().host_memory_budget == exact_host_budget));
+    check(static_cast<bool>(exact_staging_plan.value().expert_cache_size == active_expert_size));
+    ModelMemoryPlan finalized_exact_plan = exact_staging_plan.value();
+    check(static_cast<bool>(finalize_model_memory_plan(finalized_exact_plan, exact_staging_budget, 0)));
+    check(static_cast<bool>(finalized_exact_plan.expert_cache_size == active_expert_size));
+    --exact_available_memory;
+    auto undersized_staging_plan = plan_model_memory(large,
+                                                     exact_staging_budget,
+                                                     physical_memory,
+                                                     false,
+                                                     exact_available_memory);
+    check(static_cast<bool>(!undersized_staging_plan));
+    check(static_cast<bool>(undersized_staging_plan.error().code == ErrorCode::InvalidArgument));
+
     MoeModelDescriptor qnk = gpt_oss_memory_descriptor(1, 24);
     qnk.vocabulary_size = 128;
     qnk.hidden_size = 4096;
@@ -18784,12 +18899,14 @@ void test_automatic_expert_memory_planning()
         check(predicted.value().estimated_dense_size + expected_release == retained.value().estimated_dense_size);
         const uint64_t full_dense_size = retained.value().estimated_dense_size;
 
-        // Available-memory admission must use the same post-release storage
-        // that is settled after compilation, without increasing the budget.
+        // Available-memory admission reserves idle staging before compilation,
+        // then settles dense storage without changing that budget.
         Option tight = hybrid;
         tight.host_memory_budget = 0;
-        const uint64_t budget = predicted.value().estimated_dense_size + tight.expert_cache_size;
+        const uint64_t budget_without_staging = predicted.value().estimated_dense_size + tight.expert_cache_size;
+        const uint64_t budget = budget_without_staging + staging_per_device;
         const uint64_t available = 2 * gibibyte + budget;
+        const uint64_t available_without_staging = 2 * gibibyte + budget_without_staging;
         auto admitted = plan_model_memory(qwen, tight, 4 * gibibyte, true, available, false, &weights, true);
         check(admitted && admitted.value().host_memory_budget == budget);
         check(admitted.value().estimated_dense_size == predicted.value().estimated_dense_size);
@@ -18801,10 +18918,10 @@ void test_automatic_expert_memory_planning()
         check(!missing_dense && !missing_attention);
         Option cpu = tight;
         cpu.hybrid_mode = HybridMode::CpuOnly;
-        check(!plan_model_memory(qwen, cpu, 4 * gibibyte, true, available, false, &weights, true));
+        check(!plan_model_memory(qwen, cpu, 4 * gibibyte, true, available_without_staging, false, &weights, true));
         cpu = tight;
         cpu.flags |= OptionDisableGpuExpertExecution;
-        check(!plan_model_memory(qwen, cpu, 4 * gibibyte, true, available, false, &weights, true));
+        check(!plan_model_memory(qwen, cpu, 4 * gibibyte, true, available_without_staging, false, &weights, true));
         for (uint64_t disabled : {static_cast<uint64_t>(OptimizationVulkanAttention), static_cast<uint64_t>(OptimizationVulkanQnK),
                                   static_cast<uint64_t>(OptimizationVulkanExpertGpuPriority), static_cast<uint64_t>(OptimizationVulkanCommandGraph)})
         {
@@ -18997,6 +19114,14 @@ void test_sampling_and_streaming_generation()
     check(static_cast<bool>(top_k));
     check(static_cast<bool>(top_k.value().token_id == 2));
 
+    // Leave filtered token ids in the Session scratch, then ensure default
+    // sampling still uses the complete contiguous vocabulary.
+    logits = {5.0f, 5.0f, 5.0f};
+    SamplingOptions default_options;
+    auto default_after_filter = session.value()->sample(logits, default_options);
+    check(static_cast<bool>(default_after_filter));
+    check_near(default_after_filter.value().probability, 1.0f / 3.0f, 1e-6f);
+
     logits = {-10.0f, 10.0f, 9.0f, 8.0f, 7.0f, 6.0f};
     SamplingOptions bounded_options;
     bounded_options.top_k = 2;
@@ -19017,6 +19142,10 @@ void test_sampling_and_streaming_generation()
     auto invalid = session.value()->sample(logits, invalid_options);
     check(static_cast<bool>(!invalid));
     check(static_cast<bool>(invalid.error().code == ErrorCode::InvalidArgument));
+    const std::span<const float> empty_logits;
+    auto empty_invalid = session.value()->sample(empty_logits, invalid_options);
+    check(static_cast<bool>(!empty_invalid));
+    check(static_cast<bool>(empty_invalid.error().message == "cannot sample empty logits"));
 
     GenerationOptions generation_options;
     generation_options.max_new_tokens = 3;
@@ -19031,6 +19160,22 @@ void test_sampling_and_streaming_generation()
     check(static_cast<bool>(streamed.size() == 3));
     check(static_cast<bool>(generated.value().tokens[0].text == "<" + std::to_string(generated.value().tokens[0].token_id) + ">"));
     check(static_cast<bool>(session.value()->sequence_length() == 3));
+
+    auto mutable_options_session = runtime.create_session(model.value(), session_options);
+    check(static_cast<bool>(mutable_options_session));
+    GenerationOptions mutable_options;
+    mutable_options.max_new_tokens = 3;
+    mutable_options.sampling.temperature = 0.0f;
+    auto invalidated_options = mutable_options_session.value()->generate(std::vector<int32_t>{0}, mutable_options,
+                                                                         [&mutable_options](const StreamToken& token) {
+                                                                             if (token.index == 0)
+                                                                                 mutable_options.sampling.top_p = 0.0f;
+                                                                             return true;
+                                                                         });
+    check(static_cast<bool>(!invalidated_options));
+    check(static_cast<bool>(invalidated_options.error().code == ErrorCode::InvalidArgument));
+    check(static_cast<bool>(invalidated_options.error().message == "top_p must be in the range (0, 1]"));
+
     const SessionMetrics metrics = session.value()->metrics();
     check(static_cast<bool>(!metrics.timing.active));
     check(static_cast<bool>(metrics.timing.input_tokens == 1));

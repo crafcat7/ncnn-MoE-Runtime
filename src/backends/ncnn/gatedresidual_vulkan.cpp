@@ -44,7 +44,7 @@ void qwen_record(const ncnn::Pipeline* pipeline, uint32_t mode, uint32_t hidden,
                  uint32_t rows, uint32_t columns, float epsilon, float offset, const std::vector<ncnn::VkMat>& bindings,
                  ncnn::VkCompute& cmd, uint32_t kernel, uint32_t ngram, uint32_t length, uint32_t slot)
 {
-    std::vector<ncnn::vk_constant_type> constants(11);
+    static thread_local std::vector<ncnn::vk_constant_type> constants(11);
     constants[0].u32 = mode;
     constants[1].u32 = hidden;
     constants[2].u32 = copies;

@@ -1469,30 +1469,19 @@ std::shared_ptr<VulkanExpertBackend::Entry> VulkanExpertBackend::create_entry(co
     }
     else
     {
-        if (admission.up)
-            entry->qnk_operation = QnkExpert_vulkan::create_separate_with_allocator(*admission.gate_up,
-                                                                                    admission.gate_up_bias.get(),
-                                                                                    *admission.up,
-                                                                                    admission.up_bias.get(),
-                                                                                    *admission.down,
-                                                                                    admission.down_bias.get(),
-                                                                                    admission.activation_limit,
-                                                                                    vulkan_device_index,
-                                                                                    expert_weight_allocator.get(),
-                                                                                    admission.activation,
-                                                                                    vulkan_runtime,
-                                                                                    optimization_flags);
-        else
-            entry->qnk_operation = QnkExpert_vulkan::create_with_allocator(*admission.gate_up,
-                                                                           admission.gate_up_bias.get(),
-                                                                           *admission.down,
-                                                                           admission.down_bias.get(),
-                                                                           admission.activation_limit,
-                                                                           vulkan_device_index,
-                                                                           expert_weight_allocator.get(),
-                                                                           admission.activation,
-                                                                           vulkan_runtime,
-                                                                           optimization_flags);
+        entry->qnk_operation = QnkExpert_vulkan::create_impl(*admission.gate_up,
+                                                             admission.gate_up_bias.get(),
+                                                             admission.up.get(),
+                                                             admission.up_bias.get(),
+                                                             *admission.down,
+                                                             admission.down_bias.get(),
+                                                             admission.activation_limit,
+                                                             vulkan_device_index,
+                                                             expert_weight_allocator.get(),
+                                                             admission_staging_allocator.get(),
+                                                             admission.activation,
+                                                             vulkan_runtime,
+                                                             optimization_flags);
     }
     if (!entry->operation && !entry->bfloat16_operation && !entry->qnk_operation)
         return {};

@@ -19,6 +19,7 @@ namespace ncnn {
 namespace moe {
 
 static constexpr uint64_t gibibyte = 1024ull * 1024ull * 1024ull;
+static constexpr uint64_t mebibyte = 1024ull * 1024ull;
 
 static Result<uint64_t> checked_add(uint64_t left, uint64_t right, const char* name)
 {
@@ -1428,6 +1429,28 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         }
         return plan;
     }
+
+    // Reserve host budget for the idle staging pool, not peak upload memory.
+    uint64_t staging_reserve = 0;
+    if (opt.hybrid_mode == HybridMode::HybridExperts
+        && !has_flag(opt.flags, OptionDisableGpuExpertExecution))
+    {
+        const uint64_t device_count = opt.vulkan_device_indices.empty()
+                                          ? 1
+                                          : static_cast<uint64_t>(opt.vulkan_device_indices.size());
+        auto staging_capacity = checked_multiply(device_count, 64 * mebibyte,
+                                                 "GPU Expert staging reserve");
+        if (!staging_capacity)
+            return staging_capacity.error();
+        staging_reserve = opt.expert_gpu_cache_size != 0
+                              ? std::min(opt.expert_gpu_cache_size, staging_capacity.value())
+                              : staging_capacity.value();
+    }
+    const uint64_t cache_safety_reserve = std::max(safety_reserve, staging_reserve);
+    eager_capacity = plan.host_memory_budget > plan.estimated_dense_size
+                             && plan.host_memory_budget - plan.estimated_dense_size > cache_safety_reserve
+                         ? plan.host_memory_budget - plan.estimated_dense_size - cache_safety_reserve
+                         : 0;
     for (const LayerDescriptor& layer : descriptor.layers)
     {
         if (layer.dense.enabled())
@@ -1454,9 +1477,9 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         plan.estimated_dense_size -= plan.estimated_vulkan_dense_host_release_size;
         eager_capacity = 0;
         if (plan.host_memory_budget > plan.estimated_dense_size
-            && plan.host_memory_budget - plan.estimated_dense_size > safety_reserve)
+            && plan.host_memory_budget - plan.estimated_dense_size > cache_safety_reserve)
         {
-            eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - safety_reserve;
+            eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - cache_safety_reserve;
         }
     }
     if (plan.selected_mode == ExpertMemoryMode::OnDemand && file_backed_qnk_experts)
@@ -1477,9 +1500,9 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
 
         eager_capacity = 0;
         if (plan.host_memory_budget > plan.estimated_dense_size
-            && plan.host_memory_budget - plan.estimated_dense_size > safety_reserve)
+            && plan.host_memory_budget - plan.estimated_dense_size > cache_safety_reserve)
         {
-            eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - safety_reserve;
+            eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - cache_safety_reserve;
         }
     }
     if (eager_capacity < plan.minimum_active_expert_size)
@@ -1489,7 +1512,13 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
 
     const uint64_t automatic_target = physical_memory_size == 0 ? 2 * gibibyte : eager_capacity;
     plan.expert_cache_size = opt.expert_cache_size != 0 ? opt.expert_cache_size : std::min(automatic_target, eager_capacity);
-    if (plan.expert_cache_size > plan.host_memory_budget - plan.estimated_dense_size)
+    const uint64_t host_capacity = plan.host_memory_budget > plan.estimated_dense_size
+                                       ? plan.host_memory_budget - plan.estimated_dense_size
+                                       : 0;
+    const uint64_t cache_limit = opt.expert_cache_size != 0
+                                     ? (host_capacity > staging_reserve ? host_capacity - staging_reserve : 0)
+                                     : eager_capacity;
+    if (plan.expert_cache_size > cache_limit)
     {
         return Error{ErrorCode::InvalidArgument, "expert cache and dense weights exceed the host memory budget"};
     }
@@ -1519,10 +1548,28 @@ Result<void> finalize_model_memory_plan(ModelMemoryPlan& plan, const Option& opt
     const uint64_t safety_reserve = budget_limited_by_available_memory
                                         ? 0
                                         : std::max(2 * gibibyte, plan.physical_memory_size == 0 ? 2 * gibibyte : plan.physical_memory_size / 8);
+    uint64_t staging_reserve = 0;
+    if (opt.hybrid_mode == HybridMode::HybridExperts
+        && !has_flag(opt.flags, OptionDisableGpuExpertExecution))
+    {
+        const uint64_t device_count = opt.vulkan_device_indices.empty()
+                                          ? 1
+                                          : static_cast<uint64_t>(opt.vulkan_device_indices.size());
+        auto staging_capacity = checked_multiply(device_count, 64 * mebibyte,
+                                                 "GPU Expert staging reserve");
+        if (!staging_capacity)
+            return staging_capacity.error();
+        staging_reserve = opt.expert_gpu_cache_size != 0
+                              ? std::min(opt.expert_gpu_cache_size, staging_capacity.value())
+                              : staging_capacity.value();
+    }
+    const uint64_t cache_safety_reserve = std::max(safety_reserve, staging_reserve);
     const uint64_t host_capacity = plan.host_memory_budget > plan.estimated_dense_size
                                        ? plan.host_memory_budget - plan.estimated_dense_size
                                        : 0;
-    const uint64_t cache_capacity = host_capacity > safety_reserve ? host_capacity - safety_reserve : 0;
+    const uint64_t cache_capacity = host_capacity > cache_safety_reserve
+                                        ? host_capacity - cache_safety_reserve
+                                        : 0;
     if (cache_capacity < plan.minimum_active_expert_size)
         return Error{ErrorCode::InvalidArgument, "host memory budget cannot hold one layer's active Expert set"};
     if (opt.expert_cache_size == 0)
@@ -1530,7 +1577,10 @@ Result<void> finalize_model_memory_plan(ModelMemoryPlan& plan, const Option& opt
         const uint64_t automatic_target = plan.physical_memory_size == 0 ? 2 * gibibyte : cache_capacity;
         plan.expert_cache_size = std::min(automatic_target, cache_capacity);
     }
-    if (plan.expert_cache_size > host_capacity)
+    const uint64_t explicit_cache_capacity = host_capacity > staging_reserve
+                                                 ? host_capacity - staging_reserve
+                                                 : 0;
+    if (plan.expert_cache_size > (opt.expert_cache_size != 0 ? explicit_cache_capacity : cache_capacity))
         return Error{ErrorCode::InvalidArgument, "expert cache and dense weights exceed the host memory budget"};
     if (plan.expert_cache_size < plan.minimum_active_expert_size)
         return Error{ErrorCode::InvalidArgument, "expert cache is smaller than one layer's active Expert set"};

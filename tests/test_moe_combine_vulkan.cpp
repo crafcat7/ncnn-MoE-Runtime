@@ -195,7 +195,9 @@ static void combine_test_deferred_ownership()
     auto combiner = MoeCombine_vulkan::create(context);
     combine_check(static_cast<bool>(combiner), "prepare deferred combiner");
     std::vector<ExpertRoute> routes = {{2, 0, 0.75f}, {0, 1, 0.5f}, {1, 0, 0.25f}};
+    std::vector<ExpertRoute> single_route = {{1, 0, 0.625f}};
     ActivationBuffer large(rows, columns), small(rows, columns), negative(rows, columns), shared(rows, columns);
+    ActivationBuffer single(1, columns);
     for (size_t row = 0; row < rows; ++row)
         for (uint32_t column = 0; column < columns; ++column)
         {
@@ -204,9 +206,14 @@ static void combine_test_deferred_ownership()
             negative.row(row)[column] = -1.0e20f;
             shared.row(row)[column] = static_cast<float>(column % 7) / 4.0f;
         }
+    for (uint32_t column = 0; column < columns; ++column)
+        single.row(0)[column] = static_cast<float>(column + 3) / 16.0f;
     auto large_gpu = combine_upload(*seed, large);
     auto negative_gpu = combine_upload(*seed, negative);
-    std::array<MoeCombineInput_vulkan, 3> inputs = {{{&large, large_gpu, routes}, {&small, {}, routes}, {&negative, negative_gpu, routes}}};
+    std::array<MoeCombineInput_vulkan, 4> inputs = {{{&large, large_gpu, routes},
+                                                     {&small, {}, routes},
+                                                     {&negative, negative_gpu, routes},
+                                                     {&single, {}, single_route}}};
     const auto expected = combine_reference(inputs, rows, columns, &shared);
     const auto before = get_vulkan_statistics(runtime);
     auto pending = combiner->prepare(inputs, rows, columns, &shared, {});
@@ -228,8 +235,10 @@ static void combine_test_deferred_ownership()
     large.clear();
     negative.clear();
     small.clear();
+    single.clear();
     shared.clear();
     routes.assign(17, {99, 3, -123.0f});
+    single_route[0] = {0, 3, -123.0f};
     combine_check(!weak_large.expired() && !weak_negative.expired(), "pending owns completed device sources");
     combine_check(get_vulkan_statistics(runtime).compute_submissions == before.compute_submissions, "capture performs no submit");
     // Abandon a populated command, then record again from the owned canonical
@@ -241,7 +250,7 @@ static void combine_test_deferred_ownership()
         ncnn::VkCompute command(context->device());
         ncnn::VkMat output;
         combine_check(combiner->record(*pending, output, command, storage, uploads), "record deferred sum without submitting");
-        combine_check(uploads == 2 && !output.empty(), "only owned host Expert and Shared activations upload");
+        combine_check(uploads == 3 && !output.empty(), "only owned host Experts and Shared activations upload");
         combine_check(command.reset() == 0, "cancel unsubmitted Combine command");
     }
     ActivationBuffer actual(rows, columns);

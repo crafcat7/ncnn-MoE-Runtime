@@ -265,6 +265,10 @@ Native Q5_1 and IQ4_NL also keep their original 32-value blocks, using 24 and
 18 bytes respectively. Mixed Expert projections retain each matrix's encoding;
 large IQ4_NL PLE embeddings decode only the selected rows.
 
+On-demand Hybrid planning reserves host budget for idle Expert upload staging,
+up to 64 MiB per selected device. A smaller explicit GPU Expert cache reduces
+that reserve. Active uploads require additional working memory.
+
 `--cpu-packed-weights on` explicitly enables lazy in-memory repacking for
 supported Qn_K and MXFP4-Q8 CPU Expert weights. Canonical BF16 weights use the
 runtime's BF16 GEMM and dot-product kernels. The default is `off`; there is no

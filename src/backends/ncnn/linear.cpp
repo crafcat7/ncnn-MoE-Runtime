@@ -5452,14 +5452,17 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create(const TensorData& mat
                                  bias,
                                  vulkan_device_index,
                                  nullptr,
+                                 nullptr,
                                  vulkan_runtime,
-                                 optimization_flags, input_group_count);
+                                 optimization_flags,
+                                 input_group_count);
 }
 
 std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const TensorData& matrix,
                                                                           const TensorData* bias,
                                                                           uint32_t vulkan_device_index,
                                                                           ncnn::VkAllocator* weight_allocator,
+                                                                          ncnn::VkAllocator* staging_allocator,
                                                                           const VulkanRuntimePtr& vulkan_runtime,
                                                                           uint64_t optimization_flags,
                                                                           uint32_t input_group_count,
@@ -5546,6 +5549,8 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
         return {};
 
     ncnn::VulkanDevice* device = implementation.vulkan_context->device();
+    if (staging_allocator && staging_allocator->vkdev != device)
+        return {};
     implementation.option.use_vulkan_compute = true;
     implementation.option.use_fp16_packed = false;
     implementation.option.use_fp16_storage = false;
@@ -5614,7 +5619,11 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
         implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(device, storage_size));
         weight_allocator = implementation.weight_allocator.get();
     }
-    implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(device));
+    if (!staging_allocator)
+    {
+        implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(device));
+        staging_allocator = implementation.weight_staging_allocator.get();
+    }
 
     auto* independent_allocator = dynamic_cast<VulkanExpertWeightAllocator*>(weight_allocator);
     std::optional<VulkanIndependentWeightTransfer> transfer;
@@ -5622,7 +5631,7 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     std::span<uint8_t> packed_storage;
     if (independent_allocator)
     {
-        transfer.emplace(implementation.vulkan_context, implementation.weight_staging_allocator.get());
+        transfer.emplace(implementation.vulkan_context, staging_allocator);
         packed_storage = transfer->prepare_storage(storage_size, independent_allocator);
     }
     else
@@ -5679,7 +5688,7 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     ncnn::Option upload_option = implementation.option;
     upload_option.blob_vkallocator = weight_allocator;
     upload_option.workspace_vkallocator = weight_allocator;
-    upload_option.staging_vkallocator = implementation.weight_staging_allocator.get();
+    upload_option.staging_vkallocator = staging_allocator;
     bool uploaded = false;
     if (transfer)
         uploaded = transfer->record_prepared_storage(implementation.storage, independent_allocator) && transfer->submit_and_wait();
@@ -5724,6 +5733,7 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     (void)optimization_flags;
     (void)input_group_count;
     (void)extra;
+    (void)staging_allocator;
     return {};
 #endif
 }
@@ -5984,31 +5994,8 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create(const TensorData& gat
                                                            const VulkanRuntimePtr& vulkan_runtime,
                                                            uint64_t optimization_flags)
 {
-    return create_with_allocator(gate_up,
-                                 gate_up_bias,
-                                 down,
-                                 down_bias,
-                                 activation_limit,
-                                 vulkan_device_index,
-                                 nullptr,
-                                 activation,
-                                 vulkan_runtime,
-                                 optimization_flags);
-}
-
-std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_with_allocator(const TensorData& gate_up,
-                                                                          const TensorData* gate_up_bias,
-                                                                          const TensorData& down,
-                                                                          const TensorData* down_bias,
-                                                                          float activation_limit,
-                                                                          uint32_t vulkan_device_index,
-                                                                          ncnn::VkAllocator* weight_allocator,
-                                                                          ExpertActivation activation,
-                                                                          const VulkanRuntimePtr& vulkan_runtime,
-                                                                          uint64_t optimization_flags)
-{
     return create_impl(gate_up, gate_up_bias, nullptr, nullptr, down, down_bias,
-                       activation_limit, vulkan_device_index, weight_allocator, activation,
+                       activation_limit, vulkan_device_index, nullptr, nullptr, activation,
                        vulkan_runtime, optimization_flags);
 }
 
@@ -6024,26 +6011,8 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_separate(const Tensor
                                                                     const VulkanRuntimePtr& vulkan_runtime,
                                                                     uint64_t optimization_flags)
 {
-    return create_separate_with_allocator(gate, gate_bias, up, up_bias, down, down_bias,
-                                          activation_limit, vulkan_device_index, nullptr, activation,
-                                          vulkan_runtime, optimization_flags);
-}
-
-std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_separate_with_allocator(const TensorData& gate,
-                                                                                   const TensorData* gate_bias,
-                                                                                   const TensorData& up,
-                                                                                   const TensorData* up_bias,
-                                                                                   const TensorData& down,
-                                                                                   const TensorData* down_bias,
-                                                                                   float activation_limit,
-                                                                                   uint32_t vulkan_device_index,
-                                                                                   ncnn::VkAllocator* weight_allocator,
-                                                                                   ExpertActivation activation,
-                                                                                   const VulkanRuntimePtr& vulkan_runtime,
-                                                                                   uint64_t optimization_flags)
-{
     return create_impl(gate, gate_bias, &up, up_bias, down, down_bias,
-                       activation_limit, vulkan_device_index, weight_allocator, activation,
+                       activation_limit, vulkan_device_index, nullptr, nullptr, activation,
                        vulkan_runtime, optimization_flags);
 }
 
@@ -6056,6 +6025,7 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_impl(const TensorData
                                                                 float activation_limit,
                                                                 uint32_t vulkan_device_index,
                                                                 ncnn::VkAllocator* weight_allocator,
+                                                                ncnn::VkAllocator* staging_allocator,
                                                                 ExpertActivation activation,
                                                                 const VulkanRuntimePtr& vulkan_runtime,
                                                                 uint64_t optimization_flags)
@@ -6114,6 +6084,7 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_impl(const TensorData
                                                                          nullptr,
                                                                          vulkan_device_index,
                                                                          weight_allocator,
+                                                                         staging_allocator,
                                                                          vulkan_runtime,
                                                                          optimization_flags,
                                                                          1,
@@ -6125,18 +6096,21 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_impl(const TensorData
                                                                          gate_up_bias,
                                                                          vulkan_device_index,
                                                                          weight_allocator,
+                                                                         staging_allocator,
                                                                          vulkan_runtime,
                                                                          optimization_flags);
     implementation.down = QnkLinear_vulkan::create_with_allocator(down,
                                                                   down_bias,
                                                                   vulkan_device_index,
                                                                   weight_allocator,
+                                                                  staging_allocator,
                                                                   vulkan_runtime,
                                                                   optimization_flags);
     if (up && !fuse_gate_up)
     {
         implementation.up = QnkLinear_vulkan::create_with_allocator(*up, up_bias, vulkan_device_index,
-                                                                    weight_allocator, vulkan_runtime, optimization_flags);
+                                                                    weight_allocator, staging_allocator,
+                                                                    vulkan_runtime, optimization_flags);
         if (!implementation.up)
             return {};
     }
@@ -6175,6 +6149,7 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_impl(const TensorData
     (void)activation_limit;
     (void)vulkan_device_index;
     (void)weight_allocator;
+    (void)staging_allocator;
     (void)activation;
     (void)vulkan_runtime;
     (void)optimization_flags;
