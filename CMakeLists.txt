@@ -308,6 +308,8 @@ if(NCNN_MOE_USE_NCNN)
     set(NCNN_BF16 ON CACHE BOOL "Build ncnn with bfloat16 support")
     # Quantized runtime kernels do not use ncnn's INT8 operators.
     set(NCNN_INT8 OFF CACHE BOOL "Build ncnn with int8 inference" FORCE)
+    # Runtime layers use numeric IDs and ParamDict entries, not text graphs.
+    set(NCNN_STRING OFF CACHE BOOL "Build ncnn with string support" FORCE)
 
     # Disable unneeded upstream layers to keep the dependency small.
     set(NCNN_MOE_REQUIRED_LAYERS

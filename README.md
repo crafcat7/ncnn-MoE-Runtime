@@ -434,8 +434,10 @@ runners report `CPU Linear backend: moe-kernels`; benchmark metadata uses
 `cpu_linear_backend`.
 
 Bundled ncnn builds the layers required by the Runtime and Mat conversions.
-Its exported SDK uses the same layer set; direct `ncnn::Net` consumers need a
-build containing the layers required by their own models.
+Its exported SDK uses the same layer set and disables `NCNN_STRING`; direct
+`ncnn::Net` consumers need a build with the layers and string interfaces required
+by their own models. Use the generated ncnn headers and libraries from the same
+build. Standard I/O diagnostics remain enabled by default.
 
 Autoregressive dependencies are preserved within each Session. Independent
 Sessions can overlap through explicit batch submissions. Multi-Session prefill
