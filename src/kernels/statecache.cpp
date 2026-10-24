@@ -1,9 +1,20 @@
 #include "statecache.h"
 
 #include "backends/ncnn/gateddeltanet_vulkan.h"
+#include "backends/ncnn/qsaattention_vulkan.h"
+#include "backends/ncnn/qwenlayer_vulkan.h"
 
 namespace ncnn {
 namespace moe {
+
+static void refresh_gated_delta_device_size(LayerCache& cache) noexcept
+{
+    cache.device_allocated_size = cache.gated_delta_device_state ? cache.gated_delta_device_state->allocated_bytes() : 0;
+    if (cache.qsa_device_state)
+        cache.device_allocated_size += cache.qsa_device_state->allocated_bytes();
+    if (cache.ple_device_state)
+        cache.device_allocated_size += cache.ple_device_state->allocated_bytes();
+}
 
 static void capture_gated_delta_snapshot(const LayerCache& cache,
                                          GatedDeltaSnapshot& snapshot)
@@ -29,6 +40,12 @@ Result<void> begin_state_cache_transaction(std::span<LayerCache> caches,
             return Error{
                 ErrorCode::InternalError,
                 "state cache transaction is already active"};
+        }
+        if (cache.qsa_device_state || cache.ple_device_state)
+        {
+            return Error{
+                ErrorCode::UnsupportedModel,
+                "state cache transactions do not support device QSA or PLE state"};
         }
         if (!cache.gated_delta_device_state
             && cache.gated_delta_convolution.empty()
@@ -72,7 +89,7 @@ Result<void> begin_state_cache_transaction(std::span<LayerCache> caches,
                 {
                     if (cleanup_cache.gated_delta_device_state)
                     {
-                        cleanup_cache.device_allocated_size = cleanup_cache.gated_delta_device_state->allocated_bytes();
+                        refresh_gated_delta_device_size(cleanup_cache);
                     }
                 }
                 return Error{
@@ -80,7 +97,7 @@ Result<void> begin_state_cache_transaction(std::span<LayerCache> caches,
                     "failed to begin Vulkan Gated DeltaNet transaction"};
             }
             device_transactions.push_back(cache.gated_delta_device_state.get());
-            cache.device_allocated_size = cache.gated_delta_device_state->allocated_bytes();
+            refresh_gated_delta_device_size(cache);
         }
     }
 
@@ -126,7 +143,7 @@ Result<void> begin_state_cache_transaction(std::span<LayerCache> caches,
         {
             if (cleanup_cache.gated_delta_device_state)
             {
-                cleanup_cache.device_allocated_size = cleanup_cache.gated_delta_device_state->allocated_bytes();
+                refresh_gated_delta_device_size(cleanup_cache);
             }
         }
         return Error{
@@ -253,7 +270,7 @@ Result<void> finish_state_cache_transaction(std::span<LayerCache> caches,
                                             + committed_rows;
             if (cache.gated_delta_device_state)
             {
-                cache.device_allocated_size = cache.gated_delta_device_state->allocated_bytes();
+                refresh_gated_delta_device_size(cache);
             }
         }
         else

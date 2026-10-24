@@ -1,0 +1,47 @@
+#version 450
+
+layout(binding = 0) readonly buffer query_blob
+{ float query_data[]; };
+layout(binding = 1) readonly buffer key_blob
+{ float key_data[]; };
+layout(binding = 2) writeonly buffer score_blob
+{ float score_data[]; };
+layout(push_constant) uniform parameter
+{
+    uint rows;
+    uint blocks;
+    uint heads;
+    uint dimension;
+}
+p;
+shared float partial[32];
+
+void main()
+{
+    const uint unit = gl_WorkGroupID.x + gl_WorkGroupID.z * gl_NumWorkGroups.x;
+    const uint block = unit % p.blocks;
+    const uint row = unit / p.blocks;
+    const uint lane = gl_LocalInvocationID.x;
+    if (block >= p.blocks || row >= p.rows)
+        return;
+    float score = 0.0;
+    for (uint head = 0u; head < p.heads; ++head)
+    {
+        float dot = 0.0;
+        for (uint c = lane; lane < 32u && c < p.dimension; c += 32u)
+            dot += query_data[(row * p.heads + head) * p.dimension + c] * key_data[block * p.dimension + c];
+        if (lane < 32u)
+            partial[lane] = dot;
+        barrier();
+        for (uint stride = 16u; stride != 0u; stride >>= 1u)
+        {
+            if (lane < stride)
+                partial[lane] += partial[lane + stride];
+            barrier();
+        }
+        score += max(0.0, partial[0]);
+        barrier();
+    }
+    if (lane == 0u)
+        score_data[row * p.blocks + block] = score / sqrt(float(p.dimension));
+}

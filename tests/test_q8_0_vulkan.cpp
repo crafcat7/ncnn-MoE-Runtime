@@ -4,6 +4,7 @@
 #include "backends/ncnn/vulkan.h"
 #include "backends/ncnn/vulkancontext.h"
 #include "engine/expertbackend.h"
+#include "kernels/bfloat16.h"
 #include "kernels/ops.h"
 #include "kernels/qnk.h"
 
@@ -244,6 +245,247 @@ static void q8_experts(uint32_t device)
     q8_check(results.size() == 1 && results[0] == ExpertBackendExecutionResult::Executed && submission->commit(),
              "Q8_0 cached Expert executes on Vulkan");
     q8_compare(actual, q8_expert_reference(*gate, up.get(), *down, input, false, limit), "Q8_0 cached Expert reference");
+
+    TensorData router;
+    router.dtype = DType::Float32;
+    router.shape = {1, hidden};
+    router.float32_data.resize(hidden);
+    for (uint32_t column = 0; column < hidden; ++column)
+        router.float32_data[column] = static_cast<float>(static_cast<int>(column % 9) - 4) / 8.f;
+    q8_check(separate->prepare_router_gate(router) && separate->has_router_gate(), "Q8_0 Shared router gate prepared on device");
+    TensorData invalid_router = router;
+    invalid_router.shape = {2, hidden};
+    q8_check(!separate->prepare_router_gate(invalid_router) && separate->has_router_gate(), "invalid router preparation preserves prior gate");
+    for (size_t tokens : {size_t(1), size_t(5)})
+    {
+        const auto gated_input = q8_input(tokens, hidden);
+        auto expected = q8_expert_reference(*gate, up.get(), *down, gated_input, false, limit);
+        for (size_t token = 0; token < tokens; ++token)
+        {
+            double logit = 0;
+            for (uint32_t column = 0; column < hidden; ++column)
+                logit += static_cast<double>(router.float32_data[column]) * gated_input.row(token)[column];
+            const float scale = 1.f / (1.f + std::exp(-static_cast<float>(logit)));
+            for (uint32_t column = 0; column < hidden; ++column)
+                expected.row(token)[column] *= scale;
+        }
+        auto resident = q8_upload(gated_input, device, runtime);
+        DeviceTensor_vulkan result;
+        const auto before = get_vulkan_statistics(runtime);
+        q8_check(separate->forward_device(*resident, result), "Q8_0 router-gated Shared device chain");
+        const auto after = get_vulkan_statistics(runtime);
+        q8_check(after.compute_submissions == before.compute_submissions + 1
+                     && after.batch_uploads == before.batch_uploads && after.batch_downloads == before.batch_downloads,
+                 "Q8_0 router gate stays in one device submission without activation transfers");
+        q8_check(separate->materialize(result, actual), "Q8_0 gated output materialization");
+        q8_compare(actual, expected, "Q8_0 GPU router sigmoid and scale reference");
+    }
+}
+
+static void float32_device_expert(uint32_t device, bool separate, bool interleaved)
+{
+    constexpr uint32_t hidden = 64;
+    constexpr uint32_t intermediate = 32;
+    const auto runtime = create_vulkan_runtime();
+    const auto context = VulkanContext::acquire(device, runtime, OptimizationDefaultFlags);
+    q8_check(static_cast<bool>(context), "FP32 routed Expert context");
+    const auto matrix = [](uint32_t rows, uint32_t columns, uint32_t seed) {
+        auto weight = std::make_shared<TensorData>();
+        weight->dtype = DType::Float32;
+        weight->shape = {rows, columns};
+        weight->float32_data.resize(static_cast<size_t>(rows) * columns);
+        for (size_t index = 0; index < weight->float32_data.size(); ++index)
+            weight->float32_data[index] = static_cast<float>(static_cast<int>((index * 7 + seed * 3) % 19) - 9) / 128.f;
+        return weight;
+    };
+    auto gate = matrix(separate ? intermediate : intermediate * 2, hidden, 1);
+    gate->qnk_interleave_rows = interleaved;
+    auto up = separate ? matrix(intermediate, hidden, 3) : nullptr;
+    auto down = matrix(hidden, intermediate, 2);
+    const uint64_t alignment = std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
+    const uint64_t expected_charge = QnkLinear_vulkan::storage_bytes(*gate, alignment)
+                                     + QnkLinear_vulkan::storage_bytes(*down, alignment)
+                                     + (up ? QnkLinear_vulkan::storage_bytes(*up, alignment) : 0);
+    q8_check(expected_charge != 0
+                 && native_quantized_expert_storage_bytes(*gate, up.get(), *down, device, runtime, OptimizationDefaultFlags) == expected_charge,
+             "FP32 packed and separate storage planning retain original FP32 projections");
+    TensorData truncated = *gate;
+    truncated.float32_data.pop_back();
+    q8_check(native_quantized_expert_storage_bytes(truncated, up.get(), *down, device, runtime, OptimizationDefaultFlags) == 0,
+             "FP32 storage planning rejects a truncated original matrix");
+    auto backend = create_vulkan_expert_backend(expected_charge, device, nullptr, runtime, OptimizationDefaultFlags);
+    const auto source = q8_input(5, hidden);
+    auto resident = q8_upload(source, device, runtime);
+    const std::array<ExpertRoute, 3> routes = {{{4, 0, 0.7f}, {1, 1, 0.2f}, {4, 2, -0.1f}}};
+    ExpertDemandRequest demand;
+    demand.key = separate ? "fp32-separate-device" : "fp32-packed-device";
+    demand.gate_up = gate;
+    demand.up = up;
+    demand.down = down;
+    demand.activation = ExpertActivation::Silu;
+    auto upload = backend->begin_demand_batch({&demand, 1});
+    std::array<std::shared_ptr<const void>, 1> pins;
+    q8_check(upload && upload->wait(pins) == 1 && pins.front(), "FP32 cold device Expert admission");
+    upload.reset();
+    q8_check(backend->statistics().resident_size == expected_charge
+                 && gate->bfloat16_values().empty() && down->bfloat16_values().empty()
+                 && (!up || up->bfloat16_values().empty()),
+             "FP32 cache admission matches exact native storage without BF16 conversion");
+    ActivationBuffer actual;
+    std::shared_ptr<DeviceTensor_vulkan> output;
+    ExpertBackendRequest request;
+    request.key = demand.key;
+    request.output = &actual;
+    request.device_input = resident;
+    request.device_routes = routes;
+    request.device_output = &output;
+    request.input_rows = routes.size();
+    request.input_columns = hidden;
+    const auto before = get_vulkan_statistics(runtime);
+    auto submission = backend->submit_batch({&request, 1});
+    pins = {};
+    q8_check(static_cast<bool>(submission), "FP32 device-only Expert request");
+    const auto results = submission->wait();
+    q8_check(results.size() == 1 && results.front() == ExpertBackendExecutionResult::Executed && submission->commit(),
+             "FP32 routed device Expert commits without host input");
+    const auto after = get_vulkan_statistics(runtime);
+    q8_check(output && actual.rows() == 0 && after.compute_submissions == before.compute_submissions + 1
+                 && after.batch_uploads == before.batch_uploads && after.batch_downloads == before.batch_downloads,
+             "FP32 gather, projections and activation remain on device");
+    ActivationBuffer gathered(routes.size(), hidden);
+    for (size_t row = 0; row < routes.size(); ++row)
+        std::copy_n(source.row(routes[row].token_index), hidden, gathered.row(row));
+    const auto projected = forward_linear(*gate, gathered, OptimizationDefaultFlags);
+    const auto projected_up = up ? forward_linear(*up, gathered, OptimizationDefaultFlags) : ActivationBuffer();
+    ActivationBuffer activated(routes.size(), intermediate);
+    for (size_t row = 0; row < routes.size(); ++row)
+        for (uint32_t column = 0; column < intermediate; ++column)
+        {
+            const uint32_t gate_column = up || !interleaved ? column : column * 2;
+            const uint32_t up_column = interleaved ? column * 2 + 1 : intermediate + column;
+            const float value = projected.row(row)[gate_column];
+            activated.row(row)[column] = value / (1.f + std::exp(-value))
+                                         * (up ? projected_up.row(row)[column] : projected.row(row)[up_column]);
+        }
+    q8_check(MoeCombine_vulkan::materialize(*output, actual), "FP32 routed device output materialization");
+    q8_compare(actual, forward_linear(*down, activated, OptimizationDefaultFlags),
+               separate ? "FP32 separate device Expert CPU reference" : interleaved ? "FP32 interleaved device Expert CPU reference"
+                                                                                    : "FP32 packed device Expert CPU reference");
+}
+
+static void bfloat16_device_expert(uint32_t device)
+{
+    constexpr uint32_t hidden = 128;
+    constexpr uint32_t intermediate = 128;
+    const auto runtime = create_vulkan_runtime();
+    const auto context = VulkanContext::acquire(device, runtime, OptimizationDefaultFlags);
+    q8_check(static_cast<bool>(context), "BF16 routed Expert context");
+    if (context->device()->info.subgroup_size() != 32)
+    {
+        std::cout << "SKIP optional BF16 routed Expert device " << device << ": backend requires subgroup size 32\n";
+        return;
+    }
+    const auto matrix = [](uint32_t rows, uint32_t columns, uint32_t seed) {
+        auto weight = std::make_shared<TensorData>();
+        weight->dtype = DType::BFloat16;
+        weight->shape = {rows, columns};
+        weight->bfloat16_data.resize(static_cast<size_t>(rows) * columns);
+        for (size_t index = 0; index < weight->bfloat16_data.size(); ++index)
+            weight->bfloat16_data[index] = float_to_bfloat16(static_cast<float>(static_cast<int>((index * 7 + seed * 3) % 19) - 9) / 128.f);
+        return weight;
+    };
+    auto gate_up = matrix(intermediate * 2, hidden, 1);
+    auto down = matrix(hidden, intermediate, 2);
+    auto backend = create_vulkan_expert_backend(1024 * 1024, device, nullptr, runtime, OptimizationDefaultFlags);
+    const auto source = q8_input(5, hidden);
+    auto resident = q8_upload(source, device, runtime);
+    const std::array<ExpertRoute, 3> routes = {{{4, 0, 0.7f}, {1, 1, 0.2f}, {4, 2, -0.1f}}};
+    ExpertDemandRequest demand;
+    demand.key = "bf16-device";
+    demand.gate_up = gate_up;
+    demand.down = down;
+    demand.activation = ExpertActivation::Silu;
+    auto upload = backend->begin_demand_batch({&demand, 1});
+    std::array<std::shared_ptr<const void>, 1> pins;
+    q8_check(upload && upload->wait(pins) == 1 && pins.front(), "BF16 cold device Expert admission on device " + std::to_string(device));
+    upload.reset();
+    const uint64_t expected_charge = static_cast<uint64_t>(gate_up->bfloat16_data.size() + down->bfloat16_data.size()) * sizeof(uint16_t);
+    q8_check(native_quantized_expert_storage_bytes(*gate_up, nullptr, *down, device, runtime, OptimizationDefaultFlags) == expected_charge
+                 && backend->statistics().resident_size == expected_charge,
+             "BF16 eager cache planning and admission share the same payload charge");
+    ActivationBuffer actual;
+    std::shared_ptr<DeviceTensor_vulkan> output;
+    ExpertBackendRequest request;
+    request.key = demand.key;
+    request.output = &actual;
+    request.device_input = resident;
+    request.device_routes = routes;
+    request.device_output = &output;
+    request.input_rows = routes.size();
+    request.input_columns = hidden;
+    const auto before = get_vulkan_statistics(runtime);
+    auto submission = backend->submit_batch({&request, 1});
+    pins = {};
+    q8_check(static_cast<bool>(submission), "BF16 device-only Expert request");
+    const auto results = submission->wait();
+    q8_check(results.size() == 1 && results.front() == ExpertBackendExecutionResult::Executed && submission->commit(),
+             "BF16 routed device Expert commits without host input");
+    const auto after = get_vulkan_statistics(runtime);
+    q8_check(output && actual.rows() == 0 && after.compute_submissions == before.compute_submissions + 1
+                 && after.batch_uploads == before.batch_uploads && after.batch_downloads == before.batch_downloads,
+             "BF16 GPU gather/projection/SwiGLUDown retains output without activation transfers");
+    ActivationBuffer gathered(routes.size(), hidden);
+    for (size_t row = 0; row < routes.size(); ++row)
+        std::copy_n(source.row(routes[row].token_index), hidden, gathered.row(row));
+    const auto projected = forward_linear(*gate_up, gathered, OptimizationDefaultFlags);
+    ActivationBuffer activated(routes.size(), intermediate);
+    for (size_t row = 0; row < routes.size(); ++row)
+        for (uint32_t column = 0; column < intermediate; ++column)
+        {
+            const float gate = projected.row(row)[column];
+            activated.row(row)[column] = gate / (1.f + std::exp(-gate)) * projected.row(row)[intermediate + column];
+        }
+    q8_check(MoeCombine_vulkan::materialize(*output, actual), "BF16 routed device output materialization");
+    q8_compare(actual, forward_linear(*down, activated, OptimizationDefaultFlags), "BF16 device Expert CPU reference");
+}
+
+static void mxfp4_storage_billing(uint32_t device)
+{
+    const auto runtime = create_vulkan_runtime();
+    const auto matrix = [](uint32_t rows, uint32_t columns) {
+        auto weight = std::make_shared<TensorData>();
+        weight->dtype = DType::MxFp4;
+        weight->shape = {rows, columns};
+        weight->mxfp4_blocks.resize(static_cast<size_t>(rows) * (columns / 32) * 16);
+        weight->mxfp4_scales.resize(static_cast<size_t>(rows) * (columns / 32));
+        std::fill_n(weight->mxfp4_blocks.data(), weight->mxfp4_blocks.size(), uint8_t(0x11));
+        std::fill_n(weight->mxfp4_scales.data(), weight->mxfp4_scales.size(), uint8_t(127));
+        return weight;
+    };
+    const auto gate = matrix(256, 128);
+    const auto down = matrix(128, 128);
+    TensorData gate_bias;
+    gate_bias.dtype = DType::Float32;
+    gate_bias.shape = {256};
+    gate_bias.float32_data.assign(256, 0.25f);
+    TensorData down_bias;
+    down_bias.dtype = DType::Float32;
+    down_bias.shape = {128};
+    down_bias.float32_data.assign(128, -0.125f);
+    const uint64_t payload = gate->mxfp4_blocks.size() + gate->mxfp4_scales.size()
+                             + down->mxfp4_blocks.size() + down->mxfp4_scales.size();
+    const uint64_t expected_charge = payload + (gate_bias.float32_data.size() + down_bias.float32_data.size()) * sizeof(float);
+    q8_check(native_quantized_expert_storage_bytes(*gate, nullptr, *down, device, runtime, OptimizationDefaultFlags) == payload,
+             "MXFP4 eager storage planning uses the original packed payload");
+    q8_check(native_quantized_expert_storage_bytes(*gate, nullptr, *down, device, runtime, OptimizationDefaultFlags,
+                                                   &gate_bias, nullptr, &down_bias, ExpertActivation::Silu, 0.f)
+                 == expected_charge,
+             "MXFP4 storage planning includes explicit biases");
+    auto backend = create_vulkan_expert_backend(1024 * 1024, device, nullptr, runtime, OptimizationDefaultFlags);
+    std::shared_ptr<const void> pin;
+    q8_check(backend && backend->prepare_demand("mxfp4-billing", gate, &gate_bias, down, &down_bias, 0, 0.f, ExpertActivation::Silu, pin)
+                 && pin && backend->statistics().resident_size == expected_charge,
+             "MXFP4 eager cache admission and size helper use identical accounting");
 }
 #endif
 
@@ -264,6 +506,11 @@ int main()
         {
             ncnn::moe::q8_projections(device);
             ncnn::moe::q8_experts(device);
+            ncnn::moe::bfloat16_device_expert(device);
+            ncnn::moe::float32_device_expert(device, false, false);
+            ncnn::moe::float32_device_expert(device, false, true);
+            ncnn::moe::float32_device_expert(device, true, false);
+            ncnn::moe::mxfp4_storage_billing(device);
         }
         std::cout << "Native Q8_0 Vulkan projection, resident Shared chain and Expert cache tests passed\n";
         return 0;

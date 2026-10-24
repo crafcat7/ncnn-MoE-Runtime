@@ -36,7 +36,8 @@ struct Option;
                                                         bool use_vulkan_dense = false,
                                                         uint64_t available_memory_size = 0,
                                                         bool reserve_cpu_packed_weights = false,
-                                                        const WeightMapping* weights = nullptr);
+                                                        const WeightMapping* weights = nullptr,
+                                                        bool use_vulkan_attention = false);
 
 // Settle the initial cache credit after optional Vulkan operators are created.
 [[nodiscard]] Result<void> finalize_model_memory_plan(ModelMemoryPlan& plan, const Option& opt,

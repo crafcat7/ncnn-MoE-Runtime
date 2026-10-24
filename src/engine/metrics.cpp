@@ -178,6 +178,16 @@ RuntimeMetricCounters runtime_metric_counters(const SessionStatistics& statistic
     RuntimeMetricCounters result;
     result.prefill_tokens = counter_delta(statistics.prefill_tokens, start.prefill_tokens);
     result.decode_tokens = counter_delta(statistics.decode_tokens, start.decode_tokens);
+    result.expert_assignments = counter_delta(statistics.expert_assignments, start.expert_assignments);
+    result.expert_batches = counter_delta(statistics.expert_batches, start.expert_batches);
+    result.expert_cpu_batches = counter_delta(statistics.expert_cpu_batches, start.expert_cpu_batches);
+    result.expert_cpu_routes = counter_delta(statistics.expert_cpu_routes, start.expert_cpu_routes);
+    result.expert_gpu_routes = counter_delta(statistics.expert_gpu_routes, start.expert_gpu_routes);
+    result.expert_cpu_fallbacks = counter_delta(statistics.expert_cpu_fallbacks, start.expert_cpu_fallbacks);
+    result.vulkan_qwen_layers = counter_delta(statistics.vulkan_qwen_layers, start.vulkan_qwen_layers);
+    result.vulkan_gated_residual_blocks = counter_delta(statistics.vulkan_gated_residual_blocks, start.vulkan_gated_residual_blocks);
+    result.vulkan_ple_blocks = counter_delta(statistics.vulkan_ple_blocks, start.vulkan_ple_blocks);
+    result.model_compute_cpu_fallbacks = counter_delta(statistics.model_compute_cpu_fallbacks, start.model_compute_cpu_fallbacks);
     result.expert_cache_hits = counter_delta(statistics.expert_cache_hits, start.expert_cache_hits);
     result.expert_cache_misses = counter_delta(statistics.expert_cache_misses, start.expert_cache_misses);
     result.expert_io_bytes = counter_delta(statistics.expert_cache_bytes_read, start.expert_io_bytes);

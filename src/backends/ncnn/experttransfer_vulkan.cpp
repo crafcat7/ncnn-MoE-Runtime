@@ -14,10 +14,12 @@
 namespace ncnn {
 namespace moe {
 
-VulkanExpertWeightAllocator::VulkanExpertWeightAllocator(const ncnn::VulkanDevice* device, size_t _block_size)
+VulkanExpertWeightAllocator::VulkanExpertWeightAllocator(const ncnn::VulkanDevice* device, size_t _block_size,
+                                                         uint64_t physical_limit_bytes)
     : ncnn::VkBlobAllocator(device, _block_size),
       block_size(_block_size),
-      alignment(std::max<size_t>(4, device->info.buffer_offset_alignment()))
+      alignment(std::max<size_t>(4, device->info.buffer_offset_alignment())),
+      physical_limit(physical_limit_bytes)
 {
     // Always stage uploads, including on unified-memory devices. This keeps
     // host writes away from buffers concurrently read by a compute queue.
@@ -73,6 +75,34 @@ ncnn::VkBufferMemory* VulkanExpertWeightAllocator::fastMalloc(size_t size)
         return nullptr;
     VkMemoryRequirements requirements{};
     vkGetBufferMemoryRequirements(vkdev->vkdevice(), block->buffer, &requirements);
+    if (physical_limit != 0 && (requirements.size > physical_limit || allocated_bytes > physical_limit - requirements.size))
+    {
+        // A fully free warm block cannot hold this request. Reclaim it before
+        // rejecting fragmentation that would exceed the physical ceiling.
+        for (auto existing = blocks.begin(); existing != blocks.end();)
+        {
+            if (!(*existing)->used.empty())
+            {
+                ++existing;
+                continue;
+            }
+            vkDestroyBuffer(vkdev->vkdevice(), (*existing)->buffer, nullptr);
+            vkFreeMemory(vkdev->vkdevice(), (*existing)->memory, nullptr);
+            allocated_bytes -= (*existing)->memory_size;
+            existing = blocks.erase(existing);
+        }
+        if (requirements.size > physical_limit || allocated_bytes > physical_limit - requirements.size)
+        {
+            vkDestroyBuffer(vkdev->vkdevice(), block->buffer, nullptr);
+            if (limit_rejections != std::numeric_limits<uint64_t>::max()) ++limit_rejections;
+            return nullptr;
+        }
+    }
+    if (requirements.size > std::numeric_limits<uint64_t>::max() - allocated_bytes)
+    {
+        vkDestroyBuffer(vkdev->vkdevice(), block->buffer, nullptr);
+        return nullptr;
+    }
     if (buffer_memory_type_index == UINT32_MAX)
         buffer_memory_type_index = vkdev->find_memory_index(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
     block->memory = allocate_memory(requirements.size, buffer_memory_type_index);
@@ -83,10 +113,12 @@ ncnn::VkBufferMemory* VulkanExpertWeightAllocator::fastMalloc(size_t size)
         if (block->memory) vkFreeMemory(vkdev->vkdevice(), block->memory, nullptr);
         return nullptr;
     }
+    block->memory_size = requirements.size;
     try
     {
         block->free.push_back({0, block->capacity});
         blocks.push_back(std::move(block));
+        allocated_bytes += requirements.size;
     }
     catch (...)
     {
@@ -147,6 +179,7 @@ void VulkanExpertWeightAllocator::fastFree(ncnn::VkBufferMemory* buffer)
                 const Block* released = block.get();
                 vkDestroyBuffer(vkdev->vkdevice(), block->buffer, nullptr);
                 vkFreeMemory(vkdev->vkdevice(), block->memory, nullptr);
+                allocated_bytes -= block->memory_size;
                 blocks.erase(std::remove_if(blocks.begin(), blocks.end(),
                                             [released](const auto& candidate) { return candidate.get() == released; }),
                              blocks.end());
@@ -172,6 +205,19 @@ void VulkanExpertWeightAllocator::clear()
         vkFreeMemory(vkdev->vkdevice(), block->memory, nullptr);
     }
     blocks.clear();
+    allocated_bytes = 0;
+}
+
+uint64_t VulkanExpertWeightAllocator::physical_bytes() const
+{
+    const std::lock_guard<std::mutex> lock(mutex);
+    return allocated_bytes;
+}
+
+uint64_t VulkanExpertWeightAllocator::physical_limit_rejections() const
+{
+    const std::lock_guard<std::mutex> lock(mutex);
+    return limit_rejections;
 }
 
 struct VulkanExpertTransferPool::Lane

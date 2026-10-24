@@ -16183,45 +16183,129 @@ void test_gated_delta_vulkan_budget_admission()
         check(static_cast<bool>(scales_stream));
     }
 
-    WeightMapping mapping = qwen4_exp_test_mapping(descriptor);
-    for (auto& [name, tensor] : mapping)
-    {
-        if (name.find(".experts.") != std::string::npos)
+    const auto make_mapping = [&](const MoeModelDescriptor& model_descriptor) {
+        WeightMapping result = qwen4_exp_test_mapping(model_descriptor);
+        for (auto& [name, tensor] : result)
         {
-            tensor.dtype = DType::MxFp4;
-            tensor.bfloat16_data.clear();
-            auto storage = std::make_shared<MxFp4FileStorage>();
-            storage->blocks_path = blocks_path.string();
-            storage->blocks_size = tensor.element_count() / 2;
-            storage->scales_path = scales_path.string();
-            storage->scales_size = tensor.element_count() / 32;
-            tensor.mxfp4_file_storage = std::move(storage);
-            continue;
-        }
-        if (name.find(".attention.delta.") == std::string::npos
-            && name.find(".attention.output.weight") == std::string::npos)
-            continue;
+            if (name.find(".experts.") != std::string::npos)
+            {
+                tensor.dtype = DType::MxFp4;
+                tensor.bfloat16_data.clear();
+                auto storage = std::make_shared<MxFp4FileStorage>();
+                storage->blocks_path = blocks_path.string();
+                storage->blocks_size = tensor.element_count() / 2;
+                storage->scales_path = scales_path.string();
+                storage->scales_size = tensor.element_count() / 32;
+                tensor.mxfp4_file_storage = std::move(storage);
+                continue;
+            }
+            if (name.find(".attention.delta.") == std::string::npos
+                && name.find(".attention.output.weight") == std::string::npos)
+                continue;
 
-        for (size_t index = 0; index < tensor.bfloat16_data.size(); ++index)
-        {
-            float value = static_cast<float>(static_cast<int>((index * 7 + 3) % 17) - 8) / 64.0f;
-            if (name.find("convolution.weight") != std::string::npos)
-                value = index % 2 == 0 ? 0.25f : 0.5f;
-            else if (name.find("time_bias") != std::string::npos)
-                value = 0.125f;
-            else if (name.find("decay_log") != std::string::npos)
-                value = -0.5f;
-            else if (name.find("norm.weight") != std::string::npos)
-                value = 1.0f + static_cast<float>(index) / 16.0f;
-            tensor.bfloat16_data[index] = float_to_bfloat16(value);
+            for (size_t index = 0; index < tensor.bfloat16_data.size(); ++index)
+            {
+                float value = static_cast<float>(static_cast<int>((index * 7 + 3) % 17) - 8) / 64.0f;
+                if (name.find("convolution.weight") != std::string::npos)
+                    value = index % 2 == 0 ? 0.25f : 0.5f;
+                else if (name.find("time_bias") != std::string::npos)
+                    value = 0.125f;
+                else if (name.find("decay_log") != std::string::npos)
+                    value = -0.5f;
+                else if (name.find("norm.weight") != std::string::npos)
+                    value = 1.0f + static_cast<float>(index) / 16.0f;
+                tensor.bfloat16_data[index] = float_to_bfloat16(value);
+            }
         }
-    }
+        return result;
+    };
+    WeightMapping mapping = make_mapping(descriptor);
 
     CompilerOption cpu_opt;
     cpu_opt.flags |= BackendFileBackedExperts;
     cpu_opt.optimization_flags = g_test_optimization_flags;
     CompiledModel cpu_model;
     check(static_cast<bool>(compile_model(descriptor, mapping, cpu_model, HybridMode::CpuOnly, cpu_opt)));
+
+    // The continuous chain requires its complete working set. A small heap
+    // must reject admission, rather than prepare only a prefix of GPU layers.
+    for (bool explicit_cache : {false, true})
+    {
+        CompilerOption opt;
+        opt.flags |= BackendVulkanDense | BackendVulkanAttention | BackendVulkanExperts | BackendFileBackedExperts;
+        opt.optimization_flags = g_test_optimization_flags;
+        opt.device_index = get_default_gpu_index();
+        opt.vulkan_runtime = create_vulkan_runtime();
+        opt.gpu_heap_budget = UINT64_C(512) * 1024;
+        opt.explicit_expert_gpu_cache = explicit_cache;
+        opt.gpu_expert_cache_reserve = explicit_cache ? UINT64_C(128) * 1024 : 0;
+        CompiledModel rejected;
+        auto compiled = compile_model(descriptor, mapping, rejected, HybridMode::HybridExperts, opt);
+        check(!compiled);
+        check(compiled.error().code == ErrorCode::InvalidArgument);
+        check(compiled.error().message.find("Qwen Vulkan persistent weights and minimum working set exceed the GPU heap budget") == 0);
+        check(!rejected.qwen_device_chain);
+    }
+
+    if (bf16_supported)
+    {
+        MoeModelDescriptor full_descriptor = descriptor;
+        full_descriptor.layers.push_back(parsed.value().layers[3]);
+        full_descriptor.layers.back().ple = {};
+        full_descriptor.layers.back().moe.intermediate_size = full_descriptor.intermediate_size;
+        full_descriptor.layers.back().moe.expert_weight_dtype = DType::MxFp4;
+        full_descriptor.layers.back().moe.flags |= MoeDescriptorFileBackedExperts;
+        const WeightMapping full_mapping = make_mapping(full_descriptor);
+        for (bool explicit_cache : {false, true})
+        {
+            CompilerOption opt;
+            opt.flags |= BackendVulkanDense | BackendVulkanAttention | BackendVulkanExperts | BackendFileBackedExperts;
+            opt.optimization_flags = g_test_optimization_flags;
+            opt.device_index = get_default_gpu_index();
+            opt.vulkan_runtime = create_vulkan_runtime();
+            // Zero delegates the budget query to the real Vulkan live heap;
+            // this case must prepare all three GDN layers and the QSA layer.
+            opt.gpu_heap_budget = 0;
+            opt.explicit_expert_gpu_cache = explicit_cache;
+            opt.gpu_expert_cache_reserve = explicit_cache ? UINT64_C(128) * 1024 : 0;
+            CompiledModel model;
+            auto compiled = compile_model(full_descriptor, full_mapping, model, HybridMode::HybridExperts, opt);
+            if (!compiled)
+                throw std::runtime_error(std::string("Qwen complete GPU chain admission failed (")
+                                         + (explicit_cache ? "explicit cache" : "automatic cache") + "): " + compiled.error().message);
+            check(model.qwen_device_chain);
+            check(static_cast<bool>(model.qwen_device_head));
+            check(qwen_device_pending_reserve(model, opt.device_index) > UINT64_C(64) * 1024 * 1024);
+            uint32_t gated_delta_layers = 0;
+            uint32_t qsa_layers = 0;
+            for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+            {
+                const AttentionBlockPlan& attention = layer.attention;
+                check(static_cast<bool>(model.operators.at_weight(attention.output_weight).qwen_layer));
+                check(support_vulkan_attention(model.operators, attention));
+                if (attention.kind == AttentionKind::GatedDeltaNet)
+                {
+                    check(attention.gated_delta_vulkan_operator != invalid_compiled_operator_handle);
+                    check(static_cast<bool>(model.operators.at(attention.gated_delta_vulkan_operator).gated_delta));
+                    ++gated_delta_layers;
+                }
+                else
+                {
+                    check(attention.vulkan_attention_operator != invalid_compiled_operator_handle);
+                    check(static_cast<bool>(model.operators.at(attention.vulkan_attention_operator).qsa_attention));
+                    ++qsa_layers;
+                }
+            }
+            check(gated_delta_layers == 3 && qsa_layers == 1);
+            uint32_t gpu_expert_nodes = 0;
+            for (const ExecutionNode& node : model.graph.nodes)
+                if (node.type == ExecutionNodeType::ExpertGroup && node.backend == ExecutionBackend::Vulkan)
+                    ++gpu_expert_nodes;
+            check(gpu_expert_nodes == full_descriptor.layers.size());
+        }
+    }
+    else
+        std::cout << "SKIP continuous Qwen GPU chain admission: BF16 GDN requires subgroup size 32\n";
 
     struct BudgetCase
     {
@@ -16234,9 +16318,8 @@ void test_gated_delta_vulkan_budget_admission()
         bool attention_optimization;
         uint32_t expected_layers;
     };
-    // This fixed small-model budget admits one GDN layer with a fixed Expert
-    // cache and all three layers without one. Verify the compiled products
-    // and their execution rather than duplicating the budget helper formula.
+    // Explicitly disable the continuous chain to retain coverage of the legacy
+    // fractional GDN budget, including partial GPU admission and CPU parity.
     const std::array<BudgetCase, 10> cases = {{
         {"automatic cache", UINT64_C(512) * 1024, 1, false, true, true, true, 3},
         {"explicit cache", UINT64_C(512) * 1024, 1, true, true, true, true, 1},
@@ -16258,7 +16341,7 @@ void test_gated_delta_vulkan_budget_admission()
             opt.flags |= BackendVulkanExperts;
         if (test_case.attention_backend)
             opt.flags |= BackendVulkanAttention;
-        opt.optimization_flags = g_test_optimization_flags;
+        opt.optimization_flags = g_test_optimization_flags & ~OptimizationVulkanCommandGraph;
         if (!test_case.attention_optimization)
             opt.optimization_flags &= ~OptimizationVulkanAttention;
         opt.device_index = get_default_gpu_index();
@@ -16270,6 +16353,7 @@ void test_gated_delta_vulkan_budget_admission()
         auto compiled = compile_model(descriptor, mapping, model, HybridMode::HybridExperts, opt);
         if (!compiled)
             throw std::runtime_error(std::string("GDN budget compilation failed (") + test_case.name + "): " + compiled.error().message);
+        check(!model.qwen_device_chain);
 
         uint32_t admitted_layers = 0;
         for (const CompiledLayerPlan& layer : model.graph.layer_plans)
@@ -18622,6 +18706,218 @@ void test_automatic_expert_memory_planning()
     check(native_plan.value().expert_pair_resident_size == resident_pair_size);
     check(native_plan.value().minimum_active_expert_size == resident_pair_size);
     check(native_plan.value().expert_cache_size == resident_pair_size);
+
+    {
+        MoeModelDescriptor qwen = native;
+        qwen.hyper_connection_kind = HyperConnectionKind::GatedResidual;
+        qwen.layers.front().attention.kind = AttentionKind::GatedDeltaNet;
+        qwen.layers.push_back(qwen.layers.front());
+        qwen.layers.back().attention.kind = AttentionKind::Standard;
+        qwen.layers.back().attention.flags = AttentionDescriptorQsa | AttentionDescriptorQueryKeyNorm;
+        qwen.layers.front().moe.shared_expert_count = 1;
+        WeightMapping weights = native_weights;
+        uint64_t expected_release = 0;
+        const auto add_owned = [&](const std::string& name, DType dtype, uint32_t rows, uint32_t columns, bool released) {
+            TensorData tensor;
+            tensor.dtype = dtype;
+            tensor.shape = {rows, columns};
+            uint64_t payload_size = 0;
+            if (dtype == DType::Float32)
+            {
+                tensor.float32_data.assign(rows * columns, 1.0f);
+                payload_size = tensor.float32_data.size() * sizeof(float);
+            }
+            else if (dtype == DType::BFloat16)
+            {
+                tensor.bfloat16_data.assign(rows * columns, float_to_bfloat16(1.0f));
+                payload_size = tensor.bfloat16_data.size() * sizeof(uint16_t);
+            }
+            else
+            {
+                tensor.quantized_data.assign(qnk_storage_bytes(dtype, rows, columns), 0);
+                payload_size = tensor.quantized_data.size();
+            }
+            // These allocations survive even if the primary payload is freed.
+            tensor.input_column_indices.assign(3, 0);
+            tensor.quantization_scales.assign(2, 1.0f);
+            weights.insert_or_assign(name, std::move(tensor));
+            if (released)
+                expected_release += payload_size;
+        };
+        add_owned("lm_head.weight", DType::BFloat16, 5, 32, true);
+        add_owned("layers.0.attention.delta.qkv.weight", DType::Float32, 7, 32, true);
+        add_owned("layers.0.attention.delta.z.weight", DType::Q8_0, 3, 32, true);
+        add_owned("layers.0.attention.delta.beta.weight", DType::Q4K, 2, 256, false);
+        add_owned("layers.0.attention.delta.alpha.weight", DType::Q6K, 2, 256, false);
+        add_owned("layers.0.attention.output.weight", DType::Q5_1, 3, 32, false);
+        add_owned("layers.1.attention.query_norm.weight", DType::BFloat16, 1, 32, true);
+        add_owned("layers.1.attention.key_norm.weight", DType::Float32, 1, 32, true);
+        for (const char* projection : {"gate", "up", "down"})
+            add_owned("layers.0.shared_expert." + std::string(projection) + ".weight", DType::Q8_0, 2, 32, true);
+        for (const char* name : {"layers.0.attention.delta.norm.weight", "layers.0.hc.attention.base",
+                                 "layers.0.ple.input_projection.weight", "layers.0.shared_expert.router_gate.weight",
+                                 "layers.1.attention.query.weight", "layers.1.attention.output.weight",
+                                 "layers.1.attention.qsa.query_norm.weight", "layers.1.attention.qsa.key_norm.weight"})
+            add_owned(name, DType::Float32, 2, 32, false);
+        add_owned("prefix.lm_head.weight", DType::BFloat16, 1, 32, false);
+
+        Option hybrid = native_options;
+        hybrid.hybrid_mode = HybridMode::HybridExperts;
+        hybrid.host_memory_budget = 3 * gibibyte;
+        auto retained = plan_model_memory(qwen, hybrid, 4 * gibibyte, false, 0, false, &weights);
+        auto predicted = plan_model_memory(qwen, hybrid, 4 * gibibyte, true, 0, false, &weights, true);
+        check(retained && predicted);
+        check(retained.value().estimated_vulkan_dense_host_release_size == 0);
+        check(predicted.value().estimated_vulkan_dense_host_release_size == expected_release);
+        check(predicted.value().estimated_dense_size + expected_release == retained.value().estimated_dense_size);
+        const uint64_t full_dense_size = retained.value().estimated_dense_size;
+
+        // Available-memory admission must use the same post-release storage
+        // that is settled after compilation, without increasing the budget.
+        Option tight = hybrid;
+        tight.host_memory_budget = 0;
+        const uint64_t budget = predicted.value().estimated_dense_size + tight.expert_cache_size;
+        const uint64_t available = 2 * gibibyte + budget;
+        auto admitted = plan_model_memory(qwen, tight, 4 * gibibyte, true, available, false, &weights, true);
+        check(admitted && admitted.value().host_memory_budget == budget);
+        check(admitted.value().estimated_dense_size == predicted.value().estimated_dense_size);
+        check(static_cast<bool>(finalize_model_memory_plan(admitted.value(), tight, expected_release)));
+        check(admitted.value().estimated_dense_size == full_dense_size - expected_release);
+        check(admitted.value().expert_cache_size == tight.expert_cache_size);
+        auto missing_dense = plan_model_memory(qwen, tight, 4 * gibibyte, false, available, false, &weights, true);
+        auto missing_attention = plan_model_memory(qwen, tight, 4 * gibibyte, true, available, false, &weights);
+        check(!missing_dense && !missing_attention);
+        Option cpu = tight;
+        cpu.hybrid_mode = HybridMode::CpuOnly;
+        check(!plan_model_memory(qwen, cpu, 4 * gibibyte, true, available, false, &weights, true));
+        cpu = tight;
+        cpu.flags |= OptionDisableGpuExpertExecution;
+        check(!plan_model_memory(qwen, cpu, 4 * gibibyte, true, available, false, &weights, true));
+        for (uint64_t disabled : {static_cast<uint64_t>(OptimizationVulkanAttention), static_cast<uint64_t>(OptimizationVulkanQnK),
+                                  static_cast<uint64_t>(OptimizationVulkanExpertGpuPriority), static_cast<uint64_t>(OptimizationVulkanCommandGraph)})
+        {
+            Option legacy = tight;
+            legacy.optimization_flags &= ~disabled;
+            check(!plan_model_memory(qwen, legacy, 4 * gibibyte, true, available, false, &weights, true));
+        }
+        ModelMemoryPlan partial = predicted.value();
+        check(static_cast<bool>(finalize_model_memory_plan(partial, hybrid, expected_release / 2)));
+        check(partial.estimated_dense_size == full_dense_size - expected_release / 2);
+        check(partial.estimated_vulkan_dense_host_release_size == expected_release / 2);
+        ModelMemoryPlan failed_release = admitted.value();
+        check(!finalize_model_memory_plan(failed_release, tight, 0));
+
+        // Native blocks other than Q8_0 keep their original payload, including
+        // when they occupy a handle which otherwise has a resident operator.
+        for (DType dtype : {DType::Q4K, DType::Q5K, DType::Q6K, DType::IQ4NL, DType::Q5_1})
+        {
+            WeightMapping native_head = native_weights;
+            native_head.emplace("lm_head.weight", weights.at("layers.0.attention.delta.beta.weight"));
+            TensorData& head = native_head.at("lm_head.weight");
+            head.dtype = dtype;
+            head.quantized_data.assign(qnk_storage_bytes(dtype, 2, 256), 0);
+            auto unchanged = plan_model_memory(qwen, hybrid, 4 * gibibyte, true, 0, false, &native_head, true);
+            check(unchanged && unchanged.value().estimated_vulkan_dense_host_release_size == 0);
+        }
+
+        ScopedTestDirectory directory("ncnn_moe_qwen_release_plan_");
+        const auto path = directory.path() / "norms.bin";
+        const std::vector<float> payload(32, 1.0f);
+        {
+            std::ofstream file(path, std::ios::binary);
+            file.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size() * sizeof(float)));
+            check(static_cast<bool>(file));
+        }
+        const uint64_t mapped_size = payload.size() * sizeof(float);
+        auto mapping = MappedFileRange::open(path, 0, mapped_size);
+        check(static_cast<bool>(mapping));
+        TensorData mapped;
+        mapped.dtype = DType::Float32;
+        mapped.shape = {32};
+        mapped.mapped_data = mapping.value()->share_data();
+        mapped.mapped_size = mapped_size;
+        WeightMapping mapped_weights = native_weights;
+        mapped_weights.emplace("layers.1.attention.query_norm.weight", mapped);
+        mapped_weights.emplace("layers.1.attention.key_norm.weight", mapped);
+        auto full_owner = plan_model_memory(qwen, hybrid, 4 * gibibyte, true, 0, false, &mapped_weights, true);
+        check(full_owner && full_owner.value().estimated_vulkan_dense_host_release_size == mapped_size);
+        mapped_weights.emplace("retained.alias.weight", mapped);
+        auto tied_owner = plan_model_memory(qwen, hybrid, 4 * gibibyte, true, 0, false, &mapped_weights, true);
+        check(tied_owner && tied_owner.value().estimated_vulkan_dense_host_release_size == 0);
+    }
+
+    {
+        ScopedTestDirectory directory("ncnn_moe_ple_memory_plan_");
+        const auto path = directory.path() / "ple.bin";
+        const std::vector<uint8_t> payload(16 * 18, 0x53);
+        {
+            std::ofstream file(path, std::ios::binary);
+            file.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+            check(static_cast<bool>(file));
+        }
+        auto mapping = MappedFileRange::open(path, 0, payload.size());
+        check(static_cast<bool>(mapping));
+        TensorData table;
+        table.dtype = DType::IQ4NL;
+        table.shape = {16, 32};
+        table.mapped_data = mapping.value()->share_data();
+        table.mapped_size = payload.size();
+        MoeModelDescriptor ple_native = native;
+        PleDescriptor& ple = ple_native.layers.front().ple;
+        ple.embedding_dimension = 256;
+        ple.ngram_size = 3;
+        ple.heads_per_ngram = 4;
+        ple.convolution_kernel_size = 1;
+        ple.embedding_shard_count = 2;
+        ple.embedding_row_count = 32;
+        const std::string shard_name = "layers.0.ple.embedding_shard.0";
+        const auto plan_with = [&](const std::string& name, const TensorData& tensor, const MoeModelDescriptor& model, const Option& opt) {
+            WeightMapping weights = native_weights;
+            weights.emplace(name, tensor);
+            return plan_model_memory(model, opt, 4 * gibibyte, false, 0, false, &weights);
+        };
+        auto paged = plan_with(shard_name, table, ple_native, native_options);
+        check(static_cast<bool>(paged));
+        check(paged.value().estimated_dense_size == fixed_size);
+        check(paged.value().expert_cache_size == resident_pair_size);
+
+        TensorData owned = table;
+        owned.mapped_data.reset();
+        owned.mapped_size = 0;
+        owned.quantized_data = payload;
+        auto rejected_owned = plan_with(shard_name, owned, ple_native, native_options);
+        check(!rejected_owned && rejected_owned.error().code == ErrorCode::InvalidArgument);
+        Option extra_budget = native_options;
+        extra_budget.host_memory_budget += payload.size();
+        auto resident = plan_with(shard_name, owned, ple_native, extra_budget);
+        check(resident && resident.value().estimated_dense_size == fixed_size + payload.size());
+        for (const std::string& name : {std::string("ordinary.embedding.weight"),
+                                        std::string("prefix.layers.0.ple.embedding_shard.0"),
+                                        std::string("layers.0.ple.embedding_shard.0.extra"),
+                                        std::string("layers.00.ple.embedding_shard.0"),
+                                        std::string("layers.0.ple.embedding_shard.00"),
+                                        std::string("layers.0.ple.embedding_shard.2"),
+                                        std::string("layers.1.ple.embedding_shard.0")})
+        {
+            auto ordinary = plan_with(name, table, ple_native, extra_budget);
+            check(ordinary && ordinary.value().estimated_dense_size == fixed_size + payload.size());
+        }
+        MoeModelDescriptor undeclared = ple_native;
+        undeclared.layers.front().ple = {};
+        auto not_ple = plan_with(shard_name, table, undeclared, extra_budget);
+        check(not_ple && not_ple.value().estimated_dense_size == fixed_size + payload.size());
+
+        TensorData mixed = table;
+        mixed.quantized_data = payload;
+        mixed.quantization_scales.assign(3, 1.0f);
+        mixed.input_column_indices.resize(32);
+        for (uint32_t column = 0; column < 32; ++column)
+            mixed.input_column_indices[column] = column;
+        const uint64_t owned_size = payload.size() + 3 * sizeof(float) + 32 * sizeof(uint32_t);
+        extra_budget.host_memory_budget = native_options.host_memory_budget + owned_size;
+        auto mixed_plan = plan_with(shard_name, mixed, ple_native, extra_budget);
+        check(mixed_plan && mixed_plan.value().estimated_dense_size == fixed_size + owned_size);
+    }
 
     Option short_cache = native_options;
     --short_cache.expert_cache_size;

@@ -34,7 +34,11 @@ VulkanExpertVictimCache::VulkanExpertVictimCache(std::shared_ptr<VulkanContext> 
 {
     try
     {
-        weight_allocator = std::make_shared<VulkanExpertWeightAllocator>(context->device(), static_cast<size_t>(std::min<uint64_t>(cache_size, UINT64_C(64) * 1024 * 1024)));
+        constexpr uint64_t physical_allowance = UINT64_C(64) * 1024 * 1024;
+        const uint64_t physical_limit = cache_size > std::numeric_limits<uint64_t>::max() - physical_allowance
+                                            ? std::numeric_limits<uint64_t>::max()
+                                            : cache_size + physical_allowance;
+        weight_allocator = std::make_shared<VulkanExpertWeightAllocator>(context->device(), static_cast<size_t>(std::min(cache_size, physical_allowance)), physical_limit);
         upload_staging_allocator = context->device()->acquire_staging_allocator();
         for (DownloadSlot& slot : download_slots)
             slot.staging_allocator = context->device()->acquire_staging_allocator();
@@ -567,7 +571,8 @@ VulkanExpertBackend::VulkanExpertBackend(uint64_t _cache_size,
                                          uint32_t _vulkan_device_index,
                                          std::shared_ptr<VulkanExpertVictimCache> _device_weight_source,
                                          VulkanRuntimePtr _vulkan_runtime,
-                                         uint64_t _optimization_flags)
+                                         uint64_t _optimization_flags,
+                                         uint64_t physical_limit_bytes)
     : cache_size(_cache_size),
       vulkan_device_index(_vulkan_device_index),
       vulkan_runtime(std::move(_vulkan_runtime)),
@@ -580,7 +585,12 @@ VulkanExpertBackend::VulkanExpertBackend(uint64_t _cache_size,
     if (vulkan_context && cache_size != 0)
     {
         const uint64_t allocator_block_size = std::min<uint64_t>(cache_size, UINT64_C(64) * 1024 * 1024);
-        expert_weight_allocator = std::make_shared<VulkanExpertWeightAllocator>(vulkan_context->device(), static_cast<size_t>(allocator_block_size));
+        constexpr uint64_t physical_allowance = UINT64_C(64) * 1024 * 1024;
+        const uint64_t physical_limit = physical_limit_bytes != 0 ? physical_limit_bytes
+                                        : cache_size > std::numeric_limits<uint64_t>::max() - physical_allowance
+                                            ? std::numeric_limits<uint64_t>::max()
+                                            : cache_size + physical_allowance;
+        expert_weight_allocator = std::make_shared<VulkanExpertWeightAllocator>(vulkan_context->device(), static_cast<size_t>(allocator_block_size), physical_limit);
         admission_staging_allocator = std::make_unique<VulkanUploadStagingAllocator>(vulkan_context->device(), allocator_block_size);
     }
     try
@@ -651,7 +661,8 @@ static uint64_t native_expert_storage_bytes(const TensorData& gate_up, const Ten
 {
     const auto quantized = [](DType dtype) { return dtype == DType::Int4 || is_qnk_dtype(dtype); };
     if (gate_up.shape.size() != 2 || down.shape.size() != 2
-        || (!up && !quantized(gate_up.dtype) && !quantized(down.dtype))
+        || (!up && !quantized(gate_up.dtype) && !quantized(down.dtype)
+            && gate_up.dtype != DType::Float32 && down.dtype != DType::Float32)
         || (up ? up->shape != gate_up.shape || down.shape[1] != gate_up.shape[0]
                : gate_up.shape[0] % 2 != 0 || down.shape[1] != gate_up.shape[0] / 2)
         || down.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 128))
@@ -711,6 +722,72 @@ static uint64_t native_expert_storage_bytes(const TensorData& gate_up, const Ten
     return size;
 }
 
+static uint64_t executable_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
+                                                const TensorData& down, const VulkanContext& context,
+                                                uint64_t optimization_flags, const TensorData* gate_up_bias,
+                                                const TensorData* up_bias, const TensorData* down_bias,
+                                                ExpertActivation activation, float activation_limit)
+{
+    if (gate_up.shape.size() != 2 || down.shape.size() != 2
+        || gate_up.shape[0] == 0 || gate_up.shape[1] == 0 || down.shape[0] == 0 || down.shape[1] == 0
+        || (up && up->shape != gate_up.shape))
+        return 0;
+    const auto valid_mxfp4_matrix = [](const TensorData& matrix) {
+        if (matrix.shape[1] % 32 != 0
+            || matrix.shape[0] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 64)
+            || matrix.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max()))
+            return false;
+        const uint64_t scales = static_cast<uint64_t>(matrix.shape[0]) * (matrix.shape[1] / 32);
+        const uint64_t blocks = scales * 16;
+        return blocks <= static_cast<uint64_t>(std::numeric_limits<int>::max() - 3)
+               && scales <= static_cast<uint64_t>(std::numeric_limits<int>::max() - 3)
+               && matrix.mxfp4_blocks.size() == blocks && matrix.mxfp4_scales.size() == scales;
+    };
+    const auto valid_bias = [](const TensorData* bias, uint32_t columns) {
+        if (!bias) return true;
+        if (bias->shape.size() != 1 || bias->shape[0] != columns) return false;
+        if (bias->dtype == DType::Float32) return bias->float32_values().size() == columns;
+        return bias->dtype == DType::BFloat16 && bias->bfloat16_values().size() == columns;
+    };
+    const bool bfloat16_expert = !up && gate_up.dtype == DType::BFloat16 && down.dtype == DType::BFloat16
+                                 && activation == ExpertActivation::Silu && context.device()->info.subgroup_size() == 32
+                                 && gate_up.shape[0] % 2 == 0 && gate_up.shape[0] / 2 % 128 == 0
+                                 && down.shape[1] == gate_up.shape[0] / 2
+                                 && gate_up.bfloat16_values().size() == gate_up.element_count()
+                                 && down.bfloat16_values().size() == down.element_count();
+    const bool mxfp4_expert = !up && gate_up.dtype == DType::MxFp4 && down.dtype == DType::MxFp4
+                              && gate_up.shape[0] % 2 == 0 && down.shape[1] == gate_up.shape[0] / 2
+                              && valid_mxfp4_matrix(gate_up) && valid_mxfp4_matrix(down);
+    const auto quantized = [](DType dtype) { return dtype == DType::Int4 || is_qnk_dtype(dtype); };
+    const uint64_t native_size = up || quantized(gate_up.dtype) || quantized(down.dtype)
+                                         || gate_up.dtype == DType::Float32 || down.dtype == DType::Float32
+                                     ? native_expert_storage_bytes(gate_up, up, down, context, optimization_flags)
+                                     : 0;
+    if ((!mxfp4_expert && native_size == 0 && !bfloat16_expert)
+        || !valid_bias(gate_up_bias, gate_up.shape[0]) || !valid_bias(down_bias, down.shape[0])
+        || (up && !valid_bias(up_bias, up->shape[0]))
+        || (activation != ExpertActivation::Silu && activation != ExpertActivation::GptOssSwiGlu
+            && activation != ExpertActivation::DeepSeekSwiGlu)
+        || !std::isfinite(activation_limit) || activation_limit < 0.0f)
+        return 0;
+    if (native_size != 0) return native_size;
+    const auto matrix_size = [](const TensorData& matrix) {
+        return matrix.dtype == DType::BFloat16 ? static_cast<uint64_t>(matrix.bfloat16_values().size()) * sizeof(uint16_t)
+                                               : static_cast<uint64_t>(matrix.mxfp4_blocks.size()) + matrix.mxfp4_scales.size();
+    };
+    const auto bias_size = [](const TensorData* bias) {
+        return !bias ? uint64_t(0) : bias->dtype == DType::Float32 ? static_cast<uint64_t>(bias->float32_values().size()) * sizeof(float)
+                                                                   : static_cast<uint64_t>(bias->bfloat16_values().size()) * sizeof(uint16_t);
+    };
+    uint64_t size = 0;
+    for (uint64_t part : {matrix_size(gate_up), matrix_size(down), bias_size(gate_up_bias), bias_size(down_bias)})
+    {
+        if (part > std::numeric_limits<uint64_t>::max() - size) return 0;
+        size += part;
+    }
+    return size;
+}
+
 bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const TensorData> gate_up,
                                          const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down,
                                          const TensorData* down_bias, uint32_t residency_group,
@@ -723,83 +800,13 @@ bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const 
         || (down && down->mxfp4_file_storage)
         || (up && up->mxfp4_file_storage))
         return false;
-    const auto valid_mxfp4_matrix = [](const TensorData& matrix) {
-        if (matrix.shape.size() != 2 || matrix.shape[0] == 0 || matrix.shape[1] == 0
-            || matrix.shape[1] % 32 != 0
-            || matrix.shape[0] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 64)
-            || matrix.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max()))
-            return false;
-        const uint64_t scales = static_cast<uint64_t>(matrix.shape[0]) * (matrix.shape[1] / 32);
-        const uint64_t blocks = scales * 16;
-        return blocks <= static_cast<uint64_t>(std::numeric_limits<int>::max() - 3)
-               && scales <= static_cast<uint64_t>(std::numeric_limits<int>::max() - 3)
-               && matrix.mxfp4_blocks.size() == blocks
-               && matrix.mxfp4_scales.size() == scales;
-    };
-    const auto valid_bias = [](const TensorData* bias, uint32_t columns) {
-        if (!bias)
-            return true;
-        if (bias->shape.size() != 1 || bias->shape[0] != columns)
-            return false;
-        if (bias->dtype == DType::Float32)
-            return bias->float32_values().size() == columns;
-        return bias->dtype == DType::BFloat16 && bias->bfloat16_values().size() == columns;
-    };
-    const bool bfloat16_expert = !up && gate_up
-                                 && down
-                                 && gate_up->dtype == DType::BFloat16
-                                 && down->dtype == DType::BFloat16
-                                 && activation == ExpertActivation::Silu
-                                 && gate_up->shape.size() == 2
-                                 && down->shape.size() == 2
-                                 && gate_up->shape[0] % 2 == 0
-                                 && gate_up->shape[0] / 2 % 128 == 0
-                                 && down->shape[1] == gate_up->shape[0] / 2
-                                 && gate_up->bfloat16_values().size() == gate_up->element_count()
-                                 && down->bfloat16_values().size() == down->element_count();
-    const bool mxfp4_expert = !up && gate_up
-                              && down
-                              && gate_up->dtype == DType::MxFp4
-                              && down->dtype == DType::MxFp4
-                              && gate_up->shape.size() == 2
-                              && down->shape.size() == 2
-                              && gate_up->shape[0] % 2 == 0
-                              && down->shape[1] == gate_up->shape[0] / 2
-                              && valid_mxfp4_matrix(*gate_up)
-                              && valid_mxfp4_matrix(*down);
-    const auto quantized = [](const TensorData& matrix) { return matrix.dtype == DType::Int4 || is_qnk_dtype(matrix.dtype); };
-    const uint64_t native_size = gate_up && down && (up || quantized(*gate_up) || quantized(*down))
-                                     ? native_expert_storage_bytes(*gate_up, up.get(), *down, *vulkan_context, optimization_flags)
-                                     : 0;
-    const bool native_expert = native_size != 0;
-    if (key.empty()
-        || (!mxfp4_expert && !native_expert && !bfloat16_expert)
-        || !valid_bias(gate_up_bias, gate_up->shape[0])
-        || !valid_bias(down_bias, down->shape[0])
-        || (up && !valid_bias(up_bias, up->shape[0]))
-        || (activation != ExpertActivation::Silu
-            && activation != ExpertActivation::GptOssSwiGlu
-            && activation != ExpertActivation::DeepSeekSwiGlu)
-        || !std::isfinite(activation_limit) || activation_limit < 0.0f)
-    {
+    if (key.empty() || !gate_up || !down)
         return false;
-    }
-    uint64_t size = 0;
-    const std::array<uint64_t, 4> parts = {
-        native_expert ? native_size : expert_matrix_bytes(*gate_up),
-        native_expert ? 0 : expert_matrix_bytes(*down),
-        native_expert ? 0 : tensor_bytes(gate_up_bias),
-        native_expert ? 0 : tensor_bytes(down_bias)};
-    for (uint64_t part : parts)
-    {
-        if (part > cache_size - size)
-            return false;
-        size += part;
-    }
-    if (size == 0)
-    {
+    const uint64_t size = executable_expert_storage_bytes(*gate_up, up.get(), *down, *vulkan_context,
+                                                          optimization_flags, gate_up_bias, up_bias, down_bias,
+                                                          activation, activation_limit);
+    if (size == 0 || size > cache_size)
         return false;
-    }
 
     admission.key = std::move(key);
     admission.gate_up = std::move(gate_up);
@@ -958,6 +965,7 @@ bool VulkanExpertBackend::prepare_admission(PendingAdmission admission,
     const std::unique_lock<std::mutex> admission_lock(admission_mutex);
     std::vector<std::shared_ptr<Entry>> retired;
     bool reserved = false;
+    size_t maximum_physical_evictions = 0;
     {
         const std::lock_guard<std::mutex> lock(mutex);
         const auto existing = entries.find(admission.key);
@@ -1002,6 +1010,7 @@ bool VulkanExpertBackend::prepare_admission(PendingAdmission admission,
                 if (!already_queued)
                     ++admissions;
                 reserved = true;
+                maximum_physical_evictions = entries.size();
             }
             else if (already_queued)
             {
@@ -1016,26 +1025,42 @@ bool VulkanExpertBackend::prepare_admission(PendingAdmission admission,
     retired.clear();
 
     std::shared_ptr<Entry> loaded;
-    bool upload_succeeded = true;
-    try
+    auto* allocator = static_cast<VulkanExpertWeightAllocator*>(expert_weight_allocator.get());
+    for (size_t attempt = 0;; ++attempt)
     {
-        std::optional<VulkanWeightUploadBatch> upload_batch;
-        if (admission.gate_up->dtype == DType::MxFp4)
-            upload_batch.emplace(vulkan_context, admission_staging_allocator.get(), &admission_upload_scratch);
-        loaded = create_entry(admission, upload_batch ? &*upload_batch : nullptr);
-        if (upload_batch)
+        const uint64_t rejections_before = allocator->physical_limit_rejections();
+        bool upload_succeeded = true;
+        try
         {
-            upload_succeeded = upload_batch->submit();
+            std::optional<VulkanWeightUploadBatch> upload_batch;
+            if (admission.gate_up->dtype == DType::MxFp4)
+                upload_batch.emplace(vulkan_context, admission_staging_allocator.get(), &admission_upload_scratch);
+            loaded = create_entry(admission, upload_batch ? &*upload_batch : nullptr);
+            if (loaded && upload_batch) upload_succeeded = upload_batch->submit();
         }
-    }
-    catch (...)
-    {
-        upload_succeeded = false;
-    }
-    // Batch destruction releases the context lock before the last pipeline
-    // owners can be destroyed by an unsuccessful admission.
-    if (!upload_succeeded)
+        catch (...)
+        {
+            upload_succeeded = false;
+        }
+        if (loaded && upload_succeeded) break;
+        // Drop every temporary owner after the upload command is destroyed.
+        // Only physical-budget rejection permits an extra ARC eviction;
+        // malformed weights, pipeline and submission failures do not retry.
         loaded.reset();
+        if (attempt >= maximum_physical_evictions || allocator->physical_limit_rejections() == rejections_before) break;
+        try
+        {
+            const std::lock_guard<std::mutex> lock(mutex);
+            const bool from_frequent = frequent_ghost_index.find(admission.key) != frequent_ghost_index.end();
+            if (stopping || !evict_one_locked(from_frequent, admission.residency_group, admission.size)) break;
+            retired.swap(retired_entries);
+        }
+        catch (...)
+        {
+            break;
+        }
+        retired.clear();
+    }
     bool success = false;
     {
         const std::lock_guard<std::mutex> lock(mutex);
@@ -1114,6 +1139,7 @@ size_t VulkanExpertBackend::prepare_demand_batch(std::span<const ExpertDemandReq
     std::vector<size_t> duplicate_of(candidates.size(), candidates.size());
     new_indices.reserve(candidates.size());
     size_t settled_admissions = 0;
+    size_t maximum_physical_evictions = 0;
     const auto rollback_reservations = [&] {
         {
             const std::lock_guard<std::mutex> lock(mutex);
@@ -1244,36 +1270,55 @@ size_t VulkanExpertBackend::prepare_demand_batch(std::span<const ExpertDemandReq
         }
         for (size_t index = prefix; index < pins.size(); ++index) pins[index].reset();
         retired.swap(retired_entries);
+        maximum_physical_evictions = entries.size();
     }
     retired.clear();
 
     bool upload_succeeded = true;
     if (!new_indices.empty())
     {
-        try
+        auto* allocator = static_cast<VulkanExpertWeightAllocator*>(expert_weight_allocator.get());
+        for (size_t attempt = 0;; ++attempt)
         {
-            VulkanWeightUploadBatch upload_batch(vulkan_context, admission_staging_allocator.get(), &admission_upload_scratch);
-            for (size_t index = 0; index < new_indices.size(); ++index)
+            const uint64_t rejections_before = allocator->physical_limit_rejections();
+            upload_succeeded = true;
+            try
             {
-                loaded[index] = create_entry(candidates[new_indices[index]], &upload_batch);
-                if (!loaded[index])
+                VulkanWeightUploadBatch upload_batch(vulkan_context, admission_staging_allocator.get(), &admission_upload_scratch);
+                for (size_t index = 0; index < new_indices.size(); ++index)
                 {
-                    upload_succeeded = false;
-                    break;
+                    loaded[index] = create_entry(candidates[new_indices[index]], &upload_batch);
+                    if (!loaded[index])
+                    {
+                        upload_succeeded = false;
+                        break;
+                    }
                 }
+                if (upload_succeeded) upload_succeeded = upload_batch.submit();
             }
-            if (upload_succeeded)
+            catch (...)
             {
-                upload_succeeded = upload_batch.submit();
+                upload_succeeded = false;
             }
+            if (upload_succeeded) break;
+            // The failed batch's command and temporary weights must be gone
+            // before reclaiming unpinned entries and creating a fresh batch.
+            std::fill(loaded.begin(), loaded.end(), std::shared_ptr<Entry>());
+            if (attempt >= maximum_physical_evictions || allocator->physical_limit_rejections() == rejections_before) break;
+            try
+            {
+                const std::lock_guard<std::mutex> lock(mutex);
+                const auto& admission = candidates[new_indices.front()];
+                const bool from_frequent = frequent_ghost_index.find(admission.key) != frequent_ghost_index.end();
+                if (stopping || !evict_one_locked(from_frequent, admission.residency_group, admission.size)) break;
+                retired.swap(retired_entries);
+            }
+            catch (...)
+            {
+                break;
+            }
+            retired.clear();
         }
-        catch (...)
-        {
-            upload_succeeded = false;
-        }
-        // Destroy the transfer command and release its context mutex before
-        // clearing any last projection/pipeline owners on failure.
-        if (!upload_succeeded) loaded.clear();
     }
     size_t completed = prefix;
     {
@@ -1827,6 +1872,18 @@ ExpertBackendStatistics VulkanExpertBackend::statistics() const
     result.route_aggregation_routes = route_aggregation_routes;
     result.route_aggregation_bytes_saved = route_aggregation_bytes_saved;
     return result;
+}
+
+uint64_t VulkanExpertBackend::physical_bytes() const
+{
+    const auto* allocator = static_cast<const VulkanExpertWeightAllocator*>(expert_weight_allocator.get());
+    return allocator ? allocator->physical_bytes() : 0;
+}
+
+uint64_t VulkanExpertBackend::physical_limit_rejections() const
+{
+    const auto* allocator = static_cast<const VulkanExpertWeightAllocator*>(expert_weight_allocator.get());
+    return allocator ? allocator->physical_limit_rejections() : 0;
 }
 
 VulkanExpertBackend::Submission::Submission(std::shared_ptr<WorkItem> _work)
@@ -2591,6 +2648,10 @@ bool VulkanExpertBackend::forward_bfloat16_batch(WorkItem& work,
                                                  std::span<const ExpertBackendRequest> requests,
                                                  std::span<const Selection> selected)
 {
+    if (std::any_of(selected.begin(), selected.end(), [&](const Selection& selection) {
+            return selection.request_index < requests.size() && requests[selection.request_index].device_output;
+        }))
+        return forward_device_batch(requests, selected);
     if (selected.empty())
         return true;
     if (!selected.front().entry
@@ -2675,6 +2736,10 @@ bool VulkanExpertBackend::forward_qnk_batch(WorkItem& work,
 {
     if (selected.empty())
         return true;
+    if (std::any_of(selected.begin(), selected.end(), [&](const Selection& selection) {
+            return selection.request_index < requests.size() && requests[selection.request_index].device_output;
+        }))
+        return forward_device_batch(requests, selected);
     if (!selected.front().entry || !selected.front().entry->qnk_operation)
         return false;
 
@@ -2764,11 +2829,23 @@ uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const 
                                                const TensorData& down, uint32_t device_index,
                                                const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags)
 {
+    return native_quantized_expert_storage_bytes(gate_up, up, down, device_index, vulkan_runtime,
+                                                 optimization_flags, nullptr, nullptr, nullptr, ExpertActivation::Silu, 0.0f);
+}
+
+uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
+                                               const TensorData& down, uint32_t device_index,
+                                               const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags,
+                                               const TensorData* gate_up_bias, const TensorData* up_bias,
+                                               const TensorData* down_bias, ExpertActivation activation,
+                                               float activation_limit)
+{
 #if NCNN_MOE_WITH_VULKAN
     auto context = VulkanContext::acquire(device_index, vulkan_runtime, optimization_flags);
     if (!context)
         return 0;
-    return native_expert_storage_bytes(gate_up, up, down, *context, optimization_flags);
+    return executable_expert_storage_bytes(gate_up, up, down, *context, optimization_flags,
+                                           gate_up_bias, up_bias, down_bias, activation, activation_limit);
 #else
     (void)gate_up;
     (void)up;
@@ -2776,6 +2853,11 @@ uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const 
     (void)device_index;
     (void)vulkan_runtime;
     (void)optimization_flags;
+    (void)gate_up_bias;
+    (void)up_bias;
+    (void)down_bias;
+    (void)activation;
+    (void)activation_limit;
     return 0;
 #endif
 }

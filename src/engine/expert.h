@@ -39,7 +39,8 @@ void forward_shared_expert(const CompiledModel& model,
                            ActivationBuffer& output,
                            ExpertWorkspace& workspace,
                            const std::shared_ptr<const DeviceTensor_vulkan>& device_input = {},
-                           std::shared_ptr<const DeviceTensor_vulkan>* device_output = nullptr);
+                           std::shared_ptr<const DeviceTensor_vulkan>* device_output = nullptr,
+                           bool require_device_execution = false);
 
 bool support_vulkan_expert(const ExpertPlan& expert,
                            const TensorData& gate_up,

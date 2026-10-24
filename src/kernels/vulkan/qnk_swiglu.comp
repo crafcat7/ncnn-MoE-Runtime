@@ -32,6 +32,14 @@ void main()
     if (column >= p.intermediate_columns || token >= p.token_count)
         return;
 
+    // Shared Expert router gate: the projection is one scalar per token.
+    if (p.activation == 2u)
+    {
+        activated_data[token * p.intermediate_columns + column] = gate_up_data[token * p.intermediate_columns + column]
+                                                                  / (1.0 + exp(-up_data[token]));
+        return;
+    }
+
     const bool separate = p.packed_gate_up == 2u;
     const uint base = token * p.intermediate_columns * (separate ? 1u : 2u);
     const uint gate_index = p.packed_gate_up != 0u

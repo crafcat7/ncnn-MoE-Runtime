@@ -3,6 +3,7 @@
 
 #include "backends/ncnn/latentlayer_vulkan.h"
 #include "backends/ncnn/moecombine_vulkan.h"
+#include "backends/ncnn/qwenlayer_vulkan.h"
 #include "kernels/attention.h"
 #include "kernels/gateddeltanet.h"
 #include "kernels/hyperconnection.h"
@@ -70,6 +71,7 @@ struct LayerState
     std::vector<ExpertState> expert_slots;
     size_t active_expert_count = 0;
     bool experts_executed = false;
+    bool require_device_execution = false;
 
     void resize_experts(size_t count)
     {
@@ -101,6 +103,7 @@ struct LayerState
             active.device_output.reset();
         }
         experts_executed = false;
+        require_device_execution = false;
     }
 };
 
@@ -180,6 +183,7 @@ public:
     HyperConnectionScratch hyper_connection_scratch;
     AttentionScratch attention_scratch;
     LatentLayerWorkspace_vulkan latent_layer;
+    QwenLayerWorkspace_vulkan qwen_layer;
     std::vector<uint64_t> attention_positions;
     std::vector<LayerCache*> attention_caches;
     GatedDeltaScratch gated_delta_scratch;

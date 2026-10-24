@@ -108,6 +108,18 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
     check(static_cast<bool>(batch), batch ? "" : batch.error().message);
     for (size_t session = 0; session < prompts.size(); ++session)
         compare_logits(expected_logits[session], actual_logits[session], family + " two-session batch session=" + std::to_string(session), hybrid);
+    if (candidate.qwen_device_chain)
+    {
+        for (const auto& statistics : actual_statistics)
+        {
+            check(statistics.vulkan_qwen_layers == 3 * candidate.graph.layer_plans.size(), "Qwen prefill/decode did not execute every device layer");
+            check(statistics.expert_assignments > 0 && statistics.expert_gpu_routes == statistics.expert_assignments, "Qwen GPU routes do not cover every assignment");
+            check(statistics.expert_cpu_routes == 0 && statistics.expert_cpu_fallbacks == 0
+                      && statistics.model_compute_cpu_fallbacks == 0,
+                  "Qwen device chain performed CPU model execution");
+            check(statistics.vulkan_ple_blocks > 0, "Qwen device PLE was not executed");
+        }
+    }
     const auto counters = get_vulkan_statistics(candidate.vulkan_runtime);
     if (hybrid)
     {

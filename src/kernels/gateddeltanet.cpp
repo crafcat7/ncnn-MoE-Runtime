@@ -340,9 +340,7 @@ Result<void> forward_gated_delta(const WeightStore& weights,
 {
     const CompiledOperator& gated_delta_operator = operators.at(plan.gated_delta_vulkan_operator);
     const bool device_state_available = backend == ExecutionBackend::Vulkan
-                                        && gated_delta_operator.gated_delta
-                                        && (cache.gated_delta_device_state
-                                            || hidden.rows() == 1);
+                                        && gated_delta_operator.gated_delta;
     const ActivationBuffer* normalized = &hidden;
     bool normalized_ready = false;
     if (device_state_available)
@@ -370,7 +368,6 @@ Result<void> forward_gated_delta(const WeightStore& weights,
                                                                                      scratch.projected);
         if (device_executed)
         {
-            const size_t hidden_rows = hidden.rows();
             if (has_flag(plan.flags, AttentionBlockExternalResidual))
                 output.swap(scratch.projected);
             else
@@ -378,44 +375,10 @@ Result<void> forward_gated_delta(const WeightStore& weights,
                 add_batch_inplace(scratch.projected, hidden);
                 output.swap(scratch.projected);
             }
-            cache.gated_delta_convolution.clear();
-            cache.gated_delta_recurrent.clear();
-            for (size_t row = 0; row < hidden_rows; ++row)
-                record_gated_delta_cache_transaction_row(cache);
-            cache.gated_delta_token_count += hidden_rows;
-            if (cache.gated_delta_device_state)
-                cache.device_allocated_size = cache.gated_delta_device_state->allocated_bytes();
             return {};
         }
 
-        if (cache.transaction.active
-            && cache.gated_delta_device_state)
-        {
-            return Error{
-                ErrorCode::InternalError,
-                "Vulkan Gated DeltaNet failed while its transactional state was authoritative"};
-        }
-
-        // A failed device dispatch should not strand the Session on an
-        // opaque state.  Download once, then continue on the established CPU
-        // implementation.  This is a failure-path synchronization, not a
-        // per-token boundary.
-        if (cache.gated_delta_device_state)
-        {
-            std::vector<float> convolution;
-            std::vector<float> recurrent;
-            if (!cache.gated_delta_device_state->download(convolution,
-                                                          recurrent))
-            {
-                return Error{
-                    ErrorCode::InternalError,
-                    "failed to recover Vulkan Gated DeltaNet state"};
-            }
-            cache.gated_delta_convolution = std::move(convolution);
-            cache.gated_delta_recurrent = std::move(recurrent);
-            cache.gated_delta_device_state.reset();
-            cache.device_allocated_size = 0;
-        }
+        return Error{ErrorCode::InternalError, "Vulkan Gated DeltaNet execution failed"};
     }
 
     if (!normalized_ready)

@@ -7,9 +7,12 @@
 #include "kernels/int4.h"
 
 #include <algorithm>
+#include <charconv>
 #include <limits>
 #include <map>
+#include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace ncnn {
@@ -910,6 +913,163 @@ static QnkExpertEncoding qnk_expert_encoding(const WeightMapping& weights) noexc
                                    : QnkExpertEncoding::Unsupported;
 }
 
+static bool mapped_ple_embedding_shard(const std::string& name, const TensorData& tensor,
+                                       const MoeModelDescriptor& descriptor) noexcept
+{
+    if (!tensor.mapped_data || tensor.mapped_size == 0 || tensor.shape.size() != 2 || tensor.shape[0] == 0)
+        return false;
+    const std::string_view canonical = name;
+    constexpr std::string_view prefix = "layers.";
+    constexpr std::string_view marker = ".ple.embedding_shard.";
+    if (!canonical.starts_with(prefix))
+        return false;
+    const size_t separator = canonical.find(marker, prefix.size());
+    if (separator == std::string_view::npos)
+        return false;
+    const std::string_view layer_name = canonical.substr(prefix.size(), separator - prefix.size());
+    const std::string_view shard_name = canonical.substr(separator + marker.size());
+    if (layer_name.empty() || shard_name.empty()
+        || (layer_name.size() > 1 && layer_name.front() == '0')
+        || (shard_name.size() > 1 && shard_name.front() == '0'))
+        return false;
+    uint32_t layer_index = 0;
+    uint32_t shard_index = 0;
+    const auto layer = std::from_chars(layer_name.data(), layer_name.data() + layer_name.size(), layer_index);
+    const auto shard = std::from_chars(shard_name.data(), shard_name.data() + shard_name.size(), shard_index);
+    if (layer.ec != std::errc{} || layer.ptr != layer_name.data() + layer_name.size()
+        || shard.ec != std::errc{} || shard.ptr != shard_name.data() + shard_name.size()
+        || layer_index >= descriptor.layers.size())
+        return false;
+    const PleDescriptor& ple = descriptor.layers[layer_index].ple;
+    if (!ple.enabled() || ple.ngram_size < 2 || ple.heads_per_ngram == 0
+        || shard_index >= ple.embedding_shard_count || tensor.shape[0] > ple.embedding_row_count)
+        return false;
+    const uint64_t heads = static_cast<uint64_t>(ple.ngram_size - 1) * ple.heads_per_ngram;
+    return ple.embedding_dimension % heads == 0 && tensor.shape[1] == ple.embedding_dimension / heads;
+}
+
+static Result<uint64_t> qwen_vulkan_releasable_dense_size(const MoeModelDescriptor& descriptor,
+                                                          const Option& opt, const WeightMapping& weights)
+{
+    const uint64_t required_flags = OptimizationVulkanAttention | OptimizationVulkanQnK
+                                    | OptimizationVulkanExpertGpuPriority | OptimizationVulkanCommandGraph;
+    if (opt.hybrid_mode != HybridMode::HybridExperts
+        || descriptor.hyper_connection_kind != HyperConnectionKind::GatedResidual
+        || descriptor.layers.empty()
+        || has_flag(opt.flags, OptionDisableGpuExpertExecution)
+        || (opt.optimization_flags & required_flags) != required_flags)
+        return uint64_t{0};
+    for (const LayerDescriptor& layer : descriptor.layers)
+    {
+        if (layer.attention.kind != AttentionKind::GatedDeltaNet
+            && (layer.attention.kind != AttentionKind::Standard
+                || !has_flag(layer.attention.flags, AttentionDescriptorQsa)
+                || !has_flag(layer.attention.flags, AttentionDescriptorQueryKeyNorm)))
+            return uint64_t{0};
+    }
+    // The strict continuous chain rejects FP8 rather than retaining a CPU
+    // execution path. Do not predict its release for that unsupported case.
+    for (const auto& [name, tensor] : weights)
+    {
+        (void)name;
+        if (tensor.dtype == DType::Float8E4M3)
+            return uint64_t{0};
+    }
+
+    std::set<std::string> released_names;
+    const auto add = [&](const std::string& name) {
+        const auto found = weights.find(name);
+        if (found != weights.end()
+            && (found->second.dtype == DType::Float32 || found->second.dtype == DType::BFloat16
+                || found->second.dtype == DType::Q8_0))
+            released_names.insert(name);
+    };
+    add("lm_head.weight");
+    for (size_t index = 0; index < descriptor.layers.size(); ++index)
+    {
+        const LayerDescriptor& layer = descriptor.layers[index];
+        const std::string prefix = "layers." + std::to_string(index) + ".";
+        if (layer.attention.kind == AttentionKind::GatedDeltaNet)
+        {
+            for (const char* name : {"attention.delta.qkv.weight", "attention.delta.z.weight",
+                                     "attention.delta.beta.weight", "attention.delta.alpha.weight",
+                                     "attention.output.weight"})
+                add(prefix + name);
+        }
+        else
+        {
+            // QSA owns its projections internally, so their host copies stay.
+            // Its public attention operator releases only these two norms.
+            add(prefix + "attention.query_norm.weight");
+            add(prefix + "attention.key_norm.weight");
+        }
+        if (layer.moe.shared_expert_count != 0)
+        {
+            const std::string shared = prefix + "shared_expert.";
+            const auto gate = weights.find(shared + "gate.weight");
+            const auto up = weights.find(shared + "up.weight");
+            const auto down = weights.find(shared + "down.weight");
+            if (gate != weights.end() && up != weights.end() && down != weights.end()
+                && gate->second.dtype == DType::Q8_0 && up->second.dtype == DType::Q8_0
+                && down->second.dtype == DType::Q8_0)
+            {
+                add(shared + "gate.weight");
+                add(shared + "up.weight");
+                add(shared + "down.weight");
+            }
+        }
+    }
+
+    struct MappedOwner
+    {
+        uint64_t bytes = 0;
+        bool retained = false;
+    };
+    std::map<std::shared_ptr<const uint8_t>, MappedOwner, std::owner_less<std::shared_ptr<const uint8_t>>> owners;
+    uint64_t released = 0;
+    for (const auto& [name, tensor] : weights)
+    {
+        const bool release = released_names.contains(name);
+        if (tensor.mapped_data)
+        {
+            auto& owner = owners[tensor.mapped_data];
+            owner.bytes = std::max(owner.bytes, tensor.mapped_size);
+            owner.retained = owner.retained || !release;
+        }
+        if (!release)
+            continue;
+        // Match release_tensor_host_storage, not logical tensor dimensions:
+        // auxiliary metadata and native non-Q8 blocks are never reclaimed.
+        const uint64_t count = tensor.dtype == DType::Float32    ? tensor.float32_data.size()
+                               : tensor.dtype == DType::BFloat16 ? tensor.bfloat16_data.size()
+                                                                 : tensor.quantized_data.size();
+        const uint64_t width = tensor.dtype == DType::Float32    ? sizeof(float)
+                               : tensor.dtype == DType::BFloat16 ? sizeof(uint16_t)
+                                                                 : 1;
+        auto bytes = checked_multiply(count, width, "resident Qwen owned dense release");
+        if (!bytes)
+            return bytes.error();
+        auto total = checked_add(released, bytes.value(), "resident Qwen dense release");
+        if (!total)
+            return total.error();
+        released = total.value();
+    }
+    for (const auto& [owner, state] : owners)
+    {
+        (void)owner;
+        if (!state.retained)
+        {
+            // A tied embedding or any other surviving alias retains the
+            // complete owner, exactly as final host-release accounting does.
+            auto total = checked_add(released, state.bytes, "resident Qwen mapped dense release");
+            if (!total)
+                return total.error();
+            released = total.value();
+        }
+    }
+    return released;
+}
+
 static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeModelDescriptor& descriptor,
                                         ModelMemoryPlan& plan, uint64_t& expert_fixed_size,
                                         uint64_t& max_qnk_cache_pair_size)
@@ -934,6 +1094,11 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
                                    + tensor.quantization_scales.size() * sizeof(float)
                                    + tensor.input_column_indices.size() * sizeof(uint32_t)
                                    + tensor.mxfp4_blocks.size() + tensor.mxfp4_scales.size();
+        // PLE accesses mapped table rows on demand. Its immutable file pages
+        // are reclaimable rather than fixed resident storage. Keep every owned
+        // allocation and metadata byte, including when a mapped view coexists.
+        if (mapped_ple_embedding_shard(name, tensor, descriptor) && tensor.mapped_size <= bytes)
+            bytes -= tensor.mapped_size;
         if (tensor.mxfp4_file_storage)
         {
             const auto& storage = *tensor.mxfp4_file_storage;
@@ -1045,7 +1210,8 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
                                           bool use_vulkan_dense,
                                           uint64_t available_memory_size,
                                           bool reserve_cpu_packed_weights,
-                                          const WeightMapping* weights)
+                                          const WeightMapping* weights,
+                                          bool use_vulkan_attention)
 {
     if (opt.expert_memory_mode != ExpertMemoryMode::Auto
         && opt.expert_memory_mode != ExpertMemoryMode::Eager
@@ -1274,7 +1440,14 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
 
     if (use_vulkan_dense)
     {
-        auto releasable = latent_vulkan_releasable_dense_size(descriptor);
+        Result<uint64_t> releasable = uint64_t{0};
+        if (weights && descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
+        {
+            if (use_vulkan_attention)
+                releasable = qwen_vulkan_releasable_dense_size(descriptor, opt, *weights);
+        }
+        else
+            releasable = latent_vulkan_releasable_dense_size(descriptor);
         if (!releasable)
             return releasable.error();
         plan.estimated_vulkan_dense_host_release_size = std::min(releasable.value(), plan.estimated_dense_size);

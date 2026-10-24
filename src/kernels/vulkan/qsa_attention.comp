@@ -1,0 +1,115 @@
+#version 450
+
+layout(binding = 0) readonly buffer query_blob
+{ float query_data[]; };
+layout(binding = 1) readonly buffer key_blob
+{ uint key_data[]; };
+layout(binding = 2) readonly buffer value_blob
+{ uint value_data[]; };
+layout(binding = 3) readonly buffer cutoff_blob
+{ uint cutoff_data[]; };
+layout(binding = 4) readonly buffer score_blob
+{ float score_data[]; };
+layout(binding = 5) readonly buffer gate_blob
+{ float gate_data[]; };
+layout(binding = 6) writeonly buffer output_blob
+{ float output_data[]; };
+layout(push_constant) uniform parameter
+{
+    uint rows;
+    uint heads;
+    uint kv_heads;
+    uint dimension;
+    uint previous_tokens;
+    uint ratio;
+    uint blocks;
+    uint top_k;
+    uint bfloat16_cache;
+    uint output_gate;
+}
+p;
+
+shared float partial[32];
+shared float maximum_score;
+shared float denominator;
+shared float previous_scale;
+shared float current_scale;
+
+float load_key(uint index)
+{
+    const uint bits = key_data[p.bfloat16_cache != 0u ? index / 2u : index];
+    return p.bfloat16_cache != 0u ? uintBitsToFloat(((bits >> ((index & 1u) * 16u)) & 0xffffu) << 16u)
+                                  : uintBitsToFloat(bits);
+}
+
+float load_value(uint index)
+{
+    const uint bits = value_data[p.bfloat16_cache != 0u ? index / 2u : index];
+    return p.bfloat16_cache != 0u ? uintBitsToFloat(((bits >> ((index & 1u) * 16u)) & 0xffffu) << 16u)
+                                  : uintBitsToFloat(bits);
+}
+
+void main()
+{
+    const uint unit = gl_WorkGroupID.x + gl_WorkGroupID.z * gl_NumWorkGroups.x;
+    const uint head = unit % p.heads;
+    const uint row = unit / p.heads;
+    const uint lane = gl_LocalInvocationID.x;
+    if (head >= p.heads || row >= p.rows)
+        return;
+    float accumulated[8];
+    for (uint i = 0u; i < 8u; ++i)
+        accumulated[i] = 0.0;
+    if (lane == 0u)
+    {
+        maximum_score = -3.402823466e38;
+        denominator = 0.0;
+    }
+    barrier();
+    const uint visible = p.previous_tokens + row + 1u;
+    const uint complete = visible / p.ratio;
+    const uint kv_head = head / (p.heads / p.kv_heads);
+    const uint query_base = (row * p.heads + head) * p.dimension;
+    for (uint token = 0u; token < visible; ++token)
+    {
+        const uint block = token / p.ratio;
+        if (block < complete && complete > p.top_k)
+        {
+            const uint score_bits = floatBitsToUint(score_data[row * p.blocks + block]);
+            const uint threshold = cutoff_data[row * 2u];
+            if (score_bits < threshold || (score_bits == threshold && block > cutoff_data[row * 2u + 1u]))
+                continue;
+        }
+        const uint key_base = (token * p.kv_heads + kv_head) * p.dimension;
+        float dot = 0.0;
+        for (uint c = lane; lane < 32u && c < p.dimension; c += 32u)
+            dot += query_data[query_base + c] * load_key(key_base + c);
+        if (lane < 32u)
+            partial[lane] = dot;
+        barrier();
+        for (uint stride = 16u; stride != 0u; stride >>= 1u)
+        {
+            if (lane < stride)
+                partial[lane] += partial[lane + stride];
+            barrier();
+        }
+        if (lane == 0u)
+        {
+            const float score = partial[0] / sqrt(float(p.dimension));
+            const float next_maximum = max(maximum_score, score);
+            previous_scale = exp(maximum_score - next_maximum);
+            current_scale = exp(score - next_maximum);
+            denominator = denominator * previous_scale + current_scale;
+            maximum_score = next_maximum;
+        }
+        barrier();
+        for (uint c = lane; lane < 32u && c < p.dimension; c += 32u)
+            accumulated[c / 32u] = accumulated[c / 32u] * previous_scale + load_value(key_base + c) * current_scale;
+        barrier();
+    }
+    for (uint c = lane; lane < 32u && c < p.dimension; c += 32u)
+    {
+        const float gate = p.output_gate != 0u ? 1.0 / (1.0 + exp(-gate_data[query_base + c])) : 1.0;
+        output_data[query_base + c] = accumulated[c / 32u] / denominator * gate;
+    }
+}

@@ -1,5 +1,6 @@
 #include "backends/ncnn/expertbackend_vulkan.h"
 #include "backends/ncnn/linear.h"
+#include "backends/ncnn/moecombine_vulkan.h"
 #include "backends/ncnn/experttransfer_vulkan.h"
 #include "backends/ncnn/vulkancontext.h"
 #include "kernels/ops.h"
@@ -12,6 +13,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 
 namespace ncnn {
 namespace moe {
@@ -47,6 +49,205 @@ static void verify_payload(const std::shared_ptr<VulkanContext>& context, const 
     for (size_t index = 0; index < bytes; ++index)
         upload_check(static_cast<const uint8_t*>(downloaded.data)[index] == static_cast<uint8_t>(index * 13 + seed),
                      "mapped staging upload preserves every byte");
+}
+
+static void weight_physical_ceiling()
+{
+    auto runtime = create_vulkan_runtime();
+    auto context = VulkanContext::acquire(get_default_gpu_index(), runtime, OptimizationDefaultFlags);
+    upload_check(static_cast<bool>(context), "physical ceiling context");
+    const size_t alignment = std::max<size_t>(4, context->device()->info.buffer_offset_alignment());
+    const size_t block_size = std::max<size_t>(65536, alignment * 16);
+    VulkanExpertWeightAllocator probe(context->device(), block_size);
+    auto* measured = probe.fastMalloc(block_size);
+    upload_check(measured != nullptr, "measure ordinary physical allocation");
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(context->device()->vkdevice(), measured->buffer, &requirements);
+    const uint64_t block_bytes = probe.physical_bytes();
+    upload_check(block_bytes == requirements.size && block_bytes >= block_size,
+                 "physical accounting uses VkMemoryRequirements rather than payload capacity");
+    probe.fastFree(measured);
+    probe.clear();
+    measured = probe.fastMalloc(block_size * 2);
+    upload_check(measured != nullptr, "measure oversized physical allocation");
+    const uint64_t large_bytes = probe.physical_bytes();
+    probe.fastFree(measured);
+    upload_check(probe.physical_bytes() == 0, "oversized free returns actual physical bytes");
+
+    VulkanExpertWeightAllocator bounded(context->device(), block_size, block_bytes * 2);
+    const auto release = [&](ncnn::VkBufferMemory* value) { bounded.fastFree(value); };
+    std::unique_ptr<ncnn::VkBufferMemory, decltype(release)> first(bounded.fastMalloc(block_size * 3 / 4), release);
+    std::unique_ptr<ncnn::VkBufferMemory, decltype(release)> second(bounded.fastMalloc(block_size * 3 / 4), release);
+    upload_check(first && second && bounded.physical_bytes() == block_bytes * 2,
+                 "fragmentation fixture retains two partially used physical blocks");
+    std::unique_ptr<ncnn::VkBufferMemory, decltype(release)> rejected(bounded.fastMalloc(block_size / 2), release);
+    upload_check(!rejected && bounded.physical_bytes() == block_bytes * 2,
+                 "separate tail fragments cannot grow physical allocation beyond the ceiling");
+    first.reset();
+    first.reset(bounded.fastMalloc(block_size / 2));
+    upload_check(first && bounded.physical_bytes() <= block_bytes * 2,
+                 "freeing a live block recovers a previously rejected fragmented allocation");
+    first.reset();
+    second.reset();
+    bounded.clear();
+    upload_check(bounded.physical_bytes() == 0, "clear resets physical accounting after fragmented reuse");
+
+    VulkanExpertWeightAllocator warm(context->device(), block_size, large_bytes);
+    measured = warm.fastMalloc(block_size);
+    upload_check(measured != nullptr, "warm block physical reservation");
+    warm.fastFree(measured);
+    upload_check(warm.physical_bytes() == block_bytes, "ordinary empty block remains warm");
+    measured = warm.fastMalloc(block_size * 2);
+    upload_check(measured && warm.physical_bytes() == large_bytes,
+                 "oversized request reclaims incompatible warm storage before testing the physical ceiling");
+    warm.fastFree(measured);
+    upload_check(warm.physical_bytes() == 0, "oversized release restores the physical budget");
+
+    VulkanExpertWeightAllocator too_small(context->device(), block_size, block_bytes - 1);
+    upload_check(too_small.fastMalloc(block_size) == nullptr && too_small.physical_bytes() == 0,
+                 "first physical allocation cannot exceed a smaller ceiling");
+}
+
+static void demand_physical_recovery(bool mxfp4)
+{
+    const auto runtime = create_vulkan_runtime();
+    const auto context = VulkanContext::acquire(get_default_gpu_index(), runtime, OptimizationDefaultFlags);
+    upload_check(static_cast<bool>(context), "physical recovery context");
+    const size_t alignment = std::max<size_t>(4, context->device()->info.buffer_offset_alignment());
+    const uint32_t hidden = static_cast<uint32_t>(std::max<size_t>(64, alignment));
+    const uint64_t cache_size = static_cast<uint64_t>(hidden) * 1024;
+    const auto matrix = [](uint32_t rows, uint32_t columns, uint32_t seed) {
+        auto value = std::make_shared<TensorData>();
+        value->dtype = DType::Float32;
+        value->shape = {rows, columns};
+        value->qnk_interleave_rows = false;
+        value->float32_data.resize(static_cast<size_t>(rows) * columns);
+        for (size_t index = 0; index < value->float32_data.size(); ++index)
+            value->float32_data[index] = static_cast<float>(static_cast<int>((index * 7 + seed) % 19) - 9) / 64.f;
+        return value;
+    };
+    const auto old_gate = matrix(64, hidden, 3);
+    const auto old_down = matrix(hidden, 32, 5);
+    const uint32_t intermediate = mxfp4 ? 384 : 49;
+    const auto packed = [](uint32_t rows, uint32_t columns) {
+        auto value = std::make_shared<TensorData>();
+        value->dtype = DType::MxFp4;
+        value->shape = {rows, columns};
+        value->mxfp4_blocks.resize(static_cast<size_t>(rows) * (columns / 32) * 16);
+        value->mxfp4_scales.resize(static_cast<size_t>(rows) * (columns / 32));
+        std::fill_n(value->mxfp4_blocks.data(), value->mxfp4_blocks.size(), uint8_t(0x11));
+        std::fill_n(value->mxfp4_scales.data(), value->mxfp4_scales.size(), uint8_t(124));
+        return value;
+    };
+    const auto new_gate = mxfp4 ? packed(intermediate * 2, hidden) : matrix(intermediate * 2, hidden, 7);
+    const auto new_down = mxfp4 ? packed(hidden, intermediate) : matrix(hidden, intermediate, 9);
+    const uint64_t old_bytes = QnkLinear_vulkan::storage_bytes(*old_gate, alignment) + QnkLinear_vulkan::storage_bytes(*old_down, alignment);
+    const auto align = [alignment](uint64_t bytes) { return (bytes + alignment - 1) / alignment * alignment; };
+    const uint64_t new_gate_bytes = mxfp4 ? align(new_gate->mxfp4_blocks.size()) + align(new_gate->mxfp4_scales.size()) + align(new_gate->shape[0] * sizeof(float))
+                                          : QnkLinear_vulkan::storage_bytes(*new_gate, alignment);
+    const uint64_t new_bytes = native_quantized_expert_storage_bytes(*new_gate, nullptr, *new_down,
+                                                                     get_default_gpu_index(), runtime, OptimizationDefaultFlags);
+    upload_check(old_bytes * 2 < cache_size && old_bytes + new_bytes <= cache_size
+                     && new_gate_bytes > old_bytes && new_gate_bytes > cache_size - old_bytes * 2,
+                 "recovery fixture splits sufficient logical free space into unusable fragments");
+    VulkanExpertWeightAllocator measure(context->device(), static_cast<size_t>(cache_size));
+    auto* measured = measure.fastMalloc(static_cast<size_t>(cache_size));
+    upload_check(measured != nullptr, "measure recovery physical limit");
+    const uint64_t physical_limit = measure.physical_bytes();
+    measure.fastFree(measured);
+    measure.clear();
+    auto backend = std::make_shared<VulkanExpertBackend>(cache_size, get_default_gpu_index(), nullptr, runtime,
+                                                         OptimizationDefaultFlags, physical_limit);
+    std::shared_ptr<const void> pin;
+    for (const char* key : {"physical-old-a", "physical-old-b"})
+    {
+        upload_check(backend->prepare_demand(key, old_gate, nullptr, old_down, nullptr, 0, 0.f, ExpertActivation::Silu, pin),
+                     "populate one physical block with two resident Experts");
+        if (std::string_view(key) == "physical-old-a") pin.reset();
+    }
+    upload_check(backend->physical_bytes() == physical_limit && backend->statistics().evictions == 0,
+                 "both initial Experts fit the original physical allocation");
+    const auto prepare = [&] {
+        if (!mxfp4)
+            return backend->prepare_demand("physical-new", new_gate, nullptr, new_down, nullptr, 0, 0.f, ExpertActivation::Silu, pin);
+        const ExpertDemandRequest demand{"physical-new", new_gate, nullptr, new_down, nullptr, 0, 0.f, ExpertActivation::Silu};
+        auto upload = backend->begin_demand_batch({&demand, 1});
+        std::array<std::shared_ptr<const void>, 1> pins;
+        const size_t prepared = upload ? upload->wait(pins) : 0;
+        pin = pins.front();
+        return prepared == 1 && static_cast<bool>(pin);
+    };
+    auto held = std::move(pin);
+    upload_check(!prepare()
+                     && !pin && held && backend->statistics().evictions == 1 && backend->physical_bytes() <= physical_limit,
+                 "physical recovery fails finitely while the only remaining victim is pinned");
+    held.reset();
+    upload_check(prepare(),
+                 "physical fragmentation recovers through bounded unpinned ARC eviction");
+    const auto recovered = backend->statistics();
+    upload_check(backend->physical_limit_rejections() > 0 && backend->physical_bytes() <= physical_limit
+                     && recovered.evictions == 2 && recovered.resident_size == new_bytes && recovered.dropped_admissions == 1,
+                 "logical eviction plus physical recovery keeps the physical ceiling and demand reservation intact");
+    const uint64_t rejections = backend->physical_limit_rejections();
+    auto malformed = std::make_shared<TensorData>(*new_down);
+    ++malformed->shape[1];
+    std::shared_ptr<const void> invalid_pin;
+    upload_check(!backend->prepare_demand("physical-invalid", new_gate, nullptr, malformed, nullptr, 0, 0.f, ExpertActivation::Silu, invalid_pin)
+                     && !invalid_pin && backend->statistics().evictions == recovered.evictions
+                     && backend->physical_limit_rejections() == rejections,
+                 "invalid format does not cause a physical recovery eviction");
+
+    ActivationBuffer input(1, hidden);
+    for (uint32_t column = 0; column < hidden; ++column)
+        input.row(0)[column] = static_cast<float>(static_cast<int>(column % 13) - 6) / 32.f;
+    TensorData identity;
+    identity.dtype = DType::Float32;
+    identity.shape = {hidden, hidden};
+    identity.float32_data.assign(static_cast<size_t>(hidden) * hidden, 0.f);
+    const auto seed = Linear::create(identity, nullptr, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
+    auto device_input = std::make_shared<DeviceTensor_vulkan>();
+    {
+        auto graph = seed ? CommandGraph_vulkan::create(*seed) : nullptr;
+        upload_check(graph && graph->upload(input, *device_input) && graph->submit() && graph->wait(), "recovery device input upload");
+    }
+    ActivationBuffer actual;
+    std::shared_ptr<DeviceTensor_vulkan> device_output;
+    const std::array<ExpertRoute, 1> routes = {{{0, 0, 1.f}}};
+    ExpertBackendRequest request;
+    request.key = "physical-new";
+    request.output = &actual;
+    request.device_input = device_input;
+    request.device_routes = routes;
+    request.device_output = &device_output;
+    request.input_rows = 1;
+    request.input_columns = hidden;
+    const auto before = get_vulkan_statistics(runtime);
+    auto submission = backend->submit_batch({&request, 1});
+    upload_check(static_cast<bool>(submission), "recovered Expert device-only submission");
+    const auto results = submission->wait();
+    upload_check(results.size() == 1 && results.front() == ExpertBackendExecutionResult::Executed && submission->commit(),
+                 "recovered demand executes on GPU without fallback");
+    const auto after = get_vulkan_statistics(runtime);
+    upload_check(device_output && actual.rows() == 0 && before.batch_uploads == after.batch_uploads
+                     && before.batch_downloads == after.batch_downloads && after.compute_submissions == before.compute_submissions + 1,
+                 "recovery retains the continuous device execution chain");
+    ActivationBuffer activated(1, intermediate);
+    if (mxfp4)
+        forward_gate_up_mxfp4(*new_gate, nullptr, input, ExpertActivation::Silu, 0.f, activated, OptimizationDefaultFlags);
+    else
+    {
+        const auto projected = forward_linear(*new_gate, input, OptimizationDefaultFlags);
+        for (uint32_t column = 0; column < intermediate; ++column)
+        {
+            const float gate = projected.row(0)[column];
+            activated.row(0)[column] = gate / (1.f + std::exp(-gate)) * projected.row(0)[intermediate + column];
+        }
+    }
+    const auto expected = forward_linear(*new_down, activated, OptimizationDefaultFlags);
+    upload_check(MoeCombine_vulkan::materialize(*device_output, actual), "materialize recovered GPU result");
+    for (size_t index = 0; index < expected.values().size(); ++index)
+        upload_check(std::isfinite(actual.values()[index]) && std::abs(actual.values()[index] - expected.values()[index]) < 0.0002f,
+                     "recovered device result matches the independent CPU calculation");
 }
 
 static void direct_upload_pool()
@@ -493,6 +694,9 @@ int main()
     }
     try
     {
+        ncnn::moe::weight_physical_ceiling();
+        ncnn::moe::demand_physical_recovery(false);
+        ncnn::moe::demand_physical_recovery(true);
         ncnn::moe::direct_upload_pool();
         ncnn::moe::factory_direct_staging_ab();
         ncnn::moe::expert_submission_pool();

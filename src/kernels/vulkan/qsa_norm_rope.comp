@@ -1,0 +1,66 @@
+#version 450
+
+layout(binding = 0) readonly buffer input_blob
+{ float input_data[]; };
+layout(binding = 1) readonly buffer norm_blob
+{ float norm_data[]; };
+layout(binding = 2) readonly buffer frequency_blob
+{ float frequency_data[]; };
+layout(binding = 3) writeonly buffer output_blob
+{ float output_data[]; };
+layout(push_constant) uniform parameter
+{
+    uint rows;
+    uint heads;
+    uint dimension;
+    uint input_columns;
+    uint rope_dimension;
+    uint position;
+    float epsilon;
+    float weight_offset;
+    float concentration;
+}
+p;
+
+shared float partial[32];
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint unit = gl_WorkGroupID.x + gl_WorkGroupID.z * gl_NumWorkGroups.x;
+    if (unit >= p.rows * p.heads)
+        return;
+    const uint row = unit / p.heads;
+    const uint head = unit % p.heads;
+    const uint source = row * p.input_columns + head * p.dimension;
+    const uint target = unit * p.dimension;
+    float sum = 0.0;
+    for (uint c = lane; lane < 32u && c < p.dimension; c += 32u)
+        sum += input_data[source + c] * input_data[source + c];
+    if (lane < 32u)
+        partial[lane] = sum;
+    barrier();
+    for (uint stride = 16u; stride != 0u; stride >>= 1u)
+    {
+        if (lane < stride)
+            partial[lane] += partial[lane + stride];
+        barrier();
+    }
+    const float scale = inversesqrt(partial[0] / float(p.dimension) + p.epsilon);
+    const uint half_rope = p.rope_dimension / 2u;
+    for (uint c = lane; lane < 32u && c < p.dimension; c += 32u)
+    {
+        float value = input_data[source + c] * scale * (norm_data[c] + p.weight_offset);
+        if (c < p.rope_dimension)
+        {
+            const uint pair = c % half_rope;
+            const float angle = float(p.position + row) * frequency_data[pair];
+            const float cosine = cos(angle) * p.concentration;
+            const float sine = sin(angle) * p.concentration;
+            const float first = input_data[source + pair] * scale * (norm_data[pair] + p.weight_offset);
+            const float second = input_data[source + half_rope + pair] * scale * (norm_data[half_rope + pair] + p.weight_offset);
+            value = c < half_rope ? first * cosine - second * sine : first * sine + second * cosine;
+        }
+        output_data[target + c] = value;
+    }
+}

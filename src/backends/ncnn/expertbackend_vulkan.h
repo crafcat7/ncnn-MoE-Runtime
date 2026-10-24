@@ -171,11 +171,14 @@ private:
 class VulkanExpertBackend final : public ExpertBackend
 {
 public:
+    // The optional internal ceiling is for bounded allocator verification;
+    // normal callers use zero to derive logical capacity plus its allowance.
     VulkanExpertBackend(uint64_t _cache_size,
                         uint32_t _vulkan_device_index,
                         std::shared_ptr<VulkanExpertVictimCache> _device_weight_source,
                         VulkanRuntimePtr _vulkan_runtime,
-                        uint64_t _optimization_flags);
+                        uint64_t _optimization_flags,
+                        uint64_t physical_limit_bytes = 0);
 
     ~VulkanExpertBackend() override;
 
@@ -210,6 +213,8 @@ public:
     void wait_for_background_work() override;
 
     ExpertBackendStatistics statistics() const override;
+    [[nodiscard]] uint64_t physical_bytes() const;
+    [[nodiscard]] uint64_t physical_limit_rejections() const;
 
 private:
     enum class ArcList
@@ -390,6 +395,8 @@ private:
 
     bool forward_qnk_batch(WorkItem& work, std::span<const ExpertBackendRequest> requests,
                            std::span<const Selection> selected);
+    bool forward_device_batch(std::span<const ExpertBackendRequest> requests,
+                              std::span<const Selection> selected);
 
     void execute_work_item(const std::shared_ptr<WorkItem>& work);
 
@@ -472,12 +479,19 @@ private:
 
 #endif // NCNN_MOE_WITH_VULKAN
 
-// Original matrix bytes plus aligned bias/metadata for the shared residency
-// allocator. Separate BF16/FP32 dense FFNs use the same native projection path.
+// The executable cache's exact admission charge, shared with make_admission.
+// Native projections include aligned bias/metadata; packed BF16 and MXFP4
+// preserve their existing payload and explicit-bias residency accounting.
 // Returns zero when any matrix cannot be admitted or dispatched on this device.
 [[nodiscard]] uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
                                                              const TensorData& down, uint32_t device_index,
                                                              const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags);
+[[nodiscard]] uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
+                                                             const TensorData& down, uint32_t device_index,
+                                                             const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags,
+                                                             const TensorData* gate_up_bias, const TensorData* up_bias,
+                                                             const TensorData* down_bias, ExpertActivation activation,
+                                                             float activation_limit);
 
 [[nodiscard]] uint64_t native_quantized_gpu_cache_size(uint64_t available_size, uint64_t total_size,
                                                        uint64_t largest_expert_size) noexcept;

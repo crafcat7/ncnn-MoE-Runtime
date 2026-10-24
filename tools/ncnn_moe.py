@@ -196,12 +196,24 @@ def _format_runtime_metrics(metrics: Any) -> str:
             f"{_format_metric_count(expert.get('gpu_cache_hit'))}"
             " / miss "
             f"{_format_metric_count(expert.get('gpu_cache_miss'))}"
-            " / exec "
+            " / exec batches "
             f"{_format_metric_count(expert.get('gpu_executions'))}"
             " / resident "
             f"{_format_bytes_gb(expert.get('gpu_cache_resident_bytes'))}"
             " / dropped "
             f"{_format_metric_count(expert.get('gpu_cache_dropped_admissions'))}",
+            "  Expert routes: total "
+            f"{_format_metric_count(expert.get('assignments'))}"
+            " / GPU "
+            f"{_format_metric_count(expert.get('gpu_routes'))}"
+            " / CPU "
+            f"{_format_metric_count(expert.get('cpu_routes'))}"
+            " · batches total/CPU "
+            f"{_format_metric_count(expert.get('batches'))}"
+            "/"
+            f"{_format_metric_count(expert.get('cpu_batches'))}"
+            " · CPU fallbacks "
+            f"{_format_metric_count(expert.get('cpu_fallbacks'))}",
             f"  Process CPU: {process_cpu_text}",
             "  GPU: submit "
             f"{_format_metric_count(gpu.get('submit_count'), available=gpu_available)}"
@@ -227,6 +239,14 @@ def _format_runtime_metrics(metrics: Any) -> str:
             f"{_format_metric_count(gpu.get('attention_cache_materializations'), available=gpu_available)}"
             " / attention-cpu-fallback "
             f"{_format_metric_count(gpu.get('attention_cpu_fallbacks'), available=gpu_available)}",
+            "  Device blocks: Qwen "
+            f"{_format_metric_count(gpu.get('qwen_layers'), available=gpu_available)}"
+            " / gated-residual "
+            f"{_format_metric_count(gpu.get('gated_residual_blocks'), available=gpu_available)}"
+            " / PLE "
+            f"{_format_metric_count(gpu.get('ple_blocks'), available=gpu_available)}"
+            " / model-cpu-fallback "
+            f"{_format_metric_count(gpu.get('model_compute_cpu_fallbacks'), available=gpu_available)}",
         )
     )
 

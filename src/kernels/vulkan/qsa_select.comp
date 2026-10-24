@@ -1,0 +1,85 @@
+#version 450
+
+layout(binding = 0) readonly buffer score_blob
+{ float score_data[]; };
+layout(binding = 1) writeonly buffer cutoff_blob
+{ uint cutoff_data[]; };
+layout(push_constant) uniform parameter
+{
+    uint rows;
+    uint blocks;
+    uint previous_tokens;
+    uint ratio;
+    uint top_k;
+}
+p;
+shared uint partial[32];
+
+void main()
+{
+    const uint row = gl_WorkGroupID.x + gl_WorkGroupID.z * gl_NumWorkGroups.x;
+    const uint lane = gl_LocalInvocationID.x;
+    if (row >= p.rows)
+        return;
+    const uint visible = (p.previous_tokens + row + 1u) / p.ratio;
+    if (visible <= p.top_k)
+    {
+        if (lane == 0u)
+        {
+            cutoff_data[row * 2u] = 0u;
+            cutoff_data[row * 2u + 1u] = 0xffffffffu;
+        }
+        return;
+    }
+    // Radix selection of (positive IEEE score, ~block index) is exact and
+    // deterministic: equal scores select the smaller block index first.
+    uint high = 0u;
+    uint low = 0u;
+    uint rank = p.top_k;
+    for (int pass = 63; pass >= 0; --pass)
+    {
+        const uint bit = 1u << uint(pass & 31);
+        uint count = 0u;
+        for (uint block = lane; lane < 32u && block < visible; block += 32u)
+        {
+            const uint score = floatBitsToUint(score_data[row * p.blocks + block]);
+            const uint index = ~block;
+            if (pass >= 32)
+            {
+                const uint mask = ~(bit - 1u);
+                if ((score & mask) == (high | bit))
+                    ++count;
+            }
+            else
+            {
+                const uint mask = ~(bit - 1u);
+                if (score == high && (index & mask) == (low | bit))
+                    ++count;
+            }
+        }
+        if (lane < 32u)
+            partial[lane] = count;
+        barrier();
+        for (uint stride = 16u; stride != 0u; stride >>= 1u)
+        {
+            if (lane < stride)
+                partial[lane] += partial[lane + stride];
+            barrier();
+        }
+        if (partial[0] >= rank)
+        {
+            if (pass >= 32)
+                high |= bit;
+            else
+                low |= bit;
+        }
+        else
+            rank -= partial[0];
+        barrier();
+    }
+    if (lane == 0u)
+    {
+        cutoff_data[row * 2u] = high;
+        cutoff_data[row * 2u + 1u] = ~low;
+    }
+}

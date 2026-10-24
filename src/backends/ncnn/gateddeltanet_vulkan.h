@@ -62,8 +62,27 @@ public:
 
 private:
     friend class GatedDeltaNet_vulkan;
+    friend class GatedDeltaWork_vulkan;
     class Implementation;
     GatedDeltaState_vulkan();
+    std::unique_ptr<Implementation> d;
+};
+
+class GatedDeltaWork_vulkan
+{
+public:
+    GatedDeltaWork_vulkan();
+    ~GatedDeltaWork_vulkan();
+    GatedDeltaWork_vulkan(const GatedDeltaWork_vulkan&) = delete;
+    GatedDeltaWork_vulkan& operator=(const GatedDeltaWork_vulkan&) = delete;
+    // Publish recurrent state and logical token counts only after a successful wait.
+    [[nodiscard]] bool commit() noexcept;
+    // A failed submit/wait may have partially changed authoritative device state.
+    void mark_submit_failed() noexcept;
+
+private:
+    friend class GatedDeltaNet_vulkan;
+    class Implementation;
     std::unique_ptr<Implementation> d;
 };
 
@@ -113,6 +132,16 @@ public:
                                               ActivationBuffer& projected) const;
     [[nodiscard]] bool has_input_rms_norm() const noexcept;
     [[nodiscard]] GatedDeltaBatchResult_vulkan forward_batch(std::span<const GatedDeltaBatchEntry_vulkan> entries) const;
+#if NCNN_MOE_WITH_VULKAN
+    // The caller holds the context command lock and retains work through submit/wait.
+    // Discarding an unsubmitted recording leaves logical cache metadata unchanged.
+    [[nodiscard]] bool record_forward(const ncnn::VkMat& input, LayerCache& cache,
+                                      size_t token_count, ncnn::VkMat& projected,
+                                      ncnn::VkCompute& command, GatedDeltaWork_vulkan& work,
+                                      bool apply_input_rms_norm = false) const;
+    [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
+    [[nodiscard]] const ncnn::Option& option() const noexcept;
+#endif
 
 private:
     class Implementation;

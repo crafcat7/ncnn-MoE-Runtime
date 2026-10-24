@@ -333,7 +333,7 @@ static bool use_vulkan_attention(const CompiledModel& compiled,
     {
         return false;
     }
-    return support_vulkan_attention(compiled.operators, attention);
+    return compiled.qwen_device_chain || support_vulkan_attention(compiled.operators, attention);
 }
 
 static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,

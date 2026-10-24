@@ -54,6 +54,9 @@ set(NCNN_MOE_SOURCES
     src/backends/ncnn/expertbackend_vulkan.cpp
     src/backends/ncnn/experttransfer_vulkan.cpp
     src/backends/ncnn/gateddeltanet_vulkan.cpp
+    src/backends/ncnn/gatedresidual_vulkan.cpp
+    src/backends/ncnn/qwenlayer_vulkan.cpp
+    src/backends/ncnn/qsaattention_vulkan.cpp
     src/backends/ncnn/hyperconnection_vulkan.cpp
     src/backends/ncnn/rmsnorm_vulkan.cpp
     src/backends/ncnn/router_vulkan.cpp
@@ -379,6 +382,14 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/float8_rms_norm_quantize.comp
         src/kernels/vulkan/float8_swiglu_quantize.comp
         src/kernels/vulkan/gated_delta_net.comp
+        src/kernels/vulkan/qwen_elementwise.comp
+        src/kernels/vulkan/qsa_norm_rope.comp
+        src/kernels/vulkan/qsa_cache_write.comp
+        src/kernels/vulkan/qsa_pool.comp
+        src/kernels/vulkan/qsa_scores.comp
+        src/kernels/vulkan/qsa_select.comp
+        src/kernels/vulkan/qsa_attention.comp
+        src/kernels/vulkan/qsa_copy.comp
         src/kernels/vulkan/activation_rms_norm.comp
         src/kernels/vulkan/hyper_connection_project.comp
         src/kernels/vulkan/hyper_connection_mix.comp
@@ -581,7 +592,7 @@ if(NCNN_MOE_BUILD_TESTS)
     add_test(NAME ncnn_moe_latent_vulkan_test COMMAND ncnn_moe_latent_vulkan_test)
     set_tests_properties(ncnn_moe_latent_vulkan_test PROPERTIES SKIP_RETURN_CODE 77)
 
-    foreach(NCNN_MOE_VULKAN_TEST IN ITEMS hyperconnection router latent_layer shared_expert moe_combine latent_index int4 float8_row_scales q8_0 gguf_blocks)
+    foreach(NCNN_MOE_VULKAN_TEST IN ITEMS hyperconnection router latent_layer shared_expert moe_combine latent_index int4 float8_row_scales q8_0 gguf_blocks qsa qwen_layer)
         add_executable(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test tests/test_${NCNN_MOE_VULKAN_TEST}_vulkan.cpp)
         target_link_libraries(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE ncnn::moe)
         target_compile_features(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE cxx_std_20)

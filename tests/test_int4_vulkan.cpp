@@ -577,8 +577,9 @@ static void test_int4_gpu_gated_delta()
         compare(gpu_convolution, cpu_cache[0].gated_delta_convolution);
         compare(gpu_recurrent, cpu_cache[0].gated_delta_recurrent);
     };
-    // The existing scheduler initializes device recurrence with a one-token
-    // call, then retains that state for batched continuation and transactions.
+    // A fresh multi-row prefill must initialize authoritative device state.
+    execute(3);
+    compare_state();
     execute(1);
     compare_state();
     const auto* persistent = gpu_cache[0].gated_delta_device_state.get();
@@ -605,6 +606,136 @@ static void test_int4_gpu_gated_delta()
     execute(1);
     compare_state();
     int4_gpu_check(gpu_cache[0].gated_delta_device_state.get() == persistent, "native DeltaNet preserves its device state allocation");
+
+    // CPU state may precede GPU admission; the next multi-row call migrates it
+    // once and consumes every continuation row in the same device chain.
+    LayerCache migration_reference;
+    LayerCache migration_cache;
+    GatedDeltaScratch migration_scratch;
+    GatedDeltaScratch migration_gpu_scratch;
+    ActivationBuffer migration_expected;
+    ActivationBuffer migration_actual;
+    const ActivationBuffer migration_prefix = int4_gpu_input(2, hidden);
+    int4_gpu_check_result(forward_gated_delta(weights, operators, plan, ExecutionBackend::Cpu,
+                                              migration_reference, migration_scratch, migration_prefix,
+                                              migration_expected, OptimizationDefaultFlags),
+                          "CPU migration prefix");
+    migration_cache = migration_reference;
+    const ActivationBuffer migration_input = int4_gpu_input(3, hidden);
+    int4_gpu_check_result(forward_gated_delta(weights, operators, plan, ExecutionBackend::Cpu,
+                                              migration_reference, migration_scratch, migration_input,
+                                              migration_expected, OptimizationDefaultFlags),
+                          "CPU migration continuation");
+    int4_gpu_check_result(forward_gated_delta(weights, operators, plan, ExecutionBackend::Vulkan,
+                                              migration_cache, migration_gpu_scratch, migration_input,
+                                              migration_actual, OptimizationDefaultFlags),
+                          "GPU multi-row CPU-state migration");
+    int4_gpu_check_output(migration_actual, migration_expected, "migrated native DeltaNet continuation");
+    int4_gpu_check(migration_cache.gated_delta_token_count == 5 && migration_cache.gated_delta_device_state
+                       && migration_cache.gated_delta_convolution.empty() && migration_cache.gated_delta_recurrent.empty(),
+                   "GPU migration commits logical rows and releases CPU state");
+
+    const auto& context = operation->vulkan_context();
+    const auto& option = operation->option();
+    const ActivationBuffer recorded_input = int4_gpu_input(3, hidden);
+    LayerCache recorded_reference;
+    LayerCache recorded_cache;
+    GatedDeltaScratch recorded_reference_scratch;
+    ActivationBuffer recorded_expected;
+    ActivationBuffer recorded_actual(3, hidden);
+    int4_gpu_check_result(forward_gated_delta(weights, operators, plan, ExecutionBackend::Cpu,
+                                              recorded_reference, recorded_reference_scratch, recorded_input,
+                                              recorded_expected, OptimizationDefaultFlags),
+                          "recorded CPU prefill oracle");
+    const auto record_before = get_vulkan_statistics(runtime);
+    {
+        GatedDeltaWork_vulkan work;
+        auto lease = context->acquire_transfer_slot();
+        auto& slot = lease.slot();
+        int4_gpu_check(fill_staging_upload(recorded_input, slot.upload, slot.staging_allocator)
+                           && prepare_staging_batch(slot.download, 3, hidden, slot.staging_allocator),
+                       "record API staging fixture");
+        std::unique_lock<std::mutex> lock(context->command_mutex());
+        auto& command = *slot.command;
+        int4_gpu_check(!slot.command_used || command.reset() == 0, "reset record API command");
+        slot.command_used = true;
+        ncnn::VkMat device_input;
+        ncnn::VkMat device_output;
+        int4_gpu_check(record_mapped_upload(slot.upload, device_input, command, option), "record API input upload");
+        int4_gpu_check(operation->record_forward(device_input, recorded_cache, 3, device_output, command, work), "fresh device-only GDN recording");
+        const auto record_pending = get_vulkan_statistics(runtime);
+        int4_gpu_check(recorded_cache.gated_delta_token_count == 0
+                           && record_pending.gated_delta_fusions == record_before.gated_delta_fusions
+                           && record_pending.compute_submissions == record_before.compute_submissions,
+                       "recording does not publish token counts or GPU completion counters");
+        GatedDeltaWork_vulkan duplicate;
+        ncnn::VkMat duplicate_output;
+        int4_gpu_check(!operation->record_forward(device_input, recorded_cache, 3, duplicate_output, command, duplicate),
+                       "overlapping recordings of one recurrent state are rejected");
+        int4_gpu_check(record_prepared_activation_staging_download(device_output, 3, hidden, slot.download,
+                                                                   command, context->device(), option, DType::Float32),
+                       "record API output oracle readback");
+        int4_gpu_check(submit_compute_and_wait(command, context->device()) == 0, "submit recorded GDN prefill");
+        int4_gpu_check(work.commit() && !work.commit(), "GDN work commits exactly once");
+        int4_gpu_check(copy_staging_to_cpu_batch(slot.download, recorded_actual), "materialize GDN test oracle only");
+    }
+    int4_gpu_check_output(recorded_actual, recorded_expected, "recorded fresh prefill output");
+    const auto record_after = get_vulkan_statistics(runtime);
+    int4_gpu_check(recorded_cache.gated_delta_token_count == 3
+                       && record_after.gated_delta_fusions == record_before.gated_delta_fusions + 1
+                       && record_after.compute_submissions == record_before.compute_submissions
+                       && record_after.batch_uploads == record_before.batch_uploads
+                       && record_after.batch_downloads == record_before.batch_downloads,
+                   "record API leaves submission and activation transfer accounting to its caller");
+
+    LayerCache abandoned_cache;
+    {
+        GatedDeltaWork_vulkan work;
+        auto lease = context->acquire_transfer_slot();
+        auto& slot = lease.slot();
+        int4_gpu_check(fill_staging_upload(recorded_input, slot.upload, slot.staging_allocator), "abandoned record input");
+        std::unique_lock<std::mutex> lock(context->command_mutex());
+        auto& command = *slot.command;
+        int4_gpu_check(!slot.command_used || command.reset() == 0, "reset abandoned record command");
+        slot.command_used = true;
+        ncnn::VkMat device_input;
+        ncnn::VkMat device_output;
+        int4_gpu_check(record_mapped_upload(slot.upload, device_input, command, option)
+                           && operation->record_forward(device_input, abandoned_cache, 3, device_output, command, work),
+                       "record disposable fresh state");
+        int4_gpu_check(command.reset() == 0, "discard unsubmitted command before work storage");
+    }
+    int4_gpu_check(!abandoned_cache.gated_delta_device_state && abandoned_cache.gated_delta_token_count == 0
+                       && abandoned_cache.device_allocated_size == 0,
+                   "abandoned recording restores fresh cache ownership and logical metadata");
+
+    // A failed caller submit must poison existing authoritative state, rather
+    // than silently download it and execute a CPU approximation.
+    {
+        GatedDeltaWork_vulkan work;
+        auto lease = context->acquire_transfer_slot();
+        auto& slot = lease.slot();
+        int4_gpu_check(fill_staging_upload(recorded_input, slot.upload, slot.staging_allocator), "failed-submit record input");
+        std::unique_lock<std::mutex> lock(context->command_mutex());
+        auto& command = *slot.command;
+        int4_gpu_check(!slot.command_used || command.reset() == 0, "reset failed-submit record command");
+        slot.command_used = true;
+        ncnn::VkMat device_input;
+        ncnn::VkMat device_output;
+        int4_gpu_check(record_mapped_upload(slot.upload, device_input, command, option)
+                           && operation->record_forward(device_input, recorded_cache, 3, device_output, command, work),
+                       "record existing authoritative state");
+        work.mark_submit_failed();
+        int4_gpu_check(!work.commit() && command.reset() == 0, "failed work cannot publish a completion");
+    }
+    GatedDeltaScratch failed_scratch;
+    ActivationBuffer failed_output;
+    const auto failed = forward_gated_delta(weights, operators, plan, ExecutionBackend::Vulkan,
+                                            recorded_cache, failed_scratch, recorded_input, failed_output, OptimizationDefaultFlags);
+    int4_gpu_check(!failed && failed.error().code == ErrorCode::InternalError
+                       && recorded_cache.gated_delta_token_count == 3 && recorded_cache.gated_delta_device_state
+                       && recorded_cache.gated_delta_convolution.empty() && recorded_cache.gated_delta_recurrent.empty(),
+                   "failed Vulkan state never executes a silent CPU fallback");
 }
 
 #endif

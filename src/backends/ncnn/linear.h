@@ -92,6 +92,9 @@ private:
     friend class QnkExpert_vulkan;
     friend class LatentAttention_vulkan;
     friend class LayerHead_vulkan;
+    friend class QsaAttention_vulkan;
+    friend class QwenLayer_vulkan;
+    friend class GatedResidual_vulkan;
 
     // Wraps a completed unpacked FP32 device result without materializing it.
     [[nodiscard]] bool assign_completed(const ncnn::VkMat& value,
@@ -270,6 +273,10 @@ private:
     [[nodiscard]] static bool forward_batch(std::span<const Bfloat16Expert_vulkan*> experts,
                                             std::span<const ActivationBuffer*> inputs,
                                             std::span<ActivationBuffer*> outputs);
+    [[nodiscard]] bool record(const ncnn::VkMat& input, ncnn::VkMat& output,
+                              ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace,
+                              std::vector<ncnn::VkMat>& bindings,
+                              std::vector<ncnn::vk_constant_type>& constants) const;
     [[nodiscard]] uint32_t output_columns() const noexcept;
 
     class Implementation;
@@ -429,6 +436,9 @@ private:
     friend class GatedDeltaNet_vulkan;
     friend class HyperConnection_vulkan;
     friend class LayerHead_vulkan;
+    friend class QsaAttention_vulkan;
+    friend class QwenLayer_vulkan;
+    friend class GatedResidual_vulkan;
 
     friend class LatentAttention_vulkan;
     [[nodiscard]] bool record_forward(const ncnn::VkMat& input, ncnn::VkMat& output,
@@ -485,6 +495,8 @@ public:
                                                                            uint64_t optimization_flags);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
     [[nodiscard]] bool forward_device(const DeviceTensor_vulkan& input, DeviceTensor_vulkan& output) const;
+    [[nodiscard]] bool prepare_router_gate(const TensorData& weight);
+    [[nodiscard]] bool has_router_gate() const noexcept;
     [[nodiscard]] bool materialize(const DeviceTensor_vulkan& input, ActivationBuffer& output) const;
     [[nodiscard]] uint64_t device_bytes() const noexcept;
 

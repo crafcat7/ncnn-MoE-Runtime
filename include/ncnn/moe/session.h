@@ -89,6 +89,14 @@ struct SessionStatistics
     uint64_t prefill_tokens = 0;
     uint64_t decode_tokens = 0;
     uint64_t expert_assignments = 0;
+    uint64_t expert_cpu_batches = 0;
+    uint64_t expert_cpu_routes = 0;
+    uint64_t expert_gpu_routes = 0;
+    uint64_t expert_cpu_fallbacks = 0;
+    uint64_t vulkan_qwen_layers = 0;
+    uint64_t vulkan_gated_residual_blocks = 0;
+    uint64_t vulkan_ple_blocks = 0;
+    uint64_t model_compute_cpu_fallbacks = 0;
     uint64_t expert_batches = 0;
     uint64_t expert_batch_weight_bytes = 0;
     uint64_t expert_route_weight_bytes = 0;
@@ -206,6 +214,16 @@ struct RuntimeMetricCounters
 {
     uint64_t prefill_tokens = 0;
     uint64_t decode_tokens = 0;
+    uint64_t expert_assignments = 0;
+    uint64_t expert_batches = 0;
+    uint64_t expert_cpu_batches = 0;
+    uint64_t expert_cpu_routes = 0;
+    uint64_t expert_gpu_routes = 0;
+    uint64_t expert_cpu_fallbacks = 0;
+    uint64_t vulkan_qwen_layers = 0;
+    uint64_t vulkan_gated_residual_blocks = 0;
+    uint64_t vulkan_ple_blocks = 0;
+    uint64_t model_compute_cpu_fallbacks = 0;
     uint64_t speculative_proposals = 0;
     uint64_t speculative_draft_tokens = 0;
     uint64_t speculative_accepted_tokens = 0;

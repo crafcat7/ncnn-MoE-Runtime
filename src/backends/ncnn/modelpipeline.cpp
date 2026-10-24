@@ -11,9 +11,13 @@
 #include "rmsnorm_vulkan.h"
 #include "router_vulkan.h"
 #include "gateddeltanet_vulkan.h"
+#include "qsaattention_vulkan.h"
+#include "qwenlayer_vulkan.h"
+#include "expertbackend_vulkan.h"
 #include "graph/compiler.h"
 #include "engine/expert.h"
 #include "graph/compiledmodel.h"
+#include "ncnn/moe/session.h"
 #include "storage/weightstore.h"
 #include "vulkancontext.h"
 
@@ -286,6 +290,9 @@ bool support_vulkan_attention(const CompiledOperatorTable& operators,
     {
         return false;
     }
+    if (attention.vulkan_attention_operator != invalid_compiled_operator_handle
+        && operators.at(attention.vulkan_attention_operator).qsa_attention)
+        return true;
 
     if (attention.vulkan_attention_operator != invalid_compiled_operator_handle
         && operators.at(attention.vulkan_attention_operator).attention)
@@ -377,17 +384,6 @@ void release_vulkan_dense_host_copies(CompiledModel& compiled)
     // FP8 Shared Experts keep their CPU fallback despite resident Vulkan projections.
     std::vector<TensorHandle> shared_fallback_handles;
     const auto retain_shared = [&](const CompiledLayerPlan& layer) {
-        const AttentionBlockPlan& attention = layer.attention;
-        if (attention.kind == AttentionKind::GatedDeltaNet
-            && attention.gated_delta_vulkan_operator != invalid_compiled_operator_handle
-            && attention.fused_delta_input_operator == invalid_compiled_operator_handle)
-        {
-            // Fresh prefill uses the existing CPU recurrence policy. Quantized
-            // device projections may contain BF16 auxiliary matrices too.
-            for (TensorHandle handle : {attention.delta_qkv_weight, attention.delta_z_weight,
-                                        attention.delta_beta_weight, attention.delta_alpha_weight, attention.output_weight})
-                shared_fallback_handles.push_back(handle);
-        }
         if (!layer.moe.has_shared_expert)
             return;
         const ExpertPlan& shared = layer.moe.shared_expert;
@@ -850,9 +846,9 @@ static void prepare_gated_delta_attention_operators(CompiledModel& compiled,
         nullptr,
     };
     const TensorData& output_matrix = compiled.weights.at(plan.output_weight);
-    const auto quantized = [](const TensorData& weight) { return weight.dtype == DType::Int4 || is_qnk_dtype(weight.dtype); };
-    if (quantized(output_matrix)
-        || std::any_of(delta_input_matrices.begin(), delta_input_matrices.end(), [&](const TensorData* weight) { return quantized(*weight); }))
+    const auto native_projection = [](const TensorData& weight) { return weight.dtype == DType::Float32 || weight.dtype == DType::Int4 || is_qnk_dtype(weight.dtype); };
+    if (native_projection(output_matrix)
+        || std::any_of(delta_input_matrices.begin(), delta_input_matrices.end(), [&](const TensorData* weight) { return native_projection(*weight); }))
     {
         if (!has_flag(compiled.opt.optimization_flags, OptimizationVulkanQnK)
             && (is_qnk_dtype(output_matrix.dtype)
@@ -1687,6 +1683,288 @@ static Result<void> prepare_bounded_dense_qwen_pipeline(CompiledModel& compiled,
     return {};
 }
 
+static bool use_qwen_device_pipeline(const CompiledModel& compiled, const CompilerOption& opt) noexcept
+{
+    return compiled.opt.hybrid_mode == HybridMode::HybridExperts
+           && compiled.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual
+           && has_flag(opt.flags, BackendVulkanDense)
+           && has_flag(opt.flags, BackendVulkanAttention)
+           && has_flag(opt.flags, BackendVulkanExperts)
+           && has_flag(opt.optimization_flags, OptimizationVulkanAttention)
+           && has_flag(opt.optimization_flags, OptimizationVulkanQnK)
+           && has_flag(opt.optimization_flags, OptimizationVulkanExpertGpuPriority)
+           && has_flag(opt.optimization_flags, OptimizationVulkanCommandGraph);
+}
+
+static uint64_t qwen_pending_reserve(const CompiledModel& compiled, uint32_t device_index) noexcept
+{
+    const auto& descriptor = compiled.descriptor;
+    const uint64_t hidden = descriptor.hidden_size;
+    const uint64_t copies = descriptor.hyper_connection_multiplier;
+    const uint64_t expanded = saturating_multiply_u64(hidden, copies);
+    const uint64_t rank = descriptor.hyper_connection_low_rank;
+    const uint64_t concurrency = std::max(1u, compiled.opt.num_concurrent_sessions);
+    const uint64_t rows = std::max<uint64_t>(1, SessionOptions{}.prefill_chunk_size);
+    uint64_t capacity = 1;
+    while (capacity < rows)
+        capacity = saturating_multiply_u64(capacity, 2);
+
+    uint64_t peak_layer_elements = 0;
+    uint64_t persistent_states = 0;
+    uint64_t peak_initial_state = 0;
+    for (const CompiledLayerPlan& layer : compiled.graph.layer_plans)
+    {
+        if (layer.vulkan_device_index != device_index)
+            continue;
+        const auto& attention = layer.attention;
+        // Both GatedResidual pre calls retain normalized/mixed/projected/
+        // activated buffers until submission completes: 4E + 4R + 2H + 4M.
+        uint64_t elements = saturating_add_u64(saturating_multiply_u64(expanded, 4),
+                                               saturating_add_u64(saturating_multiply_u64(rank, 4),
+                                                                  saturating_add_u64(saturating_multiply_u64(hidden, 2), saturating_multiply_u64(copies, 4))));
+        // Previous combine outputs/residual, the original and device-cloned
+        // layer input, this layer's residual, and retained normalized/injection
+        // vectors overlap until the command completes.
+        elements = saturating_add_u64(elements,
+                                      saturating_add_u64(saturating_multiply_u64(expanded, 4),
+                                                         saturating_add_u64(saturating_multiply_u64(hidden, static_cast<uint64_t>(layer.moe.top_k) + 3), copies)));
+        const uint64_t expert_intermediate = saturating_multiply_u64(layer.moe.top_k,
+                                                                     saturating_multiply_u64(descriptor.intermediate_size, 2));
+        // Router projection/logits/selection-bias and compact ids/weights/status.
+        const uint64_t router = saturating_add_u64(saturating_multiply_u64(layer.moe.experts.size(), 3),
+                                                   saturating_add_u64(saturating_multiply_u64(layer.moe.top_k, 3), 1));
+        elements = saturating_add_u64(elements, saturating_add_u64(expert_intermediate, router));
+        if (attention.kind == AttentionKind::GatedDeltaNet)
+        {
+            const uint64_t key = saturating_multiply_u64(attention.kv_head_count, attention.head_dimension);
+            const uint64_t value = saturating_multiply_u64(attention.head_count, attention.value_head_dimension);
+            // Fused input, recurrent output, and output projection are live
+            // simultaneously while the GDN work ticket is pending.
+            elements = saturating_add_u64(elements,
+                                          saturating_add_u64(saturating_multiply_u64(key, 2),
+                                                             saturating_add_u64(saturating_multiply_u64(value, 3),
+                                                                                saturating_add_u64(saturating_multiply_u64(attention.head_count, 2), hidden))));
+            const uint64_t convolution = saturating_multiply_u64(saturating_add_u64(saturating_multiply_u64(key, 2), value),
+                                                                 attention.convolution_kernel_size);
+            const uint64_t recurrent = saturating_multiply_u64(saturating_multiply_u64(attention.head_count, attention.head_dimension),
+                                                               attention.value_head_dimension);
+            const uint64_t state = saturating_multiply_u64(saturating_add_u64(convolution, recurrent), sizeof(float));
+            persistent_states = saturating_add_u64(persistent_states, state);
+            // Fresh initialization additionally retains its zero/migration
+            // upload until the first command completes; layers execute in order.
+            peak_initial_state = std::max(peak_initial_state, state);
+        }
+        else if (attention.kind == AttentionKind::Standard)
+        {
+            const uint64_t query = saturating_multiply_u64(attention.head_count, attention.head_dimension);
+            const uint64_t key = saturating_multiply_u64(attention.kv_head_count, attention.head_dimension);
+            const uint64_t index = saturating_multiply_u64(static_cast<uint64_t>(attention.index_head_count) + 1,
+                                                           attention.index_head_dimension);
+            const uint64_t ratio = std::max<uint64_t>(1, attention.compression_ratio);
+            const uint64_t blocks = capacity / ratio + (capacity % ratio != 0);
+            elements = saturating_add_u64(elements,
+                                          saturating_add_u64(saturating_multiply_u64(query, 4),
+                                                             saturating_add_u64(saturating_multiply_u64(key, 3),
+                                                                                saturating_add_u64(saturating_multiply_u64(index, 2), saturating_add_u64(hidden, blocks + 2)))));
+            const uint64_t kv_element_size = attention.kv_cache_dtype == DType::BFloat16 ? sizeof(uint16_t) : sizeof(float);
+            const uint64_t kv = saturating_multiply_u64(saturating_multiply_u64(capacity, key), kv_element_size * 2);
+            const uint64_t index_state = saturating_multiply_u64(saturating_multiply_u64(capacity + std::max<uint64_t>(1, blocks),
+                                                                                         attention.index_head_dimension),
+                                                                 sizeof(float));
+            uint64_t state = saturating_add_u64(kv, index_state);
+            if (attention.vulkan_attention_operator != invalid_compiled_operator_handle)
+            {
+                const auto& qsa = compiled.operators.at(attention.vulkan_attention_operator).qsa_attention;
+                if (qsa)
+                    state = std::max(state, qsa->initial_state_bytes());
+            }
+            // A growing QSA cache keeps its old prefix and replacement buffers
+            // alive together through the fence. Reserve two default chunks,
+            // rather than the model's maximum context length.
+            persistent_states = saturating_add_u64(persistent_states, saturating_multiply_u64(state, 2));
+        }
+        if (layer.ple.enabled())
+        {
+            // Packed selected rows (bounded by FP32 embedding size), decoded
+            // embeddings, key/value and six expanded norm/gate/conv vectors.
+            elements = saturating_add_u64(elements,
+                                          saturating_add_u64(saturating_multiply_u64(expanded, 6),
+                                                             saturating_add_u64(saturating_multiply_u64(layer.ple.embedding_dimension, 2), hidden)));
+            const uint64_t history = saturating_multiply_u64(layer.ple.convolution_kernel_size - 1, layer.ple.ngram_size);
+            persistent_states = saturating_add_u64(persistent_states,
+                                                   saturating_multiply_u64(saturating_multiply_u64(history, expanded), sizeof(float)));
+        }
+        peak_layer_elements = std::max(peak_layer_elements, elements);
+    }
+    uint64_t workspace = saturating_multiply_u64(saturating_multiply_u64(peak_layer_elements, rows), sizeof(float));
+    if (device_index == compiled.opt.vulkan_device_index)
+    {
+        // Ordinary prefill requests only the final row's logits. Its head
+        // temporaries can coexist with the final layer's retained activations.
+        const uint64_t head = saturating_add_u64(descriptor.vocabulary_size,
+                                                 saturating_add_u64(saturating_multiply_u64(expanded, 2),
+                                                                    saturating_add_u64(saturating_multiply_u64(rank, 2), saturating_multiply_u64(hidden, 2))));
+        workspace = saturating_add_u64(workspace, saturating_multiply_u64(head, sizeof(float)));
+    }
+    // Each Expert allocator enforces a physical allocation ceiling at logical
+    // cache capacity plus at most 64 MiB. Fragmentation can exhaust that ceiling
+    // before the logical cache fills; it cannot consume the execution reserve.
+    const uint64_t expert_allocator_slack = (compiled.opt.expert_gpu_victim_cache_size != 0 ? 2 : 1) * UINT64_C(64) * 1024 * 1024;
+    return saturating_add_u64(expert_allocator_slack,
+                              saturating_multiply_u64(saturating_add_u64(persistent_states,
+                                                                         saturating_add_u64(peak_initial_state, workspace)),
+                                                      concurrency));
+}
+
+uint64_t qwen_device_pending_reserve(const CompiledModel& compiled, uint32_t device_index) noexcept
+{
+    return compiled.qwen_device_chain ? qwen_pending_reserve(compiled, device_index) : 0;
+}
+
+static uint64_t qwen_minimum_expert_reserve(const CompiledModel& compiled, uint32_t device_index)
+{
+    uint64_t required = 0;
+    for (const CompiledLayerPlan& layer : compiled.graph.layer_plans)
+    {
+        if (layer.vulkan_device_index != device_index)
+            continue;
+        uint64_t largest = 0;
+        for (const ExpertPlan& expert : layer.moe.experts)
+        {
+            const TensorHandle gate_handle = expert.gate_up_weight != invalid_tensor_handle ? expert.gate_up_weight : expert.gate_weight;
+            if (gate_handle == invalid_tensor_handle || expert.down_weight == invalid_tensor_handle)
+                continue;
+            const TensorData* up = expert.gate_up_weight == invalid_tensor_handle && expert.up_weight != invalid_tensor_handle
+                                       ? &compiled.weights.at(expert.up_weight)
+                                       : nullptr;
+            uint64_t bytes = native_quantized_expert_storage_bytes(compiled.weights.at(gate_handle), up,
+                                                                   compiled.weights.at(expert.down_weight), device_index,
+                                                                   compiled.vulkan_runtime, compiled.opt.optimization_flags);
+            // Non-native Expert backends still reserve their declared complete
+            // pair, rather than discounting a CPU/file-backed representation.
+            if (bytes == 0)
+                bytes = expert.weight_size;
+            largest = std::max(largest, bytes);
+        }
+        required = std::max(required, saturating_multiply_u64(largest, layer.moe.top_k));
+    }
+    return saturating_multiply_u64(required, std::max(1u, compiled.opt.num_concurrent_sessions));
+}
+
+static Result<void> check_qwen_device_budget(const CompiledModel& compiled, const CompilerOption& opt,
+                                             uint32_t device_index, uint64_t minimum_experts)
+{
+#if NCNN_MOE_WITH_VULKAN
+    auto context = VulkanContext::acquire(device_index, compiled.vulkan_runtime, compiled.opt.optimization_flags);
+    if (!context)
+        return Error{ErrorCode::UnsupportedModel, "Qwen device execution requires an available Vulkan context"};
+    const uint64_t live_budget = static_cast<uint64_t>(context->device()->get_heap_budget()) * 1024 * 1024;
+    const uint64_t usage = static_cast<uint64_t>(context->device()->get_heap_usage()) * 1024 * 1024;
+    const uint64_t budget = opt.gpu_heap_budget == 0 ? live_budget : std::min(live_budget, opt.gpu_heap_budget);
+    // The live query includes all persistent operator allocations, including
+    // allocator block/slack bytes. Only state/work and the still-unallocated
+    // executable Expert cache must be added; do not charge weights twice.
+    const uint64_t pending = qwen_pending_reserve(compiled, device_index);
+    const uint64_t experts = std::max(minimum_experts, opt.gpu_expert_cache_reserve);
+    const uint64_t reserve = saturating_add_u64(pending, experts);
+    if (budget == 0 || usage >= budget || reserve > budget - usage)
+        return Error{ErrorCode::InvalidArgument, "Qwen Vulkan persistent weights and minimum working set exceed the GPU heap budget on device "
+                                                     + std::to_string(device_index) + " (usage=" + std::to_string(usage)
+                                                     + ", pending=" + std::to_string(pending) + ", experts=" + std::to_string(experts)
+                                                     + ", budget=" + std::to_string(budget) + ")"};
+    return {};
+#else
+    (void)compiled;
+    (void)opt;
+    (void)device_index;
+    (void)minimum_experts;
+    return Error{ErrorCode::UnsupportedModel, "Qwen device execution requires Vulkan"};
+#endif
+}
+
+static Result<void> prepare_qwen_device_pipeline(CompiledModel& compiled, const CompilerOption& opt)
+{
+    for (TensorHandle handle = 0; handle < compiled.weights.size(); ++handle)
+        if (compiled.weights.at(handle).dtype == DType::Float8E4M3)
+            return Error{ErrorCode::UnsupportedModel, "continuous Qwen Vulkan execution does not support FP8 model weights"};
+    for (const auto& layer : compiled.graph.layer_plans)
+    {
+        if (layer.vulkan_device_index != compiled.opt.vulkan_device_index)
+            return Error{ErrorCode::UnsupportedModel, "Qwen device execution requires all layers and the output head on one Vulkan device"};
+    }
+    std::map<uint32_t, uint64_t> expert_reserves;
+    expert_reserves.emplace(compiled.opt.vulkan_device_index, 0);
+    for (const auto& layer : compiled.graph.layer_plans)
+        expert_reserves.emplace(layer.vulkan_device_index, 0);
+    for (auto& [device, reserve] : expert_reserves)
+    {
+        reserve = qwen_minimum_expert_reserve(compiled, device);
+        auto checked = check_qwen_device_budget(compiled, opt, device, reserve);
+        if (!checked)
+            return checked.error();
+    }
+    auto head = QnkLinear_vulkan::create(compiled.weights.at(compiled.lm_head_weight), nullptr,
+                                         compiled.opt.vulkan_device_index, compiled.vulkan_runtime,
+                                         compiled.opt.optimization_flags);
+    if (!head)
+        return Error{ErrorCode::InternalError, "failed to create the required native Vulkan Qwen LM head"};
+    compiled.operators.at_weight_mutable(compiled.lm_head_weight).qnk = std::move(head);
+    compiled.qwen_device_head = QwenLayer_vulkan::create_head(compiled);
+    if (!compiled.qwen_device_head)
+        return Error{ErrorCode::InternalError, "failed to create the required Vulkan Qwen output head"};
+    for (CompiledLayerPlan& layer : compiled.graph.layer_plans)
+    {
+        auto& attention = layer.attention;
+        if (attention.kind == AttentionKind::GatedDeltaNet)
+        {
+            prepare_gated_delta_attention_operators(compiled, layer);
+            if (!support_vulkan_attention(compiled.operators, attention))
+                return Error{ErrorCode::InternalError, "failed to create required Vulkan Gated DeltaNet at layer " + std::to_string(layer.layer_id)};
+        }
+        else if (attention.kind == AttentionKind::Standard)
+        {
+            auto qsa = QsaAttention_vulkan::create(compiled.weights, attention, layer.vulkan_device_index,
+                                                   compiled.vulkan_runtime, compiled.opt.optimization_flags);
+            if (!qsa)
+                return Error{ErrorCode::UnsupportedModel, "failed to create required Vulkan QSA at layer " + std::to_string(layer.layer_id)};
+            const auto handle = compiled.operators.allocate();
+            compiled.operators.at_mutable(handle).qsa_attention = std::move(qsa);
+            attention.vulkan_attention_operator = handle;
+        }
+        else
+            return Error{ErrorCode::UnsupportedModel, "Qwen device execution requires Gated DeltaNet or QSA attention"};
+        if (layer.moe.has_shared_expert)
+        {
+            auto& plan = layer.moe.shared_expert;
+            auto shared = QnkExpert_vulkan::create_separate(compiled.weights.at(plan.gate_weight), nullptr,
+                                                            compiled.weights.at(plan.up_weight), nullptr,
+                                                            compiled.weights.at(plan.down_weight), nullptr,
+                                                            plan.activation_limit, layer.vulkan_device_index, plan.activation,
+                                                            compiled.vulkan_runtime, compiled.opt.optimization_flags);
+            if (!shared || (layer.moe.shared_expert_gate_weight != invalid_tensor_handle && !shared->prepare_router_gate(compiled.weights.at(layer.moe.shared_expert_gate_weight))))
+                return Error{ErrorCode::InternalError, "failed to create required Vulkan Qwen shared Expert at layer " + std::to_string(layer.layer_id)};
+            const auto handle = compiled.operators.allocate();
+            compiled.operators.at_mutable(handle).qnk_expert = std::move(shared);
+            plan.vulkan_operator = handle;
+        }
+        auto operation = QwenLayer_vulkan::create(compiled, layer);
+        if (!operation)
+            return Error{ErrorCode::InternalError, "failed to create required Vulkan Qwen device layer " + std::to_string(layer.layer_id)};
+        compiled.operators.at_weight_mutable(attention.output_weight).qwen_layer = std::move(operation);
+        auto checked = check_qwen_device_budget(compiled, opt, layer.vulkan_device_index, expert_reserves.at(layer.vulkan_device_index));
+        if (!checked)
+            return checked.error();
+    }
+    for (const auto& [device, reserve] : expert_reserves)
+    {
+        auto checked = check_qwen_device_budget(compiled, opt, device, reserve);
+        if (!checked)
+            return checked.error();
+    }
+    compiled.qwen_device_chain = true;
+    return {};
+}
+
 Result<void> prepare_model_pipeline(CompiledModel& compiled,
                                     const CompilerOption& opt)
 {
@@ -1695,6 +1973,8 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled,
     compiled.operators.bind_weight_count(compiled.weights.size());
     if (compiled.opt.hybrid_mode == HybridMode::CpuOnly)
         return {};
+    if (use_qwen_device_pipeline(compiled, opt))
+        return prepare_qwen_device_pipeline(compiled, opt);
     if (use_bounded_dense_qwen_pipeline(compiled))
         return prepare_bounded_dense_qwen_pipeline(compiled, opt);
 

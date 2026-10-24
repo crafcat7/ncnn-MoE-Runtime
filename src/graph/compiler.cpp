@@ -1179,6 +1179,13 @@ static Result<void> finalize_expert(WeightStore& weights,
     const TensorData* down_weight = expert.down_weight != invalid_tensor_handle
                                         ? &weights.at(expert.down_weight)
                                         : nullptr;
+    if (expert.gate_up_weight != invalid_tensor_handle && gate_up_weight && down_weight
+        && (gate_up_weight->dtype == DType::Float32 || down_weight->dtype == DType::Float32))
+    {
+        // Native floating Experts use the same packed-layout metadata as
+        // quantized projections; the source rows are never rearranged.
+        weights.at_mutable(expert.gate_up_weight).qnk_interleave_rows = expert.layout == ExpertLayout::InterleavedGateUpDown;
+    }
     const bool has_qnk_weight = (gate_up_weight && is_qnk_dtype(gate_up_weight->dtype))
                                 || (expert.up_weight != invalid_tensor_handle
                                     && is_qnk_dtype(weights.at(expert.up_weight).dtype))
@@ -1232,6 +1239,17 @@ static Result<void> finalize_expert(WeightStore& weights,
                 && quantized(weights.at(expert.up_weight).dtype)))
         {
             expert.cache_key = "quantized:" + prefix;
+        }
+        else
+        {
+            const auto resident = [](const TensorData* weight) {
+                return weight && (weight->dtype == DType::BFloat16 || weight->dtype == DType::Float32 || weight->dtype == DType::MxFp4);
+            };
+            if (resident(gate_up_weight) && resident(down_weight)
+                && (expert.up_weight == invalid_tensor_handle || resident(&weights.at(expert.up_weight))))
+            {
+                expert.cache_key = "resident:" + prefix;
+            }
         }
     }
     return {};

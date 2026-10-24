@@ -233,6 +233,94 @@ def q8_0_copy(baseline: Path, source: Path, directory: Path, label: str) -> tupl
     return decoded_baseline, destination
 
 
+def flash_next_blocks_copy(fixture, directory: Path) -> tuple[Path, Path]:
+    """Actual Flash-Next roles: IQ4_NL PLE rows and mixed Q5_1 Expert down banks."""
+    gguf = fixtures.gguf
+    reader = gguf.GGUFReader(fixture.source)
+    architecture = reader.fields["general.architecture"].contents()
+    assert architecture == "qwen4exp"
+    destination = directory / "flash-next-blocks.gguf"
+    writer = gguf.GGUFWriter(destination, architecture)
+    for name, field in reader.fields.items():
+        if not name.startswith("GGUF.") and name != "general.architecture":
+            writer.add_key_value(name, field.contents(), field.types[0], field.types[-1] if len(field.types) > 1 else None)
+    reference = {name: (info.dtype, info.read().copy())
+                 for name, info in fixtures.importer.scan_safetensors(fixture.baseline).items()}
+    ple_shards = sorted(name for name in reference if re.fullmatch(
+        re.escape(fixtures.PREFIX) + r"layers\.\d+\.ple\.ple_embedding\.ngram_embedding\.shard_\d+\.weight", name))
+    assert len(ple_shards) == 2 and [reference[name][1].shape[0] for name in ple_shards] == [4, 4]
+    converted = set()
+    for index, tensor in enumerate(reader.tensors):
+        down = re.fullmatch(r"blk\.(\d+)\.ffn_down_exps\.weight", tensor.name)
+        ple = tensor.name == "per_layer_token_embd.weight"
+        if not ple and not down:
+            writer.add_tensor(tensor.name, np.array(tensor.data), raw_dtype=tensor.tensor_type)
+            continue
+        shape = tuple(int(value) for value in tensor.shape[::-1])
+        assert shape[-1] % 32 == 0 and len(shape) == (2 if ple else 3)
+        block_shape = (*shape[:-1], shape[-1] // 32)
+        block_index = np.arange(np.prod(block_shape)).reshape(block_shape)
+        # Small power-of-two scales make every decoded value exactly BF16.
+        scales = np.exp2(-9 - block_index % 3).astype("<f2")
+        values = np.arange(np.prod(shape)).reshape(*block_shape, 32)
+        codes = ((values + block_index[..., None] * 5 + index) % (16 if ple else 32)).astype(np.uint8)
+        if ple:
+            dtype = gguf.GGMLQuantizationType.IQ4_NL
+            scales = np.where(block_index % 3 == 1, -scales, scales).astype("<f2")
+            raw = np.empty((*block_shape, 18), np.uint8)
+            raw[..., :2] = scales.view(np.uint8).reshape(*block_shape, 2)
+            raw[..., 2:] = codes[..., :16] | (codes[..., 16:] << 4)
+        else:
+            dtype = gguf.GGMLQuantizationType.Q5_1
+            minimum = (-16 * scales.astype(np.float32)).astype("<f2")
+            raw = np.empty((*block_shape, 24), np.uint8)
+            raw[..., :2] = scales.view(np.uint8).reshape(*block_shape, 2)
+            raw[..., 2:4] = minimum.view(np.uint8).reshape(*block_shape, 2)
+            raw[..., 4:8] = np.packbits(codes >> 4, axis=-1, bitorder="little")
+            raw[..., 8:] = (codes[..., :16] & 15) | (codes[..., 16:] << 4)
+        packed = raw.reshape(*shape[:-1], -1)
+        writer.add_tensor(tensor.name, packed, raw_dtype=dtype)
+        # The upstream GGUF decoder supplies the reference, independently of
+        # the runtime's block decoder, row fetch, transforms and cache paths.
+        decoded = gguf.dequantize(packed, dtype).reshape(shape)
+        assert np.any(decoded != 0)
+        if down:
+            np.testing.assert_array_equal(decoded.reshape(*block_shape, 32),
+                                          scales.astype(np.float32)[..., None] * (codes.astype(np.float32) - 16))
+        rounded = fixtures.bfloat16(decoded)
+        np.testing.assert_array_equal(fixtures.float32(rounded), decoded)
+        if ple:
+            offset = 0
+            for name in ple_shards:
+                rows, columns = reference[name][1].shape
+                assert columns == shape[1]
+                reference[name] = ("BF16", rounded[offset:offset + rows].copy())
+                offset += rows
+            assert offset == shape[0] and not np.array_equal(rounded[0], rounded[4])
+        else:
+            for expert in range(shape[0]):
+                name = f"{fixtures.PREFIX}layers.{down[1]}.mlp.experts.{expert}.down_proj.weight"
+                reference[name] = ("BF16", rounded[expert])
+        converted.add(tensor.name)
+    assert converted == {"per_layer_token_embd.weight", "blk.0.ffn_down_exps.weight", "blk.1.ffn_down_exps.weight"}
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    mixed = gguf.GGUFReader(destination)
+    observed = {tensor.name: tensor.tensor_type for tensor in mixed.tensors}
+    assert observed["per_layer_token_embd.weight"] == gguf.GGMLQuantizationType.IQ4_NL
+    for layer in range(2):
+        assert observed[f"blk.{layer}.ffn_down_exps.weight"] == gguf.GGMLQuantizationType.Q5_1
+        assert observed[f"blk.{layer}.ffn_gate_exps.weight"] == gguf.GGMLQuantizationType.Q4_K
+        assert observed[f"blk.{layer}.ffn_up_exps.weight"] == gguf.GGMLQuantizationType.Q4_K
+    assert gguf.GGMLQuantizationType.Q6_K in observed.values()
+    baseline = directory / "flash-next-blocks-baseline"
+    fixtures.assets(baseline, json.loads((fixture.baseline / "config.json").read_text()))
+    fixtures.write_safetensors(baseline / "model.safetensors", reference)
+    return baseline, destination
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runner", type=Path, required=True)
@@ -261,6 +349,18 @@ def main() -> int:
             def writer(path, architecture, *extra, **kwargs):
                 result = real_writer(path, architecture, *extra, **kwargs)
                 add_metadata(result, architecture, model)
+                add_tensor = result.add_tensor
+
+                def tensor(name, values, *tensor_args, **tensor_kwargs):
+                    # GGML Qwen shared router gates omit their singleton output
+                    # row. Keep the independent HF oracle as [1, hidden].
+                    if (architecture == "qwen4exp" and name.endswith(".ffn_gate_inp_shexp.weight")
+                            and values.dtype == np.float32):
+                        assert values.shape == (1, model["text_config"]["hidden_size"])
+                        values = values.reshape(-1)
+                    return add_tensor(name, values, *tensor_args, **tensor_kwargs)
+
+                result.add_tensor = tensor
                 return result
 
             directory = root / label
@@ -268,6 +368,11 @@ def main() -> int:
             with patch.object(fixtures.gguf, "GGUFWriter", writer), patch.object(fixtures, "family_tensors", family_tensors):
                 fixture = (fixtures.prepare_family_gguf(directory, family, fp32=False) if family
                            else fixtures.prepare_gguf(directory, moe, reordered, fp32=False))
+            if label == "qwen4_exp":
+                gates = [tensor for tensor in fixtures.gguf.GGUFReader(fixture.source).tensors
+                         if tensor.name.endswith(".ffn_gate_inp_shexp.weight")]
+                assert len(gates) == 2 and all(tuple(tensor.shape) == (model["text_config"]["hidden_size"],)
+                                               for tensor in gates)
             for source in (fixture.source, directory / "floating.gguf"):
                 if source != fixture.source:
                     floating_copy(fixture.source, source)
@@ -306,6 +411,20 @@ def main() -> int:
                             if completed.returncode == 77:
                                 return 77
                             completed.check_returncode()
+                if family == "qwen4_exp":
+                    baseline, source = flash_next_blocks_copy(fixture, directory)
+                    for on_demand in (False, True):
+                        command = [str(args.runner.resolve()), str(baseline), str(source)]
+                        if on_demand:
+                            command.append("--on-demand")
+                        if args.hybrid:
+                            command.append("--hybrid")
+                        mode = "on-demand" if on_demand else "eager"
+                        print(f"Checking {label}: IQ4_NL PLE and mixed Q5_1 Experts with {mode} memory", flush=True)
+                        completed = subprocess.run(command)
+                        if completed.returncode == 77:
+                            return 77
+                        completed.check_returncode()
     return 0
 
 
