@@ -3113,6 +3113,7 @@ void ExpertCache::worker_loop()
             }
         }
 
+        const uint32_t completed_jobs = static_cast<uint32_t>(batch.size());
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (coalesced)
@@ -3181,10 +3182,10 @@ void ExpertCache::worker_loop()
                     mapped_bytes += entry_mapped_sizes[index];
                 }
             }
-            active_jobs -= static_cast<uint32_t>(batch.size());
-            if (high_priority.empty() && low_priority.empty() && active_jobs == 0)
-                idle.notify_all();
         }
+        // Releasing a batch may destroy failed/discarded payloads and residency
+        // tokens, so keep cleanup outside the cache lock. Its Entry pins must
+        // disappear before idle observers can immediately evict a ready entry.
         batch.clear();
         loaded_pairs.clear();
         errors.clear();
@@ -3193,6 +3194,12 @@ void ExpertCache::worker_loop()
         entry_mapped_sizes.clear();
         disk_entries.clear();
         disk_slots.clear();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            active_jobs -= completed_jobs;
+            if (high_priority.empty() && low_priority.empty() && active_jobs == 0)
+                idle.notify_all();
+        }
         ready.notify_all();
     }
 }
