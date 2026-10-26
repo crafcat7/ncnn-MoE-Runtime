@@ -515,9 +515,9 @@ static Result<std::array<int64_t, 3>> read_quantized_shape(const SafetensorsArch
 }
 
 static Result<QuantizedTensorInfo> tensor_encoding(const SafetensorsArchive& archive,
-                                                   const std::string& name)
+                                                   const std::string& name,
+                                                   const SafetensorInfo* source)
 {
-    const SafetensorInfo* source = archive.find(name);
     if (!source)
         return Error{ErrorCode::InvalidModel, "missing safetensors tensor: " + name};
     if (source->ggml_type == 2 || source->ggml_type == 3 || source->ggml_type == 6
@@ -635,7 +635,7 @@ Result<DType> SafetensorsArchive::tensor_dtype(const std::string& name) const
             return info.error();
         return DType::Int4;
     }
-    auto encoding = tensor_encoding(*this, name);
+    auto encoding = tensor_encoding(*this, name, find(name));
     if (!encoding)
         return encoding.error();
     if ((!source_quantization_method.empty() || gguf_source) && encoding.value().dtype == DType::Float32)
@@ -656,7 +656,7 @@ std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(const std::string
     {
         try
         {
-            auto encoding = tensor_encoding(*this, name);
+            auto encoding = tensor_encoding(*this, name, source);
             if (encoding && encoding.value().rows == rows && encoding.value().columns == columns
                 && qnk_storage_bytes(encoding.value().dtype, rows, columns) <= UINT64_MAX / expert_count
                 && source->size == qnk_storage_bytes(encoding.value().dtype, rows, columns) * expert_count)
@@ -886,14 +886,15 @@ Result<TensorData> SafetensorsArchive::load_float32_tensor(const std::string& na
 
 Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name, uint32_t flags) const
 {
-    if (const auto* info = find(name); info && info->transform)
+    const SafetensorInfo* info = find(name);
+    if (info && info->transform)
     {
         if (has_flag(flags, SafetensorLoadDeferMxfp4Data)
             && (info->ggml_type == 2 || info->ggml_type == 3 || info->ggml_type == 6
                 || info->ggml_type == 7 || info->ggml_type == 8 || info->ggml_type == 20 || info->ggml_type == 23
                 || (info->ggml_type >= 10 && info->ggml_type <= 15)))
         {
-            auto encoding = tensor_encoding(*this, name);
+            auto encoding = tensor_encoding(*this, name, info);
             if (!encoding)
                 return encoding.error();
             if (is_qnk_dtype(encoding.value().dtype))
@@ -904,8 +905,7 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name, uint
     const std::string prefix = source_quantized_prefix(name);
     if (!prefix.empty() && find(prefix + "qweight"))
         return load_source_int4_tensor(name);
-    const SafetensorInfo* source_info = find(name);
-    if (source_info && source_info->dtype == "F8_E4M3")
+    if (info && info->dtype == "F8_E4M3")
     {
         const std::string base = name.ends_with(".weight") ? name.substr(0, name.size() - 7) : name;
         for (const std::string& scale_name : {base + ".scale", base + ".weight_scale_inv", name + "_scale_inv"})
@@ -915,13 +915,11 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name, uint
         }
         return Error{ErrorCode::InvalidModel, "missing blockwise FP8 scale: " + name};
     }
-    auto encoding = tensor_encoding(*this, name);
+    auto encoding = tensor_encoding(*this, name, info);
     if (!encoding)
         return encoding.error();
     if (is_qnk_dtype(encoding.value().dtype))
         return load_qnk_tensor(name, encoding.value().dtype, encoding.value().rows, encoding.value().columns, flags);
-    const SafetensorInfo* info = find(name);
-
     TensorData tensor;
     tensor.shape = info->shape;
     if (info->dtype == "MXFP4")
@@ -1455,15 +1453,16 @@ Result<TensorData> SafetensorsArchive::load_qnk_tensor(const std::string& name,
                                                        uint32_t columns,
                                                        uint32_t flags) const
 {
-    if (const auto* info = find(name); info && info->transform)
+    const SafetensorInfo* source = find(name);
+    if (source && source->transform)
     {
         if (has_flag(flags, SafetensorLoadDeferMxfp4Data))
         {
-            auto deferred = defer_gguf_qnk(*info, dtype, rows, columns);
+            auto deferred = defer_gguf_qnk(*source, dtype, rows, columns);
             if (deferred || deferred.error().code != ErrorCode::UnsupportedModel)
                 return deferred;
         }
-        auto tensor = load_gguf_tensor(*info);
+        auto tensor = load_gguf_tensor(*source);
         if (!tensor)
             return tensor.error();
         if (tensor.value().dtype != dtype || tensor.value().shape != std::vector<uint32_t>{rows, columns})
@@ -1474,14 +1473,13 @@ Result<TensorData> SafetensorsArchive::load_qnk_tensor(const std::string& name,
         return Error{ErrorCode::InvalidArgument, "invalid Qn_K tensor shape: " + name};
     if (find(name + ".__qnk_shape") || find(name + ".__qnk_columns"))
     {
-        auto encoding = tensor_encoding(*this, name);
+        auto encoding = tensor_encoding(*this, name, source);
         if (!encoding)
             return encoding.error();
         if (encoding.value().dtype != dtype || encoding.value().rows != rows || encoding.value().columns != columns)
             return Error{ErrorCode::InvalidModel, "Qn_K tensor metadata disagrees with requested matrix shape: " + name};
     }
     const uint64_t expected_size = qnk_storage_bytes(dtype, rows, columns);
-    const SafetensorInfo* source = find(name);
     if (!source || source->dtype != "U8" || source->size != expected_size)
         return Error{ErrorCode::InvalidModel, "invalid Qn_K safetensors tensor: " + name};
     if (source->ggml_type != UINT32_MAX && !qnk_ggml_type_matches(source->ggml_type, dtype))

@@ -109,7 +109,6 @@ static Result<void> validate_graph(const ExecutionGraph& graph, std::vector<Exec
                                  || node.type == ExecutionNodeType::DenseFfn
                                  || node.type == ExecutionNodeType::Router
                                  || node.type == ExecutionNodeType::ExpertDispatch
-                                 || node.type == ExecutionNodeType::Expert
                                  || node.type == ExecutionNodeType::ExpertGroup
                                  || node.type == ExecutionNodeType::SharedExpertGroup
                                  || node.type == ExecutionNodeType::Combine;
@@ -149,20 +148,6 @@ static Result<void> validate_graph(const ExecutionGraph& graph, std::vector<Exec
                     ErrorCode::InvalidModel,
                     "execution graph contains an invalid weight input"};
             }
-        }
-        if (node.type == ExecutionNodeType::Expert
-            && (node.layer_plan_index == invalid_execution_layer_id
-                || node.expert_id == invalid_execution_expert_id
-                || !has_flag(node.flags, ExecutionNodeConditional)))
-        {
-            return Error{ErrorCode::InvalidModel, "execution graph Expert nodes require layer, expert, and conditional metadata"};
-        }
-        if ((node.type == ExecutionNodeType::ExpertGroup
-             || node.type == ExecutionNodeType::SharedExpertGroup)
-            && (node.layer_plan_index == invalid_execution_layer_id
-                || node.expert_id != invalid_execution_expert_id))
-        {
-            return Error{ErrorCode::InvalidModel, "execution graph ExpertGroup nodes require layer metadata and dynamic expert selection"};
         }
     }
 
@@ -296,7 +281,7 @@ static ExecutionTensorId add_tensor(ExecutionGraph& graph, std::string name, DTy
 }
 
 static ExecutionNodeId add_node(ExecutionGraph& graph, ExecutionNodeType type, ExecutionBackend backend, uint32_t backend_mask, std::string name, std::vector<ExecutionNodeId> dependencies, std::vector<ExecutionTensorId> inputs,
-                                std::vector<ExecutionTensorId> outputs, uint32_t layer_plan_index, uint32_t expert_id, uint32_t flags)
+                                std::vector<ExecutionTensorId> outputs, uint32_t layer_plan_index, uint32_t flags)
 {
     const ExecutionNodeId node_id = static_cast<ExecutionNodeId>(graph.nodes.size());
     ExecutionNode& node = graph.nodes.emplace_back();
@@ -305,7 +290,6 @@ static ExecutionNodeId add_node(ExecutionGraph& graph, ExecutionNodeType type, E
     node.backend = backend;
     node.backend_mask = backend_mask;
     node.layer_plan_index = layer_plan_index;
-    node.expert_id = expert_id;
     node.flags = flags;
     node.name = std::move(name);
     node.dependencies = std::move(dependencies);
@@ -352,7 +336,6 @@ static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
                                             {hidden},
                                             {router_scores},
                                             static_cast<uint32_t>(plan_index),
-                                            invalid_execution_expert_id,
                                             0);
     const ExecutionTensorId assignments = add_tensor(graph,
                                                      prefix + "expert_dispatch.assignments",
@@ -367,7 +350,6 @@ static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
                                               {router_scores},
                                               {assignments},
                                               static_cast<uint32_t>(plan_index),
-                                              invalid_execution_expert_id,
                                               0);
 
     const bool can_use_vulkan_experts = compiled.opt.hybrid_mode != HybridMode::CpuOnly
@@ -392,7 +374,6 @@ static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
                                                   {hidden, assignments},
                                                   {expert_output},
                                                   static_cast<uint32_t>(plan_index),
-                                                  invalid_execution_expert_id,
                                                   expert_flags);
 
     const ExecutionTensorId combined = add_tensor(graph,
@@ -421,7 +402,6 @@ static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
                                                      {hidden},
                                                      {shared_output},
                                                      static_cast<uint32_t>(plan_index),
-                                                     invalid_execution_expert_id,
                                                      0);
         if (shared_before_routed)
         {
@@ -440,7 +420,6 @@ static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
                                              std::move(combine_inputs),
                                              {combined},
                                              static_cast<uint32_t>(plan_index),
-                                             invalid_execution_expert_id,
                                              0);
     hidden = combined;
     return combine;
@@ -469,7 +448,6 @@ static Result<void> build_speculative_graph(CompiledModel& compiled,
                                         {},
                                         {hidden},
                                         invalid_execution_layer_id,
-                                        invalid_execution_expert_id,
                                         0);
     graph.nodes[previous].weight_inputs = {compiled.token_embedding};
 
@@ -513,7 +491,6 @@ static Result<void> build_speculative_graph(CompiledModel& compiled,
                                 {hidden},
                                 {attention_output, cache},
                                 static_cast<uint32_t>(plan_index),
-                                invalid_execution_expert_id,
                                 0);
             hidden = attention_output;
         }
@@ -608,7 +585,7 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
     graph.tensors.clear();
     ExecutionSchedule& schedule = compiled.schedule;
     ExecutionTensorId hidden = add_tensor(graph, "embedding.hidden", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size});
-    ExecutionNodeId previous = add_node(graph, ExecutionNodeType::TokenEmbedding, ExecutionBackend::Cpu, ExecutionBackendCpu, "token_embedding", {}, {}, {hidden}, invalid_execution_layer_id, invalid_execution_expert_id, 0);
+    ExecutionNodeId previous = add_node(graph, ExecutionNodeType::TokenEmbedding, ExecutionBackend::Cpu, ExecutionBackendCpu, "token_embedding", {}, {}, {hidden}, invalid_execution_layer_id, 0);
     graph.nodes[previous].weight_inputs = {compiled.token_embedding};
 
     for (size_t plan_index = 0; plan_index < graph.layer_plans.size(); ++plan_index)
@@ -642,7 +619,7 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
             const ExecutionTensorId attention_output = add_tensor(graph, prefix + "attention.hidden", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size});
             previous = add_node(graph, ExecutionNodeType::Attention, backend, backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, prefix + "attention",
                                 {previous}, {hidden}, {attention_output, cache},
-                                static_cast<uint32_t>(plan_index), invalid_execution_expert_id, 0);
+                                static_cast<uint32_t>(plan_index), 0);
             hidden = attention_output;
         }
 
@@ -656,7 +633,7 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
             previous = add_node(graph, ExecutionNodeType::DenseFfn, vulkan ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
                                 vulkan ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu,
                                 prefix + "ffn", {previous}, {hidden}, {output},
-                                static_cast<uint32_t>(plan_index), invalid_execution_expert_id, 0);
+                                static_cast<uint32_t>(plan_index), 0);
             hidden = output;
         }
         else
@@ -669,7 +646,7 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
     const ExecutionTensorId normalized = add_tensor(graph, "final_norm.hidden", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size});
     previous = add_node(graph, ExecutionNodeType::FinalNorm, ExecutionBackend::Cpu, ExecutionBackendCpu, "final_norm",
                         {previous}, {hidden}, {normalized},
-                        invalid_execution_layer_id, invalid_execution_expert_id, 0);
+                        invalid_execution_layer_id, 0);
     graph.nodes[previous].weight_inputs = compiled.final_norm_weight == invalid_tensor_handle
                                               ? std::vector<TensorHandle>{compiled.lm_head_weight}
                                               : std::vector<TensorHandle>{compiled.final_norm_weight,
@@ -683,7 +660,7 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
     const ExecutionTensorId logits = add_tensor(graph, "logits", DType::Float32, {0, compiled.descriptor.vocabulary_size});
     const ExecutionNodeId lm_head_node = add_node(graph, ExecutionNodeType::LmHead, lm_head_backend, lm_head_backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, "lm_head",
                                                   {previous}, {normalized}, {logits},
-                                                  invalid_execution_layer_id, invalid_execution_expert_id, 0);
+                                                  invalid_execution_layer_id, 0);
     graph.nodes[lm_head_node].weight_inputs = compiled.final_norm_weight == invalid_tensor_handle
                                                   ? std::vector<TensorHandle>{compiled.lm_head_weight}
                                                   : std::vector<TensorHandle>{compiled.lm_head_weight,

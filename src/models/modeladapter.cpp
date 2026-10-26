@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <exception>
@@ -348,43 +349,6 @@ bool parse_json_value(std::string_view json, size_t& position)
     }
 }
 
-static bool scan_json_array(const std::string& json,
-                            size_t& position,
-                            std::vector<std::string>& elements)
-{
-    if (position >= json.size() || json[position++] != '[')
-        return false;
-    position = skip_space(json, position);
-    if (position < json.size() && json[position] == ']')
-    {
-        ++position;
-        return true;
-    }
-
-    while (position < json.size())
-    {
-        position = skip_space(json, position);
-        const size_t value_start = position;
-        if (!parse_json_value(json, position))
-            return false;
-        elements.push_back(json.substr(value_start, position - value_start));
-        position = skip_space(json, position);
-        if (position >= json.size())
-            return false;
-        if (json[position] == ']')
-        {
-            ++position;
-            return true;
-        }
-        if (json[position++] != ',')
-            return false;
-        position = skip_space(json, position);
-        if (position >= json.size() || json[position] == ']')
-            return false;
-    }
-    return false;
-}
-
 std::optional<std::string_view> find_manifest_member(std::string_view json,
                                                      std::string_view key)
 {
@@ -441,16 +405,16 @@ std::optional<std::string> find_manifest_member(const std::string& json,
 
 Result<std::string> read_manifest_object(const std::string& json, const std::string& key, const char* prefix)
 {
-    const std::optional<std::string> value = find_manifest_member(json, key);
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
     if (!value)
         return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest is missing object field: " + key};
 
     if (value->empty() || (*value)[0] != '{')
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "object field: " + key};
-    return *value;
+    return std::string(*value);
 }
 
-static bool is_json_uint(const std::string& value) noexcept
+static bool is_json_uint(std::string_view value) noexcept
 {
     if (value.empty())
         return false;
@@ -468,28 +432,24 @@ static bool is_json_uint(const std::string& value) noexcept
 
 Result<uint32_t> read_manifest_uint32(const std::string& json, const std::string& key, const char* prefix)
 {
-    const std::optional<std::string> value = find_manifest_member(json, key);
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
     if (!value)
         return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest is missing integer field: " + key};
     if (!is_json_uint(*value))
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer field: " + key};
 
-    try
-    {
-        const unsigned long long parsed_value = std::stoull(*value);
-        if (parsed_value > std::numeric_limits<uint32_t>::max())
-            return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest integer is out of range: " + key};
-        return static_cast<uint32_t>(parsed_value);
-    }
-    catch (const std::exception&)
-    {
+    unsigned long long parsed_value = 0;
+    const auto parsed = std::from_chars(value->data(), value->data() + value->size(), parsed_value);
+    if (parsed.ec != std::errc() || parsed.ptr != value->data() + value->size())
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer field: " + key};
-    }
+    if (parsed_value > std::numeric_limits<uint32_t>::max())
+        return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest integer is out of range: " + key};
+    return static_cast<uint32_t>(parsed_value);
 }
 
 Result<std::string> read_manifest_string(const std::string& json, const std::string& key, const char* prefix)
 {
-    const std::optional<std::string> value = find_manifest_member(json, key);
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
     if (!value)
         return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest is missing string field: " + key};
 
@@ -507,15 +467,16 @@ Result<std::string> read_manifest_string(const std::string& json, const std::str
 
 Result<float> read_manifest_float(const std::string& json, const std::string& key, const char* prefix)
 {
-    const std::optional<std::string> value = find_manifest_member(json, key);
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
     if (!value)
         return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest is missing numeric field: " + key};
     if (!is_json_number(*value))
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "numeric field: " + key};
     try
     {
+        const std::string token(*value);
         size_t consumed = 0;
-        const float parsed_value = std::stof(*value, &consumed);
+        const float parsed_value = std::stof(token, &consumed);
         if (consumed != value->size() || !std::isfinite(parsed_value))
             return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "numeric field: " + key};
         return parsed_value;
@@ -528,7 +489,7 @@ Result<float> read_manifest_float(const std::string& json, const std::string& ke
 
 Result<bool> read_manifest_bool(const std::string& json, const std::string& key, const char* prefix)
 {
-    const std::optional<std::string> value = find_manifest_member(json, key);
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
     if (!value)
         return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest is missing boolean field: " + key};
     if (*value != "true" && *value != "false")
@@ -538,68 +499,85 @@ Result<bool> read_manifest_bool(const std::string& json, const std::string& key,
 
 Result<std::vector<uint32_t>> read_manifest_uint32_array(const std::string& json, const std::string& key, const char* prefix)
 {
-    const std::optional<std::string> value = find_manifest_member(json, key);
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
     if (!value)
         return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest is missing integer array: " + key};
 
-    std::vector<std::string> elements;
-    size_t position = 0;
-    if (!scan_json_array(*value, position, elements))
-        return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
-    position = skip_space(*value, position);
-    if (position != value->size())
+    // Member lookup validates the complete JSON value; this loop checks the array elements.
+    const std::string_view array = *value;
+    if (array.empty() || array.front() != '[')
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
 
     std::vector<uint32_t> result;
-    result.reserve(elements.size());
-    for (const std::string& element : elements)
+    size_t position = skip_space(array, 1);
+    if (position < array.size() && array[position] == ']')
+        return result;
+    for (;;)
     {
+        const size_t value_start = position;
+        while (position < array.size() && !is_space(array[position])
+               && array[position] != ',' && array[position] != ']')
+            ++position;
+        const std::string_view element = array.substr(value_start, position - value_start);
         if (!is_json_uint(element))
             return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
-        try
-        {
-            const unsigned long long parsed_value = std::stoull(element);
-            if (parsed_value > std::numeric_limits<uint32_t>::max())
-            {
-                return Error{ErrorCode::InvalidModel,
-                             std::string(prefix) + "integer array value is out of range: " + key};
-            }
-            result.push_back(static_cast<uint32_t>(parsed_value));
-        }
-        catch (const std::exception&)
-        {
+        unsigned long long parsed_value = 0;
+        const auto parsed = std::from_chars(element.data(), element.data() + element.size(), parsed_value);
+        if (parsed.ec != std::errc() || parsed.ptr != element.data() + element.size())
             return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
-        }
+        if (parsed_value > std::numeric_limits<uint32_t>::max())
+            return Error{ErrorCode::InvalidModel,
+                         std::string(prefix) + "integer array value is out of range: " + key};
+        result.push_back(static_cast<uint32_t>(parsed_value));
+
+        position = skip_space(array, position);
+        if (position >= array.size())
+            return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
+        if (array[position] == ']')
+            break;
+        if (array[position++] != ',')
+            return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
+        position = skip_space(array, position);
+        if (position >= array.size() || array[position] == ']')
+            return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
     }
     return result;
 }
 
 Result<std::vector<std::string>> read_manifest_string_array(const std::string& json, const std::string& key, const char* prefix)
 {
-    const std::optional<std::string> value = find_manifest_member(json, key);
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
     if (!value)
         return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest is missing string array: " + key};
 
-    std::vector<std::string> elements;
-    size_t position = 0;
-    if (!scan_json_array(*value, position, elements))
-        return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
-    position = skip_space(*value, position);
-    if (position != value->size())
+    const std::string_view array = *value;
+    if (array.empty() || array.front() != '[')
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
 
-    for (std::string& element : elements)
+    // Lookup has already validated the array structure; decode each string into owned output.
+    std::vector<std::string> result;
+    size_t position = skip_space(array, 1);
+    if (position < array.size() && array[position] == ']')
+        return result;
+    for (;;)
     {
-        size_t element_position = 0;
         std::string decoded;
-        if (!parse_json_string(element, element_position, &decoded))
+        if (!parse_json_string(array, position, &decoded))
             return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
-        element_position = skip_space(element, element_position);
-        if (element_position != element.size())
+
+        result.push_back(std::move(decoded));
+        position = skip_space(array, position);
+        if (position >= array.size())
             return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
-        element = std::move(decoded);
+        if (array[position] == ']')
+            break;
+        if (array[position++] != ',')
+            return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
+        position = skip_space(array, position);
+        if (position >= array.size() || array[position] == ']')
+            return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
     }
-    return elements;
+    return result;
 }
 
 float optional_manifest_float(const std::string& json, const std::string& key, float fallback)

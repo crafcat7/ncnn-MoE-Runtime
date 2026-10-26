@@ -23,6 +23,7 @@
 #include <iostream>
 #include <memory>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -254,6 +255,17 @@ struct LatentLayerFixture
         auto attention_hyper = HyperConnection_vulkan::create(attention_function, scale, attention_base, layer_copies, 20, layer_norm_epsilon, layer_hyper_epsilon, get_default_gpu_index(), runtime, layer_flags);
         auto ffn_hyper = HyperConnection_vulkan::create(ffn_function, scale, ffn_base, layer_copies, 20, layer_norm_epsilon, layer_hyper_epsilon, get_default_gpu_index(), runtime, layer_flags);
         auto norm = RmsNorm_vulkan::create(ffn_norm, layer_norm_epsilon, 0.0f, attention->vulkan_context(), attention->option());
+        layer_check(static_cast<bool>(norm), "create layer RMSNorm");
+        {
+            const auto& context = attention->vulkan_context();
+            const std::lock_guard<std::mutex> lock(context->command_mutex());
+            ncnn::VkMat input, output;
+            input.create(layer_hidden, 2, sizeof(float), context->blob_allocator());
+            ncnn::VkCompute cmd(context->device());
+            layer_check(!input.empty() && norm->record(input, output, cmd), "record RMSNorm refcount probe");
+            layer_check(input.refcount && *input.refcount == 1 && output.refcount && *output.refcount == 1,
+                        "RMSNorm record releases input/output bindings");
+        }
         auto router = Router_vulkan::create(router_weight, &router_bias, nullptr, get_default_gpu_index(), runtime, layer_flags);
         layer = LatentLayer_vulkan::create(attention, attention_hyper, ffn_hyper, norm, router);
         layer_check(static_cast<bool>(layer), "create complete layer GPU segment");

@@ -21,7 +21,6 @@ using ExecutionTensorId = uint32_t;
 inline constexpr ExecutionNodeId invalid_execution_node_id = std::numeric_limits<ExecutionNodeId>::max();
 inline constexpr ExecutionTensorId invalid_execution_tensor_id = std::numeric_limits<ExecutionTensorId>::max();
 inline constexpr uint32_t invalid_execution_layer_id = std::numeric_limits<uint32_t>::max();
-inline constexpr uint32_t invalid_execution_expert_id = std::numeric_limits<uint32_t>::max();
 
 enum class ExecutionBackend
 {
@@ -35,7 +34,6 @@ enum class ExecutionNodeType
     Attention,
     Router,
     ExpertDispatch,
-    Expert,
     ExpertGroup,
     SharedExpertGroup,
     Combine,
@@ -53,13 +51,11 @@ enum ExecutionBackendMask : uint32_t
     ExecutionBackendVulkan = UINT32_C(1) << NCNN_MOE_BACKEND_VULKAN_BIT
 };
 
-#define NCNN_MOE_NODE_CONDITIONAL_BIT     0
-#define NCNN_MOE_NODE_CPU_PREFETCH_BIT    1
-#define NCNN_MOE_NODE_REQUEST_EXPERTS_BIT 2
+#define NCNN_MOE_NODE_CPU_PREFETCH_BIT    0
+#define NCNN_MOE_NODE_REQUEST_EXPERTS_BIT 1
 
 enum ExecutionNodeFlag : uint32_t
 {
-    ExecutionNodeConditional = UINT32_C(1) << NCNN_MOE_NODE_CONDITIONAL_BIT,
     ExecutionNodeCpuPrefetch = UINT32_C(1) << NCNN_MOE_NODE_CPU_PREFETCH_BIT,
     // Submit exact reads during dispatch, before independent shared CPU work.
     ExecutionNodeRequestExperts = UINT32_C(1) << NCNN_MOE_NODE_REQUEST_EXPERTS_BIT
@@ -81,14 +77,13 @@ struct ExecutionNode
     ExecutionNodeType type = ExecutionNodeType::TokenEmbedding;
     ExecutionBackend backend = ExecutionBackend::Cpu;
     uint32_t backend_mask = ExecutionBackendCpu;
+    uint32_t flags = 0;
     // Index into ExecutionGraph::layer_plans.  The graph owns both execution
     // order and the immutable layer payload consumed by the executor.
     uint32_t layer_plan_index = invalid_execution_layer_id;
-    uint32_t expert_id = invalid_execution_expert_id;
     // WeightStore handles consumed by non-layer nodes.  Layer nodes resolve
     // their complete operator payload through layer_plan_index instead.
     std::vector<TensorHandle> weight_inputs;
-    uint32_t flags = 0;
     std::string name;
     std::vector<ExecutionNodeId> dependencies;
     std::vector<ExecutionTensorId> inputs;

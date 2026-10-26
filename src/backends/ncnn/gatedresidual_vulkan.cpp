@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <limits>
 #include <mutex>
+#include <vector>
 
 namespace ncnn {
 namespace moe {
@@ -22,10 +23,10 @@ namespace moe {
 // produces unpacked FP32 activations; immutable native matrices stay packed.
 std::shared_ptr<ncnn::Pipeline> qwen_pipeline(const std::shared_ptr<VulkanContext>& context, const ncnn::Option& opt)
 {
-    const auto binary = context->shader_binary(qwen_elementwise_shader, sizeof(qwen_elementwise_shader) - 1, opt, 0);
-    if (!binary || binary->empty()) return {};
     auto result = context->find_pipeline(qwen_elementwise_shader, 0);
     if (result) return result;
+    const auto binary = context->shader_binary(qwen_elementwise_shader, sizeof(qwen_elementwise_shader) - 1, opt, 0);
+    if (!binary || binary->empty()) return {};
     auto pipeline = std::make_unique<ncnn::Pipeline>(context->device());
     pipeline->set_local_size_xyz(128, 1, 1);
     if (pipeline->create(binary->data(), binary->size() * sizeof(uint32_t), {}) != 0) return {};
@@ -41,26 +42,37 @@ std::shared_ptr<ncnn::Pipeline> qwen_pipeline(const std::shared_ptr<VulkanContex
 }
 
 void qwen_record(const ncnn::Pipeline* pipeline, uint32_t mode, uint32_t hidden, uint32_t copies,
-                 uint32_t rows, uint32_t columns, float epsilon, float offset, const std::vector<ncnn::VkMat>& bindings,
+                 uint32_t rows, uint32_t columns, float epsilon, float offset, std::initializer_list<ncnn::VkMat> values,
                  ncnn::VkCompute& cmd, uint32_t kernel, uint32_t ngram, uint32_t length, uint32_t slot)
 {
+    static thread_local std::vector<ncnn::VkMat> bindings(6);
     static thread_local std::vector<ncnn::vk_constant_type> constants(11);
-    constants[0].u32 = mode;
-    constants[1].u32 = hidden;
-    constants[2].u32 = copies;
-    constants[3].u32 = rows;
-    constants[4].u32 = columns;
-    constants[5].u32 = kernel;
-    constants[6].u32 = ngram;
-    constants[7].u32 = length;
-    constants[8].u32 = slot;
-    constants[9].f = epsilon;
-    constants[10].f = offset;
-    ncnn::VkMat dispatcher;
-    dispatcher.w = static_cast<int>((mode == 0 || mode == 5) ? copies * 128 : columns);
-    dispatcher.h = static_cast<int>(mode == 6 ? 1 : rows);
-    dispatcher.c = 1;
-    cmd.record_pipeline(pipeline, bindings, constants, dispatcher);
+    try
+    {
+        bindings.assign(values.begin(), values.end());
+        constants[0].u32 = mode;
+        constants[1].u32 = hidden;
+        constants[2].u32 = copies;
+        constants[3].u32 = rows;
+        constants[4].u32 = columns;
+        constants[5].u32 = kernel;
+        constants[6].u32 = ngram;
+        constants[7].u32 = length;
+        constants[8].u32 = slot;
+        constants[9].f = epsilon;
+        constants[10].f = offset;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = static_cast<int>((mode == 0 || mode == 5) ? copies * 128 : columns);
+        dispatcher.h = static_cast<int>(mode == 6 ? 1 : rows);
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline, bindings, constants, dispatcher);
+    }
+    catch (...)
+    {
+        bindings.clear();
+        throw;
+    }
+    bindings.clear();
 }
 
 bool qwen_allocate(ncnn::VkMat& value, uint32_t columns, int rows, const std::shared_ptr<VulkanContext>& context)

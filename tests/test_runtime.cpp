@@ -11184,7 +11184,7 @@ void test_attention_graph_without_bias_or_sink()
             {
                 ++vulkan_lm_head_nodes;
             }
-            if (node.type == ExecutionNodeType::Expert || node.type == ExecutionNodeType::ExpertGroup)
+            if (node.type == ExecutionNodeType::ExpertGroup)
                 check(static_cast<bool>(node.backend == ExecutionBackend::Cpu));
         }
         check(static_cast<bool>(vulkan_attention_nodes == 1));
@@ -12209,7 +12209,9 @@ void test_execution_graph_and_scheduler()
         check(static_cast<bool>(graph.nodes[index].backend == ExecutionBackend::Cpu));
     }
     check(static_cast<bool>(graph.nodes[3].flags == 0));
-    check(static_cast<bool>(graph.nodes[3].expert_id == invalid_execution_expert_id));
+    check(static_cast<bool>(graph.nodes[3].layer_plan_index == 0));
+    check(static_cast<bool>(graph.nodes[3].inputs.size() == 2));
+    check(static_cast<bool>(graph.nodes[3].inputs[1] == graph.nodes[2].outputs[0]));
     check(static_cast<bool>(graph.nodes[4].dependencies.size() == 1));
     check(static_cast<bool>(graph.nodes[4].dependencies[0] == 3));
 
@@ -12236,6 +12238,20 @@ void test_execution_graph_and_scheduler()
     auto repeated_rescheduled_status = schedule_graph(rescheduled_graph, rescheduled_schedule, reschedule_options);
     check(static_cast<bool>(repeated_rescheduled_status));
     check(static_cast<bool>(rescheduled_schedule.node_order == compiled_schedule.node_order));
+
+    for (ExecutionNodeType type : {ExecutionNodeType::ExpertGroup, ExecutionNodeType::SharedExpertGroup})
+    {
+        for (uint32_t binding : {invalid_execution_layer_id, static_cast<uint32_t>(graph.layer_plans.size())})
+        {
+            ExecutionGraph invalid_graph = graph;
+            invalid_graph.nodes[3].type = type;
+            invalid_graph.nodes[3].layer_plan_index = binding;
+            ExecutionSchedule invalid_schedule;
+            auto ret = schedule_graph(invalid_graph, invalid_schedule, reschedule_options);
+            check(!ret && ret.error().code == ErrorCode::InvalidModel);
+            check(ret.error().message == (binding == invalid_execution_layer_id ? "execution graph node has an invalid layer plan binding" : "execution graph node layer plan is out of range"));
+        }
+    }
 
     ExecutionGraph branch_graph;
     for (ExecutionNodeId node_id = 0; node_id < 5; ++node_id)
@@ -19741,6 +19757,14 @@ void test_manifest_readers()
 
     auto balanced_object = read_manifest_object(R"({"object":{"value":7,"nested":{"flag":true}}})", "object");
     check(static_cast<bool>(balanced_object));
+    auto owned_nested_object = [] {
+        const std::string source = R"({"object":{"text":"first\nsecond","value":7}})";
+        return read_manifest_object(source, "object");
+    }();
+    check(static_cast<bool>(owned_nested_object));
+    auto owned_nested_text = read_manifest_string(owned_nested_object.value(), "text");
+    check(static_cast<bool>(owned_nested_text));
+    check(owned_nested_text.value() == "first\nsecond");
     auto invalid_object_type = read_manifest_object(R"({"object":[1]})", "object", "Test ");
     check(!invalid_object_type);
     check(invalid_object_type.error().message == "invalid Test object field: object");
@@ -19771,11 +19795,23 @@ void test_manifest_readers()
     auto integers = read_manifest_uint32_array(R"({"values":[0, 2, 4294967295]})", "values");
     check(static_cast<bool>(integers));
     check(integers.value() == std::vector<uint32_t>{0, 2, std::numeric_limits<uint32_t>::max()});
-    for (const char* array : {"[-1]", "[2.5]", "[,2]", "[2,]", "[2,,3]", "[2,junk]", "[4294967296]"})
+    for (const char* array : {"[-1]", "[2.5]", "[,2]", "[2,]", "[2,,3]", "[2,junk]"})
     {
         auto invalid = read_manifest_uint32_array(std::string(R"({"values":)") + array + "}", "values");
         check(!invalid);
         check(invalid.error().code == ErrorCode::InvalidModel);
+    }
+    auto array_uint32_overflow = read_manifest_uint32_array(R"({"values":[4294967296]})", "values");
+    check(!array_uint32_overflow);
+    check(array_uint32_overflow.error().message == "integer array value is out of range: values");
+    auto array_uint64_overflow = read_manifest_uint32_array(R"({"values":[18446744073709551616]})", "values");
+    check(!array_uint64_overflow);
+    check(array_uint64_overflow.error().message == "invalid integer array: values");
+    for (const char* array : {"[01]", "[+1]"})
+    {
+        auto invalid = read_manifest_uint32_array(std::string(R"({"values":)") + array + "}", "values");
+        check(!invalid);
+        check(invalid.error().message == "manifest is missing integer array: values");
     }
     auto strings = read_manifest_string_array(R"({"values":["plain","line\n","\u4f60\u597d"]})", "values");
     check(static_cast<bool>(strings));
@@ -19783,6 +19819,12 @@ void test_manifest_readers()
     check(strings.value()[0] == "plain");
     check(strings.value()[1] == "line\n");
     check(strings.value()[2] == "\xE4\xBD\xA0\xE5\xA5\xBD");
+    auto owned_strings = [] {
+        const std::string source = R"({"values":["escaped\tvalue","\u4f60\u597d"]})";
+        return read_manifest_string_array(source, "values");
+    }();
+    check(static_cast<bool>(owned_strings));
+    check(owned_strings.value() == std::vector<std::string>{"escaped\tvalue", "\xE4\xBD\xA0\xE5\xA5\xBD"});
     for (const char* array : {"[1]", R"(["x"junk])", R"(["\q"])", "[,]"})
     {
         auto invalid = read_manifest_string_array(std::string(R"({"values":)") + array + "}", "values");

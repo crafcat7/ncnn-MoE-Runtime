@@ -814,7 +814,7 @@ Result<void> forward_model(const CompiledModel& model,
             }
             continue;
         }
-        if (node->type == ExecutionNodeType::Expert || node->type == ExecutionNodeType::ExpertGroup)
+        if (node->type == ExecutionNodeType::ExpertGroup)
         {
             if (layer_state.experts_executed)
                 continue;
@@ -1861,7 +1861,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             }
             continue;
         }
-        if (node->type == ExecutionNodeType::Expert || node->type == ExecutionNodeType::ExpertGroup)
+        if (node->type == ExecutionNodeType::ExpertGroup)
         {
             LayerState& combined = workspace.staged_state;
             Result<void> shared_result;

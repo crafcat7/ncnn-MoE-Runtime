@@ -243,6 +243,14 @@ static void qwen_ple_case(uint32_t device, DType dtype)
         const std::lock_guard<std::mutex> lock(context->command_mutex());
         pipeline = qwen_pipeline(context, opt);
         qwen_check(static_cast<bool>(pipeline), "create PLE shader");
+        {
+            ncnn::VkMat probe;
+            qwen_check(qwen_allocate(probe, 128, 2, context), "allocate Qwen refcount probe");
+            ncnn::VkCompute probe_cmd(context->device());
+            qwen_record(pipeline.get(), 0, 32, 4, 2, 128, descriptor.norm_epsilon, descriptor.norm_weight_offset,
+                        {probe, probe, probe, probe, probe, probe}, probe_cmd);
+            qwen_check(probe.refcount && *probe.refcount == 1, "Qwen record releases binding references");
+        }
         ncnn::VkCompute cmd(context->device());
         ncnn::Mat zero(6 * 128, sizeof(float));
         zero.fill(0.0f);

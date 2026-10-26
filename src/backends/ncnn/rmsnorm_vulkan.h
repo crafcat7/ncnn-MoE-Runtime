@@ -26,7 +26,8 @@ public:
 #if NCNN_MOE_WITH_VULKAN
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
 #endif
-    // The caller holds the context lock and retains outputs until submission completes.
+    // The caller holds the context lock, which protects record scratch, and
+    // retains outputs until submission completes.
     [[nodiscard]] bool record(const ncnn::VkMat& input, ncnn::VkMat& output,
                               ncnn::VkCompute& cmd) const;
 

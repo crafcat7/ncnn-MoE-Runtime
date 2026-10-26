@@ -1336,8 +1336,10 @@ static void trim_sliding_cache(LayerCache& cache, const AttentionBlockPlan& plan
 static void attention_linear_into(const WeightStore& weights, const CompiledOperatorTable& operators, TensorHandle matrix, TensorHandle bias, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, ExecutionBackend backend, ActivationBuffer* quantized_input)
 {
     const TensorData& weight = weights.at(matrix);
-    ActivationBuffer* scratch = !weight.input_column_indices.empty()
-                                        && quantized_input && quantized_input->dtype() == DType::Float32
+    const bool needs_input_scratch = !weight.input_column_indices.empty()
+                                     || weight.dtype == DType::Float8E4M3;
+    ActivationBuffer* scratch = needs_input_scratch && quantized_input
+                                        && quantized_input->dtype() == DType::Float32
                                         && quantized_input != &input && quantized_input != &output
                                     ? quantized_input
                                     : nullptr;

@@ -16,12 +16,12 @@ class RmsNorm_vulkan::Implementation
 public:
 #if NCNN_MOE_WITH_VULKAN
     std::shared_ptr<VulkanContext> context;
-    ncnn::Option opt;
     std::shared_ptr<ncnn::Pipeline> pipeline;
     ncnn::VkMat weight;
     uint32_t columns = 0;
-    float epsilon = 0.0f;
-    float weight_offset = 0.0f;
+    mutable std::vector<ncnn::VkMat> bindings;
+    std::vector<unsigned char> readonly;
+    mutable std::vector<ncnn::vk_constant_type> constants;
 #endif
 };
 
@@ -49,10 +49,13 @@ std::shared_ptr<RmsNorm_vulkan> RmsNorm_vulkan::create(const TensorData& weight,
     auto result = std::shared_ptr<RmsNorm_vulkan>(new RmsNorm_vulkan);
     auto& impl = *result->d;
     impl.context = std::move(context);
-    impl.opt = opt;
     impl.columns = static_cast<uint32_t>(weight.shape[0]);
-    impl.epsilon = epsilon;
-    impl.weight_offset = weight_offset;
+    impl.bindings.resize(3);
+    impl.readonly = {1, 1, 0};
+    impl.constants.resize(4);
+    impl.constants[0].u32 = impl.columns;
+    impl.constants[2].f = epsilon;
+    impl.constants[3].f = weight_offset;
     const std::lock_guard<std::mutex> lock(impl.context->command_mutex());
     impl.pipeline = impl.context->find_pipeline(activation_rms_norm_shader, 0);
     if (!impl.pipeline)
@@ -116,21 +119,34 @@ bool RmsNorm_vulkan::record(const ncnn::VkMat& input,
     output.create(input.w, input.h, sizeof(float), impl.context->blob_allocator());
     if (output.empty())
         return false;
-    std::vector<ncnn::vk_constant_type> constants(4);
-    constants[0].u32 = impl.columns;
-    constants[1].u32 = input.h;
-    constants[2].f = impl.epsilon;
-    constants[3].f = impl.weight_offset;
-    ncnn::VkMat dispatcher;
-    dispatcher.w = 32;
-    dispatcher.h = input.h;
-    dispatcher.c = 1;
-    if (impl.weight.data)
+    auto& bindings = impl.bindings;
+    const auto& readonly = impl.readonly;
+    auto& constants = impl.constants;
+    try
     {
-        impl.weight.data->access_flags = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        impl.weight.data->stage_flags = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        bindings[0] = input;
+        bindings[1] = impl.weight;
+        bindings[2] = output;
+        constants[1].u32 = static_cast<uint32_t>(input.h);
+        ncnn::VkMat dispatcher;
+        dispatcher.w = 32;
+        dispatcher.h = input.h;
+        dispatcher.c = 1;
+        if (impl.weight.data)
+        {
+            impl.weight.data->access_flags = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            impl.weight.data->stage_flags = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        }
+        cmd.record_pipeline_readonly(impl.pipeline.get(), bindings, readonly, constants, dispatcher);
     }
-    cmd.record_pipeline_readonly(impl.pipeline.get(), {input, impl.weight, output}, {1, 1, 0}, constants, dispatcher);
+    catch (...)
+    {
+        for (auto& binding : bindings)
+            binding.release();
+        throw;
+    }
+    for (auto& binding : bindings)
+        binding.release();
     return true;
 #else
     (void)input;

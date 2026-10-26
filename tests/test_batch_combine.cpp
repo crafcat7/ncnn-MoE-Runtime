@@ -334,17 +334,17 @@ static CompiledModel make_backend_model(const CompiledModel& cpu_model)
 {
     CompiledModel model = cpu_model;
     model.opt.hybrid_mode = HybridMode::HybridExperts;
-    size_t expert_nodes = 0;
+    size_t expert_group_nodes = 0;
     for (ExecutionNode& node : model.graph.nodes)
     {
-        if (node.type == ExecutionNodeType::Expert || node.type == ExecutionNodeType::ExpertGroup)
+        if (node.type == ExecutionNodeType::ExpertGroup)
         {
             node.backend = ExecutionBackend::Vulkan;
             node.backend_mask |= ExecutionBackendVulkan;
-            ++expert_nodes;
+            ++expert_group_nodes;
         }
     }
-    require(expert_nodes == 1, "batch combine test expected one Expert node");
+    require(expert_group_nodes == 1, "batch combine test expected one dynamic ExpertGroup node");
     require(static_cast<bool>(model.schedule.validate(model.graph)), "batch combine backend schedule is invalid");
 
     MoeBlockPlan& moe = model.graph.layer_plans.front().moe;
