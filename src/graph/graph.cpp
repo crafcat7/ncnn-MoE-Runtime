@@ -239,21 +239,21 @@ Result<void> ExecutionSchedule::validate(const ExecutionGraph& graph) const
     return {};
 }
 
-Result<void> schedule_graph(ExecutionGraph& graph, ExecutionSchedule& schedule, const GraphOption& opt)
+Result<void> schedule_graph(ExecutionGraph& graph, ExecutionSchedule& schedule, uint32_t available_backends)
 {
     schedule.node_order.clear();
-    if (opt.available_backends == 0)
+    if (available_backends == 0)
         return Error{ErrorCode::InvalidArgument, "runtime scheduler requires at least one backend"};
 
     for (ExecutionNode& node : graph.nodes)
     {
-        const uint32_t usable = node.backend_mask & opt.available_backends;
+        const uint32_t usable = node.backend_mask & available_backends;
         if (usable == 0)
             return Error{ErrorCode::UnsupportedModel, "execution node has no available backend: " + node.name};
 
         const uint32_t selected = node.backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu;
-        const bool dense = node.type == ExecutionNodeType::Attention || node.type == ExecutionNodeType::LmHead;
-        if (opt.prefer_vulkan_dense && dense && has_flag(usable, ExecutionBackendVulkan))
+        const bool prefer_gpu = node.type == ExecutionNodeType::Attention || node.type == ExecutionNodeType::LmHead;
+        if (prefer_gpu && has_flag(usable, ExecutionBackendVulkan))
             node.backend = ExecutionBackend::Vulkan;
         else if (!has_flag(usable, selected))
             node.backend = has_flag(usable, ExecutionBackendCpu) ? ExecutionBackend::Cpu : ExecutionBackend::Vulkan;
@@ -499,11 +499,10 @@ static Result<void> build_speculative_graph(CompiledModel& compiled,
                                  use_vulkan_experts);
     }
 
-    GraphOption options;
-    options.available_backends = ExecutionBackendCpu;
+    uint32_t available_backends = ExecutionBackendCpu;
     if (compiled.opt.hybrid_mode != HybridMode::CpuOnly)
-        options.available_backends |= ExecutionBackendVulkan;
-    auto schedule_status = schedule_graph(graph, schedule, options);
+        available_backends |= ExecutionBackendVulkan;
+    auto schedule_status = schedule_graph(graph, schedule, available_backends);
     if (!schedule_status)
         return schedule_status.error();
 
@@ -666,11 +665,10 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
                                                   : std::vector<TensorHandle>{compiled.lm_head_weight,
                                                                               compiled.final_norm_weight};
 
-    GraphOption options;
-    options.available_backends = ExecutionBackendCpu;
+    uint32_t available_backends = ExecutionBackendCpu;
     if (compiled.opt.hybrid_mode != HybridMode::CpuOnly)
-        options.available_backends |= ExecutionBackendVulkan;
-    auto schedule_status = schedule_graph(graph, schedule, options);
+        available_backends |= ExecutionBackendVulkan;
+    auto schedule_status = schedule_graph(graph, schedule, available_backends);
     if (!schedule_status)
         return schedule_status.error();
 

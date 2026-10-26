@@ -921,7 +921,7 @@ void test_prefill_decode_and_reset()
             node.dependencies = {0};
     }
     ExecutionSchedule overlapping_schedule;
-    auto overlapping_status = schedule_graph(overlapping_graph, overlapping_schedule, GraphOption{});
+    auto overlapping_status = schedule_graph(overlapping_graph, overlapping_schedule, ExecutionBackendCpu);
     check(!overlapping_status);
     check(overlapping_status.error().message == "execution schedule overlaps an unfinished FFN layer");
 
@@ -10973,11 +10973,10 @@ void test_attention_graph_without_bias_or_sink()
           == ExecutionNodeType::ExpertGroup);
 
     ExecutionGraph rescheduled_speculative_graph = moved_speculative.speculative.graph;
-    GraphOption speculative_reschedule_options;
     ExecutionSchedule rescheduled_speculative_schedule;
     auto rescheduled_speculative_status = schedule_graph(rescheduled_speculative_graph,
                                                          rescheduled_speculative_schedule,
-                                                         speculative_reschedule_options);
+                                                         ExecutionBackendCpu);
     check(static_cast<bool>(rescheduled_speculative_status));
     check(rescheduled_speculative_schedule.node_order
           == moved_speculative.speculative.schedule.node_order);
@@ -11564,7 +11563,7 @@ void test_shared_expert_descriptor()
         dispatch->flags &= ~ExecutionNodeRequestExperts;
         routed->dependencies = {dispatch->id};
         shared->dependencies = {routed->id};
-        check(static_cast<bool>(schedule_graph(graph, schedule, {})));
+        check(static_cast<bool>(schedule_graph(graph, schedule, ExecutionBackendCpu)));
     };
     CompiledModel serial_shared_model = nonzero_shared_model;
     restore_serial_shared_schedule(serial_shared_model.graph, serial_shared_model.schedule);
@@ -12230,12 +12229,11 @@ void test_execution_graph_and_scheduler()
     check(static_cast<bool>(session_statistics.expert_batch_weight_bytes > 0));
     check(static_cast<bool>(session_statistics.expert_route_weight_bytes >= session_statistics.expert_batch_weight_bytes));
     ExecutionGraph rescheduled_graph = graph;
-    GraphOption reschedule_options;
     ExecutionSchedule rescheduled_schedule;
-    auto rescheduled_status = schedule_graph(rescheduled_graph, rescheduled_schedule, reschedule_options);
+    auto rescheduled_status = schedule_graph(rescheduled_graph, rescheduled_schedule, ExecutionBackendCpu);
     check(static_cast<bool>(rescheduled_status));
     check(static_cast<bool>(rescheduled_schedule.node_order == compiled_schedule.node_order));
-    auto repeated_rescheduled_status = schedule_graph(rescheduled_graph, rescheduled_schedule, reschedule_options);
+    auto repeated_rescheduled_status = schedule_graph(rescheduled_graph, rescheduled_schedule, ExecutionBackendCpu);
     check(static_cast<bool>(repeated_rescheduled_status));
     check(static_cast<bool>(rescheduled_schedule.node_order == compiled_schedule.node_order));
 
@@ -12247,7 +12245,7 @@ void test_execution_graph_and_scheduler()
             invalid_graph.nodes[3].type = type;
             invalid_graph.nodes[3].layer_plan_index = binding;
             ExecutionSchedule invalid_schedule;
-            auto ret = schedule_graph(invalid_graph, invalid_schedule, reschedule_options);
+            auto ret = schedule_graph(invalid_graph, invalid_schedule, ExecutionBackendCpu);
             check(!ret && ret.error().code == ErrorCode::InvalidModel);
             check(ret.error().message == (binding == invalid_execution_layer_id ? "execution graph node has an invalid layer plan binding" : "execution graph node layer plan is out of range"));
         }
@@ -12268,36 +12266,32 @@ void test_execution_graph_and_scheduler()
     branch_graph.nodes[0].dependencies = {3};
     branch_graph.nodes[2].dependencies = {1};
     branch_graph.nodes[4].dependencies = {0, 2};
-    GraphOption branch_options;
     ExecutionSchedule branch_schedule;
-    auto branch_status = schedule_graph(branch_graph, branch_schedule, branch_options);
+    auto branch_status = schedule_graph(branch_graph, branch_schedule, ExecutionBackendCpu);
     check(static_cast<bool>(branch_status));
     check(static_cast<bool>(branch_schedule.node_order == std::vector<ExecutionNodeId>{1, 3, 2, 0, 4}));
 
     ExecutionGraph duplicate_dependency_graph = branch_graph;
     duplicate_dependency_graph.nodes.back().dependencies = {0, 2, 0};
     ExecutionSchedule duplicate_schedule;
-    auto duplicate_schedule_status = schedule_graph(duplicate_dependency_graph, duplicate_schedule, branch_options);
+    auto duplicate_schedule_status = schedule_graph(duplicate_dependency_graph, duplicate_schedule, ExecutionBackendCpu);
     check(!duplicate_schedule_status);
     check(duplicate_schedule_status.error().message == "execution graph contains a duplicate dependency");
 
-    ExecutionGraph cpu_dense_graph = graph;
-    cpu_dense_graph.nodes.back().backend_mask |= ExecutionBackendVulkan;
-    GraphOption cpu_dense_options;
-    cpu_dense_options.available_backends = ExecutionBackendCpu | ExecutionBackendVulkan;
-    cpu_dense_options.prefer_vulkan_dense = false;
-    ExecutionSchedule cpu_dense_schedule;
-    auto cpu_dense_status = schedule_graph(cpu_dense_graph, cpu_dense_schedule, cpu_dense_options);
-    check(static_cast<bool>(cpu_dense_status));
-    check(static_cast<bool>(cpu_dense_graph.nodes.back().backend == ExecutionBackend::Cpu));
-    check(static_cast<bool>(cpu_dense_schedule.node_order.size() == cpu_dense_graph.nodes.size()));
+    ExecutionGraph cpu_only_graph = graph;
+    cpu_only_graph.nodes.back().backend = ExecutionBackend::Vulkan;
+    cpu_only_graph.nodes.back().backend_mask |= ExecutionBackendVulkan;
+    ExecutionSchedule cpu_only_schedule;
+    auto cpu_only_status = schedule_graph(cpu_only_graph, cpu_only_schedule, ExecutionBackendCpu);
+    check(static_cast<bool>(cpu_only_status));
+    check(static_cast<bool>(cpu_only_graph.nodes.back().backend == ExecutionBackend::Cpu));
+    check(static_cast<bool>(cpu_only_schedule.node_order.size() == cpu_only_graph.nodes.size()));
 
     ExecutionGraph hybrid_graph = graph;
     hybrid_graph.nodes.back().backend_mask |= ExecutionBackendVulkan;
-    GraphOption scheduling_options;
-    scheduling_options.available_backends = ExecutionBackendCpu | ExecutionBackendVulkan;
+    constexpr uint32_t scheduling_backends = ExecutionBackendCpu | ExecutionBackendVulkan;
     ExecutionSchedule hybrid_schedule;
-    auto hybrid_status = schedule_graph(hybrid_graph, hybrid_schedule, scheduling_options);
+    auto hybrid_status = schedule_graph(hybrid_graph, hybrid_schedule, scheduling_backends);
     check(static_cast<bool>(hybrid_status));
     check(static_cast<bool>(hybrid_schedule.validate(hybrid_graph)));
     check(static_cast<bool>(hybrid_schedule.node_order.size() == hybrid_graph.nodes.size()));
@@ -12305,6 +12299,28 @@ void test_execution_graph_and_scheduler()
     for (size_t index = 0; index + 1 < hybrid_schedule.node_order.size(); ++index)
         check(static_cast<bool>(hybrid_graph.nodes[hybrid_schedule.node_order[index]].backend == ExecutionBackend::Cpu));
     check(static_cast<bool>(hybrid_graph.nodes[hybrid_schedule.node_order.back()].backend == ExecutionBackend::Vulkan));
+
+    ExecutionGraph vulkan_only_graph;
+    ExecutionNode vulkan_dense_node;
+    vulkan_dense_node.id = 0;
+    vulkan_dense_node.type = ExecutionNodeType::LmHead;
+    vulkan_dense_node.backend = ExecutionBackend::Cpu;
+    vulkan_dense_node.backend_mask = scheduling_backends;
+    vulkan_dense_node.name = "vulkan_only_lm_head";
+    vulkan_dense_node.weight_inputs = {0};
+    vulkan_only_graph.nodes.push_back(std::move(vulkan_dense_node));
+    ExecutionSchedule vulkan_only_schedule;
+    auto vulkan_only_status = schedule_graph(vulkan_only_graph,
+                                             vulkan_only_schedule,
+                                             ExecutionBackendVulkan);
+    check(static_cast<bool>(vulkan_only_status));
+    check(static_cast<bool>(vulkan_only_graph.nodes.front().backend == ExecutionBackend::Vulkan));
+
+    ExecutionSchedule no_backend_schedule;
+    auto no_backend_status = schedule_graph(vulkan_only_graph, no_backend_schedule, 0);
+    check(!no_backend_status);
+    check(no_backend_status.error().code == ErrorCode::InvalidArgument);
+    check(no_backend_status.error().message == "runtime scheduler requires at least one backend");
 
     ExecutionSchedule invalid_node_order_schedule = hybrid_schedule;
     std::swap(invalid_node_order_schedule.node_order.front(), invalid_node_order_schedule.node_order[1]);
@@ -12323,7 +12339,7 @@ void test_execution_graph_and_scheduler()
     ExecutionGraph invalid_dependency_graph = hybrid_graph;
     invalid_dependency_graph.nodes.back().dependencies.push_back(invalid_execution_node_id);
     ExecutionSchedule invalid_dependency_schedule;
-    auto invalid_dependency_status = schedule_graph(invalid_dependency_graph, invalid_dependency_schedule, scheduling_options);
+    auto invalid_dependency_status = schedule_graph(invalid_dependency_graph, invalid_dependency_schedule, scheduling_backends);
     check(!invalid_dependency_status);
     check(static_cast<bool>(invalid_dependency_status.error().code == ErrorCode::InvalidModel));
     check(static_cast<bool>(invalid_dependency_status.error().message == "execution graph dependency is out of range"));
@@ -12333,7 +12349,7 @@ void test_execution_graph_and_scheduler()
         ExecutionGraph invalid_graph = hybrid_graph;
         invalid_graph.nodes.back().id = invalid_id;
         ExecutionSchedule invalid_schedule;
-        auto invalid_schedule_status = schedule_graph(invalid_graph, invalid_schedule, scheduling_options);
+        auto invalid_schedule_status = schedule_graph(invalid_graph, invalid_schedule, scheduling_backends);
         check(!invalid_schedule_status);
         check(invalid_schedule_status.error().code == ErrorCode::InvalidModel);
         check(invalid_schedule_status.error().message == "execution graph node ids must be contiguous and index-aligned");
@@ -12343,7 +12359,7 @@ void test_execution_graph_and_scheduler()
     unavailable_graph.nodes.back().id = invalid_execution_node_id;
     unavailable_graph.nodes.front().backend_mask = 0;
     ExecutionSchedule unavailable_schedule;
-    auto unavailable_schedule_status = schedule_graph(unavailable_graph, unavailable_schedule, scheduling_options);
+    auto unavailable_schedule_status = schedule_graph(unavailable_graph, unavailable_schedule, scheduling_backends);
     check(!unavailable_schedule_status);
     check(unavailable_schedule_status.error().code == ErrorCode::UnsupportedModel);
     check(unavailable_schedule_status.error().message == "execution node has no available backend: " + graph.nodes.front().name);
@@ -12370,9 +12386,8 @@ void test_execution_graph_and_scheduler()
         std::move(cyclic_combine),
     };
     cyclic.layer_plans.resize(1);
-    GraphOption cyclic_options;
     ExecutionSchedule invalid_schedule;
-    auto invalid_schedule_status = schedule_graph(cyclic, invalid_schedule, cyclic_options);
+    auto invalid_schedule_status = schedule_graph(cyclic, invalid_schedule, ExecutionBackendCpu);
     check(static_cast<bool>(!invalid_schedule_status));
     check(static_cast<bool>(invalid_schedule_status.error().code == ErrorCode::InvalidModel));
     check(invalid_schedule_status.error().message == "execution graph contains a dependency cycle");

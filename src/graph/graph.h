@@ -104,18 +104,12 @@ struct ExecutionSchedule
     [[nodiscard]] Result<void> validate(const ExecutionGraph& graph) const;
 };
 
-struct GraphOption
-{
-    uint32_t available_backends = ExecutionBackendCpu;
-    bool prefer_vulkan_dense = true;
-};
-
 // Selects backends in place and fills caller-owned storage.  Callers provide
 // fresh, discardable graph and schedule objects when constructing a model;
 // discard the owning model on failure.
 [[nodiscard]] Result<void> schedule_graph(ExecutionGraph& graph,
                                           ExecutionSchedule& schedule,
-                                          const GraphOption& options);
+                                          uint32_t available_backends);
 
 // Build and schedule the target and speculative graph regions.
 [[nodiscard]] Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts);
