@@ -357,13 +357,19 @@ public:
     [[nodiscard]] bool materialize(const DeviceTensor_vulkan& input, ActivationBuffer& output) const;
 
 private:
+    friend class Attention_vulkan;
     friend class LatentAttention_vulkan;
     friend class LayerHead_vulkan;
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
     [[nodiscard]] const ncnn::Option& option() const noexcept;
     [[nodiscard]] uint32_t input_columns() const noexcept;
     [[nodiscard]] uint32_t output_columns() const noexcept;
-    [[nodiscard]] bool record_forward(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace) const;
+    [[nodiscard]] bool record_forward(const ncnn::VkMat& input,
+                                      ncnn::VkMat& output,
+                                      ncnn::VkCompute& command,
+                                      std::vector<ncnn::VkMat>& workspace,
+                                      uint32_t output_column_offset = 0,
+                                      uint32_t output_stride = 0) const;
 
     class Implementation;
 
@@ -436,6 +442,7 @@ private:
     friend class GatedDeltaNet_vulkan;
     friend class HyperConnection_vulkan;
     friend class LayerHead_vulkan;
+    friend class Attention_vulkan;
     friend class QsaAttention_vulkan;
     friend class QwenLayer_vulkan;
     friend class GatedResidual_vulkan;

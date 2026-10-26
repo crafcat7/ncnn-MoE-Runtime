@@ -23,81 +23,7 @@ except ModuleNotFoundError:
     import test_native_quantized as fixtures
 
 
-def add_metadata(writer, architecture: str, model: dict) -> None:
-    text = model.get("text_config", model)
-    prefix = architecture + "."
-    writer.add_array("tokenizer.ggml.tokens", [f"token{i}" for i in range(text["vocab_size"])])
-    common = {
-        "context_length": "max_position_embeddings", "embedding_length": "hidden_size",
-        "attention.head_count": "num_attention_heads", "attention.head_count_kv": "num_key_value_heads",
-        "attention.key_length": "head_dim",
-    }
-    for key, source in common.items():
-        writer.add_uint32(prefix + key, text[source])
-    writer.add_float32(prefix + "attention.layer_norm_rms_epsilon", text["rms_norm_eps"])
-    rope = text.get("rope_parameters", {})
-    writer.add_float32(prefix + "rope.freq_base", rope.get("rope_theta", text.get("rope_theta", 10000.0)))
-    if architecture.startswith("qwen"):
-        for key, source in {
-            "ssm.group_count": "linear_num_key_heads", "ssm.state_size": "linear_key_head_dim",
-            "ssm.time_step_rank": "linear_num_value_heads", "ssm.conv_kernel": "linear_conv_kernel_dim",
-        }.items():
-            writer.add_uint32(prefix + key, text[source])
-        writer.add_uint32(prefix + "ssm.inner_size", text["linear_num_value_heads"] * text["linear_value_head_dim"])
-        writer.add_uint32(prefix + "rope.dimension_count", round(text["head_dim"] * rope["partial_rotary_factor"]))
-        if architecture == "qwen35":
-            writer.add_uint32(prefix + "feed_forward_length", text["intermediate_size"])
-        else:
-            for key, source in {
-                "expert_count": "num_experts", "expert_used_count": "num_experts_per_tok",
-                "expert_feed_forward_length": "moe_intermediate_size",
-                "expert_shared_feed_forward_length": "shared_expert_intermediate_size",
-            }.items():
-                writer.add_uint32(prefix + key, text[source])
-        if architecture == "qwen4exp":
-            for key, source in {
-                "hyper_connection.count": "hc_count", "hyper_connection.low_rank": "hc_lowrank",
-                "attention.indexer.head_count": "indexer_n_heads", "attention.indexer.key_length": "indexer_head_dim",
-                "attention.indexer.top_k": "indexer_budget", "ple.ngram_size": "ngram_size",
-                "ple.heads_per_ngram": "heads_per_ngram", "ple.conv_kernel": "ple_conv_kernel_size",
-                "ple.eos_token_id": "eos_token_id",
-            }.items():
-                writer.add_uint32(prefix + key, text[source])
-            writer.add_array(prefix + "attention.compress_ratios", [0, text["indexer_compress_ratio"]])
-            writer.add_array(prefix + "ple.layers", [value - 1 for value in text["ple_layer_ids"]])
-    elif architecture == "gpt-oss":
-        for key, source in {
-            "expert_count": "num_local_experts", "expert_used_count": "experts_per_token",
-            "expert_feed_forward_length": "intermediate_size", "attention.sliding_window": "sliding_window",
-        }.items():
-            writer.add_uint32(prefix + key, text[source])
-        writer.add_float32(prefix + "swiglu_clamp_exp", text["swiglu_limit"])
-        writer.add_float32(prefix + "rope.scaling.factor", text["rope_scaling"]["factor"])
-        writer.add_uint32(prefix + "rope.scaling.original_context_length", text["initial_context_length"])
-    else:
-        for key, source in {
-            "expert_count": "n_routed_experts", "expert_used_count": "num_experts_per_tok",
-            "expert_shared_count": "n_shared_experts", "expert_feed_forward_length": "moe_intermediate_size",
-            "attention.q_lora_rank": "q_lora_rank", "attention.output_group_count": "o_groups",
-            "attention.output_lora_rank": "o_lora_rank", "attention.sliding_window": "sliding_window",
-            "attention.indexer.head_count": "index_n_heads", "attention.indexer.key_length": "index_head_dim",
-            "attention.indexer.top_k": "index_topk", "rope.dimension_count": "qk_rope_head_dim",
-            "hyper_connection.count": "hc_mult", "hyper_connection.sinkhorn_iterations": "hc_sinkhorn_iters",
-            "hash_layer_count": "num_hash_layers",
-        }.items():
-            writer.add_uint32(prefix + key, text[source])
-        writer.add_array(prefix + "attention.compress_ratios", text["compress_ratios"])
-        writer.add_float32(prefix + "expert_weights_scale", text["routed_scaling_factor"])
-        writer.add_float32(prefix + "hyper_connection.epsilon", text["hc_eps"])
-        writer.add_float32(prefix + "swiglu_clamp_exp", text["swiglu_limit"])
-        writer.add_uint32(prefix + "expert_gating_func", 4)
-        writer.add_bool(prefix + "expert_weights_norm", True)
-        writer.add_float32(prefix + "attention.compress_rope_freq_base", 160000.0)
-        writer.add_string(prefix + "rope.scaling.type", "yarn")
-        writer.add_float32(prefix + "rope.scaling.factor", 16.0)
-        writer.add_float32(prefix + "rope.scaling.yarn_beta_fast", 32.0)
-        writer.add_float32(prefix + "rope.scaling.yarn_beta_slow", 1.0)
-        writer.add_uint32(prefix + "rope.scaling.original_context_length", text["original_max_position_embeddings"])
+add_metadata = fixtures.add_test_gguf_metadata
 
 
 def floating_copy(source: Path, destination: Path) -> None:
@@ -336,6 +262,7 @@ def main() -> int:
     real_writer = fixtures.gguf.GGUFWriter
     real_family = fixtures.family_tensors
     native_formats = fixtures.NATIVE_GGUF_FORMATS
+    gqa_native_formats = fixtures.NATIVE_GQA_GGUF_FORMATS
 
     def run_graph(label: str, baseline: Path, source: Path, on_demand: bool = False) -> None:
         command = [str(args.runner.resolve()), str(baseline), str(source)]
@@ -455,6 +382,51 @@ def main() -> int:
             run_graph(label, mixed.baseline, mixed.source)
             if moe:
                 run_graph(label, mixed.baseline, mixed.source, on_demand=True)
+            if label in ("qwen35", "qwen35moe") or family == "gpt_oss":
+                gqa_root = root / (label + "-native-gqa-13-formats")
+                gqa_root.mkdir()
+                with patch.object(fixtures.gguf, "GGUFWriter", writer), patch.object(fixtures, "family_tensors", family_tensors):
+                    if family:
+                        gqa_fixture = fixtures.prepare_family_gguf(
+                            gqa_root, family, fp32=False, native_formats=gqa_native_formats,
+                            native_scale=1 / 64, fp32_native_baseline=True)
+                    else:
+                        gqa_fixture = fixtures.prepare_gguf(
+                            gqa_root, moe, reordered, fp32=False, native_formats=gqa_native_formats,
+                            native_scale=1 / 64, fp32_native_baseline=True)
+                projection_family = family or "qwen"
+                projection_types = fixtures.standard_gqa_projection_types(gqa_fixture.source, projection_family)
+                assert len(set(projection_types.values())) == 4, (
+                    f"{label} 13-format GQA matrix did not give Q/K/V/O distinct dtypes: {projection_types}")
+                run_graph(label + " standard GQA with all 13 GGML formats",
+                          gqa_fixture.baseline, gqa_fixture.source)
+                if moe:
+                    run_graph(label + " standard GQA with all 13 GGML formats",
+                              gqa_fixture.baseline, gqa_fixture.source, on_demand=True)
+
+                mixed_root = root / (label + "-native-gqa-mixed-dtypes")
+                mixed_root.mkdir()
+                mixed_overrides = fixtures.standard_gqa_mixed_overrides(projection_family)
+                with patch.object(fixtures.gguf, "GGUFWriter", writer), patch.object(fixtures, "family_tensors", family_tensors):
+                    if family:
+                        mixed_fixture = fixtures.prepare_family_gguf(
+                            mixed_root, family, fp32=False, native_formats=gqa_native_formats,
+                            native_overrides=mixed_overrides, native_scale=1 / 64,
+                            fp32_native_baseline=True)
+                    else:
+                        mixed_fixture = fixtures.prepare_gguf(
+                            mixed_root, moe, reordered, fp32=False, native_formats=gqa_native_formats,
+                            native_overrides=mixed_overrides, native_scale=1 / 64,
+                            fp32_native_baseline=True)
+                mixed_types = fixtures.standard_gqa_projection_types(mixed_fixture.source, projection_family)
+                expected_mixed_types = {"q": "Q2_K", "k": "BF16", "v": "Q8_0", "o": "F32"}
+                assert mixed_types == expected_mixed_types, (
+                    f"{label} mixed GQA projection dtypes mismatch: {mixed_types}")
+                run_graph(label + " mixed GQA Q2_K/BF16/Q8_0/F32",
+                          mixed_fixture.baseline, mixed_fixture.source)
+                if moe:
+                    run_graph(label + " mixed GQA Q2_K/BF16/Q8_0/F32",
+                              mixed_fixture.baseline, mixed_fixture.source, on_demand=True)
             if family == "qwen4_exp":
                 # The continuous Qwen path must decode every new format
                 # from PLE selected rows; all other native matrices stay

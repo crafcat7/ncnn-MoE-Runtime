@@ -79,9 +79,8 @@ static std::string dense_config(bool tied)
            + (tied ? "true" : "false") + "}}";
 }
 
-static void check_budget_fallback(const MoeModelDescriptor& descriptor, const WeightMapping& mapping,
-                                  const std::vector<float>& prefill_logits, const std::vector<float>& decode_logits,
-                                  uint32_t device_index)
+static void check_budget_admission(const MoeModelDescriptor& descriptor, const WeightMapping& mapping,
+                                   uint32_t device_index)
 {
     for (uint64_t budget : {UINT64_C(0), UINT64_C(1)})
     {
@@ -92,23 +91,17 @@ static void check_budget_fallback(const MoeModelDescriptor& descriptor, const We
         opt.vulkan_runtime = create_vulkan_runtime();
         CompiledModel model;
         auto compiled = compile_model(descriptor, mapping, model, HybridMode::HybridExperts, opt);
-        check(static_cast<bool>(compiled), compiled ? "" : compiled.error().message);
-        for (const ExecutionNode& node : model.graph.nodes)
-            check(node.backend == ExecutionBackend::Cpu, "unbudgeted dense node must execute on CPU");
-        check(model.released_dense_host_size == 0, "CPU fallback received resident Vulkan host-release credit");
-        check(!model.weights.at(model.lm_head_weight).bfloat16_values().empty(), "fallback LM head host weights were released");
-        SessionState state;
-        SessionStatistics statistics;
-        const std::vector<int32_t> ids = {1, 2};
-        auto prefill = forward_model(model, ids, statistics, state, 0, LogitsOutput::Last);
-        check(static_cast<bool>(prefill), prefill ? "" : prefill.error().message);
-        check_logits(std::vector<float>(state.logits.row(0), state.logits.row(0) + state.logits.columns()),
-                     prefill_logits, "unbudgeted dense prefill", false);
-        const std::vector<int32_t> next = {3};
-        auto decode = forward_model(model, next, statistics, state, ids.size(), LogitsOutput::Last);
-        check(static_cast<bool>(decode), decode ? "" : decode.error().message);
-        check_logits(std::vector<float>(state.logits.row(0), state.logits.row(0) + state.logits.columns()),
-                     decode_logits, "unbudgeted dense decode", false);
+        if (budget == 0)
+        {
+            check(static_cast<bool>(compiled), compiled ? "" : compiled.error().message);
+            for (const ExecutionNode& node : model.graph.nodes)
+                check(node.backend == ExecutionBackend::Cpu, "unbudgeted dense node must execute on CPU");
+            check(model.released_dense_host_size == 0, "unbudgeted CPU model released host weights");
+            continue;
+        }
+        check(!compiled, "required Vulkan attention was admitted without a GPU budget");
+        check(compiled.error().code == ErrorCode::InvalidArgument,
+              "insufficient Vulkan attention budget did not produce an explicit admission error");
     }
 }
 
@@ -885,8 +878,7 @@ static void run_dense_package(const std::filesystem::path& root, bool tied, bool
     if (gpu != gpu_infos.end())
     {
         if (!quantized)
-            check_budget_fallback(descriptor.value(), mapping.value(), prefill.value().logits,
-                                  decode.value().logits, gpu->device_index);
+            check_budget_admission(descriptor.value(), mapping.value(), gpu->device_index);
         Option hybrid = opt;
         hybrid.hybrid_mode = HybridMode::HybridExperts;
         // Isolate FFN parity from CPU BF16 and Vulkan FP32 KV differences.

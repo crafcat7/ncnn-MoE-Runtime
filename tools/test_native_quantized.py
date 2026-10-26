@@ -21,6 +21,7 @@ import unittest
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import numpy as np
 
@@ -29,7 +30,7 @@ sys.path.insert(0, str(REPO))
 
 from tools import import_quantized as importer  # noqa: E402
 from tools.ncnn_moe_protocol import WorkerClient, WorkerError  # noqa: E402
-from tools.test_import_quantized import iq4_xs_blocks, pack_columns, pack_gptq, write_safetensors  # noqa: E402
+from tools.test_import_quantized import iq4_nl_blocks, iq4_xs_blocks, pack_columns, pack_gptq, write_safetensors  # noqa: E402
 
 try:
     import gguf
@@ -69,7 +70,7 @@ def config(moe: bool = False, reordered: bool = False) -> dict:
         "linear_key_head_dim": 32, "linear_value_head_dim": 32,
         "linear_conv_kernel_dim": 2, "max_position_embeddings": 32,
         "rms_norm_eps": 0.000001,
-        "rope_parameters": {"rope_theta": 10000.0, "partial_rotary_factor": 1.0},
+        "rope_parameters": {"rope_theta": 10000.0, "partial_rotary_factor": 0.5},
         "layer_types": ["linear_attention", "full_attention"], "hidden_act": "silu",
         "dtype": "bfloat16", "mamba_ssm_dtype": "float32",
         "attention_bias": False, "attn_output_gate": True, "tie_word_embeddings": False,
@@ -324,9 +325,110 @@ def family_tensors(family: str) -> tuple[dict, dict, list[str]]:
             "deepseek_dspark": dspark_tensors, "qwen4_exp": qwen38_tensors}[family]()
 
 
-def check_preserved_auxiliary(loaded: dict, reference: dict) -> None:
+def add_test_gguf_metadata(writer, architecture: str, model: dict) -> None:
+    """Write the small model metadata set required by direct GGUF loading."""
+    text = model.get("text_config", model)
+    prefix = architecture + "."
+    writer.add_array("tokenizer.ggml.tokens", [f"token{i}" for i in range(text["vocab_size"])])
+    common = {
+        "context_length": "max_position_embeddings", "embedding_length": "hidden_size",
+        "attention.head_count": "num_attention_heads", "attention.head_count_kv": "num_key_value_heads",
+        "attention.key_length": "head_dim",
+    }
+    for key, source in common.items():
+        writer.add_uint32(prefix + key, text[source])
+    writer.add_float32(prefix + "attention.layer_norm_rms_epsilon", text["rms_norm_eps"])
+    rope = text.get("rope_parameters", {})
+    writer.add_float32(prefix + "rope.freq_base", rope.get("rope_theta", text.get("rope_theta", 10000.0)))
+    if architecture.startswith("qwen"):
+        for key, source in {
+            "ssm.group_count": "linear_num_key_heads", "ssm.state_size": "linear_key_head_dim",
+            "ssm.time_step_rank": "linear_num_value_heads", "ssm.conv_kernel": "linear_conv_kernel_dim",
+        }.items():
+            writer.add_uint32(prefix + key, text[source])
+        writer.add_uint32(prefix + "ssm.inner_size", text["linear_num_value_heads"] * text["linear_value_head_dim"])
+        writer.add_uint32(prefix + "rope.dimension_count", round(text["head_dim"] * rope["partial_rotary_factor"]))
+        if architecture == "qwen35":
+            writer.add_uint32(prefix + "feed_forward_length", text["intermediate_size"])
+        else:
+            for key, source in {
+                "expert_count": "num_experts", "expert_used_count": "num_experts_per_tok",
+                "expert_feed_forward_length": "moe_intermediate_size",
+                "expert_shared_feed_forward_length": "shared_expert_intermediate_size",
+            }.items():
+                writer.add_uint32(prefix + key, text[source])
+        if architecture == "qwen4exp":
+            for key, source in {
+                "hyper_connection.count": "hc_count", "hyper_connection.low_rank": "hc_lowrank",
+                "attention.indexer.head_count": "indexer_n_heads", "attention.indexer.key_length": "indexer_head_dim",
+                "attention.indexer.top_k": "indexer_budget", "ple.ngram_size": "ngram_size",
+                "ple.heads_per_ngram": "heads_per_ngram", "ple.conv_kernel": "ple_conv_kernel_size",
+                "ple.eos_token_id": "eos_token_id",
+            }.items():
+                writer.add_uint32(prefix + key, text[source])
+            writer.add_array(prefix + "attention.compress_ratios", [0, text["indexer_compress_ratio"]])
+            writer.add_array(prefix + "ple.layers", [value - 1 for value in text["ple_layer_ids"]])
+    elif architecture == "gpt-oss":
+        for key, source in {
+            "expert_count": "num_local_experts", "expert_used_count": "experts_per_token",
+            "expert_feed_forward_length": "intermediate_size", "attention.sliding_window": "sliding_window",
+        }.items():
+            writer.add_uint32(prefix + key, text[source])
+        writer.add_float32(prefix + "swiglu_clamp_exp", text["swiglu_limit"])
+        writer.add_float32(prefix + "rope.scaling.factor", text["rope_scaling"]["factor"])
+        writer.add_uint32(prefix + "rope.scaling.original_context_length", text["initial_context_length"])
+    else:
+        for key, source in {
+            "expert_count": "n_routed_experts", "expert_used_count": "num_experts_per_tok",
+            "expert_shared_count": "n_shared_experts", "expert_feed_forward_length": "moe_intermediate_size",
+            "attention.q_lora_rank": "q_lora_rank", "attention.output_group_count": "o_groups",
+            "attention.output_lora_rank": "o_lora_rank", "attention.sliding_window": "sliding_window",
+            "attention.indexer.head_count": "index_n_heads", "attention.indexer.key_length": "index_head_dim",
+            "attention.indexer.top_k": "index_topk", "rope.dimension_count": "qk_rope_head_dim",
+            "hyper_connection.count": "hc_mult", "hyper_connection.sinkhorn_iterations": "hc_sinkhorn_iters",
+            "hash_layer_count": "num_hash_layers",
+        }.items():
+            writer.add_uint32(prefix + key, text[source])
+        writer.add_array(prefix + "attention.compress_ratios", text["compress_ratios"])
+        writer.add_float32(prefix + "expert_weights_scale", text["routed_scaling_factor"])
+        writer.add_float32(prefix + "hyper_connection.epsilon", text["hc_eps"])
+        writer.add_float32(prefix + "swiglu_clamp_exp", text["swiglu_limit"])
+        writer.add_uint32(prefix + "expert_gating_func", 4)
+        writer.add_bool(prefix + "expert_weights_norm", True)
+        writer.add_float32(prefix + "attention.compress_rope_freq_base", 160000.0)
+        writer.add_string(prefix + "rope.scaling.type", "yarn")
+        writer.add_float32(prefix + "rope.scaling.factor", 16.0)
+        writer.add_float32(prefix + "rope.scaling.yarn_beta_fast", 32.0)
+        writer.add_float32(prefix + "rope.scaling.yarn_beta_slow", 1.0)
+        writer.add_uint32(prefix + "rope.scaling.original_context_length", text["original_max_position_embeddings"])
+
+
+def gguf_writer_with_test_metadata(model: dict):
+    real_writer = gguf.GGUFWriter
+
+    def writer(path, architecture, *extra, **kwargs):
+        result = real_writer(path, architecture, *extra, **kwargs)
+        add_test_gguf_metadata(result, architecture, model)
+        return result
+
+    return writer
+
+
+def check_preserved_auxiliary(loaded: dict, reference: dict,
+                              normalized_f32_names: set[str] | None = None) -> None:
+    normalized_f32_names = normalized_f32_names or set()
     for name, (dtype, values) in reference.items():
+        if name in normalized_f32_names:
+            assert dtype == "BF16" and loaded[name].dtype == "BF16", name
+            np.testing.assert_array_equal(loaded[name].read(), values, err_msg=name)
+            continue
         if dtype in ("F32", "I64"):
+            if (dtype == "F32" and loaded[name].dtype == "BF16"
+                    and re.search(r"\.self_attn\.[qkvo]_proj\.weight$", name)):
+                # The general importer stores ordinary GGUF F32 projections
+                # as BF16; preserve and verify that explicit normalization.
+                np.testing.assert_array_equal(loaded[name].read(), bfloat16(values))
+                continue
             assert loaded[name].dtype == dtype, name
             np.testing.assert_array_equal(loaded[name].read().view(np.uint8), values.view(np.uint8))
 
@@ -389,13 +491,19 @@ def mapped_ple_dense_bytes(path: Path) -> int:
 
 def hybrid_dense_host_release(tensors: dict, packed_sizes: dict[str, int], *,
                               family: str = "qwen", fp8: bool = False,
-                              query_selection_bytes: int = 0) -> int:
+                              query_selection_bytes: int = 0,
+                              q8_0_dense_bytes: dict[str, int] | None = None) -> int:
     """Independently count the fixture weights owned by resident Vulkan ops.
 
     INT4/Qn_K storage remains resident on host. Ordinary unquantized Shared
     Expert router gates are separate projections and can be reclaimed. The
     Qwen4 continuous chain owns its router gates inside the Expert operation,
     so their host copies remain, while QSA owns and releases query/key norms.
+    Native Standard GQA Attention owns its pre-attention norm, sinks, and
+    (for Qwen) query/key norms for each complete Vulkan layer, as well as its
+    unquantized projection copies. Q8_0 dense Linear operators release their
+    raw GGML payloads; embeddings, Expert banks, and Qwen dense-FFN Expert
+    chains retain theirs.
     Its HC/PLE/indexer weights also retain their host storage despite GPU
     execution. FP8
     reclaims codes and scales of the output head, standard/latent Attention,
@@ -405,6 +513,47 @@ def hybrid_dense_host_release(tensors: dict, packed_sizes: dict[str, int], *,
     retained-byte expectation. Qwen4 continuous execution rejects FP8.
     """
     released = query_selection_bytes if fp8 else 0
+    qwen_family = family in ("qwen", "qwen_dense", "qwen_moe")
+    if qwen_family or family == "gpt_oss":
+        tensor_prefix = PREFIX if qwen_family else "model."
+        layer_pattern = re.compile(re.escape(tensor_prefix) + r"layers\.(\d+)\.self_attn\.[qkvo]_proj\.weight$")
+        layer_ids = {int(match[1]) for name in tensors if (match := layer_pattern.fullmatch(name))}
+        for layer_id in sorted(layer_ids):
+            prefix = tensor_prefix + f"layers.{layer_id}.self_attn."
+            projection_names = [prefix + f"{role}_proj.weight" for role in ("q", "k", "v", "o")]
+            if not all(name in tensors for name in projection_names):
+                continue
+            query_shape = tensors[projection_names[0]][1].shape
+            key_shape = tensors[projection_names[1]][1].shape
+            value_shape = tensors[projection_names[2]][1].shape
+            if (len(query_shape) != 2 or len(key_shape) != 2 or len(value_shape) != 2
+                    or query_shape[0] <= key_shape[0] or key_shape[0] != value_shape[0]):
+                continue
+            # These fixture layers exercise native Attention when at least
+            # one projection uses the packed GGML/INT4 representation.
+            if not any(name in packed_sizes for name in projection_names):
+                continue
+            for name in projection_names:
+                if name not in packed_sizes:
+                    released += tensors[name][1].nbytes
+            owned_constants = [tensor_prefix + f"layers.{layer_id}.input_layernorm.weight"]
+            if qwen_family:
+                owned_constants.extend((prefix + "q_norm.weight", prefix + "k_norm.weight"))
+            else:
+                owned_constants.append(prefix + "sinks")
+            for name in owned_constants:
+                if name in tensors and name not in packed_sizes:
+                    released += tensors[name][1].nbytes
+
+    for name, raw_bytes in (q8_0_dense_bytes or {}).items():
+        if name.endswith("embed_tokens.weight") or name in ("model.embed_tokens.weight", "embed.weight"):
+            continue
+        if ".experts." in name:
+            continue
+        if qwen_family and re.search(r"\.mlp\.(?:gate|up|down)_proj\.weight$", name):
+            continue
+        released += raw_bytes
+
     for name, (dtype, values) in tensors.items():
         if not fp8:
             qsa_owned_norm = family == "qwen4_exp" and bool(re.search(r"\.self_attn\.[qk]_norm\.weight$", name))
@@ -556,29 +705,144 @@ def qnk_blocks(rows: int, bits: int, seed: int, columns: int = 256) -> np.ndarra
     """Construct finite, nonzero GGML blocks without an importer quantizer."""
     rng = np.random.default_rng(seed)
     assert columns % 256 == 0
-    block_bytes = 144 if bits == 4 else 210
+    block_bytes = {2: 84, 3: 110, 4: 144, 5: 176, 6: 210, 8: 292}[bits]
     raw = np.empty((rows, columns // 256 * block_bytes), dtype=np.uint8)
     for block in range(columns // 256):
-        if bits == 4:
+        if bits == 2:
+            values = np.zeros((rows, 84), dtype=np.uint8)
+            values[:, :16] = 1  # subgroup scale 1, min 0 for each of 16 groups.
+            values[:, 80:82] = np.asarray([1 / 512], dtype="<f2").view(np.uint8)
+            for row in range(rows):
+                codes = (np.arange(256, dtype=np.uint16) + seed + row + block) % 4
+                packed = np.zeros(64, dtype=np.uint8)
+                for index, code in enumerate(codes):
+                    group, within = divmod(index % 128, 32)
+                    half, lane = divmod(within, 16)
+                    byte_index = index // 128 * 32 + half * 16 + lane
+                    packed[byte_index] |= np.uint8(code << (group * 2))
+                values[row, 16:80] = packed
+        elif bits == 3:
+            values = np.zeros((rows, 110), dtype=np.uint8)
+            values[:, :32] = 0xff  # enable the low two-bit q values.
+            values[:, 96:104] = 0x11  # low four bits encode scale 1.
+            values[:, 104:108] = 0xaa  # remaining two scale bits encode 1.
+            values[:, 108:110] = np.asarray([1 / 512], dtype="<f2").view(np.uint8)
+            for row in range(rows):
+                codes = (np.arange(256, dtype=np.uint16) + seed + row + block) % 4
+                packed = np.zeros(64, dtype=np.uint8)
+                for index, code in enumerate(codes):
+                    group, within = divmod(index % 128, 32)
+                    half, lane = divmod(within, 16)
+                    byte_index = index // 128 * 32 + half * 16 + lane
+                    packed[byte_index] |= np.uint8(code << (group * 2))
+                values[row, 32:96] = packed
+        elif bits == 4:
             values = np.zeros((rows, 144), dtype=np.uint8)
             for row in range(rows):
                 values[row, :2] = np.asarray([(row % 3 + 1) / 1024], dtype="<f2").view(np.uint8)
                 values[row, 2:4] = np.asarray([1 / 2048], dtype="<f2").view(np.uint8)
             values[:, 4:16] = 1
             values[:, 16:] = rng.integers(0, 256, size=(rows, 128), dtype=np.uint8)
-        else:
-            values = rng.integers(0, 256, size=(rows, 210), dtype=np.uint8)
-            values[:, 192:208] = rng.integers(1, 4, size=(rows, 16), dtype=np.uint8)
+        elif bits == 5:
+            values = np.zeros((rows, 176), dtype=np.uint8)
+            values[:, :2] = np.asarray([1 / 512], dtype="<f2").view(np.uint8)
+            values[:, 4:16] = 1  # one-bit group scales; dmin is zero.
             for row in range(rows):
-                values[row, 208:] = np.asarray([(row % 2 + 1) / 2048], dtype="<f2").view(np.uint8)
+                codes = (np.arange(256, dtype=np.uint16) + seed + row + block) % 32
+                low = np.zeros(128, dtype=np.uint8)
+                high = np.zeros(32, dtype=np.uint8)
+                for group in range(4):
+                    for half in range(2):
+                        for lane in range(32):
+                            code = int(codes[group * 64 + half * 32 + lane])
+                            low[group * 32 + lane] |= (code & 15) << (half * 4)
+                            high[lane] |= ((code >> 4) & 1) << (group * 2 + half)
+                values[row, 16:48] = high
+                values[row, 48:] = low
+        else:
+            if bits == 6:
+                values = rng.integers(0, 256, size=(rows, 210), dtype=np.uint8)
+                values[:, 192:208] = rng.integers(1, 4, size=(rows, 16), dtype=np.uint8)
+                for row in range(rows):
+                    values[row, 208:] = np.asarray([(row % 2 + 1) / 2048], dtype="<f2").view(np.uint8)
+            else:
+                values = np.zeros((rows, 292), dtype=np.uint8)
+                values[:, :4] = np.asarray([1 / 512], dtype="<f4").view(np.uint8)
+                for row in range(rows):
+                    q = ((np.arange(256, dtype=np.int16) + seed + row + block) % 17 - 8).astype(np.int8)
+                    values[row, 4:260] = q.view(np.uint8)
+                    values[row, 260:] = q.reshape(16, 16).sum(axis=1, dtype=np.int16).astype("<i2").view(np.uint8)
         raw[:, block * block_bytes:(block + 1) * block_bytes] = values
     return raw
 
 
 NATIVE_GGUF_FORMATS = ("Q4_0", "Q4_1", "Q5_0", "IQ4_XS")
+NATIVE_GQA_GGUF_FORMATS = tuple(name for name in (
+    "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_K", "Q8_0",
+    "Q4_0", "Q4_1", "Q5_0", "Q5_1", "IQ4_NL", "IQ4_XS",
+) if name in importer.GGUF_NATIVE_FORMATS)
+assert len(NATIVE_GQA_GGUF_FORMATS) == 13
 
 
-def quantized_gguf_matrix(values: np.ndarray, format_name: str) -> tuple[np.ndarray, Any, np.ndarray, int]:
+def q8_0_blocks(rows: int, columns: int, seed: int) -> np.ndarray:
+    if columns % 32:
+        raise ValueError(f"Q8_0 fixture columns are not block aligned: {columns}")
+    blocks = np.zeros((rows, columns // 32, 34), dtype=np.uint8)
+    blocks[..., :2] = np.asarray([1 / 512], dtype="<f2").view(np.uint8).reshape(1, 1, 2)
+    codes = ((np.arange(rows * columns, dtype=np.int16).reshape(rows, columns) + seed) % 17 - 8).astype(np.int8)
+    blocks[..., 2:] = codes.reshape(rows, columns // 32, 32).view(np.uint8)
+    return blocks.reshape(rows, -1)
+
+
+def q5_1_blocks(rows: int, columns: int, seed: int) -> np.ndarray:
+    if columns % 32:
+        raise ValueError(f"Q5_1 fixture columns are not block aligned: {columns}")
+    block_shape = (rows, columns // 32)
+    codes = ((np.arange(rows * columns, dtype=np.uint8).reshape(rows, columns) + seed) % 31 + 1)
+    codes = codes.reshape(*block_shape, 32)
+    blocks = np.zeros((*block_shape, 24), dtype=np.uint8)
+    blocks[..., :2] = np.asarray([1 / 512], dtype="<f2").view(np.uint8)
+    blocks[..., 4:8] = np.packbits(codes >> 4, axis=-1, bitorder="little")
+    blocks[..., 8:] = (codes[..., :16] & 15) | (codes[..., 16:] << 4)
+    return blocks.reshape(rows, -1)
+
+
+def scale_gguf_block_scales(raw: np.ndarray, format_name: str, rows: int, columns: int,
+                            amplitude_scale: float) -> None:
+    """Scale native GGUF values without changing their dtype or packed codes."""
+    if not math.isfinite(amplitude_scale) or amplitude_scale <= 0:
+        raise ValueError(f"invalid native GGUF fixture amplitude scale: {amplitude_scale}")
+    if amplitude_scale == 1:
+        return
+    _, block_elements, block_bytes = importer.GGUF_NATIVE_FORMATS[format_name]
+    blocks = raw.reshape(rows, columns // block_elements, block_bytes)
+    if format_name == "Q2_K":
+        fields, field_type = (80, 82), "f16"
+    elif format_name == "Q3_K":
+        fields, field_type = (108,), "f16"
+    elif format_name in ("Q4_K", "Q5_K"):
+        fields, field_type = (0, 2), "f16"
+    elif format_name == "Q6_K":
+        fields, field_type = (208,), "f16"
+    elif format_name == "Q8_K":
+        fields, field_type = (0,), "f32"
+    elif format_name in ("Q4_1", "Q5_1"):
+        fields, field_type = (0, 2), "f16"
+    else:
+        fields, field_type = (0,), "f16"
+    for offset in fields:
+        width = 4 if field_type == "f32" else 2
+        values = blocks[..., offset:offset + width].copy()
+        if field_type == "f32":
+            scaled = (values.view("<f4").reshape(blocks.shape[:-1]) * amplitude_scale).astype("<f4")
+        else:
+            scaled = (values.view("<f2").reshape(blocks.shape[:-1]).astype(np.float32)
+                      * amplitude_scale).astype("<f2")
+        blocks[..., offset:offset + width] = scaled.view(np.uint8).reshape(blocks.shape[:-1] + (width,))
+
+
+def quantized_gguf_matrix(values: np.ndarray, format_name: str, *,
+                          amplitude_scale: float = 1.0) -> tuple[np.ndarray, Any, np.ndarray, int]:
     """Quantize a full matrix and return raw bytes with a BF16-exact GGUF decode."""
     encoding = importer.GGUF_NATIVE_FORMATS[format_name]
     tag, block_elements, block_bytes = encoding
@@ -589,11 +853,28 @@ def quantized_gguf_matrix(values: np.ndarray, format_name: str) -> tuple[np.ndar
     dtype = getattr(gguf.GGMLQuantizationType, format_name)
     if format_name == "IQ4_XS":
         raw = iq4_xs_blocks(rows, columns, seed=int(abs(float(source.sum())) * 1e5) % 251)
+    elif format_name in ("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_K"):
+        bits = {"Q2_K": 2, "Q3_K": 3, "Q4_K": 4, "Q5_K": 5, "Q6_K": 6, "Q8_K": 8}[format_name]
+        raw = qnk_blocks(rows, bits, seed=int(abs(float(source.sum())) * 1e5) % 251, columns=columns)
+    elif format_name == "Q8_0":
+        raw = q8_0_blocks(rows, columns, seed=int(abs(float(source.sum())) * 1e5) % 251)
+    elif format_name == "Q5_1":
+        raw = q5_1_blocks(rows, columns, seed=int(abs(float(source.sum())) * 1e5) % 251)
+    elif format_name == "IQ4_NL":
+        raw = iq4_nl_blocks(rows, columns)
+        blocks = raw.reshape(rows, columns // 32, 18)
+        lanes = np.arange(16, dtype=np.uint16)
+        for row in range(rows):
+            for block in range(columns // 32):
+                low = ((lanes * 3 + row + block) & 15).astype(np.uint8)
+                high = ((lanes * 5 + row * 2 + block * 3) & 15).astype(np.uint8)
+                blocks[row, block, 2:] = low | (high << 4)
     else:
         raw = np.asarray(gguf.quantize(source, dtype)).view(np.uint8).reshape(rows, -1).copy()
     expected_bytes = rows * (columns // block_elements) * block_bytes
     if raw.nbytes != expected_bytes:
         raise ValueError(f"invalid {format_name} fixture byte count: {raw.nbytes} != {expected_bytes}")
+    scale_gguf_block_scales(raw, format_name, rows, columns, amplitude_scale)
     if format_name in ("Q4_0", "Q4_1", "Q5_0"):
         blocks = raw.reshape(rows, columns // block_elements, block_bytes)
         original_d = blocks[..., :2].copy().view("<f2").reshape(rows, -1)
@@ -602,7 +883,27 @@ def quantized_gguf_matrix(values: np.ndarray, format_name: str) -> tuple[np.ndar
         if format_name == "Q4_1":
             # Keep the quantized codes and use an exactly representable offset.
             blocks[..., 2:4] = 0
-    decoded = np.asarray(gguf.dequantize(raw, dtype), dtype=np.float32).reshape(source.shape)
+    if format_name == "Q8_K":
+        # gguf 0.19 may not expose Q8_K dequantize; this independent GGML
+        # specification decode is d(float32) * qs(int8), with bsums checked
+        # below. When the official decoder is available, compare it as well.
+        blocks = raw.reshape(rows, columns // 256, 292)
+        scales = blocks[..., :4].copy().view("<f4").reshape(rows, columns // 256)
+        codes = blocks[..., 4:260].copy().view(np.int8).reshape(rows, columns // 256, 256)
+        decoded = (scales[..., None] * codes.astype(np.float32)).reshape(source.shape)
+        sums = blocks[..., 260:].copy().view("<i2").reshape(rows, columns // 256, 16)
+        np.testing.assert_array_equal(sums, codes.reshape(rows, columns // 256, 16, 16).sum(axis=-1))
+        try:
+            upstream = np.asarray(gguf.dequantize(raw, dtype), dtype=np.float32).reshape(source.shape)
+        except (AttributeError, KeyError, NotImplementedError, TypeError, ValueError):
+            upstream = None
+        if upstream is not None:
+            np.testing.assert_array_equal(upstream, decoded)
+    else:
+        decoded = np.asarray(gguf.dequantize(raw, dtype), dtype=np.float32).reshape(source.shape)
+    self_check = np.isfinite(decoded).all() and np.any(decoded != 0)
+    if not self_check:
+        raise ValueError(f"invalid or all-zero {format_name} fixture decode")
     np.testing.assert_array_equal(float32(bfloat16(decoded)), decoded)
     return raw, dtype, decoded, tag
 
@@ -630,18 +931,23 @@ def logical_to_gguf_columns(keys: int, heads: int, dimension: int) -> np.ndarray
 
 
 def prepare_gguf(root: Path, moe: bool = False, reordered: bool = False, *, fp32: bool = True,
-                 native_formats: tuple[str, ...] | None = None) -> Fixture:
+                 native_formats: tuple[str, ...] | None = None,
+                 native_overrides: dict[str, str] | None = None,
+                 native_scale: float = 1.0,
+                 fp32_native_baseline: bool = False) -> Fixture:
     model_config = config(moe, reordered)
     reference, native_names = base_tensors(moe, reordered)
     native_names.append(PREFIX + "embed_tokens.weight")
     native_names.extend(name for name in reference if ".experts." in name and name not in native_names)
     if moe:
         native_names.extend(name for name in reference if name.endswith(("mlp.gate.weight", "mlp.shared_expert_gate.weight")))
+    native_overrides = validate_native_overrides(native_names, native_overrides)
     assets(root / "assets", model_config)
     path = root / "source.gguf"
     writer = gguf.GGUFWriter(path, "qwen35moe" if moe else "qwen35")
     writer.add_block_count(2)
     specs, packed_sizes, expert_banks = {}, {}, {}
+    q8_0_dense_bytes = {}
     text = model_config["text_config"]
     keys, heads, dimension = text["linear_num_key_heads"], text["linear_num_value_heads"], text["linear_value_head_dim"]
     value_order = logical_to_gguf_columns(keys, heads, dimension)
@@ -652,17 +958,29 @@ def prepare_gguf(root: Path, moe: bool = False, reordered: bool = False, *, fp32
         if name in native_names:
             rows, columns = values.shape
             assert columns % 256 == 0
+            override = native_overrides.get(name)
+            if override in ("BF16", "F32"):
+                dense_values = (float32(values) if values.dtype == np.uint16 else np.asarray(values, np.float32))
+                dense_values = dense_values * native_scale
+                reference[name] = write_dense_gguf_override(writer, gguf_name(name), dense_values, override)
+                continue
             if native_formats:
-                format_name = fixture_native_format(name, native_formats, dense_format_index)
+                format_name = override or fixture_native_format(name, native_formats, dense_format_index)
                 if ".experts." not in name:
                     dense_format_index += 1
-                raw, dtype, decoded, tag = quantized_gguf_matrix(values, format_name)
+                raw, dtype, decoded, tag = quantized_gguf_matrix(
+                    values, format_name, amplitude_scale=native_scale)
+            elif override:
+                raw, dtype, decoded, tag = quantized_gguf_matrix(
+                    values, override, amplitude_scale=native_scale)
             else:
                 bits = 6 if any(role in name for role in ("down_proj", "out_proj", "o_proj", "lm_head")) else 4
                 dtype = gguf.GGMLQuantizationType.Q4_K if bits == 4 else gguf.GGMLQuantizationType.Q6_K
                 raw = qnk_blocks(rows, bits, index, columns)
                 decoded = gguf.dequantize(raw, dtype).reshape(rows, columns)
                 tag = bits
+            if getattr(dtype, "name", None) == "Q8_0":
+                q8_0_dense_bytes[name] = raw.nbytes
             expected_raw = raw
             column_indices = None
             if reordered and ".linear_attn." in name:
@@ -709,7 +1027,7 @@ def prepare_gguf(root: Path, moe: bool = False, reordered: bool = False, *, fp32
     baseline = root / "baseline"
     assets(baseline, model_config)
     baseline_tensors = dict(reference)
-    if fp32 and not native_formats:
+    if fp32_native_baseline or (fp32 and not native_formats):
         for name in native_names:
             if name != PREFIX + "embed_tokens.weight":
                 source_dtype, values = reference[name]
@@ -719,7 +1037,8 @@ def prepare_gguf(root: Path, moe: bool = False, reordered: bool = False, *, fp32
     imported = root / "imported"
     importer.import_package(path, imported, root / "assets")
     loaded = importer.scan_safetensors(imported)
-    check_preserved_auxiliary(loaded, reference)
+    check_preserved_auxiliary(loaded, reference,
+                              {name for name, dtype in native_overrides.items() if dtype == "F32"})
     for name, (raw, tag, columns, column_indices) in specs.items():
         assert loaded[name].dtype == "U8", name
         np.testing.assert_array_equal(loaded[name].read().reshape(raw.shape), raw)
@@ -729,7 +1048,8 @@ def prepare_gguf(root: Path, moe: bool = False, reordered: bool = False, *, fp32
     dense_bytes, expert_bytes = weight_sizes(reference, packed_sizes)
     bf16_dense, bf16_expert = weight_sizes(reference, {})
     return Fixture(baseline, imported, path, dense_bytes, expert_bytes, bf16_dense, bf16_expert, len(specs), moe,
-                   hybrid_dense_release=hybrid_dense_host_release(reference, packed_sizes))
+                   hybrid_dense_release=hybrid_dense_host_release(
+                       reference, packed_sizes, q8_0_dense_bytes=q8_0_dense_bytes))
 
 
 def family_gguf_name(name: str, family: str) -> str:
@@ -784,9 +1104,70 @@ def family_gguf_name(name: str, family: str) -> str:
     return gguf_name(name)
 
 
+def standard_gqa_projection_names(family: str) -> dict[str, str]:
+    if family == "gpt_oss":
+        prefix = "model.layers.0.self_attn."
+    elif family in ("qwen", "qwen35", "qwen35moe", "qwen35_reordered"):
+        prefix = PREFIX + "layers.1.self_attn."
+    else:
+        raise ValueError(f"no Standard GQA fixture mapping for {family}")
+    return {role: prefix + f"{role}_proj.weight" for role in ("q", "k", "v", "o")}
+
+
+def standard_gqa_projection_types(source: Path, family: str) -> dict[str, str]:
+    if gguf is None:
+        raise RuntimeError("standard GQA GGUF inspection requires the optional gguf package")
+    names = standard_gqa_projection_names(family)
+    to_gguf_name = family_gguf_name if family == "gpt_oss" else lambda name, _family: gguf_name(name)
+    expected = {role: to_gguf_name(name, family) for role, name in names.items()}
+    tensors = {tensor.name: tensor for tensor in gguf.GGUFReader(source).tensors}
+    missing = set(expected.values()) - tensors.keys()
+    if missing:
+        raise AssertionError(f"GGUF Standard GQA fixture is missing projections: {sorted(missing)}")
+    return {role: tensors[name].tensor_type.name for role, name in expected.items()}
+
+
+def standard_gqa_mixed_overrides(family: str) -> dict[str, str]:
+    names = standard_gqa_projection_names(family)
+    return {names["q"]: "Q2_K", names["k"]: "BF16",
+            names["v"]: "Q8_0", names["o"]: "F32"}
+
+
+def validate_native_overrides(native_names: Any, overrides: dict[str, str] | None) -> dict[str, str]:
+    result = dict(overrides or {})
+    unknown_names = set(result) - set(native_names)
+    if unknown_names:
+        raise ValueError(f"native overrides refer to non-native fixture tensors: {sorted(unknown_names)}")
+    supported = set(NATIVE_GQA_GGUF_FORMATS) | {"BF16", "F32"}
+    invalid = {name: dtype for name, dtype in result.items() if dtype not in supported}
+    if invalid:
+        raise ValueError(f"unsupported native GGUF fixture overrides: {invalid}")
+    return result
+
+
+def write_dense_gguf_override(writer, name: str, values: np.ndarray,
+                              dtype: str) -> tuple[str, np.ndarray]:
+    source = np.asarray(values)
+    decoded = float32(source) if source.dtype == np.uint16 else np.asarray(source, dtype=np.float32)
+    if dtype == "BF16":
+        stored = bfloat16(decoded)
+        writer.add_tensor(name, stored, raw_dtype=gguf.GGMLQuantizationType.BF16)
+        return "BF16", stored
+    if dtype == "F32":
+        stored = np.asarray(decoded, dtype=np.float32).copy()
+        writer.add_tensor(name, stored)
+        # Keep the GGUF tensor tag as F32, but account for the loader's
+        # established F32 -> BF16 normalization in the fixture oracle.
+        return "BF16", bfloat16(stored)
+    raise ValueError(f"unsupported dense GGUF override: {dtype}")
+
+
 def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = False, fp32: bool = True,
                          native_formats: tuple[str, ...] | None = None,
-                         ple_format: str | None = None) -> Fixture:
+                         ple_format: str | None = None,
+                         native_overrides: dict[str, str] | None = None,
+                         native_scale: float = 1.0,
+                         fp32_native_baseline: bool = False) -> Fixture:
     if ple_format is not None and family != "qwen4_exp":
         raise ValueError("only Qwen4Exp has a GGUF PLE table")
     model_config, reference, native_names = family_tensors(family)
@@ -794,6 +1175,7 @@ def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = Fal
     native = set(native_names) | {embedding}
     native.update(name for name, (_, values) in reference.items()
                   if ".experts." in name and values.ndim == 2)
+    native_overrides = validate_native_overrides(native, native_overrides)
     source_config = copy.deepcopy(model_config)
     if canonical_dspark:
         source_config.update(dspark_target_layer_ids=[0], dspark_block_size=2, dspark_noise_token_id=0,
@@ -803,6 +1185,7 @@ def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = Fal
     writer = gguf.GGUFWriter(path, {"gpt_oss": "gpt-oss", "deepseek_v4": "deepseek4", "qwen4_exp": "qwen4exp"}[family])
     writer.add_block_count(2)
     specs, packed_sizes, banks = {}, {}, {}
+    q8_0_dense_bytes = {}
     if family == "qwen4_exp":
         ple = PREFIX + "layers.0.ple.ple_embedding."
         for key, source in (("layer_multipliers", "layer_multipliers"), ("head_offsets", "ngram_heads_offsets"),
@@ -835,17 +1218,30 @@ def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = Fal
             bank_name = f"blk.{layer}.ffn_{role}_exps.{expert[3]}"
         if name in native:
             rows, columns = values.shape
+            override = native_overrides.get(name)
+            if override in ("BF16", "F32"):
+                dense_values = (float32(values) if values.dtype == np.uint16 else np.asarray(values, np.float32))
+                dense_values = dense_values * native_scale
+                reference[name] = write_dense_gguf_override(writer, family_gguf_name(name, family),
+                                                             dense_values, override)
+                continue
             if native_formats:
-                format_name = fixture_native_format(name, native_formats, dense_format_index)
+                format_name = override or fixture_native_format(name, native_formats, dense_format_index)
                 if ".experts." not in name:
                     dense_format_index += 1
-                raw, dtype, decoded, tag = quantized_gguf_matrix(values, format_name)
+                raw, dtype, decoded, tag = quantized_gguf_matrix(
+                    values, format_name, amplitude_scale=native_scale)
+            elif override:
+                raw, dtype, decoded, tag = quantized_gguf_matrix(
+                    values, override, amplitude_scale=native_scale)
             else:
                 bits = 6 if any(role in name for role in ("down_proj", ".w2.", "out_proj", "o_proj", "wo_b", "head.weight")) else 4
                 dtype = gguf.GGMLQuantizationType.Q4_K if bits == 4 else gguf.GGMLQuantizationType.Q6_K
                 raw = qnk_blocks(rows, bits, index, columns)
                 decoded = gguf.dequantize(raw, dtype).reshape(rows, columns)
                 tag = bits
+            if getattr(dtype, "name", None) == "Q8_0":
+                q8_0_dense_bytes[name] = raw.nbytes
             reference[name] = ("BF16", bfloat16(decoded))
             np.testing.assert_array_equal(float32(reference[name][1]), decoded)
             specs[name] = (raw, tag, rows, columns)
@@ -880,7 +1276,7 @@ def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = Fal
     baseline = root / "baseline"
     assets(baseline, model_config)
     baseline_tensors = dict(reference)
-    if fp32 and not native_formats and ple_format is None:
+    if fp32_native_baseline or (fp32 and not native_formats and ple_format is None):
         for name in native:
             if name != embedding:
                 source_dtype, values = reference[name]
@@ -890,7 +1286,8 @@ def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = Fal
     imported = root / "imported"
     importer.import_package(path, imported, root / "assets")
     loaded = importer.scan_safetensors(imported)
-    check_preserved_auxiliary(loaded, reference)
+    check_preserved_auxiliary(loaded, reference,
+                              {name for name, dtype in native_overrides.items() if dtype == "F32"})
     if canonical_dspark:
         imported_config = json.loads((imported / "config.json").read_text())
         assert not any(name.startswith("dspark_") for name in imported_config)
@@ -901,7 +1298,8 @@ def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = Fal
     dense, expert = weight_sizes(reference, packed_sizes)
     bf16_dense, bf16_expert = weight_sizes(reference, {})
     return Fixture(baseline, imported, path, dense, expert, bf16_dense, bf16_expert, len(specs), True, False, family,
-                   hybrid_dense_host_release(reference, packed_sizes, family=family))
+                   hybrid_dense_host_release(reference, packed_sizes, family=family,
+                                             q8_0_dense_bytes=q8_0_dense_bytes))
 
 
 
@@ -1058,12 +1456,14 @@ class NativeQuantizedTests(unittest.TestCase):
 
     def run_worker(self, path: Path, moe: bool, expected: Fixture | None = None,
                    *, backend: str | None = None, extra_args: tuple[str, ...] = (),
-                   speculative: bool = False) -> dict:
-        selected_backend = backend or self.backend
-        worker_args = ["--backend", selected_backend, "--cpu-packed-weights", "off"]
+                   speculative: bool = False, pure_auto: bool = False) -> dict:
+        if pure_auto and backend is not None:
+            raise ValueError("pure Auto worker execution cannot select a backend argument")
+        selected_backend = "auto" if pure_auto else (backend or self.backend)
+        worker_args = [] if pure_auto else ["--backend", selected_backend, "--cpu-packed-weights", "off"]
         if selected_backend == "hybrid":
             self.assertIsNotNone(self.vulkan_device_index)
-        if selected_backend in ("hybrid", "auto") and self.vulkan_device_index is not None:
+        if not pure_auto and selected_backend in ("hybrid", "auto") and self.vulkan_device_index is not None:
             worker_args.extend(("--vulkan-device", str(self.vulkan_device_index)))
         with WorkerClient(self.worker, path, [*worker_args, *extra_args],
                           verbose=self.verbose_worker) as client:
@@ -1073,15 +1473,16 @@ class NativeQuantizedTests(unittest.TestCase):
             hybrid = ready["resources"]["backend"] == "hybrid"
             if hybrid:
                 capabilities = ready["capabilities"]
-                self.assertIsNotNone(self.vulkan_device_index)
                 devices = {device["index"]: device for device in capabilities["vulkan_devices"]}
-                self.assertIn(capabilities["selected_vulkan_device_index"], devices)
-                self.assertTrue(devices[capabilities["selected_vulkan_device_index"]]["name"])
-                self.assertIn(self.vulkan_device_index, devices)
-                device = devices[self.vulkan_device_index]
+                selected_device_index = ready["resources"]["vulkan_device_index"]
+                self.assertIn(selected_device_index, devices)
+                self.assertTrue(devices[selected_device_index]["name"])
+                if not pure_auto:
+                    self.assertIsNotNone(self.vulkan_device_index)
+                    self.assertEqual(selected_device_index, self.vulkan_device_index)
+                device = devices[selected_device_index]
                 self.assertNotEqual(device["type"], "cpu")
                 self.assertGreater(device["compute_queue_count"], 0)
-                self.assertEqual(ready["resources"]["vulkan_device_index"], self.vulkan_device_index)
             self.assertEqual(ready["model"]["expert_count"], 2 if moe else 0)
             if expected is not None:
                 resources = ready["resources"]
@@ -1136,6 +1537,22 @@ class NativeQuantizedTests(unittest.TestCase):
                     self.assertGreater(done["stats"]["generation"]["speculative_draft_tokens"], 0)
                 if expected is not None:
                     gpu = done["stats"]["generation_gpu"]
+                    native_gqa = expected.native_matrices > 0 and expected.family in ("qwen", "gpt_oss")
+                    if native_gqa:
+                        self.assertEqual(gpu["attention_cpu_fallbacks"], 0,
+                                         "native GQA Attention fell back to CPU")
+                        if hybrid:
+                            self.assertGreater(gpu["attention_blocks"], 0,
+                                               "native GQA model executed no Vulkan Attention blocks")
+                            self.assertGreater(gpu["attention_device_rope_fusions"], 0,
+                                               "native GQA model executed no Vulkan device-RoPE")
+                            self.assertGreater(gpu["attention_qkv_ring_fusions"], 0,
+                                               "native GQA decode executed no KV-ring append")
+                            self.assertEqual(gpu["model_compute_cpu_fallbacks"], 0,
+                                             "native GQA model compute fell back to CPU")
+                        else:
+                            self.assertEqual(gpu["attention_blocks"], 0,
+                                             "explicit CPU GQA profile unexpectedly executed Vulkan Attention")
                     if hybrid:
                         self.assertTrue(gpu["available"])
                         self.assertGreater(gpu["submit_count"], 0)
@@ -1179,12 +1596,13 @@ class NativeQuantizedTests(unittest.TestCase):
                 np.testing.assert_allclose(result["reused"][1], result["sampled"][1], rtol=0, atol=3e-5)
             return result
 
-    def compare(self, fixture: Fixture, *, direct: bool) -> None:
+    def compare(self, fixture: Fixture, *, direct: bool, auto: bool = False,
+                include_imported: bool = True) -> None:
         # Native GGUF format fixtures use a BF16 oracle after checking that the
         # official GGUF dequantization is exactly representable in BF16.
         speculative = fixture.family == "deepseek_dspark"
         baseline = self.run_worker(fixture.baseline, fixture.moe, backend="cpu", speculative=speculative)
-        paths = [("imported", fixture.imported)]
+        paths = [("imported", fixture.imported)] if include_imported else []
         if direct:
             paths.append(("direct", fixture.source))
         for label, path in paths:
@@ -1200,6 +1618,15 @@ class NativeQuantizedTests(unittest.TestCase):
                                   "gpu": result["sampled_stats"]["generation_gpu"],
                                   "speculative": result["sampled_stats"]["generation"].get("speculative_proposals"),
                                   "warm_experts": result.get("reused_stats", {}).get("generation")}), flush=True)
+        if auto:
+            auto_result = self.run_worker(fixture.source, fixture.moe, fixture, pure_auto=True,
+                                          speculative=speculative)
+            for mode in ("greedy", "sampled"):
+                self.assertEqual(auto_result[mode][0], baseline[mode][0])
+                np.testing.assert_allclose(auto_result[mode][1], baseline[mode][1], rtol=0, atol=3e-5)
+            print(json.dumps({"family": fixture.family, "path": "direct", "backend": auto_result["resources"]["backend"],
+                              "native_matrices": fixture.native_matrices, "profile": "default-auto",
+                              "gpu": auto_result["sampled_stats"]["generation_gpu"]}), flush=True)
 
     def compare_expert_memory_modes(self, fixture: Fixture) -> None:
         cache_args = ("--expert-gpu-cache-mb", "16") if self.backend == "hybrid" else ()
@@ -1303,6 +1730,88 @@ class NativeQuantizedTests(unittest.TestCase):
                 root = self.root / family
                 root.mkdir()
                 self.compare(prepare_family_gguf(root, family), direct=False)
+
+    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
+    def test_native_gguf_block_fixture_oracles(self):
+        source = plain((2, 256), 913, 1 / 64)
+        for format_name in NATIVE_GQA_GGUF_FORMATS:
+            with self.subTest(format=format_name):
+                raw, dtype, decoded, tag = quantized_gguf_matrix(source, format_name)
+                block_elements, block_bytes = importer.GGUF_NATIVE_FORMATS[format_name][1:]
+                self.assertEqual(dtype, getattr(gguf.GGMLQuantizationType, format_name))
+                self.assertEqual(tag, importer.GGUF_NATIVE_FORMATS[format_name][0])
+                self.assertEqual(raw.nbytes, source.shape[0] * (source.shape[1] // block_elements) * block_bytes)
+                self.assertTrue(np.isfinite(decoded).all())
+                self.assertTrue(np.any(decoded != 0))
+                np.testing.assert_array_equal(float32(bfloat16(decoded)), decoded)
+                if format_name == "Q8_K":
+                    # The official 0.19 package omits Q8_K dequantize on some
+                    # builds; validate the standard d(float32) * qs(int8)
+                    # layout and valid signed subgroup sums independently.
+                    blocks = raw.reshape(2, 1, 292)
+                    scales = blocks[..., :4].copy().view("<f4").reshape(2, 1)
+                    codes = blocks[..., 4:260].copy().view(np.int8).reshape(2, 1, 256)
+                    expected = (scales[..., None] * codes.astype(np.float32)).reshape(source.shape)
+                    sums = blocks[..., 260:].copy().view("<i2").reshape(2, 1, 16)
+                    np.testing.assert_array_equal(decoded, expected)
+                    np.testing.assert_array_equal(
+                        sums, codes.reshape(2, 1, 16, 16).sum(axis=-1))
+
+    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
+    def test_native_gqa_mixed_projection_dtypes(self):
+        expected_types = {"q": "Q2_K", "k": "BF16", "v": "Q8_0", "o": "F32"}
+        for family in ("qwen35moe", "gpt_oss"):
+            projection_family = "qwen" if family == "qwen35moe" else family
+            with self.subTest(family=family, fixture="13-format-matrix"):
+                matrix_root = self.root / f"{family}-13-format-matrix"
+                matrix_root.mkdir()
+                matrix_fixture = (prepare_gguf(matrix_root, True, native_formats=NATIVE_GQA_GGUF_FORMATS)
+                                  if family == "qwen35moe"
+                                  else prepare_family_gguf(matrix_root, family, native_formats=NATIVE_GQA_GGUF_FORMATS))
+                matrix_types = standard_gqa_projection_types(matrix_fixture.source, projection_family)
+                self.assertEqual(len(set(matrix_types.values())), 4,
+                                 f"13-format matrix did not give Q/K/V/O distinct dtypes: {matrix_types}")
+
+            with self.subTest(family=family, fixture="Q2_K-BF16-Q8_0-F32"):
+                mixed_root = self.root / f"{family}-mixed-gqa"
+                mixed_root.mkdir()
+                overrides = standard_gqa_mixed_overrides(projection_family)
+                model = config(True) if family == "qwen35moe" else family_tensors(family)[0]
+                with patch.object(gguf, "GGUFWriter", gguf_writer_with_test_metadata(model)):
+                    fixture = (prepare_gguf(mixed_root, True, native_formats=NATIVE_GQA_GGUF_FORMATS,
+                                            native_overrides=overrides, native_scale=1 / 64,
+                                            fp32_native_baseline=True)
+                               if family == "qwen35moe"
+                               else prepare_family_gguf(mixed_root, family, native_formats=NATIVE_GQA_GGUF_FORMATS,
+                                                        native_overrides=overrides, native_scale=1 / 64,
+                                                        fp32_native_baseline=True))
+                projection_types = standard_gqa_projection_types(fixture.source, projection_family)
+                self.assertEqual(projection_types, expected_types)
+                loaded = importer.scan_safetensors(fixture.imported)
+                for role, name in standard_gqa_projection_names(projection_family).items():
+                    imported_dtype = "BF16" if expected_types[role] in ("BF16", "F32") else "U8"
+                    self.assertEqual(loaded[name].dtype, imported_dtype, name)
+                # Reuse the CPU oracle, the selected CPU/Hybrid backend, Auto,
+                # and real Vulkan Attention/fallback counters. The generic
+                # importer normalizes ordinary GGUF F32 matrices to BF16, so
+                # execute the original mixed-dtype GGUF source for this case.
+                self.compare(fixture, direct=True, auto=True, include_imported=False)
+
+    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
+    def test_native_gqa_ggml_blocks_all_formats(self):
+        for family in ("qwen35", "gpt_oss"):
+            for format_name in NATIVE_GQA_GGUF_FORMATS:
+                with self.subTest(family=family, format=format_name):
+                    root = self.root / f"{family}-{format_name.lower()}"
+                    root.mkdir()
+                    model = config(False) if family == "qwen35" else family_tensors(family)[0]
+                    with patch.object(gguf, "GGUFWriter", gguf_writer_with_test_metadata(model)):
+                        fixture = (prepare_gguf(root, native_formats=(format_name,), native_scale=1 / 64,
+                                               fp32_native_baseline=True)
+                                   if family == "qwen35"
+                                   else prepare_family_gguf(root, family, native_formats=(format_name,),
+                                                            native_scale=1 / 64, fp32_native_baseline=True))
+                    self.compare(fixture, direct=True, auto=self.backend == "cpu")
 
     @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
     def test_native_ggml_block_formats_all_architectures(self):

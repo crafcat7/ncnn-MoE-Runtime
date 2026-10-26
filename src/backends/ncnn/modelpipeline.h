@@ -55,8 +55,12 @@ void release_vulkan_dense_host_copies(CompiledModel& compiled);
 // Per-Session recurrent/default-chunk KV state, peak-layer default prefill
 // workspace, and physical Expert allocator slack not present in live heap use.
 // Uses SessionOptions defaults; larger chunks/contexts remain allocation-checked.
-[[nodiscard]] uint64_t qwen_device_pending_reserve(const CompiledModel& compiled,
-                                                   uint32_t device_index) noexcept;
+// Per-device state/work reserve for Vulkan attention. Qwen's continuous chain
+// owns a larger specialized reserve; ordinary attention uses its initial KV
+// rings plus the common execution workspace.
+[[nodiscard]] uint64_t vulkan_pending_reserve(const CompiledModel& compiled,
+                                              uint32_t device_index,
+                                              uint64_t heap_budget) noexcept;
 
 [[nodiscard]] bool support_vulkan_attention(const CompiledOperatorTable& operators,
                                             const AttentionBlockPlan& attention) noexcept;

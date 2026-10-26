@@ -3112,7 +3112,9 @@ public:
     void record_projection(const ncnn::VkMat& input,
                            const ncnn::VkMat& output,
                            uint32_t token_count,
-                           ncnn::VkCompute& command) const;
+                           ncnn::VkCompute& command,
+                           uint32_t output_stride = 0,
+                           uint32_t output_offset = 0) const;
 #endif
     uint32_t matrix_input_columns = 0;
     uint32_t logical_input_columns = 0;
@@ -3130,10 +3132,14 @@ public:
 void Float8Linear_vulkan::Implementation::record_projection(const ncnn::VkMat& input,
                                                             const ncnn::VkMat& output,
                                                             uint32_t token_count,
-                                                            ncnn::VkCompute& command) const
+                                                            ncnn::VkCompute& command,
+                                                            uint32_t output_stride,
+                                                            uint32_t output_offset) const
 {
+    if (output_stride == 0)
+        output_stride = output_columns;
     std::vector<ncnn::VkMat> bindings = {input, packed, scales, bias, output};
-    std::vector<ncnn::vk_constant_type> constants(7);
+    std::vector<ncnn::vk_constant_type> constants(9);
     constants[0].u32 = matrix_input_columns;
     constants[1].u32 = logical_input_columns;
     constants[2].u32 = output_columns;
@@ -3141,6 +3147,8 @@ void Float8Linear_vulkan::Implementation::record_projection(const ncnn::VkMat& i
     constants[4].u32 = block_count;
     constants[5].u32 = token_count;
     constants[6].u32 = scale_row_size;
+    constants[7].u32 = output_stride;
+    constants[8].u32 = output_offset;
     ncnn::VkMat dispatcher;
     dispatcher.w = static_cast<int>(static_cast<uint64_t>(output_columns) * pipeline->local_size_x());
     dispatcher.h = static_cast<int>(token_count);
@@ -3688,7 +3696,9 @@ bool Float8Linear_vulkan::record_rms_norm_chain_parallel(const ncnn::VkMat& inpu
 bool Float8Linear_vulkan::record_forward(const ncnn::VkMat& input,
                                          ncnn::VkMat& output,
                                          ncnn::VkCompute& command,
-                                         std::vector<ncnn::VkMat>& workspace) const
+                                         std::vector<ncnn::VkMat>& workspace,
+                                         uint32_t output_column_offset,
+                                         uint32_t output_stride) const
 {
     if (!d->vulkan_context || !d->pipeline || !d->quantize_pipeline
         || input.empty() || input.dims != 2 || input.elempack != 1
@@ -3696,10 +3706,28 @@ bool Float8Linear_vulkan::record_forward(const ncnn::VkMat& input,
         || input.w != static_cast<int>(d->logical_input_columns)
         || d->logical_input_columns % 128 != 0)
         return false;
+    if (output_stride == 0)
+        output_stride = d->output_columns;
+    if (output_stride > static_cast<uint32_t>(std::numeric_limits<int>::max())
+        || output_column_offset > output_stride
+        || d->output_columns > output_stride - output_column_offset)
+        return false;
     ncnn::VkMat quantized;
     command.record_clone(input, quantized, d->option);
-    output.create(static_cast<int>(d->output_columns), input.h, sizeof(float),
-                  d->vulkan_context->blob_allocator());
+    if (output_column_offset == 0 && output_stride == d->output_columns)
+    {
+        output.create(static_cast<int>(d->output_columns), input.h, sizeof(float),
+                      d->vulkan_context->blob_allocator());
+    }
+    else if (output.empty()
+             || output.dims != 2
+             || output.elempack != 1
+             || output.elemsize != sizeof(float)
+             || output.w != static_cast<int>(output_stride)
+             || output.h != input.h)
+    {
+        return false;
+    }
     if (quantized.empty() || output.empty())
         return false;
     std::vector<ncnn::vk_constant_type> constants(2);
@@ -3711,7 +3739,12 @@ bool Float8Linear_vulkan::record_forward(const ncnn::VkMat& input,
     dispatcher.h = input.h;
     dispatcher.c = 1;
     command.record_pipeline(d->quantize_pipeline.get(), {quantized}, constants, dispatcher);
-    d->record_projection(quantized, output, static_cast<uint32_t>(input.h), command);
+    d->record_projection(quantized,
+                         output,
+                         static_cast<uint32_t>(input.h),
+                         command,
+                         output_stride,
+                         output_column_offset);
     workspace.push_back(std::move(quantized));
     return true;
 }

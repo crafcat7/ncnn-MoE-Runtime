@@ -606,15 +606,19 @@ private:
 class AttentionPackage
 {
 public:
-    explicit AttentionPackage(bool bfloat16_kv_cache = false, uint32_t sliding_window = 2, bool attention_bias = true, bool attention_sinks = true)
+    explicit AttentionPackage(bool bfloat16_kv_cache = false, uint32_t sliding_window = 2, bool attention_bias = true,
+                              bool attention_sinks = true, bool grouped_query = false)
     {
         path_ = create_unique_test_directory("ncnn_moe_attention_test_");
+        const uint32_t hidden_size = grouped_query ? 4 : 2;
+        const uint32_t attention_head_count = grouped_query ? 2 : 1;
 
         std::ofstream manifest(path_ / "config.json", std::ios::binary);
         manifest << R"({
   "model_type": "test_moe",
   "vocabulary_size": 2,
-  "hidden_size": 2,
+  "hidden_size": )"
+                 << hidden_size << R"(,
   "intermediate_size": 2,
   "layer_count": 1,
   "expert_count": 1,
@@ -623,13 +627,15 @@ public:
   "expert_layout": "up_down",
   "normalize_topk_weights": true,
   "use_attention": true,
-  "attention_head_count": 1,
+  "attention_head_count": )"
+                 << attention_head_count << R"(,
   "kv_head_count": 1,
   "head_dimension": 2,
   "sliding_window": )"
                  << sliding_window << R"(,
   "initial_context_length": 16,
-  "max_context_length": 32,
+  "max_context_length": )"
+                 << (grouped_query ? 64 : 32) << R"(,
   "rope_theta": 10000.0,
   "rope_scaling_factor": 1.0,
   "attention_bias": )"
@@ -644,36 +650,55 @@ public:
 
         std::vector<float> values;
         auto append = [&values](std::initializer_list<float> additions) { values.insert(values.end(), additions.begin(), additions.end()); };
-        append({1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f});
-        append({0.0f, 0.0f, 0.0f, 0.0f});
-        if (attention_bias)
-            append({0.0f, 0.0f});
-        append({0.0f, 0.0f, 0.0f, 0.0f});
-        if (attention_bias)
-            append({0.0f, 0.0f});
-        append({1.0f, 0.0f, 0.0f, 1.0f});
-        if (attention_bias)
-            append({0.0f, 0.0f});
-        append({1.0f, 0.0f, 0.0f, 1.0f});
-        if (attention_bias)
-            append({0.0f, 0.0f});
-        if (attention_sinks)
-            append({0.375f});
-        append({
-            1.0f,
-            1.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-        });
-        append({1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f});
+        if (!grouped_query)
+        {
+            append({1.0f, 0.0f, 0.0f, 1.0f});
+            append({1.0f, 1.0f});
+            append({0.0f, 0.0f, 0.0f, 0.0f});
+            if (attention_bias)
+                append({0.0f, 0.0f});
+            append({0.0f, 0.0f, 0.0f, 0.0f});
+            if (attention_bias)
+                append({0.0f, 0.0f});
+            append({1.0f, 0.0f, 0.0f, 1.0f});
+            if (attention_bias)
+                append({0.0f, 0.0f});
+            append({1.0f, 0.0f, 0.0f, 1.0f});
+            if (attention_bias)
+                append({0.0f, 0.0f});
+            if (attention_sinks)
+                append({0.375f});
+            append({1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                    0.0f, 0.0f, 0.0f, 0.0f});
+            append({1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f});
+        }
+        else
+        {
+            append({1.0f, 0.25f, -0.5f, 0.125f, -0.5f, 1.0f, 0.25f, 0.75f});
+            append({1.0f, 1.0f, 1.0f, 1.0f});
+            append({1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+                    0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f});
+            if (attention_bias)
+                append({0.0f, 0.0f, 0.0f, 0.0f});
+            append({1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f});
+            if (attention_bias)
+                append({0.0f, 0.0f});
+            append({0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f});
+            if (attention_bias)
+                append({0.0f, 0.0f});
+            append({1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+                    0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f});
+            if (attention_bias)
+                append({0.0f, 0.0f, 0.0f, 0.0f});
+            if (attention_sinks)
+                append({0.375f, -0.125f});
+            append({1.0f, 1.0f, 1.0f, 1.0f});
+            append({1.0f, 0.5f, -0.25f, 0.125f});
+            append({0.5f, 0.25f, 0.125f, -0.25f, -0.125f, 0.5f, 0.25f, 0.125f});
+            append({0.5f, 0.125f, 0.25f, -0.5f, -0.125f, 0.25f, 0.5f, 0.25f});
+            append({1.0f, 1.0f, 1.0f, 1.0f});
+            append({1.0f, 0.5f, -0.5f, 0.25f, -0.5f, 0.25f, 0.5f, 1.0f});
+        }
         std::ofstream weights(path_ / "model.test.bin", std::ios::binary);
         weights.write(reinterpret_cast<const char*>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(float)));
     }
@@ -10616,6 +10641,17 @@ void test_generic_mtp_int4_cache_key()
     add_float_vector("speculative.layers.0.pre_attention_norm.weight", 2, 1.0f);
     for (const char* projection : {"query", "key", "value", "output"})
         add_float(std::string("speculative.layers.0.attention.") + projection + ".weight", {2, 2});
+    mapping.value().at("speculative.mtp.input_projection.weight").float32_data = {
+        0.5f, 0.25f, -0.5f, 0.125f,
+        -0.25f, 0.5f, 0.25f, -0.5f};
+    mapping.value().at("speculative.layers.0.attention.query.weight").float32_data = {
+        1.0f, 0.25f, -0.5f, 0.75f};
+    mapping.value().at("speculative.layers.0.attention.key.weight").float32_data = {
+        0.5f, -0.25f, 0.75f, 0.5f};
+    mapping.value().at("speculative.layers.0.attention.value.weight").float32_data = {
+        0.75f, 0.25f, -0.125f, 0.5f};
+    mapping.value().at("speculative.layers.0.attention.output.weight").float32_data = {
+        1.0f, -0.125f, 0.25f, 0.75f};
     add_float_vector("speculative.layers.0.pre_ffn_norm.weight", 2, 1.0f);
     add_float("speculative.layers.0.router.weight", {1, 2});
     for (const char* projection : {"gate", "up", "down"})
@@ -10623,6 +10659,8 @@ void test_generic_mtp_int4_cache_key()
     mapping.value()["speculative.layers.0.experts.0.gate_up.weight"] = make_int4({4, 2});
     mapping.value()["speculative.layers.0.experts.0.down.weight"] = make_int4({2, 2});
 
+    MoeModelDescriptor hybrid_descriptor = descriptor;
+    WeightMapping hybrid_mapping = mapping.value();
     CompiledModel compiled;
     auto status = compile_model(std::move(descriptor), std::move(mapping).value(), compiled,
                                 HybridMode::CpuOnly);
@@ -10637,6 +10675,153 @@ void test_generic_mtp_int4_cache_key()
     check(support_vulkan_experts(compiled.weights,
                                  compiled.speculative.graph.layer_plans.back().moe,
                                  compiled.opt.optimization_flags));
+
+    TestRuntime runtime;
+    if (has_usable_vulkan_device(runtime.info(), RuntimeVulkanAttention))
+    {
+        CompilerOption hybrid_options;
+        hybrid_options.flags |= BackendVulkanDense | BackendVulkanAttention;
+        hybrid_options.device_index = get_default_gpu_index();
+        hybrid_options.vulkan_runtime = create_vulkan_runtime();
+        hybrid_options.optimization_flags = compiled.opt.optimization_flags;
+        CompiledModel hybrid;
+        auto hybrid_status = compile_model(std::move(hybrid_descriptor),
+                                           std::move(hybrid_mapping),
+                                           hybrid,
+                                           HybridMode::HybridExperts,
+                                           hybrid_options);
+        if (!hybrid_status)
+            throw std::runtime_error("generic INT4 MTP Vulkan attention compilation failed: "
+                                     + hybrid_status.error().message);
+
+        const AttentionBlockPlan& cpu_attention = compiled.speculative.graph.layer_plans.front().attention;
+        const AttentionBlockPlan& gpu_attention = hybrid.speculative.graph.layer_plans.front().attention;
+        check(cpu_attention.kind == AttentionKind::Standard);
+        check(gpu_attention.kind == AttentionKind::Standard);
+        check(gpu_attention.vulkan_attention_operator != invalid_compiled_operator_handle);
+        check(static_cast<bool>(hybrid.operators.at(gpu_attention.vulkan_attention_operator).attention));
+        check(support_vulkan_attention(hybrid.operators, gpu_attention));
+        check(hybrid.speculative.layer_nodes.size() == 1);
+        const uint32_t attention_node_id = hybrid.speculative.layer_nodes.front().attention;
+        check(attention_node_id < hybrid.speculative.graph.nodes.size());
+        const ExecutionNode& attention_node = hybrid.speculative.graph.nodes[attention_node_id];
+        check(attention_node.type == ExecutionNodeType::Attention);
+        check(attention_node.backend == ExecutionBackend::Vulkan);
+
+        SessionState cpu_state;
+        SessionState gpu_state;
+        cpu_state.speculative_layers.resize(1);
+        gpu_state.speculative_layers.resize(1);
+        const uint32_t hidden_size = hybrid.descriptor.hidden_size;
+        ActivationBuffer cold_context(1, hidden_size);
+        cold_context.row(0)[0] = 0.75f;
+        cold_context.row(0)[1] = -0.25f;
+        ActivationBuffer prefix_context(2, hidden_size);
+        prefix_context.row(0)[0] = -0.5f;
+        prefix_context.row(0)[1] = 0.375f;
+        prefix_context.row(1)[0] = 0.125f;
+        prefix_context.row(1)[1] = 0.625f;
+
+        LayerCache& gpu_cache = gpu_state.speculative_layers.front();
+        constexpr uint64_t prefix_tokens = 3;
+        const std::array<std::pair<const ActivationBuffer*, uint64_t>, 2> contexts = {{{&cold_context, 0}, {&prefix_context, 1}}};
+        const auto append_context = [](const CompiledModel& model,
+                                       ExecutionBackend backend,
+                                       SessionState& state,
+                                       const ActivationBuffer& context,
+                                       uint64_t position) {
+            return append_attention_context(model.weights,
+                                            model.operators,
+                                            model.speculative.graph.layer_plans.front().attention,
+                                            backend,
+                                            position,
+                                            state.speculative_layers.front(),
+                                            state.attention_scratch,
+                                            context,
+                                            model.opt.optimization_flags);
+        };
+        for (const auto& [context, position] : contexts)
+        {
+            check(static_cast<bool>(append_context(compiled, ExecutionBackend::Cpu,
+                                                   cpu_state, *context, position)));
+            check(static_cast<bool>(append_context(hybrid, ExecutionBackend::Vulkan,
+                                                   gpu_state, *context, position)));
+            check(gpu_cache.vulkan_attention_cache != nullptr);
+            check(gpu_cache.token_count == position + context->rows());
+            check(gpu_cache.keys.empty() && gpu_cache.values.empty());
+            check(gpu_cache.bfloat16_keys.empty() && gpu_cache.bfloat16_values.empty());
+        }
+        const auto retained_device_cache = gpu_cache.vulkan_attention_cache;
+        check(static_cast<bool>(retained_device_cache));
+        check(gpu_cache.token_count == prefix_tokens);
+        check(gpu_cache.capacity_tokens >= prefix_tokens);
+        check(gpu_cache.keys.empty() && gpu_cache.values.empty());
+        check(gpu_cache.bfloat16_keys.empty() && gpu_cache.bfloat16_values.empty());
+        check(!gpu_cache.vulkan_attention_state_unknown);
+        check(gpu_state.attention_scratch.output.rows() == prefix_context.rows());
+        check(gpu_state.attention_scratch.output.columns() == hidden_size);
+
+        for (SessionState* state : {&cpu_state, &gpu_state})
+        {
+            state->mtp_pending_target_hidden.reset(1, hidden_size, false);
+            state->mtp_pending_target_hidden.row(0)[0] = 0.375f;
+            state->mtp_pending_target_hidden.row(0)[1] = -0.125f;
+            state->mtp_pending_target_position = prefix_tokens;
+        }
+        check(static_cast<bool>(begin_state_cache_transaction(cpu_state.speculative_layers,
+                                                              hybrid.speculative.block_size)));
+        check(static_cast<bool>(begin_state_cache_transaction(gpu_state.speculative_layers,
+                                                              hybrid.speculative.block_size)));
+        SessionStatistics cpu_statistics;
+        SessionStatistics gpu_statistics;
+        SpeculativeProposal cpu_proposal;
+        SpeculativeProposal gpu_proposal;
+        const SpeculativeSampler first_token = [](std::span<const float>) -> Result<int32_t> {
+            return 0;
+        };
+        auto cpu_proposed = propose_speculative(compiled,
+                                                1,
+                                                cpu_statistics,
+                                                cpu_state,
+                                                prefix_tokens + 1,
+                                                cpu_proposal,
+                                                first_token);
+        auto gpu_proposed = propose_speculative(hybrid,
+                                                1,
+                                                gpu_statistics,
+                                                gpu_state,
+                                                prefix_tokens + 1,
+                                                gpu_proposal,
+                                                first_token);
+        check(static_cast<bool>(cpu_proposed));
+        check(static_cast<bool>(gpu_proposed));
+        check(gpu_statistics.vulkan_attention_blocks > 0);
+        check(gpu_statistics.vulkan_attention_cpu_fallbacks == 0);
+        check(cpu_proposal.token_ids == gpu_proposal.token_ids);
+        check(cpu_proposal.confidence_logits == gpu_proposal.confidence_logits);
+        check(cpu_proposal.logits.size() == gpu_proposal.logits.size());
+        check(cpu_state.speculative_layers.front().transaction.recorded_rows
+              == hybrid.speculative.block_size);
+        check(gpu_cache.transaction.recorded_rows == hybrid.speculative.block_size);
+        for (size_t row = 0; row < cpu_proposal.logits.size(); ++row)
+        {
+            check(cpu_proposal.logits[row].values().size()
+                  == gpu_proposal.logits[row].values().size());
+            for (size_t column = 0; column < cpu_proposal.logits[row].values().size(); ++column)
+                check_near(cpu_proposal.logits[row].values()[column],
+                           gpu_proposal.logits[row].values()[column],
+                           1e-4f);
+        }
+
+        check(static_cast<bool>(finish_state_cache_transaction(cpu_state.speculative_layers, 0)));
+        check(static_cast<bool>(finish_state_cache_transaction(gpu_state.speculative_layers, 0)));
+        check(cpu_state.speculative_layers.front().token_count == prefix_tokens);
+        check(gpu_cache.token_count == prefix_tokens);
+        check(gpu_cache.vulkan_attention_cache == retained_device_cache);
+        check(gpu_cache.keys.empty() && gpu_cache.values.empty());
+        check(gpu_cache.bfloat16_keys.empty() && gpu_cache.bfloat16_values.empty());
+        check(!gpu_cache.vulkan_attention_state_unknown);
+    }
 }
 
 void test_attention_graph_without_bias_or_sink()
@@ -16023,128 +16208,25 @@ void test_qwen4_exp_vulkan_projections()
             for (uint32_t column = 0; column < input.columns(); ++column)
                 input.row(row)[column] = static_cast<float>(static_cast<int>((row * 5 + column * 3) % 19) - 9) / 8.0f;
 
-        // Vulkan-resident projections reclaim their host storage by default.
-        {
-            CompilerOption opt;
-            opt.flags |= BackendVulkanDense | BackendVulkanAttention;
-            opt.device_index = get_default_gpu_index();
-            opt.vulkan_runtime = create_vulkan_runtime();
-            CompiledModel hybrid_model;
-            auto compiled = compile_model(descriptor, mapping, hybrid_model, HybridMode::HybridExperts, opt);
-            if (!compiled)
-                throw std::runtime_error("Qwen4 Exp Vulkan projection compilation failed: " + compiled.error().message);
-            const AttentionBlockPlan& hybrid_plan = hybrid_model.graph.layer_plans[3].attention;
-            check(support_vulkan_attention(hybrid_model.operators, hybrid_plan));
-            check(hybrid_plan.vulkan_attention_operator == invalid_compiled_operator_handle);
-            check(hybrid_plan.fused_qkv_operator != invalid_compiled_operator_handle
-                  || hybrid_plan.fused_qkv_gate_bfloat16_operator != invalid_compiled_operator_handle);
-            if (!qsa_attention)
-            {
-                check(has_flag(hybrid_plan.flags, AttentionBlockExternalResidual));
-                check(!has_flag(hybrid_plan.flags, AttentionBlockQsa | AttentionBlockQueryKeyNorm | AttentionBlockOutputGate));
-                const auto bfloat16_probe = Bfloat16Linear_vulkan::create(cpu_model.weights.at(cpu_plan.output_weight),
-                                                                          nullptr, opt.device_index, opt.vulkan_runtime,
-                                                                          opt.optimization_flags);
-                if (bfloat16_probe)
-                {
-                    check(static_cast<bool>(hybrid_model.operators.at(hybrid_plan.fused_qkv_operator).bfloat16));
-                    check(static_cast<bool>(hybrid_model.operators.at_weight(hybrid_plan.output_weight).bfloat16));
-                }
-            }
-            bool found_attention = false;
-            for (const ExecutionNode& node : hybrid_model.graph.nodes)
-            {
-                if (node.type == ExecutionNodeType::Attention && node.layer_plan_index == 3)
-                {
-                    check(node.backend == ExecutionBackend::Vulkan);
-                    found_attention = true;
-                }
-            }
-            check(found_attention);
-            {
-                for (TensorHandle handle : {hybrid_plan.query_weight, hybrid_plan.key_weight,
-                                            hybrid_plan.value_weight, hybrid_plan.output_weight})
-                    check(hybrid_model.weights.at(handle).bfloat16_values().empty());
-                if (qsa_attention)
-                {
-                    for (TensorHandle handle : {hybrid_plan.query_norm_weight, hybrid_plan.key_norm_weight,
-                                                hybrid_plan.qsa_query_key_weight, hybrid_plan.qsa_query_norm_weight,
-                                                hybrid_plan.qsa_key_norm_weight})
-                        check(!hybrid_model.weights.at(handle).bfloat16_values().empty());
-                }
-            }
+        LayerCache cpu_cache;
+        AttentionScratch cpu_scratch;
+        ActivationBuffer cpu_output;
+        check(static_cast<bool>(forward_attention(cpu_model.weights, cpu_model.operators, cpu_plan,
+                                                  ExecutionBackend::Cpu, 0, cpu_cache, cpu_scratch,
+                                                  input, cpu_output, cpu_model.opt.optimization_flags)));
+        check(cpu_cache.token_count == input.rows());
+        check(cpu_output.rows() == input.rows());
 
-            bool excluded_completed_blocks = false;
-            const auto compare_attention = [&](const ActivationBuffer& hidden, uint64_t position,
-                                               LayerCache& cpu_cache, LayerCache& hybrid_cache,
-                                               AttentionScratch& cpu_scratch, AttentionScratch& hybrid_scratch) {
-                ActivationBuffer cpu_output;
-                ActivationBuffer hybrid_output;
-                check(static_cast<bool>(forward_attention(cpu_model.weights, cpu_model.operators, cpu_plan,
-                                                          ExecutionBackend::Cpu, position, cpu_cache, cpu_scratch,
-                                                          hidden, cpu_output, cpu_model.opt.optimization_flags)));
-                const VulkanStatistics before = get_vulkan_statistics(hybrid_model.vulkan_runtime);
-                check(static_cast<bool>(forward_attention(hybrid_model.weights, hybrid_model.operators, hybrid_plan,
-                                                          ExecutionBackend::Vulkan, position, hybrid_cache, hybrid_scratch,
-                                                          hidden, hybrid_output, hybrid_model.opt.optimization_flags)));
-                const VulkanStatistics after = get_vulkan_statistics(hybrid_model.vulkan_runtime);
-                check(after.dispatches > before.dispatches);
-                check(after.compute_submissions > before.compute_submissions);
-                check(after.attention_blocks == before.attention_blocks);
-                check(cpu_output.rows() == hybrid_output.rows());
-                check(cpu_output.columns() == hybrid_output.columns());
-                bool nonzero_output = false;
-                for (size_t row = 0; row < cpu_output.rows(); ++row)
-                    for (uint32_t column = 0; column < cpu_output.columns(); ++column)
-                    {
-                        const float expected = cpu_output.row(row)[column];
-                        nonzero_output = nonzero_output || std::abs(expected) > 1e-5f;
-                        check_near(hybrid_output.row(row)[column], expected, 1e-4f);
-                    }
-                check(nonzero_output);
-                check(cpu_scratch.qsa_selected_offsets == hybrid_scratch.qsa_selected_offsets);
-                check(cpu_scratch.qsa_selected_indices == hybrid_scratch.qsa_selected_indices);
-                if (qsa_attention)
-                {
-                    for (size_t row = 0; row < hidden.rows(); ++row)
-                    {
-                        const uint32_t selected_count = hybrid_scratch.qsa_selected_offsets[row + 1]
-                                                        - hybrid_scratch.qsa_selected_offsets[row];
-                        excluded_completed_blocks = excluded_completed_blocks
-                                                    || selected_count < position + row + 1;
-                    }
-                }
-                check(cpu_cache.token_count == hybrid_cache.token_count);
-                check(cpu_cache.qsa_block_keys == hybrid_cache.qsa_block_keys);
-                check(cpu_cache.qsa_index_key_tail == hybrid_cache.qsa_index_key_tail);
-            };
-
-            LayerCache cpu_cache;
-            LayerCache hybrid_cache;
-            AttentionScratch cpu_scratch;
-            AttentionScratch hybrid_scratch;
-            ActivationBuffer prefill(9, input.columns());
-            std::copy_n(input.row(0), prefill.rows() * prefill.columns(), prefill.row(0));
-            compare_attention(prefill, 0, cpu_cache, hybrid_cache, cpu_scratch, hybrid_scratch);
-            for (size_t row = prefill.rows(); row < input.rows(); ++row)
-            {
-                ActivationBuffer token(1, input.columns());
-                std::copy_n(input.row(row), input.columns(), token.row(0));
-                compare_attention(token, row, cpu_cache, hybrid_cache, cpu_scratch, hybrid_scratch);
-            }
-
-            if (qsa_attention)
-                check(excluded_completed_blocks);
-
-            LayerCache context_cache;
-            AttentionScratch context_scratch;
-            check(static_cast<bool>(append_attention_context(hybrid_model.weights, hybrid_model.operators, hybrid_plan,
-                                                             ExecutionBackend::Vulkan, 0, context_cache, context_scratch,
-                                                             input, hybrid_model.opt.optimization_flags)));
-            check(context_cache.token_count == hybrid_cache.token_count);
-            check(context_cache.qsa_block_keys == hybrid_cache.qsa_block_keys);
-            check(context_cache.qsa_index_key_tail == hybrid_cache.qsa_index_key_tail);
-        }
+        // Projection-only preparation cannot admit a complete Vulkan block.
+        CompilerOption opt;
+        opt.flags |= BackendVulkanDense | BackendVulkanAttention;
+        opt.device_index = get_default_gpu_index();
+        opt.vulkan_runtime = create_vulkan_runtime();
+        CompiledModel hybrid_model;
+        auto compiled = compile_model(descriptor, mapping, hybrid_model, HybridMode::HybridExperts, opt);
+        check(!compiled);
+        check(compiled.error().code == ErrorCode::UnsupportedModel);
+        check(compiled.error().message.find("complete Qwen device pipeline") != std::string::npos);
     }
 }
 
@@ -16287,7 +16369,7 @@ void test_gated_delta_vulkan_budget_admission()
                                          + (explicit_cache ? "explicit cache" : "automatic cache") + "): " + compiled.error().message);
             check(model.qwen_device_chain);
             check(static_cast<bool>(model.qwen_device_head));
-            check(qwen_device_pending_reserve(model, opt.device_index) > UINT64_C(64) * 1024 * 1024);
+            check(vulkan_pending_reserve(model, opt.device_index, opt.gpu_heap_budget) > UINT64_C(64) * 1024 * 1024);
             uint32_t gated_delta_layers = 0;
             uint32_t qsa_layers = 0;
             for (const CompiledLayerPlan& layer : model.graph.layer_plans)
@@ -20238,6 +20320,253 @@ void test_backend_capabilities_and_hybrid_execution()
         check(static_cast<bool>(wrapped_statistics.vulkan_attention_decode_sdpa_fusions <= wrapped_statistics.vulkan_attention_blocks - 1));
         check(static_cast<bool>(wrapped_statistics.vulkan_kv_ring_resizes == 1));
         check(static_cast<bool>(wrapped_statistics.vulkan_kv_ring_wrapped_views > 0));
+
+        for (const auto& [window, sinks] : std::array<std::pair<uint32_t, bool>, 3>{{{2, true}, {2, false}, {0, true}}})
+        {
+            AttentionPackage gqa_package(false, window, true, sinks, true);
+            auto gqa_model = runtime.load_model(gqa_package.path(), attention_options);
+            auto gqa_cpu_model = runtime.load_model(gqa_package.path(), cpu_options);
+            check(static_cast<bool>(gqa_model));
+            check(static_cast<bool>(gqa_cpu_model));
+            const AttentionDescriptor& descriptor = model_compiled(*gqa_model.value()).descriptor.layers.front().attention;
+            check(descriptor.kind == AttentionKind::Standard);
+            check(descriptor.head_count == 2 && descriptor.kv_head_count == 1);
+            check((descriptor.sliding_window != 0) == (window != 0));
+            check(has_flag(descriptor.flags, AttentionDescriptorSinks) == sinks);
+
+            auto gqa_session = runtime.create_session(gqa_model.value());
+            auto gqa_cpu_session = runtime.create_session(gqa_cpu_model.value());
+            check(static_cast<bool>(gqa_session));
+            check(static_cast<bool>(gqa_cpu_session));
+            auto gqa_prefill = gqa_session.value()->prefill(attention_prompt);
+            auto gqa_cpu_prefill = gqa_cpu_session.value()->prefill(attention_prompt);
+            if (!gqa_prefill)
+                throw std::runtime_error("GQA prefill failed (window=" + std::to_string(window)
+                                         + ", sinks=" + std::to_string(sinks) + "): "
+                                         + gqa_prefill.error().message);
+            check(static_cast<bool>(gqa_cpu_prefill));
+            check(gqa_prefill.value().logits.size() == gqa_cpu_prefill.value().logits.size());
+            for (size_t index = 0; index < gqa_cpu_prefill.value().logits.size(); ++index)
+                check_near(gqa_prefill.value().logits[index], gqa_cpu_prefill.value().logits[index], 1e-4f);
+            check(gqa_session.value()->statistics().vulkan_attention_blocks == 1);
+            check(gqa_session.value()->statistics().vulkan_attention_device_rope_fusions > 0);
+            check(gqa_session.value()->statistics().vulkan_attention_cpu_fallbacks == 0);
+
+            for (uint32_t iteration = 0; iteration < 40; ++iteration)
+            {
+                const int32_t token = static_cast<int32_t>(iteration % 2);
+                auto gqa_decode = gqa_session.value()->decode(token);
+                auto gqa_cpu_decode = gqa_cpu_session.value()->decode(token);
+                if (!gqa_decode)
+                    throw std::runtime_error("GQA decode failed (window=" + std::to_string(window)
+                                             + ", sinks=" + std::to_string(sinks)
+                                             + ", step=" + std::to_string(iteration) + "): "
+                                             + gqa_decode.error().message);
+                check(static_cast<bool>(gqa_cpu_decode));
+                check(gqa_decode.value().logits.size() == gqa_cpu_decode.value().logits.size());
+                for (size_t index = 0; index < gqa_cpu_decode.value().logits.size(); ++index)
+                    check_near(gqa_decode.value().logits[index], gqa_cpu_decode.value().logits[index], 1e-4f);
+            }
+            const SessionStatistics& gqa_statistics = gqa_session.value()->statistics();
+            check(gqa_statistics.vulkan_attention_blocks > 1);
+            check(gqa_statistics.vulkan_attention_device_rope_fusions > 0);
+            check(gqa_statistics.vulkan_attention_qkv_ring_fusions > 0);
+            check(gqa_statistics.vulkan_kv_ring_appends > 0);
+            if (window != 0)
+                check(gqa_statistics.vulkan_kv_ring_wrapped_views > 0);
+            else
+                check(gqa_statistics.vulkan_kv_ring_resizes > 1);
+            check(gqa_statistics.vulkan_attention_cpu_fallbacks == 0);
+            check(gqa_statistics.model_compute_cpu_fallbacks == 0);
+            const SessionStatistics& gqa_cpu_statistics = gqa_cpu_session.value()->statistics();
+            check(gqa_cpu_statistics.vulkan_attention_blocks == 0);
+            check(gqa_cpu_statistics.vulkan_attention_cpu_fallbacks == 0);
+
+            if (window == 0)
+            {
+                const CompiledModel& gqa_compiled = model_compiled(*gqa_model.value());
+                const CompiledModel& gqa_cpu_compiled = model_compiled(*gqa_cpu_model.value());
+                const AttentionBlockPlan& gqa_plan = gqa_compiled.graph.layer_plans.front().attention;
+                const AttentionBlockPlan& gqa_cpu_plan = gqa_cpu_compiled.graph.layer_plans.front().attention;
+                const uint32_t hidden_size = gqa_compiled.descriptor.hidden_size;
+                ActivationBuffer prefix(2, hidden_size);
+                ActivationBuffer transaction_input(3, hidden_size);
+                for (size_t row = 0; row < prefix.rows(); ++row)
+                    for (uint32_t column = 0; column < hidden_size; ++column)
+                        prefix.row(row)[column] = static_cast<float>(static_cast<int>((row * 7 + column * 3) % 11) - 5) / 16.0f;
+                for (size_t row = 0; row < transaction_input.rows(); ++row)
+                    for (uint32_t column = 0; column < hidden_size; ++column)
+                        transaction_input.row(row)[column] = static_cast<float>(static_cast<int>((row * 5 + column * 7 + 2) % 13) - 6) / 32.0f;
+                const auto compare_attention_outputs = [](const ActivationBuffer& actual,
+                                                          const ActivationBuffer& expected) {
+                    check(actual.rows() == expected.rows());
+                    check(actual.columns() == expected.columns());
+                    for (size_t row = 0; row < expected.rows(); ++row)
+                        for (uint32_t column = 0; column < expected.columns(); ++column)
+                            check_near(actual.row(row)[column], expected.row(row)[column], 1e-4f);
+                };
+
+                for (size_t committed_rows : {size_t{1}, size_t{0}})
+                {
+                    std::array<LayerCache, 1> hybrid_cache;
+                    LayerCache reference_cache;
+                    AttentionScratch hybrid_scratch;
+                    AttentionScratch reference_scratch;
+                    ActivationBuffer hybrid_output;
+                    ActivationBuffer reference_output;
+                    const VulkanStatistics before_prefix = get_vulkan_statistics(gqa_compiled.vulkan_runtime);
+                    check(static_cast<bool>(forward_attention(gqa_compiled.weights, gqa_compiled.operators, gqa_plan,
+                                                              ExecutionBackend::Vulkan, 0, hybrid_cache.front(),
+                                                              hybrid_scratch, prefix, hybrid_output,
+                                                              gqa_compiled.opt.optimization_flags)));
+                    check(static_cast<bool>(forward_attention(gqa_cpu_compiled.weights, gqa_cpu_compiled.operators,
+                                                              gqa_cpu_plan, ExecutionBackend::Cpu, 0,
+                                                              reference_cache, reference_scratch, prefix,
+                                                              reference_output, gqa_cpu_compiled.opt.optimization_flags)));
+                    compare_attention_outputs(hybrid_output, reference_output);
+                    check(get_vulkan_statistics(gqa_compiled.vulkan_runtime).attention_blocks
+                          > before_prefix.attention_blocks);
+
+                    check(static_cast<bool>(begin_state_cache_transaction(hybrid_cache,
+                                                                          transaction_input.rows())));
+                    const VulkanStatistics before_transaction = get_vulkan_statistics(gqa_compiled.vulkan_runtime);
+                    check(static_cast<bool>(forward_attention(gqa_compiled.weights, gqa_compiled.operators, gqa_plan,
+                                                              ExecutionBackend::Vulkan, prefix.rows(),
+                                                              hybrid_cache.front(), hybrid_scratch,
+                                                              transaction_input, hybrid_output,
+                                                              gqa_compiled.opt.optimization_flags)));
+                    check(get_vulkan_statistics(gqa_compiled.vulkan_runtime).attention_blocks
+                          > before_transaction.attention_blocks);
+                    check(static_cast<bool>(finish_state_cache_transaction(hybrid_cache, committed_rows)));
+                    if (committed_rows != 0)
+                    {
+                        ActivationBuffer committed_input(committed_rows, hidden_size);
+                        std::copy_n(transaction_input.row(0), committed_input.values().size(),
+                                    committed_input.row(0));
+                        check(static_cast<bool>(forward_attention(gqa_cpu_compiled.weights,
+                                                                  gqa_cpu_compiled.operators, gqa_cpu_plan,
+                                                                  ExecutionBackend::Cpu, prefix.rows(),
+                                                                  reference_cache, reference_scratch,
+                                                                  committed_input, reference_output,
+                                                                  gqa_cpu_compiled.opt.optimization_flags)));
+                    }
+                    check(hybrid_cache.front().token_count == prefix.rows() + committed_rows);
+                    check(hybrid_cache.front().token_count == reference_cache.token_count);
+                    check(hybrid_cache.front().start_position == reference_cache.start_position);
+                    check(hybrid_cache.front().first_slot == reference_cache.first_slot);
+
+                    ActivationBuffer continuation(1, hidden_size);
+                    std::copy_n(transaction_input.row(committed_rows), hidden_size, continuation.row(0));
+                    const uint64_t continuation_position = prefix.rows() + committed_rows;
+                    check(static_cast<bool>(forward_attention(gqa_compiled.weights, gqa_compiled.operators, gqa_plan,
+                                                              ExecutionBackend::Vulkan, continuation_position,
+                                                              hybrid_cache.front(), hybrid_scratch,
+                                                              continuation, hybrid_output,
+                                                              gqa_compiled.opt.optimization_flags)));
+                    check(static_cast<bool>(forward_attention(gqa_cpu_compiled.weights, gqa_cpu_compiled.operators,
+                                                              gqa_cpu_plan, ExecutionBackend::Cpu,
+                                                              continuation_position, reference_cache,
+                                                              reference_scratch, continuation, reference_output,
+                                                              gqa_cpu_compiled.opt.optimization_flags)));
+                    compare_attention_outputs(hybrid_output, reference_output);
+                    check(hybrid_cache.front().token_count == reference_cache.token_count);
+                }
+
+                CompiledModel isolated_compiled = gqa_compiled;
+                AttentionBlockPlan& isolated_plan = isolated_compiled.graph.layer_plans.front().attention;
+                const CompiledOperatorHandle attention_handle = isolated_plan.vulkan_attention_operator;
+                check(attention_handle != invalid_compiled_operator_handle);
+                const auto saved_attention_operator = isolated_compiled.operators.at(attention_handle).attention;
+                check(saved_attention_operator != nullptr);
+                LayerCache seeded_cache;
+                AttentionScratch isolated_scratch;
+                ActivationBuffer isolated_output;
+                LayerCache isolated_cpu_cache;
+                AttentionScratch isolated_cpu_scratch;
+                ActivationBuffer isolated_cpu_output;
+                check(static_cast<bool>(forward_attention(isolated_compiled.weights, isolated_compiled.operators,
+                                                          isolated_plan, ExecutionBackend::Vulkan, 0,
+                                                          seeded_cache, isolated_scratch, prefix,
+                                                          isolated_output, isolated_compiled.opt.optimization_flags)));
+                check(static_cast<bool>(forward_attention(gqa_cpu_compiled.weights, gqa_cpu_compiled.operators,
+                                                          gqa_cpu_plan, ExecutionBackend::Cpu, 0,
+                                                          isolated_cpu_cache, isolated_cpu_scratch, prefix,
+                                                          isolated_cpu_output, gqa_cpu_compiled.opt.optimization_flags)));
+                compare_attention_outputs(isolated_output, isolated_cpu_output);
+
+                isolated_compiled.operators.at_mutable(attention_handle).attention.reset();
+                LayerCache empty_cache;
+                AttentionScratch failed_scratch;
+                ActivationBuffer failed_output;
+                const VulkanStatistics before_missing_prefill = get_vulkan_statistics(isolated_compiled.vulkan_runtime);
+                auto missing_prefill = forward_attention(isolated_compiled.weights, isolated_compiled.operators,
+                                                         isolated_plan, ExecutionBackend::Vulkan, 0,
+                                                         empty_cache, failed_scratch, prefix, failed_output,
+                                                         isolated_compiled.opt.optimization_flags);
+                check(!missing_prefill);
+                check(missing_prefill.error().code == ErrorCode::InternalError);
+                check(missing_prefill.error().message
+                      == "Vulkan Standard Attention was selected without a complete attention operator");
+                check(empty_cache.token_count == 0);
+                const VulkanStatistics after_missing_prefill = get_vulkan_statistics(isolated_compiled.vulkan_runtime);
+                check(after_missing_prefill.attention_blocks == before_missing_prefill.attention_blocks);
+                check(after_missing_prefill.attention_cpu_fallbacks == before_missing_prefill.attention_cpu_fallbacks);
+
+                ActivationBuffer decode_input(1, hidden_size);
+                std::copy_n(transaction_input.row(0), hidden_size, decode_input.row(0));
+                const VulkanStatistics before_missing_decode = get_vulkan_statistics(isolated_compiled.vulkan_runtime);
+                auto missing_decode = forward_attention(isolated_compiled.weights, isolated_compiled.operators,
+                                                        isolated_plan, ExecutionBackend::Vulkan, prefix.rows(),
+                                                        seeded_cache, failed_scratch, decode_input, failed_output,
+                                                        isolated_compiled.opt.optimization_flags);
+                check(!missing_decode);
+                check(missing_decode.error().code == ErrorCode::InternalError);
+                check(missing_decode.error().message
+                      == "Vulkan Standard Attention was selected without a complete attention operator");
+                check(seeded_cache.token_count == prefix.rows());
+                const VulkanStatistics after_missing_decode = get_vulkan_statistics(isolated_compiled.vulkan_runtime);
+                check(after_missing_decode.attention_blocks == before_missing_decode.attention_blocks);
+                check(after_missing_decode.attention_cpu_fallbacks == before_missing_decode.attention_cpu_fallbacks);
+
+                isolated_compiled.operators.at_mutable(attention_handle).attention = saved_attention_operator;
+                ActivationBuffer empty_input;
+                const VulkanStatistics before_failed_execution = get_vulkan_statistics(isolated_compiled.vulkan_runtime);
+                auto failed_execution = forward_attention(isolated_compiled.weights, isolated_compiled.operators,
+                                                          isolated_plan, ExecutionBackend::Vulkan, 0,
+                                                          empty_cache, failed_scratch, empty_input, failed_output,
+                                                          isolated_compiled.opt.optimization_flags);
+                check(!failed_execution);
+                check(failed_execution.error().code == ErrorCode::InternalError);
+                check(failed_execution.error().message == "Vulkan Attention execution failed");
+                check(get_vulkan_statistics(isolated_compiled.vulkan_runtime).attention_cpu_fallbacks
+                      == before_failed_execution.attention_cpu_fallbacks);
+                // Fresh LayerCache state mirrors resetting a Session after a failed execution.
+                LayerCache recovered_cache;
+                LayerCache recovered_cpu_cache;
+                AttentionScratch recovered_scratch;
+                AttentionScratch recovered_cpu_scratch;
+                ActivationBuffer recovered_output;
+                ActivationBuffer recovered_cpu_output;
+                check(static_cast<bool>(forward_attention(isolated_compiled.weights, isolated_compiled.operators,
+                                                          isolated_plan, ExecutionBackend::Vulkan, 0,
+                                                          recovered_cache, recovered_scratch, prefix,
+                                                          recovered_output, isolated_compiled.opt.optimization_flags)));
+                check(static_cast<bool>(forward_attention(gqa_cpu_compiled.weights, gqa_cpu_compiled.operators,
+                                                          gqa_cpu_plan, ExecutionBackend::Cpu, 0,
+                                                          recovered_cpu_cache, recovered_cpu_scratch, prefix,
+                                                          recovered_cpu_output, gqa_cpu_compiled.opt.optimization_flags)));
+                compare_attention_outputs(recovered_output, recovered_cpu_output);
+                check(static_cast<bool>(forward_attention(isolated_compiled.weights, isolated_compiled.operators,
+                                                          isolated_plan, ExecutionBackend::Vulkan, prefix.rows(),
+                                                          recovered_cache, recovered_scratch, decode_input,
+                                                          recovered_output, isolated_compiled.opt.optimization_flags)));
+                check(static_cast<bool>(forward_attention(gqa_cpu_compiled.weights, gqa_cpu_compiled.operators,
+                                                          gqa_cpu_plan, ExecutionBackend::Cpu, prefix.rows(),
+                                                          recovered_cpu_cache, recovered_cpu_scratch, decode_input,
+                                                          recovered_cpu_output, gqa_cpu_compiled.opt.optimization_flags)));
+                compare_attention_outputs(recovered_output, recovered_cpu_output);
+            }
+        }
 
         Option ncnn_sdpa_ring_options = hybrid_options;
         ncnn_sdpa_ring_options.optimization_flags |= OptimizationVulkanQkvRing;

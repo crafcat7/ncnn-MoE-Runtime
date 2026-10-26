@@ -632,7 +632,7 @@ Result<void> ModelLoader::resolve_gpu_cache_sizes(std::vector<uint64_t>& gpu_cac
         for (uint32_t device : device_indices)
         {
             auto& gpu = cache_gpu_infos[device];
-            const uint64_t reserve = qwen_device_pending_reserve(model, device);
+            const uint64_t reserve = vulkan_pending_reserve(model, device, gpu.heap_budget);
             gpu.heap_available = gpu.heap_available > reserve ? gpu.heap_available - reserve : 0;
         }
         std::vector<uint64_t> sizes = get_auto_gpu_cache_sizes(plan.expert_pair_size,
@@ -684,9 +684,9 @@ Result<void> ModelLoader::resolve_gpu_cache_sizes(std::vector<uint64_t>& gpu_cac
         if (heap_budget == 0 || cache_size + victim_size > heap_budget)
             return Error{ErrorCode::InvalidArgument, "combined per-device Expert GPU caches exceed the Vulkan heap budget"};
         const auto& gpu = gpu_infos[device_indices[i]];
-        const uint64_t pending = qwen_device_pending_reserve(model, device_indices[i]);
+        const uint64_t pending = vulkan_pending_reserve(model, device_indices[i], heap_budget);
         if (pending != 0 && (gpu.heap_available <= pending || cache_size + victim_size > gpu.heap_available - pending))
-            return Error{ErrorCode::InvalidArgument, "combined Expert GPU caches leave insufficient memory for Qwen device execution"};
+            return Error{ErrorCode::InvalidArgument, "combined Expert GPU caches leave insufficient memory for Vulkan attention state and workspace"};
     }
 
     return {};
@@ -965,9 +965,9 @@ Result<void> ModelLoader::configure_resident_quantized_backend()
             if (heap_budget == 0 || cache_sizes[index] > heap_budget)
                 return Error{ErrorCode::InvalidArgument, "the quantized Expert GPU cache exceeds the Vulkan heap budget"};
             const auto& gpu = gpu_infos[resident_devices[index]];
-            const uint64_t pending = qwen_device_pending_reserve(model, resident_devices[index]);
+            const uint64_t pending = vulkan_pending_reserve(model, resident_devices[index], heap_budget);
             if (pending != 0 && (gpu.heap_available <= pending || cache_sizes[index] > gpu.heap_available - pending))
-                return Error{ErrorCode::InvalidArgument, "the quantized Expert GPU cache leaves insufficient memory for the Qwen device execution state"};
+                return Error{ErrorCode::InvalidArgument, "the quantized Expert GPU cache leaves insufficient memory for Vulkan attention state and workspace"};
             cache_sizes[index] = std::min(cache_sizes[index], total_sizes[active_indices[index]]);
         }
     }
@@ -979,7 +979,7 @@ Result<void> ModelLoader::configure_resident_quantized_backend()
         for (uint32_t device : resident_devices)
         {
             GpuInfo& gpu = cache_gpu_infos[device];
-            const uint64_t reserve = qwen_device_pending_reserve(model, device);
+            const uint64_t reserve = vulkan_pending_reserve(model, device, gpu.heap_budget);
             gpu.heap_available = gpu.heap_available > reserve ? gpu.heap_available - reserve : 0;
         }
         if (smallest_dense_entry_size != std::numeric_limits<uint64_t>::max())
@@ -987,6 +987,11 @@ Result<void> ModelLoader::configure_resident_quantized_backend()
             for (uint32_t device : resident_devices)
             {
                 GpuInfo& gpu = cache_gpu_infos[device];
+                if (model.qwen_device_chain
+                    || vulkan_pending_reserve(model, device, gpu.heap_budget) != 0)
+                {
+                    continue;
+                }
                 const uint64_t reserve = dense_vulkan_workspace_reserve(gpu.heap_budget);
                 gpu.heap_available = gpu.heap_available > reserve ? gpu.heap_available - reserve : 0;
                 const uint64_t state = dense_vulkan_pending_state_size(model, device);

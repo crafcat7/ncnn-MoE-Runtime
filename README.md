@@ -89,7 +89,10 @@ requiring a resident copy of every routed weight.
 - **Heterogeneous placement.** Dense projections and Attention run through
   ncnn Vulkan while routing and sparse Expert work use the CPU; native Vulkan
   Experts execute when their weights are resident in the device cache.
-  Missing or failed device work returns to the existing CPU execution path.
+  Standard GQA Attention keeps native GGUF projections, RoPE, KV rings, SDPA,
+  output gates, and residual addition in one device submission. Hybrid requires
+  a complete GPU operator for this block and reports preparation or execution
+  failures explicitly.
 - **Fused MXFP4 compute.** Expert kernels decode MXFP4 blocks inside the
   compute loop instead of materializing complete FP32 weights. Runtime dispatch
   selects scalar, NEON, SVE2, AVX2/FMA, or AVX-512 implementations. Qwen3.6 and

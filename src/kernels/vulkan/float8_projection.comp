@@ -37,6 +37,8 @@ layout(push_constant) uniform parameter
     uint block_count;
     uint token_count;
     uint scale_row_size;
+    uint output_stride;
+    uint output_offset;
 }
 p;
 
@@ -107,5 +109,5 @@ void main()
         reduced_sum = partial_sum[0];
     }
     if (valid && lane == 0)
-        output_data[token * p.output_columns + output_column] = reduced_sum + bias_data[output_column];
+        output_data[token * p.output_stride + p.output_offset + output_column] = reduced_sum + bias_data[output_column];
 }

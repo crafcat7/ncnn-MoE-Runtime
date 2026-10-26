@@ -72,6 +72,47 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
     std::array<SessionStatistics, 2> actual_statistics;
     const std::array<std::vector<int32_t>, 2> prompts = {{{1, 2, 3}, {3, 2}}};
     const std::string family = reference.descriptor.model_type;
+    std::vector<size_t> standard_gqa_layers;
+    for (size_t layer_index = 0; layer_index < candidate.descriptor.layers.size(); ++layer_index)
+    {
+        const AttentionDescriptor& attention = candidate.descriptor.layers[layer_index].attention;
+        if (attention.kind == AttentionKind::Standard && attention.head_count > attention.kv_head_count
+            && !has_flag(attention.flags, AttentionDescriptorQsa))
+            standard_gqa_layers.push_back(layer_index);
+    }
+    if (family == "qwen3_5" || family == "qwen3_5_moe")
+    {
+        check(!standard_gqa_layers.empty(), family + ": fixture has no standard GQA layer");
+        for (size_t layer_index : standard_gqa_layers)
+        {
+            const AttentionDescriptor& attention = candidate.descriptor.layers[layer_index].attention;
+            check(has_flag(attention.flags, AttentionDescriptorQueryKeyNorm),
+                  family + ": GQA descriptor lost Q/K normalization");
+            check(has_flag(attention.flags, AttentionDescriptorOutputGate),
+                  family + ": GQA descriptor lost the output gate");
+            check(attention.qk_rope_head_dimension != 0
+                      && attention.qk_rope_head_dimension * 2 == attention.head_dimension,
+                  family + ": fixture does not exercise half-dimension partial RoPE");
+        }
+    }
+    if (family == "gpt_oss")
+    {
+        check(!standard_gqa_layers.empty(), "GPT-OSS fixture has no standard GQA layer");
+        bool has_sliding_window_layer = false;
+        for (size_t layer_index : standard_gqa_layers)
+        {
+            const AttentionDescriptor& attention = candidate.descriptor.layers[layer_index].attention;
+            check(has_flag(attention.flags, AttentionDescriptorSinks), "GPT-OSS GQA lost attention sinks");
+            const bool expected_sliding_layer = layer_index % 2 == 0;
+            check((attention.sliding_window != 0) == expected_sliding_layer,
+                  "GPT-OSS GQA layer has the wrong full/sliding-window mode");
+            has_sliding_window_layer = has_sliding_window_layer || attention.sliding_window != 0;
+            check(!has_flag(attention.flags, AttentionDescriptorQueryKeyNorm)
+                      && !has_flag(attention.flags, AttentionDescriptorOutputGate),
+                  "GPT-OSS GQA unexpectedly enabled Q/K norm or output gate");
+        }
+        check(has_sliding_window_layer, "GPT-OSS GQA fixture has no sliding-window layer");
+    }
     for (size_t session = 0; session < prompts.size(); ++session)
     {
         const auto expected = forward_model(reference, prompts[session], expected_statistics[session], expected_states[session], 0, LogitsOutput::All);
@@ -129,13 +170,49 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
         bool native_blocks = false;
         for (TensorHandle handle = 0; handle < candidate.weights.size(); ++handle)
         {
-            const DType dtype = candidate.weights.at(handle).dtype;
-            native_blocks = native_blocks || dtype == DType::Q4_0 || dtype == DType::Q4_1
-                            || dtype == DType::Q5_0 || dtype == DType::IQ4XS;
+            native_blocks = native_blocks || is_qnk_dtype(candidate.weights.at(handle).dtype);
         }
         if (native_blocks)
         {
             check(counters.dispatches > 0, family + ": native GGUF weights executed no Vulkan projections");
+            if (!standard_gqa_layers.empty())
+            {
+                check(counters.attention_blocks > 0,
+                      family + ": native GQA executed no Vulkan Attention blocks");
+                check(counters.attention_cpu_fallbacks == 0,
+                      family + ": native GQA Attention fell back to CPU");
+                for (size_t layer_index : standard_gqa_layers)
+                {
+                    const AttentionBlockPlan& attention = candidate.graph.layer_plans[layer_index].attention;
+                    bool has_native_projection = false;
+                    for (TensorHandle handle : {attention.query_weight, attention.key_weight,
+                                                attention.value_weight, attention.output_weight})
+                    {
+                        check(handle != invalid_tensor_handle,
+                              family + ": GQA projection is missing from the compiled graph");
+                        const DType dtype = candidate.weights.at(handle).dtype;
+                        const bool native = dtype == DType::Int4 || is_qnk_dtype(dtype);
+                        const bool dense = dtype == DType::BFloat16 || dtype == DType::Float32;
+                        check(native || dense,
+                              family + ": GQA projection has an unsupported GGUF dtype");
+                        has_native_projection = has_native_projection || native;
+                    }
+                    check(has_native_projection,
+                          family + ": GQA layer has no native quantized projection");
+                }
+                for (const auto& statistics : actual_statistics)
+                {
+                    check(statistics.vulkan_attention_blocks > 0,
+                          family + ": session executed no Vulkan GQA Attention block");
+                    check(statistics.vulkan_attention_device_rope_fusions > 0,
+                          family + ": GQA executed no Vulkan device RoPE");
+                    check(statistics.vulkan_kv_ring_appends > 0,
+                          family + ": GQA decode did not append to the Vulkan KV ring");
+                    check(statistics.vulkan_attention_cpu_fallbacks == 0
+                              && statistics.model_compute_cpu_fallbacks == 0,
+                          family + ": native GQA had a CPU model-compute fallback");
+                }
+            }
             if (family == "deepseek_v4")
                 check(counters.attention_blocks > 0, "native DeepSeek GGUF weights did not execute MLA on Vulkan");
             if (std::any_of(candidate.graph.layer_plans.begin(), candidate.graph.layer_plans.end(), [](const CompiledLayerPlan& layer) {
@@ -143,14 +220,17 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
                 }))
                 check(counters.gated_delta_fusions > 0, family + ": native GGUF weights did not execute GDN on Vulkan");
             check(counters.attention_cpu_fallbacks == 0, family + ": native GGUF attention fell back to CPU");
-            for (const auto& statistics : actual_statistics)
+            if (!standard_gqa_layers.empty())
             {
-                if (candidate.descriptor.expert_count != 0)
-                    check(statistics.expert_assignments > 0 && statistics.expert_gpu_routes == statistics.expert_assignments,
-                          family + ": GPU-priority routes do not cover every native Expert assignment");
-                check(statistics.expert_cpu_routes == 0 && statistics.expert_cpu_fallbacks == 0
-                          && statistics.model_compute_cpu_fallbacks == 0,
-                      family + ": native Expert execution fell back to CPU");
+                for (const auto& statistics : actual_statistics)
+                {
+                    if (candidate.descriptor.expert_count != 0)
+                        check(statistics.expert_assignments > 0 && statistics.expert_gpu_routes == statistics.expert_assignments,
+                              family + ": GPU-priority routes do not cover every native Expert assignment");
+                    check(statistics.expert_cpu_routes == 0 && statistics.expert_cpu_fallbacks == 0
+                              && statistics.model_compute_cpu_fallbacks == 0,
+                          family + ": native Expert execution fell back to CPU");
+                }
             }
         }
         const bool gpu_planned = std::any_of(candidate.graph.nodes.begin(), candidate.graph.nodes.end(), [](const ExecutionNode& node) {
@@ -170,6 +250,14 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
                      return layer.attention.kind == AttentionKind::GatedDeltaNet;
                  }))
             std::cout << "SKIP " << family << " Vulkan GDN execution: the plan selected CPU recurrence\n";
+    }
+    else if (!standard_gqa_layers.empty())
+    {
+        check(counters.attention_blocks == 0 && counters.attention_cpu_fallbacks == 0,
+              family + ": explicit CPU GQA profile executed or fell back from Vulkan Attention");
+        for (const auto& statistics : actual_statistics)
+            check(statistics.vulkan_attention_blocks == 0 && statistics.vulkan_attention_cpu_fallbacks == 0,
+                  family + ": explicit CPU GQA profile reported Vulkan Attention work or fallback");
     }
     const auto experts = candidate.expert_backend ? candidate.expert_backend->statistics() : ExpertBackendStatistics{};
     const auto host_cache = candidate.expert_cache ? candidate.expert_cache->statistics() : ExpertCacheStatistics{};

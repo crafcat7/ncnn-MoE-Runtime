@@ -1649,6 +1649,12 @@ Result<void> append_attention_context(const WeightStore& weights,
                                       const ActivationBuffer& hidden,
                                       uint64_t optimization_flags)
 {
+    if (backend == ExecutionBackend::Vulkan && plan.kind == AttentionKind::Standard
+        && !has_flag(plan.flags, AttentionBlockQsa | AttentionBlockExternalResidual))
+    {
+        return forward_attention(weights, operators, plan, backend, position_offset,
+                                 cache, scratch, hidden, scratch.output, optimization_flags);
+    }
     if (cache.vulkan_attention_cache)
     {
         const CompiledOperator& attention_operator = operators.at(plan.vulkan_attention_operator);
@@ -1836,6 +1842,14 @@ Result<void> forward_attention(const WeightStore& weights,
     }
 
     const CompiledOperator& attention_operator = operators.at(plan.vulkan_attention_operator);
+    if (backend == ExecutionBackend::Vulkan
+        && plan.kind == AttentionKind::Standard
+        && !attention_operator.attention)
+    {
+        return Error{
+            ErrorCode::InternalError,
+            "Vulkan Standard Attention was selected without a complete attention operator"};
+    }
     if (backend == ExecutionBackend::Vulkan && attention_operator.attention)
     {
         if (attention_operator.attention->forward(position_offset,
@@ -1845,21 +1859,19 @@ Result<void> forward_attention(const WeightStore& weights,
         {
             return {};
         }
-        attention_operator.attention->record_cpu_fallback();
-        if (cache.vulkan_attention_cache)
+        if (cache.vulkan_attention_cache
+            && (cache.vulkan_attention_state_unknown
+                || !attention_operator.attention->materialize_device_cache(cache)))
         {
-            if (!cache.vulkan_attention_state_unknown
-                && attention_operator.attention->materialize_device_cache(cache))
-            {
-                // The failed dispatch restored the CPU cache; use CPU Attention.
-            }
-            else
-            {
-                return Error{
-                    ErrorCode::InternalError,
-                    "Vulkan Attention failed and its device KV cache could not be materialized"};
-            }
+            return Error{
+                ErrorCode::InternalError,
+                "Vulkan Attention failed and its device KV cache could not be materialized"};
         }
+        // Keep the host shadow current for a later retry or explicit backend
+        // change, but do not run the selected Vulkan block on the CPU.
+        return Error{
+            ErrorCode::InternalError,
+            "Vulkan Attention execution failed"};
     }
 
     configure_cache(cache, plan.kv_head_count * plan.head_dimension,
