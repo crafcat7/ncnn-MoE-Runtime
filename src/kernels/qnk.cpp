@@ -407,6 +407,65 @@ static void dequantize_q8_0(const uint8_t* block, QnKOutput& output) noexcept
 #endif
 }
 
+static void dequantize_q4(DType dtype, const uint8_t* block, QnKOutput& output) noexcept
+{
+    const bool affine = dtype == DType::Q4_1;
+    const float scale = load_f16(block);
+    const float minimum = affine ? -load_f16(block + 2) : 0.0f;
+    const uint8_t* values = block + (affine ? 4 : 2);
+#if defined(__aarch64__) || defined(_M_ARM64)
+    std::array<int8_t, 16> low;
+    std::array<int8_t, 16> high;
+    for (uint32_t index = 0; index < 16; ++index)
+    {
+        low[index] = static_cast<int8_t>(static_cast<int>(values[index] & 15u) - (affine ? 0 : 8));
+        high[index] = static_cast<int8_t>(static_cast<int>(values[index] >> 4) - (affine ? 0 : 8));
+    }
+    for (uint32_t index = 0; index < 16; index += 8)
+    {
+        qnk_i8_to_f32(vld1_s8(low.data() + index), scale, minimum, affine, output, index);
+        qnk_i8_to_f32(vld1_s8(high.data() + index), scale, minimum, affine, output, index + 16);
+    }
+#else
+    for (uint32_t index = 0; index < 16; ++index)
+    {
+        const int low = static_cast<int>(values[index] & 15u) - (affine ? 0 : 8);
+        const int high = static_cast<int>(values[index] >> 4) - (affine ? 0 : 8);
+        output.output[index] = scale * static_cast<float>(low) - minimum;
+        output.output[index + 16] = scale * static_cast<float>(high) - minimum;
+    }
+#endif
+}
+
+static void dequantize_q5_0(const uint8_t* block, QnKOutput& output) noexcept
+{
+    const float scale = load_f16(block);
+    const uint32_t high_bits = load_u32(block + 2);
+    const uint8_t* values = block + 6;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    std::array<int8_t, 16> low;
+    std::array<int8_t, 16> high;
+    for (uint32_t index = 0; index < 16; ++index)
+    {
+        low[index] = static_cast<int8_t>(static_cast<int>((values[index] & 15u) | (((high_bits >> index) & 1u) << 4)) - 16);
+        high[index] = static_cast<int8_t>(static_cast<int>((values[index] >> 4) | (((high_bits >> (index + 16)) & 1u) << 4)) - 16);
+    }
+    for (uint32_t index = 0; index < 16; index += 8)
+    {
+        qnk_i8_to_f32(vld1_s8(low.data() + index), scale, 0.0f, false, output, index);
+        qnk_i8_to_f32(vld1_s8(high.data() + index), scale, 0.0f, false, output, index + 16);
+    }
+#else
+    for (uint32_t index = 0; index < 16; ++index)
+    {
+        const int low = static_cast<int>((values[index] & 15u) | (((high_bits >> index) & 1u) << 4)) - 16;
+        const int high = static_cast<int>((values[index] >> 4) | (((high_bits >> (index + 16)) & 1u) << 4)) - 16;
+        output.output[index] = scale * static_cast<float>(low);
+        output.output[index + 16] = scale * static_cast<float>(high);
+    }
+#endif
+}
+
 static constexpr std::array<int8_t, 16> iq4_nl_values = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
@@ -430,6 +489,26 @@ static void dequantize_iq4_nl(const uint8_t* block, QnKOutput& output) noexcept
         output.output[index + 16] = scale * static_cast<float>(iq4_nl_values[values[index] >> 4]);
     }
 #endif
+}
+
+static void dequantize_iq4_xs(const uint8_t* block, QnKOutput& output) noexcept
+{
+    const float scale = load_f16(block);
+    const uint16_t scales_high = load_u16(block + 2);
+    const uint8_t* scales_low = block + 4;
+    const uint8_t* values = block + 8;
+    for (uint32_t group = 0; group < 8; ++group)
+    {
+        const uint32_t packed_scale = ((scales_low[group / 2] >> ((group & 1u) * 4)) & 15u)
+                                      | (((scales_high >> (group * 2)) & 3u) << 4);
+        const float group_scale = scale * static_cast<float>(static_cast<int>(packed_scale) - 32);
+        const uint8_t* packed = values + group * 16;
+        for (uint32_t index = 0; index < 16; ++index)
+        {
+            output.output[group * 32 + index] = group_scale * iq4_nl_values[packed[index] & 15u];
+            output.output[group * 32 + index + 16] = group_scale * iq4_nl_values[packed[index] >> 4];
+        }
+    }
 }
 
 static void dequantize_q5_1(const uint8_t* block, QnKOutput& output) noexcept
@@ -672,6 +751,7 @@ static std::shared_ptr<const QnKPack> get_qnk_packed_weights(const TensorData& m
 uint32_t qnk_block_size(DType dtype) noexcept
 {
     return dtype == DType::Q8_0 || dtype == DType::IQ4NL || dtype == DType::Q5_1
+                   || dtype == DType::Q4_0 || dtype == DType::Q4_1 || dtype == DType::Q5_0
                ? 32
                : (is_qnk_dtype(dtype) ? qnk_block_elements : 0);
 }
@@ -689,6 +769,10 @@ size_t qnk_block_bytes(DType dtype) noexcept
     case DType::Q8_0: return 34;
     case DType::IQ4NL: return 18;
     case DType::Q5_1: return 24;
+    case DType::Q4_0: return 18;
+    case DType::Q4_1: return 20;
+    case DType::Q5_0: return 22;
+    case DType::IQ4XS: return 136;
     default: return 0;
     }
 }
@@ -759,6 +843,10 @@ static inline float forward_qnk(DType dtype,
     case DType::Q8_0: dequantize_q8_0(block, local); break;
     case DType::IQ4NL: dequantize_iq4_nl(block, local); break;
     case DType::Q5_1: dequantize_q5_1(block, local); break;
+    case DType::Q4_0:
+    case DType::Q4_1: dequantize_q4(dtype, block, local); break;
+    case DType::Q5_0: dequantize_q5_0(block, local); break;
+    case DType::IQ4XS: dequantize_iq4_xs(block, local); break;
     default:
         if (output)
             std::fill_n(output, qnk_block_elements, 0.0f);
@@ -815,6 +903,32 @@ float qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexc
             }
             return sum;
         }
+        if (dtype == DType::Q4_0 || dtype == DType::Q4_1)
+        {
+            const bool affine = dtype == DType::Q4_1;
+            const float minimum = affine ? load_f16(block + 2) : 0.0f;
+            const uint8_t* values = block + (affine ? 4 : 2);
+            for (uint32_t index = 0; index < 16; ++index)
+            {
+                const float low = scale * static_cast<float>(static_cast<int>(values[index] & 15u) - (affine ? 0 : 8)) + minimum;
+                const float high = scale * static_cast<float>(static_cast<int>(values[index] >> 4) - (affine ? 0 : 8)) + minimum;
+                sum += low * input[index] + high * input[index + 16];
+            }
+            return sum;
+        }
+        if (dtype == DType::Q5_0)
+        {
+            const uint32_t high_bits = load_u32(block + 2);
+            const uint8_t* values = block + 6;
+            for (uint32_t index = 0; index < 16; ++index)
+            {
+                const int low = static_cast<int>((values[index] & 15u) | (((high_bits >> index) & 1u) << 4)) - 16;
+                const int high = static_cast<int>((values[index] >> 4) | (((high_bits >> (index + 16)) & 1u) << 4)) - 16;
+                sum += scale * static_cast<float>(low) * input[index]
+                       + scale * static_cast<float>(high) * input[index + 16];
+            }
+            return sum;
+        }
         for (uint32_t index = 0; index < 32; ++index)
         {
             const int8_t value = dtype == DType::IQ4NL
@@ -826,7 +940,7 @@ float qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexc
 #endif
     }
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-    if (qnk_block_size(dtype) == qnk_block_elements)
+    if (qnk_block_size(dtype) == qnk_block_elements && dtype != DType::IQ4XS)
     {
         if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
             return msvc_avx512_qnk_dot_block(dtype, block, input);
@@ -1011,10 +1125,9 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
         if (input.dtype() != DType::Float32 && input.dtype() != DType::BFloat16)
             return false;
         for (size_t index = 0; index < matrix_count; ++index)
-            if (qnk_block_size(weights[index]->dtype) != 32
-                || (results[index]->dtype() != DType::Float32 && results[index]->dtype() != DType::BFloat16))
+            if (results[index]->dtype() != DType::Float32 && results[index]->dtype() != DType::BFloat16)
                 return false;
-        // Only activations are widened. Immutable short-block weights and
+        // Only activations are widened. Immutable GGML weights and
         // optional packed sidecars retain their original native bytes.
         ActivationBuffer prepared;
         const ActivationBuffer* float_input = &input;
@@ -1091,13 +1204,15 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
             return false;
 
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-        if (qnk_block_size(matrix.dtype) == qnk_block_elements && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
+        if (qnk_block_size(matrix.dtype) == qnk_block_elements && matrix.dtype != DType::IQ4XS
+            && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
         {
             msvc_avx512_qnk_gemm(*packed, input.row(0), columns, input.rows(),
                                  results[0]->row(0), results[0]->columns());
             return true;
         }
-        if (qnk_block_size(matrix.dtype) == qnk_block_elements && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
+        if (qnk_block_size(matrix.dtype) == qnk_block_elements && matrix.dtype != DType::IQ4XS
+            && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
         {
             msvc_avx2_qnk_gemm(*packed, input.row(0), columns, input.rows(),
                                results[0]->row(0), results[0]->columns());

@@ -162,17 +162,24 @@ static TensorData qwen_ple_table(DType dtype)
 {
     TensorData table;
     table.dtype = dtype;
-    table.shape = {4, 160};
-    const uint32_t block_bytes = dtype == DType::IQ4NL ? 18 : 34;
-    table.quantized_data.resize(4 * 5 * block_bytes);
+    const uint32_t dimension = dtype == DType::IQ4XS ? 256 : 160;
+    table.shape = {4, dimension};
+    const uint32_t block_bytes = static_cast<uint32_t>(qnk_block_bytes(dtype));
+    const uint32_t blocks = dimension / qnk_block_size(dtype);
+    table.quantized_data.resize(4 * blocks * block_bytes);
     for (uint32_t row = 0; row < 4; ++row)
-        for (uint32_t block = 0; block < 5; ++block)
+        for (uint32_t block = 0; block < blocks; ++block)
         {
-            uint8_t* data = table.quantized_data.data() + (row * 5 + block) * block_bytes;
+            uint8_t* data = table.quantized_data.data() + (row * blocks + block) * block_bytes;
             data[0] = 0;
             data[1] = static_cast<uint8_t>(0x14 + (row & 1) * 0x80); // +/- 2^-10.
             for (uint32_t byte = 2; byte < block_bytes; ++byte)
                 data[byte] = static_cast<uint8_t>(row * 67 + block * 31 + byte * 13);
+            if (dtype == DType::Q4_1 || dtype == DType::Q5_1)
+            {
+                data[2] = 0;
+                data[3] = 0x18;
+            }
         }
     return table;
 }
@@ -181,14 +188,22 @@ static void qwen_ple_case(uint32_t device, DType dtype)
 {
     WeightStore weights;
     PleBlockPlan plan;
-    plan.embedding_dimension = 640;
+    const uint32_t dimension = dtype == DType::IQ4XS ? 256 : 160;
+    plan.embedding_dimension = dimension * 4;
+    const uint32_t encoding = dtype == DType::Q4_0    ? 2
+                              : dtype == DType::Q4_1  ? 3
+                              : dtype == DType::Q5_0  ? 6
+                              : dtype == DType::Q5_1  ? 7
+                              : dtype == DType::Q8_0  ? 8
+                              : dtype == DType::IQ4NL ? 20
+                                                      : 23;
     plan.ngram_size = 3;
     plan.heads_per_ngram = 2;
     plan.convolution_kernel_size = 3;
     plan.eos_token_id = 0;
     plan.embedding_shards.push_back(qwen_add(weights, qwen_ple_table(dtype)));
-    plan.key_weight = qwen_add(weights, qwen_matrix(128, 640, 4));
-    plan.value_weight = qwen_add(weights, qwen_matrix(32, 640, 5));
+    plan.key_weight = qwen_add(weights, qwen_matrix(128, plan.embedding_dimension, 4));
+    plan.value_weight = qwen_add(weights, qwen_matrix(32, plan.embedding_dimension, 5));
     plan.key_norm_weight = qwen_add(weights, qwen_norm(128));
     plan.query_norm_weight = qwen_add(weights, qwen_norm(128));
     plan.convolution_norm_weight = qwen_add(weights, qwen_norm(128));
@@ -252,7 +267,7 @@ static void qwen_ple_case(uint32_t device, DType dtype)
                                                  expected, OptimizationDefaultFlags)),
                    "CPU PLE oracle");
         const auto& table = weights.at(plan.embedding_shards.front());
-        const uint32_t row_bytes = static_cast<uint32_t>(qnk_storage_bytes(dtype, 1, 160));
+        const uint32_t row_bytes = static_cast<uint32_t>(qnk_storage_bytes(dtype, 1, dimension));
         const uint32_t stride = (row_bytes + 3) / 4 * 4;
         ActivationBuffer packed(rows * 4, stride / 4);
         for (uint32_t row = 0; row < rows; ++row)
@@ -272,7 +287,7 @@ static void qwen_ple_case(uint32_t device, DType dtype)
                        && qwen_upload(key, key_gpu, key_staging, cmd, context, opt)
                        && qwen_upload(value, value_gpu, value_staging, cmd, context, opt)
                        && qwen_upload(packed, raw_gpu, raw_staging, cmd, context, opt)
-                       && qwen_allocate(decoded, 640, rows, context)
+                       && qwen_allocate(decoded, plan.embedding_dimension, rows, context)
                        && qwen_allocate(key_normalized, 128, rows, context)
                        && qwen_allocate(query_normalized, 128, rows, context)
                        && qwen_allocate(gated, 128, rows, context)
@@ -281,9 +296,9 @@ static void qwen_ple_case(uint32_t device, DType dtype)
                    "PLE stage allocations");
         for (const auto& constant : {key_norm, query_norm, conv_norm, conv_weight, state})
             qwen_prepare_read(constant);
-        qwen_record(pipeline.get(), 7, 640, 4, rows, 640, 0, 0,
+        qwen_record(pipeline.get(), 7, plan.embedding_dimension, 4, rows, plan.embedding_dimension, 0, 0,
                     {raw_gpu, raw_gpu, raw_gpu, raw_gpu, raw_gpu, decoded}, cmd,
-                    dtype == DType::IQ4NL ? 20 : 8, 160, stride);
+                    encoding, dimension, stride);
         qwen_record(pipeline.get(), 0, 32, 4, rows, 128, descriptor.norm_epsilon, 1,
                     {key_gpu, key_norm, key_gpu, key_gpu, key_gpu, key_normalized}, cmd);
         qwen_record(pipeline.get(), 0, 32, 4, rows, 128, descriptor.norm_epsilon, 1,
@@ -295,13 +310,13 @@ static void qwen_ple_case(uint32_t device, DType dtype)
         qwen_record(pipeline.get(), 6, 32, 4, rows, 128, 0, 0,
                     {convolution_input, gated, conv_weight, input_gpu, state, output}, cmd, 3, 3, 6, slot);
         qwen_check(prepare_staging_batch(output_staging, rows, 128, context->staging_allocator())
-                       && prepare_staging_batch(decode_staging, rows, 640, context->staging_allocator())
+                       && prepare_staging_batch(decode_staging, rows, plan.embedding_dimension, context->staging_allocator())
                        && record_prepared_activation_staging_download(output, rows, 128, output_staging, cmd, context->device(), opt)
-                       && record_prepared_activation_staging_download(decoded, rows, 640, decode_staging, cmd, context->device(), opt)
+                       && record_prepared_activation_staging_download(decoded, rows, plan.embedding_dimension, decode_staging, cmd, context->device(), opt)
                        && submit_compute_and_wait(cmd, context->device()) == 0,
                    "submit PLE phases");
         ActivationBuffer actual(rows, 128);
-        ActivationBuffer embeddings(rows, 640);
+        ActivationBuffer embeddings(rows, plan.embedding_dimension);
         qwen_check(copy_staging_to_cpu_batch(output_staging, actual) && copy_staging_to_cpu_batch(decode_staging, embeddings), "download PLE phases");
         qwen_equal(embeddings, scratch.normalized, "native PLE row decode", 0, 0);
         qwen_equal(actual, expected, "PLE grouped norm/gate/dilated convolution", 0.0005f, 0.002f);
@@ -330,8 +345,9 @@ int main()
             qwen_gr_case(device, 1, false);
             qwen_gr_case(device, 3, false);
             qwen_gr_case(device, 3, true);
-            qwen_ple_case(device, DType::IQ4NL);
-            qwen_ple_case(device, DType::Q8_0);
+            for (DType dtype : {DType::IQ4NL, DType::Q8_0, DType::Q5_1, DType::Q4_0,
+                                DType::Q4_1, DType::Q5_0, DType::IQ4XS})
+                qwen_ple_case(device, dtype);
         }
         std::cout << "Qwen device numerical tests passed\n";
         return 0;

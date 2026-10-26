@@ -64,6 +64,45 @@ def write_safetensors(path: Path, tensors: dict[str, tuple[str, np.ndarray]]) ->
             values.tofile(stream)
 
 
+def iq4_xs_blocks(rows: int, columns: int, seed: int = 0) -> np.ndarray:
+    """Build valid IQ4_XS blocks from its GGML ABI, without a quantizer."""
+    if rows <= 0 or columns <= 0 or columns % 256:
+        raise ValueError("IQ4_XS fixtures require positive rows and columns divisible by 256")
+    result = np.zeros((rows, columns // 256 * 136), dtype=np.uint8)
+    blocks = result.reshape(rows, columns // 256, 136)
+    # Signed local scales are 0, +/-1, +/-2, +/-4 and +/-8. With the
+    # power-of-two super-block delta, every decoded codebook value is BF16-exact.
+    base_scales = np.asarray([32, 33, 31, 34, 30, 36, 28, 40], dtype=np.uint8)
+    for row in range(rows):
+        for block in range(columns // 256):
+            encoded = base_scales
+            block_data = blocks[row, block]
+            block_data[:2] = np.asarray([1 / 512], dtype="<f2").view(np.uint8)
+            scale_high = 0
+            for subgroup, scale in enumerate(encoded):
+                block_data[4 + subgroup // 2] |= int(scale & 15) << (4 * (subgroup % 2))
+                scale_high |= int(scale >> 4) << (2 * subgroup)
+            block_data[2:4] = np.asarray([scale_high], dtype="<u2").view(np.uint8)
+            for subgroup in range(8):
+                lanes = np.arange(16, dtype=np.int32)
+                low = ((lanes * 3 + seed + row + block + subgroup) & 15).astype(np.uint8)
+                high = ((lanes * 5 + seed + row * 2 + block + subgroup * 3) & 15).astype(np.uint8)
+                block_data[8 + subgroup * 16:8 + (subgroup + 1) * 16] = low | (high << 4)
+    return result
+
+
+def iq4_nl_blocks(rows: int, columns: int) -> np.ndarray:
+    """Build valid IQ4_NL blocks without relying on an upstream quantizer."""
+    if rows <= 0 or columns <= 0 or columns % 32:
+        raise ValueError("IQ4_NL fixtures require positive rows and columns divisible by 32")
+    result = np.zeros((rows, columns // 32 * 18), dtype=np.uint8)
+    blocks = result.reshape(rows, columns // 32, 18)
+    blocks[..., :2] = np.asarray([1 / 512], dtype="<f2").view(np.uint8)
+    codes = np.arange(16, dtype=np.uint8)
+    blocks[..., 2:] = codes.reshape(1, 1, 16)
+    return result
+
+
 def repacked_float(*args, **kwargs):
     packed, shape, scales, zeros, indices = importer.repack_linear(*args, **kwargs)
     _, columns, group_size = shape
@@ -505,6 +544,61 @@ class ImportTests(unittest.TestCase):
         np.testing.assert_array_equal(loaded["model.language_model.layers.0.self_attn.q_proj.weight.__qnk_shape"].read(), [3, 16, 256])
         np.testing.assert_array_equal(loaded["lm_head.weight"].read(), raw_output.reshape(-1))
         np.testing.assert_array_equal(loaded["lm_head.weight.__qnk_shape"].read(), [6, 8, 256])
+
+    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
+    def test_gguf_short_block_and_iq4_xs_import_preserves_native_bytes(self):
+        source = self.assets()
+        config = json.loads((source / "config.json").read_text())
+        config["text_config"].update(hidden_size=256, vocab_size=8, intermediate_size=2)
+        (source / "config.json").write_text(json.dumps(config))
+        formats = ("Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "IQ4_NL", "IQ4_XS")
+        expected_shapes = {
+            "Q4_0": (32, 18), "Q4_1": (32, 20), "Q5_0": (32, 22),
+            "Q5_1": (32, 24), "Q8_0": (32, 34), "IQ4_NL": (32, 18), "IQ4_XS": (256, 136),
+        }
+        for format_name in formats:
+            with self.subTest(format=format_name):
+                ggml_type = getattr(gguf.GGMLQuantizationType, format_name)
+                block_elements, block_bytes = expected_shapes[format_name]
+                path = self.root / f"{format_name}.gguf"
+                writer = gguf.GGUFWriter(path, "qwen35")
+                writer.add_block_count(2)
+                writer.add_nextn_predict_layers(1)
+                writer.add_tensor("token_embd.weight", np.ones((8, 256), dtype=np.float32))
+                raw_tensors = {}
+                for name, rows, seed in (("output.weight", 8, 1),
+                                         ("blk.0.ffn_gate.weight", 2, 2),
+                                         ("blk.0.attn_q.weight", 16, 3)):
+                    values = np.random.default_rng(seed).normal(0, 0.125, (rows, 256)).astype(np.float32)
+                    raw = (iq4_xs_blocks(rows, 256, seed) if format_name == "IQ4_XS" else
+                           iq4_nl_blocks(rows, 256) if format_name == "IQ4_NL" else
+                           np.asarray(gguf.quantize(values, ggml_type)).view(np.uint8))
+                    expected_bytes = rows * (256 // block_elements) * block_bytes
+                    self.assertEqual(raw.nbytes, expected_bytes)
+                    raw_tensors[name] = (raw.reshape(rows, -1), values)
+                    writer.add_tensor(name, raw_tensors[name][0], raw_dtype=ggml_type)
+                writer.write_header_to_file()
+                writer.write_kv_data_to_file()
+                writer.write_tensors_to_file()
+                writer.close()
+
+                output = self.root / f"{format_name}-output"
+                importer.import_package(path, output, source)
+                loaded = importer.scan_safetensors(output)
+                tag, _, _ = importer.GGUF_NATIVE_FORMATS[format_name]
+                for name, (raw, values) in raw_tensors.items():
+                    target = ("lm_head.weight" if name == "output.weight" else
+                              "model.language_model.layers.0.mlp.gate_proj.weight" if name.endswith("ffn_gate.weight") else
+                              "model.language_model.layers.0.self_attn.q_proj.weight")
+                    expected_size = values.shape[0] * (256 // block_elements) * block_bytes
+                    self.assertEqual(loaded[target].dtype, "U8")
+                    self.assertEqual(loaded[target].size, expected_size)
+                    np.testing.assert_array_equal(loaded[target].read(), raw.reshape(-1))
+                    np.testing.assert_array_equal(loaded[target + ".__qnk_shape"].read(),
+                                                  [tag, values.shape[0], 256])
+                    decoded = gguf.dequantize(raw, ggml_type).reshape(values.shape)
+                    self.assertTrue(np.isfinite(decoded).all())
+                    self.assertGreater(float(np.max(np.abs(decoded))), 0.0)
 
     @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
     def test_gguf_expert_gate_up_reassembly(self):
@@ -986,8 +1080,8 @@ class ImportTests(unittest.TestCase):
         for family, arch in (("qwen3_5", "qwen35"), ("deepseek_v4", "dflash")):
             source, _ = self.family_assets(family)
             path = self.root / (arch + "-unsupported.gguf")
-            raw = gguf.quantize(np.ones((4, 256), dtype=np.float32), gguf.GGMLQuantizationType.Q8_0)
-            self.write_gguf(path, arch, [("token_embd.weight", raw, gguf.GGMLQuantizationType.Q8_0),
+            raw = np.zeros((4, 320), dtype=np.uint8)  # Q8_1 has 40 bytes per 32-value block.
+            self.write_gguf(path, arch, [("token_embd.weight", raw, gguf.GGMLQuantizationType.Q8_1),
                                          ("output.weight", np.ones((4, 256), dtype=np.float32), None)])
             output = self.root / (arch + "-unsupported-output")
             with self.assertRaisesRegex(ValueError, "native Qn_K/MXFP4|only draft weights"):

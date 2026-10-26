@@ -734,7 +734,7 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
         return false;
 
     const DType dtype = weights[0]->dtype;
-    if (qnk_block_size(dtype) == 32
+    if (qnk_block_size(dtype) == 32 || dtype == DType::IQ4XS
 #if defined(__aarch64__) || defined(_M_ARM64)
         || is_qnk_dtype(dtype)
 #endif

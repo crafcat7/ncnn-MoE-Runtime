@@ -182,6 +182,17 @@ float qnk_value(uint block, uint type, uint index)
         const int scale = qnk_signed_byte(qnk_byte(block + 192u + super * 8u + group * 2u + (lane >> 4u)));
         return qnk_f16(block + 208u) * float(scale * signed_value);
     }
+    if (type == 15u)
+    {
+        const uint subblock = index >> 5u;
+        const uint lane = index & 31u;
+        const uint packed = qnk_byte(block + 8u + subblock * 16u + (lane & 15u));
+        const uint code = (packed >> (lane < 16u ? 0u : 4u)) & 15u;
+        const uint scale_low = (qnk_byte(block + 4u + (subblock >> 1u)) >> ((subblock & 1u) * 4u)) & 15u;
+        const uint scale_high = (qnk_u16(block + 2u) >> (subblock * 2u)) & 3u;
+        const int scale = int(scale_low | (scale_high << 4u)) - 32;
+        return qnk_f16(block) * float(scale) * float(iq4_nl_values[code]);
+    }
 
     const float scale = uintBitsToFloat(qnk_u32(block));
     return scale * float(qnk_signed_byte(qnk_byte(block + 4u + index)));
@@ -265,6 +276,38 @@ void main()
                 const uint low = (packed >> (lane < 16u ? 0u : 4u)) & 15u;
                 const uint high = (qnk_byte(block_offset + 4u + (lane >> 3u)) >> (lane & 7u)) & 1u;
                 const float weight = qnk_f16(block_offset) * float(low | (high << 4u)) + qnk_f16(block_offset + 2u);
+                sum += weight * projection_input(input_row, block * 32u + lane);
+            }
+        }
+        else if (p.qnk_type == 12u || p.qnk_type == 13u)
+        {
+            // Q4_0 stores signed 4-bit values; Q4_1 stores affine values.
+            // Both pack columns 0..15 in low nibbles and 16..31 in high ones.
+            const uint matrix_row = output_column * p.block_count * p.block_bytes;
+            const uint quant_offset = p.qnk_type == 12u ? 2u : 4u;
+            for (uint block = 0u; block < p.block_count; ++block)
+            {
+                const uint block_offset = matrix_row + block * p.block_bytes;
+                const uint packed = qnk_byte(block_offset + quant_offset + (lane & 15u));
+                const uint code = (packed >> (lane < 16u ? 0u : 4u)) & 15u;
+                const float scale = qnk_f16(block_offset);
+                const float weight = p.qnk_type == 12u
+                                         ? scale * float(int(code) - 8)
+                                         : scale * float(code) + qnk_f16(block_offset + 2u);
+                sum += weight * projection_input(input_row, block * 32u + lane);
+            }
+        }
+        else if (p.qnk_type == 14u)
+        {
+            // Q5_0 stores 32 high bits before the sixteen packed low nibbles.
+            const uint matrix_row = output_column * p.block_count * p.block_bytes;
+            for (uint block = 0u; block < p.block_count; ++block)
+            {
+                const uint block_offset = matrix_row + block * p.block_bytes;
+                const uint packed = qnk_byte(block_offset + 6u + (lane & 15u));
+                const uint low = (packed >> (lane < 16u ? 0u : 4u)) & 15u;
+                const uint high = (qnk_byte(block_offset + 2u + (lane >> 3u)) >> (lane & 7u)) & 1u;
+                const float weight = qnk_f16(block_offset) * float(int(low | (high << 4u)) - 16);
                 sum += weight * projection_input(input_row, block * 32u + lane);
             }
         }

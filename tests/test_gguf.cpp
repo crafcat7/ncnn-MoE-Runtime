@@ -175,10 +175,11 @@ static void check_split(const std::filesystem::path& root)
 
 static void check_encodings(const std::filesystem::path& root)
 {
-    const std::array<uint32_t, 13> types = {0, 1, 7, 8, 10, 11, 12, 13, 14, 15, 20, 26, 30};
-    const std::array<size_t, 13> sizes = {1024, 512, 192, 272, 84, 110, 144, 176, 210, 292, 144, 1024, 512};
-    const std::array<DType, 13> dtypes = {DType::Float32, DType::Float16, DType::Q5_1, DType::Q8_0, DType::Q2K, DType::Q3K, DType::Q4K,
-                                          DType::Q5K, DType::Q6K, DType::Q8K, DType::IQ4NL, DType::Int32, DType::BFloat16};
+    const std::array<uint32_t, 17> types = {0, 1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 15, 20, 23, 26, 30};
+    const std::array<size_t, 17> sizes = {1024, 512, 144, 160, 176, 192, 272, 84, 110, 144, 176, 210, 292, 144, 136, 1024, 512};
+    const std::array<DType, 17> dtypes = {DType::Float32, DType::Float16, DType::Q4_0, DType::Q4_1, DType::Q5_0,
+                                          DType::Q5_1, DType::Q8_0, DType::Q2K, DType::Q3K, DType::Q4K, DType::Q5K,
+                                          DType::Q6K, DType::Q8K, DType::IQ4NL, DType::IQ4XS, DType::Int32, DType::BFloat16};
     for (size_t i = 0; i < types.size(); ++i)
     {
         const auto path = root / "encodings" / (std::to_string(types[i]) + ".gguf");
@@ -213,7 +214,7 @@ static void check_invalid_files(const std::filesystem::path& root)
     bytes = fixture_bytes({}, {valid});
     bytes.resize(bytes.size() - 20);
     reject(bytes, "GGUF accepted a truncated tensor payload");
-    reject(fixture_bytes({}, {{"weight", 2, {32}, std::vector<uint8_t>(18)}}), "GGUF silently accepted unsupported Q4_0");
+    reject(fixture_bytes({}, {{"weight", 9, {32}, std::vector<uint8_t>(36)}}), "GGUF accepted unsupported Q8_1");
     reject(fixture_bytes({}, {{"weight", 8, {48}, std::vector<uint8_t>(51)}}), "GGUF accepted a Q8_0 row crossing quantization blocks");
     reject(fixture_bytes({}, {{"weight", 12, {128, 2}, std::vector<uint8_t>(144)}}), "GGUF accepted a row crossing quantization blocks");
     reject(fixture_bytes({}, {{"weight", 0, {UINT64_C(1) + UINT32_MAX}, {}}}), "GGUF narrowed an oversized tensor dimension");
@@ -228,6 +229,25 @@ static void check_invalid_files(const std::filesystem::path& root)
     append_unsigned(oversized.payload, 8, 4);
     append_unsigned(oversized.payload, UINT64_MAX, 8);
     reject(fixture_bytes({oversized}, {}), "GGUF accepted an oversized array length");
+}
+
+static void check_raw_qnk_dtype_ambiguity(const std::filesystem::path& root)
+{
+    std::string header = R"({"q4_ambiguous":{"dtype":"U8","shape":[1,18],"data_offsets":[0,18]},"legacy_q4k":{"dtype":"U8","shape":[2,1,144],"data_offsets":[18,306]}})";
+    while (header.size() % 8 != 0)
+        header.push_back(' ');
+    std::vector<uint8_t> bytes;
+    append_unsigned(bytes, header.size(), 8);
+    bytes.insert(bytes.end(), header.begin(), header.end());
+    bytes.resize(bytes.size() + 306, 0);
+    const auto path = root / "raw-qnk" / "weights.safetensors";
+    write_bytes(path, bytes);
+    auto archive = SafetensorsArchive::open_file(path);
+    check(static_cast<bool>(archive), archive ? "" : archive.error().message);
+    check(!archive.value().find_qnk_expert_dtype("q4_ambiguous", 1, 1, 32),
+          "untagged 18-byte U8 data was guessed to be Q4_0 or IQ4_NL");
+    check(archive.value().find_qnk_expert_dtype("legacy_q4k", 2, 1, 256) == DType::Q4K,
+          "legacy untagged Q4_K expert bank inference changed");
 }
 
 static void check_qnk_defer_fallback(const std::filesystem::path& root, DType dtype, uint32_t ggml_type, uint32_t columns = 0,
@@ -265,12 +285,12 @@ static void check_qnk_defer_fallback(const std::filesystem::path& root, DType dt
         integer_metadata("qwen35.feed_forward_length", 4),
         std::move(tokens)};
     const std::vector<uint8_t> hidden(4 * columns * sizeof(uint16_t));
-    const bool native_small_block = qnk_block_size(dtype) == 32;
-    const std::vector<uint8_t> embedding(native_small_block ? row_bytes : columns * sizeof(float), 0x35);
+    const bool native_qnk_block = is_qnk_dtype(dtype);
+    const std::vector<uint8_t> embedding(native_qnk_block ? row_bytes : columns * sizeof(float), 0x35);
     std::vector<uint8_t> shared_gate;
     for (uint32_t column = 0; column < columns; ++column)
         append_unsigned(shared_gate, 0x3f000000u, sizeof(float)); // Nonzero 0.5f.
-    std::vector<FixtureTensor> tensors = {{"token_embd.weight", native_small_block ? ggml_type : 0u, {columns, 1}, embedding},
+    std::vector<FixtureTensor> tensors = {{"token_embd.weight", native_qnk_block ? ggml_type : 0u, {columns, 1}, embedding},
                                           {"blk.0.attn_qkv.weight", ggml_type, {columns, rows}, std::move(qkv)},
                                           {"blk.0.attn_gate.weight", 30, {columns, 4}, hidden},
                                           {"blk.0.ssm_alpha.weight", 30, {columns, 4}, hidden},
@@ -310,7 +330,7 @@ static void check_qnk_defer_fallback(const std::filesystem::path& root, DType dt
         check(values[static_cast<size_t>(row) * row_bytes] == source_rows[row] + 1,
               "eager Qn_K fallback did not preserve transformed row order");
 
-    if (native_small_block)
+    if (native_qnk_block)
     {
         auto raw = archive.value().load_tensor("model.language_model.embed_tokens.weight");
         check(raw && raw.value().dtype == dtype
@@ -423,7 +443,12 @@ int main(int argc, char** argv)
         ncnn::moe::check_split(root);
         ncnn::moe::check_encodings(root);
         ncnn::moe::check_invalid_files(root);
+        ncnn::moe::check_raw_qnk_dtype_ambiguity(root);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q4K, 12);
+        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q4_0, 2);
+        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q4_1, 3);
+        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q5_0, 6);
+        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::IQ4XS, 23);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q8_0, 8);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q5_1, 7);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::IQ4NL, 20);

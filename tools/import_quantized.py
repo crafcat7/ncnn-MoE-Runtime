@@ -577,16 +577,27 @@ def validate_gguf_metadata(reader: Any, architecture: str, config: dict[str, Any
     return total, source_mtp
 
 
-QNK_BITS = {"Q2_K": 2, "Q3_K": 3, "Q4_K": 4, "Q5_K": 5, "Q6_K": 6, "Q8_K": 8}
-QNK_BLOCK_BYTES = {2: 84, 3: 110, 4: 144, 5: 176, 6: 210, 8: 292}
+# The first value in the existing __qnk_shape sidecar is the legacy K-series
+# bit width. Keep those values unchanged and reserve 256 + GGML type for other
+# native block formats; byte width alone cannot distinguish Q4_0 from IQ4_NL.
+GGUF_NATIVE_FORMATS = {
+    "Q2_K": (2, 256, 84), "Q3_K": (3, 256, 110), "Q4_K": (4, 256, 144),
+    "Q5_K": (5, 256, 176), "Q6_K": (6, 256, 210), "Q8_K": (8, 256, 292),
+    "Q4_0": (258, 32, 18), "Q4_1": (259, 32, 20), "Q5_0": (262, 32, 22),
+    "Q5_1": (263, 32, 24), "Q8_0": (264, 32, 34), "IQ4_NL": (276, 32, 18),
+    "IQ4_XS": (279, 256, 136),
+}
 
 
 def native_gguf_matrix(name: str, tensor: Any, shape: tuple[int, ...],
                        config: dict[str, Any], data: np.ndarray | None = None
                        ) -> Iterator[tuple[str, str, np.ndarray]]:
     """Keep GGML blocks intact and describe column transforms on input vectors."""
-    bits = QNK_BITS.get(tensor.tensor_type.name)
-    if bits is None or len(shape) != 2 or shape[0] <= 0 or shape[1] <= 0 or shape[1] % 256:
+    encoding = GGUF_NATIVE_FORMATS.get(tensor.tensor_type.name)
+    if encoding is None or len(shape) != 2 or shape[0] <= 0 or shape[1] <= 0:
+        return
+    tag, block_elements, block_bytes = encoding
+    if shape[1] % block_elements:
         return
     if (not name.endswith(".weight") and not preserve_float32(name, config)
             or name.endswith(("norm.weight", "conv1d.weight"))):
@@ -595,9 +606,9 @@ def native_gguf_matrix(name: str, tensor: Any, shape: tuple[int, ...],
     keys, heads = text.get("linear_num_key_heads", 0), text.get("linear_num_value_heads", 0)
     rows, columns = shape
     raw = np.asarray(tensor.data if data is None else data).view(np.uint8)
-    row_bytes = columns // 256 * QNK_BLOCK_BYTES[bits]
+    row_bytes = columns // block_elements * block_bytes
     if raw.size != rows * row_bytes:
-        raise ValueError(f"invalid GGUF Qn_K matrix byte count: {name}")
+        raise ValueError(f"invalid GGUF native block matrix byte count: {name}")
     raw = raw.reshape(rows, row_bytes)
     input_columns = None
     if ".linear_attn." in name and keys != heads:
@@ -616,7 +627,7 @@ def native_gguf_matrix(name: str, tensor: Any, shape: tuple[int, ...],
             logical_to_packed = undo_v_reorder(np.arange(columns, dtype="<i8"), 0, keys, heads, vd)
             input_columns = np.argsort(logical_to_packed).astype("<i8")
     yield name, "U8", raw.reshape(-1)
-    yield name + ".__qnk_shape", "I64", np.asarray([bits, rows, columns], dtype="<i8")
+    yield name + ".__qnk_shape", "I64", np.asarray([tag, rows, columns], dtype="<i8")
     if input_columns is not None:
         yield name + ".__qnk_columns", "I64", input_columns
 
@@ -781,11 +792,13 @@ def gguf_weights(source: Path, config: dict[str, Any]) -> Iterator[tuple[str, st
             if len(shape) != 2 or shape[0] < parts:
                 raise ValueError("invalid Qwen4Exp PLE embedding shape/shard count")
             rows, columns = shape
-            bits = QNK_BITS.get(table.tensor_type.name)
-            if bits is not None:
-                if columns % 256:
-                    raise ValueError("PLE Qn_K embedding columns must be divisible by 256")
-                values = np.asarray(table.data).view(np.uint8).reshape(rows, columns // 256 * QNK_BLOCK_BYTES[bits])
+            encoding = GGUF_NATIVE_FORMATS.get(table.tensor_type.name)
+            if encoding is not None:
+                _, block_elements, block_bytes = encoding
+                if columns % block_elements:
+                    raise ValueError("PLE native block embedding columns are not block-aligned")
+                values = np.asarray(table.data).view(np.uint8).reshape(
+                    rows, columns // block_elements * block_bytes)
             else:
                 values = gguf_float_values(table, gguf)
             for shard in range(parts):
@@ -820,10 +833,11 @@ def gguf_weights(source: Path, config: dict[str, Any]) -> Iterator[tuple[str, st
                     or ks[0] != text.get("indexer_head_dim")):
                 raise ValueError("Qwen4Exp indexer q/k shape disagrees with canonical config")
             name = ("model.language_model." if wrapped else "model.") + f"layers.{indexer[1]}.self_attn.indexer.index_qk_proj.weight"
-            qbits, kbits = QNK_BITS.get(query.tensor_type.name), QNK_BITS.get(key.tensor_type.name)
-            if qbits is not None or kbits is not None:
-                if qbits != kbits:
-                    raise ValueError("Qwen4Exp packed indexer q/k must share a Qn_K type")
+            qencoding = GGUF_NATIVE_FORMATS.get(query.tensor_type.name)
+            kencoding = GGUF_NATIVE_FORMATS.get(key.tensor_type.name)
+            if qencoding is not None or kencoding is not None:
+                if qencoding != kencoding:
+                    raise ValueError("Qwen4Exp packed indexer q/k must share a native GGML type")
                 raw = np.concatenate((np.asarray(query.data).reshape(qs[0], -1), np.asarray(key.data).reshape(ks[0], -1)))
                 yield from native_gguf_matrix(name, query, (qs[0] + ks[0], hidden), config, raw)
             else:
@@ -867,7 +881,7 @@ def gguf_weights(source: Path, config: dict[str, Any]) -> Iterator[tuple[str, st
                              (intermediate * (2 if role == "gate_up" else 1), hidden))
             if tuple(reversed(tensor.shape)) != (count, rows, columns):
                 raise ValueError(f"GGUF expert shape disagrees with canonical config: {tensor.name}")
-            bits = QNK_BITS.get(tensor.tensor_type.name)
+            encoding = GGUF_NATIVE_FORMATS.get(tensor.tensor_type.name)
             raw = np.asarray(tensor.data)
             if tensor.tensor_type.name == "MXFP4":
                 if family not in {"gpt_oss", "deepseek_v4"} or role == "gate_up":
@@ -903,12 +917,13 @@ def gguf_weights(source: Path, config: dict[str, Any]) -> Iterator[tuple[str, st
                             yield prefix + "_blocks", "I8", blocks
                             yield prefix + "_scales", "F8_E8M0", scales
                 continue
-            if bits is not None:
-                if columns % 256:
-                    raise ValueError(f"GGUF Qn_K expert columns must be divisible by 256: {tensor.name}")
-                row_bytes = columns // 256 * QNK_BLOCK_BYTES[bits]
+            if encoding is not None:
+                _, block_elements, block_bytes = encoding
+                if columns % block_elements:
+                    raise ValueError(f"GGUF expert columns are not native block-aligned: {tensor.name}")
+                row_bytes = columns // block_elements * block_bytes
                 if raw.nbytes != count * rows * row_bytes:
-                    raise ValueError(f"invalid GGUF Qn_K expert byte count: {tensor.name}")
+                    raise ValueError(f"invalid GGUF native block expert byte count: {tensor.name}")
                 values = raw.view(np.uint8).reshape(count, rows, row_bytes)
             else:
                 values = gguf_float_values(tensor, gguf).reshape(count, rows, columns)
@@ -1114,7 +1129,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Requires NumPy; GGUF additionally requires gguf. Outputs one tensor per shard.\n"
                "AWQ/GPTQ retain packed INT4 codes, scales, zero points and GPTQ group indices.\n"
-               "GGUF Qn_K embeddings and linear matrices retain blocks, with input column maps when needed.\n"
+               "GGUF quantized embeddings and linear matrices retain blocks, with input column maps when needed.\n"
                "GGUF MXFP4 experts and HF FP8/MXFP4 retain codes and scales. Unsupported quantized matrices fail.\n"
                "Supports AWQ GEMM 4-bit; legacy GPTQ 4-bit (including g_idx/desc_act);\n"
                "FP8 E4M3 weight_scale_inv 128x128; plain BF16/F16/F32 Safetensors.\n"
@@ -1127,7 +1142,7 @@ def main() -> int:
     parser.add_argument("output", type=Path, help="New destination directory; must not exist")
     parser.add_argument("--config", type=Path, help="Canonical HF config/tokenizer directory (required for GGUF)")
     args = parser.parse_args()
-    print("Offline import preserves native AWQ/GPTQ INT4 and eligible GGUF Qn_K matrices.", file=sys.stderr)
+    print("Offline import preserves native AWQ/GPTQ INT4 and eligible GGUF quantized matrices.", file=sys.stderr)
     try:
         size = import_package(args.source, args.output, args.config)
     except (ValueError, OSError, KeyError, TypeError) as error:
@@ -1138,7 +1153,7 @@ def main() -> int:
     qnk = sum(name.endswith(".__qnk_shape") for name in tensors)
     bf16 = sum(info.dtype == "BF16" for info in tensors.values())
     print(f"Imported {len(tensors)} tensors ({size:,} weight bytes) into {args.output}: "
-          f"{int4} native INT4 matrices, {qnk} native Qn_K matrices, {bf16} BF16 tensors.")
+          f"{int4} native INT4 matrices, {qnk} native GGUF matrices, {bf16} BF16 tensors.")
     return 0
 
 

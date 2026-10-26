@@ -429,6 +429,18 @@ static void run_batch_case(const CompiledModel& cpu_model,
     compare_logits(actual, expected);
     require(statistics[0].expert_batches != 0 && statistics[1].expert_batches != 0,
             "staged batch did not record expert execution statistics");
+    for (const auto& session : statistics)
+    {
+        require(session.expert_assignments > 0
+                    && session.expert_cpu_routes + session.expert_gpu_routes == session.expert_assignments,
+                "staged batch did not attribute every route to its Session");
+        require(session.expert_gpu_routes == (commit_success ? session.expert_assignments : 0)
+                    && session.expert_cpu_routes == (commit_success ? 0 : session.expert_assignments),
+                "staged batch reported the wrong execution backend after commit");
+        require(session.expert_cpu_batches == (commit_success ? 0 : session.expert_batches)
+                    && session.expert_cpu_fallbacks == session.expert_cpu_batches,
+                "staged batch did not attribute failed GPU publication to CPU fallback");
+    }
 
     require(state->submit_count == 1, "fake backend was not submitted exactly once");
     require(state->wait_count == 1, "fake backend was not waited exactly once");

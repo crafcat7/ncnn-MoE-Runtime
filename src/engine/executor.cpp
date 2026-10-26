@@ -1913,6 +1913,18 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 LayerState& layer_state = entries[session_index].state->execution_state;
                 SessionStatistics& statistics = *entries[session_index].statistics;
                 statistics.expert_batches += layer_state.active_experts().size();
+                for (const ExpertState& active : layer_state.active_experts())
+                {
+                    const size_t index = workspace.combined_by_expert[active.batch.expert_id];
+                    if (index < workspace.expert.backend_executed.size() && workspace.expert.backend_executed[index])
+                        statistics.expert_gpu_routes += active.batch.routes.size();
+                    else
+                    {
+                        statistics.expert_cpu_routes += active.batch.routes.size();
+                        ++statistics.expert_cpu_batches;
+                        statistics.expert_cpu_fallbacks += node->backend == ExecutionBackend::Vulkan ? 1 : 0;
+                    }
+                }
                 layer_state.experts_executed = true;
             }
             continue;

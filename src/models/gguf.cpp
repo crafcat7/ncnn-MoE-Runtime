@@ -217,6 +217,9 @@ static Result<std::pair<DType, std::pair<uint64_t, uint64_t>>> tensor_encoding(u
     {
     case 0: return Encoding{DType::Float32, {1, 4}};
     case 1: return Encoding{DType::Float16, {1, 2}};
+    case 2: return Encoding{DType::Q4_0, {32, 18}};
+    case 3: return Encoding{DType::Q4_1, {32, 20}};
+    case 6: return Encoding{DType::Q5_0, {32, 22}};
     case 7: return Encoding{DType::Q5_1, {32, 24}};
     case 8: return Encoding{DType::Q8_0, {32, 34}};
     case 10: return Encoding{DType::Q2K, {256, 84}};
@@ -226,6 +229,7 @@ static Result<std::pair<DType, std::pair<uint64_t, uint64_t>>> tensor_encoding(u
     case 14: return Encoding{DType::Q6K, {256, 210}};
     case 15: return Encoding{DType::Q8K, {256, 292}};
     case 20: return Encoding{DType::IQ4NL, {32, 18}};
+    case 23: return Encoding{DType::IQ4XS, {256, 136}};
     case 26: return Encoding{DType::Int32, {1, 4}};
     case 30: return Encoding{DType::BFloat16, {1, 2}};
     case 39: return Encoding{DType::MxFp4, {32, 17}};

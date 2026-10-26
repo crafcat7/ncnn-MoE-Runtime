@@ -110,12 +110,40 @@ void main()
         uint lane = column % head_dimension;
         uint start = (row * p.copies + head) * p.state_length;
         float value = 0.0;
-        if (p.kernel_size == 20u)
+        if (p.kernel_size == 20u || p.kernel_size == 23u)
         {
             const int table[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
-            uint block = start + (lane / 32u) * 18u;
-            uint code = (source_byte(block + 2u + (lane % 16u)) >> ((lane % 32u) < 16u ? 0u : 4u)) & 15u;
-            value = unpackHalf2x16(source_half(block)).x * float(table[code]);
+            bool xs = p.kernel_size == 23u;
+            uint block = start + (lane / (xs ? 256u : 32u)) * (xs ? 136u : 18u);
+            uint group = (lane % 256u) / 32u;
+            uint codes = block + (xs ? 8u + group * 16u : 2u);
+            uint code = (source_byte(codes + (lane % 16u)) >> ((lane % 32u) < 16u ? 0u : 4u)) & 15u;
+            float scale = unpackHalf2x16(source_half(block)).x;
+            if (xs)
+            {
+                uint low = (source_byte(block + 4u + group / 2u) >> ((group % 2u) * 4u)) & 15u;
+                uint high = (source_half(block + 2u) >> (group * 2u)) & 3u;
+                scale *= float(int(low | (high << 4u)) - 32);
+            }
+            value = scale * float(table[code]);
+        }
+        else if (p.kernel_size == 2u || p.kernel_size == 3u || p.kernel_size == 6u || p.kernel_size == 7u)
+        {
+            bool affine = p.kernel_size == 3u || p.kernel_size == 7u;
+            bool five = p.kernel_size == 6u || p.kernel_size == 7u;
+            uint bytes = 18u + (affine ? 2u : 0u) + (five ? 4u : 0u);
+            uint block = start + (lane / 32u) * bytes;
+            uint offset = block + (affine ? 4u : 2u);
+            uint codes = offset + (five ? 4u : 0u);
+            uint code = (source_byte(codes + lane % 16u) >> ((lane % 32u) < 16u ? 0u : 4u)) & 15u;
+            if (five)
+            {
+                uint high = source_half(offset) | (source_half(offset + 2u) << 16u);
+                code |= ((high >> (lane % 32u)) & 1u) << 4u;
+            }
+            value = unpackHalf2x16(source_half(block)).x * float(int(code) - (affine ? 0 : five ? 16
+                                                                                                : 8));
+            if (affine) value += unpackHalf2x16(source_half(block + 2u)).x;
         }
         else if (p.kernel_size == 8u)
         {

@@ -248,7 +248,11 @@ def flash_next_blocks_copy(fixture, directory: Path) -> tuple[Path, Path]:
                  for name, info in fixtures.importer.scan_safetensors(fixture.baseline).items()}
     ple_shards = sorted(name for name in reference if re.fullmatch(
         re.escape(fixtures.PREFIX) + r"layers\.\d+\.ple\.ple_embedding\.ngram_embedding\.shard_\d+\.weight", name))
-    assert len(ple_shards) == 2 and [reference[name][1].shape[0] for name in ple_shards] == [4, 4]
+    ple_table = next(tensor for tensor in reader.tensors if tensor.name == "per_layer_token_embd.weight")
+    assert len(ple_shards) == 2
+    assert sum(reference[name][1].shape[0] for name in ple_shards) == int(ple_table.shape[1])
+    assert all(reference[name][1].shape[0] > 0 and reference[name][1].shape[1] == int(ple_table.shape[0])
+               for name in ple_shards)
     converted = set()
     for index, tensor in enumerate(reader.tensors):
         down = re.fullmatch(r"blk\.(\d+)\.ffn_down_exps\.weight", tensor.name)
@@ -296,7 +300,7 @@ def flash_next_blocks_copy(fixture, directory: Path) -> tuple[Path, Path]:
                 assert columns == shape[1]
                 reference[name] = ("BF16", rounded[offset:offset + rows].copy())
                 offset += rows
-            assert offset == shape[0] and not np.array_equal(rounded[0], rounded[4])
+            assert offset == shape[0] and not np.array_equal(rounded[0], rounded[reference[ple_shards[0]][1].shape[0]])
         else:
             for expert in range(shape[0]):
                 name = f"{fixtures.PREFIX}layers.{down[1]}.mlp.experts.{expert}.down_proj.weight"
@@ -331,6 +335,20 @@ def main() -> int:
         return 77
     real_writer = fixtures.gguf.GGUFWriter
     real_family = fixtures.family_tensors
+    native_formats = fixtures.NATIVE_GGUF_FORMATS
+
+    def run_graph(label: str, baseline: Path, source: Path, on_demand: bool = False) -> None:
+        command = [str(args.runner.resolve()), str(baseline), str(source)]
+        if on_demand:
+            command.append("--on-demand")
+        if args.hybrid:
+            command.append("--hybrid")
+        mode = "on-demand" if on_demand else "eager"
+        print(f"Checking {label}: {mode} native GGML blocks", flush=True)
+        completed = subprocess.run(command)
+        if completed.returncode == 77:
+            raise SystemExit(77)
+        completed.check_returncode()
 
     def family_tensors(family):
         model, tensors, native = real_family(family)
@@ -425,6 +443,30 @@ def main() -> int:
                         if completed.returncode == 77:
                             return 77
                         completed.check_returncode()
+            block_root = root / (label + "-native-block-mixed")
+            block_root.mkdir()
+            with patch.object(fixtures.gguf, "GGUFWriter", writer), patch.object(fixtures, "family_tensors", family_tensors):
+                if family:
+                    mixed = fixtures.prepare_family_gguf(
+                        block_root, family, fp32=False, native_formats=native_formats,
+                        ple_format=native_formats[0] if family == "qwen4_exp" else None)
+                else:
+                    mixed = fixtures.prepare_gguf(block_root, moe, reordered, fp32=False, native_formats=native_formats)
+            run_graph(label, mixed.baseline, mixed.source)
+            if moe:
+                run_graph(label, mixed.baseline, mixed.source, on_demand=True)
+            if family == "qwen4_exp":
+                # The continuous Qwen path must decode every new format
+                # from PLE selected rows; all other native matrices stay
+                # mixed across the full-model fixture.
+                for ple_format in native_formats[1:]:
+                    ple_root = root / (label + "-ple-" + ple_format.lower())
+                    ple_root.mkdir()
+                    with patch.object(fixtures.gguf, "GGUFWriter", writer), patch.object(fixtures, "family_tensors", family_tensors):
+                        ple_fixture = fixtures.prepare_family_gguf(
+                            ple_root, family, fp32=False, native_formats=native_formats,
+                            ple_format=ple_format)
+                    run_graph(label + " PLE " + ple_format, ple_fixture.baseline, ple_fixture.source)
     return 0
 
 

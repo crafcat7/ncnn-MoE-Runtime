@@ -520,15 +520,20 @@ static Result<QuantizedTensorInfo> tensor_encoding(const SafetensorsArchive& arc
     const SafetensorInfo* source = archive.find(name);
     if (!source)
         return Error{ErrorCode::InvalidModel, "missing safetensors tensor: " + name};
-    if (source->ggml_type == 7 || source->ggml_type == 8 || source->ggml_type == 20
+    if (source->ggml_type == 2 || source->ggml_type == 3 || source->ggml_type == 6
+        || source->ggml_type == 7 || source->ggml_type == 8 || source->ggml_type == 20 || source->ggml_type == 23
         || (source->ggml_type >= 10 && source->ggml_type <= 15))
     {
         static constexpr DType types[] = {DType::Q2K, DType::Q3K, DType::Q4K, DType::Q5K, DType::Q6K, DType::Q8K};
         if (source->shape.size() != 2)
             return Error{ErrorCode::InvalidModel, "GGUF block-quantized tensor must be a matrix: " + name};
-        const DType dtype = source->ggml_type == 7    ? DType::Q5_1
+        const DType dtype = source->ggml_type == 2    ? DType::Q4_0
+                            : source->ggml_type == 3  ? DType::Q4_1
+                            : source->ggml_type == 6  ? DType::Q5_0
+                            : source->ggml_type == 7  ? DType::Q5_1
                             : source->ggml_type == 8  ? DType::Q8_0
                             : source->ggml_type == 20 ? DType::IQ4NL
+                            : source->ggml_type == 23 ? DType::IQ4XS
                                                       : types[source->ggml_type - 10];
         return QuantizedTensorInfo{dtype, source->shape[0], source->shape[1], 0};
     }
@@ -582,7 +587,14 @@ static Result<QuantizedTensorInfo> tensor_encoding(const SafetensorsArchive& arc
         case 5: dtype = DType::Q5K; break;
         case 6: dtype = DType::Q6K; break;
         case 8: dtype = DType::Q8K; break;
-        default: return Error{ErrorCode::InvalidModel, "invalid Qn_K bit width: " + name};
+        case 258: dtype = DType::Q4_0; break;
+        case 259: dtype = DType::Q4_1; break;
+        case 262: dtype = DType::Q5_0; break;
+        case 263: dtype = DType::Q5_1; break;
+        case 264: dtype = DType::Q8_0; break;
+        case 276: dtype = DType::IQ4NL; break;
+        case 279: dtype = DType::IQ4XS; break;
+        default: return Error{ErrorCode::InvalidModel, "invalid native quantization tag: " + name};
         }
         const uint32_t rows = static_cast<uint32_t>(shape.value()[1]);
         const uint32_t columns = static_cast<uint32_t>(shape.value()[2]);
@@ -640,16 +652,35 @@ std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(const std::string
         return {};
 
     const SafetensorInfo* source = find(name);
-    const std::array<DType, 9> dtypes = {
+    if (source && source->dtype == "U8" && find(name + ".__qnk_shape"))
+    {
+        try
+        {
+            auto encoding = tensor_encoding(*this, name);
+            if (encoding && encoding.value().rows == rows && encoding.value().columns == columns
+                && qnk_storage_bytes(encoding.value().dtype, rows, columns) <= UINT64_MAX / expert_count
+                && source->size == qnk_storage_bytes(encoding.value().dtype, rows, columns) * expert_count)
+                return encoding.value().dtype;
+        }
+        catch (...)
+        {
+        }
+        return {};
+    }
+    const std::array<DType, 13> dtypes = {
         DType::Q2K,
         DType::Q3K,
         DType::Q4K,
         DType::Q5K,
         DType::Q6K,
         DType::Q8K,
+        DType::Q4_0,
+        DType::Q4_1,
+        DType::Q5_0,
         DType::Q8_0,
         DType::Q5_1,
         DType::IQ4NL,
+        DType::IQ4XS,
     };
     for (const DType dtype : dtypes)
     {
@@ -663,10 +694,16 @@ std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(const std::string
         if (source
             && source->dtype == "U8"
             && source->size == bank_size
-            && ((source->ggml_type == UINT32_MAX && dtype != DType::Q5_1 && dtype != DType::IQ4NL)
+            && ((source->ggml_type == UINT32_MAX
+                 && dtype != DType::Q4_0 && dtype != DType::Q4_1 && dtype != DType::Q5_0
+                 && dtype != DType::Q5_1 && dtype != DType::IQ4NL && dtype != DType::IQ4XS)
+                || (source->ggml_type == 2 && dtype == DType::Q4_0)
+                || (source->ggml_type == 3 && dtype == DType::Q4_1)
+                || (source->ggml_type == 6 && dtype == DType::Q5_0)
                 || (source->ggml_type == 7 && dtype == DType::Q5_1)
                 || (source->ggml_type == 8 && dtype == DType::Q8_0)
                 || (source->ggml_type == 20 && dtype == DType::IQ4NL)
+                || (source->ggml_type == 23 && dtype == DType::IQ4XS)
                 || (source->ggml_type >= 10 && source->ggml_type <= 15 && dtypes[source->ggml_type - 10] == dtype)))
         {
             return dtype;
@@ -852,7 +889,8 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name, uint
     if (const auto* info = find(name); info && info->transform)
     {
         if (has_flag(flags, SafetensorLoadDeferMxfp4Data)
-            && (info->ggml_type == 7 || info->ggml_type == 8 || info->ggml_type == 20
+            && (info->ggml_type == 2 || info->ggml_type == 3 || info->ggml_type == 6
+                || info->ggml_type == 7 || info->ggml_type == 8 || info->ggml_type == 20 || info->ggml_type == 23
                 || (info->ggml_type >= 10 && info->ggml_type <= 15)))
         {
             auto encoding = tensor_encoding(*this, name);
@@ -1290,12 +1328,20 @@ Result<TensorData> SafetensorsArchive::load_gguf_source(SafetensorInfo info,
 static bool qnk_ggml_type_matches(uint32_t type, DType dtype) noexcept
 {
     static constexpr DType types[] = {DType::Q2K, DType::Q3K, DType::Q4K, DType::Q5K, DType::Q6K, DType::Q8K};
+    if (type == 2)
+        return dtype == DType::Q4_0;
+    if (type == 3)
+        return dtype == DType::Q4_1;
+    if (type == 6)
+        return dtype == DType::Q5_0;
     if (type == 7)
         return dtype == DType::Q5_1;
     if (type == 8)
         return dtype == DType::Q8_0;
     if (type == 20)
         return dtype == DType::IQ4NL;
+    if (type == 23)
+        return dtype == DType::IQ4XS;
     return type >= 10 && type <= 15 && types[type - 10] == dtype;
 }
 

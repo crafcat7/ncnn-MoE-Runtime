@@ -233,7 +233,9 @@ std::shared_ptr<QwenLayer_vulkan> QwenLayer_vulkan::create(const CompiledModel& 
         {
             const auto& table = model.weights.at(handle);
             if (table.shape.size() != 2 || table.shape[1] != impl.ple.embedding_dimension / heads
-                || (table.dtype != DType::IQ4NL && table.dtype != DType::Q8_0 && table.dtype != DType::BFloat16 && table.dtype != DType::Float32)) return {};
+                || (table.dtype != DType::IQ4NL && table.dtype != DType::IQ4XS && table.dtype != DType::Q4_0
+                    && table.dtype != DType::Q4_1 && table.dtype != DType::Q5_0 && table.dtype != DType::Q5_1
+                    && table.dtype != DType::Q8_0 && table.dtype != DType::BFloat16 && table.dtype != DType::Float32)) return {};
         }
         const std::lock_guard<std::mutex> lock(impl.context->command_mutex());
         impl.pipeline = qwen_pipeline(impl.context, impl.opt);
@@ -302,9 +304,19 @@ static bool qwen_ple_rows(const WeightStore& weights, const PleBlockPlan& plan,
                                                          : qnk_storage_bytes(first.dtype, 1, dimension);
     if (bytes == 0 || bytes > UINT32_MAX - 3) return false;
     stride = static_cast<uint32_t>((bytes + 3) / 4 * 4);
-    encoding = first.dtype == DType::IQ4NL ? 20 : first.dtype == DType::Q8_0   ? 8
-                                              : first.dtype == DType::BFloat16 ? 30
-                                                                               : 0;
+    switch (first.dtype)
+    {
+    case DType::Float32: encoding = 0; break;
+    case DType::Q4_0: encoding = 2; break;
+    case DType::Q4_1: encoding = 3; break;
+    case DType::Q5_0: encoding = 6; break;
+    case DType::Q5_1: encoding = 7; break;
+    case DType::Q8_0: encoding = 8; break;
+    case DType::IQ4NL: encoding = 20; break;
+    case DType::IQ4XS: encoding = 23; break;
+    case DType::BFloat16: encoding = 30; break;
+    default: return false;
+    }
     packed.reset(tokens.size() * heads, stride / sizeof(float), true);
     const auto multipliers = weights.at(plan.hash_multipliers).int64_values();
     const auto sizes = weights.at(plan.head_vocabulary_sizes).int64_values();

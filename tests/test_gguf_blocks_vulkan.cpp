@@ -31,9 +31,13 @@ static TensorData block_matrix(DType dtype, uint32_t rows, uint32_t columns, uin
     TensorData matrix;
     matrix.dtype = dtype;
     matrix.shape = {rows, columns};
-    const size_t block_bytes = dtype == DType::IQ4NL ? 18 : dtype == DType::Q5_1 ? 24
-                                                        : dtype == DType::Q4K    ? 144
-                                                                                 : 34;
+    const size_t block_bytes = dtype == DType::IQ4NL || dtype == DType::Q4_0 ? 18
+                               : dtype == DType::Q4_1                        ? 20
+                               : dtype == DType::Q5_1                        ? 24
+                               : dtype == DType::Q5_0                        ? 22
+                               : dtype == DType::IQ4XS                       ? 136
+                               : dtype == DType::Q4K                         ? 144
+                                                                             : 34;
     const size_t size = static_cast<size_t>(qnk_storage_bytes(dtype, rows, columns));
     iq4_check(size == static_cast<size_t>(rows) * (columns / qnk_block_size(dtype)) * block_bytes, "native GGUF block byte count");
     // Unaligned host mapping, odd block counts and alternating native row
@@ -65,6 +69,31 @@ static TensorData block_matrix(DType dtype, uint32_t rows, uint32_t columns, uin
                 encoded[2 + lane] = static_cast<uint8_t>(low | (high << 4));
             }
         }
+        else if (dtype == DType::Q4_0 || dtype == DType::Q4_1)
+        {
+            if (dtype == DType::Q4_1)
+            {
+                const uint16_t minimum = block % 3 == 0 ? 0x9400 : block % 3 == 1 ? 0x1400
+                                                                                  : 0x8001;
+                encoded[2] = static_cast<uint8_t>(minimum);
+                encoded[3] = static_cast<uint8_t>(minimum >> 8);
+            }
+            const uint32_t quant_offset = dtype == DType::Q4_0 ? 2u : 4u;
+            for (uint32_t lane = 0; lane < 32; ++lane)
+            {
+                const uint8_t code = static_cast<uint8_t>((lane * 7 + block + seed) & 15);
+                encoded[quant_offset + lane % 16] |= static_cast<uint8_t>(code << (lane < 16 ? 0 : 4));
+            }
+        }
+        else if (dtype == DType::Q5_0)
+        {
+            for (uint32_t lane = 0; lane < 32; ++lane)
+            {
+                const uint8_t code = static_cast<uint8_t>((lane * 5 + block + seed) & 31);
+                encoded[6 + lane % 16] |= static_cast<uint8_t>((code & 15) << (lane < 16 ? 0 : 4));
+                encoded[2 + lane / 8] |= static_cast<uint8_t>((code >> 4) << (lane % 8));
+            }
+        }
         else if (dtype == DType::Q5_1)
         {
             const uint16_t minimum = block % 3 == 0 ? 0x9400 : block % 3 == 1 ? 0x1400
@@ -78,6 +107,23 @@ static TensorData block_matrix(DType dtype, uint32_t rows, uint32_t columns, uin
                 encoded[8 + lane % 16] |= static_cast<uint8_t>((code & 15) << (lane < 16 ? 0 : 4));
                 encoded[4 + lane / 8] |= static_cast<uint8_t>((code >> 4) << (lane % 8));
             }
+        }
+        else if (dtype == DType::IQ4XS)
+        {
+            uint16_t scale_high = 0;
+            for (uint32_t subblock = 0; subblock < 8; ++subblock)
+            {
+                const uint8_t scale_code = static_cast<uint8_t>((subblock * 9 + block + seed) % 63 + 1);
+                encoded[4 + subblock / 2] |= static_cast<uint8_t>((scale_code & 15) << ((subblock & 1) * 4));
+                scale_high |= static_cast<uint16_t>(scale_code >> 4) << (subblock * 2);
+                for (uint32_t lane = 0; lane < 32; ++lane)
+                {
+                    const uint8_t code = static_cast<uint8_t>((lane * 5 + subblock * 3 + block + seed) & 15);
+                    encoded[8 + subblock * 16 + lane % 16] |= static_cast<uint8_t>(code << (lane < 16 ? 0 : 4));
+                }
+            }
+            encoded[2] = static_cast<uint8_t>(scale_high);
+            encoded[3] = static_cast<uint8_t>(scale_high >> 8);
         }
         else
         {
@@ -124,10 +170,14 @@ static ActivationBuffer iq4_reference(const TensorData& matrix, const Activation
             double sum = 0;
             for (uint32_t column = 0; column < columns; ++column)
             {
-                const size_t block_bytes = matrix.dtype == DType::IQ4NL ? 18 : matrix.dtype == DType::Q5_1 ? 24
-                                                                           : matrix.dtype == DType::Q4K    ? 144
-                                                                                                           : 34;
-                const uint32_t block_columns = matrix.dtype == DType::Q4K ? 256 : 32;
+                const size_t block_bytes = matrix.dtype == DType::IQ4NL || matrix.dtype == DType::Q4_0 ? 18
+                                           : matrix.dtype == DType::Q4_1                               ? 20
+                                           : matrix.dtype == DType::Q5_1                               ? 24
+                                           : matrix.dtype == DType::Q5_0                               ? 22
+                                           : matrix.dtype == DType::IQ4XS                              ? 136
+                                           : matrix.dtype == DType::Q4K                                ? 144
+                                                                                                       : 34;
+                const uint32_t block_columns = matrix.dtype == DType::Q4K || matrix.dtype == DType::IQ4XS ? 256 : 32;
                 const size_t offset = (static_cast<size_t>(row) * (columns / block_columns) + column / block_columns) * block_bytes;
                 const uint32_t lane = column % block_columns;
                 const float scale = iq4_half(raw[offset], raw[offset + 1]);
@@ -153,6 +203,35 @@ static ActivationBuffer iq4_reference(const TensorData& matrix, const Activation
                     const uint32_t low = lane < 16 ? packed & 15 : packed >> 4;
                     const uint32_t code = low | (((high_bits >> lane) & 1) << 4);
                     value = scale * code + iq4_half(raw[offset + 2], raw[offset + 3]);
+                }
+                else if (matrix.dtype == DType::Q4_0 || matrix.dtype == DType::Q4_1)
+                {
+                    const size_t quant_offset = matrix.dtype == DType::Q4_0 ? 2 : 4;
+                    const uint8_t packed = raw[offset + quant_offset + lane % 16];
+                    const uint32_t code = lane < 16 ? packed & 15 : packed >> 4;
+                    value = matrix.dtype == DType::Q4_0
+                                ? scale * (static_cast<int>(code) - 8)
+                                : scale * code + iq4_half(raw[offset + 2], raw[offset + 3]);
+                }
+                else if (matrix.dtype == DType::Q5_0)
+                {
+                    const uint8_t packed = raw[offset + 6 + lane % 16];
+                    const uint32_t low = lane < 16 ? packed & 15 : packed >> 4;
+                    const uint32_t high = (raw[offset + 2 + lane / 8] >> (lane % 8)) & 1;
+                    value = scale * (static_cast<int>(low | (high << 4)) - 16);
+                }
+                else if (matrix.dtype == DType::IQ4XS)
+                {
+                    const uint32_t subblock = lane / 32;
+                    const uint32_t sublane = lane % 32;
+                    const uint8_t packed = raw[offset + 8 + subblock * 16 + sublane % 16];
+                    const uint32_t code = sublane < 16 ? packed & 15 : packed >> 4;
+                    const uint32_t scale_high = (static_cast<uint32_t>(raw[offset + 2])
+                                                 | (static_cast<uint32_t>(raw[offset + 3]) << 8))
+                                                    >> (subblock * 2)
+                                                & 3;
+                    const uint32_t scale_low = raw[offset + 4 + subblock / 2] >> ((subblock & 1) * 4) & 15;
+                    value = scale * (static_cast<int>((scale_high << 4) | scale_low) - 32) * codebook[code];
                 }
                 else
                 {
@@ -187,9 +266,11 @@ static void iq4_projections(uint32_t device, DType dtype)
     iq4_check(static_cast<bool>(context), "IQ4_NL/Q5_1 projection context");
     const uint64_t alignment = std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
     const auto align = [alignment](uint64_t value) { return (value + alignment - 1) / alignment * alignment; };
-    for (uint32_t columns : {32u, 64u, 96u, 288u})
+    const uint32_t block_columns = qnk_block_size(dtype);
+    for (uint32_t block_count : {1u, 2u, 3u, 9u})
         for (uint32_t groups : {1u, 2u})
         {
+            const uint32_t columns = block_columns * block_count;
             const TensorData matrix = block_matrix(dtype, groups == 1 ? 5 : 6, columns, columns);
             auto operation = QnkLinear_vulkan::create(matrix, nullptr, device, runtime, OptimizationDefaultFlags, groups);
             const uint64_t expected_storage = align(matrix.qnk_values().size()) + align(matrix.shape[0] * sizeof(float));
@@ -213,28 +294,30 @@ static void iq4_projections(uint32_t device, DType dtype)
         }
     for (bool extreme : {false, true})
     {
-        TensorData mapped = block_matrix(dtype, 5, 96, 7, extreme);
-        mapped.input_column_indices.resize(96);
-        for (uint32_t column = 0; column < 96; ++column)
-            mapped.input_column_indices[column] = 95 - column;
+        const uint32_t columns = block_columns * 3;
+        TensorData mapped = block_matrix(dtype, 5, columns, 7, extreme);
+        mapped.input_column_indices.resize(columns);
+        for (uint32_t column = 0; column < columns; ++column)
+            mapped.input_column_indices[column] = columns - column - 1;
         auto operation = QnkLinear_vulkan::create(mapped, nullptr, device, runtime, OptimizationDefaultFlags);
-        const auto input = iq4_input(4, 96);
+        const auto input = iq4_input(4, columns);
         ActivationBuffer actual;
         iq4_check(operation && operation->forward(input, actual), "IQ4_NL/Q5_1 mapped-column projection");
         iq4_compare(actual, iq4_reference(mapped, input), "IQ4_NL/Q5_1 column map and finite extreme scales");
     }
-    TensorData invalid = block_matrix(dtype, 5, 32, 1);
-    invalid.shape[1] = 33;
+    TensorData invalid = block_matrix(dtype, 5, block_columns, 1);
+    invalid.shape[1] = block_columns + 1;
     iq4_check(!QnkLinear_vulkan::create(invalid, nullptr, device, runtime, OptimizationDefaultFlags), "reject incomplete IQ4_NL/Q5_1 block");
-    invalid = block_matrix(dtype, 5, 32, 1);
+    invalid = block_matrix(dtype, 5, block_columns, 1);
     --invalid.mapped_size;
     iq4_check(!QnkLinear_vulkan::create(invalid, nullptr, device, runtime, OptimizationDefaultFlags), "reject truncated IQ4_NL/Q5_1 bytes");
-    const TensorData vocabulary = block_matrix(dtype, 65537, 32, 1);
+    constexpr uint32_t vocabulary_rows = 65537;
+    const TensorData vocabulary = block_matrix(dtype, vocabulary_rows, block_columns, 1);
     auto head = QnkLinear_vulkan::create(vocabulary, nullptr, device, runtime, OptimizationDefaultFlags);
-    const auto input = iq4_input(1, 32);
+    const auto input = iq4_input(1, block_columns);
     ActivationBuffer logits;
-    iq4_check(head && head->forward(input, logits), "IQ4_NL/Q5_1 LM Head exceeds 65535 workgroups");
-    iq4_compare(logits, iq4_reference(vocabulary, input), "IQ4_NL/Q5_1 tiled LM Head tail reference");
+    iq4_check(head && head->forward(input, logits), "native GGUF LM Head projection");
+    iq4_compare(logits, iq4_reference(vocabulary, input), "native GGUF tiled LM Head reference");
 }
 
 static ActivationBuffer iq4_expert_reference(const TensorData& gate, const TensorData* up, const TensorData& down,
@@ -275,8 +358,8 @@ static std::shared_ptr<DeviceTensor_vulkan> iq4_upload(const ActivationBuffer& i
 
 static void iq4_experts(uint32_t device, DType dtype, DType down_dtype)
 {
-    const uint32_t hidden = dtype == DType::Q4K ? 256 : 64;
-    constexpr uint32_t intermediate = 32;
+    const uint32_t hidden = std::max<uint32_t>(64, qnk_block_size(dtype));
+    const uint32_t intermediate = std::max<uint32_t>(32, qnk_block_size(down_dtype));
     const auto runtime = create_vulkan_runtime();
     const auto gate = std::make_shared<TensorData>(block_matrix(dtype, intermediate, hidden, 1));
     const auto up = std::make_shared<TensorData>(block_matrix(dtype, intermediate, hidden, 2));
@@ -466,22 +549,31 @@ int main()
     {
         for (uint32_t device = 0; device < ncnn::moe::get_gpu_count(); ++device)
         {
-            for (ncnn::moe::DType dtype : {ncnn::moe::DType::IQ4NL, ncnn::moe::DType::Q5_1})
+            for (ncnn::moe::DType dtype : {ncnn::moe::DType::IQ4NL, ncnn::moe::DType::Q5_1,
+                                           ncnn::moe::DType::Q4_0, ncnn::moe::DType::Q4_1,
+                                           ncnn::moe::DType::Q5_0, ncnn::moe::DType::IQ4XS})
             {
                 ncnn::moe::iq4_projections(device, dtype);
                 ncnn::moe::iq4_experts(device, dtype, dtype);
             }
-            // The real Qwen package mixes Q4_K gate/up and Q5_1 down;
-            // Q8_0 plus Q5_1 remains useful independent mixed-block coverage.
+            const std::array<std::array<ncnn::moe::DType, 2>, 4> mixed_formats = {{
+                {ncnn::moe::DType::Q4_0, ncnn::moe::DType::Q4_1},
+                {ncnn::moe::DType::Q4_1, ncnn::moe::DType::Q5_0},
+                {ncnn::moe::DType::Q5_0, ncnn::moe::DType::IQ4XS},
+                {ncnn::moe::DType::IQ4XS, ncnn::moe::DType::Q4_0},
+            }};
+            for (const auto& formats : mixed_formats)
+                ncnn::moe::iq4_experts(device, formats[0], formats[1]);
+            // Retain older K-quant and 32-value mixed-block references.
             ncnn::moe::iq4_experts(device, ncnn::moe::DType::Q4K, ncnn::moe::DType::Q5_1);
             ncnn::moe::iq4_experts(device, ncnn::moe::DType::Q8_0, ncnn::moe::DType::Q5_1);
         }
-        std::cout << "Native IQ4_NL/Q5_1 Vulkan projection, resident Shared chain and Expert cache tests passed\n";
+        std::cout << "Native GGUF block Vulkan projection, resident Shared chain and Expert cache tests passed\n";
         return 0;
     }
     catch (const std::exception& error)
     {
-        std::cerr << "Native IQ4_NL/Q5_1 Vulkan test failed: " << error.what() << '\n';
+        std::cerr << "Native GGUF block Vulkan test failed: " << error.what() << '\n';
         return 1;
     }
 #else

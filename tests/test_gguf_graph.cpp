@@ -108,6 +108,9 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
     check(static_cast<bool>(batch), batch ? "" : batch.error().message);
     for (size_t session = 0; session < prompts.size(); ++session)
         compare_logits(expected_logits[session], actual_logits[session], family + " two-session batch session=" + std::to_string(session), hybrid);
+    for (const auto& statistics : actual_statistics)
+        check(statistics.expert_cpu_routes + statistics.expert_gpu_routes == statistics.expert_assignments,
+              family + ": per-session CPU/GPU routes do not cover all Expert assignments after batched decode");
     if (candidate.qwen_device_chain)
     {
         for (const auto& statistics : actual_statistics)
@@ -123,6 +126,33 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
     const auto counters = get_vulkan_statistics(candidate.vulkan_runtime);
     if (hybrid)
     {
+        bool native_blocks = false;
+        for (TensorHandle handle = 0; handle < candidate.weights.size(); ++handle)
+        {
+            const DType dtype = candidate.weights.at(handle).dtype;
+            native_blocks = native_blocks || dtype == DType::Q4_0 || dtype == DType::Q4_1
+                            || dtype == DType::Q5_0 || dtype == DType::IQ4XS;
+        }
+        if (native_blocks)
+        {
+            check(counters.dispatches > 0, family + ": native GGUF weights executed no Vulkan projections");
+            if (family == "deepseek_v4")
+                check(counters.attention_blocks > 0, "native DeepSeek GGUF weights did not execute MLA on Vulkan");
+            if (std::any_of(candidate.graph.layer_plans.begin(), candidate.graph.layer_plans.end(), [](const CompiledLayerPlan& layer) {
+                    return layer.attention.kind == AttentionKind::GatedDeltaNet;
+                }))
+                check(counters.gated_delta_fusions > 0, family + ": native GGUF weights did not execute GDN on Vulkan");
+            check(counters.attention_cpu_fallbacks == 0, family + ": native GGUF attention fell back to CPU");
+            for (const auto& statistics : actual_statistics)
+            {
+                if (candidate.descriptor.expert_count != 0)
+                    check(statistics.expert_assignments > 0 && statistics.expert_gpu_routes == statistics.expert_assignments,
+                          family + ": GPU-priority routes do not cover every native Expert assignment");
+                check(statistics.expert_cpu_routes == 0 && statistics.expert_cpu_fallbacks == 0
+                          && statistics.model_compute_cpu_fallbacks == 0,
+                      family + ": native Expert execution fell back to CPU");
+            }
+        }
         const bool gpu_planned = std::any_of(candidate.graph.nodes.begin(), candidate.graph.nodes.end(), [](const ExecutionNode& node) {
             return node.backend == ExecutionBackend::Vulkan;
         });

@@ -5353,6 +5353,14 @@ static size_t qnk_shader_type(DType dtype) noexcept
         return 10;
     if (dtype == DType::Q5_1)
         return 11;
+    if (dtype == DType::Q4_0)
+        return 12;
+    if (dtype == DType::Q4_1)
+        return 13;
+    if (dtype == DType::Q5_0)
+        return 14;
+    if (dtype == DType::IQ4XS)
+        return 15;
     return static_cast<size_t>(dtype) - static_cast<size_t>(DType::Q2K);
 }
 
@@ -5808,14 +5816,10 @@ void QnkLinear_vulkan::record(const ncnn::VkMat& input,
     ncnn::VkMat dispatcher;
     // ncnn may round the requested 32 lanes up to the device subgroup size.
     // One complete workgroup computes one output column on every device.
-    uint32_t column_groups = implementation.output_columns;
-    if (implementation.dtype == DType::Q8_0 || implementation.dtype == DType::IQ4NL
-        || implementation.dtype == DType::Q5_1)
-    {
-        // A vocabulary-sized native 32-value LM Head can exceed the guaranteed 65535
-        // workgroups along X. Retain one row per workgroup and tile over Z.
-        column_groups = std::min(column_groups, std::min(65535u, implementation.vulkan_context->device()->info.max_workgroup_count_x()));
-    }
+    // Vocabulary-sized projections can exceed the guaranteed 65535 workgroups
+    // along X. Retain one row per workgroup and tile over Z for every encoding.
+    const uint32_t column_groups = std::min(implementation.output_columns,
+                                            std::min(65535u, implementation.vulkan_context->device()->info.max_workgroup_count_x()));
     dispatcher.w = static_cast<int>(column_groups * implementation.pipeline->local_size_x());
     dispatcher.h = static_cast<int>(constants[3].u32);
     dispatcher.c = static_cast<int>(implementation.output_columns / column_groups + (implementation.output_columns % column_groups != 0));

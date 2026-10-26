@@ -261,9 +261,10 @@ the portability and correctness fallback.
 Native GGUF Q8_0 weights use a separate 32-value, 34-byte block format and
 retain their original bytes for CPU and Vulkan execution. They do not use
 Q8_K's 256-value activation-quantization kernels or expand into BF16 at load.
-Native Q5_1 and IQ4_NL also keep their original 32-value blocks, using 24 and
-18 bytes respectively. Mixed Expert projections retain each matrix's encoding;
-large IQ4_NL PLE embeddings decode only the selected rows.
+Native Q4_0, Q4_1, Q5_0, Q5_1 and IQ4_NL also retain their 32-value blocks;
+IQ4_XS retains its 256-value blocks and signed subgroup scales. Mixed Expert
+projections retain each matrix's encoding. PLE reads only selected packed rows
+and decodes supported native formats on Vulkan in the continuous Qwen path.
 
 On-demand Hybrid planning reserves host budget for idle Expert upload staging,
 up to 64 MiB per selected device. A smaller explicit GPU Expert cache reduces
