@@ -186,31 +186,6 @@ static bool qsa_matrix(ncnn::VkMat& target, uint32_t columns, uint32_t rows, Vul
     return !target.empty();
 }
 
-static void qsa_record(ncnn::VkCompute& command, const std::shared_ptr<ncnn::Pipeline>& pipeline,
-                       const std::vector<ncnn::VkMat>& bindings, const std::vector<unsigned char>& readonly,
-                       const std::vector<ncnn::vk_constant_type>& constants,
-                       uint32_t groups_x, uint32_t groups_y = 1)
-{
-    ncnn::VkMat dispatcher;
-    // Flatten work into X/Z so full context blocks and large prefill chunks
-    // also fit Vulkan's guaranteed 65535 workgroups per dimension.
-    const uint64_t groups = static_cast<uint64_t>(groups_x) * groups_y;
-    const uint32_t width = static_cast<uint32_t>(std::min<uint64_t>(groups, 65535));
-    const uint32_t depth = static_cast<uint32_t>((groups + width - 1) / width);
-    dispatcher.w = static_cast<int>(width * pipeline->local_size_x());
-    dispatcher.h = 1;
-    dispatcher.c = static_cast<int>(depth * pipeline->local_size_z());
-    command.record_pipeline_readonly(pipeline.get(), bindings, readonly, constants, dispatcher);
-}
-
-static std::vector<ncnn::vk_constant_type> qsa_uints(std::initializer_list<uint32_t> values)
-{
-    std::vector<ncnn::vk_constant_type> result(values.size());
-    size_t index = 0;
-    for (uint32_t value : values)
-        result[index++].u32 = value;
-    return result;
-}
 #endif
 
 std::shared_ptr<QsaAttention_vulkan> QsaAttention_vulkan::create(const WeightStore& weights,
@@ -472,13 +447,44 @@ bool QsaAttention_vulkan::record_forward(const ncnn::VkMat& input,
     ticket.next = next;
     ticket.previous_tokens = previous;
     auto& storage = ticket.storage;
+    std::vector<ncnn::VkMat> bindings;
+    bindings.reserve(7);
+    std::vector<unsigned char> readonly;
+    readonly.reserve(7);
+    std::vector<ncnn::vk_constant_type> constants;
+    constants.reserve(10);
+    const auto uints = [&](std::initializer_list<uint32_t> values) -> std::vector<ncnn::vk_constant_type>& {
+        constants.resize(values.size());
+        size_t index = 0;
+        for (uint32_t value : values)
+            constants[index++].u32 = value;
+        return constants;
+    };
+    const auto record = [&](const std::shared_ptr<ncnn::Pipeline>& pipeline,
+                            std::initializer_list<ncnn::VkMat> binding_values,
+                            std::initializer_list<unsigned char> readonly_values,
+                            const std::vector<ncnn::vk_constant_type>& push_constants,
+                            uint32_t groups_x, uint32_t groups_y = 1) {
+        bindings.assign(binding_values.begin(), binding_values.end());
+        readonly.assign(readonly_values.begin(), readonly_values.end());
+        ncnn::VkMat dispatcher;
+        // Flatten work into X/Z so full context blocks and large prefill chunks
+        // also fit Vulkan's guaranteed 65535 workgroups per dimension.
+        const uint64_t groups = static_cast<uint64_t>(groups_x) * groups_y;
+        const uint32_t width = static_cast<uint32_t>(std::min<uint64_t>(groups, 65535));
+        const uint32_t depth = static_cast<uint32_t>((groups + width - 1) / width);
+        dispatcher.w = static_cast<int>(width * pipeline->local_size_x());
+        dispatcher.h = 1;
+        dispatcher.c = static_cast<int>(depth * pipeline->local_size_z());
+        command.record_pipeline_readonly(pipeline.get(), bindings, readonly, push_constants, dispatcher);
+    };
     if (grow && original && previous != 0)
     {
         const auto copy = [&](const ncnn::VkMat& source, const ncnn::VkMat& target, uint32_t words) {
             if (words != 0)
             {
-                qsa_record(command, impl.copy_pipeline, {source, target}, {1, 0},
-                           qsa_uints({words, impl.copy_pipeline->local_size_x()}), (words + 31) / 32);
+                record(impl.copy_pipeline, {source, target}, {1, 0},
+                       uints({words, impl.copy_pipeline->local_size_x()}), (words + 31) / 32);
                 ++ticket.dispatches;
             }
         };
@@ -499,48 +505,48 @@ bool QsaAttention_vulkan::record_forward(const ncnn::VkMat& input,
         gate = query;
     const auto rotate = [&](const ncnn::VkMat& source, const ncnn::VkMat& norm,
                             const ncnn::VkMat& target, uint32_t heads, uint32_t dimension, uint32_t source_columns) {
-        auto constants = qsa_uints({rows, heads, dimension, source_columns, rope_dimension, static_cast<uint32_t>(position_offset), 0, 0, 0});
+        auto& constants = uints({rows, heads, dimension, source_columns, rope_dimension, static_cast<uint32_t>(position_offset), 0, 0, 0});
         constants[6].f = plan.norm_epsilon;
         constants[7].f = plan.norm_weight_offset;
         constants[8].f = impl.concentration;
-        qsa_record(command, impl.norm_rope_pipeline, {source, norm, impl.frequency, target}, {1, 1, 1, 0}, constants, rows * heads);
+        record(impl.norm_rope_pipeline, {source, norm, impl.frequency, target}, {1, 1, 1, 0}, constants, rows * heads);
         ++ticket.dispatches;
     };
     rotate(query, impl.query_norm, rotated_query, plan.head_count, plan.head_dimension, query_columns);
     rotate(key, impl.key_norm, rotated_key, plan.kv_head_count, plan.head_dimension, columns);
     rotate(index, impl.index_query_norm, rotated_index, plan.index_head_count, plan.index_head_dimension, index_columns);
-    qsa_record(command, impl.cache_write_pipeline, {rotated_key, value, index, next->keys, next->values, next->index_raw},
-               {1, 1, 1, 0, 0, 0},
-               qsa_uints({rows, columns, index_columns, plan.index_head_dimension,
-                          plan.index_head_count * plan.index_head_dimension, previous, plan.kv_cache_dtype == DType::BFloat16 ? 1u : 0u,
-                          impl.cache_write_pipeline->local_size_x()}),
-               (std::max(rows * cache_columns, rows * plan.index_head_dimension) + 31) / 32);
+    record(impl.cache_write_pipeline, {rotated_key, value, index, next->keys, next->values, next->index_raw},
+           {1, 1, 1, 0, 0, 0},
+           uints({rows, columns, index_columns, plan.index_head_dimension,
+                  plan.index_head_count * plan.index_head_dimension, previous, plan.kv_cache_dtype == DType::BFloat16 ? 1u : 0u,
+                  impl.cache_write_pipeline->local_size_x()}),
+           (std::max(rows * cache_columns, rows * plan.index_head_dimension) + 31) / 32);
     ++ticket.dispatches;
     const uint32_t first_block = previous / plan.compression_ratio;
     if (blocks > first_block)
     {
-        auto constants = qsa_uints({first_block, blocks - first_block, plan.index_head_dimension, plan.compression_ratio,
-                                    rope_dimension, static_cast<uint32_t>(next->start_position), 0, 0, 0});
+        auto& constants = uints({first_block, blocks - first_block, plan.index_head_dimension, plan.compression_ratio,
+                                 rope_dimension, static_cast<uint32_t>(next->start_position), 0, 0, 0});
         constants[6].f = plan.norm_epsilon;
         constants[7].f = plan.norm_weight_offset;
         constants[8].f = impl.concentration;
-        qsa_record(command, impl.pool_pipeline, {next->index_raw, impl.index_key_norm, impl.frequency, next->pooled_keys},
-                   {1, 1, 1, 0}, constants, blocks - first_block);
+        record(impl.pool_pipeline, {next->index_raw, impl.index_key_norm, impl.frequency, next->pooled_keys},
+               {1, 1, 1, 0}, constants, blocks - first_block);
         ++ticket.dispatches;
     }
     if (blocks != 0)
     {
-        qsa_record(command, impl.scores_pipeline, {rotated_index, next->pooled_keys, scores}, {1, 1, 0},
-                   qsa_uints({rows, blocks, plan.index_head_count, plan.index_head_dimension}), blocks, rows);
+        record(impl.scores_pipeline, {rotated_index, next->pooled_keys, scores}, {1, 1, 0},
+               uints({rows, blocks, plan.index_head_count, plan.index_head_dimension}), blocks, rows);
         ++ticket.dispatches;
     }
-    qsa_record(command, impl.select_pipeline, {scores, cutoff}, {1, 0},
-               qsa_uints({rows, blocks, previous, plan.compression_ratio, plan.index_top_k}), rows);
-    qsa_record(command, impl.attention_pipeline, {rotated_query, next->keys, next->values, cutoff, scores, gate, attended},
-               {1, 1, 1, 1, 1, 1, 0},
-               qsa_uints({rows, plan.head_count, plan.kv_head_count, plan.head_dimension, previous, plan.compression_ratio,
-                          blocks, plan.index_top_k, plan.kv_cache_dtype == DType::BFloat16 ? 1u : 0u, impl.gate ? 1u : 0u}),
-               plan.head_count, rows);
+    record(impl.select_pipeline, {scores, cutoff}, {1, 0},
+           uints({rows, blocks, previous, plan.compression_ratio, plan.index_top_k}), rows);
+    record(impl.attention_pipeline, {rotated_query, next->keys, next->values, cutoff, scores, gate, attended},
+           {1, 1, 1, 1, 1, 1, 0},
+           uints({rows, plan.head_count, plan.kv_head_count, plan.head_dimension, previous, plan.compression_ratio,
+                  blocks, plan.index_top_k, plan.kv_cache_dtype == DType::BFloat16 ? 1u : 0u, impl.gate ? 1u : 0u}),
+           plan.head_count, rows);
     ticket.dispatches += 2;
     if (!impl.output->record_forward(attended, output, command, storage))
         return false;

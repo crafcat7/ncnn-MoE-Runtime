@@ -107,9 +107,9 @@ void forward_linear(const TensorData& matrix, const TensorData& bias, const Acti
                                           const CompiledOperator* gate_executable = nullptr,
                                           const CompiledOperator* up_executable = nullptr,
                                           ActivationBuffer* quantized_input_scratch = nullptr);
-// Input and output must be distinct Float32 buffers.
+// Input, output, and supplied scratch must be distinct Float32 buffers.
 void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, const ActivationBuffer& input, ExpertActivation activation, float activation_limit,
-                           ActivationBuffer& output, uint64_t optimization_flags);
+                           ActivationBuffer& output, uint64_t optimization_flags, ActivationBuffer* scratch = nullptr);
 [[nodiscard]] bool forward_experts_mxfp4(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch, uint64_t optimization_flags);
 [[nodiscard]] ActivationBuffer forward_rms_norm(const ActivationBuffer& input, const TensorData& weight, float epsilon, float weight_offset);
 // Input and output may be the same buffer; each row's RMS is computed before writing it.

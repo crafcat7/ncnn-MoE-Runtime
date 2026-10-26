@@ -3123,6 +3123,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     std::copy_n(repeated_expert_input.row(0),
                 repeated_expert_input.columns(),
                 repeated_expert_input.row(2));
+    ActivationBuffer linear_scratch;
     ActivationBuffer repeated_activated;
     forward_gate_up_mxfp4(expert_gate_up,
                           &expert_gate_up_bias,
@@ -3130,7 +3131,33 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                           ExpertActivation::DeepSeekSwiGlu,
                           expert_activation_limit,
                           repeated_activated,
+                          g_test_optimization_flags,
+                          &linear_scratch);
+    const std::byte* linear_scratch_data = linear_scratch.bytes().data();
+    const uint64_t linear_scratch_capacity = linear_scratch.allocated_bytes();
+    ActivationBuffer resized_activated;
+    forward_gate_up_mxfp4(expert_gate_up,
+                          &expert_gate_up_bias,
+                          input,
+                          ExpertActivation::DeepSeekSwiGlu,
+                          expert_activation_limit,
+                          resized_activated,
+                          g_test_optimization_flags,
+                          &linear_scratch);
+    ActivationBuffer resized_reference;
+    forward_gate_up_mxfp4(expert_gate_up,
+                          &expert_gate_up_bias,
+                          input,
+                          ExpertActivation::DeepSeekSwiGlu,
+                          expert_activation_limit,
+                          resized_reference,
                           g_test_optimization_flags);
+    check(resized_activated.rows() == resized_reference.rows());
+    check(resized_activated.columns() == resized_reference.columns());
+    check(linear_scratch.bytes().data() == linear_scratch_data);
+    check(linear_scratch.allocated_bytes() == linear_scratch_capacity);
+    for (size_t index = 0; index < resized_reference.values().size(); ++index)
+        check_near(resized_activated.values()[index], resized_reference.values()[index], 1e-5f);
     const ActivationBuffer repeated_reference = forward_linear(expert_down,
                                                                expert_down_bias,
                                                                repeated_activated,
@@ -3148,6 +3175,17 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
 
     ActivationBuffer single_expert_input(1, 32);
     std::copy_n(repeated_expert_input.row(0), single_expert_input.columns(), single_expert_input.row(0));
+    ActivationBuffer single_token_scratch;
+    ActivationBuffer single_token_activated;
+    forward_gate_up_mxfp4(expert_gate_up,
+                          &expert_gate_up_bias,
+                          single_expert_input,
+                          ExpertActivation::DeepSeekSwiGlu,
+                          expert_activation_limit,
+                          single_token_activated,
+                          g_test_optimization_flags,
+                          &single_token_scratch);
+    check(single_token_scratch.allocated_bytes() == 0);
     auto check_mxfp4_rejected = [&](Mxfp4Task task, const ActivationBuffer& task_input) {
         ActivationBuffer output(1, expert_down.shape[0]);
         std::fill_n(output.row(0), output.columns(), 17.0f);
@@ -12152,7 +12190,6 @@ void test_execution_graph_and_scheduler()
     check(invalid_normalization_compile_status.error().code == ErrorCode::InvalidModel);
     check(invalid_normalization_compile_status.error().message == "model descriptor layer has an invalid router normalization");
     const ExecutionGraph& graph = compiled.graph;
-    check(static_cast<bool>(graph.validate()));
     check(compiled.graph.layer_plans.front().attention.kind == AttentionKind::None);
     check(static_cast<bool>(graph.nodes.size() == 7));
     check(static_cast<bool>(!graph.tensors.empty()));
@@ -12223,13 +12260,10 @@ void test_execution_graph_and_scheduler()
 
     ExecutionGraph duplicate_dependency_graph = branch_graph;
     duplicate_dependency_graph.nodes.back().dependencies = {0, 2, 0};
-    auto duplicate_dependency = duplicate_dependency_graph.validate();
-    check(!duplicate_dependency);
-    check(duplicate_dependency.error().message == "execution graph contains a duplicate dependency");
     ExecutionSchedule duplicate_schedule;
     auto duplicate_schedule_status = schedule_graph(duplicate_dependency_graph, duplicate_schedule, branch_options);
     check(!duplicate_schedule_status);
-    check(duplicate_schedule_status.error().message == duplicate_dependency.error().message);
+    check(duplicate_schedule_status.error().message == "execution graph contains a duplicate dependency");
 
     ExecutionGraph cpu_dense_graph = graph;
     cpu_dense_graph.nodes.back().backend_mask |= ExecutionBackendVulkan;
@@ -12320,15 +12354,12 @@ void test_execution_graph_and_scheduler()
         std::move(cyclic_combine),
     };
     cyclic.layer_plans.resize(1);
-    auto invalid_graph = cyclic.validate();
-    check(!invalid_graph);
-    check(invalid_graph.error().message == "execution graph contains a dependency cycle");
     GraphOption cyclic_options;
     ExecutionSchedule invalid_schedule;
     auto invalid_schedule_status = schedule_graph(cyclic, invalid_schedule, cyclic_options);
     check(static_cast<bool>(!invalid_schedule_status));
     check(static_cast<bool>(invalid_schedule_status.error().code == ErrorCode::InvalidModel));
-    check(invalid_schedule_status.error().message == invalid_graph.error().message);
+    check(invalid_schedule_status.error().message == "execution graph contains a dependency cycle");
 }
 
 void test_expert_dispatcher_groups_routes()
@@ -19291,8 +19322,8 @@ void test_sampling_and_streaming_generation()
     baseline_counters.expert_cache_resident_size = 1;
     baseline_counters.kv_cache_logical_size = 7;
     baseline_counters.kv_cache_allocated_size = 6;
-    const RuntimeMetricCounters generation_counters = runtime_metric_counters(synthetic_statistics,
-                                                                              &baseline_counters);
+    const RuntimeMetricCounters generation_counters = metric_counters(synthetic_statistics,
+                                                                      &baseline_counters);
     check(static_cast<bool>(generation_counters.expert_gpu_executions == 3));
     check(static_cast<bool>(generation_counters.expert_io_bytes == 600));
     check(static_cast<bool>(generation_counters.gpu_submit_count == 12));
@@ -19303,8 +19334,8 @@ void test_sampling_and_streaming_generation()
     check(static_cast<bool>(generation_counters.kv_cache_allocated_size == 256));
 
     synthetic_statistics.expert_gpu_executions = baseline_counters.expert_gpu_executions;
-    const RuntimeMetricCounters no_gpu_generation = runtime_metric_counters(synthetic_statistics,
-                                                                            &baseline_counters);
+    const RuntimeMetricCounters no_gpu_generation = metric_counters(synthetic_statistics,
+                                                                    &baseline_counters);
     check(no_gpu_generation.expert_gpu_executions == 0);
 
     auto stopped_session = runtime.create_session(model.value(), session_options);

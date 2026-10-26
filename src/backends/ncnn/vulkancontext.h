@@ -59,20 +59,20 @@ struct VulkanContextCacheKeyHash
     }
 };
 
-class AtomicRuntimeCounter
+class AtomicCounter
 {
 public:
-    AtomicRuntimeCounter() noexcept = default;
-    AtomicRuntimeCounter(const AtomicRuntimeCounter&) = delete;
-    AtomicRuntimeCounter& operator=(const AtomicRuntimeCounter&) = delete;
+    AtomicCounter() noexcept = default;
+    AtomicCounter(const AtomicCounter&) = delete;
+    AtomicCounter& operator=(const AtomicCounter&) = delete;
 
-    AtomicRuntimeCounter& operator++() noexcept
+    AtomicCounter& operator++() noexcept
     {
         value.fetch_add(1, std::memory_order_relaxed);
         return *this;
     }
 
-    AtomicRuntimeCounter& operator+=(uint64_t amount) noexcept
+    AtomicCounter& operator+=(uint64_t amount) noexcept
     {
         value.fetch_add(amount, std::memory_order_relaxed);
         return *this;
@@ -89,30 +89,28 @@ private:
 
 struct VulkanRuntimeState
 {
-    AtomicRuntimeCounter compute_submissions;
-    AtomicRuntimeCounter batch_uploads;
-    AtomicRuntimeCounter batch_downloads;
-    AtomicRuntimeCounter command_graph_submissions;
-    AtomicRuntimeCounter command_graph_operations;
-    AtomicRuntimeCounter attention_qkv_rope_fusions;
-    AtomicRuntimeCounter attention_device_rope_fusions;
-    AtomicRuntimeCounter attention_qkv_ring_fusions;
-    AtomicRuntimeCounter attention_decode_sdpa_fusions;
-    AtomicRuntimeCounter attention_cache_materializations;
-    AtomicRuntimeCounter attention_cpu_fallbacks;
-    AtomicRuntimeCounter shared_expert_swiglu_fusions;
-    AtomicRuntimeCounter gated_delta_fusions;
-    AtomicRuntimeCounter gated_delta_submissions;
-    AtomicRuntimeCounter rms_norm_linear_fusions;
-    AtomicRuntimeCounter kv_ring_appends;
-    AtomicRuntimeCounter kv_ring_resizes;
-    AtomicRuntimeCounter kv_ring_wrapped_views;
-    AtomicRuntimeCounter bfloat16_cooperative_matrix_dispatches;
-    AtomicRuntimeCounter dispatches;
-    AtomicRuntimeCounter int4_dispatches;
-    AtomicRuntimeCounter attention_blocks;
-
-    [[nodiscard]] VulkanStatistics snapshot() const noexcept;
+    AtomicCounter compute_submissions;
+    AtomicCounter batch_uploads;
+    AtomicCounter batch_downloads;
+    AtomicCounter command_graph_submissions;
+    AtomicCounter command_graph_operations;
+    AtomicCounter attention_qkv_rope_fusions;
+    AtomicCounter attention_device_rope_fusions;
+    AtomicCounter attention_qkv_ring_fusions;
+    AtomicCounter attention_decode_sdpa_fusions;
+    AtomicCounter attention_cache_materializations;
+    AtomicCounter attention_cpu_fallbacks;
+    AtomicCounter shared_expert_swiglu_fusions;
+    AtomicCounter gated_delta_fusions;
+    AtomicCounter gated_delta_submissions;
+    AtomicCounter rms_norm_linear_fusions;
+    AtomicCounter kv_ring_appends;
+    AtomicCounter kv_ring_resizes;
+    AtomicCounter kv_ring_wrapped_views;
+    AtomicCounter bfloat16_cooperative_matrix_dispatches;
+    AtomicCounter dispatches;
+    AtomicCounter int4_dispatches;
+    AtomicCounter attention_blocks;
 };
 
 // Wait an already submitted command without submitting it again. Return only

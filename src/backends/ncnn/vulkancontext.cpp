@@ -562,8 +562,34 @@ std::vector<GpuInfo> get_gpu_infos()
 VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& vulkan_runtime) noexcept
 {
 #if NCNN_MOE_WITH_VULKAN
-    return vulkan_runtime ? vulkan_runtime->state.snapshot()
-                          : VulkanStatistics{};
+    if (!vulkan_runtime)
+        return {};
+
+    const auto& state = vulkan_runtime->state;
+    VulkanStatistics result;
+    result.dispatches = state.dispatches.load();
+    result.int4_dispatches = state.int4_dispatches.load();
+    result.attention_blocks = state.attention_blocks.load();
+    result.compute_submissions = state.compute_submissions.load();
+    result.batch_uploads = state.batch_uploads.load();
+    result.batch_downloads = state.batch_downloads.load();
+    result.attention_qkv_rope_fusions = state.attention_qkv_rope_fusions.load();
+    result.attention_device_rope_fusions = state.attention_device_rope_fusions.load();
+    result.attention_qkv_ring_fusions = state.attention_qkv_ring_fusions.load();
+    result.attention_decode_sdpa_fusions = state.attention_decode_sdpa_fusions.load();
+    result.attention_cache_materializations = state.attention_cache_materializations.load();
+    result.attention_cpu_fallbacks = state.attention_cpu_fallbacks.load();
+    result.shared_expert_swiglu_fusions = state.shared_expert_swiglu_fusions.load();
+    result.gated_delta_fusions = state.gated_delta_fusions.load();
+    result.gated_delta_submissions = state.gated_delta_submissions.load();
+    result.rms_norm_linear_fusions = state.rms_norm_linear_fusions.load();
+    result.kv_ring_appends = state.kv_ring_appends.load();
+    result.bfloat16_cooperative_matrix_dispatches = state.bfloat16_cooperative_matrix_dispatches.load();
+    result.command_graph_submissions = state.command_graph_submissions.load();
+    result.command_graph_operations = state.command_graph_operations.load();
+    result.kv_ring_resizes = state.kv_ring_resizes.load();
+    result.kv_ring_wrapped_views = state.kv_ring_wrapped_views.load();
+    return result;
 #else
     (void)vulkan_runtime;
     return {};
@@ -571,34 +597,6 @@ VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& vulkan_runtime) n
 }
 
 #if NCNN_MOE_WITH_VULKAN
-VulkanStatistics VulkanRuntimeState::snapshot() const noexcept
-{
-    VulkanStatistics result;
-    result.dispatches = dispatches.load();
-    result.int4_dispatches = int4_dispatches.load();
-    result.attention_blocks = attention_blocks.load();
-    result.compute_submissions = compute_submissions.load();
-    result.batch_uploads = batch_uploads.load();
-    result.batch_downloads = batch_downloads.load();
-    result.attention_qkv_rope_fusions = attention_qkv_rope_fusions.load();
-    result.attention_device_rope_fusions = attention_device_rope_fusions.load();
-    result.attention_qkv_ring_fusions = attention_qkv_ring_fusions.load();
-    result.attention_decode_sdpa_fusions = attention_decode_sdpa_fusions.load();
-    result.attention_cache_materializations = attention_cache_materializations.load();
-    result.attention_cpu_fallbacks = attention_cpu_fallbacks.load();
-    result.shared_expert_swiglu_fusions = shared_expert_swiglu_fusions.load();
-    result.gated_delta_fusions = gated_delta_fusions.load();
-    result.gated_delta_submissions = gated_delta_submissions.load();
-    result.rms_norm_linear_fusions = rms_norm_linear_fusions.load();
-    result.kv_ring_appends = kv_ring_appends.load();
-    result.bfloat16_cooperative_matrix_dispatches = bfloat16_cooperative_matrix_dispatches.load();
-    result.command_graph_submissions = command_graph_submissions.load();
-    result.command_graph_operations = command_graph_operations.load();
-    result.kv_ring_resizes = kv_ring_resizes.load();
-    result.kv_ring_wrapped_views = kv_ring_wrapped_views.load();
-    return result;
-}
-
 int wait_submitted_compute(ncnn::VkCompute& command, const ncnn::VulkanDevice* probe_device)
 {
     struct WaitContext

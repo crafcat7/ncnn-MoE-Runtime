@@ -202,7 +202,8 @@ static void forward_expert(const CompiledModel& model,
                                   expert.activation,
                                   expert.activation_limit,
                                   activated,
-                                  optimization_flags);
+                                  optimization_flags,
+                                  &workspace.gate);
         }
         else if (expert.layout == ExpertLayout::PackedGateUpDown)
         {
@@ -701,8 +702,11 @@ void forward_shared_expert(const CompiledModel& model,
 
     if (require_device_execution)
         throw std::runtime_error("Vulkan Shared Expert has no executable device chain or router gate");
+    const ExecutionBackend backend = support_vulkan_shared_experts(model.operators, moe)
+                                         ? ExecutionBackend::Vulkan
+                                         : ExecutionBackend::Cpu;
     forward_dense_ffn(model, moe.shared_expert, input, output, workspace,
-                      support_vulkan_shared_experts(model.operators, moe) ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu);
+                      backend);
     if (moe.shared_expert_gate_weight == invalid_tensor_handle)
         return;
     ActivationBuffer& gate = workspace.gate;
@@ -711,7 +715,7 @@ void forward_shared_expert(const CompiledModel& model,
                    gate,
                    optimization_flags,
                    model.operators.find_weight(moe.shared_expert_gate_weight),
-                   support_vulkan_shared_experts(model.operators, moe) ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
+                   backend,
                    &workspace.quantized_input);
     assert(gate.columns() == 1);
     for (size_t token_index = 0; token_index < output.rows(); ++token_index)

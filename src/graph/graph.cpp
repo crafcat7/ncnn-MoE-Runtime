@@ -199,12 +199,6 @@ static Result<void> validate_graph(const ExecutionGraph& graph, std::vector<Exec
     return {};
 }
 
-Result<void> ExecutionGraph::validate() const
-{
-    std::vector<ExecutionNodeId> node_order;
-    return validate_graph(*this, node_order);
-}
-
 Result<void> ExecutionSchedule::validate(const ExecutionGraph& graph) const
 {
     if (graph.nodes.empty())

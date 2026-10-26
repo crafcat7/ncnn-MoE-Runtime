@@ -1449,8 +1449,9 @@ bool forward_gate_up_float8(const TensorData& gate,
 }
 
 void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, const ActivationBuffer& input, ExpertActivation activation, float activation_limit,
-                           ActivationBuffer& output, uint64_t optimization_flags)
+                           ActivationBuffer& output, uint64_t optimization_flags, ActivationBuffer* scratch)
 {
+    assert(!scratch || (scratch != &input && scratch != &output && scratch->dtype() == DType::Float32));
     assert(&input != &output && input.dtype() == DType::Float32 && output.dtype() == DType::Float32);
     assert(matrix.dtype == DType::MxFp4 && matrix.shape.size() == 2);
     assert(matrix.shape[0] % 2 == 0 && matrix.shape[1] == input.columns());
@@ -1655,7 +1656,9 @@ void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, con
     if (parallel_enabled)
         scratch_worker_count = static_cast<size_t>(linear_team_size);
 #endif
-    std::vector<float> linear_scratch(scratch_worker_count * input.rows());
+    ActivationBuffer local_scratch;
+    ActivationBuffer& linear_scratch = scratch ? *scratch : local_scratch;
+    linear_scratch.reset(input.rows(), static_cast<uint32_t>(scratch_worker_count), false);
     const int64_t parallel_columns = static_cast<int64_t>(intermediate_size);
 #pragma omp parallel for num_threads(linear_team_size) if (parallel_enabled)
     for (int64_t column = 0; column < parallel_columns; ++column)
@@ -1673,7 +1676,7 @@ void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, con
         if (parallel_enabled)
             scratch_worker = static_cast<size_t>(omp_get_thread_num());
 #endif
-        float* linear = linear_scratch.data() + scratch_worker * input.rows();
+        float* linear = linear_scratch.row(0) + scratch_worker * input.rows();
         matmul_rows2(gate_blocks, gate_scales, up_blocks, up_scales, blocks_per_row, input.row(0), input.columns(), input.rows(),
                      output.row(0) + column, output.columns(), linear, 1);
         for (size_t token_index = 0; token_index < input.rows(); ++token_index)

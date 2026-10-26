@@ -17,7 +17,7 @@ struct VulkanStatistics;
 
 // Shared resource snapshots describe the interval, not exclusive Session work.
 void record_resource_delta(const CompiledModel& model,
-                           SessionStatistics& statistics,
+                           SessionStatistics& stats,
                            const ExpertCacheStatistics& cache_before,
                            const ExpertBackendStatistics& backend_before);
 void record_resource_delta(const CompiledModel& model,
@@ -25,12 +25,12 @@ void record_resource_delta(const CompiledModel& model,
                            const ExpertCacheStatistics& cache_before,
                            const ExpertBackendStatistics& backend_before);
 
-void record_vulkan_delta(SessionStatistics& statistics,
+void record_vulkan_delta(SessionStatistics& stats,
                          const VulkanStatistics& before,
                          const VulkanStatistics& after);
 
-RuntimeMetricCounters runtime_metric_counters(const SessionStatistics& statistics,
-                                              const RuntimeMetricCounters* baseline);
+RuntimeMetricCounters metric_counters(const SessionStatistics& stats,
+                                      const RuntimeMetricCounters* baseline);
 
 } // namespace moe
 } // namespace ncnn

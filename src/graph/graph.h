@@ -100,8 +100,6 @@ struct ExecutionGraph
     std::vector<ExecutionTensor> tensors;
     std::vector<ExecutionNode> nodes;
     std::vector<CompiledLayerPlan> layer_plans;
-
-    [[nodiscard]] Result<void> validate() const;
 };
 
 struct ExecutionSchedule
