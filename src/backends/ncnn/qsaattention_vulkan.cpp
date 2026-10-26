@@ -70,6 +70,10 @@ public:
     std::shared_ptr<ncnn::Pipeline> select_pipeline;
     std::shared_ptr<ncnn::Pipeline> attention_pipeline;
     std::shared_ptr<ncnn::Pipeline> copy_pipeline;
+    // Reused by record_forward under context->command_mutex().
+    mutable std::vector<ncnn::VkMat> bindings;
+    mutable std::vector<unsigned char> readonly;
+    mutable std::vector<ncnn::vk_constant_type> constants;
 #endif
 };
 
@@ -322,6 +326,9 @@ std::shared_ptr<QsaAttention_vulkan> QsaAttention_vulkan::create(const WeightSto
         impl.weights_bytes += static_cast<uint64_t>(value->total()) * value->elemsize;
     if (impl.norm)
         impl.weights_bytes += static_cast<uint64_t>(hidden) * sizeof(float);
+    impl.bindings.reserve(7);
+    impl.readonly.reserve(7);
+    impl.constants.reserve(10);
     return result;
 #else
     (void)weights;
@@ -447,12 +454,9 @@ bool QsaAttention_vulkan::record_forward(const ncnn::VkMat& input,
     ticket.next = next;
     ticket.previous_tokens = previous;
     auto& storage = ticket.storage;
-    std::vector<ncnn::VkMat> bindings;
-    bindings.reserve(7);
-    std::vector<unsigned char> readonly;
-    readonly.reserve(7);
-    std::vector<ncnn::vk_constant_type> constants;
-    constants.reserve(10);
+    auto& bindings = impl.bindings;
+    auto& readonly = impl.readonly;
+    auto& constants = impl.constants;
     const auto uints = [&](std::initializer_list<uint32_t> values) -> std::vector<ncnn::vk_constant_type>& {
         constants.resize(values.size());
         size_t index = 0;
@@ -465,18 +469,28 @@ bool QsaAttention_vulkan::record_forward(const ncnn::VkMat& input,
                             std::initializer_list<unsigned char> readonly_values,
                             const std::vector<ncnn::vk_constant_type>& push_constants,
                             uint32_t groups_x, uint32_t groups_y = 1) {
-        bindings.assign(binding_values.begin(), binding_values.end());
-        readonly.assign(readonly_values.begin(), readonly_values.end());
-        ncnn::VkMat dispatcher;
-        // Flatten work into X/Z so full context blocks and large prefill chunks
-        // also fit Vulkan's guaranteed 65535 workgroups per dimension.
-        const uint64_t groups = static_cast<uint64_t>(groups_x) * groups_y;
-        const uint32_t width = static_cast<uint32_t>(std::min<uint64_t>(groups, 65535));
-        const uint32_t depth = static_cast<uint32_t>((groups + width - 1) / width);
-        dispatcher.w = static_cast<int>(width * pipeline->local_size_x());
-        dispatcher.h = 1;
-        dispatcher.c = static_cast<int>(depth * pipeline->local_size_z());
-        command.record_pipeline_readonly(pipeline.get(), bindings, readonly, push_constants, dispatcher);
+        // The command owns recorded descriptors; release the reusable VkMat references after each call.
+        try
+        {
+            bindings.assign(binding_values.begin(), binding_values.end());
+            readonly.assign(readonly_values.begin(), readonly_values.end());
+            ncnn::VkMat dispatcher;
+            // Flatten work into X/Z so full context blocks and large prefill chunks
+            // also fit Vulkan's guaranteed 65535 workgroups per dimension.
+            const uint64_t groups = static_cast<uint64_t>(groups_x) * groups_y;
+            const uint32_t width = static_cast<uint32_t>(std::min<uint64_t>(groups, 65535));
+            const uint32_t depth = static_cast<uint32_t>((groups + width - 1) / width);
+            dispatcher.w = static_cast<int>(width * pipeline->local_size_x());
+            dispatcher.h = 1;
+            dispatcher.c = static_cast<int>(depth * pipeline->local_size_z());
+            command.record_pipeline_readonly(pipeline.get(), bindings, readonly, push_constants, dispatcher);
+        }
+        catch (...)
+        {
+            bindings.clear();
+            throw;
+        }
+        bindings.clear();
     };
     if (grow && original && previous != 0)
     {

@@ -165,34 +165,45 @@ static bool qsa_forward(const std::shared_ptr<QsaAttention_vulkan>& op, LayerCac
                         uint64_t position, const ActivationBuffer& input, ActivationBuffer& output,
                         bool abandon = false)
 {
-    const auto& context = op->vulkan_context();
-    const std::lock_guard<std::mutex> lock(context->command_mutex());
-    ncnn::VkCompute command(context->device());
-    ncnn::VkMat input_staging;
-    ncnn::VkMat input_gpu;
-    ncnn::VkMat output_gpu;
-    ncnn::VkMat output_staging;
-    QsaAttentionWork_vulkan work;
-    if (!fill_staging_upload(input, input_staging, context->staging_allocator())
-        || !record_mapped_activation_upload(input_staging, input_gpu, command, context->device(), op->option(),
-                                            DType::Float32)
-        || !op->record_forward(input_gpu, cache, position, output_gpu, command, work))
-        return false;
-    if (abandon)
-        return true;
-    if (!prepare_staging_batch(output_staging, input.rows(), input.columns(), context->staging_allocator())
-        || !record_prepared_activation_staging_download(output_gpu, input.rows(), input.columns(), output_staging,
-                                                        command, context->device(), op->option(), DType::Float32)
-        || submit_compute_and_wait(command, context->device()) != 0)
-        return false;
-    ActivationBuffer completed(input.rows(), input.columns());
-    if (!copy_staging_to_cpu_batch(output_staging, completed) || !work.commit() || work.commit())
-        return false;
-    output.swap(completed);
-    // QSA record itself does not upload, download or submit activations.
-    ++context->runtime_state().compute_submissions;
-    ++context->runtime_state().batch_uploads;
-    ++context->runtime_state().batch_downloads;
+    ncnn::VkMat output_probe;
+    {
+        const auto& context = op->vulkan_context();
+        const std::lock_guard<std::mutex> lock(context->command_mutex());
+        ncnn::VkCompute command(context->device());
+        ncnn::VkMat input_staging;
+        ncnn::VkMat input_gpu;
+        ncnn::VkMat output_gpu;
+        ncnn::VkMat output_staging;
+        QsaAttentionWork_vulkan work;
+        if (!fill_staging_upload(input, input_staging, context->staging_allocator())
+            || !record_mapped_activation_upload(input_staging, input_gpu, command, context->device(), op->option(),
+                                                DType::Float32)
+            || !op->record_forward(input_gpu, cache, position, output_gpu, command, work))
+            return false;
+        if (abandon)
+        {
+            output_probe = output_gpu;
+        }
+        else
+        {
+            if (!prepare_staging_batch(output_staging, input.rows(), input.columns(), context->staging_allocator())
+                || !record_prepared_activation_staging_download(output_gpu, input.rows(), input.columns(), output_staging,
+                                                                command, context->device(), op->option(), DType::Float32)
+                || submit_compute_and_wait(command, context->device()) != 0)
+                return false;
+            ActivationBuffer completed(input.rows(), input.columns());
+            if (!copy_staging_to_cpu_batch(output_staging, completed) || !work.commit() || work.commit())
+                return false;
+            output_probe = output_gpu;
+            output.swap(completed);
+            // QSA record itself does not upload, download or submit activations.
+            ++context->runtime_state().compute_submissions;
+            ++context->runtime_state().batch_uploads;
+            ++context->runtime_state().batch_downloads;
+        }
+    }
+    qsa_check(output_probe.refcount && *output_probe.refcount == 1,
+              "discarded or completed QSA work releases recorded output bindings");
     return true;
 }
 
@@ -240,9 +251,39 @@ static void qsa_case(uint32_t device, uint32_t head_dimension, DType dtype, bool
     AttentionScratch scratch;
     LayerCache reference;
     LayerCache actual;
+    LayerCache peer_reference;
+    LayerCache peer_actual;
     const uint64_t start_position = 7;
+    const uint64_t peer_start_position = 101;
     uint32_t consumed = 0;
+    uint32_t peer_consumed = 0;
     uint64_t calls = 0;
+    AttentionScratch peer_scratch;
+    const auto advance_peer = [&](uint32_t rows) {
+        const auto peer_input = qsa_input(rows, fixture.hidden, 37 + peer_consumed);
+        ActivationBuffer peer_expected;
+        ActivationBuffer peer_output;
+        auto peer_cpu = forward_attention(reference_weights, cpu_operators, fixture.plan, ExecutionBackend::Cpu,
+                                          peer_start_position + peer_consumed, peer_reference, peer_scratch,
+                                          peer_input, peer_expected, OptimizationDefaultFlags);
+        qsa_check(static_cast<bool>(peer_cpu), "interleaved CPU QSA oracle execution");
+        qsa_check(qsa_forward(op, peer_actual, peer_start_position + peer_consumed, peer_input, peer_output),
+                  "interleaved GPU QSA cache chunk");
+        ++calls;
+        qsa_parity(peer_output, peer_expected, "interleaved QSA chunk " + std::to_string(peer_consumed));
+        peer_consumed += rows;
+        qsa_check(peer_actual.token_count == peer_consumed && peer_actual.start_position == peer_start_position
+                      && peer_actual.capacity_tokens >= peer_consumed && peer_actual.qsa_device_state
+                      && peer_actual.qsa_device_state != actual.qsa_device_state
+                      && peer_actual.device_allocated_size == peer_actual.qsa_device_state->allocated_bytes(),
+                  "interleaved QSA Session keeps an independent device cache");
+        const auto& peer_state = *peer_actual.qsa_device_state;
+        qsa_check(peer_state.keys.refcount && *peer_state.keys.refcount == 1
+                      && peer_state.values.refcount && *peer_state.values.refcount == 1
+                      && peer_state.index_raw.refcount && *peer_state.index_raw.refcount == 1
+                      && peer_state.pooled_keys.refcount && *peer_state.pooled_keys.refcount == 1,
+                  "interleaved QSA cache has no retained command bindings");
+    };
     const auto before = get_vulkan_statistics(runtime);
     for (uint32_t rows : {3u, 1u, 7u, 2u, 8u, 1u})
     {
@@ -252,12 +293,14 @@ static void qsa_case(uint32_t device, uint32_t head_dimension, DType dtype, bool
         auto cpu = forward_attention(reference_weights, cpu_operators, fixture.plan, ExecutionBackend::Cpu,
                                      start_position + consumed, reference, scratch, input, expected, OptimizationDefaultFlags);
         qsa_check(static_cast<bool>(cpu), "CPU QSA oracle execution");
-        const auto old_state = actual.qsa_device_state;
-        const uint64_t old_bytes = actual.device_allocated_size;
-        qsa_check(qsa_forward(op, actual, start_position + consumed, input, output, true), "abandon recorded QSA");
-        qsa_check(actual.qsa_device_state == old_state && actual.token_count == consumed
-                      && actual.device_allocated_size == old_bytes,
-                  "abandoned work leaves authoritative state unchanged");
+        {
+            const auto old_state = actual.qsa_device_state;
+            const uint64_t old_bytes = actual.device_allocated_size;
+            qsa_check(qsa_forward(op, actual, start_position + consumed, input, output, true), "abandon recorded QSA");
+            qsa_check(actual.qsa_device_state == old_state && actual.token_count == consumed
+                          && actual.device_allocated_size == old_bytes,
+                      "abandoned work leaves authoritative state unchanged");
+        }
         qsa_check(qsa_forward(op, actual, start_position + consumed, input, output), "GPU QSA chunk");
         ++calls;
         qsa_parity(output, expected, "QSA chunk " + std::to_string(consumed));
@@ -269,6 +312,16 @@ static void qsa_case(uint32_t device, uint32_t head_dimension, DType dtype, bool
         qsa_check(actual.keys.empty() && actual.bfloat16_keys.empty() && actual.qsa_block_keys.empty()
                       && actual.qsa_index_key_tail.empty(),
                   "device QSA has no CPU cache shadow");
+        const auto& state = *actual.qsa_device_state;
+        qsa_check(state.keys.refcount && *state.keys.refcount == 1
+                      && state.values.refcount && *state.values.refcount == 1
+                      && state.index_raw.refcount && *state.index_raw.refcount == 1
+                      && state.pooled_keys.refcount && *state.pooled_keys.refcount == 1,
+                  "published QSA cache has no retained command bindings");
+        if (consumed == 3)
+            advance_peer(2);
+        else if (consumed == 4)
+            advance_peer(1);
     }
     const auto after = get_vulkan_statistics(runtime);
     qsa_check(after.attention_blocks - before.attention_blocks == calls
@@ -284,7 +337,7 @@ static void qsa_case(uint32_t device, uint32_t head_dimension, DType dtype, bool
     for (size_t index = 0; index < reference.qsa_block_keys.size(); ++index)
         qsa_check(std::abs(pooled.values()[index] - reference.qsa_block_keys[index]) <= 0.0035f,
                   "BF16 average before QSA key normalization and partial RoPE");
-    const auto stable = actual.qsa_device_state;
+    auto stable = actual.qsa_device_state;
     const auto input = qsa_input(1, fixture.hidden, consumed);
     ActivationBuffer ignored;
     qsa_check(!qsa_forward(op, actual, start_position + consumed + 1, input, ignored), "reject discontinuous QSA prefix");
@@ -294,8 +347,10 @@ static void qsa_case(uint32_t device, uint32_t head_dimension, DType dtype, bool
     std::weak_ptr<QsaCache_vulkan> old_owner = actual.qsa_device_state;
     actual = {};
     qsa_check(actual.device_allocated_size == 0 && !actual.qsa_device_state, "reset clears QSA ownership and accounting");
-    // stable deliberately holds the old lease until this case ends.
+    // An explicit lease keeps the old cache alive across Session reset.
     qsa_check(!old_owner.expired(), "held device cache lease survives Session reset");
+    stable.reset();
+    qsa_check(old_owner.expired(), "released device cache lease expires after Session reset");
     auto fresh = qsa_input(3, fixture.hidden, 0);
     LayerCache fresh_cpu;
     AttentionScratch fresh_scratch;
