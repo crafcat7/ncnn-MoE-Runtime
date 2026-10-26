@@ -444,7 +444,9 @@ bool QwenLayer_vulkan::forward(const ActivationBuffer& initial_hidden, std::span
     {
         if (initial_hidden.rows() != tokens.size() || initial_hidden.columns() != impl.hidden * impl.copies
             || initial_hidden.dtype() != DType::Float32 || !fill_staging_upload(initial_hidden, slot.upload, slot.staging_allocator)
-            || !record_mapped_upload(slot.upload, input, cmd, impl.opt)) return fail("initial activation upload");
+            || !record_mapped_activation_upload(slot.upload, input, cmd, impl.context->device(), impl.opt,
+                                                DType::Float32))
+            return fail("initial activation upload");
         ++uploads;
     }
     const uint64_t old_ple_bytes = ple_state ? ple_state->allocated_bytes() : 0;

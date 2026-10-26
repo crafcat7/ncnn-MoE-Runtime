@@ -174,7 +174,8 @@ static bool qsa_forward(const std::shared_ptr<QsaAttention_vulkan>& op, LayerCac
     ncnn::VkMat output_staging;
     QsaAttentionWork_vulkan work;
     if (!fill_staging_upload(input, input_staging, context->staging_allocator())
-        || !record_mapped_upload(input_staging, input_gpu, command, op->option())
+        || !record_mapped_activation_upload(input_staging, input_gpu, command, context->device(), op->option(),
+                                            DType::Float32)
         || !op->record_forward(input_gpu, cache, position, output_gpu, command, work))
         return false;
     if (abandon)
@@ -326,11 +327,15 @@ int main()
         }
         for (uint32_t device = 0; device < ncnn::moe::get_gpu_count(); ++device)
         {
-            qsa_case(device, 64, DType::BFloat16, false, false, true);
-            qsa_case(device, 64, DType::BFloat16, true, false, true);
-            qsa_case(device, 128, DType::Float32, false, false);
-            qsa_case(device, 256, DType::BFloat16, true, false);
-            qsa_case(device, 128, DType::BFloat16, true, true);
+            for (uint32_t round = 0; round < 4; ++round)
+            {
+                std::cout << "QSA stress round=" << (round + 1) << "/4 device=" << device << '\n';
+                qsa_case(device, 64, DType::BFloat16, false, false, true);
+                qsa_case(device, 64, DType::BFloat16, true, false, true);
+                qsa_case(device, 128, DType::Float32, false, false);
+                qsa_case(device, 256, DType::BFloat16, true, false);
+                qsa_case(device, 128, DType::BFloat16, true, true);
+            }
         }
         return 0;
 #else

@@ -87,7 +87,28 @@ bool record_mapped_activation_upload(ncnn::VkMat& staging,
     if (vulkan_activation_storage_variant(option) == 0)
     {
         if (source_dtype == DType::Float32)
-            return record_mapped_upload(staging, destination, command, option);
+        {
+            if (!device || !staging.allocator || !option.blob_vkallocator
+                || staging.allocator->vkdev != device || option.blob_vkallocator->vkdev != device
+                || staging.empty() || !staging.mapped_ptr()
+                || staging.dims < 1 || staging.dims > 4
+                || staging.elemsize != sizeof(float) || staging.elempack != 1)
+                return false;
+            staging.allocator->flush(staging.data);
+            staging.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
+            staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
+            device->convert_packing(staging, destination, 1, 1, command, option);
+            if (destination.empty() || destination.dims != staging.dims
+                || destination.w != staging.w || destination.h != staging.h
+                || destination.d != staging.d || destination.c != staging.c
+                || destination.elemsize != staging.elemsize || destination.elempack != staging.elempack)
+                return false;
+#if NCNN_BATCH
+            if (destination.n != staging.n)
+                return false;
+#endif
+            return true;
+        }
         if (!device || staging.empty() || !staging.mapped_ptr())
             return false;
         staging.allocator->flush(staging.data);
