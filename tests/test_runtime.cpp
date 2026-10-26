@@ -10191,6 +10191,117 @@ void test_speculative_generation()
             check(static_cast<bool>(build_graph(compiled, false)));
             check(compiled.speculative.enabled());
 
+#if NCNN_MOE_WITH_VULKAN
+            if (get_gpu_count() > 0)
+            {
+                const VulkanRuntimePtr dspark_vulkan_runtime = create_vulkan_runtime();
+                check(static_cast<bool>(dspark_vulkan_runtime));
+                CompilerOption dspark_pipeline_options;
+                dspark_pipeline_options.flags = BackendVulkanDense;
+                dspark_pipeline_options.optimization_flags = g_test_optimization_flags
+                                                             & ~static_cast<uint64_t>(OptimizationVulkanAttention);
+                dspark_pipeline_options.vulkan_runtime = dspark_vulkan_runtime;
+                const auto prepare_hybrid_dspark = [&](CompiledModel& candidate) {
+                    // The tiny mapped FP8 projection is a CPU fixture. Use its
+                    // equivalent FP32 matrix to isolate Shared Expert preparation.
+                    TensorData& output_a = candidate.weights.at_mutable(latent.output_a_weight);
+                    output_a = TensorData();
+                    output_a.dtype = DType::Float32;
+                    output_a.shape = {1, 2};
+                    output_a.float32_data = {0.5f, 1.0f};
+                    candidate.opt.hybrid_mode = HybridMode::HybridExperts;
+                    candidate.opt.optimization_flags = dspark_pipeline_options.optimization_flags;
+                    candidate.vulkan_runtime = dspark_vulkan_runtime;
+                    auto prepared = prepare_model_pipeline(candidate, dspark_pipeline_options);
+                    if (!prepared)
+                        throw std::runtime_error("DSpark Hybrid preparation failed: " + prepared.error().message);
+                    check(static_cast<bool>(build_graph(candidate, false)));
+                };
+                const auto speculative_shared_node = [](const CompiledModel& candidate) -> const ExecutionNode& {
+                    const ExecutionNodeId id = candidate.speculative.layer_nodes.front().shared_expert_group;
+                    check(id < candidate.speculative.graph.nodes.size());
+                    return candidate.speculative.graph.nodes[id];
+                };
+                CompiledModel no_shared_dspark = compiled;
+                prepare_hybrid_dspark(no_shared_dspark);
+
+                const auto add_dspark_shared = [](CompiledModel& candidate, DType dtype) {
+                    const uint32_t hidden = candidate.descriptor.hidden_size;
+                    const uint32_t intermediate = candidate.descriptor.layers.front().moe.intermediate_size;
+                    const auto add_weight = [&](const std::string& name, bool down) {
+                        TensorData weight;
+                        weight.dtype = dtype;
+                        weight.shape = down ? std::vector<uint32_t>{hidden, intermediate}
+                                            : std::vector<uint32_t>{intermediate, hidden};
+                        if (dtype == DType::Int4)
+                        {
+                            weight.quantization_group_size = weight.shape[1];
+                            weight.quantization_scales.assign(static_cast<size_t>(weight.shape[0]), 0.125f);
+                            weight.quantization_zero_points.assign(static_cast<size_t>(weight.shape[0]), 8);
+                            weight.quantized_data.assign(static_cast<size_t>(weight.shape[0]) * ((weight.shape[1] + 1) / 2), 0x99);
+                        }
+                        else
+                            weight.float32_data.assign(static_cast<size_t>(weight.shape[0]) * weight.shape[1], 0.125f);
+                        const auto added = candidate.weights.add(name, std::move(weight));
+                        check(static_cast<bool>(added));
+                        return added.value();
+                    };
+                    const auto configure = [&](MoeBlockPlan& moe, const std::string& prefix) {
+                        moe.has_shared_expert = true;
+                        moe.shared_expert.activation = ExpertActivation::Silu;
+                        moe.shared_expert.gate_weight = add_weight(prefix + "gate", false);
+                        moe.shared_expert.up_weight = add_weight(prefix + "up", false);
+                        moe.shared_expert.down_weight = add_weight(prefix + "down", true);
+                    };
+                    configure(candidate.graph.layer_plans.front().moe, "test_target_shared_");
+                    configure(candidate.speculative.graph.layer_plans.front().moe, "test_dspark_shared_");
+                    candidate.descriptor.layers.front().moe.shared_expert_count = 1;
+                    candidate.descriptor.layers.front().moe.shared_expert_weight_dtype = dtype;
+                    candidate.operators.bind_weight_count(candidate.weights.size());
+                };
+                CompiledModel cpu_int4_dspark = compiled;
+                add_dspark_shared(cpu_int4_dspark, DType::Int4);
+                CompiledModel gpu_int4_dspark = cpu_int4_dspark;
+                prepare_hybrid_dspark(gpu_int4_dspark);
+                const MoeBlockPlan& gpu_shared_plan = gpu_int4_dspark.speculative.graph.layer_plans.front().moe;
+                check(support_vulkan_shared_experts(gpu_int4_dspark.operators, gpu_shared_plan));
+                check(speculative_shared_node(gpu_int4_dspark).backend == ExecutionBackend::Vulkan);
+
+                ActivationBuffer shared_input(2, gpu_int4_dspark.descriptor.hidden_size);
+                shared_input.row(0)[0] = 1.0f;
+                shared_input.row(0)[1] = -0.25f;
+                shared_input.row(1)[0] = 0.5f;
+                shared_input.row(1)[1] = 0.75f;
+                ActivationBuffer cpu_shared_output;
+                ActivationBuffer gpu_shared_output;
+                ExpertWorkspace cpu_shared_workspace;
+                ExpertWorkspace gpu_shared_workspace;
+                forward_shared_expert(cpu_int4_dspark, cpu_int4_dspark.speculative.graph.layer_plans.front().moe,
+                                      shared_input, cpu_shared_output, cpu_shared_workspace);
+                const VulkanStatistics shared_before = get_vulkan_statistics(dspark_vulkan_runtime);
+                forward_shared_expert(gpu_int4_dspark, gpu_shared_plan, shared_input, gpu_shared_output, gpu_shared_workspace);
+                const VulkanStatistics shared_after = get_vulkan_statistics(dspark_vulkan_runtime);
+                check(shared_after.compute_submissions > shared_before.compute_submissions);
+                check(shared_after.int4_dispatches - shared_before.int4_dispatches == 3);
+                check(gpu_shared_output.rows() == cpu_shared_output.rows());
+                check(gpu_shared_output.columns() == cpu_shared_output.columns());
+                check(std::any_of(gpu_shared_output.values().begin(), gpu_shared_output.values().end(),
+                                  [](float value) { return std::isfinite(value) && value != 0.0f; }));
+                for (size_t index = 0; index < cpu_shared_output.values().size(); ++index)
+                {
+                    check(std::isfinite(gpu_shared_output.values()[index]));
+                    check_near(gpu_shared_output.values()[index], cpu_shared_output.values()[index], 1e-5f);
+                }
+
+                CompiledModel unsupported_dspark = compiled;
+                add_dspark_shared(unsupported_dspark, DType::Float32);
+                prepare_hybrid_dspark(unsupported_dspark);
+                check(!support_vulkan_shared_experts(unsupported_dspark.operators,
+                                                     unsupported_dspark.speculative.graph.layer_plans.front().moe));
+                check(speculative_shared_node(unsupported_dspark).backend == ExecutionBackend::Cpu);
+            }
+#endif
+
             // The two-token target alternates, so the final verification row
             // must supply the next token after each fully accepted block.
             GenerationOptions dspark_options = options;
@@ -12299,6 +12410,44 @@ void test_execution_graph_and_scheduler()
     for (size_t index = 0; index + 1 < hybrid_schedule.node_order.size(); ++index)
         check(static_cast<bool>(hybrid_graph.nodes[hybrid_schedule.node_order[index]].backend == ExecutionBackend::Cpu));
     check(static_cast<bool>(hybrid_graph.nodes[hybrid_schedule.node_order.back()].backend == ExecutionBackend::Vulkan));
+
+    for (ExecutionNodeType type : {
+             ExecutionNodeType::Attention,
+             ExecutionNodeType::ExpertGroup,
+             ExecutionNodeType::SharedExpertGroup,
+             ExecutionNodeType::DenseFfn})
+    {
+        ExecutionGraph eligible_graph = graph;
+        ExecutionNode& eligible_node = eligible_graph.nodes[3];
+        eligible_node.type = type;
+        eligible_node.backend = ExecutionBackend::Cpu;
+        eligible_node.backend_mask |= ExecutionBackendVulkan;
+        eligible_graph.nodes.front().backend = ExecutionBackend::Vulkan;
+
+        ExecutionSchedule eligible_schedule;
+        auto cpu_status = schedule_graph(eligible_graph, eligible_schedule, ExecutionBackendCpu);
+        check(static_cast<bool>(cpu_status));
+        check(static_cast<bool>(eligible_node.backend == ExecutionBackend::Cpu));
+        for (const ExecutionNode& node : eligible_graph.nodes)
+        {
+            if (node.backend_mask == ExecutionBackendCpu)
+                check(static_cast<bool>(node.backend == ExecutionBackend::Cpu));
+        }
+
+        eligible_graph.nodes.front().backend = ExecutionBackend::Vulkan;
+        auto hybrid_status = schedule_graph(eligible_graph, eligible_schedule, scheduling_backends);
+        check(static_cast<bool>(hybrid_status));
+        check(static_cast<bool>(eligible_node.backend == ExecutionBackend::Vulkan));
+        for (const ExecutionNode& node : eligible_graph.nodes)
+        {
+            if (node.backend_mask == ExecutionBackendCpu)
+                check(static_cast<bool>(node.backend == ExecutionBackend::Cpu));
+        }
+
+        auto rescheduled_cpu_status = schedule_graph(eligible_graph, eligible_schedule, ExecutionBackendCpu);
+        check(static_cast<bool>(rescheduled_cpu_status));
+        check(static_cast<bool>(eligible_node.backend == ExecutionBackend::Cpu));
+    }
 
     ExecutionGraph vulkan_only_graph;
     ExecutionNode vulkan_dense_node;

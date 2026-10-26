@@ -252,8 +252,7 @@ Result<void> schedule_graph(ExecutionGraph& graph, ExecutionSchedule& schedule, 
             return Error{ErrorCode::UnsupportedModel, "execution node has no available backend: " + node.name};
 
         const uint32_t selected = node.backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu;
-        const bool prefer_gpu = node.type == ExecutionNodeType::Attention || node.type == ExecutionNodeType::LmHead;
-        if (prefer_gpu && has_flag(usable, ExecutionBackendVulkan))
+        if (has_flag(usable, ExecutionBackendVulkan))
             node.backend = ExecutionBackend::Vulkan;
         else if (!has_flag(usable, selected))
             node.backend = has_flag(usable, ExecutionBackendCpu) ? ExecutionBackend::Cpu : ExecutionBackend::Vulkan;

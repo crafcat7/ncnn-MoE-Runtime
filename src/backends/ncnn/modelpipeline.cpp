@@ -1341,6 +1341,18 @@ static Result<void> prepare_dspark_operators(CompiledModel& compiled)
                                                            "speculative ");
         if (!prepared)
             return prepared.error();
+
+        if (layer_plan.moe.has_shared_expert)
+        {
+            prepared = prepare_shared_expert_operators(compiled.weights,
+                                                       compiled.operators,
+                                                       layer_plan.moe,
+                                                       layer_plan.vulkan_device_index,
+                                                       compiled.vulkan_runtime,
+                                                       compiled.opt.optimization_flags);
+            if (!prepared)
+                return prepared.error();
+        }
     }
     return {};
 }
