@@ -608,7 +608,7 @@ def native_gguf_matrix(name: str, tensor: Any, shape: tuple[int, ...],
     if shape[1] % block_elements:
         return
     if (not name.endswith(".weight") and not preserve_float32(name, config)
-            or name.endswith(("norm.weight", "conv1d.weight"))):
+            or name.endswith(("norm.weight", "conv1d.weight", ".ape"))):
         return
     text = text_config(config)
     keys, heads = text.get("linear_num_key_heads", 0), text.get("linear_num_value_heads", 0)
@@ -1024,7 +1024,7 @@ def gguf_weights(source: Path, config: dict[str, Any]) -> Iterator[tuple[str, st
                 raise ValueError("DeepSeek GGUF routing table must be I32")
             yield name, "I64", np.asarray(tensor.data).astype("<i8").reshape(tuple(reversed(tensor.shape)))
             continue
-        values = gguf_float_values(tensor, gguf, name.endswith(("norm.weight", "conv1d.weight")))
+        values = gguf_float_values(tensor, gguf, name.endswith(("norm.weight", "conv1d.weight", ".ape")))
         values = undo_gguf_transform(name, np.asarray(values, dtype=np.float32), config)
         yield name, "F32" if preserve_float32(name, config) else "BF16", values if preserve_float32(name, config) else to_bfloat16(values)
     if skipped_mtp:

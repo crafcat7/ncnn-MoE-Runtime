@@ -212,6 +212,7 @@ def deepseek_tensors() -> tuple[dict, dict, list[str]]:
         "n_routed_experts": 2, "num_experts_per_tok": 1, "n_shared_experts": 1,
         "num_attention_heads": 4, "num_key_value_heads": 1, "head_dim": 128,
         "q_lora_rank": 256, "qk_rope_head_dim": 64, "o_groups": 2, "o_lora_rank": 256,
+        "rope_theta": 10000.0, "partial_rotary_factor": 0.5,
         "sliding_window": 8, "max_position_embeddings": 32, "original_max_position_embeddings": 32,
         "num_hash_layers": 0, "index_n_heads": 2, "index_head_dim": 128, "index_topk": 8,
         "hc_mult": 4, "hc_sinkhorn_iters": 4, "compress_ratios": [0, 0],
@@ -248,6 +249,70 @@ def deepseek_tensors() -> tuple[dict, dict, list[str]]:
             if not role.endswith("experts.1.w3"):
                 native.append(name)
     return model_config, tensors, native
+
+
+def add_deepseek_compressors(model_config: dict, tensors: dict, native_names: list[str],
+                             compress_ratios: tuple[int, ...]) -> None:
+    if len(compress_ratios) != model_config["num_hidden_layers"]:
+        raise ValueError("DeepSeek compressor fixture ratio count must match its layer count")
+    if any(ratio not in (0, 4, 128) for ratio in compress_ratios):
+        raise ValueError("DeepSeek compressor fixtures support ratios 0, 4, and 128")
+    model_config["compress_ratios"] = list(compress_ratios)
+    if 128 in compress_ratios:
+        model_config["max_position_embeddings"] = max(model_config["max_position_embeddings"], 256)
+    for layer, ratio in enumerate(compress_ratios):
+        if ratio == 0:
+            continue
+        prefix = f"layers.{layer}.attn."
+        multiplier = 2 if ratio == 4 else 1
+        head_dim = model_config["head_dim"]
+        position = prefix + "compressor.ape"
+        tensors[position] = ("F32", (np.arange(ratio * multiplier * head_dim, dtype=np.float32)
+                                      .reshape(ratio, multiplier * head_dim) + 1) / np.float32(4096))
+        tensors[prefix + "compressor.norm.weight"] = ("BF16", bfloat16(np.ones(head_dim, np.float32)))
+        for role in ("wkv", "wgate"):
+            name = prefix + f"compressor.{role}.weight"
+            tensors[name] = ("BF16", plain((multiplier * head_dim, HIDDEN), 300 + layer))
+            native_names.append(name)
+        native_names.append(position)
+        if ratio != 4:
+            continue
+        indexer = prefix + "indexer."
+        index_dim = model_config["index_head_dim"]
+        index_heads = model_config["index_n_heads"]
+        index_position = indexer + "compressor.ape"
+        tensors[index_position] = ("F32", (np.arange(ratio * 2 * index_dim, dtype=np.float32)
+                                            .reshape(ratio, 2 * index_dim) + 5) / np.float32(8192))
+        tensors[indexer + "compressor.norm.weight"] = ("BF16", bfloat16(np.ones(index_dim, np.float32)))
+        for role in ("wkv", "wgate"):
+            name = indexer + f"compressor.{role}.weight"
+            tensors[name] = ("BF16", plain((2 * index_dim, HIDDEN), 310 + layer))
+            native_names.append(name)
+        for role, shape in (("wq_b", (index_heads * index_dim, model_config["q_lora_rank"])),
+                            ("weights_proj", (index_heads, HIDDEN))):
+            name = indexer + role + ".weight"
+            tensors[name] = ("BF16", plain(shape, 320 + layer))
+            native_names.append(name)
+        native_names.append(index_position)
+
+
+def deepseek_compressor_q8_overrides(compress_ratios: tuple[int, ...]) -> dict[str, str]:
+    overrides = {}
+    for layer, ratio in enumerate(compress_ratios):
+        if ratio == 0:
+            continue
+        prefix = f"layers.{layer}.attn."
+        overrides[prefix + "compressor.ape"] = "Q8_0"
+        for role in ("wkv", "wgate"):
+            overrides[prefix + f"compressor.{role}.weight"] = "Q8_0"
+        if ratio == 4:
+            indexer = prefix + "indexer."
+            overrides[indexer + "compressor.ape"] = "Q8_0"
+            for role in ("wkv", "wgate"):
+                overrides[indexer + f"compressor.{role}.weight"] = "Q8_0"
+            overrides[indexer + "wq_b.weight"] = "Q8_0"
+            overrides[indexer + "weights_proj.weight"] = "Q8_0"
+    return overrides
 
 
 def dspark_tensors() -> tuple[dict, dict, list[str]]:
@@ -1221,6 +1286,18 @@ def family_gguf_name(name: str, family: str) -> str:
         for block in ("attn", "ffn"):
             for kind in ("fn", "base", "scale"):
                 roles[f"hc_{block}_{kind}"] = f"hc_{block}_{kind}.weight"
+        roles.update({
+            "attn.compressor.ape": "attn_compressor_ape.weight",
+            "attn.compressor.wkv.weight": "attn_compressor_kv.weight",
+            "attn.compressor.wgate.weight": "attn_compressor_gate.weight",
+            "attn.compressor.norm.weight": "attn_compressor_norm.weight",
+            "attn.indexer.compressor.ape": "indexer_compressor_ape.weight",
+            "attn.indexer.compressor.wkv.weight": "indexer_compressor_kv.weight",
+            "attn.indexer.compressor.wgate.weight": "indexer_compressor_gate.weight",
+            "attn.indexer.compressor.norm.weight": "indexer_compressor_norm.weight",
+            "attn.indexer.wq_b.weight": "indexer.attn_q_b.weight",
+            "attn.indexer.weights_proj.weight": "indexer.proj.weight",
+        })
         for hf, gg in (("wq_a", "q_a"), ("wq_b", "q_b"), ("wkv", "kv"), ("wo_a", "output_a"), ("wo_b", "output_b")):
             roles[f"attn.{hf}.weight"] = f"attn_{gg}.weight"
         for hf, gg in (("w1", "gate"), ("w3", "up"), ("w2", "down")):
@@ -1309,10 +1386,15 @@ def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = Fal
                          ple_format: str | None = None,
                          native_overrides: dict[str, str] | None = None,
                          native_scale: float = 1.0,
-                         fp32_native_baseline: bool = False) -> Fixture:
+                         fp32_native_baseline: bool = False,
+                         deepseek_compress_ratios: tuple[int, ...] | None = None) -> Fixture:
     if ple_format is not None and family != "qwen4_exp":
         raise ValueError("only Qwen4Exp has a GGUF PLE table")
     model_config, reference, native_names = family_tensors(family)
+    if deepseek_compress_ratios is not None:
+        if family != "deepseek_v4":
+            raise ValueError("DeepSeek compressor ratios are only valid for the DeepSeek fixture")
+        add_deepseek_compressors(model_config, reference, native_names, deepseek_compress_ratios)
     embedding = "embed.weight" if family == "deepseek_v4" else ("model." if family == "gpt_oss" else PREFIX) + "embed_tokens.weight"
     native = set(native_names) | {embedding}
     native.update(name for name, (_, values) in reference.items()
@@ -1384,12 +1466,17 @@ def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = Fal
                 raw = qnk_blocks(rows, bits, index, columns)
                 decoded = gguf.dequantize(raw, dtype).reshape(rows, columns)
                 tag = bits
-            if getattr(dtype, "name", None) == "Q8_0":
+            deepseek_ape = family == "deepseek_v4" and name.endswith(".ape")
+            if getattr(dtype, "name", None) == "Q8_0" and not deepseek_ape:
                 q8_0_dense_bytes[name] = raw.nbytes
-            reference[name] = ("BF16", bfloat16(decoded))
-            np.testing.assert_array_equal(float32(reference[name][1]), decoded)
-            specs[name] = (raw, tag, rows, columns)
-            packed_sizes[name] = raw.nbytes
+            if deepseek_ape:
+                reference[name] = ("F32", decoded.copy())
+            else:
+                reference[name] = ("BF16", bfloat16(decoded))
+            np.testing.assert_array_equal(reference[name][1] if deepseek_ape else float32(reference[name][1]), decoded)
+            if not deepseek_ape:
+                specs[name] = (raw, tag, rows, columns)
+                packed_sizes[name] = raw.nbytes
             if expert:
                 banks.setdefault((bank_name, dtype), []).append(raw)
             elif name.endswith("self_attn.indexer.index_qk_proj.weight"):
@@ -1672,7 +1759,9 @@ class NativeQuantizedTests(unittest.TestCase):
 
     def run_worker(self, path: Path, moe: bool, expected: Fixture | None = None,
                    *, backend: str | None = None, extra_args: tuple[str, ...] = (),
-                   speculative: bool = False, pure_auto: bool = False) -> dict:
+                   speculative: bool = False, pure_auto: bool = False,
+                   prompt_tokens: list[int] | None = None,
+                   abandon_after_first_token: bool = False) -> dict:
         if pure_auto and backend is not None:
             raise ValueError("pure Auto worker execution cannot select a backend argument")
         selected_backend = "auto" if pure_auto else (backend or self.backend)
@@ -1738,7 +1827,24 @@ class NativeQuantizedTests(unittest.TestCase):
                 client.create_session(label, seed=seed, prefill_chunk_size=8, enable_speculative_context=speculative)
                 events = []
                 new_tokens = 6 if speculative else 4
-                done, tokens = client.generate(label, [1, 1, 2, 2, 3, 3, 4, 4], max_new_tokens=new_tokens, temperature=temperature,
+                prompt = [1, 1, 2, 2, 3, 3, 4, 4] if prompt_tokens is None else prompt_tokens
+                if abandon_after_first_token:
+                    interrupted = False
+                    def abandon(event):
+                        nonlocal interrupted
+                        if event.get("event") == "token" and not interrupted:
+                            interrupted = True
+                            raise KeyboardInterrupt
+
+                    with self.assertRaisesRegex(WorkerError, "generation cancelled by user"):
+                        client.generate(label, prompt, request_id="abandon-after-first-token",
+                                        max_new_tokens=new_tokens, temperature=temperature,
+                                        stop_tokens=[], enable_speculative=speculative,
+                                        speculative_confidence=0, speculative_max_draft=2,
+                                        metrics_enabled=True, on_event=abandon)
+                    result["abandoned"] = True
+                    return result
+                done, tokens = client.generate(label, prompt, max_new_tokens=new_tokens, temperature=temperature,
                                               stop_tokens=[], enable_speculative=speculative,
                                               speculative_confidence=0, speculative_max_draft=2,
                                               metrics_enabled=True, on_event=events.append)
@@ -1954,6 +2060,66 @@ class NativeQuantizedTests(unittest.TestCase):
                 root = self.root / family
                 root.mkdir()
                 self.compare(prepare_family_gguf(root, family), direct=False)
+
+    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
+    def test_deepseek_gguf_q8_compressor_ape_ratios(self):
+        for ratio in (4, 128):
+            with self.subTest(ratio=ratio):
+                ratios = (0, ratio)
+                root = self.root / f"deepseek-compressor-ratio{ratio}"
+                root.mkdir()
+                metadata_model = family_tensors("deepseek_v4")[0]
+                metadata_model["compress_ratios"] = list(ratios)
+                if ratio == 128:
+                    metadata_model["max_position_embeddings"] = max(metadata_model["max_position_embeddings"], 256)
+                with patch.object(gguf, "GGUFWriter", gguf_writer_with_test_metadata(metadata_model)):
+                    fixture = prepare_family_gguf(
+                        root, "deepseek_v4", deepseek_compress_ratios=ratios,
+                        native_overrides=deepseek_compressor_q8_overrides(ratios))
+                reader = gguf.GGUFReader(str(fixture.source))
+                observed = {tensor.name: tensor for tensor in reader.tensors}
+                metadata_ratios = reader.fields["deepseek4.attention.compress_ratios"].contents()
+                self.assertEqual(tuple(int(value) for value in metadata_ratios), ratios)
+
+                if ratio == 4:
+                    expected_apes = {
+                        "layers.1.attn.compressor.ape": (4, 256),
+                        "layers.1.attn.indexer.compressor.ape": (4, 256),
+                    }
+                else:
+                    expected_apes = {"layers.1.attn.compressor.ape": (128, 128)}
+                for canonical_name, shape in expected_apes.items():
+                    gguf_name = family_gguf_name(canonical_name, "deepseek_v4")
+                    tensor = observed[gguf_name]
+                    self.assertEqual(tensor.tensor_type.name, "Q8_0", gguf_name)
+                    self.assertEqual(tuple(tensor.shape[::-1]), shape, gguf_name)
+                for canonical_name in deepseek_compressor_q8_overrides(ratios):
+                    gguf_name = family_gguf_name(canonical_name, "deepseek_v4")
+                    self.assertEqual(observed[gguf_name].tensor_type.name, "Q8_0", gguf_name)
+
+                prompt = [1, 1, 2, 2, 3, 3, 4, 4]
+                if ratio == 128:
+                    prompt = prompt * 16 + [1]
+                    self.assertEqual(len(prompt), 129)
+                baseline = self.run_worker(fixture.baseline, True, backend="cpu", prompt_tokens=prompt)
+                for label, path in (("direct", fixture.source), ("imported", fixture.imported)):
+                    with self.subTest(path=label, backend=self.backend):
+                        result = self.run_worker(path, True, fixture, prompt_tokens=prompt)
+                        for mode in ("greedy", "sampled"):
+                            self.assertEqual(result[mode][0], baseline[mode][0])
+                            np.testing.assert_allclose(result[mode][1], baseline[mode][1], rtol=0, atol=3e-5)
+                        if self.backend == "hybrid":
+                            gpu = result["sampled_stats"]["generation_gpu"]
+                            self.assertGreater(gpu["attention_blocks"], 0,
+                                               f"DeepSeek ratio-{ratio} compressor executed no Vulkan Attention blocks")
+                            self.assertEqual(gpu["attention_cpu_fallbacks"], 0,
+                                             f"DeepSeek ratio-{ratio} Attention fell back to CPU")
+                            self.assertEqual(gpu["model_compute_cpu_fallbacks"], 0,
+                                             f"DeepSeek ratio-{ratio} model compute fell back to CPU")
+                if ratio == 128:
+                    abandoned = self.run_worker(fixture.source, True, fixture, prompt_tokens=prompt,
+                                                abandon_after_first_token=True)
+                    self.assertTrue(abandoned["abandoned"])
 
     @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
     def test_native_gguf_block_fixture_oracles(self):

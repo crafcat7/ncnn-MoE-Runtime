@@ -351,6 +351,39 @@ def main() -> int:
                 if completed.returncode == 77:
                     return 77
                 completed.check_returncode()
+            if family == "deepseek_v4":
+                for ratio in (4, 128):
+                    ratios = (0, ratio)
+                    compressed_root = root / f"deepseek_compressor_ratio_{ratio}"
+                    compressed_root.mkdir()
+                    overrides = fixtures.deepseek_compressor_q8_overrides(ratios)
+                    compressed_model = family_tensors(family)[0]
+                    compressed_model["compress_ratios"] = list(ratios)
+                    if ratio == 128:
+                        compressed_model["max_position_embeddings"] = max(
+                            compressed_model["max_position_embeddings"], 256)
+                    metadata_writer = fixtures.gguf_writer_with_test_metadata(compressed_model)
+                    with patch.object(fixtures.gguf, "GGUFWriter", metadata_writer), patch.object(fixtures, "family_tensors", family_tensors):
+                        compressed = fixtures.prepare_family_gguf(
+                            compressed_root, family, fp32=False,
+                            native_overrides=overrides,
+                            deepseek_compress_ratios=ratios)
+                    reader = fixtures.gguf.GGUFReader(compressed.source)
+                    metadata_ratios = reader.fields["deepseek4.attention.compress_ratios"].contents()
+                    assert tuple(int(value) for value in metadata_ratios) == ratios, metadata_ratios
+                    observed = {tensor.name: tensor for tensor in reader.tensors}
+                    expected_apes = {"layers.1.attn.compressor.ape": (ratio, 256 if ratio == 4 else 128)}
+                    if ratio == 4:
+                        expected_apes["layers.1.attn.indexer.compressor.ape"] = (4, 256)
+                    for canonical_name, shape in expected_apes.items():
+                        gguf_name = fixtures.family_gguf_name(canonical_name, family)
+                        tensor = observed[gguf_name]
+                        assert tensor.tensor_type.name == "Q8_0", f"{gguf_name}: {tensor.tensor_type.name}"
+                        assert tuple(tensor.shape[::-1]) == shape, f"{gguf_name}: {tuple(tensor.shape[::-1])}"
+                    for canonical_name in overrides:
+                        gguf_name = fixtures.family_gguf_name(canonical_name, family)
+                        assert observed[gguf_name].tensor_type.name == "Q8_0", gguf_name
+                    run_graph(f"DeepSeek ratio-{ratio} Q8_0 compressor", compressed.baseline, compressed.source)
             if moe:
                 mxfp4 = fp4_copy(fixture, directory, "MXFP4")
                 nvfp4 = fp4_copy(fixture, directory, "NVFP4")

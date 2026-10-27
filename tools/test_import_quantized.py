@@ -951,6 +951,22 @@ class ImportTests(unittest.TestCase):
         return blocks.reshape(rows, -1)
 
     @staticmethod
+    def q8_0_fixture(rows, columns, seed):
+        if columns % 32:
+            raise ValueError("Q8_0 fixture columns must be divisible by 32")
+        blocks = np.zeros((rows, columns // 32, 34), dtype=np.uint8)
+        blocks[..., :2] = np.asarray([1 / 512], dtype="<f2").view(np.uint8).reshape(1, 1, 2)
+        codes = ((np.arange(rows * columns, dtype=np.int16).reshape(rows, columns) + seed) % 17 - 8).astype(np.int8)
+        blocks[..., 2:] = codes.reshape(rows, columns // 32, 32).view(np.uint8)
+        raw = blocks.reshape(rows, -1)
+        # This is the independent GGML Q8_0 decode oracle: F16 block scale
+        # multiplied by the 32 signed codes in each block.
+        scales = blocks[..., :2].copy().view("<f2").reshape(rows, columns // 32).astype(np.float32)
+        decoded_codes = blocks[..., 2:].copy().view(np.int8).astype(np.float32)
+        decoded = (scales[..., None] * decoded_codes).reshape(rows, columns)
+        return raw, decoded
+
+    @staticmethod
     def write_gguf(path, arch, tensors, metadata=None):
         writer = gguf.GGUFWriter(path, arch)
         writer.add_block_count(1)
@@ -993,19 +1009,37 @@ class ImportTests(unittest.TestCase):
     def test_deepseek_gguf_hyper_connections_hash_and_experts(self):
         source, config = self.family_assets("deepseek_v4")
         config.update(dspark_target_layer_ids=[0], dspark_block_size=2, dspark_noise_token_id=3,
-                      dspark_markov_rank=32, num_nextn_predict_layers=1)
+                      dspark_markov_rank=32, num_nextn_predict_layers=1,
+                      compress_ratios=[4], head_dim=512, index_n_heads=2,
+                      index_head_dim=128, index_topk=8, q_lora_rank=256,
+                      o_groups=2, o_lora_rank=256, hc_mult=4)
         (source / "config.json").write_text(json.dumps(config))
         path = self.root / "deepseek.gguf"
         raw = self.q4k_rows(512, seed=5).reshape(2, 256, 144)
         hc = self.q4k_rows(6, seed=7)
         routing = np.asarray([[0, 1], [1, 0], [0, 1], [1, 0]], dtype=np.int32)
         exact = np.asarray([1.000031, 2.000061], dtype=np.float32)
+        ape_raw, ape_oracle = self.q8_0_fixture(4, 1024, seed=19)
+        index_ape_raw, index_ape_oracle = self.q8_0_fixture(4, 256, seed=29)
+        compressor_kv, _ = self.q8_0_fixture(1024, 256, seed=31)
+        compressor_gate, _ = self.q8_0_fixture(1024, 256, seed=37)
+        index_compressor_kv, _ = self.q8_0_fixture(256, 256, seed=41)
+        index_compressor_gate, _ = self.q8_0_fixture(256, 256, seed=43)
+        index_query, _ = self.q8_0_fixture(256, 256, seed=47)
+        index_weights, _ = self.q8_0_fixture(2, 256, seed=53)
         tensors = [("token_embd.weight", np.ones((4, 256), dtype=np.float32), None),
                    ("output.weight", self.q4k_rows(4), gguf.GGMLQuantizationType.Q4_K),
                    ("blk.0.hc_attn_fn.weight", hc, gguf.GGMLQuantizationType.Q4_K),
                    ("blk.0.hc_attn_base.weight", exact, None),
                    ("blk.0.exp_probs_b.bias", exact, None),
-                   ("blk.0.attn_compressor_ape.weight", exact, None),
+                   ("blk.0.attn_compressor_ape.weight", ape_raw, gguf.GGMLQuantizationType.Q8_0),
+                   ("blk.0.indexer_compressor_ape.weight", index_ape_raw, gguf.GGMLQuantizationType.Q8_0),
+                   ("blk.0.attn_compressor_kv.weight", compressor_kv, gguf.GGMLQuantizationType.Q8_0),
+                   ("blk.0.attn_compressor_gate.weight", compressor_gate, gguf.GGMLQuantizationType.Q8_0),
+                   ("blk.0.indexer_compressor_kv.weight", index_compressor_kv, gguf.GGMLQuantizationType.Q8_0),
+                   ("blk.0.indexer_compressor_gate.weight", index_compressor_gate, gguf.GGMLQuantizationType.Q8_0),
+                   ("blk.0.indexer.attn_q_b.weight", index_query, gguf.GGMLQuantizationType.Q8_0),
+                   ("blk.0.indexer.proj.weight", index_weights, gguf.GGMLQuantizationType.Q8_0),
                    ("blk.0.ffn_gate_tid2eid.weight", routing, None)]
         for role in ("gate", "up", "down"):
             tensors.append((f"blk.0.ffn_{role}_exps.weight", raw, gguf.GGMLQuantizationType.Q4_K))
@@ -1018,9 +1052,25 @@ class ImportTests(unittest.TestCase):
         np.testing.assert_array_equal(loaded["layers.0.hc_attn_fn"].read(), hc.reshape(-1))
         np.testing.assert_array_equal(loaded["layers.0.hc_attn_fn.__qnk_shape"].read(), [4, 6, 256])
         np.testing.assert_array_equal(loaded["layers.0.ffn.gate.tid2eid"].read(), routing.astype(np.int64))
-        for name in ("layers.0.hc_attn_base", "layers.0.ffn.gate.bias", "layers.0.attn.compressor.ape"):
+        for name, expected in (("layers.0.hc_attn_base", exact),
+                               ("layers.0.ffn.gate.bias", exact),
+                               ("layers.0.attn.compressor.ape", ape_oracle),
+                               ("layers.0.attn.indexer.compressor.ape", index_ape_oracle)):
             self.assertEqual(loaded[name].dtype, "F32")
-            np.testing.assert_array_equal(loaded[name].read(), exact)
+            np.testing.assert_array_equal(loaded[name].read(), expected)
+            self.assertNotIn(name + ".__qnk_shape", loaded)
+        native_q8 = {
+            "layers.0.attn.compressor.wkv.weight": (compressor_kv, 1024, 256),
+            "layers.0.attn.compressor.wgate.weight": (compressor_gate, 1024, 256),
+            "layers.0.attn.indexer.compressor.wkv.weight": (index_compressor_kv, 256, 256),
+            "layers.0.attn.indexer.compressor.wgate.weight": (index_compressor_gate, 256, 256),
+            "layers.0.attn.indexer.wq_b.weight": (index_query, 256, 256),
+            "layers.0.attn.indexer.weights_proj.weight": (index_weights, 2, 256),
+        }
+        for name, (packed, rows, columns) in native_q8.items():
+            self.assertEqual(loaded[name].dtype, "U8", name)
+            np.testing.assert_array_equal(loaded[name].read().reshape(rows, -1), packed)
+            np.testing.assert_array_equal(loaded[name + ".__qnk_shape"].read(), [264, rows, columns])
         saved = json.loads((output / "config.json").read_text())
         for key in ("dspark_target_layer_ids", "dspark_block_size", "dspark_noise_token_id", "dspark_markov_rank"):
             self.assertNotIn(key, saved)

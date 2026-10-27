@@ -7,12 +7,14 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -66,6 +68,74 @@ static FixtureMetadata string_metadata(const std::string& key, const std::string
     FixtureMetadata result{key, 8, {}};
     append_string(result.payload, value);
     return result;
+}
+
+static FixtureMetadata float_metadata(const std::string& key, float value)
+{
+    FixtureMetadata result{key, 6, {}};
+    append_unsigned(result.payload, std::bit_cast<uint32_t>(value), sizeof(value));
+    return result;
+}
+
+static FixtureMetadata float_array_metadata(const std::string& key, const std::vector<float>& values)
+{
+    FixtureMetadata result{key, 9, {}};
+    append_unsigned(result.payload, 6, 4);
+    append_unsigned(result.payload, values.size(), 8);
+    for (float value : values)
+        append_unsigned(result.payload, std::bit_cast<uint32_t>(value), sizeof(value));
+    return result;
+}
+
+static FixtureMetadata single_token_metadata()
+{
+    FixtureMetadata tokens{"tokenizer.ggml.tokens", 9, {}};
+    append_unsigned(tokens.payload, 8, 4);
+    append_unsigned(tokens.payload, 1, 8);
+    append_string(tokens.payload, "x");
+    return tokens;
+}
+
+static std::vector<FixtureMetadata> deepseek_test_metadata()
+{
+    return {string_metadata("general.architecture", "deepseek4"),
+            single_token_metadata(),
+            integer_metadata("deepseek4.block_count", 1),
+            integer_metadata("deepseek4.nextn_predict_layers", 0),
+            integer_metadata("deepseek4.context_length", 128),
+            integer_metadata("deepseek4.embedding_length", 32),
+            integer_metadata("deepseek4.expert_count", 1),
+            integer_metadata("deepseek4.expert_used_count", 1),
+            integer_metadata("deepseek4.expert_shared_count", 1),
+            integer_metadata("deepseek4.expert_feed_forward_length", 32),
+            float_metadata("deepseek4.expert_weights_scale", 1.0f),
+            integer_metadata("deepseek4.attention.head_count", 1),
+            integer_metadata("deepseek4.attention.head_count_kv", 1),
+            integer_metadata("deepseek4.attention.key_length", 32),
+            integer_metadata("deepseek4.attention.q_lora_rank", 1),
+            integer_metadata("deepseek4.attention.output_group_count", 1),
+            integer_metadata("deepseek4.attention.output_lora_rank", 1),
+            integer_metadata("deepseek4.attention.sliding_window", 128),
+            integer_metadata("deepseek4.attention.indexer.head_count", 1),
+            integer_metadata("deepseek4.attention.indexer.key_length", 32),
+            integer_metadata("deepseek4.attention.indexer.top_k", 1),
+            integer_metadata("deepseek4.rope.dimension_count", 32),
+            float_metadata("deepseek4.rope.freq_base", 10000.0f),
+            float_metadata("deepseek4.attention.compress_rope_freq_base", 10000.0f),
+            float_array_metadata("deepseek4.attention.compress_ratios", {1.0f}),
+            float_metadata("deepseek4.attention.layer_norm_rms_epsilon", 1.0e-5f),
+            integer_metadata("deepseek4.hyper_connection.count", 1),
+            integer_metadata("deepseek4.hyper_connection.sinkhorn_iterations", 1),
+            float_metadata("deepseek4.hyper_connection.epsilon", 1.0e-6f),
+            integer_metadata("deepseek4.hash_layer_count", 0),
+            integer_metadata("deepseek4.expert_gating_func", 4),
+            FixtureMetadata{"deepseek4.expert_weights_norm", 7, {1}},
+            float_metadata("deepseek4.swiglu_clamp_exp", 1.0f),
+            string_metadata("deepseek4.rope.scaling.type", "yarn"),
+            float_metadata("deepseek4.rope.scaling.factor", 1.0f),
+            integer_metadata("deepseek4.rope.scaling.original_context_length", 128),
+            float_metadata("deepseek4.rope.scaling.yarn_beta_fast", 32.0f),
+            float_metadata("deepseek4.rope.scaling.yarn_beta_slow", 1.0f)};
 }
 
 static void write_bytes(const std::filesystem::path& path, const std::vector<uint8_t>& bytes)
@@ -276,6 +346,115 @@ static void check_invalid_files(const std::filesystem::path& root)
     reject(fixture_bytes({oversized}, {}), "GGUF accepted an oversized array length");
 }
 
+static std::vector<uint8_t> q8_0_oracle_payload(std::vector<float>& expected)
+{
+    std::vector<uint8_t> payload;
+    constexpr std::array<uint16_t, 2> scales = {0x3800, 0x3400}; // 0.5 and 0.25.
+    expected.clear();
+    expected.reserve(64);
+    for (size_t block = 0; block < scales.size(); ++block)
+    {
+        append_unsigned(payload, scales[block], sizeof(uint16_t));
+        const float scale = block == 0 ? 0.5f : 0.25f;
+        for (int index = 0; index < 32; ++index)
+        {
+            const int magnitude = index % 15 + 1;
+            const int8_t quantized = static_cast<int8_t>((index & 1) == 0 ? magnitude : -magnitude);
+            payload.push_back(static_cast<uint8_t>(quantized));
+            expected.push_back(scale * quantized);
+        }
+    }
+    return payload;
+}
+
+static void check_gguf_explicit_float32_auxiliary_loading(const std::filesystem::path& root)
+{
+    const auto path = root / "explicit-f32-aux" / "model.gguf";
+    std::vector<float> q8_expected;
+    const std::vector<uint8_t> q8_payload = q8_0_oracle_payload(q8_expected);
+    std::vector<uint8_t> f16_payload;
+    for (uint16_t value : {uint16_t{0x3c01}, uint16_t{0xbe01}, uint16_t{0x3555}})
+        append_unsigned(f16_payload, value, sizeof(value));
+    std::vector<uint8_t> bf16_payload;
+    for (uint16_t value : {uint16_t{0x3f81}, uint16_t{0xc020}})
+        append_unsigned(bf16_payload, value, sizeof(value));
+    std::vector<uint8_t> int32_payload;
+    append_unsigned(int32_payload, 1, sizeof(int32_t));
+    append_unsigned(int32_payload, 2, sizeof(int32_t));
+    const std::vector<FixtureTensor> tensors = {
+        {"blk.0.attn_compressor_ape.weight", 8, {32, 2}, q8_payload},
+        {"blk.0.attn_compressor_kv.weight", 1, {3}, f16_payload},
+        {"blk.0.attn_compressor_gate.weight", 30, {2}, bf16_payload},
+        {"blk.0.attn_norm.weight", 26, {2}, int32_payload},
+        {"blk.0.attn_output_a.weight", 8, {32, 2}, q8_payload}};
+    write_bytes(path, fixture_bytes(deepseek_test_metadata(), tensors));
+
+    auto archive = SafetensorsArchive::open(path);
+    check(static_cast<bool>(archive), archive ? "" : archive.error().message);
+    const std::string ape_name = "layers.0.attn.compressor.ape";
+    const std::string main_weight_name = "layers.0.attn.wo_a.weight";
+    const SafetensorInfo* ape_info = archive.value().find(ape_name);
+    const SafetensorInfo* main_weight_info = archive.value().find(main_weight_name);
+    check(ape_info && ape_info->dtype == "U8" && ape_info->ggml_type == 8 && !ape_info->transform
+              && ape_info->shape == std::vector<uint32_t>{2, 32},
+          "DeepSeek GGUF APE alias changed its native Q8_0 range or shape");
+    check(main_weight_info && main_weight_info->dtype == "U8" && main_weight_info->ggml_type == 8
+              && !main_weight_info->transform,
+          "DeepSeek GGUF matmul alias changed its native Q8_0 encoding");
+    {
+        auto native_ape = archive.value().load_tensor(ape_name);
+        check(native_ape && native_ape.value().dtype == DType::Q8_0
+                  && native_ape.value().shape == std::vector<uint32_t>{2, 32}
+                  && native_ape.value().float32_data.empty()
+                  && native_ape.value().qnk_values().size() == q8_payload.size()
+                  && std::equal(q8_payload.begin(), q8_payload.end(), native_ape.value().qnk_values().begin()),
+              "default APE loading dequantized or changed native GGUF Q8_0 blocks");
+        auto explicit_ape = archive.value().load_float32_tensor(ape_name);
+        const auto ape_values = explicit_ape ? explicit_ape.value().float32_values() : std::span<const float>{};
+        check(explicit_ape && explicit_ape.value().dtype == DType::Float32
+                  && explicit_ape.value().shape == std::vector<uint32_t>{2, 32}
+                  && ape_values.size() == q8_expected.size()
+                  && std::equal(ape_values.begin(), ape_values.end(), q8_expected.begin()),
+              "explicit Q8_0 APE loading disagreed with the independent block oracle");
+        auto native_main = archive.value().load_tensor(main_weight_name);
+        check(native_main && native_main.value().dtype == DType::Q8_0
+                  && native_main.value().float32_data.empty()
+                  && native_main.value().qnk_values().size() == q8_payload.size()
+                  && std::equal(q8_payload.begin(), q8_payload.end(), native_main.value().qnk_values().begin()),
+              "ordinary DeepSeek matmul loading expanded its native Q8_0 weights");
+    }
+
+    auto explicit_f16 = archive.value().load_float32_tensor("layers.0.attn.compressor.wkv.weight");
+    constexpr std::array<float, 3> f16_expected = {1.0009765625f, -1.5009765625f, 0.333251953125f};
+    const auto f16_values = explicit_f16 ? explicit_f16.value().float32_values() : std::span<const float>{};
+    check(explicit_f16 && explicit_f16.value().dtype == DType::Float32
+              && explicit_f16.value().shape == std::vector<uint32_t>{3}
+              && f16_values.size() == f16_expected.size()
+              && std::equal(f16_values.begin(), f16_values.end(), f16_expected.begin()),
+          "explicit F16 auxiliary loading did not widen its stored values directly");
+    auto explicit_bf16 = archive.value().load_float32_tensor("layers.0.attn.compressor.wgate.weight");
+    constexpr std::array<float, 2> bf16_expected = {1.0078125f, -2.5f};
+    const auto bf16_values = explicit_bf16 ? explicit_bf16.value().float32_values() : std::span<const float>{};
+    check(explicit_bf16 && explicit_bf16.value().dtype == DType::Float32
+              && explicit_bf16.value().shape == std::vector<uint32_t>{2}
+              && bf16_values.size() == bf16_expected.size()
+              && std::equal(bf16_values.begin(), bf16_values.end(), bf16_expected.begin()),
+          "explicit BF16 auxiliary loading did not widen its stored values");
+    auto integer = archive.value().load_float32_tensor("layers.0.attn_norm.weight");
+    check(!integer && integer.error().code == ErrorCode::InvalidModel,
+          "explicit F32 loading accepted an integer GGUF tensor");
+
+    const auto truncated_path = root / "explicit-f32-aux-truncated" / "model.gguf";
+    write_bytes(truncated_path, fixture_bytes(deepseek_test_metadata(), tensors));
+    auto truncated_archive = SafetensorsArchive::open(truncated_path);
+    check(static_cast<bool>(truncated_archive), truncated_archive ? "" : truncated_archive.error().message);
+    const SafetensorInfo* truncated_info = truncated_archive.value().find(ape_name);
+    check(truncated_info && truncated_info->size > 0, "truncation fixture lost its APE range");
+    std::filesystem::resize_file(truncated_path, truncated_info->offset + truncated_info->size - 1);
+    check(!truncated_archive.value().load_float32_tensor(ape_name),
+          "explicit F32 loading accepted a truncated GGUF Q8_0 payload");
+}
+
 static void check_raw_qnk_dtype_ambiguity(const std::filesystem::path& root)
 {
     std::string header = R"({"q4_ambiguous":{"dtype":"U8","shape":[1,18],"data_offsets":[0,18]},"legacy_q4k":{"dtype":"U8","shape":[2,1,144],"data_offsets":[18,306]}})";
@@ -296,7 +475,7 @@ static void check_raw_qnk_dtype_ambiguity(const std::filesystem::path& root)
 }
 
 static void check_qnk_defer_fallback(const std::filesystem::path& root, DType dtype, uint32_t ggml_type, uint32_t columns = 0,
-                                     bool vector_shared_gate = false)
+                                     bool vector_shared_gate = false, bool verify_float32_transform = false)
 {
     constexpr uint32_t rows = 8;
     if (columns == 0)
@@ -344,10 +523,36 @@ static void check_qnk_defer_fallback(const std::filesystem::path& root, DType dt
                                           {"blk.0.ssm_conv1d.weight", 30, {1, rows}, std::vector<uint8_t>(rows * sizeof(uint16_t))},
                                           {"blk.0.ffn_gate_inp_shexp.weight", 0,
                                            vector_shared_gate ? std::vector<uint64_t>{columns} : std::vector<uint64_t>{columns, 1}, shared_gate}};
+    if (verify_float32_transform)
+    {
+        std::vector<uint8_t> norm;
+        norm.reserve(static_cast<size_t>(columns) * sizeof(uint16_t));
+        for (uint32_t index = 0; index < columns; ++index)
+        {
+            const uint16_t value = index == 0 ? 0x3c01 : index == 1 ? 0x3e01
+                                                                    : 0x3c00;
+            append_unsigned(norm, value, sizeof(value));
+        }
+        tensors.push_back({"blk.0.attn_norm.weight", 1, {columns}, std::move(norm)});
+    }
     write_bytes(path, fixture_bytes(metadata, tensors));
 
     auto archive = SafetensorsArchive::open(path);
     check(static_cast<bool>(archive), archive ? "" : archive.error().message);
+    if (verify_float32_transform)
+    {
+        const std::string norm_name = "model.language_model.layers.0.input_layernorm.weight";
+        const SafetensorInfo* norm_info = archive.value().find(norm_name);
+        auto norm = archive.value().load_float32_tensor(norm_name);
+        std::vector<float> expected(columns, 0.0f);
+        expected[0] = 0.0009765625f;
+        expected[1] = 0.5009765625f;
+        const auto values = norm ? norm.value().float32_values() : std::span<const float>{};
+        check(norm_info && norm_info->transform && norm_info->ggml_type == 1
+                  && norm && norm.value().dtype == DType::Float32 && norm.value().shape == std::vector<uint32_t>{columns}
+                  && values.size() == expected.size() && std::equal(values.begin(), values.end(), expected.begin()),
+              "explicit F32 transformed Qwen GGUF F16 tensor passed through BF16 precision");
+    }
     const std::string shared_name = "model.language_model.layers.0.mlp.shared_expert_gate.weight";
     auto original = GgufArchive::open(path);
     check(static_cast<bool>(original), "cannot reopen shared gate fixture metadata");
@@ -490,13 +695,14 @@ int main(int argc, char** argv)
         ncnn::moe::check_encodings(root);
         ncnn::moe::check_native_mxfp4_safetensor_pair(root);
         ncnn::moe::check_invalid_files(root);
+        ncnn::moe::check_gguf_explicit_float32_auxiliary_loading(root);
         ncnn::moe::check_raw_qnk_dtype_ambiguity(root);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q4K, 12);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q4_0, 2);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q4_1, 3);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q5_0, 6);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::IQ4XS, 23);
-        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q8_0, 8);
+        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q8_0, 8, 0, false, true);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q5_1, 7);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::IQ4NL, 20);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::IQ4NL, 20, 160);

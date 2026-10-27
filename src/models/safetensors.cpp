@@ -907,6 +907,49 @@ Result<TensorData> SafetensorsArchive::load_float32_tensor(const std::string& na
     const SafetensorInfo* info = find(name);
     if (info && info->transform)
         return load_gguf_tensor(*info, std::nullopt, {}, true);
+    if (info && (gguf_source || info->ggml_type != UINT32_MAX) && info->dtype != "F32")
+    {
+        TensorData tensor;
+        tensor.dtype = DType::Float32;
+        tensor.shape = info->shape;
+        const uint64_t count = tensor.element_count();
+        if (count == 0 || count > SIZE_MAX / sizeof(float))
+            return Error{ErrorCode::InvalidModel, "invalid F32 element count: " + name};
+        if (info->dtype == "F16" || info->dtype == "BF16")
+        {
+            if (info->size != count * sizeof(uint16_t))
+                return Error{ErrorCode::InvalidModel, "invalid floating-point byte count: " + name};
+            auto bytes = read_range(info->path, info->offset, info->size);
+            if (!bytes)
+                return bytes.error();
+            tensor.float32_data.resize(static_cast<size_t>(count));
+            for (size_t i = 0; i < tensor.float32_data.size(); ++i)
+                tensor.float32_data[i] = read_safetensor_float(bytes.value().data(), i, info->dtype);
+        }
+        else
+        {
+            auto source = load_tensor(name);
+            if (!source)
+                return source.error();
+            const DType dtype = source.value().dtype;
+            if (dtype != DType::MxFp4 && !is_qnk_dtype(dtype))
+                return Error{ErrorCode::InvalidModel, "expected floating-point GGUF tensor: " + name};
+            tensor.float32_data.resize(static_cast<size_t>(count));
+            const uint32_t block_size = qnk_block_size(dtype);
+            for (size_t block = 0; block < count / block_size; ++block)
+            {
+                float* output = tensor.float32_data.data() + block * block_size;
+                if (dtype == DType::MxFp4)
+                    mxfp4_dequantize_block(source.value().mxfp4_blocks.data() + block * 16,
+                                           source.value().mxfp4_scales[block], output);
+                else
+                    qnk_dequantize_block(dtype, source.value().qnk_values().data() + block * qnk_block_bytes(dtype), output);
+            }
+        }
+        if (std::any_of(tensor.float32_data.begin(), tensor.float32_data.end(), [](float value) { return !std::isfinite(value); }))
+            return Error{ErrorCode::InvalidModel, "non-finite F32 tensor: " + name};
+        return tensor;
+    }
     if (!info || info->dtype != "F32")
         return Error{ErrorCode::InvalidModel, "expected F32 tensor: " + name};
     TensorData tensor;
@@ -1420,26 +1463,10 @@ Result<TensorData> SafetensorsArchive::load_gguf_source(SafetensorInfo info,
         info.offset += static_cast<uint64_t>(*slice) * info.size;
         info.shape.erase(info.shape.begin());
     }
-    if (preserve_float32 && info.dtype == "F16")
-    {
-        auto bytes = read_range(info.path, info.offset, info.size);
-        if (!bytes)
-            return bytes.error();
-        TensorData tensor;
-        tensor.dtype = DType::Float32;
-        tensor.shape = info.shape;
-        if (tensor.element_count() > SIZE_MAX / sizeof(float) || info.size != tensor.element_count() * 2)
-            return Error{ErrorCode::InvalidModel, "invalid GGUF F16 source tensor"};
-        tensor.float32_data.resize(static_cast<size_t>(tensor.element_count()));
-        for (size_t i = 0; i < tensor.float32_data.size(); ++i)
-            tensor.float32_data[i] = read_safetensor_float(bytes.value().data(), i, "F16");
-        return tensor;
-    }
-    const bool load_float32 = preserve_float32 && info.dtype == "F32";
     SafetensorsArchive archive;
     archive.gguf_source = true;
     archive.tensors.emplace("source", std::move(info));
-    return load_float32 ? archive.load_float32_tensor("source") : archive.load_tensor("source");
+    return preserve_float32 ? archive.load_float32_tensor("source") : archive.load_tensor("source");
 }
 
 static Result<void> set_qnk_file_range(MxFp4FileStorage& storage,
