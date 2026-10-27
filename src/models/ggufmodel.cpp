@@ -306,8 +306,6 @@ static Result<std::unordered_map<std::string, SafetensorInfo>> deepseek_gguf_ten
             }
             continue;
         }
-        if (info.dtype == DType::MxFp4)
-            return Error{ErrorCode::UnsupportedModel, "GGUF MXFP4 is currently supported for routed Experts: " + name};
         auto target = deepseek_gguf_tensor_name(name);
         if (!target)
             return target.error();

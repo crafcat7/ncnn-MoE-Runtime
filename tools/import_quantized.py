@@ -177,9 +177,9 @@ def validate_quantization(config: dict[str, Any]) -> tuple[str, dict[str, Any]]:
                 or quant.get("activation_scheme", "dynamic") not in {"dynamic", "static"}):
             raise ValueError("only FP8 E4M3 with 128x128 weight_scale_inv blocks is supported")
         return method, quant
-    if method == "mxfp4" and config.get("model_type") == "gpt_oss":
+    if method == "mxfp4" and config.get("model_type") in MODEL_TYPES:
         return method, quant
-    raise ValueError(f"unsupported quant_method: {method!r}; native MXFP4/DeepSeek packages should load directly")
+    raise ValueError(f"unsupported quant_method: {method!r}; native MXFP4 packages require supported model roles")
 
 
 def repack_linear(weight: np.ndarray, zeros: np.ndarray, scales: np.ndarray,
@@ -261,7 +261,7 @@ def safetensor_weights(source: Path, config: dict[str, Any]) -> Iterator[tuple[s
     consumed: set[str] = set()
     quantized_count = 0
     # Source MXFP4 tensors already use the runtime's adjacent-nibble layout.
-    # Validate pairs without ever materializing floating-point expert matrices.
+    # Validate pairs without ever materializing floating-point matrices.
     for name, info in sorted(tensors.items()):
         if name.endswith("_blocks"):
             scale_name = name[:-len("blocks")] + "scales"
@@ -278,8 +278,8 @@ def safetensor_weights(source: Path, config: dict[str, Any]) -> Iterator[tuple[s
         elif info.dtype == "I8" and name.endswith(".weight"):
             scale_name = name[:-len("weight")] + "scale"
             scale = tensors.get(scale_name)
-            if (config.get("model_type") != "deepseek_v4" or scale is None
-                    or scale.dtype != "F8_E8M0" or len(info.shape) != 2
+            if (scale is None or scale.dtype != "F8_E8M0" or len(info.shape) != 2
+                    or info.shape[0] <= 0 or info.shape[1] <= 0
                     or info.shape[1] % 16 or scale.shape != (info.shape[0], info.shape[1] // 16)):
                 raise ValueError(f"invalid source MXFP4 pair: {name}")
             consumed.update((name, scale_name))
@@ -459,6 +459,14 @@ def undo_v_reorder(values: np.ndarray, axis: int, keys: int, heads: int, dimensi
     return np.swapaxes(values.reshape(expanded), axis, axis + 1).reshape(shape)
 
 
+def qwen_input_columns(columns: int, keys: int, heads: int, dimension: int) -> np.ndarray:
+    if keys <= 0 or heads <= 0 or heads % keys or columns != heads * dimension:
+        raise ValueError("invalid Qwen GGUF V-head shape/config")
+    groups = heads // keys
+    # Lay logical columns out in stored order without building and sorting a second permutation.
+    return np.arange(columns, dtype="<i8").reshape(keys, groups, dimension).swapaxes(0, 1).reshape(-1)
+
+
 def undo_gguf_transform(name: str, values: np.ndarray, config: dict[str, Any]) -> np.ndarray:
     text = text_config(config)
     if config.get("model_type") is not None and config.get("model_type") not in QWEN_TYPES:
@@ -585,7 +593,7 @@ GGUF_NATIVE_FORMATS = {
     "Q5_K": (5, 256, 176), "Q6_K": (6, 256, 210), "Q8_K": (8, 256, 292),
     "Q4_0": (258, 32, 18), "Q4_1": (259, 32, 20), "Q5_0": (262, 32, 22),
     "Q5_1": (263, 32, 24), "Q8_0": (264, 32, 34), "IQ4_NL": (276, 32, 18),
-    "IQ4_XS": (279, 256, 136),
+    "IQ4_XS": (279, 256, 136), "NVFP4": (296, 64, 36),
 }
 
 
@@ -624,8 +632,7 @@ def native_gguf_matrix(name: str, tensor: Any, shape: tuple[int, ...],
             # Undoing a column permutation would cross Qn_K block boundaries.
             # Apply its inverse to input activations instead: packed input[j]
             # is logical input[input_columns[j]], so the raw blocks stay exact.
-            logical_to_packed = undo_v_reorder(np.arange(columns, dtype="<i8"), 0, keys, heads, vd)
-            input_columns = np.argsort(logical_to_packed).astype("<i8")
+            input_columns = qwen_input_columns(columns, keys, heads, vd)
     yield name, "U8", raw.reshape(-1)
     yield name + ".__qnk_shape", "I64", np.asarray([tag, rows, columns], dtype="<i8")
     if input_columns is not None:
@@ -643,6 +650,38 @@ def gguf_mxfp4_rows(data: np.ndarray, rows: int, columns: int) -> tuple[np.ndarr
     adjacent[..., :8] = (source[..., ::2] & 15) | ((source[..., 1::2] & 15) << 4)
     adjacent[..., 8:] = (source[..., ::2] >> 4) | (source[..., 1::2] & 240)
     return adjacent.reshape(rows, columns // 2).view(np.int8), blocks[..., 0].copy()
+
+
+def native_gguf_mxfp4_matrix(name: str, tensor: Any, shape: tuple[int, ...],
+                             config: dict[str, Any], data: np.ndarray | None = None
+                             ) -> Iterator[tuple[str, str, np.ndarray]]:
+    """Store GGUF MXFP4 codes/scales in the canonical separated Safetensors pair."""
+    if (tensor.tensor_type.name != "MXFP4" or len(shape) != 2
+            or not name.endswith(".weight") or name.endswith(("norm.weight", "conv1d.weight"))):
+        return
+    rows, columns = shape
+    blocks, scales = gguf_mxfp4_rows(np.asarray(tensor.data if data is None else data), rows, columns)
+    text = text_config(config)
+    keys, heads = text.get("linear_num_key_heads", 0), text.get("linear_num_value_heads", 0)
+    input_columns = None
+    if ".linear_attn." in name and keys != heads:
+        kd, vd = text.get("linear_key_head_dim", 0), text.get("linear_value_head_dim", 0)
+        if name.endswith("in_proj_qkv.weight"):
+            qk = 2 * keys * kd
+            blocks = np.concatenate((blocks[:qk], undo_v_reorder(blocks[qk:], 0, keys, heads, vd)))
+            scales = np.concatenate((scales[:qk], undo_v_reorder(scales[qk:], 0, keys, heads, vd)))
+        elif name.endswith("in_proj_z.weight"):
+            blocks = undo_v_reorder(blocks, 0, keys, heads, vd)
+            scales = undo_v_reorder(scales, 0, keys, heads, vd)
+        elif name.endswith(("in_proj_a.weight", "in_proj_b.weight")):
+            blocks = undo_v_reorder(blocks, 0, keys, heads, 1)
+            scales = undo_v_reorder(scales, 0, keys, heads, 1)
+        elif name.endswith("out_proj.weight"):
+            input_columns = qwen_input_columns(columns, keys, heads, vd)
+    yield name, "I8", blocks
+    yield name[:-len("weight")] + "scale", "F8_E8M0", scales
+    if input_columns is not None:
+        yield name + ".__mxfp4_columns", "I64", input_columns
 
 
 def gguf_float_values(tensor: Any, gguf: Any, auxiliary: bool = False) -> np.ndarray:
@@ -799,12 +838,16 @@ def gguf_weights(source: Path, config: dict[str, Any]) -> Iterator[tuple[str, st
                     raise ValueError("PLE native block embedding columns are not block-aligned")
                 values = np.asarray(table.data).view(np.uint8).reshape(
                     rows, columns // block_elements * block_bytes)
+            elif table.tensor_type.name == "MXFP4":
+                values = np.asarray(table.data).view(np.uint8).reshape(rows, columns // 32 * 17)
             else:
                 values = gguf_float_values(table, gguf)
             for shard in range(parts):
                 begin, end = rows * shard // parts, rows * (shard + 1) // parts
                 name = prefix + f"ngram_embedding.shard_{shard}.weight"
                 native = list(native_gguf_matrix(name, table, (end - begin, columns), config, values[begin:end]))
+                if not native:
+                    native = list(native_gguf_mxfp4_matrix(name, table, (end - begin, columns), config, values[begin:end]))
                 if native:
                     yield from native
                 else:
@@ -835,7 +878,12 @@ def gguf_weights(source: Path, config: dict[str, Any]) -> Iterator[tuple[str, st
             name = ("model.language_model." if wrapped else "model.") + f"layers.{indexer[1]}.self_attn.indexer.index_qk_proj.weight"
             qencoding = GGUF_NATIVE_FORMATS.get(query.tensor_type.name)
             kencoding = GGUF_NATIVE_FORMATS.get(key.tensor_type.name)
-            if qencoding is not None or kencoding is not None:
+            if query.tensor_type.name == "MXFP4" or key.tensor_type.name == "MXFP4":
+                if query.tensor_type.name != key.tensor_type.name:
+                    raise ValueError("Qwen4 indexer q/k must share an MXFP4 encoding")
+                raw = np.concatenate((np.asarray(query.data).reshape(qs[0], -1), np.asarray(key.data).reshape(ks[0], -1)))
+                yield from native_gguf_mxfp4_matrix(name, query, (qs[0] + ks[0], hidden), config, raw)
+            elif qencoding is not None or kencoding is not None:
                 if qencoding != kencoding:
                     raise ValueError("Qwen4Exp packed indexer q/k must share a native GGML type")
                 raw = np.concatenate((np.asarray(query.data).reshape(qs[0], -1), np.asarray(key.data).reshape(ks[0], -1)))
@@ -884,7 +932,7 @@ def gguf_weights(source: Path, config: dict[str, Any]) -> Iterator[tuple[str, st
             encoding = GGUF_NATIVE_FORMATS.get(tensor.tensor_type.name)
             raw = np.asarray(tensor.data)
             if tensor.tensor_type.name == "MXFP4":
-                if family not in {"gpt_oss", "deepseek_v4"} or role == "gate_up":
+                if family not in {"gpt_oss", "deepseek_v4", *QWEN_TYPES}:
                     raise ValueError(f"unsupported native MXFP4 expert layout: {tensor.name}")
                 if family == "gpt_oss" and role in {"gate", "up"}:
                     gate_name = f"blk.{expert[1]}.ffn_gate_exps.weight"
@@ -904,12 +952,28 @@ def gguf_weights(source: Path, config: dict[str, Any]) -> Iterator[tuple[str, st
                         prefix = f"model.layers.{expert[1]}.mlp.experts.{index}.gate_up_proj"
                         yield prefix + "_blocks", "I8", blocks
                         yield prefix + "_scales", "F8_E8M0", scales
+                elif role == "gate_up":
+                    if family not in QWEN_TYPES:
+                        raise ValueError(f"unsupported native MXFP4 expert layout: {tensor.name}")
+                    for index in range(count):
+                        packed_blocks, packed_scales = gguf_mxfp4_rows(raw[index], rows, columns)
+                        for projection, begin, end in (("gate", 0, intermediate), ("up", intermediate, rows)):
+                            prefix = ("model.language_model." if wrapped else "model.") + \
+                                     f"layers.{expert[1]}.mlp.experts.{index}.{projection}_proj."
+                            yield prefix + "weight", "I8", packed_blocks[begin:end]
+                            yield prefix + "scale", "F8_E8M0", packed_scales[begin:end]
                 else:
                     for index in range(count):
                         blocks, scales = gguf_mxfp4_rows(raw[index], rows, columns)
                         if family == "deepseek_v4":
                             projection = {"gate": "w1", "up": "w3", "down": "w2"}[role]
                             prefix = f"layers.{expert[1]}.ffn.experts.{index}.{projection}."
+                            yield prefix + "weight", "I8", blocks
+                            yield prefix + "scale", "F8_E8M0", scales
+                        elif family in QWEN_TYPES:
+                            projection = "down" if role == "down" else role
+                            prefix = ("model.language_model." if wrapped else "model.") + \
+                                     f"layers.{expert[1]}.mlp.experts.{index}.{projection}_proj."
                             yield prefix + "weight", "I8", blocks
                             yield prefix + "scale", "F8_E8M0", scales
                         else:
@@ -950,6 +1014,8 @@ def gguf_weights(source: Path, config: dict[str, Any]) -> Iterator[tuple[str, st
             raise ValueError(f"duplicate mapped GGUF tensor: {name}")
         seen.add(name)
         native = list(native_gguf_matrix(name, tensor, tuple(reversed(tensor.shape)), config))
+        if not native:
+            native = list(native_gguf_mxfp4_matrix(name, tensor, tuple(reversed(tensor.shape)), config))
         if native:
             yield from native
             continue
@@ -969,6 +1035,8 @@ def gguf_weights(source: Path, config: dict[str, Any]) -> Iterator[tuple[str, st
         if text.get("tie_word_embeddings", config.get("tie_word_embeddings", False)) and embedding in seen:
             tensor = next(item for item in reader.tensors if item.name == "token_embd.weight")
             native = list(native_gguf_matrix(head, tensor, tuple(reversed(tensor.shape)), config))
+            if not native:
+                native = list(native_gguf_mxfp4_matrix(head, tensor, tuple(reversed(tensor.shape)), config))
             if native:
                 yield from native
             else:
@@ -1032,7 +1100,15 @@ class ShardWriter:
                                    if name + suffix in self.weight_map), None)
                     if suffix is None:
                         info = scan_safetensors(self.root / self.weight_map[name])[name]
-                        shape = info.shape
+                        mx_scale_name = name[:-len("weight")] + "scale"
+                        if info.dtype == "I8" and mx_scale_name in self.weight_map:
+                            scale = scan_safetensors(self.root / self.weight_map[mx_scale_name])[mx_scale_name]
+                            shape = (info.shape[0], info.shape[1] * 2)
+                            if (scale.dtype != "F8_E8M0" or info.shape[1] % 16
+                                    or scale.shape != (info.shape[0], info.shape[1] // 16)):
+                                raise ValueError(f"invalid MXFP4 Expert pair: {name}")
+                        else:
+                            shape = info.shape
                     else:
                         companion = name + suffix
                         metadata = scan_safetensors(self.root / self.weight_map[companion])[companion].read()

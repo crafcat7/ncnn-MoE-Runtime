@@ -84,8 +84,8 @@ Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor)
             for (DType dtype : {layer.dense.gate_weight_dtype, layer.dense.up_weight_dtype, layer.dense.down_weight_dtype})
             {
                 if (dtype != DType::Float32 && dtype != DType::BFloat16 && dtype != DType::Int4
-                    && dtype != DType::Float8E4M3 && !is_qnk_dtype(dtype))
-                    return Error{ErrorCode::UnsupportedModel, "dense FFN weights must use float32, bfloat16, INT4, FP8, or Qn_K"};
+                    && dtype != DType::Float8E4M3 && dtype != DType::MxFp4 && !is_qnk_dtype(dtype))
+                    return Error{ErrorCode::UnsupportedModel, "dense FFN weights must use float32, bfloat16, INT4, FP8, MXFP4, or native GGML blocks"};
             }
         }
         else
@@ -313,7 +313,12 @@ static Result<TensorHandle> require_tensor(const WeightStore& weights, const std
         if (!tensor.float32_data.empty()
             || !tensor.bfloat16_data.empty()
             || !tensor.int8_data.empty()
+            || !tensor.int64_data.empty()
+            || !tensor.quantized_data.empty()
             || !tensor.quantization_scales.empty()
+            || tensor.quantization_group_size != 0
+            || !tensor.quantization_zero_points.empty()
+            || !tensor.quantization_group_indices.empty()
             || tensor.mapped_data)
             return Error{ErrorCode::InvalidModel, "MXFP4 tensor contains unrelated storage: " + name};
     }
@@ -415,7 +420,7 @@ static Result<TensorHandle> require_linear_tensor(const WeightStore& weights, co
         const DType stored_dtype = weights.at(handle).dtype;
         if (stored_dtype == DType::Float32 || stored_dtype == DType::BFloat16
             || stored_dtype == DType::Int4 || stored_dtype == DType::Int8
-            || stored_dtype == DType::Float8E4M3 || is_qnk_dtype(stored_dtype))
+            || stored_dtype == DType::Float8E4M3 || stored_dtype == DType::MxFp4 || is_qnk_dtype(stored_dtype))
             dtype = stored_dtype;
     }
     return require_tensor(weights, name, shape, dtype);
@@ -1974,7 +1979,7 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
     if (embedding_handle != invalid_tensor_handle)
     {
         const DType stored_dtype = compiled.weights.at(embedding_handle).dtype;
-        if (stored_dtype == DType::Int4 || is_qnk_dtype(stored_dtype))
+        if (stored_dtype == DType::Int4 || stored_dtype == DType::MxFp4 || is_qnk_dtype(stored_dtype))
             embedding_dtype = stored_dtype;
     }
     auto embedding = require_tensor(compiled.weights, "token_embedding.weight", {compiled.descriptor.vocabulary_size, compiled.descriptor.hidden_size}, embedding_dtype);

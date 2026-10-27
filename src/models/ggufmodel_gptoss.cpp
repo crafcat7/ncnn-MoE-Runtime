@@ -236,7 +236,7 @@ Result<std::unordered_map<std::string, SafetensorInfo>> gguf_gpt_oss_tensors(con
             continue;
         }
         const auto mapped = roles.find(role);
-        if (mapped == roles.end() || info.ggml_type == 39)
+        if (mapped == roles.end())
             return Error{ErrorCode::UnsupportedModel, "unsupported GPT-OSS GGUF tensor: " + name};
         if (!add(prefix + mapped->second, info, info.shape, info.offset, info.size))
             return Error{ErrorCode::InvalidModel, "duplicate GPT-OSS GGUF tensor alias"};

@@ -1,4 +1,5 @@
 #include "models/modeladapter_qwen3_5.h"
+#include "models/modeladapter.h"
 #include "kernels/ops.h"
 #include "kernels/qnk.h"
 #include "graph/compiledmodel.h"
@@ -962,6 +963,45 @@ static void run_dense_package(const std::filesystem::path& root, bool tied, bool
     check(!missing && missing.error().message.find("down_proj") != std::string::npos, "missing dense FFN tensor was accepted");
 }
 
+static void check_mxfp4_row_selection()
+{
+    TensorData source;
+    source.dtype = DType::MxFp4;
+    source.shape = {8, 64};
+    source.mxfp4_blocks.resize(8 * 32);
+    source.mxfp4_scales.resize(8 * 2);
+    source.input_column_indices.resize(64);
+    for (uint32_t column = 0; column < 64; ++column)
+        source.input_column_indices[column] = 63 - column;
+    for (uint32_t row = 0; row < 8; ++row)
+    {
+        for (uint32_t index = 0; index < 32; ++index)
+            source.mxfp4_blocks[row * 32 + index] = static_cast<uint8_t>(row * 31 + index);
+        source.mxfp4_scales[row * 2] = static_cast<uint8_t>(112 + row);
+        source.mxfp4_scales[row * 2 + 1] = static_cast<uint8_t>(120 + row);
+    }
+    const std::vector<uint32_t> rows = {1, 4, 7};
+    auto selected = select_tensor_rows(source, rows);
+    check(selected && selected.value().dtype == DType::MxFp4
+              && selected.value().shape == std::vector<uint32_t>{3, 64}
+              && selected.value().mxfp4_blocks.size() == 3 * 32
+              && selected.value().mxfp4_scales.size() == 3 * 2
+              && selected.value().input_column_indices == source.input_column_indices,
+          "MXFP4 query/gate row selection lost compact blocks, scales, or input columns");
+    for (size_t output_row = 0; output_row < rows.size(); ++output_row)
+    {
+        const size_t source_row = rows[output_row];
+        for (size_t index = 0; index < 32; ++index)
+            check(selected.value().mxfp4_blocks[output_row * 32 + index] == source.mxfp4_blocks[source_row * 32 + index],
+                  "MXFP4 query/gate row selection changed packed codes");
+        for (size_t block = 0; block < 2; ++block)
+            check(selected.value().mxfp4_scales[output_row * 2 + block] == source.mxfp4_scales[source_row * 2 + block],
+                  "MXFP4 query/gate row selection separated block scales from their codes");
+    }
+    source.input_column_indices[1] = source.input_column_indices[0];
+    check(!select_tensor_rows(source, rows), "MXFP4 query/gate row selection accepted a duplicate input column");
+}
+
 } // namespace moe
 } // namespace ncnn
 
@@ -972,6 +1012,7 @@ int main()
     try
     {
         std::filesystem::create_directories(root);
+        ncnn::moe::check_mxfp4_row_selection();
         ncnn::moe::run_dense_package(root / "tied", true);
         ncnn::moe::run_dense_package(root / "untied", false);
         ncnn::moe::run_dense_package(root / "quantized", false, true);

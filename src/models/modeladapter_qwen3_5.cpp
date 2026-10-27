@@ -354,36 +354,32 @@ Result<MoeModelDescriptor> Qwen3_5MoeModelAdapter::parse_model(const ModelPackag
                 {
                     const std::string name = source + projection.first;
                     const auto* tensor = model_archive->find(name);
-                    if (!tensor && model_archive->contains_tensor(name))
+                    if (model_archive->contains_tensor(name))
+                    {
+                        auto dtype = model_archive->tensor_dtype(name);
+                        if (dtype)
+                        {
+                            *projection.second = dtype.value();
+                            continue;
+                        }
+                        if (!tensor || tensor->dtype != "U8")
+                            return dtype.error();
+                        const bool down = std::string_view(projection.first) == "down_proj.weight";
+                        const auto legacy_dtype = model_archive->find_qnk_expert_dtype(name, 1,
+                                                                                       down ? hidden_size.value() : intermediate_size.value(),
+                                                                                       down ? intermediate_size.value() : hidden_size.value());
+                        if (!legacy_dtype)
+                            return Error{ErrorCode::InvalidModel, "invalid Qwen dense native FFN tensor: " + name};
+                        *projection.second = *legacy_dtype;
+                        continue;
+                    }
+                    if (tensor)
                     {
                         auto dtype = model_archive->tensor_dtype(name);
                         if (!dtype)
                             return dtype.error();
                         *projection.second = dtype.value();
-                        continue;
                     }
-                    if (tensor && tensor->dtype == "F8_E4M3")
-                    {
-                        *projection.second = DType::Float8E4M3;
-                        continue;
-                    }
-                    if (!tensor || tensor->dtype != "U8")
-                        continue;
-                    if (model_archive->find(name + ".__int4_shape") || model_archive->find(name + ".__qnk_shape"))
-                    {
-                        auto dtype = model_archive->tensor_dtype(name);
-                        if (!dtype)
-                            return dtype.error();
-                        *projection.second = dtype.value();
-                        continue;
-                    }
-                    const bool down = std::string_view(projection.first) == "down_proj.weight";
-                    const auto dtype = model_archive->find_qnk_expert_dtype(name, 1,
-                                                                            down ? hidden_size.value() : intermediate_size.value(),
-                                                                            down ? intermediate_size.value() : hidden_size.value());
-                    if (!dtype)
-                        return Error{ErrorCode::InvalidModel, "invalid Qwen dense Qn_K FFN tensor: " + name};
-                    *projection.second = *dtype;
                 }
             }
         }
@@ -392,6 +388,18 @@ Result<MoeModelDescriptor> Qwen3_5MoeModelAdapter::parse_model(const ModelPackag
             layer.moe = moe;
             if (model_archive)
             {
+                const std::string shared = "model.language_model.layers." + std::to_string(layer_id) + ".mlp.shared_expert.";
+                for (const char* projection : {"gate_proj.weight", "up_proj.weight", "down_proj.weight"})
+                {
+                    const std::string name = shared + projection;
+                    if (!model_archive->contains_tensor(name))
+                        continue;
+                    auto dtype = model_archive->tensor_dtype(name);
+                    if (!dtype)
+                        return dtype.error();
+                    if (std::string_view(projection) == "gate_proj.weight")
+                        layer.moe.shared_expert_weight_dtype = dtype.value();
+                }
                 const std::string source = "model.language_model.layers." + std::to_string(layer_id) + ".mlp.experts.";
                 if (model_archive->contains_tensor(source + "0.gate_proj.weight")
                     || model_archive->contains_tensor(source + "0.up_proj.weight")

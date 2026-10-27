@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace ncnn {
@@ -380,6 +381,7 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
     }
     moe.expert_weight_dtype = artifact_exists ? DType::MxFp4 : DType::BFloat16;
     std::vector<DType> expert_weight_dtypes(layer_count.value(), moe.expert_weight_dtype);
+    std::vector<DType> shared_expert_weight_dtypes(layer_count.value(), moe.shared_expert_weight_dtype);
     std::vector<ExpertLayout> expert_layouts(layer_count.value(), moe.layout);
     if (!artifact_exists && !package.root.empty())
     {
@@ -392,6 +394,18 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
                 const SafetensorsArchive& archive = opened.value();
                 for (uint32_t layer_id = 0; layer_id < layer_count.value(); ++layer_id)
                 {
+                    const std::string shared = "model.language_model.layers." + std::to_string(layer_id) + ".mlp.shared_expert.";
+                    for (const char* projection : {"gate_proj.weight", "up_proj.weight", "down_proj.weight"})
+                    {
+                        const std::string name = shared + projection;
+                        if (!archive.contains_tensor(name))
+                            continue;
+                        auto dtype = archive.tensor_dtype(name);
+                        if (!dtype)
+                            return dtype.error();
+                        if (std::string_view(projection) == "gate_proj.weight")
+                            shared_expert_weight_dtypes[layer_id] = dtype.value();
+                    }
                     const std::string source = "model.language_model.layers." + std::to_string(layer_id) + ".mlp.experts.";
                     const char* projections[] = {"gate_proj.weight", "up_proj.weight", "down_proj.weight"};
                     bool separate_experts = false;
@@ -492,6 +506,7 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
         layer.pre_ffn_norm = NormType::None;
         layer.attention = type == "linear_attention" ? linear_attention : full_attention;
         layer.moe = moe;
+        layer.moe.shared_expert_weight_dtype = shared_expert_weight_dtypes[layer_id];
         layer.moe.expert_weight_dtype = expert_weight_dtypes[layer_id];
         layer.moe.layout = expert_layouts[layer_id];
         if (layer.moe.layout == ExpertLayout::GateUpDown)

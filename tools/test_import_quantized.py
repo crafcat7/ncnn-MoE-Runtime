@@ -685,6 +685,47 @@ class ImportTests(unittest.TestCase):
         np.testing.assert_array_equal(results[2][2], np.concatenate((np.arange(128), np.arange(256, 384),
                                                                    np.arange(128, 256), np.arange(384, 512))))
 
+    def test_native_nvfp4_uses_reserved_ggml_tag_without_repacking(self):
+        raw = np.arange(2 * 2 * 36, dtype=np.uint8).reshape(2, 72)
+        tensor = SimpleNamespace(tensor_type=SimpleNamespace(name="NVFP4"), data=raw)
+        results = list(importer.native_gguf_matrix("model.embed_tokens.weight", tensor, (2, 128), {}))
+        self.assertEqual(importer.GGUF_NATIVE_FORMATS["NVFP4"], (296, 64, 36))
+        self.assertEqual([item[0] for item in results], ["model.embed_tokens.weight", "model.embed_tokens.weight.__qnk_shape"])
+        self.assertEqual(results[0][1], "U8")
+        np.testing.assert_array_equal(results[0][2], raw.reshape(-1))
+        np.testing.assert_array_equal(results[1][2], [296, 2, 128])
+
+    def test_native_mxfp4_general_safetensor_roles_stay_as_code_scale_pairs(self):
+        source, _ = self.family_assets("qwen4_exp", {"quant_method": "mxfp4"})
+        roles = (
+            "model.language_model.embed_tokens.weight",
+            "lm_head.weight",
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "model.language_model.layers.0.linear_attn.out_proj.weight",
+        )
+        tensors = {}
+        expected = {}
+        for index, name in enumerate(roles):
+            packed = (np.arange(2 * 32, dtype=np.uint8).reshape(2, 32) + index * 17).view(np.int8)
+            scales = np.full((2, 2), 119 + index, dtype=np.uint8)
+            tensors[name] = ("I8", packed)
+            tensors[name[:-len("weight")] + "scale"] = ("F8_E8M0", scales)
+            expected[name], expected[name[:-len("weight")] + "scale"] = packed.copy(), scales.copy()
+        columns_name = roles[-1] + ".__mxfp4_columns"
+        columns = np.arange(64, dtype="<i8")[::-1].copy()
+        tensors[columns_name] = ("I64", columns)
+        expected[columns_name] = columns
+        write_safetensors(source / "model.safetensors", tensors)
+        output = self.root / "native-general-mxfp4"
+        importer.import_package(source, output)
+        loaded = importer.scan_safetensors(output)
+        for name, values in expected.items():
+            np.testing.assert_array_equal(loaded[name].read(), values)
+        for name in roles:
+            self.assertEqual(loaded[name].dtype, "I8")
+            self.assertEqual(loaded[name[:-len("weight")] + "scale"].dtype, "F8_E8M0")
+
     @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
     def test_gguf_native_embedding_and_recurrent_output_column_direction(self):
         source = self.assets()

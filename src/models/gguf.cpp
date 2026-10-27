@@ -233,6 +233,7 @@ static Result<std::pair<DType, std::pair<uint64_t, uint64_t>>> tensor_encoding(u
     case 26: return Encoding{DType::Int32, {1, 4}};
     case 30: return Encoding{DType::BFloat16, {1, 2}};
     case 39: return Encoding{DType::MxFp4, {32, 17}};
+    case 40: return Encoding{DType::NvFp4, {64, 36}};
     default: return Error{ErrorCode::UnsupportedModel, "unsupported GGUF tensor type: " + std::to_string(type)};
     }
 }

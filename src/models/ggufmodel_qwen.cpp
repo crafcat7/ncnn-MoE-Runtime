@@ -546,7 +546,7 @@ Result<std::unordered_map<std::string, SafetensorInfo>> gguf_qwen_tensors(const 
             else if (canonical.ends_with("out_proj.weight"))
             {
                 auto columns = qwen_grouped_rows(config.linear_keys, config.linear_values, config.linear_value_dimension);
-                if (is_qnk_dtype(tensor.dtype))
+                if (is_qnk_dtype(tensor.dtype) || tensor.dtype == DType::MxFp4)
                 {
                     transform.input_column_indices.resize(columns.size());
                     for (uint32_t column = 0; column < columns.size(); ++column)

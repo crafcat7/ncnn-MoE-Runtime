@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -175,11 +176,11 @@ static void check_split(const std::filesystem::path& root)
 
 static void check_encodings(const std::filesystem::path& root)
 {
-    const std::array<uint32_t, 17> types = {0, 1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 15, 20, 23, 26, 30};
-    const std::array<size_t, 17> sizes = {1024, 512, 144, 160, 176, 192, 272, 84, 110, 144, 176, 210, 292, 144, 136, 1024, 512};
-    const std::array<DType, 17> dtypes = {DType::Float32, DType::Float16, DType::Q4_0, DType::Q4_1, DType::Q5_0,
+    const std::array<uint32_t, 19> types = {0, 1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 15, 20, 23, 26, 30, 39, 40};
+    const std::array<size_t, 19> sizes = {1024, 512, 144, 160, 176, 192, 272, 84, 110, 144, 176, 210, 292, 144, 136, 1024, 512, 136, 144};
+    const std::array<DType, 19> dtypes = {DType::Float32, DType::Float16, DType::Q4_0, DType::Q4_1, DType::Q5_0,
                                           DType::Q5_1, DType::Q8_0, DType::Q2K, DType::Q3K, DType::Q4K, DType::Q5K,
-                                          DType::Q6K, DType::Q8K, DType::IQ4NL, DType::IQ4XS, DType::Int32, DType::BFloat16};
+                                          DType::Q6K, DType::Q8K, DType::IQ4NL, DType::IQ4XS, DType::Int32, DType::BFloat16, DType::MxFp4, DType::NvFp4};
     for (size_t i = 0; i < types.size(); ++i)
     {
         const auto path = root / "encodings" / (std::to_string(types[i]) + ".gguf");
@@ -190,6 +191,50 @@ static void check_encodings(const std::filesystem::path& root)
               "GGUF encoding size mismatch");
     }
     check(!GgufArchive::open(root / "encodings"), "GGUF directory discovery silently chose an ambiguous package");
+}
+
+static void check_native_mxfp4_safetensor_pair(const std::filesystem::path& root)
+{
+    constexpr uint32_t rows = 2;
+    constexpr uint32_t columns = 64;
+    std::vector<uint8_t> header;
+    const std::string json = R"({"layer.weight":{"dtype":"I8","shape":[2,32],"data_offsets":[0,64]},"layer.scale":{"dtype":"F8_E8M0","shape":[2,2],"data_offsets":[64,68]},"layer.weight.__mxfp4_columns":{"dtype":"I64","shape":[64],"data_offsets":[68,580]}})";
+    append_unsigned(header, json.size() + (8 - json.size() % 8) % 8, 8);
+    std::string padded = json;
+    padded.append((8 - padded.size() % 8) % 8, ' ');
+    header.insert(header.end(), padded.begin(), padded.end());
+    std::vector<uint8_t> payload(580, 0);
+    for (size_t index = 0; index < 64; ++index)
+        payload[index] = static_cast<uint8_t>(index * 3 + 1);
+    payload[64] = 120;
+    payload[65] = 121;
+    payload[66] = 122;
+    payload[67] = 123;
+    for (uint32_t index = 0; index < columns; ++index)
+    {
+        const int64_t value = columns - 1 - index;
+        std::memcpy(payload.data() + 68 + static_cast<size_t>(index) * sizeof(value), &value, sizeof(value));
+    }
+    header.insert(header.end(), payload.begin(), payload.end());
+    const auto path = root / "native-mxfp4" / "model.safetensors";
+    write_bytes(path, header);
+    auto archive = SafetensorsArchive::open_file(path);
+    check(static_cast<bool>(archive), archive ? "" : archive.error().message);
+    auto dtype = archive.value().tensor_dtype("layer.weight");
+    check(dtype && dtype.value() == DType::MxFp4, "native MXFP4 I8/scale pair was not inferred");
+    auto loaded = archive.value().load_tensor("layer.weight");
+    check(loaded && loaded.value().dtype == DType::MxFp4
+              && loaded.value().shape == std::vector<uint32_t>{rows, columns}
+              && loaded.value().mxfp4_blocks.size() == 64
+              && loaded.value().mxfp4_scales.size() == 4
+              && loaded.value().input_column_indices.size() == columns,
+          "native MXFP4 pair did not load in its canonical compact form");
+    for (size_t index = 0; index < 64; ++index)
+        check(loaded.value().mxfp4_blocks[index] == static_cast<uint8_t>(index * 3 + 1),
+              "native MXFP4 packed codes changed during loading");
+    check(loaded.value().input_column_indices.front() == columns - 1
+              && loaded.value().input_column_indices.back() == 0,
+          "native MXFP4 input-column map was not preserved");
 }
 
 static void check_invalid_files(const std::filesystem::path& root)
@@ -408,7 +453,7 @@ static void check_real_model(const std::filesystem::path& source)
     ModelPackage package{archive.value().root_path(), ModelManifest{"deepseek_v4", manifest.value()}, 0, archive.value().source_path()};
     auto descriptor = DeepSeekV4ModelAdapter().parse_model(package);
     check(static_cast<bool>(descriptor), descriptor ? "" : descriptor.error().message);
-    std::array<size_t, 40> types{};
+    std::array<size_t, 41> types{};
     for (const auto& [name, tensor] : archive.value().tensor_infos())
     {
         (void)name;
@@ -420,7 +465,8 @@ static void check_real_model(const std::filesystem::path& source)
               << " aliases=" << aliases.value().size()
               << " layers=" << descriptor.value().layers.size()
               << " F32=" << types[0] << " BF16=" << types[30]
-              << " Q8_0=" << types[8] << " I32=" << types[26] << " MXFP4=" << types[39] << '\n';
+              << " Q8_0=" << types[8] << " I32=" << types[26] << " MXFP4=" << types[39]
+              << " NVFP4=" << types[40] << '\n';
 }
 
 } // namespace moe
@@ -442,6 +488,7 @@ int main(int argc, char** argv)
         ncnn::moe::check_single_file(root);
         ncnn::moe::check_split(root);
         ncnn::moe::check_encodings(root);
+        ncnn::moe::check_native_mxfp4_safetensor_pair(root);
         ncnn::moe::check_invalid_files(root);
         ncnn::moe::check_raw_qnk_dtype_ambiguity(root);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q4K, 12);
@@ -454,6 +501,7 @@ int main(int argc, char** argv)
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::IQ4NL, 20);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::IQ4NL, 20, 160);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::IQ4NL, 20, 256);
+        ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::NvFp4, 40, 64);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q8_0, 8, 2560, true);
         ncnn::moe::check_qnk_defer_fallback(root, ncnn::moe::DType::Q8_0, 8, 2560, false);
         ncnn::moe::check_directory_selection(root);

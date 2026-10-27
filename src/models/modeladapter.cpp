@@ -797,6 +797,34 @@ Result<TensorData> select_tensor_rows(const TensorData& source,
     }
 
     const uint32_t columns = source.shape[1];
+    if (source.dtype == DType::MxFp4)
+    {
+        if (columns % 32 != 0 || source.mxfp4_file_storage
+            || source.mxfp4_blocks.size() != static_cast<uint64_t>(source.shape[0]) * columns / 2
+            || source.mxfp4_scales.size() != static_cast<uint64_t>(source.shape[0]) * columns / 32)
+            return Error{ErrorCode::InvalidModel, "invalid MXFP4 matrix row storage"};
+        auto valid_columns = validate_input_column_indices(source);
+        if (!valid_columns)
+            return valid_columns.error();
+        TensorData result;
+        result.dtype = DType::MxFp4;
+        result.shape = {static_cast<uint32_t>(rows.size()), columns};
+        result.input_column_indices = source.input_column_indices;
+        const size_t block_row_bytes = columns / 2;
+        const size_t scale_row_bytes = columns / 32;
+        result.mxfp4_blocks.resize(rows.size() * block_row_bytes);
+        result.mxfp4_scales.resize(rows.size() * scale_row_bytes);
+        for (size_t row = 0; row < rows.size(); ++row)
+        {
+            std::memcpy(result.mxfp4_blocks.data() + row * block_row_bytes,
+                        source.mxfp4_blocks.data() + static_cast<size_t>(rows[row]) * block_row_bytes,
+                        block_row_bytes);
+            std::memcpy(result.mxfp4_scales.data() + row * scale_row_bytes,
+                        source.mxfp4_scales.data() + static_cast<size_t>(rows[row]) * scale_row_bytes,
+                        scale_row_bytes);
+        }
+        return result;
+    }
     const uint8_t* source_data = nullptr;
     uint64_t row_bytes = 0;
     uint64_t source_bytes = 0;
