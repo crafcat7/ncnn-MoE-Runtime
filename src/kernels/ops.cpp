@@ -255,6 +255,42 @@ void forward_embedding_row(const TensorData& embedding, uint32_t row_index, floa
             throw std::runtime_error("invalid INT4 embedding layout");
         return;
     }
+    if (embedding.dtype == DType::MxFp4)
+    {
+        const uint64_t rows = embedding.shape[0];
+        const uint64_t block_count = hidden_size / 32 + (hidden_size % 32 != 0);
+        if (hidden_size == 0 || hidden_size % 32 != 0 || block_count == 0
+            || rows > std::numeric_limits<uint64_t>::max() / block_count)
+            throw std::runtime_error("invalid MXFP4 embedding shape");
+        const uint64_t row_blocks = block_count;
+        const uint64_t total_blocks = rows * row_blocks;
+        if (total_blocks > std::numeric_limits<size_t>::max() / 16
+            || embedding.mxfp4_blocks.size() != total_blocks * 16
+            || embedding.mxfp4_scales.size() != total_blocks)
+            throw std::runtime_error("invalid MXFP4 embedding layout");
+        const bool remap = !embedding.input_column_indices.empty();
+        if (remap && !validate_input_column_indices(embedding))
+            throw std::runtime_error("invalid MXFP4 embedding column mapping");
+        const size_t row_offset = static_cast<size_t>(row_index) * static_cast<size_t>(row_blocks);
+        std::array<float, 32> decoded;
+        for (uint32_t block = 0; block < block_count; ++block)
+        {
+            const size_t block_index = row_offset + block;
+            float* output = remap ? decoded.data() : destination + static_cast<size_t>(block) * 32;
+            mxfp4_dequantize_block(embedding.mxfp4_blocks.data() + block_index * 16,
+                                   embedding.mxfp4_scales[block_index], output);
+            if (remap)
+            {
+                const uint32_t column = block * 32;
+                for (uint32_t lane = 0; lane < 32; ++lane)
+                {
+                    const uint32_t mapped_column = embedding.input_column_indices[column + lane];
+                    destination[mapped_column] = decoded[lane];
+                }
+            }
+        }
+        return;
+    }
     if (is_qnk_dtype(embedding.dtype))
     {
         const bool remap = !embedding.input_column_indices.empty();
@@ -734,7 +770,7 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
         return false;
 
     const DType dtype = weights[0]->dtype;
-    if (qnk_block_size(dtype) == 32 || dtype == DType::IQ4XS
+    if (is_qnk_dtype(dtype) && (qnk_block_size(dtype) == 32 || dtype == DType::IQ4XS || dtype == DType::NvFp4)
 #if defined(__aarch64__) || defined(_M_ARM64)
         || is_qnk_dtype(dtype)
 #endif
@@ -1066,6 +1102,8 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
     const uint32_t input_columns = matrix.shape[1];
     assert(input.columns() == input_columns);
 
+    // Vulkan QnKLinear applies input_column_indices in its shader, so pass it
+    // the original activation buffer. CPU kernels gather below when needed.
     if (forward_linear_vulkan(op, input, output, backend))
         return;
 
@@ -1073,8 +1111,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
     ActivationBuffer local_input;
     if (!matrix.input_column_indices.empty())
     {
-        if ((matrix.dtype != DType::Int4 && !is_qnk_dtype(matrix.dtype))
-            || matrix.input_column_indices.size() != input_columns
+        if (!validate_input_column_indices(matrix)
             || input.dtype() != DType::Float32)
         {
             throw std::runtime_error("invalid quantized linear input column map");
@@ -1111,7 +1148,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
             return;
         throw std::runtime_error("invalid native GGML linear weight or activation shape");
     }
-    if (!matrix.input_column_indices.empty())
+    if (!matrix.input_column_indices.empty() && matrix.dtype != DType::MxFp4)
         throw std::runtime_error("invalid quantized linear weight layout");
     require_dense_host_storage(matrix, "linear weight");
     output.reset(input.rows(), output_columns, false);
@@ -1223,6 +1260,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
     }
     else if (matrix.dtype == DType::MxFp4)
     {
+        const ActivationBuffer& mxfp_input = *linear_input;
         const uint32_t blocks_per_row = input_columns / 32;
         const int64_t row_pair_count = static_cast<int64_t>((output_columns + 1) / 2);
         Mxfp4Q8Batch q8_input;
@@ -1230,9 +1268,9 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                             && input_columns % 32 == 0;
         if (use_q8)
         {
-            mxfp4_q8_quantize_batch(input.row(0),
-                                    input.columns(),
-                                    input.rows(),
+            mxfp4_q8_quantize_batch(mxfp_input.row(0),
+                                    mxfp_input.columns(),
+                                    mxfp_input.rows(),
                                     input_columns,
                                     q8_input);
             if (has_flag(optimization_flags, OptimizationCpuPackedWeights)
@@ -1251,7 +1289,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                                          q8_input.columns,
                                          q8_input.row_scales(0),
                                          (input_columns + 31) / 32,
-                                         input.rows(),
+                                         mxfp_input.rows(),
                                          output.row(0),
                                          output.columns());
                     return;
@@ -1277,10 +1315,10 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                                           second_scales,
                                           blocks_per_row,
                                           q8_input.row(0),
-                                          input.columns(),
+                                          mxfp_input.columns(),
                                           q8_input.row_scales(0),
                                           (input_columns + 31) / 32,
-                                          input.rows(),
+                                          mxfp_input.rows(),
                                           output.row(0) + first_row,
                                           output.columns(),
                                           output.row(0) + second_row,
@@ -1288,15 +1326,15 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                 }
                 else
                 {
-                    mxfp4_matmul_rows2(first_blocks, first_scales, second_blocks, second_scales, blocks_per_row, input.row(0), input.columns(), input.rows(),
+                    mxfp4_matmul_rows2(first_blocks, first_scales, second_blocks, second_scales, blocks_per_row, mxfp_input.row(0), mxfp_input.columns(), mxfp_input.rows(),
                                        output.row(0) + first_row, output.columns(), output.row(0) + second_row, output.columns());
                 }
             }
-            else if (input.rows() == 1)
+            else if (mxfp_input.rows() == 1)
             {
                 output.row(0)[first_row] = use_q8
                                                ? mxfp4_q8_dot(first_blocks, first_scales, blocks_per_row, q8_input.row(0), q8_input.row_scales(0))
-                                               : mxfp4_dot(first_blocks, first_scales, blocks_per_row, input.row(0));
+                                               : mxfp4_dot(first_blocks, first_scales, blocks_per_row, mxfp_input.row(0));
             }
             else
             {
@@ -1306,16 +1344,16 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                                       first_scales,
                                       blocks_per_row,
                                       q8_input.row(0),
-                                      input.columns(),
+                                      mxfp_input.columns(),
                                       q8_input.row_scales(0),
                                       (input_columns + 31) / 32,
-                                      input.rows(),
+                                      mxfp_input.rows(),
                                       output.row(0) + first_row,
                                       output.columns());
                 }
                 else
                 {
-                    mxfp4_gemm_row(first_blocks, first_scales, blocks_per_row, input.row(0), input.columns(), input.rows(), output.row(0) + first_row,
+                    mxfp4_gemm_row(first_blocks, first_scales, blocks_per_row, mxfp_input.row(0), mxfp_input.columns(), mxfp_input.rows(), output.row(0) + first_row,
                                    output.columns());
                 }
             }

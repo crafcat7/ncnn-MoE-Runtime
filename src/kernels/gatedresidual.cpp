@@ -30,7 +30,7 @@ static bool valid_projection_matrix(const TensorData& tensor, uint32_t rows, uin
     if (tensor.dtype == DType::Int8)
         return tensor.int8_values().size() == tensor.element_count()
                && tensor.quantization_scales.size() == rows;
-    return tensor.dtype == DType::Int4 || tensor.dtype == DType::Float8E4M3 || is_qnk_dtype(tensor.dtype);
+    return tensor.dtype == DType::Int4 || tensor.dtype == DType::MxFp4 || tensor.dtype == DType::Float8E4M3 || is_qnk_dtype(tensor.dtype);
 }
 
 static bool valid_bfloat16_vector(const TensorData& tensor, uint32_t size) noexcept

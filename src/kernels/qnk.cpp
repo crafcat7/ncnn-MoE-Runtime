@@ -407,6 +407,38 @@ static void dequantize_q8_0(const uint8_t* block, QnKOutput& output) noexcept
 #endif
 }
 
+static float ue4m3_to_float(uint8_t value) noexcept
+{
+    if (value == 0 || value == 0x7fu)
+        return 0.0f;
+    const uint32_t exponent = (value >> 3) & 15u;
+    const uint32_t mantissa = value & 7u;
+    if (exponent == 0)
+        return static_cast<float>(mantissa) * 0.0009765625f;
+    const uint32_t bits = (exponent + 119u) << 23;
+    float scale;
+    std::memcpy(&scale, &bits, sizeof(scale));
+    return scale * (1.0f + static_cast<float>(mantissa) * 0.125f);
+}
+
+static void dequantize_nvfp4(const uint8_t* block, QnKOutput& output) noexcept
+{
+    static constexpr float doubled_e2m1[16] = {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
+                                               -0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f};
+    for (uint32_t subblock = 0; subblock < 4; ++subblock)
+    {
+        const float scale = ue4m3_to_float(block[subblock]);
+        const uint8_t* codes = block + 4 + subblock * 8;
+        float* decoded = output.output + subblock * 16;
+        for (uint32_t index = 0; index < 8; ++index)
+        {
+            const uint8_t byte = codes[index];
+            decoded[index] = doubled_e2m1[byte & 15u] * scale;
+            decoded[index + 8] = doubled_e2m1[byte >> 4] * scale;
+        }
+    }
+}
+
 static void dequantize_q4(DType dtype, const uint8_t* block, QnKOutput& output) noexcept
 {
     const bool affine = dtype == DType::Q4_1;
@@ -750,6 +782,10 @@ static std::shared_ptr<const QnKPack> get_qnk_packed_weights(const TensorData& m
 
 uint32_t qnk_block_size(DType dtype) noexcept
 {
+    if (dtype == DType::NvFp4)
+        return 64;
+    if (dtype == DType::MxFp4)
+        return 32;
     return dtype == DType::Q8_0 || dtype == DType::IQ4NL || dtype == DType::Q5_1
                    || dtype == DType::Q4_0 || dtype == DType::Q4_1 || dtype == DType::Q5_0
                ? 32
@@ -773,6 +809,8 @@ size_t qnk_block_bytes(DType dtype) noexcept
     case DType::Q4_1: return 20;
     case DType::Q5_0: return 22;
     case DType::IQ4XS: return 136;
+    case DType::MxFp4: return 17;
+    case DType::NvFp4: return 36;
     default: return 0;
     }
 }
@@ -847,6 +885,7 @@ static inline float forward_qnk(DType dtype,
     case DType::Q4_1: dequantize_q4(dtype, block, local); break;
     case DType::Q5_0: dequantize_q5_0(block, local); break;
     case DType::IQ4XS: dequantize_iq4_xs(block, local); break;
+    case DType::NvFp4: dequantize_nvfp4(block, local); break;
     default:
         if (output)
             std::fill_n(output, qnk_block_elements, 0.0f);
@@ -865,7 +904,7 @@ static inline float forward_qnk(DType dtype,
 
 void qnk_dequantize_block(DType dtype, const uint8_t* block, float* output) noexcept
 {
-    if (!block || !output)
+    if (!block || !output || !is_qnk_dtype(dtype))
         return;
     if (dtype == DType::Q6K)
     {
@@ -880,8 +919,14 @@ void qnk_dequantize_block(DType dtype, const uint8_t* block, float* output) noex
 
 float qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexcept
 {
-    if (!block || !input)
+    if (!block || !input || !is_qnk_dtype(dtype))
         return 0.0f;
+    if (dtype == DType::NvFp4)
+    {
+        std::array<float, 64> decoded;
+        qnk_dequantize_block(dtype, block, decoded.data());
+        return float_dot(decoded.data(), input, static_cast<uint32_t>(decoded.size()));
+    }
     if (qnk_block_size(dtype) == 32)
     {
         // Consume the native FP16 scale and codes directly. K-series integer

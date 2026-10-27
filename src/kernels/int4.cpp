@@ -20,7 +20,7 @@ Result<void> validate_input_column_indices(const TensorData& tensor)
 {
     if (tensor.input_column_indices.empty())
         return {};
-    if ((tensor.dtype != DType::Int4 && !is_qnk_dtype(tensor.dtype)) || tensor.shape.size() != 2
+    if ((tensor.dtype != DType::Int4 && tensor.dtype != DType::MxFp4 && !is_qnk_dtype(tensor.dtype)) || tensor.shape.size() != 2
         || tensor.input_column_indices.size() != tensor.shape[1])
     {
         return Error{ErrorCode::InvalidModel, "quantized input column map must match the input dimension"};

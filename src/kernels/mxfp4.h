@@ -29,6 +29,16 @@ enum class MxFp4KernelKind
                                      std::span<uint8_t> blocks,
                                      std::span<uint8_t> scales) noexcept;
 
+// Repack canonical adjacent-nibble blocks and E8M0 scales into GGUF's
+// interleaved [scale, 16 code bytes] block layout. All spans must be
+// nonoverlapping and exactly sized; invalid spans return false before writing.
+[[nodiscard]] bool pack_gguf_mxfp4(std::span<const uint8_t> blocks,
+                                   std::span<const uint8_t> scales,
+                                   std::span<uint8_t> destination) noexcept;
+
+// Decode one canonical 32-value MXFP4 block into Float32 values.
+void mxfp4_dequantize_block(const uint8_t* packed, uint8_t scale, float* output) noexcept;
+
 // Unpack complete source rows directly into a strided destination. Both row
 // strides are byte distances, allowing Gate/Up to fill alternating rows without
 // a temporary packed copy. Destination holes and padding are left untouched.

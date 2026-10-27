@@ -211,18 +211,19 @@ enum class DType
     Q4_0,
     Q4_1,
     Q5_0,
-    IQ4XS
+    IQ4XS,
+    NvFp4
 };
 
-// Historical name for the native GGML block-quantized family. Most formats
-// use 256-value K blocks; Q4_0, Q4_1, Q5_0, Q8_0, IQ4_NL and Q5_1 use 32.
+// Historical name for the native GGML block-quantized family. K formats and
+// IQ4_XS use 256-value blocks; NVFP4 uses 64 and the listed legacy formats use 32.
 [[nodiscard]] inline constexpr bool is_qnk_dtype(DType dtype) noexcept
 {
     return dtype == DType::Q2K || dtype == DType::Q3K || dtype == DType::Q4K
            || dtype == DType::Q5K || dtype == DType::Q6K || dtype == DType::Q8K
            || dtype == DType::Q8_0 || dtype == DType::IQ4NL || dtype == DType::Q5_1
            || dtype == DType::Q4_0 || dtype == DType::Q4_1 || dtype == DType::Q5_0
-           || dtype == DType::IQ4XS;
+           || dtype == DType::IQ4XS || dtype == DType::NvFp4;
 }
 
 enum class NormType

@@ -163,6 +163,7 @@ private:
         case DType::Q4_1:
         case DType::Q5_0:
         case DType::IQ4XS:
+        case DType::NvFp4:
         case DType::Int4:
             return 0;
         }

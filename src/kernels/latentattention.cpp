@@ -5,6 +5,7 @@
 #include "backends/ncnn/latentattention_vulkan.h"
 #include "fastmath.h"
 #include "float8.h"
+#include "mxfp4.h"
 #include "qnk.h"
 #include "ops.h"
 #include "statecache.h"
@@ -587,9 +588,11 @@ static void matrix_rows_dot(const TensorData& matrix,
         {
             const uint32_t row = first_row + index;
             float sum = 0.0f;
-            if (is_qnk_dtype(matrix.dtype))
+            if (matrix.dtype == DType::MxFp4 || is_qnk_dtype(matrix.dtype))
             {
-                const uint8_t* weights = matrix.qnk_values().data() + row * qnk_storage_bytes(matrix.dtype, 1, columns);
+                const bool mxfp4 = matrix.dtype == DType::MxFp4;
+                const uint8_t* weights = mxfp4 ? matrix.mxfp4_blocks.data() + static_cast<size_t>(row) * (columns / 2)
+                                               : matrix.qnk_values().data() + row * qnk_storage_bytes(matrix.dtype, 1, columns);
                 for (uint32_t column = 0; column < columns; column += qnk_block_size(matrix.dtype))
                 {
                     const float* block_input = input + column;
@@ -599,7 +602,10 @@ static void matrix_rows_dot(const TensorData& matrix,
                             gathered[lane] = input[matrix.input_column_indices[column + lane]];
                         block_input = gathered.data();
                     }
-                    sum += qnk_dot_block(matrix.dtype, weights + (column / qnk_block_size(matrix.dtype)) * qnk_block_bytes(matrix.dtype), block_input);
+                    sum += mxfp4 ? mxfp4_dot(weights + column / 2,
+                                             matrix.mxfp4_scales.data() + static_cast<size_t>(row) * (columns / 32) + column / 32,
+                                             1, block_input)
+                                 : qnk_dot_block(matrix.dtype, weights + (column / qnk_block_size(matrix.dtype)) * qnk_block_bytes(matrix.dtype), block_input);
                 }
             }
             else
