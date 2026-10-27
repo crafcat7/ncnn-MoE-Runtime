@@ -63,7 +63,7 @@ static Result<void> prepare_vulkan_linear_operator(WeightStore& weights,
             return Error{ErrorCode::InternalError, "failed to create Vulkan FP8 Linear operator"};
         return {};
     }
-    if (matrix.dtype == DType::Int4 || is_qnk_dtype(matrix.dtype)
+    if (matrix.dtype == DType::Int4 || matrix.dtype == DType::MxFp4 || is_qnk_dtype(matrix.dtype)
         || (input_group_count > 1 && (matrix.dtype == DType::BFloat16 || matrix.dtype == DType::Float32)))
     {
         if (matrix.dtype == DType::Int4 || !is_qnk_dtype(matrix.dtype)
@@ -236,7 +236,7 @@ static uint64_t gated_delta_vulkan_working_set_size(const CompiledModel& compile
                                     layer.attention.output_weight};
     const bool quantized = std::any_of(std::begin(handles), std::end(handles), [&](TensorHandle handle) {
         const DType dtype = compiled.weights.at(handle).dtype;
-        return dtype == DType::Int4 || is_qnk_dtype(dtype);
+        return dtype == DType::Int4 || dtype == DType::MxFp4 || is_qnk_dtype(dtype);
     });
     if (quantized)
     {
@@ -370,6 +370,7 @@ static bool standard_attention_requires_native(const CompiledModel& compiled,
         has_native_quantized_projection = has_native_quantized_projection
                                           || dtype == DType::Int4
                                           || dtype == DType::Float8E4M3
+                                          || dtype == DType::MxFp4
                                           || is_qnk_dtype(dtype);
         all_bfloat16 = all_bfloat16 && dtype == DType::BFloat16;
     }
@@ -410,7 +411,7 @@ static bool standard_attention_native_compatible(const CompiledModel& compiled,
         if (handle == invalid_tensor_handle)
             continue;
         const DType dtype = compiled.weights.at(handle).dtype;
-        if (dtype != DType::Int4 && !is_qnk_dtype(dtype)
+        if (dtype != DType::Int4 && dtype != DType::MxFp4 && !is_qnk_dtype(dtype)
             && dtype != DType::BFloat16 && dtype != DType::Float32
             && dtype != DType::Float8E4M3)
         {
@@ -630,7 +631,7 @@ static Result<void> prepare_shared_expert_operators(WeightStore& weights,
     const TensorData& gate = weights.at(shared.gate_weight);
     const TensorData& up = weights.at(shared.up_weight);
     const bool has_router_gate = moe.shared_expert_gate_weight != invalid_tensor_handle;
-    const auto quantized = [](DType dtype) { return dtype == DType::Int4 || is_qnk_dtype(dtype); };
+    const auto quantized = [](DType dtype) { return dtype == DType::Int4 || dtype == DType::MxFp4 || is_qnk_dtype(dtype); };
     if (quantized(gate.dtype) || quantized(up.dtype) || quantized(weights.at(shared.down_weight).dtype))
     {
         auto prepared = prepare_ffn_operators(weights, operators, shared, vulkan_device_index,
@@ -720,7 +721,7 @@ static Result<void> prepare_vulkan_qkv_operator(CompiledModel& compiled,
         value_bias_data,
     };
     if (std::any_of(qkv_matrices.begin(), qkv_matrices.end(), [](const TensorData* matrix) {
-            return matrix->dtype == DType::Int4 || matrix->dtype == DType::Float8E4M3 || is_qnk_dtype(matrix->dtype);
+            return matrix->dtype == DType::Int4 || matrix->dtype == DType::MxFp4 || matrix->dtype == DType::Float8E4M3 || is_qnk_dtype(matrix->dtype);
         }))
     {
         const TensorHandle handles[] = {plan.query_weight, plan.key_weight, plan.value_weight};
@@ -940,7 +941,7 @@ static void prepare_gated_delta_attention_operators(CompiledModel& compiled,
         nullptr,
     };
     const TensorData& output_matrix = compiled.weights.at(plan.output_weight);
-    const auto native_projection = [](const TensorData& weight) { return weight.dtype == DType::Float32 || weight.dtype == DType::Int4 || is_qnk_dtype(weight.dtype); };
+    const auto native_projection = [](const TensorData& weight) { return weight.dtype == DType::Float32 || weight.dtype == DType::Int4 || weight.dtype == DType::MxFp4 || is_qnk_dtype(weight.dtype); };
     if (native_projection(output_matrix)
         || std::any_of(delta_input_matrices.begin(), delta_input_matrices.end(), [&](const TensorData* weight) { return native_projection(*weight); }))
     {

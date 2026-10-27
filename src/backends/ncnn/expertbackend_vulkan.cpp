@@ -659,7 +659,7 @@ static uint64_t native_expert_storage_bytes(const TensorData& gate_up, const Ten
                                             const TensorData& down, const VulkanContext& context,
                                             uint64_t optimization_flags)
 {
-    const auto quantized = [](DType dtype) { return dtype == DType::Int4 || is_qnk_dtype(dtype); };
+    const auto quantized = [](DType dtype) { return dtype == DType::Int4 || dtype == DType::MxFp4 || is_qnk_dtype(dtype); };
     if (gate_up.shape.size() != 2 || down.shape.size() != 2
         || (!up && !quantized(gate_up.dtype) && !quantized(down.dtype)
             && gate_up.dtype != DType::Float32 && down.dtype != DType::Float32)
@@ -700,6 +700,12 @@ static uint64_t native_expert_storage_bytes(const TensorData& gate_up, const Ten
             if (!validate_int4_tensor(*matrix))
                 return 0;
         }
+        else if (matrix->dtype == DType::MxFp4)
+        {
+            if (!has_flag(optimization_flags, OptimizationVulkanQnK)
+                || !validate_input_column_indices(*matrix))
+                return 0;
+        }
         else if (!has_flag(optimization_flags, OptimizationVulkanQnK)
                  || !is_qnk_dtype(matrix->dtype)
                  || !qnk_shape_supported(matrix->dtype, matrix->shape[0], matrix->shape[1])
@@ -720,6 +726,14 @@ static uint64_t native_expert_storage_bytes(const TensorData& gate_up, const Ten
         size += part;
     }
     return size;
+}
+
+static bool is_packed_mxfp4_expert(const TensorData* gate_up,
+                                   const TensorData* up,
+                                   const TensorData* down) noexcept
+{
+    return !up && gate_up && down
+           && gate_up->dtype == DType::MxFp4 && down->dtype == DType::MxFp4;
 }
 
 static uint64_t executable_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
@@ -755,7 +769,7 @@ static uint64_t executable_expert_storage_bytes(const TensorData& gate_up, const
                                  && down.shape[1] == gate_up.shape[0] / 2
                                  && gate_up.bfloat16_values().size() == gate_up.element_count()
                                  && down.bfloat16_values().size() == down.element_count();
-    const bool mxfp4_expert = !up && gate_up.dtype == DType::MxFp4 && down.dtype == DType::MxFp4
+    const bool mxfp4_expert = is_packed_mxfp4_expert(&gate_up, up, &down)
                               && gate_up.shape[0] % 2 == 0 && down.shape[1] == gate_up.shape[0] / 2
                               && valid_mxfp4_matrix(gate_up) && valid_mxfp4_matrix(down);
     const auto quantized = [](DType dtype) { return dtype == DType::Int4 || is_qnk_dtype(dtype); };
@@ -970,7 +984,7 @@ bool VulkanExpertBackend::prepare_admission(PendingAdmission admission,
         try
         {
             std::optional<VulkanWeightUploadBatch> upload_batch;
-            if (admission.gate_up->dtype == DType::MxFp4)
+            if (is_packed_mxfp4_expert(admission.gate_up.get(), admission.up.get(), admission.down.get()))
                 upload_batch.emplace(vulkan_context, admission_staging_allocator.get(), &admission_upload_scratch);
             loaded = create_entry(admission, upload_batch ? &*upload_batch : nullptr);
             if (loaded && upload_batch) upload_succeeded = upload_batch->submit();
@@ -1023,7 +1037,7 @@ size_t VulkanExpertBackend::prepare_demand_batch(std::span<const ExpertDemandReq
 {
     for (auto& pin : pins) pin.reset();
     if (requests.empty() || requests.size() != pins.size()) return 0;
-    if (requests.front().up || !requests.front().gate_up || requests.front().gate_up->dtype != DType::MxFp4)
+    if (!is_packed_mxfp4_expert(requests.front().gate_up.get(), requests.front().up.get(), requests.front().down.get()))
         return ExpertBackend::prepare_demand_batch(requests, pins);
 
     static constexpr size_t maximum_requests = 8;
@@ -1034,7 +1048,7 @@ size_t VulkanExpertBackend::prepare_demand_batch(std::span<const ExpertDemandReq
     for (size_t index = 0; index < limit; ++index)
     {
         const auto& request = requests[index];
-        if (request.up || !request.gate_up || request.gate_up->dtype != DType::MxFp4) break;
+        if (!is_packed_mxfp4_expert(request.gate_up.get(), request.up.get(), request.down.get())) break;
         PendingAdmission admission;
         try
         {
@@ -1439,7 +1453,7 @@ std::shared_ptr<VulkanExpertBackend::Entry> VulkanExpertBackend::create_entry(co
                                                                               VulkanWeightUploadBatch* upload_batch)
 {
     std::shared_ptr<Entry> entry = std::make_shared<Entry>();
-    if (admission.gate_up->dtype == DType::MxFp4)
+    if (is_packed_mxfp4_expert(admission.gate_up.get(), admission.up.get(), admission.down.get()))
     {
         entry->operation = Mxfp4Expert_vulkan::create_with_allocator(*admission.gate_up,
                                                                      admission.gate_up_bias.get(),
@@ -2524,10 +2538,10 @@ void VulkanExpertBackend::worker_loop()
             pending.pop_front();
             ++active_admissions;
             if (has_flag(optimization_flags, OptimizationVulkanExpertBatchAdmission)
-                && batch.front().gate_up && batch.front().gate_up->dtype == DType::MxFp4)
+                && is_packed_mxfp4_expert(batch.front().gate_up.get(), batch.front().up.get(), batch.front().down.get()))
             {
                 while (batch.size() < maximum_upload_batch && !pending.empty()
-                       && pending.front().gate_up && pending.front().gate_up->dtype == DType::MxFp4)
+                       && is_packed_mxfp4_expert(pending.front().gate_up.get(), pending.front().up.get(), pending.front().down.get()))
                 {
                     batch.push_back(std::move(pending.front()));
                     pending.pop_front();
@@ -2540,7 +2554,7 @@ void VulkanExpertBackend::worker_loop()
         try
         {
             std::optional<VulkanWeightUploadBatch> upload_batch;
-            if (batch.front().gate_up->dtype == DType::MxFp4)
+            if (is_packed_mxfp4_expert(batch.front().gate_up.get(), batch.front().up.get(), batch.front().down.get()))
                 upload_batch.emplace(vulkan_context, admission_staging_allocator.get(), &admission_upload_scratch);
             for (size_t index = 0; index < batch.size(); ++index)
                 loaded[index] = create_entry(batch[index], upload_batch ? &*upload_batch : nullptr);

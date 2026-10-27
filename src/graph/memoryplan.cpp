@@ -1100,6 +1100,7 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
         // allocation and metadata byte, including when a mapped view coexists.
         if (mapped_ple_embedding_shard(name, tensor, descriptor) && tensor.mapped_size <= bytes)
             bytes -= tensor.mapped_size;
+        uint64_t file_size = 0;
         if (tensor.mxfp4_file_storage)
         {
             const auto& storage = *tensor.mxfp4_file_storage;
@@ -1112,7 +1113,8 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
             stored = checked_add(stored.value(), storage.secondary_scales_size, "mapped Expert scales");
             if (!stored)
                 return stored.error();
-            auto total = checked_add(bytes, stored.value(), "mapped Expert storage");
+            file_size = stored.value();
+            auto total = checked_add(bytes, file_size, "mapped Expert storage");
             if (!total)
                 return total.error();
             bytes = total.value();
@@ -1128,15 +1130,7 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
             if (!total)
                 return total.error();
             expert_size.total = total.value();
-            if (!is_qnk_dtype(tensor.dtype))
-            {
-                auto resident = checked_add(expert_fixed_size, bytes,
-                                            "resident non-Qn_K Expert weights");
-                if (!resident)
-                    return resident.error();
-                expert_fixed_size = resident.value();
-            }
-            if (is_qnk_dtype(tensor.dtype))
+            if (tensor.dtype == DType::MxFp4 || is_qnk_dtype(tensor.dtype))
             {
                 if (tensor.input_column_indices.size()
                     > std::numeric_limits<uint64_t>::max() / sizeof(uint32_t))
@@ -1156,19 +1150,20 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
                     return expert_total.error();
                 expert_size.metadata = expert_total.value();
 
-                if (tensor.mxfp4_file_storage)
-                {
-                    const MxFp4FileStorage& storage = *tensor.mxfp4_file_storage;
-                    auto raw_size = checked_add(storage.blocks_size,
-                                                storage.secondary_blocks_size,
-                                                "Qn_K Expert blocks");
-                    if (!raw_size)
-                        return raw_size.error();
-                    auto expert_raw_size = checked_add(expert_size.raw, raw_size.value(), "Qn_K Expert blocks");
-                    if (!expert_raw_size)
-                        return expert_raw_size.error();
-                    expert_size.raw = expert_raw_size.value();
-                }
+                if (metadata > bytes)
+                    return Error{ErrorCode::InvalidModel, "Expert metadata exceeds its storage"};
+                const uint64_t raw_size = tensor.mxfp4_file_storage ? file_size : bytes - metadata;
+                auto raw = checked_add(expert_size.raw, raw_size, "native Expert blocks");
+                if (!raw)
+                    return raw.error();
+                expert_size.raw = raw.value();
+            }
+            else
+            {
+                auto resident = checked_add(expert_fixed_size, bytes, "resident non-Qn_K Expert weights");
+                if (!resident)
+                    return resident.error();
+                expert_fixed_size = resident.value();
             }
         }
         else
@@ -1482,7 +1477,8 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
             eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - cache_safety_reserve;
         }
     }
-    if (plan.selected_mode == ExpertMemoryMode::OnDemand && file_backed_qnk_experts)
+    if (plan.selected_mode == ExpertMemoryMode::OnDemand
+        && (file_backed_qnk_experts || (weights && moe.expert_weight_dtype == DType::MxFp4)))
     {
         auto fixed_resident = checked_add(plan.estimated_dense_size, expert_fixed_size,
                                           "fixed Qn_K Expert weights");

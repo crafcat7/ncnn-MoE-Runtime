@@ -10,6 +10,7 @@
 #include "graph/compiledmodel.h"
 #include "kernels/statecache.h"
 #include "kernels/qnk.h"
+#include "kernels/mxfp4.h"
 #include <algorithm>
 #include <bit>
 #include <cstring>
@@ -235,7 +236,8 @@ std::shared_ptr<QwenLayer_vulkan> QwenLayer_vulkan::create(const CompiledModel& 
             if (table.shape.size() != 2 || table.shape[1] != impl.ple.embedding_dimension / heads
                 || (table.dtype != DType::IQ4NL && table.dtype != DType::IQ4XS && table.dtype != DType::Q4_0
                     && table.dtype != DType::Q4_1 && table.dtype != DType::Q5_0 && table.dtype != DType::Q5_1
-                    && table.dtype != DType::Q8_0 && table.dtype != DType::BFloat16 && table.dtype != DType::Float32)) return {};
+                    && table.dtype != DType::Q8_0 && table.dtype != DType::MxFp4 && table.dtype != DType::NvFp4
+                    && table.dtype != DType::BFloat16 && table.dtype != DType::Float32)) return {};
         }
         const std::lock_guard<std::mutex> lock(impl.context->command_mutex());
         impl.pipeline = qwen_pipeline(impl.context, impl.opt);
@@ -301,6 +303,7 @@ static bool qwen_ple_rows(const WeightStore& weights, const PleBlockPlan& plan,
     const auto& first = weights.at(plan.embedding_shards.front());
     const size_t bytes = first.dtype == DType::BFloat16  ? dimension * sizeof(uint16_t)
                          : first.dtype == DType::Float32 ? dimension * sizeof(float)
+                         : first.dtype == DType::MxFp4   ? (dimension % 32 == 0 ? static_cast<size_t>(dimension / 32) * 17 : 0)
                                                          : qnk_storage_bytes(first.dtype, 1, dimension);
     if (bytes == 0 || bytes > UINT32_MAX - 3) return false;
     stride = static_cast<uint32_t>((bytes + 3) / 4 * 4);
@@ -315,6 +318,8 @@ static bool qwen_ple_rows(const WeightStore& weights, const PleBlockPlan& plan,
     case DType::IQ4NL: encoding = 20; break;
     case DType::IQ4XS: encoding = 23; break;
     case DType::BFloat16: encoding = 30; break;
+    case DType::MxFp4: encoding = 39; break;
+    case DType::NvFp4: encoding = 40; break;
     default: return false;
     }
     packed.reset(tokens.size() * heads, stride / sizeof(float), true);
@@ -354,28 +359,42 @@ static bool qwen_ple_rows(const WeightStore& weights, const PleBlockPlan& plan,
                         continue;
                     }
                     if (table.dtype != first.dtype || table.shape[1] != dimension) return false;
-                    const uint8_t* source;
-                    size_t source_size;
-                    if (table.dtype == DType::BFloat16)
+                    if (table.dtype == DType::MxFp4)
                     {
-                        const auto view = table.bfloat16_values();
-                        source = reinterpret_cast<const uint8_t*>(view.data());
-                        source_size = view.size_bytes();
-                    }
-                    else if (table.dtype == DType::Float32)
-                    {
-                        const auto view = table.float32_values();
-                        source = reinterpret_cast<const uint8_t*>(view.data());
-                        source_size = view.size_bytes();
+                        const size_t blocks = dimension / 32;
+                        const size_t offset = static_cast<size_t>(index) * blocks;
+                        auto destination = packed.mutable_row_bytes(row * heads + head);
+                        if (offset > table.mxfp4_scales.size() || blocks > table.mxfp4_scales.size() - offset
+                            || offset * 16 > table.mxfp4_blocks.size() || blocks * 16 > table.mxfp4_blocks.size() - offset * 16
+                            || !pack_gguf_mxfp4(std::span<const uint8_t>(table.mxfp4_blocks.data() + offset * 16, blocks * 16),
+                                                std::span<const uint8_t>(table.mxfp4_scales.data() + offset, blocks),
+                                                {reinterpret_cast<uint8_t*>(destination.data()), bytes})) return false;
                     }
                     else
                     {
-                        const auto view = table.qnk_values();
-                        source = view.data();
-                        source_size = view.size();
+                        const uint8_t* source;
+                        size_t source_size;
+                        if (table.dtype == DType::BFloat16)
+                        {
+                            const auto view = table.bfloat16_values();
+                            source = reinterpret_cast<const uint8_t*>(view.data());
+                            source_size = view.size_bytes();
+                        }
+                        else if (table.dtype == DType::Float32)
+                        {
+                            const auto view = table.float32_values();
+                            source = reinterpret_cast<const uint8_t*>(view.data());
+                            source_size = view.size_bytes();
+                        }
+                        else
+                        {
+                            const auto view = table.qnk_values();
+                            source = view.data();
+                            source_size = view.size();
+                        }
+                        if (!source || index * bytes > source_size || bytes > source_size - index * bytes) return false;
+                        std::memcpy(packed.mutable_row_bytes(row * heads + head).data(), source + index * bytes, bytes);
                     }
-                    if (!source || index * bytes > source_size || bytes > source_size - index * bytes) return false;
-                    std::memcpy(packed.mutable_row_bytes(row * heads + head).data(), source + index * bytes, bytes);
                     found = true;
                     break;
                 }

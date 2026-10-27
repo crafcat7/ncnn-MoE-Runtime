@@ -69,6 +69,27 @@ float qnk_f16(uint index)
 // GGML IQ4_NL stores codebook indices rather than signed/affine INT4 codes.
 const int iq4_nl_values[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10,
                                       1, 13, 25, 38, 53, 69, 89, 113);
+// ggml stores E2M1 values doubled in this shared MXFP4/NVFP4 lookup table.
+const int fp4_values_doubled[16] = int[16](0, 1, 2, 3, 4, 6, 8, 12,
+                                           0, -1, -2, -3, -4, -6, -8, -12);
+
+float qnk_e8m0_to_fp32_half(uint value)
+{
+    const uint bits = value < 2u ? (0x00200000u << value) : ((value - 1u) << 23u);
+    return uintBitsToFloat(bits);
+}
+
+float qnk_ue4m3_to_fp32(uint value)
+{
+    if (value == 0u || value == 0x7fu)
+        return 0.0;
+    const uint exponent = (value >> 3u) & 15u;
+    const uint mantissa = value & 7u;
+    if (exponent == 0u)
+        return float(mantissa) * (1.0 / 1024.0);
+    const float scale = uintBitsToFloat((exponent + 119u) << 23u);
+    return scale * (1.0 + float(mantissa) * 0.125);
+}
 
 float projection_input(uint row, uint column)
 {
@@ -234,6 +255,43 @@ void main()
                 const float weight = p.qnk_type == 7u ? uintBitsToFloat(qnk_u16(matrix_row + column * 2u) << 16u)
                                                       : uintBitsToFloat(qnk_u32(matrix_row + column * 4u));
                 sum += weight * projection_input(input_row, column);
+            }
+        }
+        else if (p.qnk_type == 16u)
+        {
+            // GGUF NVFP4 uses a 64-value, 36-byte block: four UE4M3 scale
+            // bytes followed by 32 sequential low/high-nibble E2M1 codes.
+            const uint matrix_row = output_column * p.block_count * p.block_bytes;
+            for (uint block = 0u; block < p.block_count; ++block)
+            {
+                const uint block_offset = matrix_row + block * p.block_bytes;
+                for (uint part = 0u; part < 2u; ++part)
+                {
+                    const uint within = part * 32u + lane;
+                    const uint subblock = within >> 4u;
+                    const uint sublane = within & 15u;
+                    const uint packed = qnk_byte(block_offset + 4u + subblock * 8u + (sublane & 7u));
+                    const uint code = (packed >> (sublane < 8u ? 0u : 4u)) & 15u;
+                    const float scale = qnk_ue4m3_to_fp32(qnk_byte(block_offset + subblock));
+                    const float weight = scale * float(fp4_values_doubled[code]);
+                    const uint column = block * 64u + within;
+                    sum += weight * projection_input(input_row, column);
+                }
+            }
+        }
+        else if (p.qnk_type == 17u)
+        {
+            // The temporary GGUF type-39 view keeps each 17-byte block as
+            // [E8M0 scale, sequential low/high-nibble E2M1 codes].
+            const uint matrix_row = output_column * p.block_count * p.block_bytes;
+            for (uint block = 0u; block < p.block_count; ++block)
+            {
+                const uint block_offset = matrix_row + block * p.block_bytes;
+                const uint packed = qnk_byte(block_offset + 1u + (lane & 15u));
+                const uint code = (packed >> (lane < 16u ? 0u : 4u)) & 15u;
+                const float scale = qnk_e8m0_to_fp32_half(qnk_byte(block_offset));
+                const float weight = scale * float(fp4_values_doubled[code]);
+                sum += weight * projection_input(input_row, block * 32u + lane);
             }
         }
         else if (p.qnk_type == 9u)

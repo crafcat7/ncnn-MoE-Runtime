@@ -72,6 +72,30 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
     std::array<SessionStatistics, 2> actual_statistics;
     const std::array<std::vector<int32_t>, 2> prompts = {{{1, 2, 3}, {3, 2}}};
     const std::string family = reference.descriptor.model_type;
+    size_t fp4_weights = 0;
+    for (TensorHandle handle = 0; handle < candidate.weights.size(); ++handle)
+    {
+        const TensorData& weight = candidate.weights.at(handle);
+        if (weight.dtype != DType::MxFp4 && weight.dtype != DType::NvFp4)
+            continue;
+        ++fp4_weights;
+        check(weight.float32_data.empty() && weight.bfloat16_data.empty()
+                  && weight.int8_data.empty() && weight.int64_data.empty(),
+              family + ": native FP4 retained expanded weight storage");
+        check(weight.shape.size() == 2, family + ": native FP4 weight lost its matrix shape");
+        if (weight.dtype == DType::MxFp4)
+        {
+            check(weight.quantized_data.empty() && !weight.mapped_data,
+                  family + ": MXFP4 retained unrelated packed storage");
+            if (!weight.mxfp4_file_storage)
+                check(weight.mxfp4_blocks.size() == weight.element_count() / 2
+                          && weight.mxfp4_scales.size() == weight.element_count() / 32,
+                      family + ": MXFP4 lost native code/scale storage");
+        }
+        else if (!weight.mxfp4_file_storage)
+            check(weight.qnk_values().size() == qnk_storage_bytes(weight.dtype, weight.shape[0], weight.shape[1]),
+                  family + ": NVFP4 lost native block storage");
+    }
     std::vector<size_t> standard_gqa_layers;
     for (size_t layer_index = 0; layer_index < candidate.descriptor.layers.size(); ++layer_index)
     {
@@ -165,12 +189,19 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
         }
     }
     const auto counters = get_vulkan_statistics(candidate.vulkan_runtime);
+    if (hybrid && fp4_weights != 0)
+    {
+        for (const auto& statistics : actual_statistics)
+            check(statistics.model_compute_cpu_fallbacks == 0 && statistics.vulkan_attention_cpu_fallbacks == 0,
+                  family + ": native FP4 model execution fell back to CPU");
+    }
     if (hybrid)
     {
         bool native_blocks = false;
         for (TensorHandle handle = 0; handle < candidate.weights.size(); ++handle)
         {
-            native_blocks = native_blocks || is_qnk_dtype(candidate.weights.at(handle).dtype);
+            const DType dtype = candidate.weights.at(handle).dtype;
+            native_blocks = native_blocks || dtype == DType::MxFp4 || is_qnk_dtype(dtype);
         }
         if (native_blocks)
         {
@@ -191,7 +222,7 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
                         check(handle != invalid_tensor_handle,
                               family + ": GQA projection is missing from the compiled graph");
                         const DType dtype = candidate.weights.at(handle).dtype;
-                        const bool native = dtype == DType::Int4 || is_qnk_dtype(dtype);
+                        const bool native = dtype == DType::Int4 || dtype == DType::MxFp4 || is_qnk_dtype(dtype);
                         const bool dense = dtype == DType::BFloat16 || dtype == DType::Float32;
                         check(native || dense,
                               family + ": GQA projection has an unsupported GGUF dtype");
@@ -265,7 +296,8 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
               << " int4=" << counters.int4_dispatches
               << " attention=" << counters.attention_blocks << " gated_delta=" << counters.gated_delta_fusions
               << " expert_gpu=" << experts.executions << " expert_gpu_failures=" << experts.execution_failures
-              << " host_cache_reads=" << host_cache.bytes_read << " host_cache_misses=" << host_cache.misses << '\n';
+              << " host_cache_reads=" << host_cache.bytes_read << " host_cache_misses=" << host_cache.misses
+              << " fp4_weights=" << fp4_weights << '\n';
 }
 
 } // namespace moe
@@ -340,12 +372,13 @@ int main(int argc, char** argv)
                         ncnn::moe::check(handle != ncnn::moe::invalid_tensor_handle,
                                          "on-demand Expert is missing its cached projection");
                         const auto& tensor = candidate.weights.at(handle);
-                        if (!ncnn::moe::is_qnk_dtype(tensor.dtype))
+                        if (tensor.dtype != ncnn::moe::DType::MxFp4 && !ncnn::moe::is_qnk_dtype(tensor.dtype))
                             continue;
                         qnk_experts = true;
                         ncnn::moe::check(tensor.mxfp4_file_storage && !tensor.mapped_data
-                                             && tensor.quantized_data.empty() && tensor.qnk_values().empty(),
-                                         "on-demand Qn_K projection retained resident payload");
+                                             && tensor.quantized_data.empty() && tensor.qnk_values().empty()
+                                             && tensor.mxfp4_blocks.empty() && tensor.mxfp4_scales.empty(),
+                                         "on-demand native projection retained resident payload");
                     }
                 }
             }

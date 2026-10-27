@@ -882,8 +882,8 @@ Result<void> ModelLoader::configure_resident_quantized_backend()
                                            ? &model.weights.at(expert.up_weight)
                                            : nullptr;
                 const auto quantized = [&](const TensorData& matrix) {
-                    return matrix.dtype == DType::Int4 || is_qnk_dtype(matrix.dtype)
-                           || (model.qwen_device_chain && (matrix.dtype == DType::BFloat16 || matrix.dtype == DType::Float32 || matrix.dtype == DType::MxFp4));
+                    return matrix.dtype == DType::Int4 || matrix.dtype == DType::MxFp4 || is_qnk_dtype(matrix.dtype)
+                           || (model.qwen_device_chain && (matrix.dtype == DType::BFloat16 || matrix.dtype == DType::Float32));
                 };
                 if (expert.use_gpu_cache
                     || ((quantized(gate_up) || quantized(down) || (up && quantized(*up)))

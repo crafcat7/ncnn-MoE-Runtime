@@ -44,11 +44,13 @@ def floating_copy(source: Path, destination: Path) -> None:
     writer.close()
 
 
-def mxfp4_copy(fixture, directory: Path) -> tuple[Path, Path]:
-    """Independent E2M1 codes, exponent scales, and GGUF half-block packing."""
+def fp4_copy(fixture, directory: Path, format_name: str) -> tuple[Path, Path]:
+    """Build independently packed MXFP4 or NVFP4 Expert banks and their baseline."""
+    if format_name not in ("MXFP4", "NVFP4"):
+        raise ValueError(f"unsupported FP4 format: {format_name}")
     gguf = fixtures.gguf
     reader = gguf.GGUFReader(fixture.source)
-    destination = directory / "mxfp4.gguf"
+    destination = directory / f"{format_name.lower()}.gguf"
     architecture = reader.fields["general.architecture"].contents()
     writer = gguf.GGUFWriter(destination, architecture)
     for name, field in reader.fields.items():
@@ -56,21 +58,41 @@ def mxfp4_copy(fixture, directory: Path) -> tuple[Path, Path]:
             writer.add_key_value(name, field.contents(), field.types[0], field.types[-1] if len(field.types) > 1 else None)
     reference = {name: (info.dtype, info.read().copy())
                  for name, info in fixtures.importer.scan_safetensors(fixture.baseline).items()}
-    table = np.asarray([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6], np.float32)
+    table = np.asarray([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6]
+                       if format_name == "MXFP4" else [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12],
+                       np.float32)
     for index, tensor in enumerate(reader.tensors):
         match = re.fullmatch(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight", tensor.name)
         if not match:
             writer.add_tensor(tensor.name, np.array(tensor.data), raw_dtype=tensor.tensor_type)
             continue
         shape = tuple(int(value) for value in tensor.shape[::-1])
-        codes = np.random.default_rng(index).integers(0, 16, shape, dtype=np.uint8)
-        grouped = codes.reshape(*shape[:-1], shape[-1] // 32, 32)
-        exponents = np.random.default_rng(index + 100).integers(118, 122, grouped.shape[:-1], dtype=np.uint8)
-        raw = np.empty((*grouped.shape[:-1], 17), np.uint8)
-        raw[..., 0] = exponents
-        raw[..., 1:] = grouped[..., :16] | (grouped[..., 16:] << 4)
-        writer.add_tensor(tensor.name, raw.reshape(*shape[:-1], -1), raw_dtype=gguf.GGMLQuantizationType.MXFP4)
-        decoded = (table[grouped] * np.exp2(exponents.astype(np.float32)[..., None] - 127)).reshape(shape)
+        code_seed = index if format_name == "MXFP4" else index + 300
+        codes = np.random.default_rng(code_seed).integers(0, 16, shape, dtype=np.uint8)
+        if format_name == "MXFP4":
+            grouped = codes.reshape(*shape[:-1], shape[-1] // 32, 32)
+            exponents = np.random.default_rng(index + 100).integers(118, 122, grouped.shape[:-1], dtype=np.uint8)
+            raw = np.empty((*grouped.shape[:-1], 17), np.uint8)
+            raw[..., 0] = exponents
+            raw[..., 1:] = grouped[..., :16] | (grouped[..., 16:] << 4)
+            scale_values = np.exp2(exponents.astype(np.float32) - 127)
+            dtype = gguf.GGMLQuantizationType.MXFP4
+        else:
+            columns = shape[-1]
+            grouped = codes.reshape(*shape[:-1], columns // 64, 4, 16)
+            rng = np.random.default_rng(index + 600)
+            exponents = rng.integers(0, 2, grouped.shape[:-1], dtype=np.uint8)
+            mantissas = rng.integers(1, 8, grouped.shape[:-1], dtype=np.uint8)
+            scale_bytes = (exponents << 3) | mantissas
+            raw = np.empty((*shape[:-1], columns // 64, 36), np.uint8)
+            raw[..., :4] = scale_bytes
+            raw[..., 4:] = (grouped[..., :8] | (grouped[..., 8:] << 4)).reshape(
+                *shape[:-1], columns // 64, 32)
+            scale_values = np.where(exponents == 0, mantissas.astype(np.float32) * 2 ** -10,
+                                    (1 + mantissas.astype(np.float32) / 8) * np.exp2(exponents.astype(np.float32) - 8))
+            dtype = gguf.GGMLQuantizationType.NVFP4
+        writer.add_tensor(tensor.name, raw.reshape(*shape[:-1], -1), raw_dtype=dtype)
+        decoded = (table[grouped] * scale_values[..., None]).reshape(shape)
         for expert in range(shape[0]):
             if architecture == "deepseek4":
                 role = {"gate": "w1", "up": "w3", "down": "w2"}[match[2]]
@@ -83,7 +105,7 @@ def mxfp4_copy(fixture, directory: Path) -> tuple[Path, Path]:
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
     writer.close()
-    baseline = directory / "mxfp4-baseline"
+    baseline = directory / f"{format_name.lower()}-baseline"
     fixtures.assets(baseline, json.loads((fixture.baseline / "config.json").read_text()))
     fixtures.write_safetensors(baseline / "model.safetensors", reference)
     return baseline, destination
@@ -147,7 +169,7 @@ def q8_0_copy(baseline: Path, source: Path, directory: Path, label: str) -> tupl
         converted.add(tensor.name)
     assert {"token_embd.weight", "output.weight", "blk.0.attn_q_a.weight", "blk.0.attn_output_a.weight",
             "blk.0.ffn_gate_shexp.weight", "blk.0.ffn_up_shexp.weight", "blk.0.ffn_down_shexp.weight"} <= converted
-    if "mxfp4" not in label:
+    if "fp4" not in label:
         assert "blk.0.ffn_gate_exps.weight" in converted
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -330,8 +352,10 @@ def main() -> int:
                     return 77
                 completed.check_returncode()
             if moe:
-                mxfp4 = mxfp4_copy(fixture, directory)
-                deferred = [(fixture.baseline, fixture.source, "QnK"), (*mxfp4, "MXFP4")]
+                mxfp4 = fp4_copy(fixture, directory, "MXFP4")
+                nvfp4 = fp4_copy(fixture, directory, "NVFP4")
+                deferred = [(fixture.baseline, fixture.source, "QnK"),
+                            (*mxfp4, "MXFP4"), (*nvfp4, "NVFP4")]
                 for baseline, source, encoding in deferred:
                     command = [str(args.runner.resolve()), str(baseline), str(source), "--on-demand"]
                     if args.hybrid:
@@ -342,8 +366,10 @@ def main() -> int:
                         return 77
                     completed.check_returncode()
                 if family == "deepseek_v4":
-                    for baseline, source in (q8_0_copy(fixture.baseline, fixture.source, directory, "q8_0"),
-                                             q8_0_copy(*mxfp4, directory, "q8_0-mxfp4")):
+                    mixed_sources = (q8_0_copy(fixture.baseline, fixture.source, directory, "q8_0"),
+                                     q8_0_copy(*mxfp4, directory, "q8_0-mxfp4"),
+                                     q8_0_copy(*nvfp4, directory, "q8_0-nvfp4"))
+                    for baseline, source in mixed_sources:
                         for on_demand in (False, True):
                             command = [str(args.runner.resolve()), str(baseline), str(source)]
                             if on_demand:
@@ -382,6 +408,24 @@ def main() -> int:
             run_graph(label, mixed.baseline, mixed.source)
             if moe:
                 run_graph(label, mixed.baseline, mixed.source, on_demand=True)
+            for fp4_format in ("MXFP4", "NVFP4"):
+                fp4_root = root / (label + "-" + fp4_format.lower() + "-all-matrices")
+                fp4_root.mkdir()
+                # Keep decoded native matrices near the fixture activation scale and use an exact FP32 oracle.
+                with patch.object(fixtures.gguf, "GGUFWriter", writer), patch.object(fixtures, "family_tensors", family_tensors):
+                    if family:
+                        fp4_fixture = fixtures.prepare_family_gguf(
+                            fp4_root, family, fp32=False, native_formats=(fp4_format,),
+                            ple_format=fp4_format if family == "qwen4_exp" else None,
+                            native_scale=1 / 512, fp32_native_baseline=True)
+                    else:
+                        fp4_fixture = fixtures.prepare_gguf(
+                            fp4_root, moe, reordered, fp32=False, native_formats=(fp4_format,),
+                            native_scale=1 / 512, fp32_native_baseline=True)
+                run_graph(label + " all matrices " + fp4_format, fp4_fixture.baseline, fp4_fixture.source)
+                if moe:
+                    run_graph(label + " all matrices " + fp4_format,
+                              fp4_fixture.baseline, fp4_fixture.source, on_demand=True)
             if label in ("qwen35", "qwen35moe") or family == "gpt_oss":
                 gqa_root = root / (label + "-native-gqa-13-formats")
                 gqa_root.mkdir()

@@ -10,6 +10,7 @@
 #include "engine/expertbackend.h"
 #include "kernels/float8.h"
 #include "kernels/int4.h"
+#include "kernels/mxfp4.h"
 #include "kernels/ops.h"
 #include "kernels/qnk.h"
 
@@ -5394,6 +5395,10 @@ static size_t qnk_shader_type(DType dtype) noexcept
         return 14;
     if (dtype == DType::IQ4XS)
         return 15;
+    if (dtype == DType::NvFp4)
+        return 16;
+    if (dtype == DType::MxFp4)
+        return 17;
     return static_cast<size_t>(dtype) - static_cast<size_t>(DType::Q2K);
 }
 
@@ -5432,19 +5437,61 @@ static std::span<const uint8_t> qnk_projection_values(const TensorData& matrix) 
     return matrix.qnk_values();
 }
 
+static uint64_t qnk_mxfp4_native_size(const TensorData& matrix) noexcept
+{
+    if (matrix.dtype != DType::MxFp4 || matrix.shape.size() != 2
+        || matrix.shape[0] == 0 || matrix.shape[1] == 0 || matrix.shape[1] % 32 != 0
+        || matrix.mxfp4_file_storage || !matrix.quantization_scales.empty()
+        || !matrix.float32_data.empty() || !matrix.bfloat16_data.empty()
+        || !matrix.int8_data.empty() || !matrix.int64_data.empty()
+        || !matrix.quantization_zero_points.empty() || matrix.quantization_group_size != 0
+        || !matrix.quantization_group_indices.empty() || !matrix.quantized_data.empty()
+        || matrix.mapped_data)
+    {
+        return 0;
+    }
+    const uint64_t blocks_per_row = matrix.shape[1] / 32;
+    if (matrix.shape[0] > std::numeric_limits<uint64_t>::max() / blocks_per_row)
+        return 0;
+    const uint64_t block_count = static_cast<uint64_t>(matrix.shape[0]) * blocks_per_row;
+    if (block_count > std::numeric_limits<uint64_t>::max() / 17
+        || block_count > std::numeric_limits<size_t>::max() / 16
+        || block_count > std::numeric_limits<size_t>::max() / 17)
+    {
+        return 0;
+    }
+    if (matrix.mxfp4_blocks.size() != static_cast<size_t>(block_count * 16)
+        || matrix.mxfp4_scales.size() != static_cast<size_t>(block_count))
+    {
+        return 0;
+    }
+    return block_count * 17;
+}
+
 uint64_t QnkLinear_vulkan::storage_bytes(const TensorData& matrix, uint64_t alignment) noexcept
 {
-    if ((matrix.dtype != DType::Int4 && !is_qnk_dtype(matrix.dtype) && matrix.dtype != DType::BFloat16 && matrix.dtype != DType::Float32) || matrix.shape.size() != 2
+    const bool mxfp4 = matrix.dtype == DType::MxFp4;
+    if ((matrix.dtype != DType::Int4 && !is_qnk_dtype(matrix.dtype) && matrix.dtype != DType::BFloat16 && matrix.dtype != DType::Float32 && !mxfp4) || matrix.shape.size() != 2
         || matrix.shape[0] == 0 || matrix.shape[1] == 0)
     {
         return 0;
     }
     alignment = std::max<uint64_t>(4, alignment);
-    uint64_t raw = qnk_projection_values(matrix).size();
+    uint64_t raw = 0;
+    if (mxfp4)
+    {
+        raw = qnk_mxfp4_native_size(matrix);
+        if (raw == 0)
+            return 0;
+    }
+    else
+    {
+        raw = qnk_projection_values(matrix).size();
+    }
     if (matrix.mxfp4_file_storage)
     {
         const MxFp4FileStorage& file = *matrix.mxfp4_file_storage;
-        if (!is_qnk_dtype(matrix.dtype) || raw != 0
+        if (mxfp4 || !is_qnk_dtype(matrix.dtype) || raw != 0
             || file.layout != MxFp4FileLayout::Separate || file.interleave_rows
             || file.blocks_path.empty() || file.blocks_size == 0
             || file.blocks_offset > std::numeric_limits<uint64_t>::max() - file.blocks_size
@@ -5460,6 +5507,11 @@ uint64_t QnkLinear_vulkan::storage_bytes(const TensorData& matrix, uint64_t alig
         raw = qnk_storage_bytes(matrix.dtype, matrix.shape[0], matrix.shape[1]);
         if (raw != file.blocks_size + file.secondary_blocks_size)
             return 0;
+    }
+    else if (is_qnk_dtype(matrix.dtype)
+             && raw != qnk_storage_bytes(matrix.dtype, matrix.shape[0], matrix.shape[1]))
+    {
+        return 0;
     }
     if (raw == 0)
         return 0;
@@ -5512,7 +5564,9 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
 #if NCNN_MOE_WITH_VULKAN
     const bool int4 = matrix.dtype == DType::Int4;
     const bool dense = matrix.dtype == DType::BFloat16 || matrix.dtype == DType::Float32;
-    if ((!int4 && !dense && !is_qnk_dtype(matrix.dtype))
+    const bool mxfp4 = matrix.dtype == DType::MxFp4;
+    const uint64_t mxfp4_size = mxfp4 ? qnk_mxfp4_native_size(matrix) : 0;
+    if ((!int4 && !dense && !mxfp4 && !is_qnk_dtype(matrix.dtype))
         || matrix.shape.size() != 2
         || input_group_count == 0
         || matrix.shape[0] % input_group_count != 0
@@ -5521,19 +5575,21 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
         || matrix.shape[1] == 0
         || matrix.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max())
         || (int4 && !validate_int4_tensor(matrix))
-        || (!int4 && !dense && !qnk_shape_supported(matrix.dtype, matrix.shape[0], matrix.shape[1]))
+        || (mxfp4 && mxfp4_size == 0)
+        || (!int4 && !dense && !mxfp4 && !qnk_shape_supported(matrix.dtype, matrix.shape[0], matrix.shape[1]))
         || (!int4 && !validate_input_column_indices(matrix)))
     {
         return {};
     }
     if (extra
-        && (!is_qnk_dtype(matrix.dtype)
+        && (!(is_qnk_dtype(matrix.dtype) || mxfp4)
             || extra->dtype != matrix.dtype
             || extra->shape != matrix.shape
             || input_group_count != 1
             || bias
             || qnk_has_metadata(matrix)
-            || qnk_has_metadata(*extra)))
+            || qnk_has_metadata(*extra)
+            || (mxfp4 && qnk_mxfp4_native_size(*extra) != mxfp4_size)))
     {
         return {};
     }
@@ -5543,16 +5599,18 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     {
         return {};
     }
-    const std::span<const uint8_t> raw_values = qnk_projection_values(matrix);
+    const std::span<const uint8_t> raw_values = mxfp4 ? std::span<const uint8_t>{}
+                                                      : qnk_projection_values(matrix);
     const uint64_t first_size = int4    ? static_cast<uint64_t>(matrix.shape[0]) * (matrix.shape[1] / 2 + matrix.shape[1] % 2)
                                 : dense ? static_cast<uint64_t>(matrix.shape[0]) * matrix.shape[1] * (matrix.dtype == DType::BFloat16 ? sizeof(uint16_t) : sizeof(float))
+                                : mxfp4 ? mxfp4_size
                                         : qnk_storage_bytes(matrix.dtype, matrix.shape[0], matrix.shape[1]);
-    const std::span<const uint8_t> extra_values = extra ? qnk_projection_values(*extra)
-                                                        : std::span<const uint8_t>{};
-    const uint64_t extra_size = extra ? qnk_storage_bytes(extra->dtype, matrix.shape[0], matrix.shape[1]) : 0;
+    const std::span<const uint8_t> extra_values = extra && !mxfp4 ? qnk_projection_values(*extra)
+                                                                  : std::span<const uint8_t>{};
+    const uint64_t extra_size = extra ? (mxfp4 ? mxfp4_size : qnk_storage_bytes(extra->dtype, matrix.shape[0], matrix.shape[1])) : 0;
     if (first_size == 0
-        || first_size != raw_values.size()
-        || (extra && (extra_size == 0 || extra_size != extra_values.size()))
+        || (!mxfp4 && first_size != raw_values.size())
+        || (extra && (extra_size == 0 || (!mxfp4 && extra_size != extra_values.size())))
         || first_size > std::numeric_limits<uint64_t>::max() - extra_size)
     {
         return {};
@@ -5684,12 +5742,28 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     if (packed_storage.size() != storage_size)
         return {};
     std::memset(packed_storage.data() + raw_size, 0, storage_size - raw_size);
-    std::memcpy(packed_storage.data(), raw_values.data(), static_cast<size_t>(first_size));
+    if (mxfp4)
+    {
+        if (!pack_gguf_mxfp4({matrix.mxfp4_blocks.data(), matrix.mxfp4_blocks.size()},
+                             {matrix.mxfp4_scales.data(), matrix.mxfp4_scales.size()},
+                             {packed_storage.data(), static_cast<size_t>(first_size)}))
+            return {};
+    }
+    else
+        std::memcpy(packed_storage.data(), raw_values.data(), static_cast<size_t>(first_size));
     if (extra)
     {
-        std::memcpy(packed_storage.data() + first_size,
-                    extra_values.data(),
-                    static_cast<size_t>(extra_size));
+        if (mxfp4)
+        {
+            if (!pack_gguf_mxfp4({extra->mxfp4_blocks.data(), extra->mxfp4_blocks.size()},
+                                 {extra->mxfp4_scales.data(), extra->mxfp4_scales.size()},
+                                 {packed_storage.data() + first_size, static_cast<size_t>(extra_size)}))
+                return {};
+        }
+        else
+            std::memcpy(packed_storage.data() + first_size,
+                        extra_values.data(),
+                        static_cast<size_t>(extra_size));
     }
     if (bias)
     {
@@ -6068,11 +6142,15 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_impl(const TensorData
                                                                 uint64_t optimization_flags)
 {
 #if NCNN_MOE_WITH_VULKAN
+    const auto supported_dtype = [](DType dtype) {
+        return dtype == DType::Int4 || is_qnk_dtype(dtype) || dtype == DType::MxFp4
+               || dtype == DType::BFloat16 || dtype == DType::Float32;
+    };
     if ((activation != ExpertActivation::Silu
          && activation != ExpertActivation::GptOssSwiGlu
          && activation != ExpertActivation::DeepSeekSwiGlu)
-        || (gate_up.dtype != DType::Int4 && !is_qnk_dtype(gate_up.dtype) && gate_up.dtype != DType::BFloat16 && gate_up.dtype != DType::Float32)
-        || (down.dtype != DType::Int4 && !is_qnk_dtype(down.dtype) && down.dtype != DType::BFloat16 && down.dtype != DType::Float32)
+        || !supported_dtype(gate_up.dtype)
+        || !supported_dtype(down.dtype)
         || gate_up.shape.size() != 2
         || down.shape.size() != 2
         || gate_up.shape[0] == 0
@@ -6080,7 +6158,7 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_impl(const TensorData
         || down.shape[0] == 0
         || down.shape[1] != (up ? gate_up.shape[0] : gate_up.shape[0] / 2)
         || down.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 128)
-        || (up && (up->shape != gate_up.shape || (up->dtype != DType::Int4 && !is_qnk_dtype(up->dtype) && up->dtype != DType::BFloat16 && up->dtype != DType::Float32)))
+        || (up && (up->shape != gate_up.shape || !supported_dtype(up->dtype)))
         || activation_limit < 0.0f)
     {
         return {};
@@ -6102,7 +6180,7 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_impl(const TensorData
 
     bool fuse_gate_up = up
                         && has_flag(optimization_flags, OptimizationVulkanQnK)
-                        && is_qnk_dtype(gate_up.dtype)
+                        && (is_qnk_dtype(gate_up.dtype) || gate_up.dtype == DType::MxFp4)
                         && up->dtype == gate_up.dtype
                         && down.dtype == gate_up.dtype
                         && !gate_up_bias

@@ -447,9 +447,10 @@ def weight_sizes(tensors: dict, packed_sizes: dict[str, int]) -> tuple[int, int]
 def mapped_ple_dense_bytes(path: Path) -> int:
     """Count PLE payload bytes excluded from resident totals as file-mapped.
 
-    BF16 shards and native GGUF block shards can remain mapped. F16/F32 PLE
-    sources are converted to owned BF16 and remain fully charged. Projection
-    weights, scales and metadata keep their independent byte expectations.
+    BF16 shards and native GGUF Qn_K block shards can remain mapped. F16/F32
+    PLE sources are converted to owned BF16 and remain fully charged. MXFP4
+    codes and scales are decoded into owned arrays, so they remain charged.
+    Projection weights, scales and metadata keep their independent byte expectations.
     """
     if not path.is_dir():
         return 0
@@ -841,17 +842,65 @@ def scale_gguf_block_scales(raw: np.ndarray, format_name: str, rows: int, column
         blocks[..., offset:offset + width] = scaled.view(np.uint8).reshape(blocks.shape[:-1] + (width,))
 
 
+FP4_DOUBLED_E2M1 = np.asarray([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], dtype=np.float32)
+
+
+def fp4_gguf_matrix(rows: int, columns: int, format_name: str,
+                    amplitude_scale: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """Build GGUF MXFP4/NVFP4 blocks and decode them from the documented ABI."""
+    if not math.isfinite(amplitude_scale) or amplitude_scale <= 0:
+        raise ValueError(f"invalid native GGUF fixture amplitude scale: {amplitude_scale}")
+    power = round(math.log2(amplitude_scale))
+    if not math.isclose(math.ldexp(1.0, power), amplitude_scale, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("FP4 fixture scaling must be an exactly representable power of two")
+    codes = np.random.default_rng(seed).integers(0, 16, (rows, columns), dtype=np.uint8)
+    if format_name == "MXFP4":
+        scale_byte = 128 + power
+        if scale_byte < 2 or scale_byte > 255:
+            raise ValueError("MXFP4 fixture scale is outside the E8M0 range")
+        blocks = codes.reshape(rows, columns // 32, 32)
+        raw = np.empty((rows, columns // 32, 17), dtype=np.uint8)
+        raw[..., 0] = scale_byte
+        raw[..., 1:] = blocks[..., :16] | (blocks[..., 16:] << 4)
+        half_scale = math.ldexp(1.0, scale_byte - 128)
+        decoded = (FP4_DOUBLED_E2M1[codes] * half_scale).reshape(rows, columns)
+    elif format_name == "NVFP4":
+        exponent = 8 + power
+        if exponent <= 0:
+            mantissa = int(math.ldexp(amplitude_scale, 10))
+            if mantissa < 1 or mantissa > 7 or math.ldexp(float(mantissa), -10) != amplitude_scale:
+                raise ValueError("NVFP4 fixture scale is outside the UE4M3 subnormal range")
+            scale_byte = mantissa
+        else:
+            if exponent >= 15:
+                raise ValueError("NVFP4 fixture scale is outside the UE4M3 normal range")
+            scale_byte = exponent << 3
+        blocks = codes.reshape(rows, columns // 64, 4, 16)
+        raw = np.empty((rows, columns // 64, 36), dtype=np.uint8)
+        raw[..., :4] = scale_byte
+        raw[..., 4:] = (blocks[..., :8] | (blocks[..., 8:] << 4)).reshape(rows, columns // 64, 32)
+        half_scale = amplitude_scale
+        decoded = (FP4_DOUBLED_E2M1[codes] * half_scale).reshape(rows, columns)
+    else:
+        raise ValueError(f"unsupported independent FP4 fixture format: {format_name}")
+    return raw.reshape(rows, -1), decoded.astype(np.float32)
+
+
 def quantized_gguf_matrix(values: np.ndarray, format_name: str, *,
                           amplitude_scale: float = 1.0) -> tuple[np.ndarray, Any, np.ndarray, int]:
     """Quantize a full matrix and return raw bytes with a BF16-exact GGUF decode."""
-    encoding = importer.GGUF_NATIVE_FORMATS[format_name]
+    encoding = ((39, 32, 17) if format_name == "MXFP4"
+                else importer.GGUF_NATIVE_FORMATS[format_name])
     tag, block_elements, block_bytes = encoding
     source = np.asarray(values, dtype=np.float32)
     rows, columns = source.shape
     if columns % block_elements:
         raise ValueError(f"fixture matrix is not aligned for {format_name}: {source.shape}")
     dtype = getattr(gguf.GGMLQuantizationType, format_name)
-    if format_name == "IQ4_XS":
+    if format_name in ("MXFP4", "NVFP4"):
+        seed = int(abs(float(source.sum())) * 1e5) % (1 << 32)
+        raw, decoded = fp4_gguf_matrix(rows, columns, format_name, amplitude_scale, seed)
+    elif format_name == "IQ4_XS":
         raw = iq4_xs_blocks(rows, columns, seed=int(abs(float(source.sum())) * 1e5) % 251)
     elif format_name in ("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_K"):
         bits = {"Q2_K": 2, "Q3_K": 3, "Q4_K": 4, "Q5_K": 5, "Q6_K": 6, "Q8_K": 8}[format_name]
@@ -874,7 +923,8 @@ def quantized_gguf_matrix(values: np.ndarray, format_name: str, *,
     expected_bytes = rows * (columns // block_elements) * block_bytes
     if raw.nbytes != expected_bytes:
         raise ValueError(f"invalid {format_name} fixture byte count: {raw.nbytes} != {expected_bytes}")
-    scale_gguf_block_scales(raw, format_name, rows, columns, amplitude_scale)
+    if format_name not in ("MXFP4", "NVFP4"):
+        scale_gguf_block_scales(raw, format_name, rows, columns, amplitude_scale)
     if format_name in ("Q4_0", "Q4_1", "Q5_0"):
         blocks = raw.reshape(rows, columns // block_elements, block_bytes)
         original_d = blocks[..., :2].copy().view("<f2").reshape(rows, -1)
@@ -883,7 +933,22 @@ def quantized_gguf_matrix(values: np.ndarray, format_name: str, *,
         if format_name == "Q4_1":
             # Keep the quantized codes and use an exactly representable offset.
             blocks[..., 2:4] = 0
-    if format_name == "Q8_K":
+    if format_name in ("MXFP4", "NVFP4"):
+        pass
+    elif format_name == "Q8_0":
+        # Decode the GGML ABI independently: each 34-byte block is an F16
+        # scale followed by 32 signed 8-bit values.
+        blocks = raw.reshape(rows, columns // 32, 34)
+        scales = blocks[..., :2].copy().view("<f2").reshape(rows, columns // 32).astype(np.float32)
+        codes = blocks[..., 2:].copy().view(np.int8).astype(np.float32)
+        decoded = (scales[..., None] * codes).reshape(source.shape)
+        try:
+            upstream = np.asarray(gguf.dequantize(raw, dtype), dtype=np.float32).reshape(source.shape)
+        except (AttributeError, KeyError, NotImplementedError, TypeError, ValueError):
+            upstream = None
+        if upstream is not None:
+            np.testing.assert_array_equal(upstream, decoded)
+    elif format_name == "Q8_K":
         # gguf 0.19 may not expose Q8_K dequantize; this independent GGML
         # specification decode is d(float32) * qs(int8), with bsums checked
         # below. When the official decoder is available, compare it as well.
@@ -905,7 +970,88 @@ def quantized_gguf_matrix(values: np.ndarray, format_name: str, *,
     if not self_check:
         raise ValueError(f"invalid or all-zero {format_name} fixture decode")
     np.testing.assert_array_equal(float32(bfloat16(decoded)), decoded)
+    if format_name in ("MXFP4", "NVFP4"):
+        tag = 39 if format_name == "MXFP4" else importer.GGUF_NATIVE_FORMATS[format_name][0]
     return raw, dtype, decoded, tag
+
+
+def assert_imported_gguf_native(loaded: dict, name: str, raw: np.ndarray, tag: int,
+                                rows: int, columns: int,
+                                input_columns: np.ndarray | None = None,
+                                family: str = "qwen") -> None:
+    """Check the importer's lossless native representation for one GGUF matrix."""
+    if tag == 39:
+        source = np.asarray(raw, dtype=np.uint8).reshape(rows, columns // 32, 17)
+        codes = np.empty((rows, columns // 32, 32), dtype=np.uint8)
+        codes[..., :16] = source[..., 1:] & 15
+        codes[..., 16:] = source[..., 1:] >> 4
+        adjacent = codes.reshape(rows, columns // 2, 2)
+        expected_blocks = (adjacent[..., 0] | (adjacent[..., 1] << 4)).astype(np.uint8).view(np.int8)
+        scale_values = source[..., 0]
+        if family == "gpt_oss" and ".mlp.experts." in name:
+            role = re.search(r"\.experts\.\d+\.(gate|up|down)_proj\.weight$", name)[1]
+            if role == "down":
+                prefix = name[:-len(".weight")]
+                blocks_name, scales_name = prefix + "_blocks", prefix + "_scales"
+                expected_role_blocks, expected_role_scales = expected_blocks, scale_values
+            else:
+                prefix = re.sub(r"\.(?:gate|up)_proj\.weight$", ".gate_up_proj", name)
+                blocks_name, scales_name = prefix + "_blocks", prefix + "_scales"
+                selector = 0 if role == "gate" else 1
+                expected_role_blocks = expected_blocks
+                expected_role_scales = scale_values
+                stored_blocks, stored_scales = loaded[blocks_name], loaded[scales_name]
+                assert stored_blocks.dtype == "I8" and stored_blocks.shape[0] == rows * 2, blocks_name
+                assert stored_scales.dtype == "F8_E8M0" and stored_scales.shape[0] == rows * 2, scales_name
+                np.testing.assert_array_equal(stored_blocks.read()[selector::2], expected_role_blocks)
+                np.testing.assert_array_equal(stored_scales.read()[selector::2], expected_role_scales)
+                return
+            weight, scales = loaded[blocks_name], loaded[scales_name]
+        else:
+            weight = loaded[name]
+            scales_name = name[:-len("weight")] + "scale"
+            scales = loaded[scales_name]
+        assert weight.dtype == "I8" and weight.shape == expected_blocks.shape, name
+        assert scales.dtype == "F8_E8M0" and scales.shape == (rows, columns // 32), scales_name
+        np.testing.assert_array_equal(weight.read(), expected_blocks)
+        np.testing.assert_array_equal(scales.read(), scale_values)
+        if input_columns is not None:
+            np.testing.assert_array_equal(loaded[name + ".__mxfp4_columns"].read(), input_columns)
+        return
+    weight = loaded[name]
+    assert weight.dtype == "U8", name
+    np.testing.assert_array_equal(weight.read().reshape(raw.shape), raw)
+    np.testing.assert_array_equal(loaded[name + ".__qnk_shape"].read(), [tag, rows, columns])
+    if input_columns is not None:
+        np.testing.assert_array_equal(loaded[name + ".__qnk_columns"].read(), input_columns)
+
+
+def native_mxfp4_pair(rows: int, columns: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Create an adjacent-nibble MXFP4 pair and decode it independently."""
+    if columns <= 0 or columns % 32:
+        raise ValueError(f"MXFP4 fixture matrix is not block aligned: {(rows, columns)}")
+    codes = ((np.arange(rows * columns, dtype=np.uint32).reshape(rows, columns) * 7 + seed * 3 + 1)
+             & 15).astype(np.uint8)
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).view(np.int8)
+    scales = np.full((rows, columns // 32), 127, dtype=np.uint8)
+    decoded = (FP4_DOUBLED_E2M1[codes] * np.float32(0.5)).astype(np.float32)
+    return packed, scales, decoded
+
+
+def native_nvfp4_blocks(rows: int, columns: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """Create GGUF-style UE4M3-scaled NVFP4 blocks and decode their raw bytes."""
+    if columns <= 0 or columns % 64:
+        raise ValueError(f"NVFP4 fixture matrix is not block aligned: {(rows, columns)}")
+    codes = ((np.arange(rows * columns, dtype=np.uint32).reshape(rows, columns) * 5 + seed * 7 + 3)
+             & 15).astype(np.uint8)
+    grouped = codes.reshape(rows, columns // 64, 4, 16)
+    # UE4M3 exponent 8, mantissa 0 gives scale 1 under the NVFP4 ABI.
+    scales = np.full((rows, columns // 64, 4), 8 << 3, dtype=np.uint8)
+    raw = np.empty((rows, columns // 64, 36), dtype=np.uint8)
+    raw[..., :4] = scales
+    raw[..., 4:] = (grouped[..., :8] | (grouped[..., 8:] << 4)).reshape(rows, columns // 64, 32)
+    decoded = FP4_DOUBLED_E2M1[codes]
+    return raw.reshape(rows, -1), decoded.astype(np.float32)
 
 
 def fixture_native_format(name: str, native_formats: tuple[str, ...], dense_index: int) -> str:
@@ -1040,11 +1186,7 @@ def prepare_gguf(root: Path, moe: bool = False, reordered: bool = False, *, fp32
     check_preserved_auxiliary(loaded, reference,
                               {name for name, dtype in native_overrides.items() if dtype == "F32"})
     for name, (raw, tag, columns, column_indices) in specs.items():
-        assert loaded[name].dtype == "U8", name
-        np.testing.assert_array_equal(loaded[name].read().reshape(raw.shape), raw)
-        np.testing.assert_array_equal(loaded[name + ".__qnk_shape"].read(), [tag, raw.shape[0], columns])
-        if column_indices is not None:
-            np.testing.assert_array_equal(loaded[name + ".__qnk_columns"].read(), column_indices)
+        assert_imported_gguf_native(loaded, name, raw, tag, raw.shape[0], columns, column_indices, "qwen")
     dense_bytes, expert_bytes = weight_sizes(reference, packed_sizes)
     bf16_dense, bf16_expert = weight_sizes(reference, {})
     return Fixture(baseline, imported, path, dense_bytes, expert_bytes, bf16_dense, bf16_expert, len(specs), moe,
@@ -1194,7 +1336,8 @@ def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = Fal
         ple_values = np.concatenate([
             float32(reference[ple + f"ngram_embedding.shard_{shard}.weight"][1]) for shard in range(2)])
         if ple_format:
-            ple_raw, ple_dtype, decoded, tag = quantized_gguf_matrix(ple_values, ple_format)
+            ple_raw, ple_dtype, decoded, tag = quantized_gguf_matrix(
+                ple_values, ple_format, amplitude_scale=native_scale)
             writer.add_tensor("per_layer_token_embd.weight", ple_raw, raw_dtype=ple_dtype)
             for shard in range(2):
                 name = ple + f"ngram_embedding.shard_{shard}.weight"
@@ -1205,6 +1348,7 @@ def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = Fal
                 np.testing.assert_array_equal(float32(reference[name][1]), shard_values)
                 specs[name] = (shard_raw, tag, shard_values.shape[0], shard_values.shape[1])
                 packed_sizes[name] = shard_raw.nbytes
+                native.add(name)
         else:
             writer.add_tensor("per_layer_token_embd.weight", ple_values)
     dense_format_index = 0
@@ -1293,8 +1437,7 @@ def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = Fal
         assert not any(name.startswith("dspark_") for name in imported_config)
         assert not any(name.startswith("mtp.") for name in loaded)
     for name, (raw, tag, rows, columns) in specs.items():
-        np.testing.assert_array_equal(loaded[name].read().reshape(raw.shape), raw)
-        np.testing.assert_array_equal(loaded[name + ".__qnk_shape"].read(), [tag, rows, columns])
+        assert_imported_gguf_native(loaded, name, raw, tag, rows, columns, family=family)
     dense, expert = weight_sizes(reference, packed_sizes)
     bf16_dense, bf16_expert = weight_sizes(reference, {})
     return Fixture(baseline, imported, path, dense, expert, bf16_dense, bf16_expert, len(specs), True, False, family,
@@ -1302,6 +1445,69 @@ def prepare_family_gguf(root: Path, family: str, *, canonical_dspark: bool = Fal
                                              q8_0_dense_bytes=q8_0_dense_bytes))
 
 
+def prepare_dspark_fp4(root: Path, format_name: str) -> Fixture:
+    """Build a native FP4 DSpark fixture and its independently decoded baseline."""
+    if format_name not in ("MXFP4", "NVFP4"):
+        raise ValueError(f"unsupported DSpark FP4 format: {format_name}")
+    model_config, tensors, native_names = dspark_tensors()
+    native = set(native_names)
+    if format_name == "MXFP4":
+        # DeepSeek selects the interleaved path from w1, so its w1/w3 pairs
+        # must use one layout across both target and draft Experts.
+        native.update(name for name, (_, values) in tensors.items()
+                      if ".ffn.experts." in name and name.endswith(".weight") and values.ndim == 2)
+    source = root / "source"
+    assets(source, model_config)
+    source_tensors = {}
+    reference = {name: (dtype, values.copy()) for name, (dtype, values) in tensors.items()}
+    packed_sizes = {}
+    native_data = {}
+    for index, (name, (dtype, values)) in enumerate(tensors.items()):
+        if name not in native:
+            source_tensors[name] = (dtype, values)
+            continue
+        if not name.endswith(".weight") or values.ndim != 2:
+            raise ValueError(f"unsupported DSpark native {format_name} fixture tensor: {name}")
+        rows, columns = values.shape
+        if format_name == "MXFP4":
+            raw, scales, decoded = native_mxfp4_pair(rows, columns, index + 1)
+            scale_name = name[:-len("weight")] + "scale"
+            source_tensors[name] = ("I8", raw)
+            source_tensors[scale_name] = ("F8_E8M0", scales)
+            native_data[name] = (raw, scales)
+            packed_sizes[name] = raw.nbytes + scales.nbytes
+        else:
+            raw, decoded = native_nvfp4_blocks(rows, columns, index + 1)
+            source_tensors[name] = ("U8", raw)
+            source_tensors[name + ".__qnk_shape"] = ("I64", np.asarray([296, rows, columns], dtype="<i8"))
+            native_data[name] = raw
+            packed_sizes[name] = raw.nbytes
+        reference[name] = ("BF16", bfloat16(decoded))
+    write_safetensors(source / "model.safetensors", source_tensors)
+    imported = source
+    if format_name == "MXFP4":
+        imported = root / "imported"
+        importer.import_package(source, imported)
+    loaded = importer.scan_safetensors(imported)
+    for name, data in native_data.items():
+        if format_name == "MXFP4":
+            raw, scales = data
+            scale_name = name[:-len("weight")] + "scale"
+            assert loaded[name].dtype == "I8", name
+            assert loaded[scale_name].dtype == "F8_E8M0", scale_name
+            np.testing.assert_array_equal(loaded[name].read(), raw)
+            np.testing.assert_array_equal(loaded[scale_name].read(), scales)
+        else:
+            np.testing.assert_array_equal(loaded[name].read(), data)
+            np.testing.assert_array_equal(loaded[name + ".__qnk_shape"].read(),
+                                          [296, *tensors[name][1].shape])
+    baseline = root / "baseline"
+    assets(baseline, model_config)
+    write_safetensors(baseline / "model.safetensors", reference)
+    dense, expert = weight_sizes(reference, packed_sizes)
+    bf16_dense, bf16_expert = weight_sizes(reference, {})
+    return Fixture(baseline, imported, source, dense, expert, bf16_dense, bf16_expert, len(native), True,
+                   False, "deepseek_dspark")
 
 def prepare_fp8(root: Path, family: str) -> Fixture:
     """Use independent E4M3 arithmetic and nonuniform block scales as an oracle."""
@@ -1453,6 +1659,16 @@ class NativeQuantizedTests(unittest.TestCase):
                 tensors[prefix + "shard_0.weight.__int4_scales"] = ("F32", np.ones(128, np.float32))
                 write_safetensors(path / "model.safetensors", tensors)
                 self.assertEqual(mapped_ple_dense_bytes(path), 2048 if dtype == "BF16" else 0)
+        native_path = self.root / "MXFP4"
+        assets(native_path, model_config)
+        tensors = {}
+        for shard in range(2):
+            name = prefix + f"shard_{shard}.weight"
+            tensors[name] = ("I8", np.zeros((4, 64), np.int8))
+            tensors[name[:-len("weight")] + "scale"] = ("F8_E8M0", np.zeros((4, 4), np.uint8))
+        write_safetensors(native_path / "model.safetensors", tensors)
+        # Native MXFP4 code/scale data is loaded into owned arrays, not mapped PLE payload.
+        self.assertEqual(mapped_ple_dense_bytes(native_path), 0)
 
     def run_worker(self, path: Path, moe: bool, expected: Fixture | None = None,
                    *, backend: str | None = None, extra_args: tuple[str, ...] = (),
@@ -1631,7 +1847,7 @@ class NativeQuantizedTests(unittest.TestCase):
     def compare_expert_memory_modes(self, fixture: Fixture) -> None:
         cache_args = ("--expert-gpu-cache-mb", "16") if self.backend == "hybrid" else ()
         eager = self.run_worker(fixture.imported, True, fixture,
-                                extra_args=(*cache_args, "--expert-memory", "eager"))
+                                extra_args=("--expert-memory", "eager"))
         # Biases and input-column maps stay resident outside the Expert cache.
         fixed_bytes = sum(info.size // 2 if name.endswith(".__qnk_columns") else info.size
                           for name, info in importer.scan_safetensors(fixture.imported).items()
@@ -1682,6 +1898,14 @@ class NativeQuantizedTests(unittest.TestCase):
                 self.compare(fixture, direct=True)
                 with self.subTest(confidence="canonical_int4_one_row"):
                     self.compare(quantize_tiny_confidence(fixture), direct=False)
+
+    def test_deepseek_dspark_native_fp4_proposals(self):
+        for format_name in ("MXFP4", "NVFP4"):
+            with self.subTest(format=format_name):
+                root = self.root / format_name.lower()
+                root.mkdir()
+                fixture = prepare_dspark_fp4(root, format_name)
+                self.compare(fixture, direct=True, include_imported=format_name == "MXFP4")
 
     @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
     def test_deepseek_gguf_target_only(self):
@@ -1833,6 +2057,48 @@ class NativeQuantizedTests(unittest.TestCase):
                 self.compare(fixture, direct=False)
                 if fixture.moe:
                     self.compare_expert_memory_modes(fixture)
+
+    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
+    def test_native_fp4_all_matrices_all_architectures(self):
+        for format_name in ("MXFP4", "NVFP4"):
+            for family in ("qwen35", "qwen35_reordered", "qwen35moe", "gpt_oss", "deepseek_v4", "qwen4_exp"):
+                with self.subTest(family=family, format=format_name):
+                    root = self.root / (family + "-" + format_name.lower())
+                    root.mkdir()
+                    # Keep decoded native matrices near the existing fixture activation scale.
+                    # Their exact FP32 oracle avoids adding a second BF16 rounding source.
+                    native_fixture_options = {"native_scale": 1 / 512, "fp32_native_baseline": True}
+                    model = (family_tensors(family)[0] if family in ("gpt_oss", "deepseek_v4", "qwen4_exp")
+                             else config(family == "qwen35moe", family == "qwen35_reordered"))
+                    with patch.object(gguf, "GGUFWriter", gguf_writer_with_test_metadata(model)):
+                        if family == "qwen35":
+                            fixture = prepare_gguf(root, native_formats=(format_name,), **native_fixture_options)
+                        elif family == "qwen35_reordered":
+                            fixture = prepare_gguf(root, reordered=True, native_formats=(format_name,),
+                                                    **native_fixture_options)
+                        elif family == "qwen35moe":
+                            fixture = prepare_gguf(root, True, native_formats=(format_name,), **native_fixture_options)
+                        else:
+                            fixture = prepare_family_gguf(
+                                root, family, native_formats=(format_name,),
+                                ple_format=format_name if family == "qwen4_exp" else None,
+                                **native_fixture_options)
+                    if format_name == "MXFP4" and self.backend == "cpu":
+                        # MXFP4's optional CPU Q8 activation path is approximate.
+                        # Use direct GGUF CPU execution as the path-loading oracle;
+                        # strict FP32 parity is covered with CpuMxfp4Q8 disabled.
+                        cpu_native = self.run_worker(fixture.source, fixture.moe,
+                                                     fixture, backend="cpu")
+                        imported = self.run_worker(fixture.imported, fixture.moe,
+                                                   fixture, backend="cpu")
+                        for mode in ("greedy", "sampled"):
+                            self.assertEqual(imported[mode][0], cpu_native[mode][0])
+                            np.testing.assert_allclose(imported[mode][1], cpu_native[mode][1],
+                                                       rtol=0, atol=3e-5)
+                    else:
+                        self.compare(fixture, direct=False)
+                    if fixture.moe:
+                        self.compare_expert_memory_modes(fixture)
 
     @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
     def test_qnk_expert_memory_modes(self):

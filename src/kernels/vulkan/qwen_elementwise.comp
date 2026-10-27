@@ -152,6 +152,29 @@ void main()
             int code = int(raw) - (raw >= 128u ? 256 : 0);
             value = unpackHalf2x16(source_half(block)).x * float(code);
         }
+        else if (p.kernel_size == 39u || p.kernel_size == 40u)
+        {
+            const int table[16] = int[16](0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+            bool nv = p.kernel_size == 40u;
+            uint block = start + (lane / (nv ? 64u : 32u)) * (nv ? 36u : 17u);
+            uint group = (lane % 64u) / 16u;
+            uint code = nv ? source_byte(block + 4u + group * 8u + lane % 8u)
+                           : source_byte(block + 1u + lane % 16u);
+            code = (code >> (nv ? ((lane % 16u) < 8u ? 0u : 4u) : ((lane % 32u) < 16u ? 0u : 4u))) & 15u;
+            uint raw = source_byte(block + (nv ? group : 0u));
+            float scale;
+            if (nv)
+            {
+                uint exponent = (raw >> 3u) & 15u;
+                uint mantissa = raw & 7u;
+                scale = raw == 0u || raw == 127u ? 0.0
+                        : exponent == 0u         ? float(mantissa) * exp2(-10.0)
+                                                 : (1.0 + float(mantissa) * 0.125) * exp2(float(exponent) - 8.0);
+            }
+            else
+                scale = uintBitsToFloat(raw < 2u ? (0x00200000u << raw) : ((raw - 1u) << 23u));
+            value = scale * float(table[code]);
+        }
         else if (p.kernel_size == 30u)
             value = uintBitsToFloat(source_half(start + lane * 2u) << 16u);
         else if (p.kernel_size == 0u)
