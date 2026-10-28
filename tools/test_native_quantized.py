@@ -1972,26 +1972,21 @@ class NativeQuantizedTests(unittest.TestCase):
             self.assertLessEqual(generation["cache_resident_bytes"], resources["expert_cache_bytes"])
         self.assertGreater(deferred["greedy_stats"]["generation"]["io_bytes"], 0)
 
-    def test_awq_dense(self):
-        self.compare(prepare_int4(self.root, "awq", False), direct=True)
+    def test_hf_int4_paths(self):
+        for method in ("awq", "gptq"):
+            for moe in (False, True):
+                with self.subTest(method=method, moe=moe):
+                    root = self.root / f"{method}-{'moe' if moe else 'dense'}"
+                    root.mkdir()
+                    self.compare(prepare_int4(root, method, moe), direct=True)
 
-    def test_gptq_dense_act_order(self):
-        self.compare(prepare_int4(self.root, "gptq", False), direct=True)
-
-    def test_awq_moe_mixed_expert_storage(self):
-        self.compare(prepare_int4(self.root, "awq", True), direct=True)
-
-    def test_gptq_moe_mixed_expert_storage(self):
-        self.compare(prepare_int4(self.root, "gptq", True), direct=True)
-
-    def test_gpt_oss_native_int4(self):
-        self.compare_native_family("gpt_oss")
-
-    def test_deepseek_v4_native_int4(self):
-        self.compare_native_family("deepseek_v4")
-
-    def test_qwen38_flash_native_int4(self):
-        self.compare_native_family("qwen4_exp")
+    def test_native_int4_families(self):
+        for family in ("gpt_oss", "deepseek_v4", "qwen4_exp"):
+            for method in ("awq", "gptq"):
+                with self.subTest(family=family, method=method):
+                    root = self.root / f"{family}-{method}"
+                    root.mkdir()
+                    self.compare(prepare_int4(root, method, True, family), direct=True)
 
     def test_deepseek_dspark_native_proposals(self):
         for method in ("awq", "gptq"):
@@ -2032,24 +2027,18 @@ class NativeQuantizedTests(unittest.TestCase):
             probabilities = [event["probability"] for event in events if event.get("event") == "token"]
             np.testing.assert_allclose(probabilities, baseline["greedy"][1], rtol=0, atol=3e-5)
 
-    def compare_native_family(self, family: str):
-        for method in ("awq", "gptq"):
-            with self.subTest(family=family, method=method):
-                root = self.root / method
+    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
+    def test_real_gguf_q4k_q6k_fixtures(self):
+        fixtures = (
+            ("dense", False, False),
+            ("moe", True, False),
+            ("recurrent_columns_and_embedding", False, True),
+        )
+        for name, moe, reordered in fixtures:
+            with self.subTest(fixture=name):
+                root = self.root / name
                 root.mkdir()
-                self.compare(prepare_int4(root, method, True, family), direct=True)
-
-    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
-    def test_real_gguf_q4k_q6k_dense(self):
-        self.compare(prepare_gguf(self.root), direct=False)
-
-    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
-    def test_real_gguf_q4k_q6k_moe(self):
-        self.compare(prepare_gguf(self.root, True), direct=False)
-
-    @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
-    def test_real_gguf_recurrent_columns_and_embedding(self):
-        self.compare(prepare_gguf(self.root, reordered=True), direct=False)
+                self.compare(prepare_gguf(root, moe, reordered), direct=False)
 
     @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
     def test_real_gguf_native_families(self):
@@ -2404,8 +2393,19 @@ def main() -> int:
                     return 77
                 if eligible_device is not None:
                     NativeQuantizedTests.vulkan_device_index = eligible_device["index"]
-    suite = (unittest.defaultTestLoader.loadTestsFromNames(test_args, module=sys.modules[__name__])
-             if test_args else unittest.defaultTestLoader.loadTestsFromTestCase(NativeQuantizedTests))
+    if test_args:
+        suite = unittest.defaultTestLoader.loadTestsFromNames(test_args, module=sys.modules[__name__])
+    else:
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(NativeQuantizedTests)
+        if args.backend == "hybrid":
+            # The CPU job already runs these offline checks.
+            cpu_only_tests = {
+                "test_hybrid_dense_release_expected_accounting",
+                "test_mapped_ple_expected_accounting",
+                "test_native_gguf_block_fixture_oracles",
+            }
+            suite = unittest.TestSuite(
+                test for test in suite if test._testMethodName not in cpu_only_tests)
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
 

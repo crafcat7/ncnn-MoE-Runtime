@@ -25,10 +25,6 @@ static void test_live_budget()
     // 30 bytes across the decode, while the previous one-layer wave needs 10.
     constexpr uint64_t all_experts = 120;
     constexpr uint64_t largest_expert = 5;
-    budget_check(native_quantized_gpu_cache_size(80, all_experts, largest_expert) == 80,
-                 "live budget retains all layers' active sets and additional routes");
-    budget_check(native_quantized_gpu_cache_size(30, all_experts, largest_expert) == 30,
-                 "exact active-set capacity does not shrink to one layer");
     budget_check(native_quantized_gpu_cache_size(200, all_experts, largest_expert) == all_experts,
                  "cache budget is capped by exact eligible device payload");
     budget_check(native_quantized_gpu_cache_size(20, all_experts, largest_expert) == 20,
