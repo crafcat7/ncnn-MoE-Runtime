@@ -6,7 +6,7 @@
 #include <cctype>
 #include <fstream>
 #include <limits>
-#include <regex>
+#include <string_view>
 #include <utility>
 
 namespace ncnn {
@@ -207,7 +207,7 @@ static bool read_metadata_value(GgufReader& reader, uint64_t type,
 struct ParsedGguf
 {
     std::unordered_map<std::string, GgufMetadataValue> metadata;
-    std::vector<GgufTensorInfo> tensors;
+    std::vector<std::pair<std::string, GgufTensorInfo>> tensors;
 };
 
 static Result<std::pair<DType, std::pair<uint64_t, uint64_t>>> tensor_encoding(uint64_t type)
@@ -283,10 +283,11 @@ static Result<ParsedGguf> parse_gguf(const std::filesystem::path& path)
     {
         GgufTensorInfo tensor;
         tensor.path = path;
+        std::string name;
         uint64_t dimensions = 0;
-        if (!reader.read_string(tensor.name, 1024) || !reader.read_unsigned(dimensions, 4))
+        if (!reader.read_string(name, 1024) || !reader.read_unsigned(dimensions, 4))
             return reader.error();
-        if (tensor.name.empty() || tensor.name.find('\0') != std::string::npos || dimensions == 0 || dimensions > 4)
+        if (name.empty() || name.find('\0') != std::string::npos || dimensions == 0 || dimensions > 4)
             return Error{ErrorCode::InvalidModel, "invalid GGUF tensor name or dimension count: " + path.string()};
         uint64_t elements = 1;
         uint64_t contiguous_dimension = 0;
@@ -296,7 +297,7 @@ static Result<ParsedGguf> parse_gguf(const std::filesystem::path& path)
             if (!reader.read_unsigned(extent, 8))
                 return reader.error();
             if (extent == 0 || extent > std::numeric_limits<uint32_t>::max() || elements > std::numeric_limits<uint64_t>::max() / extent)
-                return Error{ErrorCode::InvalidModel, "invalid GGUF tensor shape: " + tensor.name};
+                return Error{ErrorCode::InvalidModel, "invalid GGUF tensor shape: " + name};
             elements *= extent;
             if (dimension == 0)
                 contiguous_dimension = extent;
@@ -314,24 +315,27 @@ static Result<ParsedGguf> parse_gguf(const std::filesystem::path& path)
         const auto [block_size, block_bytes] = encoding.value().second;
         if (contiguous_dimension % block_size != 0 || elements / block_size > std::numeric_limits<uint64_t>::max() / block_bytes
             || tensor.offset % alignment != 0)
-            return Error{ErrorCode::InvalidModel, "invalid GGUF quantized shape or tensor offset: " + tensor.name};
+            return Error{ErrorCode::InvalidModel, "invalid GGUF quantized shape or tensor offset: " + name};
         tensor.size = elements / block_size * block_bytes;
-        parsed.tensors.push_back(std::move(tensor));
+        parsed.tensors.emplace_back(std::move(name), std::move(tensor));
     }
     const uint64_t padding = reader.offset() % alignment == 0 ? 0 : alignment - reader.offset() % alignment;
     if (reader.offset() > file_size || padding > file_size - reader.offset())
         return Error{ErrorCode::InvalidModel, "truncated GGUF tensor data alignment: " + path.string()};
     const uint64_t data_offset = reader.offset() + padding;
-    for (GgufTensorInfo& tensor : parsed.tensors)
+    for (auto& [name, tensor] : parsed.tensors)
     {
         if (tensor.offset > file_size - data_offset || tensor.size > file_size - data_offset - tensor.offset)
-            return Error{ErrorCode::InvalidModel, "truncated GGUF tensor payload: " + tensor.name};
+            return Error{ErrorCode::InvalidModel, "truncated GGUF tensor payload: " + name};
         tensor.offset += data_offset;
     }
     std::vector<const GgufTensorInfo*> ranges;
     ranges.reserve(parsed.tensors.size());
-    for (const GgufTensorInfo& tensor : parsed.tensors)
+    for (const auto& [name, tensor] : parsed.tensors)
+    {
+        (void)name;
         ranges.push_back(&tensor);
+    }
     std::sort(ranges.begin(), ranges.end(), [](const GgufTensorInfo* left, const GgufTensorInfo* right) { return left->offset < right->offset; });
     for (size_t i = 1; i < ranges.size(); ++i)
     {
@@ -346,6 +350,46 @@ static bool gguf_extension(const std::filesystem::path& path)
     std::string extension = path.extension().string();
     std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
     return extension == ".gguf";
+}
+
+static bool gguf_split(std::string_view name, uint32_t& count,
+                       std::string_view* prefix = nullptr, uint32_t* index = nullptr)
+{
+    constexpr size_t suffix_size = 20;
+    if (name.size() <= suffix_size)
+        return false;
+    const size_t prefix_size = name.size() - suffix_size;
+    if (name[prefix_size] != '-')
+        return false;
+    constexpr std::string_view separator = "-of-";
+    for (size_t i = 0; i < separator.size(); ++i)
+        if (std::tolower(static_cast<unsigned char>(name[prefix_size + 6 + i])) != separator[i])
+            return false;
+    constexpr std::string_view extension = ".gguf";
+    for (size_t i = 0; i < extension.size(); ++i)
+    {
+        if (std::tolower(static_cast<unsigned char>(name[name.size() - extension.size() + i])) != extension[i])
+            return false;
+    }
+    const std::string_view index_text = name.substr(prefix_size + 1, 5);
+    const std::string_view count_text = name.substr(prefix_size + 10, 5);
+    uint32_t parsed_index = 0;
+    uint32_t parsed_count = 0;
+    for (size_t i = 0; i < 5; ++i)
+    {
+        const char index_digit = index_text[i];
+        const char count_digit = count_text[i];
+        if (index_digit < '0' || index_digit > '9' || count_digit < '0' || count_digit > '9')
+            return false;
+        parsed_index = parsed_index * 10 + static_cast<uint32_t>(index_digit - '0');
+        parsed_count = parsed_count * 10 + static_cast<uint32_t>(count_digit - '0');
+    }
+    count = parsed_count;
+    if (prefix)
+        *prefix = name.substr(0, prefix_size);
+    if (index)
+        *index = parsed_index;
+    return true;
 }
 
 static Result<std::filesystem::path> discover_gguf(const std::filesystem::path& path)
@@ -372,17 +416,18 @@ static Result<std::filesystem::path> discover_gguf(const std::filesystem::path& 
     if (candidates.empty())
         return Error{ErrorCode::InvalidModel, "model directory contains no GGUF files: " + path.string()};
     std::sort(candidates.begin(), candidates.end());
-    const std::regex split_pattern("^(.+)-([0-9]{5})-of-([0-9]{5})\\.gguf$", std::regex::icase);
-    std::smatch first;
     const std::string first_name = candidates.front().filename().string();
-    const bool split = std::regex_match(first_name, first, split_pattern);
+    std::string_view first_prefix;
+    uint32_t first_count = 0;
+    const bool split = gguf_split(first_name, first_count, &first_prefix);
     for (size_t i = 1; i < candidates.size(); ++i)
     {
-        std::smatch current;
         const std::string name = candidates[i].filename().string();
-        if (!split || !std::regex_match(name, current, split_pattern)
+        std::string_view current_prefix;
+        uint32_t current_count = 0;
+        if (!split || !gguf_split(name, current_count, &current_prefix)
             || candidates[i].parent_path() != candidates.front().parent_path()
-            || current[1].str() != first[1].str() || current[3].str() != first[3].str())
+            || current_prefix != first_prefix || current_count != first_count)
             return Error{ErrorCode::InvalidArgument, "multiple GGUF packages found; select a .gguf file or package directory explicitly: " + path.string()};
     }
     return candidates.front();
@@ -412,15 +457,15 @@ Result<GgufArchive> GgufArchive::open(const std::filesystem::path& root_or_file)
     const uint64_t count = count_value.value_or(1);
     if (count == 0 || count > 99999)
         return Error{ErrorCode::InvalidModel, "invalid GGUF split.count"};
-    std::smatch match;
     const std::string filename = discovered.value().filename().string();
-    const std::regex split_pattern("^(.+)-([0-9]{5})-of-([0-9]{5})\\.gguf$", std::regex::icase);
-    const bool numbered = std::regex_match(filename, match, split_pattern);
+    uint32_t split_index = 0;
+    uint32_t split_count = 0;
+    const bool numbered = gguf_split(filename, split_count, nullptr, &split_index);
     uint64_t selected_index = 0;
     if (numbered)
     {
-        selected_index = std::stoull(match[2].str());
-        if (selected_index == 0 || selected_index > count || std::stoull(match[3].str()) != count)
+        selected_index = split_index;
+        if (selected_index == 0 || selected_index > count || split_count != count)
             return Error{ErrorCode::InvalidModel, "GGUF split filename disagrees with split.count"};
         --selected_index;
     }
@@ -433,8 +478,6 @@ Result<GgufArchive> GgufArchive::open(const std::filesystem::path& root_or_file)
         return Error{ErrorCode::InvalidModel, "GGUF package exceeds the tensor count limit"};
 
     GgufArchive archive;
-    archive.selected_source = discovered.value();
-    archive.selected_root = std::filesystem::is_directory(absolute, error) ? absolute : absolute.parent_path();
     uint64_t metadata_value_count = 0;
     for (uint64_t index = 0; index < count; ++index)
     {
@@ -442,7 +485,9 @@ Result<GgufArchive> GgufArchive::open(const std::filesystem::path& root_or_file)
         if (numbered)
         {
             const std::string number = std::to_string(index + 1);
-            path = path.parent_path() / (match[1].str() + "-" + std::string(5 - number.size(), '0') + number + "-of-" + match[3].str() + path.extension().string());
+            std::string shard_name = filename;
+            shard_name.replace(filename.size() - 19, 5, std::string(5 - number.size(), '0') + number);
+            path = path.parent_path() / shard_name;
         }
         auto shard = index == selected_index ? std::move(initial) : parse_gguf(path);
         if (!shard)
@@ -474,11 +519,11 @@ Result<GgufArchive> GgufArchive::open(const std::filesystem::path& root_or_file)
                 archive.metadata.emplace(key, std::move(value));
             }
         }
-        for (GgufTensorInfo& tensor : shard.value().tensors)
+        for (auto& [name, tensor] : shard.value().tensors)
         {
-            const std::string name = tensor.name;
-            if (!archive.tensors.emplace(name, std::move(tensor)).second)
-                return Error{ErrorCode::InvalidModel, "duplicate GGUF tensor name: " + name};
+            auto [found, inserted] = archive.tensors.try_emplace(std::move(name), std::move(tensor));
+            if (!inserted)
+                return Error{ErrorCode::InvalidModel, "duplicate GGUF tensor name: " + found->first};
         }
     }
     if (total && *total != archive.tensors.size())
@@ -506,16 +551,6 @@ const std::unordered_map<std::string, GgufTensorInfo>& GgufArchive::tensor_infos
 const std::unordered_map<std::string, GgufMetadataValue>& GgufArchive::metadata_values() const noexcept
 {
     return metadata;
-}
-
-const std::filesystem::path& GgufArchive::source_path() const noexcept
-{
-    return selected_source;
-}
-
-const std::filesystem::path& GgufArchive::root_path() const noexcept
-{
-    return selected_root;
 }
 
 } // namespace moe

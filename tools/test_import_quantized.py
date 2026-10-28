@@ -140,6 +140,12 @@ class ImportTests(unittest.TestCase):
         gc.collect()
         self.temporary.cleanup()
 
+    def test_deepseek_gguf_kv_a_norm_alias_maps_to_kv_norm(self):
+        self.assertEqual(
+            importer.gguf_tensor_name("blk.0.attn_kv_a_norm.weight", False, "deepseek_v4"),
+            "layers.0.attn.kv_norm.weight",
+        )
+
     def assets(self, quant=None, model_type="qwen3_5") -> Path:
         root = self.root / "source"
         root.mkdir(exist_ok=True)
@@ -1200,6 +1206,45 @@ class ImportTests(unittest.TestCase):
         np.testing.assert_array_equal(loaded["model.embed_tokens.weight"].read(), embedding.reshape(-1))
         np.testing.assert_array_equal(loaded["lm_head.weight"].read(), output.reshape(-1))
         np.testing.assert_array_equal(loaded["model.norm.weight"].read(), importer.to_bfloat16(np.ones(256)))
+
+    def test_open_gguf_preserves_split_filename_casing_from_any_member(self):
+        source = self.root / "Model-00002-OF-00002.GGUF"
+        expected = [self.root / "Model-00001-OF-00002.GGUF", source]
+        paths_seen = []
+        little_endian = object()
+
+        class Field:
+            def __init__(self, value):
+                self.value = value
+
+            def contents(self):
+                return self.value
+
+        class Reader:
+            def __init__(self, path):
+                self.path = Path(path)
+                paths_seen.append(self.path)
+                index = 0 if self.path.name == expected[0].name else 1
+                self.fields = {
+                    "split.count": Field(2),
+                    "split.no": Field(index),
+                    "split.tensors.count": Field(2),
+                    "general.architecture": Field("gpt-oss"),
+                }
+                self.tensors = [self.path.name]
+                self.endianess = little_endian
+
+            def get_field(self, name):
+                return self.fields.get(name)
+
+        fake_gguf = SimpleNamespace(GGUFReader=Reader, GGUFEndian=SimpleNamespace(LITTLE=little_endian))
+        expected_paths = {str(path) for path in expected}
+        with patch.object(Path, "is_file", lambda path: str(path) in expected_paths):
+            archive = importer.open_gguf(source, fake_gguf)
+
+        self.assertEqual([str(path) for path in paths_seen], [str(source), str(expected[0])])
+        self.assertEqual([str(reader.path) for reader in archive.readers], [str(expected[0]), str(source)])
+        self.assertEqual(archive.tensors, [expected[0].name, source.name])
 
     @unittest.skipIf(gguf is None, "optional official gguf package is not installed")
     def test_split_gguf_rejects_missing_duplicate_and_inconsistent_shards(self):

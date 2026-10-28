@@ -388,6 +388,7 @@ def gguf_tensor_name(name: str, wrapped: bool, family: str = "qwen3_5") -> str:
             "attn_sinks.weight": "attn.attn_sink", "attn_q_a.weight": "attn.wq_a.weight",
             "attn_q_b.weight": "attn.wq_b.weight", "attn_q_a_norm.weight": "attn.q_norm.weight",
             "attn_kv.weight": "attn.wkv.weight", "attn_kv_norm.weight": "attn.kv_norm.weight",
+            "attn_kv_a_norm.weight": "attn.kv_norm.weight",
             "attn_output_a.weight": "attn.wo_a.weight", "attn_output_b.weight": "attn.wo_b.weight",
             "attn_compressor_ape.weight": "attn.compressor.ape", "attn_compressor_kv.weight": "attn.compressor.wkv.weight",
             "attn_compressor_gate.weight": "attn.compressor.wgate.weight", "attn_compressor_norm.weight": "attn.compressor.norm.weight",
@@ -736,7 +737,7 @@ def open_gguf(source: Path, gguf: Any) -> GgufArchive:
     fields: dict[str, Any] = {}
     tensors = []
     for index in range(count):
-        path = source.with_name(f"{match[1]}-{index + 1:05d}-of-{count:05d}.gguf")
+        path = source.with_name(source.name[:match.start(2)] + f"{index + 1:05d}" + source.name[match.end(2):])
         if not path.is_file():
             raise ValueError(f"missing GGUF shard: {path.name}")
         reader = initial if path == source else gguf.GGUFReader(str(path))

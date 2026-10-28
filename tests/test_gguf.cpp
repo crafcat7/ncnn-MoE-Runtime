@@ -242,6 +242,41 @@ static void check_split(const std::filesystem::path& root)
     auto oversized = GgufArchive::open(first);
     check(!oversized && oversized.error().message.find("tensor count limit") != std::string::npos,
           "GGUF did not reject an oversized package catalog before expanding shards");
+
+    metadata[2] = integer_metadata("split.no", 0);
+    metadata[3] = integer_metadata("split.tensors.count", 1);
+    const auto uppercase_directory = root / "split-uppercase";
+    write_bytes(uppercase_directory / "model-00001-OF-00002.GGUF", fixture_bytes(metadata, {}));
+    metadata[2] = integer_metadata("split.no", 1);
+    write_bytes(uppercase_directory / "model-00002-OF-00002.GGUF",
+                fixture_bytes(metadata, {{"weight", 39, {32}, std::vector<uint8_t>(17, 0x52)}}));
+    auto uppercase = GgufArchive::open(uppercase_directory);
+    check(uppercase && uppercase.value().tensor_infos().size() == 1
+              && uppercase.value().find("weight") && uppercase.value().find("weight")->dtype == DType::MxFp4,
+          "GGUF did not discover uppercase -OF-/.GGUF shards");
+
+    const std::array<std::pair<const char*, uint64_t>, 6> invalid_names = {{
+        {"-00001-of-00002.gguf", 0},
+        {"model-0001-of-00002.gguf", 0},
+        {"model-00001-of-00002-extra.gguf", 0},
+        {"model-00000-of-00002.gguf", 0},
+        {"model-00003-of-00002.gguf", 2},
+        {"model-00001-of-00003.gguf", 0},
+    }};
+    for (size_t index = 0; index < invalid_names.size(); ++index)
+    {
+        const auto& [name, shard_number] = invalid_names[index];
+        auto invalid_metadata = metadata;
+        invalid_metadata[2] = integer_metadata("split.no", shard_number);
+        invalid_metadata[3] = integer_metadata("split.tensors.count", 0);
+        const auto invalid_path = root / "split-invalid" / name;
+        write_bytes(invalid_path, fixture_bytes(invalid_metadata, {}));
+        auto invalid = GgufArchive::open(invalid_path);
+        const std::string expected_error = index < 3 ? "requires standard" : "disagrees";
+        check(!invalid && invalid.error().code == ErrorCode::InvalidModel
+                  && invalid.error().message.find(expected_error) != std::string::npos,
+              "GGUF accepted malformed split filename with split.count=2: " + std::string(name));
+    }
 }
 
 static void check_encodings(const std::filesystem::path& root)
@@ -388,6 +423,21 @@ static void check_gguf_explicit_float32_auxiliary_loading(const std::filesystem:
         {"blk.0.attn_norm.weight", 26, {2}, int32_payload},
         {"blk.0.attn_output_a.weight", 8, {32, 2}, q8_payload}};
     write_bytes(path, fixture_bytes(deepseek_test_metadata(), tensors));
+
+    const std::array<std::string, 3> malformed_layer_names = {
+        "blk.x.attn_norm.weight", "blk.0x.attn_norm.weight", "blk.18446744073709551616.attn_norm.weight"};
+    for (size_t index = 0; index < malformed_layer_names.size(); ++index)
+    {
+        auto malformed_tensors = tensors;
+        malformed_tensors[3].name = malformed_layer_names[index];
+        const auto malformed_path = root / ("deepseek-invalid-layer-" + std::to_string(index)) / "model.gguf";
+        write_bytes(malformed_path, fixture_bytes(deepseek_test_metadata(), malformed_tensors));
+        auto malformed_archive = GgufArchive::open(malformed_path);
+        check(static_cast<bool>(malformed_archive), malformed_archive ? "" : malformed_archive.error().message);
+        auto malformed_mapping = gguf_model_tensors(malformed_archive.value());
+        check(!malformed_mapping,
+              "DeepSeek GGUF model mapping accepted malformed layer id: " + malformed_layer_names[index]);
+    }
 
     auto archive = SafetensorsArchive::open(path);
     check(static_cast<bool>(archive), archive ? "" : archive.error().message);
@@ -630,7 +680,7 @@ static void check_directory_selection(const std::filesystem::path& root)
     check(!SafetensorsArchive::open(directory), "checkpoint selection searched a child GGUF package");
     auto explicit_child = GgufArchive::open(child.parent_path());
     check(explicit_child && has_gguf_source(child.parent_path())
-              && explicit_child.value().source_path() == std::filesystem::absolute(child),
+              && explicit_child.value().tensor_infos().at("weight").path == std::filesystem::absolute(child),
           "GGUF could not open an explicitly selected package directory");
     write_bytes(directory / "other" / "model.gguf", bytes);
     check(!has_gguf_source(directory) && !GgufArchive::open(directory),
@@ -639,7 +689,7 @@ static void check_directory_selection(const std::filesystem::path& root)
     write_bytes(top, bytes);
     auto selected = GgufArchive::open(directory);
     check(selected && has_gguf_source(directory)
-              && selected.value().source_path() == std::filesystem::absolute(top),
+              && selected.value().tensor_infos().at("weight").path == std::filesystem::absolute(top),
           "GGUF did not match files in the selected directory");
     write_bytes(directory / "other.gguf", bytes);
     auto ambiguous = GgufArchive::open(directory);
@@ -655,7 +705,12 @@ static void check_real_model(const std::filesystem::path& source)
     check(static_cast<bool>(manifest), manifest ? "" : manifest.error().message);
     auto aliases = gguf_model_tensors(archive.value());
     check(static_cast<bool>(aliases), aliases ? "" : aliases.error().message);
-    ModelPackage package{archive.value().root_path(), ModelManifest{"deepseek_v4", manifest.value()}, 0, archive.value().source_path()};
+    const auto absolute_source = std::filesystem::absolute(source);
+    const auto package_root = std::filesystem::is_directory(absolute_source) ? absolute_source : absolute_source.parent_path();
+    ModelPackage package{package_root,
+                         ModelManifest{"deepseek_v4", manifest.value()},
+                         0,
+                         absolute_source};
     auto descriptor = DeepSeekV4ModelAdapter().parse_model(package);
     check(static_cast<bool>(descriptor), descriptor ? "" : descriptor.error().message);
     std::array<size_t, 41> types{};
@@ -665,7 +720,7 @@ static void check_real_model(const std::filesystem::path& source)
         if (tensor.ggml_type < types.size())
             ++types[tensor.ggml_type];
     }
-    std::cout << "GGUF source=" << archive.value().source_path().string()
+    std::cout << "GGUF source=" << source.string()
               << " tensors=" << archive.value().tensor_infos().size()
               << " aliases=" << aliases.value().size()
               << " layers=" << descriptor.value().layers.size()

@@ -402,6 +402,20 @@ class RuntimeOptionsTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_model_weight_files_preserves_split_filename_casing(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-gguf-case-") as directory:
+            source = Path(directory) / "Model-00002-OF-00003.GGUF"
+            exact_names = {
+                "Model-00001-OF-00003.GGUF",
+                "Model-00002-OF-00003.GGUF",
+                "Model-00003-OF-00003.GGUF",
+            }
+            with patch.object(Path, "is_file", lambda path: path.name in exact_names):
+                self.assertEqual(
+                    [path.name for path in model_weight_files(source)],
+                    sorted(exact_names),
+                )
+
     def test_all_gguf_families_use_authoritative_worker_profile(self) -> None:
         cases = (*FAMILY_CASES, ("qwen3_5", "qwen3.6", [248046, 248044]),
                  ("qwen35", "qwen3.6", [248046, 248044]),

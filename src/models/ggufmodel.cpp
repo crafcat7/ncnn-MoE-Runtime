@@ -9,8 +9,8 @@
 #include <cctype>
 #include <iomanip>
 #include <limits>
-#include <regex>
 #include <sstream>
+#include <string_view>
 
 namespace ncnn {
 namespace moe {
@@ -40,6 +40,26 @@ bool has_gguf_source(const std::filesystem::path& path)
             found = true;
     }
     return found;
+}
+
+bool gguf_layer_name(std::string_view name, std::string_view& number, std::string_view& suffix) noexcept
+{
+    number = {};
+    suffix = {};
+    if (!name.starts_with("blk."))
+        return false;
+    const size_t separator = name.find('.', 4);
+    if (separator == std::string_view::npos)
+        return false;
+    const std::string_view layer = name.substr(4, separator - 4);
+    const std::string_view role = name.substr(separator + 1);
+    if (layer.empty() || role.empty()
+        || !std::all_of(layer.begin(), layer.end(), [](char c) { return c >= '0' && c <= '9'; })
+        || std::any_of(role.begin(), role.end(), [](char c) { return c == '\n' || c == '\r'; }))
+        return false;
+    number = layer;
+    suffix = role;
+    return true;
 }
 
 static Result<std::string> metadata_json(const GgufMetadataValue& value)
@@ -189,7 +209,9 @@ static Result<std::string> deepseek_gguf_manifest(const GgufArchive& archive)
     return result + "}}";
 }
 
-static Result<std::string> deepseek_gguf_tensor_name(const std::string& name)
+static Result<std::string> deepseek_gguf_tensor_name(const std::string& name,
+                                                     std::string_view number,
+                                                     std::string_view suffix)
 {
     static const std::unordered_map<std::string, std::string> roots = {
         {"token_embd.weight", "embed.weight"},
@@ -235,17 +257,12 @@ static Result<std::string> deepseek_gguf_tensor_name(const std::string& name)
         {"ffn_gate_shexp.weight", "ffn.shared_experts.w1.weight"},
         {"ffn_up_shexp.weight", "ffn.shared_experts.w3.weight"},
         {"ffn_down_shexp.weight", "ffn.shared_experts.w2.weight"}};
-    static const std::regex block("blk\\.([0-9]+)\\.(.+)");
-    std::smatch match;
-    if (std::regex_match(name, match, block))
-    {
-        if (const auto found = fields.find(match[2].str()); found != fields.end())
-            return "layers." + match[1].str() + "." + found->second;
-    }
+    if (const auto found = fields.find(std::string(suffix)); found != fields.end() && !number.empty())
+        return "layers." + std::string(number) + "." + found->second;
     return Error{ErrorCode::UnsupportedModel, "unsupported DeepSeek GGUF tensor: " + name};
 }
 
-static std::string gguf_storage_dtype(uint32_t type)
+std::string gguf_storage_dtype(uint32_t type)
 {
     switch (type)
     {
@@ -273,40 +290,44 @@ static Result<std::unordered_map<std::string, SafetensorInfo>> deepseek_gguf_ten
     const auto* mtp = archive.find_metadata("deepseek4.nextn_predict_layers");
     const uint64_t target_layers = *layer_count - (mtp ? mtp->unsigned_integer().value_or(0) : 0);
     std::unordered_map<std::string, SafetensorInfo> result;
-    static const std::regex expert_bank("blk\\.([0-9]+)\\.ffn_(gate|up|down)_exps\\.weight");
-    static const std::regex block("blk\\.([0-9]+)\\..+");
     for (const auto& [name, info] : archive.tensor_infos())
     {
-        std::smatch match;
-        if (std::regex_match(name, match, block))
+        std::string_view number;
+        std::string_view suffix;
+        const bool block_tensor = gguf_layer_name(name, number, suffix);
+        if (block_tensor)
         {
-            const std::string number = match[1].str();
             uint64_t layer = 0;
             const auto parsed = std::from_chars(number.data(), number.data() + number.size(), layer);
-            if (parsed.ec != std::errc() || layer >= *layer_count)
+            if (parsed.ec != std::errc() || parsed.ptr != number.data() + number.size() || layer >= *layer_count)
                 return Error{ErrorCode::InvalidModel, "GGUF tensor exceeds target layer count: " + name};
             if (layer >= target_layers)
                 continue;
         }
-        if (std::regex_match(name, match, expert_bank))
+        std::string_view role;
+        if (suffix == "ffn_gate_exps.weight")
+            role = "w1";
+        else if (suffix == "ffn_up_exps.weight")
+            role = "w3";
+        else if (suffix == "ffn_down_exps.weight")
+            role = "w2";
+        if (block_tensor && !role.empty())
         {
             if (info.shape.size() != 3 || info.shape[0] != *expert_count || info.size % *expert_count != 0)
                 return Error{ErrorCode::InvalidModel, "invalid GGUF Expert bank: " + name};
             if (*expert_count > maximum_tensor_aliases - std::min(result.size(), maximum_tensor_aliases))
                 return Error{ErrorCode::InvalidModel, "GGUF Expert aliases exceed the supported catalog size"};
-            const std::string role = match[2].str() == "gate" ? "w1" : match[2].str() == "up" ? "w3"
-                                                                                              : "w2";
             const uint64_t slice_size = info.size / *expert_count;
             for (uint32_t expert = 0; expert < *expert_count; ++expert)
             {
-                const std::string target = "layers." + match[1].str() + ".ffn.experts." + std::to_string(expert) + "." + role + ".weight";
+                const std::string target = "layers." + std::string(number) + ".ffn.experts." + std::to_string(expert) + "." + std::string(role) + ".weight";
                 SafetensorInfo slice{info.path, gguf_storage_dtype(info.ggml_type), {info.shape[1], info.shape[2]}, info.offset + expert * slice_size, slice_size, info.ggml_type};
                 if (!result.emplace(target, std::move(slice)).second)
                     return Error{ErrorCode::InvalidModel, "duplicate mapped GGUF tensor: " + target};
             }
             continue;
         }
-        auto target = deepseek_gguf_tensor_name(name);
+        auto target = deepseek_gguf_tensor_name(name, number, suffix);
         if (!target)
             return target.error();
         if (result.size() >= maximum_tensor_aliases)

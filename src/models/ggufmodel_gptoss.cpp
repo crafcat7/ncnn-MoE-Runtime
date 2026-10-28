@@ -5,7 +5,7 @@
 #include <charconv>
 #include <cmath>
 #include <limits>
-#include <regex>
+#include <string_view>
 
 namespace ncnn {
 namespace moe {
@@ -193,8 +193,6 @@ Result<std::unordered_map<std::string, SafetensorInfo>> gguf_gpt_oss_tensors(con
         {"attn_sinks.weight", "self_attn.sinks"},
         {"ffn_gate_inp.weight", "mlp.router.weight"},
         {"ffn_gate_inp.bias", "mlp.router.bias"}};
-    static const std::regex block("blk\\.([0-9]+)\\.(.+)");
-    static const std::regex bank("ffn_(gate|up|down)_exps\\.(weight|bias)");
     std::unordered_map<std::string, SafetensorInfo> result;
     const auto add = [&](const std::string& name, const GgufTensorInfo& info, std::vector<uint32_t> shape, uint64_t offset, uint64_t size) -> bool {
         return result.size() < 1024 * 1024
@@ -208,34 +206,36 @@ Result<std::unordered_map<std::string, SafetensorInfo>> gguf_gpt_oss_tensors(con
                 return Error{ErrorCode::InvalidModel, "duplicate or excessive GPT-OSS GGUF tensors"};
             continue;
         }
-        std::smatch match;
-        if (!std::regex_match(name, match, block))
+        std::string_view number;
+        std::string_view role;
+        if (!gguf_layer_name(name, number, role))
             return Error{ErrorCode::UnsupportedModel, "unknown GPT-OSS GGUF tensor: " + name};
-        const std::string number = match[1].str();
         uint64_t layer = 0;
-        if (std::from_chars(number.data(), number.data() + number.size(), layer).ec != std::errc() || layer >= layers)
+        const auto parsed = std::from_chars(number.data(), number.data() + number.size(), layer);
+        if (parsed.ec != std::errc() || parsed.ptr != number.data() + number.size() || layer >= layers)
             return Error{ErrorCode::InvalidModel, "GPT-OSS GGUF tensor layer is out of range"};
-        const std::string prefix = "model.layers." + number + ".";
-        const std::string role = match[2].str();
-        std::smatch expert;
-        if (std::regex_match(role, expert, bank))
+        const std::string prefix = "model.layers." + std::string(number) + ".";
+        const bool gate = role == "ffn_gate_exps.weight" || role == "ffn_gate_exps.bias";
+        const bool up = role == "ffn_up_exps.weight" || role == "ffn_up_exps.bias";
+        const bool down_bank = role == "ffn_down_exps.weight" || role == "ffn_down_exps.bias";
+        if (gate || up || down_bank)
         {
-            const bool down = expert[1].str() == "down";
-            const bool bias = expert[2].str() == "bias";
+            const bool down = down_bank;
+            const bool bias = role.ends_with(".bias");
             const std::vector<uint32_t> expected = bias ? std::vector<uint32_t>{static_cast<uint32_t>(experts), static_cast<uint32_t>(down ? hidden : intermediate)}
                                                         : std::vector<uint32_t>{static_cast<uint32_t>(experts), static_cast<uint32_t>(down ? hidden : intermediate), static_cast<uint32_t>(down ? intermediate : hidden)};
             if (info.shape != expected || info.size % experts != 0 || experts > 1024 * 1024 - result.size())
                 return Error{ErrorCode::InvalidModel, "invalid GPT-OSS GGUF Expert bank: " + name};
             const uint64_t size = info.size / experts;
-            const std::string projection = down ? "down_proj" : expert[1].str() == "gate" ? "gate_proj"
-                                                                                          : "up_proj";
+            const std::string projection = down ? "down_proj" : gate ? "gate_proj"
+                                                                     : "up_proj";
             const std::vector<uint32_t> shape(expected.begin() + 1, expected.end());
             for (uint64_t index = 0; index < experts; ++index)
                 if (!add(prefix + "mlp.experts." + std::to_string(index) + "." + projection + (bias ? ".bias" : ".weight"), info, shape, info.offset + index * size, size))
                     return Error{ErrorCode::InvalidModel, "duplicate GPT-OSS GGUF Expert tensors"};
             continue;
         }
-        const auto mapped = roles.find(role);
+        const auto mapped = roles.find(std::string(role));
         if (mapped == roles.end())
             return Error{ErrorCode::UnsupportedModel, "unsupported GPT-OSS GGUF tensor: " + name};
         if (!add(prefix + mapped->second, info, info.shape, info.offset, info.size))

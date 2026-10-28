@@ -1,4 +1,5 @@
 #include "ggufmodel_qwen.h"
+#include "ggufmodel.h"
 #include "json.h"
 
 #include <algorithm>
@@ -7,7 +8,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
-#include <regex>
+#include <string_view>
 #include <unordered_set>
 
 namespace ncnn {
@@ -316,22 +317,9 @@ Result<std::string> gguf_qwen_manifest(const GgufArchive& archive)
     return manifest.finish();
 }
 
-static std::string qwen_gguf_dtype(uint32_t type)
-{
-    switch (type)
-    {
-    case 0: return "F32";
-    case 1: return "F16";
-    case 26: return "I32";
-    case 30: return "BF16";
-    case 39: return "MXFP4";
-    default: return "U8";
-    }
-}
-
 static SafetensorInfo qwen_gguf_info(const GgufTensorInfo& tensor)
 {
-    return SafetensorInfo{tensor.path, qwen_gguf_dtype(tensor.ggml_type), tensor.shape, tensor.offset, tensor.size, tensor.ggml_type};
+    return SafetensorInfo{tensor.path, gguf_storage_dtype(tensor.ggml_type), tensor.shape, tensor.offset, tensor.size, tensor.ggml_type};
 }
 
 static std::vector<uint32_t> qwen_grouped_rows(uint32_t keys, uint32_t heads, uint32_t dimension, uint32_t prefix = 0)
@@ -350,7 +338,8 @@ static std::vector<uint32_t> qwen_grouped_rows(uint32_t keys, uint32_t heads, ui
     return rows;
 }
 
-static Result<std::string> qwen_tensor_name(const std::string& name, bool extended)
+static Result<std::string> qwen_tensor_name(const std::string& name, bool extended,
+                                            std::string_view number, std::string_view suffix)
 {
     const std::string prefix = "model.language_model.";
     static const std::unordered_map<std::string, std::string> roots = {
@@ -363,9 +352,7 @@ static Result<std::string> qwen_tensor_name(const std::string& name, bool extend
         return std::string("lm_head.weight");
     if (const auto found = roots.find(name); found != roots.end())
         return prefix + found->second;
-    static const std::regex block("blk\\.([0-9]+)\\.(.+)");
-    std::smatch match;
-    if (!std::regex_match(name, match, block))
+    if (number.empty() || suffix.empty())
         return Error{ErrorCode::UnsupportedModel, "unsupported Qwen GGUF tensor: " + name};
     static const std::unordered_map<std::string, std::string> fields = {
         {"attn_norm.weight", "input_layernorm.weight"},
@@ -402,9 +389,9 @@ static Result<std::string> qwen_tensor_name(const std::string& name, bool extend
         {"ple_norm_query.weight", "ple.norm_query.weight"},
         {"ple_norm_conv.weight", "ple.norm_conv.weight"},
         {"ple_conv1d.weight", "ple.conv1d.weight"}};
-    const auto found = fields.find(match[2].str());
+    const auto found = fields.find(std::string(suffix));
     if (found != fields.end())
-        return prefix + "layers." + match[1].str() + "." + found->second;
+        return prefix + "layers." + std::string(number) + "." + found->second;
     if (extended)
     {
         for (const auto& [gguf_role, hf_role] : {std::pair{"attn", "attn"}, std::pair{"ffn", "mlp"}})
@@ -412,8 +399,8 @@ static Result<std::string> qwen_tensor_name(const std::string& name, bool extend
             for (const auto& [gguf_part, hf_part] : {std::pair{"norm", "hc_norm"}, std::pair{"down", "input_mix_weight_down"},
                                                      std::pair{"up", "input_mix_weight_up"}, std::pair{"inject", "block_inject_weight"}})
             {
-                if (match[2].str() == std::string("hc_") + gguf_role + "_" + gguf_part + ".weight")
-                    return prefix + "layers." + match[1].str() + "." + hf_role + "_hyper_connection." + hf_part + ".weight";
+                if (suffix == std::string("hc_") + gguf_role + "_" + gguf_part + ".weight")
+                    return prefix + "layers." + std::string(number) + "." + hf_role + "_hyper_connection." + hf_part + ".weight";
             }
         }
     }
@@ -434,30 +421,35 @@ Result<std::unordered_map<std::string, SafetensorInfo>> gguf_qwen_tensors(const 
             return Error{ErrorCode::InvalidModel, "duplicate or excessive Qwen GGUF tensor aliases: " + name};
         return {};
     };
-    static const std::regex block("blk\\.([0-9]+)\\.(.+)");
-    static const std::regex bank("ffn_(gate|up|down|gate_up)_exps\\.weight");
     for (const auto& [name, tensor] : archive.tensor_infos())
     {
         if (consumed.contains(name) || name == "per_layer_token_embd.weight")
             continue;
-        std::smatch match;
-        if (std::regex_match(name, match, block))
+        std::string_view number;
+        std::string_view suffix;
+        const bool block_tensor = gguf_layer_name(name, number, suffix);
+        if (block_tensor)
         {
             uint32_t layer = 0;
-            const std::string number = match[1].str();
             const auto conversion = std::from_chars(number.data(), number.data() + number.size(), layer);
-            if (conversion.ec != std::errc() || layer >= config.source_layers)
+            if (conversion.ec != std::errc() || conversion.ptr != number.data() + number.size() || layer >= config.source_layers)
                 return Error{ErrorCode::InvalidModel, "Qwen GGUF tensor exceeds source layer count: " + name};
             if (layer >= config.layers)
                 continue;
-            const std::string suffix = match[2].str();
-            std::smatch expert;
-            if (std::regex_match(suffix, expert, bank))
+            std::string_view role;
+            if (suffix == "ffn_gate_exps.weight")
+                role = "gate";
+            else if (suffix == "ffn_up_exps.weight")
+                role = "up";
+            else if (suffix == "ffn_down_exps.weight")
+                role = "down";
+            else if (suffix == "ffn_gate_up_exps.weight")
+                role = "gate_up";
+            if (!role.empty())
             {
                 if (config.experts == 0 || tensor.shape.size() != 3 || tensor.shape[0] != config.experts
                     || tensor.size % config.experts != 0 || config.experts > 1024 * 1024 - result.size())
                     return Error{ErrorCode::InvalidModel, "invalid Qwen GGUF Expert bank: " + name};
-                const std::string role = expert[1].str();
                 const uint64_t expert_size = tensor.size / config.experts;
                 for (uint32_t index = 0; index < config.experts; ++index)
                 {
@@ -465,7 +457,7 @@ Result<std::unordered_map<std::string, SafetensorInfo>> gguf_qwen_tensors(const 
                     info.offset += static_cast<uint64_t>(index) * expert_size;
                     info.size = expert_size;
                     info.shape.erase(info.shape.begin());
-                    const std::string target = "model.language_model.layers." + number + ".mlp.experts." + std::to_string(index) + ".";
+                    const std::string target = "model.language_model.layers." + std::string(number) + ".mlp.experts." + std::to_string(index) + ".";
                     if (role == "gate_up")
                     {
                         if (info.shape[0] != config.intermediate * 2 || info.size % 2 != 0)
@@ -482,7 +474,7 @@ Result<std::unordered_map<std::string, SafetensorInfo>> gguf_qwen_tensors(const 
                     }
                     else
                     {
-                        auto status = add(target + role + "_proj.weight", std::move(info));
+                        auto status = add(target + std::string(role) + "_proj.weight", std::move(info));
                         if (!status)
                             return status.error();
                     }
@@ -491,7 +483,7 @@ Result<std::unordered_map<std::string, SafetensorInfo>> gguf_qwen_tensors(const 
             }
             if (extended && (suffix == "indexer.q_proj.weight" || suffix == "indexer.k_proj.weight"))
             {
-                const std::string base = "blk." + number + ".indexer.";
+                const std::string base = "blk." + std::string(number) + ".indexer.";
                 const auto* query = archive.find(base + "q_proj.weight");
                 const auto* key = archive.find(base + "k_proj.weight");
                 if (!query || !key || query->shape.size() != 2 || key->shape.size() != 2
@@ -504,7 +496,7 @@ Result<std::unordered_map<std::string, SafetensorInfo>> gguf_qwen_tensors(const 
                 info.shape[0] += key->shape[0];
                 info.size += key->size;
                 info.transform = std::move(transform);
-                auto status = add("model.language_model.layers." + number + ".self_attn.indexer.index_qk_proj.weight", std::move(info));
+                auto status = add("model.language_model.layers." + std::string(number) + ".self_attn.indexer.index_qk_proj.weight", std::move(info));
                 if (!status)
                     return status.error();
                 consumed.insert(base + "q_proj.weight");
@@ -512,7 +504,7 @@ Result<std::unordered_map<std::string, SafetensorInfo>> gguf_qwen_tensors(const 
                 continue;
             }
         }
-        auto target = qwen_tensor_name(name, extended);
+        auto target = qwen_tensor_name(name, extended, number, suffix);
         if (!target)
             return target.error();
         SafetensorInfo info = qwen_gguf_info(tensor);

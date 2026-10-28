@@ -30,11 +30,11 @@ def model_weight_files(model: Path) -> list[Path]:
     if model.is_file():
         if model.suffix.lower() != ".gguf":
             raise AdapterError(f"model file must be GGUF: {model}")
-        split = re.fullmatch(r"(.+)-\d{5}-of-(\d{5})\.gguf", model.name, re.IGNORECASE)
+        split = re.fullmatch(r"(.+)-(\d{5})-of-(\d{5})\.gguf", model.name, re.IGNORECASE)
         if split is None:
             return [model]
-        shards = [model.with_name(f"{split[1]}-{index:05d}-of-{split[2]}.gguf")
-                  for index in range(1, int(split[2]) + 1)]
+        shards = [model.with_name(model.name[:split.start(2)] + f"{index:05d}" + model.name[split.end(2):])
+                  for index in range(1, int(split[3]) + 1)]
         if not shards or any(not path.is_file() for path in shards):
             raise AdapterError(f"GGUF split package is incomplete: {model}")
         return shards

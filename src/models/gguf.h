@@ -51,7 +51,6 @@ struct GgufMetadataValue
 struct GgufTensorInfo
 {
     std::filesystem::path path;
-    std::string name;
     DType dtype = DType::Float32;
     uint32_t ggml_type = 0;
     // GGUF stores the contiguous dimension first; runtime shapes reverse it.
@@ -70,14 +69,10 @@ public:
     [[nodiscard]] const GgufMetadataValue* find_metadata(const std::string& key) const noexcept;
     [[nodiscard]] const std::unordered_map<std::string, GgufTensorInfo>& tensor_infos() const noexcept;
     [[nodiscard]] const std::unordered_map<std::string, GgufMetadataValue>& metadata_values() const noexcept;
-    [[nodiscard]] const std::filesystem::path& source_path() const noexcept;
-    [[nodiscard]] const std::filesystem::path& root_path() const noexcept;
 
 private:
     std::unordered_map<std::string, GgufTensorInfo> tensors;
     std::unordered_map<std::string, GgufMetadataValue> metadata;
-    std::filesystem::path selected_source;
-    std::filesystem::path selected_root;
 };
 
 } // namespace moe
