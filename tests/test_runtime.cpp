@@ -6482,7 +6482,7 @@ void test_safetensors_dense_mmap()
 {
     const std::filesystem::path directory = create_unique_test_directory("ncnn_moe_safetensors_mmap_test_");
     const std::filesystem::path path = directory / "model.safetensors";
-    std::string header = R"({"bf16":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]},"f32":{"dtype":"F32","shape":[2],"data_offsets":[4,12]},"bank":{"dtype":"BF16","shape":[2,1,1],"data_offsets":[12,16]},"overflow_bank":{"dtype":"BF16","shape":[2,4294967295,4294967295],"data_offsets":[12,16]},"bad_bank_size":{"dtype":"BF16","shape":[2,1,1],"data_offsets":[24,26]},"bias_bank":{"dtype":"BF16","shape":[2,2],"data_offsets":[16,24]},"bad_bias_bank_size":{"dtype":"BF16","shape":[2,2],"data_offsets":[26,28]}})";
+    std::string header = R"({"bf16":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]},"f32":{"dtype":"F32","shape":[2],"data_offsets":[4,12]},"bank":{"dtype":"BF16","shape":[2,1,1],"data_offsets":[12,16]},"bias_bank":{"dtype":"BF16","shape":[2,2],"data_offsets":[16,24]}})";
     while (header.size() % 8 != 0)
         header.push_back(' ');
     const uint64_t header_size = header.size();
@@ -6503,10 +6503,6 @@ void test_safetensors_dense_mmap()
         stream.write(reinterpret_cast<const char*>(float_values.data()), sizeof(float_values));
         stream.write(reinterpret_cast<const char*>(bank_values.data()), sizeof(bank_values));
         stream.write(reinterpret_cast<const char*>(bias_bank_values.data()), sizeof(bias_bank_values));
-        const std::array<uint8_t, 2> bad_bank_data = {};
-        stream.write(reinterpret_cast<const char*>(bad_bank_data.data()), sizeof(bad_bank_data));
-        const std::array<uint8_t, 2> bad_bias_bank_data = {};
-        stream.write(reinterpret_cast<const char*>(bad_bias_bank_data.data()), sizeof(bad_bias_bank_data));
     }
 
     TensorData retained_bank_slice;
@@ -6601,16 +6597,10 @@ void test_safetensors_dense_mmap()
         };
         check_invalid_bank("bank", 1, {2, 1});
         check_invalid_bank("bank", 1, {1, 1});
-        check_invalid_bank("overflow_bank", 2, {2});
-        check_invalid_bank("overflow_bank",
-                           2,
-                           {std::numeric_limits<uint32_t>::max(), std::numeric_limits<uint32_t>::max()});
         check_invalid_bank("bank", 0, {1, 1});
         check_invalid_bank("bank", 2, {0, 1});
         check_invalid_bank("bank", 2, {1, 0});
-        check_invalid_bank("bad_bank_size", 2, {1, 1});
         check_invalid_bank("bias_bank", 2, {1});
-        check_invalid_bank("bad_bias_bank_size", 2, {2});
     }
     check(static_cast<bool>(retained_bank_slice.mapped_data));
     check(retained_bank_slice.shape == std::vector<uint32_t>{1, 1});
@@ -6734,38 +6724,31 @@ void test_safetensors_packed_mxfp4_expert()
     check(static_cast<bool>(pair.value().gate_up->mxfp4_blocks.front() == 9));
     check(static_cast<bool>(pair.value().gate_up->mxfp4_scales.front() == 123));
 
-    const std::filesystem::path invalid_path = directory / "invalid_payloads.safetensors";
-    write_archive(invalid_path, R"({
+    const std::filesystem::path matrix_path = directory / "matrix_payloads.safetensors";
+    write_archive(matrix_path, R"({
         "blocks":{"dtype":"I8","shape":[1,16],"data_offsets":[0,16]},
         "scales":{"dtype":"F8_E8M0","shape":[1,1],"data_offsets":[16,17]},
-        "short_blocks":{"dtype":"I8","shape":[1,16],"data_offsets":[17,32]},
-        "short_scales":{"dtype":"F8_E8M0","shape":[1,1],"data_offsets":[32,32]},
-        "expert_blocks":{"dtype":"U8","shape":[2,1,1,16],"data_offsets":[32,48]},
-        "expert_scales":{"dtype":"U8","shape":[2,1,1],"data_offsets":[48,50]},
-        "full_expert_blocks":{"dtype":"U8","shape":[2,1,1,16],"data_offsets":[50,82]},
-        "short_expert_scales":{"dtype":"U8","shape":[2,1,1],"data_offsets":[82,83]}
+        "expert_blocks":{"dtype":"U8","shape":[2,1,1,16],"data_offsets":[17,49]},
+        "expert_scales":{"dtype":"U8","shape":[2,1,1],"data_offsets":[49,51]}
     })",
-                  std::vector<uint8_t>(83, 3));
-    auto invalid_archive = SafetensorsArchive::open_file(invalid_path);
-    check(static_cast<bool>(invalid_archive));
+                  std::vector<uint8_t>(51, 3));
+    auto matrix_archive = SafetensorsArchive::open_file(matrix_path);
+    check(static_cast<bool>(matrix_archive));
     const auto check_invalid = [](const Result<TensorData>& result) {
         check(!result);
         check(result.error().code == ErrorCode::InvalidModel);
     };
     for (uint32_t flags : std::array<uint32_t, 2>{0, SafetensorLoadDeferMxfp4Data})
     {
-        auto tensor = invalid_archive.value().load_mxfp4_tensor("blocks", "scales", 1, 32, flags);
+        auto tensor = matrix_archive.value().load_mxfp4_tensor("blocks", "scales", 1, 32, flags);
         check(static_cast<bool>(tensor));
-        auto interleaved = invalid_archive.value().load_interleaved_mxfp4_tensor("blocks", "scales", "blocks", "scales", 1, 32, flags);
+        auto interleaved = matrix_archive.value().load_interleaved_mxfp4_tensor("blocks", "scales", "blocks", "scales", 1, 32, flags);
         check(static_cast<bool>(interleaved));
         check(interleaved.value().shape == std::vector<uint32_t>({2, 32}));
-        check_invalid(invalid_archive.value().load_mxfp4_tensor("short_blocks", "scales", 1, 32, flags));
-        check_invalid(invalid_archive.value().load_mxfp4_tensor("blocks", "short_scales", 1, 32, flags));
-        check_invalid(invalid_archive.value().load_interleaved_mxfp4_tensor("blocks", "scales", "short_blocks", "scales", 1, 32, flags));
-        check_invalid(invalid_archive.value().load_interleaved_mxfp4_tensor("blocks", "scales", "blocks", "short_scales", 1, 32, flags));
-        check_invalid(invalid_archive.value().load_mxfp4_expert("expert_blocks", "expert_scales", 0, 1, 32, flags));
-        check_invalid(invalid_archive.value().load_mxfp4_expert("full_expert_blocks", "short_expert_scales", 0, 1, 32, flags));
-        check_invalid(invalid_archive.value().load_interleaved_mxfp4_tensor("blocks", "scales", "blocks", "scales", std::numeric_limits<uint32_t>::max() / 2 + 1, 32, flags));
+        check_invalid(matrix_archive.value().load_mxfp4_tensor("blocks", "scales", 2, 32, flags));
+        check_invalid(matrix_archive.value().load_interleaved_mxfp4_tensor("blocks", "scales", "blocks", "scales", 2, 32, flags));
+        check_invalid(matrix_archive.value().load_mxfp4_expert("expert_blocks", "expert_scales", 2, 1, 32, flags));
+        check_invalid(matrix_archive.value().load_interleaved_mxfp4_tensor("blocks", "scales", "blocks", "scales", std::numeric_limits<uint32_t>::max() / 2 + 1, 32, flags));
     }
 
     std::error_code ignored;

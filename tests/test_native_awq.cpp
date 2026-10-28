@@ -1,5 +1,8 @@
 #include "models/safetensors.h"
 #include "kernels/int4.h"
+#include "engine/modelloader.h"
+#include "ncnn/moe/modeladapter.h"
+#include "ncnn/moe/runtime.h"
 
 #include <algorithm>
 #include <array>
@@ -9,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -183,6 +187,162 @@ static std::string native_awq_config(bool awq, int64_t group_size, bool desc_act
                                                                             : ",\"desc_act\":false}");
 }
 
+class NativeAwqOnDemandAdapter final : public ModelAdapter
+{
+public:
+    explicit NativeAwqOnDemandAdapter(uint32_t& _map_calls,
+                                      DType _expert_weight_dtype = DType::BFloat16,
+                                      bool _dense_qnk = false)
+        : map_calls(_map_calls),
+          expert_weight_dtype(_expert_weight_dtype),
+          dense_qnk(_dense_qnk)
+    {
+    }
+
+    bool can_load(const ModelManifest& manifest) const override
+    {
+        return manifest.model_type == "native_awq_preflight_test";
+    }
+
+    Result<MoeModelDescriptor> parse_model(const ModelPackage& package) const override
+    {
+        MoeModelDescriptor descriptor;
+        descriptor.model_type = package.manifest.model_type;
+        descriptor.vocabulary_size = 16;
+        const uint32_t dimension = is_qnk_dtype(expert_weight_dtype) ? 32 : 16;
+        descriptor.hidden_size = dimension;
+        descriptor.intermediate_size = dimension;
+        descriptor.expert_count = dense_qnk ? 0 : 1;
+        descriptor.experts_per_token = dense_qnk ? 0 : 1;
+        LayerDescriptor layer;
+        if (dense_qnk)
+        {
+            layer.dense.intermediate_size = dimension;
+            layer.dense.gate_weight_dtype = expert_weight_dtype;
+        }
+        else
+        {
+            layer.moe.expert_count = 1;
+            layer.moe.top_k = 1;
+            layer.moe.intermediate_size = dimension;
+            // Model an adapter whose gate projection is BF16 while down is INT4.
+            layer.moe.expert_weight_dtype = expert_weight_dtype;
+        }
+        descriptor.layers.push_back(layer);
+        return descriptor;
+    }
+
+    Result<WeightMapping> map_weights(const ModelPackage&, const MoeModelDescriptor&) const override
+    {
+        ++map_calls;
+        return Error{ErrorCode::InternalError, "map_weights reached before a loader preflight rejection"};
+    }
+
+private:
+    uint32_t& map_calls;
+    DType expert_weight_dtype;
+    bool dense_qnk;
+};
+
+static void test_native_awq_on_demand_preflight()
+{
+    struct PreflightCase
+    {
+        Option option;
+        uint64_t physical_memory_size;
+        const char* error_message;
+    };
+
+    Option invalid_memory_mode;
+    invalid_memory_mode.expert_memory_mode = static_cast<ExpertMemoryMode>(3);
+    Option excessive_memory_budget;
+    excessive_memory_budget.host_memory_budget = 17;
+    Option overflowing_gpu_cache;
+    overflowing_gpu_cache.expert_gpu_cache_size = std::numeric_limits<uint64_t>::max();
+    overflowing_gpu_cache.expert_gpu_victim_cache_size = 1;
+    Option disabled_gpu_cache;
+    disabled_gpu_cache.flags |= OptionDisableGpuExpertExecution;
+    disabled_gpu_cache.expert_gpu_cache_size = 1;
+    const std::array<PreflightCase, 4> option_cases = {{
+        {invalid_memory_mode, 0, "expert memory mode is invalid"},
+        {excessive_memory_budget, 16, "host memory budget exceeds detected physical memory"},
+        {overflowing_gpu_cache, 0, "the combined Expert GPU cache capacity overflows"},
+        {disabled_gpu_cache, 0, "GPU Expert execution cannot be disabled while an Expert GPU cache is configured"},
+    }};
+    for (const PreflightCase& test_case : option_cases)
+    {
+        RuntimeInfo info;
+        info.physical_memory_size = test_case.physical_memory_size;
+        uint32_t map_calls = 0;
+        std::vector<std::shared_ptr<ModelAdapter>> adapters{std::make_shared<NativeAwqOnDemandAdapter>(map_calls)};
+        CompiledModel compiled;
+        ModelLoader loader(info, adapters, test_case.option, compiled);
+        auto loaded = loader.load({});
+        native_awq_check(!loaded && loaded.error().code == ErrorCode::InvalidArgument
+                             && loaded.error().message == test_case.error_message,
+                         "an invalid runtime option was not rejected with its existing error before model loading");
+        native_awq_check(map_calls == 0, "an invalid runtime option reached map_weights");
+    }
+
+    NativeAwqDirectory directory;
+    {
+        std::ofstream config(directory.path / "config.json");
+        config << "{\"model_type\":\"native_awq_preflight_test\",\"quantization_config\":"
+               << native_awq_config(true, 8) << '}';
+        native_awq_check(static_cast<bool>(config), "write OnDemand fixture config");
+    }
+    NativeAwqArchive fixture;
+    std::vector<uint16_t> gate_weights(16 * 16, UINT16_C(0x3f80));
+    fixture.add("model.layers.0.mlp.experts.0.gate_proj.weight", "BF16", {16, 16},
+                gate_weights.data(), gate_weights.size() * sizeof(uint16_t));
+    fixture.projection("model.layers.0.mlp.experts.0.down_proj.", true, 16, 8, "F32", false, false);
+    fixture.write(directory.path);
+
+    for (bool explicit_cache : {false, true})
+    {
+        uint32_t map_calls = 0;
+        Runtime runtime;
+        runtime.register_adapter(std::make_shared<NativeAwqOnDemandAdapter>(map_calls));
+        Option option;
+        if (explicit_cache)
+            option.expert_cache_size = 1;
+        else
+            option.expert_memory_mode = ExpertMemoryMode::OnDemand;
+        auto model = runtime.load_model(directory.path, option);
+        native_awq_check(!model && model.error().code == ErrorCode::UnsupportedModel,
+                         "explicit OnDemand request did not reject source INT4 Experts");
+        native_awq_check(map_calls == 0, "source INT4 Expert was mapped before OnDemand rejection");
+    }
+
+    struct PackedPreflightCase
+    {
+        DType expert_weight_dtype;
+        bool dense_qnk;
+        const char* error_message;
+    };
+    const std::array<PackedPreflightCase, 3> packed_cases = {{
+        {DType::Q4_0, true, "dense Qn_K FFNs require CpuPackedWeightMode::Disabled; CPU packed weights are supported for routed Experts only"},
+        {DType::BFloat16, false, "CPU packed weights are unavailable for this model or CPU"},
+        {DType::Q4_0, false, "native imported weights require CpuPackedWeightMode::Disabled"},
+    }};
+    Option packed_option;
+    packed_option.cpu_packed_weight_mode = CpuPackedWeightMode::Enabled;
+    for (const PackedPreflightCase& test_case : packed_cases)
+    {
+        uint32_t map_calls = 0;
+        RuntimeInfo info;
+        std::vector<std::shared_ptr<ModelAdapter>> adapters{
+            std::make_shared<NativeAwqOnDemandAdapter>(map_calls, test_case.expert_weight_dtype, test_case.dense_qnk)};
+        CompiledModel compiled;
+        ModelLoader loader(info, adapters, packed_option, compiled);
+        auto loaded = loader.load(directory.path);
+        native_awq_check(!loaded && loaded.error().code == ErrorCode::UnsupportedModel
+                             && loaded.error().message == test_case.error_message,
+                         "CPU-packed weights were not rejected with the expected preflight error");
+        native_awq_check(map_calls == 0, "CPU-packed preflight rejection reached map_weights");
+    }
+}
+
 static void check_native_awq_projection(bool awq, const std::string& dtype, int64_t group_size,
                                         bool indices, bool permuted, bool alias, bool desc_act = false)
 {
@@ -198,6 +358,7 @@ static void check_native_awq_projection(bool awq, const std::string& dtype, int6
     native_awq_check(static_cast<bool>(opened), "valid source archive rejected");
     const SafetensorsArchive& archive = opened.value();
     native_awq_check(archive.has_native_quantized_tensors() && archive.contains_tensor(logical), "logical quantized tensor was not detected");
+    native_awq_check(!archive.has_int4_experts(), "dense INT4 tensor was classified as a routed Expert");
     auto inferred = archive.tensor_dtype(logical);
     native_awq_check(inferred && inferred.value() == DType::Int4, "source dtype was not INT4");
     auto loaded = archive.load_tensor(logical);
@@ -412,6 +573,7 @@ void test_native_awq()
     test_native_awq_unquantized_weights();
     test_native_awq_orphan_metadata();
     test_native_awq_manifest_snapshot();
+    test_native_awq_on_demand_preflight();
 }
 
 } // namespace moe

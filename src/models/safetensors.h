@@ -65,6 +65,7 @@ public:
     [[nodiscard]] const SafetensorInfo* find(const std::string& name) const noexcept;
     [[nodiscard]] bool contains_tensor(const std::string& name) const noexcept;
     [[nodiscard]] bool has_native_quantized_tensors() const noexcept;
+    [[nodiscard]] bool has_int4_experts() const noexcept;
     [[nodiscard]] bool has_float8_tensors() const noexcept;
     [[nodiscard]] Result<DType> tensor_dtype(const std::string& name) const;
     [[nodiscard]] Result<TensorData> load_tensor(const std::string& name, uint32_t flags = 0) const;
@@ -96,12 +97,12 @@ private:
                                                       std::optional<uint32_t> slice = std::nullopt,
                                                       std::vector<uint32_t> shape = {},
                                                       bool preserve_float32 = false) const;
-    [[nodiscard]] Result<TensorData> load_source_int4_tensor(const std::string& name) const;
+    [[nodiscard]] Result<TensorData> load_int4_tensor(const std::string& name) const;
 
     std::unordered_map<std::string, SafetensorInfo> tensors;
-    std::string source_quantization_method;
-    int64_t source_quantization_group_size = 0;
-    bool source_quantization_desc_act = false;
+    std::string quant_method;
+    int64_t quant_group_size = 0;
+    bool quant_desc_act = false;
     bool gguf_source = false;
 };
 

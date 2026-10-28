@@ -889,31 +889,6 @@ enum class QnkExpertEncoding
     Unsupported
 };
 
-static QnkExpertEncoding qnk_expert_encoding(const WeightMapping& weights) noexcept
-{
-    bool found = false;
-    bool qnk_only = true;
-    bool file_backed = true;
-    for (const auto& [name, tensor] : weights)
-    {
-        if (name.find(".experts.") == std::string::npos || !name.ends_with(".weight"))
-            continue;
-        if (is_qnk_dtype(tensor.dtype))
-        {
-            found = true;
-            file_backed = file_backed && static_cast<bool>(tensor.mxfp4_file_storage);
-        }
-        else
-        {
-            qnk_only = false;
-        }
-    }
-    if (!found)
-        return QnkExpertEncoding::None;
-    return qnk_only && file_backed ? QnkExpertEncoding::FileBacked
-                                   : QnkExpertEncoding::Unsupported;
-}
-
 static bool mapped_ple_embedding_shard(const std::string& name, const TensorData& tensor,
                                        const MoeModelDescriptor& descriptor) noexcept
 {
@@ -1073,7 +1048,8 @@ static Result<uint64_t> qwen_vulkan_releasable_dense_size(const MoeModelDescript
 
 static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeModelDescriptor& descriptor,
                                         ModelMemoryPlan& plan, uint64_t& expert_fixed_size,
-                                        uint64_t& max_qnk_cache_pair_size)
+                                        uint64_t& max_qnk_cache_pair_size,
+                                        QnkExpertEncoding& qnk_encoding)
 {
     struct MappedExpertSize
     {
@@ -1081,7 +1057,11 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
         uint64_t raw = 0;
         uint64_t metadata = 0;
     };
-    std::map<std::string, MappedExpertSize> expert_sizes;
+    // WeightMapping owns these names for the lifetime of this local aggregation.
+    std::map<std::string_view, MappedExpertSize> expert_sizes;
+    bool found = false;
+    bool qnk_only = true;
+    bool file_backed = true;
     for (const auto& [name, tensor] : weights)
     {
         uint64_t bytes = tensor.dtype == DType::Int4
@@ -1122,10 +1102,23 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
         const size_t marker = name.find(".experts.");
         if (marker != std::string::npos)
         {
+            if (name.ends_with(".weight"))
+            {
+                if (is_qnk_dtype(tensor.dtype))
+                {
+                    found = true;
+                    file_backed = file_backed && static_cast<bool>(tensor.mxfp4_file_storage);
+                }
+                else
+                {
+                    qnk_only = false;
+                }
+            }
+
             const size_t end = name.find('.', marker + 9);
             if (end == std::string::npos)
                 return Error{ErrorCode::InvalidModel, "invalid canonical Expert tensor name: " + name};
-            MappedExpertSize& expert_size = expert_sizes[name.substr(0, end)];
+            MappedExpertSize& expert_size = expert_sizes[std::string_view(name.data(), end)];
             auto total = checked_add(expert_size.total, bytes, "mapped Expert weights");
             if (!total)
                 return total.error();
@@ -1174,6 +1167,9 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
             plan.estimated_dense_size = total.value();
         }
     }
+    qnk_encoding = !found ? QnkExpertEncoding::None
+                          : (qnk_only && file_backed ? QnkExpertEncoding::FileBacked
+                                                     : QnkExpertEncoding::Unsupported);
     for (const auto& [name, expert_size] : expert_sizes)
     {
         (void)name;
@@ -1220,6 +1216,7 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
     bool budget_limited_by_available_memory = false;
     uint64_t expert_fixed_size = 0;
     uint64_t max_qnk_cache_pair_size = 0;
+    QnkExpertEncoding qnk_encoding = QnkExpertEncoding::None;
     plan.requested_mode = opt.expert_memory_mode;
     plan.physical_memory_size = physical_memory_size;
     plan.available_memory_size = available_memory_size;
@@ -1258,7 +1255,8 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
             return Error{ErrorCode::UnsupportedModel, "native imported weights require CpuPackedWeightMode::Disabled"};
         auto sizes = mapped_weight_sizes(*weights, descriptor, plan,
                                          expert_fixed_size,
-                                         max_qnk_cache_pair_size);
+                                         max_qnk_cache_pair_size,
+                                         qnk_encoding);
         if (!sizes)
             return sizes.error();
     }
@@ -1285,8 +1283,6 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         return !layer.dense.enabled();
     });
     const MoeDescriptor& moe = first_moe->moe;
-    const QnkExpertEncoding qnk_encoding = weights ? qnk_expert_encoding(*weights)
-                                                   : QnkExpertEncoding::None;
     const bool has_qnk_experts = qnk_encoding != QnkExpertEncoding::None;
     const bool file_backed_qnk_experts = qnk_encoding == QnkExpertEncoding::FileBacked;
     const auto add_expert_layers = [&](const MoeDescriptor& layer_moe,

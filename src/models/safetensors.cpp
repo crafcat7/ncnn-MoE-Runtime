@@ -264,6 +264,35 @@ static Result<void> parse_header(const std::filesystem::path& path,
             || data_start > std::numeric_limits<uint64_t>::max() - end
             || data_start + end > file_size)
             return Error{ErrorCode::InvalidModel, "invalid safetensors data range: " + name};
+        uint64_t element_size = 0;
+        if (*dtype == "F32" || *dtype == "I32")
+            element_size = 4;
+        else if (*dtype == "F16" || *dtype == "BF16")
+            element_size = 2;
+        else if (*dtype == "I64")
+            element_size = 8;
+        else if (*dtype == "I8" || *dtype == "U8" || *dtype == "F8_E4M3" || *dtype == "F8_E8M0")
+            element_size = 1;
+        if (element_size != 0)
+        {
+            uint64_t element_count = 1;
+            if (std::find(shape.value().begin(), shape.value().end(), 0) != shape.value().end())
+            {
+                element_count = 0;
+            }
+            else
+            {
+                for (uint32_t dimension : shape.value())
+                {
+                    if (element_count > std::numeric_limits<uint64_t>::max() / dimension)
+                        return Error{ErrorCode::InvalidModel, "safetensors shape element count overflows: " + name};
+                    element_count *= dimension;
+                }
+            }
+            if (element_count > std::numeric_limits<uint64_t>::max() / element_size
+                || end - begin != element_count * element_size)
+                return Error{ErrorCode::InvalidModel, "safetensors tensor byte count disagrees with its shape: " + name};
+        }
         if (tensors.contains(name))
             return Error{ErrorCode::InvalidModel, "duplicate safetensors tensor: " + name};
         tensors.emplace(std::move(name), SafetensorInfo{path, std::move(*dtype), std::move(shape).value(), data_start + begin, end - begin});
@@ -308,7 +337,7 @@ static std::string source_quantized_prefix(const std::string& name)
     return {};
 }
 
-struct SourceInt4TensorInfo
+struct Int4Info
 {
     const SafetensorInfo* weights = nullptr;
     const SafetensorInfo* zeros = nullptr;
@@ -320,16 +349,16 @@ struct SourceInt4TensorInfo
     uint32_t groups = 0;
 };
 
-static Result<SourceInt4TensorInfo> source_int4_tensor_info(const SafetensorsArchive& archive,
-                                                            const std::string& name,
-                                                            const std::string& method,
-                                                            int64_t group_size,
-                                                            bool desc_act)
+static Result<Int4Info> int4_info(const SafetensorsArchive& archive,
+                                  const std::string& name,
+                                  const std::string& method,
+                                  int64_t group_size,
+                                  bool desc_act)
 {
     if (method != "awq" && method != "gptq")
         return Error{ErrorCode::UnsupportedModel, "source qweight requires AWQ/GPTQ quantization_config: " + name};
     const std::string prefix = source_quantized_prefix(name);
-    SourceInt4TensorInfo info;
+    Int4Info info;
     info.weights = archive.find(prefix + "qweight");
     info.zeros = archive.find(prefix + "qzeros");
     info.scales = archive.find(prefix + "scales");
@@ -406,19 +435,19 @@ Result<SafetensorsArchive> SafetensorsArchive::open(const std::filesystem::path&
     auto config = read_source_quantization_config(root, manifest_json);
     if (!config)
         return config.error();
-    archive.source_quantization_method = config.value().method;
-    archive.source_quantization_group_size = config.value().group_size;
-    archive.source_quantization_desc_act = config.value().desc_act;
+    archive.quant_method = config.value().method;
+    archive.quant_group_size = config.value().group_size;
+    archive.quant_desc_act = config.value().desc_act;
     for (const auto& item : archive.tensors)
     {
         if (item.first.ends_with(".qweight"))
         {
-            auto info = source_int4_tensor_info(archive, item.first, archive.source_quantization_method,
-                                                archive.source_quantization_group_size, archive.source_quantization_desc_act);
+            auto info = int4_info(archive, item.first, archive.quant_method,
+                                  archive.quant_group_size, archive.quant_desc_act);
             if (!info)
                 return info.error();
         }
-        else if (!archive.source_quantization_method.empty()
+        else if (!archive.quant_method.empty()
                  && (item.first.ends_with(".qzeros") || item.first.ends_with(".g_idx")))
         {
             const std::string prefix = item.first.substr(0, item.first.size() - (item.first.ends_with(".g_idx") ? 5 : 6));
@@ -479,7 +508,20 @@ bool SafetensorsArchive::has_native_quantized_tensors() const noexcept
             if (scale != tensors.end() && scale->second.dtype == "F8_E8M0")
                 return true;
         }
-        if (!source_quantization_method.empty() && item.first.ends_with(".qweight"))
+        if (!quant_method.empty() && item.first.ends_with(".qweight"))
+            return true;
+    }
+    return false;
+}
+
+bool SafetensorsArchive::has_int4_experts() const noexcept
+{
+    for (const auto& item : tensors)
+    {
+        const std::string& name = item.first;
+        if (name.find(".experts.") == std::string::npos)
+            continue;
+        if (name.ends_with(".qweight") || name.ends_with(".__int4_shape"))
             return true;
     }
     return false;
@@ -695,7 +737,8 @@ Result<DType> SafetensorsArchive::tensor_dtype(const std::string& name) const
     const std::string prefix = source_quantized_prefix(name);
     if (!prefix.empty() && find(prefix + "qweight"))
     {
-        auto info = source_int4_tensor_info(*this, name, source_quantization_method, source_quantization_group_size, source_quantization_desc_act);
+        auto info = int4_info(*this, name, quant_method, quant_group_size,
+                              quant_desc_act);
         if (!info)
             return info.error();
         return DType::Int4;
@@ -703,7 +746,7 @@ Result<DType> SafetensorsArchive::tensor_dtype(const std::string& name) const
     auto encoding = tensor_encoding(*this, name, find(name));
     if (!encoding)
         return encoding.error();
-    if ((!source_quantization_method.empty() || gguf_source) && encoding.value().dtype == DType::Float32)
+    if ((!quant_method.empty() || gguf_source) && encoding.value().dtype == DType::Float32)
         return DType::BFloat16;
     return encoding.value().dtype;
 }
@@ -803,12 +846,13 @@ static float read_safetensor_float(const uint8_t* data, size_t index, const std:
     return safetensor_half_to_float(value);
 }
 
-Result<TensorData> SafetensorsArchive::load_source_int4_tensor(const std::string& name) const
+Result<TensorData> SafetensorsArchive::load_int4_tensor(const std::string& name) const
 {
-    auto parsed = source_int4_tensor_info(*this, name, source_quantization_method, source_quantization_group_size, source_quantization_desc_act);
+    auto parsed = int4_info(*this, name, quant_method, quant_group_size,
+                            quant_desc_act);
     if (!parsed)
         return parsed.error();
-    const SourceInt4TensorInfo& info = parsed.value();
+    const Int4Info& info = parsed.value();
     TensorData tensor;
     tensor.dtype = DType::Int4;
     tensor.shape = {info.rows, info.columns};
@@ -824,7 +868,7 @@ Result<TensorData> SafetensorsArchive::load_source_int4_tensor(const std::string
         for (uint32_t column = 0; column < info.columns; ++column)
         {
             const uint32_t group = read_packed_u32(bytes.value().data(), column);
-            if (group >= info.groups || (!source_quantization_desc_act && group != column / info.group_size))
+            if (group >= info.groups || (!quant_desc_act && group != column / info.group_size))
                 return Error{ErrorCode::InvalidModel, "invalid or noncanonical GPTQ g_idx: " + name};
             tensor.quantization_group_indices[column] = group;
             canonical = canonical && group == column / info.group_size;
@@ -844,7 +888,7 @@ Result<TensorData> SafetensorsArchive::load_source_int4_tensor(const std::string
     auto zeros = read_range(info.zeros->path, info.zeros->offset, info.zeros->size);
     if (!zeros)
         return zeros.error();
-    const bool awq = source_quantization_method == "awq";
+    const bool awq = quant_method == "awq";
     constexpr std::array<uint32_t, 8> awq_reverse_order = {0, 4, 1, 5, 2, 6, 3, 7};
     const size_t metadata_count = static_cast<size_t>(info.rows) * info.groups;
     tensor.quantization_scales.resize(metadata_count);
@@ -990,7 +1034,7 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name, uint
     }
     const std::string prefix = source_quantized_prefix(name);
     if (!prefix.empty() && find(prefix + "qweight"))
-        return load_source_int4_tensor(name);
+        return load_int4_tensor(name);
     if (info && info->dtype == "F8_E4M3")
     {
         const std::string base = name.ends_with(".weight") ? name.substr(0, name.size() - 7) : name;
@@ -1112,7 +1156,7 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name, uint
         if (!status)
             return Error{ErrorCode::InvalidModel, status.error().message + ": " + name};
     }
-    else if (info->dtype == "F16" || (info->dtype == "F32" && (!source_quantization_method.empty() || gguf_source)))
+    else if (info->dtype == "F16" || (info->dtype == "F32" && (!quant_method.empty() || gguf_source)))
     {
         const size_t element_size = info->dtype == "F16" ? sizeof(uint16_t) : sizeof(float);
         if (tensor.element_count() > std::numeric_limits<uint64_t>::max() / element_size
@@ -2024,23 +2068,39 @@ Result<TensorData> SafetensorsArchive::load_bfloat16_slice(const std::string& na
     if (!info || info->dtype != "BF16" || info->shape.empty() || index >= info->shape[0])
         return Error{ErrorCode::InvalidModel, "invalid BF16 tensor slice: " + name};
     uint64_t element_count = 1;
-    for (uint32_t dimension : shape)
-        element_count *= dimension;
+    if (std::find(shape.begin(), shape.end(), 0) != shape.end())
+    {
+        element_count = 0;
+    }
+    else
+    {
+        for (uint32_t dimension : shape)
+        {
+            if (element_count > std::numeric_limits<uint64_t>::max() / dimension)
+                return Error{ErrorCode::InvalidModel, "BF16 tensor slice shape overflows: " + name};
+            element_count *= dimension;
+        }
+    }
+    if (element_count > std::numeric_limits<uint64_t>::max() / sizeof(uint16_t)
+        || element_count > std::numeric_limits<size_t>::max() / sizeof(uint16_t))
+        return Error{ErrorCode::InvalidModel, "BF16 tensor slice size overflows: " + name};
     const uint64_t slice_size = element_count * sizeof(uint16_t);
-    if (slice_size * info->shape[0] != info->size)
+    const uint64_t slice_count = info->shape[0];
+    if (info->size % slice_count != 0 || info->size / slice_count != slice_size)
         return Error{ErrorCode::InvalidModel, "BF16 tensor slice shape mismatch: " + name};
+    const uint64_t relative_offset = static_cast<uint64_t>(index) * slice_size;
 
     TensorData tensor;
     tensor.dtype = DType::BFloat16;
     tensor.shape = std::move(shape);
-    auto mapped = MappedFileRange::open(info->path, info->offset + index * slice_size, slice_size);
+    auto mapped = MappedFileRange::open(info->path, info->offset + relative_offset, slice_size);
     if (mapped && reinterpret_cast<uintptr_t>(mapped.value()->data()) % alignof(uint16_t) == 0)
     {
         tensor.mapped_data = mapped.value()->share_data();
         tensor.mapped_size = slice_size;
         return tensor;
     }
-    auto data = read_range(info->path, info->offset + index * slice_size, slice_size);
+    auto data = read_range(info->path, info->offset + relative_offset, slice_size);
     if (!data)
         return data.error();
     tensor.bfloat16_data.resize(static_cast<size_t>(element_count));

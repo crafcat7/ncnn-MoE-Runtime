@@ -108,8 +108,13 @@ public:
         if (malformed != 0)
             add(name + ".__int4_shape", "I64", {3}, shape, sizeof(shape));
         if (malformed != 18)
+        {
+            const size_t scale_size = malformed == 12   ? sizeof(scales) / 2
+                                      : malformed == 20 ? sizeof(scales) - sizeof(float)
+                                                        : sizeof(scales);
             add(name + ".__int4_scales", malformed == 12 ? "BF16" : "F32", {4, malformed == 1 ? 2u : 3u},
-                scales, malformed == 20 ? sizeof(scales) - sizeof(float) : sizeof(scales));
+                scales, scale_size);
+        }
         if (malformed != 6)
             add(name + ".__int4_zeros", "U8", malformed == 19 ? std::vector<uint32_t>{12} : std::vector<uint32_t>{4, 3}, zeros, sizeof(zeros));
         if (include_indices)
@@ -244,6 +249,12 @@ static void test_int4_archive()
         invalid.add_int4("weight", malformed);
         invalid.write(directory.path / "invalid.safetensors");
         auto archive = SafetensorsArchive::open_file(directory.path / "invalid.safetensors");
+        if (malformed == 1 || malformed == 8 || malformed == 9 || malformed == 13 || malformed == 20 || malformed == 21)
+        {
+            quant_archive_check(!archive && archive.error().code == ErrorCode::InvalidModel,
+                                "reject malformed standard dtype byte count while opening INT4 fixture");
+            continue;
+        }
         quant_archive_check(static_cast<bool>(archive), "open malformed INT4 fixture");
         auto tensor = archive.value().load_tensor("weight");
         quant_archive_check(!tensor && tensor.error().code == ErrorCode::InvalidModel, "reject malformed native INT4 metadata");
@@ -330,6 +341,12 @@ static void test_qnk_archive()
         }
         invalid.write(directory.path / "invalid.safetensors");
         auto archive = SafetensorsArchive::open_file(directory.path / "invalid.safetensors");
+        if (malformed == 4 || malformed == 5 || malformed == 6 || malformed == 10)
+        {
+            quant_archive_check(!archive && archive.error().code == ErrorCode::InvalidModel,
+                                "reject malformed standard dtype byte count while opening Qn_K fixture");
+            continue;
+        }
         quant_archive_check(static_cast<bool>(archive), "open malformed Qn_K fixture");
         quant_archive_check(!archive.value().load_tensor("weight"), "reject malformed Qn_K columns or untagged Qn_K bytes");
         if (malformed <= 4)
@@ -369,12 +386,63 @@ static void test_safetensor_shape_metadata()
     write_shape_test_archive(path, "[]", 2);
     auto scalar = SafetensorsArchive::open_file(path);
     quant_archive_check(scalar && scalar.value().find("weight")->shape.empty(), "preserve empty scalar shape metadata");
-    write_shape_test_archive(path, "[0, 2]", 0);
+    write_shape_test_archive(path, "[4294967295,4294967295,2,0]", 0);
     auto empty = SafetensorsArchive::open_file(path);
-    quant_archive_check(empty && empty.value().find("weight")->shape == std::vector<uint32_t>{0, 2}, "preserve zero dimension shape metadata");
+    quant_archive_check(empty && empty.value().find("weight")->shape == std::vector<uint32_t>{4294967295u, 4294967295u, 2, 0},
+                        "treat zero dimension as empty even when earlier shape product overflows");
     write_shape_test_archive(path, "[ 2 ]", 4);
     auto normal = SafetensorsArchive::open_file(path);
     quant_archive_check(normal && normal.value().find("weight")->shape == std::vector<uint32_t>{2}, "preserve valid integer shape metadata");
+    write_shape_test_archive(path, "[4294967295,4294967295,2]", 0);
+    auto overflow = SafetensorsArchive::open_file(path);
+    quant_archive_check(!overflow && overflow.error().code == ErrorCode::InvalidModel,
+                        "reject standard dtype shape product overflow while opening");
+
+    const std::array<const char*, 9> dtypes = {"F32", "F16", "BF16", "I64", "I32", "I8", "U8", "F8_E4M3", "F8_E8M0"};
+    const std::array<size_t, 9> element_sizes = {4, 2, 2, 8, 4, 1, 1, 1, 1};
+    const std::array<uint8_t, 9> payload = {};
+    for (size_t index = 0; index < dtypes.size(); ++index)
+    {
+        QuantArchiveTestFile mismatch;
+        mismatch.add("weight", dtypes[index], {1}, payload.data(), element_sizes[index] + 1);
+        mismatch.write(path);
+        auto invalid = SafetensorsArchive::open_file(path);
+        quant_archive_check(!invalid && invalid.error().code == ErrorCode::InvalidModel,
+                            "reject standard dtype shape-byte mismatch while opening");
+    }
+    QuantArchiveTestFile custom_packed;
+    custom_packed.add("weight", "MXFP4", {std::numeric_limits<uint32_t>::max(), std::numeric_limits<uint32_t>::max(), 2}, payload.data(), 0);
+    custom_packed.write(path);
+    auto custom_archive = SafetensorsArchive::open_file(path);
+    quant_archive_check(static_cast<bool>(custom_archive), "leave custom packed dtype validation to its format-specific loader");
+
+    QuantArchiveTestFile slices;
+    const std::array<uint16_t, 8> slice_values = {0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0, 0x40e0, 0x4100};
+    slices.add("bank", "BF16", {2, 2, 2}, slice_values.data(), sizeof(slice_values));
+    slices.write(path);
+    auto slice_archive = SafetensorsArchive::open_file(path);
+    quant_archive_check(static_cast<bool>(slice_archive), "open BF16 slice fixture");
+    {
+        auto reshaped = slice_archive.value().load_bfloat16_slice("bank", 1, {4});
+        quant_archive_check(reshaped && reshaped.value().shape == std::vector<uint32_t>{4}
+                                && reshaped.value().bfloat16_values().size() == 4
+                                && reshaped.value().bfloat16_values()[0] == slice_values[4],
+                            "allow BF16 slice reshape with matching element count");
+    }
+    std::error_code remove_error;
+    std::filesystem::remove(path, remove_error);
+    quant_archive_check(!remove_error, "remove BF16 slice source before invalid shape checks");
+    const uint32_t max_dimension = std::numeric_limits<uint32_t>::max();
+    const std::array<std::vector<uint32_t>, 3> invalid_slice_shapes = {
+        std::vector<uint32_t>{max_dimension, max_dimension, 2},
+        std::vector<uint32_t>{max_dimension, max_dimension},
+        std::vector<uint32_t>{1}};
+    for (const auto& invalid_shape : invalid_slice_shapes)
+    {
+        auto invalid_slice = slice_archive.value().load_bfloat16_slice("bank", 1, invalid_shape);
+        quant_archive_check(!invalid_slice && invalid_slice.error().code == ErrorCode::InvalidModel,
+                            "reject invalid BF16 slice shape before reading its source");
+    }
     write_shape_test_archive(path, "[2]", 4, "[ 0 , 4 ]");
     auto spaced = SafetensorsArchive::open_file(path);
     quant_archive_check(spaced && spaced.value().find("weight")->size == 4,

@@ -181,6 +181,24 @@ Result<void> ModelLoader::validate_option()
         return Error{ErrorCode::InvalidArgument, "Expert GPU victim reuse-probe interval must be between 1 and 1024"};
     if (opt.num_concurrent_sessions == 0 || opt.num_concurrent_sessions > 1024)
         return Error{ErrorCode::InvalidArgument, "num_concurrent_sessions must be between 1 and 1024"};
+    if (opt.expert_memory_mode != ExpertMemoryMode::Auto
+        && opt.expert_memory_mode != ExpertMemoryMode::Eager
+        && opt.expert_memory_mode != ExpertMemoryMode::OnDemand)
+    {
+        return Error{ErrorCode::InvalidArgument, "expert memory mode is invalid"};
+    }
+    if (opt.host_memory_budget != 0 && info.physical_memory_size != 0
+        && opt.host_memory_budget > info.physical_memory_size)
+    {
+        return Error{ErrorCode::InvalidArgument, "host memory budget exceeds detected physical memory"};
+    }
+    if (opt.expert_gpu_cache_size > std::numeric_limits<uint64_t>::max() - opt.expert_gpu_victim_cache_size)
+        return Error{ErrorCode::InvalidArgument, "the combined Expert GPU cache capacity overflows"};
+    if (has_flag(opt.flags, OptionDisableGpuExpertExecution)
+        && (opt.expert_gpu_cache_size != 0 || opt.expert_gpu_victim_cache_size != 0))
+    {
+        return Error{ErrorCode::InvalidArgument, "GPU Expert execution cannot be disabled while an Expert GPU cache is configured"};
+    }
 
     return {};
 }
@@ -314,26 +332,22 @@ Result<void> ModelLoader::plan_memory()
     if (!use_native_weights)
     {
         auto archive = SafetensorsArchive::open(package.root, package.manifest.raw_json);
-        use_native_weights = archive
-                             && (archive.value().has_native_quantized_tensors()
-                                 || (!reserve_cpu_packed_weights && archive.value().has_float8_tensors()));
+        if (archive)
+        {
+            const bool needs_cache = opt.expert_memory_mode == ExpertMemoryMode::OnDemand || opt.expert_cache_size != 0;
+            if (needs_cache && descriptor.expert_count != 0
+                && (std::any_of(descriptor.layers.begin(), descriptor.layers.end(), [](const LayerDescriptor& layer) {
+                        return layer.moe.expert_count != 0 && layer.moe.expert_weight_dtype == DType::Int4;
+                    })
+                    || archive.value().has_int4_experts()))
+            {
+                return Error{ErrorCode::UnsupportedModel,
+                             "on-demand expert storage requires an explicitly file-backed Expert encoding"};
+            }
+            use_native_weights = archive.value().has_native_quantized_tensors()
+                                 || (!reserve_cpu_packed_weights && archive.value().has_float8_tensors());
+        }
     }
-    if (use_native_weights)
-    {
-        const uint32_t old_flags = package.flags;
-        package.flags |= ModelPackageDeferMxfp4Experts;
-        auto mapped = adapter->map_weights(package, descriptor);
-        package.flags = old_flags;
-        if (!mapped)
-            return mapped.error();
-        native_weights = std::move(mapped).value();
-        native_quantized_experts = std::any_of(native_weights->begin(), native_weights->end(), [](const auto& item) {
-            return item.first.find(".experts.") != std::string::npos
-                   && (item.second.dtype == DType::Int4 || is_qnk_dtype(item.second.dtype));
-        });
-    }
-    const bool use_vulkan_compute = opt.hybrid_mode == HybridMode::HybridExperts;
-    const bool use_vulkan_dense_host_release = use_vulkan_compute && has_flag(info.flags, RuntimeVulkan);
 
     if (reserve_cpu_packed_weights
         && std::any_of(descriptor.layers.begin(), descriptor.layers.end(), [](const LayerDescriptor& layer) {
@@ -353,6 +367,25 @@ Result<void> ModelLoader::plan_memory()
             ErrorCode::UnsupportedModel,
             "CPU packed weights are unavailable for this model or CPU"};
     }
+    if (use_native_weights && reserve_cpu_packed_weights)
+        return Error{ErrorCode::UnsupportedModel, "native imported weights require CpuPackedWeightMode::Disabled"};
+
+    if (use_native_weights)
+    {
+        const uint32_t old_flags = package.flags;
+        package.flags |= ModelPackageDeferMxfp4Experts;
+        auto mapped = adapter->map_weights(package, descriptor);
+        package.flags = old_flags;
+        if (!mapped)
+            return mapped.error();
+        native_weights = std::move(mapped).value();
+        native_quantized_experts = std::any_of(native_weights->begin(), native_weights->end(), [](const auto& item) {
+            return item.first.find(".experts.") != std::string::npos
+                   && (item.second.dtype == DType::Int4 || is_qnk_dtype(item.second.dtype));
+        });
+    }
+    const bool use_vulkan_compute = opt.hybrid_mode == HybridMode::HybridExperts;
+    const bool use_vulkan_dense_host_release = use_vulkan_compute && has_flag(info.flags, RuntimeVulkan);
 
     const uint64_t available_size = available_memory_size();
     auto planned = plan_model_memory(descriptor,
@@ -452,12 +485,7 @@ Result<void> ModelLoader::plan_memory()
     if (use_file_backed_mxfp4 || use_file_backed_qnk)
         package.flags |= ModelPackageDeferMxfp4Experts;
 
-    if (opt.expert_gpu_cache_size > std::numeric_limits<uint64_t>::max() - opt.expert_gpu_victim_cache_size)
-        return Error{ErrorCode::InvalidArgument, "the combined Expert GPU cache capacity overflows"};
-
     requested_gpu_cache_size = opt.expert_gpu_cache_size + opt.expert_gpu_victim_cache_size;
-    if (has_flag(opt.flags, OptionDisableGpuExpertExecution) && requested_gpu_cache_size != 0)
-        return Error{ErrorCode::InvalidArgument, "GPU Expert execution cannot be disabled while an Expert GPU cache is configured"};
     if (native_quantized_experts && opt.expert_gpu_victim_cache_size != 0)
         return Error{ErrorCode::UnsupportedModel, "the Expert GPU victim cache requires MXFP4 Expert weights"};
 

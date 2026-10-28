@@ -15,14 +15,6 @@ static Result<void> add_deepseek_projection(WeightMapping& mapping, const Safete
                                             const std::string& target, const std::string& source,
                                             uint32_t flags = 0);
 
-static Result<DType> deepseek_projection_dtype(const SafetensorsArchive& archive, const std::string& source)
-{
-    const SafetensorInfo* tensor = archive.find(source);
-    if (tensor && tensor->dtype == "F8_E4M3")
-        return DType::Float8E4M3;
-    return archive.tensor_dtype(source);
-}
-
 static bool is_deepseek_fp4_expert(const SafetensorsArchive& archive, const std::string& source)
 {
     const SafetensorInfo* weight = archive.find(source + "w1.weight");
@@ -58,7 +50,7 @@ static Result<void> inspect_deepseek_experts(const SafetensorsArchive& archive,
             continue;
         for (size_t projection_index = 0; projection_index < projection_count; ++projection_index)
         {
-            auto dtype = deepseek_projection_dtype(archive, expert + projections[projection_index] + ".weight");
+            auto dtype = archive.tensor_dtype(expert + projections[projection_index] + ".weight");
             if (!dtype)
                 return dtype.error();
             if (expert_id == 0 && projection_index == 0)
@@ -395,11 +387,11 @@ Result<MoeModelDescriptor> DeepSeekV4ModelAdapter::parse_model(const ModelPackag
             auto status = inspect_deepseek_experts(*archive, source, layer.moe);
             if (!status)
                 return status.error();
-            auto projection_dtype = deepseek_projection_dtype(*archive, source + "attn.wq_a.weight");
+            auto projection_dtype = archive->tensor_dtype(source + "attn.wq_a.weight");
             if (!projection_dtype)
                 return projection_dtype.error();
             layer.attention.projection_weight_dtype = projection_dtype.value();
-            auto shared_dtype = deepseek_projection_dtype(*archive, source + "ffn.shared_experts.w1.weight");
+            auto shared_dtype = archive->tensor_dtype(source + "ffn.shared_experts.w1.weight");
             if (!shared_dtype)
                 return shared_dtype.error();
             layer.moe.shared_expert_weight_dtype = shared_dtype.value();
@@ -468,7 +460,7 @@ static Result<void> add_common_layer_tensors(WeightMapping& mapping, const Safet
 static Result<void> add_deepseek_projection(WeightMapping& mapping, const SafetensorsArchive& archive,
                                             const std::string& target, const std::string& source, uint32_t flags)
 {
-    auto dtype = deepseek_projection_dtype(archive, source + ".weight");
+    auto dtype = archive.tensor_dtype(source + ".weight");
     if (!dtype)
         return dtype.error();
     auto tensor = dtype.value() == DType::Float8E4M3
