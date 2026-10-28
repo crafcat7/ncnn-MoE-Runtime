@@ -475,10 +475,11 @@ Result<void> forward_model(const CompiledModel& model,
             }
             if (deferred_final_norm
                 && node->backend == ExecutionBackend::Vulkan
-                && lm_head_operator.bfloat16
-                && lm_head_operator.bfloat16->forward_rms_norm_chain(*lm_head_input,
-                                                                     state.logits))
+                && lm_head_operator.bfloat16)
             {
+                if (!lm_head_operator.bfloat16->forward_rms_norm_chain(*lm_head_input,
+                                                                       state.logits))
+                    return Error{ErrorCode::InternalError, "Vulkan LM head RMSNorm chain execution failed"};
                 produced_logits = true;
                 deferred_final_norm = false;
                 continue;
@@ -1407,10 +1408,11 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weight_inputs[0]);
             if (deferred_final_norm
                 && node->backend == ExecutionBackend::Vulkan
-                && lm_head_operator.bfloat16
-                && lm_head_operator.bfloat16->forward_rms_norm_chain(merged,
-                                                                     scratch.staged_output))
+                && lm_head_operator.bfloat16)
             {
+                if (!lm_head_operator.bfloat16->forward_rms_norm_chain(merged,
+                                                                       scratch.staged_output))
+                    return Error{ErrorCode::InternalError, "Vulkan LM head RMSNorm chain execution failed"};
                 deferred_final_norm = false;
             }
             else

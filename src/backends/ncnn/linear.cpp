@@ -4945,6 +4945,7 @@ std::shared_ptr<Mxfp4Linear_vulkan> Mxfp4Linear_vulkan::create_with_allocator(co
 {
 #if NCNN_MOE_WITH_VULKAN
     if (matrix.dtype != DType::MxFp4 || matrix.shape.size() != 2 || matrix.shape[0] == 0 || matrix.shape[1] == 0 || matrix.shape[1] % 32 != 0
+        || !matrix.input_column_indices.empty()
         || matrix.shape[0] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 64)
         || matrix.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max()))
     {
@@ -7198,7 +7199,8 @@ std::shared_ptr<Mxfp4Expert_vulkan> Mxfp4Expert_vulkan::create_with_allocator(co
                                                                               VulkanWeightUploadBatch* upload_batch)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (gate_up.shape.size() != 2 || gate_up.shape[0] % 2 != 0 || down.shape.size() != 2 || down.shape[1] != gate_up.shape[0] / 2 || activation_limit < 0.0f)
+    if (gate_up.shape.size() != 2 || gate_up.shape[0] % 2 != 0 || down.shape.size() != 2 || down.shape[1] != gate_up.shape[0] / 2 || activation_limit < 0.0f
+        || !gate_up.input_column_indices.empty() || !down.input_column_indices.empty())
     {
         return {};
     }

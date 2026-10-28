@@ -194,7 +194,7 @@ static void forward_expert(const CompiledModel& model,
             prefetch_tensor(gate_up_weight);
         const TensorData* gate_up_bias = expert.gate_up_bias == invalid_tensor_handle ? nullptr : &weights.at(expert.gate_up_bias);
         ActivationBuffer& activated = workspace.projection;
-        if (gate_up_weight.dtype == DType::MxFp4)
+        if (gate_up_weight.dtype == DType::MxFp4 && gate_up_weight.input_column_indices.empty())
         {
             forward_gate_up_mxfp4(gate_up_weight,
                                   gate_up_bias,
@@ -524,15 +524,20 @@ void forward_dense_ffn(const CompiledModel& model,
     if (backend == ExecutionBackend::Vulkan)
     {
         const CompiledOperator& fused = model.operators.at(ffn.vulkan_operator);
-        if (fused.qnk_expert && fused.qnk_expert->forward(input, output))
-            return;
-        const CompiledOperator& down = model.operators.at_weight(ffn.down_weight);
-        if (fused.bfloat16 && down.bfloat16
-            && fused.bfloat16->forward_swiglu_chain(input, *down.bfloat16,
-                                                    model.weights.at(ffn.up_weight).shape[0],
-                                                    ffn.activation, ffn.activation_limit, false, output))
+        if (fused.qnk_expert)
         {
-            return;
+            if (fused.qnk_expert->forward(input, output))
+                return;
+            throw std::runtime_error("Vulkan dense FFN execution failed");
+        }
+        const CompiledOperator& down = model.operators.at_weight(ffn.down_weight);
+        if (fused.bfloat16 && down.bfloat16)
+        {
+            if (fused.bfloat16->forward_swiglu_chain(input, *down.bfloat16,
+                                                     model.weights.at(ffn.up_weight).shape[0],
+                                                     ffn.activation, ffn.activation_limit, false, output))
+                return;
+            throw std::runtime_error("Vulkan dense FFN execution failed");
         }
         if (ffn.gate_up_weight == invalid_tensor_handle)
         {
@@ -586,11 +591,14 @@ void forward_shared_expert(const CompiledModel& model,
                 *device_output = std::move(completed);
                 return;
             }
-            if (require_device_execution)
-                throw std::runtime_error("Vulkan native Shared Expert device execution failed");
+            throw std::runtime_error("Vulkan native Shared Expert device execution failed");
         }
-        if (!require_device_execution && qnk_shared->forward(input, output))
-            return;
+        if (!require_device_execution)
+        {
+            if (qnk_shared->forward(input, output))
+                return;
+            throw std::runtime_error("Vulkan native Shared Expert execution failed");
+        }
     }
     const auto& float8_gate = model.operators.at_weight(expert.gate_weight).float8;
     const auto& float8_up = model.operators.at_weight(expert.up_weight).float8;
@@ -611,12 +619,14 @@ void forward_shared_expert(const CompiledModel& model,
             return;
     }
     const CompiledOperator& fused_shared_operator = model.operators.at(moe.fused_shared_input_bfloat16_operator);
+    bool shared_bfloat_chain_attempted = false;
     if (fused_shared_operator.bfloat16
         && expert.down_weight != invalid_tensor_handle)
     {
         const CompiledOperator& down_operator = model.operators.at_weight(expert.down_weight);
         if (down_operator.bfloat16)
         {
+            shared_bfloat_chain_attempted = true;
             const uint32_t intermediate = model.weights.at(expert.up_weight).shape[0];
             if (device_output && device_input && !device_input->empty())
             {
@@ -702,7 +712,8 @@ void forward_shared_expert(const CompiledModel& model,
 
     if (require_device_execution)
         throw std::runtime_error("Vulkan Shared Expert has no executable device chain or router gate");
-    const ExecutionBackend backend = support_vulkan_shared_experts(model.operators, moe)
+    const ExecutionBackend backend = !shared_bfloat_chain_attempted
+                                             && support_vulkan_shared_experts(model.operators, moe)
                                          ? ExecutionBackend::Vulkan
                                          : ExecutionBackend::Cpu;
     forward_dense_ffn(model, moe.shared_expert, input, output, workspace,
@@ -1131,7 +1142,11 @@ bool support_vulkan_expert(const ExpertPlan& expert,
         return false;
     }
     if (!up && gate_up.dtype == DType::MxFp4 && down.dtype == DType::MxFp4)
-        return true;
+    {
+        if (gate_up.input_column_indices.empty() && down.input_column_indices.empty())
+            return true;
+        return has_flag(optimization_flags, OptimizationVulkanQnK);
+    }
     if (!up && gate_up.dtype == DType::BFloat16 && down.dtype == DType::BFloat16)
     {
         return expert.activation == ExpertActivation::Silu

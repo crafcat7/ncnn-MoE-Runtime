@@ -141,7 +141,18 @@ static void shared_model(CompiledModel& model, uint32_t hidden, uint32_t interme
         if (q8_0)
             shared_check(static_cast<bool>(model.operators.at(shared.vulkan_operator).qnk_expert) == expect_gpu, "Q8_0 uses resident Expert chain");
         else if (bfloat16)
-            shared_check(static_cast<bool>(model.operators.at(plan.moe.fused_shared_input_bfloat16_operator).bfloat16) == expect_gpu, "BF16 uses fused resident gate/up weights");
+        {
+            const bool fused_chain_supported = intermediate != 0
+                                               && intermediate % 128 == 0
+                                               && (activation == ExpertActivation::Silu
+                                                   || activation == ExpertActivation::DeepSeekSwiGlu);
+            const bool has_fused = static_cast<bool>(model.operators.at(plan.moe.fused_shared_input_bfloat16_operator).bfloat16);
+            if (fused_chain_supported)
+                shared_check(has_fused == expect_gpu, "BF16 uses fused resident gate/up weights");
+            else
+                shared_check(!has_fused && support_vulkan_ffn(model.operators, plan.moe.shared_expert) == expect_gpu,
+                             "unsupported BF16 fused chain uses prepared projection operators");
+        }
         else
         {
             shared_check(plan.moe.fused_shared_input_bfloat16_operator == invalid_compiled_operator_handle, "FP8 uses separate resident weights");
@@ -183,6 +194,23 @@ static void shared_test_optional_preparation()
     shared_check(get_vulkan_statistics(runtime).compute_submissions == before.compute_submissions,
                  "optional Shared preparation failure uses CPU");
     shared_check_output(actual, expected, "optional Shared CPU tail parity", 0.0f, 0.0f);
+
+    {
+        CompiledModel bf16_model;
+        CompiledModel bf16_cpu;
+        shared_model(bf16_model, 128, 64, 0.0f, runtime, true, true, true);
+        shared_model(bf16_cpu, 128, 64, 0.0f, {}, false, true, true);
+        const auto& bf16_moe = bf16_model.graph.layer_plans[0].moe;
+        release_vulkan_dense_host_copies(bf16_model);
+        forward_shared_expert(bf16_cpu, bf16_cpu.graph.layer_plans[0].moe, input, expected, workspace);
+        const auto bf16_before = get_vulkan_statistics(runtime);
+        forward_shared_expert(bf16_model, bf16_moe, input, actual, workspace);
+        const auto bf16_after = get_vulkan_statistics(runtime);
+        const bool qnk = static_cast<bool>(bf16_model.operators.at(bf16_moe.shared_expert.vulkan_operator).qnk_expert);
+        shared_check(bf16_after.compute_submissions == bf16_before.compute_submissions + (qnk ? 1 : 3),
+                     "unsupported BF16 Shared fusion executes prepared Vulkan projections");
+        shared_check_output(actual, expected, "unsupported BF16 Shared GPU CPU parity");
+    }
 }
 
 static std::shared_ptr<DeviceTensor_vulkan> shared_upload(const ActivationBuffer& input,

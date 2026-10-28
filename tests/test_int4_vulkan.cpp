@@ -743,6 +743,58 @@ static void test_int4_gpu_gated_delta()
                        && recorded_cache.gated_delta_token_count == 3 && recorded_cache.gated_delta_device_state
                        && recorded_cache.gated_delta_convolution.empty() && recorded_cache.gated_delta_recurrent.empty(),
                    "failed Vulkan state never executes a silent CPU fallback");
+
+    {
+        plan.pre_attention_norm_weight = add("batch_pre_norm", int4_gpu_float_tensor({hidden}, 0.5f));
+        std::array<LayerCache, 2> cpu_cache;
+        std::array<LayerCache, 2> gpu_cache;
+        std::array<GatedDeltaScratch, 2> cpu_scratch;
+        std::array<GatedDeltaScratch, 2> gpu_scratch;
+        std::array<ActivationBuffer, 2> input;
+        std::array<ActivationBuffer, 2> cpu_output;
+        std::array<ActivationBuffer, 2> gpu_output;
+        std::array<GatedDeltaBatchEntry, 2> entries;
+        for (size_t index = 0; index < entries.size(); ++index)
+            entries[index] = {&input[index], &gpu_scratch[index], &gpu_cache[index], &gpu_output[index]};
+        std::vector<GatedDeltaBatchEntry_vulkan> device_entries;
+
+        for (size_t round = 0; round < 2; ++round)
+        {
+            for (size_t index = 0; index < input.size(); ++index)
+            {
+                input[index] = int4_gpu_input(1, hidden);
+                input[index].row(0)[index] += round == 0 ? 0.125f : -0.25f;
+            }
+            int4_gpu_check_result(begin_state_cache_transaction(cpu_cache, 1), "begin CPU GDN batch transaction");
+            int4_gpu_check_result(begin_state_cache_transaction(gpu_cache, 1), "begin GPU GDN batch transaction");
+            for (size_t index = 0; index < input.size(); ++index)
+                int4_gpu_check_result(forward_gated_delta(weights, operators, plan, ExecutionBackend::Cpu,
+                                                          cpu_cache[index], cpu_scratch[index], input[index], cpu_output[index],
+                                                          OptimizationDefaultFlags),
+                                      "CPU GDN batch reference");
+
+            const auto before = get_vulkan_statistics(runtime);
+            int4_gpu_check(forward_gated_delta_batch(weights, operators, plan, ExecutionBackend::Vulkan,
+                                                     entries, device_entries, OptimizationDefaultFlags),
+                           "execute transactional GDN batch");
+            const auto after = get_vulkan_statistics(runtime);
+            const bool mirrored = round != 0;
+            int4_gpu_check(device_entries.size() == (mirrored ? entries.size() : 0)
+                               && after.gated_delta_submissions == before.gated_delta_submissions + (mirrored ? 1 : 2)
+                               && after.gated_delta_fusions == before.gated_delta_fusions + 2
+                               && after.int4_dispatches == before.int4_dispatches + (mirrored ? 5 : 10),
+                           mirrored ? "existing mirrors keep one shared GDN batch submit"
+                                    : "fresh transactions dispatch per Session without batch preparation");
+            for (size_t index = 0; index < input.size(); ++index)
+                int4_gpu_check_output(gpu_output[index], cpu_output[index], "transactional GDN batch parity");
+            int4_gpu_check_result(finish_state_cache_transaction(cpu_cache, 1), "commit CPU GDN batch transaction");
+            int4_gpu_check_result(finish_state_cache_transaction(gpu_cache, 1), "commit GPU GDN batch transaction");
+            for (size_t index = 0; index < input.size(); ++index)
+                int4_gpu_check(gpu_cache[index].gated_delta_token_count == round + 1
+                                   && gpu_cache[index].gated_delta_device_state,
+                               "GDN transaction preserves the existing device mirror");
+        }
+    }
 }
 
 #endif

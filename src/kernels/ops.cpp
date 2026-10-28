@@ -1079,14 +1079,21 @@ static bool forward_linear_vulkan(const CompiledOperator* op,
 {
     if (backend != ExecutionBackend::Vulkan || !op)
         return false;
-    return (op->bfloat16
-            && op->bfloat16->forward(input, output))
-           || (op->float8
-               && op->float8->forward(input, output))
-           || (op->qnk
-               && op->qnk->forward(input, output))
-           || (op->linear
-               && op->linear->forward(input, output));
+    bool executed = false;
+    if (op->bfloat16)
+        executed = op->bfloat16->forward(input, output);
+    else if (op->float8)
+        executed = op->float8->forward(input, output);
+    else if (op->qnk)
+        executed = op->qnk->forward(input, output);
+    else if (op->linear)
+        executed = op->linear->forward(input, output);
+    else
+        return false;
+
+    if (!executed)
+        throw std::runtime_error("Vulkan linear execution failed");
+    return true;
 }
 
 void forward_linear(const TensorData& matrix, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op, ExecutionBackend backend, ActivationBuffer* quantized_input_scratch)
@@ -1101,6 +1108,11 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
     const uint32_t output_columns = matrix.shape[0];
     const uint32_t input_columns = matrix.shape[1];
     assert(input.columns() == input_columns);
+    if (input.rows() == 0)
+    {
+        output.reset(0, output_columns, false);
+        return;
+    }
 
     // Vulkan QnKLinear applies input_column_indices in its shader, so pass it
     // the original activation buffer. CPU kernels gather below when needed.
@@ -1489,6 +1501,8 @@ bool forward_gate_up_float8(const TensorData& gate,
 void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, const ActivationBuffer& input, ExpertActivation activation, float activation_limit,
                            ActivationBuffer& output, uint64_t optimization_flags, ActivationBuffer* scratch)
 {
+    if (!matrix.input_column_indices.empty())
+        throw std::runtime_error("MXFP4 fused gate/up does not support input column maps");
     assert(!scratch || (scratch != &input && scratch != &output && scratch->dtype() == DType::Float32));
     assert(&input != &output && input.dtype() == DType::Float32 && output.dtype() == DType::Float32);
     assert(matrix.dtype == DType::MxFp4 && matrix.shape.size() == 2);
@@ -1811,6 +1825,8 @@ static bool support_experts_mxfp4(std::span<const Mxfp4Task> tasks)
             || task.down->dtype != DType::MxFp4
             || task.gate_up->shape.size() != 2
             || task.down->shape.size() != 2
+            || !task.gate_up->input_column_indices.empty()
+            || !task.down->input_column_indices.empty()
             || task.gate_up->shape[0] % 2 != 0
             || task.gate_up->shape[1] != task.input->columns()
             || task.down->shape[1] != task.gate_up->shape[0] / 2
@@ -2755,11 +2771,19 @@ bool forward_experts_mxfp4(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scrat
 
 void forward_linear(const TensorData& matrix, const TensorData& bias, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op, ExecutionBackend backend, ActivationBuffer* quantized_input_scratch)
 {
+    assert(matrix.shape.size() == 2);
+    const uint32_t output_columns = matrix.shape[0];
+    assert(input.columns() == matrix.shape[1]);
+    assert(bias.shape.size() == 1 && bias.shape[0] == output_columns);
+    if (input.rows() == 0)
+    {
+        output.reset(0, output_columns, false);
+        return;
+    }
     if (forward_linear_vulkan(op, input, output, backend))
         return;
     forward_linear(matrix, input, output, optimization_flags, op, ExecutionBackend::Cpu, quantized_input_scratch);
     require_dense_host_storage(bias, "linear bias");
-    assert(bias.shape.size() == 1 && bias.shape[0] == output.columns());
     if (bias.dtype == DType::Float32)
     {
         const std::span<const float> values = bias.float32_values();

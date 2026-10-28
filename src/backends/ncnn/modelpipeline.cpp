@@ -596,7 +596,11 @@ static Result<void> prepare_ffn_operators(WeightStore& weights,
         }
     }
     if (gate.dtype == DType::BFloat16 && up.dtype == DType::BFloat16
-        && down.dtype == DType::BFloat16)
+        && down.dtype == DType::BFloat16
+        && (ffn.activation == ExpertActivation::Silu
+            || ffn.activation == ExpertActivation::DeepSeekSwiGlu)
+        && up.shape.size() == 2
+        && up.shape[0] % 128 == 0)
     {
         auto fused = Bfloat16Linear_vulkan::create_fused({&gate, &up}, {nullptr, nullptr},
                                                          vulkan_device_index, vulkan_runtime, optimization_flags);
@@ -630,9 +634,18 @@ static Result<void> prepare_shared_expert_operators(WeightStore& weights,
     ExpertPlan& shared = moe.shared_expert;
     const TensorData& gate = weights.at(shared.gate_weight);
     const TensorData& up = weights.at(shared.up_weight);
+    const TensorData& down = weights.at(shared.down_weight);
     const bool has_router_gate = moe.shared_expert_gate_weight != invalid_tensor_handle;
     const auto quantized = [](DType dtype) { return dtype == DType::Int4 || dtype == DType::MxFp4 || is_qnk_dtype(dtype); };
-    if (quantized(gate.dtype) || quantized(up.dtype) || quantized(weights.at(shared.down_weight).dtype))
+    const bool unsupported_bfloat16_chain = gate.dtype == DType::BFloat16
+                                            && up.dtype == DType::BFloat16
+                                            && (down.dtype != DType::BFloat16
+                                                || (shared.activation != ExpertActivation::Silu
+                                                    && shared.activation != ExpertActivation::DeepSeekSwiGlu)
+                                                || up.shape.size() != 2
+                                                || up.shape[0] % 128 != 0);
+    if (quantized(gate.dtype) || quantized(up.dtype) || quantized(down.dtype)
+        || unsupported_bfloat16_chain)
     {
         auto prepared = prepare_ffn_operators(weights, operators, shared, vulkan_device_index,
                                               vulkan_runtime, optimization_flags);

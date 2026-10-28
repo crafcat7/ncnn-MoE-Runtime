@@ -3734,14 +3734,21 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         mixed_model.opt.optimization_flags = g_test_optimization_flags & ~OptimizationCpuMxfp4Q8;
         MoeBlockPlan mixed_moe;
         mixed_moe.experts.resize(2);
-        const std::array<TensorData, 2> mixed_gate_up = {
+        std::array<TensorData, 2> mixed_gate_up = {
             make_mixed_mxfp4(64, 32, 1),
             make_mixed_bfloat16(64, 32, 2),
         };
-        const std::array<TensorData, 2> mixed_down = {
+        std::array<TensorData, 2> mixed_down = {
             make_mixed_mxfp4(32, 32, 3),
             make_mixed_bfloat16(32, 32, 4),
         };
+        mixed_gate_up[0].input_column_indices.resize(mixed_gate_up[0].shape[1]);
+        mixed_down[0].input_column_indices.resize(mixed_down[0].shape[1]);
+        for (uint32_t column = 0; column < mixed_gate_up[0].shape[1]; ++column)
+        {
+            mixed_gate_up[0].input_column_indices[column] = mixed_gate_up[0].shape[1] - column - 1;
+            mixed_down[0].input_column_indices[column] = mixed_down[0].shape[1] - column - 1;
+        }
         for (size_t expert_id = 0; expert_id < mixed_moe.experts.size(); ++expert_id)
         {
             ExpertPlan& expert = mixed_moe.experts[expert_id];
@@ -3799,7 +3806,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 const TensorData& gate_up = mixed_gate_up[expert_id];
                 const TensorData& down = mixed_down[expert_id];
                 ActivationBuffer activated;
-                if (gate_up.dtype == DType::MxFp4)
+                if (gate_up.dtype == DType::MxFp4 && gate_up.input_column_indices.empty())
                 {
                     forward_gate_up_mxfp4(gate_up,
                                           nullptr,
@@ -4671,6 +4678,38 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     check(static_cast<bool>(std::string(mxfp4_kernel_name()).size() > 0));
     const std::string activation_kernel_name = scaled_silu_kernel_name(g_test_optimization_flags);
     check(!activation_kernel_name.empty());
+
+    {
+        TensorData mapped_gate_up = expert_gate_up;
+        mapped_gate_up.input_column_indices.resize(mapped_gate_up.shape[1]);
+        for (uint32_t column = 0; column < mapped_gate_up.shape[1]; ++column)
+            mapped_gate_up.input_column_indices[column] = mapped_gate_up.shape[1] - column - 1;
+
+        bool fused_rejected_map = false;
+        ActivationBuffer rejected_output;
+        try
+        {
+            forward_gate_up_mxfp4(mapped_gate_up, nullptr, repeated_expert_input,
+                                  ExpertActivation::Silu, 0.0f, rejected_output, 0);
+        }
+        catch (const std::runtime_error&)
+        {
+            fused_rejected_map = true;
+        }
+        check(fused_rejected_map);
+
+        ActivationBuffer grouped_output(1, expert_down.shape[0]);
+        std::fill_n(grouped_output.row(0), grouped_output.columns(), 17.0f);
+        Mxfp4Task grouped_task;
+        grouped_task.gate_up = &mapped_gate_up;
+        grouped_task.down = &expert_down;
+        grouped_task.input = &repeated_expert_input;
+        grouped_task.output = &grouped_output;
+        grouped_task.activation = ExpertActivation::Silu;
+        check(!forward_experts_mxfp4(std::span<const Mxfp4Task>(&grouped_task, 1), nullptr, 0));
+        check(std::all_of(grouped_output.values().begin(), grouped_output.values().end(),
+                          [](float value) { return value == 17.0f; }));
+    }
 }
 
 void test_qnk_cpu_kernel()

@@ -733,7 +733,9 @@ static bool is_packed_mxfp4_expert(const TensorData* gate_up,
                                    const TensorData* down) noexcept
 {
     return !up && gate_up && down
-           && gate_up->dtype == DType::MxFp4 && down->dtype == DType::MxFp4;
+           && gate_up->dtype == DType::MxFp4 && down->dtype == DType::MxFp4
+           && gate_up->input_column_indices.empty()
+           && down->input_column_indices.empty();
 }
 
 static uint64_t executable_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
@@ -769,15 +771,19 @@ static uint64_t executable_expert_storage_bytes(const TensorData& gate_up, const
                                  && down.shape[1] == gate_up.shape[0] / 2
                                  && gate_up.bfloat16_values().size() == gate_up.element_count()
                                  && down.bfloat16_values().size() == down.element_count();
-    const bool mxfp4_expert = is_packed_mxfp4_expert(&gate_up, up, &down)
+    const bool mxfp4_expert = !up && gate_up.dtype == DType::MxFp4 && down.dtype == DType::MxFp4
                               && gate_up.shape[0] % 2 == 0 && down.shape[1] == gate_up.shape[0] / 2
                               && valid_mxfp4_matrix(gate_up) && valid_mxfp4_matrix(down);
+    const bool specialized_mxfp4_expert = mxfp4_expert
+                                          && is_packed_mxfp4_expert(&gate_up, up, &down);
+    const bool mapped_mxfp4_expert = mxfp4_expert && !specialized_mxfp4_expert;
     const auto quantized = [](DType dtype) { return dtype == DType::Int4 || is_qnk_dtype(dtype); };
-    const uint64_t native_size = up || quantized(gate_up.dtype) || quantized(down.dtype)
+    const uint64_t native_size = up || mapped_mxfp4_expert
+                                         || quantized(gate_up.dtype) || quantized(down.dtype)
                                          || gate_up.dtype == DType::Float32 || down.dtype == DType::Float32
                                      ? native_expert_storage_bytes(gate_up, up, down, context, optimization_flags)
                                      : 0;
-    if ((!mxfp4_expert && native_size == 0 && !bfloat16_expert)
+    if ((!specialized_mxfp4_expert && native_size == 0 && !bfloat16_expert)
         || !valid_bias(gate_up_bias, gate_up.shape[0]) || !valid_bias(down_bias, down.shape[0])
         || (up && !valid_bias(up_bias, up->shape[0]))
         || (activation != ExpertActivation::Silu && activation != ExpertActivation::GptOssSwiGlu

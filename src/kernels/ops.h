@@ -108,6 +108,8 @@ void forward_linear(const TensorData& matrix, const TensorData& bias, const Acti
                                           const CompiledOperator* up_executable = nullptr,
                                           ActivationBuffer* quantized_input_scratch = nullptr);
 // Input, output, and supplied scratch must be distinct Float32 buffers.
+// The fused MXFP4 gate/up kernel requires an empty input_column_indices map;
+// mapped weights must use the generic linear path before the activation epilogue.
 void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, const ActivationBuffer& input, ExpertActivation activation, float activation_limit,
                            ActivationBuffer& output, uint64_t optimization_flags, ActivationBuffer* scratch = nullptr);
 [[nodiscard]] bool forward_experts_mxfp4(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch, uint64_t optimization_flags);

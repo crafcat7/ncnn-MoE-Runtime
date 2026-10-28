@@ -4,6 +4,9 @@
 #include "backends/ncnn/vulkan.h"
 #include "backends/ncnn/vulkancontext.h"
 #include "engine/expertbackend.h"
+#include "engine/expert.h"
+#include "graph/compiledoperator.h"
+#include "graph/layerplan.h"
 #include "kernels/ops.h"
 #include "kernels/qnk.h"
 
@@ -432,6 +435,51 @@ static void block_projections(uint32_t device, DType dtype)
         block_check(operation && operation->forward(input, actual), "NVFP4 all-scale projection dispatch");
         block_compare(actual, block_reference(matrix, input), "NVFP4 all 256 UE4M3 encodings", 0.001f, 0.00005f);
     }
+    if (dtype == DType::Q4_0)
+    {
+        TensorData matrix = block_matrix(dtype, 5, block_columns, 17);
+        TensorData incompatible = block_matrix(dtype, 5, block_columns * 2, 19);
+        CompiledOperator op;
+        op.qnk = QnkLinear_vulkan::create(incompatible, nullptr, device, runtime, OptimizationDefaultFlags);
+        block_check(static_cast<bool>(op.qnk), "create mismatched Q4_0 Vulkan projection");
+        const ActivationBuffer input = block_input(1, block_columns);
+        ActivationBuffer output(1, matrix.shape[0]);
+        std::fill_n(output.row(0), output.columns(), -123.5f);
+        const auto before = get_vulkan_statistics(runtime);
+        bool failed = false;
+        try
+        {
+            forward_linear(matrix, input, output, OptimizationDefaultFlags, &op, ExecutionBackend::Vulkan);
+        }
+        catch (const std::runtime_error& error)
+        {
+            failed = std::string(error.what()) == "Vulkan linear execution failed";
+        }
+        const auto after = get_vulkan_statistics(runtime);
+        block_check(failed, "failed selected Vulkan linear operator is reported");
+        block_check(output.rows() == 1 && output.columns() == matrix.shape[0]
+                        && std::all_of(output.values().begin(), output.values().end(), [](float value) { return value == -123.5f; }),
+                    "failed selected Vulkan linear operator does not publish CPU fallback output");
+        block_check(after.dispatches == before.dispatches
+                        && after.compute_submissions == before.compute_submissions,
+                    "shape-rejected Vulkan linear operator does not submit GPU work");
+
+        TensorData bias;
+        bias.dtype = DType::Float32;
+        bias.shape = {matrix.shape[0]};
+        bias.float32_data.resize(matrix.shape[0]);
+        const ActivationBuffer empty_input = block_input(0, block_columns);
+        forward_linear(matrix, empty_input, output, OptimizationDefaultFlags, &op, ExecutionBackend::Vulkan);
+        block_check(output.rows() == 0 && output.columns() == matrix.shape[0],
+                    "zero-row Vulkan linear projection is an empty no-op");
+        forward_linear(matrix, bias, empty_input, output, OptimizationDefaultFlags, &op, ExecutionBackend::Vulkan);
+        block_check(output.rows() == 0 && output.columns() == matrix.shape[0],
+                    "zero-row Vulkan linear projection with bias is an empty no-op");
+        const auto empty_after = get_vulkan_statistics(runtime);
+        block_check(empty_after.dispatches == before.dispatches
+                        && empty_after.compute_submissions == before.compute_submissions,
+                    "zero-row Vulkan linear projections skip dispatch");
+    }
     TensorData invalid = block_matrix(dtype, 5, block_columns, 1);
     if (dtype == DType::MxFp4)
     {
@@ -626,6 +674,77 @@ static void mixed_fp4_experts(uint32_t device)
         block_check(results.size() == 1 && results[0] == ExpertStatus::Executed && submission->commit(),
                     "mixed packed gate/up cache hit executes through QnkExpert_vulkan");
         block_compare_expert(cached_output, golden, "mixed packed gate/up cache reference", gate_up_dtype, down_dtype);
+    }
+}
+
+static void mapped_mxfp4_experts(uint32_t device)
+{
+    constexpr uint32_t hidden = 64;
+    constexpr uint32_t intermediate = 64;
+    const auto runtime = create_vulkan_runtime();
+    const auto context = VulkanContext::acquire(device, runtime, OptimizationDefaultFlags);
+    block_check(static_cast<bool>(context), "mapped MXFP4 Expert context");
+    const uint64_t alignment = std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
+    const uint64_t no_qnk_flags = OptimizationDefaultFlags & ~OptimizationVulkanQnK;
+    ExpertPlan plan;
+    plan.activation = ExpertActivation::Silu;
+    plan.layout = ExpertLayout::PackedGateUpDown;
+
+    for (bool map_gate_up : {true, false})
+    {
+        const TensorData gate = block_matrix(DType::MxFp4, intermediate, hidden, 21 + map_gate_up);
+        const TensorData up = block_matrix(DType::MxFp4, intermediate, hidden, 22 + map_gate_up);
+        auto packed = std::make_shared<TensorData>(packed_gate_up(gate, up));
+        auto down = std::make_shared<TensorData>(block_matrix(DType::MxFp4, hidden, intermediate, 23 + map_gate_up));
+        TensorData& mapped = map_gate_up ? *packed : *down;
+        mapped.input_column_indices.resize(mapped.shape[1]);
+        for (uint32_t column = 0; column < mapped.shape[1]; ++column)
+            mapped.input_column_indices[column] = mapped.shape[1] - column - 1;
+
+        block_check(support_vulkan_expert(plan, *packed, *down, OptimizationDefaultFlags),
+                    "mapped MXFP4 Expert is selected for QnK Vulkan execution");
+        block_check(!support_vulkan_expert(plan, *packed, *down, no_qnk_flags),
+                    "mapped MXFP4 Expert is rejected before Vulkan execution when QnK is disabled");
+        const uint64_t native_storage = QnkLinear_vulkan::storage_bytes(*packed, alignment)
+                                        + QnkLinear_vulkan::storage_bytes(*down, alignment);
+        block_check(native_storage != 0, "mapped MXFP4 QnK projection storage sizes");
+        block_check(!Mxfp4Linear_vulkan::create(mapped, nullptr, device, runtime, OptimizationDefaultFlags),
+                    "specialized MXFP4 projection rejects the mapped matrix");
+        block_check(!Mxfp4Expert_vulkan::create(*packed, nullptr, *down, nullptr, 0.0f, device,
+                                                ExpertActivation::Silu, runtime, OptimizationDefaultFlags),
+                    "specialized MXFP4 Expert rejects mapped gate/up or down before upload");
+
+        auto no_qnk_backend = create_vulkan_expert_backend(native_storage + 4096, device, nullptr,
+                                                           runtime, no_qnk_flags);
+        std::shared_ptr<const void> rejected_pin;
+        const std::string key = map_gate_up ? "mapped-mxfp4-gate-up" : "mapped-mxfp4-down";
+        const ExpertDemandRequest demand{key, packed, nullptr, down, nullptr, 0, 0.0f,
+                                         ExpertActivation::Silu, nullptr};
+        block_check(no_qnk_backend && !no_qnk_backend->prepare_demand(demand, rejected_pin)
+                        && !rejected_pin,
+                    "mapped MXFP4 Expert is rejected during admission when QnK is disabled");
+
+        auto backend = create_vulkan_expert_backend(native_storage + 4096, device, nullptr,
+                                                    runtime, OptimizationDefaultFlags);
+        std::shared_ptr<const void> pin;
+        block_check(backend && backend->prepare_demand(demand, pin) && pin,
+                    "mapped MXFP4 Expert admission uses QnK storage sizing");
+        block_check(backend->statistics().resident_size == native_storage,
+                    "mapped MXFP4 Expert resident bytes include uploaded column map");
+
+        const ActivationBuffer input = block_input(4, hidden);
+        const ActivationBuffer expected = block_expert_reference(*packed, nullptr, *down, input, false, 0.0f);
+        ActivationBuffer actual;
+        const std::array<ExpertRequest, 1> requests = {ExpertRequest{key, &input, &actual}};
+        auto submission = backend->submit_batch(requests);
+        block_check(static_cast<bool>(submission), "mapped MXFP4 Expert cache submission");
+        const auto results = submission->wait();
+        block_check(results.size() == 1 && results[0] == ExpertStatus::Executed && submission->commit(),
+                    "mapped MXFP4 Expert executes through the admitted Vulkan path");
+        const ExpertBackendStatistics stats = backend->statistics();
+        block_check(stats.executions == 1 && stats.execution_failures == 0,
+                    "mapped MXFP4 Expert executes without a failed Vulkan attempt");
+        block_compare_expert(actual, expected, "mapped MXFP4 gate/up/down Vulkan reference", DType::MxFp4, DType::MxFp4);
     }
 }
 
@@ -903,6 +1022,7 @@ int main()
                 ncnn::moe::block_experts(device, dtype, dtype);
             }
             ncnn::moe::mixed_fp4_experts(device);
+            ncnn::moe::mapped_mxfp4_experts(device);
             const std::array<std::array<ncnn::moe::DType, 2>, 4> mixed_formats = {{
                 {ncnn::moe::DType::Q4_0, ncnn::moe::DType::Q4_1},
                 {ncnn::moe::DType::Q4_1, ncnn::moe::DType::Q5_0},

@@ -1782,10 +1782,10 @@ Result<bool> forward_attention_batch(const CompiledOperatorTable& operators,
                                      std::span<AttentionBatchEntry> entries,
                                      uint64_t optimization_flags)
 {
-    (void)optimization_flags;
     const CompiledOperator& attention_operator = operators.at(plan.vulkan_attention_operator);
     if (backend != ExecutionBackend::Vulkan
         || entries.size() < 2
+        || !has_flag(optimization_flags, OptimizationVulkanAttentionBatch)
         || !attention_operator.attention)
         return false;
 
@@ -1842,6 +1842,8 @@ Result<void> forward_attention(const WeightStore& weights,
             ErrorCode::UnsupportedModel,
             "state cache transaction does not support sliding Attention"};
     }
+    if (cache.transaction.active && has_flag(plan.flags, AttentionBlockQsa))
+        return Error{ErrorCode::UnsupportedModel, "QSA cache transactions are not supported"};
 
     const CompiledOperator& attention_operator = operators.at(plan.vulkan_attention_operator);
     if (backend == ExecutionBackend::Vulkan

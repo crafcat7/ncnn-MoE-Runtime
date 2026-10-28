@@ -513,10 +513,7 @@ bool forward_gated_delta_batch(const WeightStore& weights,
     if (entries.empty())
         return true;
     const CompiledOperator& gated_delta_operator = operators.at(plan.gated_delta_vulkan_operator);
-    if (backend != ExecutionBackend::Vulkan
-        || !gated_delta_operator.gated_delta
-        || entries.size() == 1)
-    {
+    const auto forward_each = [&]() {
         for (GatedDeltaBatchEntry& entry : entries)
         {
             if (!entry.hidden || !entry.scratch || !entry.cache || !entry.output)
@@ -534,18 +531,31 @@ bool forward_gated_delta_batch(const WeightStore& weights,
                 return false;
         }
         return true;
+    };
+    if (backend != ExecutionBackend::Vulkan
+        || !gated_delta_operator.gated_delta
+        || entries.size() == 1)
+    {
+        return forward_each();
     }
 
     device_entries.clear();
+    // Validate the complete batch before normalizing any row. A transaction
+    // without an existing device mirror cannot enter the batch kernel, while
+    // its single-row Vulkan path can still initialize and execute state.
+    if (std::any_of(entries.begin(), entries.end(), [](const GatedDeltaBatchEntry& entry) {
+            return !entry.hidden || !entry.scratch || !entry.cache || !entry.output
+                   || entry.hidden->rows() != 1
+                   || (entry.cache->transaction.active
+                       && !entry.cache->gated_delta_device_state);
+        }))
+    {
+        return forward_each();
+    }
+
     device_entries.reserve(entries.size());
     for (GatedDeltaBatchEntry& entry : entries)
     {
-        if (!entry.hidden || !entry.scratch || !entry.cache || !entry.output
-            || entry.hidden->rows() != 1)
-        {
-            device_entries.clear();
-            break;
-        }
         const ActivationBuffer* normalized = entry.hidden;
         if (plan.pre_attention_norm_weight != invalid_tensor_handle)
         {
@@ -590,23 +600,7 @@ bool forward_gated_delta_batch(const WeightStore& weights,
     // The batch path is an optimization for independent decode rows.  If a
     // device allocation or dispatch is unavailable, preserve the established
     // per-Session implementation and its failure-path state handoff.
-    for (GatedDeltaBatchEntry& entry : entries)
-    {
-        if (!entry.hidden || !entry.scratch || !entry.cache || !entry.output)
-            return false;
-        auto executed = forward_gated_delta(weights,
-                                            operators,
-                                            plan,
-                                            backend,
-                                            *entry.cache,
-                                            *entry.scratch,
-                                            *entry.hidden,
-                                            *entry.output,
-                                            optimization_flags);
-        if (!executed)
-            return false;
-    }
-    return true;
+    return forward_each();
 }
 
 } // namespace moe

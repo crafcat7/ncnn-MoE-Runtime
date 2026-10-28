@@ -789,6 +789,9 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
 
     const auto& prepared_latent_operator = operators.at_weight(plan.query_a_weight).latent_attention;
     if (backend == ExecutionBackend::Vulkan && prepared_latent_operator
+#if NCNN_MOE_WITH_VULKAN
+        && prepared_latent_operator->can_record()
+#endif
         && has_flag(optimization_flags, OptimizationVulkanAttention)
         && has_flag(optimization_flags, OptimizationVulkanLatentInputRmsNorm)
         && (plan.compression_ratio == 0 || vulkan_latent_compressor_enabled(backend, optimization_flags))
