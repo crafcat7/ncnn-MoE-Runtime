@@ -128,16 +128,6 @@ bool QwenLayerWorkspace_vulkan::active() const noexcept
     return false;
 #endif
 }
-uint64_t QwenLayerWorkspace_vulkan::allocated_bytes() const noexcept
-{
-    uint64_t bytes = d->selected.allocated_bytes();
-#if NCNN_MOE_WITH_VULKAN
-    bytes += static_cast<uint64_t>(d->buffers.capacity()) * sizeof(ncnn::VkMat);
-    bytes += d->packed.allocated_bytes();
-    bytes += static_cast<uint64_t>(d->history.capacity()) * sizeof(int32_t);
-#endif
-    return bytes;
-}
 const std::shared_ptr<const DeviceTensor_vulkan>& QwenLayerWorkspace_vulkan::device_input() const noexcept
 { return d->normalized; }
 
@@ -160,7 +150,6 @@ public:
     std::shared_ptr<RmsNorm_vulkan> final_norm;
     std::shared_ptr<ncnn::Pipeline> pipeline;
     ncnn::VkMat key_norm, query_norm, conv_norm, convolution_weight;
-    uint64_t bytes = 0;
     void release_buffers()
     {
         key_norm.release();
@@ -183,15 +172,6 @@ QwenLayer_vulkan::~QwenLayer_vulkan()
     }
 #endif
 }
-uint64_t QwenLayer_vulkan::device_bytes() const noexcept
-{
-#if NCNN_MOE_WITH_VULKAN
-    return d->bytes;
-#else
-    return 0;
-#endif
-}
-
 std::shared_ptr<QwenLayer_vulkan> QwenLayer_vulkan::create(const CompiledModel& model, const CompiledLayerPlan& layer)
 {
 #if NCNN_MOE_WITH_VULKAN
@@ -222,7 +202,6 @@ std::shared_ptr<QwenLayer_vulkan> QwenLayer_vulkan::create(const CompiledModel& 
                                         layer.vulkan_device_index, model.vulkan_runtime, model.opt.optimization_flags);
     impl.combiner = MoeCombine_vulkan::create(impl.context);
     if (!impl.router || !impl.combiner) return {};
-    impl.bytes = impl.attention_hyper->device_bytes() + impl.ffn_hyper->device_bytes();
     if (impl.ple.enabled())
     {
         impl.ple_key = QnkLinear_vulkan::create(model.weights.at(impl.ple.key_weight), nullptr, layer.vulkan_device_index, model.vulkan_runtime, model.opt.optimization_flags);
@@ -248,9 +227,6 @@ std::shared_ptr<QwenLayer_vulkan> QwenLayer_vulkan::create(const CompiledModel& 
             || !qwen_float_weight(model.weights.at(impl.ple.convolution_norm_weight), impl.conv_norm, cmd, impl.opt)
             || !qwen_float_weight(model.weights.at(impl.ple.convolution_weight), impl.convolution_weight, cmd, impl.opt)
             || submit_compute_and_wait(cmd, impl.context->device()) != 0) return {};
-        impl.bytes += impl.ple_key->device_bytes() + impl.ple_value->device_bytes()
-                      + impl.key_norm.total() * impl.key_norm.elemsize + impl.query_norm.total() * impl.query_norm.elemsize
-                      + impl.conv_norm.total() * impl.conv_norm.elemsize + impl.convolution_weight.total() * impl.convolution_weight.elemsize;
     }
     return result;
 #else
@@ -283,7 +259,6 @@ std::shared_ptr<QwenLayer_vulkan> QwenLayer_vulkan::create_head(const CompiledMo
     else if (model.descriptor.final_norm != NormType::None)
         return {};
     if (!impl.lm_head) return {};
-    impl.bytes = impl.attention_hyper->device_bytes();
     return result;
 #else
     (void)model;

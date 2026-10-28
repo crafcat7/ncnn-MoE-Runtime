@@ -69,7 +69,6 @@ public:
                                                                      uint32_t device_index,
                                                                      const VulkanRuntimePtr& runtime,
                                                                      uint64_t optimization_flags);
-    [[nodiscard]] uint64_t device_bytes() const noexcept;
     [[nodiscard]] uint64_t initial_state_bytes() const noexcept;
 #if NCNN_MOE_WITH_VULKAN
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;

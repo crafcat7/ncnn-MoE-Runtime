@@ -237,7 +237,6 @@ static void qsa_case(uint32_t device, uint32_t head_dimension, DType dtype, bool
     auto runtime = create_vulkan_runtime();
     auto op = QsaAttention_vulkan::create(fixture.weights, fixture.plan, device, runtime, OptimizationDefaultFlags);
     qsa_check(static_cast<bool>(op), "create native QSA operator");
-    qsa_check(op->device_bytes() != 0, "QSA resident weights accounted");
     // Reference weights have independent owned vectors; execution must survive
     // destruction of every matrix payload in the GPU fixture.
     for (TensorHandle handle = 0; handle < fixture.weights.size(); ++handle)

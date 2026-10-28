@@ -24,7 +24,6 @@ public:
     [[nodiscard]] static std::shared_ptr<GatedResidual_vulkan> create(const WeightStore& weights,
                                                                       const GatedResidualPlan& plan, const MoeModelDescriptor& descriptor, uint32_t device,
                                                                       const VulkanRuntimePtr& runtime, uint64_t flags);
-    [[nodiscard]] uint64_t device_bytes() const noexcept;
 #if NCNN_MOE_WITH_VULKAN
     [[nodiscard]] const std::shared_ptr<VulkanContext>& context() const noexcept;
     [[nodiscard]] const ncnn::Option& option() const noexcept;

@@ -187,7 +187,6 @@ RuntimeMetricCounters metric_counters(const SessionStatistics& stats,
     result.vulkan_qwen_layers = counter_delta(stats.vulkan_qwen_layers, start.vulkan_qwen_layers);
     result.vulkan_gated_residual_blocks = counter_delta(stats.vulkan_gated_residual_blocks, start.vulkan_gated_residual_blocks);
     result.vulkan_ple_blocks = counter_delta(stats.vulkan_ple_blocks, start.vulkan_ple_blocks);
-    result.model_compute_cpu_fallbacks = counter_delta(stats.model_compute_cpu_fallbacks, start.model_compute_cpu_fallbacks);
     result.expert_cache_hits = counter_delta(stats.expert_cache_hits, start.expert_cache_hits);
     result.expert_cache_misses = counter_delta(stats.expert_cache_misses, start.expert_cache_misses);
     result.expert_io_bytes = counter_delta(stats.expert_cache_bytes_read, start.expert_io_bytes);

@@ -187,14 +187,6 @@ std::shared_ptr<GatedResidual_vulkan> GatedResidual_vulkan::create(const WeightS
     return {};
 #endif
 }
-uint64_t GatedResidual_vulkan::device_bytes() const noexcept
-{
-#if NCNN_MOE_WITH_VULKAN
-    return d->down->device_bytes() + d->up->device_bytes() + (d->inject ? d->inject->device_bytes() : 0) + d->norm.total() * d->norm.elemsize;
-#else
-    return 0;
-#endif
-}
 #if NCNN_MOE_WITH_VULKAN
 const std::shared_ptr<VulkanContext>& GatedResidual_vulkan::context() const noexcept
 { return d->context; }

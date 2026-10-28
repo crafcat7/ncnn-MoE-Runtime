@@ -32,7 +32,6 @@ public:
     ~QwenLayerWorkspace_vulkan();
     void reset();
     [[nodiscard]] bool active() const noexcept;
-    [[nodiscard]] uint64_t allocated_bytes() const noexcept;
     [[nodiscard]] const std::shared_ptr<const DeviceTensor_vulkan>& device_input() const noexcept;
 
 private:
@@ -47,7 +46,6 @@ public:
     [[nodiscard]] static std::shared_ptr<QwenLayer_vulkan> create(const CompiledModel& model,
                                                                   const CompiledLayerPlan& layer);
     [[nodiscard]] static std::shared_ptr<QwenLayer_vulkan> create_head(const CompiledModel& model);
-    [[nodiscard]] uint64_t device_bytes() const noexcept;
     [[nodiscard]] bool forward(const ActivationBuffer& initial_hidden, std::span<const int32_t> tokens,
                                uint64_t position, LayerCache& cache, const ExpertDispatchOptions& options,
                                ExpertDispatchPlan& routes, QwenLayerWorkspace_vulkan& workspace, std::string& error) const;

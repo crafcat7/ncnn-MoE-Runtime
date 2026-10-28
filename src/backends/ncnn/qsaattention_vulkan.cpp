@@ -49,7 +49,6 @@ public:
     ncnn::Option opt;
     AttentionBlockPlan plan;
     uint32_t hidden = 0;
-    uint64_t weights_bytes = 0;
     float concentration = 1.0f;
     std::shared_ptr<QnkLinear_vulkan> query;
     std::shared_ptr<QnkLinear_vulkan> key;
@@ -320,12 +319,6 @@ std::shared_ptr<QsaAttention_vulkan> QsaAttention_vulkan::create(const WeightSto
         command.record_upload(upload[index], *destination[index], upload_opt);
     if (command.submit_and_wait() != 0 || std::any_of(destination.begin(), destination.end(), [](const ncnn::VkMat* value) { return value->empty(); }))
         return {};
-    impl.weights_bytes = impl.query->device_bytes() + impl.key->device_bytes() + impl.value->device_bytes()
-                         + impl.index->device_bytes() + impl.output->device_bytes() + (impl.gate ? impl.gate->device_bytes() : 0);
-    for (const ncnn::VkMat* value : destination)
-        impl.weights_bytes += static_cast<uint64_t>(value->total()) * value->elemsize;
-    if (impl.norm)
-        impl.weights_bytes += static_cast<uint64_t>(hidden) * sizeof(float);
     impl.bindings.reserve(7);
     impl.readonly.reserve(7);
     impl.constants.reserve(10);
@@ -337,15 +330,6 @@ std::shared_ptr<QsaAttention_vulkan> QsaAttention_vulkan::create(const WeightSto
     (void)runtime;
     (void)optimization_flags;
     return {};
-#endif
-}
-
-uint64_t QsaAttention_vulkan::device_bytes() const noexcept
-{
-#if NCNN_MOE_WITH_VULKAN
-    return d->weights_bytes;
-#else
-    return 0;
 #endif
 }
 

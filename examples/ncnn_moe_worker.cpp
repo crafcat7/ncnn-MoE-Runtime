@@ -196,7 +196,6 @@ static std::string gpu_metrics_json(const RuntimeMetricCounters& counters, bool 
     result.add_uint("qwen_layers", counters.vulkan_qwen_layers);
     result.add_uint("gated_residual_blocks", counters.vulkan_gated_residual_blocks);
     result.add_uint("ple_blocks", counters.vulkan_ple_blocks);
-    result.add_uint("model_compute_cpu_fallbacks", counters.model_compute_cpu_fallbacks);
     result.add_uint("batch_uploads", counters.vulkan_batch_uploads);
     result.add_uint("batch_downloads", counters.vulkan_batch_downloads);
     result.add_uint("attention_qkv_rope_fusions", counters.vulkan_attention_qkv_rope_fusions);

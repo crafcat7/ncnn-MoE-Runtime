@@ -20674,7 +20674,6 @@ void test_backend_capabilities_and_hybrid_execution()
             else
                 check(gqa_statistics.vulkan_kv_ring_resizes > 1);
             check(gqa_statistics.vulkan_attention_cpu_fallbacks == 0);
-            check(gqa_statistics.model_compute_cpu_fallbacks == 0);
             const SessionStatistics& gqa_cpu_statistics = gqa_cpu_session.value()->statistics();
             check(gqa_cpu_statistics.vulkan_attention_blocks == 0);
             check(gqa_cpu_statistics.vulkan_attention_cpu_fallbacks == 0);

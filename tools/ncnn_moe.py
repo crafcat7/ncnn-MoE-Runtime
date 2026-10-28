@@ -244,9 +244,7 @@ def _format_runtime_metrics(metrics: Any) -> str:
             " / gated-residual "
             f"{_format_metric_count(gpu.get('gated_residual_blocks'), available=gpu_available)}"
             " / PLE "
-            f"{_format_metric_count(gpu.get('ple_blocks'), available=gpu_available)}"
-            " / model-cpu-fallback "
-            f"{_format_metric_count(gpu.get('model_compute_cpu_fallbacks'), available=gpu_available)}",
+            f"{_format_metric_count(gpu.get('ple_blocks'), available=gpu_available)}",
         )
     )
 

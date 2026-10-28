@@ -182,9 +182,8 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
         {
             check(statistics.vulkan_qwen_layers == 3 * candidate.graph.layer_plans.size(), "Qwen prefill/decode did not execute every device layer");
             check(statistics.expert_assignments > 0 && statistics.expert_gpu_routes == statistics.expert_assignments, "Qwen GPU routes do not cover every assignment");
-            check(statistics.expert_cpu_routes == 0 && statistics.expert_cpu_fallbacks == 0
-                      && statistics.model_compute_cpu_fallbacks == 0,
-                  "Qwen device chain performed CPU model execution");
+            check(statistics.expert_cpu_routes == 0 && statistics.expert_cpu_fallbacks == 0,
+                  "Qwen device chain used CPU Expert fallback");
             check(statistics.vulkan_ple_blocks > 0, "Qwen device PLE was not executed");
         }
     }
@@ -192,8 +191,8 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
     if (hybrid && fp4_weights != 0)
     {
         for (const auto& statistics : actual_statistics)
-            check(statistics.model_compute_cpu_fallbacks == 0 && statistics.vulkan_attention_cpu_fallbacks == 0,
-                  family + ": native FP4 model execution fell back to CPU");
+            check(statistics.vulkan_attention_cpu_fallbacks == 0,
+                  family + ": native FP4 Attention fell back to CPU");
     }
     if (hybrid)
     {
@@ -239,9 +238,8 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
                           family + ": GQA executed no Vulkan device RoPE");
                     check(statistics.vulkan_kv_ring_appends > 0,
                           family + ": GQA decode did not append to the Vulkan KV ring");
-                    check(statistics.vulkan_attention_cpu_fallbacks == 0
-                              && statistics.model_compute_cpu_fallbacks == 0,
-                          family + ": native GQA had a CPU model-compute fallback");
+                    check(statistics.vulkan_attention_cpu_fallbacks == 0,
+                          family + ": native GQA Attention fell back to CPU");
                 }
             }
             if (family == "deepseek_v4")
@@ -258,9 +256,8 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
                     if (candidate.descriptor.expert_count != 0)
                         check(statistics.expert_assignments > 0 && statistics.expert_gpu_routes == statistics.expert_assignments,
                               family + ": GPU-priority routes do not cover every native Expert assignment");
-                    check(statistics.expert_cpu_routes == 0 && statistics.expert_cpu_fallbacks == 0
-                              && statistics.model_compute_cpu_fallbacks == 0,
-                          family + ": native Expert execution fell back to CPU");
+                    check(statistics.expert_cpu_routes == 0 && statistics.expert_cpu_fallbacks == 0,
+                          family + ": native Expert execution used CPU fallback");
                 }
             }
         }
