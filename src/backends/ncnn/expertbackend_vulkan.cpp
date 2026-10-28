@@ -2070,7 +2070,6 @@ bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const Exper
         return false;
     rows.resize(total_rows);
     weights.resize(total_rows);
-    std::vector<uint32_t> cursors(offsets.begin(), offsets.end() - 1);
     size_t row_offset = 0;
     for (const Selection& selection : selected)
     {
@@ -2078,7 +2077,7 @@ bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const Exper
         for (size_t batch_index = 0; batch_index < request.route_aggregation.routes.size(); ++batch_index)
         {
             const ExpertRoute& route = request.route_aggregation.routes[batch_index];
-            const uint32_t destination = cursors[route.token_index]++;
+            const uint32_t destination = offsets[route.token_index]++;
             if (destination >= rows.size() || row_offset + batch_index > std::numeric_limits<uint32_t>::max())
                 return false;
             rows[destination] = static_cast<uint32_t>(row_offset + batch_index);
@@ -2086,6 +2085,9 @@ bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const Exper
         }
         row_offset += request.rows();
     }
+    for (uint32_t token = token_count; token > 0; --token)
+        offsets[token] = offsets[token - 1];
+    offsets[0] = 0;
     return true;
 }
 
@@ -2738,12 +2740,7 @@ bool VulkanExpertBackend::forward_qnk_batch(WorkItem& work,
             outputs[index] = request.output;
         }
         if (!QnkExpert_vulkan::forward_batch(experts, inputs, outputs))
-        {
-            // Packed and independent gate/up layouts can share one cache
-            // wave without sharing the kernel's batched matrix geometry.
-            for (size_t index = 0; index < experts.size(); ++index)
-                if (!experts[index]->forward(*inputs[index], *outputs[index])) return false;
-        }
+            return false;
     }
 
     if (use_route_aggregation)

@@ -1442,11 +1442,11 @@ Result<void> forward_moe(const CompiledModel& model,
     pending.clear();
     uncached.reserve(active_expert_count);
     pending.reserve(active_expert_count);
-    std::vector<uint8_t>& backend_executed = scratch.backend_executed;
+    std::vector<ExpertStatus>& backend_status = scratch.backend_status;
     std::vector<uint8_t>& backend_aggregated = scratch.backend_aggregated;
     std::vector<size_t>& backend_indices = scratch.backend_indices;
     std::vector<ExpertRequest>& backend_requests = scratch.backend_requests;
-    backend_executed.clear();
+    backend_status.clear();
     backend_aggregated.clear();
     backend_indices.clear();
     backend_requests.clear();
@@ -1456,7 +1456,7 @@ Result<void> forward_moe(const CompiledModel& model,
     bool backend_reservation_shape_valid = true;
     if (use_backend_batch)
     {
-        backend_executed.assign(active_expert_count, 0);
+        backend_status.assign(active_expert_count, ExpertStatus::NotResident);
         backend_aggregated.assign(active_expert_count, 0);
         backend_indices.reserve(active_expert_count);
         backend_requests.reserve(active_expert_count);
@@ -1550,19 +1550,33 @@ Result<void> forward_moe(const CompiledModel& model,
             backend_reservation_shape_valid = planned.size() == backend_indices.size();
             if (!backend_reservation_shape_valid)
             {
-                // A shape mismatch invalidates the batch and enables CPU retry.
+                // A malformed reservation is a failed backend response, not
+                // a cold-cache miss eligible for demand upload.
                 backend_submission->abort();
+                for (size_t active_index : backend_indices)
+                    backend_status[active_index] = ExpertStatus::Failed;
             }
             else
             {
                 for (size_t result_index = 0; result_index < planned.size(); ++result_index)
                 {
-                    if (planned[result_index] != ExpertStatus::Executed)
-                        continue;
-                    backend_executed[backend_indices[result_index]] = 1;
-                    backend_reserved_work = true;
+                    const size_t active_index = backend_indices[result_index];
+                    if (planned[result_index] == ExpertStatus::Executed)
+                    {
+                        backend_status[active_index] = ExpertStatus::Executed;
+                        backend_reserved_work = true;
+                    }
+                    else if (planned[result_index] != ExpertStatus::NotResident)
+                    {
+                        backend_status[active_index] = ExpertStatus::Failed;
+                    }
                 }
             }
+        }
+        else
+        {
+            for (size_t active_index : backend_indices)
+                backend_status[active_index] = ExpertStatus::Failed;
         }
     }
 
@@ -1584,6 +1598,15 @@ Result<void> forward_moe(const CompiledModel& model,
                         backend_result_contract_valid = false;
                         break;
                     }
+                }
+            }
+            if (!backend_result_contract_valid)
+            {
+                for (size_t active_index : backend_indices)
+                {
+                    if (!gpu_priority && backend_status[active_index] == ExpertStatus::NotResident)
+                        continue;
+                    backend_status[active_index] = ExpertStatus::Failed;
                 }
             }
             bool backend_has_executed = false;
@@ -1608,80 +1631,87 @@ Result<void> forward_moe(const CompiledModel& model,
             scratch.backend_aggregated_output_valid = std::any_of(backend_aggregated.begin(),
                                                                   backend_aggregated.end(),
                                                                   [](uint8_t value) { return value != 0; });
-            std::vector<size_t>& failed_indices = scratch.failed_indices;
-            failed_indices.clear();
-            failed_indices.reserve(backend_indices.size());
             for (size_t result_index = 0; result_index < backend_indices.size(); ++result_index)
             {
                 const size_t active_index = backend_indices[result_index];
-                if (!backend_executed[active_index])
+                // Non-priority misses have already completed on the CPU.
+                // Only reserved work still needs recovery at this late wait.
+                if (!gpu_priority
+                    && backend_status[active_index] != ExpertStatus::Executed
+                    && backend_status[active_index] != ExpertStatus::Failed)
                     continue;
                 const ExpertStatus backend_result = result_index < backend_results.size()
                                                         ? backend_results[result_index]
                                                         : ExpertStatus::Failed;
-                if (!backend_commit_succeeded
-                    || backend_result != ExpertStatus::Executed)
+                if (backend_result == ExpertStatus::Failed
+                    || (backend_status[active_index] == ExpertStatus::Executed
+                        && (!backend_commit_succeeded || backend_result != ExpertStatus::Executed)))
                 {
-                    backend_executed[active_index] = 0;
-                    failed_indices.push_back(active_index);
+                    backend_status[active_index] = ExpertStatus::Failed;
                     continue;
                 }
             }
-
-            if (layer_state.require_device_execution && !failed_indices.empty())
-                return Error{ErrorCode::InternalError, "Vulkan resident Expert execution or publication failed"};
-            if (!gpu_priority && !failed_indices.empty())
-            {
-                size_t uncached_count = 0;
-                for (size_t failed_index = 0; failed_index < failed_indices.size(); ++failed_index)
-                {
-                    const size_t active_index = failed_indices[failed_index];
-                    ExpertState& active = layer_state.active_experts()[active_index];
-                    active.device_output.reset();
-                    const ExpertPlan& expert = moe.experts[active.batch.expert_id];
-                    if (model.expert_cache && !expert.cache_key.empty())
-                    {
-                        const TensorData& gate_up = model.weights.at(expert.gate_up_weight);
-                        const TensorData& down = model.weights.at(expert.down_weight);
-                        const auto wait_start = expert_cache_wait_start(model);
-                        const std::array<ExpertCachePairRequest, 1> requests{{{
-                            &gate_up,
-                            &down,
-                            residency_group,
-                            expert.cache_key,
-                            victim_metadata(model, expert, layer_state.normalized.rows()),
-                        }}};
-                        std::array<ExpertCacheLease, 1> leases;
-                        auto lease_count = model.expert_cache->wait_acquire_ready_pairs(requests, leases, true, 1, true, false);
-                        if (!lease_count) return lease_count.error();
-                        bool drained = false;
-                        while (lease_count.value() == 0)
-                        {
-                            if (drained)
-                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                            model.expert_backend->wait_for_background_work();
-                            lease_count = model.expert_cache->wait_acquire_ready_pairs(requests, leases, true, 1, true, false);
-                            if (!lease_count) return lease_count.error();
-                            drained = true;
-                        }
-                        active.cache_wait_us += expert_cache_wait_elapsed(wait_start);
-                        if (!leases[0].gate_up)
-                            return Error{ErrorCode::InternalError, "Expert cache ready wait acquired no pair"};
-                        active.lease = std::move(leases[0]);
-                        admit_vulkan_expert(model, expert, active.lease, residency_group,
-                                            static_cast<uint32_t>(layer_state.normalized.rows()), backend);
-                        forward_cpu(std::span<const size_t>(&active_index, 1), "Vulkan resident Expert execution or publication failed");
-                        active.lease = {};
-                    }
-                    else
-                    {
-                        failed_indices[uncached_count++] = active_index;
-                    }
-                }
-                failed_indices.resize(uncached_count);
-                forward_cpu(failed_indices, "Vulkan resident Expert execution or publication failed");
-            }
             backend_submission.reset();
+        }
+
+        std::vector<size_t>& recovery_indices = scratch.wave_failed_indices;
+        recovery_indices.clear();
+        recovery_indices.reserve(backend_indices.size());
+        for (size_t active_index : backend_indices)
+            if (backend_status[active_index] == ExpertStatus::Failed)
+                recovery_indices.push_back(active_index);
+
+        if (layer_state.require_device_execution && !recovery_indices.empty())
+            return Error{ErrorCode::InternalError, "Vulkan resident Expert execution or publication failed"};
+        if (!recovery_indices.empty())
+        {
+            size_t uncached_count = 0;
+            for (size_t failed_index = 0; failed_index < recovery_indices.size(); ++failed_index)
+            {
+                const size_t active_index = recovery_indices[failed_index];
+                ExpertState& active = layer_state.active_experts()[active_index];
+                active.device_output.reset();
+                const ExpertPlan& expert = moe.experts[active.batch.expert_id];
+                if (model.expert_cache && expert.gate_up_weight != invalid_tensor_handle
+                    && !expert.cache_key.empty())
+                {
+                    const TensorData& gate_up = model.weights.at(expert.gate_up_weight);
+                    const TensorData& down = model.weights.at(expert.down_weight);
+                    const auto wait_start = expert_cache_wait_start(model);
+                    const std::array<ExpertCachePairRequest, 1> requests{{{
+                        &gate_up,
+                        &down,
+                        residency_group,
+                        expert.cache_key,
+                        victim_metadata(model, expert, layer_state.normalized.rows()),
+                    }}};
+                    std::array<ExpertCacheLease, 1> leases;
+                    auto lease_count = model.expert_cache->wait_acquire_ready_pairs(requests, leases, true, 1, true, false);
+                    if (!lease_count) return lease_count.error();
+                    bool drained = false;
+                    while (lease_count.value() == 0)
+                    {
+                        if (drained)
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        model.expert_backend->wait_for_background_work();
+                        lease_count = model.expert_cache->wait_acquire_ready_pairs(requests, leases, true, 1, true, false);
+                        if (!lease_count) return lease_count.error();
+                        drained = true;
+                    }
+                    active.cache_wait_us += expert_cache_wait_elapsed(wait_start);
+                    if (!leases[0].gate_up)
+                        return Error{ErrorCode::InternalError, "Expert cache ready wait acquired no pair"};
+                    active.lease = std::move(leases[0]);
+                    forward_cpu(std::span<const size_t>(&active_index, 1), "Vulkan resident Expert execution or publication failed");
+                    active.lease = {};
+                }
+                else
+                {
+                    recovery_indices[uncached_count++] = active_index;
+                }
+            }
+            recovery_indices.resize(uncached_count);
+            forward_cpu(recovery_indices, "Vulkan resident Expert execution or publication failed");
         }
 
         return {};
@@ -1705,7 +1735,8 @@ Result<void> forward_moe(const CompiledModel& model,
         for (size_t active_index : backend_indices)
         {
             const auto& expert = moe.experts[layer_state.active_experts()[active_index].batch.expert_id];
-            if (!backend_executed[active_index] && !expert.cache_key.empty())
+            if (backend_status[active_index] == ExpertStatus::NotResident
+                && !expert.cache_key.empty())
                 candidates.push_back(active_index);
             if (candidates.size() == 8) break;
         }
@@ -1780,12 +1811,40 @@ Result<void> forward_moe(const CompiledModel& model,
         for (size_t index = prestaged_prepared; index < prestaged_pins.size(); ++index) prestaged_pins[index].reset();
         prestaged_upload.reset();
     }
+    if (!prestaged_indices.empty()
+        && std::any_of(prestaged_indices.begin(), prestaged_indices.end(), [&](size_t active_index) {
+               return backend_status[active_index] == ExpertStatus::Failed;
+           }))
+    {
+        // Keep completed uploads for healthy requests; failed requests must
+        // not re-enter compute through the preloaded wave after CPU recovery.
+        size_t count = 0;
+        size_t prepared = 0;
+        for (size_t index = 0; index < prestaged_indices.size(); ++index)
+        {
+            const size_t active_index = prestaged_indices[index];
+            if (backend_status[active_index] == ExpertStatus::Failed)
+            {
+                layer_state.active_experts()[active_index].lease = {};
+                if (index < prestaged_pins.size()) prestaged_pins[index].reset();
+                continue;
+            }
+            prestaged_indices[count] = active_index;
+            if (index < prestaged_prepared) ++prepared;
+            if (count != index && index < prestaged_pins.size())
+                prestaged_pins[count] = std::move(prestaged_pins[index]);
+            ++count;
+        }
+        prestaged_indices.resize(count);
+        if (!prestaged_pins.empty()) prestaged_pins.resize(count);
+        prestaged_prepared = prepared;
+    }
 
     for (size_t active_index = 0; active_index < active_expert_count; ++active_index)
     {
         ExpertState& active = layer_state.active_experts()[active_index];
         const ExpertPlan& expert = moe.experts[active.batch.expert_id];
-        if (use_backend_batch && backend_executed[active_index])
+        if (use_backend_batch && backend_status[active_index] != ExpertStatus::NotResident)
             continue;
         if (std::find(prestaged_indices.begin(), prestaged_indices.end(), active_index) != prestaged_indices.end())
             continue;
@@ -1877,10 +1936,13 @@ Result<void> forward_moe(const CompiledModel& model,
             auto& active = layer_state.active_experts()[active_index];
             if (valid && results[index] == ExpertStatus::Executed)
             {
-                backend_executed[active_index] = 1;
+                if (use_backend_batch)
+                    backend_status[active_index] = ExpertStatus::Executed;
             }
             else
             {
+                // This transient wave list owns demand-failure recovery;
+                // leaving status NotResident prevents the late finalizer from recovering it twice.
                 active.device_output.reset();
                 failed_indices.push_back(active_index);
             }
@@ -2186,8 +2248,8 @@ Result<void> forward_moe(const CompiledModel& model,
     if (stats)
     {
         stats->expert_batches += active_expert_count;
-        for (size_t index = 0; index < backend_executed.size(); ++index)
-            if (backend_executed[index])
+        for (size_t index = 0; index < backend_status.size(); ++index)
+            if (backend_status[index] == ExpertStatus::Executed)
                 stats->expert_gpu_routes += layer_state.active_experts()[index].batch.routes.size();
         if (expert_cache_wait_timing_enabled(model))
         {

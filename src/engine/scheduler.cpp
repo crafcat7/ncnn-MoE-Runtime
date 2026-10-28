@@ -43,9 +43,8 @@ public:
 private:
     using Work = std::function<void(BatchWorkspace&)>;
 
-    [[nodiscard]] static Result<void> get_session_lock_order(std::vector<Session*>& sessions,
-                                                             const char* null_message,
-                                                             const char* duplicate_message);
+    [[nodiscard]] static Result<void> sort_sessions(std::vector<Session*>& sessions,
+                                                    const char* duplicate_message);
     [[nodiscard]] static Result<std::vector<Result<PrefillResult>>> prefill(std::span<Session* const> lock_order,
                                                                             std::span<const PrefillBatchRequest> requests,
                                                                             BatchWorkspace& workspace);
@@ -81,15 +80,9 @@ private:
     std::atomic<uint64_t> staged_decode_batches{0};
 };
 
-Result<void> BatchSchedulerPrivate::get_session_lock_order(std::vector<Session*>& sessions,
-                                                           const char* null_message,
-                                                           const char* duplicate_message)
+Result<void> BatchSchedulerPrivate::sort_sessions(std::vector<Session*>& sessions,
+                                                  const char* duplicate_message)
 {
-    for (const Session* session : sessions)
-    {
-        if (!session)
-            return Error{ErrorCode::InvalidArgument, null_message};
-    }
     std::sort(sessions.begin(), sessions.end(), std::less<Session*>());
     if (std::adjacent_find(sessions.begin(), sessions.end()) != sessions.end())
         return Error{ErrorCode::InvalidArgument, duplicate_message};
@@ -389,9 +382,7 @@ std::future<std::vector<Result<PrefillResult>>> BatchSchedulerPrivate::submit_pr
         lock_order.push_back(session);
     }
 
-    auto lock_result = get_session_lock_order(lock_order,
-                                              "staged prefill session cannot be null",
-                                              "staged prefill requires unique sessions");
+    auto lock_result = sort_sessions(lock_order, "staged prefill requires unique sessions");
     if (!lock_result)
     {
         reject("a prefill batch requires unique sessions and non-empty inputs");
@@ -476,9 +467,7 @@ std::future<std::vector<Result<DecodeResult>>> BatchSchedulerPrivate::submit_dec
         }
     }
 
-    auto lock_result = get_session_lock_order(lock_order,
-                                              "staged decode session cannot be null",
-                                              "a decode batch requires unique non-null sessions");
+    auto lock_result = sort_sessions(lock_order, "a decode batch requires unique non-null sessions");
     if (!lock_result)
     {
         state->promise.set_value(std::vector<Result<DecodeResult>>(requests.size(), lock_result.error()));

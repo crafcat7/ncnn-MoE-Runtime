@@ -5574,6 +5574,7 @@ void test_ncnn_vulkan_qnk_expert_operator()
     separate_up.dtype = dtype;
     separate_up.shape = {intermediate_columns, qnk_columns};
     separate_up.quantized_data = make_q4k(intermediate_columns, qnk_columns, 41);
+
     const ActivationBuffer separate_gate_output = forward_linear(separate_gate, input, 0);
     const ActivationBuffer separate_up_output = forward_linear(separate_up, input, 0);
     ActivationBuffer separate_activated(input_rows, intermediate_columns);
@@ -5843,21 +5844,45 @@ void test_ncnn_vulkan_qnk_expert_operator()
         }
     }
     const ActivationBuffer second_expected = forward_linear(*backend_down_second, second_activated, 0);
-    auto direct_second = QnkExpert_vulkan::create(*backend_gate_up_second,
-                                                  nullptr,
-                                                  *backend_down_second,
-                                                  nullptr,
-                                                  0.0f,
-                                                  automatic_vulkan_device_index,
-                                                  ExpertActivation::GptOssSwiGlu,
-                                                  vulkan_runtime,
-                                                  g_test_optimization_flags | OptimizationVulkanQnK);
+
+    const std::vector<uint8_t> packed_second_gate_up = std::move(backend_gate_up_second->quantized_data);
+    const uint32_t second_intermediate_columns = backend_gate_up_second->shape[0] / 2;
+    const size_t second_row_bytes = static_cast<size_t>(qnk_block_count) * qnk_block_bytes_value;
+    backend_gate_up_second->shape[0] = second_intermediate_columns;
+    backend_gate_up_second->quantized_data.resize(static_cast<size_t>(second_intermediate_columns) * second_row_bytes);
+    auto backend_up_second = std::make_shared<TensorData>();
+    backend_up_second->dtype = backend_gate_up_second->dtype;
+    backend_up_second->shape = backend_gate_up_second->shape;
+    backend_up_second->quantized_data.resize(static_cast<size_t>(second_intermediate_columns) * second_row_bytes);
+    for (uint32_t row = 0; row < second_intermediate_columns; ++row)
+    {
+        std::memcpy(backend_gate_up_second->quantized_data.data() + static_cast<size_t>(row) * second_row_bytes,
+                    packed_second_gate_up.data() + static_cast<size_t>(row * 2) * second_row_bytes,
+                    second_row_bytes);
+        std::memcpy(backend_up_second->quantized_data.data() + static_cast<size_t>(row) * second_row_bytes,
+                    packed_second_gate_up.data() + static_cast<size_t>(row * 2 + 1) * second_row_bytes,
+                    second_row_bytes);
+    }
+
+    auto direct_second = QnkExpert_vulkan::create_separate(*backend_gate_up_second,
+                                                           nullptr,
+                                                           *backend_up_second,
+                                                           nullptr,
+                                                           *backend_down_second,
+                                                           nullptr,
+                                                           0.0f,
+                                                           automatic_vulkan_device_index,
+                                                           ExpertActivation::GptOssSwiGlu,
+                                                           vulkan_runtime,
+                                                           g_test_optimization_flags | OptimizationVulkanQnK);
     ActivationBuffer direct_second_output;
     check(static_cast<bool>(direct_second));
     check(static_cast<bool>(direct_second->forward(input, direct_second_output)));
-    backend->admit(ExpertDemandRequest{"qnk-expert-second", backend_gate_up_second, nullptr,
-                                       backend_down_second, nullptr, 0, 0.0f,
-                                       ExpertActivation::GptOssSwiGlu});
+    ExpertDemandRequest second_admission{"qnk-expert-second", backend_gate_up_second, nullptr,
+                                         backend_down_second, nullptr, 0, 0.0f,
+                                         ExpertActivation::GptOssSwiGlu};
+    second_admission.up = backend_up_second;
+    backend->admit(second_admission);
     backend->wait_for_background_work();
     check(backend->statistics().stores == 2);
 
@@ -8523,6 +8548,19 @@ void test_file_backed_mxfp4_expert_cache()
         auto invalid_target = bounded_span.wait_acquire_ready_pairs(std::span(bounded_requests).last(1), std::span(leases).first(1), true, 0);
         check(!invalid_target && invalid_target.error().code == ErrorCode::InvalidArgument);
         check(bounded_span.statistics().queued_reads == 2);
+
+        leases = {};
+        const std::array<ExpertCachePairRequest, 2> malformed_batch = {{
+            bounded_requests[2],
+            {nullptr, &down_one, 0, "malformed"},
+        }};
+        auto invalid_request = bounded_span.wait_acquire_ready_pairs(malformed_batch, leases);
+        check(!invalid_request && invalid_request.error().code == ErrorCode::InvalidArgument);
+        check(bounded_span.statistics().queued_reads == 2);
+        check(std::all_of(leases.begin(), leases.end(), [](const ExpertCacheLease& lease) {
+            return !lease.gate_up && !lease.down
+                   && lease.gate_up_operator == nullptr && lease.down_operator == nullptr;
+        }));
     }
 
     // A failed read must wake a coalesced wait even while a different admitted
@@ -22275,7 +22313,7 @@ void test_dense_expert_thread_budget()
                                                             && !checked_cold_backend_scratch;
                     if (check_cold_backend_scratch)
                     {
-                        check(scratch.backend_executed.capacity() == 0);
+                        check(scratch.backend_status.capacity() == 0);
                         check(scratch.backend_aggregated.capacity() == 0);
                         check(scratch.backend_indices.capacity() == 0);
                         check(scratch.backend_requests.capacity() == 0);
@@ -22283,7 +22321,7 @@ void test_dense_expert_thread_budget()
                     if (hidden == 32 && token_count == 1 && threads == 2 && !poisoned_backend_scratch)
                     {
                         const size_t stale_count = state.active_experts().size() + 3;
-                        scratch.backend_executed.assign(stale_count, 1);
+                        scratch.backend_status.assign(stale_count, ExpertStatus::Executed);
                         scratch.backend_aggregated.assign(stale_count, 1);
                         scratch.backend_indices.assign(stale_count, std::numeric_limits<size_t>::max());
                         scratch.backend_requests.resize(stale_count);
@@ -22300,14 +22338,14 @@ void test_dense_expert_thread_budget()
                     check(static_cast<bool>(forward_moe(model, moe, state, &statistics, scratch, 0, ExecutionBackend::Cpu, prefetch)));
                     check(state.experts_executed);
                     check(scratch.decode_tasks.empty());
-                    check(scratch.backend_executed.empty());
+                    check(scratch.backend_status.empty());
                     check(scratch.backend_aggregated.empty());
                     check(scratch.backend_indices.empty());
                     check(scratch.backend_requests.empty());
                     check(!scratch.backend_aggregated_output_valid);
                     if (check_cold_backend_scratch)
                     {
-                        check(scratch.backend_executed.capacity() == 0);
+                        check(scratch.backend_status.capacity() == 0);
                         check(scratch.backend_aggregated.capacity() == 0);
                         check(scratch.backend_indices.capacity() == 0);
                         check(scratch.backend_requests.capacity() == 0);

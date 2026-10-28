@@ -117,16 +117,15 @@ struct ExpertScratch
     std::vector<size_t> ready_indices;
     std::vector<ExpertCachePairRequest> cache_requests;
     std::vector<ExpertCacheLease> cache_leases;
-    std::vector<uint8_t> backend_executed;
+    std::vector<ExpertStatus> backend_status;
     std::vector<uint8_t> backend_aggregated;
     std::vector<size_t> backend_indices;
     std::vector<ExpertRequest> backend_requests;
     // Final arrays are consumed synchronously before the next wait. Pending
     // submissions keep their own reservations and never borrow this storage.
     std::vector<ExpertStatus> backend_results;
-    std::vector<size_t> failed_indices;
-    // Separate wave storage stays stable while asynchronous submissions own
-    // request spans. Clear owners after execution, retain vector capacity.
+    // Reused sequentially for initial backend recovery and demand waves.
+    // Clear owners after execution, retain vector capacity.
     std::vector<size_t> prestaged_indices;
     std::vector<ExpertDemandRequest> prestaged_demands;
     std::vector<std::shared_ptr<const void>> prestaged_pins;

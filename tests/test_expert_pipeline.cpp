@@ -124,7 +124,7 @@ public:
 
         std::vector<ExpertStatus> wait() override
         {
-            if (waited) return planned;
+            if (waited) return final;
             if (live && owner.compute_wait_observer) owner.compute_wait_observer();
             for (size_t index = 0; index < entries.size(); ++index)
             {
@@ -141,8 +141,12 @@ public:
                 --owner.in_flight;
                 if (initial) owner.initial_in_flight = false;
             }
+            final = planned;
+            if (owner.fail_unresident_result)
+                for (size_t index = 0; index < entries.size(); ++index)
+                    if (!entries[index]) final[index] = ExpertStatus::Failed;
             waited = true;
-            return planned;
+            return final;
         }
 
         bool commit() override
@@ -174,6 +178,7 @@ public:
         std::vector<std::shared_ptr<Entry>> entries;
         std::vector<ActivationBuffer> outputs;
         std::vector<ExpertStatus> planned;
+        std::vector<ExpertStatus> final;
         bool initial = false;
         bool live = false;
         bool waited = false;
@@ -243,6 +248,7 @@ public:
 
     std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertRequest> requests) override
     {
+        if (return_null_submission) return {};
         return std::make_unique<Compute>(*this, requests);
     }
 
@@ -297,6 +303,8 @@ public:
     bool invalid_demand = false;
     bool synchronous_default = false;
     bool reject_second_request = false;
+    bool fail_unresident_result = false;
+    bool return_null_submission = false;
     std::function<void(const std::string&)> admit_observer;
     std::function<void()> demand_wait_observer;
     std::function<void()> compute_wait_observer;
@@ -398,6 +406,7 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
         };
     }
     bool threw = false;
+    const size_t submissions_before = backend->submission_count;
     try
     {
         auto result = forward_moe(model, moe, state, &statistics, scratch, 0, ExecutionBackend::Vulkan, false, shared_work);
@@ -430,8 +439,19 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
     pipeline_check(backend->in_flight == 0 && backend->maximum_wave <= 8, "pipeline drains bounded compute and upload waves");
     const uint64_t expected_gpu = capacity == 0 || invalid_demand
                                       ? (resident_first ? 1 : 0)
-                                      : expert_count - (reject_one ? 1 : 0) + (resident_first && fail_initial_commit ? 1 : 0);
+                                      : expert_count - (reject_one ? 1 : 0);
     pipeline_check(backend->executed == expected_gpu, "transient capacity pressure cannot cause CPU fallback");
+    if (resident_first && fail_initial_commit)
+    {
+        pipeline_check(statistics.expert_cpu_fallbacks == 1 && statistics.expert_cpu_routes == 1,
+                       "failed resident Expert falls back to CPU once");
+        const size_t wave_capacity = std::max<size_t>(1, std::min(capacity, size_t(8)));
+        const size_t expected_submissions = 1 + (expert_count - 1 + wave_capacity - 1) / wave_capacity;
+        pipeline_check(backend->submission_count - submissions_before == expected_submissions,
+                       "failed resident Expert is not resubmitted after its CPU recovery");
+        pipeline_check(statistics.expert_gpu_routes == expert_count - 1,
+                       "only successfully committed demand Experts count as GPU routes");
+    }
     if (capacity != 0 && !invalid_demand && !resident_all)
         pipeline_check(backend->overlap_begins != 0, "next upload begins before current compute wait");
     if (capacity == 1 && !invalid_demand)
@@ -475,13 +495,18 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
         pipeline_check(!prefill_model.expert_cache,
                        "hybrid prefill failure cases use original model weights without a host cache");
 
-        for (size_t prefill_case = 0; prefill_case < 3; ++prefill_case)
+        for (size_t prefill_case = 0; prefill_case < 5; ++prefill_case)
         {
             const bool fail_commit_case = prefill_case != 0;
             const bool reject_second_expert = prefill_case == 2;
+            const bool fail_unresident_result_case = prefill_case >= 3;
             auto prefill_backend = std::make_shared<PipelineTestBackend>(reject_second_expert ? 2 : (fail_commit_case ? 1 : 0));
             prefill_model.expert_backend = prefill_backend;
             prefill_backend->reject_second_request = reject_second_expert;
+            prefill_backend->fail_unresident_result = fail_unresident_result_case;
+            prefill_model.opt.optimization_flags = OptimizationDefaultFlags & ~OptimizationVulkanExpertGpuPriority;
+            if (prefill_case == 3)
+                prefill_model.opt.optimization_flags |= OptimizationVulkanExpertGpuPriority;
             if (fail_commit_case)
             {
                 const size_t resident_count = reject_second_expert ? 2 : 1;
@@ -548,7 +573,11 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
                 const size_t aborts_before = prefill_backend->abort_count;
                 const size_t rejected_before = prefill_backend->rejected_requests;
                 const size_t commits_before = prefill_backend->commit_attempts;
+                const size_t submissions_before = prefill_backend->submission_count;
                 const uint64_t executed_before = prefill_backend->executed;
+                const uint64_t cpu_fallbacks_before = prefill_statistics.expert_cpu_fallbacks;
+                const uint64_t cpu_routes_before = prefill_statistics.expert_cpu_routes;
+                const uint64_t gpu_routes_before = prefill_statistics.expert_gpu_routes;
                 const auto prefill_result = forward_moe(prefill_model,
                                                         prefill_moe,
                                                         prefill_state,
@@ -567,6 +596,16 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
                     pipeline_check(prefill_backend->commit_attempts == commits_before + 1
                                        && prefill_backend->executed == executed_before + 1,
                                    "first resident Expert executes and its failed commit reaches CPU fallback");
+                if (fail_unresident_result_case)
+                {
+                    pipeline_check(prefill_backend->submission_count == submissions_before + 1
+                                       && prefill_backend->executed == executed_before + 1,
+                                   "final Failed statuses do not resubmit resident or cold Experts");
+                    pipeline_check(prefill_statistics.expert_cpu_fallbacks - cpu_fallbacks_before == 2
+                                       && prefill_statistics.expert_cpu_routes - cpu_routes_before == 2 * route_count
+                                       && prefill_statistics.expert_gpu_routes == gpu_routes_before,
+                                   "resident and NotResident-to-Failed Experts each use CPU fallback once");
+                }
                 if (reject_second_expert)
                     pipeline_check(prefill_backend->rejected_requests - rejected_before == 1,
                                    "second whole-Expert request is rejected on every route-count pass");
@@ -1337,6 +1376,48 @@ static void pipeline_multidevice_prefix()
     upload->abort();
     pipeline_check(upload->wait(pins) == 0 && !pins[0] && !pins[1] && !pins[2] && !pins[3],
                    "aborted demand cannot republish a resident pin");
+
+    second->return_null_submission = true;
+    ActivationBuffer input(1, 32);
+    std::fill_n(input.row(0), 32, 0.25f);
+    ActivationBuffer cold_output;
+    ActivationBuffer null_output;
+    backend->admit({"first-B", gate, nullptr, down, nullptr, 0, 4.0f, ExpertActivation::DeepSeekSwiGlu});
+    backend->admit({"second-A", gate, nullptr, down, nullptr, 1, 4.0f, ExpertActivation::DeepSeekSwiGlu});
+    std::array<ExpertRequest, 2> compute_requests{};
+    compute_requests[0].key = "first-B";
+    compute_requests[0].input = &input;
+    compute_requests[0].output = &cold_output;
+    compute_requests[1].key = "second-A";
+    compute_requests[1].input = &input;
+    compute_requests[1].output = &null_output;
+    auto compute = backend->submit_batch(compute_requests);
+    pipeline_check(compute
+                       && compute->reservations().size() == 2
+                       && compute->reservations()[0] == ExpertStatus::NotResident
+                       && compute->reservations()[1] == ExpertStatus::Failed,
+                   "multi-device passes through a child cache miss and marks a null child submission Failed");
+    std::vector<ExpertStatus> results = compute->wait();
+    pipeline_check(results.size() == 2
+                       && results[0] == ExpertStatus::NotResident
+                       && results[1] == ExpertStatus::Failed,
+                   "multi-device final statuses retain NotResident versus child failure");
+    compute->abort();
+
+    auto unmapped_backend = create_multi_device_expert_backend({first, second}, {0, 1}, {0, 1, 99});
+    unmapped_backend->admit({"unmapped-group", gate, nullptr, down, nullptr, 2, 4.0f, ExpertActivation::DeepSeekSwiGlu});
+    ExpertRequest unmapped_request{};
+    unmapped_request.key = "unmapped-group";
+    unmapped_request.input = &input;
+    unmapped_request.output = &cold_output;
+    auto unmapped = unmapped_backend->submit_batch(std::span<const ExpertRequest>(&unmapped_request, 1));
+    pipeline_check(unmapped && unmapped->reservations().size() == 1
+                       && unmapped->reservations()[0] == ExpertStatus::Failed,
+                   "multi-device reports an unmapped backend request as Failed");
+    results = unmapped->wait();
+    pipeline_check(results.size() == 1 && results[0] == ExpertStatus::Failed,
+                   "multi-device preserves an unmapped request failure through wait");
+    unmapped->abort();
 }
 
 } // namespace moe

@@ -3085,19 +3085,10 @@ void ExpertCache::worker_loop()
             for (size_t index = 0; index < batch.size(); ++index)
             {
                 const std::shared_ptr<Entry>& entry = batch[index];
-                if (errors[index])
-                {
-                    entry->state = Entry::State::Failed;
-                    entry->error = *errors[index];
-                    const auto existing = entries.find(entry->key);
-                    if (existing != entries.end() && existing->second == entry)
-                    {
-                        remove_resident_locked(*entry, false);
-                        entries.erase(existing);
-                    }
-                    continue;
-                }
-                if (has_flag(entry->flags, Entry::DiscardWhenReady)
+                auto& error = errors[index];
+                bool discarded_speculative = false;
+                if (!error
+                    && has_flag(entry->flags, Entry::DiscardWhenReady)
                     && has_flag(entry->flags, Entry::Speculative))
                 {
                     if (!restored[index])
@@ -3106,27 +3097,26 @@ void ExpertCache::worker_loop()
                         mapped_ranges += entry_mapped_range_counts[index];
                         mapped_bytes += entry_mapped_sizes[index];
                     }
-                    entry->state = Entry::State::Failed;
-                    entry->error = Error{ErrorCode::InternalError, "unused speculative Expert read was discarded"};
-                    const auto existing = entries.find(entry->key);
-                    if (existing != entries.end() && existing->second == entry)
-                    {
-                        remove_resident_locked(*entry, false);
-                        entries.erase(existing);
-                    }
-                    ++unused_speculative_reads;
-                    continue;
+                    error = Error{ErrorCode::InternalError, "unused speculative Expert read was discarded"};
+                    discarded_speculative = true;
                 }
-                if (!loaded_pairs[index])
+                else if (!error && !loaded_pairs[index])
+                {
+                    error = Error{ErrorCode::InternalError, "Expert read completed without a payload"};
+                }
+
+                if (error)
                 {
                     entry->state = Entry::State::Failed;
-                    entry->error = Error{ErrorCode::InternalError, "Expert read completed without a payload"};
+                    entry->error = std::move(*error);
                     const auto existing = entries.find(entry->key);
                     if (existing != entries.end() && existing->second == entry)
                     {
                         remove_resident_locked(*entry, false);
                         entries.erase(existing);
                     }
+                    if (discarded_speculative)
+                        ++unused_speculative_reads;
                     continue;
                 }
                 ExpertVictimPair pair = std::move(*loaded_pairs[index]);
@@ -3297,6 +3287,19 @@ Result<size_t> ExpertCache::wait_acquire_ready_pairs(std::span<const ExpertCache
             ErrorCode::InvalidArgument,
             "Expert cache ready target must be positive"};
     }
+    for (const ExpertCachePairRequest& request : requests)
+    {
+        if (!request.gate_up
+            || !request.down
+            || !is_supported_file_backed_pair(*request.gate_up, *request.down)
+            || request.prepared_key.empty())
+        {
+            return Error{
+                ErrorCode::InvalidArgument,
+                "Expert cache ready wait requires prepared file-backed pairs"};
+        }
+    }
+
     // Release every previous output pin before trying to reserve a prefix.
     // Capacity exhaustion can leave an unadmitted tail, which must also stay
     // empty when callers reuse their lease storage.
@@ -3316,17 +3319,7 @@ Result<size_t> ExpertCache::wait_acquire_ready_pairs(std::span<const ExpertCache
     bool capacity_exhausted = false;
     for (size_t index = 0; index < requests.size(); ++index)
     {
-        leases[index] = {};
         const ExpertCachePairRequest& request = requests[index];
-        if (!request.gate_up
-            || !request.down
-            || !is_supported_file_backed_pair(*request.gate_up, *request.down)
-            || request.prepared_key.empty())
-        {
-            return Error{
-                ErrorCode::InvalidArgument,
-                "Expert cache ready wait requires prepared file-backed pairs"};
-        }
         for (;;)
         {
             bool temporarily_exhausted = false;

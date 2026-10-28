@@ -1918,7 +1918,8 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 for (const ExpertState& active : layer_state.active_experts())
                 {
                     const size_t index = workspace.combined_by_expert[active.batch.expert_id];
-                    if (index < workspace.expert.backend_executed.size() && workspace.expert.backend_executed[index])
+                    if (index < workspace.expert.backend_status.size()
+                        && workspace.expert.backend_status[index] == ExpertStatus::Executed)
                         statistics.expert_gpu_routes += active.batch.routes.size();
                     else
                     {

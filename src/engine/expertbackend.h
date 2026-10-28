@@ -34,7 +34,7 @@ struct ExpertKeyHash
     }
 };
 
-enum class ExpertStatus
+enum class ExpertStatus : uint8_t
 {
     NotResident,
     Executed,

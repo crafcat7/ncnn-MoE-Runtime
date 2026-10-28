@@ -183,10 +183,10 @@ static void test_unbudgeted_device_fallback()
     const std::array<ExpertRequest, 1> requests = {ExpertRequest{"missing", &input, &output}};
     auto submission = backend->submit_batch(requests);
     budget_check(submission && submission->reservations().size() == 1
-                     && submission->reservations()[0] == ExpertStatus::NotResident,
-                 "unbudgeted submission reserves CPU fallback");
+                     && submission->reservations()[0] == ExpertStatus::Failed,
+                 "unbudgeted submission selects CPU fallback without a demand retry");
     const auto results = submission->wait();
-    budget_check(results.size() == 1 && results[0] == ExpertStatus::NotResident
+    budget_check(results.size() == 1 && results[0] == ExpertStatus::Failed
                      && output.row(0)[0] == 123.f && child->submissions == 0,
                  "unbudgeted submission neither executes nor publishes output");
 }

@@ -6387,37 +6387,14 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
     if (experts.empty() || experts.size() != inputs.size() || experts.size() != outputs.size())
         return false;
 
-    const QnkExpert_vulkan* first_operator = experts.front();
-    if (!first_operator || !first_operator->d)
-        return false;
-    const Implementation& first_expert = *first_operator->d;
-    if (!first_expert.gate_up
-        || !first_expert.down
-        || !first_expert.vulkan_context
-        || !first_expert.swiglu_pipeline)
-    {
-        return false;
-    }
-
-    const QnkLinear_vulkan::Implementation& first_gate = *first_expert.gate_up->d;
-    const QnkLinear_vulkan::Implementation& first_down = *first_expert.down->d;
-    if (!first_gate.pipeline
-        || !first_down.pipeline
-        || (!first_expert.up && first_gate.output_columns % 2 != 0)
-        || first_down.input_columns != first_expert.intermediate_columns
-        || first_down.output_columns != first_expert.output_columns)
-    {
-        return false;
-    }
-
-    const uint32_t input_columns = first_gate.input_columns;
-    const uint32_t output_columns = first_down.output_columns;
-    const DType output_dtype = outputs.front() ? outputs.front()->dtype() : DType::Int32;
-    if (input_columns == 0 || output_columns == 0 || output_dtype != DType::Float32)
-        return false;
-
+    const Implementation* first_expert_ptr = nullptr;
+    const QnkLinear_vulkan::Implementation* first_gate_ptr = nullptr;
+    const QnkLinear_vulkan::Implementation* first_down_ptr = nullptr;
+    uint32_t input_columns = 0;
+    uint32_t output_columns = 0;
     size_t total_rows = 0;
     bool shared_input = true;
+    bool batch_compatible = true;
     uint64_t int4_ops = 0;
     for (size_t index = 0; index < experts.size(); ++index)
     {
@@ -6432,23 +6409,20 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
             || input->rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max())
             || input->rows() > static_cast<size_t>(std::numeric_limits<int>::max())
             || input->dtype() != DType::Float32
-            || input->columns() != input_columns
-            || output->dtype() != output_dtype)
+            || output->element_size() == 0)
         {
             return false;
         }
+        if (output->dtype() != DType::Float32)
+            batch_compatible = false;
         const Implementation& expert = *operator_instance->d;
         if (!expert.gate_up
             || !expert.down
             || !expert.vulkan_context
             || !expert.swiglu_pipeline
-            || expert.vulkan_context != first_expert.vulkan_context
-            || expert.intermediate_columns != first_expert.intermediate_columns
-            || expert.output_columns != output_columns
-            || expert.activation != first_expert.activation
-            || expert.activation_limit != first_expert.activation_limit
-            || static_cast<bool>(expert.up) != static_cast<bool>(first_expert.up)
-            || expert.interleave_gate_up_rows != first_expert.interleave_gate_up_rows)
+            || !expert.gate_up->d
+            || !expert.down->d
+            || (expert.up && !expert.up->d))
         {
             return false;
         }
@@ -6456,30 +6430,102 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
         const QnkLinear_vulkan::Implementation& down = *expert.down->d;
         if (!gate.pipeline
             || !down.pipeline
-            || gate.vulkan_context != first_expert.vulkan_context
-            || down.vulkan_context != first_expert.vulkan_context
-            || gate.input_columns != input_columns
-            || gate.output_columns != first_gate.output_columns
-            || down.input_columns != first_down.input_columns
-            || down.output_columns != output_columns)
+            || gate.vulkan_context != expert.vulkan_context
+            || down.vulkan_context != expert.vulkan_context
+            || gate.input_columns == 0
+            || gate.output_columns == 0
+            || expert.intermediate_columns == 0
+            || expert.output_columns == 0
+            || down.input_columns != expert.intermediate_columns
+            || down.output_columns != expert.output_columns)
         {
             return false;
         }
-        if (expert.up && (!expert.up->d->pipeline || expert.up->d->vulkan_context != first_expert.vulkan_context || expert.up->input_columns() != input_columns || expert.up->output_columns() != expert.intermediate_columns))
+        if (expert.up)
+        {
+            const QnkLinear_vulkan::Implementation& up = *expert.up->d;
+            if (!up.pipeline
+                || up.vulkan_context != expert.vulkan_context
+                || gate.output_columns != expert.intermediate_columns
+                || up.input_columns != gate.input_columns
+                || up.output_columns != expert.intermediate_columns)
+            {
+                return false;
+            }
+        }
+        else if (gate.output_columns % 2 != 0
+                 || gate.output_columns / 2 != expert.intermediate_columns)
         {
             return false;
         }
+
+        if (input->columns() != gate.input_columns
+            || static_cast<size_t>(gate.input_columns) > std::numeric_limits<size_t>::max() / sizeof(float))
+        {
+            return false;
+        }
+        const size_t input_row_bytes = static_cast<size_t>(gate.input_columns) * sizeof(float);
+        if (input->rows() > std::numeric_limits<size_t>::max() / input_row_bytes
+            || input->bytes().size() != input->rows() * input_row_bytes)
+        {
+            return false;
+        }
+
+        if (!first_expert_ptr)
+        {
+            first_expert_ptr = &expert;
+            first_gate_ptr = &gate;
+            first_down_ptr = &down;
+            input_columns = gate.input_columns;
+            output_columns = down.output_columns;
+        }
+        else if (expert.vulkan_context != first_expert_ptr->vulkan_context
+                 || expert.intermediate_columns != first_expert_ptr->intermediate_columns
+                 || expert.output_columns != first_expert_ptr->output_columns
+                 || expert.activation != first_expert_ptr->activation
+                 || expert.activation_limit != first_expert_ptr->activation_limit
+                 || static_cast<bool>(expert.up) != static_cast<bool>(first_expert_ptr->up)
+                 || expert.interleave_gate_up_rows != first_expert_ptr->interleave_gate_up_rows
+                 || gate.input_columns != first_gate_ptr->input_columns
+                 || gate.output_columns != first_gate_ptr->output_columns
+                 || down.input_columns != first_down_ptr->input_columns
+                 || down.output_columns != first_down_ptr->output_columns)
+        {
+            // These Experts are individually valid, but cannot share the
+            // single upload/output geometry used by the batched path.
+            batch_compatible = false;
+        }
+
         int4_ops += gate.dtype == DType::Int4 ? 1 : 0;
         int4_ops += down.dtype == DType::Int4 ? 1 : 0;
         if (expert.up && expert.up->d->dtype == DType::Int4)
             ++int4_ops;
-        if (total_rows > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) - input->rows())
-            return false;
-        total_rows += input->rows();
+        if (batch_compatible)
+        {
+            const size_t uint32_max = static_cast<size_t>(std::numeric_limits<uint32_t>::max());
+            if (input->rows() > uint32_max - total_rows)
+                batch_compatible = false;
+            else
+                total_rows += input->rows();
+        }
         shared_input = shared_input && input == inputs.front();
     }
-    if (total_rows == 0 || total_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
-        return false;
+    if (batch_compatible && total_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
+        batch_compatible = false;
+    if (!batch_compatible)
+    {
+        // Complete the inexpensive validation pass before allowing any
+        // per-Expert execution, then fall back once for static incompatibility.
+        for (size_t index = 0; index < experts.size(); ++index)
+            if (!experts[index]->forward(*inputs[index], *outputs[index]))
+                return false;
+        return true;
+    }
+
+    const Implementation& first_expert = *first_expert_ptr;
+    const QnkLinear_vulkan::Implementation& first_gate = *first_gate_ptr;
+    const QnkLinear_vulkan::Implementation& first_down = *first_down_ptr;
+    const DType output_dtype = DType::Float32;
 
     const size_t upload_rows = shared_input ? inputs.front()->rows() : total_rows;
     VulkanRuntimeState& runtime_state = first_expert.vulkan_context->runtime_state();
@@ -6514,8 +6560,6 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
     for (const ActivationBuffer* input : inputs)
     {
         const size_t input_size = input->rows() * static_cast<size_t>(input_columns) * sizeof(float);
-        if (input->bytes().size() != input_size)
-            return false;
         std::memcpy(mapped_input_data + row_offset * static_cast<size_t>(input_columns) * sizeof(float),
                     input->bytes().data(),
                     input_size);

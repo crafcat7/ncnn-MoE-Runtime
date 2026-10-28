@@ -429,6 +429,7 @@ MultiDeviceExpertBackend::Submission::Submission(MultiDeviceExpertBackend* owner
       final(planned)
 {
     children.reserve(owner->backends.size());
+    size_t mapped_count = 0;
     for (size_t backend_index = 0; backend_index < owner->backends.size(); ++backend_index)
     {
         if (request_indices[backend_index].empty())
@@ -437,6 +438,7 @@ MultiDeviceExpertBackend::Submission::Submission(MultiDeviceExpertBackend* owner
         }
         ChildSubmission child;
         child.request_indices = std::move(request_indices[backend_index]);
+        mapped_count += child.request_indices.size();
         child.requests.reserve(child.request_indices.size());
         for (size_t request_index : child.request_indices)
         {
@@ -467,7 +469,23 @@ MultiDeviceExpertBackend::Submission::Submission(MultiDeviceExpertBackend* owner
                 }
             }
         }
+        else
+        {
+            for (const size_t request_index : child.request_indices)
+                planned[request_index] = ExpertStatus::Failed;
+        }
         children.push_back(std::move(child));
+    }
+    if (mapped_count != requests.size())
+    {
+        for (size_t request_index = 0; request_index < requests.size(); ++request_index)
+        {
+            const bool mapped = std::any_of(children.begin(), children.end(), [request_index](const ChildSubmission& child) {
+                return std::find(child.request_indices.begin(), child.request_indices.end(), request_index) != child.request_indices.end();
+            });
+            if (!mapped)
+                planned[request_index] = ExpertStatus::Failed;
+        }
     }
     final = planned;
 }
