@@ -802,7 +802,8 @@ bool Tokenizer::load_gguf_impl(const std::string& model_path, size_t vocabulary_
         total_vocabulary = 201088;
         if (integer_value("tokenizer.ggml.bos_token_id") != 199998
             || integer_value("tokenizer.ggml.eos_token_id") != 200002
-            || !optional_id("tokenizer.ggml.padding_token_id", 199999))
+            || (!optional_id("tokenizer.ggml.padding_token_id", 199999)
+                && !optional_id("tokenizer.ggml.padding_token_id", 200017)))
             return false;
     }
     else if ((*architecture == "qwen35" || *architecture == "qwen35moe" || *architecture == "qwen4exp")

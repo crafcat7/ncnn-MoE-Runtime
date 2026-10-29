@@ -566,7 +566,9 @@ struct Fixture
     uint32_t first_byte = 0;
     uint32_t bos = 0;
     uint32_t eos = 0;
+    uint32_t padding = 0;
     bool has_bos = true;
+    bool has_padding = false;
     bool add_bos = false;
 
     uint32_t byte_id(uint8_t byte) const
@@ -680,7 +682,7 @@ static void write_fixture(const std::filesystem::path& path, const Fixture& valu
     std::vector<uint8_t> bytes{'G', 'G', 'U', 'F'};
     append_unsigned(bytes, 3, 4);
     append_unsigned(bytes, 0, 8);
-    append_unsigned(bytes, 9 + (value.has_bos ? 1 : 0), 8);
+    append_unsigned(bytes, 9 + (value.has_bos ? 1 : 0) + (value.has_padding ? 1 : 0), 8);
     const auto string_metadata = [&](std::string_view key, std::string_view text) {
         append_string(bytes, key);
         append_unsigned(bytes, 8, 4);
@@ -698,6 +700,8 @@ static void write_fixture(const std::filesystem::path& path, const Fixture& valu
     integer_metadata("tokenizer.ggml.eos_token_id", value.eos);
     if (value.has_bos)
         integer_metadata("tokenizer.ggml.bos_token_id", value.bos);
+    if (value.has_padding)
+        integer_metadata("tokenizer.ggml.padding_token_id", value.padding);
     append_string(bytes, "tokenizer.ggml.add_bos_token");
     append_unsigned(bytes, 7, 4);
     bytes.push_back(static_cast<uint8_t>(value.add_bos));
@@ -781,6 +785,20 @@ static void check_profile(const std::filesystem::path& root, Fixture value, bool
         expected.insert(expected.end(), {200007, 200006});
         append("assistant");
         check(tokenizer.encode_chat(R"([{"role":"user","content":"hi"}])", false) == expected, "Harmony chat boundaries changed");
+        const auto text_ids = tokenizer.encode(text);
+        for (uint32_t padding : {200000u, 199999u, 200017u})
+        {
+            value.has_padding = true;
+            value.padding = padding;
+            write_fixture(path, value);
+            check(tokenizer.load(path.string(), value.tokens.size()) == (padding != 200000),
+                  "GPT-OSS padding admission changed: " + std::to_string(padding));
+            check(tokenizer.encode(text) == text_ids, "GPT-OSS padding changed text encoding");
+            check(tokenizer.encode_chat(R"([{"role":"user","content":"hi"}])", false) == expected,
+                  "GPT-OSS padding changed chat encoding");
+            check(tokenizer.stop_tokens() == std::vector<int32_t>({200002, 200012}),
+                  "GPT-OSS padding changed Harmony stop tokens");
+        }
     }
     else if (deepseek)
     {
