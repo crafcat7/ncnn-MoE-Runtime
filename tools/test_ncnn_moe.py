@@ -32,6 +32,7 @@ from ncnn_moe import (  # noqa: E402
     _format_runtime_metrics,
     configure_standard_streams,
     cli_runtime_settings,
+    default_generation_values,
     default_worker_path,
     find_worker,
     load_adapter,
@@ -232,6 +233,15 @@ class FakeWorkerClient:
 
 
 class RuntimeOptionsTests(unittest.TestCase):
+    def test_generation_defaults_preserve_explicit_temperature(self) -> None:
+        for name, top_k, top_p in (("gpt-oss", 0, 1.0), ("deepseek-v4", 0, 1.0), ("qwen3.6", 20, 0.95)):
+            for temperature, expected in ((None, 1.0), (0.0, 0.0), (0.5, 0.5)):
+                with self.subTest(model=name, temperature=temperature):
+                    self.assertEqual(
+                        default_generation_values(SimpleNamespace(name=name), _arguments(temperature=temperature)),
+                        (expected, top_k, top_p),
+                    )
+
     def test_io_defaults_to_auto_and_only_exposes_mmap_or_buffered(self) -> None:
         io_flags = ("--mmap-experts", "--buffered-expert-io")
         for command in ("run", "chat", "inspect", "tune"):

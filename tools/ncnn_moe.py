@@ -586,7 +586,7 @@ def open_worker(
 
 def default_generation_values(adapter: ModelAdapter, arguments: argparse.Namespace) -> tuple[float, int, float]:
     if arguments.temperature is None:
-        temperature = 0.0 if adapter.name == "gpt-oss" else 1.0
+        temperature = 1.0
     else:
         temperature = arguments.temperature
     if arguments.top_k is None:
