@@ -2260,6 +2260,18 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
     {
         return false;
     }
+    if (projected_gpu.elempack != residual_input_gpu.elempack)
+    {
+        ncnn::VkMat packed;
+        vkdev->convert_packing(projected_gpu,
+                               packed,
+                               residual_input_gpu.elempack,
+                               command,
+                               implementation.option);
+        if (packed.empty())
+            return false;
+        projected_gpu = packed;
+    }
     std::vector<ncnn::VkMat> add_input = {residual_input_gpu, projected_gpu};
     std::vector<ncnn::VkMat> add_output(1);
     if (implementation.add->forward(add_input, add_output, command, implementation.option) != 0)

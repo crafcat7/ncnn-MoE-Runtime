@@ -607,7 +607,7 @@ class AttentionPackage
 {
 public:
     explicit AttentionPackage(bool bfloat16_kv_cache = false, uint32_t sliding_window = 2, bool attention_bias = true,
-                              bool attention_sinks = true, bool grouped_query = false)
+                              bool attention_sinks = true, bool grouped_query = false, uint32_t context_length = 0)
     {
         path_ = create_unique_test_directory("ncnn_moe_attention_test_");
         const uint32_t hidden_size = grouped_query ? 4 : 2;
@@ -635,7 +635,9 @@ public:
                  << sliding_window << R"(,
   "initial_context_length": 16,
   "max_context_length": )"
-                 << (grouped_query ? 64 : 32) << R"(,
+                 << (context_length != 0 ? context_length : grouped_query ? 64
+                                                                          : 32)
+                 << R"(,
   "rope_theta": 10000.0,
   "rope_scaling_factor": 1.0,
   "attention_bias": )"
@@ -20482,6 +20484,49 @@ void test_backend_capabilities_and_hybrid_execution()
         for (size_t index = 0; index < cpu_attention_prefill.value().logits.size(); ++index)
         {
             check_near(attention_prefill.value().logits[index], cpu_attention_prefill.value().logits[index], 1e-4f);
+        }
+
+        {
+            // A four-column projection permits pack4 output while a long
+            // host prefill retains an unpacked residual.
+            AttentionPackage replay_package(false, 2, true, true, true, 1024);
+            auto replay_model = runtime.load_model(replay_package.path(), attention_options);
+            auto cpu_replay_model = runtime.load_model(replay_package.path(), cpu_options);
+            check(static_cast<bool>(replay_model));
+            check(static_cast<bool>(cpu_replay_model));
+            SessionOptions replay_options;
+            replay_options.prefill_chunk_size = 512;
+            auto replay = runtime.create_session(replay_model.value(), replay_options);
+            auto cpu_replay = runtime.create_session(cpu_replay_model.value(), replay_options);
+            check(static_cast<bool>(replay));
+            check(static_cast<bool>(cpu_replay));
+            std::vector<int32_t> prompt(512);
+            for (size_t index = 0; index < prompt.size(); ++index)
+                prompt[index] = static_cast<int32_t>(index % 2);
+            for (uint32_t pass = 0; pass < 2; ++pass)
+            {
+                check(static_cast<bool>(replay.value()->reset()));
+                check(static_cast<bool>(cpu_replay.value()->reset()));
+                auto prefill = replay.value()->prefill(prompt);
+                auto cpu_prefill = cpu_replay.value()->prefill(prompt);
+                check(static_cast<bool>(prefill));
+                check(static_cast<bool>(cpu_prefill));
+                check(prefill.value().logits.size() == cpu_prefill.value().logits.size());
+                for (size_t index = 0; index < cpu_prefill.value().logits.size(); ++index)
+                    check_near(prefill.value().logits[index], cpu_prefill.value().logits[index], 1e-4f);
+                check(replay.value()->statistics().vulkan_attention_blocks == 1);
+                check(replay.value()->statistics().vulkan_attention_cpu_fallbacks == 0);
+
+                auto decode = replay.value()->decode(1);
+                auto cpu_decode = cpu_replay.value()->decode(1);
+                check(static_cast<bool>(decode));
+                check(static_cast<bool>(cpu_decode));
+                check(decode.value().logits.size() == cpu_decode.value().logits.size());
+                for (size_t index = 0; index < cpu_decode.value().logits.size(); ++index)
+                    check_near(decode.value().logits[index], cpu_decode.value().logits[index], 1e-4f);
+                check(replay.value()->statistics().vulkan_attention_blocks == 2);
+                check(replay.value()->statistics().vulkan_attention_cpu_fallbacks == 0);
+            }
         }
 
         {
