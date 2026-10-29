@@ -1275,8 +1275,6 @@ class ConversationApp:
         if completion.answer:
             print("[answer]")
             print(completion.answer)
-        elif not self.arguments.stream:
-            print(completion.reasoning)
 
     def status_after(self, done: dict[str, Any], reused: bool) -> None:
         metrics = done.get("metrics", {})
@@ -1446,7 +1444,7 @@ class ConversationApp:
                 continue
             try:
                 completion, done, reused = self.send(line)
-                if not self.arguments.stream or not completion.answer:
+                if not self.arguments.stream:
                     self.display_completion(completion)
                 self.status_after(done, reused)
             except (AdapterError, WorkerError, ValueError) as error:
@@ -1500,7 +1498,7 @@ def run_command(arguments: argparse.Namespace) -> int:
             ephemeral=True,
         )
         completion, done, reused = app.send(prompt)
-        if not arguments.stream or not completion.answer:
+        if not arguments.stream:
             app.display_completion(completion)
         app.status_after(done, reused)
         return 0

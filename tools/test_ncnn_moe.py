@@ -1250,6 +1250,30 @@ class ConversationTests(unittest.TestCase):
             "[reasoning]\nreason\ufffd\n[answer]\n  answer\ufffd \t\n",
         )
 
+    def test_streamed_harmony_reasoning_is_not_reprinted_when_generation_stops_early(self) -> None:
+        truncated_reasoning = [
+            (200006, "<|start|>"),
+            (300001, "assistant"),
+            (200005, "<|channel|>"),
+            (300002, "analysis"),
+            (200008, "<|message|>"),
+            (300003, "Let's"),
+            (300004, " consider"),
+        ]
+
+        for stream, final_only, show_reasoning in ((True, False, True), (False, False, True),
+                                                   (True, True, True), (True, False, False)):
+            with self.subTest(stream=stream, final_only=final_only, show_reasoning=show_reasoning):
+                app, _, _ = self._app(
+                    "gpt_oss",
+                    response=truncated_reasoning,
+                    arguments=_arguments(stream=stream, stream_final_only=final_only, show_reasoning=show_reasoning),
+                )
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(app.chat(io.StringIO("question\n/exit\n")), 0)
+                self.assertEqual(output.getvalue(), "[reasoning]\nLet's consider\n" if show_reasoning and not final_only else "")
+
     def test_only_matching_legacy_fingerprints_migrate(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ncnn-moe-legacy-check-") as directory:
             root = Path(directory)
