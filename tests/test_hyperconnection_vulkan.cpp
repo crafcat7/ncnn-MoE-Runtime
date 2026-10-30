@@ -5,6 +5,7 @@
 #include "kernels/float8.h"
 #include "kernels/fastmath.h"
 #include "kernels/ops.h"
+#include "kernels/qnk.h"
 #include "backends/ncnn/vulkancontext.h"
 #include "kernels/hyperconnection.h"
 
@@ -51,6 +52,86 @@ static TensorData hyper_weight(uint32_t rows, uint32_t columns, uint32_t seed)
         {
             const int sample = static_cast<int>((row * 19 + column * 7 + column / 11 + seed * 5) % 37) - 18;
             result.float32_data[static_cast<size_t>(row) * columns + column] = static_cast<float>(sample) * 0.0078125f;
+        }
+    }
+    return result;
+}
+
+static TensorData hyper_native_weight(uint32_t rows, uint32_t columns, uint32_t seed,
+                                      DType dtype, TensorData& reference)
+{
+    if (dtype == DType::Float32)
+    {
+        reference = hyper_weight(rows, columns, seed);
+        return reference;
+    }
+    hyper_check(columns % 256 == 0, "native HC fixture requires complete Qn_K blocks");
+    TensorData result;
+    result.dtype = dtype;
+    result.shape = {rows, columns};
+    result.input_column_indices.resize(columns);
+    for (uint32_t column = 0; column < columns; ++column)
+        result.input_column_indices[column] = column;
+    // A non-involutory permutation catches applying its inverse by mistake.
+    result.input_column_indices[0] = 1;
+    result.input_column_indices[1] = 2;
+    result.input_column_indices[2] = 0;
+    reference.dtype = DType::Float32;
+    reference.shape = result.shape;
+    reference.float32_data.resize(static_cast<size_t>(rows) * columns);
+    if (dtype == DType::Int4)
+    {
+        result.quantization_group_size = 128;
+        const uint32_t groups = columns / 128;
+        result.quantized_data.resize(static_cast<size_t>(rows) * columns / 2, 0);
+        result.quantization_scales.resize(static_cast<size_t>(rows) * groups);
+        result.quantization_zero_points.resize(result.quantization_scales.size());
+        result.quantization_group_indices.resize(columns);
+        for (uint32_t column = 0; column < columns; ++column)
+            result.quantization_group_indices[column] = (column / 16) % groups;
+        for (uint32_t row = 0; row < rows; ++row)
+        {
+            for (uint32_t group = 0; group < groups; ++group)
+            {
+                const size_t index = static_cast<size_t>(row) * groups + group;
+                result.quantization_scales[index] = static_cast<float>((row + group) % 3 + 1) * 0.0078125f;
+                result.quantization_zero_points[index] = static_cast<uint8_t>((row + group) % 5 + 5);
+            }
+            for (uint32_t column = 0; column < columns; ++column)
+            {
+                const uint8_t code = static_cast<uint8_t>((row * 3 + column * 5 + seed) % 16);
+                const size_t index = static_cast<size_t>(row) * columns / 2 + column / 2;
+                result.quantized_data[index] |= code << ((column % 2) * 4);
+                const size_t group_index = static_cast<size_t>(row) * groups + result.quantization_group_indices[column];
+                const size_t logical_index = static_cast<size_t>(row) * columns + result.input_column_indices[column];
+                reference.float32_data[logical_index] = (static_cast<int>(code) - result.quantization_zero_points[group_index])
+                                                        * result.quantization_scales[group_index];
+            }
+        }
+    }
+    else
+    {
+        hyper_check(dtype == DType::Q8K, "native HC fixture dtype");
+        result.quantized_data.resize(static_cast<size_t>(qnk_storage_bytes(dtype, rows, columns)), 0);
+        const size_t stride = static_cast<size_t>(columns / 256) * 292;
+        for (uint32_t row = 0; row < rows; ++row)
+        {
+            for (uint32_t block = 0; block < columns / 256; ++block)
+            {
+                uint8_t* raw = result.quantized_data.data() + row * stride + block * 292;
+                const float scale = static_cast<float>((row + block) % 3 + 1) * 0.0078125f;
+                std::memcpy(raw, &scale, sizeof(scale));
+                int16_t sums[16] = {};
+                for (uint32_t offset = 0; offset < 256; ++offset)
+                {
+                    const uint32_t column = block * 256 + offset;
+                    const int8_t code = static_cast<int8_t>(static_cast<int>((row * 3 + column * 5 + seed) % 16) - 8);
+                    raw[4 + offset] = static_cast<uint8_t>(code);
+                    sums[offset / 16] += code;
+                    reference.float32_data[static_cast<size_t>(row) * columns + result.input_column_indices[column]] = code * scale;
+                }
+                std::memcpy(raw + 260, sums, sizeof(sums));
+            }
         }
     }
     return result;
@@ -115,12 +196,15 @@ static void hyper_compare(const ncnn::Mat& actual, std::span<const float> expect
 }
 
 static void hyper_test_numerical(uint32_t copies, uint32_t hidden_size, uint32_t rows,
-                                 uint32_t iterations, float norm_epsilon, float hyper_epsilon, bool cancel_first = false)
+                                 uint32_t iterations, float norm_epsilon, float hyper_epsilon, bool cancel_first = false,
+                                 DType function_dtype = DType::Float32)
 {
     const std::string label = "M=" + std::to_string(copies) + " H=" + std::to_string(hidden_size) + " rows=" + std::to_string(rows) + " iterations=" + std::to_string(iterations);
     const uint32_t mix_columns = copies * (copies + 2);
-    const TensorData function = hyper_weight(mix_columns, copies * hidden_size, 3);
-    const TensorData head_function = hyper_weight(copies, copies * hidden_size, 7);
+    TensorData reference_function;
+    TensorData reference_head_function;
+    const TensorData function = hyper_native_weight(mix_columns, copies * hidden_size, 3, function_dtype, reference_function);
+    const TensorData head_function = hyper_native_weight(copies, copies * hidden_size, 7, function_dtype, reference_head_function);
     const std::vector<float> scales = {0.4f, -0.75f, 1.25f};
     const std::vector<float> head_scales = {-0.55f};
     const TensorData scale = hyper_vector(scales);
@@ -135,7 +219,7 @@ static void hyper_test_numerical(uint32_t copies, uint32_t hidden_size, uint32_t
     HyperConnectionMix expected_mix;
     ActivationBuffer expected_post;
     ActivationBuffer expected_head;
-    hyper_check(static_cast<bool>(forward_hyper_connection_pre(input, function, scale, base, copies, iterations,
+    hyper_check(static_cast<bool>(forward_hyper_connection_pre(input, reference_function, scale, base, copies, iterations,
                                                                norm_epsilon, hyper_epsilon, expected_mix, scratch, 0)),
                 "CPU pre oracle");
     const ActivationBuffer expected_projection = scratch.projection;
@@ -144,7 +228,7 @@ static void hyper_test_numerical(uint32_t copies, uint32_t hidden_size, uint32_t
         for (uint32_t copy = 0; copy < copies; ++copy)
             expected_pre[row * copies + copy] = 1.0f / (1.0f + float_approximate_exp(-expected_projection.row(row)[copy] * scales[0] - base.float32_data[copy])) + hyper_epsilon;
     hyper_check(static_cast<bool>(forward_hyper_connection_post(branch, input, expected_mix, copies, expected_post)), "CPU post oracle");
-    hyper_check(static_cast<bool>(forward_hyper_connection_head(input, head_function, head_scale, head_base, copies,
+    hyper_check(static_cast<bool>(forward_hyper_connection_head(input, reference_head_function, head_scale, head_base, copies,
                                                                 norm_epsilon, hyper_epsilon, expected_head, scratch, 0)),
                 "CPU head oracle");
     if (copies > 1 && iterations == 1)
@@ -156,9 +240,11 @@ static void hyper_test_numerical(uint32_t copies, uint32_t hidden_size, uint32_t
         hyper_check(asymmetric, "transpose oracle requires asymmetric combine");
     }
     const VulkanRuntimePtr runtime = create_vulkan_runtime();
-    auto op = HyperConnection_vulkan::create(function, scale, base, copies, iterations, norm_epsilon, hyper_epsilon, 0, runtime, OptimizationDefaultFlags);
-    auto head = HyperConnection_vulkan::create(head_function, head_scale, head_base, copies, iterations, norm_epsilon, hyper_epsilon, 0, runtime, OptimizationDefaultFlags);
+    auto op = HyperConnection_vulkan::create(function, scale, base, copies, iterations, norm_epsilon, hyper_epsilon, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
+    auto head = HyperConnection_vulkan::create(head_function, head_scale, head_base, copies, iterations, norm_epsilon, hyper_epsilon, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     hyper_check(op && head && !op->is_head() && head->is_head(), "create HC operators");
+    if (function_dtype == DType::Int4 || is_qnk_dtype(function_dtype))
+        hyper_check(op->device_bytes() < function.element_count() * sizeof(float), "native HC must not allocate a dense matrix copy");
     hyper_check(op->input_columns() == copies * hidden_size && op->multiplier() == copies && op->vulkan_context() == head->vulkan_context(), "HC operator shape/context");
     const std::shared_ptr<VulkanContext> context = op->vulkan_context();
     const ncnn::Mat input_host = hyper_host(input);
@@ -263,9 +349,9 @@ static void hyper_test_device_chain()
                                                                 norm_epsilon, hyper_epsilon, expected, scratch, 0)),
                 "chain CPU head");
     const VulkanRuntimePtr runtime = create_vulkan_runtime();
-    auto first = HyperConnection_vulkan::create(first_function, scale, first_base, copies, iterations, norm_epsilon, hyper_epsilon, 0, runtime, OptimizationDefaultFlags);
-    auto second = HyperConnection_vulkan::create(second_function, scale, second_base, copies, iterations, norm_epsilon, hyper_epsilon, 0, runtime, OptimizationDefaultFlags);
-    auto head = HyperConnection_vulkan::create(head_function, head_scale, head_base, copies, iterations, norm_epsilon, hyper_epsilon, 0, runtime, OptimizationDefaultFlags);
+    auto first = HyperConnection_vulkan::create(first_function, scale, first_base, copies, iterations, norm_epsilon, hyper_epsilon, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
+    auto second = HyperConnection_vulkan::create(second_function, scale, second_base, copies, iterations, norm_epsilon, hyper_epsilon, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
+    auto head = HyperConnection_vulkan::create(head_function, head_scale, head_base, copies, iterations, norm_epsilon, hyper_epsilon, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     hyper_check(first && second && head, "create chain operators");
     const std::shared_ptr<VulkanContext> context = first->vulkan_context();
     HyperConnectionMix_vulkan first_mix;
@@ -323,10 +409,12 @@ static TensorData hyper_lm_weight(DType dtype)
 static void hyper_test_layer_head(DType dtype, uint32_t rows)
 {
     constexpr uint32_t copies = 4;
-    constexpr uint32_t hidden_size = 128;
+    const bool native = dtype == DType::Int4 || is_qnk_dtype(dtype);
+    const uint32_t hidden_size = native ? 256 : 128;
     constexpr float norm_epsilon = 1e-6f;
     constexpr float hyper_epsilon = 1e-5f;
-    const TensorData function = hyper_weight(copies, copies * hidden_size, 3);
+    TensorData reference_function;
+    const TensorData function = hyper_native_weight(copies, copies * hidden_size, 3, native ? dtype : DType::Float32, reference_function);
     const TensorData base = hyper_bases(copies, true, 7);
     const std::vector<float> scales = {0.45f};
     const TensorData scale = hyper_vector(scales);
@@ -334,38 +422,48 @@ static void hyper_test_layer_head(DType dtype, uint32_t rows)
     for (uint32_t column = 0; column < hidden_size; ++column)
         norm_values[column] = 0.7f + static_cast<float>(column % 13) * 0.025f;
     const TensorData norm_weight = hyper_vector(norm_values);
-    const TensorData lm_weight = hyper_lm_weight(dtype);
+    TensorData reference_lm;
+    const TensorData lm_weight = native ? hyper_native_weight(hidden_size, hidden_size, 17, dtype, reference_lm) : hyper_lm_weight(dtype);
     const ActivationBuffer input = hyper_input(rows, copies * hidden_size, 5);
     HyperConnectionScratch scratch;
     ActivationBuffer headed;
-    hyper_check(static_cast<bool>(forward_hyper_connection_head(input, function, scale, base, copies,
+    hyper_check(static_cast<bool>(forward_hyper_connection_head(input, reference_function, scale, base, copies,
                                                                 norm_epsilon, hyper_epsilon, headed, scratch, 0)),
                 "layer head CPU HC");
     const ActivationBuffer expected_hidden = forward_rms_norm(headed, norm_weight, norm_epsilon, 0.0f);
     const VulkanRuntimePtr runtime = create_vulkan_runtime();
     CompiledOperator compiled;
-    if (dtype == DType::Float8E4M3)
-        compiled.float8 = Float8Linear_vulkan::create(lm_weight, nullptr, 1, 0, runtime, OptimizationDefaultFlags);
+    if (native)
+        compiled.qnk = QnkLinear_vulkan::create(lm_weight, nullptr, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
+    else if (dtype == DType::Float8E4M3)
+        compiled.float8 = Float8Linear_vulkan::create(lm_weight, nullptr, 1, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     else if (dtype == DType::BFloat16)
-        compiled.bfloat16 = Bfloat16Linear_vulkan::create(lm_weight, nullptr, 0, runtime, OptimizationDefaultFlags);
+        compiled.bfloat16 = Bfloat16Linear_vulkan::create(lm_weight, nullptr, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     else
-        compiled.linear = Linear::create(lm_weight, nullptr, 0, runtime, OptimizationDefaultFlags);
+        compiled.linear = Linear::create(lm_weight, nullptr, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     ActivationBuffer expected;
     bool projected = false;
-    if (compiled.float8)
+    if (compiled.qnk)
+    {
+        expected = forward_linear(reference_lm, expected_hidden, 0);
+        projected = true;
+    }
+    else if (compiled.float8)
         projected = compiled.float8->forward(expected_hidden, expected);
     else if (compiled.bfloat16)
         projected = compiled.bfloat16->forward(expected_hidden, expected);
     else if (compiled.linear)
         projected = compiled.linear->forward(expected_hidden, expected);
     hyper_check(projected, "existing resident LM projection oracle");
-    const long previous_count = compiled.float8     ? compiled.float8.use_count()
+    const long previous_count = compiled.qnk        ? compiled.qnk.use_count()
+                                : compiled.float8   ? compiled.float8.use_count()
                                 : compiled.bfloat16 ? compiled.bfloat16.use_count()
                                                     : compiled.linear.use_count();
     auto op = LayerHead_vulkan::create(function, scale, base, norm_weight, compiled, copies,
-                                       norm_epsilon, hyper_epsilon, 0, runtime, OptimizationDefaultFlags);
+                                       norm_epsilon, hyper_epsilon, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     hyper_check(static_cast<bool>(op), "create LayerHead");
-    const long shared_count = compiled.float8     ? compiled.float8.use_count()
+    const long shared_count = compiled.qnk        ? compiled.qnk.use_count()
+                              : compiled.float8   ? compiled.float8.use_count()
                               : compiled.bfloat16 ? compiled.bfloat16.use_count()
                                                   : compiled.linear.use_count();
     hyper_check(shared_count == previous_count + 1, "LayerHead shares existing LM projection owner");
@@ -388,7 +486,8 @@ static void hyper_test_layer_head(DType dtype, uint32_t rows)
     const uint64_t submissions = get_vulkan_statistics(runtime).compute_submissions;
     ncnn::VkCompute cmd(context->device());
     cmd.record_clone(input_host, input_device, op->option());
-    hyper_check(op->record(input_device, logits, hc_workspace, temporaries, cmd), "record LayerHead");
+    hyper_check(op->record_hidden(input_device, normalized, hc_workspace, temporaries, cmd), "record LayerHead hidden");
+    hyper_check(op->record_logits(normalized, logits, temporaries, cmd), "record LayerHead logits");
     hyper_check(temporaries.size() == (dtype == DType::Float8E4M3 ? 3u : 2u), "HC/RMS/LM device stages recorded");
     hyper_check(op->record_hidden(input_device, normalized, hidden_workspace, hidden_temporaries, cmd), "record LayerHead normalized hidden");
     hyper_check(op->record_logits(hidden_temporaries.back(), reused_logits, hidden_temporaries, cmd), "reuse normalized device logits");
@@ -411,10 +510,10 @@ static void hyper_test_rejection()
     const std::vector<float> scales = {0.4f, 0.8f, 0.6f};
     const TensorData scale = hyper_vector(scales);
     const VulkanRuntimePtr runtime = create_vulkan_runtime();
-    hyper_check(!HyperConnection_vulkan::create(function, scale, base, 0, 20, 1e-6f, 1e-5f, 0, runtime, OptimizationDefaultFlags), "reject multiplier zero");
-    hyper_check(!HyperConnection_vulkan::create(function, scale, base, 4, 0, 1e-6f, 1e-5f, 0, runtime, OptimizationDefaultFlags), "reject iterations zero");
-    hyper_check(!HyperConnection_vulkan::create(function, scale, base, 4, 20, std::numeric_limits<float>::infinity(), 1e-5f, 0, runtime, OptimizationDefaultFlags), "reject infinite norm epsilon");
-    auto op = HyperConnection_vulkan::create(function, scale, base, copies, 20, 1e-6f, 1e-5f, 0, runtime, OptimizationDefaultFlags);
+    hyper_check(!HyperConnection_vulkan::create(function, scale, base, 0, 20, 1e-6f, 1e-5f, get_default_gpu_index(), runtime, OptimizationDefaultFlags), "reject multiplier zero");
+    hyper_check(!HyperConnection_vulkan::create(function, scale, base, 4, 0, 1e-6f, 1e-5f, get_default_gpu_index(), runtime, OptimizationDefaultFlags), "reject iterations zero");
+    hyper_check(!HyperConnection_vulkan::create(function, scale, base, 4, 20, std::numeric_limits<float>::infinity(), 1e-5f, get_default_gpu_index(), runtime, OptimizationDefaultFlags), "reject infinite norm epsilon");
+    auto op = HyperConnection_vulkan::create(function, scale, base, copies, 20, 1e-6f, 1e-5f, get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     hyper_check(static_cast<bool>(op), "create rejection operator");
     const std::shared_ptr<VulkanContext> context = op->vulkan_context();
     const ActivationBuffer input = hyper_input(2, 148, 3);
@@ -462,12 +561,29 @@ int main()
         ncnn::moe::hyper_test_numerical(4, 129, 3, 2, 0.01f, 0.005f);
         ncnn::moe::hyper_test_numerical(8, 33, 2, 1, 1e-5f, 0.01f);
         ncnn::moe::hyper_test_numerical(4, 1, 2, 20, 1e-6f, 1e-5f);
+        ncnn::moe::hyper_test_numerical(4, 256, 1, 20, 1e-6f, 1e-5f, true, ncnn::moe::DType::Int4);
+        ncnn::moe::hyper_test_numerical(4, 256, 3, 20, 1e-6f, 1e-5f, false, ncnn::moe::DType::Int4);
+        ncnn::moe::hyper_test_numerical(4, 256, 1, 20, 1e-6f, 1e-5f, true, ncnn::moe::DType::Q8K);
+        ncnn::moe::hyper_test_numerical(4, 256, 3, 20, 1e-6f, 1e-5f, false, ncnn::moe::DType::Q8K);
         ncnn::moe::hyper_test_device_chain();
         ncnn::moe::hyper_test_layer_head(ncnn::moe::DType::Float32, 3);
-        ncnn::moe::hyper_test_layer_head(ncnn::moe::DType::BFloat16, 1);
-        ncnn::moe::hyper_test_layer_head(ncnn::moe::DType::BFloat16, 3);
+        const auto context = ncnn::moe::VulkanContext::acquire(ncnn::moe::get_default_gpu_index(),
+                                                               ncnn::moe::create_vulkan_runtime(),
+                                                               ncnn::moe::OptimizationDefaultFlags);
+        ncnn::moe::hyper_check(static_cast<bool>(context), "create BF16 capability context");
+        if (context->device()->info.subgroup_size() == 32)
+        {
+            ncnn::moe::hyper_test_layer_head(ncnn::moe::DType::BFloat16, 1);
+            ncnn::moe::hyper_test_layer_head(ncnn::moe::DType::BFloat16, 3);
+        }
+        else
+            std::cout << "SKIP: BF16 LayerHead projections require Vulkan subgroup size 32\n";
         ncnn::moe::hyper_test_layer_head(ncnn::moe::DType::Float8E4M3, 1);
         ncnn::moe::hyper_test_layer_head(ncnn::moe::DType::Float8E4M3, 3);
+        ncnn::moe::hyper_test_layer_head(ncnn::moe::DType::Int4, 1);
+        ncnn::moe::hyper_test_layer_head(ncnn::moe::DType::Int4, 3);
+        ncnn::moe::hyper_test_layer_head(ncnn::moe::DType::Q8K, 1);
+        ncnn::moe::hyper_test_layer_head(ncnn::moe::DType::Q8K, 3);
         ncnn::moe::hyper_test_rejection();
         std::cout << "Vulkan HyperConnection tests passed\n";
         return 0;

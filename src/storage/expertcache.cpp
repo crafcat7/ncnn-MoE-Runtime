@@ -1,7 +1,9 @@
 #include "expertcache.h"
 #include "expertresidency.h"
 #include "graph/compiledoperator.h"
+#include "kernels/int4.h"
 #include "kernels/mxfp4.h"
+#include "kernels/qnk.h"
 #include "mappedfile.h"
 
 #include <algorithm>
@@ -18,6 +20,10 @@
 #include <shared_mutex>
 #include <utility>
 
+#if defined(__APPLE__)
+#include <Availability.h>
+#endif
+
 #if defined(_WIN32)
 #if !defined(NOMINMAX)
 #define NOMINMAX
@@ -25,6 +31,7 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #endif
 
@@ -55,6 +62,12 @@ static ThreadReadEvent& thread_read_event() noexcept
 {
     static thread_local ThreadReadEvent event;
     return event;
+}
+
+static std::array<ThreadReadEvent, 3>& thread_direct_batch_events() noexcept
+{
+    static thread_local std::array<ThreadReadEvent, 3> events;
+    return events;
 }
 
 #endif
@@ -146,6 +159,14 @@ struct ExpertCache::FileRangeReader
 
     Result<LoadedRange> load(const std::string& path, uint64_t offset, uint64_t size, ExpertIoMode io_mode)
     {
+        return load(path, offset, size, io_mode, nullptr, 0);
+    }
+
+    // A scratch-backed result is consumed before this worker's next read.
+    // Only normalized Expert payloads are published to ARC or caller leases.
+    Result<LoadedRange> load(const std::string& path, uint64_t offset, uint64_t size, ExpertIoMode io_mode,
+                             MxFp4ByteBuffer* scratch, uint64_t scratch_limit)
+    {
         if (size > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
         {
             return Error{
@@ -176,7 +197,7 @@ struct ExpertCache::FileRangeReader
         {
             const auto started = sample ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};
-            auto direct = read_direct(path, offset, size);
+            auto direct = read_direct(path, offset, size, scratch, scratch_limit);
             if (direct)
             {
                 direct_read_ranges.fetch_add(1, std::memory_order_relaxed);
@@ -203,12 +224,19 @@ struct ExpertCache::FileRangeReader
                                              : std::chrono::steady_clock::time_point{};
 #endif
         LoadedRange loaded;
-        loaded.data.resize(static_cast<size_t>(size));
+        if (scratch && size <= scratch_limit)
+        {
+            if (scratch->size() < size)
+                scratch->resize(static_cast<size_t>(size));
+            loaded.data = MxFp4ByteBuffer(scratch->storage, static_cast<size_t>(size));
+        }
+        else
+        {
+            loaded.data.resize(static_cast<size_t>(size));
+        }
         auto status = read(path, offset, loaded.data);
         if (!status)
             return status.error();
-        buffered_read_ranges.fetch_add(1, std::memory_order_relaxed);
-        buffered_read_bytes.fetch_add(size, std::memory_order_relaxed);
 #if defined(_WIN32)
         if (sample)
         {
@@ -261,16 +289,17 @@ struct ExpertCache::FileRangeReader
     }
 
 #if defined(_WIN32)
-    Result<MxFp4ByteBuffer> read_direct(const std::string& path, uint64_t offset, uint64_t size)
+    static constexpr uint64_t direct_alignment = 64 * 1024;
+    struct DirectPlan
     {
-        const HANDLE read_event = thread_read_event().handle;
-        if (read_event == nullptr)
-        {
-            return Error{
-                ErrorCode::IoError,
-                "cannot create direct Expert read event: " + path};
-        }
-        static constexpr uint64_t direct_alignment = 64 * 1024;
+        uint64_t aligned_offset = 0;
+        uint64_t prefix = 0;
+        uint64_t logical_size = 0;
+        uint64_t request_size = 0;
+    };
+
+    static Result<DirectPlan> plan_direct_read(const std::string& path, uint64_t offset, uint64_t size)
+    {
         const uint64_t aligned_offset = offset - offset % direct_alignment;
         const uint64_t prefix = offset - aligned_offset;
         if (size > std::numeric_limits<uint64_t>::max() - prefix)
@@ -293,27 +322,64 @@ struct ExpertCache::FileRangeReader
                 ErrorCode::InvalidArgument,
                 "direct Expert range is outside the supported size"};
         }
+        return DirectPlan{aligned_offset, prefix, logical_size, request_size};
+    }
 
+    Result<MxFp4ByteBuffer> direct_buffer(uint64_t request_size, MxFp4ByteBuffer* scratch, uint64_t scratch_limit)
+    {
+        const bool retain = scratch && request_size <= scratch_limit;
+        const bool reuse = retain && scratch->size() >= request_size
+                           && reinterpret_cast<uintptr_t>(scratch->data()) % direct_alignment == 0;
+        uint8_t* allocation = reuse ? scratch->data() : nullptr;
+        std::shared_ptr<uint8_t> owner;
+        if (reuse)
+        {
+            owner = scratch->storage;
+        }
+        else
+        {
+            allocation = static_cast<uint8_t*>(VirtualAlloc(nullptr, static_cast<SIZE_T>(request_size), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            if (!allocation)
+            {
+                return Error{
+                    ErrorCode::IoError,
+                    "cannot allocate aligned direct Expert buffer"};
+            }
+            owner = std::shared_ptr<uint8_t>(allocation,
+                                             [](uint8_t* pointer) {
+                                                 if (pointer)
+                                                     VirtualFree(pointer, 0, MEM_RELEASE);
+                                             });
+            if (retain)
+            {
+                *scratch = MxFp4ByteBuffer(owner, static_cast<size_t>(request_size));
+            }
+        }
+        return MxFp4ByteBuffer(std::move(owner), static_cast<size_t>(request_size));
+    }
+
+    Result<MxFp4ByteBuffer> read_direct(const std::string& path, uint64_t offset, uint64_t size,
+                                        MxFp4ByteBuffer* scratch, uint64_t scratch_limit)
+    {
+        const HANDLE read_event = thread_read_event().handle;
+        if (read_event == nullptr)
+            return Error{ErrorCode::IoError, "cannot create direct Expert read event: " + path};
+        auto planned = plan_direct_read(path, offset, size);
+        if (!planned)
+            return planned.error();
+        const DirectPlan plan = planned.value();
         auto handle_result = direct_handle_for(path);
         if (!handle_result)
             return handle_result.error();
         const Handle handle = handle_result.value();
-        uint8_t* allocation = static_cast<uint8_t*>(VirtualAlloc(nullptr, static_cast<SIZE_T>(request_size), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-        if (!allocation)
-        {
-            return Error{
-                ErrorCode::IoError,
-                "cannot allocate aligned direct Expert buffer"};
-        }
-        std::shared_ptr<uint8_t> owner(allocation,
-                                       [](uint8_t* pointer) {
-                                           if (pointer)
-                                               VirtualFree(pointer, 0, MEM_RELEASE);
-                                       });
+        auto buffer = direct_buffer(plan.request_size, scratch, scratch_limit);
+        if (!buffer)
+            return buffer.error();
+        uint8_t* allocation = buffer.value().data();
 
         OVERLAPPED operation{};
-        operation.Offset = static_cast<DWORD>(aligned_offset);
-        operation.OffsetHigh = static_cast<DWORD>(aligned_offset >> 32);
+        operation.Offset = static_cast<DWORD>(plan.aligned_offset);
+        operation.OffsetHigh = static_cast<DWORD>(plan.aligned_offset >> 32);
         operation.hEvent = read_event;
         if (operation.hEvent == nullptr || !ResetEvent(operation.hEvent))
         {
@@ -322,7 +388,7 @@ struct ExpertCache::FileRangeReader
                 "cannot prepare direct Expert read event: " + path};
         }
         DWORD read_bytes = 0;
-        const BOOL started = ReadFile(handle, allocation, static_cast<DWORD>(request_size), nullptr, &operation);
+        const BOOL started = ReadFile(handle, allocation, static_cast<DWORD>(plan.request_size), nullptr, &operation);
         const DWORD start_error = started ? ERROR_SUCCESS : GetLastError();
         if (!started && start_error != ERROR_IO_PENDING)
         {
@@ -330,19 +396,246 @@ struct ExpertCache::FileRangeReader
                 ErrorCode::IoError,
                 "cannot start direct Expert read: " + path};
         }
-        if (!GetOverlappedResult(handle, &operation, &read_bytes, TRUE) || static_cast<uint64_t>(read_bytes) < logical_size)
+        const BOOL completed = GetOverlappedResult(handle, &operation, &read_bytes, TRUE);
+        if (!completed || static_cast<uint64_t>(read_bytes) < plan.logical_size)
         {
             return Error{
                 ErrorCode::IoError,
                 "cannot complete direct Expert read: " + path};
         }
 
-        std::shared_ptr<uint8_t> view(owner, allocation + static_cast<size_t>(prefix));
+        std::shared_ptr<uint8_t> view(buffer.value().storage, allocation + static_cast<size_t>(plan.prefix));
         return MxFp4ByteBuffer(std::move(view), static_cast<size_t>(size));
+    }
+
+    struct DirectRange
+    {
+        const std::string* path = nullptr;
+        uint64_t offset = 0;
+        uint64_t size = 0;
+    };
+
+    struct DirectSlot
+    {
+        DirectPlan plan;
+        const DirectRange* range = nullptr;
+        HANDLE handle = INVALID_HANDLE_VALUE;
+        OVERLAPPED operation{};
+        uint8_t* base = nullptr;
+        bool active = false;
+        bool fallback = false;
+        bool processed = false;
+    };
+
+    void completed_direct_slot(const DirectSlot& slot) noexcept
+    {
+        direct_read_ranges.fetch_add(1, std::memory_order_relaxed);
+        direct_read_bytes.fetch_add(slot.range->size, std::memory_order_relaxed);
+    }
+
+    // Owns every submitted OVERLAPPED until completion, including exceptions
+    // from a converter or a Buffered retry. Never cancel another worker's I/O.
+    struct DirectBatchDrain
+    {
+        FileRangeReader& reader;
+        std::span<DirectSlot> slots;
+
+        ~DirectBatchDrain() noexcept
+        {
+            for (DirectSlot& slot : slots)
+                if (slot.active)
+                    CancelIoEx(slot.handle, &slot.operation);
+            for (DirectSlot& slot : slots)
+            {
+                if (!slot.active)
+                    continue;
+                DWORD bytes = 0;
+                const BOOL completed = GetOverlappedResult(slot.handle, &slot.operation, &bytes, TRUE);
+                slot.active = false;
+                if (completed && static_cast<uint64_t>(bytes) >= slot.plan.logical_size)
+                    reader.completed_direct_slot(slot);
+                // An intentional cancellation is not a failed Direct-policy
+                // probe and must not force Auto to Buffered or request retry.
+            }
+        }
+    };
+
+    using DirectConverter = Result<void> (*)(const void*, size_t, std::span<const uint8_t>);
+
+    Result<void> load_direct_ranges(std::span<const DirectRange> ranges, ExpertIoMode io_mode,
+                                    MxFp4ByteBuffer& scratch, uint64_t scratch_limit,
+                                    const void* conversion_context, DirectConverter convert)
+    {
+        auto& events = thread_direct_batch_events();
+        size_t cursor = 0;
+        while (cursor < ranges.size())
+        {
+            std::array<DirectPlan, 3> plans{};
+            size_t count = 0;
+            uint64_t arena_size = 0;
+            const bool direct = io_mode == ExpertIoMode::Direct
+                                || (io_mode == ExpertIoMode::Auto && selected_read_policy() == ReadPolicyDirect);
+            if (direct)
+            {
+                while (count < plans.size() && cursor + count < ranges.size())
+                {
+                    const DirectRange& range = ranges[cursor + count];
+                    auto plan = plan_direct_read(*range.path, range.offset, range.size);
+                    if (!plan || plan.value().request_size > scratch_limit - arena_size)
+                        break;
+                    plans[count] = plan.value();
+                    arena_size += plan.value().request_size;
+                    ++count;
+                }
+            }
+            // Preserve the complete scalar policy (including over-cap Direct
+            // allocation, adaptive sampling, and fallback) for one large bank.
+            if (count < 2)
+            {
+                const DirectRange& range = ranges[cursor];
+                auto raw = load(*range.path, range.offset, range.size, io_mode, &scratch, scratch_limit);
+                if (!raw)
+                    return raw.error();
+                auto converted = convert(conversion_context, cursor, std::span<const uint8_t>(raw.value().data.data(), raw.value().data.size()));
+                if (!converted)
+                    return converted.error();
+                ++cursor;
+                continue;
+            }
+
+            // All slots are planned and the arena is grown before the first
+            // submission. No pending operation can observe resize or reuse.
+            auto arena = direct_buffer(arena_size, &scratch, scratch_limit);
+            if (!arena)
+            {
+                // Allocation pressure preserves the existing scalar fallback
+                // instead of making pipelining a new model-admission limit.
+                const DirectRange& range = ranges[cursor];
+                auto raw = load(*range.path, range.offset, range.size, io_mode, &scratch, scratch_limit);
+                if (!raw)
+                    return raw.error();
+                auto converted = convert(conversion_context, cursor, std::span<const uint8_t>(raw.value().data.data(), raw.value().data.size()));
+                if (!converted)
+                    return converted.error();
+                ++cursor;
+                continue;
+            }
+            std::array<DirectSlot, 3> slots{};
+            DirectBatchDrain drain{*this, {slots.data(), count}};
+            const auto fail_direct = [&](DirectSlot& slot) {
+                slot.fallback = true;
+                direct_read_fallbacks.fetch_add(1, std::memory_order_relaxed);
+                if (io_mode == ExpertIoMode::Auto)
+                    adaptive_read_policy.store(ReadPolicyBuffered, std::memory_order_relaxed);
+            };
+            uint64_t arena_offset = 0;
+            for (size_t index = 0; index < count; ++index)
+            {
+                DirectSlot& slot = slots[index];
+                slot.range = &ranges[cursor + index];
+                slot.plan = plans[index];
+                slot.base = arena.value().data() + static_cast<size_t>(arena_offset);
+                arena_offset += slot.plan.request_size;
+                // A failure in an earlier submission only changes work which
+                // has not yet been submitted; already active slots complete.
+                if (io_mode == ExpertIoMode::Auto && selected_read_policy() != ReadPolicyDirect)
+                {
+                    slot.fallback = true;
+                    continue;
+                }
+                auto handle = direct_handle_for(*slot.range->path);
+                slot.operation.Offset = static_cast<DWORD>(slot.plan.aligned_offset);
+                slot.operation.OffsetHigh = static_cast<DWORD>(slot.plan.aligned_offset >> 32);
+                slot.operation.hEvent = events[index].handle;
+                if (!handle || !slot.operation.hEvent || !ResetEvent(slot.operation.hEvent))
+                {
+                    fail_direct(slot);
+                    continue;
+                }
+                slot.handle = handle.value();
+                const BOOL started = ReadFile(slot.handle, slot.base, static_cast<DWORD>(slot.plan.request_size), nullptr, &slot.operation);
+                const DWORD error = started ? ERROR_SUCCESS : GetLastError();
+                if (!started && error != ERROR_IO_PENDING)
+                {
+                    fail_direct(slot);
+                    continue;
+                }
+                slot.active = true;
+            }
+
+            size_t remaining = count;
+            while (remaining != 0)
+            {
+                size_t selected = count;
+                std::array<HANDLE, 3> waiting{};
+                std::array<size_t, 3> waiting_slots{};
+                DWORD waiting_count = 0;
+                for (size_t index = 0; index < count; ++index)
+                {
+                    if (slots[index].processed)
+                        continue;
+                    if (slots[index].fallback)
+                    {
+                        selected = index;
+                        break;
+                    }
+                    waiting[waiting_count] = slots[index].operation.hEvent;
+                    waiting_slots[waiting_count++] = index;
+                }
+                if (selected == count)
+                {
+                    const DWORD completed = WaitForMultipleObjects(waiting_count, waiting.data(), FALSE, INFINITE);
+                    if (completed - WAIT_OBJECT_0 >= waiting_count)
+                        return Error{ErrorCode::IoError, "cannot wait for pipelined Direct Expert reads"};
+                    selected = waiting_slots[completed - WAIT_OBJECT_0];
+                }
+                DirectSlot& slot = slots[selected];
+                bool direct_complete = false;
+                if (slot.active)
+                {
+                    DWORD bytes = 0;
+                    const BOOL completed = GetOverlappedResult(slot.handle, &slot.operation, &bytes, FALSE);
+                    if (!completed && GetLastError() == ERROR_IO_INCOMPLETE)
+                        continue;
+                    slot.active = false;
+                    if (completed && static_cast<uint64_t>(bytes) >= slot.plan.logical_size)
+                    {
+                        completed_direct_slot(slot);
+                        direct_complete = true;
+                    }
+                    else
+                    {
+                        fail_direct(slot);
+                    }
+                }
+                if (slot.fallback)
+                {
+                    // This slot is disjoint from every still-pending Direct
+                    // destination. Never retry through the arena base owner.
+                    auto read_status = read(*slot.range->path, slot.range->offset,
+                                            std::span<uint8_t>(slot.base, static_cast<size_t>(slot.range->size)));
+                    if (!read_status)
+                        return read_status.error();
+                }
+                const uint8_t* payload = slot.base + (direct_complete ? static_cast<size_t>(slot.plan.prefix) : 0);
+                auto converted = convert(conversion_context, cursor + selected, std::span<const uint8_t>(payload, static_cast<size_t>(slot.range->size)));
+                if (!converted)
+                    return converted.error();
+                slot.processed = true;
+                --remaining;
+            }
+            cursor += count;
+        }
+        return {};
     }
 #endif
 
     Result<void> read(const std::string& path, uint64_t offset, MxFp4ByteBuffer& destination)
+    {
+        return read(path, offset, std::span<uint8_t>(destination.data(), destination.size()));
+    }
+
+    Result<void> read(const std::string& path, uint64_t offset, std::span<uint8_t> destination)
     {
 #if defined(_WIN32)
         const HANDLE read_event = thread_read_event().handle;
@@ -419,8 +712,112 @@ struct ExpertCache::FileRangeReader
             posix_fadvise(handle, static_cast<off_t>(offset), static_cast<off_t>(destination.size()), POSIX_FADV_DONTNEED);
         }
 #endif
+        buffered_read_ranges.fetch_add(1, std::memory_order_relaxed);
+        buffered_read_bytes.fetch_add(destination.size(), std::memory_order_relaxed);
         return {};
     }
+
+#if !defined(_WIN32) && (!defined(__APPLE__) || __MAC_OS_X_VERSION_MIN_REQUIRED >= 110000)
+    Result<void> read_scatter(const std::string& path,
+                              uint64_t offset,
+                              uint64_t size,
+                              std::span<iovec> destinations)
+    {
+        const uint64_t maximum_offset = static_cast<uint64_t>(std::numeric_limits<off_t>::max());
+        if (size == 0
+            || size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
+            || size > static_cast<uint64_t>(std::numeric_limits<ssize_t>::max())
+            || size > maximum_offset
+            || offset > maximum_offset
+            || size - 1 > maximum_offset - offset)
+        {
+            return Error{ErrorCode::InvalidModel, "invalid coalesced Expert file range: " + path};
+        }
+
+        uint64_t destination_size = 0;
+        for (const iovec& destination : destinations)
+        {
+            if (!destination.iov_base
+                || destination.iov_len == 0
+                || destination.iov_len > std::numeric_limits<uint64_t>::max() - destination_size)
+            {
+                return Error{ErrorCode::InvalidModel, "invalid coalesced Expert destination: " + path};
+            }
+            destination_size += destination.iov_len;
+        }
+        if (destination_size != size)
+            return Error{ErrorCode::InvalidModel, "coalesced Expert destination size does not match file range: " + path};
+
+        static const size_t maximum_iov_count = [] {
+            size_t maximum = 16;
+#if defined(IOV_MAX)
+            maximum = static_cast<size_t>(IOV_MAX);
+#endif
+#if defined(_SC_IOV_MAX)
+            const long runtime_maximum = sysconf(_SC_IOV_MAX);
+            if (runtime_maximum > 0)
+                maximum = static_cast<size_t>(runtime_maximum);
+#endif
+            return std::min(maximum, static_cast<size_t>(std::numeric_limits<int>::max()));
+        }();
+
+        auto handle_result = handle_for(path);
+        if (!handle_result)
+            return handle_result.error();
+        const Handle handle = handle_result.value();
+        size_t first_destination = 0;
+        size_t completed = 0;
+        while (completed < static_cast<size_t>(size))
+        {
+            if (first_destination == destinations.size())
+                return Error{ErrorCode::InvalidModel, "coalesced Expert destinations ended early: " + path};
+            const size_t vector_count = std::min(maximum_iov_count, destinations.size() - first_destination);
+            ssize_t read_bytes = 0;
+            do
+            {
+                read_bytes = preadv(handle,
+                                    destinations.data() + first_destination,
+                                    static_cast<int>(vector_count),
+                                    static_cast<off_t>(offset + completed));
+            } while (read_bytes < 0 && errno == EINTR);
+            if (read_bytes < 0)
+            {
+                return Error{
+                    ErrorCode::IoError,
+                    "cannot read coalesced Expert shard range: " + path + ": " + std::strerror(errno)};
+            }
+            if (read_bytes == 0)
+                return Error{ErrorCode::IoError, "coalesced Expert shard range is truncated: " + path};
+
+            size_t remaining = static_cast<size_t>(read_bytes);
+            if (remaining > static_cast<size_t>(size) - completed)
+                return Error{ErrorCode::IoError, "coalesced Expert read exceeded its file range: " + path};
+            completed += remaining;
+            while (remaining != 0)
+            {
+                iovec& destination = destinations[first_destination];
+                if (remaining >= destination.iov_len)
+                {
+                    remaining -= destination.iov_len;
+                    ++first_destination;
+                }
+                else
+                {
+                    destination.iov_base = static_cast<uint8_t*>(destination.iov_base) + remaining;
+                    destination.iov_len -= remaining;
+                    remaining = 0;
+                }
+            }
+        }
+
+#if defined(__linux__) && defined(POSIX_FADV_DONTNEED)
+        posix_fadvise(handle, static_cast<off_t>(offset), static_cast<off_t>(size), POSIX_FADV_DONTNEED);
+#endif
+        buffered_read_ranges.fetch_add(1, std::memory_order_relaxed);
+        buffered_read_bytes.fetch_add(size, std::memory_order_relaxed);
+        return {};
+    }
+#endif
 
 private:
     static void close_handle(Handle handle) noexcept
@@ -676,18 +1073,116 @@ static bool is_file_backed_bfloat16_tensor(const TensorData& tensor) noexcept
 static bool is_supported_file_backed_pair(const TensorData& gate_up,
                                           const TensorData& down) noexcept
 {
-    return (gate_up.mxfp4_file_storage && down.mxfp4_file_storage)
+    const bool mxfp4_pair = gate_up.dtype == DType::MxFp4
+                            && down.dtype == DType::MxFp4
+                            && gate_up.mxfp4_file_storage
+                            && down.mxfp4_file_storage;
+    const bool qnk_pair = is_qnk_dtype(gate_up.dtype)
+                          && is_qnk_dtype(down.dtype)
+                          && gate_up.mxfp4_file_storage
+                          && down.mxfp4_file_storage;
+    return mxfp4_pair || qnk_pair
            || (is_file_backed_bfloat16_tensor(gate_up)
                && is_file_backed_bfloat16_tensor(down));
+}
+
+static Result<uint64_t> gguf_mxfp4_stored_size(const TensorData& tensor)
+{
+    const MxFp4FileStorage& file = *tensor.mxfp4_file_storage;
+    if (tensor.shape.size() != 2 || tensor.shape[0] == 0 || tensor.shape[1] == 0
+        || tensor.shape[1] % 32 != 0 || (file.interleave_rows && tensor.shape[0] % 2 != 0))
+        return Error{ErrorCode::InvalidModel, "invalid file-backed GGUF MXFP4 matrix shape"};
+    const uint64_t rows = tensor.shape[0] / (file.interleave_rows ? 2 : 1);
+    const uint64_t blocks = rows * (tensor.shape[1] / 32);
+    if (blocks > std::numeric_limits<uint64_t>::max() / 17)
+        return Error{ErrorCode::InvalidModel, "GGUF MXFP4 range byte count overflows"};
+    const uint64_t size = blocks * 17;
+    if (file.blocks_path.empty() || file.blocks_size != size
+        || file.blocks_offset > std::numeric_limits<uint64_t>::max() - size
+        || !file.scales_path.empty() || file.scales_size != 0 || file.scales_offset != 0
+        || !file.secondary_scales_path.empty() || file.secondary_scales_size != 0 || file.secondary_scales_offset != 0)
+        return Error{ErrorCode::InvalidModel, "invalid file-backed GGUF MXFP4 range"};
+    if (file.interleave_rows)
+    {
+        if (file.secondary_blocks_path.empty() || file.secondary_blocks_size != size
+            || file.secondary_blocks_offset > std::numeric_limits<uint64_t>::max() - size
+            || size > std::numeric_limits<uint64_t>::max() / 2)
+            return Error{ErrorCode::InvalidModel, "invalid GGUF MXFP4 Gate/Up range"};
+    }
+    else if (!file.secondary_blocks_path.empty() || file.secondary_blocks_size != 0 || file.secondary_blocks_offset != 0)
+        return Error{ErrorCode::InvalidModel, "non-interleaved GGUF MXFP4 matrix has secondary ranges"};
+    const uint64_t total = size * (file.interleave_rows ? 2 : 1);
+    if (total > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+        return Error{ErrorCode::InvalidModel, "file-backed GGUF MXFP4 matrix is too large"};
+    return total;
 }
 
 Result<uint64_t> ExpertCache::stored_size(const TensorData& tensor)
 {
     if (is_file_backed_bfloat16_tensor(tensor))
         return tensor.mapped_size;
+    if (is_qnk_dtype(tensor.dtype))
+    {
+        if (!tensor.mxfp4_file_storage)
+            return Error{ErrorCode::InvalidArgument, "expert cache requires a file-backed Qn_K tensor"};
+        const MxFp4FileStorage& source = *tensor.mxfp4_file_storage;
+        if (source.layout != MxFp4FileLayout::Separate || source.interleave_rows
+            || tensor.shape.size() != 2
+            || !qnk_shape_supported(tensor.dtype, tensor.shape[0], tensor.shape[1])
+            || !tensor.float32_data.empty() || !tensor.bfloat16_data.empty()
+            || !tensor.int64_data.empty() || !tensor.int8_data.empty()
+            || !tensor.quantized_data.empty() || !tensor.mxfp4_blocks.empty()
+            || !tensor.quantization_scales.empty() || tensor.quantization_group_size != 0
+            || !tensor.quantization_zero_points.empty() || !tensor.quantization_group_indices.empty()
+            || !tensor.mxfp4_scales.empty() || tensor.mapped_data || tensor.mapped_size != 0
+            || !source.scales_path.empty() || source.scales_offset != 0 || source.scales_size != 0
+            || !source.secondary_scales_path.empty() || source.secondary_scales_offset != 0 || source.secondary_scales_size != 0)
+        {
+            return Error{ErrorCode::InvalidModel, "invalid file-backed Qn_K tensor metadata"};
+        }
+        const uint64_t expected_size = qnk_storage_bytes(tensor.dtype, tensor.shape[0], tensor.shape[1]);
+        if (expected_size == 0 || expected_size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
+            || source.blocks_path.empty() || source.blocks_size == 0
+            || source.blocks_offset > std::numeric_limits<uint64_t>::max() - source.blocks_size)
+        {
+            return Error{ErrorCode::InvalidModel, "invalid file-backed Qn_K primary range"};
+        }
+        auto columns = validate_input_column_indices(tensor);
+        if (!columns)
+            return columns.error();
+        uint64_t size = source.blocks_size;
+        if (source.secondary_blocks_path.empty())
+        {
+            if (source.secondary_blocks_offset != 0 || source.secondary_blocks_size != 0
+                || source.blocks_size != expected_size)
+            {
+                return Error{ErrorCode::InvalidModel, "invalid file-backed Qn_K range size"};
+            }
+        }
+        else
+        {
+            if (tensor.shape[0] % 2 != 0
+                || source.secondary_blocks_size == 0
+                || source.secondary_blocks_offset > std::numeric_limits<uint64_t>::max() - source.secondary_blocks_size
+                || source.blocks_size != qnk_storage_bytes(tensor.dtype, tensor.shape[0] / 2, tensor.shape[1])
+                || source.secondary_blocks_size != source.blocks_size
+                || source.blocks_size > std::numeric_limits<uint64_t>::max() - source.secondary_blocks_size)
+            {
+                return Error{ErrorCode::InvalidModel, "invalid file-backed Qn_K secondary range"};
+            }
+            size += source.secondary_blocks_size;
+            if (size != expected_size)
+                return Error{ErrorCode::InvalidModel, "file-backed Qn_K ranges do not match the tensor shape"};
+        }
+        return size;
+    }
     if (tensor.dtype != DType::MxFp4 || !tensor.mxfp4_file_storage)
-        return Error{ErrorCode::InvalidArgument, "expert cache requires file-backed MXFP4 or BF16 tensors"};
+        return Error{ErrorCode::InvalidArgument, "expert cache requires file-backed MXFP4, Qn_K, or BF16 tensors"};
     const MxFp4FileStorage& source = *tensor.mxfp4_file_storage;
+    if (source.layout == MxFp4FileLayout::GgufBlockInterleaved)
+        return gguf_mxfp4_stored_size(tensor);
+    if (source.layout != MxFp4FileLayout::Separate)
+        return Error{ErrorCode::InvalidModel, "unknown file-backed MXFP4 layout"};
     if (source.scales_size > std::numeric_limits<uint64_t>::max() - source.blocks_size)
         return Error{ErrorCode::InvalidModel, "file-backed MXFP4 tensor byte count overflows"};
     uint64_t size = source.blocks_size + source.scales_size;
@@ -721,6 +1216,15 @@ Result<uint64_t> ExpertCache::packed_weight_size(const TensorData& tensor)
 {
     if (tensor.dtype == DType::BFloat16 && tensor.shape.size() == 2)
         return uint64_t{0};
+    if (is_qnk_dtype(tensor.dtype))
+    {
+        if (tensor.shape.size() != 2 || !qnk_shape_supported(tensor.dtype, tensor.shape[0], tensor.shape[1]))
+            return Error{ErrorCode::InvalidModel, "packed Expert reservation requires a valid Qn_K matrix"};
+        const uint64_t size = qnk_packed_storage_bytes(tensor.dtype, tensor.shape[0], tensor.shape[1]);
+        if (size == 0)
+            return Error{ErrorCode::InvalidModel, "packed Qn_K byte count overflows"};
+        return size;
+    }
     if (tensor.dtype != DType::MxFp4 || tensor.shape.size() != 2)
         return Error{ErrorCode::InvalidArgument, "packed Expert reservation requires an MXFP4 matrix"};
     const uint64_t rows = tensor.shape[0];
@@ -753,20 +1257,57 @@ std::string ExpertCache::make_pair_key(const TensorData& gate_up, const TensorDa
                + std::to_string(reinterpret_cast<uintptr_t>(down.mapped_data.get()))
                + ":" + std::to_string(down.mapped_size);
     }
+    if (is_qnk_dtype(gate_up.dtype) || is_qnk_dtype(down.dtype))
+    {
+        std::string key = "qnk:";
+        const auto append = [&key](const TensorData& tensor) {
+            key += std::to_string(static_cast<uint32_t>(tensor.dtype)) + ":";
+            for (uint32_t dimension : tensor.shape)
+                key += std::to_string(dimension) + ",";
+            key += tensor.qnk_interleave_rows ? ":interleaved:" : ":packed:";
+            key += std::to_string(tensor.input_column_indices.size()) + ":";
+            if (!tensor.input_column_indices.empty())
+            {
+                key.append(reinterpret_cast<const char*>(tensor.input_column_indices.data()),
+                           tensor.input_column_indices.size() * sizeof(uint32_t));
+                key.push_back(':');
+            }
+            if (!tensor.mxfp4_file_storage)
+            {
+                key += "no-file|";
+                return;
+            }
+            const MxFp4FileStorage& file = *tensor.mxfp4_file_storage;
+            key += std::to_string(static_cast<uint32_t>(file.layout)) + ":";
+            const auto range = [&key](const std::string& path, uint64_t offset, uint64_t size) {
+                key += std::to_string(path.size()) + ":" + path + ":"
+                       + std::to_string(offset) + ":" + std::to_string(size) + "|";
+            };
+            range(file.blocks_path, file.blocks_offset, file.blocks_size);
+            range(file.secondary_blocks_path, file.secondary_blocks_offset, file.secondary_blocks_size);
+        };
+        append(gate_up);
+        append(down);
+        return key;
+    }
     const MxFp4FileStorage& gate = *gate_up.mxfp4_file_storage;
     const MxFp4FileStorage& projection = *down.mxfp4_file_storage;
-    return gate.blocks_path + ":" + std::to_string(gate.blocks_offset)
-           + ":" + std::to_string(gate.blocks_size)
-           + ":" + gate.scales_path + ":" + std::to_string(gate.scales_offset)
-           + ":" + std::to_string(gate.scales_size)
-           + ":" + gate.secondary_blocks_path + ":" + std::to_string(gate.secondary_blocks_offset)
-           + ":" + std::to_string(gate.secondary_blocks_size)
-           + ":" + gate.secondary_scales_path + ":" + std::to_string(gate.secondary_scales_offset)
-           + ":" + std::to_string(gate.secondary_scales_size)
-           + "|" + projection.blocks_path + ":" + std::to_string(projection.blocks_offset)
-           + ":" + std::to_string(projection.blocks_size)
-           + ":" + projection.scales_path + ":" + std::to_string(projection.scales_offset)
-           + ":" + std::to_string(projection.scales_size);
+    std::string key = gate.blocks_path + ":" + std::to_string(gate.blocks_offset)
+                      + ":" + std::to_string(gate.blocks_size)
+                      + ":" + gate.scales_path + ":" + std::to_string(gate.scales_offset)
+                      + ":" + std::to_string(gate.scales_size)
+                      + ":" + gate.secondary_blocks_path + ":" + std::to_string(gate.secondary_blocks_offset)
+                      + ":" + std::to_string(gate.secondary_blocks_size)
+                      + ":" + gate.secondary_scales_path + ":" + std::to_string(gate.secondary_scales_offset)
+                      + ":" + std::to_string(gate.secondary_scales_size)
+                      + "|" + projection.blocks_path + ":" + std::to_string(projection.blocks_offset)
+                      + ":" + std::to_string(projection.blocks_size)
+                      + ":" + projection.scales_path + ":" + std::to_string(projection.scales_offset)
+                      + ":" + std::to_string(projection.scales_size);
+    if (gate.layout != MxFp4FileLayout::Separate || projection.layout != MxFp4FileLayout::Separate)
+        key += "|layout:" + std::to_string(static_cast<uint32_t>(gate.layout))
+               + ":" + std::to_string(static_cast<uint32_t>(projection.layout));
+    return key;
 }
 
 static Result<void> copy_interleaved_mxfp4_rows(const TensorData& source,
@@ -813,6 +1354,194 @@ static Result<void> copy_interleaved_mxfp4_rows(const TensorData& source,
     return {};
 }
 
+static bool copy_gguf_mxfp4_rows(const TensorData& source,
+                                 const MxFp4ByteBuffer& first,
+                                 const MxFp4ByteBuffer& second,
+                                 TensorData& loaded)
+{
+    const MxFp4FileStorage& file = *source.mxfp4_file_storage;
+    const size_t scale_count = static_cast<size_t>(source.element_count() / 32);
+    const auto convert = [&](const MxFp4ByteBuffer& raw, size_t raw_offset, size_t scale_offset, size_t count) {
+        return unpack_gguf_mxfp4({raw.data() + raw_offset, count * 17},
+                                 {loaded.mxfp4_blocks.data() + scale_offset * 16, count * 16},
+                                 {loaded.mxfp4_scales.data() + scale_offset, count});
+    };
+    if (!file.interleave_rows)
+        return convert(first, 0, 0, scale_count);
+    const size_t row_scales = source.shape[1] / 32;
+    return unpack_gguf_mxfp4_rows({first.data(), first.size()}, row_scales,
+                                  row_scales * 32, row_scales * 2,
+                                  {loaded.mxfp4_blocks.data(), loaded.mxfp4_blocks.size()},
+                                  {loaded.mxfp4_scales.data(), loaded.mxfp4_scales.size()})
+           && unpack_gguf_mxfp4_rows({second.data(), second.size()}, row_scales,
+                                     row_scales * 32, row_scales * 2,
+                                     {loaded.mxfp4_blocks.data() + row_scales * 16, loaded.mxfp4_blocks.size() - row_scales * 16},
+                                     {loaded.mxfp4_scales.data() + row_scales, loaded.mxfp4_scales.size() - row_scales});
+}
+
+Result<ExpertVictimPair> ExpertCache::load_gguf_pair(const TensorData& gate_up, const TensorData& down,
+                                                     uint64_t& mapped_range_count, uint64_t& mapped_size)
+{
+    auto gate_size = gguf_mxfp4_stored_size(gate_up);
+    auto down_size = gguf_mxfp4_stored_size(down);
+    if (!gate_size)
+        return gate_size.error();
+    if (!down_size)
+        return down_size.error();
+    if (gate_size.value() > std::numeric_limits<size_t>::max() - down_size.value())
+        return Error{ErrorCode::InvalidModel, "GGUF Expert resident pair size overflows"};
+
+    MxFp4ByteBuffer resident;
+    resident.resize(static_cast<size_t>(gate_size.value() + down_size.value()));
+    const auto make_tensor = [&](const TensorData& source, size_t offset) {
+        auto tensor = std::make_shared<TensorData>();
+        tensor->dtype = DType::MxFp4;
+        tensor->shape = source.shape;
+        const size_t scale_count = static_cast<size_t>(source.element_count() / 32);
+        tensor->mxfp4_blocks = MxFp4ByteBuffer(std::shared_ptr<uint8_t>(resident.storage, resident.data() + offset), scale_count * 16);
+        tensor->mxfp4_scales = MxFp4ByteBuffer(std::shared_ptr<uint8_t>(resident.storage, resident.data() + offset + scale_count * 16), scale_count);
+        return tensor;
+    };
+    ExpertVictimPair pair{make_tensor(gate_up, 0), make_tensor(down, static_cast<size_t>(gate_size.value()))};
+
+    // A cache worker owns this raw scratch for its lifetime. Never retain a
+    // normalized Expert outside ARC, or lend the scratch to a published lease.
+    // Large ranges fall back to transient buffers; retained raw capacity is
+    // bounded independently of checkpoint dimensions and worker count.
+    static thread_local MxFp4ByteBuffer scratch;
+    const uint64_t scratch_limit = std::min<uint64_t>(16 * 1024 * 1024,
+                                                      cache_size / std::max<size_t>(1, workers.size()));
+    const auto convert_rows = [](const TensorData& source, TensorData& destination, size_t range,
+                                 std::span<const uint8_t> raw) -> Result<void> {
+        const size_t row_scales = source.shape[1] / 32;
+        const size_t row_step = source.mxfp4_file_storage->interleave_rows ? 2 : 1;
+        const size_t block_offset = range * row_scales * 16;
+        const size_t scale_offset = range * row_scales;
+        if (!unpack_gguf_mxfp4_rows(raw, row_scales,
+                                    row_step * row_scales * 16, row_step * row_scales,
+                                    {destination.mxfp4_blocks.data() + block_offset, destination.mxfp4_blocks.size() - block_offset},
+                                    {destination.mxfp4_scales.data() + scale_offset, destination.mxfp4_scales.size() - scale_offset}))
+            return Error{ErrorCode::InvalidModel, "cannot unpack GGUF Expert rows"};
+        return {};
+    };
+#if defined(_WIN32)
+    if (io_mode == ExpertIoMode::Direct
+        || (io_mode == ExpertIoMode::Auto && reader->selected_read_policy() == FileRangeReader::ReadPolicyDirect))
+    {
+        struct RowTarget
+        {
+            const TensorData* source = nullptr;
+            TensorData* destination = nullptr;
+            size_t range = 0;
+        };
+        std::array<FileRangeReader::DirectRange, 4> ranges{};
+        std::array<RowTarget, 4> targets{};
+        size_t count = 0;
+        const auto append = [&](const TensorData& source, TensorData& destination) {
+            const auto& file = *source.mxfp4_file_storage;
+            ranges[count] = {&file.blocks_path, file.blocks_offset, file.blocks_size};
+            targets[count++] = {&source, &destination, 0};
+            if (file.interleave_rows)
+            {
+                ranges[count] = {&file.secondary_blocks_path, file.secondary_blocks_offset, file.secondary_blocks_size};
+                targets[count++] = {&source, &destination, 1};
+            }
+        };
+        append(gate_up, *pair.gate_up);
+        append(down, *pair.down);
+        using RowConverter = Result<void> (*)(const TensorData&, TensorData&, size_t, std::span<const uint8_t>);
+        struct ConversionContext
+        {
+            const RowTarget* targets;
+            RowConverter convert;
+        };
+        const ConversionContext conversion{targets.data(), convert_rows};
+        auto read = reader->load_direct_ranges({ranges.data(), count}, io_mode, scratch, scratch_limit,
+                                               &conversion,
+                                               [](const void* context, size_t index, std::span<const uint8_t> raw) {
+                                                   const auto& conversion = *static_cast<const ConversionContext*>(context);
+                                                   const RowTarget& target = conversion.targets[index];
+                                                   return conversion.convert(*target.source, *target.destination, target.range, raw);
+                                               });
+        if (!read)
+            return read.error();
+        return pair;
+    }
+#endif
+    const auto load_tensor_rows = [&](const TensorData& source, TensorData& destination) -> Result<void> {
+        const auto& file = *source.mxfp4_file_storage;
+        const size_t range_count = file.interleave_rows ? 2 : 1;
+        for (size_t range = 0; range < range_count; ++range)
+        {
+            const std::string& path = range == 0 ? file.blocks_path : file.secondary_blocks_path;
+            const uint64_t offset = range == 0 ? file.blocks_offset : file.secondary_blocks_offset;
+            const uint64_t size = range == 0 ? file.blocks_size : file.secondary_blocks_size;
+            auto raw = reader->load(path, offset, size, io_mode, &scratch, scratch_limit);
+            if (!raw)
+                return raw.error();
+            if (raw.value().mapped)
+            {
+                ++mapped_range_count;
+                mapped_size += size;
+            }
+            auto converted = convert_rows(source, destination, range, {raw.value().data.data(), raw.value().data.size()});
+            if (!converted)
+                return converted.error();
+        }
+        return {};
+    };
+    auto gate = load_tensor_rows(gate_up, *pair.gate_up);
+    if (!gate)
+        return gate.error();
+    auto projection = load_tensor_rows(down, *pair.down);
+    if (!projection)
+        return projection.error();
+    return pair;
+}
+
+Result<std::shared_ptr<TensorData>> ExpertCache::load_gguf_tensor(const TensorData& source,
+                                                                  uint64_t& mapped_range_count, uint64_t& mapped_size)
+{
+    auto size = gguf_mxfp4_stored_size(source);
+    if (!size)
+        return size.error();
+    const MxFp4FileStorage& file = *source.mxfp4_file_storage;
+    auto first = reader->load(file.blocks_path, file.blocks_offset, file.blocks_size, io_mode);
+    if (!first)
+        return first.error();
+    if (first.value().mapped)
+    {
+        ++mapped_range_count;
+        mapped_size += file.blocks_size;
+    }
+    auto loaded = std::make_shared<TensorData>();
+    loaded->dtype = DType::MxFp4;
+    loaded->shape = source.shape;
+    const size_t scale_count = static_cast<size_t>(source.element_count() / 32);
+    MxFp4ByteBuffer resident;
+    resident.resize(static_cast<size_t>(size.value()));
+    const std::shared_ptr<uint8_t> owner = resident.storage;
+    loaded->mxfp4_blocks = MxFp4ByteBuffer(owner, scale_count * 16);
+    loaded->mxfp4_scales = MxFp4ByteBuffer(std::shared_ptr<uint8_t>(owner, owner.get() + scale_count * 16), scale_count);
+    if (!file.interleave_rows)
+    {
+        if (!copy_gguf_mxfp4_rows(source, first.value().data, {}, *loaded))
+            return Error{ErrorCode::InvalidModel, "cannot unpack file-backed GGUF MXFP4 matrix"};
+        return loaded;
+    }
+    auto second = reader->load(file.secondary_blocks_path, file.secondary_blocks_offset, file.secondary_blocks_size, io_mode);
+    if (!second)
+        return second.error();
+    if (second.value().mapped)
+    {
+        ++mapped_range_count;
+        mapped_size += file.secondary_blocks_size;
+    }
+    if (!copy_gguf_mxfp4_rows(source, first.value().data, second.value().data, *loaded))
+        return Error{ErrorCode::InvalidModel, "cannot unpack file-backed GGUF MXFP4 Gate/Up matrix"};
+    return loaded;
+}
+
 Result<std::shared_ptr<TensorData>> ExpertCache::load_tensor(const TensorData& source, uint64_t& mapped_range_count, uint64_t& mapped_size)
 {
     if (is_file_backed_bfloat16_tensor(source))
@@ -839,9 +1568,55 @@ Result<std::shared_ptr<TensorData>> ExpertCache::load_tensor(const TensorData& s
         }
         return loaded;
     }
+    if (is_qnk_dtype(source.dtype))
+    {
+        if (!source.mxfp4_file_storage)
+            return Error{ErrorCode::InvalidArgument, "Expert tensor is not file-backed"};
+        const MxFp4FileStorage& file = *source.mxfp4_file_storage;
+        const uint64_t size = qnk_storage_bytes(source.dtype, source.shape[0], source.shape[1]);
+        if (size == 0 || size > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+            return Error{ErrorCode::InvalidModel, "invalid file-backed Qn_K matrix shape"};
+        auto loaded = std::make_shared<TensorData>();
+        loaded->dtype = source.dtype;
+        loaded->shape = source.shape;
+        loaded->qnk_interleave_rows = source.qnk_interleave_rows;
+        loaded->input_column_indices = source.input_column_indices;
+        if (file.secondary_blocks_path.empty())
+        {
+            auto range = reader->load(file.blocks_path, file.blocks_offset, file.blocks_size, io_mode);
+            if (!range)
+                return range.error();
+            if (range.value().mapped)
+            {
+                ++mapped_range_count;
+                mapped_size += file.blocks_size;
+            }
+            loaded->mapped_data = range.value().data.storage;
+            loaded->mapped_size = range.value().data.size();
+            return loaded;
+        }
+
+        MxFp4ByteBuffer resident;
+        resident.resize(static_cast<size_t>(size));
+        const std::shared_ptr<uint8_t> owner = resident.storage;
+        MxFp4ByteBuffer primary(std::shared_ptr<uint8_t>(owner, owner.get()), static_cast<size_t>(file.blocks_size));
+        MxFp4ByteBuffer secondary(std::shared_ptr<uint8_t>(owner, owner.get() + static_cast<size_t>(file.blocks_size)),
+                                  static_cast<size_t>(file.secondary_blocks_size));
+        auto status = reader->read(file.blocks_path, file.blocks_offset, primary);
+        if (!status)
+            return status.error();
+        status = reader->read(file.secondary_blocks_path, file.secondary_blocks_offset, secondary);
+        if (!status)
+            return status.error();
+        loaded->mapped_data = std::move(resident.storage);
+        loaded->mapped_size = size;
+        return loaded;
+    }
     if (!source.mxfp4_file_storage)
         return Error{ErrorCode::InvalidArgument, "Expert tensor is not file-backed"};
     const MxFp4FileStorage& file = *source.mxfp4_file_storage;
+    if (file.layout == MxFp4FileLayout::GgufBlockInterleaved)
+        return load_gguf_tensor(source, mapped_range_count, mapped_size);
     if (file.blocks_size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
         || file.scales_size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
         || file.secondary_blocks_size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
@@ -1084,6 +1859,8 @@ Result<ExpertVictimPair> ExpertCache::load_pair(const TensorData& gate_up, const
             std::move(loaded_gate).value(),
             std::move(loaded_down).value()};
     }
+    if (is_qnk_dtype(gate_up.dtype) && is_qnk_dtype(down.dtype))
+        return load_independent_pair(gate_up, down, mapped_range_count, mapped_size);
     if (!gate_up.mxfp4_file_storage || !down.mxfp4_file_storage)
     {
         return Error{
@@ -1092,6 +1869,12 @@ Result<ExpertVictimPair> ExpertCache::load_pair(const TensorData& gate_up, const
     }
     const MxFp4FileStorage& gate = *gate_up.mxfp4_file_storage;
     const MxFp4FileStorage& projection = *down.mxfp4_file_storage;
+    if (gate.layout == MxFp4FileLayout::GgufBlockInterleaved
+        && projection.layout == MxFp4FileLayout::GgufBlockInterleaved)
+        return load_gguf_pair(gate_up, down, mapped_range_count, mapped_size);
+    if (gate.layout == MxFp4FileLayout::GgufBlockInterleaved
+        || projection.layout == MxFp4FileLayout::GgufBlockInterleaved)
+        return load_independent_pair(gate_up, down, mapped_range_count, mapped_size);
     if (gate.interleave_rows)
         return load_interleaved_pair(gate_up, down, mapped_range_count, mapped_size);
     struct Range
@@ -1212,7 +1995,9 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(std::spa
     for (const std::shared_ptr<Entry>& entry : batch)
     {
         if (is_file_backed_bfloat16_tensor(entry->gate_up_source)
-            || is_file_backed_bfloat16_tensor(entry->down_source))
+            || is_file_backed_bfloat16_tensor(entry->down_source)
+            || is_qnk_dtype(entry->gate_up_source.dtype)
+            || is_qnk_dtype(entry->down_source.dtype))
         {
             return std::vector<ExpertVictimPair>();
         }
@@ -1220,6 +2005,9 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(std::spa
 
     std::vector<Range> ranges;
     ranges.reserve(batch.size() * 6);
+#if !defined(_WIN32) && (!defined(__APPLE__) || __MAC_OS_X_VERSION_MIN_REQUIRED >= 110000)
+    bool scatter_to_resident = true;
+#endif
     for (size_t entry_index = 0; entry_index < batch.size(); ++entry_index)
     {
         const Entry& entry = *batch[entry_index];
@@ -1230,17 +2018,25 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(std::spa
         }
         const MxFp4FileStorage& gate = *entry.gate_up_source.mxfp4_file_storage;
         const MxFp4FileStorage& down = *entry.down_source.mxfp4_file_storage;
+        const bool gguf_gate = gate.layout == MxFp4FileLayout::GgufBlockInterleaved;
+        const bool gguf_down = down.layout == MxFp4FileLayout::GgufBlockInterleaved;
         if (down.interleave_rows)
             return Error{ErrorCode::InvalidModel, "coalesced Expert read does not support an interleaved Down tensor"};
+#if !defined(_WIN32) && (!defined(__APPLE__) || __MAC_OS_X_VERSION_MIN_REQUIRED >= 110000)
+        scatter_to_resident = scatter_to_resident && !gate.interleave_rows && !gguf_gate && !gguf_down;
+#endif
         ranges.push_back({&gate.blocks_path, gate.blocks_offset, gate.blocks_size, static_cast<uint32_t>(entry_index), 0, 0});
-        ranges.push_back({&gate.scales_path, gate.scales_offset, gate.scales_size, static_cast<uint32_t>(entry_index), 1, 0});
+        if (!gguf_gate)
+            ranges.push_back({&gate.scales_path, gate.scales_offset, gate.scales_size, static_cast<uint32_t>(entry_index), 1, 0});
         if (gate.interleave_rows)
         {
             ranges.push_back({&gate.secondary_blocks_path, gate.secondary_blocks_offset, gate.secondary_blocks_size, static_cast<uint32_t>(entry_index), 2, 0});
-            ranges.push_back({&gate.secondary_scales_path, gate.secondary_scales_offset, gate.secondary_scales_size, static_cast<uint32_t>(entry_index), 3, 0});
+            if (!gguf_gate)
+                ranges.push_back({&gate.secondary_scales_path, gate.secondary_scales_offset, gate.secondary_scales_size, static_cast<uint32_t>(entry_index), 3, 0});
         }
         ranges.push_back({&down.blocks_path, down.blocks_offset, down.blocks_size, static_cast<uint32_t>(entry_index), 4, 0});
-        ranges.push_back({&down.scales_path, down.scales_offset, down.scales_size, static_cast<uint32_t>(entry_index), 5, 0});
+        if (!gguf_down)
+            ranges.push_back({&down.scales_path, down.scales_offset, down.scales_size, static_cast<uint32_t>(entry_index), 5, 0});
     }
     for (const Range& range : ranges)
     {
@@ -1254,7 +2050,7 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(std::spa
         }
     }
     uint64_t independent_range_count = 0;
-    // Ranges are emitted per entry: at most four Gate/Up segments plus two Down segments.
+    // GGUF emits one segment per projection; separate blocks/scales emit two.
     size_t range_cursor = 0;
     for (uint32_t entry_index = 0; entry_index < batch.size(); ++entry_index)
     {
@@ -1327,28 +2123,6 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(std::spa
 
     coalesced = true;
     saved_range_count = independent_range_count - clusters.size();
-    for (Cluster& cluster : clusters)
-    {
-        auto loaded = reader->load(*cluster.path, cluster.offset, cluster.size, io_mode);
-        if (!loaded)
-            return loaded.error();
-        cluster.loaded = std::move(loaded).value();
-        if (cluster.loaded.mapped)
-        {
-            ++mapped_range_count;
-            mapped_size += cluster.size;
-        }
-    }
-
-    std::vector<std::array<MxFp4ByteBuffer, 6>> sources(batch.size());
-    for (const Range& range : ranges)
-    {
-        const Cluster& cluster = clusters[range.cluster];
-        const std::shared_ptr<uint8_t> owner = cluster.loaded.data.storage;
-        std::shared_ptr<uint8_t> view(owner, owner.get() + static_cast<size_t>(range.offset - cluster.offset));
-        sources[range.entry][range.destination] = MxFp4ByteBuffer(std::move(view), static_cast<size_t>(range.size));
-    }
-
     std::vector<ExpertVictimPair> loaded_pairs(batch.size());
     for (size_t entry_index = 0; entry_index < batch.size(); ++entry_index)
     {
@@ -1366,9 +2140,17 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(std::spa
         const uint64_t total_size = gate_size.value() + down_size.value();
         if (total_size > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
             return Error{ErrorCode::InvalidModel, "coalesced Expert pair is too large"};
-        const size_t gate_blocks_size = static_cast<size_t>(gate.blocks_size + gate.secondary_blocks_size);
-        const size_t gate_scales_size = static_cast<size_t>(gate.scales_size + gate.secondary_scales_size);
+        const bool gguf_gate = gate.layout == MxFp4FileLayout::GgufBlockInterleaved;
+        const size_t gate_scales_size = static_cast<size_t>(gguf_gate ? gate_source.element_count() / 32
+                                                                      : gate.scales_size + gate.secondary_scales_size);
+        const size_t gate_blocks_size = gguf_gate ? gate_scales_size * 16
+                                                  : static_cast<size_t>(gate.blocks_size + gate.secondary_blocks_size);
         const MxFp4FileStorage& down = *down_source.mxfp4_file_storage;
+        const bool gguf_down = down.layout == MxFp4FileLayout::GgufBlockInterleaved;
+        const size_t down_scales_size = static_cast<size_t>(gguf_down ? down_source.element_count() / 32
+                                                                      : down.scales_size);
+        const size_t down_blocks_size = gguf_down ? down_scales_size * 16
+                                                  : static_cast<size_t>(down.blocks_size);
         MxFp4ByteBuffer resident;
         resident.resize(static_cast<size_t>(total_size));
         const std::shared_ptr<uint8_t> resident_owner = resident.storage;
@@ -1378,39 +2160,126 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(std::spa
             resident_offset += size;
             return MxFp4ByteBuffer(std::move(view), size);
         };
-        const std::array<MxFp4ByteBuffer, 6>& entry_sources = sources[entry_index];
 
         auto loaded_gate = std::make_shared<TensorData>();
         loaded_gate->dtype = DType::MxFp4;
         loaded_gate->shape = gate_source.shape;
         loaded_gate->mxfp4_blocks = make_resident_view(gate_blocks_size);
         loaded_gate->mxfp4_scales = make_resident_view(gate_scales_size);
-        if (gate.interleave_rows)
+
+        auto loaded_down = std::make_shared<TensorData>();
+        loaded_down->dtype = DType::MxFp4;
+        loaded_down->shape = down_source.shape;
+        loaded_down->mxfp4_blocks = make_resident_view(down_blocks_size);
+        loaded_down->mxfp4_scales = make_resident_view(down_scales_size);
+        loaded_pairs[entry_index] = {std::move(loaded_gate), std::move(loaded_down)};
+    }
+
+#if !defined(_WIN32) && (!defined(__APPLE__) || __MAC_OS_X_VERSION_MIN_REQUIRED >= 110000)
+    if (scatter_to_resident)
+    {
+        std::vector<iovec> destinations;
+        destinations.reserve(ranges.size());
+        size_t range_index = 0;
+        for (size_t cluster_index = 0; cluster_index < clusters.size(); ++cluster_index)
+        {
+            destinations.clear();
+            while (range_index < ranges.size() && ranges[range_index].cluster == cluster_index)
+            {
+                const Range& range = ranges[range_index++];
+                ExpertVictimPair& pair = loaded_pairs[range.entry];
+                MxFp4ByteBuffer* destination = nullptr;
+                switch (range.destination)
+                {
+                case 0:
+                    destination = &pair.gate_up->mxfp4_blocks;
+                    break;
+                case 1:
+                    destination = &pair.gate_up->mxfp4_scales;
+                    break;
+                case 4:
+                    destination = &pair.down->mxfp4_blocks;
+                    break;
+                case 5:
+                    destination = &pair.down->mxfp4_scales;
+                    break;
+                default:
+                    return Error{ErrorCode::InvalidModel, "invalid coalesced Expert destination"};
+                }
+                if (destination->size() != range.size)
+                    return Error{ErrorCode::InvalidModel, "coalesced Expert destination size does not match file range"};
+                destinations.push_back({destination->data(), destination->size()});
+            }
+            auto read = reader->read_scatter(*clusters[cluster_index].path,
+                                             clusters[cluster_index].offset,
+                                             clusters[cluster_index].size,
+                                             destinations);
+            if (!read)
+                return read.error();
+        }
+        return loaded_pairs;
+    }
+#endif
+
+    std::vector<std::array<MxFp4ByteBuffer, 6>> sources(batch.size());
+    for (Cluster& cluster : clusters)
+    {
+        auto loaded = reader->load(*cluster.path, cluster.offset, cluster.size, io_mode);
+        if (!loaded)
+            return loaded.error();
+        cluster.loaded = std::move(loaded).value();
+        if (cluster.loaded.mapped)
+        {
+            ++mapped_range_count;
+            mapped_size += cluster.size;
+        }
+    }
+    for (const Range& range : ranges)
+    {
+        const Cluster& cluster = clusters[range.cluster];
+        const std::shared_ptr<uint8_t> owner = cluster.loaded.data.storage;
+        std::shared_ptr<uint8_t> view(owner, owner.get() + static_cast<size_t>(range.offset - cluster.offset));
+        sources[range.entry][range.destination] = MxFp4ByteBuffer(std::move(view), static_cast<size_t>(range.size));
+    }
+    for (size_t entry_index = 0; entry_index < batch.size(); ++entry_index)
+    {
+        const TensorData& gate_source = batch[entry_index]->gate_up_source;
+        const MxFp4FileStorage& gate = *gate_source.mxfp4_file_storage;
+        const std::array<MxFp4ByteBuffer, 6>& entry_sources = sources[entry_index];
+        ExpertVictimPair& pair = loaded_pairs[entry_index];
+        if (gate.layout == MxFp4FileLayout::GgufBlockInterleaved)
+        {
+            if (!copy_gguf_mxfp4_rows(gate_source, entry_sources[0], entry_sources[2], *pair.gate_up))
+                return Error{ErrorCode::InvalidModel, "cannot unpack coalesced GGUF MXFP4 Gate/Up matrix"};
+        }
+        else if (gate.interleave_rows)
         {
             auto copied = copy_interleaved_mxfp4_rows(gate_source,
                                                       entry_sources[0],
                                                       entry_sources[1],
                                                       entry_sources[2],
                                                       entry_sources[3],
-                                                      loaded_gate->mxfp4_blocks,
-                                                      loaded_gate->mxfp4_scales);
+                                                      pair.gate_up->mxfp4_blocks,
+                                                      pair.gate_up->mxfp4_scales);
             if (!copied)
                 return copied.error();
         }
         else
         {
-            std::memcpy(loaded_gate->mxfp4_blocks.data(), entry_sources[0].data(), entry_sources[0].size());
-            std::memcpy(loaded_gate->mxfp4_scales.data(), entry_sources[1].data(), entry_sources[1].size());
+            std::memcpy(pair.gate_up->mxfp4_blocks.data(), entry_sources[0].data(), entry_sources[0].size());
+            std::memcpy(pair.gate_up->mxfp4_scales.data(), entry_sources[1].data(), entry_sources[1].size());
         }
-
-        auto loaded_down = std::make_shared<TensorData>();
-        loaded_down->dtype = DType::MxFp4;
-        loaded_down->shape = down_source.shape;
-        loaded_down->mxfp4_blocks = make_resident_view(static_cast<size_t>(down.blocks_size));
-        loaded_down->mxfp4_scales = make_resident_view(static_cast<size_t>(down.scales_size));
-        std::memcpy(loaded_down->mxfp4_blocks.data(), entry_sources[4].data(), entry_sources[4].size());
-        std::memcpy(loaded_down->mxfp4_scales.data(), entry_sources[5].data(), entry_sources[5].size());
-        loaded_pairs[entry_index] = {std::move(loaded_gate), std::move(loaded_down)};
+        const TensorData& down_source = batch[entry_index]->down_source;
+        if (down_source.mxfp4_file_storage->layout == MxFp4FileLayout::GgufBlockInterleaved)
+        {
+            if (!copy_gguf_mxfp4_rows(down_source, entry_sources[4], {}, *pair.down))
+                return Error{ErrorCode::InvalidModel, "cannot unpack coalesced GGUF MXFP4 Down matrix"};
+        }
+        else
+        {
+            std::memcpy(pair.down->mxfp4_blocks.data(), entry_sources[4].data(), entry_sources[4].size());
+            std::memcpy(pair.down->mxfp4_scales.data(), entry_sources[5].data(), entry_sources[5].size());
+        }
     }
     return loaded_pairs;
 }
@@ -1681,6 +2550,14 @@ bool ExpertCache::evict_one_locked(bool incoming_from_frequent_ghost, bool specu
     Entry* victim = prefer_recent
                         ? find_victim_locked(arc_recent, speculative_admission, preferred_group, forward_anchor)
                         : find_victim_locked(arc_frequent, speculative_admission, preferred_group, forward_anchor);
+    // ARC reuse takes priority over the layer fair-share tie-break. Keep a
+    // frequent entry when another layer still has an eligible recent entry.
+    if (!victim && preferred_group != invalid_residency_group)
+    {
+        victim = prefer_recent
+                     ? find_victim_locked(arc_recent, speculative_admission, invalid_residency_group)
+                     : find_victim_locked(arc_frequent, speculative_admission, invalid_residency_group);
+    }
     if (!victim)
     {
         victim = prefer_recent
@@ -1690,14 +2567,8 @@ bool ExpertCache::evict_one_locked(bool incoming_from_frequent_ghost, bool specu
     if (!victim && preferred_group != invalid_residency_group)
     {
         victim = prefer_recent
-                     ? find_victim_locked(arc_recent, speculative_admission, invalid_residency_group)
-                     : find_victim_locked(arc_frequent, speculative_admission, invalid_residency_group);
-        if (!victim)
-        {
-            victim = prefer_recent
-                         ? find_victim_locked(arc_frequent, speculative_admission, invalid_residency_group)
-                         : find_victim_locked(arc_recent, speculative_admission, invalid_residency_group);
-        }
+                     ? find_victim_locked(arc_frequent, speculative_admission, invalid_residency_group)
+                     : find_victim_locked(arc_recent, speculative_admission, invalid_residency_group);
     }
     if (!victim
         && !speculative_admission
@@ -1760,6 +2631,8 @@ Result<std::shared_ptr<ExpertCache::Entry>> ExpertCache::enqueue_pair(const Tens
         *already_ready = false;
     if (temporarily_exhausted)
         *temporarily_exhausted = false;
+    if (!is_supported_file_backed_pair(gate_up, down))
+        return Error{ErrorCode::InvalidArgument, "expert cache requires a supported file-backed pair"};
     auto gate_size = stored_size(gate_up);
     if (!gate_size)
         return gate_size.error();
@@ -1770,6 +2643,17 @@ Result<std::shared_ptr<ExpertCache::Entry>> ExpertCache::enqueue_pair(const Tens
         return Error{ErrorCode::InvalidModel, "expert pair byte count overflows"};
     const uint64_t stored_size = gate_size.value() + down_size.value();
     uint64_t required_size = stored_size;
+    for (const TensorData* tensor : std::array<const TensorData*, 2>{&gate_up, &down})
+    {
+        if (!is_qnk_dtype(tensor->dtype))
+            continue;
+        if (tensor->input_column_indices.size() > std::numeric_limits<uint64_t>::max() / sizeof(uint32_t))
+            return Error{ErrorCode::InvalidModel, "Qn_K column-map byte count overflows"};
+        const uint64_t metadata_size = static_cast<uint64_t>(tensor->input_column_indices.size()) * sizeof(uint32_t);
+        if (metadata_size > (std::numeric_limits<uint64_t>::max() - required_size) / 2)
+            return Error{ErrorCode::InvalidModel, "expert pair byte count overflows"};
+        required_size += metadata_size * 2;
+    }
     if (reserve_cpu_packed_weights)
     {
         auto packed_gate_size = packed_weight_size(gate_up);
@@ -1975,19 +2859,30 @@ void ExpertCache::worker_loop()
         uint64_t offset = 0;
         uint64_t size = 0;
     };
-    const auto collect_ranges = [](const Entry& entry, std::array<PhysicalRange, 6>& ranges) {
-        const MxFp4FileStorage& gate = *entry.gate_up_source.mxfp4_file_storage;
-        const MxFp4FileStorage& down = *entry.down_source.mxfp4_file_storage;
+    const auto collect_ranges = [](const Entry& entry, std::array<PhysicalRange, 8>& ranges) {
         size_t count = 0;
-        ranges[count++] = {&gate.blocks_path, gate.blocks_offset, gate.blocks_size};
-        ranges[count++] = {&gate.scales_path, gate.scales_offset, gate.scales_size};
-        if (gate.interleave_rows)
-        {
-            ranges[count++] = {&gate.secondary_blocks_path, gate.secondary_blocks_offset, gate.secondary_blocks_size};
-            ranges[count++] = {&gate.secondary_scales_path, gate.secondary_scales_offset, gate.secondary_scales_size};
-        }
-        ranges[count++] = {&down.blocks_path, down.blocks_offset, down.blocks_size};
-        ranges[count++] = {&down.scales_path, down.scales_offset, down.scales_size};
+        const auto append = [&ranges, &count](const std::string& path, uint64_t offset, uint64_t size) {
+            if (!path.empty() && size != 0)
+                ranges[count++] = {&path, offset, size};
+        };
+        const auto append_tensor = [&append](const TensorData& tensor) {
+            if (!tensor.mxfp4_file_storage)
+                return;
+            const MxFp4FileStorage& file = *tensor.mxfp4_file_storage;
+            append(file.blocks_path, file.blocks_offset, file.blocks_size);
+            if (tensor.dtype == DType::MxFp4 && file.layout == MxFp4FileLayout::Separate)
+                append(file.scales_path, file.scales_offset, file.scales_size);
+            if (file.interleave_rows)
+            {
+                append(file.secondary_blocks_path, file.secondary_blocks_offset, file.secondary_blocks_size);
+                if (tensor.dtype == DType::MxFp4 && file.layout == MxFp4FileLayout::Separate)
+                    append(file.secondary_scales_path, file.secondary_scales_offset, file.secondary_scales_size);
+            }
+            else if (!file.secondary_blocks_path.empty())
+                append(file.secondary_blocks_path, file.secondary_blocks_offset, file.secondary_blocks_size);
+        };
+        append_tensor(entry.gate_up_source);
+        append_tensor(entry.down_source);
         return count;
     };
     const auto entries_are_adjacent = [&collect_ranges](const Entry& first, const Entry& second) {
@@ -1998,8 +2893,8 @@ void ExpertCache::worker_loop()
         {
             return false;
         }
-        std::array<PhysicalRange, 6> first_ranges;
-        std::array<PhysicalRange, 6> second_ranges;
+        std::array<PhysicalRange, 8> first_ranges;
+        std::array<PhysicalRange, 8> second_ranges;
         const size_t first_count = collect_ranges(first, first_ranges);
         const size_t second_count = collect_ranges(second, second_ranges);
         for (size_t first_index = 0; first_index < first_count; ++first_index)
@@ -2010,8 +2905,10 @@ void ExpertCache::worker_loop()
                 const PhysicalRange& right = second_ranges[second_index];
                 if (*left.path != *right.path)
                     continue;
-                if (left.offset + left.size == right.offset
-                    || right.offset + right.size == left.offset)
+                if (left.offset <= std::numeric_limits<uint64_t>::max() - left.size
+                    && right.offset <= std::numeric_limits<uint64_t>::max() - right.size
+                    && (left.offset + left.size == right.offset
+                        || right.offset + right.size == left.offset))
                 {
                     return true;
                 }
@@ -2176,6 +3073,7 @@ void ExpertCache::worker_loop()
             }
         }
 
+        const uint32_t completed_jobs = static_cast<uint32_t>(batch.size());
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (coalesced)
@@ -2187,19 +3085,10 @@ void ExpertCache::worker_loop()
             for (size_t index = 0; index < batch.size(); ++index)
             {
                 const std::shared_ptr<Entry>& entry = batch[index];
-                if (errors[index])
-                {
-                    entry->state = Entry::State::Failed;
-                    entry->error = *errors[index];
-                    const auto existing = entries.find(entry->key);
-                    if (existing != entries.end() && existing->second == entry)
-                    {
-                        remove_resident_locked(*entry, false);
-                        entries.erase(existing);
-                    }
-                    continue;
-                }
-                if (has_flag(entry->flags, Entry::DiscardWhenReady)
+                auto& error = errors[index];
+                bool discarded_speculative = false;
+                if (!error
+                    && has_flag(entry->flags, Entry::DiscardWhenReady)
                     && has_flag(entry->flags, Entry::Speculative))
                 {
                     if (!restored[index])
@@ -2208,27 +3097,26 @@ void ExpertCache::worker_loop()
                         mapped_ranges += entry_mapped_range_counts[index];
                         mapped_bytes += entry_mapped_sizes[index];
                     }
-                    entry->state = Entry::State::Failed;
-                    entry->error = Error{ErrorCode::InternalError, "unused speculative Expert read was discarded"};
-                    const auto existing = entries.find(entry->key);
-                    if (existing != entries.end() && existing->second == entry)
-                    {
-                        remove_resident_locked(*entry, false);
-                        entries.erase(existing);
-                    }
-                    ++unused_speculative_reads;
-                    continue;
+                    error = Error{ErrorCode::InternalError, "unused speculative Expert read was discarded"};
+                    discarded_speculative = true;
                 }
-                if (!loaded_pairs[index])
+                else if (!error && !loaded_pairs[index])
+                {
+                    error = Error{ErrorCode::InternalError, "Expert read completed without a payload"};
+                }
+
+                if (error)
                 {
                     entry->state = Entry::State::Failed;
-                    entry->error = Error{ErrorCode::InternalError, "Expert read completed without a payload"};
+                    entry->error = std::move(*error);
                     const auto existing = entries.find(entry->key);
                     if (existing != entries.end() && existing->second == entry)
                     {
                         remove_resident_locked(*entry, false);
                         entries.erase(existing);
                     }
+                    if (discarded_speculative)
+                        ++unused_speculative_reads;
                     continue;
                 }
                 ExpertVictimPair pair = std::move(*loaded_pairs[index]);
@@ -2244,10 +3132,10 @@ void ExpertCache::worker_loop()
                     mapped_bytes += entry_mapped_sizes[index];
                 }
             }
-            active_jobs -= static_cast<uint32_t>(batch.size());
-            if (high_priority.empty() && low_priority.empty() && active_jobs == 0)
-                idle.notify_all();
         }
+        // Releasing a batch may destroy failed/discarded payloads and residency
+        // tokens, so keep cleanup outside the cache lock. Its Entry pins must
+        // disappear before idle observers can immediately evict a ready entry.
         batch.clear();
         loaded_pairs.clear();
         errors.clear();
@@ -2256,6 +3144,12 @@ void ExpertCache::worker_loop()
         entry_mapped_sizes.clear();
         disk_entries.clear();
         disk_slots.clear();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            active_jobs -= completed_jobs;
+            if (high_priority.empty() && low_priority.empty() && active_jobs == 0)
+                idle.notify_all();
+        }
         ready.notify_all();
     }
 }
@@ -2292,11 +3186,10 @@ Result<ExpertCacheLease> ExpertCache::acquire_pair(const TensorData& gate_up,
     entry->flags &= ~Entry::FirstExactMiss;
 
     ExpertCacheLease lease;
-    lease.gate_up = entry->gate_up;
-    lease.down = entry->down;
+    lease.gate_up = std::shared_ptr<const TensorData>(entry, entry->gate_up.get());
+    lease.down = std::shared_ptr<const TensorData>(entry, entry->down.get());
     lease.gate_up_operator = &entry->gate_up_operator;
     lease.down_operator = &entry->down_operator;
-    lease.pin = entry;
     return lease;
 }
 
@@ -2323,9 +3216,9 @@ Result<bool> ExpertCache::try_acquire_ready_pairs(std::span<const ExpertCachePai
     }
 
     static constexpr size_t inline_entry_count = 16;
-    std::array<std::shared_ptr<Entry>, inline_entry_count> inline_entries;
-    std::vector<std::shared_ptr<Entry>> overflow_entries;
-    std::shared_ptr<Entry>* ready_entries = inline_entries.data();
+    std::array<const std::shared_ptr<Entry>*, inline_entry_count> inline_entries;
+    std::vector<const std::shared_ptr<Entry>*> overflow_entries;
+    const std::shared_ptr<Entry>** ready_entries = inline_entries.data();
     if (requests.size() > inline_entry_count)
     {
         overflow_entries.resize(requests.size());
@@ -2341,12 +3234,12 @@ Result<bool> ExpertCache::try_acquire_ready_pairs(std::span<const ExpertCachePai
         {
             return false;
         }
-        ready_entries[index] = existing->second;
+        ready_entries[index] = &existing->second;
     }
 
     for (size_t index = 0; index < requests.size(); ++index)
     {
-        const std::shared_ptr<Entry>& entry = ready_entries[index];
+        const std::shared_ptr<Entry>& entry = *ready_entries[index];
         if (requests[index].victim_execution.enabled)
         {
             entry->victim_execution = requests[index].victim_execution;
@@ -2360,11 +3253,10 @@ Result<bool> ExpertCache::try_acquire_ready_pairs(std::span<const ExpertCachePai
         entry->flags &= ~Entry::FirstExactMiss;
 
         ExpertCacheLease& lease = leases[index];
-        lease.gate_up = entry->gate_up;
-        lease.down = entry->down;
+        lease.gate_up = std::shared_ptr<const TensorData>(entry, entry->gate_up.get());
+        lease.down = std::shared_ptr<const TensorData>(entry, entry->down.get());
         lease.gate_up_operator = &entry->gate_up_operator;
         lease.down_operator = &entry->down_operator;
-        lease.pin = entry;
     }
     return true;
 }
@@ -2373,7 +3265,8 @@ Result<size_t> ExpertCache::wait_acquire_ready_pairs(std::span<const ExpertCache
                                                      std::span<ExpertCacheLease> leases,
                                                      bool wait_for_any,
                                                      size_t target_ready_count,
-                                                     bool wait_for_ready)
+                                                     bool wait_for_ready,
+                                                     bool wait_for_capacity)
 {
     if (requests.size() != leases.size())
     {
@@ -2394,6 +3287,19 @@ Result<size_t> ExpertCache::wait_acquire_ready_pairs(std::span<const ExpertCache
             ErrorCode::InvalidArgument,
             "Expert cache ready target must be positive"};
     }
+    for (const ExpertCachePairRequest& request : requests)
+    {
+        if (!request.gate_up
+            || !request.down
+            || !is_supported_file_backed_pair(*request.gate_up, *request.down)
+            || request.prepared_key.empty())
+        {
+            return Error{
+                ErrorCode::InvalidArgument,
+                "Expert cache ready wait requires prepared file-backed pairs"};
+        }
+    }
+
     // Release every previous output pin before trying to reserve a prefix.
     // Capacity exhaustion can leave an unadmitted tail, which must also stay
     // empty when callers reuse their lease storage.
@@ -2413,17 +3319,7 @@ Result<size_t> ExpertCache::wait_acquire_ready_pairs(std::span<const ExpertCache
     bool capacity_exhausted = false;
     for (size_t index = 0; index < requests.size(); ++index)
     {
-        leases[index] = {};
         const ExpertCachePairRequest& request = requests[index];
-        if (!request.gate_up
-            || !request.down
-            || !is_supported_file_backed_pair(*request.gate_up, *request.down)
-            || request.prepared_key.empty())
-        {
-            return Error{
-                ErrorCode::InvalidArgument,
-                "Expert cache ready wait requires prepared file-backed pairs"};
-        }
         for (;;)
         {
             bool temporarily_exhausted = false;
@@ -2443,7 +3339,7 @@ Result<size_t> ExpertCache::wait_acquire_ready_pairs(std::span<const ExpertCache
             }
             if (!temporarily_exhausted)
                 return queued.error();
-            if (enqueued_count != 0 || !wait_for_ready)
+            if (enqueued_count != 0 || !wait_for_ready || !wait_for_capacity)
             {
                 capacity_exhausted = true;
                 break;
@@ -2516,11 +3412,10 @@ Result<size_t> ExpertCache::wait_acquire_ready_pairs(std::span<const ExpertCache
         entry->flags &= ~Entry::FirstExactMiss;
 
         ExpertCacheLease& lease = leases[index];
-        lease.gate_up = entry->gate_up;
-        lease.down = entry->down;
+        lease.gate_up = std::shared_ptr<const TensorData>(entry, entry->gate_up.get());
+        lease.down = std::shared_ptr<const TensorData>(entry, entry->down.get());
         lease.gate_up_operator = &entry->gate_up_operator;
         lease.down_operator = &entry->down_operator;
-        lease.pin = entry;
         ++acquired;
     }
     return acquired;

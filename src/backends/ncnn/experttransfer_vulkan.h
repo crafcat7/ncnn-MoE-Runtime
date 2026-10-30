@@ -24,7 +24,9 @@ class VulkanContext;
 class VulkanExpertWeightAllocator final : public ncnn::VkBlobAllocator
 {
 public:
-    VulkanExpertWeightAllocator(const ncnn::VulkanDevice* device, size_t block_size);
+    // Zero keeps the internal unbounded mode. Production Expert caches supply
+    // a ceiling charged by each allocation's actual VkMemoryRequirements.
+    VulkanExpertWeightAllocator(const ncnn::VulkanDevice* device, size_t block_size, uint64_t physical_limit_bytes = 0);
     ~VulkanExpertWeightAllocator() override;
     using ncnn::VkBlobAllocator::fastFree;
     using ncnn::VkBlobAllocator::fastMalloc;
@@ -33,6 +35,8 @@ public:
     ncnn::VkImageMemory* fastMalloc(int, int, int, size_t, int) override;
     void fastFree(ncnn::VkImageMemory*) override;
     void clear() override;
+    [[nodiscard]] uint64_t physical_bytes() const;
+    [[nodiscard]] uint64_t physical_limit_rejections() const;
 
 private:
     struct Range
@@ -45,11 +49,15 @@ private:
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         size_t capacity = 0;
+        VkDeviceSize memory_size = 0;
         std::list<Range> free;
         std::list<Range> used;
     };
     const size_t block_size;
     const size_t alignment;
+    const uint64_t physical_limit;
+    uint64_t allocated_bytes = 0;
+    uint64_t limit_rejections = 0;
     mutable std::mutex mutex;
     std::vector<std::unique_ptr<Block>> blocks;
 };

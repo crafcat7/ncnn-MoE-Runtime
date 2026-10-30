@@ -80,9 +80,11 @@ struct Mxfp4Scratch
 // Shares Linear's workload threshold and current thread budget with callers
 // choosing between operator-level and outer task parallelism.
 [[nodiscard]] int cpu_linear_team_size(uint64_t operation_count, DType dtype) noexcept;
+void forward_embedding_row(const TensorData& embedding, uint32_t row, float* output);
 void forward_embedding(const TensorData& embedding, std::span<const int32_t> input_ids, ActivationBuffer& output);
 [[nodiscard]] ActivationBuffer forward_linear(const TensorData& matrix, const ActivationBuffer& input, uint64_t optimization_flags, const CompiledOperator* op = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
 // A quantized input scratch, when supplied, must not alias input or output.
+// Float32 scratch also holds gathered inputs for quantized column permutations.
 void forward_linear(const TensorData& matrix, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu, ActivationBuffer* quantized_input_scratch = nullptr);
 [[nodiscard]] bool forward_linear(std::initializer_list<const TensorData*> matrices,
                                   const ActivationBuffer& input,
@@ -105,9 +107,11 @@ void forward_linear(const TensorData& matrix, const TensorData& bias, const Acti
                                           const CompiledOperator* gate_executable = nullptr,
                                           const CompiledOperator* up_executable = nullptr,
                                           ActivationBuffer* quantized_input_scratch = nullptr);
-// Input and output must be distinct Float32 buffers.
+// Input, output, and supplied scratch must be distinct Float32 buffers.
+// The fused MXFP4 gate/up kernel requires an empty input_column_indices map;
+// mapped weights must use the generic linear path before the activation epilogue.
 void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, const ActivationBuffer& input, ExpertActivation activation, float activation_limit,
-                           ActivationBuffer& output, uint64_t optimization_flags);
+                           ActivationBuffer& output, uint64_t optimization_flags, ActivationBuffer* scratch = nullptr);
 [[nodiscard]] bool forward_experts_mxfp4(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scratch, uint64_t optimization_flags);
 [[nodiscard]] ActivationBuffer forward_rms_norm(const ActivationBuffer& input, const TensorData& weight, float epsilon, float weight_offset);
 // Input and output may be the same buffer; each row's RMS is computed before writing it.

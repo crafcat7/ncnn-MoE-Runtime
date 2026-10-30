@@ -1,4 +1,33 @@
-#Qwen3.6 - 35B - A3B
+# Qwen3.5 / Qwen3.6
+
+## Dense text models
+
+The `qwen3_5` adapter also admits the dense text architecture used by
+[`Qwen3.6-27B`](https://huggingface.co/Qwen/Qwen3.6-27B) and the
+[`Qwen3.5` dense series](https://huggingface.co/Qwen/Qwen3.5-4B).
+It reads `text_config.intermediate_size` and ordinary
+`mlp.{gate_proj,up_proj,down_proj}.weight` tensors. Tied output embeddings are
+supported. Each dense FFN executes directly, without routing, Expert cache
+allocation, or Expert statistics. Gated DeltaNet and full Attention use the
+existing CPU/mixed backends, including Vulkan dense FFNs.
+
+Use the same `run` and `chat` commands below with the dense model directory.
+The dense path is text-only and target-only; vision and MTP tensors are not
+executed. Native text accepts the validated Qwen3.5 and Qwen3.6 tokenizer and
+string-message templates. Automated tests cover generated tiny packages and
+the official tokenizer assets; full-checkpoint generation and throughput have
+not yet been measured for these dense models.
+
+Dense FFN projections may retain native affine INT4 or raw Q2_K–Q8_K blocks.
+Each gate/up/down projection has its own dtype, including mixed Q4_K/Q6_K
+layers. CPU and Vulkan paths retain packed weights without persistent expanded copies.
+AWQ/GPTQ scales, zero points and GPTQ group indices are preserved. Attention
+and the output head can also use quantized projections. Keep
+`--cpu-packed-weights off` for native imported weights; resident packed storage
+is not admitted for this path. See the [model catalog](../README.md) for the
+quantized-package import boundary.
+
+## Qwen3.6-35B-A3B
 
 The built-in `qwen3_5_moe` adapter runs the text backbone from the official
 [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
@@ -97,7 +126,7 @@ python -m pip install -e .
 python tools\ncnn_moe.py run `
   --model .\models\qwen3.6\Qwen3.6-35B-A3B `
   --prompt "Briefly explain mixture-of-experts models." `
-  --max-new-tokens 1024 --stream --backend hybrid --no-speculative
+  --max-new-tokens 1024 --stream --backend hybrid
 python tools\ncnn_moe.py chat `
   --model .\models\qwen3.6\Qwen3.6-35B-A3B
 ```
@@ -105,8 +134,8 @@ python tools\ncnn_moe.py chat `
 Thinking mode uses the checkpoint defaults: temperature 1.0, Top-P 0.95,
 Top-K 20, and Min-P 0.0. `--no-thinking` requests the official template's
 direct-answer mode. `--show-reasoning` or `/reasoning` expands the hidden
-reasoning channel. `--no-speculative` selects the target-only path, and
-`--speculative-max-draft N` caps the model-provided draft window when the
+reasoning channel. The runtime automatically uses the model-provided speculative
+plan when supported. `--speculative-max-draft N` caps the draft window when the
 checkpoint exposes one. The CLI locates `ncnn_moe_worker` automatically or
 accepts `--worker PATH`. Scripted runs can add `--no-metrics` to suppress
 periodic metrics events while retaining final statistics.
@@ -318,13 +347,13 @@ does not establish quality parity between BF16 and MXFP4 routed weights.
 
 ### Speculative-decoding status
 
-MTP remains experimental and opt-in. The runner and Python wrapper default to
-target-only generation. Batched verification with the packed-BF16 target path
+MTP remains experimental. The reference runner defaults to target-only
+generation. Batched verification with the packed-BF16 target path
 does not currently preserve the complete greedy sequence. Sequential target
 verification preserves the required token and transactional-state behavior,
-but it is not the recommended performance profile. Use `--speculative` only
-for focused validation and `--no-speculative` for the documented target-only
-path.
+but it is not the recommended performance profile. The reference runner and
+benchmark retain `--speculative` for focused validation and `--no-speculative`
+for the documented target-only measurements.
 
 ### Reproduce the current profile
 

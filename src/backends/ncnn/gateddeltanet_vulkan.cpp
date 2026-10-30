@@ -28,10 +28,9 @@ namespace moe {
 
 #if NCNN_MOE_WITH_VULKAN
 
-// One workgroup owns the recurrent state.  The token loop is intentionally
-// sequential, while convolution channels and value heads remain parallel.
-// This keeps the state transition on the device without changing the
-// cross-token ordering required by DeltaNet.
+// One workgroup owns the recurrent state. Tokens and value heads are visited
+// in order; lanes parallelize convolution channels and each head's columns.
+// This preserves the cross-token ordering required by DeltaNet.
 
 static bool create_pipeline(const std::shared_ptr<VulkanContext>& context,
                             const ncnn::Option& opt,
@@ -100,6 +99,7 @@ public:
     bool initialized = false;
     bool cpu_state_pending = false;
     bool state_unknown = false;
+    bool recording_pending = false;
     bool transaction_active = false;
     bool transaction_initial_recorded = false;
     bool transaction_initial_pending = false;
@@ -255,6 +255,117 @@ public:
 #endif
 };
 
+class GatedDeltaWork_vulkan::Implementation
+{
+public:
+#if NCNN_MOE_WITH_VULKAN
+    LayerCache* cache = nullptr;
+    std::shared_ptr<GatedDeltaState_vulkan> state;
+    ncnn::VkMat input;
+    ncnn::VkMat fused;
+    ncnn::VkMat recurrent_output;
+    ncnn::VkMat projected;
+    size_t rows = 0;
+    uint32_t dispatches = 0;
+    uint32_t int4_ops = 0;
+    uint64_t previous_state_allocated_size = 0;
+    bool created_state = false;
+    bool owns_recording = false;
+    bool recorded = false;
+    bool failed = false;
+    bool completed = false;
+
+    ~Implementation()
+    {
+        if (!state || completed)
+            return;
+        auto& implementation = *state->d;
+        if (owns_recording)
+        {
+            implementation.recording_pending = false;
+            implementation.transaction_initial_pending = false;
+            implementation.transaction_row_pending = false;
+            implementation.transaction_row_submitted = false;
+        }
+        if (created_state && cache && cache->gated_delta_device_state == state)
+        {
+            cache->gated_delta_device_state.reset();
+        }
+    }
+#endif
+};
+
+GatedDeltaWork_vulkan::GatedDeltaWork_vulkan()
+    : d(new Implementation)
+{
+}
+
+GatedDeltaWork_vulkan::~GatedDeltaWork_vulkan() = default;
+
+void GatedDeltaWork_vulkan::mark_submit_failed() noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (!d->state || d->completed)
+        return;
+    d->failed = true;
+    auto& state = *d->state->d;
+    if (state.transaction_active && state.transaction_row_pending)
+    {
+        if (state.transaction_initial_recorded)
+            state.transaction_requires_restore = true;
+        else
+            state.transaction_state_unknown = true;
+    }
+    else if (!d->created_state)
+        state.state_unknown = true;
+#endif
+}
+
+bool GatedDeltaWork_vulkan::commit() noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (!d->recorded || d->failed || d->completed || !d->cache
+        || d->cache->gated_delta_device_state != d->state)
+        return false;
+    auto& state = *d->state->d;
+    if (state.transaction_initial_pending)
+    {
+        state.transaction_initial_pending = false;
+        state.transaction_initial_recorded = true;
+    }
+    if (state.transaction_row_pending)
+    {
+        ++state.recorded_rows;
+        state.transaction_row_pending = false;
+        state.transaction_row_submitted = false;
+        state.transaction_requires_restore = false;
+    }
+    state.initialized = true;
+    state.recording_pending = false;
+    state.cpu_state_pending = false;
+    state.cpu_convolution = ncnn::VkMat();
+    state.cpu_recurrent = ncnn::VkMat();
+    state.zero_convolution = ncnn::VkMat();
+    state.zero_recurrent = ncnn::VkMat();
+    d->cache->gated_delta_convolution.clear();
+    d->cache->gated_delta_recurrent.clear();
+    for (size_t row = 0; row < d->rows; ++row)
+        record_gated_delta_cache_transaction_row(*d->cache);
+    d->cache->gated_delta_token_count += d->rows;
+    d->cache->device_allocated_size -= std::min(d->cache->device_allocated_size, d->previous_state_allocated_size);
+    d->cache->device_allocated_size += d->state->allocated_bytes();
+    VulkanRuntimeState& runtime = state.vulkan_context->runtime_state();
+    runtime.dispatches += d->dispatches;
+    runtime.int4_dispatches += d->int4_ops;
+    ++runtime.gated_delta_fusions;
+    ++runtime.gated_delta_submissions;
+    d->completed = true;
+    return true;
+#else
+    return false;
+#endif
+}
+
 class GatedDeltaNet_vulkan::Implementation
 {
 public:
@@ -262,6 +373,8 @@ public:
     std::shared_ptr<VulkanContext> vulkan_context;
     std::shared_ptr<Bfloat16Linear_vulkan> fused_input;
     std::shared_ptr<Bfloat16Linear_vulkan> output_projection;
+    std::array<std::shared_ptr<QnkLinear_vulkan>, 4> quantized_inputs;
+    std::shared_ptr<QnkLinear_vulkan> quantized_output;
     std::unique_ptr<ncnn::VkWeightAllocator> weight_allocator;
     std::unique_ptr<ncnn::VkWeightStagingAllocator> weight_staging_allocator;
     std::shared_ptr<ncnn::Pipeline> pipeline;
@@ -270,6 +383,9 @@ public:
     ncnn::VkMat decay_log;
     ncnn::VkMat norm_weight;
     ncnn::Option opt;
+    uint32_t input_columns = 0;
+    uint32_t output_columns = 0;
+    uint32_t int4_ops = 0;
     uint32_t convolution_size = 0;
     uint32_t value_size = 0;
     uint32_t fused_columns = 0;
@@ -699,27 +815,93 @@ GatedDeltaNet_vulkan::create(const std::shared_ptr<Bfloat16Linear_vulkan>& fused
                              const VulkanRuntimePtr& vulkan_runtime,
                              uint64_t optimization_flags)
 {
+    return create_impl(fused_input, {}, convolution_weight, time_bias, decay_log, norm_weight,
+                       output_projection, {}, head_count, kv_head_count, head_dimension,
+                       value_head_dimension, convolution_kernel_size, norm_epsilon, sigmoid_gate,
+                       vulkan_device_index, vulkan_runtime, optimization_flags);
+}
+
+std::shared_ptr<GatedDeltaNet_vulkan>
+GatedDeltaNet_vulkan::create_quantized(std::span<const std::shared_ptr<QnkLinear_vulkan>> inputs,
+                                       const TensorData& convolution_weight,
+                                       const TensorData& time_bias,
+                                       const TensorData& decay_log,
+                                       const TensorData& norm_weight,
+                                       const std::shared_ptr<QnkLinear_vulkan>& output_projection,
+                                       uint32_t head_count,
+                                       uint32_t kv_head_count,
+                                       uint32_t head_dimension,
+                                       uint32_t value_head_dimension,
+                                       uint32_t convolution_kernel_size,
+                                       float norm_epsilon,
+                                       bool sigmoid_gate,
+                                       uint32_t vulkan_device_index,
+                                       const VulkanRuntimePtr& vulkan_runtime,
+                                       uint64_t optimization_flags)
+{
+    return create_impl({}, inputs, convolution_weight, time_bias, decay_log, norm_weight,
+                       {}, output_projection, head_count, kv_head_count, head_dimension,
+                       value_head_dimension, convolution_kernel_size, norm_epsilon, sigmoid_gate,
+                       vulkan_device_index, vulkan_runtime, optimization_flags);
+}
+
+std::shared_ptr<GatedDeltaNet_vulkan>
+GatedDeltaNet_vulkan::create_impl(const std::shared_ptr<Bfloat16Linear_vulkan>& fused_input,
+                                  std::span<const std::shared_ptr<QnkLinear_vulkan>> quantized_inputs,
+                                  const TensorData& convolution_weight,
+                                  const TensorData& time_bias,
+                                  const TensorData& decay_log,
+                                  const TensorData& norm_weight,
+                                  const std::shared_ptr<Bfloat16Linear_vulkan>& output_projection,
+                                  const std::shared_ptr<QnkLinear_vulkan>& quantized_output,
+                                  uint32_t head_count,
+                                  uint32_t kv_head_count,
+                                  uint32_t head_dimension,
+                                  uint32_t value_head_dimension,
+                                  uint32_t convolution_kernel_size,
+                                  float norm_epsilon,
+                                  bool sigmoid_gate,
+                                  uint32_t vulkan_device_index,
+                                  const VulkanRuntimePtr& vulkan_runtime,
+                                  uint64_t optimization_flags)
+{
 #if NCNN_MOE_WITH_VULKAN
-    if (!fused_input || !output_projection || head_count == 0
+    const bool quantized = !quantized_inputs.empty();
+    if ((quantized ? quantized_inputs.size() != 4 || !quantized_output : !fused_input || !output_projection)
+        || head_count == 0
         || kv_head_count == 0 || head_count % kv_head_count != 0
         || head_dimension == 0 || value_head_dimension == 0
         || convolution_kernel_size == 0)
     {
         return {};
     }
-    const uint32_t key_size = kv_head_count * head_dimension;
-    const uint32_t value_size = head_count * value_head_dimension;
-    const uint32_t convolution_size = key_size * 2 + value_size;
-    const uint32_t fused_columns = convolution_size + value_size + head_count * 2;
-    const std::shared_ptr<VulkanContext>& fused_context = fused_input->vulkan_context();
-    const std::shared_ptr<VulkanContext>& output_context = output_projection->vulkan_context();
+    for (const auto& projection : quantized_inputs)
+        if (!projection)
+            return {};
+    const uint64_t key_size = static_cast<uint64_t>(kv_head_count) * head_dimension;
+    const uint64_t value_columns = static_cast<uint64_t>(head_count) * value_head_dimension;
+    if (key_size > static_cast<uint64_t>(std::numeric_limits<int>::max() / 2)
+        || value_columns > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+    {
+        return {};
+    }
+    const uint64_t convolution_columns = key_size * 2 + value_columns;
+    const uint64_t total_columns = convolution_columns + value_columns + static_cast<uint64_t>(head_count) * 2;
+    if (total_columns > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+        return {};
+    const uint32_t value_size = static_cast<uint32_t>(value_columns);
+    const uint32_t convolution_size = static_cast<uint32_t>(convolution_columns);
+    const uint32_t fused_columns = static_cast<uint32_t>(total_columns);
+    const std::shared_ptr<VulkanContext>& fused_context = quantized ? quantized_inputs.front()->vulkan_context() : fused_input->vulkan_context();
+    const std::shared_ptr<VulkanContext>& output_context = quantized ? quantized_output->vulkan_context() : output_projection->vulkan_context();
+    const uint32_t input_columns = quantized ? quantized_inputs.front()->input_columns() : fused_input->input_columns();
     if (!fused_context || !output_context
         || fused_context->optimization_flags() != optimization_flags
         || output_context->optimization_flags() != optimization_flags
         || fused_context->runtime().get() != vulkan_runtime.get()
         || fused_context.get() != output_context.get()
-        || fused_input->output_columns() != fused_columns
-        || output_projection->input_columns() != value_size
+        || (!quantized && fused_input->output_columns() != fused_columns)
+        || (quantized ? quantized_output->input_columns() : output_projection->input_columns()) != value_size
         || convolution_weight.element_count()
                != static_cast<size_t>(convolution_size)
                       * convolution_kernel_size
@@ -737,13 +919,36 @@ GatedDeltaNet_vulkan::create(const std::shared_ptr<Bfloat16Linear_vulkan>& fused
     {
         return {};
     }
+    if (quantized)
+    {
+        const std::array<uint32_t, 4> columns = {convolution_size, value_size, head_count, head_count};
+        for (size_t index = 0; index < quantized_inputs.size(); ++index)
+        {
+            const auto& projection = quantized_inputs[index];
+            if (projection->vulkan_context() != fused_context || projection->input_columns() != input_columns
+                || projection->output_columns() != columns[index])
+            {
+                return {};
+            }
+        }
+    }
 
     std::shared_ptr<GatedDeltaNet_vulkan> result(new GatedDeltaNet_vulkan);
     Implementation& implementation = *result->d;
     implementation.vulkan_context = fused_context;
     implementation.fused_input = fused_input;
     implementation.output_projection = output_projection;
-    implementation.opt = fused_input->option();
+    if (quantized)
+    {
+        std::copy(quantized_inputs.begin(), quantized_inputs.end(), implementation.quantized_inputs.begin());
+        implementation.quantized_output = quantized_output;
+        for (const auto& projection : quantized_inputs)
+            implementation.int4_ops += projection->dtype() == DType::Int4 ? 1 : 0;
+        implementation.int4_ops += quantized_output->dtype() == DType::Int4 ? 1 : 0;
+    }
+    implementation.opt = quantized ? quantized_inputs.front()->option() : fused_input->option();
+    implementation.input_columns = input_columns;
+    implementation.output_columns = quantized ? quantized_output->output_columns() : output_projection->output_columns();
     implementation.convolution_size = convolution_size;
     implementation.value_size = value_size;
     implementation.fused_columns = fused_columns;
@@ -764,7 +969,7 @@ GatedDeltaNet_vulkan::create(const std::shared_ptr<Bfloat16Linear_vulkan>& fused
         }
     }
 
-    implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(implementation.vulkan_context->device()));
+    implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(implementation.vulkan_context->device(), static_cast<size_t>(vulkan_weight_block_size)));
     implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(implementation.vulkan_context->device()));
     ncnn::Mat convolution_model;
     ncnn::Mat time_model;
@@ -804,11 +1009,13 @@ GatedDeltaNet_vulkan::create(const std::shared_ptr<Bfloat16Linear_vulkan>& fused
     return result;
 #else
     (void)fused_input;
+    (void)quantized_inputs;
     (void)convolution_weight;
     (void)time_bias;
     (void)decay_log;
     (void)norm_weight;
     (void)output_projection;
+    (void)quantized_output;
     (void)head_count;
     (void)kv_head_count;
     (void)head_dimension;
@@ -823,31 +1030,85 @@ GatedDeltaNet_vulkan::create(const std::shared_ptr<Bfloat16Linear_vulkan>& fused
 #endif
 }
 
-bool GatedDeltaNet_vulkan::forward_impl(const ActivationBuffer& input,
-                                        LayerCache& cache,
-                                        ActivationBuffer& projected,
-                                        bool apply_input_rms_norm) const
+void GatedDeltaNet_vulkan::record_input_projection(const ncnn::VkMat& input, ncnn::VkMat& output,
+                                                   ncnn::VkCompute& command, bool normalize) const
 {
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
-    const uint32_t input_columns = implementation.fused_input->input_columns();
-    const uint32_t output_columns = implementation.output_projection->output_columns();
-    if (!implementation.vulkan_context
-        || !implementation.pipeline
-        || input.rows() == 0
-        || input.columns() != input_columns
-        || input.rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max())
-        || (cache.transaction.active && input.rows() != 1))
+    if (implementation.quantized_output)
     {
-        return false;
+        std::vector<ncnn::VkMat> bindings;
+        bindings.reserve(4);
+        std::vector<ncnn::vk_constant_type> constants;
+        constants.reserve(15);
+        uint32_t column_offset = 0;
+        for (const auto& projection : implementation.quantized_inputs)
+        {
+            projection->record(input, output, command, column_offset, bindings, constants);
+            column_offset += projection->output_columns();
+        }
     }
-    VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
+    else if (normalize)
+        implementation.fused_input->record_rms_norm_projection(input, output, command);
+    else
+        implementation.fused_input->record_scalar_projection(input, output, command);
+#else
+    (void)input;
+    (void)output;
+    (void)command;
+    (void)normalize;
+#endif
+}
 
-    bool created_device_state = false;
+void GatedDeltaNet_vulkan::record_output_projection(const ncnn::VkMat& input, ncnn::VkMat& output,
+                                                    ncnn::VkCompute& command) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (d->quantized_output)
+        d->quantized_output->record(input, output, command);
+    else
+        d->output_projection->record_scalar_projection(input, output, command);
+#else
+    (void)input;
+    (void)output;
+    (void)command;
+#endif
+}
+
+#if NCNN_MOE_WITH_VULKAN
+
+const std::shared_ptr<VulkanContext>& GatedDeltaNet_vulkan::vulkan_context() const noexcept
+{
+    return d->vulkan_context;
+}
+
+const ncnn::Option& GatedDeltaNet_vulkan::option() const noexcept
+{
+    return d->opt;
+}
+
+bool GatedDeltaNet_vulkan::record_forward(const ncnn::VkMat& input, LayerCache& cache,
+                                          size_t token_count, ncnn::VkMat& projected,
+                                          ncnn::VkCompute& command, GatedDeltaWork_vulkan& work,
+                                          bool apply_input_rms_norm) const
+{
+    const Implementation& implementation = *d;
+    if (!implementation.vulkan_context || !implementation.pipeline || input.empty()
+        || input.dims > 2 || input.w != static_cast<int>(implementation.input_columns)
+        || token_count == 0 || token_count > static_cast<size_t>(std::numeric_limits<int>::max())
+        || input.h != static_cast<int>(token_count) || input.elempack != 1 || input.elemsize != sizeof(float)
+        || &input == &projected || work.d->state
+        || cache.gated_delta_token_count > std::numeric_limits<uint64_t>::max() - token_count
+        || (cache.transaction.active
+            && (token_count != 1 || (!cache.gated_delta_device_state && cache.transaction.recorded_rows != 0))))
+        return false;
+
+    auto& pending = *work.d;
+    pending.cache = &cache;
+    pending.rows = token_count;
+    pending.previous_state_allocated_size = cache.gated_delta_device_state ? cache.gated_delta_device_state->allocated_bytes() : 0;
     if (!cache.gated_delta_device_state)
     {
-        const bool has_cpu_state = !cache.gated_delta_convolution.empty()
-                                   || !cache.gated_delta_recurrent.empty();
         cache.gated_delta_device_state = GatedDeltaState_vulkan::create(implementation.vulkan_context,
                                                                         implementation.convolution_size,
                                                                         implementation.convolution_kernel_size,
@@ -857,210 +1118,119 @@ bool GatedDeltaNet_vulkan::forward_impl(const ActivationBuffer& input,
                                                                         implementation.opt);
         if (!cache.gated_delta_device_state)
             return false;
-        created_device_state = true;
-        if (has_cpu_state
-            && !cache.gated_delta_device_state->prepare_cpu_state(cache.gated_delta_convolution,
-                                                                  cache.gated_delta_recurrent))
-        {
-            cache.gated_delta_device_state.reset();
-            return false;
-        }
+        pending.created_state = true;
     }
-    struct DeviceStateCreationAttempt
-    {
-        LayerCache* cache = nullptr;
-
-        ~DeviceStateCreationAttempt()
-        {
-            if (cache)
-            {
-                cache->gated_delta_device_state.reset();
-                cache->device_allocated_size = 0;
-            }
-        }
-
-        void complete() noexcept
-        {
-            cache = nullptr;
-        }
-    } creation_attempt{
-        created_device_state ? &cache : nullptr};
-    std::shared_ptr<GatedDeltaState_vulkan> state = cache.gated_delta_device_state;
-    GatedDeltaState_vulkan::Implementation& state_implementation = *state->d;
-    if (state_implementation.state_unknown)
+    pending.state = cache.gated_delta_device_state;
+    auto& state = *pending.state->d;
+    if (state.state_unknown || state.recording_pending || state.vulkan_context != implementation.vulkan_context
+        || (state.transaction_active && !cache.transaction.active)
+        || state.transaction_initial_pending || state.transaction_row_pending)
         return false;
-    if (cache.transaction.active
-        && !state_implementation.transaction_active)
-    {
-        if (!state->begin_transaction(cache.transaction.expected_rows))
-            return false;
-    }
-    cache.device_allocated_size = state->allocated_bytes();
+    pending.owns_recording = true;
+    state.recording_pending = true;
+    if (pending.created_state
+        && (!cache.gated_delta_convolution.empty() || !cache.gated_delta_recurrent.empty())
+        && !pending.state->prepare_cpu_state(cache.gated_delta_convolution, cache.gated_delta_recurrent))
+        return false;
+    if (cache.transaction.active && !state.transaction_active
+        && !pending.state->begin_transaction(cache.transaction.expected_rows))
+        return false;
 
+    pending.fused.create(static_cast<int>(implementation.fused_columns), static_cast<int>(token_count),
+                         sizeof(float), implementation.vulkan_context->blob_allocator());
+    pending.recurrent_output.create(static_cast<int>(implementation.value_size), static_cast<int>(token_count),
+                                    sizeof(float), implementation.vulkan_context->blob_allocator());
+    pending.projected.create(static_cast<int>(implementation.output_columns), static_cast<int>(token_count),
+                             sizeof(float), implementation.vulkan_context->blob_allocator());
+    if (pending.fused.empty() || pending.recurrent_output.empty() || pending.projected.empty())
+        return false;
+    pending.input = input;
+    if (!state.record_initial_state(command))
+        return false;
+    record_input_projection(input, pending.fused, command, apply_input_rms_norm && has_input_rms_norm());
+    const std::vector<ncnn::VkMat> bindings = {pending.fused, state.convolution, state.recurrent,
+                                               implementation.convolution_weight, implementation.time_bias,
+                                               implementation.decay_log, implementation.norm_weight, pending.recurrent_output};
+    std::vector<ncnn::vk_constant_type> constants(11);
+    constants[0].u32 = implementation.convolution_size;
+    constants[1].u32 = implementation.value_size;
+    constants[2].u32 = implementation.fused_columns;
+    constants[3].u32 = implementation.head_count;
+    constants[4].u32 = implementation.kv_head_count;
+    constants[5].u32 = implementation.head_dimension;
+    constants[6].u32 = implementation.value_head_dimension;
+    constants[7].u32 = implementation.convolution_kernel_size;
+    constants[8].u32 = static_cast<uint32_t>(token_count);
+    constants[9].f = implementation.norm_epsilon;
+    constants[10].u32 = implementation.sigmoid_gate ? 1u : 0u;
+    ncnn::VkMat dispatcher;
+    dispatcher.w = 128;
+    dispatcher.h = 1;
+    dispatcher.c = 1;
+    command.record_pipeline_readonly(implementation.pipeline.get(), bindings, {0, 0, 0, 1, 1, 1, 1, 0}, constants, dispatcher);
+    if (!state.record_transaction_row(command))
+        return false;
+    record_output_projection(pending.recurrent_output, pending.projected, command);
+    projected = pending.projected;
+    pending.dispatches = (implementation.quantized_output ? 4u : 1u) + 2;
+    pending.int4_ops = implementation.int4_ops;
+    pending.recorded = true;
+    return true;
+}
+
+#endif
+
+bool GatedDeltaNet_vulkan::forward_impl(const ActivationBuffer& input,
+                                        LayerCache& cache,
+                                        ActivationBuffer& projected,
+                                        bool apply_input_rms_norm) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    const Implementation& implementation = *d;
+    if (!implementation.vulkan_context || !implementation.pipeline || input.rows() == 0
+        || input.columns() != implementation.input_columns
+        || input.rows() > static_cast<size_t>(std::numeric_limits<int>::max())
+        || (cache.transaction.active && input.rows() != 1))
+        return false;
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
     const bool direct_host_input = vulkan_activation_storage_variant(implementation.opt) == 0
-                                   && implementation.vulkan_context->support_direct_host_buffer(input.rows() * input.columns() * sizeof(float),
-                                                                                                input.dtype());
-    if (!fill_staging_upload(input,
-                             transfer_slot.upload,
-                             transfer_slot.staging_allocator)
-        || !prepare_staging_batch(transfer_slot.download,
-                                  input.rows(),
-                                  output_columns,
-                                  transfer_slot.staging_allocator))
-    {
+                                   && implementation.vulkan_context->support_direct_host_buffer(input.rows() * input.columns() * sizeof(float), input.dtype());
+    if (!fill_staging_upload(input, transfer_slot.upload, transfer_slot.staging_allocator)
+        || !prepare_staging_batch(transfer_slot.download, input.rows(), implementation.output_columns, transfer_slot.staging_allocator))
         return false;
-    }
     const DType projected_dtype = projected.dtype();
-    projected.reset(input.rows(),
-                    output_columns,
-                    false);
-
+    projected.reset(input.rows(), implementation.output_columns, false);
+    GatedDeltaWork_vulkan work;
     std::unique_lock<std::mutex> lock(implementation.vulkan_context->command_mutex());
-    ncnn::VkCompute& cmd = *transfer_slot.command;
-    if (transfer_slot.command_used)
-    {
-        if (cmd.reset() != 0)
-            return false;
-        ++runtime_state.command_buffer_reuses;
-    }
+    ncnn::VkCompute& command = *transfer_slot.command;
+    if (transfer_slot.command_used && command.reset() != 0)
+        return false;
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;
     if (direct_host_input)
         input_gpu = bind_direct_host_input(transfer_slot.upload);
-    else if (!record_mapped_upload(transfer_slot.upload,
-                                   input_gpu,
-                                   cmd,
-                                   implementation.opt))
-    {
+    else if (!record_mapped_upload(transfer_slot.upload, input_gpu, command, implementation.opt))
         return false;
-    }
-    std::array<GatedDeltaState_vulkan::Implementation*, 1>
-        transaction_states = {&state_implementation};
-    GatedDeltaState_vulkan::Implementation::RecordingGuard
-        transaction_recording(transaction_states);
-    if (!state_implementation.record_initial_state(cmd))
-    {
-        return false;
-    }
-
-    const bool use_input_rms_norm = apply_input_rms_norm
-                                    && implementation.fused_input->has_rms_norm_chain();
-    ncnn::VkMat fused_gpu;
-    fused_gpu.create(static_cast<int>(implementation.fused_columns),
-                     static_cast<int>(input.rows()),
-                     sizeof(float),
-                     implementation.vulkan_context->blob_allocator());
-    ncnn::VkMat recurrent_output_gpu;
-    recurrent_output_gpu.create(static_cast<int>(implementation.value_size),
-                                static_cast<int>(input.rows()),
-                                sizeof(float),
-                                implementation.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
-    output_gpu.create(static_cast<int>(output_columns),
-                      static_cast<int>(input.rows()),
-                      sizeof(float),
-                      implementation.vulkan_context->blob_allocator());
-    if (fused_gpu.empty() || recurrent_output_gpu.empty() || output_gpu.empty())
+    if (!record_forward(input_gpu, cache, input.rows(), output_gpu, command, work, apply_input_rms_norm)
+        || !record_prepared_activation_staging_download(output_gpu, input.rows(), implementation.output_columns,
+                                                        transfer_slot.download, command, implementation.vulkan_context->device(),
+                                                        implementation.opt, projected_dtype))
         return false;
-
-    if (use_input_rms_norm)
+    if (submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0)
     {
-        implementation.fused_input->record_rms_norm_projection(input_gpu,
-                                                               fused_gpu,
-                                                               cmd);
-    }
-    else
-    {
-        implementation.fused_input->record_scalar_projection(input_gpu,
-                                                             fused_gpu,
-                                                             cmd);
-    }
-
-    std::vector<ncnn::VkMat> delta_bindings = {
-        fused_gpu,
-        state_implementation.convolution,
-        state_implementation.recurrent,
-        implementation.convolution_weight,
-        implementation.time_bias,
-        implementation.decay_log,
-        implementation.norm_weight,
-        recurrent_output_gpu};
-    std::vector<ncnn::vk_constant_type> delta_constants(11);
-    delta_constants[0].u32 = implementation.convolution_size;
-    delta_constants[1].u32 = implementation.value_size;
-    delta_constants[2].u32 = implementation.fused_columns;
-    delta_constants[3].u32 = implementation.head_count;
-    delta_constants[4].u32 = implementation.kv_head_count;
-    delta_constants[5].u32 = implementation.head_dimension;
-    delta_constants[6].u32 = implementation.value_head_dimension;
-    delta_constants[7].u32 = implementation.convolution_kernel_size;
-    delta_constants[8].u32 = static_cast<uint32_t>(input.rows());
-    delta_constants[9].f = implementation.norm_epsilon;
-    delta_constants[10].u32 = implementation.sigmoid_gate ? 1u : 0u;
-    ncnn::VkMat delta_dispatcher;
-    delta_dispatcher.w = 128;
-    delta_dispatcher.h = 1;
-    delta_dispatcher.c = 1;
-    cmd.record_pipeline_readonly(implementation.pipeline.get(),
-                                 delta_bindings,
-                                 {0, 0, 0, 1, 1, 1, 1, 0},
-                                 delta_constants,
-                                 delta_dispatcher);
-    if (!state_implementation.record_transaction_row(cmd))
-        return false;
-
-    implementation.output_projection->record_scalar_projection(recurrent_output_gpu,
-                                                               output_gpu,
-                                                               cmd);
-
-    if (!record_prepared_activation_staging_download(output_gpu,
-                                                     input.rows(),
-                                                     output_columns,
-                                                     transfer_slot.download,
-                                                     cmd,
-                                                     implementation.vulkan_context->device(),
-                                                     implementation.opt,
-                                                     projected_dtype))
-    {
+        work.mark_submit_failed();
         return false;
     }
-    if (submit_compute_and_wait(cmd, implementation.vulkan_context->device()) != 0)
-    {
-        transaction_recording.mark_submit_failed();
-        if (!state_implementation.transaction_active
-            && !created_device_state)
-        {
-            state_implementation.state_unknown = true;
-        }
+    if (!work.commit())
         return false;
-    }
-    transaction_recording.mark_submitted();
     if (!copy_staging_to_cpu_batch(transfer_slot.download, projected))
-    {
-        if (!state_implementation.transaction_active
-            && !created_device_state)
-        {
-            state_implementation.state_unknown = true;
-        }
         return false;
-    }
-    transaction_recording.commit_rows();
-    state_implementation.initialized = true;
-    state_implementation.cpu_state_pending = false;
-    state_implementation.cpu_convolution = ncnn::VkMat();
-    state_implementation.cpu_recurrent = ncnn::VkMat();
-    state_implementation.zero_convolution = ncnn::VkMat();
-    state_implementation.zero_recurrent = ncnn::VkMat();
-    runtime_state.dispatches += 3;
-    ++runtime_state.gated_delta_fusions;
-    ++runtime_state.gated_delta_submissions;
-    ++runtime_state.compute_submissions;
-    ++runtime_state.batch_uploads;
-    ++runtime_state.batch_downloads;
-    cache.device_allocated_size = state->allocated_bytes();
-    creation_attempt.complete();
+    VulkanRuntimeState& runtime = implementation.vulkan_context->runtime_state();
+    ++runtime.compute_submissions;
+    ++runtime.batch_uploads;
+    ++runtime.batch_downloads;
     return true;
 #else
     (void)input;
@@ -1123,8 +1293,8 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
         return GatedDeltaBatchResult_vulkan::NotExecuted;
     }
     VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
-    const uint32_t input_columns = implementation.fused_input->input_columns();
-    const uint32_t output_columns = implementation.output_projection->output_columns();
+    const uint32_t input_columns = implementation.input_columns;
+    const uint32_t output_columns = implementation.output_columns;
 
     const size_t total_rows = entries.size();
     ActivationBuffer combined_normalized;
@@ -1209,7 +1379,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
         }
         std::shared_ptr<GatedDeltaState_vulkan> state = cache.gated_delta_device_state;
         GatedDeltaState_vulkan::Implementation& state_implementation = *state->d;
-        if (state_implementation.state_unknown)
+        if (state_implementation.state_unknown || state_implementation.recording_pending)
             return GatedDeltaBatchResult_vulkan::Failed;
         if (state_implementation.vulkan_context != implementation.vulkan_context)
             return GatedDeltaBatchResult_vulkan::NotExecuted;
@@ -1269,7 +1439,6 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
     {
         if (cmd.reset() != 0)
             return GatedDeltaBatchResult_vulkan::NotExecuted;
-        ++runtime_state.command_buffer_reuses;
     }
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;
@@ -1317,9 +1486,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
         }
     }
 
-    implementation.fused_input->record_scalar_projection(input_gpu,
-                                                         fused_gpu,
-                                                         cmd);
+    record_input_projection(input_gpu, fused_gpu, cmd, false);
 
     for (size_t entry_index = 0; entry_index < entries.size(); ++entry_index)
     {
@@ -1362,9 +1529,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
             return GatedDeltaBatchResult_vulkan::NotExecuted;
     }
 
-    implementation.output_projection->record_scalar_projection(recurrent_output_gpu,
-                                                               output_gpu,
-                                                               cmd);
+    record_output_projection(recurrent_output_gpu, output_gpu, cmd);
 
     if (!record_prepared_activation_staging_download(output_gpu,
                                                      total_rows,
@@ -1414,7 +1579,9 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
         cache.gated_delta_token_count += 1;
         cache.device_allocated_size = states[entry_index]->allocated_bytes();
     }
-    runtime_state.dispatches += entries.size() + 2;
+    runtime_state.dispatches += entries.size() + (implementation.quantized_output ? 4u : 1u) + 1;
+    if (implementation.int4_ops != 0)
+        runtime_state.int4_dispatches += implementation.int4_ops;
     runtime_state.gated_delta_fusions += entries.size();
     ++runtime_state.gated_delta_submissions;
     ++runtime_state.compute_submissions;

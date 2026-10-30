@@ -161,6 +161,10 @@ Result<std::shared_ptr<MappedFileRange>> MappedFileRange::open(const std::filesy
             ErrorCode::IoError,
             "cannot map model shard range: " + path.string()};
     }
+    CloseHandle(range->mapping_handle);
+    range->mapping_handle = nullptr;
+    CloseHandle(range->file_handle);
+    range->file_handle = INVALID_HANDLE_VALUE;
 #else
     if (aligned_offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()))
     {
@@ -177,6 +181,9 @@ Result<std::shared_ptr<MappedFileRange>> MappedFileRange::open(const std::filesy
         range->view = nullptr;
         return Error{ErrorCode::IoError, "cannot map model shard range: " + path.string() + ": " + std::strerror(errno)};
     }
+    const int file_handle = range->file_handle;
+    range->file_handle = -1;
+    close(file_handle);
 #endif
     range->data_ptr = static_cast<uint8_t*>(range->view) + static_cast<size_t>(prefix);
     return range;

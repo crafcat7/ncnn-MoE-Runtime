@@ -15,12 +15,14 @@ class Option;
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace ncnn {
 namespace moe {
 
 struct LayerCache;
 struct LatentAttentionRowContext;
+struct CompiledOperator;
 class Float8Linear_vulkan;
 class DeviceTensor_vulkan;
 class VulkanContext;
@@ -72,6 +74,10 @@ public:
                                                                         const TensorData& sinks,
                                                                         std::shared_ptr<Float8Linear_vulkan> output_a,
                                                                         std::shared_ptr<Float8Linear_vulkan> output_b);
+    [[nodiscard]] static std::shared_ptr<LatentAttention_vulkan> create(const AttentionBlockPlan& plan,
+                                                                        const TensorData& sinks,
+                                                                        const CompiledOperator& output_a,
+                                                                        const CompiledOperator& output_b);
     // CPU caches have already committed the current row. Mirrors are optional
     // and may be discarded without affecting fallback or speculative undo.
     [[nodiscard]] bool forward_batch(std::span<const uint64_t> positions,
@@ -101,6 +107,17 @@ public:
 #endif
 
 private:
+#if NCNN_MOE_WITH_VULKAN
+    [[nodiscard]] static std::shared_ptr<VulkanContext> projection_context(const CompiledOperator& op) noexcept;
+    [[nodiscard]] static const ncnn::Option* projection_option(const CompiledOperator& op) noexcept;
+    [[nodiscard]] static uint32_t projection_input_columns(const CompiledOperator& op) noexcept;
+    [[nodiscard]] static uint32_t projection_output_columns(const CompiledOperator& op) noexcept;
+    [[nodiscard]] bool record_projection(const CompiledOperator& op,
+                                         const ncnn::VkMat& input,
+                                         ncnn::VkMat& output,
+                                         ncnn::VkCompute& cmd,
+                                         std::vector<ncnn::VkMat>& storage) const;
+#endif
     class Implementation;
     LatentAttention_vulkan();
     std::unique_ptr<Implementation> d;

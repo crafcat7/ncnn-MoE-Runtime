@@ -101,6 +101,20 @@ struct MoeDescriptor
     uint32_t flags = 0;
 };
 
+struct DenseDescriptor
+{
+    uint32_t intermediate_size = 0;
+    DType gate_weight_dtype = DType::Float32;
+    DType up_weight_dtype = DType::Float32;
+    DType down_weight_dtype = DType::Float32;
+    ExpertActivation activation = ExpertActivation::Silu;
+
+    [[nodiscard]] bool enabled() const noexcept
+    {
+        return intermediate_size != 0;
+    }
+};
+
 struct PleDescriptor
 {
     uint32_t embedding_dimension = 0;
@@ -121,6 +135,7 @@ struct LayerDescriptor
 {
     AttentionDescriptor attention;
     MoeDescriptor moe;
+    DenseDescriptor dense;
     PleDescriptor ple;
 
     NormType pre_attention_norm = NormType::None;

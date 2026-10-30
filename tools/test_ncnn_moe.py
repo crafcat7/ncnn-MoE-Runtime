@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free tests for the native-text worker client and chat flow."""
+"""Dependency-free unit tests, or a worker smoke test with --worker and --model."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import copy
 import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -23,6 +24,7 @@ from ncnn_moe_adapters import (  # noqa: E402
     Completion,
     NATIVE_TEXT_VERSION,
     create_adapter,
+    model_weight_files,
 )
 from ncnn_moe import (  # noqa: E402
     ConversationApp,
@@ -30,15 +32,19 @@ from ncnn_moe import (  # noqa: E402
     _format_runtime_metrics,
     configure_standard_streams,
     cli_runtime_settings,
+    default_generation_values,
     default_worker_path,
     find_worker,
     load_adapter,
     parse_arguments,
+    resolve_model,
+    lightweight_model_fingerprint,
 )
 from ncnn_moe_protocol import WorkerClient, WorkerError  # noqa: E402
 from ncnn_moe_state import merge_runtime_settings, runtime_args_from_settings  # noqa: E402
 import benchmark_prompt  # noqa: E402
 import benchmark_runtime  # noqa: E402
+import benchmark_reference_matrix  # noqa: E402
 
 
 FAMILY_CASES = (
@@ -64,6 +70,17 @@ def _model(root: Path, model_type: str, *, context: int = 2048) -> Path:
     return root
 
 
+def _gguf(path: Path, text: str = "tokenizer metadata") -> Path:
+    def string(value: str) -> bytes:
+        data = value.encode("utf-8")
+        return struct.pack("<Q", len(data)) + data
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(struct.pack("<4sIQQ", b"GGUF", 3, 0, 1)
+                     + string("tokenizer.stub") + struct.pack("<I", 8) + string(text))
+    return path
+
+
 def _ready(stop_tokens: list[int] | None = None, *, supported: bool = True) -> dict[str, object]:
     model: dict[str, object] = {
         "native_text_supported": supported,
@@ -80,7 +97,6 @@ def _arguments(**overrides: object) -> SimpleNamespace:
         "title": "",
         "seed": 7,
         "prefill_chunk_size": 8,
-        "no_speculative": False,
         "max_new_tokens": 8,
         "temperature": None,
         "top_k": None,
@@ -217,6 +233,136 @@ class FakeWorkerClient:
 
 
 class RuntimeOptionsTests(unittest.TestCase):
+    def test_generation_defaults_preserve_explicit_temperature(self) -> None:
+        for name, top_k, top_p in (("gpt-oss", 0, 1.0), ("deepseek-v4", 0, 1.0), ("qwen3.6", 20, 0.95)):
+            for temperature, expected in ((None, 1.0), (0.0, 0.0), (0.5, 0.5)):
+                with self.subTest(model=name, temperature=temperature):
+                    self.assertEqual(
+                        default_generation_values(SimpleNamespace(name=name), _arguments(temperature=temperature)),
+                        (expected, top_k, top_p),
+                    )
+
+    def test_io_defaults_to_auto_and_only_exposes_mmap_or_buffered(self) -> None:
+        io_flags = ("--mmap-experts", "--buffered-expert-io")
+        for command in ("run", "chat", "inspect", "tune"):
+            with self.subTest(command=command):
+                arguments = parse_arguments([command])
+                self.assertFalse(hasattr(arguments, "direct_expert_io"))
+                settings = merge_runtime_settings(
+                    cli=cli_runtime_settings(arguments), session=None, profile=None, user=None
+                )
+                self.assertEqual(runtime_args_from_settings(settings), [])
+                for flag in io_flags:
+                    selected = cli_runtime_settings(parse_arguments([command, flag]))
+                    self.assertEqual(runtime_args_from_settings(selected), [flag])
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    parse_arguments([command, "--direct-expert-io"])
+                self.assertEqual(error.exception.code, 2)
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    parse_arguments([command, *io_flags])
+                self.assertEqual(error.exception.code, 2)
+
+    def test_removed_direct_setting_is_ignored_in_every_saved_layer(self) -> None:
+        for enabled in (True, False):
+            obsolete = {"direct_expert_io": enabled}
+            self.assertEqual(runtime_args_from_settings(obsolete), [])
+            for source in ("user", "profile", "session", "cli"):
+                layers = {"cli": {}, "session": None, "profile": None, "user": None}
+                layers[source] = obsolete
+                with self.subTest(enabled=enabled, source=source):
+                    settings = merge_runtime_settings(**layers)
+                    self.assertEqual(settings, {"backend": "auto"})
+                    self.assertEqual(runtime_args_from_settings(settings), [])
+        settings = merge_runtime_settings(
+            cli={"buffered_expert_io": True}, session={"direct_expert_io": True},
+            profile=None, user={"mmap_experts": True}
+        )
+        self.assertEqual(settings, {"backend": "auto", "buffered_expert_io": True})
+        self.assertEqual(runtime_args_from_settings(settings), ["--buffered-expert-io"])
+
+    def test_io_modes_obey_whole_group_layer_priority(self) -> None:
+        order = ("user", "profile", "session", "cli")
+        for low_index, lower in enumerate(order):
+            for higher in order[low_index + 1:]:
+                for low_key, high_key, flag in (
+                    ("buffered_expert_io", "mmap_experts", "--mmap-experts"),
+                    ("mmap_experts", "buffered_expert_io", "--buffered-expert-io"),
+                ):
+                    layers = {"cli": {}, "session": None, "profile": None, "user": None}
+                    layers[lower] = {low_key: True}
+                    layers[higher] = {high_key: True}
+                    with self.subTest(lower=lower, higher=higher, selected=high_key):
+                        settings = merge_runtime_settings(**layers)
+                        self.assertEqual(settings, {"backend": "auto", high_key: True})
+                        self.assertEqual(runtime_args_from_settings(settings), [flag])
+
+    def test_io_conflicts_are_rejected_within_each_layer(self) -> None:
+        conflicting = {"mmap_experts": True, "buffered_expert_io": True}
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            runtime_args_from_settings(conflicting)
+        for source in ("user", "profile", "session", "cli"):
+            layers = {"cli": {}, "session": None, "profile": None, "user": None}
+            layers[source] = conflicting
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                merge_runtime_settings(**layers)
+
+    def test_explicit_false_io_preference_selects_auto_and_none_inherits(self) -> None:
+        for key in ("mmap_experts", "buffered_expert_io"):
+            inherited = merge_runtime_settings(
+                cli={key: None}, session=None, profile=None, user={key: True}
+            )
+            self.assertEqual(inherited[key], True)
+            automatic = merge_runtime_settings(
+                cli={key: False}, session=None, profile=None, user={key: True}
+            )
+            self.assertEqual(automatic, {"backend": "auto", key: False})
+            self.assertEqual(runtime_args_from_settings(automatic), [])
+
+    def test_restored_io_choice_reaches_worker_as_one_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = merge_runtime_settings(
+                cli={"mmap_experts": True}, session=None, profile=None,
+                user={"buffered_expert_io": True, "direct_expert_io": True}
+            )
+            process = SimpleNamespace(
+                stdin=io.StringIO(), stdout=io.StringIO('{"event":"ready"}\n'), poll=lambda: 0
+            )
+            worker, model = Path(sys.executable).resolve(), Path(directory).resolve()
+            with patch("ncnn_moe_protocol.subprocess.Popen", return_value=process) as popen:
+                client = WorkerClient(worker, model, runtime_args_from_settings(settings))
+            try:
+                self.assertEqual(popen.call_args.args[0], [str(worker), str(model), "--mmap-experts"])
+            finally:
+                client.close()
+
+    def test_automatic_host_release_and_speculation_have_no_cli_switch(self) -> None:
+        for command in ("run", "chat", "inspect", "tune"):
+            arguments = parse_arguments([command])
+            self.assertFalse(hasattr(arguments, "release_vulkan_dense_host"))
+            self.assertFalse(hasattr(arguments, "no_speculative"))
+            for flag in ("--release-vulkan-dense-host", "--no-speculative"):
+                with self.subTest(command=command, flag=flag), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        parse_arguments([command, flag])
+                    self.assertEqual(error.exception.code, 2)
+
+    def test_removed_policy_settings_are_ignored_on_restore(self) -> None:
+        for enabled in (True, False):
+            obsolete = {"release_vulkan_dense_host": enabled, "no_speculative": enabled}
+            self.assertEqual(runtime_args_from_settings(obsolete), [])
+            for source in ("user", "profile", "session", "cli"):
+                layers = {"cli": {}, "session": None, "profile": None, "user": None}
+                layers[source] = {**obsolete, "backend": "hybrid"}
+                with self.subTest(enabled=enabled, source=source):
+                    settings = merge_runtime_settings(**layers)
+                    self.assertEqual(settings, {"backend": "hybrid"})
+                    self.assertEqual(runtime_args_from_settings(settings), ["--hybrid"])
+                    client = ProtocolTests.QueuedClient([{"event": "session_created"}, {"event": "done"}])
+                    client.create_session("restored")
+                    client.generate("restored", [0])
+                    self.assertTrue(client.sent[0]["enable_speculative_context"])
+                    self.assertTrue(client.sent[1]["enable_speculative"])
+
     def test_removed_concurrent_command_flags_are_rejected(self) -> None:
         for command in ("run", "chat", "inspect", "tune"):
             with self.subTest(command=command):
@@ -266,6 +412,138 @@ class RuntimeOptionsTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_model_weight_files_preserves_split_filename_casing(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-gguf-case-") as directory:
+            source = Path(directory) / "Model-00002-OF-00003.GGUF"
+            exact_names = {
+                "Model-00001-OF-00003.GGUF",
+                "Model-00002-OF-00003.GGUF",
+                "Model-00003-OF-00003.GGUF",
+            }
+            with patch.object(Path, "is_file", lambda path: path.name in exact_names):
+                self.assertEqual(
+                    [path.name for path in model_weight_files(source)],
+                    sorted(exact_names),
+                )
+
+    def test_all_gguf_families_use_authoritative_worker_profile(self) -> None:
+        cases = (*FAMILY_CASES, ("qwen3_5", "qwen3.6", [248046, 248044]),
+                 ("qwen35", "qwen3.6", [248046, 248044]),
+                 ("qwen35moe", "qwen3.6", [248046, 248044]),
+                 ("qwen4exp", "qwen3.8", [248046, 248044]),
+                 ("deepseek4", "deepseek-v4", [1]))
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-gguf-families-") as directory:
+            root = Path(directory)
+            for model_type, name, stops in cases:
+                with self.subTest(model_type=model_type):
+                    source = _gguf(root / model_type / "model.gguf")
+                    ready = _ready(stops)
+                    ready["model"].update(model_type=model_type)
+                    self.assertEqual(load_adapter(_arguments(), source, ready).name, name)
+                    # A stale config must not override the archive's selected
+                    # family after the native loader identified it.
+                    (source.parent / "config.json").write_text(
+                        json.dumps({"model_type": "unrelated_architecture", "max_position_embeddings": 2048}), encoding="utf-8")
+                    adapter = load_adapter(_arguments(), source, ready)
+                    self.assertEqual(adapter.name, name)
+                    self.assertEqual(adapter.stop_tokens, stops)
+                    self.assertEqual(adapter.context_limit, 4096)
+
+    def test_gguf_directory_and_split_file_use_worker_model_metadata(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-gguf-") as directory:
+            root = Path(directory)
+            first = _gguf(root / "weights" / "model-00001-of-00002.gguf", "first")
+            second = _gguf(first.with_name("model-00002-of-00002.gguf"), "second")
+            package = first.parent
+            # Selecting a shard must use the same package identity as its
+            # directory, without inheriting an unrelated parent configuration.
+            (root / "config.json").write_text(json.dumps({"model_type": "unrelated_architecture"}), encoding="utf-8")
+            ready = _ready([1])
+            ready["model"].update(model_type="deepseek_v4", max_context_tokens=1048576)
+            for source in (package, first, second):
+                with self.subTest(source=source):
+                    adapter = load_adapter(_arguments(), source, ready)
+                    self.assertEqual(adapter.model_type, "deepseek_v4")
+                    self.assertEqual(adapter.context_limit, 1048576)
+                    self.assertEqual(adapter.stop_tokens, [1])
+                    self.assertEqual(adapter.legacy_model_fingerprints, ())
+                    self.assertEqual(resolve_model(SimpleNamespace(model_opt=str(source))), source.resolve())
+                    self.assertEqual(len(lightweight_model_fingerprint(source)), 20)
+            before = load_adapter(_arguments(), second, ready).model_fingerprint
+            self.assertEqual(load_adapter(_arguments(), package, ready).model_fingerprint, before)
+            self.assertEqual(lightweight_model_fingerprint(package), lightweight_model_fingerprint(second))
+            _gguf(first, "FIRST")
+            self.assertNotEqual(load_adapter(_arguments(), second, ready).model_fingerprint, before)
+            first.unlink()
+            with self.assertRaisesRegex(AdapterError, "incomplete"):
+                load_adapter(_arguments(), second, ready)
+
+    def test_model_directory_does_not_discover_child_packages(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-current-directory-") as directory:
+            root = Path(directory)
+            _gguf(root / "gguf-child" / "model.gguf")
+            child = _model(root / "hf-child", "deepseek_v4")
+            (child / "model.safetensors").write_bytes(b"child HF weights")
+            self.assertEqual(model_weight_files(root), [])
+            with self.assertRaisesRegex(ValueError, "no model files found directly.*Subdirectories are not searched"):
+                resolve_model(SimpleNamespace(model_opt=str(root)))
+            self.assertEqual(resolve_model(SimpleNamespace(model_opt=str(child))), child.resolve())
+            self.assertEqual(resolve_model(SimpleNamespace(model_opt=str(root / "gguf-child"))),
+                             (root / "gguf-child").resolve())
+            with self.assertRaisesRegex(AdapterError, "config.json is missing"):
+                create_adapter(root)
+            # Python must not fingerprint a different model merely because
+            # a native worker profile or an empty parent directory was passed.
+            ready = _ready([1])
+            ready["model"].update(model_type="deepseek_v4")
+            with self.assertRaisesRegex(AdapterError, "config.json is missing"):
+                load_adapter(_arguments(), root, ready)
+
+    def test_gguf_directory_fingerprint_ignores_child_packages(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-gguf-current-directory-") as directory:
+            root = Path(directory)
+            selected = _gguf(root / "model.gguf", "selected")
+            ready = _ready([1])
+            ready["model"].update(model_type="deepseek_v4")
+            before = load_adapter(_arguments(), root, ready).model_fingerprint
+            lightweight = lightweight_model_fingerprint(root)
+            unrelated = _gguf(root / "nested" / "model.gguf", "unrelated")
+            (unrelated.parent / "model.safetensors").write_bytes(b"unrelated HF weights")
+            self.assertEqual(model_weight_files(root), [selected])
+            self.assertEqual(load_adapter(_arguments(), root, ready).model_fingerprint, before)
+            self.assertEqual(load_adapter(_arguments(), selected, ready).model_fingerprint, before)
+            self.assertEqual(lightweight_model_fingerprint(root), lightweight)
+            _gguf(unrelated, "different child metadata")
+            self.assertEqual(load_adapter(_arguments(), root, ready).model_fingerprint, before)
+            self.assertEqual(lightweight_model_fingerprint(root), lightweight)
+
+    def test_gguf_fingerprint_includes_metadata_between_weight_samples(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-gguf-metadata-") as directory:
+            path = _gguf(Path(directory) / "model.gguf", "a" * 16000)
+            ready = _ready([1])
+            ready["model"].update(model_type="deepseek_v4")
+            before = load_adapter(_arguments(), path, ready).model_fingerprint
+            data = bytearray(path.read_bytes())
+            data[8000] = ord("b")
+            path.write_bytes(data)
+            self.assertNotEqual(load_adapter(_arguments(), path, ready).model_fingerprint, before)
+            path.write_bytes(b"GGUF")
+            with self.assertRaisesRegex(AdapterError, "truncated"):
+                load_adapter(_arguments(), path, ready)
+
+    def test_hf_directory_keeps_safetensors_precedence_over_gguf(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-hf-gguf-") as directory:
+            model = _model(Path(directory), "deepseek_v4")
+            (model / "model.safetensors").write_bytes(b"existing HF weights")
+            original = create_adapter(model).model_fingerprint
+            lightweight = lightweight_model_fingerprint(model)
+            (model / "unrelated.gguf").write_bytes(b"not a loaded GGUF package")
+            child = _gguf(model / "nested" / "model.gguf")
+            (child.parent / "model.safetensors").write_bytes(b"unrelated child HF weights")
+            self.assertEqual(model_weight_files(model), [model / "model.safetensors"])
+            self.assertEqual(create_adapter(model).model_fingerprint, original)
+            self.assertEqual(lightweight_model_fingerprint(model), lightweight)
+
     def test_four_model_families_need_no_python_tokenizer_packages(self) -> None:
         original_import = __import__
 
@@ -373,6 +651,17 @@ class AdapterTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_worker_accepts_a_gguf_file_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-gguf-client-") as directory:
+            model = _gguf(Path(directory) / "model.gguf")
+            process = SimpleNamespace(stdin=io.StringIO(), stdout=io.StringIO('{"event":"ready"}\n'), poll=lambda: 0)
+            with patch("ncnn_moe_protocol.subprocess.Popen", return_value=process) as popen:
+                client = WorkerClient(Path(sys.executable), model)
+            try:
+                self.assertEqual(popen.call_args.args[0][:2], [str(Path(sys.executable).resolve()), str(model.resolve())])
+            finally:
+                client.close()
+
     class QueuedClient(WorkerClient):
         def __init__(self, events: list[dict[str, object]], *, interrupt: bool = False) -> None:
             self.events = list(events)
@@ -391,6 +680,15 @@ class ProtocolTests(unittest.TestCase):
     @staticmethod
     def _failing_callback(_: dict[str, object]) -> None:
         raise RuntimeError("callback failed")
+
+    def test_protocol_defaults_to_speculation_and_retains_internal_control(self) -> None:
+        for overrides, enabled in (({}, True), ({"enable_speculative": False}, False)):
+            client = self.QueuedClient([{"event": "session_created"}, {"event": "done"}])
+            session_options = {} if enabled else {"enable_speculative_context": False}
+            client.create_session("auto", **session_options)
+            client.generate("auto", [0], **overrides)
+            self.assertEqual(client.sent[0]["enable_speculative_context"], enabled)
+            self.assertEqual(client.sent[1]["enable_speculative"], enabled)
 
     def test_console_codec_and_redirected_input_are_frontend_owned(self) -> None:
         text = "中文 café 😀"
@@ -522,6 +820,45 @@ class ProtocolTests(unittest.TestCase):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_reference_io_defaults_and_retained_modes_match_runner_contract(self) -> None:
+        automatic = benchmark_runtime.parse_arguments(["runner", "model"])
+        self.assertFalse(hasattr(automatic, "direct_expert_io"))
+        command = benchmark_runtime.runner_command(automatic)
+        for flag in ("--direct-expert-io", "--mmap-experts", "--buffered-expert-io"):
+            self.assertNotIn(flag, command)
+        for flag in ("--mmap-experts", "--buffered-expert-io"):
+            selected = benchmark_runtime.parse_arguments(["runner", "model", flag])
+            benchmark_runtime.validate_arguments(selected)
+            self.assertIn(flag, benchmark_runtime.runner_command(selected))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            benchmark_runtime.parse_arguments(["runner", "model", "--direct-expert-io"])
+        self.assertEqual(error.exception.code, 2)
+        conflicting = benchmark_runtime.parse_arguments(
+            ["runner", "model", "--mmap-experts", "--buffered-expert-io"]
+        )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            benchmark_runtime.validate_arguments(conflicting)
+
+    def test_reference_matrix_uses_default_auto_without_removed_direct_flag(self) -> None:
+        for family in ("gpt-oss", *benchmark_reference_matrix.DEEPSEEK_FAMILIES):
+            argv = ["benchmark_reference_matrix", family, "--runner", "runner", "--output-dir", "out"]
+            argv += ["--model-20b", "20b", "--model-120b", "120b"] if family == "gpt-oss" else ["--model", "model"]
+            with self.subTest(family=family), patch.object(sys, "argv", argv):
+                arguments = benchmark_reference_matrix.parse_arguments()
+                cases = benchmark_reference_matrix.gpt_oss_cases(arguments) if family == "gpt-oss" else benchmark_reference_matrix.deepseek_cases(arguments)
+                self.assertTrue(cases)
+                for case in cases:
+                    for flag in ("--direct-expert-io", "--mmap-experts", "--buffered-expert-io"):
+                        self.assertNotIn(flag, case["extra"])
+
+    def test_reference_benchmark_retains_target_control_without_host_release_flag(self) -> None:
+        arguments = benchmark_runtime.parse_arguments(["runner", "model", "--no-speculative"])
+        self.assertFalse(hasattr(arguments, "release_vulkan_dense_host"))
+        self.assertIn("--no-speculative", benchmark_runtime.runner_command(arguments))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            benchmark_runtime.parse_arguments(["runner", "model", "--release-vulkan-dense-host"])
+        self.assertEqual(error.exception.code, 2)
+
     def test_benchmarks_preserve_generation_and_basic_metrics(self) -> None:
         event = {
             "prompt_tok_per_second": 2.0,
@@ -923,6 +1260,30 @@ class ConversationTests(unittest.TestCase):
             "[reasoning]\nreason\ufffd\n[answer]\n  answer\ufffd \t\n",
         )
 
+    def test_streamed_harmony_reasoning_is_not_reprinted_when_generation_stops_early(self) -> None:
+        truncated_reasoning = [
+            (200006, "<|start|>"),
+            (300001, "assistant"),
+            (200005, "<|channel|>"),
+            (300002, "analysis"),
+            (200008, "<|message|>"),
+            (300003, "Let's"),
+            (300004, " consider"),
+        ]
+
+        for stream, final_only, show_reasoning in ((True, False, True), (False, False, True),
+                                                   (True, True, True), (True, False, False)):
+            with self.subTest(stream=stream, final_only=final_only, show_reasoning=show_reasoning):
+                app, _, _ = self._app(
+                    "gpt_oss",
+                    response=truncated_reasoning,
+                    arguments=_arguments(stream=stream, stream_final_only=final_only, show_reasoning=show_reasoning),
+                )
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(app.chat(io.StringIO("question\n/exit\n")), 0)
+                self.assertEqual(output.getvalue(), "[reasoning]\nLet's consider\n" if show_reasoning and not final_only else "")
+
     def test_only_matching_legacy_fingerprints_migrate(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ncnn-moe-legacy-check-") as directory:
             root = Path(directory)
@@ -1051,12 +1412,10 @@ def main() -> int:
     parser.add_argument("--auto", action="store_true")
     arguments = parser.parse_args()
 
-    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
-    if not result.wasSuccessful():
-        return 1
     if arguments.worker is None and arguments.model is None:
-        return 0
+        suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        return 0 if result.wasSuccessful() else 1
     if arguments.worker is None or arguments.model is None:
         parser.error("--worker and --model must be provided together")
     _runtime_smoke(arguments.worker, arguments.model, auto=arguments.auto)

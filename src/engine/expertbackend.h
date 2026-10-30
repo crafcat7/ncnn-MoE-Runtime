@@ -12,11 +12,9 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace ncnn {
@@ -36,7 +34,7 @@ struct ExpertKeyHash
     }
 };
 
-enum class ExpertBackendExecutionResult
+enum class ExpertStatus : uint8_t
 {
     NotResident,
     Executed,
@@ -50,6 +48,8 @@ inline constexpr size_t vulkan_expert_gpu_admission_min_rows = 2;
 
 inline constexpr size_t vulkan_expert_gpu_victim_min_rows = 32;
 
+// Physical residency and execution counters for the shared FFN cache.
+// Dense FFNs contribute here without creating Expert routes or assignments.
 struct ExpertBackendStatistics
 {
     uint64_t hits = 0;
@@ -77,7 +77,7 @@ struct ExpertBackendStatistics
     uint64_t route_aggregation_bytes_saved = 0;
 };
 
-struct ExpertBackendRequest
+struct ExpertRequest
 {
     struct RouteAggregation
     {
@@ -141,6 +141,9 @@ struct ExpertDemandRequest
     uint32_t residency_group = 0;
     float activation_limit = 0.0f;
     ExpertActivation activation = ExpertActivation::GptOssSwiGlu;
+    // When present, gate_up names the independent gate projection.
+    std::shared_ptr<const TensorData> up;
+    const TensorData* up_bias = nullptr;
 };
 
 class ExpertDemandSubmission
@@ -167,15 +170,15 @@ public:
     // The reservation span has exactly one entry per request and remains
     // stable until wait() returns. It is only a scheduling decision: backend
     // output is private to the submission until commit() succeeds.
-    [[nodiscard]] virtual std::span<const ExpertBackendExecutionResult> reservations() const noexcept = 0;
+    [[nodiscard]] virtual std::span<const ExpertStatus> reservations() const noexcept = 0;
 
     // wait() returns exactly one final result per reservation. A final
     // Executed result is valid only for a request reserved as Executed.
-    [[nodiscard]] virtual std::vector<ExpertBackendExecutionResult> wait() = 0;
+    [[nodiscard]] virtual std::vector<ExpertStatus> wait() = 0;
 
     // Replace the caller's result array. Backends can preserve its capacity;
     // the default keeps existing by-value implementations compatible.
-    virtual void wait(std::vector<ExpertBackendExecutionResult>& results)
+    virtual void wait(std::vector<ExpertStatus>& results)
     {
         results = wait();
     }
@@ -195,37 +198,15 @@ public:
     virtual ~ExpertBackend() = default;
 
     // Weight ownership is retained until asynchronous admission completes.
-    virtual void admit(std::string key,
-                       std::shared_ptr<const TensorData> gate_up,
-                       const TensorData* gate_up_bias,
-                       std::shared_ptr<const TensorData> down,
-                       const TensorData* down_bias,
-                       uint32_t residency_group,
-                       float activation_limit,
-                       ExpertActivation activation = ExpertActivation::GptOssSwiGlu)
-        = 0;
+    virtual void admit(const ExpertDemandRequest& request) = 0;
 
     // Complete a bounded current-wave upload. On success, pin keeps the
     // resident pair alive until submit_batch captures its selected entries.
     // Unsupported or exhausted backends leave pin empty for CPU fallback.
-    [[nodiscard]] virtual bool prepare_demand(std::string key,
-                                              std::shared_ptr<const TensorData> gate_up,
-                                              const TensorData* gate_up_bias,
-                                              std::shared_ptr<const TensorData> down,
-                                              const TensorData* down_bias,
-                                              uint32_t residency_group,
-                                              float activation_limit,
-                                              ExpertActivation activation,
+    [[nodiscard]] virtual bool prepare_demand(const ExpertDemandRequest& request,
                                               std::shared_ptr<const void>& pin)
     {
-        (void)key;
-        (void)gate_up;
-        (void)gate_up_bias;
-        (void)down;
-        (void)down_bias;
-        (void)residency_group;
-        (void)activation_limit;
-        (void)activation;
+        (void)request;
         pin.reset();
         return false;
     }
@@ -247,7 +228,7 @@ public:
         (void)coordinator;
     }
 
-    [[nodiscard]] virtual std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) = 0;
+    [[nodiscard]] virtual std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertRequest> requests) = 0;
 
     // Suspend background device-weight admission while the foreground
     // executor owns the Vulkan submission path. The cache may continue to
@@ -260,82 +241,6 @@ public:
     virtual void wait_for_background_work() = 0;
 
     [[nodiscard]] virtual ExpertBackendStatistics statistics() const = 0;
-};
-
-class MultiDeviceExpertBackend final : public ExpertBackend
-{
-public:
-    MultiDeviceExpertBackend(std::vector<std::shared_ptr<ExpertBackend>> _backends, std::vector<uint32_t> device_indices, std::vector<uint32_t> _residency_group_devices, bool _key_sharded);
-
-    void admit(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
-               float activation_limit, ExpertActivation activation) override;
-
-    bool prepare_demand(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias,
-                        std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
-                        float activation_limit, ExpertActivation activation, std::shared_ptr<const void>& pin) override;
-
-    size_t prepare_demand_batch(std::span<const ExpertDemandRequest> requests,
-                                std::span<std::shared_ptr<const void>> pins) override;
-
-    std::unique_ptr<ExpertDemandSubmission> begin_demand_batch(std::span<const ExpertDemandRequest> requests) override;
-
-    void set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator) override;
-
-    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) override;
-
-    void set_foreground_active(bool active) noexcept override;
-
-    void wait_for_background_work() override;
-
-    ExpertBackendStatistics statistics() const override;
-
-private:
-    struct ChildSubmission
-    {
-        std::vector<size_t> request_indices;
-        std::vector<ExpertBackendRequest> requests;
-        std::unique_ptr<ExpertSubmission> submission;
-        bool reservation_shape_valid = true;
-    };
-
-    class Submission final : public ExpertSubmission
-    {
-    public:
-        Submission(MultiDeviceExpertBackend* owner, std::span<const ExpertBackendRequest> requests, std::vector<std::vector<size_t>> request_indices);
-
-        ~Submission() override;
-
-        std::span<const ExpertBackendExecutionResult> reservations() const noexcept override;
-
-        std::vector<ExpertBackendExecutionResult> wait() override;
-
-        void wait(std::vector<ExpertBackendExecutionResult>& results) override;
-
-        bool commit() override;
-
-        void abort() noexcept override;
-
-    private:
-        std::vector<ExpertBackendRequest> client_requests;
-        std::vector<ActivationBuffer> private_outputs;
-        std::vector<ChildSubmission> children;
-        std::vector<ExpertBackendExecutionResult> planned;
-        std::vector<ExpertBackendExecutionResult> final;
-        bool waited = false;
-        bool committed = false;
-        bool aborted = false;
-    };
-
-    size_t backend_for_group(uint32_t residency_group) const;
-
-    size_t fallback_backend(std::string_view key) const;
-
-    std::vector<std::shared_ptr<ExpertBackend>> backends;
-    std::vector<uint32_t> residency_group_devices;
-    std::unordered_map<uint32_t, size_t> device_to_backend;
-    mutable std::mutex placement_mutex;
-    std::unordered_map<std::string, size_t, ExpertKeyHash, std::equal_to<>> key_placements;
-    bool key_sharded = false;
 };
 
 class ScopedExpertBackendForeground

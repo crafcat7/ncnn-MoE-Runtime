@@ -62,6 +62,12 @@ CPU weight repacking is opt-in. Pass
 When the option is absent, the worker keeps repacking off and does not reserve
 an in-memory packed layout.
 
+Hybrid loading automatically releases eligible dense host weight copies after
+resident Vulkan operators own them. On-demand Expert caches can use the recovered
+RAM; weights required by CPU paths remain available.
+Normal generation automatically uses a model-provided speculative plan when
+supported. These policies do not require separate CLI switches.
+
 The CLI is the interactive text entry point; C++ consumers can use
 `Model::encode`, `Model::decode`, and `Model::stop_tokens`. The four
 model-named native executables (`ncnn_moe_gpt_oss`,

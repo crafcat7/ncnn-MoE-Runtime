@@ -104,6 +104,48 @@ static TensorData latent_bfloat16_weight(uint32_t rows, uint32_t columns, uint32
     return result;
 }
 
+static TensorData latent_q8_weight(uint32_t rows, uint32_t columns, uint32_t seed, float scale)
+{
+    TensorData result;
+    result.dtype = DType::Q8_0;
+    result.shape = {rows, columns};
+    result.quantized_data.resize(static_cast<size_t>(rows) * (columns / 32) * 34);
+    const uint16_t half = static_cast<uint16_t>((std::ilogb(scale) - 4 + 15) << 10);
+    for (uint32_t row = 0; row < rows; ++row)
+        for (uint32_t block = 0; block < columns / 32; ++block)
+        {
+            uint8_t* data = result.quantized_data.data() + (static_cast<size_t>(row) * (columns / 32) + block) * 34;
+            data[0] = static_cast<uint8_t>(half);
+            data[1] = static_cast<uint8_t>(half >> 8);
+            for (uint32_t lane = 0; lane < 32; ++lane)
+                data[2 + lane] = static_cast<uint8_t>(static_cast<int8_t>(static_cast<int>((row * 17 + (block * 32 + lane) * 13 + seed * 11) % 31) - 15));
+        }
+    return result;
+}
+
+static TensorData latent_projection_weight(uint32_t rows, uint32_t columns, uint32_t seed, float scale, bool bfloat16, bool q8_0 = false)
+{
+    if (q8_0)
+        return latent_q8_weight(rows, columns, seed, scale);
+    TensorData result = latent_fp8_weight(rows, columns, seed, scale);
+    if (!bfloat16)
+        return result;
+    TensorData expanded;
+    expanded.dtype = DType::BFloat16;
+    expanded.shape = result.shape;
+    expanded.bfloat16_data.resize(static_cast<size_t>(rows) * columns);
+    const uint32_t column_blocks = (columns + 127) / 128;
+    for (uint32_t row = 0; row < rows; ++row)
+        for (uint32_t column = 0; column < columns; ++column)
+        {
+            const size_t index = static_cast<size_t>(row) * columns + column;
+            const float value = float8_e4m3_to_float(result.float8_values()[index])
+                                * result.quantization_scales[static_cast<size_t>(row / 128) * column_blocks + column / 128];
+            expanded.bfloat16_data[index] = float_to_bfloat16(value);
+        }
+    return expanded;
+}
+
 static AttentionBlockPlan latent_test_plan(uint32_t compression_ratio)
 {
     AttentionBlockPlan plan;
@@ -566,7 +608,7 @@ static void latent_check_cache_values(const std::vector<float>& actual,
 }
 #endif
 
-static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
+static void latent_test_end_to_end(uint32_t ratio, bool record_path = false, bool bfloat16 = false, bool q8_0 = false)
 {
     const uint64_t flags = static_cast<uint64_t>(OptimizationVulkanAttention)
                            | static_cast<uint64_t>(OptimizationVulkanLatentInputRmsNorm)
@@ -574,46 +616,61 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
     WeightStore weights;
     AttentionBlockPlan plan = latent_test_plan(ratio);
     plan.pre_attention_norm_weight = latent_add_weight(weights, latent_float_weight({128}, 1.0f));
-    plan.query_a_weight = latent_add_weight(weights, latent_fp8_weight(128, 128, 1, 0.25f));
+    plan.query_a_weight = latent_add_weight(weights, latent_projection_weight(128, 128, 1, 0.25f, bfloat16, q8_0));
     plan.query_norm_weight = latent_add_weight(weights, latent_float_weight({128}, 1.0f));
-    plan.query_b_weight = latent_add_weight(weights, latent_fp8_weight(2048, 128, 5, 0.125f));
-    plan.key_value_weight = latent_add_weight(weights, latent_fp8_weight(512, 128, 7, 0.125f));
+    plan.query_b_weight = latent_add_weight(weights, latent_projection_weight(2048, 128, 5, 0.125f, bfloat16, q8_0));
+    plan.key_value_weight = latent_add_weight(weights, latent_projection_weight(512, 128, 7, 0.125f, bfloat16, q8_0));
     plan.key_value_norm_weight = latent_add_weight(weights, latent_float_weight({512}, 1.0f));
     TensorData sinks = latent_float_weight({4}, 0.0f);
     sinks.float32_data = {-1.5f, 0.0f, 3.0f, 12.0f};
     plan.sinks = latent_add_weight(weights, std::move(sinks));
-    plan.output_a_weight = latent_add_weight(weights, latent_fp8_weight(128, 1024, 3, 0.03125f));
-    plan.output_b_weight = latent_add_weight(weights, latent_fp8_weight(128, 128, 11, 0.125f));
+    plan.output_a_weight = latent_add_weight(weights, latent_projection_weight(128, 1024, 3, 0.03125f, bfloat16, q8_0));
+    plan.output_b_weight = latent_add_weight(weights, latent_projection_weight(128, 128, 11, 0.125f, bfloat16, q8_0));
     if (ratio != 0)
     {
         const uint32_t multiplier = ratio == 4 ? 2 : 1;
-        plan.compressor_key_value_weight = latent_add_weight(weights, latent_bfloat16_weight(multiplier * 512, 128, 13));
-        plan.compressor_gate_weight = latent_add_weight(weights, latent_bfloat16_weight(multiplier * 512, 128, 17));
+        plan.compressor_key_value_weight = latent_add_weight(weights, (q8_0 ? latent_q8_weight(multiplier * 512, 128, 13, 0.125f) : latent_bfloat16_weight(multiplier * 512, 128, 13)));
+        plan.compressor_gate_weight = latent_add_weight(weights, (q8_0 ? latent_q8_weight(multiplier * 512, 128, 17, 0.125f) : latent_bfloat16_weight(multiplier * 512, 128, 17)));
         plan.compressor_position = latent_add_weight(weights, latent_float_weight({ratio, multiplier * 512}, 0.0f));
         plan.compressor_norm_weight = latent_add_weight(weights, latent_float_weight({512}, 1.0f));
         if (ratio == 4)
         {
-            plan.indexer_compressor_key_value_weight = latent_add_weight(weights, latent_bfloat16_weight(256, 128, 19));
-            plan.indexer_compressor_gate_weight = latent_add_weight(weights, latent_bfloat16_weight(256, 128, 23));
+            plan.indexer_compressor_key_value_weight = latent_add_weight(weights, (q8_0 ? latent_q8_weight(256, 128, 19, 0.125f) : latent_bfloat16_weight(256, 128, 19)));
+            plan.indexer_compressor_gate_weight = latent_add_weight(weights, (q8_0 ? latent_q8_weight(256, 128, 23, 0.125f) : latent_bfloat16_weight(256, 128, 23)));
             plan.indexer_compressor_position = latent_add_weight(weights, latent_float_weight({ratio, 256}, 0.0f));
             plan.indexer_compressor_norm_weight = latent_add_weight(weights, latent_float_weight({128}, 1.0f));
-            plan.indexer_query_weight = latent_add_weight(weights, latent_bfloat16_weight(256, 128, 29));
-            plan.indexer_weights_weight = latent_add_weight(weights, latent_bfloat16_weight(2, 128, 31));
+            plan.indexer_query_weight = latent_add_weight(weights, (q8_0 ? latent_q8_weight(256, 128, 29, 0.125f) : latent_bfloat16_weight(256, 128, 29)));
+            plan.indexer_weights_weight = latent_add_weight(weights, (q8_0 ? latent_q8_weight(2, 128, 31, 0.125f) : latent_bfloat16_weight(2, 128, 31)));
         }
     }
     CompiledOperatorTable operators;
     operators.bind_weight_count(weights.size());
     const VulkanRuntimePtr runtime = create_vulkan_runtime();
-    const std::array<TensorHandle, 5> fp8_handles = {plan.query_a_weight, plan.query_b_weight, plan.key_value_weight, plan.output_a_weight, plan.output_b_weight};
-    for (TensorHandle handle : fp8_handles)
+    const std::array<TensorHandle, 5> projection_handles = {plan.query_a_weight, plan.query_b_weight, plan.key_value_weight, plan.output_a_weight, plan.output_b_weight};
+    for (TensorHandle handle : projection_handles)
     {
         const uint32_t groups = handle == plan.output_a_weight ? plan.output_group_count : 1;
-        operators.at_weight_mutable(handle).float8 = Float8Linear_vulkan::create(weights.at(handle), nullptr, groups, get_default_gpu_index(), runtime, flags);
-        latent_check(static_cast<bool>(operators.at_weight(handle).float8), "compile FP8 MLA projection");
+        CompiledOperator& op = operators.at_weight_mutable(handle);
+        if (q8_0 || (bfloat16 && groups > 1))
+            op.qnk = QnkLinear_vulkan::create(weights.at(handle), nullptr, get_default_gpu_index(), runtime, flags, groups);
+        else if (bfloat16)
+            op.bfloat16 = Bfloat16Linear_vulkan::create(weights.at(handle), nullptr, get_default_gpu_index(), runtime, flags);
+        else
+            op.float8 = Float8Linear_vulkan::create(weights.at(handle), nullptr, groups, get_default_gpu_index(), runtime, flags);
+        latent_check(op.float8 || op.bfloat16 || op.qnk, "compile MLA projection");
     }
-    latent_check(operators.at_weight(plan.query_a_weight).float8->prepare_rms_norm(weights.at(plan.query_norm_weight), plan.norm_epsilon), "prepare query rank normalization");
-    latent_check(operators.at_weight(plan.query_a_weight).float8->prepare_input_rms_norm(weights.at(plan.pre_attention_norm_weight), plan.norm_epsilon), "prepare GPU input normalization");
-    operators.at_weight_mutable(plan.query_a_weight).latent_attention = LatentAttention_vulkan::create(plan, weights.at(plan.sinks), operators.at_weight(plan.output_a_weight).float8, operators.at_weight(plan.output_b_weight).float8);
+    const CompiledOperator& query_a = operators.at_weight(plan.query_a_weight);
+    if (bfloat16)
+    {
+        latent_check(query_a.bfloat16->prepare_output_rms_norm(weights.at(plan.query_norm_weight), plan.norm_epsilon), "prepare BF16 query rank normalization");
+        latent_check(query_a.bfloat16->prepare_input_rms_norm(weights.at(plan.pre_attention_norm_weight), plan.norm_epsilon), "prepare BF16 GPU input normalization");
+    }
+    else if (!q8_0)
+    {
+        latent_check(query_a.float8->prepare_rms_norm(weights.at(plan.query_norm_weight), plan.norm_epsilon), "prepare query rank normalization");
+        latent_check(query_a.float8->prepare_input_rms_norm(weights.at(plan.pre_attention_norm_weight), plan.norm_epsilon), "prepare GPU input normalization");
+    }
+    operators.at_weight_mutable(plan.query_a_weight).latent_attention = LatentAttention_vulkan::create(plan, weights.at(plan.sinks), operators.at_weight(plan.output_a_weight), operators.at_weight(plan.output_b_weight));
     latent_check(static_cast<bool>(operators.at_weight(plan.query_a_weight).latent_attention), "compile end-to-end GPU MLA core");
 #if NCNN_MOE_WITH_VULKAN
     if (record_path)
@@ -625,8 +682,12 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
         {
             if (handle == invalid_tensor_handle)
                 continue;
-            operators.at_weight_mutable(handle).bfloat16 = Bfloat16Linear_vulkan::create(weights.at(handle), nullptr, get_default_gpu_index(), runtime, flags);
-            latent_check(static_cast<bool>(operators.at_weight(handle).bfloat16), "compile BF16 compressor/index projection");
+            CompiledOperator& op = operators.at_weight_mutable(handle);
+            if (q8_0)
+                op.qnk = QnkLinear_vulkan::create(weights.at(handle), nullptr, get_default_gpu_index(), runtime, flags);
+            else
+                op.bfloat16 = Bfloat16Linear_vulkan::create(weights.at(handle), nullptr, get_default_gpu_index(), runtime, flags);
+            latent_check(op.bfloat16 || op.qnk, "compile compressor/index projection");
         }
         latent_check(operators.at_weight(plan.query_a_weight).latent_attention->prepare(weights, operators, flags), "prepare continuous GPU MLA segment");
         latent_check(operators.at_weight(plan.query_a_weight).latent_attention->can_record(), "continuous GPU MLA capability");
@@ -634,6 +695,14 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
 #else
     (void)record_path;
 #endif
+    const WeightStore oracle_weights = weights;
+    if (q8_0)
+        for (TensorHandle handle = 0; handle < weights.size(); ++handle)
+            if (weights.at(handle).dtype == DType::Q8_0)
+            {
+                std::vector<uint8_t>().swap(weights.at_mutable(handle).quantized_data);
+                latent_check(weights.at(handle).qnk_values().empty(), "Q8_0 MLA runs after native host storage release");
+            }
     CompiledOperatorTable prior_operators = operators;
     prior_operators.at_weight_mutable(plan.query_a_weight).latent_attention.reset();
 
@@ -652,7 +721,7 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
             return latent_forward_record(operators.at_weight(plan.query_a_weight).latent_attention, input, positions, caches, output);
         }
 #endif
-        return static_cast<bool>(forward_latent_attention(weights, operators, plan, ExecutionBackend::Vulkan, position, cache, gpu_scratch, input, output, flags));
+        return static_cast<bool>(forward_latent_attention(oracle_weights, operators, plan, ExecutionBackend::Vulkan, position, cache, gpu_scratch, input, output, flags));
     };
     const uint64_t count = ratio == 128 ? 129 : 9;
     for (uint64_t position = 0; position < count; ++position)
@@ -663,8 +732,8 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
         ActivationBuffer expected;
         ActivationBuffer actual;
         ActivationBuffer prior_output;
-        latent_check(static_cast<bool>(forward_latent_attention(weights, operators, plan, ExecutionBackend::Cpu, position, cpu_cache, cpu_scratch, input, expected, flags)), "end-to-end CPU MLA forward");
-        latent_check(static_cast<bool>(forward_latent_attention(weights, prior_operators, plan, ExecutionBackend::Vulkan, position, prior_cache, prior_scratch, input, prior_output, flags)), "prior Hybrid MLA CPU-attention path");
+        latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, operators, plan, ExecutionBackend::Cpu, position, cpu_cache, cpu_scratch, input, expected, flags)), "end-to-end CPU MLA forward");
+        latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, plan, ExecutionBackend::Vulkan, position, prior_cache, prior_scratch, input, prior_output, flags)), "prior Hybrid MLA CPU-attention path");
         const VulkanStatistics before = get_vulkan_statistics(runtime);
         latent_check(forward_gpu(position, gpu_cache, input, actual), "end-to-end GPU MLA forward ratio=" + std::to_string(ratio) + " position=" + std::to_string(position));
         const VulkanStatistics after = get_vulkan_statistics(runtime);
@@ -681,7 +750,7 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
             latent_check(after.batch_downloads == before.batch_downloads + 2, "end-to-end downloads only CPU KV projection and final output");
             latent_check(gpu_scratch.query.rows() == 0, "raw query projection stays on GPU");
         }
-        const std::string label = "end-to-end ratio " + std::to_string(ratio) + " position " + std::to_string(position);
+        const std::string label = std::string(q8_0 ? "Q8_0" : (bfloat16 ? "BF16" : "FP8")) + " end-to-end ratio " + std::to_string(ratio) + " position " + std::to_string(position);
 #if NCNN_MOE_WITH_VULKAN
         if (record_path)
         {
@@ -698,10 +767,10 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
             latent_check(cpu_cache.latent_compressed == gpu_cache.latent_compressed, "CPU compressor canonical state parity");
             latent_check(cpu_cache.latent_selected_indices == gpu_cache.latent_selected_indices, "CPU compressed index selection parity");
         }
-        latent_check_output(actual, prior_output, label + " existing Hybrid parity", record_path ? 0.015f : 0.005f, record_path ? 0.015f : 0.005f);
-        // CPU grouped outA uses unquantized activations; Hybrid has always
-        // quantized those activations before the FP8 projection.
-        latent_check_output(actual, expected, label + " CPU parity including existing output quantization", 0.05f, 0.08f);
+        latent_check_output(actual, prior_output, label + " existing Hybrid parity", (bfloat16 || q8_0) ? 0.003f : (record_path ? 0.015f : 0.005f), (bfloat16 || q8_0) ? 0.003f : (record_path ? 0.015f : 0.005f));
+        // BF16 has no FP8 activation quantization and must agree with the
+        // independent CPU attention and grouped projection oracle tightly.
+        latent_check_output(actual, expected, label + " CPU parity including existing output quantization", (bfloat16 || q8_0) ? 0.003f : 0.05f, (bfloat16 || q8_0) ? 0.003f : 0.08f);
     }
 
     const std::vector<float> initial_window = gpu_cache.latent_window;
@@ -726,11 +795,11 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
     ActivationBuffer expected;
     ActivationBuffer actual;
     ActivationBuffer prior_output;
-    latent_check(static_cast<bool>(forward_latent_attention(weights, operators, plan, ExecutionBackend::Cpu, count, cpu_cache, cpu_scratch, branch_input, expected, flags)), "CPU replacement branch after rollback");
-    latent_check(static_cast<bool>(forward_latent_attention(weights, prior_operators, plan, ExecutionBackend::Vulkan, count, prior_cache, prior_scratch, branch_input, prior_output, flags)), "prior Hybrid replacement branch after rollback");
+    latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, operators, plan, ExecutionBackend::Cpu, count, cpu_cache, cpu_scratch, branch_input, expected, flags)), "CPU replacement branch after rollback");
+    latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, plan, ExecutionBackend::Vulkan, count, prior_cache, prior_scratch, branch_input, prior_output, flags)), "prior Hybrid replacement branch after rollback");
     latent_check(forward_gpu(count, gpu_cache, branch_input, actual), "GPU replacement branch after rollback");
-    latent_check_output(actual, prior_output, "GPU MLA replacement branch existing Hybrid parity", record_path ? 0.015f : 0.005f, record_path ? 0.015f : 0.005f);
-    latent_check_output(actual, expected, "GPU MLA replacement branch CPU parity including existing output quantization", 0.05f, 0.08f);
+    latent_check_output(actual, prior_output, "GPU MLA replacement branch existing Hybrid parity", (bfloat16 || q8_0) ? 0.003f : (record_path ? 0.015f : 0.005f), (bfloat16 || q8_0) ? 0.003f : (record_path ? 0.015f : 0.005f));
+    latent_check_output(actual, expected, "GPU MLA replacement branch CPU parity including existing output quantization", (bfloat16 || q8_0) ? 0.003f : 0.05f, (bfloat16 || q8_0) ? 0.003f : 0.08f);
 #if NCNN_MOE_WITH_VULKAN
     if (record_path)
     {
@@ -744,7 +813,7 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
                      "abandoned GPU MLA recorder preserves canonical state");
         latent_check(!gpu_cache.latent_device_state, "abandoned GPU MLA recorder invalidates device state");
         LayerCache reference_branch = prior_cache;
-        latent_check(static_cast<bool>(forward_latent_attention(weights, prior_operators, plan, ExecutionBackend::Vulkan, count + 1, reference_branch, prior_scratch, branch_input, prior_output, flags)), "prior Hybrid after abandoned recorder");
+        latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, plan, ExecutionBackend::Vulkan, count + 1, reference_branch, prior_scratch, branch_input, prior_output, flags)), "prior Hybrid after abandoned recorder");
         latent_check(forward_gpu(count + 1, gpu_cache, branch_input, actual), "GPU MLA reconstructs cache after abandoned recorder");
         latent_check_output(actual, prior_output, "GPU MLA after canceled recorder", 0.015f, 0.015f);
 
@@ -768,7 +837,7 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
             ActivationBuffer row_input(1, 128);
             std::copy_n(prefill_input.row(row), 128, row_input.row(0));
             ActivationBuffer row_output;
-            latent_check(static_cast<bool>(forward_latent_attention(weights, prior_operators, plan, ExecutionBackend::Vulkan, row, prefill_reference, prior_scratch, row_input, row_output, flags)), "prefill CPU canonical oracle");
+            latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, plan, ExecutionBackend::Vulkan, row, prefill_reference, prior_scratch, row_input, row_output, flags)), "prefill CPU canonical oracle");
             std::copy_n(row_output.row(0), 128, prefill_expected.row(row));
         }
         latent_check_output(actual, prefill_expected, "GPU MLA prefill row ordering", 0.02f, 0.02f);
@@ -784,7 +853,7 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
         latent_check(independent.latent_device_state.get() != shared && gpu_cache.latent_device_state.get() == shared,
                      "GPU MLA recording detaches copied cache state");
         latent_check(gpu_cache.latent_token_count == count + 2, "GPU MLA cloned branch preserves original token count");
-        if (ratio == 4)
+        if (ratio == 4 && !q8_0)
         {
             for (uint32_t top_k : {plan.sliding_window * plan.head_dimension, 512u})
             {
@@ -797,8 +866,8 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
                                                                get_default_gpu_index(), runtime, flags);
                 latent_check(static_cast<bool>(index_weights_operator.linear), "compile generic GPU index weight projection");
                 auto alias_core = LatentAttention_vulkan::create(alias_plan, weights.at(plan.sinks),
-                                                                 operators.at_weight(plan.output_a_weight).float8,
-                                                                 operators.at_weight(plan.output_b_weight).float8);
+                                                                 operators.at_weight(plan.output_a_weight),
+                                                                 operators.at_weight(plan.output_b_weight));
                 latent_check(alias_core && alias_core->prepare(weights, alias_operators, flags), "prepare selected-index allocation regression");
                 LayerCache alias_cache;
                 alias_cache.latent_cache = true;
@@ -817,7 +886,7 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
                 LayerCache alias_reference = alias_cache;
                 ActivationBuffer alias_expected;
                 AttentionScratch alias_scratch;
-                latent_check(static_cast<bool>(forward_latent_attention(weights, prior_operators, alias_plan, ExecutionBackend::Vulkan,
+                latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, alias_plan, ExecutionBackend::Vulkan,
                                                                         alias_position, alias_reference, alias_scratch, branch_input, alias_expected, flags)),
                              "selected-index allocation CPU canonical oracle");
                 const std::array<uint64_t, 1> alias_positions = {alias_position};
@@ -837,6 +906,9 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
         }
     }
 #endif
+    const std::weak_ptr<LatentAttention_vulkan> lifetime = operators.at_weight(plan.query_a_weight).latent_attention;
+    operators.at_weight_mutable(plan.query_a_weight).latent_attention.reset();
+    latent_check(lifetime.expired(), "prepared MLA projections must not retain their owning operator");
 }
 
 } // namespace moe
@@ -861,8 +933,23 @@ int main()
         ncnn::moe::latent_test_end_to_end(4);
         ncnn::moe::latent_test_end_to_end(128);
         ncnn::moe::latent_test_end_to_end(0, true);
-        ncnn::moe::latent_test_end_to_end(4, true);
-        ncnn::moe::latent_test_end_to_end(128, true);
+        ncnn::moe::latent_test_end_to_end(0, true, false, true);
+        ncnn::moe::latent_test_end_to_end(4, true, false, true);
+        ncnn::moe::latent_test_end_to_end(128, true, false, true);
+        const auto context = ncnn::moe::VulkanContext::acquire(ncnn::moe::get_default_gpu_index(),
+                                                               ncnn::moe::create_vulkan_runtime(),
+                                                               ncnn::moe::OptimizationDefaultFlags);
+        ncnn::moe::latent_check(static_cast<bool>(context), "create recorded compressor capability context");
+        if (context->device()->info.subgroup_size() == 32)
+        {
+            ncnn::moe::latent_test_end_to_end(0, true, true);
+            ncnn::moe::latent_test_end_to_end(4, true);
+            ncnn::moe::latent_test_end_to_end(128, true);
+            ncnn::moe::latent_test_end_to_end(4, true, true);
+            ncnn::moe::latent_test_end_to_end(128, true, true);
+        }
+        else
+            std::cout << "SKIP: recorded BF16 MLA compressor tests require Vulkan subgroup size 32\n";
         std::cout << "Vulkan MLA tests passed\n";
         return 0;
     }

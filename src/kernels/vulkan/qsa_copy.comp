@@ -1,0 +1,19 @@
+#version 450
+
+layout(binding = 0) readonly buffer source_blob
+{ uint source_data[]; };
+layout(binding = 1) writeonly buffer target_blob
+{ uint target_data[]; };
+layout(push_constant) uniform parameter
+{
+    uint words;
+    uint local_size;
+}
+p;
+
+void main()
+{
+    const uint index = gl_GlobalInvocationID.x + gl_WorkGroupID.z * gl_NumWorkGroups.x * p.local_size;
+    if (index < p.words)
+        target_data[index] = source_data[index];
+}

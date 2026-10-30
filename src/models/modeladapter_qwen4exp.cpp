@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace ncnn {
@@ -265,7 +266,7 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
     auto activation = read_manifest_string(json, "hidden_act", "Qwen4 Exp ");
     if (!activation)
         return activation.error();
-    auto activation_dtype = read_manifest_string(json, "dtype", "Qwen4 Exp ");
+    auto activation_dtype = read_manifest_string(json, find_manifest_member(json, "dtype") ? "dtype" : "torch_dtype", "Qwen4 Exp ");
     if (!activation_dtype)
         return activation_dtype.error();
     auto state_dtype = read_manifest_string(json, "mamba_ssm_dtype", "Qwen4 Exp ");
@@ -284,6 +285,7 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
         return rotary_dimension_result.error();
     const uint32_t rotary_dimension = rotary_dimension_result.value();
     if (hidden_size.value() == 0 || intermediate_size.value() == 0
+        || intermediate_size.value() > std::numeric_limits<uint32_t>::max() / 2
         || layer_count.value() == 0 || expert_count.value() == 0
         || top_k.value() == 0 || top_k.value() > expert_count.value()
         || attention_head_count.value() == 0 || kv_head_count.value() == 0
@@ -303,7 +305,7 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
         || index_budget.value() % index_compression.value() != 0
         || hyper_low_rank.value() == 0
         || rotary_dimension > index_head_dimension.value()
-        || activation.value() != "silu" || activation_dtype.value() != "bfloat16"
+        || activation.value() != "silu" || (activation_dtype.value() != "bfloat16" && activation_dtype.value() != "float16")
         || state_dtype.value() != "float32" || output_gate_type.value() != "sigmoid"
         || attention_bias.value() || hyper_count.value() != 4
         || ple_embedding_dimension.value() != hidden_size.value()
@@ -362,7 +364,7 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
             return parsed_mtp_layer_count.error();
         mtp_layer_count = parsed_mtp_layer_count.value();
     }
-    auto artifact_status = optional_artifact_exists(package.root / mxfp4_artifact_name, "Qwen4 Exp MXFP4 artifact");
+    auto artifact_status = package.weights_path.empty() ? optional_artifact_exists(package.root / mxfp4_artifact_name, "Qwen4 Exp MXFP4 artifact") : Result<bool>(false);
     if (!artifact_status)
         return artifact_status.error();
     const bool artifact_exists = artifact_status.value();
@@ -378,6 +380,99 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
             return artifact_status.error();
     }
     moe.expert_weight_dtype = artifact_exists ? DType::MxFp4 : DType::BFloat16;
+    std::vector<DType> expert_weight_dtypes(layer_count.value(), moe.expert_weight_dtype);
+    std::vector<DType> shared_expert_weight_dtypes(layer_count.value(), moe.shared_expert_weight_dtype);
+    std::vector<ExpertLayout> expert_layouts(layer_count.value(), moe.layout);
+    if (!artifact_exists && !package.root.empty())
+    {
+        std::error_code archive_error;
+        if (std::filesystem::is_directory(package.root, archive_error) && !archive_error)
+        {
+            auto opened = SafetensorsArchive::open(package.weights_path.empty() ? package.root : package.weights_path, package.manifest.raw_json);
+            if (opened)
+            {
+                const SafetensorsArchive& archive = opened.value();
+                for (uint32_t layer_id = 0; layer_id < layer_count.value(); ++layer_id)
+                {
+                    const std::string shared = "model.language_model.layers." + std::to_string(layer_id) + ".mlp.shared_expert.";
+                    for (const char* projection : {"gate_proj.weight", "up_proj.weight", "down_proj.weight"})
+                    {
+                        const std::string name = shared + projection;
+                        if (!archive.contains_tensor(name))
+                            continue;
+                        auto dtype = archive.tensor_dtype(name);
+                        if (!dtype)
+                            return dtype.error();
+                        if (std::string_view(projection) == "gate_proj.weight")
+                            shared_expert_weight_dtypes[layer_id] = dtype.value();
+                    }
+                    const std::string source = "model.language_model.layers." + std::to_string(layer_id) + ".mlp.experts.";
+                    const char* projections[] = {"gate_proj.weight", "up_proj.weight", "down_proj.weight"};
+                    bool separate_experts = false;
+                    for (uint32_t expert_id = 0; expert_id < expert_count.value(); ++expert_id)
+                    {
+                        for (const char* projection : projections)
+                        {
+                            const std::string name = source + std::to_string(expert_id) + "." + projection;
+                            if (archive.contains_tensor(name) || archive.find(name + ".__int4_shape")
+                                || archive.find(name + ".__int4_scales") || archive.find(name + ".__int4_zeros")
+                                || archive.find(name + ".__int4_g_idx") || archive.find(name + ".__qnk_shape"))
+                            {
+                                separate_experts = true;
+                            }
+                        }
+                    }
+                    if (separate_experts)
+                    {
+                        bool first_projection = true;
+                        auto first_dtype = archive.tensor_dtype(source + "0.gate_proj.weight");
+                        if (!first_dtype)
+                            return first_dtype.error();
+                        const bool native_mxfp4 = first_dtype.value() == DType::MxFp4;
+                        for (uint32_t expert_id = 0; expert_id < expert_count.value(); ++expert_id)
+                        {
+                            for (const char* projection : projections)
+                            {
+                                const std::string name = source + std::to_string(expert_id) + "." + projection;
+                                auto dtype = archive.tensor_dtype(name);
+                                if (!dtype)
+                                    return dtype.error();
+                                if ((dtype.value() == DType::MxFp4) != native_mxfp4)
+                                    return Error{ErrorCode::UnsupportedModel, "inconsistent Qwen4 native MXFP4 Expert encodings: " + name};
+                                if (dtype.value() != DType::Float32 && dtype.value() != DType::BFloat16
+                                    && dtype.value() != DType::Float8E4M3
+                                    && dtype.value() != DType::MxFp4
+                                    && dtype.value() != DType::Int4 && !is_qnk_dtype(dtype.value()))
+                                {
+                                    return Error{ErrorCode::UnsupportedModel, "unsupported Qwen4 Exp separate Expert dtype: " + name};
+                                }
+                                if (first_projection || dtype.value() == DType::Int4)
+                                    expert_weight_dtypes[layer_id] = dtype.value();
+                                first_projection = false;
+                            }
+                        }
+                        expert_layouts[layer_id] = native_mxfp4 ? ExpertLayout::InterleavedGateUpDown : ExpertLayout::GateUpDown;
+                        continue;
+                    }
+                    const SafetensorInfo* gate_up = archive.find(source + "gate_up_proj");
+                    const SafetensorInfo* down = archive.find(source + "down_proj");
+                    if ((!gate_up || gate_up->dtype != "U8") && (!down || down->dtype != "U8"))
+                        continue;
+                    const auto gate_up_dtype = archive.find_qnk_expert_dtype(source + "gate_up_proj",
+                                                                             expert_count.value(),
+                                                                             intermediate_size.value() * 2,
+                                                                             hidden_size.value());
+                    const auto down_dtype = archive.find_qnk_expert_dtype(source + "down_proj",
+                                                                          expert_count.value(),
+                                                                          hidden_size.value(),
+                                                                          intermediate_size.value());
+                    if (!gate_up_dtype || !down_dtype || gate_up_dtype != down_dtype)
+                        return Error{ErrorCode::InvalidModel, "invalid Qwen4 Exp Qn_K Expert banks: " + source};
+                    expert_weight_dtypes[layer_id] = *gate_up_dtype;
+                }
+            }
+        }
+    }
     moe.shared_expert_weight_dtype = DType::BFloat16;
     moe.flags = MoeDescriptorSharedExpertGate
                 | MoeDescriptorFileBackedExperts;
@@ -411,6 +506,11 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
         layer.pre_ffn_norm = NormType::None;
         layer.attention = type == "linear_attention" ? linear_attention : full_attention;
         layer.moe = moe;
+        layer.moe.shared_expert_weight_dtype = shared_expert_weight_dtypes[layer_id];
+        layer.moe.expert_weight_dtype = expert_weight_dtypes[layer_id];
+        layer.moe.layout = expert_layouts[layer_id];
+        if (layer.moe.layout == ExpertLayout::GateUpDown)
+            layer.moe.flags &= ~MoeDescriptorFileBackedExperts;
         if (layer_id + 1 == ple_layer_ids.value()[0])
         {
             layer.ple.embedding_dimension = ple_embedding_dimension.value();
@@ -429,7 +529,7 @@ Result<WeightMapping> Qwen4ExpModelAdapter::map_weights(const ModelPackage& pack
 {
     if (descriptor.model_type != "qwen4_exp")
         return Error{ErrorCode::UnsupportedModel, "unsupported Qwen4 Exp model_type: " + descriptor.model_type};
-    auto opened = SafetensorsArchive::open(package.root);
+    auto opened = SafetensorsArchive::open(package.weights_path.empty() ? package.root : package.weights_path, package.manifest.raw_json);
     if (!opened)
         return opened.error();
     SafetensorsArchive archive = std::move(opened).value();
@@ -465,7 +565,47 @@ Result<WeightMapping> Qwen4ExpModelAdapter::map_weights(const ModelPackage& pack
             return status.error();
         const MoeDescriptor& moe = descriptor.layers[layer_id].moe;
         const std::string artifact_experts = mxfp4_expert_prefix(layer_id);
-        if (moe.expert_weight_dtype == DType::MxFp4)
+        if (moe.layout == ExpertLayout::GateUpDown)
+        {
+            const std::pair<const char*, const char*> projections[] = {
+                {"gate.weight", "gate_proj.weight"},
+                {"up.weight", "up_proj.weight"},
+                {"down.weight", "down_proj.weight"},
+            };
+            for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
+            {
+                const std::string expert = expert_prefix(layer_id, expert_id);
+                const std::string expert_source = source + "mlp.experts." + std::to_string(expert_id) + ".";
+                for (const auto& projection : projections)
+                {
+                    status = add_tensor(mapping, archive, expert + projection.first,
+                                        expert_source + projection.second, expert_load_flags);
+                    if (!status)
+                        return status.error();
+                }
+            }
+        }
+        else if (moe.expert_weight_dtype == DType::MxFp4 && archive.contains_tensor(source + "mlp.experts.0.gate_proj.weight"))
+        {
+            for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
+            {
+                const std::string expert_source = source + "mlp.experts." + std::to_string(expert_id) + ".";
+                const std::string expert = expert_prefix(layer_id, expert_id);
+                auto gate_up = archive.load_interleaved_mxfp4_tensor(expert_source + "gate_proj.weight", {},
+                                                                     expert_source + "up_proj.weight", {},
+                                                                     moe.intermediate_size, descriptor.hidden_size,
+                                                                     expert_load_flags);
+                if (!gate_up)
+                    return gate_up.error();
+                mapping.emplace(expert + "gate_up.weight", std::move(gate_up).value());
+                auto down = archive.load_mxfp4_tensor(expert_source + "down_proj.weight", {},
+                                                      descriptor.hidden_size, moe.intermediate_size, expert_load_flags);
+                if (!down)
+                    return down.error();
+                mapping.emplace(expert + "down.weight", std::move(down).value());
+            }
+        }
+        else if (moe.expert_weight_dtype == DType::MxFp4)
         {
             for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
             {
@@ -492,6 +632,33 @@ Result<WeightMapping> Qwen4ExpModelAdapter::map_weights(const ModelPackage& pack
                                           expert_load_flags);
                 if (!status)
                     return status.error();
+            }
+        }
+        else if (is_qnk_dtype(moe.expert_weight_dtype))
+        {
+            for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
+            {
+                const std::string expert = expert_prefix(layer_id, expert_id);
+                auto gate_up = archive.load_qnk_expert(source + "mlp.experts.gate_up_proj",
+                                                       moe.expert_weight_dtype,
+                                                       expert_id,
+                                                       moe.expert_count,
+                                                       moe.intermediate_size * 2,
+                                                       descriptor.hidden_size,
+                                                       expert_load_flags);
+                if (!gate_up)
+                    return gate_up.error();
+                mapping.emplace(expert + "gate_up.weight", std::move(gate_up).value());
+                auto down = archive.load_qnk_expert(source + "mlp.experts.down_proj",
+                                                    moe.expert_weight_dtype,
+                                                    expert_id,
+                                                    moe.expert_count,
+                                                    descriptor.hidden_size,
+                                                    moe.intermediate_size,
+                                                    expert_load_flags);
+                if (!down)
+                    return down.error();
+                mapping.emplace(expert + "down.weight", std::move(down).value());
             }
         }
         else

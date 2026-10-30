@@ -5,6 +5,7 @@
 #include "experttransfer_vulkan.h"
 #include "storage/expertresidency.h"
 #include "kernels/qnk.h"
+#include "kernels/int4.h"
 
 #if NCNN_MOE_WITH_VULKAN
 #include <allocator.h>
@@ -33,7 +34,11 @@ VulkanExpertVictimCache::VulkanExpertVictimCache(std::shared_ptr<VulkanContext> 
 {
     try
     {
-        weight_allocator = std::make_shared<VulkanExpertWeightAllocator>(context->device(), static_cast<size_t>(std::min<uint64_t>(cache_size, UINT64_C(64) * 1024 * 1024)));
+        constexpr uint64_t physical_allowance = UINT64_C(64) * 1024 * 1024;
+        const uint64_t physical_limit = cache_size > std::numeric_limits<uint64_t>::max() - physical_allowance
+                                            ? std::numeric_limits<uint64_t>::max()
+                                            : cache_size + physical_allowance;
+        weight_allocator = std::make_shared<VulkanExpertWeightAllocator>(context->device(), static_cast<size_t>(std::min(cache_size, physical_allowance)), physical_limit);
         upload_staging_allocator = context->device()->acquire_staging_allocator();
         for (DownloadSlot& slot : download_slots)
             slot.staging_allocator = context->device()->acquire_staging_allocator();
@@ -364,6 +369,10 @@ void VulkanExpertVictimCache::materialize(const DeviceEntry& entry, const Tensor
 
 std::shared_ptr<VulkanExpertVictimCache::DeviceEntry> VulkanExpertVictimCache::upload(const PendingAdmission& admission)
 {
+    if (admission.size > static_cast<uint64_t>(std::numeric_limits<int>::max()) - 15)
+        return {};
+    // Match the physical size of the previous one-dimensional host Mat.
+    const size_t upload_size = (static_cast<size_t>(admission.size) + 15) / 16 * 16;
     auto entry = std::make_shared<DeviceEntry>();
     entry->size = admission.size;
     entry->gate_blocks_size = admission.gate_up->mxfp4_blocks.size();
@@ -386,13 +395,13 @@ std::shared_ptr<VulkanExpertVictimCache::DeviceEntry> VulkanExpertVictimCache::u
     }
     entry->execution = admission.execution;
     entry->weight_allocator = weight_allocator;
-    ncnn::Mat payload(static_cast<int>(admission.size), sizeof(uint8_t));
-    if (payload.empty()) return {};
-    std::memset(payload.data, 0, payload.total() * payload.elemsize);
-    copy_payload(admission, static_cast<uint8_t*>(payload.data));
     auto* independent_allocator = static_cast<VulkanExpertWeightAllocator*>(weight_allocator.get());
     VulkanIndependentWeightTransfer command(context, upload_staging_allocator);
-    if (!command.record(payload, entry->data, independent_allocator) || !command.submit_and_wait()) return {};
+    const auto payload = command.prepare_storage(upload_size, independent_allocator);
+    if (payload.size() != upload_size) return {};
+    std::memset(payload.data(), 0, payload.size());
+    copy_payload(admission, payload.data());
+    if (!command.record_prepared_storage(entry->data, independent_allocator) || !command.submit_and_wait()) return {};
     return entry;
 }
 
@@ -562,7 +571,8 @@ VulkanExpertBackend::VulkanExpertBackend(uint64_t _cache_size,
                                          uint32_t _vulkan_device_index,
                                          std::shared_ptr<VulkanExpertVictimCache> _device_weight_source,
                                          VulkanRuntimePtr _vulkan_runtime,
-                                         uint64_t _optimization_flags)
+                                         uint64_t _optimization_flags,
+                                         uint64_t physical_limit_bytes)
     : cache_size(_cache_size),
       vulkan_device_index(_vulkan_device_index),
       vulkan_runtime(std::move(_vulkan_runtime)),
@@ -575,7 +585,12 @@ VulkanExpertBackend::VulkanExpertBackend(uint64_t _cache_size,
     if (vulkan_context && cache_size != 0)
     {
         const uint64_t allocator_block_size = std::min<uint64_t>(cache_size, UINT64_C(64) * 1024 * 1024);
-        expert_weight_allocator = std::make_shared<VulkanExpertWeightAllocator>(vulkan_context->device(), static_cast<size_t>(allocator_block_size));
+        constexpr uint64_t physical_allowance = UINT64_C(64) * 1024 * 1024;
+        const uint64_t physical_limit = physical_limit_bytes != 0 ? physical_limit_bytes
+                                        : cache_size > std::numeric_limits<uint64_t>::max() - physical_allowance
+                                            ? std::numeric_limits<uint64_t>::max()
+                                            : cache_size + physical_allowance;
+        expert_weight_allocator = std::make_shared<VulkanExpertWeightAllocator>(vulkan_context->device(), static_cast<size_t>(allocator_block_size), physical_limit);
         admission_staging_allocator = std::make_unique<VulkanUploadStagingAllocator>(vulkan_context->device(), allocator_block_size);
     }
     try
@@ -640,15 +655,101 @@ void VulkanExpertBackend::set_foreground_active(bool active) noexcept
     }
 }
 
-bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const TensorData> gate_up,
-                                         const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down,
-                                         const TensorData* down_bias, uint32_t residency_group,
-                                         float activation_limit, ExpertActivation activation,
-                                         PendingAdmission& admission) const
+static uint64_t native_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
+                                            const TensorData& down, const VulkanContext& context,
+                                            uint64_t optimization_flags)
 {
+    const auto quantized = [](DType dtype) { return dtype == DType::Int4 || dtype == DType::MxFp4 || is_qnk_dtype(dtype); };
+    if (gate_up.shape.size() != 2 || down.shape.size() != 2
+        || (!up && !quantized(gate_up.dtype) && !quantized(down.dtype)
+            && gate_up.dtype != DType::Float32 && down.dtype != DType::Float32)
+        || (up ? up->shape != gate_up.shape || down.shape[1] != gate_up.shape[0]
+               : gate_up.shape[0] % 2 != 0 || down.shape[1] != gate_up.shape[0] / 2)
+        || down.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 128))
+    {
+        return 0;
+    }
+    const uint64_t alignment = std::max<uint64_t>(4, context.device()->info.buffer_offset_alignment());
+    const uint64_t maximum_range = context.device()->info.physicalDeviceProperties().limits.maxStorageBufferRange;
+    const uint32_t projection_lanes = std::max<uint32_t>(32, context.device()->info.subgroup_size());
+    uint64_t size = 0;
+    for (const TensorData* matrix : {&gate_up, up, &down})
+    {
+        if (!matrix)
+            continue;
+        if (matrix->shape.size() != 2 || matrix->shape[0] == 0 || matrix->shape[1] == 0
+            || matrix->shape[0] > static_cast<uint32_t>(std::numeric_limits<int>::max()) / projection_lanes
+            || matrix->shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max()))
+        {
+            return 0;
+        }
+        const uint64_t elements = static_cast<uint64_t>(matrix->shape[0]) * matrix->shape[1];
+        if (matrix->dtype == DType::BFloat16 || matrix->dtype == DType::Float32)
+        {
+            const uint64_t element_size = matrix->dtype == DType::BFloat16 ? sizeof(uint16_t) : sizeof(float);
+            const uint64_t count = matrix->dtype == DType::BFloat16 ? matrix->bfloat16_values().size()
+                                                                    : matrix->float32_values().size();
+            if (!matrix->input_column_indices.empty() || count != elements
+                || elements > static_cast<uint64_t>(std::numeric_limits<int>::max()) / element_size)
+            {
+                return 0;
+            }
+        }
+        else if (matrix->dtype == DType::Int4)
+        {
+            if (!validate_int4_tensor(*matrix))
+                return 0;
+        }
+        else if (matrix->dtype == DType::MxFp4)
+        {
+            if (!has_flag(optimization_flags, OptimizationVulkanQnK)
+                || !validate_input_column_indices(*matrix))
+                return 0;
+        }
+        else if (!has_flag(optimization_flags, OptimizationVulkanQnK)
+                 || !is_qnk_dtype(matrix->dtype)
+                 || !qnk_shape_supported(matrix->dtype, matrix->shape[0], matrix->shape[1])
+                 || (!matrix->mxfp4_file_storage
+                     && matrix->qnk_values().size() != qnk_storage_bytes(matrix->dtype, matrix->shape[0], matrix->shape[1]))
+                 || !validate_input_column_indices(*matrix))
+        {
+            return 0;
+        }
+        // Each projection owns one packed allocation containing the original
+        // matrix, an aligned FP32 bias (also when absent), and its metadata.
+        const uint64_t part = QnkLinear_vulkan::storage_bytes(*matrix, alignment);
+        if (part == 0 || part > static_cast<uint64_t>(std::numeric_limits<int>::max())
+            || part > maximum_range || part > std::numeric_limits<uint64_t>::max() - size)
+        {
+            return 0;
+        }
+        size += part;
+    }
+    return size;
+}
+
+static bool is_packed_mxfp4_expert(const TensorData* gate_up,
+                                   const TensorData* up,
+                                   const TensorData* down) noexcept
+{
+    return !up && gate_up && down
+           && gate_up->dtype == DType::MxFp4 && down->dtype == DType::MxFp4
+           && gate_up->input_column_indices.empty()
+           && down->input_column_indices.empty();
+}
+
+static uint64_t executable_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
+                                                const TensorData& down, const VulkanContext& context,
+                                                uint64_t optimization_flags, const TensorData* gate_up_bias,
+                                                const TensorData* up_bias, const TensorData* down_bias,
+                                                ExpertActivation activation, float activation_limit)
+{
+    if (gate_up.shape.size() != 2 || down.shape.size() != 2
+        || gate_up.shape[0] == 0 || gate_up.shape[1] == 0 || down.shape[0] == 0 || down.shape[1] == 0
+        || (up && up->shape != gate_up.shape))
+        return 0;
     const auto valid_mxfp4_matrix = [](const TensorData& matrix) {
-        if (matrix.shape.size() != 2 || matrix.shape[0] == 0 || matrix.shape[1] == 0
-            || matrix.shape[1] % 32 != 0
+        if (matrix.shape[1] % 32 != 0
             || matrix.shape[0] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 64)
             || matrix.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max()))
             return false;
@@ -656,100 +757,110 @@ bool VulkanExpertBackend::make_admission(std::string key, std::shared_ptr<const 
         const uint64_t blocks = scales * 16;
         return blocks <= static_cast<uint64_t>(std::numeric_limits<int>::max() - 3)
                && scales <= static_cast<uint64_t>(std::numeric_limits<int>::max() - 3)
-               && matrix.mxfp4_blocks.size() == blocks
-               && matrix.mxfp4_scales.size() == scales;
+               && matrix.mxfp4_blocks.size() == blocks && matrix.mxfp4_scales.size() == scales;
     };
     const auto valid_bias = [](const TensorData* bias, uint32_t columns) {
-        if (!bias)
-            return true;
-        if (bias->shape.size() != 1 || bias->shape[0] != columns)
-            return false;
-        if (bias->dtype == DType::Float32)
-            return bias->float32_values().size() == columns;
+        if (!bias) return true;
+        if (bias->shape.size() != 1 || bias->shape[0] != columns) return false;
+        if (bias->dtype == DType::Float32) return bias->float32_values().size() == columns;
         return bias->dtype == DType::BFloat16 && bias->bfloat16_values().size() == columns;
     };
-    const bool bfloat16_expert = gate_up
-                                 && down
-                                 && gate_up->dtype == DType::BFloat16
-                                 && down->dtype == DType::BFloat16
-                                 && activation == ExpertActivation::Silu
-                                 && gate_up->shape.size() == 2
-                                 && down->shape.size() == 2
-                                 && gate_up->shape[0] % 2 == 0
-                                 && gate_up->shape[0] / 2 % 128 == 0
-                                 && down->shape[1] == gate_up->shape[0] / 2
-                                 && gate_up->bfloat16_values().size() == gate_up->element_count()
-                                 && down->bfloat16_values().size() == down->element_count();
-    const bool mxfp4_expert = gate_up
-                              && down
-                              && gate_up->dtype == DType::MxFp4
-                              && down->dtype == DType::MxFp4
-                              && gate_up->shape.size() == 2
-                              && down->shape.size() == 2
-                              && gate_up->shape[0] % 2 == 0
-                              && down->shape[1] == gate_up->shape[0] / 2
-                              && valid_mxfp4_matrix(*gate_up)
-                              && valid_mxfp4_matrix(*down);
-    const bool qnk_expert = gate_up
-                            && down
-                            && is_qnk_dtype(gate_up->dtype)
-                            && gate_up->dtype == down->dtype
-                            && gate_up->shape.size() == 2
-                            && down->shape.size() == 2
-                            && gate_up->shape[0] % 2 == 0
-                            && down->shape[1] == gate_up->shape[0] / 2
-                            && qnk_shape_supported(gate_up->dtype, gate_up->shape[0], gate_up->shape[1])
-                            && qnk_shape_supported(down->dtype, down->shape[0], down->shape[1]);
-    if (key.empty()
-        || (!mxfp4_expert && !qnk_expert && !bfloat16_expert)
-        || !valid_bias(gate_up_bias, gate_up->shape[0])
-        || !valid_bias(down_bias, down->shape[0])
-        || (activation != ExpertActivation::Silu
-            && activation != ExpertActivation::GptOssSwiGlu
+    const bool bfloat16_expert = !up && gate_up.dtype == DType::BFloat16 && down.dtype == DType::BFloat16
+                                 && activation == ExpertActivation::Silu && context.device()->info.subgroup_size() == 32
+                                 && gate_up.shape[0] % 2 == 0 && gate_up.shape[0] / 2 % 128 == 0
+                                 && down.shape[1] == gate_up.shape[0] / 2
+                                 && gate_up.bfloat16_values().size() == gate_up.element_count()
+                                 && down.bfloat16_values().size() == down.element_count();
+    const bool mxfp4_expert = !up && gate_up.dtype == DType::MxFp4 && down.dtype == DType::MxFp4
+                              && gate_up.shape[0] % 2 == 0 && down.shape[1] == gate_up.shape[0] / 2
+                              && valid_mxfp4_matrix(gate_up) && valid_mxfp4_matrix(down);
+    const bool specialized_mxfp4_expert = mxfp4_expert
+                                          && is_packed_mxfp4_expert(&gate_up, up, &down);
+    const bool mapped_mxfp4_expert = mxfp4_expert && !specialized_mxfp4_expert;
+    const auto quantized = [](DType dtype) { return dtype == DType::Int4 || is_qnk_dtype(dtype); };
+    const uint64_t native_size = up || mapped_mxfp4_expert
+                                         || quantized(gate_up.dtype) || quantized(down.dtype)
+                                         || gate_up.dtype == DType::Float32 || down.dtype == DType::Float32
+                                     ? native_expert_storage_bytes(gate_up, up, down, context, optimization_flags)
+                                     : 0;
+    if ((!specialized_mxfp4_expert && native_size == 0 && !bfloat16_expert)
+        || !valid_bias(gate_up_bias, gate_up.shape[0]) || !valid_bias(down_bias, down.shape[0])
+        || (up && !valid_bias(up_bias, up->shape[0]))
+        || (activation != ExpertActivation::Silu && activation != ExpertActivation::GptOssSwiGlu
             && activation != ExpertActivation::DeepSeekSwiGlu)
         || !std::isfinite(activation_limit) || activation_limit < 0.0f)
-    {
-        return false;
-    }
+        return 0;
+    if (native_size != 0) return native_size;
+    const auto matrix_size = [](const TensorData& matrix) {
+        return matrix.dtype == DType::BFloat16 ? static_cast<uint64_t>(matrix.bfloat16_values().size()) * sizeof(uint16_t)
+                                               : static_cast<uint64_t>(matrix.mxfp4_blocks.size()) + matrix.mxfp4_scales.size();
+    };
+    const auto bias_size = [](const TensorData* bias) {
+        return !bias ? uint64_t(0) : bias->dtype == DType::Float32 ? static_cast<uint64_t>(bias->float32_values().size()) * sizeof(float)
+                                                                   : static_cast<uint64_t>(bias->bfloat16_values().size()) * sizeof(uint16_t);
+    };
     uint64_t size = 0;
-    const std::array<uint64_t, 4> parts = {expert_matrix_bytes(*gate_up), expert_matrix_bytes(*down), tensor_bytes(gate_up_bias), tensor_bytes(down_bias)};
-    for (uint64_t part : parts)
+    for (uint64_t part : {matrix_size(gate_up), matrix_size(down), bias_size(gate_up_bias), bias_size(down_bias)})
     {
-        if (part > cache_size - size)
-            return false;
+        if (part > std::numeric_limits<uint64_t>::max() - size) return 0;
         size += part;
     }
-    if (size == 0)
-    {
-        return false;
-    }
+    return size;
+}
 
-    admission.key = std::move(key);
-    admission.gate_up = std::move(gate_up);
-    admission.down = std::move(down);
-    if (gate_up_bias)
+bool VulkanExpertBackend::make_admission(const ExpertDemandRequest& request,
+                                         PendingAdmission& admission) const
+{
+    if (!vulkan_context
+        || (request.gate_up && request.gate_up->mxfp4_file_storage)
+        || (request.down && request.down->mxfp4_file_storage)
+        || (request.up && request.up->mxfp4_file_storage))
+        return false;
+    if (request.key.empty() || !request.gate_up || !request.down)
+        return false;
+    const TensorData* up_bias = request.up ? request.up_bias : nullptr;
+    const uint64_t size = executable_expert_storage_bytes(*request.gate_up, request.up.get(), *request.down, *vulkan_context,
+                                                          optimization_flags, request.gate_up_bias, up_bias, request.down_bias,
+                                                          request.activation, request.activation_limit);
+    if (size == 0 || size > cache_size)
+        return false;
+
+    admission.key = request.key;
+    admission.gate_up = request.gate_up;
+    admission.down = request.down;
+    admission.up = request.up;
+    if (request.gate_up_bias)
     {
-        admission.gate_up_bias = std::make_shared<TensorData>(*gate_up_bias);
+        admission.gate_up_bias = std::make_shared<TensorData>(*request.gate_up_bias);
     }
-    if (down_bias)
+    if (request.down_bias)
     {
-        admission.down_bias = std::make_shared<TensorData>(*down_bias);
+        admission.down_bias = std::make_shared<TensorData>(*request.down_bias);
     }
-    admission.activation_limit = activation_limit;
-    admission.activation = activation;
-    admission.residency_group = residency_group;
+    if (up_bias)
+        admission.up_bias = std::make_shared<TensorData>(*up_bias);
+    admission.activation_limit = request.activation_limit;
+    admission.activation = request.activation;
+    admission.residency_group = request.residency_group;
     admission.size = size;
     return true;
 }
 
-void VulkanExpertBackend::admit(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down,
-                                const TensorData* down_bias, uint32_t residency_group, float activation_limit,
-                                ExpertActivation activation)
+void VulkanExpertBackend::admit(const ExpertDemandRequest& request)
 {
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (stopping || entries.contains(request.key) || pending_keys.contains(request.key))
+            return;
+    }
     PendingAdmission admission;
-    if (!make_admission(std::move(key), std::move(gate_up), gate_up_bias, std::move(down), down_bias,
-                        residency_group, activation_limit, activation, admission))
+    if (!make_admission(request, admission))
         return;
+    enqueue_admission(std::move(admission));
+}
+
+void VulkanExpertBackend::enqueue_admission(PendingAdmission admission)
+{
     const uint64_t size = admission.size;
     const std::lock_guard<std::mutex> lock(mutex);
     if (stopping || entries.find(admission.key) != entries.end() || pending_keys.find(admission.key) != pending_keys.end())
@@ -775,14 +886,7 @@ void VulkanExpertBackend::admit(std::string key, std::shared_ptr<const TensorDat
     work_available.notify_one();
 }
 
-bool VulkanExpertBackend::prepare_demand(std::string key,
-                                         std::shared_ptr<const TensorData> gate_up,
-                                         const TensorData* gate_up_bias,
-                                         std::shared_ptr<const TensorData> down,
-                                         const TensorData* down_bias,
-                                         uint32_t residency_group,
-                                         float activation_limit,
-                                         ExpertActivation activation,
+bool VulkanExpertBackend::prepare_demand(const ExpertDemandRequest& request,
                                          std::shared_ptr<const void>& pin)
 {
     pin.reset();
@@ -790,15 +894,19 @@ bool VulkanExpertBackend::prepare_demand(std::string key,
     try
     {
         if (!vulkan_context || !expert_weight_allocator
-            || !make_admission(std::move(key), std::move(gate_up), gate_up_bias,
-                               std::move(down), down_bias, residency_group,
-                               activation_limit, activation, admission))
+            || !make_admission(request, admission))
             return false;
     }
     catch (...)
     {
         return false;
     }
+    return prepare_admission(std::move(admission), pin);
+}
+
+bool VulkanExpertBackend::prepare_admission(PendingAdmission admission,
+                                            std::shared_ptr<const void>& pin)
+{
     {
         const std::lock_guard<std::mutex> lock(mutex);
         const auto existing = entries.find(admission.key);
@@ -814,6 +922,7 @@ bool VulkanExpertBackend::prepare_demand(std::string key,
     const std::unique_lock<std::mutex> admission_lock(admission_mutex);
     std::vector<std::shared_ptr<Entry>> retired;
     bool reserved = false;
+    size_t maximum_physical_evictions = 0;
     {
         const std::lock_guard<std::mutex> lock(mutex);
         const auto existing = entries.find(admission.key);
@@ -858,6 +967,7 @@ bool VulkanExpertBackend::prepare_demand(std::string key,
                 if (!already_queued)
                     ++admissions;
                 reserved = true;
+                maximum_physical_evictions = entries.size();
             }
             else if (already_queued)
             {
@@ -872,26 +982,42 @@ bool VulkanExpertBackend::prepare_demand(std::string key,
     retired.clear();
 
     std::shared_ptr<Entry> loaded;
-    bool upload_succeeded = true;
-    try
+    auto* allocator = static_cast<VulkanExpertWeightAllocator*>(expert_weight_allocator.get());
+    for (size_t attempt = 0;; ++attempt)
     {
-        std::optional<VulkanWeightUploadBatch> upload_batch;
-        if (admission.gate_up->dtype == DType::MxFp4)
-            upload_batch.emplace(vulkan_context, admission_staging_allocator.get(), &admission_upload_scratch);
-        loaded = create_entry(admission, upload_batch ? &*upload_batch : nullptr);
-        if (upload_batch)
+        const uint64_t rejections_before = allocator->physical_limit_rejections();
+        bool upload_succeeded = true;
+        try
         {
-            upload_succeeded = upload_batch->submit();
+            std::optional<VulkanWeightUploadBatch> upload_batch;
+            if (is_packed_mxfp4_expert(admission.gate_up.get(), admission.up.get(), admission.down.get()))
+                upload_batch.emplace(vulkan_context, admission_staging_allocator.get(), &admission_upload_scratch);
+            loaded = create_entry(admission, upload_batch ? &*upload_batch : nullptr);
+            if (loaded && upload_batch) upload_succeeded = upload_batch->submit();
         }
-    }
-    catch (...)
-    {
-        upload_succeeded = false;
-    }
-    // Batch destruction releases the context lock before the last pipeline
-    // owners can be destroyed by an unsuccessful admission.
-    if (!upload_succeeded)
+        catch (...)
+        {
+            upload_succeeded = false;
+        }
+        if (loaded && upload_succeeded) break;
+        // Drop every temporary owner after the upload command is destroyed.
+        // Only physical-budget rejection permits an extra ARC eviction;
+        // malformed weights, pipeline and submission failures do not retry.
         loaded.reset();
+        if (attempt >= maximum_physical_evictions || allocator->physical_limit_rejections() == rejections_before) break;
+        try
+        {
+            const std::lock_guard<std::mutex> lock(mutex);
+            const bool from_frequent = frequent_ghost_index.find(admission.key) != frequent_ghost_index.end();
+            if (stopping || !evict_one_locked(from_frequent, admission.residency_group, admission.size)) break;
+            retired.swap(retired_entries);
+        }
+        catch (...)
+        {
+            break;
+        }
+        retired.clear();
+    }
     bool success = false;
     {
         const std::lock_guard<std::mutex> lock(mutex);
@@ -917,7 +1043,7 @@ size_t VulkanExpertBackend::prepare_demand_batch(std::span<const ExpertDemandReq
 {
     for (auto& pin : pins) pin.reset();
     if (requests.empty() || requests.size() != pins.size()) return 0;
-    if (!requests.front().gate_up || requests.front().gate_up->dtype != DType::MxFp4)
+    if (!is_packed_mxfp4_expert(requests.front().gate_up.get(), requests.front().up.get(), requests.front().down.get()))
         return ExpertBackend::prepare_demand_batch(requests, pins);
 
     static constexpr size_t maximum_requests = 8;
@@ -928,14 +1054,12 @@ size_t VulkanExpertBackend::prepare_demand_batch(std::span<const ExpertDemandReq
     for (size_t index = 0; index < limit; ++index)
     {
         const auto& request = requests[index];
-        if (!request.gate_up || request.gate_up->dtype != DType::MxFp4) break;
+        if (!is_packed_mxfp4_expert(request.gate_up.get(), request.up.get(), request.down.get())) break;
         PendingAdmission admission;
         try
         {
             if (!vulkan_context || !expert_weight_allocator
-                || !make_admission(std::string(request.key), request.gate_up, request.gate_up_bias,
-                                   request.down, request.down_bias, request.residency_group,
-                                   request.activation_limit, request.activation, admission))
+                || !make_admission(request, admission))
             {
                 break;
             }
@@ -970,6 +1094,7 @@ size_t VulkanExpertBackend::prepare_demand_batch(std::span<const ExpertDemandReq
     std::vector<size_t> duplicate_of(candidates.size(), candidates.size());
     new_indices.reserve(candidates.size());
     size_t settled_admissions = 0;
+    size_t maximum_physical_evictions = 0;
     const auto rollback_reservations = [&] {
         {
             const std::lock_guard<std::mutex> lock(mutex);
@@ -1100,36 +1225,55 @@ size_t VulkanExpertBackend::prepare_demand_batch(std::span<const ExpertDemandReq
         }
         for (size_t index = prefix; index < pins.size(); ++index) pins[index].reset();
         retired.swap(retired_entries);
+        maximum_physical_evictions = entries.size();
     }
     retired.clear();
 
     bool upload_succeeded = true;
     if (!new_indices.empty())
     {
-        try
+        auto* allocator = static_cast<VulkanExpertWeightAllocator*>(expert_weight_allocator.get());
+        for (size_t attempt = 0;; ++attempt)
         {
-            VulkanWeightUploadBatch upload_batch(vulkan_context, admission_staging_allocator.get(), &admission_upload_scratch);
-            for (size_t index = 0; index < new_indices.size(); ++index)
+            const uint64_t rejections_before = allocator->physical_limit_rejections();
+            upload_succeeded = true;
+            try
             {
-                loaded[index] = create_entry(candidates[new_indices[index]], &upload_batch);
-                if (!loaded[index])
+                VulkanWeightUploadBatch upload_batch(vulkan_context, admission_staging_allocator.get(), &admission_upload_scratch);
+                for (size_t index = 0; index < new_indices.size(); ++index)
                 {
-                    upload_succeeded = false;
-                    break;
+                    loaded[index] = create_entry(candidates[new_indices[index]], &upload_batch);
+                    if (!loaded[index])
+                    {
+                        upload_succeeded = false;
+                        break;
+                    }
                 }
+                if (upload_succeeded) upload_succeeded = upload_batch.submit();
             }
-            if (upload_succeeded)
+            catch (...)
             {
-                upload_succeeded = upload_batch.submit();
+                upload_succeeded = false;
             }
+            if (upload_succeeded) break;
+            // The failed batch's command and temporary weights must be gone
+            // before reclaiming unpinned entries and creating a fresh batch.
+            std::fill(loaded.begin(), loaded.end(), std::shared_ptr<Entry>());
+            if (attempt >= maximum_physical_evictions || allocator->physical_limit_rejections() == rejections_before) break;
+            try
+            {
+                const std::lock_guard<std::mutex> lock(mutex);
+                const auto& admission = candidates[new_indices.front()];
+                const bool from_frequent = frequent_ghost_index.find(admission.key) != frequent_ghost_index.end();
+                if (stopping || !evict_one_locked(from_frequent, admission.residency_group, admission.size)) break;
+                retired.swap(retired_entries);
+            }
+            catch (...)
+            {
+                break;
+            }
+            retired.clear();
         }
-        catch (...)
-        {
-            upload_succeeded = false;
-        }
-        // Destroy the transfer command and release its context mutex before
-        // clearing any last projection/pipeline owners on failure.
-        if (!upload_succeeded) loaded.clear();
     }
     size_t completed = prefix;
     {
@@ -1137,7 +1281,7 @@ size_t VulkanExpertBackend::prepare_demand_batch(std::span<const ExpertDemandReq
         for (size_t index = 0; index < new_indices.size(); ++index)
         {
             const size_t request_index = new_indices[index];
-            const auto& admission = candidates[request_index];
+            auto& admission = candidates[request_index];
             bool installed = false;
             try
             {
@@ -1159,6 +1303,7 @@ size_t VulkanExpertBackend::prepare_demand_batch(std::span<const ExpertDemandReq
                 ++dropped_admissions;
                 completed = std::min(completed, request_index);
             }
+            admission = {};
             finish_admission_locked();
             ++settled_admissions;
         }
@@ -1188,8 +1333,9 @@ VulkanExpertBackend::DemandSubmission::~DemandSubmission()
 size_t VulkanExpertBackend::DemandSubmission::wait(std::span<std::shared_ptr<const void>> pins)
 {
     for (auto& pin : pins) pin.reset();
-    if (!work || pins.size() != work->requests.size()) return 0;
+    if (!work) return 0;
     std::unique_lock<std::mutex> lock(work->mutex);
+    if (pins.size() != work->pins.size()) return 0;
     work->completed.wait(lock, [this] { return work->done; });
     if (work->aborted) return 0;
     std::copy(work->pins.begin(), work->pins.end(), pins.begin());
@@ -1208,28 +1354,37 @@ std::unique_ptr<ExpertDemandSubmission> VulkanExpertBackend::begin_demand_batch(
 {
     auto work = std::make_shared<DemandWork>();
     work->keys.reserve(requests.size());
-    work->biases.reserve(requests.size() * 2);
+    work->biases.reserve(requests.size() * 3);
     work->requests.assign(requests.begin(), requests.end());
     work->pins.resize(requests.size());
     for (size_t index = 0; index < requests.size(); ++index)
     {
         work->keys.emplace_back(requests[index].key);
         work->requests[index].key = work->keys.back();
-        for (bool gate : {true, false})
+        for (size_t projection = 0; projection < 3; ++projection)
         {
-            const TensorData* source = gate ? requests[index].gate_up_bias : requests[index].down_bias;
+            const TensorData* source = projection == 0   ? requests[index].gate_up_bias
+                                       : projection == 1 ? requests[index].down_bias
+                                                         : requests[index].up_bias;
             if (!source) continue;
             work->biases.push_back(std::make_shared<const TensorData>(*source));
-            if (gate)
+            if (projection == 0)
                 work->requests[index].gate_up_bias = work->biases.back().get();
-            else
+            else if (projection == 1)
                 work->requests[index].down_bias = work->biases.back().get();
+            else
+                work->requests[index].up_bias = work->biases.back().get();
         }
     }
     {
         const std::lock_guard<std::mutex> lock(mutex);
         if (stopping || demand_pending.size() >= 2)
+        {
+            work->requests.clear();
+            work->keys.clear();
+            work->biases.clear();
             work->done = true;
+        }
         else
             demand_pending.push_back(work);
     }
@@ -1275,6 +1430,9 @@ void VulkanExpertBackend::demand_loop()
             const std::lock_guard<std::mutex> lock(work->mutex);
             work->prefix = prefix;
             if (work->aborted) work->pins.clear();
+            work->requests.clear();
+            work->keys.clear();
+            work->biases.clear();
             work->done = true;
         }
         work->completed.notify_all();
@@ -1301,7 +1459,7 @@ std::shared_ptr<VulkanExpertBackend::Entry> VulkanExpertBackend::create_entry(co
                                                                               VulkanWeightUploadBatch* upload_batch)
 {
     std::shared_ptr<Entry> entry = std::make_shared<Entry>();
-    if (admission.gate_up->dtype == DType::MxFp4)
+    if (is_packed_mxfp4_expert(admission.gate_up.get(), admission.up.get(), admission.down.get()))
     {
         entry->operation = Mxfp4Expert_vulkan::create_with_allocator(*admission.gate_up,
                                                                      admission.gate_up_bias.get(),
@@ -1315,7 +1473,8 @@ std::shared_ptr<VulkanExpertBackend::Entry> VulkanExpertBackend::create_entry(co
                                                                      optimization_flags,
                                                                      upload_batch);
     }
-    else if (admission.gate_up->dtype == DType::BFloat16)
+    else if (!admission.up && admission.gate_up->dtype == DType::BFloat16
+             && admission.down->dtype == DType::BFloat16)
     {
         entry->bfloat16_operation = Bfloat16Expert_vulkan::create_with_allocator(*admission.gate_up,
                                                                                  admission.gate_up_bias.get(),
@@ -1330,18 +1489,23 @@ std::shared_ptr<VulkanExpertBackend::Entry> VulkanExpertBackend::create_entry(co
     }
     else
     {
-        entry->qnk_operation = QnkExpert_vulkan::create_with_allocator(*admission.gate_up,
-                                                                       admission.gate_up_bias.get(),
-                                                                       *admission.down,
-                                                                       admission.down_bias.get(),
-                                                                       admission.activation_limit,
-                                                                       vulkan_device_index,
-                                                                       expert_weight_allocator.get(),
-                                                                       admission.activation,
-                                                                       vulkan_runtime,
-                                                                       optimization_flags);
+        entry->qnk_operation = QnkExpert_vulkan::create_impl(*admission.gate_up,
+                                                             admission.gate_up_bias.get(),
+                                                             admission.up.get(),
+                                                             admission.up_bias.get(),
+                                                             *admission.down,
+                                                             admission.down_bias.get(),
+                                                             admission.activation_limit,
+                                                             vulkan_device_index,
+                                                             expert_weight_allocator.get(),
+                                                             admission_staging_allocator.get(),
+                                                             admission.activation,
+                                                             vulkan_runtime,
+                                                             optimization_flags);
     }
     if (!entry->operation && !entry->bfloat16_operation && !entry->qnk_operation)
+        return {};
+    if (entry->qnk_operation && entry->qnk_operation->device_bytes() != admission.size)
         return {};
     entry->key = admission.key;
     entry->weight_allocator = expert_weight_allocator;
@@ -1403,6 +1567,11 @@ bool VulkanExpertBackend::install_entry_locked(std::shared_ptr<Entry>& entry)
 void VulkanExpertBackend::WorkItem::clear_references() noexcept
 {
     selected.clear();
+    dispatch.clear();
+    bfloat16_experts.clear();
+    qnk_experts.clear();
+    inputs.clear();
+    outputs.clear();
     private_aggregation.clear();
     for (auto& output : private_outputs)
         output.clear();
@@ -1411,14 +1580,19 @@ void VulkanExpertBackend::WorkItem::clear_references() noexcept
     for (auto& output : private_device_outputs)
         output.reset();
     uint64_t size = private_aggregation.allocated_bytes()
-                    + client_requests.capacity() * sizeof(ExpertBackendRequest)
-                    + requests.capacity() * sizeof(ExpertBackendRequest)
+                    + client_requests.capacity() * sizeof(ExpertRequest)
+                    + requests.capacity() * sizeof(ExpertRequest)
                     + private_outputs.capacity() * sizeof(ActivationBuffer)
                     + private_device_outputs.capacity() * sizeof(std::shared_ptr<DeviceTensor_vulkan>)
                     + private_route_completed.capacity() * sizeof(uint8_t)
                     + selected.capacity() * sizeof(Selection)
-                    + planned.capacity() * sizeof(ExpertBackendExecutionResult)
-                    + final.capacity() * sizeof(ExpertBackendExecutionResult);
+                    + dispatch.capacity() * sizeof(Selection)
+                    + bfloat16_experts.capacity() * sizeof(const Bfloat16Expert_vulkan*)
+                    + qnk_experts.capacity() * sizeof(const QnkExpert_vulkan*)
+                    + inputs.capacity() * sizeof(const ActivationBuffer*)
+                    + outputs.capacity() * sizeof(ActivationBuffer*)
+                    + planned.capacity() * sizeof(ExpertStatus)
+                    + final.capacity() * sizeof(ExpertStatus);
     for (const auto& output : private_outputs)
         size += output.allocated_bytes();
     // Large prefill storage is reclaimed once its submission is released.
@@ -1432,6 +1606,11 @@ void VulkanExpertBackend::WorkItem::clear_references() noexcept
         decltype(private_device_outputs)().swap(private_device_outputs);
         decltype(private_route_completed)().swap(private_route_completed);
         decltype(selected)().swap(selected);
+        decltype(dispatch)().swap(dispatch);
+        decltype(bfloat16_experts)().swap(bfloat16_experts);
+        decltype(qnk_experts)().swap(qnk_experts);
+        decltype(inputs)().swap(inputs);
+        decltype(outputs)().swap(outputs);
         decltype(planned)().swap(planned);
         decltype(final)().swap(final);
     }
@@ -1452,15 +1631,13 @@ std::shared_ptr<VulkanExpertBackend::WorkItem> VulkanExpertBackend::acquire_work
     return work;
 }
 
-std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<const ExpertBackendRequest> requests)
+std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<const ExpertRequest> requests)
 {
     auto work = acquire_work_item();
     std::unique_ptr<ExpertSubmission> submission;
     bool queued = false;
     try
     {
-        // Failed preparation can leave a sole-owned item without a ticket.
-        work->clear_references();
         work->client_requests.assign(requests.begin(), requests.end());
         work->requests = work->client_requests;
         if (work->private_outputs.size() < requests.size())
@@ -1472,7 +1649,7 @@ std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<co
         work->private_route_completed.assign(requests.size(), 0);
         for (size_t request_index = 0; request_index < requests.size(); ++request_index)
         {
-            ExpertBackendRequest& private_request = work->requests[request_index];
+            ExpertRequest& private_request = work->requests[request_index];
             private_request.output = &work->private_outputs[request_index];
             if (private_request.device_output)
                 private_request.device_output = &work->private_device_outputs[request_index];
@@ -1491,7 +1668,7 @@ std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<co
                 private_request.route_aggregation.completed = &work->private_route_completed[request_index];
             }
         }
-        work->planned.assign(requests.size(), ExpertBackendExecutionResult::NotResident);
+        work->planned.assign(requests.size(), ExpertStatus::NotResident);
         work->selected.reserve(requests.size());
         {
             std::unique_lock<std::mutex> lock(mutex);
@@ -1499,11 +1676,11 @@ std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<co
             std::vector<Selection>& candidates = work->selected;
             for (size_t request_index = 0; request_index < requests.size(); ++request_index)
             {
-                const ExpertBackendRequest& request = requests[request_index];
+                const ExpertRequest& request = requests[request_index];
                 if (!request.output || request.rows() == 0 || request.columns() == 0
                     || (!request.has_host_input() && !request.device_input))
                 {
-                    work->planned[request_index] = ExpertBackendExecutionResult::Failed;
+                    work->planned[request_index] = ExpertStatus::Failed;
                     continue;
                 }
                 auto existing = entries.find(request.key);
@@ -1564,7 +1741,7 @@ std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<co
             // non-resident or failed requests.
             for (const Selection& selection : candidates)
             {
-                work->planned[selection.request_index] = ExpertBackendExecutionResult::Executed;
+                work->planned[selection.request_index] = ExpertStatus::Executed;
             }
             // Prepare the public handle before borrowed inputs become visible
             // to the worker. A failed queue allocation completes the private item
@@ -1641,6 +1818,18 @@ ExpertBackendStatistics VulkanExpertBackend::statistics() const
     return result;
 }
 
+uint64_t VulkanExpertBackend::physical_bytes() const
+{
+    const auto* allocator = static_cast<const VulkanExpertWeightAllocator*>(expert_weight_allocator.get());
+    return allocator ? allocator->physical_bytes() : 0;
+}
+
+uint64_t VulkanExpertBackend::physical_limit_rejections() const
+{
+    const auto* allocator = static_cast<const VulkanExpertWeightAllocator*>(expert_weight_allocator.get());
+    return allocator ? allocator->physical_limit_rejections() : 0;
+}
+
 VulkanExpertBackend::Submission::Submission(std::shared_ptr<WorkItem> _work)
     : work(std::move(_work))
 {
@@ -1656,7 +1845,7 @@ VulkanExpertBackend::Submission::~Submission()
         work->clear_references();
 }
 
-std::span<const ExpertBackendExecutionResult> VulkanExpertBackend::Submission::reservations() const noexcept
+std::span<const ExpertStatus> VulkanExpertBackend::Submission::reservations() const noexcept
 {
     return work->planned;
 }
@@ -1668,14 +1857,14 @@ void VulkanExpertBackend::Submission::wait_completion()
     waited = true;
 }
 
-std::vector<ExpertBackendExecutionResult> VulkanExpertBackend::Submission::wait()
+std::vector<ExpertStatus> VulkanExpertBackend::Submission::wait()
 {
-    std::vector<ExpertBackendExecutionResult> results;
+    std::vector<ExpertStatus> results;
     wait(results);
     return results;
 }
 
-void VulkanExpertBackend::Submission::wait(std::vector<ExpertBackendExecutionResult>& results)
+void VulkanExpertBackend::Submission::wait(std::vector<ExpertStatus>& results)
 {
     wait_completion();
     results.assign(work->final.begin(), work->final.end());
@@ -1697,8 +1886,8 @@ bool VulkanExpertBackend::Submission::commit()
     bool require_all_route_requests = false;
     for (size_t index = 0; index < work->final.size(); ++index)
     {
-        ExpertBackendRequest& client = work->client_requests[index];
-        const bool executed = work->final[index] == ExpertBackendExecutionResult::Executed;
+        ExpertRequest& client = work->client_requests[index];
+        const bool executed = work->final[index] == ExpertStatus::Executed;
         if (executed && !client.output)
         {
             aborted = true;
@@ -1752,9 +1941,9 @@ bool VulkanExpertBackend::Submission::commit()
     bool route_published = false;
     for (size_t index = 0; index < work->final.size(); ++index)
     {
-        if (work->final[index] != ExpertBackendExecutionResult::Executed)
+        if (work->final[index] != ExpertStatus::Executed)
             continue;
-        ExpertBackendRequest& client = work->client_requests[index];
+        ExpertRequest& client = work->client_requests[index];
         client.output->swap(work->private_outputs[index]);
         if (client.device_output)
             client.device_output->swap(work->private_device_outputs[index]);
@@ -1780,7 +1969,7 @@ void VulkanExpertBackend::Submission::abort() noexcept
     aborted = true;
 }
 
-bool VulkanExpertBackend::route_aggregation_enabled(std::span<const ExpertBackendRequest> requests,
+bool VulkanExpertBackend::route_aggregation_enabled(std::span<const ExpertRequest> requests,
                                                     std::span<const Selection> selected,
                                                     uint32_t output_columns,
                                                     ActivationBuffer*& output,
@@ -1799,7 +1988,7 @@ bool VulkanExpertBackend::route_aggregation_enabled(std::span<const ExpertBacken
         return false;
 
     bool require_all_requests = false;
-    for (const ExpertBackendRequest& request : requests)
+    for (const ExpertRequest& request : requests)
     {
         require_all_requests = require_all_requests
                                || request.route_aggregation.require_all_requests;
@@ -1808,10 +1997,10 @@ bool VulkanExpertBackend::route_aggregation_enabled(std::span<const ExpertBacken
     {
         if (selection.request_index >= requests.size())
             return false;
-        const ExpertBackendRequest& request = requests[selection.request_index];
+        const ExpertRequest& request = requests[selection.request_index];
         if (request.device_output)
             return false;
-        const ExpertBackendRequest::RouteAggregation& aggregation = request.route_aggregation;
+        const ExpertRequest::RouteAggregation& aggregation = request.route_aggregation;
         if (request.rows() == 0 || !aggregation.output || !aggregation.completed || aggregation.token_count == 0
             || aggregation.routes.size() != request.rows()
             || aggregation.output->rows() != aggregation.token_count
@@ -1845,7 +2034,7 @@ bool VulkanExpertBackend::route_aggregation_enabled(std::span<const ExpertBacken
     return true;
 }
 
-bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const ExpertBackendRequest> requests,
+bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const ExpertRequest> requests,
                                                            std::span<const Selection> selected,
                                                            std::vector<uint32_t>& offsets,
                                                            std::vector<uint32_t>& rows,
@@ -1853,13 +2042,13 @@ bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const Exper
 {
     if (selected.empty())
         return false;
-    const ExpertBackendRequest::RouteAggregation& first = requests[selected.front().request_index].route_aggregation;
+    const ExpertRequest::RouteAggregation& first = requests[selected.front().request_index].route_aggregation;
     const uint32_t token_count = first.token_count;
     offsets.assign(static_cast<size_t>(token_count) + 1, 0);
     size_t total_rows = 0;
     for (const Selection& selection : selected)
     {
-        const ExpertBackendRequest& request = requests[selection.request_index];
+        const ExpertRequest& request = requests[selection.request_index];
         const auto& aggregation = request.route_aggregation;
         if (aggregation.token_count != token_count || aggregation.routes.size() != request.rows())
             return false;
@@ -1881,15 +2070,14 @@ bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const Exper
         return false;
     rows.resize(total_rows);
     weights.resize(total_rows);
-    std::vector<uint32_t> cursors(offsets.begin(), offsets.end() - 1);
     size_t row_offset = 0;
     for (const Selection& selection : selected)
     {
-        const ExpertBackendRequest& request = requests[selection.request_index];
+        const ExpertRequest& request = requests[selection.request_index];
         for (size_t batch_index = 0; batch_index < request.route_aggregation.routes.size(); ++batch_index)
         {
             const ExpertRoute& route = request.route_aggregation.routes[batch_index];
-            const uint32_t destination = cursors[route.token_index]++;
+            const uint32_t destination = offsets[route.token_index]++;
             if (destination >= rows.size() || row_offset + batch_index > std::numeric_limits<uint32_t>::max())
                 return false;
             rows[destination] = static_cast<uint32_t>(row_offset + batch_index);
@@ -1897,6 +2085,9 @@ bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const Exper
         }
         row_offset += request.rows();
     }
+    for (uint32_t token = token_count; token > 0; --token)
+        offsets[token] = offsets[token - 1];
+    offsets[0] = 0;
     return true;
 }
 
@@ -1912,6 +2103,8 @@ uint64_t VulkanExpertBackend::qnk_bytes(const TensorData& tensor)
 
 uint64_t VulkanExpertBackend::expert_matrix_bytes(const TensorData& tensor)
 {
+    if (tensor.dtype == DType::Int4)
+        return int4_storage_bytes(tensor);
     if (tensor.dtype == DType::MxFp4)
         return mxfp4_bytes(tensor);
     if (tensor.dtype == DType::BFloat16)
@@ -2145,19 +2338,56 @@ void VulkanExpertBackend::execute_work_item(const std::shared_ptr<WorkItem>& wor
     bool executed = work->selected.empty();
     if (!work->selected.empty())
     {
-        const std::shared_ptr<Entry>& entry = work->selected.front().entry;
-        if (entry && entry->operation)
-            executed = forward_batch(work->requests, work->selected);
-        else if (entry && entry->bfloat16_operation)
+        const auto operation_kind = [](const std::shared_ptr<Entry>& entry) {
+            return !entry ? 0 : entry->operation        ? 1
+                            : entry->bfloat16_operation ? 2
+                            : entry->qnk_operation      ? 3
+                                                        : 0;
+        };
+        const int kind = operation_kind(work->selected.front().entry);
+        const bool homogeneous = std::all_of(work->selected.begin(), work->selected.end(), [&](const Selection& selection) {
+            return operation_kind(selection.entry) == kind;
+        });
+        const auto forward = [&](int selected_kind, std::span<const Selection> selected) {
+            if (selected_kind == 1)
+                return forward_batch(work->requests, selected);
+            if (selected_kind == 2)
+                return forward_bfloat16_batch(*work, work->requests, selected);
+            return selected_kind == 3 && forward_qnk_batch(*work, work->requests, selected);
+        };
+        if (homogeneous)
         {
-            executed = forward_bfloat16_batch(work->requests, work->selected);
+            executed = forward(kind, work->selected);
         }
-        else if (entry && entry->qnk_operation)
+        else
         {
-            executed = forward_qnk_batch(work->requests, work->selected);
+            // Each family publishes its own host output. A shared aggregate
+            // cannot be overwritten by independent family submissions.
+            for (ExpertRequest& request : work->requests)
+            {
+                request.route_aggregation.output = nullptr;
+                request.route_aggregation.completed = nullptr;
+            }
+            executed = std::all_of(work->selected.begin(), work->selected.end(), [&](const Selection& selection) {
+                return operation_kind(selection.entry) != 0;
+            });
+            for (int selected_kind = 1; executed && selected_kind <= 3; ++selected_kind)
+            {
+                std::vector<Selection>& dispatch = work->dispatch;
+                dispatch.clear();
+                for (const Selection& selection : work->selected)
+                    if (operation_kind(selection.entry) == selected_kind) dispatch.push_back(selection);
+                if (!dispatch.empty() && !forward(selected_kind, dispatch))
+                {
+                    executed = false;
+                    break;
+                }
+            }
+            work->dispatch.clear();
         }
     }
     uint64_t aggregated_route_count = 0;
+    uint64_t device_source_count = 0;
     uint32_t route_aggregation_token_count = 0;
     uint32_t route_aggregation_columns = 0;
     bool route_aggregated = false;
@@ -2165,9 +2395,11 @@ void VulkanExpertBackend::execute_work_item(const std::shared_ptr<WorkItem>& wor
     {
         for (const Selection& selection : work->selected)
         {
+            if (selection.entry->device_source_pin)
+                ++device_source_count;
             if (selection.request_index >= work->requests.size())
                 continue;
-            const ExpertBackendRequest& request = work->requests[selection.request_index];
+            const ExpertRequest& request = work->requests[selection.request_index];
             if (!request.route_aggregation.completed || *request.route_aggregation.completed == 0)
                 continue;
             if (!route_aggregated)
@@ -2203,24 +2435,18 @@ void VulkanExpertBackend::execute_work_item(const std::shared_ptr<WorkItem>& wor
                 {
                     ++device_source_execution_failures;
                 }
-                final[selection.request_index] = ExpertBackendExecutionResult::Failed;
+                final[selection.request_index] = ExpertStatus::Failed;
             }
         }
         else
         {
             executions += work->selected.size();
+            device_source_executions += device_source_count;
             if (route_aggregated)
             {
                 ++route_aggregation_batches;
                 route_aggregation_routes += aggregated_route_count;
                 route_aggregation_bytes_saved += saved_transfer_size;
-            }
-            for (const Selection& selection : work->selected)
-            {
-                if (selection.entry->device_source_pin)
-                {
-                    ++device_source_executions;
-                }
             }
         }
     }
@@ -2246,6 +2472,11 @@ void VulkanExpertBackend::execute_work_item(const std::shared_ptr<WorkItem>& wor
     {
         const std::lock_guard<std::mutex> lock(work->mutex);
         work->selected.clear();
+        work->dispatch.clear();
+        work->bfloat16_experts.clear();
+        work->qnk_experts.clear();
+        work->inputs.clear();
+        work->outputs.clear();
         work->done = true;
     }
     work->completed.notify_all();
@@ -2315,10 +2546,10 @@ void VulkanExpertBackend::worker_loop()
             pending.pop_front();
             ++active_admissions;
             if (has_flag(optimization_flags, OptimizationVulkanExpertBatchAdmission)
-                && batch.front().gate_up && batch.front().gate_up->dtype == DType::MxFp4)
+                && is_packed_mxfp4_expert(batch.front().gate_up.get(), batch.front().up.get(), batch.front().down.get()))
             {
                 while (batch.size() < maximum_upload_batch && !pending.empty()
-                       && pending.front().gate_up && pending.front().gate_up->dtype == DType::MxFp4)
+                       && is_packed_mxfp4_expert(pending.front().gate_up.get(), pending.front().up.get(), pending.front().down.get()))
                 {
                     batch.push_back(std::move(pending.front()));
                     pending.pop_front();
@@ -2331,7 +2562,7 @@ void VulkanExpertBackend::worker_loop()
         try
         {
             std::optional<VulkanWeightUploadBatch> upload_batch;
-            if (batch.front().gate_up->dtype == DType::MxFp4)
+            if (is_packed_mxfp4_expert(batch.front().gate_up.get(), batch.front().up.get(), batch.front().down.get()))
                 upload_batch.emplace(vulkan_context, admission_staging_allocator.get(), &admission_upload_scratch);
             for (size_t index = 0; index < batch.size(); ++index)
                 loaded[index] = create_entry(batch[index], upload_batch ? &*upload_batch : nullptr);
@@ -2353,14 +2584,20 @@ void VulkanExpertBackend::worker_loop()
             pending_keys.erase(batch[index].key);
             if (!stopping && !install_entry_locked(loaded[index]))
                 ++dropped_admissions;
+            batch[index] = {};
             finish_admission_locked();
         }
     }
 }
 
-bool VulkanExpertBackend::forward_bfloat16_batch(std::span<const ExpertBackendRequest> requests,
+bool VulkanExpertBackend::forward_bfloat16_batch(WorkItem& work,
+                                                 std::span<const ExpertRequest> requests,
                                                  std::span<const Selection> selected)
 {
+    if (std::any_of(selected.begin(), selected.end(), [&](const Selection& selection) {
+            return selection.request_index < requests.size() && requests[selection.request_index].device_output;
+        }))
+        return forward_device_batch(requests, selected);
     if (selected.empty())
         return true;
     if (!selected.front().entry
@@ -2369,26 +2606,27 @@ bool VulkanExpertBackend::forward_bfloat16_batch(std::span<const ExpertBackendRe
         return false;
     }
 
-    std::vector<const Bfloat16Expert_vulkan*> experts;
-    std::vector<const ActivationBuffer*> inputs;
-    std::vector<ActivationBuffer*> outputs;
-    experts.reserve(selected.size());
-    inputs.reserve(selected.size());
-    outputs.reserve(selected.size());
-    for (const Selection& selection : selected)
+    std::vector<const Bfloat16Expert_vulkan*>& experts = work.bfloat16_experts;
+    std::vector<const ActivationBuffer*>& inputs = work.inputs;
+    std::vector<ActivationBuffer*>& outputs = work.outputs;
+    experts.resize(selected.size());
+    inputs.resize(selected.size());
+    outputs.resize(selected.size());
+    for (size_t index = 0; index < selected.size(); ++index)
     {
+        const Selection& selection = selected[index];
         if (selection.request_index >= requests.size()
             || !selection.entry
             || !selection.entry->bfloat16_operation)
         {
             return false;
         }
-        const ExpertBackendRequest& request = requests[selection.request_index];
+        const ExpertRequest& request = requests[selection.request_index];
         if (!request.has_host_input() || !request.output)
             return false;
-        experts.push_back(selection.entry->bfloat16_operation.get());
-        inputs.push_back(request.input);
-        outputs.push_back(request.output);
+        experts[index] = selection.entry->bfloat16_operation.get();
+        inputs[index] = request.input;
+        outputs[index] = request.output;
     }
 
     const uint32_t output_columns = selected.front().entry->bfloat16_operation->output_columns();
@@ -2415,7 +2653,7 @@ bool VulkanExpertBackend::forward_bfloat16_batch(std::span<const ExpertBackendRe
         aggregated_output->reset(aggregated_token_count, output_columns, true);
         for (const Selection& selection : selected)
         {
-            const ExpertBackendRequest& request = requests[selection.request_index];
+            const ExpertRequest& request = requests[selection.request_index];
             if (request.route_aggregation.routes.size()
                 != request.rows())
             {
@@ -2438,10 +2676,16 @@ bool VulkanExpertBackend::forward_bfloat16_batch(std::span<const ExpertBackendRe
     return true;
 }
 
-bool VulkanExpertBackend::forward_qnk_batch(std::span<const ExpertBackendRequest> requests, std::span<const Selection> selected)
+bool VulkanExpertBackend::forward_qnk_batch(WorkItem& work,
+                                            std::span<const ExpertRequest> requests,
+                                            std::span<const Selection> selected)
 {
     if (selected.empty())
         return true;
+    if (std::any_of(selected.begin(), selected.end(), [&](const Selection& selection) {
+            return selection.request_index < requests.size() && requests[selection.request_index].device_output;
+        }))
+        return forward_device_batch(requests, selected);
     if (!selected.front().entry || !selected.front().entry->qnk_operation)
         return false;
 
@@ -2457,7 +2701,7 @@ bool VulkanExpertBackend::forward_qnk_batch(std::span<const ExpertBackendRequest
         {
             return false;
         }
-        const ExpertBackendRequest& request = requests[selection.request_index];
+        const ExpertRequest& request = requests[selection.request_index];
         if (!request.has_host_input() || !request.output)
         {
             return false;
@@ -2475,24 +2719,25 @@ bool VulkanExpertBackend::forward_qnk_batch(std::span<const ExpertBackendRequest
     if (selected.size() == 1)
     {
         const Selection& selection = selected.front();
-        const ExpertBackendRequest& request = requests[selection.request_index];
+        const ExpertRequest& request = requests[selection.request_index];
         if (!selection.entry->qnk_operation->forward(*request.input, *request.output))
             return false;
     }
     else
     {
-        std::vector<const QnkExpert_vulkan*> experts;
-        std::vector<const ActivationBuffer*> inputs;
-        std::vector<ActivationBuffer*> outputs;
-        experts.reserve(selected.size());
-        inputs.reserve(selected.size());
-        outputs.reserve(selected.size());
-        for (const Selection& selection : selected)
+        std::vector<const QnkExpert_vulkan*>& experts = work.qnk_experts;
+        std::vector<const ActivationBuffer*>& inputs = work.inputs;
+        std::vector<ActivationBuffer*>& outputs = work.outputs;
+        experts.resize(selected.size());
+        inputs.resize(selected.size());
+        outputs.resize(selected.size());
+        for (size_t index = 0; index < selected.size(); ++index)
         {
-            const ExpertBackendRequest& request = requests[selection.request_index];
-            experts.push_back(selection.entry->qnk_operation.get());
-            inputs.push_back(request.input);
-            outputs.push_back(request.output);
+            const Selection& selection = selected[index];
+            const ExpertRequest& request = requests[selection.request_index];
+            experts[index] = selection.entry->qnk_operation.get();
+            inputs[index] = request.input;
+            outputs[index] = request.output;
         }
         if (!QnkExpert_vulkan::forward_batch(experts, inputs, outputs))
             return false;
@@ -2500,19 +2745,13 @@ bool VulkanExpertBackend::forward_qnk_batch(std::span<const ExpertBackendRequest
 
     if (use_route_aggregation)
     {
-        if (!aggregated_output)
-            return false;
         aggregated_output->reset(aggregated_token_count, output_columns, true);
         for (const Selection& selection : selected)
         {
-            const ExpertBackendRequest& request = requests[selection.request_index];
-            if (request.route_aggregation.routes.size() != request.rows())
-                return false;
+            const ExpertRequest& request = requests[selection.request_index];
             for (size_t row = 0; row < request.rows(); ++row)
             {
                 const ExpertRoute& route = request.route_aggregation.routes[row];
-                if (route.token_index >= aggregated_output->rows())
-                    return false;
                 float* destination = aggregated_output->row(route.token_index);
                 const float* source = request.output->row(row);
                 for (uint32_t column = 0; column < output_columns; ++column)
@@ -2526,6 +2765,52 @@ bool VulkanExpertBackend::forward_qnk_batch(std::span<const ExpertBackendRequest
 }
 
 #endif // NCNN_MOE_WITH_VULKAN
+
+uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
+                                               const TensorData& down, uint32_t device_index,
+                                               const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags)
+{
+    return native_quantized_expert_storage_bytes(gate_up, up, down, device_index, vulkan_runtime,
+                                                 optimization_flags, nullptr, nullptr, nullptr, ExpertActivation::Silu, 0.0f);
+}
+
+uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
+                                               const TensorData& down, uint32_t device_index,
+                                               const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags,
+                                               const TensorData* gate_up_bias, const TensorData* up_bias,
+                                               const TensorData* down_bias, ExpertActivation activation,
+                                               float activation_limit)
+{
+#if NCNN_MOE_WITH_VULKAN
+    auto context = VulkanContext::acquire(device_index, vulkan_runtime, optimization_flags);
+    if (!context)
+        return 0;
+    return executable_expert_storage_bytes(gate_up, up, down, *context, optimization_flags,
+                                           gate_up_bias, up_bias, down_bias, activation, activation_limit);
+#else
+    (void)gate_up;
+    (void)up;
+    (void)down;
+    (void)device_index;
+    (void)vulkan_runtime;
+    (void)optimization_flags;
+    (void)gate_up_bias;
+    (void)up_bias;
+    (void)down_bias;
+    (void)activation;
+    (void)activation_limit;
+    return 0;
+#endif
+}
+
+uint64_t native_quantized_gpu_cache_size(uint64_t available_size, uint64_t total_size,
+                                         uint64_t largest_expert_size) noexcept
+{
+    if (total_size < largest_expert_size || largest_expert_size == 0)
+        return 0;
+    const uint64_t available = std::min(available_size, total_size);
+    return available < largest_expert_size ? 0 : available;
+}
 
 std::shared_ptr<ExpertBackend> create_vulkan_expert_backend(uint64_t cache_size, uint32_t device_index,
                                                             std::shared_ptr<ExpertVictimCache> device_weight_source,

@@ -5,6 +5,8 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #endif
 
+layout(constant_id = 0) const uint workgroup_size = 32;
+
 layout(binding = 0) buffer data_blob
 {
     float data[];
@@ -22,9 +24,7 @@ layout(push_constant) uniform parameter
 }
 p;
 
-#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
-shared float partial[32];
-#endif
+shared float partial[workgroup_size];
 
 float quantize_float8_e4m3(float value)
 {
@@ -57,31 +57,38 @@ float quantize_float8_e4m3(float value)
 void main()
 {
     const uint token = gl_WorkGroupID.y;
-    const uint lane = gl_LocalInvocationID.x;
+    const uint lane = gl_LocalInvocationIndex;
     float square_sum = 0.0;
-    for (uint column = lane; column < p.columns; column += 32)
+    for (uint column = lane; column < p.columns; column += workgroup_size)
     {
         const float value = data[token * p.columns + column];
         square_sum += value * value;
     }
+    float inverse_rms = 0.0;
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
-    const float total_square_sum = subgroupAdd(square_sum);
-    const float inverse_rms = inversesqrt(total_square_sum / float(p.columns) + p.epsilon);
-#else
-    partial[lane] = square_sum;
-    barrier();
-    for (uint stride = 16; stride > 0; stride >>= 1)
+    if (gl_NumSubgroups == 1)
     {
-        if (lane < stride)
-            partial[lane] += partial[lane + stride];
+        const float total_square_sum = subgroupAdd(square_sum);
+        inverse_rms = inversesqrt(total_square_sum / float(p.columns) + p.epsilon);
+    }
+    else
+#endif
+    {
+        partial[lane] = square_sum;
+        barrier();
+        for (uint stride = workgroup_size >> 1; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+                partial[lane] += partial[lane + stride];
+            barrier();
+        }
+        inverse_rms = inversesqrt(partial[0] / float(p.columns) + p.epsilon);
         barrier();
     }
-    const float inverse_rms = inversesqrt(partial[0] / float(p.columns) + p.epsilon);
-#endif
     for (uint block_begin = 0; block_begin < p.columns; block_begin += 128)
     {
         float maximum = 0.0001;
-        for (uint offset = lane; offset < 128; offset += 32)
+        for (uint offset = lane; offset < 128; offset += workgroup_size)
         {
             const uint column = block_begin + offset;
             if (column < p.columns)
@@ -91,21 +98,28 @@ void main()
                 maximum = max(maximum, abs(data[index]));
             }
         }
+        float scale = 0.0;
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
-        const float block_maximum = subgroupMax(maximum);
-        const float scale = exp2(ceil(log2(block_maximum / 448.0)));
-#else
-        partial[lane] = maximum;
-        barrier();
-        for (uint stride = 16; stride > 0; stride >>= 1)
+        if (gl_NumSubgroups == 1)
         {
-            if (lane < stride)
-                partial[lane] = max(partial[lane], partial[lane + stride]);
+            const float block_maximum = subgroupMax(maximum);
+            scale = exp2(ceil(log2(block_maximum / 448.0)));
+        }
+        else
+#endif
+        {
+            partial[lane] = maximum;
+            barrier();
+            for (uint stride = workgroup_size >> 1; stride > 0; stride >>= 1)
+            {
+                if (lane < stride)
+                    partial[lane] = max(partial[lane], partial[lane + stride]);
+                barrier();
+            }
+            scale = exp2(ceil(log2(partial[0] / 448.0)));
             barrier();
         }
-        const float scale = exp2(ceil(log2(partial[0] / 448.0)));
-#endif
-        for (uint offset = lane; offset < 128; offset += 32)
+        for (uint offset = lane; offset < 128; offset += workgroup_size)
         {
             const uint column = block_begin + offset;
             if (column < p.columns)
@@ -114,8 +128,5 @@ void main()
                 data[index] = quantize_float8_e4m3(clamp(data[index] / scale, -448.0, 448.0)) * scale;
             }
         }
-#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
-        barrier();
-#endif
     }
 }

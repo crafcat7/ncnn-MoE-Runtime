@@ -122,7 +122,7 @@ static void router_test_scores()
     selection_bias.float32_data.resize(count);
     for (uint32_t expert = 0; expert < count; ++expert)
         selection_bias.float32_data[expert] = static_cast<float>((expert * 31) % 17) * 0.01f;
-    auto router = Router_vulkan::create(weight, nullptr, &selection_bias, 0,
+    auto router = Router_vulkan::create(weight, nullptr, &selection_bias, get_default_gpu_index(),
                                         runtime, OptimizationDefaultFlags);
     router_check(static_cast<bool>(router), "router create");
     ActivationBuffer input(3, count);
@@ -154,7 +154,7 @@ static void router_test_scores()
                 const ActivationBuffer selected = router_run(*router, input, options);
                 router_check(static_cast<bool>(Router_vulkan::decode_selected(selected, options, actual)),
                              "GPU selected decode");
-                router_check_plan(actual, expected, "score/bias/normalization");
+                router_check_plan(actual, expected, "score=" + std::to_string(static_cast<uint32_t>(score)) + " normalization=" + std::to_string(static_cast<uint32_t>(normalization)) + " bias=" + std::to_string(with_bias));
             }
         }
     }
@@ -190,7 +190,7 @@ static void router_test_ties_and_extremes()
     bias.dtype = DType::BFloat16;
     bias.shape = {32};
     bias.bfloat16_data.assign(32, float_to_bfloat16(0.5f));
-    auto router = Router_vulkan::create(weight, &bias, nullptr, 0, create_vulkan_runtime(),
+    auto router = Router_vulkan::create(weight, &bias, nullptr, get_default_gpu_index(), create_vulkan_runtime(),
                                         OptimizationDefaultFlags);
     router_check(static_cast<bool>(router), "BF16 router create with bias");
     ActivationBuffer input(1, 32);
@@ -260,7 +260,7 @@ static void router_test_ties_and_extremes()
 static void router_test_invalid()
 {
     const TensorData weight = router_identity(8);
-    auto router = Router_vulkan::create(weight, nullptr, nullptr, 0,
+    auto router = Router_vulkan::create(weight, nullptr, nullptr, get_default_gpu_index(),
                                         create_vulkan_runtime(), OptimizationDefaultFlags);
     router_check(static_cast<bool>(router), "invalid test router create");
     ActivationBuffer input(2, 8);

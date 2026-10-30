@@ -15,7 +15,11 @@ static std::array<float, 256> make_avx512_scale_table()
 {
     std::array<float, 256> table = {};
     for (uint32_t index = 0; index < table.size(); ++index)
-        table[index] = std::ldexp(1.0f, static_cast<int>(index) - 127);
+    {
+        const uint32_t bits = index < 2 ? (UINT32_C(0x00200000) << index)
+                                        : (static_cast<uint32_t>(index - 1) << 23);
+        table[index] = std::bit_cast<float>(bits);
+    }
     return table;
 }
 
@@ -120,7 +124,7 @@ static __forceinline void avx512_accumulate_contiguous_rows4_block(const uint8_t
         __m512 decoded[2];
         avx512_decode_block(packed + matrix_row * packed_row_bytes + static_cast<size_t>(block_index) * 16, decoded);
         const __m512 block = _mm512_fmadd_ps(decoded[1], input_high, _mm512_mul_ps(decoded[0], input_low));
-        totals[row] = _mm512_fmadd_ps(block, _mm512_set1_ps(0.5f * scales_by_exponent[scales[matrix_row * block_count + block_index]]), totals[row]);
+        totals[row] = _mm512_fmadd_ps(block, _mm512_set1_ps(scales_by_exponent[scales[matrix_row * block_count + block_index]]), totals[row]);
     }
 }
 
@@ -141,7 +145,7 @@ static __forceinline void avx512_accumulate_contiguous_rows4_tokens2_block(const
         const size_t matrix_row = first_row + row;
         __m512 decoded[2];
         avx512_decode_block(packed + matrix_row * packed_row_bytes + static_cast<size_t>(block_index) * 16, decoded);
-        const __m512 scale = _mm512_set1_ps(0.5f * scales_by_exponent[scales[matrix_row * block_count + block_index]]);
+        const __m512 scale = _mm512_set1_ps(scales_by_exponent[scales[matrix_row * block_count + block_index]]);
         totals[row] = _mm512_fmadd_ps(_mm512_fmadd_ps(decoded[1], first_input_high, _mm512_mul_ps(decoded[0], first_input_low)), scale, totals[row]);
         totals[4 + row] = _mm512_fmadd_ps(_mm512_fmadd_ps(decoded[1], second_input_high, _mm512_mul_ps(decoded[0], second_input_low)), scale, totals[4 + row]);
     }
@@ -598,7 +602,7 @@ float msvc_avx512_mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32
         avx512_decode_block(packed + static_cast<size_t>(block_index) * 16, decoded);
         const float* input_block = input + static_cast<size_t>(block_index) * 32;
         const __m512 accumulator = _mm512_fmadd_ps(decoded[1], _mm512_loadu_ps(input_block + 16), _mm512_mul_ps(decoded[0], _mm512_loadu_ps(input_block)));
-        total = _mm512_fmadd_ps(accumulator, _mm512_set1_ps(0.5f * scales_by_exponent[scales[block_index]]), total);
+        total = _mm512_fmadd_ps(accumulator, _mm512_set1_ps(scales_by_exponent[scales[block_index]]), total);
     }
     return _mm512_reduce_add_ps(total);
 }
@@ -656,7 +660,7 @@ void msvc_avx512_mxfp4_q8_packed_gemm(const uint8_t* packed,
                         if (matrix_row >= row_count)
                             continue;
                         output[token * output_stride + matrix_row] += static_cast<float>(dots[row])
-                                                                      * (0.5f * scales_by_exponent[packed_block[row]])
+                                                                      * (scales_by_exponent[packed_block[row]])
                                                                       * input_scale;
                     }
                 }
@@ -681,7 +685,7 @@ void msvc_avx512_mxfp4_gemm_row(const uint8_t* packed, const uint8_t* scales, ui
         __m512 decoded[2];
         avx512_decode_block(packed + static_cast<size_t>(block_index) * 16, decoded);
         const size_t input_offset = static_cast<size_t>(block_index) * 32;
-        const float scale = 0.5f * scales_by_exponent[scales[block_index]];
+        const float scale = scales_by_exponent[scales[block_index]];
         for (size_t token_index = 0; token_index < token_count; ++token_index)
         {
             const float* token = input + token_index * input_stride + input_offset;
@@ -715,8 +719,8 @@ void msvc_avx512_mxfp4_matmul_rows2(const uint8_t* first_packed, const uint8_t* 
             const __m512 input_high = _mm512_loadu_ps(input_block + 16);
             const __m512 first_block = _mm512_fmadd_ps(decoded_rows[0][1], input_high, _mm512_mul_ps(decoded_rows[0][0], input_low));
             const __m512 second_block = _mm512_fmadd_ps(decoded_rows[1][1], input_high, _mm512_mul_ps(decoded_rows[1][0], input_low));
-            first_total = _mm512_fmadd_ps(first_block, _mm512_set1_ps(0.5f * scales_by_exponent[first_scales[block_index]]), first_total);
-            second_total = _mm512_fmadd_ps(second_block, _mm512_set1_ps(0.5f * scales_by_exponent[second_scales[block_index]]), second_total);
+            first_total = _mm512_fmadd_ps(first_block, _mm512_set1_ps(scales_by_exponent[first_scales[block_index]]), first_total);
+            second_total = _mm512_fmadd_ps(second_block, _mm512_set1_ps(scales_by_exponent[second_scales[block_index]]), second_total);
         }
         first_output[0] = _mm512_reduce_add_ps(first_total);
         second_output[0] = _mm512_reduce_add_ps(second_total);
@@ -741,8 +745,8 @@ void msvc_avx512_mxfp4_matmul_rows2(const uint8_t* first_packed, const uint8_t* 
             __m512 decoded_rows[2][2];
             avx512_decode_block(first_packed + static_cast<size_t>(block_index) * 16, decoded_rows[0]);
             avx512_decode_block(second_packed + static_cast<size_t>(block_index) * 16, decoded_rows[1]);
-            const __m512 first_scale = _mm512_set1_ps(0.5f * scales_by_exponent[first_scales[block_index]]);
-            const __m512 second_scale = _mm512_set1_ps(0.5f * scales_by_exponent[second_scales[block_index]]);
+            const __m512 first_scale = _mm512_set1_ps(scales_by_exponent[first_scales[block_index]]);
+            const __m512 second_scale = _mm512_set1_ps(scales_by_exponent[second_scales[block_index]]);
             const size_t input_offset = static_cast<size_t>(block_index) * 32;
             for (size_t token_index = 0; token_index < token_count; ++token_index)
             {
@@ -769,8 +773,8 @@ void msvc_avx512_mxfp4_matmul_rows2(const uint8_t* first_packed, const uint8_t* 
         avx512_decode_block(first_packed + static_cast<size_t>(block_index) * 16, decoded_rows[0]);
         avx512_decode_block(second_packed + static_cast<size_t>(block_index) * 16, decoded_rows[1]);
         const size_t input_offset = static_cast<size_t>(block_index) * 32;
-        const float first_scale = 0.5f * scales_by_exponent[first_scales[block_index]];
-        const float second_scale = 0.5f * scales_by_exponent[second_scales[block_index]];
+        const float first_scale = scales_by_exponent[first_scales[block_index]];
+        const float second_scale = scales_by_exponent[second_scales[block_index]];
         for (size_t token_index = 0; token_index < token_count; ++token_index)
         {
             const float* token = input + token_index * input_stride + input_offset;

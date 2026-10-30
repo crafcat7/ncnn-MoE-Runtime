@@ -10,6 +10,8 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #endif
 
+layout(constant_id = 0) const uint workgroup_size = 32;
+
 layout(binding = 0) readonly buffer input_blob
 {
     float input_data[];
@@ -75,16 +77,14 @@ float mxfp4_product(float value, float input_value, float scale)
 #endif
 }
 
-#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
-shared float gate_partial[32];
-shared float up_partial[32];
-#endif
+shared float gate_partial[workgroup_size];
+shared float up_partial[workgroup_size];
 
 void main()
 {
     const uint intermediate_column = gl_WorkGroupID.x;
     const uint token = gl_WorkGroupID.y;
-    const uint lane = gl_LocalInvocationID.x;
+    const uint lane = gl_LocalInvocationIndex;
     const bool valid = intermediate_column < p.intermediate_columns && token < p.token_count;
     float gate_sum = 0.0;
     float up_sum = 0.0;
@@ -113,9 +113,32 @@ void main()
                                     decode_scale(scale_byte(up_scale_row + block)));
         }
     }
+    float reduced_gate = 0.0;
+    float reduced_up = 0.0;
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
-    const float reduced_gate = subgroupAdd(gate_sum);
-    const float reduced_up = subgroupAdd(up_sum);
+    if (gl_NumSubgroups == 1)
+    {
+        reduced_gate = subgroupAdd(gate_sum);
+        reduced_up = subgroupAdd(up_sum);
+    }
+    else
+#endif
+    {
+        gate_partial[lane] = gate_sum;
+        up_partial[lane] = up_sum;
+        barrier();
+        for (uint stride = workgroup_size >> 1; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+            {
+                gate_partial[lane] += gate_partial[lane + stride];
+                up_partial[lane] += up_partial[lane + stride];
+            }
+            barrier();
+        }
+        reduced_gate = gate_partial[0];
+        reduced_up = up_partial[0];
+    }
     if (valid && lane == 0)
     {
         float gate = reduced_gate + bias_data[intermediate_column * 2];
@@ -141,43 +164,4 @@ void main()
             output_data[token * p.intermediate_columns + intermediate_column] = silu * (up + 1.0);
         }
     }
-#else
-    gate_partial[lane] = gate_sum;
-    up_partial[lane] = up_sum;
-    barrier();
-    for (uint stride = 16; stride > 0; stride >>= 1)
-    {
-        if (lane < stride)
-        {
-            gate_partial[lane] += gate_partial[lane + stride];
-            up_partial[lane] += up_partial[lane + stride];
-        }
-        barrier();
-    }
-    if (valid && lane == 0)
-    {
-        float gate = gate_partial[0] + bias_data[intermediate_column * 2];
-        float up = up_partial[0] + bias_data[intermediate_column * 2 + 1];
-        if (p.activation_limit > 0.0)
-        {
-            gate = min(gate, p.activation_limit);
-            up = clamp(up, -p.activation_limit, p.activation_limit);
-        }
-        if (p.activation == 2)
-        {
-            const float silu = gate / (1.0 + exp(-gate));
-            output_data[token * p.intermediate_columns + intermediate_column] = silu * up;
-        }
-        else if (p.activation == 1)
-        {
-            const float silu = gate / (1.0 + exp(-gate));
-            output_data[token * p.intermediate_columns + intermediate_column] = silu * up;
-        }
-        else
-        {
-            const float silu = gate / (1.0 + exp(-1.702 * gate));
-            output_data[token * p.intermediate_columns + intermediate_column] = silu * (up + 1.0);
-        }
-    }
-#endif
 }

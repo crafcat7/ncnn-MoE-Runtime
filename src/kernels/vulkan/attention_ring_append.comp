@@ -26,8 +26,15 @@ layout(push_constant) uniform parameter
     uint destination_cstep;
     uint capacity;
     uint destination_start;
+    uint round_kv;
 }
 p;
+
+float round_bf16(float value)
+{
+    const uint bits = floatBitsToUint(value);
+    return uintBitsToFloat((bits + 0x7fffu + ((bits >> 16u) & 1u)) & 0xffff0000u);
+}
 
 void main()
 {
@@ -41,8 +48,10 @@ void main()
     const uint slot = (p.destination_start + row) % p.capacity;
     const uint destination_index = channel * p.destination_cstep + slot * p.width + column;
     const uint duplicate_index = destination_index + p.capacity * p.width;
-    const float key = buffer_ld1(source_key_data, source_index);
-    const float value = buffer_ld1(source_value_data, source_index);
+    const float source_key = buffer_ld1(source_key_data, source_index);
+    const float source_value = buffer_ld1(source_value_data, source_index);
+    const float key = p.round_kv != 0u ? round_bf16(source_key) : source_key;
+    const float value = p.round_kv != 0u ? round_bf16(source_value) : source_value;
     buffer_st1(destination_key_data, destination_index, key);
     buffer_st1(destination_key_data, duplicate_index, key);
     buffer_st1(destination_value_data, destination_index, value);

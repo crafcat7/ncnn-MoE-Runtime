@@ -1,6 +1,7 @@
 #include "tokenizer.h"
 
 #include "json.h"
+#include "gguf.h"
 #include "modeladapter.h"
 #include "storage/mappedfile.h"
 #include "unicodedata.h"
@@ -507,6 +508,192 @@ static const char qwen38_template[] = R"QWEN38({%- set image_count = namespace(v
     {%- endif %}
 {%- endif %})QWEN38";
 
+// Pinned Unsloth revision: merge leading system/developer messages.
+static const char qwen38_unsloth_template[] = R"QWEN38U({%- set image_count = namespace(value=0) %}
+{%- set video_count = namespace(value=0) %}
+{%- macro render_content(content, do_vision_count, is_system_content=false) %}
+    {%- if content is string %}
+        {{- content }}
+    {%- elif content is iterable and content is not mapping %}
+        {%- for item in content %}
+            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}
+                {%- if is_system_content %}
+                    {{- raise_exception('System message cannot contain images.') }}
+                {%- endif %}
+                {%- if do_vision_count %}
+                    {%- set image_count.value = image_count.value + 1 %}
+                {%- endif %}
+                {%- if add_vision_id %}
+                    {{- 'Picture ' ~ image_count.value ~ ': ' }}
+                {%- endif %}
+                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
+            {%- elif 'video' in item or item.type == 'video' %}
+                {%- if is_system_content %}
+                    {{- raise_exception('System message cannot contain videos.') }}
+                {%- endif %}
+                {%- if do_vision_count %}
+                    {%- set video_count.value = video_count.value + 1 %}
+                {%- endif %}
+                {%- if add_vision_id %}
+                    {{- 'Video ' ~ video_count.value ~ ': ' }}
+                {%- endif %}
+                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}
+            {%- elif 'text' in item %}
+                {{- item.text }}
+            {%- else %}
+                {{- raise_exception('Unexpected item type in content.') }}
+            {%- endif %}
+        {%- endfor %}
+    {%- elif content is none or content is undefined %}
+        {{- '' }}
+    {%- else %}
+        {{- raise_exception('Unexpected content type.') }}
+    {%- endif %}
+{%- endmacro %}
+{%- if not messages %}
+    {{- raise_exception('No messages provided.') }}
+{%- endif %}
+{%- set sysns = namespace(count=0, text='') %}
+{%- for message in messages %}
+    {%- if sysns.count == loop.index0 and (message.role == 'system' or message.role == 'developer') %}
+        {%- set sys_content = render_content(message.content, false, true)|trim %}
+        {%- if sys_content %}
+            {%- set sysns.text = sysns.text + ('\n' if sysns.text else '') + sys_content %}
+        {%- endif %}
+        {%- set sysns.count = sysns.count + 1 %}
+    {%- endif %}
+{%- endfor %}
+{%- set num_sys = sysns.count %}
+{%- set merged_system = sysns.text %}
+{%- set reasoning_instructions = '' %}
+{%- if enable_thinking is undefined or enable_thinking is true %}
+    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+    {%- if resolved_reasoning_effort == 'high' %}
+        {%- set resolved_reasoning_effort = 'xhigh' %}
+    {%- endif %}
+    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
+        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}
+    {%- endif %}
+    {%- if resolved_reasoning_effort == 'xhigh' %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
+    {%- elif resolved_reasoning_effort == 'low' %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
+    {%- endif %}
+{%- endif %}
+{%- if tools and tools is iterable and tools is not mapping %}
+    {{- '<|im_start|>system\n' }}
+    {%- if reasoning_instructions %}
+        {{- reasoning_instructions + '\n\n' }}
+    {%- endif %}
+    {{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>" }}
+    {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
+    {%- if merged_system %}
+        {{- '\n\n' + merged_system }}
+    {%- endif %}
+    {{- '<|im_end|>\n' }}
+{%- else %}
+    {%- if merged_system %}
+        {{- '<|im_start|>system\n' + (reasoning_instructions + '\n\n' if reasoning_instructions else '')  + merged_system + '<|im_end|>\n' }}
+    {%- elif reasoning_instructions %}
+        {{- '<|im_start|>system\n' + reasoning_instructions + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" %}
+        {%- set content = render_content(message.content, false)|trim %}
+        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}
+            {%- set ns.multi_step_tool = false %}
+            {%- set ns.last_query_index = index %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- if loop.index0 >= num_sys %}
+    {%- set content = render_content(message.content, true)|trim %}
+    {%- if message.role == "system" or message.role == "developer" %}
+        {{- raise_exception('System message must be at the beginning.') }}
+    {%- elif message.role == "user" %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- endif %}
+        {%- set reasoning_content = reasoning_content|trim %}
+        {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}
+            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if tool_call.function is defined %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {%- if tool_call.name is not defined or tool_call.name is none %}
+                    {{- raise_exception('Tool call is missing a function name.') }}
+                {%- endif %}
+                {%- if loop.first %}
+                    {%- if content|trim %}
+                        {{- '\n\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                    {%- else %}
+                        {{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                    {%- endif %}
+                {%- else %}
+                    {{- '\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                {%- endif %}
+                {%- if tool_call.arguments is mapping %}
+                    {%- for args_name, args_value in tool_call.arguments|items %}
+                        {{- '<parameter=' + args_name + '>\n' }}
+                        {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}
+                        {{- args_value }}
+                        {{- '\n</parameter>\n' }}
+                    {%- endfor %}
+                {%- elif tool_call.arguments is string %}
+                    {%- if tool_call.arguments|trim %}
+                        {{- raise_exception('Tool call arguments for function "' + (tool_call.name | string) + '" were passed as a JSON string. Parse them into an object before calling apply_chat_template.') }}
+                    {%- endif %}
+                {%- elif tool_call.arguments is defined and tool_call.arguments is not none %}
+                    {{- raise_exception('Tool call arguments for function "' + (tool_call.name | string) + '" must be an object/mapping or a JSON string.') }}
+                {%- endif %}
+                {{- '</function>\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.previtem and loop.previtem.role != "tool" %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- content }}
+        {{- '\n</tool_response>' }}
+        {%- if not loop.last and loop.nextitem.role != "tool" %}
+            {{- '<|im_end|>\n' }}
+        {%- elif loop.last %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- else %}
+        {{- raise_exception('Unexpected message role.') }}
+    {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- else %}
+        {{- '<think>\n' }}
+    {%- endif %}
+{%- endif %}
+{#- Unsloth fixes - developer role, merged system messages, tool calling #})QWEN38U";
+
 struct Tokenizer::EncodeScratch
 {
     struct Choice
@@ -549,7 +736,11 @@ bool Tokenizer::load(const std::string& model_directory, size_t vocabulary_size)
     Tokenizer loaded;
     try
     {
-        if (!loaded.load_impl(model_directory, vocabulary_size))
+        const std::filesystem::path path(model_directory);
+        const bool gguf = std::filesystem::is_regular_file(path)
+                          || !std::filesystem::is_regular_file(path / "tokenizer.json");
+        if (!(gguf ? loaded.load_gguf_impl(model_directory, vocabulary_size)
+                   : loaded.load_impl(model_directory, vocabulary_size)))
             return false;
     }
     catch (...)
@@ -557,6 +748,301 @@ bool Tokenizer::load(const std::string& model_directory, size_t vocabulary_size)
         return false;
     }
     *this = std::move(loaded);
+    return true;
+}
+
+bool Tokenizer::load_gguf_impl(const std::string& model_path, size_t vocabulary_size)
+{
+    auto opened = GgufArchive::open(model_path);
+    if (!opened)
+        return false;
+    const GgufArchive& archive = opened.value();
+    const auto string_value = [&](const char* key) -> const std::string* {
+        const auto* item = archive.find_metadata(key);
+        return item ? item->string() : nullptr;
+    };
+    const auto array_value = [&](const char* key) -> const GgufMetadataValue::Array* {
+        const auto* item = archive.find_metadata(key);
+        return item ? item->array() : nullptr;
+    };
+    const auto integer_value = [&](const char* key) -> std::optional<uint64_t> {
+        const auto* item = archive.find_metadata(key);
+        return item ? item->unsigned_integer() : std::nullopt;
+    };
+    const auto optional_id = [&](const char* key, uint64_t expected) {
+        return !archive.find_metadata(key) || integer_value(key) == expected;
+    };
+    const auto* architecture = string_value("general.architecture");
+    const auto* model = string_value("tokenizer.ggml.model");
+    const auto* pre = string_value("tokenizer.ggml.pre");
+    const auto* tokens = array_value("tokenizer.ggml.tokens");
+    const auto* types = array_value("tokenizer.ggml.token_type");
+    const auto* merge_list = array_value("tokenizer.ggml.merges");
+    if (!architecture || !model || *model != "gpt2" || !pre || !tokens || !types
+        || types->size() != tokens->size() || !merge_list || merge_list->empty())
+        return false;
+
+    Family new_family = Family::None;
+    bool new_merge_leading_system_messages = false;
+    size_t base_vocabulary = 0;
+    size_t total_vocabulary = 0;
+    if (*architecture == "deepseek4" && *pre == "joyai-llm")
+    {
+        new_family = Family::DeepSeekV4;
+        base_vocabulary = 128000;
+        total_vocabulary = 129280;
+        if (integer_value("tokenizer.ggml.bos_token_id") != 0
+            || integer_value("tokenizer.ggml.eos_token_id") != 1)
+            return false;
+    }
+    else if (*architecture == "gpt-oss" && *pre == "gpt-4o")
+    {
+        new_family = Family::GptOss;
+        base_vocabulary = 199998;
+        total_vocabulary = 201088;
+        if (integer_value("tokenizer.ggml.bos_token_id") != 199998
+            || integer_value("tokenizer.ggml.eos_token_id") != 200002
+            || (!optional_id("tokenizer.ggml.padding_token_id", 199999)
+                && !optional_id("tokenizer.ggml.padding_token_id", 200017)))
+            return false;
+    }
+    else if ((*architecture == "qwen35" || *architecture == "qwen35moe" || *architecture == "qwen4exp")
+             && *pre == "qwen35")
+    {
+        base_vocabulary = 248044;
+        total_vocabulary = 248320;
+        if (integer_value("tokenizer.ggml.eos_token_id") != 248046
+            || !optional_id("tokenizer.ggml.bos_token_id", 248044)
+            || !optional_id("tokenizer.ggml.padding_token_id", 248044))
+            return false;
+        const auto* chat = string_value("tokenizer.chat_template");
+        if (!chat)
+            return false;
+        if (*chat == std::string_view(qwen38_template, sizeof(qwen38_template) - 1))
+            new_family = Family::Qwen38;
+        else if (*chat == std::string_view(qwen38_unsloth_template, sizeof(qwen38_unsloth_template) - 1))
+        {
+            new_family = Family::Qwen38;
+            new_merge_leading_system_messages = true;
+        }
+        else if (*architecture != "qwen4exp")
+        {
+            bool supported = *chat == std::string_view(qwen36_template, sizeof(qwen36_template) - 1);
+            if (!supported && *architecture == "qwen35")
+            {
+                std::string dense_template(qwen36_template, sizeof(qwen36_template) - 1);
+                const std::pair<std::string_view, std::string_view> differences[] = {
+                    {"(preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index)", "loop.index0 > ns.last_query_index"},
+                    {"args_value | string if args_value is string else args_value | tojson | safe", "args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string"},
+                };
+                for (const auto& difference : differences)
+                {
+                    const size_t position = dense_template.find(difference.first);
+                    if (position == std::string::npos)
+                        return false;
+                    dense_template.replace(position, difference.first.size(), difference.second);
+                }
+                supported = *chat == dense_template;
+            }
+            if (supported)
+                new_family = Family::Qwen36;
+        }
+        // Architecture and the BPE profile do not identify a chat revision.
+        // Accept only templates whose string-message behavior is implemented.
+        if (new_family == Family::None)
+            return false;
+    }
+    else
+        return false;
+    if (tokens->size() != total_vocabulary || (vocabulary_size != 0 && vocabulary_size != total_vocabulary))
+        return false;
+    for (const char* key : {"tokenizer.ggml.add_bos_token", "tokenizer.ggml.add_eos_token", "tokenizer.ggml.add_space_prefix"})
+    {
+        const auto* item = archive.find_metadata(key);
+        if (item && item->boolean() != std::optional<bool>(false))
+            return false;
+    }
+    const bool qwen = new_family == Family::Qwen36 || new_family == Family::Qwen38;
+    const bool gpt = new_family == Family::GptOss;
+    const bool deepseek = new_family == Family::DeepSeekV4;
+    static const std::array<std::string_view, 21> gpt_tokens = {
+        "<|startoftext|>", "<|endoftext|>", "<|reserved_200000|>", "<|reserved_200001|>", "<|return|>",
+        "<|constrain|>", "<|reserved_200004|>", "<|channel|>", "<|start|>", "<|end|>", "<|message|>",
+        "<|reserved_200009|>", "<|reserved_200010|>", "<|reserved_200011|>", "<|call|>",
+        "<|reserved_200013|>", "<|reserved_200014|>", "<|reserved_200015|>", "<|reserved_200016|>",
+        "<|reserved_200017|>", "<|endofprompt|>"};
+    static const std::array<std::string_view, 33> qwen_tokens = {
+        "<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|object_ref_start|>", "<|object_ref_end|>",
+        "<|box_start|>", "<|box_end|>", "<|quad_start|>", "<|quad_end|>", "<|vision_start|>", "<|vision_end|>",
+        "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>", "<tool_call>", "</tool_call>", "<|fim_prefix|>",
+        "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>", "<tool_response>",
+        "</tool_response>", "<think>", "</think>", "<|audio_start|>", "<|audio_end|>", "<tts_pad>", "<tts_text_bos>",
+        "<tts_text_eod>", "<tts_text_bos_single>", "<|audio_pad|>"};
+    if (gpt || qwen)
+    {
+        const std::span<const std::string_view> expected = gpt ? std::span<const std::string_view>(gpt_tokens)
+                                                               : std::span<const std::string_view>(qwen_tokens);
+        for (size_t i = 0; i < expected.size(); ++i)
+        {
+            const auto* token = (*tokens)[base_vocabulary + i].string();
+            if (!token || (*token != expected[i] && !(gpt && i == 20 && *token == "<|reserved_200018|>")))
+                return false;
+        }
+    }
+    else
+    {
+        static const std::array<std::pair<uint32_t, std::string_view>, 10> required = {{{0, "<｜begin▁of▁sentence｜>"}, {1, "<｜end▁of▁sentence｜>"}, {2, "<｜▁pad▁｜>"}, {128803, "<｜User｜>"}, {128804, "<｜Assistant｜>"}, {128821, "<think>"}, {128822, "</think>"}, {128825, "｜DSML｜"}, {128828, "<｜latest_reminder｜>"}, {129279, "<｜image｜>"}}};
+        for (const auto& item : required)
+        {
+            const auto* token = (*tokens)[item.first].string();
+            if (!token || *token != item.second)
+                return false;
+        }
+    }
+
+    constexpr size_t max_bytes = 64 * 1024 * 1024;
+    std::array<int16_t, 512> byte_for_symbol;
+    byte_for_symbol.fill(-1);
+    std::array<uint32_t, 256> symbol_for_byte{};
+    uint32_t next_symbol = 256;
+    for (uint32_t byte = 0; byte < 256; ++byte)
+    {
+        const bool visible = (byte >= 33 && byte <= 126) || (byte >= 161 && byte <= 172)
+                             || (byte >= 174 && byte <= 255);
+        const uint32_t symbol = visible ? byte : next_symbol++;
+        symbol_for_byte[byte] = symbol;
+        byte_for_symbol[symbol] = static_cast<int16_t>(byte);
+    }
+    index.resize(total_vocabulary);
+    std::unordered_map<std::string, uint32_t> vocab;
+    vocab.reserve(total_vocabulary);
+    added_token_trie.emplace_back();
+    const auto add_token = [&](uint32_t id, std::string_view token) {
+        uint32_t node = 0;
+        for (const unsigned char byte : token)
+        {
+            const auto& edges = added_token_trie[node].edges;
+            const auto edge = std::lower_bound(edges.begin(), edges.end(), byte,
+                                               [](const auto& item, uint8_t value) { return item.first < value; });
+            if (edge == edges.end() || edge->first != byte)
+            {
+                const uint32_t child = static_cast<uint32_t>(added_token_trie.size());
+                added_token_trie.emplace_back();
+                auto& parent = added_token_trie[node].edges;
+                const auto at = std::lower_bound(parent.begin(), parent.end(), byte,
+                                                 [](const auto& item, uint8_t value) { return item.first < value; });
+                parent.insert(at, {byte, child});
+                node = child;
+            }
+            else
+                node = edge->second;
+        }
+        added_token_trie[node].token_id = id;
+        added_token_trie[node].terminal = true;
+    };
+    const auto store = [&](uint32_t id, std::string_view token, bool added, bool special) {
+        Entry& entry = index[id];
+        entry.offset = static_cast<uint32_t>(bytes.size());
+        for (size_t offset = 0; offset < token.size();)
+        {
+            if (bytes.size() >= max_bytes)
+                return false;
+            if (added)
+                bytes.push_back(static_cast<uint8_t>(token[offset++]));
+            else
+            {
+                const uint32_t cp = read_utf8(token, offset);
+                if (cp >= byte_for_symbol.size() || byte_for_symbol[cp] < 0)
+                    return false;
+                bytes.push_back(static_cast<uint8_t>(byte_for_symbol[cp]));
+            }
+        }
+        entry.length = static_cast<uint32_t>(bytes.size() - entry.offset);
+        entry.flags = static_cast<uint8_t>(Present | (special ? Special : 0));
+        return true;
+    };
+    for (uint32_t id = 0; id < tokens->size(); ++id)
+    {
+        const auto* token = (*tokens)[id].string();
+        const auto type = (*types)[id].integer();
+        const bool added = (deepseek && id < 3) || id >= base_vocabulary;
+        const size_t added_count = gpt ? gpt_tokens.size() : qwen ? qwen_tokens.size()
+                                                                  : total_vocabulary - base_vocabulary;
+        const bool unused = !deepseek && id >= base_vocabulary + added_count;
+        if (!token || token->empty() || !type || !vocab.emplace(*token, id).second)
+            return false;
+        if (unused)
+        {
+            // Standard GGUF exporters pad the logits vocabulary with UNUSED
+            // pieces. GPT-OSS replaces these with Harmony reserved spellings.
+            if (*type != 5 && !(gpt && (*type == 3 || *type == 4) && *token == "<|reserved_" + std::to_string(id) + "|>"))
+                return false;
+            continue;
+        }
+        if (added ? *type != 3 && *type != 4 : *type != 1)
+            return false;
+        // GGUF exporters may promote user-defined <|fim_*|> pieces to CONTROL.
+        // The supported Qwen profile still exposes them, as its HF tokenizer does.
+        const size_t relative = added && id >= base_vocabulary ? id - base_vocabulary : 0;
+        const bool special = qwen  ? added && (relative < 14 || relative >= 26)
+                             : gpt ? added
+                                   : id < 3 || *type == 3;
+        if (!store(id, *token, added, special))
+            return false;
+        if (added && !(gpt && id == 200018))
+            add_token(id, *token);
+        else if (gpt && !added)
+        {
+            const Entry& entry = index[id];
+            if (!raw_piece_ids.emplace(std::string(reinterpret_cast<const char*>(bytes.data() + entry.offset), entry.length), id).second)
+                return false;
+        }
+    }
+    for (uint32_t byte = 0; byte < 256; ++byte)
+    {
+        std::string symbol;
+        append_utf8(symbol_for_byte[byte], symbol);
+        const auto found = vocab.find(symbol);
+        if (found == vocab.end() || found->second >= base_vocabulary || (deepseek && found->second < 3))
+            return false;
+        byte_ids[byte] = static_cast<int32_t>(found->second);
+    }
+    merges.reserve(merge_list->size());
+    for (size_t rank = 0; rank < merge_list->size(); ++rank)
+    {
+        const auto* text = (*merge_list)[rank].string();
+        if (!text || rank >= std::numeric_limits<uint32_t>::max())
+            return false;
+        const size_t separator = text->find(' ');
+        if (separator == std::string::npos || separator == 0 || separator + 1 == text->size())
+            return false;
+        const auto left = vocab.find(text->substr(0, separator));
+        const auto right = vocab.find(text->substr(separator + 1));
+        const auto merged = vocab.find(text->substr(0, separator) + text->substr(separator + 1));
+        if (left == vocab.end() || right == vocab.end() || merged == vocab.end()
+            || left->second >= base_vocabulary || right->second >= base_vocabulary || merged->second >= base_vocabulary
+            || (deepseek && (left->second < 3 || right->second < 3 || merged->second < 3))
+            || !merges.emplace(merge_key(left->second, right->second), Merge{static_cast<uint32_t>(rank), merged->second}).second)
+            return false;
+    }
+    if (gpt)
+    {
+        // Match Harmony's reserved overlay, including one non-logits sentinel.
+        index.resize(total_vocabulary + 1);
+        for (uint32_t id = 200018; id <= total_vocabulary; ++id)
+        {
+            const std::string token = "<|reserved_" + std::to_string(id) + "|>";
+            if (!store(id, token, true, true))
+                return false;
+            add_token(id, token);
+        }
+        stops = {200002, 200012};
+    }
+    else
+        stops = qwen ? std::vector<int32_t>{248046, 248044} : std::vector<int32_t>{1};
+    family = new_family;
+    ignore_merges = gpt;
+    merge_leading_system_messages = new_merge_leading_system_messages;
     return true;
 }
 
@@ -609,6 +1095,7 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
         return false;
     const std::optional<std::string> model_type = json_string(model_config, "model_type");
     Family new_family = Family::None;
+    bool new_merge_leading_system_messages = false;
     size_t base_vocab_size = 0;
     size_t total_vocab_size = 0;
     bool has_nfc = false;
@@ -627,7 +1114,7 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
         total_vocab_size = 129280;
         split_regexes.assign(deepseek_regexes.begin(), deepseek_regexes.end());
     }
-    else if (model_type == "qwen3_5_moe")
+    else if (model_type == "qwen3_5_moe" || model_type == "qwen3_5")
     {
         new_family = Family::Qwen36;
         base_vocab_size = 248044;
@@ -649,7 +1136,9 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
     if (new_family == Family::Qwen36 || new_family == Family::Qwen38)
     {
         text_config = find_manifest_member(std::string_view(model_config), "text_config");
-        const std::string expected_text_type = new_family == Family::Qwen36 ? "qwen3_5_moe_text" : "qwen4_exp_text";
+        const std::string expected_text_type = model_type == "qwen3_5"       ? "qwen3_5_text"
+                                               : model_type == "qwen3_5_moe" ? "qwen3_5_moe_text"
+                                                                             : "qwen4_exp_text";
         if (!text_config || json_integer(*text_config, "vocab_size") != std::optional<int64_t>(248320) || json_string(*text_config, "model_type") != std::optional<std::string>(expected_text_type))
             return false;
     }
@@ -664,12 +1153,36 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
         const std::string template_file((std::istreambuf_iterator<char>(template_input)), std::istreambuf_iterator<char>());
         if (template_input.bad())
             return false;
-        const std::string_view pinned_template = new_family == Family::Qwen36
-                                                     ? std::string_view(qwen36_template, sizeof(qwen36_template) - 1)
-                                                     : std::string_view(qwen38_template, sizeof(qwen38_template) - 1);
         const std::optional<std::string> config_template = json_string(config, "chat_template");
-        if (template_file != pinned_template || !config_template || *config_template != pinned_template)
+        // Qwen3.8-27B retains the Qwen3.5 architecture and tokenizer assets,
+        // but uses the Qwen3.8 chat template and its thinking-history defaults.
+        new_merge_leading_system_messages = template_file == std::string_view(qwen38_unsloth_template, sizeof(qwen38_unsloth_template) - 1);
+        const bool qwen38_chat = new_merge_leading_system_messages || template_file == std::string_view(qwen38_template, sizeof(qwen38_template) - 1);
+        bool supported_template = qwen38_chat
+                                  || (new_family == Family::Qwen36
+                                      && template_file == std::string_view(qwen36_template, sizeof(qwen36_template) - 1));
+        if (!supported_template && model_type == "qwen3_5")
+        {
+            // Qwen3.5 has the same string-message behavior with the default
+            // preserve_thinking value. Tool-call objects are outside this API.
+            std::string dense_template(qwen36_template, sizeof(qwen36_template) - 1);
+            const std::pair<std::string_view, std::string_view> differences[] = {
+                {"(preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index)", "loop.index0 > ns.last_query_index"},
+                {"args_value | string if args_value is string else args_value | tojson | safe", "args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string"},
+            };
+            for (const auto& difference : differences)
+            {
+                const size_t position = dense_template.find(difference.first);
+                if (position == std::string::npos)
+                    return false;
+                dense_template.replace(position, difference.first.size(), difference.second);
+            }
+            supported_template = template_file == dense_template;
+        }
+        if (!supported_template || !config_template || *config_template != template_file)
             return false;
+        if (qwen38_chat)
+            new_family = Family::Qwen38;
     }
 
     auto take_value = [](std::string_view text, size_t& position, std::string_view& value) {
@@ -1529,6 +2042,7 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
     stops.swap(new_stops);
     family = new_family;
     ignore_merges = profile_ignore_merges;
+    merge_leading_system_messages = new_merge_leading_system_messages;
     return true;
 }
 
@@ -1959,6 +2473,7 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
     {
         std::string role;
         std::string content;
+        std::string reasoning;
         std::string_view text{};
     };
     std::vector<Message> messages;
@@ -1982,6 +2497,7 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
         Message message;
         bool has_role = false;
         bool has_content = false;
+        bool has_reasoning = false;
         for (;;)
         {
             position = skip_space(messages_json, position);
@@ -1999,12 +2515,16 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
             if (position >= messages_json.size() || messages_json[position++] != ':')
                 throw std::invalid_argument("invalid message member");
             position = skip_space(messages_json, position);
-            if (key != "role" && key != "content")
+            const bool reasoning_field = family == Family::Qwen38 && key == "reasoning_content";
+            if (key != "role" && key != "content" && !reasoning_field)
                 throw std::invalid_argument("message fields are limited to role and content strings");
-            if (position >= messages_json.size() || messages_json[position] != '"')
+            if (position >= messages_json.size())
+                throw std::invalid_argument("invalid message member");
+            if (!reasoning_field && messages_json[position] != '"')
                 throw std::invalid_argument("message role and content must be strings");
             std::string value;
-            if (!parse_json_string(messages_json, position, &value))
+            if (messages_json[position] == '"' ? !parse_json_string(messages_json, position, &value)
+                                               : !parse_json_value(messages_json, position))
                 throw std::invalid_argument("invalid message string");
             if (key == "role")
             {
@@ -2013,12 +2533,19 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
                 has_role = true;
                 message.role = std::move(value);
             }
-            else
+            else if (key == "content")
             {
                 if (has_content)
                     throw std::invalid_argument("duplicate message content");
                 has_content = true;
                 message.content = std::move(value);
+            }
+            else
+            {
+                if (has_reasoning)
+                    throw std::invalid_argument("duplicate message reasoning_content");
+                has_reasoning = true;
+                message.reasoning = std::move(value);
             }
             position = skip_space(messages_json, position);
             if (position >= messages_json.size())
@@ -2086,66 +2613,83 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
 
     if (family == Family::DeepSeekV4)
     {
-        std::vector<Message> normalized;
-        for (const Message& message : messages)
+        size_t count = 0;
+        for (size_t i = 0; i < messages.size(); ++i)
         {
+            Message& message = messages[i];
             if (message.role != "system" && message.role != "developer" && message.role != "user" && message.role != "assistant" && message.role != "tool")
                 throw std::invalid_argument("Unknown DeepSeek-V4 role");
             if (message.role == "tool")
             {
-                const std::string tool_result = "<tool_result>" + message.content + "</tool_result>";
-                if (!normalized.empty() && normalized.back().role == "user")
-                    normalized.back().content += "\n\n" + tool_result;
-                else
-                    normalized.push_back({"user", tool_result});
+                if (count != 0 && messages[count - 1].role == "user")
+                {
+                    std::string& content = messages[count - 1].content;
+                    content.append("\n\n<tool_result>");
+                    content.append(message.content);
+                    content.append("</tool_result>");
+                    continue;
+                }
+                message.role = "user";
+                message.content.insert(0, "<tool_result>");
+                message.content.append("</tool_result>");
             }
-            else if (message.role == "user" && !normalized.empty() && normalized.back().role == "user")
+            else if (message.role == "user" && count != 0 && messages[count - 1].role == "user")
             {
-                normalized.back().content += "\n\n" + message.content;
+                std::string& content = messages[count - 1].content;
+                content.append("\n\n");
+                content.append(message.content);
+                continue;
             }
-            else
-                normalized.push_back({message.role, message.content});
+            if (count != i)
+                messages[count] = std::move(message);
+            ++count;
         }
+        messages.resize(count);
         int32_t last_user_index = -1;
-        for (size_t i = 0; i < normalized.size(); ++i)
+        for (size_t i = 0; i < messages.size(); ++i)
         {
-            if (normalized[i].role == "user")
+            if (messages[i].role == "user")
                 last_user_index = static_cast<int32_t>(i);
         }
         const bool thinking = enable_thinking;
         if (thinking && last_user_index >= 0)
         {
-            std::vector<Message> kept;
-            kept.reserve(normalized.size());
-            for (size_t i = 0; i < normalized.size(); ++i)
+            count = 0;
+            for (size_t i = 0; i < messages.size(); ++i)
             {
-                if (normalized[i].role == "developer" && static_cast<int32_t>(i) < last_user_index)
+                if (messages[i].role == "developer" && static_cast<int32_t>(i) < last_user_index)
                     continue;
-                kept.push_back(std::move(normalized[i]));
+                if (count != i)
+                    messages[count] = std::move(messages[i]);
+                ++count;
             }
-            normalized.swap(kept);
+            messages.resize(count);
             last_user_index = -1;
-            for (size_t i = 0; i < normalized.size(); ++i)
+            for (size_t i = 0; i < messages.size(); ++i)
             {
-                if (normalized[i].role == "user")
+                if (messages[i].role == "user")
                     last_user_index = static_cast<int32_t>(i);
             }
         }
 
         std::string prompt = "<｜begin▁of▁sentence｜>";
-        for (size_t i = 0; i < normalized.size(); ++i)
+        for (size_t i = 0; i < messages.size(); ++i)
         {
-            const Message& message = normalized[i];
+            const Message& message = messages[i];
             if (message.role == "system")
                 prompt += message.content;
             else if (message.role == "developer")
             {
                 if (message.content.empty())
                     throw std::invalid_argument("Invalid message for role developer");
-                prompt += "<｜User｜>" + message.content;
+                prompt += "<｜User｜>";
+                prompt += message.content;
             }
             else if (message.role == "user")
-                prompt += "<｜User｜>" + message.content;
+            {
+                prompt += "<｜User｜>";
+                prompt += message.content;
+            }
             else if (message.role == "assistant")
             {
                 if (thinking && static_cast<int32_t>(i) > last_user_index)
@@ -2153,8 +2697,8 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
                 prompt += message.content;
                 prompt += "<｜end▁of▁sentence｜>";
             }
-            const bool next_is_assistant = i + 1 < normalized.size() && normalized[i + 1].role == "assistant";
-            if (i + 1 < normalized.size() && !next_is_assistant)
+            const bool next_is_assistant = i + 1 < messages.size() && messages[i + 1].role == "assistant";
+            if (i + 1 < messages.size() && !next_is_assistant)
                 continue;
             if (message.role == "user" || message.role == "developer")
             {
@@ -2192,29 +2736,40 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
 
     static constexpr std::string_view reasoning_instruction = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
     std::string prompt;
+    size_t leading_system_count = 0;
     if (family == Family::Qwen38)
     {
         const std::string_view instruction = enable_thinking ? reasoning_instruction : std::string_view();
-        if (messages.front().role == "system")
+        std::string merged_system;
+        std::string_view content;
+        if (merge_leading_system_messages)
         {
-            const std::string_view content = messages.front().text;
-            if (!content.empty())
+            for (const Message& message : messages)
             {
-                prompt += "<|im_start|>system\n";
-                if (!instruction.empty())
+                if (message.role != "system" && message.role != "developer")
+                    break;
+                ++leading_system_count;
+                if (!message.text.empty())
                 {
-                    prompt += instruction;
-                    prompt += "\n\n";
+                    if (!merged_system.empty())
+                        merged_system += '\n';
+                    merged_system += message.text;
                 }
-                prompt += content;
-                prompt += "<|im_end|>\n";
             }
-            else if (!instruction.empty())
+            content = merged_system;
+        }
+        else if (messages.front().role == "system")
+            content = messages.front().text;
+        if (!content.empty())
+        {
+            prompt += "<|im_start|>system\n";
+            if (!instruction.empty())
             {
-                prompt += "<|im_start|>system\n";
                 prompt += instruction;
-                prompt += "<|im_end|>\n";
+                prompt += "\n\n";
             }
+            prompt += content;
+            prompt += "<|im_end|>\n";
         }
         else if (!instruction.empty())
         {
@@ -2239,16 +2794,16 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
         if (!(content.starts_with("<tool_response>") && content.ends_with("</tool_response>")))
             last_user_index = static_cast<int32_t>(i);
     }
-    if (last_user_index < 0)
+    if (last_user_index < 0 && !merge_leading_system_messages)
         throw std::invalid_argument("No user query found in messages.");
 
-    for (size_t i = 0; i < messages.size(); ++i)
+    for (size_t i = leading_system_count; i < messages.size(); ++i)
     {
         const Message& message = messages[i];
         const std::string_view content = message.text;
-        if (message.role == "system")
+        if (message.role == "system" || (merge_leading_system_messages && message.role == "developer"))
         {
-            if (i != 0)
+            if (merge_leading_system_messages || i != 0)
                 throw std::invalid_argument("System message must be at the beginning.");
         }
         else if (message.role == "user")
@@ -2259,7 +2814,7 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
         }
         else if (message.role == "assistant")
         {
-            std::string_view reasoning;
+            std::string_view reasoning = trim(message.reasoning);
             std::string_view body = content;
             if (family == Family::Qwen36)
             {

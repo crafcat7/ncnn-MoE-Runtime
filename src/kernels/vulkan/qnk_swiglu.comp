@@ -10,6 +10,10 @@ layout(binding = 1) writeonly buffer activated_blob
 {
     float activated_data[];
 };
+layout(binding = 2) readonly buffer up_blob
+{
+    float up_data[];
+};
 
 layout(push_constant) uniform parameter
 {
@@ -28,7 +32,16 @@ void main()
     if (column >= p.intermediate_columns || token >= p.token_count)
         return;
 
-    const uint base = token * p.intermediate_columns * 2u;
+    // Shared Expert router gate: the projection is one scalar per token.
+    if (p.activation == 2u)
+    {
+        activated_data[token * p.intermediate_columns + column] = gate_up_data[token * p.intermediate_columns + column]
+                                                                  / (1.0 + exp(-up_data[token]));
+        return;
+    }
+
+    const bool separate = p.packed_gate_up == 2u;
+    const uint base = token * p.intermediate_columns * (separate ? 1u : 2u);
     const uint gate_index = p.packed_gate_up != 0u
                                 ? base + column
                                 : base + column * 2u;
@@ -36,7 +49,7 @@ void main()
                               ? base + p.intermediate_columns + column
                               : base + column * 2u + 1u;
     float gate = gate_up_data[gate_index];
-    float up = gate_up_data[up_index];
+    float up = separate ? up_data[base + column] : gate_up_data[up_index];
     if (p.activation_limit > 0.0)
     {
         gate = min(gate, p.activation_limit);

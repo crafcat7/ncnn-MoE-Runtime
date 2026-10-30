@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace ncnn {
@@ -20,6 +21,35 @@ enum class MxFp4KernelKind
 [[nodiscard]] MxFp4KernelKind mxfp4_kernel_kind() noexcept;
 [[nodiscard]] const char* mxfp4_kernel_name() noexcept;
 [[nodiscard]] uint32_t mxfp4_decode_row_pair_group_size() noexcept;
+
+// Split GGUF's 17-byte blocks and reorder their low/high half-block nibbles
+// into the adjacent-value packing used by the CPU and Vulkan MXFP4 kernels.
+// All three spans must be nonoverlapping; invalid spans return false before writing.
+[[nodiscard]] bool unpack_gguf_mxfp4(std::span<const uint8_t> source,
+                                     std::span<uint8_t> blocks,
+                                     std::span<uint8_t> scales) noexcept;
+
+// Repack canonical adjacent-nibble blocks and E8M0 scales into GGUF's
+// interleaved [scale, 16 code bytes] block layout. All spans must be
+// nonoverlapping and exactly sized; invalid spans return false before writing.
+[[nodiscard]] bool pack_gguf_mxfp4(std::span<const uint8_t> blocks,
+                                   std::span<const uint8_t> scales,
+                                   std::span<uint8_t> destination) noexcept;
+
+// Decode one canonical 32-value MXFP4 block into Float32 values.
+void mxfp4_dequantize_block(const uint8_t* packed, uint8_t scale, float* output) noexcept;
+
+// Unpack complete source rows directly into a strided destination. Both row
+// strides are byte distances, allowing Gate/Up to fill alternating rows without
+// a temporary packed copy. Destination holes and padding are left untouched.
+// Destination spans may include padding, but must cover the final written row;
+// all spans must be nonoverlapping. Invalid arguments are rejected before writes.
+[[nodiscard]] bool unpack_gguf_mxfp4_rows(std::span<const uint8_t> source,
+                                          size_t blocks_per_row,
+                                          size_t block_row_stride,
+                                          size_t scale_row_stride,
+                                          std::span<uint8_t> blocks,
+                                          std::span<uint8_t> scales) noexcept;
 
 [[nodiscard]] float mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input) noexcept;
 

@@ -9,9 +9,10 @@
 namespace ncnn {
 namespace moe {
 
-static float e8m0_scale(uint8_t exponent) noexcept
+static float e8m0_half_scale(uint8_t exponent) noexcept
 {
-    const uint32_t bits = exponent == 0 ? UINT32_C(0x00400000) : static_cast<uint32_t>(exponent) << 23;
+    const uint32_t bits = exponent < 2 ? (UINT32_C(0x00200000) << exponent)
+                                       : (static_cast<uint32_t>(exponent - 1) << 23);
     return std::bit_cast<float>(bits);
 }
 
@@ -48,7 +49,7 @@ float sve2_mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32_t bloc
     for (uint32_t block = 0; block < block_count; ++block)
     {
         decode_mxfp4_block(packed + static_cast<size_t>(block) * 16, decoded);
-        accumulator = accumulate_decoded(decoded, input + static_cast<size_t>(block) * 32, 0.5f * e8m0_scale(scales[block]), accumulator);
+        accumulator = accumulate_decoded(decoded, input + static_cast<size_t>(block) * 32, e8m0_half_scale(scales[block]), accumulator);
     }
     return svaddv_f32(svptrue_b32(), accumulator);
 }
@@ -69,8 +70,8 @@ void sve2_mxfp4_matmul_rows2(const uint8_t* first_packed, const uint8_t* first_s
             decode_mxfp4_block(first_packed + static_cast<size_t>(block) * 16, first_decoded);
             decode_mxfp4_block(second_packed + static_cast<size_t>(block) * 16, second_decoded);
             const float* block_input = token_input + static_cast<size_t>(block) * 32;
-            first_accumulator = accumulate_decoded(first_decoded, block_input, 0.5f * e8m0_scale(first_scales[block]), first_accumulator);
-            second_accumulator = accumulate_decoded(second_decoded, block_input, 0.5f * e8m0_scale(second_scales[block]), second_accumulator);
+            first_accumulator = accumulate_decoded(first_decoded, block_input, e8m0_half_scale(first_scales[block]), first_accumulator);
+            second_accumulator = accumulate_decoded(second_decoded, block_input, e8m0_half_scale(second_scales[block]), second_accumulator);
         }
         first_output[token * first_output_stride] = svaddv_f32(svptrue_b32(), first_accumulator);
         second_output[token * second_output_stride] = svaddv_f32(svptrue_b32(), second_accumulator);

@@ -1,3 +1,7 @@
+# ==============================================================================
+# Installed SDK consumer test
+# ==============================================================================
+
 cmake_minimum_required(VERSION 3.21)
 
 project(ncnn_moe_public_api_test LANGUAGES CXX)

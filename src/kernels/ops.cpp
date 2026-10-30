@@ -3,6 +3,7 @@
 #include "bfloat16.h"
 #include "fastmath.h"
 #include "float8.h"
+#include "int4.h"
 #include "mxfp4.h"
 #include "qnk.h"
 #include "vector.h"
@@ -66,6 +67,10 @@ static bool dense_host_storage_available(const TensorData& tensor) noexcept
     if (tensor.dtype == DType::Float8E4M3)
         return tensor.float8_values().size() == tensor.element_count()
                && !tensor.quantization_scales.empty();
+    if (is_qnk_dtype(tensor.dtype))
+        return tensor.shape.size() == 2
+               && qnk_storage_bytes(tensor.dtype, tensor.shape[0], tensor.shape[1]) != 0
+               && tensor.qnk_values().size() == qnk_storage_bytes(tensor.dtype, tensor.shape[0], tensor.shape[1]);
     return true;
 }
 
@@ -226,21 +231,111 @@ static void apply_float8_gate_up_activation(float* output,
             up_value = std::clamp(up_value, -activation_limit,
                                   activation_limit);
         }
-        output[column] = up_value * expert_activation(gate[column], activation, activation_limit, optimization_flags);
+        if (activation == ExpertActivation::GptOssSwiGlu)
+        {
+            const float gate_value = activation_limit > 0.0f ? std::min(gate[column], activation_limit) : gate[column];
+            if (activation_limit > 0.0f)
+                up_value = std::clamp(up_value, -activation_limit, activation_limit);
+            output[column] = scaled_silu(gate_value, 1.702f, optimization_flags) * (up_value + 1.0f);
+        }
+        else
+            output[column] = up_value * expert_activation(gate[column], activation, activation_limit, optimization_flags);
+    }
+}
+
+void forward_embedding_row(const TensorData& embedding, uint32_t row_index, float* destination)
+{
+    assert(embedding.shape.size() == 2);
+    const uint32_t hidden_size = embedding.shape[1];
+    if (row_index >= embedding.shape[0])
+        throw std::runtime_error("embedding token ID is out of range");
+    if (embedding.dtype == DType::Int4)
+    {
+        if (!int4_dequantize_row(embedding, row_index, destination))
+            throw std::runtime_error("invalid INT4 embedding layout");
+        return;
+    }
+    if (embedding.dtype == DType::MxFp4)
+    {
+        const uint64_t rows = embedding.shape[0];
+        const uint64_t block_count = hidden_size / 32 + (hidden_size % 32 != 0);
+        if (hidden_size == 0 || hidden_size % 32 != 0 || block_count == 0
+            || rows > std::numeric_limits<uint64_t>::max() / block_count)
+            throw std::runtime_error("invalid MXFP4 embedding shape");
+        const uint64_t row_blocks = block_count;
+        const uint64_t total_blocks = rows * row_blocks;
+        if (total_blocks > std::numeric_limits<size_t>::max() / 16
+            || embedding.mxfp4_blocks.size() != total_blocks * 16
+            || embedding.mxfp4_scales.size() != total_blocks)
+            throw std::runtime_error("invalid MXFP4 embedding layout");
+        const bool remap = !embedding.input_column_indices.empty();
+        if (remap && !validate_input_column_indices(embedding))
+            throw std::runtime_error("invalid MXFP4 embedding column mapping");
+        const size_t row_offset = static_cast<size_t>(row_index) * static_cast<size_t>(row_blocks);
+        std::array<float, 32> decoded;
+        for (uint32_t block = 0; block < block_count; ++block)
+        {
+            const size_t block_index = row_offset + block;
+            float* output = remap ? decoded.data() : destination + static_cast<size_t>(block) * 32;
+            mxfp4_dequantize_block(embedding.mxfp4_blocks.data() + block_index * 16,
+                                   embedding.mxfp4_scales[block_index], output);
+            if (remap)
+            {
+                const uint32_t column = block * 32;
+                for (uint32_t lane = 0; lane < 32; ++lane)
+                {
+                    const uint32_t mapped_column = embedding.input_column_indices[column + lane];
+                    destination[mapped_column] = decoded[lane];
+                }
+            }
+        }
+        return;
+    }
+    if (is_qnk_dtype(embedding.dtype))
+    {
+        const bool remap = !embedding.input_column_indices.empty();
+        const uint64_t row_bytes = qnk_storage_bytes(embedding.dtype, 1, hidden_size);
+        if ((remap && embedding.input_column_indices.size() != hidden_size)
+            || !qnk_shape_supported(embedding.dtype, embedding.shape[0], hidden_size)
+            || embedding.qnk_values().size() != row_bytes * embedding.shape[0])
+            throw std::runtime_error("invalid quantized embedding layout");
+        const uint8_t* row = embedding.qnk_values().data() + static_cast<size_t>(row_index) * row_bytes;
+        std::array<float, qnk_block_elements> decoded;
+        for (uint32_t column = 0; column < hidden_size; column += qnk_block_size(embedding.dtype))
+        {
+            float* block = remap ? decoded.data() : destination + column;
+            qnk_dequantize_block(embedding.dtype, row + (column / qnk_block_size(embedding.dtype)) * qnk_block_bytes(embedding.dtype), block);
+            if (remap)
+            {
+                for (uint32_t lane = 0; lane < qnk_block_size(embedding.dtype); ++lane)
+                    destination[embedding.input_column_indices[column + lane]] = block[lane];
+            }
+        }
+        return;
+    }
+    const size_t offset = static_cast<size_t>(row_index) * hidden_size;
+    const uint32_t input_blocks = hidden_size / 128 + (hidden_size % 128 != 0);
+    for (uint32_t column = 0; column < hidden_size; ++column)
+    {
+        if (embedding.dtype == DType::Int8)
+            destination[column] = embedding.int8_values()[offset + column] * embedding.quantization_scales[row_index];
+        else if (embedding.dtype == DType::Float8E4M3)
+            destination[column] = tensor_value(embedding, offset + column)
+                                  * embedding.quantization_scales[static_cast<size_t>(row_index / embedding.float8_scale_row_size) * input_blocks + column / 128];
+        else
+            destination[column] = tensor_value(embedding, offset + column);
     }
 }
 
 void forward_embedding(const TensorData& embedding, std::span<const int32_t> input_ids, ActivationBuffer& output)
 {
     assert(embedding.shape.size() == 2);
-    const uint32_t hidden_size = embedding.shape[1];
-    output.reset(input_ids.size(), hidden_size, false);
+    output.reset(input_ids.size(), embedding.shape[1], false);
     for (size_t token_index = 0; token_index < input_ids.size(); ++token_index)
     {
-        const size_t offset = static_cast<size_t>(input_ids[token_index]) * hidden_size;
-        float* destination = output.row(token_index);
-        for (uint32_t column = 0; column < hidden_size; ++column)
-            destination[column] = tensor_value(embedding, offset + column);
+        if (input_ids[token_index] < 0)
+            throw std::runtime_error("embedding token ID is out of range");
+        forward_embedding_row(embedding, static_cast<uint32_t>(input_ids[token_index]), output.row(token_index));
     }
 }
 
@@ -273,7 +368,7 @@ static void float8_linear_group_into(const TensorData& matrix,
     const uint8_t* weights = matrix_values.data()
                              + static_cast<size_t>(first_output_column) * input_columns;
     const float* scales = matrix.quantization_scales.data()
-                          + static_cast<size_t>(first_output_column / block_size) * input_blocks;
+                          + static_cast<size_t>(first_output_column / matrix.float8_scale_row_size) * input_blocks;
     if (quantized_input.rows() > 1)
     {
         float8_e4m3_quantized_input_dot_rows_batch(weights, input_columns, scales, quantized_input.row(0),
@@ -315,7 +410,7 @@ static void float8_linear_quantized_into(const TensorData& matrix,
     assert(quantized_input.columns() == input_columns);
     constexpr uint32_t block_size = 128;
     const uint32_t input_blocks = (input_columns + block_size - 1) / block_size;
-    const uint32_t output_blocks = (output_columns + block_size - 1) / block_size;
+    const uint32_t output_blocks = (output_columns + matrix.float8_scale_row_size - 1) / matrix.float8_scale_row_size;
     assert(matrix.float8_values().size() == matrix.element_count());
     assert(matrix.quantization_scales.size()
            == static_cast<size_t>(output_blocks) * input_blocks);
@@ -623,6 +718,8 @@ static uint32_t float8_linear_row_group_size_for_shape(const TensorData& matrix,
                                                        uint64_t optimization_flags) noexcept
 {
     const uint32_t kernel_group = float8_linear_row_group_size(optimization_flags);
+    if (matrix.float8_scale_row_size == 1)
+        return 1;
     if (token_count == 1 || matrix.shape[0] < 8)
         return kernel_group;
     // Use a wider output tile when activation reuse is available.
@@ -649,7 +746,7 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
     const CompiledOperator* const* owners = ops.size() == 0 ? nullptr : ops.begin();
     for (size_t i = 0; i < matrix_count; ++i)
     {
-        if (!weights[i] || !result[i])
+        if (!weights[i] || !result[i] || !weights[i]->input_column_indices.empty())
             return false;
     }
 
@@ -673,6 +770,35 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
         return false;
 
     const DType dtype = weights[0]->dtype;
+    if (is_qnk_dtype(dtype) && (qnk_block_size(dtype) == 32 || dtype == DType::IQ4XS || dtype == DType::NvFp4)
+#if defined(__aarch64__) || defined(_M_ARM64)
+        || is_qnk_dtype(dtype)
+#endif
+    )
+    {
+        if (matrix_count != 2)
+            return false;
+        for (size_t i = 0; i < matrix_count; ++i)
+        {
+            const CompiledOperator* op = owners ? owners[i] : nullptr;
+            if (op && (op->linear || op->bfloat16 || op->float8 || op->qnk))
+                return false;
+        }
+        std::array<std::shared_ptr<const QnKPack>*, 2> sidecars{};
+        if (owners)
+        {
+            for (size_t i = 0; i < matrix_count; ++i)
+                sidecars[i] = owners[i] ? &owners[i]->qnk_packed : nullptr;
+        }
+        const auto sidecar_span = std::span<std::shared_ptr<const QnKPack>* const>(sidecars.data(), matrix_count);
+        return forward_linear_qnk(matrices,
+                                  input,
+                                  outputs,
+                                  has_flag(optimization_flags, OptimizationCpuPackedWeights),
+                                  sidecar_span);
+    }
+    if (is_qnk_dtype(dtype))
+        return false;
     bool use_bfloat16 = false;
 #if defined(__aarch64__) || defined(_M_ARM64)
     use_bfloat16 = dtype == DType::BFloat16;
@@ -742,8 +868,11 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
         for (size_t i = 0; i < matrix_count; ++i)
         {
             const TensorData& matrix = *weights[i];
-            const uint32_t output_blocks = matrix.shape[0] / block_size
-                                           + (matrix.shape[0] % block_size != 0);
+            if (matrix.float8_scale_row_size != 1 && matrix.float8_scale_row_size != 128)
+                return false;
+            row_group_size = std::min(row_group_size, matrix.float8_scale_row_size);
+            const uint32_t output_blocks = matrix.shape[0] / matrix.float8_scale_row_size
+                                           + (matrix.shape[0] % matrix.float8_scale_row_size != 0);
             const uint64_t scale_count = static_cast<uint64_t>(output_blocks) * input_blocks;
             if (matrix.float8_values().size() != matrix.element_count()
                 || matrix.quantization_scales.size() != scale_count)
@@ -950,14 +1079,21 @@ static bool forward_linear_vulkan(const CompiledOperator* op,
 {
     if (backend != ExecutionBackend::Vulkan || !op)
         return false;
-    return (op->bfloat16
-            && op->bfloat16->forward(input, output))
-           || (op->float8
-               && op->float8->forward(input, output))
-           || (op->qnk
-               && op->qnk->forward(input, output))
-           || (op->linear
-               && op->linear->forward(input, output));
+    bool executed = false;
+    if (op->bfloat16)
+        executed = op->bfloat16->forward(input, output);
+    else if (op->float8)
+        executed = op->float8->forward(input, output);
+    else if (op->qnk)
+        executed = op->qnk->forward(input, output);
+    else if (op->linear)
+        executed = op->linear->forward(input, output);
+    else
+        return false;
+
+    if (!executed)
+        throw std::runtime_error("Vulkan linear execution failed");
+    return true;
 }
 
 void forward_linear(const TensorData& matrix, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op, ExecutionBackend backend, ActivationBuffer* quantized_input_scratch)
@@ -972,16 +1108,60 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
     const uint32_t output_columns = matrix.shape[0];
     const uint32_t input_columns = matrix.shape[1];
     assert(input.columns() == input_columns);
+    if (input.rows() == 0)
+    {
+        output.reset(0, output_columns, false);
+        return;
+    }
 
+    // Vulkan QnKLinear applies input_column_indices in its shader, so pass it
+    // the original activation buffer. CPU kernels gather below when needed.
     if (forward_linear_vulkan(op, input, output, backend))
         return;
-    if (is_qnk_dtype(matrix.dtype)
-        && forward_linear_qnk(matrix,
-                              input,
-                              output,
-                              has_flag(optimization_flags, OptimizationCpuPackedWeights),
-                              op ? &op->qnk_packed : nullptr))
+
+    const ActivationBuffer* linear_input = &input;
+    ActivationBuffer local_input;
+    if (!matrix.input_column_indices.empty())
+    {
+        if (!validate_input_column_indices(matrix)
+            || input.dtype() != DType::Float32)
+        {
+            throw std::runtime_error("invalid quantized linear input column map");
+        }
+        ActivationBuffer& prepared = quantized_input_scratch && quantized_input_scratch->dtype() == DType::Float32
+                                         ? *quantized_input_scratch
+                                         : local_input;
+        prepared.reset(input.rows(), input_columns, false);
+        for (size_t row = 0; row < input.rows(); ++row)
+        {
+            const float* source = input.row(row);
+            float* destination = prepared.row(row);
+            for (uint32_t column = 0; column < input_columns; ++column)
+                destination[column] = source[matrix.input_column_indices[column]];
+        }
+        linear_input = &prepared;
+    }
+    if (matrix.dtype == DType::Int4)
+    {
+        if (!forward_linear_int4(matrix, *linear_input, output))
+            throw std::runtime_error("invalid INT4 linear weight or activation shape");
         return;
+    }
+    if (is_qnk_dtype(matrix.dtype))
+    {
+        require_dense_host_storage(matrix, "linear weight");
+        std::array<std::shared_ptr<const QnKPack>*, 1> sidecars = {op ? &op->qnk_packed : nullptr};
+        const auto sidecar_span = std::span<std::shared_ptr<const QnKPack>* const>(sidecars.data(), sidecars.size());
+        if (forward_linear_qnk({&matrix},
+                               *linear_input,
+                               {&output},
+                               has_flag(optimization_flags, OptimizationCpuPackedWeights),
+                               sidecar_span))
+            return;
+        throw std::runtime_error("invalid native GGML linear weight or activation shape");
+    }
+    if (!matrix.input_column_indices.empty() && matrix.dtype != DType::MxFp4)
+        throw std::runtime_error("invalid quantized linear weight layout");
     require_dense_host_storage(matrix, "linear weight");
     output.reset(input.rows(), output_columns, false);
     const int64_t parallel_output_columns = static_cast<int64_t>(output_columns);
@@ -1092,6 +1272,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
     }
     else if (matrix.dtype == DType::MxFp4)
     {
+        const ActivationBuffer& mxfp_input = *linear_input;
         const uint32_t blocks_per_row = input_columns / 32;
         const int64_t row_pair_count = static_cast<int64_t>((output_columns + 1) / 2);
         Mxfp4Q8Batch q8_input;
@@ -1099,9 +1280,9 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                             && input_columns % 32 == 0;
         if (use_q8)
         {
-            mxfp4_q8_quantize_batch(input.row(0),
-                                    input.columns(),
-                                    input.rows(),
+            mxfp4_q8_quantize_batch(mxfp_input.row(0),
+                                    mxfp_input.columns(),
+                                    mxfp_input.rows(),
                                     input_columns,
                                     q8_input);
             if (has_flag(optimization_flags, OptimizationCpuPackedWeights)
@@ -1120,7 +1301,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                                          q8_input.columns,
                                          q8_input.row_scales(0),
                                          (input_columns + 31) / 32,
-                                         input.rows(),
+                                         mxfp_input.rows(),
                                          output.row(0),
                                          output.columns());
                     return;
@@ -1146,10 +1327,10 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                                           second_scales,
                                           blocks_per_row,
                                           q8_input.row(0),
-                                          input.columns(),
+                                          mxfp_input.columns(),
                                           q8_input.row_scales(0),
                                           (input_columns + 31) / 32,
-                                          input.rows(),
+                                          mxfp_input.rows(),
                                           output.row(0) + first_row,
                                           output.columns(),
                                           output.row(0) + second_row,
@@ -1157,15 +1338,15 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                 }
                 else
                 {
-                    mxfp4_matmul_rows2(first_blocks, first_scales, second_blocks, second_scales, blocks_per_row, input.row(0), input.columns(), input.rows(),
+                    mxfp4_matmul_rows2(first_blocks, first_scales, second_blocks, second_scales, blocks_per_row, mxfp_input.row(0), mxfp_input.columns(), mxfp_input.rows(),
                                        output.row(0) + first_row, output.columns(), output.row(0) + second_row, output.columns());
                 }
             }
-            else if (input.rows() == 1)
+            else if (mxfp_input.rows() == 1)
             {
                 output.row(0)[first_row] = use_q8
                                                ? mxfp4_q8_dot(first_blocks, first_scales, blocks_per_row, q8_input.row(0), q8_input.row_scales(0))
-                                               : mxfp4_dot(first_blocks, first_scales, blocks_per_row, input.row(0));
+                                               : mxfp4_dot(first_blocks, first_scales, blocks_per_row, mxfp_input.row(0));
             }
             else
             {
@@ -1175,16 +1356,16 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                                       first_scales,
                                       blocks_per_row,
                                       q8_input.row(0),
-                                      input.columns(),
+                                      mxfp_input.columns(),
                                       q8_input.row_scales(0),
                                       (input_columns + 31) / 32,
-                                      input.rows(),
+                                      mxfp_input.rows(),
                                       output.row(0) + first_row,
                                       output.columns());
                 }
                 else
                 {
-                    mxfp4_gemm_row(first_blocks, first_scales, blocks_per_row, input.row(0), input.columns(), input.rows(), output.row(0) + first_row,
+                    mxfp4_gemm_row(first_blocks, first_scales, blocks_per_row, mxfp_input.row(0), mxfp_input.columns(), mxfp_input.rows(), output.row(0) + first_row,
                                    output.columns());
                 }
             }
@@ -1231,13 +1412,17 @@ bool forward_gate_up_float8(const TensorData& gate,
     const uint32_t output_columns = gate.shape[0];
     const uint32_t input_columns = gate.shape[1];
     const uint32_t input_blocks = (input_columns + block_size - 1) / block_size;
-    const uint32_t output_blocks = (output_columns + block_size - 1) / block_size;
+    if ((gate.float8_scale_row_size != 1 && gate.float8_scale_row_size != 128)
+        || (up.float8_scale_row_size != 1 && up.float8_scale_row_size != 128))
+        return false;
+    const uint32_t gate_output_blocks = (output_columns + gate.float8_scale_row_size - 1) / gate.float8_scale_row_size;
+    const uint32_t up_output_blocks = (output_columns + up.float8_scale_row_size - 1) / up.float8_scale_row_size;
     if (gate.float8_values().size() != gate.element_count()
         || up.float8_values().size() != up.element_count()
         || gate.quantization_scales.size()
-               != static_cast<size_t>(output_blocks) * input_blocks
+               != static_cast<size_t>(gate_output_blocks) * input_blocks
         || up.quantization_scales.size()
-               != static_cast<size_t>(output_blocks) * input_blocks)
+               != static_cast<size_t>(up_output_blocks) * input_blocks)
     {
         return false;
     }
@@ -1255,7 +1440,8 @@ bool forward_gate_up_float8(const TensorData& gate,
     prepare_quantized_float8_input(quantized_input, input, optimization_flags);
 
     output.reset(input.rows(), output_columns, false);
-    const uint32_t row_group_size = float8_linear_row_group_size(optimization_flags);
+    const uint32_t row_group_size = std::min({float8_linear_row_group_size(optimization_flags),
+                                              gate.float8_scale_row_size, up.float8_scale_row_size});
     const int64_t output_group_count = (static_cast<int64_t>(output_columns) + row_group_size - 1)
                                        / row_group_size;
     const uint64_t operation_count = static_cast<uint64_t>(output_columns) * input_columns * input.rows()
@@ -1275,10 +1461,10 @@ bool forward_gate_up_float8(const TensorData& gate,
         const uint8_t* up_weights = up_values.data()
                                     + static_cast<size_t>(first_output_column) * input_columns;
         const float* gate_scales = gate.quantization_scales.data()
-                                   + static_cast<size_t>(first_output_column / block_size)
+                                   + static_cast<size_t>(first_output_column / gate.float8_scale_row_size)
                                          * input_blocks;
         const float* up_scales = up.quantization_scales.data()
-                                 + static_cast<size_t>(first_output_column / block_size)
+                                 + static_cast<size_t>(first_output_column / up.float8_scale_row_size)
                                        * input_blocks;
         for (size_t token_index = 0; token_index < input.rows();
              ++token_index)
@@ -1313,8 +1499,11 @@ bool forward_gate_up_float8(const TensorData& gate,
 }
 
 void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, const ActivationBuffer& input, ExpertActivation activation, float activation_limit,
-                           ActivationBuffer& output, uint64_t optimization_flags)
+                           ActivationBuffer& output, uint64_t optimization_flags, ActivationBuffer* scratch)
 {
+    if (!matrix.input_column_indices.empty())
+        throw std::runtime_error("MXFP4 fused gate/up does not support input column maps");
+    assert(!scratch || (scratch != &input && scratch != &output && scratch->dtype() == DType::Float32));
     assert(&input != &output && input.dtype() == DType::Float32 && output.dtype() == DType::Float32);
     assert(matrix.dtype == DType::MxFp4 && matrix.shape.size() == 2);
     assert(matrix.shape[0] % 2 == 0 && matrix.shape[1] == input.columns());
@@ -1519,7 +1708,9 @@ void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, con
     if (parallel_enabled)
         scratch_worker_count = static_cast<size_t>(linear_team_size);
 #endif
-    std::vector<float> linear_scratch(scratch_worker_count * input.rows());
+    ActivationBuffer local_scratch;
+    ActivationBuffer& linear_scratch = scratch ? *scratch : local_scratch;
+    linear_scratch.reset(input.rows(), static_cast<uint32_t>(scratch_worker_count), false);
     const int64_t parallel_columns = static_cast<int64_t>(intermediate_size);
 #pragma omp parallel for num_threads(linear_team_size) if (parallel_enabled)
     for (int64_t column = 0; column < parallel_columns; ++column)
@@ -1537,7 +1728,7 @@ void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, con
         if (parallel_enabled)
             scratch_worker = static_cast<size_t>(omp_get_thread_num());
 #endif
-        float* linear = linear_scratch.data() + scratch_worker * input.rows();
+        float* linear = linear_scratch.row(0) + scratch_worker * input.rows();
         matmul_rows2(gate_blocks, gate_scales, up_blocks, up_scales, blocks_per_row, input.row(0), input.columns(), input.rows(),
                      output.row(0) + column, output.columns(), linear, 1);
         for (size_t token_index = 0; token_index < input.rows(); ++token_index)
@@ -1634,6 +1825,8 @@ static bool support_experts_mxfp4(std::span<const Mxfp4Task> tasks)
             || task.down->dtype != DType::MxFp4
             || task.gate_up->shape.size() != 2
             || task.down->shape.size() != 2
+            || !task.gate_up->input_column_indices.empty()
+            || !task.down->input_column_indices.empty()
             || task.gate_up->shape[0] % 2 != 0
             || task.gate_up->shape[1] != task.input->columns()
             || task.down->shape[1] != task.gate_up->shape[0] / 2
@@ -2578,11 +2771,19 @@ bool forward_experts_mxfp4(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scrat
 
 void forward_linear(const TensorData& matrix, const TensorData& bias, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op, ExecutionBackend backend, ActivationBuffer* quantized_input_scratch)
 {
+    assert(matrix.shape.size() == 2);
+    const uint32_t output_columns = matrix.shape[0];
+    assert(input.columns() == matrix.shape[1]);
+    assert(bias.shape.size() == 1 && bias.shape[0] == output_columns);
+    if (input.rows() == 0)
+    {
+        output.reset(0, output_columns, false);
+        return;
+    }
     if (forward_linear_vulkan(op, input, output, backend))
         return;
     forward_linear(matrix, input, output, optimization_flags, op, ExecutionBackend::Cpu, quantized_input_scratch);
     require_dense_host_storage(bias, "linear bias");
-    assert(bias.shape.size() == 1 && bias.shape[0] == output.columns());
     if (bias.dtype == DType::Float32)
     {
         const std::span<const float> values = bias.float32_values();

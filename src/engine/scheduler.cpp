@@ -43,15 +43,14 @@ public:
 private:
     using Work = std::function<void(BatchWorkspace&)>;
 
-    [[nodiscard]] static Result<void> get_session_lock_order(std::vector<Session*>& sessions,
-                                                             const char* null_message,
-                                                             const char* duplicate_message);
-    [[nodiscard]] static Result<std::vector<PrefillResult>> prefill(std::span<Session* const> lock_order,
-                                                                    std::span<const PrefillBatchRequest> requests,
-                                                                    BatchWorkspace& workspace);
-    [[nodiscard]] static Result<std::vector<DecodeResult>> decode(std::span<Session* const> lock_order,
-                                                                  std::span<const DecodeBatchRequest> requests,
-                                                                  BatchWorkspace& workspace);
+    [[nodiscard]] static Result<void> sort_sessions(std::vector<Session*>& sessions,
+                                                    const char* duplicate_message);
+    [[nodiscard]] static Result<std::vector<Result<PrefillResult>>> prefill(std::span<Session* const> lock_order,
+                                                                            std::span<const PrefillBatchRequest> requests,
+                                                                            BatchWorkspace& workspace);
+    [[nodiscard]] static Result<std::vector<Result<DecodeResult>>> decode(std::span<Session* const> lock_order,
+                                                                          std::span<const DecodeBatchRequest> requests,
+                                                                          BatchWorkspace& workspace);
 
     void stop_workers();
     void worker_loop();
@@ -81,24 +80,18 @@ private:
     std::atomic<uint64_t> staged_decode_batches{0};
 };
 
-Result<void> BatchSchedulerPrivate::get_session_lock_order(std::vector<Session*>& sessions,
-                                                           const char* null_message,
-                                                           const char* duplicate_message)
+Result<void> BatchSchedulerPrivate::sort_sessions(std::vector<Session*>& sessions,
+                                                  const char* duplicate_message)
 {
-    for (const Session* session : sessions)
-    {
-        if (!session)
-            return Error{ErrorCode::InvalidArgument, null_message};
-    }
     std::sort(sessions.begin(), sessions.end(), std::less<Session*>());
     if (std::adjacent_find(sessions.begin(), sessions.end()) != sessions.end())
         return Error{ErrorCode::InvalidArgument, duplicate_message};
     return {};
 }
 
-Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(std::span<Session* const> lock_order,
-                                                                  std::span<const PrefillBatchRequest> requests,
-                                                                  BatchWorkspace& workspace)
+Result<std::vector<Result<PrefillResult>>> BatchSchedulerPrivate::prefill(std::span<Session* const> lock_order,
+                                                                          std::span<const PrefillBatchRequest> requests,
+                                                                          BatchWorkspace& workspace)
 {
     if (lock_order.empty() || lock_order.size() != requests.size())
     {
@@ -158,7 +151,7 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(std::span<Sess
         session->stats_scratch = session->stats;
     }
 
-    std::vector<PrefillResult> results(requests.size());
+    std::vector<Result<PrefillResult>> results(requests.size(), PrefillResult{});
     std::vector<DecodeBatchEntry> entries;
     entries.reserve(requests.size());
 
@@ -180,7 +173,7 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(std::span<Sess
                 session.state.get(),
                 session.token_count + token_index,
                 token_index + 1 == requests[session_index].input_ids.size()
-                    ? &results[session_index].logits
+                    ? &results[session_index].value().logits
                     : nullptr,
             });
         }
@@ -209,14 +202,14 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(std::span<Sess
     {
         Session& session = *requests[index].session;
         session.commit_execution(requests[index].input_ids.size(), 0);
-        results[index].processed_tokens = static_cast<uint32_t>(requests[index].input_ids.size());
+        results[index].value().processed_tokens = static_cast<uint32_t>(requests[index].input_ids.size());
     }
     return results;
 }
 
-Result<std::vector<DecodeResult>> BatchSchedulerPrivate::decode(std::span<Session* const> lock_order,
-                                                                std::span<const DecodeBatchRequest> requests,
-                                                                BatchWorkspace& workspace)
+Result<std::vector<Result<DecodeResult>>> BatchSchedulerPrivate::decode(std::span<Session* const> lock_order,
+                                                                        std::span<const DecodeBatchRequest> requests,
+                                                                        BatchWorkspace& workspace)
 {
     if (lock_order.empty() || lock_order.size() != requests.size())
     {
@@ -244,7 +237,7 @@ Result<std::vector<DecodeResult>> BatchSchedulerPrivate::decode(std::span<Sessio
             return Error{ErrorCode::InvalidArgument, token_id_error_message};
     }
 
-    std::vector<DecodeResult> results(requests.size());
+    std::vector<Result<DecodeResult>> results(requests.size(), DecodeResult{});
     std::vector<DecodeBatchEntry> entries(requests.size());
     for (size_t index = 0; index < requests.size(); ++index)
     {
@@ -256,7 +249,7 @@ Result<std::vector<DecodeResult>> BatchSchedulerPrivate::decode(std::span<Sessio
             &session.stats_scratch,
             session.state.get(),
             session.token_count,
-            &results[index].logits,
+            &results[index].value().logits,
         };
     }
 
@@ -276,7 +269,7 @@ Result<std::vector<DecodeResult>> BatchSchedulerPrivate::decode(std::span<Sessio
     {
         Session& session = *requests[index].session;
         session.commit_execution(0, 1);
-        results[index].sequence_length = session.token_count;
+        results[index].value().sequence_length = session.token_count;
     }
     return results;
 }
@@ -389,9 +382,7 @@ std::future<std::vector<Result<PrefillResult>>> BatchSchedulerPrivate::submit_pr
         lock_order.push_back(session);
     }
 
-    auto lock_result = get_session_lock_order(lock_order,
-                                              "staged prefill session cannot be null",
-                                              "staged prefill requires unique sessions");
+    auto lock_result = sort_sessions(lock_order, "staged prefill requires unique sessions");
     if (!lock_result)
     {
         reject("a prefill batch requires unique sessions and non-empty inputs");
@@ -413,11 +404,7 @@ std::future<std::vector<Result<PrefillResult>>> BatchSchedulerPrivate::submit_pr
             auto ret = prefill(lock_order, requests, workspace);
             staged_prefill_batches.fetch_add(1, std::memory_order_relaxed);
             if (ret)
-            {
-                results.reserve(ret.value().size());
-                for (PrefillResult& result : ret.value())
-                    results.emplace_back(std::move(result));
-            }
+                results = std::move(ret).value();
             else
             {
                 results.assign(requests.size(), ret.error());
@@ -480,9 +467,7 @@ std::future<std::vector<Result<DecodeResult>>> BatchSchedulerPrivate::submit_dec
         }
     }
 
-    auto lock_result = get_session_lock_order(lock_order,
-                                              "staged decode session cannot be null",
-                                              "a decode batch requires unique non-null sessions");
+    auto lock_result = sort_sessions(lock_order, "a decode batch requires unique non-null sessions");
     if (!lock_result)
     {
         state->promise.set_value(std::vector<Result<DecodeResult>>(requests.size(), lock_result.error()));
@@ -505,11 +490,7 @@ std::future<std::vector<Result<DecodeResult>>> BatchSchedulerPrivate::submit_dec
                 auto ret = decode(lock_order, requests, workspace);
                 staged_decode_batches.fetch_add(1, std::memory_order_relaxed);
                 if (ret)
-                {
-                    results.reserve(ret.value().size());
-                    for (DecodeResult& result : ret.value())
-                        results.emplace_back(std::move(result));
-                }
+                    results = std::move(ret).value();
                 else
                 {
                     results.assign(requests.size(), ret.error());

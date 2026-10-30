@@ -7,6 +7,7 @@
 #include "backends/ncnn/rmsnorm_vulkan.h"
 #include "backends/ncnn/router_vulkan.h"
 #include "backends/ncnn/vulkan.h"
+#include "backends/ncnn/vulkancontext.h"
 #include "graph/compiledoperator.h"
 #include "kernels/attention.h"
 #include "kernels/float8.h"
@@ -22,6 +23,7 @@
 #include <iostream>
 #include <memory>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -104,6 +106,47 @@ static TensorData layer_fp8(uint32_t rows, uint32_t columns, uint32_t seed, floa
     return result;
 }
 
+static TensorData layer_q8(uint32_t rows, uint32_t columns, uint32_t seed, float scale)
+{
+    TensorData result;
+    result.dtype = DType::Q8_0;
+    result.shape = {rows, columns};
+    result.quantized_data.resize(static_cast<size_t>(rows) * (columns / 32) * 34);
+    const uint16_t half = static_cast<uint16_t>((std::ilogb(scale) - 4 + 15) << 10);
+    for (uint32_t row = 0; row < rows; ++row)
+        for (uint32_t block = 0; block < columns / 32; ++block)
+        {
+            uint8_t* data = result.quantized_data.data() + (static_cast<size_t>(row) * (columns / 32) + block) * 34;
+            data[0] = static_cast<uint8_t>(half);
+            data[1] = static_cast<uint8_t>(half >> 8);
+            for (uint32_t lane = 0; lane < 32; ++lane)
+                data[2 + lane] = static_cast<uint8_t>(static_cast<int8_t>(static_cast<int>((row * 17 + (block * 32 + lane) * 13 + seed * 11) % 31) - 15));
+        }
+    return result;
+}
+
+static TensorData layer_projection(uint32_t rows, uint32_t columns, uint32_t seed, float scale, bool bfloat16, bool q8_0 = false)
+{
+    if (q8_0)
+        return layer_q8(rows, columns, seed, scale);
+    TensorData result = layer_fp8(rows, columns, seed, scale);
+    if (!bfloat16)
+        return result;
+    TensorData expanded;
+    expanded.dtype = DType::BFloat16;
+    expanded.shape = result.shape;
+    expanded.bfloat16_data.resize(static_cast<size_t>(rows) * columns);
+    const uint32_t column_blocks = (columns + 127) / 128;
+    for (uint32_t row = 0; row < rows; ++row)
+        for (uint32_t column = 0; column < columns; ++column)
+        {
+            const size_t index = static_cast<size_t>(row) * columns + column;
+            expanded.bfloat16_data[index] = float_to_bfloat16(float8_e4m3_to_float(result.float8_values()[index])
+                                                              * result.quantization_scales[static_cast<size_t>(row / 128) * column_blocks + column / 128]);
+        }
+    return expanded;
+}
+
 static TensorHandle layer_add(WeightStore& weights, TensorData tensor)
 {
     auto result = weights.add("latent_layer_" + std::to_string(weights.size()), std::move(tensor));
@@ -122,6 +165,7 @@ static TensorData layer_base(uint32_t rows, uint32_t seed)
 struct LatentLayerFixture
 {
     WeightStore weights;
+    WeightStore oracle_weights;
     AttentionBlockPlan plan;
     CompiledOperatorTable operators;
     TensorData attention_function;
@@ -137,7 +181,7 @@ struct LatentLayerFixture
     LayerCache staged_cache;
     LayerCache gpu_cache;
 
-    LatentLayerFixture(const VulkanRuntimePtr& runtime, uint32_t seed)
+    LatentLayerFixture(const VulkanRuntimePtr& runtime, uint32_t seed, bool bfloat16 = false, bool q8_0 = false)
         : attention_function(layer_matrix(24, layer_copies * layer_hidden, seed, 0.0005f)),
           ffn_function(layer_matrix(24, layer_copies * layer_hidden, seed + 3, 0.0005f)),
           attention_base(layer_base(24, seed)),
@@ -170,36 +214,68 @@ struct LatentLayerFixture
         plan.rope_ntk_beta = 32.0f;
         plan.norm_epsilon = layer_norm_epsilon;
         plan.pre_attention_norm_weight = layer_add(weights, layer_constant({128}, 1.0f));
-        plan.query_a_weight = layer_add(weights, layer_fp8(128, 128, seed + 1, 0.25f));
+        plan.query_a_weight = layer_add(weights, layer_projection(128, 128, seed + 1, 0.25f, bfloat16, q8_0));
         plan.query_norm_weight = layer_add(weights, layer_constant({128}, 1.0f));
-        plan.query_b_weight = layer_add(weights, layer_fp8(2048, 128, seed + 5, 0.125f));
-        plan.key_value_weight = layer_add(weights, layer_fp8(512, 128, seed + 7, 0.125f));
+        plan.query_b_weight = layer_add(weights, layer_projection(2048, 128, seed + 5, 0.125f, bfloat16, q8_0));
+        plan.key_value_weight = layer_add(weights, layer_projection(512, 128, seed + 7, 0.125f, bfloat16, q8_0));
         plan.key_value_norm_weight = layer_add(weights, layer_constant({512}, 1.0f));
         TensorData sinks = layer_constant({4}, 0.0f);
         sinks.float32_data = {-1.5f, 0.0f, 3.0f, 12.0f};
         plan.sinks = layer_add(weights, std::move(sinks));
         // Small output scales retain a nonzero MLA contribution without amplifying quantization.
-        plan.output_a_weight = layer_add(weights, layer_fp8(128, 1024, seed + 3, 0.015625f));
-        plan.output_b_weight = layer_add(weights, layer_fp8(128, 128, seed + 11, 0.0625f));
+        plan.output_a_weight = layer_add(weights, layer_projection(128, 1024, seed + 3, 0.015625f, bfloat16, q8_0));
+        plan.output_b_weight = layer_add(weights, layer_projection(128, 128, seed + 11, 0.0625f, bfloat16, q8_0));
         operators.bind_weight_count(weights.size());
         const std::array<TensorHandle, 5> projections = {plan.query_a_weight, plan.query_b_weight, plan.key_value_weight, plan.output_a_weight, plan.output_b_weight};
         for (const TensorHandle handle : projections)
         {
             const uint32_t groups = handle == plan.output_a_weight ? plan.output_group_count : 1;
-            operators.at_weight_mutable(handle).float8 = Float8Linear_vulkan::create(weights.at(handle), nullptr, groups, get_default_gpu_index(), runtime, layer_flags);
-            layer_check(static_cast<bool>(operators.at_weight(handle).float8), "create layer FP8 projection");
+            CompiledOperator& op = operators.at_weight_mutable(handle);
+            if (q8_0 || (bfloat16 && groups > 1))
+                op.qnk = QnkLinear_vulkan::create(weights.at(handle), nullptr, get_default_gpu_index(), runtime, layer_flags, groups);
+            else if (bfloat16)
+                op.bfloat16 = Bfloat16Linear_vulkan::create(weights.at(handle), nullptr, get_default_gpu_index(), runtime, layer_flags);
+            else
+                op.float8 = Float8Linear_vulkan::create(weights.at(handle), nullptr, groups, get_default_gpu_index(), runtime, layer_flags);
+            layer_check(op.float8 || op.bfloat16 || op.qnk, "create layer projection");
         }
-        const auto& query = operators.at_weight(plan.query_a_weight).float8;
-        layer_check(query->prepare_rms_norm(weights.at(plan.query_norm_weight), layer_norm_epsilon), "prepare query norm");
-        layer_check(query->prepare_input_rms_norm(weights.at(plan.pre_attention_norm_weight), layer_norm_epsilon), "prepare MLA input norm");
-        auto attention = LatentAttention_vulkan::create(plan, weights.at(plan.sinks), operators.at_weight(plan.output_a_weight).float8, operators.at_weight(plan.output_b_weight).float8);
+        const CompiledOperator& query = operators.at_weight(plan.query_a_weight);
+        if (bfloat16)
+        {
+            layer_check(query.bfloat16->prepare_output_rms_norm(weights.at(plan.query_norm_weight), layer_norm_epsilon), "prepare BF16 query norm");
+            layer_check(query.bfloat16->prepare_input_rms_norm(weights.at(plan.pre_attention_norm_weight), layer_norm_epsilon), "prepare BF16 MLA input norm");
+        }
+        else if (!q8_0)
+        {
+            layer_check(query.float8->prepare_rms_norm(weights.at(plan.query_norm_weight), layer_norm_epsilon), "prepare query norm");
+            layer_check(query.float8->prepare_input_rms_norm(weights.at(plan.pre_attention_norm_weight), layer_norm_epsilon), "prepare MLA input norm");
+        }
+        auto attention = LatentAttention_vulkan::create(plan, weights.at(plan.sinks), operators.at_weight(plan.output_a_weight), operators.at_weight(plan.output_b_weight));
         layer_check(attention && attention->prepare(weights, operators, layer_flags) && attention->can_record(), "prepare layer MLA recorder");
         auto attention_hyper = HyperConnection_vulkan::create(attention_function, scale, attention_base, layer_copies, 20, layer_norm_epsilon, layer_hyper_epsilon, get_default_gpu_index(), runtime, layer_flags);
         auto ffn_hyper = HyperConnection_vulkan::create(ffn_function, scale, ffn_base, layer_copies, 20, layer_norm_epsilon, layer_hyper_epsilon, get_default_gpu_index(), runtime, layer_flags);
         auto norm = RmsNorm_vulkan::create(ffn_norm, layer_norm_epsilon, 0.0f, attention->vulkan_context(), attention->option());
+        layer_check(static_cast<bool>(norm), "create layer RMSNorm");
+        {
+            const auto& context = attention->vulkan_context();
+            const std::lock_guard<std::mutex> lock(context->command_mutex());
+            ncnn::VkMat input, output;
+            input.create(layer_hidden, 2, sizeof(float), context->blob_allocator());
+            ncnn::VkCompute cmd(context->device());
+            layer_check(!input.empty() && norm->record(input, output, cmd), "record RMSNorm refcount probe");
+            layer_check(input.refcount && *input.refcount == 1 && output.refcount && *output.refcount == 1,
+                        "RMSNorm record releases input/output bindings");
+        }
         auto router = Router_vulkan::create(router_weight, &router_bias, nullptr, get_default_gpu_index(), runtime, layer_flags);
         layer = LatentLayer_vulkan::create(attention, attention_hyper, ffn_hyper, norm, router);
         layer_check(static_cast<bool>(layer), "create complete layer GPU segment");
+        oracle_weights = weights;
+        if (q8_0)
+            for (TensorHandle handle : projections)
+            {
+                std::vector<uint8_t>().swap(weights.at_mutable(handle).quantized_data);
+                layer_check(weights.at(handle).qnk_values().empty(), "continuous Q8_0 layer has no host matrix storage");
+            }
     }
 };
 
@@ -255,7 +331,7 @@ static ActivationBuffer layer_cpu(LatentLayerFixture& fixture, const ActivationB
     AttentionScratch attention_scratch;
     layer_check(static_cast<bool>(forward_hyper_connection_pre(input, fixture.attention_function, fixture.scale, fixture.attention_base, layer_copies, 20, layer_norm_epsilon, layer_hyper_epsilon, attention_mix, hc_scratch, 0)), "CPU attention HC pre");
     std::vector<LayerCache*> caches(positions.size(), backend == ExecutionBackend::Cpu ? &fixture.cpu_cache : &fixture.staged_cache);
-    layer_check(static_cast<bool>(forward_latent_attention_batch(fixture.weights, fixture.operators, fixture.plan, backend, positions, caches, attention_scratch, attention_mix.reduced, attention_output, layer_flags)), "CPU MLA reference");
+    layer_check(static_cast<bool>(forward_latent_attention_batch(fixture.oracle_weights, fixture.operators, fixture.plan, backend, positions, caches, attention_scratch, attention_mix.reduced, attention_output, layer_flags)), "CPU MLA reference");
     if (attention_result)
         *attention_result = attention_output;
     layer_check(static_cast<bool>(forward_hyper_connection_post(attention_output, input, attention_mix, layer_copies, residual)), "CPU attention HC post");
@@ -305,20 +381,21 @@ enum class LayerEndpoint
     HiddenOnly
 };
 
-static void layer_test_two_layers(uint32_t rows, LayerEndpoint endpoint, uint32_t seed, bool resident_combine = false, bool deferred_combine = false)
+static void layer_test_two_layers(uint32_t rows, LayerEndpoint endpoint, uint32_t seed, bool resident_combine = false, bool deferred_combine = false, bool bfloat16 = false, bool q8_0 = false)
 {
     const std::string label = "rows=" + std::to_string(rows) + " endpoint=" + std::to_string(static_cast<uint32_t>(endpoint))
-                              + " seed=" + std::to_string(seed) + " combine=" + (deferred_combine ? "deferred" : (resident_combine ? "resident" : "host"));
+                              + " seed=" + std::to_string(seed) + " combine=" + (deferred_combine ? "deferred" : (resident_combine ? "resident" : "host"))
+                              + " projection=" + (q8_0 ? "Q8_0" : (bfloat16 ? "BF16" : "FP8"));
     const VulkanRuntimePtr runtime = create_vulkan_runtime();
-    LatentLayerFixture first(runtime, seed);
-    LatentLayerFixture second(runtime, seed + 17);
+    LatentLayerFixture first(runtime, seed, bfloat16, q8_0);
+    LatentLayerFixture second(runtime, seed + 17, bfloat16, q8_0);
     std::unique_ptr<LatentLayerFixture> first_host;
     std::unique_ptr<LatentLayerFixture> second_host;
     LatentLayerWorkspace_vulkan host_workspace;
     if (resident_combine || deferred_combine)
     {
-        first_host = std::make_unique<LatentLayerFixture>(runtime, seed);
-        second_host = std::make_unique<LatentLayerFixture>(runtime, seed + 17);
+        first_host = std::make_unique<LatentLayerFixture>(runtime, seed, bfloat16, q8_0);
+        second_host = std::make_unique<LatentLayerFixture>(runtime, seed + 17, bfloat16, q8_0);
     }
     const TensorData head_function = layer_matrix(layer_copies, layer_copies * layer_hidden, seed + 29, 0.0005f);
     const TensorData head_base = layer_base(layer_copies, seed + 31);
@@ -384,9 +461,9 @@ static void layer_test_two_layers(uint32_t rows, LayerEndpoint endpoint, uint32_
         }
         layer_check(after.attention_blocks == before.attention_blocks + rows && after.attention_cpu_fallbacks == before.attention_cpu_fallbacks, label + ": GPU MLA executes every row");
         layer_check(workspace.active() && fixture.gpu_cache.latent_token_count == rows && fixture.gpu_cache.latent_device_state, label + ": persistent GPU activation/cache");
-        // CPU grouped output-A uses original activations; the established Hybrid chain quantizes to FP8.
-        // Check that difference at the MLA branch, before RMS can amplify it, then check fusion tightly.
-        layer_compare(staged_attention, cpu_attention, label + ": CPU MLA branch including existing FP8 projection quantization", 0.05f, 0.08f);
+        // FP8 grouped output-A quantizes activations in the established Hybrid
+        // chain. BF16 keeps them in FP32 and must meet the tighter CPU oracle.
+        layer_compare(staged_attention, cpu_attention, label + ": CPU MLA branch parity", (bfloat16 || q8_0) ? 0.003f : 0.05f, (bfloat16 || q8_0) ? 0.003f : 0.08f);
         layer_compare(actual_normalized, staged_normalized, label + ": CPU HC/norm with staged Hybrid MLA parity", 0.003f, 0.003f);
         const ActivationBuffer cpu_router_logits = forward_linear(fixture.router_weight, fixture.router_bias, actual_normalized, 0);
         ExpertDispatchPlan cpu_routes;
@@ -707,6 +784,21 @@ int main()
         ncnn::moe::layer_test_two_layers(3, ncnn::moe::LayerEndpoint::LastLogits, 19, false, true);
         ncnn::moe::layer_test_two_layers(3, ncnn::moe::LayerEndpoint::Materialize, 13, false, true);
         ncnn::moe::layer_test_two_layers(1, ncnn::moe::LayerEndpoint::HiddenOnly, 29, false, true);
+        const auto context = ncnn::moe::VulkanContext::acquire(ncnn::moe::get_default_gpu_index(),
+                                                               ncnn::moe::create_vulkan_runtime(),
+                                                               ncnn::moe::OptimizationDefaultFlags);
+        ncnn::moe::layer_check(static_cast<bool>(context), "create BF16 layer capability context");
+        if (context->device()->info.subgroup_size() == 32)
+        {
+            ncnn::moe::layer_test_two_layers(1, ncnn::moe::LayerEndpoint::Materialize, 31, false, false, true);
+            ncnn::moe::layer_test_two_layers(3, ncnn::moe::LayerEndpoint::LastLogits, 37, true, false, true);
+            ncnn::moe::layer_test_two_layers(3, ncnn::moe::LayerEndpoint::HiddenOnly, 41, false, true, true);
+        }
+        else
+            std::cout << "SKIP: BF16 layer projections require Vulkan subgroup size 32\n";
+        ncnn::moe::layer_test_two_layers(1, ncnn::moe::LayerEndpoint::Materialize, 43, false, false, false, true);
+        ncnn::moe::layer_test_two_layers(3, ncnn::moe::LayerEndpoint::LastLogits, 47, true, false, false, true);
+        ncnn::moe::layer_test_two_layers(3, ncnn::moe::LayerEndpoint::HiddenOnly, 53, false, true, false, true);
         ncnn::moe::layer_test_workspace_reuse();
     }
     catch (const std::exception& error)

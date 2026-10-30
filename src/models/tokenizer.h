@@ -73,6 +73,7 @@ private:
     };
 
     bool load_impl(const std::string& model_directory, size_t vocabulary_size);
+    bool load_gguf_impl(const std::string& model_path, size_t vocabulary_size);
     void encode_impl(std::string_view text,
                      bool use_added,
                      EncodeScratch& scratch,
@@ -88,6 +89,7 @@ private:
     std::array<int32_t, 256> byte_ids{};
     Family family = Family::None;
     bool ignore_merges = false;
+    bool merge_leading_system_messages = false;
 };
 
 } // namespace moe

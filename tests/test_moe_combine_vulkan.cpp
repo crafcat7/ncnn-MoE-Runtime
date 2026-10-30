@@ -195,7 +195,9 @@ static void combine_test_deferred_ownership()
     auto combiner = MoeCombine_vulkan::create(context);
     combine_check(static_cast<bool>(combiner), "prepare deferred combiner");
     std::vector<ExpertRoute> routes = {{2, 0, 0.75f}, {0, 1, 0.5f}, {1, 0, 0.25f}};
+    std::vector<ExpertRoute> single_route = {{1, 0, 0.625f}};
     ActivationBuffer large(rows, columns), small(rows, columns), negative(rows, columns), shared(rows, columns);
+    ActivationBuffer single(1, columns);
     for (size_t row = 0; row < rows; ++row)
         for (uint32_t column = 0; column < columns; ++column)
         {
@@ -204,9 +206,14 @@ static void combine_test_deferred_ownership()
             negative.row(row)[column] = -1.0e20f;
             shared.row(row)[column] = static_cast<float>(column % 7) / 4.0f;
         }
+    for (uint32_t column = 0; column < columns; ++column)
+        single.row(0)[column] = static_cast<float>(column + 3) / 16.0f;
     auto large_gpu = combine_upload(*seed, large);
     auto negative_gpu = combine_upload(*seed, negative);
-    std::array<MoeCombineInput_vulkan, 3> inputs = {{{&large, large_gpu, routes}, {&small, {}, routes}, {&negative, negative_gpu, routes}}};
+    std::array<MoeCombineInput_vulkan, 4> inputs = {{{&large, large_gpu, routes},
+                                                     {&small, {}, routes},
+                                                     {&negative, negative_gpu, routes},
+                                                     {&single, {}, single_route}}};
     const auto expected = combine_reference(inputs, rows, columns, &shared);
     const auto before = get_vulkan_statistics(runtime);
     auto pending = combiner->prepare(inputs, rows, columns, &shared, {});
@@ -228,8 +235,10 @@ static void combine_test_deferred_ownership()
     large.clear();
     negative.clear();
     small.clear();
+    single.clear();
     shared.clear();
     routes.assign(17, {99, 3, -123.0f});
+    single_route[0] = {0, 3, -123.0f};
     combine_check(!weak_large.expired() && !weak_negative.expired(), "pending owns completed device sources");
     combine_check(get_vulkan_statistics(runtime).compute_submissions == before.compute_submissions, "capture performs no submit");
     // Abandon a populated command, then record again from the owned canonical
@@ -241,7 +250,7 @@ static void combine_test_deferred_ownership()
         ncnn::VkCompute command(context->device());
         ncnn::VkMat output;
         combine_check(combiner->record(*pending, output, command, storage, uploads), "record deferred sum without submitting");
-        combine_check(uploads == 2 && !output.empty(), "only owned host Expert and Shared activations upload");
+        combine_check(uploads == 3 && !output.empty(), "only owned host Experts and Shared activations upload");
         combine_check(command.reset() == 0, "cancel unsubmitted Combine command");
     }
     ActivationBuffer actual(rows, columns);
@@ -294,7 +303,7 @@ static void combine_test_expert_publication()
     auto seed = combine_seed(runtime, columns);
     VulkanExpertBackend backend(65536, get_default_gpu_index(), {}, runtime, combine_flags);
     auto gate = combine_mxfp4(64, columns), down = combine_mxfp4(columns, columns);
-    backend.admit("retained", gate, nullptr, down, nullptr, 0, 0.0f, ExpertActivation::DeepSeekSwiGlu);
+    backend.admit({"retained", gate, nullptr, down, nullptr, 0, 0.0f, ExpertActivation::DeepSeekSwiGlu});
     backend.wait_for_background_work();
     ActivationBuffer normalized(4, columns);
     for (size_t row = 0; row < normalized.rows(); ++row)
@@ -304,7 +313,7 @@ static void combine_test_expert_publication()
     routes[0] = {{2, 0, 0.5f}};
     routes[1] = {{3, 0, 0.25f}, {0, 0, 0.75f}, {1, 0, 0.5f}};
     std::array<ActivationBuffer, 2> input, host_output;
-    std::array<ExpertBackendRequest, 2> requests;
+    std::array<ExpertRequest, 2> requests;
     for (size_t i = 0; i < requests.size(); ++i)
     {
         input[i].reset(routes[i].size(), columns, false);
@@ -312,7 +321,7 @@ static void combine_test_expert_publication()
         requests[i] = {"retained", &input[i], &host_output[i], 0, {}};
     }
     auto baseline = backend.submit_batch(requests);
-    combine_check(baseline && baseline->wait() == std::vector<ExpertBackendExecutionResult>(2, ExpertBackendExecutionResult::Executed)
+    combine_check(baseline && baseline->wait() == std::vector<ExpertStatus>(2, ExpertStatus::Executed)
                       && baseline->commit(),
                   "GPU host baseline expert output");
     baseline.reset();
@@ -325,7 +334,7 @@ static void combine_test_expert_publication()
         requests[i].device_output = &resident_output[i];
     }
     auto canceled = backend.submit_batch(requests);
-    combine_check(canceled && canceled->wait() == std::vector<ExpertBackendExecutionResult>(2, ExpertBackendExecutionResult::Executed), "resident expert private execution");
+    combine_check(canceled && canceled->wait() == std::vector<ExpertStatus>(2, ExpertStatus::Executed), "resident expert private execution");
     canceled->abort();
     combine_check(!canceled->commit() && resident_output[0] == normalized_gpu && resident_output[1] == normalized_gpu, "abort publishes no resident output");
     combine_exact(host_output[0], reference[0], "abort preserves first host output");
@@ -333,7 +342,7 @@ static void combine_test_expert_publication()
     canceled.reset();
     const auto before = get_vulkan_statistics(runtime);
     auto completed = backend.submit_batch(requests);
-    combine_check(completed && completed->wait() == std::vector<ExpertBackendExecutionResult>(2, ExpertBackendExecutionResult::Executed), "resident expert completion");
+    combine_check(completed && completed->wait() == std::vector<ExpertStatus>(2, ExpertStatus::Executed), "resident expert completion");
     combine_check(resident_output[0] == normalized_gpu && resident_output[1] == normalized_gpu, "wait does not publish private output");
     combine_check(completed->commit(), "resident expert atomic commit");
     completed.reset();

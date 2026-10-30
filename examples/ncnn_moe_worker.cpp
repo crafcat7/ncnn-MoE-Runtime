@@ -146,6 +146,12 @@ static std::string gpu_infos_json(const std::vector<GpuInfo>& gpu_infos)
 static std::string expert_metrics_json(const RuntimeMetricCounters& counters)
 {
     JsonObject result;
+    result.add_uint("assignments", counters.expert_assignments);
+    result.add_uint("batches", counters.expert_batches);
+    result.add_uint("cpu_batches", counters.expert_cpu_batches);
+    result.add_uint("cpu_routes", counters.expert_cpu_routes);
+    result.add_uint("gpu_routes", counters.expert_gpu_routes);
+    result.add_uint("cpu_fallbacks", counters.expert_cpu_fallbacks);
     result.add_uint("cache_hit", counters.expert_cache_hits);
     result.add_uint("cache_miss", counters.expert_cache_misses);
     result.add_uint("io_bytes", counters.expert_io_bytes);
@@ -154,11 +160,15 @@ static std::string expert_metrics_json(const RuntimeMetricCounters& counters)
     result.add_uint("gpu_cache_miss", counters.expert_gpu_cache_misses);
     result.add_uint("gpu_cache_admissions", counters.expert_gpu_cache_admissions);
     result.add_uint("gpu_cache_stores", counters.expert_gpu_cache_stores);
+    result.add_uint("gpu_cache_evictions", counters.expert_gpu_cache_evictions);
     result.add_uint("gpu_cache_dropped_admissions", counters.expert_gpu_cache_dropped_admissions);
     result.add_uint("gpu_cache_resident_bytes", counters.expert_gpu_cache_resident_size);
     result.add_uint("gpu_cache_pending_bytes", counters.expert_gpu_cache_pending_size);
     result.add_uint("gpu_executions", counters.expert_gpu_executions);
     result.add_uint("gpu_execution_failures", counters.expert_gpu_execution_failures);
+    result.add_uint("speculative_proposals", counters.speculative_proposals);
+    result.add_uint("speculative_draft_tokens", counters.speculative_draft_tokens);
+    result.add_uint("speculative_accepted_tokens", counters.speculative_accepted_tokens);
     result.add_uint("gpu_route_aggregation_batches", counters.expert_gpu_route_aggregation_batches);
     result.add_uint("gpu_route_aggregation_routes", counters.expert_gpu_route_aggregation_routes);
     result.add_uint("gpu_route_aggregation_bytes_saved", counters.expert_gpu_route_aggregation_bytes_saved);
@@ -179,9 +189,13 @@ static std::string gpu_metrics_json(const RuntimeMetricCounters& counters, bool 
     else
         result.add_null("submit_count");
     result.add_uint("linear_dispatches", counters.vulkan_linear_dispatches);
+    result.add_uint("int4_dispatches", counters.vulkan_int4_dispatches);
     result.add_uint("attention_blocks", counters.vulkan_attention_blocks);
     result.add_uint("gated_delta_fusions", counters.vulkan_gated_delta_fusions);
     result.add_uint("gated_delta_submissions", counters.vulkan_gated_delta_submissions);
+    result.add_uint("qwen_layers", counters.vulkan_qwen_layers);
+    result.add_uint("gated_residual_blocks", counters.vulkan_gated_residual_blocks);
+    result.add_uint("ple_blocks", counters.vulkan_ple_blocks);
     result.add_uint("batch_uploads", counters.vulkan_batch_uploads);
     result.add_uint("batch_downloads", counters.vulkan_batch_downloads);
     result.add_uint("attention_qkv_rope_fusions", counters.vulkan_attention_qkv_rope_fusions);
@@ -502,11 +516,17 @@ static Option parse_options(int argc, char** argv, int first_argument)
         else if (argument == "--expected-concurrency")
             result.num_concurrent_sessions = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expected-concurrency")));
         else if (argument == "--mmap-experts")
+        {
+            if (result.expert_io_mode != ExpertIoMode::Auto && result.expert_io_mode != ExpertIoMode::Mmap)
+                throw std::invalid_argument("Expert mmap and buffered I/O modes are mutually exclusive");
             result.expert_io_mode = ExpertIoMode::Mmap;
-        else if (argument == "--direct-expert-io")
-            result.expert_io_mode = ExpertIoMode::Direct;
+        }
         else if (argument == "--buffered-expert-io")
+        {
+            if (result.expert_io_mode != ExpertIoMode::Auto && result.expert_io_mode != ExpertIoMode::Buffered)
+                throw std::invalid_argument("Expert mmap and buffered I/O modes are mutually exclusive");
             result.expert_io_mode = ExpertIoMode::Buffered;
+        }
         else if (argument == "--disable-gpu-victim-execution")
             result.flags |= OptionDisableGpuVictimExecution;
         else if (argument == "--disable-gpu-expert-execution")
@@ -519,8 +539,6 @@ static Option parse_options(int argc, char** argv, int first_argument)
             result.optimization_flags &= ~OptimizationVulkanExpertDirectStaging;
         else if (argument == "--disable-vulkan-shared-expert-overlap")
             result.optimization_flags &= ~OptimizationVulkanSharedExpertOverlap;
-        else if (argument == "--release-vulkan-dense-host")
-            result.flags |= OptionReleaseVulkanDenseHostStorage;
         else
             throw std::invalid_argument("unknown worker option: " + argument);
     }
@@ -1430,8 +1448,8 @@ static void print_usage(const char* executable)
               << "           --expert-cache-mb N, --expert-gpu-cache-mb N, --expert-io-workers N,\n"
               << "           --expert-memory auto|eager|on-demand, --cpu-packed-weights on|off,\n"
               << "           --vulkan-device N, --vulkan-devices N[,N...]\n"
-              << "  io/cache: --mmap-experts, --direct-expert-io, --buffered-expert-io,\n"
-              << "            --release-vulkan-dense-host, --disable-gpu-expert-execution,\n"
+              << "  io/cache: --mmap-experts, --buffered-expert-io,\n"
+              << "            --disable-gpu-expert-execution,\n"
               << "            --expected-concurrency N\n"
               << "  debug: --disable-vulkan-joint-cache-eviction\n"
               << "  debug: --disable-vulkan-mxfp4-row-tile\n"

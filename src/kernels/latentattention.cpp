@@ -5,6 +5,8 @@
 #include "backends/ncnn/latentattention_vulkan.h"
 #include "fastmath.h"
 #include "float8.h"
+#include "mxfp4.h"
+#include "qnk.h"
 #include "ops.h"
 #include "statecache.h"
 #include "vector.h"
@@ -572,27 +574,86 @@ static bool select_compressed_indices(const WeightStore& weights,
     return true;
 }
 
-static void fp8_matrix_rows_dot(const TensorData& matrix,
-                                uint32_t first_row,
-                                uint32_t row_count,
-                                const float* input,
-                                float* output)
+static void matrix_rows_dot(const TensorData& matrix,
+                            uint32_t first_row,
+                            uint32_t row_count,
+                            const float* input,
+                            float* output)
 {
     const uint32_t columns = matrix.shape[1];
+    if (matrix.dtype != DType::Float8E4M3)
+    {
+        std::array<float, qnk_block_elements> gathered;
+        for (uint32_t index = 0; index < row_count; ++index)
+        {
+            const uint32_t row = first_row + index;
+            float sum = 0.0f;
+            if (matrix.dtype == DType::MxFp4 || is_qnk_dtype(matrix.dtype))
+            {
+                const bool mxfp4 = matrix.dtype == DType::MxFp4;
+                const uint8_t* weights = mxfp4 ? matrix.mxfp4_blocks.data() + static_cast<size_t>(row) * (columns / 2)
+                                               : matrix.qnk_values().data() + row * qnk_storage_bytes(matrix.dtype, 1, columns);
+                for (uint32_t column = 0; column < columns; column += qnk_block_size(matrix.dtype))
+                {
+                    const float* block_input = input + column;
+                    if (!matrix.input_column_indices.empty())
+                    {
+                        for (uint32_t lane = 0; lane < qnk_block_size(matrix.dtype); ++lane)
+                            gathered[lane] = input[matrix.input_column_indices[column + lane]];
+                        block_input = gathered.data();
+                    }
+                    sum += mxfp4 ? mxfp4_dot(weights + column / 2,
+                                             matrix.mxfp4_scales.data() + static_cast<size_t>(row) * (columns / 32) + column / 32,
+                                             1, block_input)
+                                 : qnk_dot_block(matrix.dtype, weights + (column / qnk_block_size(matrix.dtype)) * qnk_block_bytes(matrix.dtype), block_input);
+                }
+            }
+            else
+            {
+                const uint32_t groups = matrix.dtype == DType::Int4
+                                            ? (columns + matrix.quantization_group_size - 1) / matrix.quantization_group_size
+                                            : 0;
+                for (uint32_t column = 0; column < columns; ++column)
+                {
+                    float weight;
+                    if (matrix.dtype == DType::Int4)
+                    {
+                        const uint8_t code = (matrix.int4_values()[static_cast<size_t>(row) * ((columns + 1) / 2) + column / 2]
+                                              >> ((column % 2) * 4))
+                                             & 15;
+                        const uint32_t group = matrix.quantization_group_indices.empty()
+                                                   ? column / matrix.quantization_group_size
+                                                   : matrix.quantization_group_indices[column];
+                        const size_t metadata = static_cast<size_t>(row) * groups + group;
+                        weight = (static_cast<int>(code) - matrix.quantization_zero_points[metadata]) * matrix.quantization_scales[metadata];
+                    }
+                    else if (matrix.dtype == DType::Int8)
+                        weight = matrix.int8_values()[static_cast<size_t>(row) * columns + column] * matrix.quantization_scales[row];
+                    else
+                        weight = matrix.dtype == DType::BFloat16
+                                     ? bfloat16_to_float(matrix.bfloat16_values()[static_cast<size_t>(row) * columns + column])
+                                     : matrix.float32_values()[static_cast<size_t>(row) * columns + column];
+                    const uint32_t logical = matrix.input_column_indices.empty() ? column : matrix.input_column_indices[column];
+                    sum += weight * input[logical];
+                }
+            }
+            output[index] = sum;
+        }
+        return;
+    }
     const uint32_t input_blocks = (columns + 127) / 128;
     uint32_t processed = 0;
     while (processed < row_count)
     {
         const uint32_t row = first_row + processed;
-        // Scales are shared by 128 output rows.  Do not let the small
-        // multi-row kernel cross that boundary.
-        const uint32_t scale_rows = 128 - row % 128;
+        // Do not let the multi-row kernel cross an output-scale boundary.
+        const uint32_t scale_rows = matrix.float8_scale_row_size - row % matrix.float8_scale_row_size;
         const uint32_t rows = std::min<uint32_t>({4, row_count - processed, scale_rows});
         float8_e4m3_block_dot_rows4(matrix.float8_values().data()
                                         + static_cast<size_t>(row) * columns,
                                     columns,
                                     matrix.quantization_scales.data()
-                                        + static_cast<size_t>(row / 128) * input_blocks,
+                                        + static_cast<size_t>(row / matrix.float8_scale_row_size) * input_blocks,
                                     input,
                                     columns,
                                     128,
@@ -624,6 +685,82 @@ static int latent_output_group_team_size(size_t row_count,
 #endif
 }
 
+static Result<void> forward_output(const WeightStore& weights,
+                                   const CompiledOperatorTable& operators,
+                                   const AttentionBlockPlan& plan,
+                                   ExecutionBackend backend,
+                                   AttentionScratch& scratch,
+                                   ActivationBuffer& attention_output,
+                                   ActivationBuffer& output,
+                                   uint64_t optimization_flags)
+{
+    const TensorData& output_a = weights.at(plan.output_a_weight);
+    const TensorData& output_b = weights.at(plan.output_b_weight);
+    const CompiledOperator& output_a_operator = operators.at_weight(plan.output_a_weight);
+    const CompiledOperator& output_b_operator = operators.at_weight(plan.output_b_weight);
+    if (backend == ExecutionBackend::Vulkan
+        && output_a_operator.float8
+        && output_b_operator.float8)
+    {
+        if (output_a_operator.float8->forward_chain(attention_output, *output_b_operator.float8, output))
+            return {};
+    }
+    ActivationBuffer& output_rank = scratch.projected;
+    const bool device_projected = backend == ExecutionBackend::Vulkan && output_a_operator.qnk
+                                  && output_a_operator.qnk->forward(attention_output, output_rank);
+    if (!device_projected && backend == ExecutionBackend::Vulkan && output_a_operator.float8)
+    {
+        forward_linear(output_a, attention_output, output_rank, optimization_flags,
+                       operators.find_weight(plan.output_a_weight), backend,
+                       &scratch.quantized_input);
+    }
+    else if (!device_projected)
+    {
+        output_rank.reset(attention_output.rows(), plan.output_group_count * plan.output_lora_rank, false);
+        const uint32_t heads_per_group = plan.head_count / plan.output_group_count;
+        const uint32_t group_columns = heads_per_group * plan.head_dimension;
+        if (output_a.dtype == DType::Float8E4M3)
+        {
+            for (size_t row = 0; row < attention_output.rows(); ++row)
+                for (uint32_t group = 0; group < plan.output_group_count; ++group)
+                    quantize_float8_e4m3_inplace(attention_output.row(row) + static_cast<size_t>(group) * group_columns,
+                                                 group_columns, 128, true, optimization_flags);
+        }
+#if defined(_OPENMP)
+        const int output_team_size = latent_output_group_team_size(attention_output.rows(), plan.output_group_count, group_columns,
+                                                                   plan.output_lora_rank);
+        const int64_t output_tasks = static_cast<int64_t>(attention_output.rows())
+                                     * plan.output_group_count;
+#pragma omp parallel for schedule(static) num_threads(output_team_size) if (output_team_size > 1)
+#else
+        const int64_t output_tasks = static_cast<int64_t>(attention_output.rows())
+                                     * plan.output_group_count;
+#endif
+        for (int64_t task = 0; task < output_tasks; ++task)
+        {
+            const size_t row_index = static_cast<size_t>(task)
+                                     / plan.output_group_count;
+            const uint32_t group = static_cast<uint32_t>(task)
+                                   % plan.output_group_count;
+            const float* group_input = attention_output.row(row_index)
+                                       + static_cast<size_t>(group)
+                                             * group_columns;
+            float* group_output = output_rank.row(row_index)
+                                  + static_cast<size_t>(group)
+                                        * plan.output_lora_rank;
+            matrix_rows_dot(output_a,
+                            group * plan.output_lora_rank,
+                            plan.output_lora_rank,
+                            group_input,
+                            group_output);
+        }
+    }
+    forward_linear(output_b, output_rank, output, optimization_flags,
+                   operators.find_weight(plan.output_b_weight), backend,
+                   &scratch.quantized_input);
+    return {};
+}
+
 Result<void> forward_latent_attention_batch(const WeightStore& weights,
                                             const CompiledOperatorTable& operators,
                                             const AttentionBlockPlan& plan,
@@ -652,6 +789,9 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
 
     const auto& prepared_latent_operator = operators.at_weight(plan.query_a_weight).latent_attention;
     if (backend == ExecutionBackend::Vulkan && prepared_latent_operator
+#if NCNN_MOE_WITH_VULKAN
+        && prepared_latent_operator->can_record()
+#endif
         && has_flag(optimization_flags, OptimizationVulkanAttention)
         && has_flag(optimization_flags, OptimizationVulkanLatentInputRmsNorm)
         && (plan.compression_ratio == 0 || vulkan_latent_compressor_enabled(backend, optimization_flags))
@@ -1297,62 +1437,8 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         }
     }
 
-    const TensorData& output_a = weights.at(plan.output_a_weight);
-    const TensorData& output_b = weights.at(plan.output_b_weight);
-    const CompiledOperator& output_a_operator = operators.at_weight(plan.output_a_weight);
-    const CompiledOperator& output_b_operator = operators.at_weight(plan.output_b_weight);
-    if (backend == ExecutionBackend::Vulkan
-        && output_a_operator.float8
-        && output_b_operator.float8)
-    {
-        if (output_a_operator.float8->forward_chain(attention_output, *output_b_operator.float8, output))
-            return {};
-    }
-    ActivationBuffer& output_rank = scratch.projected;
-    if (backend == ExecutionBackend::Vulkan && output_a_operator.float8)
-    {
-        forward_linear(output_a, attention_output, output_rank, optimization_flags,
-                       operators.find_weight(plan.output_a_weight), backend,
-                       &scratch.quantized_input);
-    }
-    else
-    {
-        output_rank.reset(input.rows(), plan.output_group_count * plan.output_lora_rank, false);
-        const uint32_t heads_per_group = plan.head_count / plan.output_group_count;
-        const uint32_t group_columns = heads_per_group * plan.head_dimension;
-#if defined(_OPENMP)
-        const int output_team_size = latent_output_group_team_size(input.rows(), plan.output_group_count, group_columns,
-                                                                   plan.output_lora_rank);
-        const int64_t output_tasks = static_cast<int64_t>(input.rows())
-                                     * plan.output_group_count;
-#pragma omp parallel for schedule(static) num_threads(output_team_size) if (output_team_size > 1)
-#else
-        const int64_t output_tasks = static_cast<int64_t>(input.rows())
-                                     * plan.output_group_count;
-#endif
-        for (int64_t task = 0; task < output_tasks; ++task)
-        {
-            const size_t row_index = static_cast<size_t>(task)
-                                     / plan.output_group_count;
-            const uint32_t group = static_cast<uint32_t>(task)
-                                   % plan.output_group_count;
-            const float* group_input = attention_output.row(row_index)
-                                       + static_cast<size_t>(group)
-                                             * group_columns;
-            float* group_output = output_rank.row(row_index)
-                                  + static_cast<size_t>(group)
-                                        * plan.output_lora_rank;
-            fp8_matrix_rows_dot(output_a,
-                                group * plan.output_lora_rank,
-                                plan.output_lora_rank,
-                                group_input,
-                                group_output);
-        }
-    }
-    forward_linear(output_b, output_rank, output, optimization_flags,
-                   operators.find_weight(plan.output_b_weight), backend,
-                   &scratch.quantized_input);
-    return {};
+    return forward_output(weights, operators, plan, backend, scratch, attention_output, output,
+                          optimization_flags);
 }
 
 Result<void> forward_latent_attention(const WeightStore& weights,
@@ -1618,62 +1704,8 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
         }
     }
 
-    const TensorData& output_a = weights.at(plan.output_a_weight);
-    const TensorData& output_b = weights.at(plan.output_b_weight);
-    const CompiledOperator& output_a_operator = operators.at_weight(plan.output_a_weight);
-    const CompiledOperator& output_b_operator = operators.at_weight(plan.output_b_weight);
-    if (backend == ExecutionBackend::Vulkan
-        && output_a_operator.float8
-        && output_b_operator.float8)
-    {
-        if (output_a_operator.float8->forward_chain(attention_output, *output_b_operator.float8, output))
-            return {};
-    }
-    ActivationBuffer& output_rank = scratch.projected;
-    if (backend == ExecutionBackend::Vulkan && output_a_operator.float8)
-    {
-        forward_linear(output_a, attention_output, output_rank, optimization_flags,
-                       operators.find_weight(plan.output_a_weight), backend,
-                       &scratch.quantized_input);
-    }
-    else
-    {
-        output_rank.reset(input.rows(), plan.output_group_count * plan.output_lora_rank, false);
-        const uint32_t heads_per_group = plan.head_count / plan.output_group_count;
-        const uint32_t group_columns = heads_per_group * plan.head_dimension;
-#if defined(_OPENMP)
-        const int output_team_size = latent_output_group_team_size(input.rows(), plan.output_group_count, group_columns,
-                                                                   plan.output_lora_rank);
-        const int64_t output_tasks = static_cast<int64_t>(input.rows())
-                                     * plan.output_group_count;
-#pragma omp parallel for schedule(static) num_threads(output_team_size) if (output_team_size > 1)
-#else
-        const int64_t output_tasks = static_cast<int64_t>(input.rows())
-                                     * plan.output_group_count;
-#endif
-        for (int64_t task = 0; task < output_tasks; ++task)
-        {
-            const size_t row = static_cast<size_t>(task)
-                               / plan.output_group_count;
-            const uint32_t group = static_cast<uint32_t>(task)
-                                   % plan.output_group_count;
-            const float* group_input = attention_output.row(row)
-                                       + static_cast<size_t>(group)
-                                             * group_columns;
-            float* group_output = output_rank.row(row)
-                                  + static_cast<size_t>(group)
-                                        * plan.output_lora_rank;
-            fp8_matrix_rows_dot(output_a,
-                                group * plan.output_lora_rank,
-                                plan.output_lora_rank,
-                                group_input,
-                                group_output);
-        }
-    }
-    forward_linear(output_b, output_rank, output, optimization_flags,
-                   operators.find_weight(plan.output_b_weight), backend,
-                   &scratch.quantized_input);
-    return {};
+    return forward_output(weights, operators, plan, backend, scratch, attention_output, output,
+                          optimization_flags);
 }
 
 } // namespace moe

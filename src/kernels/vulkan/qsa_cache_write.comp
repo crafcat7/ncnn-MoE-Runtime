@@ -1,0 +1,58 @@
+#version 450
+
+layout(binding = 0) readonly buffer key_blob
+{ float key_data[]; };
+layout(binding = 1) readonly buffer value_blob
+{ float value_data[]; };
+layout(binding = 2) readonly buffer index_blob
+{ float index_data[]; };
+layout(binding = 3) writeonly buffer key_cache_blob
+{ uint key_cache[]; };
+layout(binding = 4) writeonly buffer value_cache_blob
+{ uint value_cache[]; };
+layout(binding = 5) writeonly buffer index_cache_blob
+{ float index_cache[]; };
+layout(push_constant) uniform parameter
+{
+    uint rows;
+    uint columns;
+    uint index_columns;
+    uint index_dimension;
+    uint index_offset;
+    uint previous_tokens;
+    uint bfloat16_cache;
+    uint local_size;
+}
+p;
+
+uint bf16(float v)
+{
+    uint bits = floatBitsToUint(v);
+    return (bits + 0x7fffu + ((bits >> 16u) & 1u)) >> 16u;
+}
+
+void main()
+{
+    const uint item = gl_GlobalInvocationID.x + gl_WorkGroupID.z * gl_NumWorkGroups.x * p.local_size;
+    const uint units = p.bfloat16_cache != 0u ? p.columns / 2u : p.columns;
+    if (item < p.rows * units)
+    {
+        const uint row = item / units;
+        const uint column = item % units;
+        const uint target = (p.previous_tokens + row) * units + column;
+        const uint source = row * p.columns + column * (p.bfloat16_cache != 0u ? 2u : 1u);
+        key_cache[target] = p.bfloat16_cache != 0u
+                                ? bf16(key_data[source]) | (bf16(key_data[source + 1u]) << 16u)
+                                : floatBitsToUint(key_data[source]);
+        value_cache[target] = p.bfloat16_cache != 0u
+                                  ? bf16(value_data[source]) | (bf16(value_data[source + 1u]) << 16u)
+                                  : floatBitsToUint(value_data[source]);
+    }
+    if (item < p.rows * p.index_dimension)
+    {
+        const uint row = item / p.index_dimension;
+        const uint column = item % p.index_dimension;
+        index_cache[(p.previous_tokens + row) * p.index_dimension + column]
+            = uintBitsToFloat(bf16(index_data[row * p.index_columns + p.index_offset + column]) << 16u);
+    }
+}

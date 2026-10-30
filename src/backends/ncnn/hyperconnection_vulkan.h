@@ -18,6 +18,8 @@ class Option;
 namespace moe {
 
 class VulkanContext;
+class LayerHead_vulkan;
+class LatentLayer_vulkan;
 
 struct HyperConnectionMix_vulkan
 {
@@ -34,6 +36,7 @@ struct HyperConnectionWorkspace_vulkan
 {
 #if NCNN_MOE_WITH_VULKAN
     std::shared_ptr<VulkanContext> context;
+    ncnn::VkMat normalized;
     ncnn::VkMat projection;
     ncnn::VkMat pre;
 #endif
@@ -43,6 +46,7 @@ class HyperConnection_vulkan
 {
 public:
     ~HyperConnection_vulkan();
+    [[nodiscard]] uint64_t device_bytes() const noexcept;
 
     // Function rows select either pre/post (M*(M+2)) or head (M).
     [[nodiscard]] static std::shared_ptr<HyperConnection_vulkan> create(const TensorData& function,
@@ -83,6 +87,11 @@ public:
 #endif
 
 private:
+    friend class LayerHead_vulkan;
+    friend class LatentLayer_vulkan;
+    // record_pre/record_head each record one projection; the enclosing
+    // operator publishes this count after the command completes.
+    [[nodiscard]] uint32_t int4_ops() const noexcept;
     class Implementation;
     HyperConnection_vulkan();
     std::unique_ptr<Implementation> d;

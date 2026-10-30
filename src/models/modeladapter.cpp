@@ -1,13 +1,17 @@
 #include "modeladapter.h"
 
 #include "json.h"
+#include "kernels/int4.h"
+#include "kernels/qnk.h"
 #include "ncnn/moe/modeladapter.h"
 #include "safetensors.h"
 #include "storage/mappedfile.h"
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <iomanip>
@@ -345,43 +349,6 @@ bool parse_json_value(std::string_view json, size_t& position)
     }
 }
 
-static bool scan_json_array(const std::string& json,
-                            size_t& position,
-                            std::vector<std::string>& elements)
-{
-    if (position >= json.size() || json[position++] != '[')
-        return false;
-    position = skip_space(json, position);
-    if (position < json.size() && json[position] == ']')
-    {
-        ++position;
-        return true;
-    }
-
-    while (position < json.size())
-    {
-        position = skip_space(json, position);
-        const size_t value_start = position;
-        if (!parse_json_value(json, position))
-            return false;
-        elements.push_back(json.substr(value_start, position - value_start));
-        position = skip_space(json, position);
-        if (position >= json.size())
-            return false;
-        if (json[position] == ']')
-        {
-            ++position;
-            return true;
-        }
-        if (json[position++] != ',')
-            return false;
-        position = skip_space(json, position);
-        if (position >= json.size() || json[position] == ']')
-            return false;
-    }
-    return false;
-}
-
 std::optional<std::string_view> find_manifest_member(std::string_view json,
                                                      std::string_view key)
 {
@@ -438,16 +405,16 @@ std::optional<std::string> find_manifest_member(const std::string& json,
 
 Result<std::string> read_manifest_object(const std::string& json, const std::string& key, const char* prefix)
 {
-    const std::optional<std::string> value = find_manifest_member(json, key);
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
     if (!value)
         return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest is missing object field: " + key};
 
     if (value->empty() || (*value)[0] != '{')
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "object field: " + key};
-    return *value;
+    return std::string(*value);
 }
 
-static bool is_json_uint(const std::string& value) noexcept
+static bool is_json_uint(std::string_view value) noexcept
 {
     if (value.empty())
         return false;
@@ -465,28 +432,24 @@ static bool is_json_uint(const std::string& value) noexcept
 
 Result<uint32_t> read_manifest_uint32(const std::string& json, const std::string& key, const char* prefix)
 {
-    const std::optional<std::string> value = find_manifest_member(json, key);
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
     if (!value)
         return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest is missing integer field: " + key};
     if (!is_json_uint(*value))
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer field: " + key};
 
-    try
-    {
-        const unsigned long long parsed_value = std::stoull(*value);
-        if (parsed_value > std::numeric_limits<uint32_t>::max())
-            return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest integer is out of range: " + key};
-        return static_cast<uint32_t>(parsed_value);
-    }
-    catch (const std::exception&)
-    {
+    unsigned long long parsed_value = 0;
+    const auto parsed = std::from_chars(value->data(), value->data() + value->size(), parsed_value);
+    if (parsed.ec != std::errc() || parsed.ptr != value->data() + value->size())
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer field: " + key};
-    }
+    if (parsed_value > std::numeric_limits<uint32_t>::max())
+        return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest integer is out of range: " + key};
+    return static_cast<uint32_t>(parsed_value);
 }
 
 Result<std::string> read_manifest_string(const std::string& json, const std::string& key, const char* prefix)
 {
-    const std::optional<std::string> value = find_manifest_member(json, key);
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
     if (!value)
         return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest is missing string field: " + key};
 
@@ -504,15 +467,16 @@ Result<std::string> read_manifest_string(const std::string& json, const std::str
 
 Result<float> read_manifest_float(const std::string& json, const std::string& key, const char* prefix)
 {
-    const std::optional<std::string> value = find_manifest_member(json, key);
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
     if (!value)
         return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest is missing numeric field: " + key};
     if (!is_json_number(*value))
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "numeric field: " + key};
     try
     {
+        const std::string token(*value);
         size_t consumed = 0;
-        const float parsed_value = std::stof(*value, &consumed);
+        const float parsed_value = std::stof(token, &consumed);
         if (consumed != value->size() || !std::isfinite(parsed_value))
             return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "numeric field: " + key};
         return parsed_value;
@@ -525,7 +489,7 @@ Result<float> read_manifest_float(const std::string& json, const std::string& ke
 
 Result<bool> read_manifest_bool(const std::string& json, const std::string& key, const char* prefix)
 {
-    const std::optional<std::string> value = find_manifest_member(json, key);
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
     if (!value)
         return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest is missing boolean field: " + key};
     if (*value != "true" && *value != "false")
@@ -535,68 +499,85 @@ Result<bool> read_manifest_bool(const std::string& json, const std::string& key,
 
 Result<std::vector<uint32_t>> read_manifest_uint32_array(const std::string& json, const std::string& key, const char* prefix)
 {
-    const std::optional<std::string> value = find_manifest_member(json, key);
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
     if (!value)
         return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest is missing integer array: " + key};
 
-    std::vector<std::string> elements;
-    size_t position = 0;
-    if (!scan_json_array(*value, position, elements))
-        return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
-    position = skip_space(*value, position);
-    if (position != value->size())
+    // Member lookup validates the complete JSON value; this loop checks the array elements.
+    const std::string_view array = *value;
+    if (array.empty() || array.front() != '[')
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
 
     std::vector<uint32_t> result;
-    result.reserve(elements.size());
-    for (const std::string& element : elements)
+    size_t position = skip_space(array, 1);
+    if (position < array.size() && array[position] == ']')
+        return result;
+    for (;;)
     {
+        const size_t value_start = position;
+        while (position < array.size() && !is_space(array[position])
+               && array[position] != ',' && array[position] != ']')
+            ++position;
+        const std::string_view element = array.substr(value_start, position - value_start);
         if (!is_json_uint(element))
             return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
-        try
-        {
-            const unsigned long long parsed_value = std::stoull(element);
-            if (parsed_value > std::numeric_limits<uint32_t>::max())
-            {
-                return Error{ErrorCode::InvalidModel,
-                             std::string(prefix) + "integer array value is out of range: " + key};
-            }
-            result.push_back(static_cast<uint32_t>(parsed_value));
-        }
-        catch (const std::exception&)
-        {
+        unsigned long long parsed_value = 0;
+        const auto parsed = std::from_chars(element.data(), element.data() + element.size(), parsed_value);
+        if (parsed.ec != std::errc() || parsed.ptr != element.data() + element.size())
             return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
-        }
+        if (parsed_value > std::numeric_limits<uint32_t>::max())
+            return Error{ErrorCode::InvalidModel,
+                         std::string(prefix) + "integer array value is out of range: " + key};
+        result.push_back(static_cast<uint32_t>(parsed_value));
+
+        position = skip_space(array, position);
+        if (position >= array.size())
+            return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
+        if (array[position] == ']')
+            break;
+        if (array[position++] != ',')
+            return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
+        position = skip_space(array, position);
+        if (position >= array.size() || array[position] == ']')
+            return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "integer array: " + key};
     }
     return result;
 }
 
 Result<std::vector<std::string>> read_manifest_string_array(const std::string& json, const std::string& key, const char* prefix)
 {
-    const std::optional<std::string> value = find_manifest_member(json, key);
+    const std::optional<std::string_view> value = find_manifest_member(std::string_view(json), std::string_view(key));
     if (!value)
         return Error{ErrorCode::InvalidModel, std::string(prefix) + "manifest is missing string array: " + key};
 
-    std::vector<std::string> elements;
-    size_t position = 0;
-    if (!scan_json_array(*value, position, elements))
-        return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
-    position = skip_space(*value, position);
-    if (position != value->size())
+    const std::string_view array = *value;
+    if (array.empty() || array.front() != '[')
         return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
 
-    for (std::string& element : elements)
+    // Lookup has already validated the array structure; decode each string into owned output.
+    std::vector<std::string> result;
+    size_t position = skip_space(array, 1);
+    if (position < array.size() && array[position] == ']')
+        return result;
+    for (;;)
     {
-        size_t element_position = 0;
         std::string decoded;
-        if (!parse_json_string(element, element_position, &decoded))
+        if (!parse_json_string(array, position, &decoded))
             return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
-        element_position = skip_space(element, element_position);
-        if (element_position != element.size())
+
+        result.push_back(std::move(decoded));
+        position = skip_space(array, position);
+        if (position >= array.size())
             return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
-        element = std::move(decoded);
+        if (array[position] == ']')
+            break;
+        if (array[position++] != ',')
+            return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
+        position = skip_space(array, position);
+        if (position >= array.size() || array[position] == ']')
+            return Error{ErrorCode::InvalidModel, "invalid " + std::string(prefix) + "string array: " + key};
     }
-    return elements;
+    return result;
 }
 
 float optional_manifest_float(const std::string& json, const std::string& key, float fallback)
@@ -787,14 +768,195 @@ Result<void> validate_mxfp4_artifact_expert_bank(const SafetensorsArchive& archi
 Result<void> add_tensor(WeightMapping& mapping,
                         const SafetensorsArchive& archive,
                         const std::string& target,
-                        const std::string& source)
+                        const std::string& source,
+                        uint32_t flags)
 {
-    auto tensor = archive.load_tensor(source);
+    auto tensor = archive.load_tensor(source, flags);
     if (!tensor)
         return tensor.error();
 
     mapping.emplace(target, std::move(tensor).value());
     return {};
+}
+
+Result<TensorData> select_tensor_rows(const TensorData& source,
+                                      const std::vector<uint32_t>& rows)
+{
+    if (source.shape.size() != 2 || source.shape[0] == 0 || source.shape[1] == 0
+        || rows.empty() || rows.size() > std::numeric_limits<uint32_t>::max())
+    {
+        return Error{ErrorCode::InvalidModel, "invalid matrix row selection"};
+    }
+    bool contiguous = true;
+    for (size_t row = 0; row < rows.size(); ++row)
+    {
+        if (rows[row] >= source.shape[0])
+            return Error{ErrorCode::InvalidModel, "matrix row selection is out of range"};
+        if (static_cast<uint64_t>(rows[row]) != static_cast<uint64_t>(rows.front()) + row)
+            contiguous = false;
+    }
+
+    const uint32_t columns = source.shape[1];
+    if (source.dtype == DType::MxFp4)
+    {
+        if (columns % 32 != 0 || source.mxfp4_file_storage
+            || source.mxfp4_blocks.size() != static_cast<uint64_t>(source.shape[0]) * columns / 2
+            || source.mxfp4_scales.size() != static_cast<uint64_t>(source.shape[0]) * columns / 32)
+            return Error{ErrorCode::InvalidModel, "invalid MXFP4 matrix row storage"};
+        auto valid_columns = validate_input_column_indices(source);
+        if (!valid_columns)
+            return valid_columns.error();
+        TensorData result;
+        result.dtype = DType::MxFp4;
+        result.shape = {static_cast<uint32_t>(rows.size()), columns};
+        result.input_column_indices = source.input_column_indices;
+        const size_t block_row_bytes = columns / 2;
+        const size_t scale_row_bytes = columns / 32;
+        result.mxfp4_blocks.resize(rows.size() * block_row_bytes);
+        result.mxfp4_scales.resize(rows.size() * scale_row_bytes);
+        for (size_t row = 0; row < rows.size(); ++row)
+        {
+            std::memcpy(result.mxfp4_blocks.data() + row * block_row_bytes,
+                        source.mxfp4_blocks.data() + static_cast<size_t>(rows[row]) * block_row_bytes,
+                        block_row_bytes);
+            std::memcpy(result.mxfp4_scales.data() + row * scale_row_bytes,
+                        source.mxfp4_scales.data() + static_cast<size_t>(rows[row]) * scale_row_bytes,
+                        scale_row_bytes);
+        }
+        return result;
+    }
+    const uint8_t* source_data = nullptr;
+    uint64_t row_bytes = 0;
+    uint64_t source_bytes = 0;
+    TensorData result;
+    result.dtype = source.dtype;
+    result.shape = {static_cast<uint32_t>(rows.size()), columns};
+    result.qnk_interleave_rows = source.qnk_interleave_rows;
+    if (source.dtype == DType::BFloat16)
+    {
+        const auto values = source.bfloat16_values();
+        if (values.size() != source.element_count())
+            return Error{ErrorCode::InvalidModel, "invalid BF16 matrix row storage"};
+        source_data = reinterpret_cast<const uint8_t*>(values.data());
+        row_bytes = static_cast<uint64_t>(columns) * sizeof(uint16_t);
+        source_bytes = values.size_bytes();
+    }
+    else if (source.dtype == DType::Float32)
+    {
+        const auto values = source.float32_values();
+        if (values.size() != source.element_count())
+            return Error{ErrorCode::InvalidModel, "invalid F32 matrix row storage"};
+        source_data = reinterpret_cast<const uint8_t*>(values.data());
+        row_bytes = static_cast<uint64_t>(columns) * sizeof(float);
+        source_bytes = values.size_bytes();
+    }
+    else if (source.dtype == DType::Float8E4M3)
+    {
+        const auto values = source.float8_values();
+        if (values.size() != source.element_count()
+            || (!source.quantized_data.empty() && source.mapped_data)
+            || (source.float8_scale_row_size != 1 && source.float8_scale_row_size != 128))
+            return Error{ErrorCode::InvalidModel, "invalid FP8 matrix row storage"};
+        const size_t scale_columns = columns / 128 + (columns % 128 != 0);
+        const size_t scale_rows = source.shape[0] / source.float8_scale_row_size
+                                  + (source.shape[0] % source.float8_scale_row_size != 0);
+        if (scale_rows > std::numeric_limits<size_t>::max() / scale_columns
+            || source.quantization_scales.size() != scale_rows * scale_columns
+            || rows.size() > std::numeric_limits<size_t>::max() / scale_columns)
+        {
+            return Error{ErrorCode::InvalidModel, "invalid FP8 matrix row scales"};
+        }
+        for (float scale : source.quantization_scales)
+            if (!(scale > 0.f) || !std::isfinite(scale))
+                return Error{ErrorCode::InvalidModel, "invalid FP8 matrix row scale value"};
+        source_data = values.data();
+        row_bytes = columns;
+        source_bytes = values.size();
+        result.float8_scale_row_size = 1;
+        result.quantization_scales.resize(rows.size() * scale_columns);
+        for (size_t row = 0; row < rows.size(); ++row)
+        {
+            const size_t scale_row = rows[row] / source.float8_scale_row_size;
+            std::copy_n(source.quantization_scales.data() + scale_row * scale_columns,
+                        scale_columns, result.quantization_scales.data() + row * scale_columns);
+        }
+    }
+    else if (source.dtype == DType::Int4)
+    {
+        auto status = validate_int4_tensor(source);
+        if (!status)
+            return status.error();
+        const auto values = source.int4_values();
+        source_data = values.data();
+        row_bytes = columns / 2 + columns % 2;
+        source_bytes = values.size();
+        const size_t groups = columns / source.quantization_group_size
+                              + (columns % source.quantization_group_size != 0);
+        if (rows.size() > std::numeric_limits<size_t>::max() / groups)
+            return Error{ErrorCode::InvalidModel, "INT4 matrix row selection is too large"};
+        result.quantization_group_size = source.quantization_group_size;
+        result.quantization_group_indices = source.quantization_group_indices;
+        result.input_column_indices = source.input_column_indices;
+        result.quantization_scales.resize(rows.size() * groups);
+        result.quantization_zero_points.resize(rows.size() * groups);
+        for (size_t row = 0; row < rows.size(); ++row)
+        {
+            std::copy_n(source.quantization_scales.data() + static_cast<size_t>(rows[row]) * groups,
+                        groups, result.quantization_scales.data() + row * groups);
+            std::copy_n(source.quantization_zero_points.data() + static_cast<size_t>(rows[row]) * groups,
+                        groups, result.quantization_zero_points.data() + row * groups);
+        }
+    }
+    else if (is_qnk_dtype(source.dtype))
+    {
+        if (!qnk_shape_supported(source.dtype, source.shape[0], columns))
+            return Error{ErrorCode::InvalidModel, "invalid Qn_K matrix row shape"};
+        auto status = validate_input_column_indices(source);
+        if (!status)
+            return status.error();
+        result.input_column_indices = source.input_column_indices;
+        const auto values = source.qnk_values();
+        source_data = values.data();
+        source_bytes = values.size();
+        row_bytes = qnk_storage_bytes(source.dtype, 1, columns);
+    }
+    else
+    {
+        return Error{ErrorCode::UnsupportedModel, "unsupported matrix dtype for row selection"};
+    }
+    if (row_bytes == 0 || row_bytes > std::numeric_limits<size_t>::max() / rows.size()
+        || source_bytes != row_bytes * source.shape[0])
+    {
+        return Error{ErrorCode::InvalidModel, "invalid matrix row byte count"};
+    }
+    const size_t selected_bytes = static_cast<size_t>(row_bytes * rows.size());
+    const size_t stride = static_cast<size_t>(row_bytes);
+    if (contiguous && source.mapped_data && source_data == source.mapped_data.get())
+    {
+        result.mapped_data = std::shared_ptr<const uint8_t>(source.mapped_data,
+                                                            source.mapped_data.get() + static_cast<size_t>(rows.front()) * stride);
+        result.mapped_size = selected_bytes;
+        return result;
+    }
+    uint8_t* destination;
+    if (source.dtype == DType::BFloat16)
+    {
+        result.bfloat16_data.resize(selected_bytes / sizeof(uint16_t));
+        destination = reinterpret_cast<uint8_t*>(result.bfloat16_data.data());
+    }
+    else if (source.dtype == DType::Float32)
+    {
+        result.float32_data.resize(selected_bytes / sizeof(float));
+        destination = reinterpret_cast<uint8_t*>(result.float32_data.data());
+    }
+    else
+    {
+        result.quantized_data.resize(selected_bytes);
+        destination = result.quantized_data.data();
+    }
+    for (size_t row = 0; row < rows.size(); ++row)
+        std::memcpy(destination + row * stride, source_data + static_cast<size_t>(rows[row]) * stride, stride);
+    return result;
 }
 
 Result<void> add_bfloat16_slice(WeightMapping& mapping,
@@ -910,36 +1072,35 @@ static Result<void> add_query_gate(WeightMapping& mapping,
     {
         return Error{ErrorCode::InvalidModel, "invalid interleaved " + std::string(description) + " query/gate tensor: " + source};
     }
-    const size_t head_elements = static_cast<size_t>(static_cast<uint64_t>(head_dimension) * hidden_size);
-    const size_t combined_head_elements = head_elements * 2;
     auto loaded = archive.load_tensor(source);
     if (!loaded)
         return loaded.error();
     const TensorData& combined = loaded.value();
-    if (combined.dtype != DType::BFloat16
-        || combined.shape != std::vector<uint32_t>{combined_rows, hidden_size}
-        || combined.bfloat16_values().size() != combined.element_count())
+    if (combined.shape != std::vector<uint32_t>{combined_rows, hidden_size})
     {
         return Error{ErrorCode::InvalidModel, "invalid interleaved " + std::string(description) + " query/gate tensor: " + source};
     }
 
-    TensorData query;
-    query.dtype = DType::BFloat16;
-    query.shape = {static_cast<uint32_t>(query_rows), hidden_size};
-    query.bfloat16_data.resize(static_cast<size_t>(query_rows * hidden_size));
-    TensorData gate;
-    gate.dtype = DType::BFloat16;
-    gate.shape = {static_cast<uint32_t>(query_rows), hidden_size};
-    gate.bfloat16_data.resize(static_cast<size_t>(query_rows * hidden_size));
-    const std::span<const uint16_t> values = combined.bfloat16_values();
+    std::vector<uint32_t> query_selection;
+    std::vector<uint32_t> gate_selection;
+    query_selection.reserve(static_cast<size_t>(query_rows));
+    gate_selection.reserve(static_cast<size_t>(query_rows));
     for (uint32_t head = 0; head < head_count; ++head)
     {
-        const uint16_t* source_head = values.data() + static_cast<size_t>(head) * combined_head_elements;
-        std::copy_n(source_head, head_elements, query.bfloat16_data.data() + static_cast<size_t>(head) * head_elements);
-        std::copy_n(source_head + head_elements, head_elements, gate.bfloat16_data.data() + static_cast<size_t>(head) * head_elements);
+        for (uint32_t row = 0; row < head_dimension; ++row)
+        {
+            query_selection.push_back(head * head_dimension * 2 + row);
+            gate_selection.push_back(head * head_dimension * 2 + head_dimension + row);
+        }
     }
-    mapping.emplace(target_prefix + "attention.query.weight", std::move(query));
-    mapping.emplace(target_prefix + "attention.output_gate.weight", std::move(gate));
+    auto query = select_tensor_rows(combined, query_selection);
+    if (!query)
+        return query.error();
+    auto gate = select_tensor_rows(combined, gate_selection);
+    if (!gate)
+        return gate.error();
+    mapping.emplace(target_prefix + "attention.query.weight", std::move(query).value());
+    mapping.emplace(target_prefix + "attention.output_gate.weight", std::move(gate).value());
     return {};
 }
 

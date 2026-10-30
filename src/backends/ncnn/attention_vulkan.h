@@ -2,6 +2,7 @@
 #define NCNN_MOE_ATTENTION_VULKAN_H
 
 #include "kernels/activationbuffer.h"
+#include "graph/compiledoperator.h"
 
 #include "ncnn/moe/types.h"
 #include "ncnn/moe/option.h"
@@ -10,6 +11,7 @@
 #include <mat.h>
 #endif
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -23,6 +25,8 @@ namespace moe {
 struct LayerCache;
 class Linear;
 class Bfloat16Linear_vulkan;
+class QnkLinear_vulkan;
+class Float8Linear_vulkan;
 
 #if NCNN_MOE_WITH_VULKAN
 class AttentionCache_vulkan
@@ -99,13 +103,19 @@ public:
                                                                   std::shared_ptr<Bfloat16Linear_vulkan> fused_qkv_gate,
                                                                   std::shared_ptr<Bfloat16Linear_vulkan> output_projection,
                                                                   const AttentionConfig_vulkan& config);
+    [[nodiscard]] static std::shared_ptr<Attention_vulkan> create_native(const TensorData& norm_weight,
+                                                                         const TensorData* query_norm_weight,
+                                                                         const TensorData* key_norm_weight,
+                                                                         const TensorData* sinks,
+                                                                         // Q, K, V, output projection, and optional output gate.
+                                                                         const std::array<CompiledOperator, 5>& projections,
+                                                                         const AttentionConfig_vulkan& config);
     // One upload, one submission, and one download per Attention block.
     [[nodiscard]] bool forward(uint64_t position_offset, LayerCache& cache, const ActivationBuffer& input, ActivationBuffer& output) const;
     // Materializes an otherwise valid device KV ring into the CPU cache.  This
     // is the recovery boundary used when a new Vulkan dispatch cannot be
     // committed but the previous device ring is still authoritative.
     [[nodiscard]] bool materialize_device_cache(LayerCache& cache) const;
-    void record_cpu_fallback() const noexcept;
     // Independent one-row Session caches recorded into one queue submission.
     [[nodiscard]] AttentionBatchResult_vulkan forward_batch(std::span<const AttentionBatchEntry_vulkan> entries) const;
 
@@ -114,6 +124,11 @@ private:
 
 #if NCNN_MOE_WITH_VULKAN
     [[nodiscard]] bool support_qkv_rope(size_t token_count) const noexcept;
+
+    [[nodiscard]] bool record_native_qkv(const ncnn::VkMat& input,
+                                         ncnn::VkMat& output,
+                                         ncnn::VkCompute& command,
+                                         std::vector<ncnn::VkMat>& workspace) const;
 
     [[nodiscard]] bool record_qkv_rope(const ncnn::VkMat& fused_qkv,
                                        const ncnn::VkMat& cosine,
@@ -146,6 +161,16 @@ private:
 #endif
 
     Attention_vulkan();
+    [[nodiscard]] static std::shared_ptr<Attention_vulkan> create_impl(const TensorData& norm_weight,
+                                                                       const TensorData* query_norm_weight,
+                                                                       const TensorData* key_norm_weight,
+                                                                       const TensorData* sinks,
+                                                                       std::shared_ptr<Linear> fused_qkv,
+                                                                       std::shared_ptr<Linear> output_projection,
+                                                                       std::shared_ptr<Bfloat16Linear_vulkan> fused_qkv_gate,
+                                                                       std::shared_ptr<Bfloat16Linear_vulkan> output_projection_bfloat16,
+                                                                       std::array<CompiledOperator, 5> native_projections,
+                                                                       const AttentionConfig_vulkan& config);
     std::unique_ptr<Implementation> d;
 };
 

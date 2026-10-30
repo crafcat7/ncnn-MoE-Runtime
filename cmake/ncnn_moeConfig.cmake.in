@@ -1,7 +1,12 @@
+# ==============================================================================
+# Installed ncnn_moe package
+# ==============================================================================
+
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
 
+# Restore the OpenMP imported target before ncnn requests it.
 if(@NCNN_MOE_WITH_OPENMP@ OR @NCNN_MOE_WITH_NCNN@)
     include("${CMAKE_CURRENT_LIST_DIR}/ncnn_moe_openmp.cmake")
 endif()

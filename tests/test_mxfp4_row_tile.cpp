@@ -102,9 +102,9 @@ static void row_tile_test()
         {
             for (const float limit : {0.0f, 0.125f})
             {
-                auto scalar = Mxfp4Expert_vulkan::create(gate_up, gate_bias, down, projection_bias, limit, 0,
+                auto scalar = Mxfp4Expert_vulkan::create(gate_up, gate_bias, down, projection_bias, limit, get_default_gpu_index(),
                                                          activation, runtime, flags_off);
-                auto tiled = Mxfp4Expert_vulkan::create(gate_up, gate_bias, down, projection_bias, limit, 0,
+                auto tiled = Mxfp4Expert_vulkan::create(gate_up, gate_bias, down, projection_bias, limit, get_default_gpu_index(),
                                                         activation, runtime, flags_on);
                 row_tile_check(scalar && tiled, "row tile expert creation");
                 for (const size_t rows : row_counts)

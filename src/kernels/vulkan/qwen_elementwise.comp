@@ -1,0 +1,206 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer a_blob
+{ float a[]; };
+layout(binding = 1) readonly buffer b_blob
+{ float b[]; };
+layout(binding = 2) readonly buffer c_blob
+{ float c[]; };
+layout(binding = 3) readonly buffer d_blob
+{ float d[]; };
+layout(binding = 4) buffer state_blob
+{ float state[]; };
+layout(binding = 5) writeonly buffer output_blob
+{ float output_data[]; };
+layout(push_constant) uniform parameter
+{
+    uint mode;
+    uint hidden;
+    uint copies;
+    uint rows;
+    uint columns;
+    uint kernel_size;
+    uint ngram_size;
+    uint state_length;
+    uint first_slot;
+    float epsilon;
+    float weight_offset;
+}
+p;
+
+shared float partial[128];
+float sigmoid(float x)
+{ return 1.0 / (1.0 + exp(-x)); }
+uint source_byte(uint offset)
+{
+    return (floatBitsToUint(a[offset / 4u]) >> ((offset % 4u) * 8u)) & 255u;
+}
+uint source_half(uint offset)
+{ return source_byte(offset) | (source_byte(offset + 1u) << 8u); }
+
+void main()
+{
+    uint lane = gl_LocalInvocationID.x;
+    uint column = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    uint expanded = p.hidden * p.copies;
+    if (p.mode == 0u || p.mode == 5u)
+    {
+        uint group = gl_WorkGroupID.x;
+        if (row >= p.rows || group >= p.copies) return;
+        uint offset = (row * p.copies + group) * p.hidden;
+        float sum = 0.0;
+        for (uint i = lane; i < p.hidden; i += 128u)
+            sum += p.mode == 0u ? a[offset + i] * a[offset + i] : a[offset + i] * b[offset + i];
+        partial[lane] = sum;
+        barrier();
+        for (uint width = 64u; width > 0u; width >>= 1u)
+        {
+            if (lane < width) partial[lane] += partial[lane + width];
+            barrier();
+        }
+        float scale;
+        if (p.mode == 0u)
+            scale = inversesqrt(partial[0] / float(p.hidden) + p.epsilon);
+        else
+        {
+            float score = partial[0] * inversesqrt(float(p.hidden));
+            score = sign(score) * sqrt(max(abs(score), 1e-6));
+            scale = sigmoid(score);
+        }
+        for (uint i = lane; i < p.hidden; i += 128u)
+            output_data[offset + i] = p.mode == 0u
+                                          ? a[offset + i] * scale * (b[group * p.hidden + i] + p.weight_offset)
+                                          : scale * c[row * p.hidden + i];
+        return;
+    }
+    if (p.mode == 6u)
+    {
+        if (column >= expanded) return;
+        uint slot = p.first_slot;
+        for (uint token = 0u; token < p.rows; ++token)
+        {
+            float convolution = 0.0;
+            uint tap = slot;
+            for (uint kernel = 0u; kernel + 1u < p.kernel_size; ++kernel)
+            {
+                convolution += state[tap * expanded + column] * c[column * p.kernel_size + kernel];
+                tap += p.ngram_size;
+                if (tap >= p.state_length) tap -= p.state_length;
+            }
+            float current = a[token * expanded + column];
+            convolution += current * c[column * p.kernel_size + p.kernel_size - 1u];
+            output_data[token * expanded + column] = d[token * expanded + column]
+                                                     + b[token * expanded + column] + convolution * sigmoid(convolution);
+            if (p.state_length != 0u)
+            {
+                state[slot * expanded + column] = current;
+                slot = (slot + 1u) % p.state_length;
+            }
+        }
+        return;
+    }
+    if (row >= p.rows || column >= p.columns) return;
+    uint index = row * p.columns + column;
+    if (p.mode == 7u)
+    {
+        uint head_dimension = p.ngram_size;
+        uint head = column / head_dimension;
+        uint lane = column % head_dimension;
+        uint start = (row * p.copies + head) * p.state_length;
+        float value = 0.0;
+        if (p.kernel_size == 20u || p.kernel_size == 23u)
+        {
+            const int table[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+            bool xs = p.kernel_size == 23u;
+            uint block = start + (lane / (xs ? 256u : 32u)) * (xs ? 136u : 18u);
+            uint group = (lane % 256u) / 32u;
+            uint codes = block + (xs ? 8u + group * 16u : 2u);
+            uint code = (source_byte(codes + (lane % 16u)) >> ((lane % 32u) < 16u ? 0u : 4u)) & 15u;
+            float scale = unpackHalf2x16(source_half(block)).x;
+            if (xs)
+            {
+                uint low = (source_byte(block + 4u + group / 2u) >> ((group % 2u) * 4u)) & 15u;
+                uint high = (source_half(block + 2u) >> (group * 2u)) & 3u;
+                scale *= float(int(low | (high << 4u)) - 32);
+            }
+            value = scale * float(table[code]);
+        }
+        else if (p.kernel_size == 2u || p.kernel_size == 3u || p.kernel_size == 6u || p.kernel_size == 7u)
+        {
+            bool affine = p.kernel_size == 3u || p.kernel_size == 7u;
+            bool five = p.kernel_size == 6u || p.kernel_size == 7u;
+            uint bytes = 18u + (affine ? 2u : 0u) + (five ? 4u : 0u);
+            uint block = start + (lane / 32u) * bytes;
+            uint offset = block + (affine ? 4u : 2u);
+            uint codes = offset + (five ? 4u : 0u);
+            uint code = (source_byte(codes + lane % 16u) >> ((lane % 32u) < 16u ? 0u : 4u)) & 15u;
+            if (five)
+            {
+                uint high = source_half(offset) | (source_half(offset + 2u) << 16u);
+                code |= ((high >> (lane % 32u)) & 1u) << 4u;
+            }
+            value = unpackHalf2x16(source_half(block)).x * float(int(code) - (affine ? 0 : five ? 16
+                                                                                                : 8));
+            if (affine) value += unpackHalf2x16(source_half(block + 2u)).x;
+        }
+        else if (p.kernel_size == 8u)
+        {
+            uint block = start + (lane / 32u) * 34u;
+            uint raw = source_byte(block + 2u + lane % 32u);
+            int code = int(raw) - (raw >= 128u ? 256 : 0);
+            value = unpackHalf2x16(source_half(block)).x * float(code);
+        }
+        else if (p.kernel_size == 39u || p.kernel_size == 40u)
+        {
+            const int table[16] = int[16](0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+            bool nv = p.kernel_size == 40u;
+            uint block = start + (lane / (nv ? 64u : 32u)) * (nv ? 36u : 17u);
+            uint group = (lane % 64u) / 16u;
+            uint code = nv ? source_byte(block + 4u + group * 8u + lane % 8u)
+                           : source_byte(block + 1u + lane % 16u);
+            code = (code >> (nv ? ((lane % 16u) < 8u ? 0u : 4u) : ((lane % 32u) < 16u ? 0u : 4u))) & 15u;
+            uint raw = source_byte(block + (nv ? group : 0u));
+            float scale;
+            if (nv)
+            {
+                uint exponent = (raw >> 3u) & 15u;
+                uint mantissa = raw & 7u;
+                scale = raw == 0u || raw == 127u ? 0.0
+                        : exponent == 0u         ? float(mantissa) * exp2(-10.0)
+                                                 : (1.0 + float(mantissa) * 0.125) * exp2(float(exponent) - 8.0);
+            }
+            else
+                scale = uintBitsToFloat(raw < 2u ? (0x00200000u << raw) : ((raw - 1u) << 23u));
+            value = scale * float(table[code]);
+        }
+        else if (p.kernel_size == 30u)
+            value = uintBitsToFloat(source_half(start + lane * 2u) << 16u);
+        else if (p.kernel_size == 0u)
+            value = a[(start / 4u) + lane];
+        output_data[index] = value;
+    }
+    else if (p.mode == 1u)
+    {
+        float value = a[index] / float(p.copies);
+        output_data[index] = value * sigmoid(value);
+    }
+    else if (p.mode == 2u)
+        output_data[index] = 2.0 * sigmoid(a[index] / float(p.copies));
+    else if (p.mode == 3u)
+    {
+        float value = 0.0;
+        for (uint copy = 0u; copy < p.copies; ++copy)
+        {
+            uint offset = (row * p.copies + copy) * p.hidden + column;
+            value += a[offset] * sigmoid(b[offset]) / float(p.copies);
+        }
+        output_data[index] = value;
+    }
+    else if (p.mode == 4u)
+    {
+        uint copy = column / p.hidden;
+        output_data[index] = a[index] + b[row * p.hidden + column % p.hidden] * c[row * p.copies + copy];
+    }
+}

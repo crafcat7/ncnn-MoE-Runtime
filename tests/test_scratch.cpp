@@ -1,7 +1,9 @@
 #include "kernels/attention.h"
 #include "kernels/activationbuffer.h"
+#include "kernels/float8.h"
 #include "kernels/mxfp4.h"
 #include "kernels/ops.h"
+#include "kernels/qnk.h"
 #include "kernels/statecache.h"
 #include "engine/cpu.h"
 #include "graph/compiledoperator.h"
@@ -74,16 +76,16 @@ static TensorData make_mxfp4_tensor(uint32_t rows, uint32_t columns, uint32_t se
     return tensor;
 }
 
-static void check_mxfp4_outputs(const ActivationBuffer& actual,
-                                const ActivationBuffer& expected,
-                                float tolerance)
+static void check_outputs(const ActivationBuffer& actual,
+                          const ActivationBuffer& expected,
+                          float tolerance)
 {
-    scratch_check(actual.rows() == expected.rows(), "MXFP4 output row count");
-    scratch_check(actual.columns() == expected.columns(), "MXFP4 output column count");
+    scratch_check(actual.rows() == expected.rows(), "output row count");
+    scratch_check(actual.columns() == expected.columns(), "output column count");
     for (size_t row = 0; row < actual.rows(); ++row)
     {
         for (uint32_t column = 0; column < actual.columns(); ++column)
-            scratch_check_near(actual.row(row)[column], expected.row(row)[column], tolerance, "MXFP4 output");
+            scratch_check_near(actual.row(row)[column], expected.row(row)[column], tolerance, "output");
     }
 }
 
@@ -155,7 +157,7 @@ static void test_mxfp4_scratch_reuse()
                                         q8_flags),
                   "MXFP4 fresh Q8 batch");
     for (size_t index = 0; index < tasks.size(); ++index)
-        check_mxfp4_outputs(outputs[index], fresh_outputs[index], 1e-5f);
+        check_outputs(outputs[index], fresh_outputs[index], 1e-5f);
 
     std::array<ActivationBuffer, 3> expected;
     for (size_t index = 0; index < tasks.size(); ++index)
@@ -166,7 +168,7 @@ static void test_mxfp4_scratch_reuse()
                                             nullptr,
                                             scalar_flags),
                       "MXFP4 reference batch");
-        check_mxfp4_outputs(outputs[index], expected[index], 2.0f);
+        check_outputs(outputs[index], expected[index], 2.0f);
     }
 
     const uint8_t* q8_enabled_data = scratch.q8_down_enabled.data();
@@ -210,23 +212,12 @@ static void test_mxfp4_scratch_reuse()
                                         &scratch,
                                         q8_flags),
                   "MXFP4 shrink batch");
-    check_mxfp4_outputs(outputs[0], fresh_shrink_output, 1e-5f);
+    check_outputs(outputs[0], fresh_shrink_output, 1e-5f);
     scratch_check(scratch.activated.size() == activated_size, "MXFP4 scratch size after shrink");
     scratch_check(scratch.q8_down_enabled.size() == q8_enabled_size, "Q8 bookkeeping after shrink");
     scratch_check(scratch.q8_down_packed.size() == q8_packed_size, "Q8 packed storage after shrink");
     scratch_check(scratch.activated[0].bytes().data() == activated_storage[0], "MXFP4 storage after shrink");
 
-    std::array<ActivationBuffer, 3> regrow_fresh_outputs;
-    std::array<Mxfp4Task, 3> regrow_fresh_tasks = tasks;
-    for (size_t index = 0; index < regrow_fresh_tasks.size(); ++index)
-        regrow_fresh_tasks[index].output = &regrow_fresh_outputs[index];
-    Mxfp4Scratch regrow_fresh_scratch;
-    scratch_check(forward_experts_mxfp4(std::span<const Mxfp4Task>(regrow_fresh_tasks.data(), regrow_fresh_tasks.size()),
-                                        &regrow_fresh_scratch,
-                                        q8_flags),
-                  "MXFP4 fresh Q8 regrow batch");
-    for (size_t index = 0; index < tasks.size(); ++index)
-        tasks[index].output = &outputs[index];
     scratch_check(forward_experts_mxfp4(std::span<const Mxfp4Task>(tasks.data(), tasks.size()),
                                         &scratch,
                                         q8_flags),
@@ -236,7 +227,7 @@ static void test_mxfp4_scratch_reuse()
     {
         scratch_check(scratch.activated[index].bytes().data() == activated_storage[index],
                       "MXFP4 storage after regrow");
-        check_mxfp4_outputs(outputs[index], regrow_fresh_outputs[index], 1e-5f);
+        check_outputs(outputs[index], fresh_outputs[index], 1e-5f);
     }
     for (const auto& packed : scratch.q8_down_packed)
         scratch_check(!packed, "packed sidecar reference cleanup after regrow");
@@ -259,7 +250,7 @@ static void test_mxfp4_scratch_reuse()
         {
             scratch_check(!owner.mxfp4_q8_packed, "FP32 row-pair path avoids packed sidecar");
         }
-        check_mxfp4_outputs(outputs[0], regrow_fresh_outputs[0], 1e-5f);
+        check_outputs(outputs[0], fresh_outputs[0], 1e-5f);
     }
 }
 
@@ -461,7 +452,7 @@ static void test_attention_scratch_reuse()
                   long_hidden,
                   accelerated_long_output,
                   accelerated_flags);
-    check_mxfp4_outputs(accelerated_long_output, reference_long_output, 1e-4f);
+    check_outputs(accelerated_long_output, reference_long_output, 1e-4f);
     scratch_check(flash_scratch.logits.empty(), "cold flash leaves logits untouched");
     scratch_check(flash_scratch.logits.capacity() == 0, "cold flash does not allocate logits");
     scratch_check(!flash_scratch.workspace.empty(), "flash worker storage allocation");
@@ -586,7 +577,7 @@ static void test_attention_scratch_reuse()
                   short_hidden_again,
                   accelerated_short_output,
                   accelerated_flags);
-    check_mxfp4_outputs(accelerated_short_output, reference_short_output, 1e-4f);
+    check_outputs(accelerated_short_output, reference_short_output, 1e-4f);
     scratch_check(flash_scratch.logits.data() == logits_data,
                   "flash reuse preserves prior logits storage");
     scratch_check(flash_scratch.logits.size() == logits_size,
@@ -631,7 +622,7 @@ static void test_attention_scratch_reuse()
                       small_token,
                       small_reference_output,
                       reference_flags);
-        check_mxfp4_outputs(small_output, small_reference_output, 1e-4f);
+        check_outputs(small_output, small_reference_output, 1e-4f);
         scratch_check(small_scratch.flash_partial_max.empty(),
                       "small split workload falls back");
 
@@ -666,7 +657,7 @@ static void test_attention_scratch_reuse()
                       split_token,
                       split_reference_output,
                       reference_flags);
-        check_mxfp4_outputs(split_output, split_reference_output, 1e-4f);
+        check_outputs(split_output, split_reference_output, 1e-4f);
         scratch_check(split_scratch.logits.empty(), "cold split-KV leaves logits untouched");
         scratch_check(split_scratch.logits.capacity() == 0, "cold split-KV does not allocate logits");
         scratch_check(!split_scratch.workspace.empty(), "split worker storage allocation");
@@ -714,7 +705,7 @@ static void test_attention_scratch_reuse()
                       split_token,
                       ring_reference_output,
                       reference_flags);
-        check_mxfp4_outputs(ring_output, ring_reference_output, 1e-4f);
+        check_outputs(ring_output, ring_reference_output, 1e-4f);
         scratch_check(split_scratch.workspace.data() == split_worker_data,
                       "split worker storage reuse");
         scratch_check(split_scratch.workspace.capacity() == split_worker_capacity,
@@ -735,7 +726,7 @@ static void test_attention_scratch_reuse()
                       split_token,
                       single_thread_output,
                       accelerated_flags);
-        check_mxfp4_outputs(single_thread_output, split_reference_output, 1e-4f);
+        check_outputs(single_thread_output, split_reference_output, 1e-4f);
 
         thread_limit_scope.set(attention_test_thread_count);
         LayerCache split_again_cache = make_float_attention_cache(split_columns,
@@ -752,7 +743,7 @@ static void test_attention_scratch_reuse()
                       split_token,
                       split_again_output,
                       accelerated_flags);
-        check_mxfp4_outputs(split_again_output, split_reference_output, 1e-4f);
+        check_outputs(split_again_output, split_reference_output, 1e-4f);
 
         constexpr uint64_t multithread_context = 4096;
         const LayerCache initial_multithread_cache = make_float_attention_cache(split_columns,
@@ -799,7 +790,7 @@ static void test_attention_scratch_reuse()
                       split_token,
                       poisoned_logits_output,
                       reference_flags);
-        check_mxfp4_outputs(poisoned_logits_output, multithread_logits_output, 1e-4f);
+        check_outputs(poisoned_logits_output, multithread_logits_output, 1e-4f);
         scratch_check(multithread_scratch.logits.data() == logits_data,
                       "head logits storage reuse");
         scratch_check(multithread_scratch.logits.capacity() == logits_capacity,
@@ -807,10 +798,134 @@ static void test_attention_scratch_reuse()
     }
 }
 
+static TensorData make_mapped_q8k_attention_projection(uint32_t rows,
+                                                       uint32_t columns,
+                                                       uint32_t seed)
+{
+    TensorData tensor;
+    tensor.dtype = DType::Q8K;
+    tensor.shape = {rows, columns};
+    tensor.input_column_indices.resize(columns);
+    for (uint32_t column = 0; column < columns; ++column)
+        tensor.input_column_indices[column] = columns - column - 1;
+
+    tensor.quantized_data.resize(static_cast<size_t>(qnk_storage_bytes(tensor.dtype, rows, columns)));
+    std::vector<float> values(columns);
+    const size_t row_bytes = qnk_block_bytes(tensor.dtype);
+    for (uint32_t row = 0; row < rows; ++row)
+    {
+        for (uint32_t column = 0; column < columns; ++column)
+            values[column] = static_cast<float>(static_cast<int>((row * 17 + column * 3 + seed) % 31) - 15) / 128.0f;
+        qnk_q8k_quantize(values.data(), tensor.quantized_data.data() + row * row_bytes, columns);
+    }
+    return tensor;
+}
+
+static TensorData make_float8_attention_projection(uint32_t rows,
+                                                   uint32_t columns,
+                                                   uint32_t seed)
+{
+    TensorData tensor;
+    tensor.dtype = DType::Float8E4M3;
+    tensor.shape = {rows, columns};
+    tensor.float8_scale_row_size = 1;
+    const uint32_t input_blocks = columns / 128 + (columns % 128 != 0);
+    tensor.quantization_scales.assign(static_cast<size_t>(rows) * input_blocks, 1.0f);
+    tensor.quantized_data.resize(static_cast<size_t>(rows) * columns);
+    for (size_t index = 0; index < tensor.quantized_data.size(); ++index)
+    {
+        const float value = static_cast<float>(static_cast<int>((index * 7 + seed * 11) % 43) - 21) / 64.0f;
+        tensor.quantized_data[index] = float_to_float8_e4m3(value);
+    }
+    return tensor;
+}
+
+static void test_attention_mixed_projection_scratch_reuse()
+{
+    constexpr uint32_t input_columns = 256;
+    WeightStore weights;
+    AttentionBlockPlan plan;
+    plan.kind = AttentionKind::Standard;
+    plan.flags = AttentionBlockExternalResidual;
+    plan.head_count = 1;
+    plan.kv_head_count = 1;
+    plan.head_dimension = 2;
+    plan.value_head_dimension = 2;
+    plan.rope_head_dimension = 2;
+    plan.norm_epsilon = 1e-6f;
+    plan.query_weight = add_attention_weight(weights, "scratch_mixed_query",
+                                             make_mapped_q8k_attention_projection(2, input_columns, 1));
+    plan.key_weight = add_attention_weight(weights, "scratch_mixed_key",
+                                           make_mapped_q8k_attention_projection(2, input_columns, 2));
+    plan.value_weight = add_attention_weight(weights, "scratch_mixed_value",
+                                             make_mapped_q8k_attention_projection(2, input_columns, 3));
+    plan.query_bias = add_attention_weight(weights, "scratch_mixed_query_bias",
+                                           TensorData{DType::Float32, {2}, {0.01f, -0.02f}});
+    plan.key_bias = add_attention_weight(weights, "scratch_mixed_key_bias",
+                                         TensorData{DType::Float32, {2}, {-0.03f, 0.04f}});
+    plan.value_bias = add_attention_weight(weights, "scratch_mixed_value_bias",
+                                           TensorData{DType::Float32, {2}, {0.02f, -0.01f}});
+    plan.output_weight = add_attention_weight(weights, "scratch_mixed_output",
+                                              make_float8_attention_projection(input_columns, 2, 4));
+
+    CompiledOperatorTable operators;
+    operators.bind_weight_count(weights.size());
+    const uint64_t flags = OptimizationDefaultFlags
+                           & ~(OptimizationCpuFloat8FusedProjections
+                               | OptimizationCpuPackedWeights
+                               | OptimizationCpuFlashAttention
+                               | OptimizationCpuSplitKvAttention);
+    LayerCache cache;
+    LayerCache reference_cache;
+    AttentionScratch scratch;
+    AttentionScratch reference_scratch;
+    reference_scratch.quantized_input = ActivationBuffer(0, 0, DType::BFloat16);
+    const std::byte* scratch_storage = nullptr;
+    uint64_t scratch_capacity = 0;
+    uint64_t position = 0;
+    for (size_t rows : {4u, 1u, 3u, 4u})
+    {
+        const ActivationBuffer hidden = make_attention_hidden(rows, input_columns);
+        ActivationBuffer actual;
+        ActivationBuffer expected;
+        auto expected_result = forward_attention(weights, operators, plan, ExecutionBackend::Cpu,
+                                                 position, reference_cache, reference_scratch,
+                                                 hidden, expected, flags);
+        scratch_check(static_cast<bool>(expected_result), "mixed projection reference attention");
+        auto actual_result = forward_attention(weights, operators, plan, ExecutionBackend::Cpu,
+                                               position, cache, scratch, hidden, actual, flags);
+        scratch_check(static_cast<bool>(actual_result), "mixed projection scratch attention");
+        check_outputs(actual, expected, 1e-5f);
+        scratch_check(cache.keys == reference_cache.keys
+                          && cache.values == reference_cache.values,
+                      "mixed projection KV cache parity");
+
+        scratch_check(scratch.quantized_input.rows() == rows
+                          && scratch.quantized_input.columns() == 2,
+                      "FP8 output projection reuses attention scratch");
+        if (!scratch_storage)
+        {
+            scratch_storage = scratch.quantized_input.bytes().data();
+            scratch_capacity = scratch.quantized_input.allocated_bytes();
+            scratch_check(scratch_capacity >= 4u * input_columns * sizeof(float),
+                          "mixed projection scratch warm capacity");
+        }
+        else
+        {
+            scratch_check(scratch.quantized_input.bytes().data() == scratch_storage,
+                          "mixed projection scratch pointer reuse");
+            scratch_check(scratch.quantized_input.allocated_bytes() == scratch_capacity,
+                          "mixed projection scratch capacity reuse");
+        }
+        position += rows;
+    }
+}
+
 void test_reusable_kernel_scratch()
 {
     test_mxfp4_scratch_reuse();
     test_attention_scratch_reuse();
+    test_attention_mixed_projection_scratch_reuse();
 }
 
 } // namespace moe

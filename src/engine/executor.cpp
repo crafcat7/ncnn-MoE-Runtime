@@ -22,6 +22,7 @@
 #include "backends/ncnn/latentlayer_vulkan.h"
 #include "backends/ncnn/moecombine_vulkan.h"
 #include "backends/ncnn/layerhead_vulkan.h"
+#include "backends/ncnn/qwenlayer_vulkan.h"
 
 #include "graph/router.h"
 #include "graph/compiledmodel.h"
@@ -74,13 +75,17 @@ struct PendingRouterPrediction
 
 struct ScopedLatentLayerWorkspace
 {
-    explicit ScopedLatentLayerWorkspace(LatentLayerWorkspace_vulkan& _workspace)
-        : workspace(_workspace)
+    explicit ScopedLatentLayerWorkspace(LatentLayerWorkspace_vulkan& _workspace,
+                                        std::vector<MoeCombineInput_vulkan>& _combine_inputs)
+        : workspace(_workspace),
+          combine_inputs(_combine_inputs)
     {
+        combine_inputs.clear();
         workspace.reset();
     }
     ~ScopedLatentLayerWorkspace()
     {
+        combine_inputs.clear();
         workspace.reset();
         // Bound inactive publication storage after a large prefill. Normal
         // decode/batch capacities remain reusable for the next execution.
@@ -89,6 +94,16 @@ struct ScopedLatentLayerWorkspace
             workspace.release();
     }
     LatentLayerWorkspace_vulkan& workspace;
+    std::vector<MoeCombineInput_vulkan>& combine_inputs;
+};
+
+struct ScopedQwenLayerWorkspace
+{
+    QwenLayerWorkspace_vulkan& workspace;
+    explicit ScopedQwenLayerWorkspace(QwenLayerWorkspace_vulkan& value) : workspace(value)
+    { workspace.reset(); }
+    ~ScopedQwenLayerWorkspace()
+    { workspace.reset(); }
 };
 
 static void resolve_router_predictions(const CompiledModel& model,
@@ -144,11 +159,8 @@ static bool has_unknown_vulkan_attention_state(const SessionState& state) noexce
 }
 
 static void prepare_execution_state(const CompiledModel& model,
-                                    SessionStatistics& statistics,
                                     SessionState& state)
 {
-    if (statistics.expert_token_counts.size() < model.descriptor.expert_count)
-        statistics.expert_token_counts.resize(model.descriptor.expert_count, 0);
     if (state.layers.size() != model.graph.layer_plans.size())
         state.layers.resize(model.graph.layer_plans.size());
     state.execution_state.reset();
@@ -167,7 +179,22 @@ static void forward_layer_shared_expert(const CompiledModel& model,
     if (shared_expert_completed(state)) return;
     forward_shared_expert(model, moe, state.normalized, state.shared_expert_output,
                           state.shared_expert_workspace, state.normalized_device,
-                          retain_device_output ? &state.shared_expert_device_output : nullptr);
+                          retain_device_output ? &state.shared_expert_device_output : nullptr,
+                          state.require_device_execution);
+}
+
+static void forward_dense_layer(const CompiledModel& model,
+                                const CompiledLayerPlan& layer,
+                                ActivationBuffer& hidden,
+                                LayerState& scratch,
+                                ExecutionBackend backend)
+{
+    forward_rms_norm(hidden, model.weights.at(layer.dense_pre_ffn_norm_weight),
+                     model.descriptor.norm_epsilon, scratch.normalized, model.descriptor.norm_weight_offset);
+    forward_dense_ffn(model, layer.dense_ffn, scratch.normalized, scratch.shared_expert_output,
+                      scratch.shared_expert_workspace, backend);
+    add_batch_inplace(hidden, scratch.shared_expert_output);
+    scratch.reset();
 }
 
 static ExpertDispatchOptions latent_router_options(const CompiledModel& model,
@@ -198,23 +225,29 @@ static ExpertDispatchOptions latent_router_options(const CompiledModel& model,
 
 static void split_latent_routes(const ExpertDispatchPlan& batch, uint32_t row, ExpertDispatchPlan& result)
 {
-    result.batches.clear();
     result.assignment_count = 0;
+    size_t batch_count = 0;
     for (const ExpertBatch& source : batch.batches)
     {
-        ExpertBatch selected;
-        selected.expert_id = source.expert_id;
-        for (const ExpertRoute& route : source.routes)
-        {
-            if (route.token_index != row)
-                continue;
-            selected.routes.push_back({0, route.rank, route.weight});
-        }
-        if (selected.routes.empty())
+        const auto first = std::find_if(source.routes.begin(), source.routes.end(),
+                                        [row](const ExpertRoute& route) { return route.token_index == row; });
+        if (first == source.routes.end())
             continue;
-        result.assignment_count += selected.routes.size();
-        result.batches.push_back(std::move(selected));
+
+        if (batch_count == result.batches.size())
+            result.batches.emplace_back();
+        ExpertBatch& selected = result.batches[batch_count++];
+        selected.expert_id = source.expert_id;
+        selected.routes.clear();
+        for (auto route = first; route != source.routes.end(); ++route)
+        {
+            if (route->token_index != row)
+                continue;
+            selected.routes.push_back({0, route->rank, route->weight});
+            ++result.assignment_count;
+        }
     }
+    result.batches.resize(batch_count);
 }
 
 Result<void> forward_model(const CompiledModel& model,
@@ -243,7 +276,7 @@ Result<void> forward_model(const CompiledModel& model,
             return Error{ErrorCode::InvalidArgument, "token id is outside the model vocabulary"};
     }
 
-    prepare_execution_state(model, statistics, state);
+    prepare_execution_state(model, state);
 
     ExpertCacheStatistics execution_cache_before;
     if (model.expert_cache)
@@ -288,7 +321,11 @@ Result<void> forward_model(const CompiledModel& model,
     bool deferred_final_norm = false;
     bool produced_logits = false;
     LatentLayerWorkspace_vulkan& layer_workspace = state.latent_layer;
-    const ScopedLatentLayerWorkspace latent_workspace_scope(layer_workspace);
+    const ScopedLatentLayerWorkspace latent_workspace_scope(layer_workspace,
+                                                            state.expert_scratch.combine_inputs);
+    const ScopedQwenLayerWorkspace qwen_workspace_scope(state.qwen_layer);
+    if (model.qwen_device_chain && (use_speculative_context || has_flag(model.opt.flags, OptionRouterPrediction)))
+        return Error{ErrorCode::InvalidArgument, "continuous Qwen Vulkan execution does not support speculative cache transactions or router prediction"};
     bool fused_router_ready = false;
     bool deferred_gpu_head = false;
     const bool use_layer_fusion = !use_speculative_context
@@ -311,6 +348,15 @@ Result<void> forward_model(const CompiledModel& model,
         }
         if (node->type == ExecutionNodeType::FinalNorm)
         {
+            if (model.qwen_device_chain)
+            {
+                if (!QwenLayer_vulkan::finish(model, logits_output != LogitsOutput::None,
+                                              logits_output == LogitsOutput::Last, state.logits, state.qwen_layer))
+                    return Error{ErrorCode::InternalError, "continuous Qwen Vulkan LM head execution failed"};
+                produced_logits = logits_output != LogitsOutput::None;
+                statistics.vulkan_gated_residual_blocks += logits_output != LogitsOutput::None ? 1 : 0;
+                continue;
+            }
             const size_t expected_weights = model.descriptor.final_norm == NormType::None ? 1 : 2;
             if (node->weight_inputs.size() != expected_weights)
                 return Error{ErrorCode::InternalError, "final norm node has an invalid weight binding"};
@@ -395,6 +441,7 @@ Result<void> forward_model(const CompiledModel& model,
         }
         if (node->type == ExecutionNodeType::LmHead)
         {
+            if (model.qwen_device_chain) continue;
             const size_t expected_weights = model.descriptor.final_norm == NormType::None ? 1 : 2;
             if (node->weight_inputs.size() != expected_weights)
                 return Error{ErrorCode::InternalError, "LM head node has an invalid weight binding"};
@@ -428,10 +475,11 @@ Result<void> forward_model(const CompiledModel& model,
             }
             if (deferred_final_norm
                 && node->backend == ExecutionBackend::Vulkan
-                && lm_head_operator.bfloat16
-                && lm_head_operator.bfloat16->forward_rms_norm_chain(*lm_head_input,
-                                                                     state.logits))
+                && lm_head_operator.bfloat16)
             {
+                if (!lm_head_operator.bfloat16->forward_rms_norm_chain(*lm_head_input,
+                                                                       state.logits))
+                    return Error{ErrorCode::InternalError, "Vulkan LM head RMSNorm chain execution failed"};
                 produced_logits = true;
                 deferred_final_norm = false;
                 continue;
@@ -472,8 +520,31 @@ Result<void> forward_model(const CompiledModel& model,
             return Error{ErrorCode::InternalError, "execution layer id is out of range"};
         LayerState& layer_state = state.execution_state;
         const MoeBlockPlan& moe = layer.moe;
+        if (node->type == ExecutionNodeType::DenseFfn)
+        {
+            if (layer_workspace.active() && !LatentLayer_vulkan::materialize_hidden(layer_workspace, hidden))
+                return Error{ErrorCode::InternalError, "cannot materialize dense FFN input"};
+            forward_dense_layer(model, layer, hidden, layer_state, node->backend);
+            continue;
+        }
         if (node->type == ExecutionNodeType::Attention)
         {
+            if (model.qwen_device_chain)
+            {
+                const auto& fused = model.operators.at_weight(layer.attention.output_weight).qwen_layer;
+                auto options = latent_router_options(model, moe, input_ids, state.expert_scratch.explicit_expert_ids);
+                std::string device_error;
+                if (!fused || !fused->forward(hidden, input_ids, position_offset, state.layers[layer.layer_id], options, layer_state.dispatch_plan, state.qwen_layer, device_error))
+                    return Error{ErrorCode::InternalError, "continuous Qwen Vulkan layer " + std::to_string(layer.layer_id) + " execution failed: " + device_error};
+                layer_state.normalized.reset(input_ids.size(), model.descriptor.hidden_size, false);
+                layer_state.normalized_device = state.qwen_layer.device_input();
+                layer_state.require_device_execution = true;
+                fused_router_ready = true;
+                ++statistics.vulkan_qwen_layers;
+                statistics.vulkan_gated_residual_blocks += 2;
+                statistics.vulkan_ple_blocks += layer.ple.enabled() ? 1 : 0;
+                continue;
+            }
             if (layer_workspace.active()
                 && (layer.ple.enabled() || layer.attention.kind != AttentionKind::MultiHeadLatent)
                 && !LatentLayer_vulkan::materialize_hidden(layer_workspace, hidden))
@@ -744,7 +815,7 @@ Result<void> forward_model(const CompiledModel& model,
             }
             continue;
         }
-        if (node->type == ExecutionNodeType::Expert || node->type == ExecutionNodeType::ExpertGroup)
+        if (node->type == ExecutionNodeType::ExpertGroup)
         {
             if (layer_state.experts_executed)
                 continue;
@@ -762,7 +833,7 @@ Result<void> forward_model(const CompiledModel& model,
             auto executed = forward_moe(model,
                                         moe,
                                         layer_state,
-                                        statistics,
+                                        &statistics,
                                         state.expert_scratch,
                                         layer.layer_id,
                                         node->backend,
@@ -787,19 +858,44 @@ Result<void> forward_model(const CompiledModel& model,
             if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0
                 && !layer_state.shared_expert_device_output)
                 return Error{ErrorCode::InternalError, "Combine executed before Shared Expert group"};
-            bool device_combined = false;
-            std::vector<MoeCombineInput_vulkan> device_inputs;
-            bool has_device_output = static_cast<bool>(layer_state.shared_expert_device_output);
-            for (const auto& active : layer_state.active_experts())
+            if (model.qwen_device_chain)
             {
-                device_inputs.push_back({&active.output, active.device_output, active.batch.routes});
-                has_device_output = has_device_output || static_cast<bool>(active.device_output);
+                auto& inputs = state.expert_scratch.combine_inputs;
+                inputs.clear();
+                for (const auto& active : layer_state.active_experts())
+                {
+                    if (!active.device_output)
+                        return Error{ErrorCode::InternalError, "continuous Qwen Vulkan Expert output is not resident"};
+                    inputs.push_back({nullptr, active.device_output, active.batch.routes});
+                }
+                if ((moe.has_shared_expert && !layer_state.shared_expert_device_output)
+                    || !QwenLayer_vulkan::defer_combine(inputs, input_ids.size(), model.descriptor.hidden_size,
+                                                        layer_state.shared_expert_device_output, state.qwen_layer))
+                    return Error{ErrorCode::InternalError, "continuous Qwen Vulkan Expert combine failed"};
+                inputs.clear();
+                fused_router_ready = false;
+                layer_state.reset();
+                continue;
+            }
+            bool device_combined = false;
+            bool has_device_output = fused_router_ready
+                                     && static_cast<bool>(layer_state.shared_expert_device_output);
+            if (fused_router_ready)
+            {
+                for (const auto& active : layer_state.active_experts())
+                    has_device_output = has_device_output || static_cast<bool>(active.device_output);
             }
             if (fused_router_ready && has_device_output)
             {
-                device_combined = LatentLayer_vulkan::defer_combine(device_inputs, hidden.rows(), model.descriptor.hidden_size,
+                std::vector<MoeCombineInput_vulkan>& inputs = state.expert_scratch.combine_inputs;
+                inputs.clear();
+                inputs.reserve(layer_state.active_experts().size());
+                for (const auto& active : layer_state.active_experts())
+                    inputs.push_back({&active.output, active.device_output, active.batch.routes});
+                device_combined = LatentLayer_vulkan::defer_combine(inputs, hidden.rows(), model.descriptor.hidden_size,
                                                                     moe.has_shared_expert ? &layer_state.shared_expert_output : nullptr,
                                                                     layer_state.shared_expert_device_output, layer_workspace);
+                inputs.clear();
             }
             if (!device_combined)
             {
@@ -874,17 +970,19 @@ Result<void> forward_model(const CompiledModel& model,
             }
             if (device_combined) fused_router_ready = false;
 
-            const auto target = std::find(model.speculative.target_layer_ids.begin(),
-                                          model.speculative.target_layer_ids.end(),
-                                          layer.layer_id);
-            if (target != model.speculative.target_layer_ids.end()
-                && use_speculative_context)
+            if (use_speculative_context)
             {
-                capture_speculative_hidden(hidden,
-                                           model.descriptor.hidden_size,
-                                           model.descriptor.hyper_connection_multiplier,
-                                           static_cast<size_t>(std::distance(model.speculative.target_layer_ids.begin(), target)),
-                                           state.speculative_main_hidden);
+                const auto target = std::find(model.speculative.target_layer_ids.begin(),
+                                              model.speculative.target_layer_ids.end(),
+                                              layer.layer_id);
+                if (target != model.speculative.target_layer_ids.end())
+                {
+                    capture_speculative_hidden(hidden,
+                                               model.descriptor.hidden_size,
+                                               model.descriptor.hyper_connection_multiplier,
+                                               static_cast<size_t>(std::distance(model.speculative.target_layer_ids.begin(), target)),
+                                               state.speculative_main_hidden);
+                }
             }
             layer_state.reset();
             continue;
@@ -899,7 +997,7 @@ Result<void> forward_model(const CompiledModel& model,
             "execution graph ended before a Router prediction target"};
     }
 
-    record_model_resource_delta(model, statistics, execution_cache_before, expert_backend_before);
+    record_resource_delta(model, statistics, execution_cache_before, expert_backend_before);
 
     if (logits_output != LogitsOutput::None && !produced_logits)
         return Error{ErrorCode::InternalError, "execution graph did not produce logits"};
@@ -908,9 +1006,9 @@ Result<void> forward_model(const CompiledModel& model,
     if (model.vulkan_runtime)
     {
         const VulkanStatistics final_vulkan_execution = get_vulkan_statistics(model.vulkan_runtime);
-        record_vulkan_execution_delta(statistics,
-                                      initial_vulkan_execution,
-                                      final_vulkan_execution);
+        record_vulkan_delta(statistics,
+                            initial_vulkan_execution,
+                            final_vulkan_execution);
     }
     statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
     return {};
@@ -927,6 +1025,7 @@ struct ScopedBatchWorkspace
 
         expert.cache_requests.clear();
         expert.cache_leases.clear();
+        expert.combine_inputs.clear();
         expert.backend_requests.clear();
         expert.decode_tasks.clear();
         expert.kernels.effective_tasks.clear();
@@ -1051,7 +1150,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         {
             return Error{ErrorCode::InvalidArgument, "token id is outside the model vocabulary"};
         }
-        prepare_execution_state(model, *entry.statistics, *entry.state);
+        prepare_execution_state(model, *entry.state);
     }
     ExpertScratch& batch_scratch = workspace.expert;
     ExpertCacheStatistics cache_before;
@@ -1129,7 +1228,8 @@ Result<void> forward_decode_batch(const CompiledModel& model,
     bool deferred_gpu_head = false;
     bool fused_router_ready = false;
     LatentLayerWorkspace_vulkan& layer_workspace = workspace.latent_layer;
-    const ScopedLatentLayerWorkspace latent_workspace_scope(layer_workspace);
+    const ScopedLatentLayerWorkspace latent_workspace_scope(layer_workspace,
+                                                            workspace.expert.combine_inputs);
     ExpertDispatchPlan& fused_routes = workspace.latent_routes;
     const auto& gpu_head = model.operators.at_weight(model.hyper_head_function).layer_head;
     const bool use_layer_fusion = (!model.speculative.enabled() || !use_speculative_context)
@@ -1308,10 +1408,11 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weight_inputs[0]);
             if (deferred_final_norm
                 && node->backend == ExecutionBackend::Vulkan
-                && lm_head_operator.bfloat16
-                && lm_head_operator.bfloat16->forward_rms_norm_chain(merged,
-                                                                     scratch.staged_output))
+                && lm_head_operator.bfloat16)
             {
+                if (!lm_head_operator.bfloat16->forward_rms_norm_chain(merged,
+                                                                       scratch.staged_output))
+                    return Error{ErrorCode::InternalError, "Vulkan LM head RMSNorm chain execution failed"};
                 deferred_final_norm = false;
             }
             else
@@ -1355,6 +1456,23 @@ Result<void> forward_decode_batch(const CompiledModel& model,
 
         const CompiledLayerPlan& layer = model.graph.layer_plans[node->layer_plan_index];
         const MoeBlockPlan& moe = layer.moe;
+        if (node->type == ExecutionNodeType::DenseFfn)
+        {
+            ActivationBuffer& merged = batch_scratch.staged_merged;
+            if (layer_workspace.active())
+            {
+                if (!LatentLayer_vulkan::materialize_hidden(layer_workspace, merged))
+                    return Error{ErrorCode::InternalError, "cannot materialize staged dense FFN input"};
+            }
+            else if (!merge_hidden_rows(merged))
+            {
+                return Error{ErrorCode::InternalError, "cannot merge staged dense FFN rows"};
+            }
+            forward_dense_layer(model, layer, merged, workspace.staged_state, node->backend);
+            if (!split_hidden_rows(merged))
+                return Error{ErrorCode::InternalError, "cannot split staged dense FFN rows"};
+            continue;
+        }
         if (node->type == ExecutionNodeType::Attention)
         {
             if (layer_workspace.active() && layer.attention.kind != AttentionKind::MultiHeadLatent)
@@ -1533,9 +1651,9 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                         const VulkanStatistics fallback_batch_vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
                         for (const DecodeBatchEntry& entry : entries)
                         {
-                            record_vulkan_execution_delta(*entry.statistics,
-                                                          batch_vulkan_before,
-                                                          fallback_batch_vulkan_after);
+                            record_vulkan_delta(*entry.statistics,
+                                                batch_vulkan_before,
+                                                fallback_batch_vulkan_after);
                         }
                         batch_vulkan_before = fallback_batch_vulkan_after;
                     }
@@ -1569,9 +1687,9 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                             && model.vulkan_runtime)
                         {
                             const VulkanStatistics solo_vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
-                            record_vulkan_execution_delta(*entries[session_index].statistics,
-                                                          batch_vulkan_before,
-                                                          solo_vulkan_after);
+                            record_vulkan_delta(*entries[session_index].statistics,
+                                                batch_vulkan_before,
+                                                solo_vulkan_after);
                             batch_vulkan_before = solo_vulkan_after;
                         }
                         state.hidden.swap(state.attention_scratch.output);
@@ -1723,7 +1841,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                         ExpertState& active = combined.active_experts()[combined_index];
                         active.batch.expert_id = expert_id;
                         active.batch.routes.clear();
-                        active.metrics = {};
+                        active.cache_wait_us = 0;
                     }
                     ExpertState& destination = combined.active_experts()[combined_index];
                     for (size_t route_index = 0; route_index < source.batch.routes.size(); ++route_index)
@@ -1745,10 +1863,9 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             }
             continue;
         }
-        if (node->type == ExecutionNodeType::Expert || node->type == ExecutionNodeType::ExpertGroup)
+        if (node->type == ExecutionNodeType::ExpertGroup)
         {
             LayerState& combined = workspace.staged_state;
-            SessionStatistics aggregate_statistics;
             Result<void> shared_result;
             std::function<void()> shared_work;
             if (moe.has_shared_expert && node->backend == ExecutionBackend::Vulkan
@@ -1762,7 +1879,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             auto executed = forward_moe(model,
                                         moe,
                                         combined,
-                                        aggregate_statistics,
+                                        nullptr,
                                         workspace.expert,
                                         layer.layer_id,
                                         node->backend,
@@ -1789,7 +1906,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                         continue;
                     SessionStatistics& route_statistics = *entries[route.token_index].statistics;
                     ++route_statistics.expert_route_rank_demands[route.rank];
-                    route_statistics.expert_route_rank_demand_queue_time_microseconds[route.rank] += active.metrics.cache_wait_time_microseconds;
+                    route_statistics.expert_route_rank_demand_queue_time_microseconds[route.rank] += active.cache_wait_us;
                 }
             }
 
@@ -1798,6 +1915,19 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 LayerState& layer_state = entries[session_index].state->execution_state;
                 SessionStatistics& statistics = *entries[session_index].statistics;
                 statistics.expert_batches += layer_state.active_experts().size();
+                for (const ExpertState& active : layer_state.active_experts())
+                {
+                    const size_t index = workspace.combined_by_expert[active.batch.expert_id];
+                    if (index < workspace.expert.backend_status.size()
+                        && workspace.expert.backend_status[index] == ExpertStatus::Executed)
+                        statistics.expert_gpu_routes += active.batch.routes.size();
+                    else
+                    {
+                        statistics.expert_cpu_routes += active.batch.routes.size();
+                        ++statistics.expert_cpu_batches;
+                        statistics.expert_cpu_fallbacks += node->backend == ExecutionBackend::Vulkan ? 1 : 0;
+                    }
+                }
                 layer_state.experts_executed = true;
             }
             continue;
@@ -1823,38 +1953,48 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             const std::vector<size_t>& combined_by_expert = workspace.combined_by_expert;
             const size_t missing = std::numeric_limits<size_t>::max();
             bool device_combined = false;
-            bool has_device_output = static_cast<bool>(combined.shared_expert_device_output);
-            std::vector<MoeCombineInput_vulkan> device_inputs;
+            bool has_device_output = fused_router_ready
+                                     && static_cast<bool>(combined.shared_expert_device_output);
             for (size_t expert_id = 0; expert_id < combined_by_expert.size(); ++expert_id)
             {
                 const size_t index = combined_by_expert[expert_id];
                 if (index == missing) continue;
                 if (index >= combined.active_experts().size())
                     return Error{ErrorCode::InternalError, "combined Expert index is out of range"};
-                const auto& active = combined.active_experts()[index];
-                device_inputs.push_back({&active.output, active.device_output, active.batch.routes});
-                has_device_output = has_device_output || static_cast<bool>(active.device_output);
+                if (fused_router_ready)
+                    has_device_output = has_device_output
+                                        || static_cast<bool>(combined.active_experts()[index].device_output);
             }
             for (const auto& entry : entries)
                 if (!entry.state->execution_state.experts_executed)
                     return Error{ErrorCode::InternalError, "Combine executed before its Expert wave"};
-            ActivationBuffer shared_host_batch;
+            const ActivationBuffer* shared_host = nullptr;
             if (moe.has_shared_expert && !combined.shared_expert_device_output)
             {
-                shared_host_batch.reset(session_count, model.descriptor.hidden_size, false);
                 for (size_t row = 0; row < session_count; ++row)
                 {
                     const auto& output = entries[row].state->execution_state.shared_expert_output;
                     if (output.rows() != 1 || output.columns() != model.descriptor.hidden_size)
                         return Error{ErrorCode::InternalError, "Combine executed before Shared Expert group"};
-                    std::copy_n(output.row(0), model.descriptor.hidden_size, shared_host_batch.row(row));
                 }
+                shared_host = &combined.shared_expert_output;
             }
             if (fused_router_ready && has_device_output)
             {
-                device_combined = LatentLayer_vulkan::defer_combine(device_inputs, session_count, model.descriptor.hidden_size,
-                                                                    shared_host_batch.rows() ? &shared_host_batch : nullptr,
+                std::vector<MoeCombineInput_vulkan>& inputs = batch_scratch.combine_inputs;
+                inputs.clear();
+                inputs.reserve(combined.active_experts().size());
+                for (size_t expert_id = 0; expert_id < combined_by_expert.size(); ++expert_id)
+                {
+                    const size_t index = combined_by_expert[expert_id];
+                    if (index == missing) continue;
+                    const auto& active = combined.active_experts()[index];
+                    inputs.push_back({&active.output, active.device_output, active.batch.routes});
+                }
+                device_combined = LatentLayer_vulkan::defer_combine(inputs, session_count, model.descriptor.hidden_size,
+                                                                    shared_host,
                                                                     combined.shared_expert_device_output, layer_workspace);
+                inputs.clear();
             }
             if (!device_combined)
             {
@@ -1961,11 +2101,16 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 }
             }
             if (device_combined) fused_router_ready = false;
-            const auto target = std::find(model.speculative.target_layer_ids.begin(),
-                                          model.speculative.target_layer_ids.end(),
-                                          layer.layer_id);
-            const size_t target_index = static_cast<size_t>(std::distance(model.speculative.target_layer_ids.begin(),
-                                                                          target));
+            const bool capture_speculative_context = model.speculative.enabled() && use_speculative_context;
+            const auto target = capture_speculative_context
+                                    ? std::find(model.speculative.target_layer_ids.begin(),
+                                                model.speculative.target_layer_ids.end(),
+                                                layer.layer_id)
+                                    : model.speculative.target_layer_ids.end();
+            const size_t target_index = capture_speculative_context
+                                            ? static_cast<size_t>(std::distance(model.speculative.target_layer_ids.begin(),
+                                                                                target))
+                                            : 0;
             for (size_t session_index = 0; session_index < session_count; ++session_index)
             {
                 LayerState& layer_state = entries[session_index].state->execution_state;
@@ -1985,7 +2130,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         return Error{ErrorCode::InternalError, "unsupported execution graph node"};
     }
 
-    record_batch_resource_delta(model, entries, cache_before, backend_before);
+    record_resource_delta(model, entries, cache_before, backend_before);
     for (size_t session_index = 0; session_index < session_count; ++session_index)
     {
         if (entries[session_index].logits
@@ -1998,7 +2143,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
     {
         const VulkanStatistics batch_vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
         for (const DecodeBatchEntry& entry : entries)
-            record_vulkan_execution_delta(*entry.statistics, batch_vulkan_before, batch_vulkan_after);
+            record_vulkan_delta(*entry.statistics, batch_vulkan_before, batch_vulkan_after);
     }
     const uint64_t bf16_dispatches = bf16.dispatches();
     for (const DecodeBatchEntry& entry : entries)
@@ -2362,18 +2507,20 @@ static void admit_ready_router_prediction(const CompiledModel& model,
         if (token_count >= vulkan_expert_gpu_admission_min_rows
             || model.opt.hybrid_mode == HybridMode::HybridExperts)
         {
-            model.expert_backend->admit(expert.cache_key,
-                                        std::move(lease.gate_up),
-                                        expert.gate_up_bias == invalid_tensor_handle
-                                            ? nullptr
-                                            : &model.weights.at(expert.gate_up_bias),
-                                        std::move(lease.down),
-                                        expert.down_bias == invalid_tensor_handle
-                                            ? nullptr
-                                            : &model.weights.at(expert.down_bias),
-                                        layer.layer_id,
-                                        expert.activation_limit,
-                                        expert.activation);
+            ExpertDemandRequest demand;
+            demand.key = expert.cache_key;
+            demand.gate_up = std::move(lease.gate_up);
+            demand.gate_up_bias = expert.gate_up_bias == invalid_tensor_handle
+                                      ? nullptr
+                                      : &model.weights.at(expert.gate_up_bias);
+            demand.down = std::move(lease.down);
+            demand.down_bias = expert.down_bias == invalid_tensor_handle
+                                   ? nullptr
+                                   : &model.weights.at(expert.down_bias);
+            demand.residency_group = layer.layer_id;
+            demand.activation_limit = expert.activation_limit;
+            demand.activation = expert.activation;
+            model.expert_backend->admit(demand);
         }
         admitted_ids[admitted_count++] = expert_id;
     }

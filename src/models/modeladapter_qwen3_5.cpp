@@ -79,13 +79,14 @@ static Result<void> validate_mxfp4_artifact(const ModelPackage& package,
 
 bool Qwen3_5MoeModelAdapter::can_load(const ModelManifest& manifest) const
 {
-    return manifest.model_type == "qwen3_5_moe";
+    return manifest.model_type == "qwen3_5_moe" || manifest.model_type == "qwen3_5";
 }
 
 Result<MoeModelDescriptor> Qwen3_5MoeModelAdapter::parse_model(const ModelPackage& package) const
 {
-    if (package.manifest.model_type != "qwen3_5_moe")
+    if (!can_load(package.manifest))
         return Error{ErrorCode::UnsupportedModel, "unsupported Qwen model_type: " + package.manifest.model_type};
+    const bool dense = package.manifest.model_type == "qwen3_5";
 
     const std::string& manifest_json = package.manifest.raw_json;
     std::string text_config_json;
@@ -115,22 +116,22 @@ Result<MoeModelDescriptor> Qwen3_5MoeModelAdapter::parse_model(const ModelPackag
     auto hidden_size = read_manifest_uint32(json, "hidden_size", "Qwen3 MoE ");
     if (!hidden_size)
         return hidden_size.error();
-    auto intermediate_size = read_manifest_uint32(json, "moe_intermediate_size", "Qwen3 MoE ");
+    auto intermediate_size = read_manifest_uint32(json, dense ? "intermediate_size" : "moe_intermediate_size", "Qwen3 ");
     if (!intermediate_size)
         return intermediate_size.error();
-    auto shared_intermediate_size = read_manifest_uint32(json, "shared_expert_intermediate_size", "Qwen3 MoE ");
+    auto shared_intermediate_size = dense ? Result<uint32_t>(intermediate_size.value()) : read_manifest_uint32(json, "shared_expert_intermediate_size", "Qwen3 MoE ");
     if (!shared_intermediate_size)
         return shared_intermediate_size.error();
     auto layer_count = read_manifest_uint32(json, "num_hidden_layers", "Qwen3 MoE ");
     if (!layer_count)
         return layer_count.error();
-    auto mtp_layer_count = read_manifest_uint32(json, "mtp_num_hidden_layers", "Qwen3 MoE ");
+    auto mtp_layer_count = dense ? Result<uint32_t>(0) : read_manifest_uint32(json, "mtp_num_hidden_layers", "Qwen3 MoE ");
     if (!mtp_layer_count)
         return mtp_layer_count.error();
-    auto expert_count = read_manifest_uint32(json, "num_experts", "Qwen3 MoE ");
+    auto expert_count = dense ? Result<uint32_t>(0) : read_manifest_uint32(json, "num_experts", "Qwen3 MoE ");
     if (!expert_count)
         return expert_count.error();
-    auto top_k = read_manifest_uint32(json, "num_experts_per_tok", "Qwen3 MoE ");
+    auto top_k = dense ? Result<uint32_t>(0) : read_manifest_uint32(json, "num_experts_per_tok", "Qwen3 MoE ");
     if (!top_k)
         return top_k.error();
     auto attention_head_count = read_manifest_uint32(json, "num_attention_heads", "Qwen3 MoE ");
@@ -177,7 +178,7 @@ Result<MoeModelDescriptor> Qwen3_5MoeModelAdapter::parse_model(const ModelPackag
     auto activation = read_manifest_string(json, "hidden_act", "Qwen3 MoE ");
     if (!activation)
         return activation.error();
-    auto activation_dtype = read_manifest_string(json, "dtype", "Qwen3 MoE ");
+    auto activation_dtype = read_manifest_string(json, find_manifest_member(json, "dtype") ? "dtype" : "torch_dtype", "Qwen3 MoE ");
     if (!activation_dtype)
         return activation_dtype.error();
     auto state_dtype = read_manifest_string(json, "mamba_ssm_dtype", "Qwen3 MoE ");
@@ -189,7 +190,7 @@ Result<MoeModelDescriptor> Qwen3_5MoeModelAdapter::parse_model(const ModelPackag
     auto attention_output_gate = read_manifest_bool(json, "attn_output_gate", "Qwen3 MoE ");
     if (!attention_output_gate)
         return attention_output_gate.error();
-    auto mtp_dedicated_embeddings = read_manifest_bool(json, "mtp_use_dedicated_embeddings", "Qwen3 MoE ");
+    auto mtp_dedicated_embeddings = dense ? Result<bool>(false) : read_manifest_bool(json, "mtp_use_dedicated_embeddings", "Qwen3 MoE ");
     if (!mtp_dedicated_embeddings)
         return mtp_dedicated_embeddings.error();
 
@@ -206,11 +207,12 @@ Result<MoeModelDescriptor> Qwen3_5MoeModelAdapter::parse_model(const ModelPackag
         || attention_head_count.value() % kv_head_count.value() != 0
         || linear_value_head_count.value() % linear_key_head_count.value() != 0
         || activation.value() != "silu"
-        || activation_dtype.value() != "bfloat16"
+        || (activation_dtype.value() != "bfloat16" && activation_dtype.value() != "float16")
         || state_dtype.value() != "float32"
         || attention_bias.value()
         || !attention_output_gate.value()
-        || mtp_layer_count.value() != 1
+        || (!dense && mtp_layer_count.value() != 1
+            && (package.weights_path.empty() || mtp_layer_count.value() != 0))
         || mtp_dedicated_embeddings.value())
     {
         return Error{ErrorCode::InvalidModel, "unsupported Qwen3 MoE architectural dimensions"};
@@ -246,7 +248,7 @@ Result<MoeModelDescriptor> Qwen3_5MoeModelAdapter::parse_model(const ModelPackag
     moe.normalization = RouterNormalization::SelectedExperts;
     moe.activation = ExpertActivation::Silu;
     moe.layout = ExpertLayout::PackedGateUpDown;
-    auto artifact_status = optional_artifact_exists(package.root / mxfp4_artifact_name, "Qwen MXFP4 artifact");
+    auto artifact_status = dense || !package.weights_path.empty() ? Result<bool>(false) : optional_artifact_exists(package.root / mxfp4_artifact_name, "Qwen MXFP4 artifact");
     if (!artifact_status)
         return artifact_status.error();
     const bool artifact_exists = artifact_status.value();
@@ -262,39 +264,38 @@ Result<MoeModelDescriptor> Qwen3_5MoeModelAdapter::parse_model(const ModelPackag
             return artifact_status.error();
     }
     std::optional<DType> detected_qnk_expert_dtype;
+    std::optional<SafetensorsArchive> model_archive;
     if (!artifact_exists && !package.root.empty())
     {
-        std::error_code archive_error;
-        if (std::filesystem::is_directory(package.root, archive_error) && !archive_error)
+        auto opened = SafetensorsArchive::open(package.weights_path.empty() ? package.root : package.weights_path, package.manifest.raw_json);
+        if (opened)
+            model_archive = std::move(opened).value();
+    }
+    if (!dense && model_archive)
+    {
+        SafetensorsArchive& archive = *model_archive;
+        for (uint32_t layer_id = 0; layer_id < layer_count.value(); ++layer_id)
         {
-            auto opened = SafetensorsArchive::open(package.root);
-            if (opened)
+            const std::string source = "model.language_model.layers." + std::to_string(layer_id) + ".mlp.experts.";
+            const auto gate_up_dtype = archive.find_qnk_expert_dtype(source + "gate_up_proj",
+                                                                     expert_count.value(),
+                                                                     intermediate_size.value() * 2,
+                                                                     hidden_size.value());
+            const auto down_dtype = archive.find_qnk_expert_dtype(source + "down_proj",
+                                                                  expert_count.value(),
+                                                                  hidden_size.value(),
+                                                                  intermediate_size.value());
+            if (!gate_up_dtype || !down_dtype || gate_up_dtype != down_dtype)
             {
-                SafetensorsArchive& archive = opened.value();
-                for (uint32_t layer_id = 0; layer_id < layer_count.value(); ++layer_id)
-                {
-                    const std::string source = "model.language_model.layers." + std::to_string(layer_id) + ".mlp.experts.";
-                    const auto gate_up_dtype = archive.find_qnk_expert_dtype(source + "gate_up_proj",
-                                                                             expert_count.value(),
-                                                                             intermediate_size.value() * 2,
-                                                                             hidden_size.value());
-                    const auto down_dtype = archive.find_qnk_expert_dtype(source + "down_proj",
-                                                                          expert_count.value(),
-                                                                          hidden_size.value(),
-                                                                          intermediate_size.value());
-                    if (!gate_up_dtype || !down_dtype || gate_up_dtype != down_dtype)
-                    {
-                        detected_qnk_expert_dtype.reset();
-                        break;
-                    }
-                    if (!detected_qnk_expert_dtype)
-                        detected_qnk_expert_dtype = gate_up_dtype;
-                    else if (detected_qnk_expert_dtype != gate_up_dtype)
-                    {
-                        detected_qnk_expert_dtype.reset();
-                        break;
-                    }
-                }
+                detected_qnk_expert_dtype.reset();
+                break;
+            }
+            if (!detected_qnk_expert_dtype)
+                detected_qnk_expert_dtype = gate_up_dtype;
+            else if (detected_qnk_expert_dtype != gate_up_dtype)
+            {
+                detected_qnk_expert_dtype.reset();
+                break;
             }
         }
     }
@@ -305,7 +306,7 @@ Result<MoeModelDescriptor> Qwen3_5MoeModelAdapter::parse_model(const ModelPackag
     moe.flags = MoeDescriptorSharedExpertGate;
 
     MoeModelDescriptor descriptor;
-    descriptor.model_type = "qwen3_5_moe";
+    descriptor.model_type = package.manifest.model_type;
     descriptor.vocabulary_size = vocabulary_size.value();
     descriptor.hidden_size = hidden_size.value();
     descriptor.intermediate_size = intermediate_size.value();
@@ -334,7 +335,104 @@ Result<MoeModelDescriptor> Qwen3_5MoeModelAdapter::parse_model(const ModelPackag
         layer.pre_attention_norm = NormType::RmsNorm;
         layer.pre_ffn_norm = NormType::RmsNorm;
         layer.attention = layer_type == "linear_attention" ? linear_attention : full_attention;
-        layer.moe = moe;
+        if (dense)
+        {
+            layer.dense.intermediate_size = intermediate_size.value();
+            layer.dense.gate_weight_dtype = DType::BFloat16;
+            layer.dense.up_weight_dtype = DType::BFloat16;
+            layer.dense.down_weight_dtype = DType::BFloat16;
+            layer.dense.activation = ExpertActivation::Silu;
+            if (model_archive)
+            {
+                const std::string source = "model.language_model.layers." + std::to_string(layer_id) + ".mlp.";
+                const std::pair<const char*, DType*> projections[] = {
+                    {"gate_proj.weight", &layer.dense.gate_weight_dtype},
+                    {"up_proj.weight", &layer.dense.up_weight_dtype},
+                    {"down_proj.weight", &layer.dense.down_weight_dtype},
+                };
+                for (const auto& projection : projections)
+                {
+                    const std::string name = source + projection.first;
+                    const auto* tensor = model_archive->find(name);
+                    if (model_archive->contains_tensor(name))
+                    {
+                        auto dtype = model_archive->tensor_dtype(name);
+                        if (dtype)
+                        {
+                            *projection.second = dtype.value();
+                            continue;
+                        }
+                        if (!tensor || tensor->dtype != "U8")
+                            return dtype.error();
+                        const bool down = std::string_view(projection.first) == "down_proj.weight";
+                        const auto legacy_dtype = model_archive->find_qnk_expert_dtype(name, 1,
+                                                                                       down ? hidden_size.value() : intermediate_size.value(),
+                                                                                       down ? intermediate_size.value() : hidden_size.value());
+                        if (!legacy_dtype)
+                            return Error{ErrorCode::InvalidModel, "invalid Qwen dense native FFN tensor: " + name};
+                        *projection.second = *legacy_dtype;
+                        continue;
+                    }
+                    if (tensor)
+                    {
+                        auto dtype = model_archive->tensor_dtype(name);
+                        if (!dtype)
+                            return dtype.error();
+                        *projection.second = dtype.value();
+                    }
+                }
+            }
+        }
+        else
+        {
+            layer.moe = moe;
+            if (model_archive)
+            {
+                const std::string shared = "model.language_model.layers." + std::to_string(layer_id) + ".mlp.shared_expert.";
+                for (const char* projection : {"gate_proj.weight", "up_proj.weight", "down_proj.weight"})
+                {
+                    const std::string name = shared + projection;
+                    if (!model_archive->contains_tensor(name))
+                        continue;
+                    auto dtype = model_archive->tensor_dtype(name);
+                    if (!dtype)
+                        return dtype.error();
+                    if (std::string_view(projection) == "gate_proj.weight")
+                        layer.moe.shared_expert_weight_dtype = dtype.value();
+                }
+                const std::string source = "model.language_model.layers." + std::to_string(layer_id) + ".mlp.experts.";
+                if (model_archive->contains_tensor(source + "0.gate_proj.weight")
+                    || model_archive->contains_tensor(source + "0.up_proj.weight")
+                    || model_archive->contains_tensor(source + "0.down_proj.weight"))
+                {
+                    auto first_dtype = model_archive->tensor_dtype(source + "0.gate_proj.weight");
+                    if (!first_dtype)
+                        return first_dtype.error();
+                    const bool native_mxfp4 = first_dtype.value() == DType::MxFp4;
+                    layer.moe.layout = native_mxfp4 ? ExpertLayout::InterleavedGateUpDown : ExpertLayout::GateUpDown;
+                    if (native_mxfp4)
+                    {
+                        layer.moe.flags |= MoeDescriptorFileBackedExperts;
+                        layer.moe.expert_weight_dtype = DType::MxFp4;
+                    }
+                    else
+                        layer.moe.flags &= ~MoeDescriptorFileBackedExperts;
+                    for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
+                    {
+                        for (const char* projection : {"gate_proj.weight", "up_proj.weight", "down_proj.weight"})
+                        {
+                            auto dtype = model_archive->tensor_dtype(source + std::to_string(expert_id) + "." + projection);
+                            if (!dtype)
+                                return dtype.error();
+                            if ((dtype.value() == DType::MxFp4) != native_mxfp4)
+                                return Error{ErrorCode::UnsupportedModel, "inconsistent Qwen native MXFP4 Expert encodings: " + source};
+                            if (dtype.value() == DType::Int4 || dtype.value() == DType::Float8E4M3 || is_qnk_dtype(dtype.value()))
+                                layer.moe.expert_weight_dtype = dtype.value();
+                        }
+                    }
+                }
+            }
+        }
     }
     return descriptor;
 }
@@ -347,14 +445,16 @@ static Result<void> add_qnk_expert(WeightMapping& mapping,
                                    uint32_t expert_id,
                                    uint32_t expert_count,
                                    uint32_t rows,
-                                   uint32_t columns)
+                                   uint32_t columns,
+                                   uint32_t flags)
 {
     auto tensor = archive.load_qnk_expert(source,
                                           dtype,
                                           expert_id,
                                           expert_count,
                                           rows,
-                                          columns);
+                                          columns,
+                                          flags);
     if (!tensor)
         return tensor.error();
     mapping.emplace(target, std::move(tensor).value());
@@ -363,9 +463,10 @@ static Result<void> add_qnk_expert(WeightMapping& mapping,
 
 Result<WeightMapping> Qwen3_5MoeModelAdapter::map_weights(const ModelPackage& package, const MoeModelDescriptor& descriptor) const
 {
-    if (descriptor.model_type != "qwen3_5_moe")
+    if (descriptor.model_type != "qwen3_5_moe" && descriptor.model_type != "qwen3_5")
         return Error{ErrorCode::UnsupportedModel, "unsupported Qwen model_type: " + descriptor.model_type};
-    auto opened = SafetensorsArchive::open(package.root);
+    const bool dense = descriptor.model_type == "qwen3_5";
+    auto opened = SafetensorsArchive::open(package.weights_path.empty() ? package.root : package.weights_path, package.manifest.raw_json);
     if (!opened)
         return opened.error();
     SafetensorsArchive archive = std::move(opened).value();
@@ -385,7 +486,21 @@ Result<WeightMapping> Qwen3_5MoeModelAdapter::map_weights(const ModelPackage& pa
                         "model.language_model.norm.weight");
     if (!status)
         return status.error();
-    status = add_tensor(mapping, archive, "lm_head.weight", "lm_head.weight");
+    std::string head_source = "lm_head.weight";
+    if (dense)
+    {
+        const auto text_config = find_manifest_member(package.manifest.raw_json, "text_config");
+        const std::string config = text_config ? std::string(*text_config) : package.manifest.raw_json;
+        if (find_manifest_member(config, "tie_word_embeddings"))
+        {
+            auto tied = read_manifest_bool(config, "tie_word_embeddings", "Qwen3 ");
+            if (!tied)
+                return tied.error();
+            if (tied.value())
+                head_source = "model.language_model.embed_tokens.weight";
+        }
+    }
+    status = add_tensor(mapping, archive, "lm_head.weight", head_source);
     if (!status)
         return status.error();
 
@@ -405,92 +520,162 @@ Result<WeightMapping> Qwen3_5MoeModelAdapter::map_weights(const ModelPackage& pa
                             source + "post_attention_layernorm.weight");
         if (!status)
             return status.error();
-        status = add_tensor(mapping,
-                            archive,
-                            target + "router.weight",
-                            source + "mlp.gate.weight");
-        if (!status)
-            return status.error();
-        status = add_qwen_shared_expert(mapping, archive, source, target);
-        if (!status)
-            return status.error();
-
-        const MoeDescriptor& moe = descriptor.layers[layer_id].moe;
-        const bool compiled_mxfp4_experts = moe.expert_weight_dtype == DType::MxFp4;
-        const bool compiled_qnk_experts = is_qnk_dtype(moe.expert_weight_dtype);
-        const std::string artifact_experts = mxfp4_expert_prefix(layer_id);
-        if (!compiled_qnk_experts && !compiled_mxfp4_experts)
+        if (dense)
         {
-            if (moe.intermediate_size > std::numeric_limits<uint32_t>::max() / 2)
-                return Error{ErrorCode::InvalidModel, "Qwen3 MoE BF16 Expert dimensions overflow"};
-            status = add_bfloat16_expert_bank(mapping, archive, target, "gate_up.weight",
-                                              source + "mlp.experts.gate_up_proj", moe.expert_count,
-                                              {moe.intermediate_size * 2, descriptor.hidden_size});
-            if (!status)
-                return status.error();
-            status = add_bfloat16_expert_bank(mapping, archive, target, "down.weight",
-                                              source + "mlp.experts.down_proj", moe.expert_count,
-                                              {descriptor.hidden_size, moe.intermediate_size});
-            if (!status)
-                return status.error();
+            const std::pair<const char*, const char*> projections[] = {
+                {"gate", "gate_proj"},
+                {"up", "up_proj"},
+                {"down", "down_proj"},
+            };
+            for (const auto& projection : projections)
+            {
+                const std::string tensor_source = source + "mlp." + projection.second + ".weight";
+                const std::string tensor_target = target + "ffn." + projection.first + ".weight";
+                const auto& ffn = descriptor.layers[layer_id].dense;
+                const bool down = std::string_view(projection.first) == "down";
+                const DType dtype = down ? ffn.down_weight_dtype : std::string_view(projection.first) == "up" ? ffn.up_weight_dtype
+                                                                                                              : ffn.gate_weight_dtype;
+                if (is_qnk_dtype(dtype))
+                {
+                    auto tensor = archive.load_qnk_tensor(tensor_source, dtype,
+                                                          down ? descriptor.hidden_size : ffn.intermediate_size,
+                                                          down ? ffn.intermediate_size : descriptor.hidden_size);
+                    if (!tensor)
+                        return tensor.error();
+                    mapping.emplace(tensor_target, std::move(tensor).value());
+                }
+                else
+                    status = add_tensor(mapping, archive, tensor_target, tensor_source);
+                if (!status)
+                    return status.error();
+            }
         }
         else
         {
-            for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
+            status = add_tensor(mapping,
+                                archive,
+                                target + "router.weight",
+                                source + "mlp.gate.weight");
+            if (!status)
+                return status.error();
+            status = add_qwen_shared_expert(mapping, archive, source, target);
+            if (!status)
+                return status.error();
+
+            const MoeDescriptor& moe = descriptor.layers[layer_id].moe;
+            const bool compiled_mxfp4_experts = moe.expert_weight_dtype == DType::MxFp4;
+            const bool compiled_qnk_experts = is_qnk_dtype(moe.expert_weight_dtype);
+            const std::string artifact_experts = mxfp4_expert_prefix(layer_id);
+            if (moe.layout == ExpertLayout::GateUpDown)
             {
-                const std::string expert = expert_prefix(layer_id, expert_id);
-                if (compiled_qnk_experts)
+                for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
                 {
-                    status = add_qnk_expert(mapping,
-                                            archive,
-                                            expert + "gate_up.weight",
-                                            source + "mlp.experts.gate_up_proj",
-                                            moe.expert_weight_dtype,
-                                            expert_id,
-                                            moe.expert_count,
-                                            moe.intermediate_size * 2,
-                                            descriptor.hidden_size);
+                    const std::string expert_source = source + "mlp.experts." + std::to_string(expert_id) + ".";
+                    const std::string expert_target = expert_prefix(layer_id, expert_id);
+                    for (const auto& projection : {std::pair{"gate", "gate_proj"}, std::pair{"up", "up_proj"}, std::pair{"down", "down_proj"}})
+                    {
+                        status = add_tensor(mapping, archive, expert_target + projection.first + ".weight",
+                                            expert_source + projection.second + ".weight", expert_load_flags);
+                        if (!status)
+                            return status.error();
+                    }
                 }
-                else
+            }
+            else if (compiled_mxfp4_experts && archive.contains_tensor(source + "mlp.experts.0.gate_proj.weight"))
+            {
+                for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
                 {
-                    status = add_mxfp4_expert(mapping,
-                                              archive,
-                                              expert + "gate_up.weight",
-                                              artifact_experts + "gate_up.blocks",
-                                              artifact_experts + "gate_up.scales",
-                                              expert_id,
-                                              moe.intermediate_size * 2,
-                                              descriptor.hidden_size,
-                                              expert_load_flags);
+                    const std::string expert_source = source + "mlp.experts." + std::to_string(expert_id) + ".";
+                    const std::string expert = expert_prefix(layer_id, expert_id);
+                    auto gate_up = archive.load_interleaved_mxfp4_tensor(expert_source + "gate_proj.weight", {},
+                                                                         expert_source + "up_proj.weight", {},
+                                                                         moe.intermediate_size, descriptor.hidden_size,
+                                                                         expert_load_flags);
+                    if (!gate_up)
+                        return gate_up.error();
+                    mapping.emplace(expert + "gate_up.weight", std::move(gate_up).value());
+                    auto down = archive.load_mxfp4_tensor(expert_source + "down_proj.weight", {},
+                                                          descriptor.hidden_size, moe.intermediate_size, expert_load_flags);
+                    if (!down)
+                        return down.error();
+                    mapping.emplace(expert + "down.weight", std::move(down).value());
                 }
+            }
+            else if (!compiled_qnk_experts && !compiled_mxfp4_experts)
+            {
+                if (moe.intermediate_size > std::numeric_limits<uint32_t>::max() / 2)
+                    return Error{ErrorCode::InvalidModel, "Qwen3 MoE BF16 Expert dimensions overflow"};
+                status = add_bfloat16_expert_bank(mapping, archive, target, "gate_up.weight",
+                                                  source + "mlp.experts.gate_up_proj", moe.expert_count,
+                                                  {moe.intermediate_size * 2, descriptor.hidden_size});
                 if (!status)
                     return status.error();
-                if (compiled_qnk_experts)
-                {
-                    status = add_qnk_expert(mapping,
-                                            archive,
-                                            expert + "down.weight",
-                                            source + "mlp.experts.down_proj",
-                                            moe.expert_weight_dtype,
-                                            expert_id,
-                                            moe.expert_count,
-                                            descriptor.hidden_size,
-                                            moe.intermediate_size);
-                }
-                else
-                {
-                    status = add_mxfp4_expert(mapping,
-                                              archive,
-                                              expert + "down.weight",
-                                              artifact_experts + "down.blocks",
-                                              artifact_experts + "down.scales",
-                                              expert_id,
-                                              descriptor.hidden_size,
-                                              moe.intermediate_size,
-                                              expert_load_flags);
-                }
+                status = add_bfloat16_expert_bank(mapping, archive, target, "down.weight",
+                                                  source + "mlp.experts.down_proj", moe.expert_count,
+                                                  {descriptor.hidden_size, moe.intermediate_size});
                 if (!status)
                     return status.error();
+            }
+            else
+            {
+                for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
+                {
+                    const std::string expert = expert_prefix(layer_id, expert_id);
+                    if (compiled_qnk_experts)
+                    {
+                        status = add_qnk_expert(mapping,
+                                                archive,
+                                                expert + "gate_up.weight",
+                                                source + "mlp.experts.gate_up_proj",
+                                                moe.expert_weight_dtype,
+                                                expert_id,
+                                                moe.expert_count,
+                                                moe.intermediate_size * 2,
+                                                descriptor.hidden_size,
+                                                expert_load_flags);
+                    }
+                    else
+                    {
+                        status = add_mxfp4_expert(mapping,
+                                                  archive,
+                                                  expert + "gate_up.weight",
+                                                  artifact_experts + "gate_up.blocks",
+                                                  artifact_experts + "gate_up.scales",
+                                                  expert_id,
+                                                  moe.intermediate_size * 2,
+                                                  descriptor.hidden_size,
+                                                  expert_load_flags);
+                    }
+                    if (!status)
+                        return status.error();
+                    if (compiled_qnk_experts)
+                    {
+                        status = add_qnk_expert(mapping,
+                                                archive,
+                                                expert + "down.weight",
+                                                source + "mlp.experts.down_proj",
+                                                moe.expert_weight_dtype,
+                                                expert_id,
+                                                moe.expert_count,
+                                                descriptor.hidden_size,
+                                                moe.intermediate_size,
+                                                expert_load_flags);
+                    }
+                    else
+                    {
+                        status = add_mxfp4_expert(mapping,
+                                                  archive,
+                                                  expert + "down.weight",
+                                                  artifact_experts + "down.blocks",
+                                                  artifact_experts + "down.scales",
+                                                  expert_id,
+                                                  descriptor.hidden_size,
+                                                  moe.intermediate_size,
+                                                  expert_load_flags);
+                    }
+                    if (!status)
+                        return status.error();
+                }
             }
         }
 

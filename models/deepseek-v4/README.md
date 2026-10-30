@@ -10,16 +10,24 @@ No GGUF conversion or private checkpoint format is required. Both packages
 share the same 43-layer target model. The DSpark package additionally exposes
 the draft layers and prediction heads used by the optional speculative path.
 
+AWQ/GPTQ INT4 Safetensors also load directly, including complete DSpark
+draft layers and prediction heads. The [shared importer](../README.md#quantized-package-import)
+accepts target `deepseek4` GGUF Qn_K/MXFP4, including standard split files;
+its output omits DSpark draft metadata because target GGUF has no draft
+weights. FP8 source weights and precise scale values remain native. Generated
+models validate CPU/Vulkan execution and actual DSpark proposals; full-size
+quantized quality and performance have not been measured.
+
 ## Model support
 
 | Area | Implementation |
 | --- | --- |
 | Package | Official multi-shard Hugging Face Safetensors and `config.json` |
-| Dense weights | Blockwise FP8 E4M3 values with E8M0 scales |
+| Dense weights | Native FP8 E4M3 with exact scales, INT4 or Qn_K |
 | Attention | Latent Attention, 128-token window, ratio-4/128 compression, learned indexing, sinks, and YaRN RoPE |
 | Hyper-Connections | Four mHC streams, Sinkhorn mixing, and learned head reduction |
-| Experts | FP4 E2M1 routed Experts, FP8 shared Expert, square-root Softplus routing, selection bias, route scaling, and token-hash layers |
-| Mixed execution | Vulkan FP8 Dense projections with CPU Attention cache logic, routing, and Experts |
+| Experts | Official FP4 E2M1 routed / FP8 shared weights or native INT4/Qn_K variants, square-root Softplus routing, selection bias, route scaling, and token-hash layers |
+| Mixed execution | Vulkan Dense projections and eligible native Experts; CPU cache logic, routing and fallback |
 | Expert residency | Automatic, eager, or byte-bounded on-demand |
 | Expert I/O | Asynchronous range reads, Windows aligned direct I/O, mmap, and byte-aware ARC |
 | Scheduling | Ragged Prefill and staged cross-Session mHC, Attention, routing, and Expert batching |
@@ -100,7 +108,6 @@ and chat usage should use `ncnn_moe.py`.
 | `--top-p P` | Nucleus sampling probability threshold |
 | `--min-p P` | Remove tokens below a fraction of the highest probability |
 | `--seed N` | Sampling seed |
-| `--no-speculative` | Disable DSpark speculative decoding when the package provides it |
 | `--speculative-confidence P` | Override the DSpark confidence threshold |
 | `--speculative-max-draft N` | Bound the number of draft tokens per proposal |
 
@@ -140,7 +147,6 @@ python tools\ncnn_moe.py run `
 | `--expert-cache-mb N` | Bound resident Expert pairs in RAM |
 | `--expert-io-workers N` | Set asynchronous read concurrency |
 | `--mmap-experts` | Map on-demand Expert ranges |
-| `--direct-expert-io` | Force aligned direct reads when supported |
 | `--buffered-expert-io` | Force conventional buffered reads |
 | `--expert-gpu-cache-mb N` | Add an executable Vulkan Expert cache |
 | `--expert-gpu-victim-cache-mb N` | Add a compressed-weight Vulkan cache behind the host ARC |
@@ -154,11 +160,11 @@ and Session mix before assigning memory to Vulkan Expert tiers.
 DeepSeek-V4-Flash-DSpark uses its draft layers, Markov/confidence heads, and
 transactional latent-cache rollback. It is enabled by default when the package
 contains the complete DSpark metadata and tensor set. DeepSeek-V4-Flash has no
-DSpark plan and always executes the target model directly. `--no-speculative`
-provides a deterministic DSpark baseline for correctness or performance
-comparisons. Acceptance rate and net speedup remain workload- and
-cache-dependent, so deployment decisions require end-to-end measurement on
-the target machine.
+DSpark plan and always executes the target model directly. The reference
+benchmark's `--no-speculative` control provides a target-only baseline for
+correctness or performance comparisons. Acceptance rate and net speedup remain
+workload- and cache-dependent, so deployment decisions require end-to-end
+measurement on the target machine.
 
 For throughput tests with multiple DSpark Sessions, add
 `--parallel-speculative` together with `--parallel-sessions N`. Each Session
@@ -222,7 +228,7 @@ python tools\benchmark_runtime.py `
   --no-speculative --warmup 1 --cache-warmup-runs 1 --repeats 3 `
   --backend hybrid --expert-memory on-demand `
   --host-memory-mb 28672 --expert-cache-mb 16384 `
-  --expert-io-workers 4 --direct-expert-io --vulkan-device-index 0
+  --expert-io-workers 4 --vulkan-device-index 0
 ```
 
 This checkpoint has no DSpark plan, so these are target-model results.

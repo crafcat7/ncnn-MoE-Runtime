@@ -34,7 +34,8 @@ float approximate_exp(float value)
         return 0.0;
     const bool negative = value < 0.0;
     const float magnitude = abs(value);
-    const float exponent = fma(magnitude, 1.4426950408889634, 12582912.0) - 12582912.0;
+    // Preserve the FP32 rounding step in range reduction.
+    precise float exponent = fma(magnitude, 1.4426950408889634, 12582912.0) - 12582912.0;
     const float remainder = fma(exponent, -0.693145751953125,
                                 fma(exponent, -0.000001428606765330187, magnitude));
     float polynomial = 0.00137805939;
@@ -97,6 +98,8 @@ void main()
         barrier();
     }
     maximum = reduction[0];
+    // All subgroups must read the maximum before reduction is reused.
+    barrier();
     if (row_invalid != 0)
     {
         if (lane == 0)

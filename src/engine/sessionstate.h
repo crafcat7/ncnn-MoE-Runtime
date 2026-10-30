@@ -2,6 +2,8 @@
 #define NCNN_MOE_SESSIONSTATE_H
 
 #include "backends/ncnn/latentlayer_vulkan.h"
+#include "backends/ncnn/moecombine_vulkan.h"
+#include "backends/ncnn/qwenlayer_vulkan.h"
 #include "kernels/attention.h"
 #include "kernels/gateddeltanet.h"
 #include "kernels/hyperconnection.h"
@@ -27,11 +29,6 @@ namespace moe {
 
 struct SessionStatistics;
 
-struct ExpertExecutionMetrics
-{
-    uint64_t cache_wait_time_microseconds = 0;
-};
-
 struct ExpertWorkspace
 {
     ActivationBuffer projection;
@@ -46,7 +43,7 @@ struct ExpertState
     ActivationBuffer output;
     std::shared_ptr<DeviceTensor_vulkan> device_output;
     ExpertCacheLease lease;
-    ExpertExecutionMetrics metrics;
+    uint64_t cache_wait_us = 0;
 
     void prepare(ExpertBatch& next_batch)
     {
@@ -56,7 +53,7 @@ struct ExpertState
         next_batch.routes.clear();
         lease = {};
         device_output.reset();
-        metrics = {};
+        cache_wait_us = 0;
     }
 };
 
@@ -74,6 +71,7 @@ struct LayerState
     std::vector<ExpertState> expert_slots;
     size_t active_expert_count = 0;
     bool experts_executed = false;
+    bool require_device_execution = false;
 
     void resize_experts(size_t count)
     {
@@ -105,6 +103,7 @@ struct LayerState
             active.device_output.reset();
         }
         experts_executed = false;
+        require_device_execution = false;
     }
 };
 
@@ -118,16 +117,15 @@ struct ExpertScratch
     std::vector<size_t> ready_indices;
     std::vector<ExpertCachePairRequest> cache_requests;
     std::vector<ExpertCacheLease> cache_leases;
-    std::vector<uint8_t> backend_executed;
+    std::vector<ExpertStatus> backend_status;
     std::vector<uint8_t> backend_aggregated;
     std::vector<size_t> backend_indices;
-    std::vector<ExpertBackendRequest> backend_requests;
+    std::vector<ExpertRequest> backend_requests;
     // Final arrays are consumed synchronously before the next wait. Pending
     // submissions keep their own reservations and never borrow this storage.
-    std::vector<ExpertBackendExecutionResult> backend_results;
-    std::vector<size_t> failed_indices;
-    // Separate wave storage stays stable while asynchronous submissions own
-    // request spans. Clear owners after execution, retain vector capacity.
+    std::vector<ExpertStatus> backend_results;
+    // Reused sequentially for initial backend recovery and demand waves.
+    // Clear owners after execution, retain vector capacity.
     std::vector<size_t> prestaged_indices;
     std::vector<ExpertDemandRequest> prestaged_demands;
     std::vector<std::shared_ptr<const void>> prestaged_pins;
@@ -135,14 +133,15 @@ struct ExpertScratch
     std::vector<ExpertCachePairRequest> prestaged_cache_requests;
     std::vector<ExpertCacheLease> prestaged_cache_leases;
     std::vector<size_t> current_wave_indices;
-    std::vector<ExpertBackendRequest> current_wave_requests;
+    std::vector<ExpertRequest> current_wave_requests;
     std::vector<size_t> next_wave_indices;
-    std::vector<ExpertBackendRequest> next_wave_requests;
+    std::vector<ExpertRequest> next_wave_requests;
     std::vector<size_t> wave_failed_indices;
     std::vector<size_t> wave_cpu_indices;
     std::vector<ExpertDemandRequest> wave_demands;
     std::vector<size_t> wave_demand_indices;
     std::vector<std::shared_ptr<const void>> prepared_pins;
+    std::vector<MoeCombineInput_vulkan> combine_inputs;
     bool backend_aggregated_output_valid = false;
     ActivationBuffer backend_aggregated_output;
     ActivationBuffer staged_merged;
@@ -183,6 +182,7 @@ public:
     HyperConnectionScratch hyper_connection_scratch;
     AttentionScratch attention_scratch;
     LatentLayerWorkspace_vulkan latent_layer;
+    QwenLayerWorkspace_vulkan qwen_layer;
     std::vector<uint64_t> attention_positions;
     std::vector<LayerCache*> attention_caches;
     GatedDeltaScratch gated_delta_scratch;

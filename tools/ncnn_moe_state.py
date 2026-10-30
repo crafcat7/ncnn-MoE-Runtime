@@ -155,7 +155,16 @@ def profile_key(
     return f"{hardware}:{model}:{context_tokens}:{session_count}"
 
 
+_EXPERT_IO_KEYS = ("mmap_experts", "buffered_expert_io")
+
+
+def _validate_expert_io_settings(settings: dict[str, Any]) -> None:
+    if sum(bool(settings.get(key)) for key in _EXPERT_IO_KEYS) > 1:
+        raise ValueError("Expert mmap and buffered I/O modes are mutually exclusive")
+
+
 def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
+    _validate_expert_io_settings(settings)
     args: list[str] = []
     backend = settings.get("backend")
     if backend and backend != "auto":
@@ -195,10 +204,8 @@ def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
         args.extend(["--vulkan-devices", str(devices)])
     for key, option in (
         ("mmap_experts", "--mmap-experts"),
-        ("direct_expert_io", "--direct-expert-io"),
         ("buffered_expert_io", "--buffered-expert-io"),
         ("disable_gpu_victim_execution", "--disable-gpu-victim-execution"),
-        ("release_vulkan_dense_host", "--release-vulkan-dense-host"),
         ("disable_vulkan_joint_cache_eviction", "--disable-vulkan-joint-cache-eviction"),
         ("disable_vulkan_mxfp4_row_tile", "--disable-vulkan-mxfp4-row-tile"),
         ("disable_vulkan_expert_direct_staging", "--disable-vulkan-expert-direct-staging"),
@@ -218,11 +225,21 @@ def merge_runtime_settings(
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for source in (user or {}, profile or {}, session or {}, cli):
+        io_settings = {key: source[key] for key in _EXPERT_IO_KEYS if source.get(key) is not None}
+        _validate_expert_io_settings(io_settings)
+        if io_settings:
+            # A higher-priority layer selects the whole I/O mode. Explicit
+            # false values select Auto; omitted/None preferences inherit.
+            for key in _EXPERT_IO_KEYS:
+                result.pop(key, None)
         for key, value in source.items():
             if value is not None:
                 result[key] = value
     # Ignore removed experimental options in saved sessions/configs/profiles.
     for key in (
+        "release_vulkan_dense_host",
+        "no_speculative",
+        "direct_expert_io",
         "gpu_decode_experts",
         "profiling",
         "vulkan_expert_concurrent_commands",

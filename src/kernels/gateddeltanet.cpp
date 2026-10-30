@@ -340,9 +340,7 @@ Result<void> forward_gated_delta(const WeightStore& weights,
 {
     const CompiledOperator& gated_delta_operator = operators.at(plan.gated_delta_vulkan_operator);
     const bool device_state_available = backend == ExecutionBackend::Vulkan
-                                        && gated_delta_operator.gated_delta
-                                        && (cache.gated_delta_device_state
-                                            || hidden.rows() == 1);
+                                        && gated_delta_operator.gated_delta;
     const ActivationBuffer* normalized = &hidden;
     bool normalized_ready = false;
     if (device_state_available)
@@ -370,7 +368,6 @@ Result<void> forward_gated_delta(const WeightStore& weights,
                                                                                      scratch.projected);
         if (device_executed)
         {
-            const size_t hidden_rows = hidden.rows();
             if (has_flag(plan.flags, AttentionBlockExternalResidual))
                 output.swap(scratch.projected);
             else
@@ -378,44 +375,10 @@ Result<void> forward_gated_delta(const WeightStore& weights,
                 add_batch_inplace(scratch.projected, hidden);
                 output.swap(scratch.projected);
             }
-            cache.gated_delta_convolution.clear();
-            cache.gated_delta_recurrent.clear();
-            for (size_t row = 0; row < hidden_rows; ++row)
-                record_gated_delta_cache_transaction_row(cache);
-            cache.gated_delta_token_count += hidden_rows;
-            if (cache.gated_delta_device_state)
-                cache.device_allocated_size = cache.gated_delta_device_state->allocated_bytes();
             return {};
         }
 
-        if (cache.transaction.active
-            && cache.gated_delta_device_state)
-        {
-            return Error{
-                ErrorCode::InternalError,
-                "Vulkan Gated DeltaNet failed while its transactional state was authoritative"};
-        }
-
-        // A failed device dispatch should not strand the Session on an
-        // opaque state.  Download once, then continue on the established CPU
-        // implementation.  This is a failure-path synchronization, not a
-        // per-token boundary.
-        if (cache.gated_delta_device_state)
-        {
-            std::vector<float> convolution;
-            std::vector<float> recurrent;
-            if (!cache.gated_delta_device_state->download(convolution,
-                                                          recurrent))
-            {
-                return Error{
-                    ErrorCode::InternalError,
-                    "failed to recover Vulkan Gated DeltaNet state"};
-            }
-            cache.gated_delta_convolution = std::move(convolution);
-            cache.gated_delta_recurrent = std::move(recurrent);
-            cache.gated_delta_device_state.reset();
-            cache.device_allocated_size = 0;
-        }
+        return Error{ErrorCode::InternalError, "Vulkan Gated DeltaNet execution failed"};
     }
 
     if (!normalized_ready)
@@ -453,18 +416,27 @@ Result<void> forward_gated_delta(const WeightStore& weights,
     }
     if (!fused_input)
     {
+        ActivationBuffer* quantized_input = scratch.fused_input.dtype() == DType::Float32
+                                                    && &scratch.fused_input != normalized
+                                                    && &scratch.fused_input != &hidden
+                                                ? &scratch.fused_input
+                                                : nullptr;
         if (backend != ExecutionBackend::Cpu
             || !forward_linear({&weights.at(plan.delta_qkv_weight),
                                 &weights.at(plan.delta_z_weight)},
                                *normalized, {&scratch.qkv, &scratch.z}, optimization_flags,
                                {operators.find_weight(plan.delta_qkv_weight),
                                 operators.find_weight(plan.delta_z_weight)},
-                               &scratch.fused_input))
+                               quantized_input))
         {
-            forward_linear(weights.at(plan.delta_qkv_weight), *normalized, scratch.qkv, optimization_flags,
-                           operators.find_weight(plan.delta_qkv_weight));
-            forward_linear(weights.at(plan.delta_z_weight), *normalized, scratch.z, optimization_flags,
-                           operators.find_weight(plan.delta_z_weight));
+            const TensorData& qkv = weights.at(plan.delta_qkv_weight);
+            const TensorData& z = weights.at(plan.delta_z_weight);
+            forward_linear(qkv, *normalized, scratch.qkv, optimization_flags,
+                           operators.find_weight(plan.delta_qkv_weight), ExecutionBackend::Cpu,
+                           qkv.input_column_indices.empty() ? nullptr : quantized_input);
+            forward_linear(z, *normalized, scratch.z, optimization_flags,
+                           operators.find_weight(plan.delta_z_weight), ExecutionBackend::Cpu,
+                           z.input_column_indices.empty() ? nullptr : quantized_input);
         }
         if (backend != ExecutionBackend::Cpu
             || !forward_linear({&weights.at(plan.delta_beta_weight),
@@ -472,12 +444,16 @@ Result<void> forward_gated_delta(const WeightStore& weights,
                                *normalized, {&scratch.beta, &scratch.alpha}, optimization_flags,
                                {operators.find_weight(plan.delta_beta_weight),
                                 operators.find_weight(plan.delta_alpha_weight)},
-                               &scratch.fused_input))
+                               quantized_input))
         {
-            forward_linear(weights.at(plan.delta_beta_weight), *normalized, scratch.beta, optimization_flags,
-                           operators.find_weight(plan.delta_beta_weight));
-            forward_linear(weights.at(plan.delta_alpha_weight), *normalized, scratch.alpha, optimization_flags,
-                           operators.find_weight(plan.delta_alpha_weight));
+            const TensorData& beta = weights.at(plan.delta_beta_weight);
+            const TensorData& alpha = weights.at(plan.delta_alpha_weight);
+            forward_linear(beta, *normalized, scratch.beta, optimization_flags,
+                           operators.find_weight(plan.delta_beta_weight), ExecutionBackend::Cpu,
+                           beta.input_column_indices.empty() ? nullptr : quantized_input);
+            forward_linear(alpha, *normalized, scratch.alpha, optimization_flags,
+                           operators.find_weight(plan.delta_alpha_weight), ExecutionBackend::Cpu,
+                           alpha.input_column_indices.empty() ? nullptr : quantized_input);
         }
     }
     scratch.recurrent_output.reset(hidden.rows(),
@@ -516,7 +492,8 @@ Result<void> forward_gated_delta(const WeightStore& weights,
                    scratch.recurrent_output,
                    projected,
                    optimization_flags,
-                   operators.find_weight(plan.output_weight));
+                   operators.find_weight(plan.output_weight),
+                   backend);
     if (!has_flag(plan.flags, AttentionBlockExternalResidual))
         add_batch_inplace(projected, hidden);
     if (&projected != &output)
@@ -536,10 +513,7 @@ bool forward_gated_delta_batch(const WeightStore& weights,
     if (entries.empty())
         return true;
     const CompiledOperator& gated_delta_operator = operators.at(plan.gated_delta_vulkan_operator);
-    if (backend != ExecutionBackend::Vulkan
-        || !gated_delta_operator.gated_delta
-        || entries.size() == 1)
-    {
+    const auto forward_each = [&]() {
         for (GatedDeltaBatchEntry& entry : entries)
         {
             if (!entry.hidden || !entry.scratch || !entry.cache || !entry.output)
@@ -557,18 +531,31 @@ bool forward_gated_delta_batch(const WeightStore& weights,
                 return false;
         }
         return true;
+    };
+    if (backend != ExecutionBackend::Vulkan
+        || !gated_delta_operator.gated_delta
+        || entries.size() == 1)
+    {
+        return forward_each();
     }
 
     device_entries.clear();
+    // Validate the complete batch before normalizing any row. A transaction
+    // without an existing device mirror cannot enter the batch kernel, while
+    // its single-row Vulkan path can still initialize and execute state.
+    if (std::any_of(entries.begin(), entries.end(), [](const GatedDeltaBatchEntry& entry) {
+            return !entry.hidden || !entry.scratch || !entry.cache || !entry.output
+                   || entry.hidden->rows() != 1
+                   || (entry.cache->transaction.active
+                       && !entry.cache->gated_delta_device_state);
+        }))
+    {
+        return forward_each();
+    }
+
     device_entries.reserve(entries.size());
     for (GatedDeltaBatchEntry& entry : entries)
     {
-        if (!entry.hidden || !entry.scratch || !entry.cache || !entry.output
-            || entry.hidden->rows() != 1)
-        {
-            device_entries.clear();
-            break;
-        }
         const ActivationBuffer* normalized = entry.hidden;
         if (plan.pre_attention_norm_weight != invalid_tensor_handle)
         {
@@ -613,23 +600,7 @@ bool forward_gated_delta_batch(const WeightStore& weights,
     // The batch path is an optimization for independent decode rows.  If a
     // device allocation or dispatch is unavailable, preserve the established
     // per-Session implementation and its failure-path state handoff.
-    for (GatedDeltaBatchEntry& entry : entries)
-    {
-        if (!entry.hidden || !entry.scratch || !entry.cache || !entry.output)
-            return false;
-        auto executed = forward_gated_delta(weights,
-                                            operators,
-                                            plan,
-                                            backend,
-                                            *entry.cache,
-                                            *entry.scratch,
-                                            *entry.hidden,
-                                            *entry.output,
-                                            optimization_flags);
-        if (!executed)
-            return false;
-    }
-    return true;
+    return forward_each();
 }
 
 } // namespace moe

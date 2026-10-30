@@ -17,6 +17,8 @@ namespace moe {
 class AttentionCache_vulkan;
 class GatedDeltaState_vulkan;
 class LatentCache_vulkan;
+class QsaCache_vulkan;
+class PleState_vulkan;
 
 struct LatentVectorUndo
 {
@@ -154,6 +156,8 @@ struct LayerCache
     // incomplete final block retains raw BF16 keys.
     std::vector<float> qsa_block_keys;
     std::vector<uint16_t> qsa_index_key_tail;
+    std::shared_ptr<QsaCache_vulkan> qsa_device_state;
+    std::shared_ptr<PleState_vulkan> ple_device_state;
     std::vector<int32_t> ple_token_history;
     std::vector<float> ple_convolution_state;
     // Physical row of the oldest token in ple_convolution_state.
@@ -199,7 +203,7 @@ struct LayerCache
             return static_cast<uint64_t>(gated_delta_convolution.size() + gated_delta_recurrent.size()) * sizeof(float)
                    + auxiliary_size;
         }
-        if (gated_delta_device_state)
+        if (gated_delta_device_state || qsa_device_state || ple_device_state)
         {
             return device_allocated_size + auxiliary_size;
         }

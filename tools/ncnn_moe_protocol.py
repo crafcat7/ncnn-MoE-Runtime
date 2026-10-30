@@ -34,8 +34,8 @@ class WorkerClient:
         self.model = Path(model).resolve()
         if not self.worker.is_file():
             raise WorkerError(f"worker does not exist: {self.worker}")
-        if not self.model.is_dir():
-            raise WorkerError(f"model directory does not exist: {self.model}")
+        if not self.model.is_dir() and not (self.model.is_file() and self.model.suffix.lower() == ".gguf"):
+            raise WorkerError(f"model directory or GGUF file does not exist: {self.model}")
         self._process = subprocess.Popen(
             [str(self.worker), str(self.model), *map(str, runtime_args)],
             stdin=subprocess.PIPE,

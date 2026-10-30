@@ -1,0 +1,77 @@
+#version 450
+
+layout(binding = 0) readonly buffer raw_blob
+{ float raw_data[]; };
+layout(binding = 1) readonly buffer norm_blob
+{ float norm_data[]; };
+layout(binding = 2) readonly buffer frequency_blob
+{ float frequency_data[]; };
+layout(binding = 3) writeonly buffer output_blob
+{ float output_data[]; };
+layout(push_constant) uniform parameter
+{
+    uint first_block;
+    uint blocks;
+    uint dimension;
+    uint ratio;
+    uint rope_dimension;
+    uint start_position;
+    float epsilon;
+    float weight_offset;
+    float concentration;
+}
+p;
+
+shared float pooled[512];
+shared float partial[32];
+
+float round_bf16(float value)
+{
+    uint bits = floatBitsToUint(value);
+    return uintBitsToFloat((bits + 0x7fffu + ((bits >> 16u) & 1u)) & 0xffff0000u);
+}
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint unit = gl_WorkGroupID.x + gl_WorkGroupID.z * gl_NumWorkGroups.x;
+    const uint block = p.first_block + unit;
+    if (unit >= p.blocks)
+        return;
+    float sum = 0.0;
+    for (uint c = lane; lane < 32u && c < p.dimension; c += 32u)
+    {
+        float value = 0.0;
+        for (uint token = 0u; token < p.ratio; ++token)
+            value += raw_data[(block * p.ratio + token) * p.dimension + c];
+        value = round_bf16(value / float(p.ratio));
+        pooled[c] = value;
+        sum += value * value;
+    }
+    if (lane < 32u)
+        partial[lane] = sum;
+    barrier();
+    for (uint stride = 16u; stride != 0u; stride >>= 1u)
+    {
+        if (lane < stride)
+            partial[lane] += partial[lane + stride];
+        barrier();
+    }
+    const float scale = inversesqrt(partial[0] / float(p.dimension) + p.epsilon);
+    const uint half_rope = p.rope_dimension / 2u;
+    for (uint c = lane; lane < 32u && c < p.dimension; c += 32u)
+    {
+        float value = pooled[c] * scale * (norm_data[c] + p.weight_offset);
+        if (c < p.rope_dimension)
+        {
+            const uint pair = c % half_rope;
+            const float angle = float(p.start_position + block * p.ratio) * frequency_data[pair];
+            const float first = pooled[pair] * scale * (norm_data[pair] + p.weight_offset);
+            const float second = pooled[half_rope + pair] * scale * (norm_data[half_rope + pair] + p.weight_offset);
+            value = (c < half_rope ? first * cos(angle) - second * sin(angle)
+                                   : first * sin(angle) + second * cos(angle))
+                    * p.concentration;
+        }
+        output_data[block * p.dimension + c] = value;
+    }
+}

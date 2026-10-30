@@ -26,18 +26,27 @@ struct TensorData;
 enum class ExecutionBackend;
 
 // Input and output must be distinct; existing output capacity is reused.
+void forward_dense_ffn(const CompiledModel& model,
+                       const ExpertPlan& ffn,
+                       const ActivationBuffer& input,
+                       ActivationBuffer& output,
+                       ExpertWorkspace& workspace,
+                       ExecutionBackend backend);
+
 void forward_shared_expert(const CompiledModel& model,
                            const MoeBlockPlan& moe,
                            const ActivationBuffer& input,
                            ActivationBuffer& output,
                            ExpertWorkspace& workspace,
                            const std::shared_ptr<const DeviceTensor_vulkan>& device_input = {},
-                           std::shared_ptr<const DeviceTensor_vulkan>* device_output = nullptr);
+                           std::shared_ptr<const DeviceTensor_vulkan>* device_output = nullptr,
+                           bool require_device_execution = false);
 
 bool support_vulkan_expert(const ExpertPlan& expert,
                            const TensorData& gate_up,
                            const TensorData& down,
-                           uint64_t optimization_flags);
+                           uint64_t optimization_flags,
+                           const TensorData* up = nullptr);
 
 ExpertVictimExecutionMetadata victim_metadata(const CompiledModel& model,
                                               const ExpertPlan& expert,
@@ -60,7 +69,7 @@ void prepare_experts(const MoeBlockPlan& moe,
 [[nodiscard]] Result<void> forward_moe(const CompiledModel& model,
                                        const MoeBlockPlan& moe,
                                        LayerState& layer_state,
-                                       SessionStatistics& stats,
+                                       SessionStatistics* stats,
                                        ExpertScratch& scratch,
                                        uint32_t residency_group,
                                        ExecutionBackend backend,

@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any, TextIO
 
 try:
-    from ncnn_moe_adapters import AdapterError, Completion, ModelAdapter, NATIVE_TEXT_VERSION, create_adapter
+    from ncnn_moe_adapters import (
+        AdapterError, Completion, ModelAdapter, NATIVE_TEXT_VERSION, create_adapter,
+        model_asset_root, model_config_path, model_weight_files, weight_fingerprint_samples,
+    )
     from ncnn_moe_protocol import WorkerClient, WorkerError
     from ncnn_moe_state import (
         SessionStore,
@@ -25,7 +28,10 @@ try:
         runtime_args_from_settings,
     )
 except ModuleNotFoundError:  # Installed entry point: tools is a package.
-    from .ncnn_moe_adapters import AdapterError, Completion, ModelAdapter, NATIVE_TEXT_VERSION, create_adapter
+    from .ncnn_moe_adapters import (
+        AdapterError, Completion, ModelAdapter, NATIVE_TEXT_VERSION, create_adapter,
+        model_asset_root, model_config_path, model_weight_files, weight_fingerprint_samples,
+    )
     from .ncnn_moe_protocol import WorkerClient, WorkerError
     from .ncnn_moe_state import (
         SessionStore,
@@ -190,12 +196,24 @@ def _format_runtime_metrics(metrics: Any) -> str:
             f"{_format_metric_count(expert.get('gpu_cache_hit'))}"
             " / miss "
             f"{_format_metric_count(expert.get('gpu_cache_miss'))}"
-            " / exec "
+            " / exec batches "
             f"{_format_metric_count(expert.get('gpu_executions'))}"
             " / resident "
             f"{_format_bytes_gb(expert.get('gpu_cache_resident_bytes'))}"
             " / dropped "
             f"{_format_metric_count(expert.get('gpu_cache_dropped_admissions'))}",
+            "  Expert routes: total "
+            f"{_format_metric_count(expert.get('assignments'))}"
+            " / GPU "
+            f"{_format_metric_count(expert.get('gpu_routes'))}"
+            " / CPU "
+            f"{_format_metric_count(expert.get('cpu_routes'))}"
+            " · batches total/CPU "
+            f"{_format_metric_count(expert.get('batches'))}"
+            "/"
+            f"{_format_metric_count(expert.get('cpu_batches'))}"
+            " · CPU fallbacks "
+            f"{_format_metric_count(expert.get('cpu_fallbacks'))}",
             f"  Process CPU: {process_cpu_text}",
             "  GPU: submit "
             f"{_format_metric_count(gpu.get('submit_count'), available=gpu_available)}"
@@ -221,13 +239,19 @@ def _format_runtime_metrics(metrics: Any) -> str:
             f"{_format_metric_count(gpu.get('attention_cache_materializations'), available=gpu_available)}"
             " / attention-cpu-fallback "
             f"{_format_metric_count(gpu.get('attention_cpu_fallbacks'), available=gpu_available)}",
+            "  Device blocks: Qwen "
+            f"{_format_metric_count(gpu.get('qwen_layers'), available=gpu_available)}"
+            " / gated-residual "
+            f"{_format_metric_count(gpu.get('gated_residual_blocks'), available=gpu_available)}"
+            " / PLE "
+            f"{_format_metric_count(gpu.get('ple_blocks'), available=gpu_available)}",
         )
     )
 
 
 def _add_model_position(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("model_pos", nargs="?", help="Model directory")
-    parser.add_argument("--model", dest="model_opt", help="Model directory")
+    parser.add_argument("--model", dest="model_opt", help="Model directory or GGUF file")
 
 
 def _add_worker_options(parser: argparse.ArgumentParser) -> None:
@@ -256,10 +280,8 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expected-concurrency", type=int)
     expert_io_group = parser.add_mutually_exclusive_group()
     expert_io_group.add_argument("--mmap-experts", action="store_true", default=None)
-    expert_io_group.add_argument("--direct-expert-io", action="store_true", default=None)
     expert_io_group.add_argument("--buffered-expert-io", action="store_true", default=None)
     parser.add_argument("--disable-gpu-victim-execution", action="store_true", default=None)
-    parser.add_argument("--release-vulkan-dense-host", action="store_true", default=None)
     parser.add_argument("--disable-vulkan-joint-cache-eviction", action="store_true", default=None)
     parser.add_argument("--disable-vulkan-mxfp4-row-tile", action="store_true", default=None)
     parser.add_argument("--disable-vulkan-expert-direct-staging", action="store_true", default=None)
@@ -297,7 +319,6 @@ def _add_generation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--top-p", type=float)
     parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--no-speculative", action="store_true")
     parser.add_argument("--speculative-confidence", type=float, default=0.5)
     parser.add_argument("--speculative-max-draft", type=int, default=0)
     _add_metrics_options(parser)
@@ -383,11 +404,17 @@ def resolve_model(arguments: argparse.Namespace, *, required: bool = True) -> Pa
     value = getattr(arguments, "model_opt", None) or getattr(arguments, "model_pos", None)
     if not value:
         if required:
-            raise ValueError("a model directory is required; pass --model PATH or a positional model")
+            raise ValueError("a model path is required; pass --model PATH or a positional model")
         return None
     model = Path(value).expanduser().resolve()
-    if not model.is_dir():
-        raise ValueError(f"model directory does not exist: {model}")
+    if not model.is_dir() and not (model.is_file() and model.suffix.lower() == ".gguf"):
+        raise ValueError(f"model directory or GGUF file does not exist: {model}")
+    if model.is_dir() and not model_config_path(model).is_file() and not model_weight_files(model):
+        raise ValueError(
+            f"no model files found directly in directory: {model}; "
+            "expected config.json or .gguf files. Subdirectories are not searched; "
+            "pass the directory containing the model files or a GGUF file"
+        )
     return model
 
 
@@ -439,15 +466,18 @@ def find_worker(explicit: str | None, root: Path) -> Path:
 
 def lightweight_model_fingerprint(model: Path) -> str:
     digest = hashlib.sha256()
-    digest.update((model / "config.json").read_bytes())
-    for path in sorted(model.rglob("*.safetensors")):
-        digest.update(path.relative_to(model).as_posix().encode("utf-8"))
+    config = model_config_path(model)
+    if config.is_file():
+        digest.update(config.read_bytes())
+    root = model_asset_root(model)
+    for path in model_weight_files(model):
+        relative = path.name if path.suffix.lower() == ".gguf" else path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
         digest.update(str(path.stat().st_size).encode("ascii"))
-        with path.open("rb") as stream:
-            digest.update(stream.read(4096))
-            if path.stat().st_size > 4096:
-                stream.seek(-4096, 2)
-                digest.update(stream.read(4096))
+        head, tail = weight_fingerprint_samples(path)
+        digest.update(head)
+        if tail:
+            digest.update(tail)
     return digest.hexdigest()[:20]
 
 
@@ -465,10 +495,8 @@ def cli_runtime_settings(arguments: argparse.Namespace) -> dict[str, Any]:
         "vulkan_devices",
         "expected_concurrency",
         "mmap_experts",
-        "direct_expert_io",
         "buffered_expert_io",
         "disable_gpu_victim_execution",
-        "release_vulkan_dense_host",
         "disable_vulkan_joint_cache_eviction",
         "disable_vulkan_mxfp4_row_tile",
         "disable_vulkan_expert_direct_staging",
@@ -558,7 +586,7 @@ def open_worker(
 
 def default_generation_values(adapter: ModelAdapter, arguments: argparse.Namespace) -> tuple[float, int, float]:
     if arguments.temperature is None:
-        temperature = 0.0 if adapter.name == "gpt-oss" else 1.0
+        temperature = 1.0
     else:
         temperature = arguments.temperature
     if arguments.top_k is None:
@@ -691,7 +719,6 @@ class ConversationApp:
             self.native_session_id,
             seed=arguments.seed,
             prefill_chunk_size=arguments.prefill_chunk_size,
-            enable_speculative_context=not arguments.no_speculative,
         )
         replay_succeeded = False
         if record and self.messages:
@@ -1179,7 +1206,6 @@ class ConversationApp:
             "top_k": top_k,
             "top_p": top_p,
             "min_p": self.arguments.min_p,
-            "enable_speculative": not self.arguments.no_speculative,
             "speculative_confidence": self.arguments.speculative_confidence,
             "speculative_max_draft": self.arguments.speculative_max_draft,
             "metrics_enabled": metrics_trace_enabled(self.arguments),
@@ -1249,8 +1275,6 @@ class ConversationApp:
         if completion.answer:
             print("[answer]")
             print(completion.answer)
-        elif not self.arguments.stream:
-            print(completion.reasoning)
 
     def status_after(self, done: dict[str, Any], reused: bool) -> None:
         metrics = done.get("metrics", {})
@@ -1420,7 +1444,7 @@ class ConversationApp:
                 continue
             try:
                 completion, done, reused = self.send(line)
-                if not self.arguments.stream or not completion.answer:
+                if not self.arguments.stream:
                     self.display_completion(completion)
                 self.status_after(done, reused)
             except (AdapterError, WorkerError, ValueError) as error:
@@ -1450,6 +1474,7 @@ def load_adapter(arguments: argparse.Namespace, model: Path, ready: dict[str, An
         model,
         thinking=thinking,
         native_stop_tokens=stop_tokens,
+        native_model_info=model_info,
     )
 
 
@@ -1473,7 +1498,7 @@ def run_command(arguments: argparse.Namespace) -> int:
             ephemeral=True,
         )
         completion, done, reused = app.send(prompt)
-        if not arguments.stream or not completion.answer:
+        if not arguments.stream:
             app.display_completion(completion)
         app.status_after(done, reused)
         return 0

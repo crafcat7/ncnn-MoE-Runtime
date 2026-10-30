@@ -44,19 +44,6 @@ bool prepare_staging_batch(ncnn::VkMat& buffer,
     return true;
 }
 
-bool prepare_staging_tensor(ncnn::VkMat& buffer,
-                            int width,
-                            int height,
-                            int channels,
-                            size_t element_size,
-                            ncnn::VkAllocator* allocator)
-{
-    buffer.create(width, height, channels, element_size, allocator);
-    if (buffer.empty() || !buffer.mapped_ptr())
-        return false;
-    return true;
-}
-
 bool record_mapped_upload(ncnn::VkMat& staging,
                           ncnn::VkMat& destination,
                           ncnn::VkCompute& command,
@@ -100,7 +87,28 @@ bool record_mapped_activation_upload(ncnn::VkMat& staging,
     if (vulkan_activation_storage_variant(option) == 0)
     {
         if (source_dtype == DType::Float32)
-            return record_mapped_upload(staging, destination, command, option);
+        {
+            if (!device || !staging.allocator || !option.blob_vkallocator
+                || staging.allocator->vkdev != device || option.blob_vkallocator->vkdev != device
+                || staging.empty() || !staging.mapped_ptr()
+                || staging.dims < 1 || staging.dims > 4
+                || staging.elemsize != sizeof(float) || staging.elempack != 1)
+                return false;
+            staging.allocator->flush(staging.data);
+            staging.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
+            staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
+            device->convert_packing(staging, destination, 1, 1, command, option);
+            if (destination.empty() || destination.dims != staging.dims
+                || destination.w != staging.w || destination.h != staging.h
+                || destination.d != staging.d || destination.c != staging.c
+                || destination.elemsize != staging.elemsize || destination.elempack != staging.elempack)
+                return false;
+#if NCNN_BATCH
+            if (destination.n != staging.n)
+                return false;
+#endif
+            return true;
+        }
         if (!device || staging.empty() || !staging.mapped_ptr())
             return false;
         staging.allocator->flush(staging.data);
@@ -137,13 +145,6 @@ ncnn::VkMat bind_direct_host_input(ncnn::VkMat& staging)
 {
     staging.allocator->flush(staging.data);
     staging.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
-    staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
-    return staging;
-}
-
-ncnn::VkMat prepare_direct_host_output(ncnn::VkMat& staging)
-{
-    staging.data->access_flags = VK_ACCESS_HOST_READ_BIT;
     staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
     return staging;
 }
@@ -561,8 +562,34 @@ std::vector<GpuInfo> get_gpu_infos()
 VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& vulkan_runtime) noexcept
 {
 #if NCNN_MOE_WITH_VULKAN
-    return vulkan_runtime ? vulkan_runtime->state.snapshot()
-                          : VulkanStatistics{};
+    if (!vulkan_runtime)
+        return {};
+
+    const auto& state = vulkan_runtime->state;
+    VulkanStatistics result;
+    result.dispatches = state.dispatches.load();
+    result.int4_dispatches = state.int4_dispatches.load();
+    result.attention_blocks = state.attention_blocks.load();
+    result.compute_submissions = state.compute_submissions.load();
+    result.batch_uploads = state.batch_uploads.load();
+    result.batch_downloads = state.batch_downloads.load();
+    result.attention_qkv_rope_fusions = state.attention_qkv_rope_fusions.load();
+    result.attention_device_rope_fusions = state.attention_device_rope_fusions.load();
+    result.attention_qkv_ring_fusions = state.attention_qkv_ring_fusions.load();
+    result.attention_decode_sdpa_fusions = state.attention_decode_sdpa_fusions.load();
+    result.attention_cache_materializations = state.attention_cache_materializations.load();
+    result.attention_cpu_fallbacks = state.attention_cpu_fallbacks.load();
+    result.shared_expert_swiglu_fusions = state.shared_expert_swiglu_fusions.load();
+    result.gated_delta_fusions = state.gated_delta_fusions.load();
+    result.gated_delta_submissions = state.gated_delta_submissions.load();
+    result.rms_norm_linear_fusions = state.rms_norm_linear_fusions.load();
+    result.kv_ring_appends = state.kv_ring_appends.load();
+    result.bfloat16_cooperative_matrix_dispatches = state.bfloat16_cooperative_matrix_dispatches.load();
+    result.command_graph_submissions = state.command_graph_submissions.load();
+    result.command_graph_operations = state.command_graph_operations.load();
+    result.kv_ring_resizes = state.kv_ring_resizes.load();
+    result.kv_ring_wrapped_views = state.kv_ring_wrapped_views.load();
+    return result;
 #else
     (void)vulkan_runtime;
     return {};
@@ -570,34 +597,6 @@ VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& vulkan_runtime) n
 }
 
 #if NCNN_MOE_WITH_VULKAN
-VulkanStatistics VulkanRuntimeState::snapshot() const noexcept
-{
-    VulkanStatistics result;
-    result.dispatches = dispatches.load();
-    result.attention_blocks = attention_blocks.load();
-    result.compute_submissions = compute_submissions.load();
-    result.batch_uploads = batch_uploads.load();
-    result.batch_downloads = batch_downloads.load();
-    result.attention_qkv_rope_fusions = attention_qkv_rope_fusions.load();
-    result.attention_device_rope_fusions = attention_device_rope_fusions.load();
-    result.attention_qkv_ring_fusions = attention_qkv_ring_fusions.load();
-    result.attention_decode_sdpa_fusions = attention_decode_sdpa_fusions.load();
-    result.attention_cache_materializations = attention_cache_materializations.load();
-    result.attention_cpu_fallbacks = attention_cpu_fallbacks.load();
-    result.shared_expert_swiglu_fusions = shared_expert_swiglu_fusions.load();
-    result.gated_delta_fusions = gated_delta_fusions.load();
-    result.gated_delta_submissions = gated_delta_submissions.load();
-    result.rms_norm_linear_fusions = rms_norm_linear_fusions.load();
-    result.kv_ring_appends = kv_ring_appends.load();
-    result.bfloat16_cooperative_matrix_dispatches = bfloat16_cooperative_matrix_dispatches.load();
-    result.command_buffer_reuses = command_buffer_reuses.load();
-    result.command_graph_submissions = command_graph_submissions.load();
-    result.command_graph_operations = command_graph_operations.load();
-    result.kv_ring_resizes = kv_ring_resizes.load();
-    result.kv_ring_wrapped_views = kv_ring_wrapped_views.load();
-    return result;
-}
-
 int wait_submitted_compute(ncnn::VkCompute& command, const ncnn::VulkanDevice* probe_device)
 {
     struct WaitContext

@@ -6,15 +6,19 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace ncnn {
 namespace moe {
 
-// Qn_K uses 256-value blocks; Q8_K is the activation format for dot products.
+// Qn_K uses 256-value blocks; Q8_K is the activation format for its dot products.
+// This is also the maximum scratch size. Native row strides use qnk_block_size.
 inline constexpr uint32_t qnk_block_elements = 256;
 
+[[nodiscard]] uint32_t qnk_block_size(DType dtype) noexcept;
 [[nodiscard]] size_t qnk_block_bytes(DType dtype) noexcept;
 [[nodiscard]] uint64_t qnk_storage_bytes(DType dtype, size_t rows, uint32_t columns) noexcept;
 [[nodiscard]] uint64_t qnk_packed_storage_bytes(DType dtype, size_t rows, uint32_t columns) noexcept;
@@ -28,7 +32,6 @@ struct QnKPack
     size_t rows = 0;
     uint32_t columns = 0;
     uint32_t block_count = 0;
-    uint32_t tile_rows = 8;
 
     void clear() noexcept
     {
@@ -36,13 +39,12 @@ struct QnKPack
         rows = 0;
         columns = 0;
         block_count = 0;
-        tile_rows = 8;
     }
 
     [[nodiscard]] bool valid() const noexcept
     {
         return is_qnk_dtype(dtype) && rows != 0 && columns != 0 && block_count != 0
-               && tile_rows == 8 && !storage.empty();
+               && !storage.empty();
     }
 };
 
@@ -50,10 +52,10 @@ struct QnKPack
                                                      size_t row,
                                                      uint32_t block) noexcept
 {
-    const size_t tile = row / weights.tile_rows;
-    const size_t lane = row % weights.tile_rows;
+    const size_t tile = row / 8;
+    const size_t lane = row % 8;
     const size_t block_bytes = qnk_block_bytes(weights.dtype);
-    const size_t offset = (((tile * weights.block_count + block) * weights.tile_rows + lane) * block_bytes);
+    const size_t offset = (((tile * weights.block_count + block) * 8 + lane) * block_bytes);
     return weights.storage.data() + offset;
 }
 
@@ -75,11 +77,11 @@ void qnk_q8k_quantize(const float* source,
                                     uint32_t columns,
                                     QnKPack& output) noexcept;
 
-[[nodiscard]] bool forward_linear_qnk(const TensorData& matrix,
+[[nodiscard]] bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
                                       const ActivationBuffer& input,
-                                      ActivationBuffer& output,
+                                      std::initializer_list<ActivationBuffer*> outputs,
                                       bool use_packed_weights,
-                                      std::shared_ptr<const QnKPack>* sidecar = nullptr) noexcept;
+                                      std::span<std::shared_ptr<const QnKPack>* const> sidecars = {}) noexcept;
 
 } // namespace moe
 } // namespace ncnn

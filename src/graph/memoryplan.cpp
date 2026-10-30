@@ -4,16 +4,22 @@
 
 #include "kernels/mxfp4.h"
 #include "kernels/qnk.h"
+#include "kernels/int4.h"
 
 #include <algorithm>
+#include <charconv>
 #include <limits>
+#include <map>
+#include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace ncnn {
 namespace moe {
 
 static constexpr uint64_t gibibyte = 1024ull * 1024ull * 1024ull;
+static constexpr uint64_t mebibyte = 1024ull * 1024ull;
 
 static Result<uint64_t> checked_add(uint64_t left, uint64_t right, const char* name)
 {
@@ -37,7 +43,7 @@ static Result<uint64_t> matrix_storage_size(uint64_t rows, uint64_t columns, DTy
     if (dtype == DType::Float8E4M3)
     {
         const uint64_t scale_count = ((rows + 127) / 128) * ((columns + 127) / 128);
-        return checked_add(elements.value(), scale_count, name);
+        return checked_add(elements.value(), scale_count * sizeof(float), name);
     }
     if (is_qnk_dtype(dtype))
     {
@@ -77,7 +83,7 @@ static Result<void> add_vector_size(uint64_t count, uint64_t element_size, const
     return {};
 }
 
-static Result<uint64_t> latent_fp8_dense_size(const MoeModelDescriptor& descriptor)
+static Result<uint64_t> latent_dense_size(const MoeModelDescriptor& descriptor)
 {
     uint64_t total = 0;
     const uint64_t element_size = descriptor.activation_dtype == DType::BFloat16 ? 2 : 4;
@@ -158,7 +164,9 @@ static Result<uint64_t> latent_fp8_dense_size(const MoeModelDescriptor& descript
         const AttentionDescriptor& attention = layer.attention;
         const MoeDescriptor& moe = layer.moe;
         if (attention.kind != AttentionKind::MultiHeadLatent
-            || attention.projection_weight_dtype != DType::Float8E4M3
+            || (attention.projection_weight_dtype != DType::Float8E4M3
+                && attention.projection_weight_dtype != DType::BFloat16
+                && attention.projection_weight_dtype != DType::Q8_0)
             || attention.output_group_count == 0
             || attention.head_count % attention.output_group_count != 0)
         {
@@ -288,7 +296,9 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
     if (descriptor.layers.empty()
         || descriptor.hyper_connection_multiplier <= 1
         || descriptor.layers.front().attention.kind != AttentionKind::MultiHeadLatent
-        || descriptor.layers.front().attention.projection_weight_dtype != DType::Float8E4M3)
+        || (descriptor.layers.front().attention.projection_weight_dtype != DType::Float8E4M3
+            && descriptor.layers.front().attention.projection_weight_dtype != DType::BFloat16
+            && descriptor.layers.front().attention.projection_weight_dtype != DType::Q8_0))
     {
         return uint64_t{0};
     }
@@ -296,7 +306,7 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
     uint64_t total = 0;
     Result<void> status = add_matrix_size(descriptor.vocabulary_size,
                                           descriptor.hidden_size,
-                                          DType::BFloat16,
+                                          descriptor.activation_dtype,
                                           "Vulkan LM head",
                                           total);
     if (!status)
@@ -306,7 +316,9 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
     {
         const AttentionDescriptor& attention = layer.attention;
         if (attention.kind != AttentionKind::MultiHeadLatent
-            || attention.projection_weight_dtype != DType::Float8E4M3
+            || (attention.projection_weight_dtype != DType::Float8E4M3
+                && attention.projection_weight_dtype != DType::BFloat16
+                && attention.projection_weight_dtype != DType::Q8_0)
             || attention.output_group_count == 0
             || attention.head_count % attention.output_group_count != 0)
         {
@@ -324,7 +336,7 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
         {
             status = add_matrix_size(matrix.first,
                                      matrix.second,
-                                     DType::Float8E4M3,
+                                     attention.projection_weight_dtype,
                                      "Vulkan latent projection",
                                      total);
             if (!status)
@@ -334,14 +346,16 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
         {
             status = add_matrix_size(static_cast<uint64_t>(attention.index_head_count) * attention.index_head_dimension,
                                      attention.query_lora_rank,
-                                     DType::Float8E4M3,
+                                     attention.projection_weight_dtype,
                                      "Vulkan index query",
                                      total);
             if (!status)
                 return status.error();
         }
 
-        if (layer.moe.shared_expert_count != 0)
+        // FP8 shared projections retain their CPU fallback host weights.
+        if (layer.moe.shared_expert_count != 0
+            && layer.moe.shared_expert_weight_dtype != DType::Float8E4M3)
         {
             status = add_matrix_size(layer.moe.intermediate_size,
                                      descriptor.hidden_size,
@@ -371,12 +385,14 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
 
 static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
 {
-    const bool latent_fp8 = !descriptor.layers.empty()
-                            && descriptor.hyper_connection_multiplier > 1
-                            && descriptor.layers.front().attention.kind == AttentionKind::MultiHeadLatent
-                            && descriptor.layers.front().attention.projection_weight_dtype == DType::Float8E4M3;
-    if (latent_fp8)
-        return latent_fp8_dense_size(descriptor);
+    const bool latent = !descriptor.layers.empty()
+                        && descriptor.hyper_connection_multiplier > 1
+                        && descriptor.layers.front().attention.kind == AttentionKind::MultiHeadLatent
+                        && (descriptor.layers.front().attention.projection_weight_dtype == DType::Float8E4M3
+                            || descriptor.layers.front().attention.projection_weight_dtype == DType::BFloat16
+                            || descriptor.layers.front().attention.projection_weight_dtype == DType::Q8_0);
+    if (latent)
+        return latent_dense_size(descriptor);
 
     const uint64_t element_size = descriptor.activation_dtype == DType::BFloat16 ? 2 : 4;
     auto embedding_elements = checked_multiply(descriptor.vocabulary_size, descriptor.hidden_size, "embedding");
@@ -510,6 +526,21 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
         }
 
         uint64_t layer_auxiliary_size = 0;
+        if (layer.dense.enabled())
+        {
+            auto status = add_matrix_size(layer.dense.intermediate_size, descriptor.hidden_size,
+                                          layer.dense.gate_weight_dtype, "dense FFN gate", layer_auxiliary_size);
+            if (!status)
+                return status.error();
+            status = add_matrix_size(layer.dense.intermediate_size, descriptor.hidden_size,
+                                     layer.dense.up_weight_dtype, "dense FFN up", layer_auxiliary_size);
+            if (!status)
+                return status.error();
+            status = add_matrix_size(descriptor.hidden_size, layer.dense.intermediate_size,
+                                     layer.dense.down_weight_dtype, "dense FFN down", layer_auxiliary_size);
+            if (!status)
+                return status.error();
+        }
         if (layer.ple.enabled())
         {
             if (layer.ple.ngram_size < 2 || layer.ple.heads_per_ngram == 0)
@@ -559,7 +590,10 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
                                                   "PLE metadata");
             if (!metadata_size)
                 return metadata_size.error();
-            layer_auxiliary_size = metadata_size.value();
+            auto auxiliary_size = checked_add(layer_auxiliary_size, metadata_size.value(), "layer auxiliary weights");
+            if (!auxiliary_size)
+                return auxiliary_size.error();
+            layer_auxiliary_size = auxiliary_size.value();
         }
 
         if (descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
@@ -848,10 +882,328 @@ static Result<uint64_t> packed_expert_pair_size(const MoeModelDescriptor& descri
     return checked_add(gate_up.value(), down.value(), "packed expert pair");
 }
 
+enum class QnkExpertEncoding
+{
+    None,
+    FileBacked,
+    Unsupported
+};
+
+static bool mapped_ple_embedding_shard(const std::string& name, const TensorData& tensor,
+                                       const MoeModelDescriptor& descriptor) noexcept
+{
+    if (!tensor.mapped_data || tensor.mapped_size == 0 || tensor.shape.size() != 2 || tensor.shape[0] == 0)
+        return false;
+    const std::string_view canonical = name;
+    constexpr std::string_view prefix = "layers.";
+    constexpr std::string_view marker = ".ple.embedding_shard.";
+    if (!canonical.starts_with(prefix))
+        return false;
+    const size_t separator = canonical.find(marker, prefix.size());
+    if (separator == std::string_view::npos)
+        return false;
+    const std::string_view layer_name = canonical.substr(prefix.size(), separator - prefix.size());
+    const std::string_view shard_name = canonical.substr(separator + marker.size());
+    if (layer_name.empty() || shard_name.empty()
+        || (layer_name.size() > 1 && layer_name.front() == '0')
+        || (shard_name.size() > 1 && shard_name.front() == '0'))
+        return false;
+    uint32_t layer_index = 0;
+    uint32_t shard_index = 0;
+    const auto layer = std::from_chars(layer_name.data(), layer_name.data() + layer_name.size(), layer_index);
+    const auto shard = std::from_chars(shard_name.data(), shard_name.data() + shard_name.size(), shard_index);
+    if (layer.ec != std::errc{} || layer.ptr != layer_name.data() + layer_name.size()
+        || shard.ec != std::errc{} || shard.ptr != shard_name.data() + shard_name.size()
+        || layer_index >= descriptor.layers.size())
+        return false;
+    const PleDescriptor& ple = descriptor.layers[layer_index].ple;
+    if (!ple.enabled() || ple.ngram_size < 2 || ple.heads_per_ngram == 0
+        || shard_index >= ple.embedding_shard_count || tensor.shape[0] > ple.embedding_row_count)
+        return false;
+    const uint64_t heads = static_cast<uint64_t>(ple.ngram_size - 1) * ple.heads_per_ngram;
+    return ple.embedding_dimension % heads == 0 && tensor.shape[1] == ple.embedding_dimension / heads;
+}
+
+static Result<uint64_t> qwen_vulkan_releasable_dense_size(const MoeModelDescriptor& descriptor,
+                                                          const Option& opt, const WeightMapping& weights)
+{
+    const uint64_t required_flags = OptimizationVulkanAttention | OptimizationVulkanQnK
+                                    | OptimizationVulkanExpertGpuPriority | OptimizationVulkanCommandGraph;
+    if (opt.hybrid_mode != HybridMode::HybridExperts
+        || descriptor.hyper_connection_kind != HyperConnectionKind::GatedResidual
+        || descriptor.layers.empty()
+        || has_flag(opt.flags, OptionDisableGpuExpertExecution)
+        || (opt.optimization_flags & required_flags) != required_flags)
+        return uint64_t{0};
+    for (const LayerDescriptor& layer : descriptor.layers)
+    {
+        if (layer.attention.kind != AttentionKind::GatedDeltaNet
+            && (layer.attention.kind != AttentionKind::Standard
+                || !has_flag(layer.attention.flags, AttentionDescriptorQsa)
+                || !has_flag(layer.attention.flags, AttentionDescriptorQueryKeyNorm)))
+            return uint64_t{0};
+    }
+    // The strict continuous chain rejects FP8 rather than retaining a CPU
+    // execution path. Do not predict its release for that unsupported case.
+    for (const auto& [name, tensor] : weights)
+    {
+        (void)name;
+        if (tensor.dtype == DType::Float8E4M3)
+            return uint64_t{0};
+    }
+
+    std::set<std::string> released_names;
+    const auto add = [&](const std::string& name) {
+        const auto found = weights.find(name);
+        if (found != weights.end()
+            && (found->second.dtype == DType::Float32 || found->second.dtype == DType::BFloat16
+                || found->second.dtype == DType::Q8_0))
+            released_names.insert(name);
+    };
+    add("lm_head.weight");
+    for (size_t index = 0; index < descriptor.layers.size(); ++index)
+    {
+        const LayerDescriptor& layer = descriptor.layers[index];
+        const std::string prefix = "layers." + std::to_string(index) + ".";
+        if (layer.attention.kind == AttentionKind::GatedDeltaNet)
+        {
+            for (const char* name : {"attention.delta.qkv.weight", "attention.delta.z.weight",
+                                     "attention.delta.beta.weight", "attention.delta.alpha.weight",
+                                     "attention.output.weight"})
+                add(prefix + name);
+        }
+        else
+        {
+            // QSA owns its projections internally, so their host copies stay.
+            // Its public attention operator releases only these two norms.
+            add(prefix + "attention.query_norm.weight");
+            add(prefix + "attention.key_norm.weight");
+        }
+        if (layer.moe.shared_expert_count != 0)
+        {
+            const std::string shared = prefix + "shared_expert.";
+            const auto gate = weights.find(shared + "gate.weight");
+            const auto up = weights.find(shared + "up.weight");
+            const auto down = weights.find(shared + "down.weight");
+            if (gate != weights.end() && up != weights.end() && down != weights.end()
+                && gate->second.dtype == DType::Q8_0 && up->second.dtype == DType::Q8_0
+                && down->second.dtype == DType::Q8_0)
+            {
+                add(shared + "gate.weight");
+                add(shared + "up.weight");
+                add(shared + "down.weight");
+            }
+        }
+    }
+
+    struct MappedOwner
+    {
+        uint64_t bytes = 0;
+        bool retained = false;
+    };
+    std::map<std::shared_ptr<const uint8_t>, MappedOwner, std::owner_less<std::shared_ptr<const uint8_t>>> owners;
+    uint64_t released = 0;
+    for (const auto& [name, tensor] : weights)
+    {
+        const bool release = released_names.contains(name);
+        if (tensor.mapped_data)
+        {
+            auto& owner = owners[tensor.mapped_data];
+            owner.bytes = std::max(owner.bytes, tensor.mapped_size);
+            owner.retained = owner.retained || !release;
+        }
+        if (!release)
+            continue;
+        // Match release_tensor_host_storage, not logical tensor dimensions:
+        // auxiliary metadata and native non-Q8 blocks are never reclaimed.
+        const uint64_t count = tensor.dtype == DType::Float32    ? tensor.float32_data.size()
+                               : tensor.dtype == DType::BFloat16 ? tensor.bfloat16_data.size()
+                                                                 : tensor.quantized_data.size();
+        const uint64_t width = tensor.dtype == DType::Float32    ? sizeof(float)
+                               : tensor.dtype == DType::BFloat16 ? sizeof(uint16_t)
+                                                                 : 1;
+        auto bytes = checked_multiply(count, width, "resident Qwen owned dense release");
+        if (!bytes)
+            return bytes.error();
+        auto total = checked_add(released, bytes.value(), "resident Qwen dense release");
+        if (!total)
+            return total.error();
+        released = total.value();
+    }
+    for (const auto& [owner, state] : owners)
+    {
+        (void)owner;
+        if (!state.retained)
+        {
+            // A tied embedding or any other surviving alias retains the
+            // complete owner, exactly as final host-release accounting does.
+            auto total = checked_add(released, state.bytes, "resident Qwen mapped dense release");
+            if (!total)
+                return total.error();
+            released = total.value();
+        }
+    }
+    return released;
+}
+
+static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeModelDescriptor& descriptor,
+                                        ModelMemoryPlan& plan, uint64_t& expert_fixed_size,
+                                        uint64_t& max_qnk_cache_pair_size,
+                                        QnkExpertEncoding& qnk_encoding)
+{
+    struct MappedExpertSize
+    {
+        uint64_t total = 0;
+        uint64_t raw = 0;
+        uint64_t metadata = 0;
+    };
+    // WeightMapping owns these names for the lifetime of this local aggregation.
+    std::map<std::string_view, MappedExpertSize> expert_sizes;
+    bool found = false;
+    bool qnk_only = true;
+    bool file_backed = true;
+    for (const auto& [name, tensor] : weights)
+    {
+        uint64_t bytes = tensor.dtype == DType::Int4
+                             ? int4_storage_bytes(tensor)
+                             : tensor.mapped_size
+                                   + tensor.float32_data.size() * sizeof(float)
+                                   + tensor.bfloat16_data.size() * sizeof(uint16_t)
+                                   + tensor.int64_data.size() * sizeof(int64_t)
+                                   + tensor.int8_data.size()
+                                   + tensor.quantized_data.size()
+                                   + tensor.quantization_scales.size() * sizeof(float)
+                                   + tensor.input_column_indices.size() * sizeof(uint32_t)
+                                   + tensor.mxfp4_blocks.size() + tensor.mxfp4_scales.size();
+        // PLE accesses mapped table rows on demand. Its immutable file pages
+        // are reclaimable rather than fixed resident storage. Keep every owned
+        // allocation and metadata byte, including when a mapped view coexists.
+        if (mapped_ple_embedding_shard(name, tensor, descriptor) && tensor.mapped_size <= bytes)
+            bytes -= tensor.mapped_size;
+        uint64_t file_size = 0;
+        if (tensor.mxfp4_file_storage)
+        {
+            const auto& storage = *tensor.mxfp4_file_storage;
+            auto stored = checked_add(storage.blocks_size, storage.secondary_blocks_size, "mapped Expert blocks");
+            if (!stored)
+                return stored.error();
+            stored = checked_add(stored.value(), storage.scales_size, "mapped Expert scales");
+            if (!stored)
+                return stored.error();
+            stored = checked_add(stored.value(), storage.secondary_scales_size, "mapped Expert scales");
+            if (!stored)
+                return stored.error();
+            file_size = stored.value();
+            auto total = checked_add(bytes, file_size, "mapped Expert storage");
+            if (!total)
+                return total.error();
+            bytes = total.value();
+        }
+        const size_t marker = name.find(".experts.");
+        if (marker != std::string::npos)
+        {
+            if (name.ends_with(".weight"))
+            {
+                if (is_qnk_dtype(tensor.dtype))
+                {
+                    found = true;
+                    file_backed = file_backed && static_cast<bool>(tensor.mxfp4_file_storage);
+                }
+                else
+                {
+                    qnk_only = false;
+                }
+            }
+
+            const size_t end = name.find('.', marker + 9);
+            if (end == std::string::npos)
+                return Error{ErrorCode::InvalidModel, "invalid canonical Expert tensor name: " + name};
+            MappedExpertSize& expert_size = expert_sizes[std::string_view(name.data(), end)];
+            auto total = checked_add(expert_size.total, bytes, "mapped Expert weights");
+            if (!total)
+                return total.error();
+            expert_size.total = total.value();
+            if (tensor.dtype == DType::MxFp4 || is_qnk_dtype(tensor.dtype))
+            {
+                if (tensor.input_column_indices.size()
+                    > std::numeric_limits<uint64_t>::max() / sizeof(uint32_t))
+                {
+                    return Error{ErrorCode::InvalidModel, "Qn_K column-map byte count overflows"};
+                }
+                const uint64_t metadata = static_cast<uint64_t>(tensor.input_column_indices.size())
+                                          * sizeof(uint32_t);
+                auto fixed_metadata = checked_add(expert_fixed_size, metadata,
+                                                  "fixed Qn_K Expert metadata");
+                if (!fixed_metadata)
+                    return fixed_metadata.error();
+                expert_fixed_size = fixed_metadata.value();
+                auto expert_total = checked_add(expert_size.metadata, metadata,
+                                                "Qn_K Expert metadata");
+                if (!expert_total)
+                    return expert_total.error();
+                expert_size.metadata = expert_total.value();
+
+                if (metadata > bytes)
+                    return Error{ErrorCode::InvalidModel, "Expert metadata exceeds its storage"};
+                const uint64_t raw_size = tensor.mxfp4_file_storage ? file_size : bytes - metadata;
+                auto raw = checked_add(expert_size.raw, raw_size, "native Expert blocks");
+                if (!raw)
+                    return raw.error();
+                expert_size.raw = raw.value();
+            }
+            else
+            {
+                auto resident = checked_add(expert_fixed_size, bytes, "resident non-Qn_K Expert weights");
+                if (!resident)
+                    return resident.error();
+                expert_fixed_size = resident.value();
+            }
+        }
+        else
+        {
+            auto total = checked_add(plan.estimated_dense_size, bytes, "mapped dense weights");
+            if (!total)
+                return total.error();
+            plan.estimated_dense_size = total.value();
+        }
+    }
+    qnk_encoding = !found ? QnkExpertEncoding::None
+                          : (qnk_only && file_backed ? QnkExpertEncoding::FileBacked
+                                                     : QnkExpertEncoding::Unsupported);
+    for (const auto& [name, expert_size] : expert_sizes)
+    {
+        (void)name;
+        auto total = checked_add(plan.estimated_expert_size, expert_size.total, "mapped Expert weights");
+        if (!total)
+            return total.error();
+        plan.estimated_expert_size = total.value();
+        plan.expert_pair_size = std::max(plan.expert_pair_size, expert_size.total);
+
+        auto resident_metadata = checked_multiply(expert_size.metadata, 2,
+                                                  "resident Qn_K Expert metadata");
+        if (!resident_metadata)
+            return resident_metadata.error();
+        auto resident_pair = checked_add(expert_size.raw, resident_metadata.value(),
+                                         "resident Qn_K Expert pair");
+        if (!resident_pair)
+            return resident_pair.error();
+        max_qnk_cache_pair_size = std::max(max_qnk_cache_pair_size, resident_pair.value());
+    }
+    plan.expert_pair_resident_size = plan.expert_pair_size;
+    plan.estimated_expert_resident_size = plan.estimated_expert_size;
+    auto active = checked_multiply(plan.expert_pair_size, descriptor.experts_per_token, "mapped active Experts");
+    if (!active)
+        return active.error();
+    plan.minimum_active_expert_size = active.value();
+    return {};
+}
+
 Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, const Option& opt, uint64_t physical_memory_size,
-                                          bool release_vulkan_dense_host_storage,
+                                          bool use_vulkan_dense,
                                           uint64_t available_memory_size,
-                                          bool reserve_cpu_packed_weights)
+                                          bool reserve_cpu_packed_weights,
+                                          const WeightMapping* weights,
+                                          bool use_vulkan_attention)
 {
     if (opt.expert_memory_mode != ExpertMemoryMode::Auto
         && opt.expert_memory_mode != ExpertMemoryMode::Eager
@@ -862,6 +1214,9 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
 
     ModelMemoryPlan plan;
     bool budget_limited_by_available_memory = false;
+    uint64_t expert_fixed_size = 0;
+    uint64_t max_qnk_cache_pair_size = 0;
+    QnkExpertEncoding qnk_encoding = QnkExpertEncoding::None;
     plan.requested_mode = opt.expert_memory_mode;
     plan.physical_memory_size = physical_memory_size;
     plan.available_memory_size = available_memory_size;
@@ -894,16 +1249,42 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         plan.host_memory_budget = 8 * gibibyte;
     }
 
-    auto estimated_dense = dense_size(descriptor);
-    if (!estimated_dense)
-        return estimated_dense.error();
+    if (weights)
+    {
+        if (reserve_cpu_packed_weights)
+            return Error{ErrorCode::UnsupportedModel, "native imported weights require CpuPackedWeightMode::Disabled"};
+        auto sizes = mapped_weight_sizes(*weights, descriptor, plan,
+                                         expert_fixed_size,
+                                         max_qnk_cache_pair_size,
+                                         qnk_encoding);
+        if (!sizes)
+            return sizes.error();
+    }
+    else
+    {
+        auto estimated_dense = dense_size(descriptor);
+        if (!estimated_dense)
+            return estimated_dense.error();
+        plan.estimated_dense_size = estimated_dense.value();
+    }
     // PLE embedding shards remain file-backed and are paged on demand.  The
     // dense estimate covers only their resident projections and state.
-    plan.estimated_dense_size = estimated_dense.value();
 
     if (descriptor.layers.empty())
         return Error{ErrorCode::InvalidModel, "memory planner requires at least one layer"};
-    const MoeDescriptor& moe = descriptor.layers.front().moe;
+    if (std::all_of(descriptor.layers.begin(), descriptor.layers.end(), [](const LayerDescriptor& layer) {
+            return layer.dense.enabled();
+        }))
+    {
+        plan.selected_mode = ExpertMemoryMode::Eager;
+        return plan;
+    }
+    const auto first_moe = std::find_if(descriptor.layers.begin(), descriptor.layers.end(), [](const LayerDescriptor& layer) {
+        return !layer.dense.enabled();
+    });
+    const MoeDescriptor& moe = first_moe->moe;
+    const bool has_qnk_experts = qnk_encoding != QnkExpertEncoding::None;
+    const bool file_backed_qnk_experts = qnk_encoding == QnkExpertEncoding::FileBacked;
     const auto add_expert_layers = [&](const MoeDescriptor& layer_moe,
                                        uint64_t layer_count) -> Result<void> {
         auto pair_size = expert_pair_size(descriptor, layer_moe.expert_weight_dtype);
@@ -952,31 +1333,36 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         plan.estimated_cpu_packed_expert_size = total_packed_expert_size.value();
         return {};
     };
-    for (const LayerDescriptor& layer : descriptor.layers)
+    if (!weights)
     {
-        auto status = add_expert_layers(layer.moe, 1);
-        if (!status)
-            return status.error();
+        for (const LayerDescriptor& layer : descriptor.layers)
+        {
+            if (layer.dense.enabled())
+                continue;
+            auto status = add_expert_layers(layer.moe, 1);
+            if (!status)
+                return status.error();
+        }
+        if (descriptor.speculative_layer_count != 0)
+        {
+            // MTP and D-Spark bind speculative gate/up weights as one 2I x H matrix.
+            MoeDescriptor speculative_moe = descriptor.layers.back().moe;
+            speculative_moe.layout = ExpertLayout::PackedGateUpDown;
+            auto status = add_expert_layers(speculative_moe, descriptor.speculative_layer_count);
+            if (!status)
+                return status.error();
+        }
+        auto active_size = checked_multiply(plan.expert_pair_resident_size, moe.top_k, "active experts");
+        if (!active_size)
+            return active_size.error();
+        plan.minimum_active_expert_size = active_size.value();
+        auto resident_expert_size = checked_add(plan.estimated_expert_size,
+                                                plan.estimated_cpu_packed_expert_size,
+                                                "resident expert weights");
+        if (!resident_expert_size)
+            return resident_expert_size.error();
+        plan.estimated_expert_resident_size = resident_expert_size.value();
     }
-    if (descriptor.speculative_layer_count != 0)
-    {
-        // MTP and D-Spark bind speculative gate/up weights as one 2I x H matrix.
-        MoeDescriptor speculative_moe = descriptor.layers.back().moe;
-        speculative_moe.layout = ExpertLayout::PackedGateUpDown;
-        auto status = add_expert_layers(speculative_moe, descriptor.speculative_layer_count);
-        if (!status)
-            return status.error();
-    }
-    auto active_size = checked_multiply(plan.expert_pair_resident_size, moe.top_k, "active experts");
-    if (!active_size)
-        return active_size.error();
-    plan.minimum_active_expert_size = active_size.value();
-    auto resident_expert_size = checked_add(plan.estimated_expert_size,
-                                            plan.estimated_cpu_packed_expert_size,
-                                            "resident expert weights");
-    if (!resident_expert_size)
-        return resident_expert_size.error();
-    plan.estimated_expert_resident_size = resident_expert_size.value();
 
     const uint64_t safety_reserve = budget_limited_by_available_memory
                                         ? 0
@@ -986,7 +1372,9 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
     {
         eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - safety_reserve;
     }
-    const auto supports_file_backed_experts = [](const MoeDescriptor& descriptor) {
+    const auto supports_file_backed_experts = [has_qnk_experts, file_backed_qnk_experts](const MoeDescriptor& descriptor) {
+        if (has_qnk_experts)
+            return file_backed_qnk_experts;
         return descriptor.expert_weight_dtype == DType::MxFp4
                || (descriptor.expert_weight_dtype == DType::BFloat16
                    && has_flag(descriptor.flags, MoeDescriptorFileBackedExperts));
@@ -1032,27 +1420,81 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         }
         return plan;
     }
+
+    // Reserve host budget for the idle staging pool, not peak upload memory.
+    uint64_t staging_reserve = 0;
+    if (opt.hybrid_mode == HybridMode::HybridExperts
+        && !has_flag(opt.flags, OptionDisableGpuExpertExecution))
+    {
+        const uint64_t device_count = opt.vulkan_device_indices.empty()
+                                          ? 1
+                                          : static_cast<uint64_t>(opt.vulkan_device_indices.size());
+        auto staging_capacity = checked_multiply(device_count, 64 * mebibyte,
+                                                 "GPU Expert staging reserve");
+        if (!staging_capacity)
+            return staging_capacity.error();
+        staging_reserve = opt.expert_gpu_cache_size != 0
+                              ? std::min(opt.expert_gpu_cache_size, staging_capacity.value())
+                              : staging_capacity.value();
+    }
+    const uint64_t cache_safety_reserve = std::max(safety_reserve, staging_reserve);
+    eager_capacity = plan.host_memory_budget > plan.estimated_dense_size
+                             && plan.host_memory_budget - plan.estimated_dense_size > cache_safety_reserve
+                         ? plan.host_memory_budget - plan.estimated_dense_size - cache_safety_reserve
+                         : 0;
     for (const LayerDescriptor& layer : descriptor.layers)
     {
+        if (layer.dense.enabled())
+            continue;
         if (!supports_file_backed_experts(layer.moe))
         {
             return Error{ErrorCode::UnsupportedModel, "on-demand mode requires a file-backed Expert encoding"};
         }
     }
 
-    if (release_vulkan_dense_host_storage)
+    if (use_vulkan_dense)
     {
-        auto releasable = latent_vulkan_releasable_dense_size(descriptor);
+        Result<uint64_t> releasable = uint64_t{0};
+        if (weights && descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
+        {
+            if (use_vulkan_attention)
+                releasable = qwen_vulkan_releasable_dense_size(descriptor, opt, *weights);
+        }
+        else
+            releasable = latent_vulkan_releasable_dense_size(descriptor);
         if (!releasable)
             return releasable.error();
-        plan.estimated_dense_size = releasable.value() >= plan.estimated_dense_size
-                                        ? 0
-                                        : plan.estimated_dense_size - releasable.value();
+        plan.estimated_vulkan_dense_host_release_size = std::min(releasable.value(), plan.estimated_dense_size);
+        plan.estimated_dense_size -= plan.estimated_vulkan_dense_host_release_size;
         eager_capacity = 0;
         if (plan.host_memory_budget > plan.estimated_dense_size
-            && plan.host_memory_budget - plan.estimated_dense_size > safety_reserve)
+            && plan.host_memory_budget - plan.estimated_dense_size > cache_safety_reserve)
         {
-            eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - safety_reserve;
+            eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - cache_safety_reserve;
+        }
+    }
+    if (plan.selected_mode == ExpertMemoryMode::OnDemand
+        && (file_backed_qnk_experts || (weights && moe.expert_weight_dtype == DType::MxFp4)))
+    {
+        auto fixed_resident = checked_add(plan.estimated_dense_size, expert_fixed_size,
+                                          "fixed Qn_K Expert weights");
+        if (!fixed_resident)
+            return fixed_resident.error();
+        plan.estimated_dense_size = fixed_resident.value();
+
+        plan.expert_pair_resident_size = max_qnk_cache_pair_size;
+        auto active = checked_multiply(plan.expert_pair_resident_size,
+                                       descriptor.experts_per_token,
+                                       "mapped active Experts");
+        if (!active)
+            return active.error();
+        plan.minimum_active_expert_size = active.value();
+
+        eager_capacity = 0;
+        if (plan.host_memory_budget > plan.estimated_dense_size
+            && plan.host_memory_budget - plan.estimated_dense_size > cache_safety_reserve)
+        {
+            eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - cache_safety_reserve;
         }
     }
     if (eager_capacity < plan.minimum_active_expert_size)
@@ -1062,7 +1504,13 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
 
     const uint64_t automatic_target = physical_memory_size == 0 ? 2 * gibibyte : eager_capacity;
     plan.expert_cache_size = opt.expert_cache_size != 0 ? opt.expert_cache_size : std::min(automatic_target, eager_capacity);
-    if (plan.expert_cache_size > plan.host_memory_budget - plan.estimated_dense_size)
+    const uint64_t host_capacity = plan.host_memory_budget > plan.estimated_dense_size
+                                       ? plan.host_memory_budget - plan.estimated_dense_size
+                                       : 0;
+    const uint64_t cache_limit = opt.expert_cache_size != 0
+                                     ? (host_capacity > staging_reserve ? host_capacity - staging_reserve : 0)
+                                     : eager_capacity;
+    if (plan.expert_cache_size > cache_limit)
     {
         return Error{ErrorCode::InvalidArgument, "expert cache and dense weights exceed the host memory budget"};
     }
@@ -1071,6 +1519,64 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         return Error{ErrorCode::InvalidArgument, "expert cache is smaller than one layer's active Expert set"};
     }
     return plan;
+}
+
+Result<void> finalize_model_memory_plan(ModelMemoryPlan& plan, const Option& opt,
+                                        uint64_t released_dense_host_size)
+{
+    auto retained_size = checked_add(plan.estimated_dense_size, plan.estimated_vulkan_dense_host_release_size,
+                                     "dense host storage before Vulkan reclamation");
+    if (!retained_size)
+        return retained_size.error();
+    plan.estimated_dense_size = retained_size.value() - std::min(retained_size.value(), released_dense_host_size);
+    plan.estimated_vulkan_dense_host_release_size = std::min(retained_size.value(), released_dense_host_size);
+    if (plan.selected_mode != ExpertMemoryMode::OnDemand)
+        return {};
+
+    const bool budget_limited_by_available_memory = opt.host_memory_budget == 0
+                                                    && plan.physical_memory_size != 0
+                                                    && plan.available_memory_size != 0
+                                                    && plan.host_memory_budget < plan.physical_memory_size / 4 * 3;
+    const uint64_t safety_reserve = budget_limited_by_available_memory
+                                        ? 0
+                                        : std::max(2 * gibibyte, plan.physical_memory_size == 0 ? 2 * gibibyte : plan.physical_memory_size / 8);
+    uint64_t staging_reserve = 0;
+    if (opt.hybrid_mode == HybridMode::HybridExperts
+        && !has_flag(opt.flags, OptionDisableGpuExpertExecution))
+    {
+        const uint64_t device_count = opt.vulkan_device_indices.empty()
+                                          ? 1
+                                          : static_cast<uint64_t>(opt.vulkan_device_indices.size());
+        auto staging_capacity = checked_multiply(device_count, 64 * mebibyte,
+                                                 "GPU Expert staging reserve");
+        if (!staging_capacity)
+            return staging_capacity.error();
+        staging_reserve = opt.expert_gpu_cache_size != 0
+                              ? std::min(opt.expert_gpu_cache_size, staging_capacity.value())
+                              : staging_capacity.value();
+    }
+    const uint64_t cache_safety_reserve = std::max(safety_reserve, staging_reserve);
+    const uint64_t host_capacity = plan.host_memory_budget > plan.estimated_dense_size
+                                       ? plan.host_memory_budget - plan.estimated_dense_size
+                                       : 0;
+    const uint64_t cache_capacity = host_capacity > cache_safety_reserve
+                                        ? host_capacity - cache_safety_reserve
+                                        : 0;
+    if (cache_capacity < plan.minimum_active_expert_size)
+        return Error{ErrorCode::InvalidArgument, "host memory budget cannot hold one layer's active Expert set"};
+    if (opt.expert_cache_size == 0)
+    {
+        const uint64_t automatic_target = plan.physical_memory_size == 0 ? 2 * gibibyte : cache_capacity;
+        plan.expert_cache_size = std::min(automatic_target, cache_capacity);
+    }
+    const uint64_t explicit_cache_capacity = host_capacity > staging_reserve
+                                                 ? host_capacity - staging_reserve
+                                                 : 0;
+    if (plan.expert_cache_size > (opt.expert_cache_size != 0 ? explicit_cache_capacity : cache_capacity))
+        return Error{ErrorCode::InvalidArgument, "expert cache and dense weights exceed the host memory budget"};
+    if (plan.expert_cache_size < plan.minimum_active_expert_size)
+        return Error{ErrorCode::InvalidArgument, "expert cache is smaller than one layer's active Expert set"};
+    return {};
 }
 
 } // namespace moe

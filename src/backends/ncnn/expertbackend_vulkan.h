@@ -171,23 +171,23 @@ private:
 class VulkanExpertBackend final : public ExpertBackend
 {
 public:
+    // The optional internal ceiling is for bounded allocator verification;
+    // normal callers use zero to derive logical capacity plus its allowance.
     VulkanExpertBackend(uint64_t _cache_size,
                         uint32_t _vulkan_device_index,
                         std::shared_ptr<VulkanExpertVictimCache> _device_weight_source,
                         VulkanRuntimePtr _vulkan_runtime,
-                        uint64_t _optimization_flags);
+                        uint64_t _optimization_flags,
+                        uint64_t physical_limit_bytes = 0);
 
     ~VulkanExpertBackend() override;
 
     void set_foreground_active(bool active) noexcept override;
 
-    void admit(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias, std::shared_ptr<const TensorData> down,
-               const TensorData* down_bias, uint32_t residency_group, float activation_limit,
-               ExpertActivation activation) override;
+    void admit(const ExpertDemandRequest& request) override;
 
-    bool prepare_demand(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias,
-                        std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
-                        float activation_limit, ExpertActivation activation, std::shared_ptr<const void>& pin) override;
+    bool prepare_demand(const ExpertDemandRequest& request,
+                        std::shared_ptr<const void>& pin) override;
 
     size_t prepare_demand_batch(std::span<const ExpertDemandRequest> requests,
                                 std::span<std::shared_ptr<const void>> pins) override;
@@ -195,11 +195,13 @@ public:
     std::unique_ptr<ExpertDemandSubmission> begin_demand_batch(std::span<const ExpertDemandRequest> requests) override;
     void set_residency_coordinator(std::shared_ptr<ExpertResidencyCoordinator> coordinator) override;
 
-    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertBackendRequest> requests) override;
+    std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertRequest> requests) override;
 
     void wait_for_background_work() override;
 
     ExpertBackendStatistics statistics() const override;
+    [[nodiscard]] uint64_t physical_bytes() const;
+    [[nodiscard]] uint64_t physical_limit_rejections() const;
 
 private:
     enum class ArcList
@@ -232,15 +234,20 @@ private:
 
     struct WorkItem
     {
-        std::vector<ExpertBackendRequest> client_requests;
-        std::vector<ExpertBackendRequest> requests;
+        std::vector<ExpertRequest> client_requests;
+        std::vector<ExpertRequest> requests;
         std::vector<ActivationBuffer> private_outputs;
         std::vector<std::shared_ptr<DeviceTensor_vulkan>> private_device_outputs;
         ActivationBuffer private_aggregation;
         std::vector<uint8_t> private_route_completed;
         std::vector<Selection> selected;
-        std::vector<ExpertBackendExecutionResult> planned;
-        std::vector<ExpertBackendExecutionResult> final;
+        std::vector<Selection> dispatch;
+        std::vector<const Bfloat16Expert_vulkan*> bfloat16_experts;
+        std::vector<const QnkExpert_vulkan*> qnk_experts;
+        std::vector<const ActivationBuffer*> inputs;
+        std::vector<ActivationBuffer*> outputs;
+        std::vector<ExpertStatus> planned;
+        std::vector<ExpertStatus> final;
         std::mutex mutex;
         std::condition_variable completed;
         bool done = false;
@@ -258,10 +265,10 @@ private:
 
         ~Submission() override;
 
-        std::span<const ExpertBackendExecutionResult> reservations() const noexcept override;
+        std::span<const ExpertStatus> reservations() const noexcept override;
 
-        std::vector<ExpertBackendExecutionResult> wait() override;
-        void wait(std::vector<ExpertBackendExecutionResult>& results) override;
+        std::vector<ExpertStatus> wait() override;
+        void wait(std::vector<ExpertStatus>& results) override;
 
         bool commit() override;
 
@@ -307,29 +314,31 @@ private:
         std::shared_ptr<const TensorData> down;
         std::shared_ptr<const TensorData> gate_up_bias;
         std::shared_ptr<const TensorData> down_bias;
+        std::shared_ptr<const TensorData> up;
+        std::shared_ptr<const TensorData> up_bias;
         float activation_limit = 0.0f;
         ExpertActivation activation = ExpertActivation::GptOssSwiGlu;
         uint32_t residency_group = 0;
         uint64_t size = 0;
     };
 
-    bool make_admission(std::string key, std::shared_ptr<const TensorData> gate_up, const TensorData* gate_up_bias,
-                        std::shared_ptr<const TensorData> down, const TensorData* down_bias, uint32_t residency_group,
-                        float activation_limit, ExpertActivation activation, PendingAdmission& admission) const;
+    bool make_admission(const ExpertDemandRequest& request, PendingAdmission& admission) const;
+    void enqueue_admission(PendingAdmission admission);
+    bool prepare_admission(PendingAdmission admission, std::shared_ptr<const void>& pin);
     std::shared_ptr<Entry> create_entry(const PendingAdmission& admission, VulkanWeightUploadBatch* upload_batch);
     bool install_entry_locked(std::shared_ptr<Entry>& entry);
 
     using GhostList = std::list<ExpertKeySize>;
     using GhostIndex = std::unordered_map<std::string, GhostList::iterator, ExpertKeyHash, std::equal_to<>>;
 
-    static bool route_aggregation_enabled(std::span<const ExpertBackendRequest> requests,
+    static bool route_aggregation_enabled(std::span<const ExpertRequest> requests,
                                           std::span<const Selection> selected,
                                           uint32_t output_columns,
                                           ActivationBuffer*& output,
                                           uint32_t& token_count,
                                           uint64_t optimization_flags);
 
-    static bool build_route_aggregation_metadata(std::span<const ExpertBackendRequest> requests,
+    static bool build_route_aggregation_metadata(std::span<const ExpertRequest> requests,
                                                  std::span<const Selection> selected,
                                                  std::vector<uint32_t>& offsets,
                                                  std::vector<uint32_t>& rows,
@@ -363,12 +372,15 @@ private:
 
     bool evict_one_locked(bool incoming_from_frequent, uint32_t incoming_group, uint64_t required);
 
-    bool forward_batch(std::span<const ExpertBackendRequest> requests, std::span<const Selection> selected);
+    bool forward_batch(std::span<const ExpertRequest> requests, std::span<const Selection> selected);
 
-    bool forward_bfloat16_batch(std::span<const ExpertBackendRequest> requests,
+    bool forward_bfloat16_batch(WorkItem& work, std::span<const ExpertRequest> requests,
                                 std::span<const Selection> selected);
 
-    bool forward_qnk_batch(std::span<const ExpertBackendRequest> requests, std::span<const Selection> selected);
+    bool forward_qnk_batch(WorkItem& work, std::span<const ExpertRequest> requests,
+                           std::span<const Selection> selected);
+    bool forward_device_batch(std::span<const ExpertRequest> requests,
+                              std::span<const Selection> selected);
 
     void execute_work_item(const std::shared_ptr<WorkItem>& work);
 
@@ -450,6 +462,23 @@ private:
 };
 
 #endif // NCNN_MOE_WITH_VULKAN
+
+// The executable cache's exact admission charge, shared with make_admission.
+// Native projections include aligned bias/metadata; packed BF16 and MXFP4
+// preserve their existing payload and explicit-bias residency accounting.
+// Returns zero when any matrix cannot be admitted or dispatched on this device.
+[[nodiscard]] uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
+                                                             const TensorData& down, uint32_t device_index,
+                                                             const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags);
+[[nodiscard]] uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
+                                                             const TensorData& down, uint32_t device_index,
+                                                             const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags,
+                                                             const TensorData* gate_up_bias, const TensorData* up_bias,
+                                                             const TensorData* down_bias, ExpertActivation activation,
+                                                             float activation_limit);
+
+[[nodiscard]] uint64_t native_quantized_gpu_cache_size(uint64_t available_size, uint64_t total_size,
+                                                       uint64_t largest_expert_size) noexcept;
 
 [[nodiscard]] std::shared_ptr<ExpertBackend> create_vulkan_expert_backend(uint64_t cache_size, uint32_t device_index,
                                                                           std::shared_ptr<ExpertVictimCache> device_weight_source,

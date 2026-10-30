@@ -16,11 +16,14 @@ class Linear;
 class Bfloat16Linear_vulkan;
 class Float8Linear_vulkan;
 class QnkLinear_vulkan;
+class QnkExpert_vulkan;
 class Attention_vulkan;
 class LatentAttention_vulkan;
 class LatentLayer_vulkan;
 class LayerHead_vulkan;
 class GatedDeltaNet_vulkan;
+class QsaAttention_vulkan;
+class QwenLayer_vulkan;
 struct Mxfp4Q8PackedMatrix;
 struct QnKPack;
 
@@ -32,11 +35,14 @@ struct CompiledOperator
     std::shared_ptr<Bfloat16Linear_vulkan> bfloat16;
     std::shared_ptr<Float8Linear_vulkan> float8;
     std::shared_ptr<QnkLinear_vulkan> qnk;
+    std::shared_ptr<QnkExpert_vulkan> qnk_expert;
     std::shared_ptr<Attention_vulkan> attention;
     std::shared_ptr<LatentAttention_vulkan> latent_attention;
     std::shared_ptr<LatentLayer_vulkan> latent_layer;
     std::shared_ptr<LayerHead_vulkan> layer_head;
     std::shared_ptr<GatedDeltaNet_vulkan> gated_delta;
+    std::shared_ptr<QsaAttention_vulkan> qsa_attention;
+    std::shared_ptr<QwenLayer_vulkan> qwen_layer;
 
     // Created lazily when the explicit CPU packed-weight option is enabled.
     mutable std::shared_ptr<const Mxfp4Q8PackedMatrix> mxfp4_q8_packed;

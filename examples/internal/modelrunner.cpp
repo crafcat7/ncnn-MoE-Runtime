@@ -166,7 +166,6 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                                                                     " [--disable-forward-aware-cache]"
                                                                     " [--disable-rank-adaptive-prefetch]"
                                                                     " [--disable-cross-expert-read-coalescing]"
-                                                                    " [--release-vulkan-dense-host]"
                                                                     " [--router-prediction] [--async-router-prediction]"
                                                                     " [--forward-aware-cache]"
                                                                     " [--rank-adaptive-prefetch] [--cross-expert-read-coalescing]"
@@ -174,7 +173,6 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                                                                     " [--vulkan-device N]"
                                                                     " [--vulkan-devices N[,N...]]"
                                                                     " [--mmap-experts]"
-                                                                    " [--direct-expert-io]"
                                                                     " [--buffered-expert-io]"
                                                                     " [--cache-warmup-runs N]"
                                                                     " [--parallel-sessions N]"
@@ -353,10 +351,6 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             {
                 opt.flags &= ~ncnn::moe::OptionCrossExpertReadCoalescing;
             }
-            else if (argument == "--release-vulkan-dense-host")
-            {
-                opt.flags |= ncnn::moe::OptionReleaseVulkanDenseHostStorage;
-            }
             else if (argument == "--router-prediction")
             {
                 opt.flags |= ncnn::moe::OptionRouterPrediction;
@@ -448,14 +442,14 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
             }
             else if (argument == "--mmap-experts")
             {
+                if (opt.expert_io_mode != ncnn::moe::ExpertIoMode::Auto && opt.expert_io_mode != ncnn::moe::ExpertIoMode::Mmap)
+                    throw std::invalid_argument("Expert mmap and buffered I/O modes are mutually exclusive");
                 opt.expert_io_mode = ncnn::moe::ExpertIoMode::Mmap;
-            }
-            else if (argument == "--direct-expert-io")
-            {
-                opt.expert_io_mode = ncnn::moe::ExpertIoMode::Direct;
             }
             else if (argument == "--buffered-expert-io")
             {
+                if (opt.expert_io_mode != ncnn::moe::ExpertIoMode::Auto && opt.expert_io_mode != ncnn::moe::ExpertIoMode::Buffered)
+                    throw std::invalid_argument("Expert mmap and buffered I/O modes are mutually exclusive");
                 opt.expert_io_mode = ncnn::moe::ExpertIoMode::Buffered;
             }
             else if (argument == "--cache-warmup-runs")
@@ -863,15 +857,15 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
                                                       ? static_cast<double>(generation.tokens.size()) / generation_seconds
                                                       : 0.0;
         const ncnn::moe::SessionStatistics statistics = active_sessions.front()->statistics();
-        uint64_t speculative_proposals = 0;
-        uint64_t speculative_draft_tokens = 0;
-        uint64_t speculative_accepted_tokens = 0;
-        for (const ncnn::moe::SessionPtr& session : active_sessions)
+        uint64_t speculative_proposals = statistics.speculative_proposals;
+        uint64_t speculative_draft_tokens = statistics.speculative_draft_tokens;
+        uint64_t speculative_accepted_tokens = statistics.speculative_accepted_tokens;
+        for (size_t session_index = 1; session_index < active_sessions.size(); ++session_index)
         {
-            const ncnn::moe::SessionStatistics session_statistics = session->statistics();
-            speculative_proposals += session_statistics.speculative_proposals;
-            speculative_draft_tokens += session_statistics.speculative_draft_tokens;
-            speculative_accepted_tokens += session_statistics.speculative_accepted_tokens;
+            const ncnn::moe::SessionMetrics session_metrics = active_sessions[session_index]->metrics();
+            speculative_proposals += session_metrics.cumulative.speculative_proposals;
+            speculative_draft_tokens += session_metrics.cumulative.speculative_draft_tokens;
+            speculative_accepted_tokens += session_metrics.cumulative.speculative_accepted_tokens;
         }
         std::cout << "generated " << generation.tokens.size() << " token(s) in " << generation_seconds << " s\n";
         if (!prompt_text.empty())

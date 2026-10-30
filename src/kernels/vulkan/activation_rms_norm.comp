@@ -28,12 +28,13 @@ void main()
     const uint row = gl_WorkGroupID.y;
     const uint lane = gl_LocalInvocationID.x;
     float square_sum = 0.0;
-    for (uint column = lane; column < p.columns; column += 32)
+    for (uint column = lane; lane < 32u && column < p.columns; column += 32)
     {
         const float value = input_data[row * p.columns + column];
         square_sum += value * value;
     }
-    partial[lane] = square_sum;
+    if (lane < 32u)
+        partial[lane] = square_sum;
     barrier();
     for (uint stride = 16; stride > 0; stride >>= 1)
     {
@@ -42,6 +43,6 @@ void main()
         barrier();
     }
     const float inverse_rms = inversesqrt(partial[0] / float(p.columns) + p.epsilon);
-    for (uint column = lane; column < p.columns; column += 32)
+    for (uint column = lane; lane < 32u && column < p.columns; column += 32)
         output_data[row * p.columns + column] = input_data[row * p.columns + column] * inverse_rms * (weight_data[column] + p.weight_offset);
 }

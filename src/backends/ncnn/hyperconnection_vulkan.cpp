@@ -1,4 +1,6 @@
 #include "hyperconnection_vulkan.h"
+#include "linear.h"
+#include "rmsnorm_vulkan.h"
 #include "vulkancontext.h"
 
 #if NCNN_MOE_WITH_VULKAN
@@ -12,6 +14,7 @@
 #include <pipeline.h>
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -103,6 +106,8 @@ public:
     ncnn::VkMat function;
     ncnn::VkMat scale;
     ncnn::VkMat base;
+    std::shared_ptr<QnkLinear_vulkan> native_projection;
+    std::shared_ptr<RmsNorm_vulkan> norm;
     uint32_t columns = 0;
     uint32_t output_columns = 0;
     uint32_t copies = 0;
@@ -110,19 +115,29 @@ public:
     float norm_epsilon = 0.0f;
     float hyper_epsilon = 0.0f;
     bool head = false;
+    uint64_t device_bytes = 0;
     std::shared_ptr<ncnn::Pipeline> project_pipeline;
     std::shared_ptr<ncnn::Pipeline> mix_pipeline;
     std::shared_ptr<ncnn::Pipeline> reduce_pipeline;
     std::shared_ptr<ncnn::Pipeline> post_pipeline;
 
-    void record_project(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& cmd) const
+    bool record_project(const ncnn::VkMat& input, ncnn::VkMat& output,
+                        ncnn::VkMat& normalized, ncnn::VkCompute& cmd) const
     {
+        if (native_projection)
+        {
+            if (!norm->record(input, normalized, cmd))
+                return false;
+            native_projection->record(normalized, output, cmd);
+            return true;
+        }
         std::vector<ncnn::vk_constant_type> constants(3);
         constants[0].u32 = columns;
         constants[1].u32 = output_columns;
         constants[2].f = norm_epsilon;
         prepare_hyper_weight_read(function);
         record_hyper_pipeline(project_pipeline.get(), {input, function, output}, constants, 128, output_columns, input.h, cmd);
+        return true;
     }
 
     void record_mix(const ncnn::VkMat& projection, ncnn::VkMat& pre,
@@ -155,6 +170,24 @@ HyperConnection_vulkan::HyperConnection_vulkan()
 
 HyperConnection_vulkan::~HyperConnection_vulkan() = default;
 
+uint64_t HyperConnection_vulkan::device_bytes() const noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    return d->device_bytes;
+#else
+    return 0;
+#endif
+}
+
+uint32_t HyperConnection_vulkan::int4_ops() const noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    return d->native_projection && d->native_projection->dtype() == DType::Int4 ? 1u : 0u;
+#else
+    return 0;
+#endif
+}
+
 std::shared_ptr<HyperConnection_vulkan> HyperConnection_vulkan::create(const TensorData& function,
                                                                        const TensorData& scale,
                                                                        const TensorData& base,
@@ -167,17 +200,21 @@ std::shared_ptr<HyperConnection_vulkan> HyperConnection_vulkan::create(const Ten
                                                                        uint64_t optimization_flags)
 {
 #if NCNN_MOE_WITH_VULKAN
+    const bool native_projection = function.dtype == DType::Int4 || is_qnk_dtype(function.dtype)
+                                   || function.dtype == DType::BFloat16
+                                   || (function.dtype == DType::Float32 && !function.input_column_indices.empty());
     if (multiplier == 0 || multiplier > 8 || norm_epsilon <= 0.0f || hyper_epsilon <= 0.0f
         || !std::isfinite(norm_epsilon) || !std::isfinite(hyper_epsilon)
-        || function.dtype != DType::Float32 || function.shape.size() != 2 || function.shape[1] == 0
+        || (!native_projection && function.dtype != DType::Float32) || function.shape.size() != 2 || function.shape[1] == 0
         || function.shape[1] % multiplier != 0 || function.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max())
-        || function.float32_values().size() != function.element_count()
+        || (!native_projection && function.float32_values().size() != function.element_count())
         || base.dtype != DType::Float32 || base.shape.size() != 1
         || base.shape[0] != function.shape[0] || base.float32_values().size() != function.shape[0]
         || scale.dtype != DType::Float32)
         return {};
     const bool head = function.shape[0] == multiplier;
     if ((!head && function.shape[0] != multiplier * (multiplier + 2))
+        || scale.shape != std::vector<uint32_t>{head ? 1u : 3u}
         || scale.float32_values().size() != (head ? 1u : 3u)
         || (!head && sinkhorn_iterations == 0)
         || function.element_count() > std::numeric_limits<uint32_t>::max())
@@ -205,30 +242,60 @@ std::shared_ptr<HyperConnection_vulkan> HyperConnection_vulkan::create(const Ten
     implementation.opt.blob_vkallocator = context->blob_allocator();
     implementation.opt.workspace_vkallocator = context->blob_allocator();
     implementation.opt.staging_vkallocator = context->staging_allocator();
+    if (native_projection)
+    {
+        implementation.native_projection = QnkLinear_vulkan::create(function, nullptr, vulkan_device_index,
+                                                                    vulkan_runtime, optimization_flags);
+        if (!implementation.native_projection || implementation.native_projection->vulkan_context() != context
+            || vulkan_activation_storage_variant(implementation.native_projection->option()) != 0)
+            return {};
+        TensorData norm_weight;
+        norm_weight.dtype = DType::Float32;
+        norm_weight.shape = {implementation.columns};
+        norm_weight.float32_data.assign(implementation.columns, 1.0f);
+        implementation.norm = RmsNorm_vulkan::create(norm_weight, norm_epsilon, 0.0f, context, implementation.opt);
+        if (!implementation.norm)
+            return {};
+    }
     const std::lock_guard<std::mutex> lock(context->command_mutex());
-    if (!create_hyper_pipeline(context, implementation.opt, hyper_connection_project_shader, static_cast<int>(sizeof(hyper_connection_project_shader) - 1), implementation.project_pipeline)
+    if ((!native_projection && !create_hyper_pipeline(context, implementation.opt, hyper_connection_project_shader, static_cast<int>(sizeof(hyper_connection_project_shader) - 1), implementation.project_pipeline))
         || !create_hyper_pipeline(context, implementation.opt, hyper_connection_mix_shader, static_cast<int>(sizeof(hyper_connection_mix_shader) - 1), implementation.mix_pipeline)
         || !create_hyper_pipeline(context, implementation.opt, hyper_connection_reduce_shader, static_cast<int>(sizeof(hyper_connection_reduce_shader) - 1), implementation.reduce_pipeline)
         || !create_hyper_pipeline(context, implementation.opt, hyper_connection_post_shader, static_cast<int>(sizeof(hyper_connection_post_shader) - 1), implementation.post_pipeline))
         return {};
-    ncnn::Mat function_host(static_cast<int>(implementation.columns), static_cast<int>(implementation.output_columns), sizeof(float));
+    ncnn::Mat function_host;
     ncnn::Mat scale_host(static_cast<int>(scale.float32_values().size()), sizeof(float));
     ncnn::Mat base_host(static_cast<int>(base.float32_values().size()), sizeof(float));
-    if (function_host.empty() || scale_host.empty() || base_host.empty())
+    if (scale_host.empty() || base_host.empty())
         return {};
-    function_host.fill(0.0f);
-    std::memcpy(function_host.data, function.float32_values().data(), static_cast<size_t>(function.element_count()) * sizeof(float));
+    if (!native_projection)
+    {
+        function_host.create(static_cast<int>(implementation.columns), static_cast<int>(implementation.output_columns), sizeof(float));
+        if (function_host.empty())
+            return {};
+        std::memcpy(function_host.data, function.float32_values().data(), static_cast<size_t>(function.element_count()) * sizeof(float));
+    }
     std::memcpy(scale_host.data, scale.float32_values().data(), scale_host.total() * sizeof(float));
     std::memcpy(base_host.data, base.float32_values().data(), base_host.total() * sizeof(float));
     ncnn::VkCompute cmd(context->device());
     // record_upload packs a 2-D matrix along its rows even when packing layout is disabled.
     // These shaders address the original row-major FP32 values, so preserve pack1 storage.
-    cmd.record_clone(function_host, implementation.function, implementation.opt);
+    if (!native_projection)
+        cmd.record_clone(function_host, implementation.function, implementation.opt);
     cmd.record_clone(scale_host, implementation.scale, implementation.opt);
     cmd.record_clone(base_host, implementation.base, implementation.opt);
-    if (implementation.function.empty() || implementation.scale.empty() || implementation.base.empty()
+    if ((!native_projection && implementation.function.empty()) || implementation.scale.empty() || implementation.base.empty()
         || submit_compute_and_wait(cmd, context->device()) != 0)
         return {};
+    const uint64_t alignment = std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
+    const auto aligned_bytes = [alignment](uint64_t bytes) { return (bytes + alignment - 1) / alignment * alignment; };
+    implementation.device_bytes = aligned_bytes(scale.element_count() * sizeof(float))
+                                  + aligned_bytes(base.element_count() * sizeof(float));
+    if (native_projection)
+        implementation.device_bytes += implementation.native_projection->device_bytes()
+                                       + aligned_bytes(static_cast<uint64_t>(implementation.columns) * sizeof(float));
+    else
+        implementation.device_bytes += aligned_bytes(function.element_count() * sizeof(float));
     ++context->runtime_state().compute_submissions;
     return result;
 #else
@@ -281,7 +348,7 @@ bool HyperConnection_vulkan::record_pre(const ncnn::VkMat& input,
         || static_cast<uint32_t>(input.h) > d->context->device()->info.max_workgroup_count_y()
         || static_cast<uint32_t>(input.h) > d->context->device()->info.max_workgroup_count_z()
         || &input == &result.reduced || &input == &result.post || &input == &result.combine
-        || &input == &workspace.projection || &input == &workspace.pre)
+        || &input == &workspace.normalized || &input == &workspace.projection || &input == &workspace.pre)
         return false;
     HyperConnectionMix_vulkan next;
     HyperConnectionWorkspace_vulkan work;
@@ -293,7 +360,8 @@ bool HyperConnection_vulkan::record_pre(const ncnn::VkMat& input,
         || !allocate_hyper_buffer(work.projection, d->output_columns, input.h, d->context)
         || !allocate_hyper_buffer(work.pre, d->copies, input.h, d->context))
         return false;
-    d->record_project(input, work.projection, cmd);
+    if (!d->record_project(input, work.projection, work.normalized, cmd))
+        return false;
     d->record_mix(work.projection, work.pre, next.post, next.combine, cmd);
     d->record_reduce(input, work.pre, next.reduced, cmd);
     result = std::move(next);
@@ -334,8 +402,8 @@ bool HyperConnection_vulkan::record_head(const ncnn::VkMat& input,
     if (!d->head || !valid_hyper_buffer(input, d->columns, input.h) || &output == &input
         || static_cast<uint32_t>(input.h) > d->context->device()->info.max_workgroup_count_y()
         || static_cast<uint32_t>(input.h) > d->context->device()->info.max_workgroup_count_z()
-        || &input == &workspace.projection || &input == &workspace.pre
-        || &output == &workspace.projection || &output == &workspace.pre)
+        || &input == &workspace.normalized || &input == &workspace.projection || &input == &workspace.pre
+        || &output == &workspace.normalized || &output == &workspace.projection || &output == &workspace.pre)
         return false;
     HyperConnectionWorkspace_vulkan work;
     work.context = d->context;
@@ -344,7 +412,8 @@ bool HyperConnection_vulkan::record_head(const ncnn::VkMat& input,
         || !allocate_hyper_buffer(work.projection, d->output_columns, input.h, d->context)
         || !allocate_hyper_buffer(work.pre, d->copies, input.h, d->context))
         return false;
-    d->record_project(input, work.projection, cmd);
+    if (!d->record_project(input, work.projection, work.normalized, cmd))
+        return false;
     ncnn::VkMat unused_post;
     ncnn::VkMat unused_combine;
     d->record_mix(work.projection, work.pre, unused_post, unused_combine, cmd);

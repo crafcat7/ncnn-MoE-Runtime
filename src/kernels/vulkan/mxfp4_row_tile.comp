@@ -10,6 +10,8 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #endif
 
+layout(constant_id = 0) const uint workgroup_size = 32;
+
 layout(binding = 0) readonly buffer input_blob
 {
     float input_data[];
@@ -84,10 +86,8 @@ vec4 mxfp4_products(float value, vec4 inputs, float scale)
 #endif
 }
 
-#if !(ncnn_subgroup_basic && ncnn_subgroup_arithmetic)
-shared vec4 sum_partial[32];
-shared vec4 up_partial[32];
-#endif
+shared vec4 sum_partial[workgroup_size];
+shared vec4 up_partial[workgroup_size];
 
 void store_tile(uint first_row, uint output_column, vec4 sum, vec4 up_sum)
 {
@@ -121,7 +121,7 @@ void main()
 {
     const uint output_column = gl_WorkGroupID.x;
     const uint first_row = gl_WorkGroupID.y * 4u;
-    const uint lane = gl_LocalInvocationID.x;
+    const uint lane = gl_LocalInvocationIndex;
     const bool gate_mode = p.mode == 0u;
     const bool valid = output_column < p.output_columns && first_row < p.token_count;
     vec4 sum = vec4(0.0);
@@ -159,28 +159,34 @@ void main()
             }
         }
     }
-#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
-    const vec4 reduced_sum = subgroupAdd(sum);
+    vec4 reduced_sum = vec4(0.0);
     vec4 reduced_up = vec4(0.0);
-    if (gate_mode)
-        reduced_up = subgroupAdd(up_sum);
-    if (valid && lane == 0u)
-        store_tile(first_row, output_column, reduced_sum, reduced_up);
-#else
-    sum_partial[lane] = sum;
-    up_partial[lane] = up_sum;
-    barrier();
-    for (uint stride = 16u; stride > 0u; stride >>= 1u)
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    if (gl_NumSubgroups == 1)
     {
-        if (lane < stride)
-        {
-            sum_partial[lane] += sum_partial[lane + stride];
-            if (gate_mode)
-                up_partial[lane] += up_partial[lane + stride];
-        }
+        reduced_sum = subgroupAdd(sum);
+        if (gate_mode)
+            reduced_up = subgroupAdd(up_sum);
+    }
+    else
+#endif
+    {
+        sum_partial[lane] = sum;
+        up_partial[lane] = up_sum;
         barrier();
+        for (uint stride = workgroup_size >> 1u; stride > 0u; stride >>= 1u)
+        {
+            if (lane < stride)
+            {
+                sum_partial[lane] += sum_partial[lane + stride];
+                if (gate_mode)
+                    up_partial[lane] += up_partial[lane + stride];
+            }
+            barrier();
+        }
+        reduced_sum = sum_partial[0];
+        reduced_up = up_partial[0];
     }
     if (valid && lane == 0u)
-        store_tile(first_row, output_column, sum_partial[0], up_partial[0]);
-#endif
+        store_tile(first_row, output_column, reduced_sum, reduced_up);
 }

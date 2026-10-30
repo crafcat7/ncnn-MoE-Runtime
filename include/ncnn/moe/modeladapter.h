@@ -28,6 +28,8 @@ struct ModelPackage
     std::filesystem::path root;
     ModelManifest manifest;
     uint32_t flags = 0;
+    // Optional explicit weight source, including a selected GGUF split shard.
+    std::filesystem::path weights_path;
 };
 
 class ModelAdapter

@@ -36,11 +36,178 @@
 namespace ncnn {
 namespace moe {
 
+static bool gguf_mxfp4_overlap(const uint8_t* first, size_t first_size, const uint8_t* second, size_t second_size) noexcept
+{
+    const uintptr_t first_address = reinterpret_cast<uintptr_t>(first);
+    const uintptr_t second_address = reinterpret_cast<uintptr_t>(second);
+    return first_address <= second_address ? second_address - first_address < first_size
+                                           : first_address - second_address < second_size;
+}
+
+static void unpack_gguf_mxfp4_rows_baseline(const uint8_t* source, uint8_t* blocks, uint8_t* scales,
+                                            size_t rows, size_t blocks_per_row,
+                                            size_t block_row_stride, size_t scale_row_stride) noexcept
+{
+#if defined(__x86_64__) || defined(_M_X64) || defined(__SSE2__)
+    const __m128i low_mask = _mm_set1_epi16(0x000f);
+    const __m128i high_mask = _mm_set1_epi16(0x00f0);
+#endif
+    for (size_t row = 0; row < rows; ++row)
+    {
+        const uint8_t* input = source + row * blocks_per_row * 17;
+        uint8_t* packed_row = blocks + row * block_row_stride;
+        uint8_t* scale_row = scales + row * scale_row_stride;
+        for (size_t block = 0; block < blocks_per_row; ++block)
+        {
+            const uint8_t* codes = input + block * 17 + 1;
+            uint8_t* output = packed_row + block * 16;
+            scale_row[block] = input[block * 17];
+#if defined(__x86_64__) || defined(_M_X64) || defined(__SSE2__)
+            // Each 16-bit lane holds consecutive GGUF codes. Join their low
+            // nibbles, then their high nibbles, without expanding to 32 values.
+            const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(codes));
+            const __m128i low = _mm_or_si128(_mm_and_si128(packed, low_mask),
+                                             _mm_and_si128(_mm_srli_epi16(packed, 4), high_mask));
+            const __m128i high = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(packed, 4), low_mask),
+                                              _mm_and_si128(_mm_srli_epi16(packed, 8), high_mask));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(output), _mm_packus_epi16(low, high));
+#else
+            for (size_t pair = 0; pair < 8; ++pair)
+            {
+                const uint8_t first = codes[pair * 2];
+                const uint8_t second = codes[pair * 2 + 1];
+                output[pair] = static_cast<uint8_t>((first & 15u) | (second & 15u) << 4);
+                output[pair + 8] = static_cast<uint8_t>((first >> 4) | (second & 240u));
+            }
+#endif
+        }
+    }
+}
+
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx2"))) static void avx2_unpack_gguf_mxfp4_rows(const uint8_t* source, uint8_t* blocks, uint8_t* scales,
+                                                                        size_t rows, size_t blocks_per_row,
+                                                                        size_t block_row_stride, size_t scale_row_stride) noexcept
+{
+    const __m256i low_mask = _mm256_set1_epi16(0x000f);
+    const __m256i high_mask = _mm256_set1_epi16(0x00f0);
+    for (size_t row = 0; row < rows; ++row)
+    {
+        const uint8_t* input = source + row * blocks_per_row * 17;
+        uint8_t* output = blocks + row * block_row_stride;
+        uint8_t* scale = scales + row * scale_row_stride;
+        size_t block = 0;
+        for (; block + 1 < blocks_per_row; block += 2)
+        {
+            // Both 16-byte loads stay within their own 17-byte GGUF block.
+            const __m256i packed = _mm256_loadu2_m128i(reinterpret_cast<const __m128i*>(input + block * 17 + 18),
+                                                       reinterpret_cast<const __m128i*>(input + block * 17 + 1));
+            const __m256i low = _mm256_or_si256(_mm256_and_si256(packed, low_mask),
+                                                _mm256_and_si256(_mm256_srli_epi16(packed, 4), high_mask));
+            const __m256i high = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask),
+                                                 _mm256_and_si256(_mm256_srli_epi16(packed, 8), high_mask));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(output + block * 16), _mm256_packus_epi16(low, high));
+            scale[block] = input[block * 17];
+            scale[block + 1] = input[(block + 1) * 17];
+        }
+        if (block < blocks_per_row)
+            unpack_gguf_mxfp4_rows_baseline(input + block * 17, output + block * 16, scale + block,
+                                            1, 1, 16, 1);
+    }
+}
+#endif
+
+using GgufMxFp4RowsKernel = void (*)(const uint8_t*, uint8_t*, uint8_t*, size_t, size_t, size_t, size_t) noexcept;
+
+static GgufMxFp4RowsKernel gguf_mxfp4_rows_kernel() noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    if ((cpu_isa_flags() & CpuIsaX86Avx2Fma) != 0)
+        return msvc_avx2_unpack_gguf_mxfp4_rows;
+#elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+    if ((cpu_isa_flags() & CpuIsaX86Avx2Fma) != 0)
+        return avx2_unpack_gguf_mxfp4_rows;
+#endif
+    return unpack_gguf_mxfp4_rows_baseline;
+}
+
+bool unpack_gguf_mxfp4_rows(std::span<const uint8_t> source,
+                            size_t blocks_per_row,
+                            size_t block_row_stride,
+                            size_t scale_row_stride,
+                            std::span<uint8_t> blocks,
+                            std::span<uint8_t> scales) noexcept
+{
+    if (source.empty() || source.size() % 17 != 0 || blocks_per_row == 0
+        || source.size() / 17 % blocks_per_row != 0)
+        return false;
+    const size_t rows = source.size() / 17 / blocks_per_row;
+    // blocks_per_row <= source.size()/17, so this product cannot overflow.
+    const size_t block_row_bytes = blocks_per_row * 16;
+    if (block_row_stride < block_row_bytes || scale_row_stride < blocks_per_row
+        || blocks.size() < block_row_bytes || scales.size() < blocks_per_row
+        || rows - 1 > (blocks.size() - block_row_bytes) / block_row_stride
+        || rows - 1 > (scales.size() - blocks_per_row) / scale_row_stride
+        || gguf_mxfp4_overlap(source.data(), source.size(), blocks.data(), blocks.size())
+        || gguf_mxfp4_overlap(source.data(), source.size(), scales.data(), scales.size())
+        || gguf_mxfp4_overlap(blocks.data(), blocks.size(), scales.data(), scales.size()))
+        return false;
+    static const GgufMxFp4RowsKernel kernel = gguf_mxfp4_rows_kernel();
+    const GgufMxFp4RowsKernel selected = blocks_per_row > 1 ? kernel : unpack_gguf_mxfp4_rows_baseline;
+    selected(source.data(), blocks.data(), scales.data(), rows, blocks_per_row, block_row_stride, scale_row_stride);
+    return true;
+}
+
+bool unpack_gguf_mxfp4(std::span<const uint8_t> source,
+                       std::span<uint8_t> blocks,
+                       std::span<uint8_t> scales) noexcept
+{
+    if (source.empty() || source.size() % 17 != 0
+        || scales.size() != source.size() / 17 || blocks.size() != scales.size() * 16)
+        return false;
+    return unpack_gguf_mxfp4_rows(source, scales.size(), blocks.size(), scales.size(), blocks, scales);
+}
+
+bool pack_gguf_mxfp4(std::span<const uint8_t> blocks,
+                     std::span<const uint8_t> scales,
+                     std::span<uint8_t> destination) noexcept
+{
+    if (scales.empty() || scales.size() > std::numeric_limits<size_t>::max() / 17
+        || blocks.size() != scales.size() * 16 || destination.size() != scales.size() * 17
+        || gguf_mxfp4_overlap(blocks.data(), blocks.size(), scales.data(), scales.size())
+        || gguf_mxfp4_overlap(blocks.data(), blocks.size(), destination.data(), destination.size())
+        || gguf_mxfp4_overlap(scales.data(), scales.size(), destination.data(), destination.size()))
+        return false;
+
+    for (size_t block = 0; block < scales.size(); ++block)
+    {
+        const uint8_t* packed = blocks.data() + block * 16;
+        uint8_t* encoded = destination.data() + block * 17;
+        encoded[0] = scales[block];
+        for (size_t pair = 0; pair < 8; ++pair)
+        {
+            encoded[1 + pair * 2] = static_cast<uint8_t>((packed[pair] & 15u)
+                                                         | ((packed[pair + 8] & 15u) << 4));
+            encoded[2 + pair * 2] = static_cast<uint8_t>((packed[pair] >> 4)
+                                                         | (packed[pair + 8] & 240u));
+        }
+    }
+    return true;
+}
+
 static std::array<float, 256> make_scale_table()
 {
     std::array<float, 256> table = {};
     for (uint32_t index = 0; index < table.size(); ++index)
-        table[index] = std::ldexp(1.0f, static_cast<int>(index) - 127);
+    {
+        // GGML E8M0 scale is a half-scale because its MXFP4 codebook is
+        // doubled.  Construct the exact bit pattern so 0 and 255 remain
+        // finite subnormal/normal powers of two instead of underflowing or
+        // becoming infinity.
+        const uint32_t bits = index < 2 ? (UINT32_C(0x00200000) << index)
+                                        : (static_cast<uint32_t>(index - 1) << 23);
+        std::memcpy(&table[index], &bits, sizeof(bits));
+    }
     return table;
 }
 
@@ -50,9 +217,24 @@ static const std::array<float, 256>& scale_table()
     return values;
 }
 
+void mxfp4_dequantize_block(const uint8_t* packed, uint8_t scale, float* output) noexcept
+{
+    if (!packed || !output)
+        return;
+    static constexpr float doubled_e2m1[16] = {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
+                                               -0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f};
+    const float block_scale = scale_table()[scale];
+    for (uint32_t index = 0; index < 16; ++index)
+    {
+        const uint8_t byte = packed[index];
+        output[index * 2] = doubled_e2m1[byte & 15u] * block_scale;
+        output[index * 2 + 1] = doubled_e2m1[byte >> 4] * block_scale;
+    }
+}
+
 static float scalar_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input) noexcept
 {
-    static constexpr float values[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    static constexpr float values[16] = {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f, -0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f};
     const std::array<float, 256>& scales_by_exponent = scale_table();
     float sum = 0.0f;
     for (uint32_t block_index = 0; block_index < block_count; ++block_index)
@@ -74,7 +256,7 @@ static float scalar_dot(const uint8_t* packed, const uint8_t* scales, uint32_t b
 static void scalar_gemm_row(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input, size_t input_stride, size_t token_count,
                             float* output, size_t output_stride) noexcept
 {
-    static constexpr float values[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    static constexpr float values[16] = {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f, -0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f};
     const std::array<float, 256>& scales_by_exponent = scale_table();
     for (size_t token_index = 0; token_index < token_count; ++token_index)
         output[token_index * output_stride] = 0.0f;
@@ -103,7 +285,7 @@ static void scalar_matmul_rows2(const uint8_t* first_packed, const uint8_t* firs
                                 uint32_t block_count, const float* input, size_t input_stride, size_t token_count, float* first_output,
                                 size_t first_output_stride, float* second_output, size_t second_output_stride) noexcept
 {
-    static constexpr float values[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    static constexpr float values[16] = {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f, -0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f};
     const std::array<float, 256>& scales_by_exponent = scale_table();
     for (size_t token_index = 0; token_index < token_count; ++token_index)
     {
@@ -222,7 +404,7 @@ static float scalar_mxfp4_q8_dot(const uint8_t* packed, const uint8_t* scales, u
             integer_sum += static_cast<int32_t>(mxfp4_integer_values[packed_value >> 4]) * input_block[byte * 2 + 1];
         }
         sum += static_cast<float>(integer_sum)
-               * (0.5f * scales_by_exponent[scales[block]])
+               * (scales_by_exponent[scales[block]])
                * input_scales[block];
     }
     return sum;
@@ -264,7 +446,7 @@ __attribute__((target("avx2,ssse3"))) static float avx2_mxfp4_q8_dot(const uint8
                                                        input_high);
         const int32_t integer_sum = avx2_horizontal_sum_epi32(_mm256_add_epi32(product_low, product_high));
         sum += static_cast<float>(integer_sum)
-               * (0.5f * scales_by_exponent[scales[block]])
+               * (scales_by_exponent[scales[block]])
                * input_scales[block];
     }
     return sum;
@@ -413,7 +595,7 @@ static void scalar_packed_gemv(const Mxfp4Q8PackedMatrix& weights, const int8_t*
                         continue;
                     const uint8_t* row_values = packed_values + (static_cast<size_t>(chunk) * tile_rows + row) * chunk_bytes;
                     accumulators[row] += static_cast<float>(scalar_packed_chunk_dot(row_values, input_chunk, chunk_bytes))
-                                         * (0.5f * scales_by_exponent[packed_block[row]]) * input_scale;
+                                         * (scales_by_exponent[packed_block[row]]) * input_scale;
                 }
             }
         }
@@ -467,7 +649,7 @@ static void scalar_packed_gemm(const Mxfp4Q8PackedMatrix& weights, const int8_t*
                             continue;
                         const uint8_t* row_values = packed_values + (static_cast<size_t>(chunk) * tile_rows + row) * chunk_bytes;
                         output[token * output_stride + matrix_row] += static_cast<float>(scalar_packed_chunk_dot(row_values, input_chunk, chunk_bytes))
-                                                                      * (0.5f * scales_by_exponent[packed_block[row]]) * input_scale;
+                                                                      * (scales_by_exponent[packed_block[row]]) * input_scale;
                     }
                 }
             }
@@ -701,7 +883,7 @@ static float neon_dot(const uint8_t* packed, const uint8_t* scales, uint32_t blo
         NCNN_MOE_ACCUMULATE_MXFP4_NEON(high_16, 16);
         NCNN_MOE_ACCUMULATE_MXFP4_NEON(high_high_16, 24);
 #undef NCNN_MOE_ACCUMULATE_MXFP4_NEON
-        sum += vaddvq_f32(accumulator) * (0.5f * scales_by_exponent[scales[block_index]]);
+        sum += vaddvq_f32(accumulator) * (scales_by_exponent[scales[block_index]]);
     }
     return sum;
 }
@@ -731,7 +913,7 @@ static void neon_gemm_row(const uint8_t* packed, const uint8_t* scales, uint32_t
             vmovl_s8(vget_high_s8(decoded_high)),
         };
         const size_t input_offset = static_cast<size_t>(block_index) * 32;
-        const float scale = 0.5f * scales_by_exponent[scales[block_index]];
+        const float scale = scales_by_exponent[scales[block_index]];
         for (size_t token_index = 0; token_index < token_count; ++token_index)
         {
             const float* token = input + token_index * input_stride + input_offset;
@@ -780,8 +962,8 @@ static void neon_matmul_rows2(const uint8_t* first_packed, const uint8_t* first_
             decoded_rows[row][3] = vmovl_s8(vget_high_s8(decoded_high));
         }
         const size_t input_offset = static_cast<size_t>(block_index) * 32;
-        const float first_scale = 0.5f * scales_by_exponent[first_scales[block_index]];
-        const float second_scale = 0.5f * scales_by_exponent[second_scales[block_index]];
+        const float first_scale = scales_by_exponent[first_scales[block_index]];
+        const float second_scale = scales_by_exponent[second_scales[block_index]];
         for (size_t token_index = 0; token_index < token_count; ++token_index)
         {
             const float* token = input + token_index * input_stride + input_offset;
@@ -833,7 +1015,7 @@ __attribute__((target("avx2,fma,ssse3"))) static float avx2_dot(const uint8_t* p
         const __m128 halves = _mm_add_ps(_mm256_castps256_ps128(accumulator), _mm256_extractf128_ps(accumulator, 1));
         const __m128 pairs = _mm_hadd_ps(halves, halves);
         const float block_sum = _mm_cvtss_f32(_mm_hadd_ps(pairs, pairs));
-        sum += block_sum * (0.5f * scales_by_exponent[scales[block_index]]);
+        sum += block_sum * (scales_by_exponent[scales[block_index]]);
     }
     return sum;
 }
@@ -856,7 +1038,7 @@ __attribute__((target("avx2,fma,ssse3"))) static void avx2_gemm_row(const uint8_
             _mm_shuffle_epi8(value_table, _mm_unpackhi_epi8(low, high)),
         };
         const size_t input_offset = static_cast<size_t>(block_index) * 32;
-        const float scale = 0.5f * scales_by_exponent[scales[block_index]];
+        const float scale = scales_by_exponent[scales[block_index]];
         for (size_t token_index = 0; token_index < token_count; ++token_index)
         {
             const float* token = input + token_index * input_stride + input_offset;
@@ -903,8 +1085,8 @@ __attribute__((target("avx2,fma,ssse3"))) static void avx2_matmul_rows2(const ui
             decoded_rows[row][1] = _mm_shuffle_epi8(value_table, _mm_unpackhi_epi8(low, high));
         }
         const size_t input_offset = static_cast<size_t>(block_index) * 32;
-        const float first_scale = 0.5f * scales_by_exponent[first_scales[block_index]];
-        const float second_scale = 0.5f * scales_by_exponent[second_scales[block_index]];
+        const float first_scale = scales_by_exponent[first_scales[block_index]];
+        const float second_scale = scales_by_exponent[second_scales[block_index]];
         for (size_t token_index = 0; token_index < token_count; ++token_index)
         {
             const float* token = input + token_index * input_stride + input_offset;
@@ -950,7 +1132,7 @@ __attribute__((target("avx2,fma,ssse3"))) NCNN_MOE_DEFINE_MXFP4_ROW_PAIR_KERNEL(
         const float* input_block = input + static_cast<size_t>(block_index) * 32;
         __m512 accumulator = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(decoded_low)), _mm512_loadu_ps(input_block));
         accumulator = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(decoded_high)), _mm512_loadu_ps(input_block + 16), accumulator);
-        sum += _mm512_reduce_add_ps(accumulator) * (0.5f * scales_by_exponent[scales[block_index]]);
+        sum += _mm512_reduce_add_ps(accumulator) * (scales_by_exponent[scales[block_index]]);
     }
     return sum;
 }
@@ -974,7 +1156,7 @@ __attribute__((target("avx512f,avx512bw,avx512vl,ssse3,fma"))) static void avx51
         const __m512 weights = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(decoded_low));
         const __m512 weights_high = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(decoded_high));
         const size_t input_offset = static_cast<size_t>(block_index) * 32;
-        const float scale = 0.5f * scales_by_exponent[scales[block_index]];
+        const float scale = scales_by_exponent[scales[block_index]];
         for (size_t token_index = 0; token_index < token_count; ++token_index)
         {
             const float* token = input + token_index * input_stride + input_offset;
@@ -1013,8 +1195,8 @@ __attribute__((target("avx512f,avx512bw,avx512vl,ssse3,fma"))) static void avx51
             decoded_high[row] = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_shuffle_epi8(value_table, _mm_unpackhi_epi8(low, high))));
         }
         const size_t input_offset = static_cast<size_t>(block_index) * 32;
-        const float first_scale = 0.5f * scales_by_exponent[first_scales[block_index]];
-        const float second_scale = 0.5f * scales_by_exponent[second_scales[block_index]];
+        const float first_scale = scales_by_exponent[first_scales[block_index]];
+        const float second_scale = scales_by_exponent[second_scales[block_index]];
         for (size_t token_index = 0; token_index < token_count; ++token_index)
         {
             const float* token = input + token_index * input_stride + input_offset;

@@ -107,8 +107,10 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
                               && renormalize
                               && options.selection_bias.empty()
                               && options.explicit_expert_ids.empty();
+    const bool explicit_scores = !options.explicit_expert_ids.empty()
+                                 && options.score_function != RouterScoreFunction::Softmax;
     std::vector<float>& scores = result.scores;
-    if (!softmax_topk)
+    if (!softmax_topk && !explicit_scores)
         scores.reserve(options.expert_count);
     std::vector<RouteCandidate>& selected = result.selected;
     selected.reserve(static_cast<size_t>(options.top_k) + 1);
@@ -135,7 +137,8 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
         }
         else
         {
-            router_scores(logits, options.expert_count, options.score_function, scores);
+            if (!explicit_scores)
+                router_scores(logits, options.expert_count, options.score_function, scores);
             if (options.explicit_expert_ids.empty())
             {
                 select_topk_routes(scores.data(), options.selection_bias, options.expert_count, options.top_k, selected);
@@ -148,11 +151,13 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
                     const uint32_t expert_id = options.explicit_expert_ids[static_cast<size_t>(token_index) * options.top_k + route_index];
                     if (expert_id >= options.expert_count)
                         return Error{ErrorCode::InvalidArgument, "explicit expert id is out of range"};
-                    selected.push_back({expert_id, scores[expert_id]});
+                    const float score = explicit_scores ? score_router_logit(logits[expert_id], options.score_function)
+                                                        : scores[expert_id];
+                    selected.push_back({expert_id, score});
                 }
             }
             for (const RouteCandidate& candidate : selected)
-                selected_sum += scores[candidate.expert_id];
+                selected_sum += explicit_scores ? candidate.score : scores[candidate.expert_id];
         }
 
         if (renormalize && selected_sum <= 0.0f)
@@ -160,7 +165,7 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
         for (uint32_t rank = 0; rank < selected.size(); ++rank)
         {
             const RouteCandidate& candidate = selected[rank];
-            const float score = softmax_topk ? candidate.score : scores[candidate.expert_id];
+            const float score = softmax_topk || explicit_scores ? candidate.score : scores[candidate.expert_id];
             const float weight = (renormalize ? score / selected_sum : score) * options.routed_scaling_factor;
             result.route_scratch[candidate.expert_id].push_back({token_index, rank, weight});
         }

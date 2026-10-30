@@ -306,7 +306,6 @@ def gpt_oss_cases(arguments):
                             "20480",
                             "--expert-io-workers",
                             "4",
-                            "--direct-expert-io",
                         ],
                     }
                 )
@@ -339,7 +338,6 @@ def gpt_oss_cases(arguments):
                             "4",
                             "--parallel-sessions",
                             "2",
-                            "--direct-expert-io",
                             *(
                                 [
                                     "--expert-gpu-cache-mb",
@@ -377,7 +375,6 @@ def gpt_oss_cases(arguments):
                             "28672",
                             "--expert-io-workers",
                             "4",
-                            "--direct-expert-io",
                             "--expert-cache-sweep-mb",
                             "1024",
                             "10240",
@@ -402,9 +399,6 @@ def deepseek_cases(arguments):
         str(arguments.host_memory_mb),
         "--expert-io-workers",
         str(arguments.expert_io_workers),
-        # Direct reads avoid an extra buffered copy for the packed Expert
-        # ranges on Windows; POSIX readers keep their normal pread path.
-        "--direct-expert-io",
     ]
 
     if not arguments.skip_single:

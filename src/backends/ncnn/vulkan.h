@@ -19,11 +19,11 @@ using VulkanRuntimePtr = std::shared_ptr<VulkanRuntime>;
 struct VulkanStatistics
 {
     uint64_t dispatches = 0;
+    uint64_t int4_dispatches = 0;
     uint64_t attention_blocks = 0;
     uint64_t compute_submissions = 0;
     uint64_t batch_uploads = 0;
     uint64_t batch_downloads = 0;
-    uint64_t command_buffer_reuses = 0;
     uint64_t command_graph_submissions = 0;
     uint64_t command_graph_operations = 0;
     uint64_t attention_qkv_rope_fusions = 0;
