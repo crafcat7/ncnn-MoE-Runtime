@@ -19,6 +19,9 @@ CMakeLists.txt text eol=lf
 .gitignore text eol=lf
 LICENSE text eol=lf
 
+# Unified-diff context lines may contain only their single-space prefix.
+*.patch text eol=lf -whitespace
+
 # Model and compiled artifacts are binary even when force-added intentionally.
 *.bin binary
 *.safetensors binary

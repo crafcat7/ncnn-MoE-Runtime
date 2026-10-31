@@ -299,6 +299,11 @@ if(NCNN_MOE_USE_NCNN)
             "'git submodule update --init --recursive'.")
     endif()
 
+    include(cmake/ncnn_moe_prepare_ncnn.cmake)
+    ncnn_moe_prepare_ncnn("${CMAKE_CURRENT_SOURCE_DIR}/third_party/ncnn"
+        "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/third_party/patches/ncnn"
+        NCNN_MOE_NCNN_SOURCE_DIR)
+
     # Force runtime-owned options when reconfiguring an existing cache.
     set(NCNN_BUILD_BENCHMARK OFF CACHE BOOL "Build ncnn benchmark")
     set(NCNN_BUILD_TESTS OFF CACHE BOOL "Build ncnn tests")
@@ -319,7 +324,7 @@ if(NCNN_MOE_USE_NCNN)
         # RMSNorm reuses the LayerNorm Vulkan shaders.
         list(APPEND NCNN_MOE_REQUIRED_LAYERS layernorm)
     endif()
-    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ncnn/src/CMakeLists.txt"
+    file(STRINGS "${NCNN_MOE_NCNN_SOURCE_DIR}/src/CMakeLists.txt"
         NCNN_MOE_LAYER_DECLARATIONS REGEX [=[^ncnn_add_layer\(]=])
     foreach(NCNN_MOE_LAYER_DECLARATION IN LISTS NCNN_MOE_LAYER_DECLARATIONS)
         string(REGEX MATCH [=[^ncnn_add_layer\(([A-Za-z0-9_]+)]=]
@@ -333,7 +338,7 @@ if(NCNN_MOE_USE_NCNN)
                 "build with layer ${NCNN_MOE_LAYER_NAME}" FORCE)
         endif()
     endforeach()
-    add_subdirectory(third_party/ncnn)
+    add_subdirectory("${NCNN_MOE_NCNN_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/third_party/ncnn")
     if(TARGET ncnn)
         if(NCNN_OPENMP AND NOT NCNN_SIMPLEOMP AND TARGET OpenMP::OpenMP_CXX
             AND NOT OpenMP_CXX_FOUND AND NOT OPENMP_FOUND)
@@ -352,7 +357,7 @@ if(NCNN_MOE_USE_NCNN)
         if(NCNN_MOE_USE_VULKAN AND NCNN_VULKAN)
             target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_WITH_VULKAN=1)
             target_include_directories(ncnn_moe PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ncnn/src/layer)
+                ${NCNN_MOE_NCNN_SOURCE_DIR}/src/layer)
             set(NCNN_MOE_WITH_VULKAN ON)
             if(APPLE)
                 target_compile_definitions(ncnn_moe PRIVATE
@@ -487,7 +492,7 @@ if(NCNN_MOE_BUILD_TESTS)
         target_compile_features(ncnn_moe_linear_allocation_vulkan_test PRIVATE cxx_std_20)
         target_compile_definitions(ncnn_moe_linear_allocation_vulkan_test PRIVATE NCNN_MOE_WITH_VULKAN=1)
         target_include_directories(ncnn_moe_linear_allocation_vulkan_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ncnn/src/layer)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src ${NCNN_MOE_NCNN_SOURCE_DIR}/src/layer)
         add_test(NAME ncnn_moe_linear_allocation_vulkan COMMAND ncnn_moe_linear_allocation_vulkan_test)
     endif()
 
@@ -800,6 +805,8 @@ endif()
 if(NCNN_MOE_BUILD_TESTS)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME ncnn_moe_ncnn_patches
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ncnn_patches.py)
         add_test(NAME ncnn_moe_python_unit
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ncnn_moe.py)
 

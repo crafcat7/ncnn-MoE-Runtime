@@ -179,9 +179,19 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-The pinned ncnn submodule is built with the runtime. Restore it with
-`git submodule update --init --recursive` when necessary. A CPU-only build can
-be selected with `-DNCNN_MOE_USE_VULKAN=OFF`.
+The ncnn submodule pins an unmodified Tencent/ncnn revision. Restore it with
+`git submodule update --init --recursive` when necessary. CMake requires Git
+and applies `third_party/patches/ncnn/*.patch` to a copy under
+`BUILD_DIR/_deps/ncnn-src` before building; the submodule stays unchanged.
+Repeated builds reuse that copy. Changes to the patches or upstream sources
+automatically refresh it, and patch conflicts stop configuration with an error.
+A CPU-only build can be selected with `-DNCNN_MOE_USE_VULKAN=OFF`.
+
+To update ncnn, select the desired upstream commit in `third_party/ncnn`, update
+its nested submodules, and rebuild. Maintain Runtime extensions in the patches
+and commit both the updated submodule pointer and any patch changes. The current
+patch is based on release `20261020` (`7e36d25`); builds do not fetch or advance
+the pinned revision automatically.
 
 To compare native text handling with the official Python implementations, build
 `ncnn_moe_tokenizer_test` and run
@@ -526,7 +536,8 @@ assets/            Published benchmark visualizations used by model reports
 examples/          Unified worker, benchmark/reference runners, protocol helpers, and MXFP4 microbenchmark
 tools/             Unified CLI/adapters, fixtures, packed-Expert tooling, and Qn_K/runtime benchmarks
 tests/             Deterministic, parity, cache, scheduling, concurrency, and error-path tests
-third_party/ncnn/  Pinned ncnn source submodule
+third_party/ncnn/  Pinned upstream ncnn source submodule
+third_party/patches/ncnn/  Runtime extensions applied by CMake
 ```
 
 Private source files are grouped by owning responsibility and retain direct,
