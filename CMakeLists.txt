@@ -82,6 +82,7 @@ set(NCNN_MOE_SOURCES
     src/graph/compiler.cpp
     src/graph/graph.cpp
     src/graph/memoryplan.cpp
+    src/graph/resourceplan.cpp
     src/graph/router.cpp
     # Kernels
     src/kernels/attention.cpp
