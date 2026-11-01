@@ -1,0 +1,63 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer partial_blob
+{ float partial_data[]; };
+layout(binding = 1) writeonly buffer output_blob
+{ float output_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint head_dimension;
+    uint head_count;
+    uint split_count;
+}
+p;
+
+shared float merged_max;
+shared float merged_sum;
+
+void main()
+{
+    const uint head = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationIndex;
+    const uint partial_stride = p.head_dimension + 2;
+
+    if (lane == 0)
+    {
+        float maximum = uintBitsToFloat(0xfeffffffu);
+        for (uint split = 0; split < p.split_count; ++split)
+        {
+            const uint offset = (split * p.head_count + head) * partial_stride;
+            if (partial_data[offset + p.head_dimension + 1] > 0.0)
+                maximum = max(maximum, partial_data[offset + p.head_dimension]);
+        }
+        float denominator = 0.0;
+        for (uint split = 0; split < p.split_count; ++split)
+        {
+            const uint offset = (split * p.head_count + head) * partial_stride;
+            const float sum = partial_data[offset + p.head_dimension + 1];
+            if (sum > 0.0)
+                denominator += sum * exp(partial_data[offset + p.head_dimension] - maximum);
+        }
+        merged_max = maximum;
+        merged_sum = denominator;
+    }
+    barrier();
+
+    for (uint column = lane; column < p.head_dimension; column += gl_WorkGroupSize.x)
+    {
+        float numerator = 0.0;
+        for (uint split = 0; split < p.split_count; ++split)
+        {
+            const uint offset = (split * p.head_count + head) * partial_stride;
+            if (partial_data[offset + p.head_dimension + 1] > 0.0)
+            {
+                const float weight = exp(partial_data[offset + p.head_dimension] - merged_max);
+                numerator += partial_data[offset + column] * weight;
+            }
+        }
+        output_data[head * p.head_dimension + column] = merged_sum > 0.0 ? numerator / merged_sum : 0.0;
+    }
+}

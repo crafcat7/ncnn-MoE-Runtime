@@ -2522,6 +2522,7 @@ static bool graph_has_expert_banks(const CompiledModel& model, const ExecutionGr
 // persistent weights/state and host-visible transfer-slot storage are omitted.
 static Result<void> append_graph_node_scratch(const CompiledModel& model, const ExecutionGraph& graph,
                                               const ExecutionNode& node, uint32_t rows, uint32_t context_tokens,
+                                              uint32_t sequence_count,
                                               uint64_t alignment, uint32_t first, uint32_t last,
                                               std::vector<GraphMemoryBuffer>& buffers)
 {
@@ -2584,9 +2585,30 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
             columns.insert(columns.end(), {1, 1});
             if (!direct_ring) columns.insert(columns.end(), {key, key});
             if (gate) columns.push_back(query);
-            const bool decode_sdpa = rows == 1 && attention.head_dimension <= 128 && context_tokens <= 4096
+            const bool decode_sdpa = rows == 1 && attention.head_dimension <= 128
+                                     && static_cast<uint64_t>(context_tokens) + (has_flag(attention.flags, AttentionBlockSink) ? 1 : 0) <= 4096
                                      && (attention.sliding_window == 0 || context_tokens <= attention.sliding_window)
                                      && has_flag(model.opt.optimization_flags, OptimizationVulkanDecodeSdpa);
+#if NCNN_MOE_WITH_VULKAN
+            if (rows == 1 || sequence_count > 1)
+            {
+                const auto& op = model.operators.at(attention.vulkan_attention_operator).attention;
+                uint64_t workspace_bytes = 0;
+                // A bounded sliding view can use decode even when the Session
+                // capacity exceeds its window. Reserve the same planner's
+                // monotonic bound over that capacity before recording starts.
+                if (op && !op->decode_workspace_bytes(context_tokens, workspace_bytes))
+                    return Error{ErrorCode::InternalError, "failed to plan Vulkan Attention decode workspace"};
+                // A multi-Session batch records independent one-row decodes;
+                // each workspace survives until the shared submission fence.
+                // Keep each allocation separate to include per-buffer alignment.
+                for (uint32_t index = 0; workspace_bytes != 0 && index < std::min(rows, sequence_count); ++index)
+                {
+                    auto ret = add(workspace_bytes / sizeof(float), 1);
+                    if (!ret) return ret.error();
+                }
+            }
+#endif
             if (!decode_sdpa)
             {
                 // Both qk_cross and the uploaded additive mask have one plane
@@ -2793,7 +2815,7 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
 
 static Result<void> append_graph_region_memory(const CompiledModel& model, const ExecutionGraph& graph,
                                                const ExecutionSchedule& schedule, uint32_t rows, uint32_t logits_rows,
-                                               uint32_t context_tokens, uint32_t node_offset,
+                                               uint32_t context_tokens, uint32_t sequence_count, uint32_t node_offset,
                                                std::vector<GraphMemoryBuffer>& buffers,
                                                std::vector<GraphMemorySubmission>& submissions)
 {
@@ -3082,7 +3104,7 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
             }
         }
         auto ret = append_graph_node_scratch(model, graph, node, node.type == ExecutionNodeType::LmHead ? logits_rows : rows,
-                                             context_tokens, alignment, starts[node_id], ends[node_id], buffers);
+                                             context_tokens, sequence_count, alignment, starts[node_id], ends[node_id], buffers);
         if (!ret) return ret.error();
     }
     return {};
@@ -3104,14 +3126,14 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
         std::vector<GraphMemoryBuffer> buffers;
         std::vector<GraphMemorySubmission> submissions;
         auto ret = append_graph_region_memory(compiled, compiled.graph, compiled.schedule, rows, rows,
-                                              result.context_tokens, 0, buffers, submissions);
+                                              result.context_tokens, sequence_count, 0, buffers, submissions);
         if (!ret) return ret.error();
         // Target and draft graphs execute serially, sharing the same arena.
         // Draft verification can record one full speculative block at once.
         const uint32_t draft_rows = std::max(rows, compiled.speculative.block_size);
         ret = append_graph_region_memory(compiled, compiled.speculative.graph, compiled.speculative.schedule,
                                          draft_rows, draft_rows,
-                                         result.context_tokens, static_cast<uint32_t>(compiled.graph.nodes.size()), buffers, submissions);
+                                         result.context_tokens, sequence_count, static_cast<uint32_t>(compiled.graph.nodes.size()), buffers, submissions);
         if (!ret) return ret.error();
         auto plan = plan_graph_memory(buffers, submissions);
         if (!plan) return plan.error();

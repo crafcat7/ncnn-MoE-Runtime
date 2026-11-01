@@ -1,4 +1,5 @@
 #include "attention_vulkan.h"
+#include "attentiondecode_vulkan.h"
 #include "linear.h"
 #include "rmsnorm_vulkan.h"
 #include "vulkancontext.h"
@@ -69,6 +70,7 @@ public:
             qkv_norm_rope_pipeline.reset();
             output_gate_pipeline.reset();
             decode_sdpa_pipeline.reset();
+            decode_matrix.reset();
             ring_append_pipeline.reset();
             ring_zero_pipeline.reset();
             const std::lock_guard<std::mutex> lock(vulkan_context->command_mutex());
@@ -100,6 +102,8 @@ public:
     std::shared_ptr<ncnn::Pipeline> qkv_norm_rope_pipeline;
     std::shared_ptr<ncnn::Pipeline> output_gate_pipeline;
     std::shared_ptr<ncnn::Pipeline> decode_sdpa_pipeline;
+    std::unique_ptr<AttentionDecodeVulkan> decode_matrix;
+    AttentionDecodeCapabilities decode_capabilities;
     std::shared_ptr<ncnn::Pipeline> ring_append_pipeline;
     std::shared_ptr<ncnn::Pipeline> ring_zero_pipeline;
     std::vector<ncnn::Layer*> layers;
@@ -1392,6 +1396,23 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
     implementation.option.use_packing_layout = false;
     ncnn::VulkanDevice* vkdev = implementation.vulkan_context->device();
     implementation.kv_option = implementation.option;
+    if (has_flag(config.optimization_flags, OptimizationVulkanDecodeSdpa)
+        && has_flag(config.optimization_flags, OptimizationVulkanBfloat16CoopMatrix))
+    {
+        implementation.decode_capabilities = query_attention_decode_capabilities(vkdev->info);
+        AttentionDecodePlan plan;
+        const AttentionDecodeShape shape{config.head_count, config.kv_head_count, config.head_dimension, 1,
+                                         config.kv_cache_dtype == DType::BFloat16,
+                                         vulkan_activation_element_size(implementation.kv_option) == sizeof(uint16_t)};
+        if (!make_attention_decode_plan(implementation.decode_capabilities, shape, plan))
+            return {};
+        if (plan.path == AttentionDecodePath::Matrix)
+        {
+            implementation.decode_matrix = std::make_unique<AttentionDecodeVulkan>();
+            if (!implementation.decode_matrix->create(implementation.vulkan_context, implementation.option, plan))
+                return {};
+        }
+    }
 
     const uint32_t half_dimension = config.head_dimension / 2;
     const uint32_t rope_half_dimension = rope_dimension / 2;
@@ -1693,6 +1714,7 @@ public:
     size_t rows = 0;
     bool allocate_ring = false, ring_resized = false, mutated_original = false;
     bool qkv_rope = false, device_rope = false, qkv_ring = false, decode_sdpa = false;
+    bool decode_matrix = false;
     bool wrapped = false, promoted = false;
     bool recorded = false, failed = false, committed = false;
 #endif
@@ -1742,6 +1764,7 @@ bool AttentionWork_vulkan::commit() noexcept
     state.attention_device_rope_fusions += d->device_rope;
     state.attention_qkv_ring_fusions += d->qkv_ring;
     state.attention_decode_sdpa_fusions += d->decode_sdpa;
+    state.bfloat16_cooperative_matrix_dispatches += d->decode_matrix;
     ++state.kv_ring_appends;
     state.kv_ring_resizes += d->ring_resized;
     state.kv_ring_wrapped_views += d->wrapped;
@@ -1758,6 +1781,48 @@ const std::shared_ptr<VulkanContext>& Attention_vulkan::vulkan_context() const n
 { return d->vulkan_context; }
 const ncnn::Option& Attention_vulkan::option() const noexcept
 { return d->option; }
+
+bool Attention_vulkan::decode_workspace_bytes(uint32_t context_tokens, uint64_t& bytes) const noexcept
+{
+    bytes = 0;
+    if (!d->decode_matrix) return true;
+    AttentionDecodePlan plan;
+    const AttentionDecodeShape shape{d->config.head_count, d->config.kv_head_count, d->config.head_dimension,
+                                     std::max(1u, context_tokens), d->config.kv_cache_dtype == DType::BFloat16,
+                                     vulkan_activation_element_size(d->kv_option) == sizeof(uint16_t)};
+    if (!make_attention_decode_plan(d->decode_capabilities, shape, plan)
+        || plan.path != AttentionDecodePath::Matrix) return false;
+    bytes = plan.scratch_bytes;
+    return true;
+}
+
+bool Attention_vulkan::record_decode(const ncnn::VkMat& query, const ncnn::VkMat& key,
+                                     const ncnn::VkMat& value, uint64_t destination_count,
+                                     ncnn::VkMat& output, ncnn::VkCompute& command,
+                                     std::vector<ncnn::VkMat>& workspace) const
+{
+    if (d->decode_matrix)
+    {
+        const uint32_t sink_rows = has_flag(d->config.flags, AttentionSink) ? 1 : 0;
+        if (destination_count <= sink_rows || destination_count > std::numeric_limits<uint32_t>::max()) return false;
+        AttentionDecodePlan plan;
+        const AttentionDecodeShape shape{d->config.head_count, d->config.kv_head_count, d->config.head_dimension,
+                                         static_cast<uint32_t>(destination_count - sink_rows), d->config.kv_cache_dtype == DType::BFloat16,
+                                         vulkan_activation_element_size(d->kv_option) == sizeof(uint16_t)};
+        if (!make_attention_decode_plan(d->decode_capabilities, shape, plan)
+            || plan.path != AttentionDecodePath::Matrix) return false;
+        // The general SDPA view includes a synthetic sink row. Matrix decode
+        // handles its denominator contribution explicitly without loading KV.
+        ncnn::VkMat real_key = key, real_value = value;
+        real_key.h = real_value.h = static_cast<int>(shape.kv_tokens);
+        return d->decode_matrix->record(plan, query, real_key, real_value, d->attention_sinks,
+                                        has_flag(d->config.flags, AttentionSink), output, command,
+                                        d->option.blob_vkallocator, workspace);
+    }
+    return record_attention_decode_sdpa(d->decode_sdpa_pipeline.get(), query, key, value,
+                                        d->attention_sinks, d->config, destination_count, output,
+                                        command, d->option.blob_vkallocator);
+}
 
 bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cache,
                                       const ncnn::VkMat& input, ncnn::VkMat& output,
@@ -2180,8 +2245,8 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
     auto& attention_matrix = ticket.buffers.emplace_back();
     if (use_decode_sdpa)
     {
-        if (!record_attention_decode_sdpa(implementation.decode_sdpa_pipeline.get(), query_rope, combined_key, combined_value, implementation.attention_sinks, config,
-                                          destination_count, attention_matrix, command, implementation.option.blob_vkallocator))
+        if (!record_decode(query_rope, combined_key, combined_value, destination_count,
+                           attention_matrix, command, projection_workspace))
         {
             return false;
         }
@@ -2401,6 +2466,7 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
     ticket.device_rope = device_rope;
     ticket.qkv_ring = use_qkv_ring;
     ticket.decode_sdpa = use_decode_sdpa;
+    ticket.decode_matrix = use_decode_sdpa && implementation.decode_matrix != nullptr;
     ticket.wrapped = ring_first_slot + destination_count > ring_capacity;
     ticket.promoted = promote_host_cache;
     ticket.recorded = true;
@@ -3268,18 +3334,15 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
 
         if (work.use_decode_sdpa)
         {
-            if (!record_attention_decode_sdpa(implementation.decode_sdpa_pipeline.get(),
-                                              work.query_rope,
-                                              work.combined_key,
-                                              work.combined_value,
-                                              implementation.attention_sinks,
-                                              config,
-                                              work.destination_count,
-                                              work.attention_matrix,
-                                              command,
-                                              implementation.option.blob_vkallocator))
+            if (!record_decode(work.query_rope,
+                               work.combined_key,
+                               work.combined_value,
+                               work.destination_count,
+                               work.attention_matrix,
+                               command,
+                               work.projection_workspace))
             {
-                return AttentionBatchResult_vulkan::NotExecuted;
+                return AttentionBatchResult_vulkan::Failed;
             }
         }
         else
@@ -3509,6 +3572,8 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
         ++runtime_state.attention_qkv_ring_fusions;
     if (representative.use_decode_sdpa)
         ++runtime_state.attention_decode_sdpa_fusions;
+    if (representative.use_decode_sdpa && implementation.decode_matrix)
+        runtime_state.bfloat16_cooperative_matrix_dispatches += prepared.size();
     ++runtime_state.kv_ring_appends;
     if (representative.ring_first_slot
             + representative.destination_count

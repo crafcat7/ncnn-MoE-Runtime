@@ -272,6 +272,70 @@ static void decode_storage(const DecodeCase& spec, const CompiledModel& gpu)
                   "plain Attention did not preserve its selected BF16/FP32 representation");
 }
 
+static void decode_graph_memory(const CompiledModel& gpu)
+{
+    const auto& attention = gpu.graph.layer_plans[0].attention;
+    const auto& operation = gpu.operators.at(attention.vulkan_attention_operator).attention;
+    segment_check(operation && has_flag(attention.flags, AttentionBlockSink),
+                  "graph memory regression requires prepared Attention with a sink");
+    const auto context = operation->vulkan_context();
+    const uint32_t device = context->device()->info.device_index();
+    const uint64_t alignment = std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
+    const auto scheduled = std::find_if(gpu.schedule.node_order.begin(), gpu.schedule.node_order.end(), [&](ExecutionNodeId id) {
+        const auto& node = gpu.graph.nodes[id];
+        return node.type == ExecutionNodeType::Attention && node.layer_plan_index == 0;
+    });
+    segment_check(scheduled != gpu.schedule.node_order.end(), "Attention memory fixture has no scheduled Attention node");
+    const uint32_t position = static_cast<uint32_t>(scheduled - gpu.schedule.node_order.begin());
+    const auto allocations = [&](const GraphMemoryPlan& plan, uint64_t bytes) {
+        std::vector<const GraphMemoryAllocation*> found;
+        for (const auto& item : plan.allocations)
+            if (item.device_index == device && item.first_node == position && item.size == bytes)
+                found.push_back(&item);
+        return found;
+    };
+    uint64_t workspace_bytes = 0;
+    segment_check(operation->decode_workspace_bytes(257, workspace_bytes), "cannot query planned matrix decode workspace");
+    if (workspace_bytes != 0)
+    {
+        const auto check_workspaces = [&](const GraphMemoryPlan& plan, uint32_t expected, const char* phase) {
+            const auto workspaces = allocations(plan, workspace_bytes);
+            segment_check(workspaces.size() == expected,
+                          std::string(phase) + " did not retain one matrix workspace per concurrently recorded Session");
+            const uint64_t aligned_bytes = (workspace_bytes + alignment - 1) / alignment * alignment;
+            for (size_t index = 0; index < workspaces.size(); ++index)
+            {
+                const auto& current = *workspaces[index];
+                segment_check(current.offset % alignment == 0 && current.last_node >= position,
+                              std::string(phase) + " matrix workspace is not aligned or live at Attention");
+                for (size_t previous = 0; previous < index; ++previous)
+                {
+                    const auto& other = *workspaces[previous];
+                    segment_check(current.offset >= other.offset + aligned_bytes
+                                      || other.offset >= current.offset + aligned_bytes,
+                                  std::string(phase) + " simultaneous Session workspaces overlap their aligned ranges");
+                }
+            }
+        };
+        const auto three = plan_model_graph_memory(gpu, 3, 3, 257);
+        segment_check(static_cast<bool>(three), "three-Session Attention graph planning failed");
+        check_workspaces(three.value().prefill, 3, "three-row prefill");
+        check_workspaces(three.value().decode, 3, "three-Session decode");
+        const auto two = plan_model_graph_memory(gpu, 2, 3, 257);
+        segment_check(static_cast<bool>(two), "two-row/three-Session Attention graph planning failed");
+        check_workspaces(two.value().prefill, 2, "two-row prefill");
+        check_workspaces(two.value().decode, 3, "three-Session decode after two-row prefill");
+        const auto single = plan_model_graph_memory(gpu, 3, 1, 257);
+        segment_check(static_cast<bool>(single), "single-Session Attention graph planning failed");
+        check_workspaces(single.value().prefill, 0, "single-Session multi-row prefill");
+        check_workspaces(single.value().decode, 1, "single-Session decode");
+    }
+    else
+        std::cout << "SKIP: matrix workspace graph regression requires matrix Attention capability\n";
+
+    std::cout << "Attention graph memory: concurrent Session workspaces passed\n";
+}
+
 static void decode_sequence(const DecodeCase& spec, const CompiledModel& cpu, const CompiledModel& gpu)
 {
     const auto& plan = gpu.graph.layer_plans[0].attention;
@@ -413,6 +477,8 @@ static int run(uint32_t device, bool kernel_only)
             const auto cpu = decode_model(spec, false, device);
             const auto gpu = decode_model(spec, true, device);
             decode_storage(spec, gpu);
+            if (spec.head_dimension == 64 && spec.cache_dtype == DType::BFloat16 && spec.sinks && spec.window == 0)
+                decode_graph_memory(gpu);
             decode_sequence(spec, cpu, gpu);
             decode_staged(cpu, gpu);
         }

@@ -51,6 +51,7 @@ endif()
 set(NCNN_MOE_SOURCES
     # ncnn backends
     src/backends/ncnn/attention_vulkan.cpp
+    src/backends/ncnn/attentiondecode_vulkan.cpp
     src/backends/ncnn/expertbackend_vulkan.cpp
     src/backends/ncnn/experttransfer_vulkan.cpp
     src/backends/ncnn/graphallocator_vulkan.cpp
@@ -383,6 +384,8 @@ endif()
 if(NCNN_MOE_WITH_VULKAN)
     set(NCNN_MOE_VULKAN_SHADER_SOURCES
         src/kernels/vulkan/attention_decode_sdpa.comp
+        src/kernels/vulkan/attention_gqa_matrix.comp
+        src/kernels/vulkan/attention_gqa_reduce.comp
         src/kernels/vulkan/attention_output_gate.comp
         src/kernels/vulkan/attention_qkv_norm_rope.comp
         src/kernels/vulkan/attention_qkv_rope.comp
@@ -505,7 +508,19 @@ if(NCNN_MOE_BUILD_TESTS)
     target_include_directories(ncnn_moe_graph_memory_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME ncnn_moe_graph_memory COMMAND ncnn_moe_graph_memory_test)
 
+    add_executable(ncnn_moe_attention_decode_plan_test tests/test_attention_decode_plan.cpp)
+    target_compile_features(ncnn_moe_attention_decode_plan_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_attention_decode_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ncnn_moe_attention_decode_plan COMMAND ncnn_moe_attention_decode_plan_test)
+
     if(NCNN_MOE_WITH_VULKAN)
+        add_executable(ncnn_moe_attention_gqa_vulkan_test tests/test_attention_gqa_vulkan.cpp)
+        target_link_libraries(ncnn_moe_attention_gqa_vulkan_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_attention_gqa_vulkan_test PRIVATE cxx_std_20)
+        target_compile_definitions(ncnn_moe_attention_gqa_vulkan_test PRIVATE NCNN_MOE_WITH_VULKAN=1)
+        target_include_directories(ncnn_moe_attention_gqa_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+        add_test(NAME ncnn_moe_attention_gqa_vulkan COMMAND ncnn_moe_attention_gqa_vulkan_test)
+        set_tests_properties(ncnn_moe_attention_gqa_vulkan PROPERTIES SKIP_RETURN_CODE 77)
         add_executable(ncnn_moe_graph_allocator_vulkan_test tests/test_graph_allocator_vulkan.cpp)
         target_link_libraries(ncnn_moe_graph_allocator_vulkan_test PRIVATE ncnn::moe)
         target_compile_features(ncnn_moe_graph_allocator_vulkan_test PRIVATE cxx_std_20)

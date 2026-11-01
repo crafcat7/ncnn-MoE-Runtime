@@ -143,6 +143,8 @@ public:
 #if NCNN_MOE_WITH_VULKAN
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
     [[nodiscard]] const ncnn::Option& option() const noexcept;
+    // Upper bound for the selected decode path's retained private workspace.
+    [[nodiscard]] bool decode_workspace_bytes(uint32_t context_tokens, uint64_t& bytes) const noexcept;
     // Caller owns the command lock and retains work through its fence. The
     // branch-only form lets a generic residual operator compose the block.
     [[nodiscard]] bool record_forward(uint64_t position_offset, LayerCache& cache,
@@ -155,6 +157,10 @@ private:
     class Implementation;
 
 #if NCNN_MOE_WITH_VULKAN
+    [[nodiscard]] bool record_decode(const ncnn::VkMat& query, const ncnn::VkMat& key,
+                                     const ncnn::VkMat& value, uint64_t destination_count,
+                                     ncnn::VkMat& output, ncnn::VkCompute& command,
+                                     std::vector<ncnn::VkMat>& workspace) const;
     [[nodiscard]] bool support_qkv_rope(size_t token_count) const noexcept;
 
     [[nodiscard]] bool record_native_qkv(const ncnn::VkMat& input,
