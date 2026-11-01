@@ -41,6 +41,111 @@ static void scratch_check_near(float actual, float expected, float tolerance, co
         throw std::runtime_error(std::string("scratch test mismatch: ") + message);
 }
 
+struct ExternalActivationStorage
+{
+    alignas(16) std::array<std::byte, 256> bytes{};
+};
+
+static void test_activation_external_storage()
+{
+    auto storage = std::make_shared<ExternalActivationStorage>();
+    const std::weak_ptr<ExternalActivationStorage> owner = storage;
+    ActivationBuffer external;
+    external.assign_external(2, 5, DType::Float32, storage->bytes, storage);
+    const auto* address = storage->bytes.data();
+    scratch_check(external.bytes().data() == address && external.bytes().size() == 10 * sizeof(float)
+                      && external.rows() == 2 && external.columns() == 5 && external.dtype() == DType::Float32,
+                  "external activation must expose only the logical rows of its owned storage");
+    for (size_t index = 0; index < external.values().size(); ++index)
+        external.row(index / 5)[index % 5] = static_cast<float>(index) * 0.25f - 1.0f;
+    const std::vector<float> original(external.values().begin(), external.values().end());
+
+    ActivationBuffer copied = external;
+    ActivationBuffer assigned(1, 1);
+    assigned = external;
+    scratch_check(copied.bytes().data() != address && assigned.bytes().data() != address
+                      && std::equal(original.begin(), original.end(), copied.values().begin())
+                      && std::equal(original.begin(), original.end(), assigned.values().begin()),
+                  "copying an external activation must preserve independent value storage");
+    copied.row(0)[0] = 91.0f;
+    assigned.row(1)[4] = -93.0f;
+    scratch_check(external.row(0)[0] == original.front() && external.row(1)[4] == original.back(),
+                  "mutable activation copies aliased a published external output");
+    storage.reset();
+    scratch_check(!owner.expired(), "external activation failed to retain its storage owner");
+    ActivationBuffer moved = std::move(external);
+    scratch_check(moved.bytes().data() == address && !owner.expired(), "external activation move lost its storage owner");
+    ActivationBuffer swapped(1, 2);
+    swapped.row(0)[0] = 17.0f;
+    swapped.row(0)[1] = -19.0f;
+    moved.swap(swapped);
+    scratch_check(swapped.bytes().data() == address && swapped.rows() == 2 && swapped.columns() == 5
+                      && moved.rows() == 1 && moved.columns() == 2 && moved.row(0)[0] == 17.0f && moved.row(0)[1] == -19.0f,
+                  "activation swap failed to exchange both external and owned storage metadata");
+    swapped.clear();
+    scratch_check(owner.expired() && swapped.rows() == 0 && swapped.columns() == 0 && swapped.bytes().empty(),
+                  "clearing external activation retained the storage lease or published rows");
+    scratch_check(copied.row(1)[4] == original.back() && assigned.row(0)[0] == original.front(),
+                  "releasing external storage invalidated deep copies");
+
+    storage = std::make_shared<ExternalActivationStorage>();
+    const std::weak_ptr<ExternalActivationStorage> reset_owner = storage;
+    external.assign_external(2, 5, DType::Float32, storage->bytes, storage);
+    std::copy(original.begin(), original.end(), external.row(0));
+    storage.reset();
+    external.reset(3, 5, false);
+    scratch_check(reset_owner.expired() && external.rows() == 3 && external.columns() == 5
+                      && std::equal(original.begin(), original.end(), external.values().begin())
+                      && std::all_of(external.row(2), external.row(2) + 5, [](float value) { return value == 0.0f; }),
+                  "external reset(false) must detach, preserve old values and initialize added elements");
+    // One non-FP32 case covers byte-oriented copies and eight-byte row stride.
+    {
+        auto typed_owner = std::make_shared<ExternalActivationStorage>();
+        ActivationBuffer typed;
+        typed.assign_external(2, 3, DType::Int64, typed_owner->bytes, typed_owner);
+        scratch_check(typed.dtype() == DType::Int64 && typed.bytes().size() == 6 * typed.element_size()
+                          && typed.row_bytes(1).data() == typed.bytes().data() + 3 * typed.element_size(),
+                      "external typed activation shape or row stride mismatch");
+        for (size_t index = 0; index < typed.bytes().size(); ++index)
+            typed.mutable_bytes()[index] = static_cast<std::byte>((index * 11 + 7) % 256);
+        const ActivationBuffer copy = typed;
+        scratch_check(copy.dtype() == DType::Int64 && copy.bytes().data() != typed.bytes().data()
+                          && std::equal(typed.bytes().begin(), typed.bytes().end(), copy.bytes().begin()),
+                      "external typed activation copy changed its byte representation");
+    }
+}
+
+static void test_activation_external_rejection()
+{
+    auto storage = std::make_shared<ExternalActivationStorage>();
+    ActivationBuffer output;
+    output.assign_external(1, 3, DType::Float32, storage->bytes, storage);
+    output.row(0)[0] = 31.0f;
+    output.row(0)[1] = -37.0f;
+    output.row(0)[2] = 41.0f;
+    const auto* address = output.bytes().data();
+    const auto reject = [&](size_t rows, uint32_t columns, DType dtype, std::span<std::byte> bytes, std::shared_ptr<void> owner) {
+        bool rejected = false;
+        try
+        {
+            output.assign_external(rows, columns, dtype, bytes, std::move(owner));
+        }
+        catch (const std::exception&)
+        {
+            rejected = true;
+        }
+        scratch_check(rejected && output.rows() == 1 && output.columns() == 3 && output.dtype() == DType::Float32
+                          && output.bytes().data() == address && output.row(0)[0] == 31.0f
+                          && output.row(0)[1] == -37.0f && output.row(0)[2] == 41.0f,
+                      "invalid external activation replaced or corrupted the published output");
+    };
+    reject(1, 4, DType::Float32, std::span<std::byte>(storage->bytes).first(15), storage);
+    reject(1, 2, DType::Float32, std::span<std::byte>(storage->bytes).subspan(1), storage);
+    reject(1, 4, DType::Float32, storage->bytes, {});
+    reject(1, 4, DType::MxFp4, storage->bytes, storage);
+    reject(std::numeric_limits<size_t>::max(), 2, DType::Float32, storage->bytes, storage);
+}
+
 #if defined(_OPENMP)
 struct ScratchOpenMpDynamicScope
 {
@@ -923,6 +1028,8 @@ static void test_attention_mixed_projection_scratch_reuse()
 
 void test_reusable_kernel_scratch()
 {
+    test_activation_external_storage();
+    test_activation_external_rejection();
     test_mxfp4_scratch_reuse();
     test_attention_scratch_reuse();
     test_attention_mixed_projection_scratch_reuse();

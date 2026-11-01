@@ -3,9 +3,11 @@
 #include "experttransfer_vulkan.h"
 #include "graphallocator_vulkan.h"
 #include "kernels/activationbuffer.h"
+#include "graph/memoryplan.h"
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -338,6 +340,96 @@ bool copy_staging_to_cpu_batch(ncnn::VkMat& staging,
     staging.data->access_flags = VK_ACCESS_HOST_READ_BIT;
     staging.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
     return true;
+}
+
+struct VulkanHostOutput::Storage
+{
+    explicit Storage(std::shared_ptr<VulkanContext> owner)
+        : context(std::move(owner)), allocator(std::make_unique<ncnn::VkStagingAllocator>(context->device()))
+    {
+    }
+    // Destruction order is buffer, allocator, then the device/context owner.
+    std::shared_ptr<VulkanContext> context;
+    std::unique_ptr<ncnn::VkStagingAllocator> allocator;
+    ncnn::VkMat buffer;
+};
+
+VulkanHostOutput::VulkanHostOutput() = default;
+VulkanHostOutput::~VulkanHostOutput() = default;
+
+bool VulkanHostOutput::prepare(const std::shared_ptr<VulkanContext>& context,
+                               size_t rows, uint32_t columns, uint64_t slot_capacity_limit,
+                               ncnn::VkMat& destination, ActivationBuffer& pending)
+{
+    if (!context || rows == 0 || columns == 0 || rows > static_cast<size_t>(INT_MAX)
+        || columns > static_cast<uint32_t>(INT_MAX)
+        || rows > std::numeric_limits<size_t>::max() / sizeof(float) / columns)
+        return false;
+    const size_t bytes = rows * static_cast<size_t>(columns) * sizeof(float);
+    const auto planned = plan_host_output_slot_size(rows, columns);
+    if (!planned || planned.value() > slot_capacity_limit) return false;
+    for (const auto& slot : slots)
+        if (slot && slot->buffer.data->capacity > slot_capacity_limit) return false;
+    std::shared_ptr<Storage>* chosen = nullptr;
+    for (auto& slot : slots)
+    {
+        if (slot && slot.use_count() != 1) continue;
+        if (slot && slot->context == context && slot->buffer.total() * slot->buffer.elemsize >= bytes)
+        {
+            chosen = &slot;
+            break;
+        }
+        if (!chosen) chosen = &slot;
+    }
+    if (!chosen) return false;
+    if (!*chosen || (*chosen)->context != context || (*chosen)->buffer.total() * (*chosen)->buffer.elemsize < bytes)
+    {
+        auto replacement = std::make_shared<Storage>(context);
+        if (!prepare_staging_batch(replacement->buffer, rows, columns, replacement->allocator.get())
+            || replacement->buffer.data->capacity > slot_capacity_limit) return false;
+        *chosen = std::move(replacement);
+    }
+    const auto& slot = *chosen;
+    ncnn::VkMat view = slot->buffer;
+    view.w = static_cast<int>(columns);
+    view.h = static_cast<int>(rows);
+    view.cstep = rows * static_cast<size_t>(columns);
+#if NCNN_BATCH
+    view.nstep = view.cstep;
+#endif
+    if (!view.mapped_ptr()) return false;
+    ActivationBuffer prepared;
+    prepared.assign_external(rows, columns, DType::Float32,
+                             {static_cast<std::byte*>(view.mapped_ptr()), slot->buffer.total() * slot->buffer.elemsize}, slot);
+    destination = std::move(view);
+    pending.swap(prepared);
+    slot_capacity = std::max(slot_capacity, slot_capacity_limit);
+    return true;
+}
+
+bool VulkanHostOutput::complete(ncnn::VkMat& destination, const ActivationBuffer& pending)
+{
+    if (destination.empty() || !destination.allocator || pending.dtype() != DType::Float32
+        || !has_batch_shape(destination, pending.rows(), pending.columns(), sizeof(float))
+        || destination.mapped_ptr() != pending.bytes().data()) return false;
+    destination.allocator->invalidate(destination.data);
+    destination.data->access_flags = VK_ACCESS_HOST_READ_BIT;
+    destination.data->stage_flags = VK_PIPELINE_STAGE_HOST_BIT;
+    return true;
+}
+
+uint64_t VulkanHostOutput::allocated_bytes() const noexcept
+{
+    uint64_t size = 0;
+    for (const auto& slot : slots)
+        if (slot && slot->buffer.data) size += slot->buffer.data->capacity;
+    return size;
+}
+
+void VulkanHostOutput::clear() noexcept
+{
+    for (auto& slot : slots) slot.reset();
+    slot_capacity = 0;
 }
 
 bool copy_staging_to_cpu_batches(ncnn::VkMat& staging,

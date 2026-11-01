@@ -466,6 +466,33 @@ private:
     int completion_error = 0;
 };
 
+// Two transactional host-visible output slots per execution workspace. A
+// published ActivationBuffer leases its slot; only unleased slots are reused.
+// Callers plan the payload bound before recording and serialize preparation
+// under the context command mutex. Each slot owns its allocator so a published
+// output may safely outlive the workspace or be released on another thread.
+class VulkanHostOutput
+{
+public:
+    VulkanHostOutput();
+    ~VulkanHostOutput();
+    VulkanHostOutput(const VulkanHostOutput&) = delete;
+    VulkanHostOutput& operator=(const VulkanHostOutput&) = delete;
+    [[nodiscard]] bool prepare(const std::shared_ptr<VulkanContext>& context,
+                               size_t rows, uint32_t columns, uint64_t slot_capacity_limit,
+                               ncnn::VkMat& destination, ActivationBuffer& pending);
+    [[nodiscard]] static bool complete(ncnn::VkMat& destination, const ActivationBuffer& pending);
+    [[nodiscard]] uint64_t allocated_bytes() const noexcept;
+    [[nodiscard]] uint64_t planned_capacity() const noexcept
+    { return slot_capacity; }
+    void clear() noexcept;
+
+private:
+    struct Storage;
+    std::array<std::shared_ptr<Storage>, 2> slots;
+    uint64_t slot_capacity = 0;
+};
+
 // Caller serializes allocations and frees in the command domain. Only free
 // buffers are cached; retained upload commands keep their active buffers alive.
 class VulkanUploadStagingAllocator final : public ncnn::VkStagingAllocator

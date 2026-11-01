@@ -39,7 +39,14 @@ ncnn::VkBufferMemory* VulkanExpertWeightAllocator::fastMalloc(size_t size)
     const size_t aligned = ((size + alignment - 1) / alignment) * alignment;
     const std::lock_guard<std::mutex> lock(mutex);
     const auto allocate_range = [&](Block& block, std::list<Range>::iterator range) {
-        auto result = std::make_unique<ncnn::VkBufferMemory>();
+        std::unique_ptr<Allocation> result;
+        if (retain_free_blocks && spare_allocations)
+        {
+            result.reset(spare_allocations);
+            spare_allocations = spare_allocations->next;
+        }
+        else
+            result = std::make_unique<Allocation>();
         result->buffer = block.buffer;
         result->offset = range->offset;
         result->capacity = aligned;
@@ -49,13 +56,34 @@ ncnn::VkBufferMemory* VulkanExpertWeightAllocator::fastMalloc(size_t size)
         result->access_flags = 0;
         result->stage_flags = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         result->refcount = 0;
-        // Allocate the range node before changing free-space accounting.
-        // fastFree can then splice it without allocating from a destructor.
-        block.used.push_back({range->offset, aligned});
-        range->offset += aligned;
-        range->size -= aligned;
-        if (range->size == 0) block.free.erase(range);
-        return result.release();
+        result->next = nullptr;
+        if (range->size == aligned)
+        {
+            // An exact hole already owns the required bookkeeping node.
+            block.used.splice(block.used.end(), block.free, range);
+            result->range = range;
+        }
+        else
+        {
+            // Obtain the node before changing free-space accounting. Splice
+            // and descriptor publication then cannot allocate or throw.
+            if (retain_free_blocks && !spare_ranges.empty())
+            {
+                auto reused = spare_ranges.begin();
+                *reused = {range->offset, aligned};
+                block.used.splice(block.used.end(), spare_ranges, reused);
+            }
+            else
+                block.used.push_back({range->offset, aligned});
+            result->range = std::prev(block.used.end());
+            range->offset += aligned;
+            range->size -= aligned;
+        }
+        result->block = &block;
+        result->range->allocation = result.get();
+        ++live_allocations;
+        peak_live_allocations = std::max(peak_live_allocations, live_allocations);
+        return static_cast<ncnn::VkBufferMemory*>(result.release());
     };
     if (retain_free_blocks)
     {
@@ -159,62 +187,81 @@ ncnn::VkBufferMemory* VulkanExpertWeightAllocator::fastMalloc(size_t size)
     return allocate_range(*blocks.back(), blocks.back()->free.begin());
 }
 
+void VulkanExpertWeightAllocator::recycle_range(std::list<Range>& ranges,
+                                                std::list<Range>::iterator range) noexcept
+{
+    if (retain_free_blocks && spare_ranges.size() < peak_live_allocations)
+    {
+        range->allocation = nullptr;
+        spare_ranges.splice(spare_ranges.end(), ranges, range);
+    }
+    else
+        ranges.erase(range);
+}
+
 void VulkanExpertWeightAllocator::fastFree(ncnn::VkBufferMemory* buffer)
 {
     if (!buffer) return;
     const std::lock_guard<std::mutex> lock(mutex);
-    for (const auto& block : blocks)
+    auto* allocation = static_cast<Allocation*>(buffer);
+    Block* block = allocation->block;
+    if (!block)
     {
-        if (block->buffer != buffer->buffer) continue;
-        auto next = block->free.begin();
-        while (next != block->free.end() && next->offset < buffer->offset) ++next;
-        auto used = block->used.begin();
-        while (used != block->used.end() && used->offset != buffer->offset) ++used;
-        if (used == block->used.end())
-        {
-            delete buffer;
-            return;
-        }
-        block->free.splice(next, block->used, used);
-        auto inserted = used;
-        if (inserted != block->free.begin())
-        {
-            auto previous = std::prev(inserted);
-            if (previous->offset + previous->size == inserted->offset)
-            {
-                previous->size += inserted->size;
-                block->free.erase(inserted);
-                inserted = previous;
-            }
-        }
-        next = std::next(inserted);
-        if (next != block->free.end() && inserted->offset + inserted->size == next->offset)
-        {
-            inserted->size += next->size;
-            block->free.erase(next);
-        }
-        delete buffer;
-        if (block->used.empty() && !retain_free_blocks)
-        {
-            const bool another_free = std::any_of(blocks.begin(), blocks.end(), [&](const auto& other) {
-                return other.get() != block.get() && other->used.empty();
-            });
-            // Retain at most one ordinary warm block. Oversized fully free
-            // buffers are returned immediately, so shape churn is bounded.
-            if (block->capacity > block_size || another_free)
-            {
-                const Block* released = block.get();
-                vkDestroyBuffer(vkdev->vkdevice(), block->buffer, nullptr);
-                vkFreeMemory(vkdev->vkdevice(), block->memory, nullptr);
-                allocated_bytes -= block->memory_size;
-                blocks.erase(std::remove_if(blocks.begin(), blocks.end(),
-                                            [released](const auto& candidate) { return candidate.get() == released; }),
-                             blocks.end());
-            }
-        }
+        // clear() invalidates backing, but disarms outstanding metadata so
+        // releasing such an old handle never dereferences a destroyed Block.
+        delete allocation;
         return;
     }
-    delete buffer;
+    auto next = block->free.begin();
+    while (next != block->free.end() && next->offset < buffer->offset) ++next;
+    auto inserted = allocation->range;
+    block->free.splice(next, block->used, inserted);
+    inserted->allocation = nullptr;
+    allocation->block = nullptr;
+    allocation->range = {};
+    --live_allocations;
+    if (inserted != block->free.begin())
+    {
+        auto previous = std::prev(inserted);
+        if (previous->offset + previous->size == inserted->offset)
+        {
+            previous->size += inserted->size;
+            recycle_range(block->free, inserted);
+            inserted = previous;
+        }
+    }
+    next = std::next(inserted);
+    if (next != block->free.end() && inserted->offset + inserted->size == next->offset)
+    {
+        inserted->size += next->size;
+        recycle_range(block->free, next);
+    }
+    if (retain_free_blocks)
+    {
+        // A header is acquired from this list before creating another one;
+        // therefore live + cached headers never exceed the live high-water mark.
+        allocation->next = spare_allocations;
+        spare_allocations = allocation;
+    }
+    else
+        delete allocation;
+    if (block->used.empty() && !retain_free_blocks)
+    {
+        const bool another_free = std::any_of(blocks.begin(), blocks.end(), [&](const auto& other) {
+            return other.get() != block && other->used.empty();
+        });
+        // Retain at most one ordinary warm block. Oversized fully free
+        // buffers are returned immediately, so shape churn is bounded.
+        if (block->capacity > block_size || another_free)
+        {
+            vkDestroyBuffer(vkdev->vkdevice(), block->buffer, nullptr);
+            vkFreeMemory(vkdev->vkdevice(), block->memory, nullptr);
+            allocated_bytes -= block->memory_size;
+            blocks.erase(std::remove_if(blocks.begin(), blocks.end(),
+                                        [block](const auto& candidate) { return candidate.get() == block; }),
+                         blocks.end());
+        }
+    }
 }
 
 ncnn::VkImageMemory* VulkanExpertWeightAllocator::fastMalloc(int, int, int, size_t, int)
@@ -228,10 +275,23 @@ void VulkanExpertWeightAllocator::clear()
     const std::lock_guard<std::mutex> lock(mutex);
     for (const auto& block : blocks)
     {
+        for (const auto& range : block->used)
+        {
+            range.allocation->block = nullptr;
+            range.allocation->range = {};
+        }
         vkDestroyBuffer(vkdev->vkdevice(), block->buffer, nullptr);
         vkFreeMemory(vkdev->vkdevice(), block->memory, nullptr);
     }
     blocks.clear();
+    while (spare_allocations)
+    {
+        auto* next = spare_allocations->next;
+        delete spare_allocations;
+        spare_allocations = next;
+    }
+    spare_ranges.clear();
+    live_allocations = peak_live_allocations = 0;
     allocated_bytes = 0;
 }
 

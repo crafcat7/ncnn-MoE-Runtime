@@ -10,6 +10,7 @@
 #include "sharedffn_vulkan.h"
 #include "vulkancontext.h"
 #include "graph/compiledmodel.h"
+#include "graph/memoryplan.h"
 #include "graph/submissionbudget.h"
 #include "kernels/statecache.h"
 
@@ -34,6 +35,8 @@ class GpuSegmentWorkspace_vulkan::Implementation
 public:
     std::shared_ptr<const DeviceTensor_vulkan> normalized;
 #if NCNN_MOE_WITH_VULKAN
+    std::shared_ptr<VulkanHostOutput> host_output;
+    uint64_t host_output_slot_size = 0;
     std::shared_ptr<VulkanContext> context;
     ncnn::Option option;
     std::shared_ptr<ncnn::Layer> add;
@@ -84,8 +87,12 @@ public:
 class GpuSegment_vulkan::Implementation
 {
 public:
+    Implementation();
+    ~Implementation();
     std::shared_ptr<VulkanContext> context;
 #if NCNN_MOE_WITH_VULKAN
+    class BankWorkspace;
+    std::unique_ptr<BankWorkspace> bank_workspace;
     ncnn::Option option;
     std::shared_ptr<Attention_vulkan> attention;
     std::shared_ptr<GatedDeltaNet_vulkan> delta;
@@ -106,7 +113,24 @@ GpuSegmentWorkspace_vulkan::GpuSegmentWorkspace_vulkan() : d(new Implementation)
 }
 GpuSegmentWorkspace_vulkan::~GpuSegmentWorkspace_vulkan() = default;
 void GpuSegmentWorkspace_vulkan::reset()
-{ d.reset(new Implementation); }
+{
+#if NCNN_MOE_WITH_VULKAN
+    Implementation next;
+    next.host_output = std::move(d->host_output);
+    next.host_output_slot_size = d->host_output_slot_size;
+    *d = std::move(next);
+#else
+    *d = Implementation{};
+#endif
+}
+void GpuSegmentWorkspace_vulkan::reserve_host_output(uint64_t slot_capacity) noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    d->host_output_slot_size = std::max(d->host_output_slot_size, slot_capacity);
+#else
+    (void)slot_capacity;
+#endif
+}
 bool GpuSegmentWorkspace_vulkan::active() const noexcept
 {
 #if NCNN_MOE_WITH_VULKAN
@@ -118,7 +142,7 @@ bool GpuSegmentWorkspace_vulkan::active() const noexcept
 uint64_t GpuSegmentWorkspace_vulkan::allocated_bytes() const noexcept
 {
 #if NCNN_MOE_WITH_VULKAN
-    uint64_t bytes = 0;
+    uint64_t bytes = d->host_output ? d->host_output->allocated_bytes() : 0;
     for (const auto& value : {d->normalized, d->residual, d->combined})
         if (value && !value->empty()) bytes += value->value()->total() * value->value()->elemsize;
     return bytes;
@@ -373,14 +397,58 @@ public:
     const ActivationBuffer* initial_hidden = nullptr;
     std::vector<ncnn::VkMat> storage;
     std::vector<std::unique_ptr<AttentionWork_vulkan>> attention_work;
+    size_t attention_work_used = 0;
     std::vector<std::unique_ptr<GatedDeltaWork_vulkan>> delta_work;
     std::vector<std::unique_ptr<QsaAttentionWork_vulkan>> qsa_work;
     RouterWorkspace_vulkan router_work;
     FfnRecordStatistics_vulkan ffn_statistics;
+    std::shared_ptr<VulkanHostOutput> host_output;
+    uint64_t host_output_slot_size = 0;
+    ActivationBuffer pending_logits;
+    // Mapped views are destroyed before their lease and dedicated allocator.
     ncnn::VkMat upload, input, normalized_attention, branch, residual, normalized, output, selected_staging;
     uint32_t selected_columns = 0;
     size_t output_rows = 0;
     bool uploaded = false, standalone = false, produce_logits = false, last_row_only = false, fused_head = false;
+
+    std::span<std::unique_ptr<AttentionWork_vulkan>> active_attention_work() noexcept
+    {
+        return {attention_work.data(), attention_work_used};
+    }
+
+    // Called only after command retirement and publication/failure handling.
+    // Keep empty metadata capacity; no allocation or Session owner is deferred.
+    void retire() noexcept
+    {
+        for (auto& work : active_attention_work()) work->retire();
+        attention_work_used = 0;
+        // These tickets do not yet expose a reusable-state API.
+        delta_work.clear();
+        qsa_work.clear();
+        storage.clear();
+        router_work = {};
+        for (auto* value : {&upload, &input, &normalized_attention, &branch,
+                            &residual, &normalized, &output, &selected_staging})
+            value->release();
+        pending_logits.clear();
+        host_output.reset();
+        host_output_slot_size = 0;
+        previous = {};
+        positions.clear();
+        caches.clear();
+        selection_bias.clear();
+        explicit_ids.clear();
+        options = {};
+        initial_hidden = nullptr;
+        ffn_statistics = {};
+        selected_columns = 0;
+        output_rows = 0;
+        uploaded = standalone = produce_logits = last_row_only = fused_head = false;
+        recorded = attempted = completed = published = failed = false;
+        error.clear();
+        // In particular, a head-owned pool must not retain its own target.
+        target.reset();
+    }
 
     bool record_layer(const ncnn::VkMat* combined, ncnn::VkCompute& command,
                       const ncnn::VkMat* recorded_hidden = nullptr, bool download_routes = true)
@@ -441,8 +509,10 @@ public:
             ncnn::VkMat output;
             if (d->attention)
             {
-                attention_work.push_back(std::make_unique<AttentionWork_vulkan>());
-                if (!d->attention->record_forward(positions[first], *caches[first], source, output, command, *attention_work.back(), false)) return fail("Standard Attention device recording failed");
+                if (attention_work_used == attention_work.size())
+                    attention_work.push_back(std::make_unique<AttentionWork_vulkan>());
+                auto& work = *attention_work[attention_work_used++];
+                if (!d->attention->record_forward(positions[first], *caches[first], source, output, command, work, false)) return fail("Standard Attention device recording failed");
             }
             else if (d->delta)
             {
@@ -563,7 +633,20 @@ public:
                 storage.push_back(unpacked);
                 output = unpacked;
             }
-            if (!prepare_staging_batch(selected_staging, output_rows, output.w, d->context->staging_allocator())
+            if (!host_output) host_output = std::make_shared<VulkanHostOutput>();
+            // Direct compiler clients plan their requested output explicitly;
+            // Runtime workspaces receive the model's admitted shape bound.
+            if (host_output_slot_size == 0)
+            {
+                const auto planned = plan_host_output_slot_size(output_rows, output.w);
+                if (!planned)
+                {
+                    error = planned.error().message;
+                    return false;
+                }
+                host_output_slot_size = std::max(planned.value(), host_output->planned_capacity());
+            }
+            if (!host_output->prepare(d->context, output_rows, output.w, host_output_slot_size, selected_staging, pending_logits)
                 || !record_prepared_activation_staging_download(output, output_rows, output.w, selected_staging, command, d->context->device(), d->option))
             {
                 error = "cannot record Vulkan logits download";
@@ -593,6 +676,95 @@ public:
     }
 #endif
 };
+
+#if NCNN_MOE_WITH_VULKAN
+class GpuSegment_vulkan::Implementation::BankWorkspace
+{
+public:
+    // One pool per compiled head, serialized by its Context command mutex.
+    // Slots are bounded by the largest planned chunk plus its optional head;
+    // per-slot row/ticket capacity is bounded by admitted Session row counts.
+    std::vector<std::unique_ptr<GpuSegmentContinuation_vulkan::Implementation>> slots;
+    std::vector<GpuSegmentContinuation_vulkan::Implementation*> work;
+    std::vector<ncnn::VkMat> bank_storage;
+    struct LayerWorkCoefficients
+    {
+        double attention_router_per_row = 0;
+        double routed_expert_per_selection_row = 0;
+        double shared_per_row = 0;
+    };
+    struct LayerWork
+    {
+        double attention_router = 0;
+        double experts = 0;
+    };
+    std::vector<LayerWorkCoefficients> layer_work_coefficients;
+    std::vector<LayerWork> layer_work;
+    double head_work_per_row = 0;
+    const CompiledModel* work_coefficients_model = nullptr;
+
+    void prepare_work_coefficients(const CompiledModel& model)
+    {
+        if (work_coefficients_model == &model && layer_work_coefficients.size() == model.graph.layer_plans.size()) return;
+        // A copied compiled model may share its head but own a different graph.
+        // Bind this cache to the current immutable compiled model as well.
+        // Inspect weight shapes once; rows and selected-expert counts remain
+        // runtime inputs. Publish the cache only after all shapes are read.
+        std::vector<LayerWorkCoefficients> prepared(model.graph.layer_plans.size());
+        const auto projection_work = [&](TensorHandle handle) -> double {
+            if (handle == invalid_tensor_handle) return 0;
+            const auto& shape = model.weights.at(handle).shape;
+            return shape.size() == 2 ? 2.0 * shape[0] * shape[1] : 0;
+        };
+        const auto expert_work = [&](const ExpertPlan& expert) {
+            return projection_work(expert.gate_weight) + projection_work(expert.up_weight)
+                   + projection_work(expert.gate_up_weight) + projection_work(expert.down_weight);
+        };
+        for (size_t layer = 0; layer < prepared.size(); ++layer)
+        {
+            const auto& plan = model.graph.layer_plans[layer];
+            const auto& a = plan.attention;
+            auto& coefficients = prepared[layer];
+            for (auto handle : {a.query_weight, a.key_weight, a.value_weight, a.output_weight, a.output_gate_weight,
+                                a.delta_qkv_weight, a.delta_z_weight, a.delta_beta_weight, a.delta_alpha_weight,
+                                a.query_a_weight, a.query_b_weight, a.key_value_weight, a.output_a_weight, a.output_b_weight,
+                                a.qsa_query_key_weight, plan.moe.router_weight})
+                coefficients.attention_router_per_row += projection_work(handle);
+            const auto& bank = model.gpu_expert_banks[layer]->description();
+            coefficients.routed_expert_per_selection_row = 2.0 * bank.intermediate_columns
+                                                           * (2.0 * bank.input_columns + bank.output_columns);
+            if (plan.moe.has_shared_expert)
+                coefficients.shared_per_row = expert_work(plan.moe.shared_expert);
+        }
+        const double prepared_head_work = projection_work(model.lm_head_weight);
+        layer_work_coefficients = std::move(prepared);
+        head_work_per_row = prepared_head_work;
+        work_coefficients_model = &model;
+    }
+
+    GpuSegmentContinuation_vulkan::Implementation& acquire()
+    {
+        const size_t index = work.size();
+        if (index == slots.size())
+            slots.push_back(std::make_unique<GpuSegmentContinuation_vulkan::Implementation>());
+        auto& result = *slots[index];
+        // Publish the slot before assigning any target/cache owners, so an
+        // allocation exception while preparing it is covered by retirement.
+        work.push_back(&result);
+        return result;
+    }
+
+    void retire() noexcept
+    {
+        for (auto* pending : work) pending->retire();
+        work.clear();
+        bank_storage.clear();
+    }
+};
+#endif
+
+GpuSegment_vulkan::Implementation::Implementation() = default;
+GpuSegment_vulkan::Implementation::~Implementation() = default;
 
 GpuSegmentContinuation_vulkan::GpuSegmentContinuation_vulkan() : d(new Implementation)
 {
@@ -636,7 +808,7 @@ void GpuSegmentContinuation_vulkan::abort() noexcept
 #if NCNN_MOE_WITH_VULKAN
     if (d->attempted)
     {
-        for (auto& work : d->attention_work) work->mark_submit_failed();
+        for (auto& work : d->active_attention_work()) work->mark_submit_failed();
         for (auto& work : d->delta_work) work->mark_submit_failed();
         // QSA can append into a shared allocation before metadata publication.
         // A submitted, discarded transaction cannot leave it reusable as old KV.
@@ -705,6 +877,9 @@ std::shared_ptr<GpuSegmentContinuation_vulkan> GpuSegment_vulkan::prepare_head_c
     }
     auto result = std::shared_ptr<GpuSegmentContinuation_vulkan>(new GpuSegmentContinuation_vulkan);
     result->d->target = d;
+    if (!workspace.d->host_output) workspace.d->host_output = std::make_shared<VulkanHostOutput>();
+    result->d->host_output = workspace.d->host_output;
+    result->d->host_output_slot_size = workspace.d->host_output_slot_size;
     result->d->previous = *workspace.d;
     result->d->produce_logits = produce_logits;
     result->d->last_row_only = last_row_only;
@@ -743,7 +918,7 @@ bool GpuSegmentContinuation_vulkan::publish(ExpertDispatchPlan& routes, GpuSegme
     }
     if (!normalized->assign_completed(d->normalized, target.context) || !residual->assign_completed(d->residual, target.context))
         return fail("cannot publish completed Vulkan segment activations");
-    for (auto& work : d->attention_work)
+    for (auto& work : d->active_attention_work())
         if (!work->commit()) return fail("Standard Attention cache publication failed");
     for (auto& work : d->delta_work)
         if (!work->commit()) return fail("GatedDeltaNet state publication failed");
@@ -789,11 +964,9 @@ bool GpuSegmentContinuation_vulkan::publish_head(ActivationBuffer& logits, GpuSe
     }
     const auto& target = *d->target;
     const std::lock_guard<std::mutex> lock(target.context->command_mutex());
-    ActivationBuffer completed;
     if (d->produce_logits)
     {
-        completed.reset(d->output_rows, static_cast<uint32_t>(d->output.w), false);
-        if (!copy_staging_to_cpu_batch(d->selected_staging, completed))
+        if (!VulkanHostOutput::complete(d->selected_staging, d->pending_logits))
         {
             error = "cannot read Vulkan logits";
             abort();
@@ -809,7 +982,11 @@ bool GpuSegmentContinuation_vulkan::publish_head(ActivationBuffer& logits, GpuSe
     counters.compute_submissions += d->standalone;
     ++counters.resident_graph_submissions;
     counters.batch_downloads += d->produce_logits;
-    if (d->produce_logits) logits.swap(completed);
+    if (d->produce_logits)
+    {
+        logits.swap(d->pending_logits);
+        d->pending_logits.clear();
+    }
     auto& current = *workspace.d;
     current.normalized.reset();
     current.residual.reset();
@@ -830,7 +1007,8 @@ bool GpuSegmentContinuation_vulkan::publish_head(ActivationBuffer& logits, GpuSe
 bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const ActivationBuffer& initial_hidden,
                                       std::span<const uint64_t> positions, std::span<LayerCache* const> caches,
                                       std::span<const ExpertDispatchOptions> options,
-                                      bool produce_logits, bool last_row_only, ActivationBuffer& logits, std::string& error)
+                                      bool produce_logits, bool last_row_only, ActivationBuffer& logits, std::string& error,
+                                      GpuSegmentWorkspace_vulkan* workspace)
 {
 #if NCNN_MOE_WITH_VULKAN
     const size_t layers = model.graph.layer_plans.size();
@@ -857,41 +1035,33 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
             return false;
         }
     const uint32_t chunk_layers = bank_chunk_layers(model, static_cast<uint32_t>(rows));
+    GpuSegmentWorkspace_vulkan local_workspace;
+    auto& output_workspace = workspace ? *workspace : local_workspace;
+    if (!output_workspace.d->host_output) output_workspace.d->host_output = std::make_shared<VulkanHostOutput>();
     const std::lock_guard<std::mutex> lock(context->command_mutex());
+    auto& head_implementation = *model.gpu_head->d;
+    if (!head_implementation.bank_workspace)
+        head_implementation.bank_workspace = std::make_unique<Implementation::BankWorkspace>();
+    auto& pooled = *head_implementation.bank_workspace;
     ncnn::VkMat hidden;
     ncnn::VkMat validation_upload, validation, validation_download;
-    std::vector<std::unique_ptr<GpuSegmentContinuation_vulkan::Implementation>> work;
-    std::vector<ncnn::VkMat> bank_storage;
+    auto& work = pooled.work;
+    auto& bank_storage = pooled.bank_storage;
     // The original chunk remains the allocation/retirement unit. Internal
     // submissions share one exclusively leased queue and retain every operand.
     VulkanComputeBatch batches(*context);
-    std::vector<double> layer_work(layers);
-    const auto projection_work = [&](TensorHandle handle) -> double {
-        if (handle == invalid_tensor_handle) return 0;
-        const auto& shape = model.weights.at(handle).shape;
-        return shape.size() == 2 ? 2.0 * rows * shape[0] * shape[1] : 0;
-    };
-    const auto expert_work = [&](const ExpertPlan& expert) {
-        return projection_work(expert.gate_weight) + projection_work(expert.up_weight)
-               + projection_work(expert.gate_up_weight) + projection_work(expert.down_weight);
-    };
-    double total_work = produce_logits ? projection_work(model.lm_head_weight) : 0;
+    pooled.prepare_work_coefficients(model);
+    auto& layer_work = pooled.layer_work;
+    layer_work.resize(layers);
+    const double head_work = produce_logits ? pooled.head_work_per_row * (last_row_only ? 1.0 : rows) : 0;
+    double total_work = head_work;
     for (size_t layer = 0; layer < layers; ++layer)
     {
-        const auto& plan = model.graph.layer_plans[layer];
-        const auto& a = plan.attention;
-        double work_estimate = 0;
-        for (auto handle : {a.query_weight, a.key_weight, a.value_weight, a.output_weight, a.output_gate_weight,
-                            a.delta_qkv_weight, a.delta_z_weight, a.delta_beta_weight, a.delta_alpha_weight,
-                            a.query_a_weight, a.query_b_weight, a.key_value_weight, a.output_a_weight, a.output_b_weight,
-                            a.qsa_query_key_weight, plan.moe.router_weight})
-            work_estimate += projection_work(handle);
-        const auto& bank = model.gpu_expert_banks[layer]->description();
-        work_estimate += 2.0 * rows * options[layer].top_k * bank.intermediate_columns
-                         * (2.0 * bank.input_columns + bank.output_columns);
-        if (plan.moe.has_shared_expert) work_estimate += expert_work(plan.moe.shared_expert);
-        layer_work[layer] = std::max(1.0, work_estimate);
-        total_work += layer_work[layer];
+        const auto& coefficients = pooled.layer_work_coefficients[layer];
+        auto& estimate = layer_work[layer];
+        estimate.attention_router = std::max(1.0, rows * coefficients.attention_router_per_row);
+        estimate.experts = std::max(1.0, rows * (options[layer].top_k * coefficients.routed_expert_per_selection_row + coefficients.shared_per_row));
+        total_work += estimate.attention_router + estimate.experts;
     }
     GpuSubmissionBudget budget(total_work);
     bool successful = false, submitted = false, chunk_attempted = false;
@@ -902,7 +1072,7 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
             if (chunk_attempted)
                 for (auto& pending : work)
                 {
-                    for (auto& attention : pending->attention_work) attention->mark_submit_failed();
+                    for (auto& attention : pending->active_attention_work()) attention->mark_submit_failed();
                     for (auto& delta : pending->delta_work) delta->mark_submit_failed();
                 }
             // A partially executed chain cannot be replayed against the old
@@ -910,6 +1080,9 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
             if (submitted)
                 for (auto* cache : caches) cache->vulkan_attention_state_unknown = true;
         }
+        // Also run on exceptions: never leave target/cache references in the
+        // head-owned pool, and never move GPU operand cleanup to a later token.
+        pooled.retire();
     };
     std::unique_ptr<void, decltype(cleanup)> guard(reinterpret_cast<void*>(1), cleanup);
     auto fail = [&](const std::string& reason) { error = reason; return false; };
@@ -918,8 +1091,7 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
         if (batches.reset() != 0) return fail("cannot reset resident Expert bank commands");
         auto* recording = batches.next();
         if (!recording) return fail("cannot acquire ordered resident Expert bank command");
-        work.clear();
-        bank_storage.clear();
+        pooled.retire();
         validation_upload.release();
         validation.release();
         validation_download.release();
@@ -937,19 +1109,32 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
             || !record_mapped_upload(validation_upload, validation, *recording, option))
             return fail("cannot initialize resident Expert bank validation");
         const size_t end = std::min(layers, first + chunk_layers);
+        const auto flush_before = [&](double next_work) {
+            if (!budget.would_flush_before(next_work)) return true;
+            submitted = chunk_attempted = true;
+            if (batches.submit() != 0) return fail("resident Expert bank asynchronous submit failed");
+            budget.submitted();
+            recording = batches.next();
+            if (!recording) return fail("cannot acquire next resident Expert bank command");
+            return true;
+        };
         for (size_t layer = first; layer < end; ++layer)
         {
-            auto& command = *recording;
-            auto pending = std::make_unique<GpuSegmentContinuation_vulkan::Implementation>();
-            auto& current = *pending;
+            if (!flush_before(layer_work[layer].attention_router)) return false;
+            auto& current = pooled.acquire();
             current.target = model.gpu_segments[layer]->d;
             current.positions.assign(positions.begin(), positions.end());
             current.caches.assign(caches.begin() + layer * rows, caches.begin() + (layer + 1) * rows);
             current.options = options[layer];
             current.initial_hidden = &initial_hidden;
-            work.push_back(std::move(pending));
-            if (!current.record_layer(nullptr, command, hidden.empty() ? nullptr : &hidden, false))
+            if (!current.record_layer(nullptr, *recording, hidden.empty() ? nullptr : &hidden, false))
                 return fail(current.error);
+            budget.record(layer_work[layer].attention_router);
+            // Submit completed record-only stages before a large successor.
+            // All operands and producer access metadata survive until the
+            // original chunk fence, including Router IDs consumed below.
+            if (!flush_before(layer_work[layer].experts)) return false;
+            auto& command = *recording;
             ncnn::VkMat combined;
             if (!model.gpu_expert_banks[layer]->record(current.normalized, current.router_work.selected,
                                                        options[layer].top_k, combined, validation, command, bank_storage))
@@ -975,33 +1160,30 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
             hidden = added[0];
             current.storage.push_back(hidden);
             ++current.ffn_statistics.dispatches;
-            // Split at complete record-only layer boundaries. The validation
-            // word, hidden values and KV producers keep their access metadata.
-            // Leave the tail in this command when a memory chunk ends.
-            if (budget.append(layer_work[layer]) && layer + 1 < end)
-            {
-                submitted = chunk_attempted = true;
-                if (batches.submit() != 0) return fail("resident Expert bank asynchronous submit failed");
-                recording = batches.next();
-                if (!recording) return fail("cannot acquire next resident Expert bank command");
-            }
+            budget.record(layer_work[layer].experts);
         }
-        auto& command = *recording;
         if (end == layers)
         {
-            auto head = std::make_unique<GpuSegmentContinuation_vulkan::Implementation>();
-            head->target = model.gpu_head->d;
-            head->produce_logits = produce_logits;
-            head->last_row_only = last_row_only;
-            work.push_back(std::move(head));
-            if (!work.back()->record_head(nullptr, command, &hidden)) return fail(work.back()->error);
+            if (produce_logits && !flush_before(head_work)) return false;
+            auto& head = pooled.acquire();
+            head.target = model.gpu_head->d;
+            head.host_output = output_workspace.d->host_output;
+            head.host_output_slot_size = output_workspace.d->host_output_slot_size;
+            head.produce_logits = produce_logits;
+            head.last_row_only = last_row_only;
+            if (!head.record_head(nullptr, *recording, &hidden)) return fail(head.error);
+            if (produce_logits) budget.record(head_work);
         }
+        auto& command = *recording;
         if (!prepare_staging_batch(validation_download, 1, 1, context->staging_allocator())
             || !record_prepared_activation_staging_download(validation, 1, 1, validation_download,
                                                             command, context->device(), option))
             return fail("cannot record resident Expert bank validation download");
         submitted = chunk_attempted = true;
-        if (batches.submit() != 0 || batches.wait() != 0)
+        if (batches.submit() != 0)
+            return fail("resident Expert bank submit or fence wait failed");
+        budget.submitted();
+        if (batches.wait() != 0)
             return fail("resident Expert bank submit or fence wait failed");
         ActivationBuffer checked(1, 1);
         if (!copy_staging_to_cpu_batch(validation_download, checked)
@@ -1011,9 +1193,9 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
         if (end == layers && produce_logits)
         {
             auto& head = *work.back();
-            completed.reset(head.output_rows, static_cast<uint32_t>(head.output.w), false);
-            if (!copy_staging_to_cpu_batch(head.selected_staging, completed))
+            if (!VulkanHostOutput::complete(head.selected_staging, head.pending_logits))
                 return fail("cannot read resident Expert bank logits");
+            completed.swap(head.pending_logits);
         }
         const size_t chunk_submissions = batches.submission_count();
         // Retire command-owned operands before publishing caches or logits;
@@ -1021,7 +1203,7 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
         if (batches.reset() != 0) return fail("cannot retire resident Expert bank commands");
         for (auto& pending : work)
         {
-            for (auto& attention : pending->attention_work)
+            for (auto& attention : pending->active_attention_work())
                 if (!attention->commit()) return fail("resident Expert bank Attention cache publication failed");
             for (auto& delta : pending->delta_work)
                 if (!delta->commit()) return fail("resident Expert bank GatedDeltaNet publication failed");
@@ -1048,8 +1230,7 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
         if (end == layers && produce_logits) logits.swap(completed);
         chunk_attempted = false;
         // Release completed private operands before the next recording chunk.
-        work.clear();
-        bank_storage.clear();
+        pooled.retire();
     }
     if (!produce_logits) logits.clear();
     successful = true;
@@ -1063,6 +1244,7 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
     (void)produce_logits;
     (void)last_row_only;
     (void)logits;
+    (void)workspace;
     error = "resident Expert banks are unavailable in this build";
     return false;
 #endif
@@ -1228,6 +1410,9 @@ bool GpuSegment_vulkan::finish(bool produce_logits, bool last_row_only, Activati
     auto pending = std::shared_ptr<GpuSegmentContinuation_vulkan>(new GpuSegmentContinuation_vulkan);
     auto& work = *pending->d;
     work.target = d;
+    if (!workspace.d->host_output) workspace.d->host_output = std::make_shared<VulkanHostOutput>();
+    work.host_output = workspace.d->host_output;
+    work.host_output_slot_size = workspace.d->host_output_slot_size;
     work.previous = *workspace.d;
     work.produce_logits = produce_logits;
     work.last_row_only = last_row_only;

@@ -707,6 +707,88 @@ static void bank_chain_abort(const CompiledModel& gpu)
                   "a bank transaction reused submitted state after failure without reset");
 }
 
+static void bank_persistent_logits(const CompiledModel& cpu, const CompiledModel& gpu, bool explicit_reservation = true)
+{
+    const auto memory = plan_model_graph_memory(gpu, 3, 1, 16);
+    const auto prepared = ensure_model_graph_resources(gpu, 3, 16);
+    segment_check(memory && prepared && memory.value().host_output_slot_size != 0,
+                  "persistent bank output fixture planning failed");
+    GpuSegmentWorkspace_vulkan workspace;
+    if (explicit_reservation) workspace.reserve_host_output(memory.value().host_output_slot_size);
+    std::array<LayerCache, segment_layers> caches;
+    std::array<ExpertDispatchOptions, segment_layers> options;
+    for (auto& option : options) option.expert_count = option.top_k = 4;
+    SessionState expected;
+    SessionStatistics statistics;
+    ActivationBuffer logits, held_prefill;
+    std::vector<ActivationBuffer> snapshots;
+    uint64_t position = 0;
+    std::string error;
+    for (size_t step = 0; step < 3; ++step)
+    {
+        const bool multiple_rows = explicit_reservation ? step == 0 : step == 1;
+        const std::vector<int32_t> ids = multiple_rows ? std::vector<int32_t>{1, 4, 2}
+                                                       : std::vector<int32_t>{static_cast<int32_t>(step + 5)};
+        const auto reference = forward_model(cpu, ids, statistics, expected, position, LogitsOutput::All);
+        segment_check(static_cast<bool>(reference), reference ? "" : reference.error().message);
+        ActivationBuffer input;
+        forward_embedding(gpu.weights.at(gpu.token_embedding), ids, input);
+        std::vector<uint64_t> positions(ids.size());
+        std::vector<LayerCache*> pointers(segment_layers * ids.size());
+        for (size_t row = 0; row < ids.size(); ++row)
+        {
+            positions[row] = position + row;
+            for (size_t layer = 0; layer < segment_layers; ++layer) pointers[layer * ids.size() + row] = &caches[layer];
+        }
+        if (step == 1) held_prefill = std::move(logits);
+        if (step == 2) held_prefill.clear();
+        segment_check(GpuSegment_vulkan::forward_banks(gpu, input, positions, pointers, options, true, false,
+                                                       logits, error, &workspace),
+                      "persistent bank output execution failed: " + error);
+        segment_compare(logits.values(), expected.logits.values(), "persistent bank complete logits step " + std::to_string(step));
+        if (step == 1)
+        {
+            segment_check(std::equal(held_prefill.values().begin(), held_prefill.values().end(), snapshots[0].values().begin()),
+                          "a later decode overwrote still-published prefill logits");
+        }
+        snapshots.push_back(logits);
+        position += ids.size();
+        segment_check(caches[0].token_count == position && caches[1].gated_delta_token_count == position,
+                      "persistent bank decode did not publish each cache exactly once");
+        workspace.reset();
+        segment_check(!workspace.active() && workspace.allocated_bytes() <= memory.value().host_output_workspace_size,
+                      "transient workspace reset discarded output accounting or retained an unfinished segment");
+    }
+
+    const ActivationBuffer published = logits;
+    const std::byte* published_pointer = logits.bytes().data();
+    const std::array<int32_t, 1> ids{11};
+    ActivationBuffer input;
+    forward_embedding(gpu.weights.at(gpu.token_embedding), ids, input);
+    const std::array<uint64_t, 1> positions{position};
+    std::array<LayerCache*, segment_layers> pointers;
+    for (size_t layer = 0; layer < segment_layers; ++layer) pointers[layer] = &caches[layer];
+    const auto before = get_vulkan_statistics(gpu.vulkan_runtime);
+    options[0].top_k = 0;
+    segment_check(!GpuSegment_vulkan::forward_banks(gpu, input, positions, pointers, options, true, true,
+                                                    logits, error, &workspace)
+                      && get_vulkan_statistics(gpu.vulkan_runtime).compute_submissions == before.compute_submissions
+                      && logits.bytes().data() == published_pointer
+                      && std::equal(logits.values().begin(), logits.values().end(), published.values().begin()),
+                  "persistent workspace preflight failure replaced published logits or submitted work");
+    options[0].top_k = 4;
+    const std::array<uint32_t, 4> duplicate{0, 0, 1, 2};
+    options[0].explicit_expert_ids = duplicate;
+    segment_check(!GpuSegment_vulkan::forward_banks(gpu, input, positions, pointers, options, true, true,
+                                                    logits, error, &workspace)
+                      && error.find("invalid GPU routing") != std::string::npos
+                      && logits.bytes().data() == published_pointer
+                      && std::equal(logits.values().begin(), logits.values().end(), published.values().begin()),
+                  "submitted persistent workspace failure changed already published full logits");
+    for (const auto& cache : caches)
+        segment_check(cache.vulkan_attention_state_unknown, "failed persistent bank transaction left submitted cache state reusable");
+}
+
 static void bank_models()
 {
     for (const DType dtype : {DType::MxFp4, DType::BFloat16, DType::Float32})
@@ -717,11 +799,16 @@ static void bank_models()
         bank_engine(cpu, streaming, false);
         const auto resident = bank_model(true, dtype, false, true, layout);
         bank_engine(cpu, resident, true);
-        bank_chain_abort(resident);
+        if (dtype == DType::BFloat16)
+        {
+            bank_chain_abort(resident);
+            bank_persistent_logits(cpu, resident);
+        }
     }
     const auto interleaved_cpu = bank_model(false, DType::BFloat16, false, true);
     const auto interleaved_bank = bank_model(true, DType::BFloat16, false, true);
     bank_engine(interleaved_cpu, interleaved_bank, true);
+    bank_persistent_logits(interleaved_cpu, interleaved_bank, false);
     const auto cpu = bank_model(false, DType::BFloat16, true, true, ExpertLayout::PackedGateUpDown);
     const auto native_delta = bank_model(true, DType::BFloat16, true, true, ExpertLayout::PackedGateUpDown);
     bank_engine(cpu, native_delta, true);

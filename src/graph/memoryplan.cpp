@@ -19,6 +19,23 @@
 namespace ncnn {
 namespace moe {
 
+Result<uint64_t> plan_host_output_slot_size(uint64_t rows, uint32_t columns)
+{
+    constexpr uint64_t alignment = 64;
+    constexpr uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    if (rows == 0 || columns == 0 || rows > static_cast<uint64_t>(std::numeric_limits<int>::max())
+        || columns > static_cast<uint32_t>(std::numeric_limits<int>::max())
+        || rows > maximum / columns / sizeof(float))
+        return Error{ErrorCode::InvalidArgument, "Vulkan host output shape exceeds the allocation range"};
+    const uint64_t bytes = rows * columns * sizeof(float);
+    if (bytes > maximum - (alignment - 1))
+        return Error{ErrorCode::InvalidArgument, "Vulkan host output alignment exceeds the allocation range"};
+    const uint64_t aligned = (bytes + alignment - 1) / alignment * alignment;
+    if (aligned > std::numeric_limits<size_t>::max())
+        return Error{ErrorCode::InvalidArgument, "Vulkan host output size exceeds the addressable range"};
+    return aligned;
+}
+
 static constexpr uint64_t gibibyte = 1024ull * 1024ull * 1024ull;
 static constexpr uint64_t mebibyte = 1024ull * 1024ull;
 

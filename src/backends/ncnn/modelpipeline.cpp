@@ -3119,6 +3119,25 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
     result.prefill_rows = prefill_rows;
     result.sequence_count = sequence_count;
     result.context_tokens = std::max(prefill_rows, context_tokens);
+    uint32_t host_output_rows = 0;
+    for (const ExecutionGraph* graph : {&compiled.graph, &compiled.speculative.graph})
+        if (std::any_of(graph->nodes.begin(), graph->nodes.end(), [](const ExecutionNode& node) {
+                return node.type == ExecutionNodeType::LmHead && node.backend == ExecutionBackend::Vulkan;
+            }))
+        {
+            host_output_rows = std::max({host_output_rows, prefill_rows, sequence_count});
+            if (graph == &compiled.speculative.graph)
+                host_output_rows = std::max(host_output_rows, compiled.speculative.block_size);
+        }
+    if (host_output_rows != 0)
+    {
+        const auto slot_size = plan_host_output_slot_size(host_output_rows, compiled.descriptor.vocabulary_size);
+        if (!slot_size) return slot_size.error();
+        if (slot_size.value() > UINT64_MAX / 2)
+            return Error{ErrorCode::InvalidArgument, "Vulkan host output workspace exceeds the allocation range"};
+        result.host_output_slot_size = slot_size.value();
+        result.host_output_workspace_size = slot_size.value() * 2;
+    }
     const uint64_t total_nodes = static_cast<uint64_t>(compiled.graph.nodes.size()) + compiled.speculative.graph.nodes.size();
     if (total_nodes > UINT32_MAX)
         return Error{ErrorCode::InvalidModel, "graph memory schedule exceeds the node position range"};

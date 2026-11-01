@@ -2,6 +2,7 @@
 #include "backends/ncnn/vulkancontext.h"
 #include "engine/graphresources.h"
 #include "graph/compiledmodel.h"
+#include "kernels/activationbuffer.h"
 
 #include <algorithm>
 #include <array>
@@ -189,6 +190,143 @@ static void test_cross_thread_allocation(uint32_t device_index)
                 "cross-thread graph execution escaped its shared physical ceiling");
 }
 
+static void test_allocator_descriptor_retirement(uint32_t device_index)
+{
+    auto runtime = create_vulkan_runtime();
+    auto context = VulkanContext::acquire(device_index, runtime, OptimizationDefaultFlags);
+    arena_check(static_cast<bool>(context), "descriptor retirement context creation failed");
+    VulkanGraphAllocator arena(context->device());
+    const size_t unit = std::max<size_t>(256, context->device()->info.buffer_offset_alignment());
+    arena_check(arena.reserve_graph_compute(unit * 16), "descriptor retirement reservation failed");
+    const uint64_t physical = arena.physical_size().total_physical_size;
+    auto* first = arena.fastMalloc(unit);
+    arena_check(first != nullptr, "descriptor retirement allocation failed");
+    first->access_flags = VK_ACCESS_SHADER_WRITE_BIT;
+    first->stage_flags = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    arena.fastFree(first);
+    auto* reused = arena.fastMalloc(unit * 2);
+    arena_check(reused && reused->capacity >= unit * 2 && reused->access_flags == 0
+                    && reused->stage_flags == VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                    && arena.physical_size().total_physical_size == physical,
+                "range reuse retained stale synchronization state or grew the reserved backing");
+
+    // A pre-clear handle must not free a replacement allocation's live range.
+    arena.clear();
+    arena_check(arena.reserve_graph_compute(unit * 16), "graph arena reservation after clear failed");
+    auto* current = arena.fastMalloc(unit * 3);
+    arena_check(current != nullptr, "graph arena allocation after clear failed");
+    arena.fastFree(reused);
+    auto* adjacent = arena.fastMalloc(unit);
+    arena_check(adjacent && (adjacent->buffer != current->buffer || adjacent->offset >= current->offset + current->capacity || current->offset >= adjacent->offset + adjacent->capacity)
+                    && arena.physical_size().total_physical_size == physical,
+                "disposing a stale descriptor exposed a live range or exceeded the arena ceiling");
+    arena.fastFree(adjacent);
+    arena.fastFree(current);
+}
+
+static void write_host_output(const std::shared_ptr<VulkanContext>& context, VulkanGraphAllocator& arena,
+                              ncnn::VkMat& destination, const ActivationBuffer& pending, float base)
+{
+    ncnn::Mat expected(static_cast<int>(pending.columns()), static_cast<int>(pending.rows()), sizeof(float));
+    float* values = expected;
+    for (size_t index = 0; index < pending.rows() * pending.columns(); ++index)
+        values[index] = base + static_cast<float>(index) * 0.125f;
+    const std::lock_guard<std::mutex> lock(context->command_mutex());
+    const void* mapped = pending.bytes().data();
+    ncnn::VkCompute command(context->device());
+    ncnn::VkMat device;
+    const ncnn::Option option = graph_option(arena, *context);
+    command.record_upload(expected, device, option);
+    arena_check(!device.empty()
+                    && record_prepared_activation_staging_download(device, pending.rows(), pending.columns(), destination,
+                                                                   command, context->device(), option),
+                "planned host output transfer recording failed");
+    arena_check(destination.mapped_ptr() == mapped, "host output recording replaced the leased mapped allocation");
+    arena_check(command.submit_and_wait() == 0 && VulkanHostOutput::complete(destination, pending),
+                "planned host output transfer completion failed");
+    for (size_t index = 0; index < pending.rows() * pending.columns(); ++index)
+        arena_check(pending.values()[index] == values[index], "mapped host output lost a full-logits value");
+}
+
+static void test_host_output_leases(uint32_t device_index)
+{
+    auto runtime = create_vulkan_runtime();
+    auto context = VulkanContext::acquire(device_index, runtime, OptimizationDefaultFlags);
+    arena_check(static_cast<bool>(context), "host output context creation failed");
+    VulkanGraphAllocator arena(context->device());
+    arena_check(arena.reserve_graph_compute(64 * 1024), "host output transfer reservation failed");
+    const auto small_plan = plan_host_output_slot_size(2, 17);
+    const auto large_plan = plan_host_output_slot_size(3, 33);
+    arena_check(small_plan && large_plan, "host output fixture planning failed");
+    VulkanHostOutput pool;
+    ActivationBuffer first, second;
+    ncnn::VkMat first_device, second_device;
+    const auto prepare = [&](VulkanHostOutput& target, size_t rows, uint32_t columns, uint64_t limit,
+                             ncnn::VkMat& destination, ActivationBuffer& pending) {
+        const std::lock_guard<std::mutex> lock(context->command_mutex());
+        return target.prepare(context, rows, columns, limit, destination, pending);
+    };
+    arena_check(prepare(pool, 2, 17, small_plan.value(), first_device, first)
+                    && prepare(pool, 1, 19, small_plan.value(), second_device, second),
+                "two simultaneously leased host output slots could not be prepared");
+    arena_check(first.bytes().data() == first_device.mapped_ptr()
+                    && second.bytes().data() == second_device.mapped_ptr()
+                    && first.bytes().data() != second.bytes().data()
+                    && pool.allocated_bytes() <= 2 * small_plan.value(),
+                "host output slots overlap, copy through owned storage, or exceed their planned bound");
+    write_host_output(context, arena, first_device, first, -3.0f);
+    write_host_output(context, arena, second_device, second, 7.0f);
+    const ActivationBuffer first_snapshot(first), second_snapshot(second);
+    arena_check(!VulkanHostOutput::complete(first_device, second),
+                "host output completion accepted a lease for a different mapped slot");
+
+    ActivationBuffer rejected;
+    rejected.reset(1, 1, true);
+    rejected.row(0)[0] = 123.0f;
+    const std::byte* rejected_pointer = rejected.bytes().data();
+    ncnn::VkMat rejected_device = first_device;
+    const uint64_t initial_bytes = pool.allocated_bytes();
+    arena_check(!prepare(pool, 1, 1, small_plan.value(), rejected_device, rejected)
+                    && rejected.bytes().data() == rejected_pointer && rejected.row(0)[0] == 123.0f
+                    && rejected_device.data == first_device.data && pool.allocated_bytes() == initial_bytes,
+                "exhausted host output preparation changed the previous destination or published output");
+    rejected_device.release();
+
+    const std::byte* first_pointer = first.bytes().data();
+    first_device.release();
+    first.clear();
+    arena_check(prepare(pool, 1, 13, small_plan.value(), first_device, first)
+                    && first.bytes().data() == first_pointer && pool.allocated_bytes() == initial_bytes,
+                "released host output storage was not reused for a smaller logical shape");
+    write_host_output(context, arena, first_device, first, 31.0f);
+    arena_check(std::equal(second.values().begin(), second.values().end(), second_snapshot.values().begin())
+                    && first_snapshot.row(0)[0] == -3.0f,
+                "slot reuse changed another live lease or a deep-copy snapshot");
+
+    first_device.release();
+    first.clear();
+    arena_check(!prepare(pool, 3, 33, small_plan.value(), rejected_device, rejected)
+                    && rejected.row(0)[0] == 123.0f && rejected_device.empty()
+                    && pool.allocated_bytes() == initial_bytes,
+                "an unplanned larger host output allocated storage or changed its destination");
+    arena_check(prepare(pool, 3, 33, large_plan.value(), first_device, first)
+                    && pool.allocated_bytes() <= 2 * large_plan.value(),
+                "a larger planned host output could not replace a free slot within its bound");
+    write_host_output(context, arena, first_device, first, 43.0f);
+    arena_check(std::equal(second.values().begin(), second.values().end(), second_snapshot.values().begin()),
+                "growing a free host output slot invalidated a live smaller output");
+
+    // The external owner, rather than the workspace or the command, keeps the
+    // mapped allocation and its dedicated allocator alive after publication.
+    first_device.release();
+    second_device.release();
+    pool.clear();
+    arena_check(pool.allocated_bytes() == 0
+                    && first.row(2)[32] == 43.0f + 98.0f * 0.125f
+                    && std::equal(second.values().begin(), second.values().end(), second_snapshot.values().begin()),
+                "clearing a workspace invalidated its already published full logits");
+}
+
 static void test_model_shape_growth(uint32_t device_index)
 {
     CompiledModel model;
@@ -237,11 +375,17 @@ static void test_model_shape_growth(uint32_t device_index)
         return query_vulkan_graph_compute(model.vulkan_runtime, device_index, model.opt.optimization_flags).total_physical_size;
     };
     const uint64_t initial = physical_size();
+    const uint64_t initial_host_slot = model.graph_resources->plan.host_output_slot_size;
+    const uint64_t initial_host_workspace = model.graph_resources->plan.host_output_workspace_size;
     arena_check(initial != 0 && model.graph_resources->plan.prefill_rows == 512,
                 "model graph preparation did not physically reserve its planned shape");
     arena_check(static_cast<bool>(ensure_model_graph_resources(model, 1, 1024)), "long-context decode planning failed");
     arena_check(model.graph_resources->plan.prefill_rows == 1 && model.graph_resources->plan.context_tokens == 1024,
                 "decode growth must not reserve the Cartesian product of previous shape maxima");
+    arena_check(initial_host_slot != 0 && initial_host_workspace == 2 * initial_host_slot
+                    && model.graph_resources->plan.host_output_slot_size == initial_host_slot
+                    && model.graph_resources->plan.host_output_workspace_size == initial_host_workspace,
+                "smaller-row context replanning forgot the capacity of retained host output slots");
     arena_check(physical_size() == initial, "long-context decode failed to reuse the larger prefill allocation");
     arena_check(static_cast<bool>(ensure_model_graph_resources(model, 512, 1024)), "later long-context prefill planning failed");
     arena_check(model.graph_resources->plan.prefill_rows == 512 && model.graph_resources->plan.context_tokens == 1024,
@@ -270,6 +414,8 @@ int main()
         {
             ncnn::moe::test_reservation_reuse_and_growth(device);
             ncnn::moe::test_cross_thread_allocation(device);
+            ncnn::moe::test_allocator_descriptor_retirement(device);
+            ncnn::moe::test_host_output_leases(device);
             ncnn::moe::test_model_shape_growth(device);
         }
         std::cout << "Vulkan graph arena allocation, reuse, growth and cross-thread tests passed\n";

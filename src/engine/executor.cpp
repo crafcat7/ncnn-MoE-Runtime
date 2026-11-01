@@ -342,6 +342,11 @@ Result<void> forward_model(const CompiledModel& model,
     if (!graph_resources)
         return graph_resources.error();
     prepare_execution_state(model, state);
+    if (model.graph_resources)
+    {
+        const std::lock_guard<std::mutex> lock(model.graph_resources->mutex);
+        state.gpu_segment.reserve_host_output(model.graph_resources->plan.host_output_slot_size);
+    }
 
     ExpertCacheStatistics execution_cache_before;
     if (model.expert_cache)
@@ -439,7 +444,7 @@ Result<void> forward_model(const CompiledModel& model,
                 std::string error;
                 if (!GpuSegment_vulkan::forward_banks(model, hidden, positions, caches, options,
                                                       logits_output != LogitsOutput::None, logits_output == LogitsOutput::Last,
-                                                      state.logits, error))
+                                                      state.logits, error, &state.gpu_segment))
                     return Error{ErrorCode::InternalError, "resident Expert bank chain failed: " + error};
                 statistics.expert_assignments += assignments;
                 statistics.expert_gpu_routes += assignments;
@@ -1355,6 +1360,11 @@ Result<void> forward_decode_batch(const CompiledModel& model,
     auto graph_resources = ensure_model_graph_resources(model, 1, context_tokens, static_cast<uint32_t>(entries.size()));
     if (!graph_resources)
         return graph_resources.error();
+    if (model.graph_resources)
+    {
+        const std::lock_guard<std::mutex> lock(model.graph_resources->mutex);
+        workspace.gpu_segment.reserve_host_output(model.graph_resources->plan.host_output_slot_size);
+    }
     const CpuOpenMpThreadLimitScope openmp_scope;
 
     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
@@ -1565,7 +1575,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 ActivationBuffer completed;
                 std::string error;
                 if (!GpuSegment_vulkan::forward_banks(model, scratch.staged_output, positions, caches, options,
-                                                      requested_count != 0, false, completed, error))
+                                                      requested_count != 0, false, completed, error, &workspace.gpu_segment))
                     return Error{ErrorCode::InternalError, "resident staged Expert bank chain failed: " + error};
                 for (size_t row = 0; row < session_count; ++row)
                 {

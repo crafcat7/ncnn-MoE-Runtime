@@ -42,10 +42,12 @@ public:
     void configure_graph_pool(bool allow_growth);
 
 private:
+    struct Allocation;
     struct Range
     {
         size_t offset;
         size_t size;
+        Allocation* allocation = nullptr;
     };
     struct Block
     {
@@ -56,6 +58,15 @@ private:
         std::list<Range> free;
         std::list<Range> used;
     };
+    // Every allocation, including ordinary Expert storage, uses this header.
+    // Stable Block addresses and list iterators avoid scans during retirement.
+    struct Allocation : ncnn::VkBufferMemory
+    {
+        Block* block = nullptr;
+        std::list<Range>::iterator range;
+        Allocation* next = nullptr;
+    };
+    void recycle_range(std::list<Range>& ranges, std::list<Range>::iterator range) noexcept;
     const size_t block_size;
     const size_t alignment;
     const uint64_t physical_limit;
@@ -65,6 +76,12 @@ private:
     bool allow_physical_growth = true;
     mutable std::mutex mutex;
     std::vector<std::unique_ptr<Block>> blocks;
+    // Graph-only metadata reuse is bounded by peak simultaneously live
+    // allocations, independently of token count and physical arena capacity.
+    Allocation* spare_allocations = nullptr;
+    std::list<Range> spare_ranges;
+    size_t live_allocations = 0;
+    size_t peak_live_allocations = 0;
 };
 
 // Two isolated admission lanes retain pools, command buffers, fences and

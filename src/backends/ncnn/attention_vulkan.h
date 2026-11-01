@@ -39,6 +39,10 @@ public:
     AttentionWork_vulkan& operator=(const AttentionWork_vulkan&) = delete;
     [[nodiscard]] bool commit() noexcept;
     void mark_submit_failed() noexcept;
+    // The owner has drained/reset every referencing command and handled cache
+    // publication or failure. Release all operands now, retain empty CPU slots.
+    // As with recording, the caller holds the Context command mutex.
+    void retire() noexcept;
 
 private:
     friend class Attention_vulkan;

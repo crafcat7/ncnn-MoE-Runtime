@@ -28,6 +28,7 @@ public:
     GpuSegmentWorkspace_vulkan(const GpuSegmentWorkspace_vulkan&) = delete;
     GpuSegmentWorkspace_vulkan& operator=(const GpuSegmentWorkspace_vulkan&) = delete;
     void reset();
+    void reserve_host_output(uint64_t slot_capacity) noexcept;
     [[nodiscard]] bool active() const noexcept;
     [[nodiscard]] uint64_t allocated_bytes() const noexcept;
     [[nodiscard]] const std::shared_ptr<const DeviceTensor_vulkan>& device_input() const noexcept;
@@ -62,7 +63,8 @@ public:
                                             std::span<const uint64_t> positions, std::span<LayerCache* const> caches,
                                             std::span<const ExpertDispatchOptions> options,
                                             bool produce_logits, bool last_row_only,
-                                            ActivationBuffer& logits, std::string& error);
+                                            ActivationBuffer& logits, std::string& error,
+                                            GpuSegmentWorkspace_vulkan* workspace = nullptr);
 
     // Prepare a private transaction before entering the Expert command lock.
     // The Region records it only in the wave that completes its aggregate.

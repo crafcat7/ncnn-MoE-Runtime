@@ -300,6 +300,70 @@ static void segment_boundary_and_rejection(const CompiledModel& cpu, const Compi
     segment_check(!workspace.active() && !workspace.device_input(), "reset retained a published normalized input");
     segment_check(GpuSegment_vulkan::supports(gpu, layer), "rejected input mutated prepared segment capabilities");
 }
+
+static void segment_standalone_head_capacity(const CompiledModel& cpu, const CompiledModel& gpu)
+{
+    const auto planned = plan_host_output_slot_size(2, gpu.descriptor.vocabulary_size);
+    segment_check(static_cast<bool>(planned), "standalone head output planning failed");
+    GpuSegmentWorkspace_vulkan workspace;
+    workspace.reserve_host_output(1);
+    ActivationBuffer logits(1, 1);
+    logits.row(0)[0] = -101.0f;
+    for (size_t step = 0; step < 2; ++step)
+    {
+        const std::vector<int32_t> ids = step == 0 ? std::vector<int32_t>{2, 6}
+                                                   : std::vector<int32_t>{static_cast<int32_t>(step + 3)};
+        ActivationBuffer input;
+        forward_embedding(cpu.weights.at(cpu.token_embedding), ids, input);
+        LayerCache cache, expected_cache;
+        std::vector<uint64_t> positions(ids.size());
+        std::vector<LayerCache*> caches(ids.size(), &cache);
+        for (size_t row = 0; row < positions.size(); ++row) positions[row] = row;
+        ExpertDispatchOptions options;
+        options.expert_count = segment_experts;
+        options.top_k = segment_top_k;
+        ExpertDispatchPlan routes;
+        std::string error;
+        segment_check(gpu.gpu_segments[0]->forward(input, positions, caches, options, routes, workspace, error),
+                      "standalone head input segment failed: " + error);
+        ActivationBuffer aggregate(ids.size(), segment_hidden);
+        const auto device_aggregate = segment_upload(aggregate, gpu);
+        segment_check(GpuSegment_vulkan::defer_combine(device_aggregate, workspace),
+                      "standalone head could not retain its completed aggregate");
+
+        AttentionScratch scratch;
+        ActivationBuffer expected;
+        const auto& layer = cpu.graph.layer_plans[0];
+        const auto attention = forward_attention(cpu.weights, cpu.operators, layer.attention, ExecutionBackend::Cpu,
+                                                 0, expected_cache, scratch, input, expected, cpu.opt.optimization_flags);
+        segment_check(static_cast<bool>(attention), attention ? "" : attention.error().message);
+        const auto normalized = forward_rms_norm(expected, cpu.weights.at(layer.moe.pre_ffn_norm_weight),
+                                                 cpu.descriptor.norm_epsilon, cpu.descriptor.norm_weight_offset);
+        ActivationBuffer shared;
+        ExpertWorkspace shared_workspace;
+        forward_shared_expert(cpu, layer.moe, normalized, shared, shared_workspace);
+        add_batch_inplace(expected, shared);
+        const auto final = forward_rms_norm(expected, cpu.weights.at(cpu.final_norm_weight),
+                                            cpu.descriptor.norm_epsilon, cpu.descriptor.norm_weight_offset);
+        const auto reference = forward_linear(cpu.weights.at(cpu.lm_head_weight), final, cpu.opt.optimization_flags);
+        ActivationBuffer hidden;
+        if (step == 0)
+        {
+            const auto before = get_vulkan_statistics(gpu.vulkan_runtime);
+            segment_check(!gpu.gpu_head->finish(true, false, hidden, logits, workspace, error)
+                              && workspace.active() && logits.rows() == 1 && logits.columns() == 1 && logits.row(0)[0] == -101.0f
+                              && get_vulkan_statistics(gpu.vulkan_runtime).compute_submissions == before.compute_submissions,
+                          "standalone head ignored its explicit output bound or published a failed recording");
+            workspace.reserve_host_output(planned.value());
+        }
+        segment_check(gpu.gpu_head->finish(true, false, hidden, logits, workspace, error),
+                      "standalone head failed after planned output admission: " + error);
+        segment_compare(logits.values(), reference.values(), "standalone head complete mapped logits");
+        segment_check(workspace.allocated_bytes() <= 2 * planned.value(),
+                      "standalone head exceeded its planned output capacity");
+        workspace.reset();
+    }
+}
 #endif
 
 static int run()
@@ -335,6 +399,7 @@ static int run()
             }
             // Fixture-only products are prepared before sealing the shared arena.
             segment_boundary_and_rejection(cpu, gpu);
+            segment_standalone_head_capacity(cpu, gpu);
             const auto reserved = prepare_model_graph_resources(gpu, 4);
             segment_check(static_cast<bool>(reserved), reserved ? "" : reserved.error().message);
             segment_check(gpu.graph_resources && gpu.graph_resources->plan.sequence_count == 2,

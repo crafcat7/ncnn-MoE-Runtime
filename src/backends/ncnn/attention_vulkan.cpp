@@ -1706,6 +1706,7 @@ public:
     std::shared_ptr<AttentionCache_vulkan> next_cache;
     std::deque<ncnn::VkMat> buffers;
     std::deque<std::vector<ncnn::VkMat>> lists;
+    size_t buffers_used = 0, lists_used = 0;
     ncnn::VkMat rope_cosine, rope_sine, attention_mask, attention_cache_key, attention_cache_value;
     AttentionConfig_vulkan config;
     uint64_t previous_tokens = 0, previous_start = 0;
@@ -1717,6 +1718,41 @@ public:
     bool decode_matrix = false;
     bool wrapped = false, promoted = false;
     bool recorded = false, failed = false, committed = false;
+
+    ncnn::VkMat& keep_buffer(const ncnn::VkMat& value = {})
+    {
+        if (buffers_used == buffers.size()) buffers.emplace_back();
+        auto& result = buffers[buffers_used++];
+        result = value;
+        return result;
+    }
+
+    std::vector<ncnn::VkMat>& keep_list()
+    {
+        if (lists_used == lists.size()) lists.emplace_back();
+        return lists[lists_used++];
+    }
+
+    std::vector<ncnn::VkMat>& keep_list(size_t count)
+    {
+        auto& result = keep_list();
+        result.resize(count);
+        return result;
+    }
+
+    std::vector<ncnn::VkMat>& keep_list(size_t count, const ncnn::VkMat& value)
+    {
+        auto& result = keep_list();
+        result.assign(count, value);
+        return result;
+    }
+
+    std::vector<ncnn::VkMat>& keep_list(std::initializer_list<ncnn::VkMat> values)
+    {
+        auto& result = keep_list();
+        result.assign(values);
+        return result;
+    }
 #endif
 };
 
@@ -1724,6 +1760,35 @@ AttentionWork_vulkan::AttentionWork_vulkan() : d(new Implementation)
 {
 }
 AttentionWork_vulkan::~AttentionWork_vulkan() = default;
+
+void AttentionWork_vulkan::retire() noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    // Slot objects remain stable for record_forward's references, but no VkMat
+    // survives retirement. Device allocation lifetimes are unchanged.
+    for (size_t i = 0; i < d->buffers_used; ++i) d->buffers[i].release();
+    for (size_t i = 0; i < d->lists_used; ++i) d->lists[i].clear();
+    d->buffers_used = d->lists_used = 0;
+    d->rope_cosine.release();
+    d->rope_sine.release();
+    d->attention_mask.release();
+    d->attention_cache_key.release();
+    d->attention_cache_value.release();
+    d->original.reset();
+    d->next_cache.reset();
+    d->context.reset();
+    d->cache = nullptr;
+    d->config = {};
+    d->previous_tokens = d->previous_start = 0;
+    d->retained_tokens = d->dropped_tokens = d->next_first_slot = d->ring_capacity = 0;
+    d->allocated_cache_size = 0;
+    d->rows = 0;
+    d->allocate_ring = d->ring_resized = d->mutated_original = false;
+    d->qkv_rope = d->device_rope = d->qkv_ring = d->decode_sdpa = false;
+    d->decode_matrix = d->wrapped = d->promoted = false;
+    d->recorded = d->failed = d->committed = false;
+#endif
+}
 
 void AttentionWork_vulkan::mark_submit_failed() noexcept
 {
@@ -1973,16 +2038,16 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
     }
 
     ncnn::VulkanDevice* vkdev = implementation.vulkan_context->device();
-    auto& input_gpu = ticket.buffers.emplace_back();
-    auto& cosine_gpu = ticket.buffers.emplace_back(device_rope
-                                                       ? implementation.rope_inverse_frequencies_gpu
-                                                       : ncnn::VkMat());
-    auto& sine_gpu = ticket.buffers.emplace_back(device_rope
-                                                     ? implementation.rope_inverse_frequencies_gpu
-                                                     : ncnn::VkMat());
-    auto& mask_gpu = ticket.buffers.emplace_back();
-    auto& promoted_key_gpu = ticket.buffers.emplace_back();
-    auto& promoted_value_gpu = ticket.buffers.emplace_back();
+    auto& input_gpu = ticket.keep_buffer();
+    auto& cosine_gpu = ticket.keep_buffer(device_rope
+                                              ? implementation.rope_inverse_frequencies_gpu
+                                              : ncnn::VkMat());
+    auto& sine_gpu = ticket.keep_buffer(device_rope
+                                            ? implementation.rope_inverse_frequencies_gpu
+                                            : ncnn::VkMat());
+    auto& mask_gpu = ticket.keep_buffer();
+    auto& promoted_key_gpu = ticket.keep_buffer();
+    auto& promoted_value_gpu = ticket.keep_buffer();
     input_gpu = input;
     if (!device_rope
         && (!record_mapped_upload(ticket.rope_cosine, cosine_gpu, command, implementation.option)
@@ -2011,17 +2076,17 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
             return false;
         }
     }
-    auto& normalized_gpu = ticket.buffers.emplace_back();
+    auto& normalized_gpu = ticket.keep_buffer();
     if (!implementation.norm->record(input_gpu, normalized_gpu, command))
     {
         return false;
     }
-    auto& fused_gpu = ticket.buffers.emplace_back();
-    auto& normalized_unpacked_gpu = ticket.buffers.emplace_back(normalized_gpu);
-    auto& projection_workspace = ticket.lists.emplace_back();
+    auto& fused_gpu = ticket.keep_buffer();
+    auto& normalized_unpacked_gpu = ticket.keep_buffer(normalized_gpu);
+    auto& projection_workspace = ticket.keep_list();
     if ((use_native || use_norm_rope || fused_gate) && normalized_unpacked_gpu.elempack != 1)
     {
-        auto& unpacked = ticket.buffers.emplace_back();
+        auto& unpacked = ticket.keep_buffer();
         vkdev->convert_packing(normalized_unpacked_gpu,
                                unpacked,
                                1,
@@ -2110,14 +2175,14 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
     ticket.mutated_original = has_device_cache && !ring_resized;
     const uint64_t append_slot = (ring_first_slot + cache.token_count) % ring_capacity;
 
-    auto& query_rope = ticket.buffers.emplace_back();
-    auto& key_rope = ticket.buffers.emplace_back();
-    auto& value_heads = ticket.buffers.emplace_back();
-    auto& output_gate = ticket.buffers.emplace_back();
-    auto& fused_qkv_unpacked = ticket.buffers.emplace_back(fused_gpu);
+    auto& query_rope = ticket.keep_buffer();
+    auto& key_rope = ticket.keep_buffer();
+    auto& value_heads = ticket.keep_buffer();
+    auto& output_gate = ticket.keep_buffer();
+    auto& fused_qkv_unpacked = ticket.keep_buffer(fused_gpu);
     if (fused_qkv_unpacked.elempack != 1)
     {
-        auto& unpacked = ticket.buffers.emplace_back();
+        auto& unpacked = ticket.keep_buffer();
         vkdev->convert_packing(fused_qkv_unpacked, unpacked, 1, command, implementation.option);
         fused_qkv_unpacked = unpacked;
     }
@@ -2141,16 +2206,16 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
     }
     else
     {
-        auto& qkv_input = ticket.lists.emplace_back(1, fused_gpu);
-        auto& qkv = ticket.lists.emplace_back(3);
+        auto& qkv_input = ticket.keep_list(1, fused_gpu);
+        auto& qkv = ticket.keep_list(3);
         if (implementation.slice_qkv->forward(qkv_input, qkv, command, implementation.option) != 0)
         {
             return false;
         }
 
-        auto& query_shaped = ticket.buffers.emplace_back();
-        auto& key_shaped = ticket.buffers.emplace_back();
-        auto& value_shaped = ticket.buffers.emplace_back();
+        auto& query_shaped = ticket.keep_buffer();
+        auto& key_shaped = ticket.keep_buffer();
+        auto& value_shaped = ticket.keep_buffer();
         if (implementation.reshape_query->forward(qkv[0], query_shaped, command, implementation.option) != 0
             || implementation.reshape_key_value->forward(qkv[1], key_shaped, command, implementation.option) != 0
             || implementation.reshape_key_value->forward(qkv[2], value_shaped, command, implementation.option) != 0)
@@ -2158,8 +2223,8 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
             return false;
         }
 
-        auto& query_heads = ticket.buffers.emplace_back();
-        auto& key_heads = ticket.buffers.emplace_back();
+        auto& query_heads = ticket.keep_buffer();
+        auto& key_heads = ticket.keep_buffer();
         if (implementation.permute_heads_tokens->forward(query_shaped, query_heads, command, implementation.option) != 0
             || implementation.permute_heads_tokens->forward(key_shaped, key_heads, command, implementation.option) != 0
             || implementation.permute_heads_tokens->forward(value_shaped, value_heads, command, implementation.option) != 0)
@@ -2168,35 +2233,35 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
         }
         if (query_heads.elempack != 1)
         {
-            auto& unpacked = ticket.buffers.emplace_back();
+            auto& unpacked = ticket.keep_buffer();
             vkdev->convert_packing(query_heads, unpacked, 1, command, implementation.option);
             query_heads = unpacked;
         }
         if (key_heads.elempack != 1)
         {
-            auto& unpacked = ticket.buffers.emplace_back();
+            auto& unpacked = ticket.keep_buffer();
             vkdev->convert_packing(key_heads, unpacked, 1, command, implementation.option);
             key_heads = unpacked;
         }
         if (value_heads.elempack != 1)
         {
-            auto& unpacked = ticket.buffers.emplace_back();
+            auto& unpacked = ticket.keep_buffer();
             vkdev->convert_packing(value_heads, unpacked, 1, command, implementation.option);
             value_heads = unpacked;
         }
 
-        auto& query_rope_input = ticket.lists.emplace_back(std::initializer_list<ncnn::VkMat>{
+        auto& query_rope_input = ticket.keep_list(std::initializer_list<ncnn::VkMat>{
             query_heads,
             cosine_gpu,
             sine_gpu,
         });
-        auto& key_rope_input = ticket.lists.emplace_back(std::initializer_list<ncnn::VkMat>{
+        auto& key_rope_input = ticket.keep_list(std::initializer_list<ncnn::VkMat>{
             key_heads,
             cosine_gpu,
             sine_gpu,
         });
-        auto& query_rope_output = ticket.lists.emplace_back(1);
-        auto& key_rope_output = ticket.lists.emplace_back(1);
+        auto& query_rope_output = ticket.keep_list(1);
+        auto& key_rope_output = ticket.keep_list(1);
         if (implementation.rotary->forward(query_rope_input, query_rope_output, command, implementation.option) != 0
             || implementation.rotary->forward(key_rope_input, key_rope_output, command, implementation.option) != 0)
         {
@@ -2236,13 +2301,13 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
         }
     }
 
-    auto& combined_key = ticket.buffers.emplace_back(attention_ring_view(next_cache->key, ring_first_slot, destination_count));
-    auto& combined_value = ticket.buffers.emplace_back(attention_ring_view(next_cache->value, ring_first_slot, destination_count));
+    auto& combined_key = ticket.keep_buffer(attention_ring_view(next_cache->key, ring_first_slot, destination_count));
+    auto& combined_value = ticket.keep_buffer(attention_ring_view(next_cache->value, ring_first_slot, destination_count));
     if (combined_key.empty() || combined_value.empty())
     {
         return false;
     }
-    auto& attention_matrix = ticket.buffers.emplace_back();
+    auto& attention_matrix = ticket.keep_buffer();
     if (use_decode_sdpa)
     {
         if (!record_decode(query_rope, combined_key, combined_value, destination_count,
@@ -2261,8 +2326,8 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
                 return false;
             }
         }
-        auto& sdpa_key = ticket.buffers.emplace_back(combined_key);
-        auto& sdpa_value = ticket.buffers.emplace_back(combined_value);
+        auto& sdpa_key = ticket.keep_buffer(combined_key);
+        auto& sdpa_value = ticket.keep_buffer(combined_value);
         if (low_precision_kv)
         {
             vkdev->convert_packing(combined_key,
@@ -2284,19 +2349,19 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
                 return false;
             }
         }
-        auto& sdpa_input = ticket.lists.emplace_back(std::initializer_list<ncnn::VkMat>{
+        auto& sdpa_input = ticket.keep_list(std::initializer_list<ncnn::VkMat>{
             query_rope,
             sdpa_key,
             sdpa_value,
             mask_gpu,
         });
-        auto& sdpa_output = ticket.lists.emplace_back(1);
+        auto& sdpa_output = ticket.keep_list(1);
         if (implementation.sdpa->forward(sdpa_input, sdpa_output, command, implementation.option) != 0)
         {
             return false;
         }
 
-        auto& attention_token_major = ticket.buffers.emplace_back();
+        auto& attention_token_major = ticket.keep_buffer();
         if (implementation.permute_heads_tokens->forward(sdpa_output[0], attention_token_major, command, implementation.option) != 0
             || implementation.reshape_attention->forward(attention_token_major, attention_matrix, command, implementation.option) != 0)
         {
@@ -2306,7 +2371,7 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
 
     if ((use_native || projection_bfloat16) && attention_matrix.elempack != 1)
     {
-        auto& unpacked = ticket.buffers.emplace_back();
+        auto& unpacked = ticket.keep_buffer();
         vkdev->convert_packing(attention_matrix,
                                unpacked,
                                1,
@@ -2319,7 +2384,7 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
     {
         if (attention_matrix.elempack != 1)
         {
-            auto& unpacked = ticket.buffers.emplace_back();
+            auto& unpacked = ticket.keep_buffer();
             vkdev->convert_packing(attention_matrix,
                                    unpacked,
                                    1,
@@ -2337,7 +2402,7 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
             return false;
         }
     }
-    auto& projected_gpu = ticket.buffers.emplace_back();
+    auto& projected_gpu = ticket.keep_buffer();
     if (projection_bfloat16)
     {
         if (attention_matrix.empty()
@@ -2385,12 +2450,12 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
     }
     if (add_residual)
     {
-        auto& residual_input_gpu = ticket.buffers.emplace_back(input_gpu);
+        auto& residual_input_gpu = ticket.keep_buffer(input_gpu);
         if (use_native
             && (residual_input_gpu.elempack != 1
                 || residual_input_gpu.elemsize != sizeof(float)))
         {
-            auto& unpacked = ticket.buffers.emplace_back();
+            auto& unpacked = ticket.keep_buffer();
             vkdev->convert_packing(residual_input_gpu,
                                    unpacked,
                                    1,
@@ -2411,7 +2476,7 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
         }
         if (projected_gpu.elempack != residual_input_gpu.elempack)
         {
-            auto& packed = ticket.buffers.emplace_back();
+            auto& packed = ticket.keep_buffer();
             vkdev->convert_packing(projected_gpu,
                                    packed,
                                    residual_input_gpu.elempack,
@@ -2421,8 +2486,8 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
                 return false;
             projected_gpu = packed;
         }
-        auto& add_input = ticket.lists.emplace_back(std::initializer_list<ncnn::VkMat>{residual_input_gpu, projected_gpu});
-        auto& add_output = ticket.lists.emplace_back(1);
+        auto& add_input = ticket.keep_list(std::initializer_list<ncnn::VkMat>{residual_input_gpu, projected_gpu});
+        auto& add_output = ticket.keep_list(1);
         if (implementation.add->forward(add_input, add_output, command, implementation.option) != 0)
         {
             return false;
@@ -2432,10 +2497,10 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
     }
     else
         output = projected_gpu;
-    auto& download_gpu = ticket.buffers.emplace_back(output);
+    auto& download_gpu = ticket.keep_buffer(output);
     if (download_gpu.elempack != 1)
     {
-        auto& unpacked = ticket.buffers.emplace_back();
+        auto& unpacked = ticket.keep_buffer();
         vkdev->convert_packing(download_gpu, unpacked, 1, command, implementation.option);
         download_gpu = unpacked;
     }

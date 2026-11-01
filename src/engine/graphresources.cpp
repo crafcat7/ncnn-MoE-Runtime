@@ -363,6 +363,10 @@ Result<void> ensure_model_graph_resources(const CompiledModel& model, uint64_t r
     auto plan = plan_model_graph_memory(model, next_rows, std::max(sequence_count, resources.plan.sequence_count), next_context);
     if (!plan)
         return plan.error();
+    // Published host outputs may outlive a smaller-row context replan. Keep
+    // each workspace's already-admitted slot capacity until model teardown.
+    plan.value().host_output_slot_size = std::max(plan.value().host_output_slot_size, resources.plan.host_output_slot_size);
+    plan.value().host_output_workspace_size = std::max(plan.value().host_output_workspace_size, resources.plan.host_output_workspace_size);
     auto allocated = allocate_graph_resources(model, plan.value(), nullptr);
     if (!allocated)
         return allocated.error();

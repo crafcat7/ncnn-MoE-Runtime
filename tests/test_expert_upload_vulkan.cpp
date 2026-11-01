@@ -110,6 +110,29 @@ static void weight_physical_ceiling()
     VulkanExpertWeightAllocator too_small(context->device(), block_size, block_bytes - 1);
     upload_check(too_small.fastMalloc(block_size) == nullptr && too_small.physical_bytes() == 0,
                  "first physical allocation cannot exceed a smaller ceiling");
+
+    // Graph descriptor metadata is also used by ordinary Expert allocations.
+    // A handle invalidated by clear is safe to dispose on the CPU after a new
+    // allocation, without returning that new allocation's range to the pool.
+    auto* stale = bounded.fastMalloc(block_size / 2);
+    upload_check(stale != nullptr, "ordinary Expert stale-handle fixture allocation");
+    bounded.clear();
+    upload_check(bounded.physical_bytes() == 0, "ordinary Expert clear releases invalidated backing");
+    auto* replacement = bounded.fastMalloc(block_size / 2);
+    upload_check(replacement != nullptr, "ordinary Expert allocation after clear");
+    const VkBuffer replacement_buffer = replacement->buffer;
+    const size_t replacement_offset = replacement->offset;
+    bounded.fastFree(stale);
+    upload_check(bounded.physical_bytes() == block_bytes && replacement->buffer == replacement_buffer
+                     && replacement->offset == replacement_offset,
+                 "disposing a stale Expert descriptor affected a replacement allocation");
+    auto* adjacent = bounded.fastMalloc(block_size / 2);
+    upload_check(adjacent && adjacent->buffer == replacement_buffer
+                     && adjacent->offset >= replacement->offset + replacement->capacity
+                     && bounded.physical_bytes() == block_bytes,
+                 "ordinary Expert descriptor disposal exposed a live range or exceeded its physical ceiling");
+    bounded.fastFree(adjacent);
+    bounded.fastFree(replacement);
 }
 
 static void demand_physical_recovery(bool mxfp4)

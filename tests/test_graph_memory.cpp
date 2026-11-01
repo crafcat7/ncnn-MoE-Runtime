@@ -30,6 +30,25 @@ static void test_submission_budget()
     }
 }
 
+static void test_submission_budget_lookahead()
+{
+    const double large = std::numeric_limits<double>::max();
+    GpuSubmissionBudget budget(4000.0);
+    memory_check(!budget.would_flush_before(large), "an empty command must not be submitted");
+    budget.record(1);
+    memory_check(budget.would_flush_before(large) && budget.would_flush_before(large),
+                 "considering a boundary must preserve unacknowledged work");
+    budget.submitted();
+    memory_check(!budget.would_flush_before(large), "successful submission must clear pending work");
+    for (double work : {std::numeric_limits<double>::infinity(),
+                        std::numeric_limits<double>::quiet_NaN(), -1.0})
+    {
+        budget.record(work);
+        memory_check(budget.would_flush_before(large), "nonfinite estimates must not prevent progress");
+        budget.submitted();
+    }
+}
+
 static const GraphMemoryAllocation& allocation(const GraphMemoryPlan& plan, uint32_t id, uint32_t device = 0)
 {
     const auto found = std::find_if(plan.allocations.begin(), plan.allocations.end(), [&](const GraphMemoryAllocation& item) {
@@ -348,6 +367,47 @@ static void test_model_graph_lifetimes_and_shapes()
                  "zero-sized execution variants must be rejected before planning their graph");
 }
 
+static void test_host_output_planning()
+{
+    const auto rows = plan_host_output_slot_size(3, 17);
+    memory_check(rows && rows.value() >= 3 * 17 * sizeof(float),
+                 "host output capacity must contain every FP32 row");
+    memory_check(!plan_host_output_slot_size(0, 1) && !plan_host_output_slot_size(1, 0)
+                     && !plan_host_output_slot_size(UINT64_MAX, 2)
+                     && !plan_host_output_slot_size(1, UINT32_MAX),
+                 "host output planning accepted empty or unrepresentable Vulkan shapes");
+
+    CompiledModel model = model_memory_fixture();
+    const auto prefill = plan_model_graph_memory(model, 8, 3, 64);
+    const auto decode = plan_model_graph_memory(model, 3, 8, 64);
+    const auto expected = plan_host_output_slot_size(8, model.descriptor.vocabulary_size);
+    memory_check(prefill && decode && expected
+                     && prefill.value().host_output_slot_size == expected.value()
+                     && decode.value().host_output_slot_size == expected.value()
+                     && prefill.value().host_output_workspace_size == 2 * expected.value()
+                     && decode.value().host_output_workspace_size == 2 * expected.value(),
+                 "per-workspace host output capacity must cover All prefill and staged decode without multiplying Sessions twice");
+    const auto larger_context = plan_model_graph_memory(model, 8, 3, 1024);
+    memory_check(larger_context && larger_context.value().host_output_slot_size == prefill.value().host_output_slot_size,
+                 "KV context growth changed the independently planned host output shape");
+    for (auto& node : model.graph.nodes)
+        if (node.type == ExecutionNodeType::LmHead)
+        {
+            node.backend = ExecutionBackend::Cpu;
+            node.backend_mask = ExecutionBackendCpu;
+        }
+    const auto cpu_head = plan_model_graph_memory(model, 8, 3, 64);
+    memory_check(cpu_head && cpu_head.value().host_output_slot_size == 0 && cpu_head.value().host_output_workspace_size == 0,
+                 "CPU LM heads must not reserve mapped Vulkan output slots");
+
+    // Force workspace arithmetic to fail before any device allocation plan.
+    CompiledModel huge = model_memory_fixture();
+    huge.descriptor.vocabulary_size = static_cast<uint32_t>(std::numeric_limits<int>::max());
+    const auto overflow = plan_model_graph_memory(huge, static_cast<uint32_t>(std::numeric_limits<int>::max()), 1, 64);
+    memory_check(!overflow && overflow.error().code == ErrorCode::InvalidArgument,
+                 "two simultaneously owned host output slots overflowed their workspace capacity");
+}
+
 } // namespace moe
 } // namespace ncnn
 
@@ -357,11 +417,13 @@ int main()
     {
         ncnn::moe::test_closed_lifetimes_and_branches();
         ncnn::moe::test_submission_budget();
+        ncnn::moe::test_submission_budget_lookahead();
         ncnn::moe::test_submission_fences();
         ncnn::moe::test_alignment_and_reuse();
         ncnn::moe::test_devices_empty_buffers_and_validation();
         ncnn::moe::test_overflow();
         ncnn::moe::test_model_graph_lifetimes_and_shapes();
+        ncnn::moe::test_host_output_planning();
         std::cout << "Graph memory lifetime tests passed\n";
         return 0;
     }
