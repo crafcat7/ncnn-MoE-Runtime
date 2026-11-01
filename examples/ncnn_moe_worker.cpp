@@ -198,6 +198,15 @@ static std::string gpu_metrics_json(const RuntimeMetricCounters& counters, bool 
     result.add_uint("ple_blocks", counters.vulkan_ple_blocks);
     result.add_uint("batch_uploads", counters.vulkan_batch_uploads);
     result.add_uint("batch_downloads", counters.vulkan_batch_downloads);
+    result.add_uint("weight_upload_bytes", counters.vulkan_weight_upload_bytes);
+    result.add_uint("weight_transfer_submissions", counters.vulkan_weight_transfer_submissions);
+    result.add_uint("weight_visibility_submissions", counters.vulkan_weight_visibility_submissions);
+    result.add_uint("weight_transfer_fence_waits", counters.vulkan_weight_transfer_fence_waits);
+    result.add_uint("weight_transfer_wait_microseconds", counters.vulkan_weight_transfer_wait_microseconds);
+    result.add_uint("resident_graph_submissions", counters.vulkan_resident_graph_submissions);
+    result.add_uint("resident_graph_activation_upload_bytes", counters.vulkan_resident_graph_activation_upload_bytes);
+    result.add_uint("resident_graph_activation_download_bytes", counters.vulkan_resident_graph_activation_download_bytes);
+    result.add_uint("resident_graph_route_download_bytes", counters.vulkan_resident_graph_route_download_bytes);
     result.add_uint("attention_qkv_rope_fusions", counters.vulkan_attention_qkv_rope_fusions);
     result.add_uint("attention_device_rope_fusions", counters.vulkan_attention_device_rope_fusions);
     result.add_uint("attention_qkv_ring_fusions", counters.vulkan_attention_qkv_ring_fusions);
@@ -235,6 +244,68 @@ static std::string stats_json(const SessionMetrics& metrics)
     result.add_uint("kv_cache_logical_bytes", metrics.cumulative.kv_cache_logical_size);
     result.add_uint("kv_cache_allocated_bytes", metrics.cumulative.kv_cache_allocated_size);
 
+    return result.finish();
+}
+
+static std::string gpu_resource_plan_json(const CompiledModel& model)
+{
+    const ModelMemoryPlan& memory_plan = model.memory_plan;
+    std::string result = "[";
+    for (const GpuResourcePlan& plan : memory_plan.gpu_devices)
+    {
+        if (result.size() != 1)
+            result.push_back(',');
+        JsonObject device;
+        device.add_uint("device_index", plan.initial.device_index);
+        device.add_uint("heap_budget_bytes", plan.initial.heap_budget);
+        device.add_uint("initial_heap_usage_bytes", plan.initial.heap_usage);
+        device.add_uint("estimated_persistent_bytes", plan.admitted.persistent_size);
+        device.add_uint("session_state_bytes", plan.admitted.session_state_size);
+        device.add_uint("peak_workspace_bytes", plan.admitted.workspace_size);
+        device.add_uint("expected_concurrency", plan.num_concurrent_sessions);
+        device.add_uint("execution_reserve_bytes", gpu_resource_execution_reserve(plan));
+        device.add_uint("allocated_execution_bytes", plan.allocated_execution_size);
+        const auto physical = query_vulkan_graph_compute(model.vulkan_runtime, plan.initial.device_index, model.opt.optimization_flags);
+        device.add_uint("arena_preparation_physical_bytes", physical.preparation_physical_size);
+        device.add_uint("arena_compute_physical_bytes", physical.compute_physical_size);
+        device.add_uint("arena_total_physical_bytes", physical.total_physical_size);
+        device.add_uint("planned_prefill_rows", memory_plan.graph.prefill_rows);
+        device.add_uint("planned_context_tokens", memory_plan.graph.context_tokens);
+        for (const auto& arena : memory_plan.graph.prefill.devices)
+            if (arena.device_index == plan.initial.device_index)
+                device.add_uint("prefill_graph_peak_bytes", arena.peak_size);
+        for (const auto& arena : memory_plan.graph.decode.devices)
+            if (arena.device_index == plan.initial.device_index)
+                device.add_uint("decode_graph_peak_bytes", arena.peak_size);
+        device.add_uint("expert_cache_reserve_bytes", plan.expert_cache_reserve);
+        result += device.finish();
+    }
+    result.push_back(']');
+    return result;
+}
+
+static std::string placement_json(const CompiledModel& compiled)
+{
+    JsonObject result;
+    uint64_t attention_gpu = 0;
+    uint64_t attention_cpu = 0;
+    uint64_t gated_delta_gpu = 0;
+    uint64_t gated_delta_cpu = 0;
+    for (const ExecutionNode& node : compiled.graph.nodes)
+    {
+        if (node.type != ExecutionNodeType::Attention || node.layer_plan_index >= compiled.graph.layer_plans.size())
+            continue;
+        const bool gpu = node.backend == ExecutionBackend::Vulkan;
+        (gpu ? attention_gpu : attention_cpu)++;
+        if (compiled.graph.layer_plans[node.layer_plan_index].attention.kind == AttentionKind::GatedDeltaNet)
+            (gpu ? gated_delta_gpu : gated_delta_cpu)++;
+    }
+    result.add_uint("attention_gpu_layers", attention_gpu);
+    result.add_uint("attention_cpu_layers", attention_cpu);
+    result.add_uint("gated_delta_gpu_layers", gated_delta_gpu);
+    result.add_uint("gated_delta_cpu_layers", gated_delta_cpu);
+    result.add_bool("gpu_expert_backend_available", compiled.expert_backend || !compiled.gpu_expert_banks.empty());
+    result.add_bool("gpu_expert_bank_available", !compiled.gpu_expert_banks.empty());
     return result.finish();
 }
 
@@ -700,6 +771,9 @@ private:
         resources.add_uint("host_memory_budget_bytes", memory_plan.host_memory_budget);
         resources.add_uint("expert_cache_bytes", memory_plan.expert_cache_size);
         resources.add_uint("expert_gpu_cache_bytes", effective.expert_gpu_cache_size);
+        resources.add_uint("expert_gpu_bank_bytes", model_compiled(*model).gpu_expert_bank_size);
+        resources.add_uint("expert_gpu_bank_layers", model_compiled(*model).gpu_expert_banks.size());
+        resources.add_uint("expert_gpu_bank_submission_rows", model_compiled(*model).bank_submission_rows);
         resources.add_uint("expert_gpu_victim_cache_bytes", effective.expert_gpu_victim_cache_size);
         resources.add_uint("expert_io_workers", effective.num_expert_io_threads);
         resources.add_uint("expected_concurrency", effective.num_concurrent_sessions);
@@ -718,6 +792,8 @@ private:
         resources.add_uint("estimated_cpu_packed_expert_bytes", memory_plan.estimated_cpu_packed_expert_size);
         resources.add_uint("estimated_expert_resident_bytes", memory_plan.estimated_expert_resident_size);
         resources.add_uint("minimum_active_expert_bytes", memory_plan.minimum_active_expert_size);
+        resources.add_raw("gpu_resource_plan", gpu_resource_plan_json(model_compiled(*model)));
+        resources.add_raw("placement", placement_json(model_compiled(*model)));
 
         JsonObject info_json;
         info_json.add_uint("physical_memory_bytes", info.physical_memory_size);

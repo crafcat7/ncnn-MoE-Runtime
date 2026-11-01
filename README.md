@@ -86,9 +86,10 @@ requiring a resident copy of every routed weight.
 
 ## Why it is fast
 
-- **Heterogeneous placement.** Dense projections and Attention run through
-  ncnn Vulkan while routing and sparse Expert work use the CPU; native Vulkan
-  Experts execute when their weights are resident in the device cache.
+- **Heterogeneous placement.** Dense projections, Attention, and supported
+  routed Experts run through ncnn Vulkan. Resident segments also record
+  normalization, routing, Top-K, shared Experts, and residual addition on GPU;
+  CPU cache scheduling consumes compact selected Expert IDs and weights.
   Standard GQA Attention keeps native GGUF projections, RoPE, KV rings, SDPA,
   output gates, and residual addition in one device submission. Hybrid requires
   a complete GPU operator for this block and reports preparation or execution
@@ -337,6 +338,42 @@ ncnn::moe::Result<ncnn::moe::GenerationResult> run(
     return session.value()->generate(input_ids.value(), generation_options);
 }
 ```
+
+Hybrid execution uses one per-device resource plan across model adapters.
+Backend capabilities determine placement before execution. The scheduled graph's
+tensor lifetimes, operator temporaries, and Session state determine the Prefill
+and Decode memory reservations; the shared Vulkan arena is physically reserved
+before the Expert cache is sized. Automatic GPU Expert caching uses the remaining
+live device budget, without model-specific heap fractions. Larger execution
+shapes replan and reserve memory with the same backend placement.
+
+GPU graph allocation, Expert upload, and selected GPU computation failures return
+errors instead of retrying computation on the CPU. An Expert cache miss uploads
+the missing weights and continues on the GPU. Unsupported operator combinations
+can be assigned to the CPU during planning, with explicit graph boundaries.
+
+On one device, supported ordinary-residual Standard/GatedDeltaNet MoE layers
+use a common resident segment selected from prepared operator capabilities.
+Operators record into the segment owner's command; the owner submits, waits,
+and publishes activations and cache updates only after successful completion.
+Normalized inputs and routed aggregates remain on GPU across Expert cache waves
+and layer boundaries. The next segment records shared Experts and residuals;
+the final head reads back logits. Embedding, sampling, explicit host consumers,
+and ExpertStore scheduling retain their host boundaries. Existing hyperconnection
+paths remain separate; explicit CPU router prediction and multiple devices do
+not select this segment. The existing `OptimizationVulkanCommandGraph` flag
+controls its admission.
+
+Supported native Expert formats share bounded upload batches across Experts and projections.
+Independent transfer queues use a semaphore to order copy and compute visibility;
+devices with multiple compute queues need only the final host fence wait. Generic
+routed FFN regions accept resident device input or upload host input once, retain
+results across cache waves, and record the final weighted reduction in the last
+wave's existing command. Resident consumers receive a device aggregate; explicit
+host consumers request its download. Weight-copy submissions, visibility
+submissions, completed copy bytes, and fence waits are reported separately from
+compute submissions. Resident graph counters separate activation transfer bytes
+from compact route readbacks; final logits are not intermediate activations.
 
 Expert I/O is selected with `opt.expert_io_mode`: `ExpertIoMode::Auto` (the
 default), `Mmap`, `Direct`, or `Buffered`. This replaces the three mutually

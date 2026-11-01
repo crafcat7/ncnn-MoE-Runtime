@@ -176,7 +176,7 @@ def _format_runtime_metrics(metrics: Any) -> str:
     cache_hit_text = _format_metric_count(expert.get("cache_hit"))
     if isinstance(cache_hit_rate, (int, float)):
         cache_hit_text += f" ({float(cache_hit_rate) * 100:.1f}%)"
-    return "\n".join(
+    lines = list(
         (
             "metrics",
             "  Prompt: "
@@ -215,7 +215,7 @@ def _format_runtime_metrics(metrics: Any) -> str:
             " · CPU fallbacks "
             f"{_format_metric_count(expert.get('cpu_fallbacks'))}",
             f"  Process CPU: {process_cpu_text}",
-            "  GPU: submit "
+            "  GPU: compute submit "
             f"{_format_metric_count(gpu.get('submit_count'), available=gpu_available)}"
             " · utilization "
             f"{_format_gpu_utilization(gpu_device)}"
@@ -247,6 +247,30 @@ def _format_runtime_metrics(metrics: Any) -> str:
             f"{_format_metric_count(gpu.get('ple_blocks'), available=gpu_available)}",
         )
     )
+
+    if "weight_transfer_submissions" in gpu:
+        lines.append(
+            "  GPU weight transfer: copy/visibility submit "
+            f"{_format_metric_count(gpu.get('weight_transfer_submissions'), available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('weight_visibility_submissions'), available=gpu_available)}"
+            " · bytes "
+            f"{_format_bytes_gb(gpu.get('weight_upload_bytes'))}"
+            " · fence waits "
+            f"{_format_metric_count(gpu.get('weight_transfer_fence_waits'), available=gpu_available)}"
+        )
+    if gpu.get("resident_graph_submissions", 0):
+        lines.append(
+            "  GPU resident graph: submit "
+            f"{_format_metric_count(gpu.get('resident_graph_submissions'), available=gpu_available)}"
+            " · activation H2D/D2H "
+            f"{_format_metric_count(gpu.get('resident_graph_activation_upload_bytes'), available=gpu_available)}"
+            "/"
+            f"{_format_metric_count(gpu.get('resident_graph_activation_download_bytes'), available=gpu_available)} B"
+            " · route D2H "
+            f"{_format_metric_count(gpu.get('resident_graph_route_download_bytes'), available=gpu_available)} B"
+        )
+    return "\n".join(lines)
 
 
 def _add_model_position(parser: argparse.ArgumentParser) -> None:
