@@ -1,0 +1,54 @@
+diff --git a/src/command.h b/src/command.h
+--- a/src/command.h
++++ b/src/command.h
+@@ -101,6 +101,9 @@
+ #endif // NCNN_PLATFORM_API
+ 
+     int submit();
++    // Caller exclusively owns this compute-family queue through completion.
++    // The command does not acquire or reclaim a borrowed queue.
++    int submit(VkQueue borrowed_compute_queue);
+ 
+     int wait();
+ 
+diff --git a/src/command.cpp b/src/command.cpp
+--- a/src/command.cpp
++++ b/src/command.cpp
+@@ -2189,6 +2189,11 @@
+ 
+ int VkCompute::submit()
+ {
++    return submit(0);
++}
++
++int VkCompute::submit(VkQueue borrowed_compute_queue)
++{
+     if (d->submitted)
+     {
+         NCNN_LOGE("VkCompute::submit called while a command is in flight");
+@@ -2300,7 +2305,7 @@
+             return -1;
+     }
+ 
+-    VkQueue compute_queue = vkdev->acquire_queue(vkdev->info.compute_queue_family_index());
++    VkQueue compute_queue = borrowed_compute_queue ? borrowed_compute_queue : vkdev->acquire_queue(vkdev->info.compute_queue_family_index());
+     if (compute_queue == 0)
+     {
+         NCNN_LOGE("out of compute queue");
+@@ -2324,12 +2329,14 @@
+         if (ret != VK_SUCCESS)
+         {
+             NCNN_LOGE("vkQueueSubmit failed %d", ret);
+-            vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
++            if (!borrowed_compute_queue)
++                vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
+             return -1;
+         }
+     }
+ 
+-    vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
++    if (!borrowed_compute_queue)
++        vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
+ 
+     d->submitted = true;
+     return 0;
