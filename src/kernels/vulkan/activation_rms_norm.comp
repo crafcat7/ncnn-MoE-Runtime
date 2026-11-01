@@ -1,5 +1,12 @@
 #version 450
 
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(constant_id = 0) const uint use_subgroup_reductions = 0;
+
 layout(binding = 0) readonly buffer input_blob
 {
     float input_data[];
@@ -18,31 +25,63 @@ layout(push_constant) uniform parameter
     uint rows;
     float epsilon;
     float weight_offset;
+    uint workgroup_size;
 }
 p;
 
-shared float partial[32];
+shared float partial[256];
 
 void main()
 {
     const uint row = gl_WorkGroupID.y;
     const uint lane = gl_LocalInvocationID.x;
+    const uint row_offset = row * p.columns;
     float square_sum = 0.0;
-    for (uint column = lane; lane < 32u && column < p.columns; column += 32)
+    for (uint column = lane * 4u; column < p.columns; column += p.workgroup_size * 4u)
     {
-        const float value = input_data[row * p.columns + column];
-        square_sum += value * value;
+        vec4 values = vec4(input_data[row_offset + column], 0.0, 0.0, 0.0);
+        if (column + 1u < p.columns) values.y = input_data[row_offset + column + 1u];
+        if (column + 2u < p.columns) values.z = input_data[row_offset + column + 2u];
+        if (column + 3u < p.columns) values.w = input_data[row_offset + column + 3u];
+        square_sum += dot(values, values);
     }
-    if (lane < 32u)
-        partial[lane] = square_sum;
-    barrier();
-    for (uint stride = 16; stride > 0; stride >>= 1)
+    float inverse_rms = 0.0;
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    if (use_subgroup_reductions != 0u)
     {
-        if (lane < stride)
-            partial[lane] += partial[lane + stride];
+        const float subgroup_sum = subgroupAdd(square_sum);
+        if (gl_SubgroupInvocationID == 0u)
+            partial[gl_SubgroupID] = subgroup_sum;
         barrier();
+        if (gl_SubgroupID == 0u)
+        {
+            // Each subgroup contributes one value. A subgroup may contain 32 or
+            // 64 lanes; no lane-count assumption is needed by either reduction.
+            float value = 0.0;
+            for (uint subgroup = gl_SubgroupInvocationID; subgroup < gl_NumSubgroups; subgroup += gl_SubgroupSize)
+                value += partial[subgroup];
+            const float total = subgroupAdd(value);
+            if (gl_SubgroupInvocationID == 0u)
+                partial[0] = inversesqrt(total / float(p.columns) + p.epsilon);
+        }
+        barrier();
+        inverse_rms = partial[0];
     }
-    const float inverse_rms = inversesqrt(partial[0] / float(p.columns) + p.epsilon);
-    for (uint column = lane; lane < 32u && column < p.columns; column += 32)
-        output_data[row * p.columns + column] = input_data[row * p.columns + column] * inverse_rms * (weight_data[column] + p.weight_offset);
+    else
+#endif
+    {
+        partial[lane] = square_sum;
+        barrier();
+        for (uint stride = p.workgroup_size >> 1u; stride > 0u; stride >>= 1u)
+        {
+            if (lane < stride)
+                partial[lane] += partial[lane + stride];
+            barrier();
+        }
+        inverse_rms = inversesqrt(partial[0] / float(p.columns) + p.epsilon);
+    }
+    for (uint column = lane * 4u; column < p.columns; column += p.workgroup_size * 4u)
+        for (uint item = 0u; item < 4u && column + item < p.columns; ++item)
+            output_data[row_offset + column + item] = input_data[row_offset + column + item]
+                                                      * inverse_rms * (weight_data[column + item] + p.weight_offset);
 }

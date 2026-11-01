@@ -495,6 +495,14 @@ if(NCNN_MOE_BUILD_TESTS)
         target_include_directories(ncnn_moe_linear_allocation_vulkan_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src ${NCNN_MOE_NCNN_SOURCE_DIR}/src/layer)
         add_test(NAME ncnn_moe_linear_allocation_vulkan COMMAND ncnn_moe_linear_allocation_vulkan_test)
+
+        add_executable(ncnn_moe_rmsnorm_vulkan_test tests/test_rmsnorm_vulkan.cpp)
+        target_link_libraries(ncnn_moe_rmsnorm_vulkan_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_rmsnorm_vulkan_test PRIVATE cxx_std_20)
+        target_compile_definitions(ncnn_moe_rmsnorm_vulkan_test PRIVATE NCNN_MOE_WITH_VULKAN=1)
+        target_include_directories(ncnn_moe_rmsnorm_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+        add_test(NAME ncnn_moe_rmsnorm_vulkan COMMAND ncnn_moe_rmsnorm_vulkan_test)
+        set_tests_properties(ncnn_moe_rmsnorm_vulkan PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
     # --- Core regression suite ------------------------------------------------

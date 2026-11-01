@@ -7,6 +7,7 @@
 
 namespace ncnn {
 class Option;
+class VkAllocator;
 class VkMat;
 class VkCompute;
 
@@ -18,16 +19,21 @@ class RmsNorm_vulkan
 {
 public:
     ~RmsNorm_vulkan();
+    // An optional weight allocator must outlive the operator. Output storage
+    // continues to use the Context's graph allocator.
     [[nodiscard]] static std::shared_ptr<RmsNorm_vulkan> create(const TensorData& weight,
                                                                 float epsilon,
                                                                 float weight_offset,
                                                                 std::shared_ptr<VulkanContext> context,
-                                                                const ncnn::Option& opt);
+                                                                const ncnn::Option& opt,
+                                                                ncnn::VkAllocator* weight_allocator = nullptr);
 #if NCNN_MOE_WITH_VULKAN
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
 #endif
     // The caller holds the context lock, which protects record scratch, and
     // retains outputs until submission completes.
+    // Input and output variables must differ; an output view sharing input
+    // storage receives a distinct allocation and never overwrites input.
     [[nodiscard]] bool record(const ncnn::VkMat& input, ncnn::VkMat& output,
                               ncnn::VkCompute& cmd) const;
 
